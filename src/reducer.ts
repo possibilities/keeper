@@ -1237,10 +1237,14 @@ function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
  * snapshot-invariant scans (the bash `json_each` exact-match scan over the 1.1k
  * mutation rows and the git-rm/git-mv deletion scan, both identical for every
  * dirty file) and re-`prepare`ing the two tool statements per file — bun:sqlite
- * does not cache `prepare()`. Hoisting collapses the bash scan to a once-built
- * exact-match index and the deletion scan to a once-parsed row list, and shares
- * one prepared statement pair across the loop. The matched-row set per file is
- * byte-identical to the per-file scans, so re-fold determinism is untouched.
+ * does not cache `prepare()`. Hoisting collapsed the bash scan to a built
+ * exact-match index and the deletion scan to a parsed row list, sharing one
+ * prepared statement pair across the loop. fn-892 then makes both INCREMENTAL:
+ * the index + row list are owned by the per-`Database` {@link GitAttribMemo} and
+ * a fold appends only the `id > maxId` delta rather than rebuilding from a
+ * full-history scan. The matched-row set per file stays byte-identical to the
+ * per-file scans (the consumer is newest-wins `(ts, id)`, order-insensitive), so
+ * re-fold determinism is untouched.
  */
 interface BashMutationRow {
   id: number;
@@ -1264,17 +1268,76 @@ interface ExplicitAttribHoist {
   // The bash exact-match scan, materialized once as `target token → rows`. The
   // SQL probe was `json_each(targets) WHERE value = ?` (exact equality), so a
   // per-token bucket reproduces the same matched set via an O(1) JS lookup.
+  // Owned by the per-`Database` {@link GitAttribMemo} — INCREMENTALLY appended,
+  // not rebuilt, so the returned reference is the live memo map.
   bashByToken: Map<string, BashMutationRow[]>;
   // The git-rm/git-mv rows, pulled and JSON-parsed ONCE; matched per file in JS
   // via `bashTargetMatches` (exact / dir-prefix / fnmatch) exactly as before.
+  // Also owned by the per-`Database` memo (appended, not rebuilt).
   deletionRows: DeletionMutationRow[];
 }
 
 /**
+ * Per-`Database` incremental memo for the two pass-1 attribution scans (fn-892).
+ *
+ * The two scans in {@link buildExplicitAttribHoist} (a bash exact-match scan over
+ * every `bash_mutation_kind IS NOT NULL` row and a git-rm/git-mv deletion scan)
+ * are snapshot-invariant — they ran once per snapshot but rescanned the WHOLE
+ * `events` table each time, so the dominant steady-state fold cost grew
+ * monotonically with log size. This memo collapses each to O(rows since the last
+ * fold): per fold we scan only `id > maxId` and APPEND the freshly-parsed rows
+ * into the cached structures, then bump `maxId`.
+ *
+ * Correctness rests on three facts:
+ *  - the event log below head is APPEND-ONLY (rows are never deleted; retention
+ *    only NULLs fold-unread bodies — never `bash_mutation_kind` /
+ *    `bash_mutation_targets`, the only columns these scans read), so an
+ *    incremental append over `id > maxId` is a faithful SUPERSET of a full rescan;
+ *  - attribution is newest-wins re-evaluated per `(file_path)` on `(ts, id)` in
+ *    `findExplicitAttributions` / the UPSERT WHERE clause, so id-insertion order
+ *    (the watermark axis) need not match ts order — a later-inserted older-ts row
+ *    still loses correctly on re-evaluation;
+ *  - the persisted `file_attributions` projection is order-insensitive
+ *    (newest-wins UPSERT by `last_mutation_at`), so an in-memory append never
+ *    perturbs the on-disk bytes — a warm-cache fold equals a cold rescan.
+ *
+ * This is the LIVE-ONLY / charter-excluded git surface (`git_status`,
+ * `file_attributions`), so in-process per-`Database` memoization is acceptable: it
+ * is NOT a projection, never persisted, and re-derives for free on a fresh
+ * connection (a cold entry's first scan is `id > 0` = the whole history once,
+ * preserving boot-seed full fidelity). Keyed by `Database` via a `WeakMap` so a
+ * dropped connection's memo is collected; a test using a fresh DB per case starts
+ * cold by construction (see CLAUDE.md test-isolation note).
+ */
+interface GitAttribMemo {
+  maxId: number;
+  bashByToken: Map<string, BashMutationRow[]>;
+  deletionRows: DeletionMutationRow[];
+}
+
+const gitAttribMemos = new WeakMap<Database, GitAttribMemo>();
+
+/**
+ * Test-only: drop the per-`Database` git-attribution memo so the NEXT fold on
+ * this connection starts cold (a full `id > 0` rescan). Production never calls
+ * this — the WeakMap collects a dropped connection's memo on its own, and a
+ * fresh-DB-per-test is cold by construction. Exposed so a warm-vs-cold
+ * equivalence test can force a cold rescan on a connection it has already warmed
+ * (see the CLAUDE.md WeakMap test-isolation note).
+ */
+export function __resetGitAttribMemoForTest(db: Database): void {
+  gitAttribMemos.delete(db);
+}
+
+/**
  * Build the per-snapshot {@link ExplicitAttribHoist} once before the pass-1
- * loop. The two scans here ran once per dirty file before; now they run once
- * per snapshot. `acc` carries the prepare-vs-execute timing split for the
- * `[gitfold-breakdown]` line (pure instrumentation).
+ * loop. The two scans here ran once per dirty file (fn-787 hoisted them to once
+ * per snapshot); fn-892 makes each INCREMENTAL via the per-`Database`
+ * {@link GitAttribMemo}, so a steady-state fold scans only the `id > maxId`
+ * delta and appends into the cached structures instead of re-scanning the whole
+ * `events` table. `acc` carries the prepare-vs-execute timing split for the
+ * `[gitfold-breakdown]` line (pure instrumentation; `p1_bash_rows` /
+ * `p1_del_rows` now report the per-fold delta, not full history).
  */
 function buildExplicitAttribHoist(
   db: Database,
@@ -1297,26 +1360,54 @@ function buildExplicitAttribHoist(
           AND mutation_path = ?`,
   );
 
-  // Bash exact-match scan — pull the sparse mutation subset ONCE and bucket each
-  // row under every target token it carries (the SQL `json_each ... = ?` probe
-  // was per-file per-token exact equality, so a per-token bucket is equivalent).
+  // Per-`Database` incremental memo (fn-892): scan only `id > maxId` and append
+  // into the cached structures, so steady-state pass-1 cost is O(rows since the
+  // last fold), not O(history). A cold entry (no memo for this connection) starts
+  // at `maxId = 0`, so its first scan is `id > 0` = the whole history once —
+  // preserving boot-seed full fidelity. See {@link GitAttribMemo}.
+  let memo = gitAttribMemos.get(db);
+  if (memo == null) {
+    memo = { maxId: 0, bashByToken: new Map(), deletionRows: [] };
+    gitAttribMemos.set(db, memo);
+  }
+  const bashByToken = memo.bashByToken;
+  const deletionRows = memo.deletionRows;
+  const fromId = memo.maxId;
+  // Highest `id` seen across BOTH scans — including malformed/body-nulled rows
+  // the parse loops `continue` past. The watermark MUST advance past those too,
+  // or a permanently-malformed low row would re-anchor every later scan (and
+  // re-process the whole tail forever). Strict `id > fromId` (never `>=`) so the
+  // watermark row is never re-applied.
+  let newMaxId = fromId;
+
+  // Bash exact-match scan — pull the sparse mutation subset newer than the memo
+  // watermark and bucket each row under every target token it carries (the SQL
+  // `json_each ... = ?` probe was per-file per-token exact equality, so a
+  // per-token bucket is equivalent). The partial `idx_events_bash_attr` covers
+  // the `bash_mutation_kind IS NOT NULL` predicate as a SEARCH; the `id > ?`
+  // rowid bound makes it the incremental slice. NO `ORDER BY` — the per-token
+  // buckets feed a newest-wins `(ts, id)` consumer that is order-insensitive, so
+  // an ordered scan would only buy a needless TEMP B-TREE.
   const _bashP0 = acc != null ? performance.now() : 0;
   const bashStmt = db.prepare(
     `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind,
             e.bash_mutation_targets AS targets
        FROM events e
-      WHERE e.bash_mutation_kind IS NOT NULL`,
+      WHERE e.bash_mutation_kind IS NOT NULL
+        AND e.id > ?`,
   );
   const _bashP1 = acc != null ? performance.now() : 0;
-  const bashScanRows = bashStmt.all() as Array<{
+  const bashScanRows = bashStmt.all(fromId) as Array<{
     id: number;
     ts: number;
     session_id: string;
     kind: string;
     targets: string | null;
   }>;
-  const bashByToken = new Map<string, BashMutationRow[]>();
   for (const row of bashScanRows) {
+    // Advance the watermark FIRST, before any `continue`, so a malformed or
+    // empty-targets row still moves `maxId` past itself.
+    if (row.id > newMaxId) newMaxId = row.id;
     if (row.targets == null || row.targets.length === 0) continue;
     let tokens: unknown;
     try {
@@ -1349,25 +1440,31 @@ function buildExplicitAttribHoist(
     acc.bashScanRows += bashScanRows.length;
   }
 
-  // git-rm / git-mv deletion scan — pull + JSON-parse the targets ONCE; per file
-  // the directory-prefix / fnmatch match still runs in JS via bashTargetMatches.
+  // git-rm / git-mv deletion scan — same incremental `id > ?` bound; per file the
+  // directory-prefix / fnmatch match still runs in JS via bashTargetMatches. This
+  // selects a strict SUBSET of the bash scan's rows (git-rm/git-mv both satisfy
+  // `bash_mutation_kind IS NOT NULL`), so the bash scan already advanced the
+  // watermark past every id here — but advance defensively per-row regardless.
+  // No `ORDER BY` — the deletionRows consumer is newest-wins (ts, id), so
+  // append-order does not affect the projection (same rationale as the bash scan).
   const _delP0 = acc != null ? performance.now() : 0;
   const deletionStmt = db.prepare(
     `SELECT id, ts, session_id, bash_mutation_kind AS kind,
             bash_mutation_targets AS targets
        FROM events
-      WHERE bash_mutation_kind IN ('git-rm', 'git-mv')`,
+      WHERE bash_mutation_kind IN ('git-rm', 'git-mv')
+        AND id > ?`,
   );
   const _delP1 = acc != null ? performance.now() : 0;
-  const deletionScanRows = deletionStmt.all() as Array<{
+  const deletionScanRows = deletionStmt.all(fromId) as Array<{
     id: number;
     ts: number;
     session_id: string;
     kind: string;
     targets: string | null;
   }>;
-  const deletionRows: DeletionMutationRow[] = [];
   for (const row of deletionScanRows) {
+    if (row.id > newMaxId) newMaxId = row.id;
     if (row.session_id == null || row.session_id.length === 0) continue;
     if (row.targets == null || row.targets.length === 0) continue;
     let tokens: unknown;
@@ -1393,6 +1490,9 @@ function buildExplicitAttribHoist(
     acc.deletionScanExecMs += performance.now() - _delP1;
     acc.deletionScanRows += deletionScanRows.length;
   }
+
+  // Commit the advanced watermark. Strict-`>` scans next fold resume from here.
+  memo.maxId = newMaxId;
 
   return { toolStmt, bashByToken, deletionRows };
 }

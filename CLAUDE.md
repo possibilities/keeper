@@ -90,15 +90,20 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE serving.
 - **A fold whose per-event cost grows with history — OR with board / projection
   size — is a re-fold time-bomb.** Any projection whose per-event fold cost scales
-  with history length (the git fold's `computeRepoBashWindows` self-joins the whole
-  log per `GitSnapshot` — the ~6-day fn-856 replay over 4.3M events) OR with the
-  board / projection size (the old `syncPlanLinks` re-derived a touched epic over
-  EVERY session that ever touched it — O(touched_epics × swept_sessions) per plan
-  event, the fn-888 ~15-min socket-down catch-up) is a replay time-bomb: model it
-  **live-only, constant-bounded, or an idempotent per-key replace-merge** (fn-888
+  with history length (the git fold's pass-1 explicit-attribution `buildExplicitAttribHoist`
+  ran two UNBOUNDED full-history `events` scans per `GitSnapshot` — a bash exact-match
+  scan + a git-rm/git-mv deletion scan, the dominant steady-state reducer cost until
+  fn-892 made them incremental via a per-`Database` `WeakMap` memo that scans only
+  `id > maxId` and appends; `computeRepoBashWindows` pass-2 is already bounded by
+  `MAX_BASH_WINDOW_SEC`) OR with the board / projection size (the old `syncPlanLinks`
+  re-derived a touched epic over EVERY session that ever touched it —
+  O(touched_epics × swept_sessions) per plan event, the fn-888 ~15-min socket-down
+  catch-up) is a replay time-bomb: model it **live-only, constant-bounded, an
+  incremental id-watermark memo, or an idempotent per-key replace-merge** (fn-888
   swapped the full session-sweep for a per-session `mergeJobLinkSlice` whose cost is
-  independent of how many sessions touched the epic), never
-  O(history)/O(board)-per-event.
+  independent of how many sessions touched the epic; fn-892 swapped the pass-1
+  full-history scans for an `id > maxId` append memo on the live-only git surface),
+  never O(history)/O(board)-per-event.
 
 ## Hook rules
 

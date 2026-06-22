@@ -1802,13 +1802,29 @@ from a monotonically ratcheting one to the currently-dirty set, and
 the fn-679 bound collapses the ITERATED pass-4 set from the entire
 undischarged set under `project_dir` (dominated by non-discharging
 `'planctl'`-source attributions, 288 in production) to the same event-relevant
-union. The dominant GitSnapshot cost is pass 1 (explicit attribution),
+union. Pass 1 (explicit attribution) was the dominant GitSnapshot cost,
 not pass 4: its tool-mutation arms, bash exact-match scan, and
 git-rm/git-mv deletion scan run inside a per-dirty-file loop, so fn-787
 hoists the two snapshot-invariant scans (bash + deletion) and the two
 tool prepared statements ONCE per snapshot — mirroring the pass-2
-`computeRepoBashWindows` hoist — and matches each file in JS, keeping
-steady-state folds under the realtime bar. Re-fold determinism is preserved: both the persisted set and
+`computeRepoBashWindows` hoist — and matches each file in JS. fn-892 then
+makes those two hoisted scans INCREMENTAL: a per-`Database` `WeakMap` memo
+(`buildExplicitAttribHoist`) scans only `bash_mutation_kind IS NOT NULL AND
+id > maxId` (and the git-rm/git-mv subset), appends the freshly-parsed rows
+into the cached `bashByToken` / `deletionRows` structures, and bumps `maxId`
+— so steady-state pass-1 cost is O(rows since the last fold), independent of
+history length, instead of re-scanning the whole `events` table every
+`GitSnapshot`. A cold entry's first scan is `id > 0` = the whole history
+once, preserving boot-seed full fidelity. The memo is sound because the log
+below head is append-only (retention only NULLs fold-unread bodies, never
+the `bash_mutation_kind` / `bash_mutation_targets` columns these scans read)
+and the consumer is newest-wins `(ts, id)` order-insensitive, so an
+incremental append is byte-identical to a full rescan — proven by the
+`test/refold-equivalence.test.ts` differential re-fold (git floor lowered to
+0) and a warm-cache-vs-cold-rescan equivalence test. The memo lives only in
+process memory on the live-only git surface; it is NOT a projection, never
+persisted, and re-derives for free on a fresh connection.
+Re-fold determinism is preserved: both the persisted set and
 the bound read only event-derived state (this snapshot's
 `dirty_files`, `file_attributions` populated by passes 1-3, and the
 prior `git_status.jobs` blob). Per-job project-wide counters
@@ -1825,9 +1841,14 @@ replayed from history. A monotonic `events.id` SKIP-FLOOR
 git fold for `id <= floor`, and a **boot-seed producer** (`src/git-boot-seed.ts`)
 re-derives the surface for currently-dirty roots before the daemon serves; live
 events above the floor keep it current. The carve-out exists because the
-`projectGitStatus` / `computeRepoBashWindows` git fold self-joins the WHOLE event
-log per `GitSnapshot` — an O(history)-per-event fold whose replay cost grows
+`projectGitStatus` git fold historically re-scanned the WHOLE event log per
+`GitSnapshot` (the pass-1 bash + git-rm/git-mv scans, now memoized incrementally
+by fn-892; `computeRepoBashWindows`'s pass-2 self-join stays bounded by
+`MAX_BASH_WINDOW_SEC`) — an O(history)-per-event fold whose replay cost grew
 without bound (the fn-856 incident: a 4.3M-event re-fold projected to ~6 days).
+The memo keeps a LIVE fold incremental but does NOT make the surface re-fold
+safe — it stays live-only because a cold re-fold's first scan is still the whole
+history and the producer-fed git counters are deliberately charter-excluded.
 The general rule it codifies: any projection whose per-event fold cost grows with
 history length is a replay time-bomb — model it live-only or constant-bounded,
 never O(history)-per-event. The re-fold byte-identical determinism described

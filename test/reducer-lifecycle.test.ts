@@ -16,7 +16,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { applyEvent, drain } from "../src/reducer";
+import { __resetGitAttribMemoForTest, applyEvent, drain } from "../src/reducer";
 import type { Event } from "../src/types";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
@@ -1956,6 +1956,176 @@ test("fn-787 re-fold determinism: hoisted pass-1 scans (tool + bash-exact + git-
   expect(
     JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
   ).toBe(JSON.stringify(jobs1));
+});
+
+test("fn-892 incremental pass-1 memo: warm-cache fold equals a cold full rescan byte-for-byte", () => {
+  // The pass-1 bash + git-rm/git-mv scans are memoized per `Database` (fn-892):
+  // each fold scans only `id > maxId` and appends to the cached structures. This
+  // proves the WARM path (memo built incrementally across several GitSnapshots,
+  // each interleaving NEW mutations) reproduces the SAME `file_attributions` as a
+  // COLD full rescan (memo forced cold, one `id > 0` scan) over the identical log.
+  // Equivalence rests on the scans being a faithful superset (append-only log) and
+  // the consumer being newest-wins on (ts, id) — order-insensitive.
+  //
+  // Three snapshot rounds, each preceded by a fresh bash + git-rm mutation, so the
+  // memo's incremental delta is non-empty on every fold (not just the first).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-w" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-w" });
+
+  function seedRound(n: number): void {
+    insertEvent({
+      hook_event: "PostToolUse",
+      tool_name: "Bash",
+      session_id: "sess-w",
+      cwd: "/repo",
+      ts: 1000 + n * 10,
+      bash_mutation_kind: "fs-remove",
+      bash_mutation_targets: JSON.stringify([`/repo/gen/out${n}.ts`]),
+      data: JSON.stringify({ tool_input: { command: `rm gen/out${n}.ts` } }),
+    });
+    insertEvent({
+      hook_event: "PostToolUse",
+      tool_name: "Bash",
+      session_id: "sess-w",
+      cwd: "/repo",
+      ts: 1000 + n * 10 + 1,
+      bash_mutation_kind: "git-rm",
+      bash_mutation_targets: JSON.stringify([`/repo/legacy${n}`]),
+      data: JSON.stringify({ tool_input: { command: `git rm -r legacy${n}` } }),
+    });
+    insertEvent({
+      hook_event: "GitSnapshot",
+      session_id: "/repo",
+      cwd: "/repo",
+      ts: 1000 + n * 10 + 2,
+      data: JSON.stringify({
+        project_dir: "/repo",
+        branch: "main",
+        head_oid: `oid${n}`,
+        upstream: null,
+        ahead: null,
+        behind: null,
+        // Every round's snapshot carries EVERY round's files so far, so a later
+        // fold must still see earlier-round mutation rows (proving the memo
+        // retained them across appends, not just the latest delta).
+        dirty_files: Array.from({ length: n + 1 }, (_, i) => [
+          { path: `gen/out${i}.ts`, xy: " D" as const, mtime_ms: null },
+          { path: `legacy${i}/a.ts`, xy: " D" as const, mtime_ms: null },
+        ]).flat(),
+      }),
+    });
+  }
+
+  // WARM path: drain after EACH round so the memo accumulates incrementally.
+  for (let n = 0; n < 3; n++) {
+    seedRound(n);
+    drainAll();
+  }
+  const warm = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  // Sanity: the run produced bash + git-rm attributions across all three rounds.
+  expect(warm.length).toBeGreaterThan(0);
+
+  // COLD path: rewind the cursor + wipe the projection, FORCE the memo cold, then
+  // re-drain the whole log in one pass — the memo does a single `id > 0` rescan.
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetGitAttribMemoForTest(db);
+  drainAll();
+  const cold = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+
+  // Byte-identical: the incremental append equals the full scan.
+  expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+});
+
+test("fn-892 incremental pass-1 memo: a malformed bash_mutation_targets row advances the watermark (no stall, no throw)", () => {
+  // A permanently-malformed `bash_mutation_targets` row must still advance the
+  // memo watermark past itself — otherwise it would re-anchor every later scan
+  // and re-process the whole tail forever. Seed a malformed bash row BEFORE a
+  // valid one + snapshot; the valid attribution must land and a re-drain on the
+  // warmed memo must reproduce it byte-for-byte.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-m" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-m",
+    cwd: "/repo",
+    ts: 500,
+    bash_mutation_kind: "fs-remove",
+    // Malformed JSON — the parse `continue`s, but the watermark must still move.
+    bash_mutation_targets: "{not valid json",
+    data: JSON.stringify({ tool_input: { command: "rm x" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-m",
+    cwd: "/repo",
+    ts: 510,
+    bash_mutation_kind: "fs-remove",
+    bash_mutation_targets: JSON.stringify(["/repo/good.ts"]),
+    data: JSON.stringify({ tool_input: { command: "rm good.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 520,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "good.ts", xy: " D", mtime_ms: null }],
+    }),
+  });
+  // Never throws — the malformed row safe-folds.
+  expect(() => drainAll()).not.toThrow();
+  const good = db
+    .query(
+      "SELECT op, source FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "sess-m", "good.ts") as {
+    op: string;
+    source: string;
+  } | null;
+  expect(good).not.toBeNull();
+  expect(good?.source).toBe("bash");
+
+  // Re-fold on the SAME warmed connection (memo already past the malformed row)
+  // reproduces the attribution byte-for-byte — the watermark did not stall.
+  const warm = JSON.stringify(
+    db
+      .query(
+        "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+      )
+      .all(),
+  );
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetGitAttribMemoForTest(db);
+  drainAll();
+  const cold = JSON.stringify(
+    db
+      .query(
+        "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+      )
+      .all(),
+  );
+  expect(warm).toBe(cold);
 });
 
 test("GitSnapshot multi-attribution: two sessions touch the same file → both rows in attributions[]", () => {
