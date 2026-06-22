@@ -11,7 +11,9 @@
  *  - non-fast-forward → logged to the skip-log + skipped (no rebase, no commit
  *    rewrite; local HEAD unchanged);
  *  - a push failure returns cleanly (no throw — the hook would exit 0);
- *  - a held lockfile prevents a second concurrent push.
+ *  - a held lockfile prevents a second concurrent push (and logs the skip);
+ *  - an orphaned lock (holder pid gone, or older than the staleness threshold) is
+ *    reclaimed so a hook-timeout kill never blocks every later push forever.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -21,6 +23,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,6 +68,13 @@ function gitIn(dir: string, ...args: string[]): string {
 
 function headSha(): string {
   return git("rev-parse", "HEAD").trim();
+}
+
+/** A pid that is certainly gone: spawn `true`, wait for it to exit, reuse its
+ * pid. `process.kill(pid, 0)` then throws ESRCH, marking the lock reclaimable. */
+function findDeadPid(): number {
+  const proc = Bun.spawnSync(["true"]);
+  return proc.pid ?? 999_999;
 }
 
 /** Remote-tracked SHA for the bare origin's main (after the local fetched it). */
@@ -184,17 +194,54 @@ describe("pushDocs", () => {
     expect(existsSync(logFile)).toBe(true);
   });
 
-  test("a held lockfile prevents a second push", () => {
+  test("a live, fresh lockfile prevents a second push and logs the skip", () => {
     bare = addBareOrigin(true);
     addDoc("note.md", "# note\n");
-    // Pre-create the lockfile to simulate a concurrent session holding it.
+    // Pre-create the lockfile stamped with THIS (live) pid to simulate a
+    // concurrent session holding it — a live holder must still block.
     const gitDir = git("rev-parse", "--git-dir").trim();
     const lockPath = join(repo, gitDir, "keeper-push.lock");
-    writeFileSync(lockPath, "");
+    writeFileSync(lockPath, `${process.pid}\n`);
 
     expect(pushDocs(repo)).toBe("locked");
     // Nothing was pushed — origin still at its initial main.
     expect(aheadOfUpstream(repo)).toBe(1);
+    // The skip is visible in the skip-log so a stuck lock is diagnosable.
+    expect(existsSync(logFile)).toBe(true);
+    expect(readFileSync(logFile, "utf8")).toContain("class=locked");
+  });
+
+  test("an orphaned lock (holder pid gone) is reclaimed and the push proceeds", () => {
+    bare = addBareOrigin(true);
+    addDoc("note.md", "# note\n");
+    const localHead = headSha();
+    const gitDir = git("rev-parse", "--git-dir").trim();
+    const lockPath = join(repo, gitDir, "keeper-push.lock");
+    // Stamp the lock with a pid that is certainly gone. process.kill(pid, 0)
+    // throws ESRCH for a non-existent pid → reclaimable even within the window.
+    writeFileSync(lockPath, `${findDeadPid()}\n`);
+
+    expect(pushDocs(repo)).toBe("pushed");
+    expect(originMainSha()).toBe(localHead);
+    // The reclaimed-then-acquired lock is released after the push completes.
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("an orphaned lock older than the staleness threshold is reclaimed", () => {
+    bare = addBareOrigin(true);
+    addDoc("note.md", "# note\n");
+    const localHead = headSha();
+    const gitDir = git("rev-parse", "--git-dir").trim();
+    const lockPath = join(repo, gitDir, "keeper-push.lock");
+    // Stamp with THIS live pid (liveness check alone would NOT reclaim) but
+    // backdate the mtime well past the >60s staleness threshold.
+    writeFileSync(lockPath, `${process.pid}\n`);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath, old, old);
+
+    expect(pushDocs(repo)).toBe("pushed");
+    expect(originMainSha()).toBe(localHead);
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   test("released lockfile allows the next push", () => {

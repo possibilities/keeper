@@ -16,8 +16,9 @@
  *  - skip a mid-operation repo (merge/cherry-pick/rebase/bisect) and a
  *    detached/unborn HEAD — pushing mid-op or off a detached HEAD is wrong;
  *  - `@{u}` upstream check: no upstream → no-op; 0 commits ahead → no-op;
- *  - acquire a `.git/keeper-push.lock` lockfile (`wx` open, O_EXCL) so concurrent
- *    sessions don't race a push — skip if already locked;
+ *  - acquire a pid-stamped `.git/keeper-push.lock` lockfile (`wx` open, O_EXCL) so
+ *    concurrent sessions don't race a push — an orphaned lock (holder pid gone, or
+ *    older than the staleness threshold) is reclaimed; a live one logs + skips;
  *  - `git push --no-progress` with a subprocess timeout and `GIT_TERMINAL_PROMPT=0`
  *    so a credential prompt fails fast instead of hanging;
  *  - on non-fast-forward / auth / network / any failure LOG to a file under
@@ -39,7 +40,10 @@ import {
   closeSync,
   existsSync,
   openSync,
+  readFileSync,
+  statSync,
   unlinkSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -48,6 +52,14 @@ import { isAbsolute, join, resolve } from "node:path";
 // slipped GIT_TERMINAL_PROMPT, stuck lock) must not stall the turn; the timeout
 // kills the child and the call reports a non-zero exit, which is logged + skipped.
 const GIT_TIMEOUT_MS = 8000;
+
+// Staleness threshold for an orphaned push lock. A live holder releases its lock
+// in `pushDocs`'s finally; the only way a lock outlives its holder is a hard kill
+// of the Stop hook (the harness can time one out) between acquire and release.
+// Set comfortably above `GIT_TIMEOUT_MS` (the longest a healthy holder can hold
+// the lock — one bounded `git push`) so a genuinely-live holder is never
+// reclaimed out from under a slow push.
+const LOCK_STALE_MS = 60_000;
 
 /**
  * Run git with the ambient env (plus any `extraEnv`), an explicit cwd, and a
@@ -248,30 +260,102 @@ function logSkip(cwd: string, line: string): void {
   }
 }
 
-/**
- * Try to acquire the push lockfile with an exclusive create (`wx` / O_EXCL).
- * Returns true on acquisition. A pre-existing lock (a concurrent session mid-push)
- * returns false — the caller skips this push. Any other open error also returns
- * false (skip rather than risk a racing push).
- */
-function tryAcquireLock(lockPath: string): boolean {
-  try {
-    const fd = openSync(lockPath, "wx");
-    closeSync(fd);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Release the lockfile, swallowing a missing-file / IO error. */
 function releaseLock(lockPath: string): void {
   try {
     unlinkSync(lockPath);
   } catch {
-    // best-effort; a stale lock is cleaned by the next successful acquire path
-    // only if removed — but a crashed holder leaving a stale lock self-heals on
-    // the operator's next manual push, and never blocks a Stop.
+    // best-effort; an orphaned lock (a holder hard-killed before this release) is
+    // reclaimed by the next push's `tryAcquireLock` — see its staleness check —
+    // so a crashed holder never blocks a Stop forever.
+  }
+}
+
+/**
+ * Decide whether a pre-existing lock is orphaned and safe to reclaim. A lock is
+ * orphaned when its stamped holder pid is verifiably gone, OR when it is older
+ * than `LOCK_STALE_MS` (the holder was hard-killed before releasing). An
+ * unreadable / unstamped / unparseable lock falls back to the mtime check alone.
+ * Any probe error is treated as "not reclaimable" — never reclaim on doubt, so a
+ * live holder is never raced.
+ */
+function isLockStale(lockPath: string): boolean {
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(lockPath).mtimeMs;
+  } catch {
+    // Lock vanished between the failed acquire and this stat — let the caller
+    // retry the exclusive create rather than reclaim a non-existent lock.
+    return false;
+  }
+  if (Date.now() - mtimeMs > LOCK_STALE_MS) {
+    return true;
+  }
+  // Within the staleness window — only reclaim if the stamped holder is gone.
+  let pid: number;
+  try {
+    pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+  } catch {
+    return false;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    // Signal 0 probes liveness without delivering a signal: throws ESRCH when no
+    // such process exists (reclaimable). An EPERM (process exists, not ours) or
+    // any other error means the holder is alive — do not reclaim.
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/**
+ * Try to acquire the push lockfile with an exclusive create (`wx` / O_EXCL),
+ * stamping it with this process's pid so a later push can probe holder liveness.
+ * Returns true on acquisition. A pre-existing lock that is orphaned (holder pid
+ * gone, or older than `LOCK_STALE_MS`) is reclaimed and re-acquired; a live,
+ * fresh lock (a concurrent session mid-push) returns false so the caller skips.
+ * Any other open / reclaim error returns false (skip rather than race a push).
+ */
+function tryAcquireLock(lockPath: string): boolean {
+  if (stampLock(lockPath)) {
+    return true;
+  }
+  // The exclusive create failed — a lock already exists (or an IO error). If the
+  // existing lock is orphaned, reclaim it and retry the exclusive create ONCE; a
+  // reclaim failure or a still-live lock falls through to a skip.
+  if (!isLockStale(lockPath)) {
+    return false;
+  }
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Lost the reclaim race (another session unlinked it first) or an IO error —
+    // skip rather than risk a racing push.
+    return false;
+  }
+  return stampLock(lockPath);
+}
+
+/**
+ * Exclusively create + pid-stamp the lockfile. Returns true on success, false if
+ * the lock already exists (O_EXCL collision) or on any IO error. Split out so
+ * both the first acquire and the post-reclaim retry stamp identically.
+ */
+function stampLock(lockPath: string): boolean {
+  try {
+    const fd = openSync(lockPath, "wx");
+    try {
+      writeSync(fd, `${process.pid}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -304,6 +388,12 @@ export function pushDocs(docsDir: string): string {
 
   const lockPath = lockfilePath(docsDir);
   if (!tryAcquireLock(lockPath)) {
+    // A live, fresh lock — a concurrent session is mid-push. Log so a stuck lock
+    // (one that never clears across turns) is diagnosable from the skip-log.
+    logSkip(
+      docsDir,
+      `push-skipped class=locked :: lockfile held at ${lockPath}`,
+    );
     return "locked";
   }
   try {
