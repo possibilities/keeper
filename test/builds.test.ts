@@ -50,7 +50,8 @@ function freshRow(overrides: Record<string, unknown>): Record<string, unknown> {
 
 test("resolveStatus: all seven buildbot result codes map to distinct labels", () => {
   const labels = [0, 1, 2, 3, 4, 5, 6].map(
-    (results) => resolveStatus({ results, complete: 1 }).label,
+    (results) =>
+      resolveStatus({ build_number: 42, results, complete: 1 }).label,
   );
   expect(labels).toEqual([
     "SUCCESS",
@@ -66,14 +67,41 @@ test("resolveStatus: all seven buildbot result codes map to distinct labels", ()
 });
 
 test("resolveStatus: results NULL + complete falsy is RUNNING, not an error", () => {
-  expect(resolveStatus({ results: null, complete: 0 }).label).toBe("RUNNING");
+  // A real running build always carries a build_number — that's what
+  // distinguishes it from the never-built placeholder (checked first).
+  expect(
+    resolveStatus({ build_number: 5, results: null, complete: 0 }).label,
+  ).toBe("RUNNING");
   // `complete` absent (undefined) is also in-flight.
-  expect(resolveStatus({ results: null }).label).toBe("RUNNING");
+  expect(resolveStatus({ build_number: 5, results: null }).label).toBe(
+    "RUNNING",
+  );
+});
+
+test("resolveStatus: NULL build_number is `never built`, checked before RUNNING", () => {
+  // The all-null placeholder: build_number AND results both NULL. The
+  // never-built branch fires FIRST, so it never collapses into RUNNING.
+  expect(resolveStatus({ build_number: null, results: null }).label).toBe(
+    "never built",
+  );
+  expect(
+    resolveStatus({ build_number: null, results: null, complete: null }).label,
+  ).toBe("never built");
+  // Glyph is ASCII-safe and distinct from running (~), unknown (?), skipped (-).
+  const glyph = resolveStatus({ build_number: null }).glyph;
+  expect(glyph).not.toBe("~");
+  expect(glyph).not.toBe("?");
+  expect(glyph).not.toBe("-");
+  expect(/^[\x20-\x7e]+$/.test(glyph)).toBe(true);
 });
 
 test("resolveStatus: an out-of-range / non-numeric code degrades to UNKNOWN", () => {
-  expect(resolveStatus({ results: 99, complete: 1 }).label).toBe("UNKNOWN");
-  expect(resolveStatus({ results: "2", complete: 1 }).label).toBe("UNKNOWN");
+  expect(
+    resolveStatus({ build_number: 1, results: 99, complete: 1 }).label,
+  ).toBe("UNKNOWN");
+  expect(
+    resolveStatus({ build_number: 1, results: "2", complete: 1 }).label,
+  ).toBe("UNKNOWN");
 });
 
 // ---------------------------------------------------------------------------
@@ -132,6 +160,29 @@ test("renderRow: each result code produces a distinct rendered line", () => {
   // RUNNING line too — eight distinct renders total.
   lines.push(renderRow(freshRow({ results: null, complete: 0 }), NOW_MS));
   expect(new Set(lines).size).toBe(8);
+});
+
+test("renderRow: a never-built (NULL build_number) row renders `never built`, distinct from every other status", () => {
+  // The all-null placeholder: build_number AND results NULL.
+  const neverBuiltLine = renderRow(
+    freshRow({
+      build_number: null,
+      results: null,
+      complete: null,
+      state_string: "never built",
+    }),
+    NOW_MS,
+  );
+  expect(neverBuiltLine).toContain("never built");
+  expect(neverBuiltLine).toContain("#?");
+  expect(neverBuiltLine).not.toContain("RUNNING");
+  expect(neverBuiltLine).not.toContain("UNKNOWN");
+  // Distinct from RUNNING + all seven result codes — nine distinct renders.
+  const others = [0, 1, 2, 3, 4, 5, 6].map((results) =>
+    renderRow(freshRow({ results, complete: 1 }), NOW_MS),
+  );
+  others.push(renderRow(freshRow({ results: null, complete: 0 }), NOW_MS));
+  expect(new Set([...others, neverBuiltLine]).size).toBe(9);
 });
 
 test("renderRow: an older row renders its age in minutes", () => {

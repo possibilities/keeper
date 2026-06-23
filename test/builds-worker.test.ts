@@ -23,6 +23,7 @@ import {
   type BuildsMessage,
   BuildsScanner,
   buildsGateKey,
+  NEVER_BUILT_STATE,
   parseBuilders,
   parseLatestBuild,
   runPollCycle,
@@ -47,6 +48,24 @@ function finished(
     started_at: 1000,
     complete_at: 1100,
     ...overrides,
+  };
+}
+
+/** An all-null `never built` placeholder message for `project`. */
+function neverBuilt(
+  project: string,
+  builderId: number | null = 1,
+): BuildSnapshotMessage {
+  return {
+    kind: "build-snapshot",
+    project,
+    builder_id: builderId,
+    build_number: null,
+    complete: null,
+    results: null,
+    state_string: NEVER_BUILT_STATE,
+    started_at: null,
+    complete_at: null,
   };
 }
 
@@ -124,10 +143,29 @@ test("parseLatestBuild reports a running build (complete:false, results:null)", 
   expect(msg?.state_string).toBe("building");
 });
 
-test("parseLatestBuild returns null for a never-built builder and malformed bodies", () => {
-  expect(parseLatestBuild("alpha", 1, { builds: [] })).toBeNull();
+test("parseLatestBuild mints an all-null `never built` placeholder for a parsed empty array", () => {
+  // The ONLY null-producing shape promoted to a placeholder: HTTP 200 +
+  // `{"builds":[]}` (a registered builder that has never produced a build).
+  expect(parseLatestBuild("alpha", 7, { builds: [] })).toEqual({
+    kind: "build-snapshot",
+    project: "alpha",
+    builder_id: 7,
+    build_number: null,
+    complete: null,
+    results: null,
+    state_string: NEVER_BUILT_STATE,
+    started_at: null,
+    complete_at: null,
+  });
+});
+
+test("parseLatestBuild returns null for malformed bodies — never a placeholder (conflation hazard)", () => {
+  // Every shape EXCEPT a parsed empty array stays null: a placeholder minted
+  // from `{}` / a missing-array / an array-of-non-objects would spawn phantom
+  // rows or flap pending↔real.
   expect(parseLatestBuild("alpha", 1, {})).toBeNull();
   expect(parseLatestBuild("alpha", 1, null)).toBeNull();
+  expect(parseLatestBuild("alpha", 1, { builds: "nope" })).toBeNull();
   expect(parseLatestBuild("alpha", 1, { builds: ["nope"] })).toBeNull();
 });
 
@@ -140,6 +178,22 @@ test("applySnapshot suppresses an unchanged build (zero events between polls)", 
   s.applySnapshot(finished("alpha")); // identical → suppressed
   s.applySnapshot(finished("alpha"));
   expect(out).toHaveLength(1);
+});
+
+test("a never-built placeholder emits exactly once and dedupes on repeat polls", () => {
+  const out: BuildsMessage[] = [];
+  const s = new BuildsScanner((m) => out.push(m));
+  // Repeated never-built polls (gate key excludes state_string + builder_id,
+  // so the all-null placeholder is stable) → emitted once.
+  s.applySnapshot(neverBuilt("alpha"));
+  s.applySnapshot(neverBuilt("alpha"));
+  s.applySnapshot(neverBuilt("alpha"));
+  expect(out).toEqual([neverBuilt("alpha")]);
+  // When the builder later runs, build_number moves → the real snapshot
+  // supersedes the placeholder (a second event).
+  s.applySnapshot(finished("alpha", { build_number: 1 }));
+  expect(out).toHaveLength(2);
+  expect((out[1] as BuildSnapshotMessage).build_number).toBe(1);
 });
 
 test("a build emits exactly two events: start (running) then finish", () => {
@@ -276,6 +330,25 @@ test("runPollCycle: a per-builder fetch failure skips that builder without tombs
   expect(out.some((m) => m.kind === "build-deleted")).toBe(false);
 });
 
+test("runPollCycle: an empty-array builder mints a placeholder but a fetch failure stays silent (no conflation)", async () => {
+  const out: BuildsMessage[] = [];
+  const s = new BuildsScanner((m) => out.push(m));
+
+  const fetcher = async (url: string): Promise<unknown | null> => {
+    if (url.endsWith("/api/v2/builders")) {
+      return buildersResponse(["alpha", "beta"]);
+    }
+    // alpha: HTTP 200 + `{"builds":[]}` → placeholder. beta: fetch failure →
+    // silent (a null body never reaches parseLatestBuild).
+    if (url.includes("/builders/1/")) return { builds: [] };
+    return null;
+  };
+  await runPollCycle(BASE, s, new AbortController().signal, fetcher);
+  // alpha placeholder emitted; beta minted NOTHING and was NOT tombstoned.
+  expect(out).toEqual([neverBuilt("alpha")]);
+  expect(out.some((m) => m.kind === "build-deleted")).toBe(false);
+});
+
 test("runPollCycle: a successful enumeration drops a builder no longer present", async () => {
   const out: BuildsMessage[] = [];
   const s = new BuildsScanner((m) => out.push(m));
@@ -330,6 +403,40 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row", () =
   const s = new BuildsScanner((m) => out.push(m));
   seedFromDb(db, s);
   // An identical live snapshot must be suppressed by the seeded gate.
+  s.applySnapshot(msg);
+  expect(out).toEqual([]);
+  db.close();
+});
+
+test("seedFromDb round-trips an all-null `never built` placeholder row without re-emitting", () => {
+  const { db } = freshMemDb();
+  const msg = neverBuilt("alpha", 7);
+  // Land the placeholder row exactly as main's onmessage handler would: all
+  // build fields NULL, the sentinel state_string, builder_id carried.
+  db.run(
+    `INSERT INTO builds (
+       project, builder_id, build_number, complete, results,
+       state_string, started_at, complete_at, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      msg.project,
+      msg.builder_id,
+      msg.build_number,
+      msg.complete,
+      msg.results,
+      msg.state_string,
+      msg.started_at,
+      msg.complete_at,
+      1,
+      1100,
+    ],
+  );
+
+  const out: BuildsMessage[] = [];
+  const s = new BuildsScanner((m) => out.push(m));
+  seedFromDb(db, s);
+  // An identical placeholder poll must be suppressed by the seeded gate — no
+  // re-emit on boot for a never-built builder.
   s.applySnapshot(msg);
   expect(out).toEqual([]);
   db.close();

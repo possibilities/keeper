@@ -182,13 +182,28 @@ export function parseBuilders(body: unknown): BuilderRef[] {
   return out;
 }
 
+/** Sentinel `state_string` carried by a never-built builder's placeholder. */
+export const NEVER_BUILT_STATE = "never built";
+
 /**
  * Parse a `/api/v2/builders/<id>/builds?order=-number&limit=1` response into a
- * snapshot message for `project`, or null when there is no build to report. A
- * never-built builder returns `{"builds": []}` → null (no null row). A running
- * build (`complete:false`, `results:null`) is reported distinctly. Pure; a
- * malformed shape folds to null (the caller skips that builder, preserving its
- * gate).
+ * snapshot message for `project`, or null when there is no build to report.
+ *
+ * Two distinct outcomes for the absence of a build:
+ * - A registered-but-never-built builder returns HTTP 200 + `{"builds": []}`.
+ *   That parsed-empty-array is the ONLY null-producing shape promoted to an
+ *   all-null-build-fields placeholder snapshot (carrying `builder_id` + the
+ *   constant {@link NEVER_BUILT_STATE} sentinel), so the builder renders as a
+ *   distinct `never built` row instead of staying invisible.
+ * - Every other shape that carries no usable build — a non-object body, a
+ *   missing or non-array `builds`, an array of non-objects — still returns
+ *   null (the caller skips that builder, preserving its gate). A transient
+ *   per-builder FETCH failure is handled upstream in `runPollCycle` (a null
+ *   body never reaches here), so the placeholder is never minted from a
+ *   failure: the two `null` sources stay un-conflated.
+ *
+ * Pure; the placeholder payload is fully deterministic (no wall-clock / env),
+ * so the resulting BuildSnapshot event re-folds byte-identically.
  */
 export function parseLatestBuild(
   project: string,
@@ -199,8 +214,26 @@ export function parseLatestBuild(
     return null;
   }
   const arr = (body as { builds?: unknown }).builds;
-  if (!Array.isArray(arr) || arr.length === 0) {
-    return null; // never-built builder, or empty body — emit nothing.
+  if (!Array.isArray(arr)) {
+    return null; // missing / non-array `builds` — emit nothing.
+  }
+  if (arr.length === 0) {
+    // Registered-but-never-built: a true empty enumeration (HTTP 200 +
+    // `{"builds":[]}`). Mint an all-null placeholder so the builder renders as
+    // a distinct `never built` row. `state_string` and `builder_id` are
+    // EXCLUDED from the gate key, so this emits exactly once; when the builder
+    // later runs, `build_number` moves and the real snapshot supersedes it.
+    return {
+      kind: "build-snapshot",
+      project,
+      builder_id: builderid,
+      build_number: null,
+      complete: null,
+      results: null,
+      state_string: NEVER_BUILT_STATE,
+      started_at: null,
+      complete_at: null,
+    };
   }
   const b = arr[0];
   if (!b || typeof b !== "object") {

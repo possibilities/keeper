@@ -18,8 +18,11 @@
  * Status is mapped from buildbot result codes (0 SUCCESS, 1 WARNINGS,
  * 2 FAILURE, 3 SKIPPED, 4 EXCEPTION, 5 RETRY, 6 CANCELLED). A NULL
  * `results` with `complete=0` is a RUNNING build — a documented state, not
- * an error. Age is derived client-side from `updated_at` (cosmetic render
- * concern, never folded).
+ * an error. A NULL `build_number` is a registered-but-never-built builder,
+ * rendered as the distinct neutral `never built` state (the all-null
+ * placeholder the daemon-side worker mints for a `{"builds":[]}` enumeration)
+ * — checked before RUNNING so it never collapses into it. Age is derived
+ * client-side from `updated_at` (cosmetic render concern, never folded).
  *
  * Each row also carries a `[build]`/`[deploy]`/`[install]` job-type tag
  * (epic fn-891). The tag is derived purely at render time from the builder
@@ -59,10 +62,12 @@ snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
 Rows show one registered buildbot builder: project name, a job-type tag
 (\`[build]\` / \`[deploy]\` / \`[install]\`, derived from the builder-name
 suffix), a status glyph + label (SUCCESS / WARNINGS / FAILURE / SKIPPED /
-EXCEPTION / RETRY / CANCELLED / RUNNING), the latest build number, the build
-state string, and an age. RUNNING (\`results\` NULL, build in flight) is a
-normal state, not an error. An empty table means no builds yet — is
-\`buildbot_url\` configured?
+EXCEPTION / RETRY / CANCELLED / RUNNING / never built), the latest build
+number, the build state string, and an age. RUNNING (\`results\` NULL, build
+in flight) is a normal state, not an error; "never built" (no build number) is
+a registered builder that has not yet produced a build — also normal, neither
+broken nor in progress. An empty table means NO registered builders at all —
+is \`buildbot_url\` configured?
 `;
 
 /**
@@ -77,6 +82,11 @@ interface Status {
 
 const RUNNING: Status = { glyph: "~", label: "RUNNING" };
 const UNKNOWN: Status = { glyph: "?", label: "UNKNOWN" };
+// A registered builder that has never produced a build (no `build_number`).
+// A distinct NEUTRAL state — not `unknown` (read as "CI broke") nor `running`
+// (read as "in progress"). Glyph `.` is ASCII-safe and distinct from `~`
+// (running), `?` (unknown), and `-` (skipped).
+const NEVER_BUILT: Status = { glyph: ".", label: "never built" };
 
 const RESULT_STATUS: Record<number, Status> = {
   0: { glyph: "ok", label: "SUCCESS" },
@@ -89,14 +99,22 @@ const RESULT_STATUS: Record<number, Status> = {
 };
 
 /**
- * Resolve the display status from a builds row. A NULL `results` with
- * `complete` falsy is RUNNING (documented in-flight state). Otherwise map
- * the numeric buildbot result code; an out-of-range / non-numeric code
- * degrades to UNKNOWN rather than throwing at the read boundary.
+ * Resolve the display status from a builds row. Branch order is load-bearing:
+ *
+ * 1. A NULL `build_number` is a registered-but-never-built builder — the
+ *    all-null placeholder the worker mints for `{"builds":[]}`. This is
+ *    checked FIRST, before the RUNNING test, so a placeholder (whose `results`
+ *    is also NULL) renders as the distinct neutral NEVER_BUILT state rather
+ *    than collapsing into RUNNING.
+ * 2. A NULL `results` with `complete` falsy is RUNNING (in-flight build).
+ * 3. Otherwise map the numeric buildbot result code; an out-of-range /
+ *    non-numeric code degrades to UNKNOWN rather than throwing at the read
+ *    boundary.
  */
 export function resolveStatus(row: Record<string, unknown>): Status {
   const results = row.results;
   const complete = row.complete;
+  if (row.build_number == null) return NEVER_BUILT;
   if (results == null && !complete) return RUNNING;
   if (typeof results === "number" && results in RESULT_STATUS) {
     return RESULT_STATUS[results] as Status;
