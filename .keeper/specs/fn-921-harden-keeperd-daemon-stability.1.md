@@ -99,5 +99,5 @@ barrier is split out to task `.4` (it crosses into commit-work's process/files
 - [ ] commit-work's live-`git status` attribution read is NOT regressed (the synced barrier itself is task `.4`)
 
 ## Done summary
-
+git-worker is now poll-only (two-tier .git-metadata stat poll armed unconditionally at worker start, decoupled from @parcel/watcher) so a watcher hang/mute can't freeze the surface; a supervisor seed-liveness watchdog recovers a stuck seed_required without a bounce; gated-root read keys reconcile with the toplevel write key at non-fold sites.
 ## Evidence
