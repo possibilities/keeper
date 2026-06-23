@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-23T08:01:07.385000Z",
   "created_at": "2026-06-23T00:18:29.502000Z",
   "created_by_close_of": "fn-894-keeper-pair-via-agentwrap",
   "depends_on_epics": [
@@ -11,11 +12,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Reconcile pair empty-turn contract and cover pair orchestration",
   "touched_repos": [
     "/Users/mike/code/agentwrap",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-23T00:18:29.502000Z"
+  "updated_at": "2026-06-23T08:01:07.385000Z"
 }
