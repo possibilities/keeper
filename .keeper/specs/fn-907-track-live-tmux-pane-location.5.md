@@ -62,5 +62,5 @@ the birth session. Run `bun run test:full`.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Consumers now COALESCE the live backend_exec_session_id onto the forensic backend_exec_birth_session_id (restore-set, dash view-model, cli/jobs) so a demoted/unresolved live session never shrinks the restorable set or mis-groups a card; surfaced the birth column on JOBS_DESCRIPTOR + Job type; updated README + CLAUDE.md for the schema-v83 tmux live-only surface.
 ## Evidence
