@@ -30,6 +30,7 @@
  * timeout); 2 = arg fault (bad flags, missing prompt file).
  */
 
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   readFileSync,
@@ -315,7 +316,13 @@ export async function main(argv: string[]): Promise<void> {
     readOnly,
     ...(v.model !== undefined ? { model: v.model } : {}),
     ...(v.effort !== undefined ? { effort: v.effort } : {}),
-    ...(v.session !== undefined ? { session: v.session } : {}),
+    // Each partner gets its OWN tmux session (unique unless --session is given).
+    // Concurrent pair launches — e.g. /plan:panel fanning claude + codex out in
+    // one turn — would otherwise race to create the shared default `agentwrap`
+    // session and one fails with tmux "duplicate session" (a TOCTOU between
+    // has-session and new-session). A per-launch name sidesteps it entirely; the
+    // window is still reaped by pane id and tmux drops the emptied session.
+    session: v.session ?? `keeper-pair-${randomUUID().slice(0, 8)}`,
   });
   const startMs = Date.now();
   const launchRes = runAgentwrap(launchArgv, env, cwd);
