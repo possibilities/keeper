@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-23T19:07:52.331000Z",
+  "depends_on": [
+    "fn-919-plumb-keeper-pair-timeout-through.1"
+  ],
+  "epic": "fn-919-plumb-keeper-pair-timeout-through",
+  "id": "fn-919-plumb-keeper-pair-timeout-through.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Emit --stop-timeout-ms and widen keeper's kill margin",
+  "updated_at": "2026-06-23T19:07:52.331000Z"
+}
