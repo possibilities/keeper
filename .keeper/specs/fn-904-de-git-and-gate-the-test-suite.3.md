@@ -53,5 +53,5 @@ runner returning non-zero.
 - [ ] `classifyPushError` branches covered by captured-from-real-git stderr goldens
 
 ## Done summary
-
+De-gitted the commit/push test surfaces: injected a runGit-shaped seam at each git boundary (commit-work gitExec, doc-commit, the two ~/docs hooks) defaulting to the real spawn, then rewrote commit-work / doc-commit / docs-pusher / sidecar-writer tests to assert decisions in-process with a faked runner + captured-from-real-git push stderr goldens. Hooks stay dep-free; cold-start import set unchanged.
 ## Evidence
