@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Remove yaml output, relocate yamlDump",
-  "updated_at": "2026-06-23T07:58:41.694000Z"
+  "updated_at": "2026-06-23T10:21:51.366000Z",
+  "worker_done_at": "2026-06-23T10:21:51.366000Z"
 }

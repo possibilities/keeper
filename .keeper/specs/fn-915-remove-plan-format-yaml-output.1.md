@@ -59,5 +59,5 @@ bucket via `KEEPER_PLAN_RUN_SLOW=1` — run the full suite before landing.
 - [ ] `format.ts` header + relocated `yamlDump` docstring are present-tense (no removal/"formerly" narration)
 
 ## Done summary
-
+Removed the dead --format yaml output surface: relocated yamlDump into the prompt plugin (its sole caller's home) with byte-parity options intact, dropped js-yaml import + yaml branch from plan format.ts, and stripped yaml from both readFormat validators and all --format help strings. Both plugins typecheck/lint clean; touched plan suites green (fast+slow); prompt round-trip test asserts byte-identical bundle YAML.
 ## Evidence
