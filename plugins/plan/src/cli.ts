@@ -71,14 +71,14 @@ import { runWorkerResume } from "./verbs/worker_resume.ts";
 // import site; the definitions live in src/emit.ts.
 export { emitMutating, emitReadonly } from "./emit.ts";
 
-const PROG = "planctl";
+const PROG = "keeper plan";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 
 // Verbs that own their stdout contract and must bypass the trailer (raw markdown
 // / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
 const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
 
-// Subgroups ("planctl <group> <sub>"). A subgroup owns its own --help and
+// Subgroups ("keeper plan <group> <sub>"). A subgroup owns its own --help and
 // subcommand dispatch, so post-command --help is routed to the group, not the
 // top-level help.
 const SUBGROUP_NAMES = new Set([
@@ -132,7 +132,7 @@ const COMMANDS: CommandSpec[] = [
   },
   {
     name: "detect",
-    shortHelp: "Check if cwd belongs to a planctl project.",
+    shortHelp: "Check if cwd belongs to a plan project.",
     implemented: true,
   },
   { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
@@ -155,7 +155,7 @@ const COMMANDS: CommandSpec[] = [
   },
   {
     name: "init",
-    shortHelp: "Initialize a planctl project for the current directory.",
+    shortHelp: "Initialize a plan project for the current directory.",
     implemented: true,
   },
   {
@@ -555,7 +555,7 @@ const WORKER_GROUP: GroupSpec = {
 // FormattedGroup semantics: the leaf emits {success:true,...} via formatOutput
 // (or the typed error envelope + exit 1) and NO trailing plan_invocation line
 // fires (the group dispatch returns before emitTrailer). All three are
-// runtime-state-only — zero .planctl/ commits.
+// runtime-state-only — zero .keeper/ commits.
 const AUDIT_RISK_CHOICES = ["Low", "Medium", "High"];
 
 const AUDIT_GROUP: GroupSpec = {

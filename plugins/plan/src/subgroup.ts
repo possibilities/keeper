@@ -15,7 +15,7 @@
 
 import type { OutputFormat } from "./format.ts";
 
-const PROG = "planctl";
+const PROG = "keeper plan";
 // click's effective help wrap width: max_content_width (80) minus its 2-column
 // right margin. Verified against the Python binary's group-help wrap points.
 const HELP_WIDTH = 78;
@@ -29,7 +29,7 @@ export interface SubcommandSpec {
   run: (rest: string[], format: OutputFormat | null) => void;
 }
 
-/** A nested command group (`planctl <group> <sub> ...`). */
+/** A nested command group (`keeper plan <group> <sub> ...`). */
 export interface GroupSpec {
   name: string;
   description: string;
@@ -52,7 +52,7 @@ export function noSuchSubcommand(group: string, name: string): never {
 /** click's parameter usage error on a leaf subcommand (e.g. an out-of-Choice
  * --risk): the leaf's own Usage line + try-help on stderr, then `Error:
  * <message>`, exit 2. `argsHint` is the trailing usage tail (e.g. "EPIC_ID") so
- * the line reads `Usage: planctl <group> <sub> [OPTIONS] <argsHint>`. */
+ * the line reads `Usage: keeper plan <group> <sub> [OPTIONS] <argsHint>`. */
 export function leafUsageError(
   group: string,
   sub: string,
@@ -142,7 +142,7 @@ export function printLeafHelp(group: string, spec: SubcommandSpec): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Dispatch `planctl <group> <sub> [args]`. `groupArgs` is everything after the
+/** Dispatch `keeper plan <group> <sub> [args]`. `groupArgs` is everything after the
  * group name (the global --format is intercepted before this and passed in).
  * `--help` with no subcommand (or as the first token) prints the group help and
  * returns true to signal the caller to stop. A known subcommand whose args carry

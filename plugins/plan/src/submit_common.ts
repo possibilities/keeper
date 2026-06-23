@@ -171,7 +171,7 @@ export function resolveAuditContext(
     if (!hasDataDir(projectRoot)) {
       throw new SubmitError(
         "NOT_A_PROJECT",
-        `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
+        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
       );
     }
     ctx = contextForRoot(projectRoot);
@@ -187,7 +187,7 @@ export function resolveAuditContext(
     throw new SubmitError(
       "BRIEF_MISSING",
       `no audit brief for ${epicId} at ${bp}; ` +
-        `run \`planctl close-preflight ${epicId}\` first`,
+        `run \`keeper plan close-preflight ${epicId}\` first`,
       { expected: bp },
     );
   }

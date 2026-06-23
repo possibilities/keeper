@@ -76,7 +76,7 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
   const projectRoot = findProjectRoot();
 
   if (!hasDataDir(projectRoot)) {
-    emitError("No planctl project found. Run 'planctl init' first.", format);
+    emitError("No plan project found. Run 'keeper plan init' first.", format);
   }
 
   return contextForRoot(projectRoot);
@@ -183,7 +183,7 @@ export function resolveOwningProjectForId(
   switch (res.reason) {
     case "no_project":
       emitError(
-        `No planctl project found at ${res.projectRoot}. Run 'planctl init' first.`,
+        `No plan project found at ${res.projectRoot}. Run 'keeper plan init' first.`,
         format,
       );
       break;

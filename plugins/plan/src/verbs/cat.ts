@@ -31,8 +31,8 @@ export function runCat(idStr: string, project: string | null): number {
   if (!res.ok) {
     if (res.reason === "no_project") {
       process.stderr.write(
-        `Error: No planctl project found at ${res.projectRoot}. ` +
-          "Run 'planctl init' first.\n",
+        `Error: No plan project found at ${res.projectRoot}. ` +
+          "Run 'keeper plan init' first.\n",
       );
     } else if (res.reason === "ambiguous") {
       process.stderr.write(

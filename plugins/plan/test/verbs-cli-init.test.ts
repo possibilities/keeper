@@ -44,11 +44,11 @@ const SID = { CLAUDE_CODE_SESSION_ID: "test-cli-init" };
 describe("cli --help", () => {
   const getTmp = withTmpdir("planctl-cli-help-");
 
-  test("exit 0 and names planctl", () => {
+  test("exit 0 and names the live command", () => {
     // test_cli.py::test_cli_help
     const r = runCli(["--help"], { cwd: getTmp() });
     expect(r.code).toBe(0);
-    expect(r.output.toLowerCase()).toContain("planctl");
+    expect(r.output.toLowerCase()).toContain("keeper plan");
   });
 
   test("no scout / interview subcommands (removed surfaces)", () => {

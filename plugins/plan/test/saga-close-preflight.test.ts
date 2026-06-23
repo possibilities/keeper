@@ -433,7 +433,7 @@ describe("close-preflight --project flag", () => {
         { cwd: elsewhere, home: proj.home },
       );
       expect(r.code).toBe(0);
-      expect(r.output.includes("No planctl project found")).toBe(false);
+      expect(r.output.includes("No plan project found")).toBe(false);
       const env = parseCliOutput(r.output);
       expect(env.success).toBe(true);
       expect("brief_ref" in env).toBe(true);

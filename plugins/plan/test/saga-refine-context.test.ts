@@ -206,7 +206,7 @@ describe("empty epic + gates", () => {
     expect(r.code).toBe(1);
     const err = envelope(r.output).error as Record<string, unknown>;
     expect(err.code).toBe("NO_PROJECT");
-    expect(err.message as string).toContain("No planctl project found at");
+    expect(err.message as string).toContain("No plan project found at");
     expect(err.message as string).toContain(project.home);
     expect(err.message as string).not.toContain("Epic not found");
   });

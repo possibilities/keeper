@@ -72,8 +72,8 @@ export function runRefineContext(opts: {
     if (resolution.reason === "no_project") {
       emitRefineError(
         "NO_PROJECT",
-        `No planctl project found at ${resolution.projectRoot}. ` +
-          `Run 'planctl init' first.`,
+        `No plan project found at ${resolution.projectRoot}. ` +
+          `Run 'keeper plan init' first.`,
         format,
       );
     }

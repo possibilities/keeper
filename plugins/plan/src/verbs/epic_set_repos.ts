@@ -25,7 +25,7 @@ import { runSetter } from "../validation_restamp.ts";
 /** Build the warn message + emit the WARN: stderr line for a bad repo path.
  * Mirrors the verb-side wrap of _validate_repo_path's error. */
 function warnFor(err: string, epicId: string): string {
-  const msg = `${err}; 'planctl validate --epic ${epicId}' will reject this until the path is fixed`;
+  const msg = `${err}; 'keeper plan validate --epic ${epicId}' will reject this until the path is fixed`;
   process.stderr.write(`WARN: ${msg}\n`);
   return msg;
 }

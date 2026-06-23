@@ -53,8 +53,10 @@ describe.skipIf(!PROCESS_ENABLED)("unknown command", () => {
   test("exit 2 on stderr with click's no-such-command shape", () => {
     const r = run(["frobnicate"], tmpdir());
     expect(r.code).toBe(2);
-    expect(r.stderr).toContain("Usage: planctl [OPTIONS] COMMAND [ARGS]...");
-    expect(r.stderr).toContain("Try 'planctl --help' for help.");
+    expect(r.stderr).toContain(
+      "Usage: keeper plan [OPTIONS] COMMAND [ARGS]...",
+    );
+    expect(r.stderr).toContain("Try 'keeper plan --help' for help.");
     expect(r.stderr).toContain("Error: No such command 'frobnicate'.");
   });
 });
@@ -116,7 +118,7 @@ describe.skipIf(!PROCESS_ENABLED)("state-path", () => {
       expect(r.code).toBe(1);
       expect(r.stdout).toBe(
         '{\n  "success": false,\n' +
-          '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+          '  "error": "No plan project found. Run \'keeper plan init\' first."\n}\n',
       );
       expect(r.stdout).not.toContain("plan_invocation");
     } finally {
@@ -153,7 +155,7 @@ describe.skipIf(!PROCESS_ENABLED)(
         ).toBe(true);
         expect(r.stdout).not.toContain('"plan_invocation"');
         expect(r.stdout).toContain(
-          "No planctl project found. Run 'planctl init' first.",
+          "No plan project found. Run 'keeper plan init' first.",
         );
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -199,7 +201,7 @@ describe.skipIf(!PROCESS_ENABLED)(
           expect(r.code).toBe(1);
           expect(r.stdout).toBe(
             '{\n  "success": false,\n' +
-              '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+              '  "error": "No plan project found. Run \'keeper plan init\' first."\n}\n',
           );
           expect(r.stdout).not.toContain("plan_invocation");
         } finally {

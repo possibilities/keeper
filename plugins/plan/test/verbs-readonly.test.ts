@@ -112,7 +112,7 @@ describe("state-path", () => {
     const [primary] = split(r.stdout);
     expect(primary).toBe(
       '{\n  "success": false,\n' +
-        '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+        '  "error": "No plan project found. Run \'keeper plan init\' first."\n}\n',
     );
   });
 });
@@ -175,7 +175,7 @@ describe("detect", () => {
     expect(r.stdout).toContain(
       "{\n" +
         '  "success": false,\n' +
-        '  "error": "No planctl project found. Run \'planctl init\' first."\n' +
+        '  "error": "No plan project found. Run \'keeper plan init\' first."\n' +
         "}\n",
     );
   });
@@ -265,7 +265,7 @@ describe("status", () => {
     expect(r.code).toBe(1);
     expect(split(r.stdout)[0]).toBe(
       '{\n  "success": false,\n' +
-        '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+        '  "error": "No plan project found. Run \'keeper plan init\' first."\n}\n',
     );
   });
 });
@@ -359,7 +359,7 @@ describe("epics", () => {
     expect(r.code).toBe(1);
     expect(split(r.stdout)[0]).toBe(
       '{\n  "success": false,\n' +
-        '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+        '  "error": "No plan project found. Run \'keeper plan init\' first."\n}\n',
     );
   });
 });

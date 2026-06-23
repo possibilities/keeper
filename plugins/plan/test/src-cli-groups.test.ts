@@ -46,7 +46,7 @@ describe.skipIf(!PROCESS_ENABLED)("epic group help", () => {
     const r = run(["epic", "--help"], tmpdir());
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(
-      "Usage: planctl epic [OPTIONS] COMMAND [ARGS]...",
+      "Usage: keeper plan epic [OPTIONS] COMMAND [ARGS]...",
     );
     expect(r.stdout).toContain("Manage epics.");
     expect(r.stdout).toContain("--format [json|yaml|human]");
@@ -76,7 +76,7 @@ describe.skipIf(!PROCESS_ENABLED)("epic group help", () => {
     const r = run(["epic"], tmpdir());
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(
-      "Usage: planctl epic [OPTIONS] COMMAND [ARGS]...",
+      "Usage: keeper plan epic [OPTIONS] COMMAND [ARGS]...",
     );
   });
 
@@ -84,9 +84,9 @@ describe.skipIf(!PROCESS_ENABLED)("epic group help", () => {
     const r = run(["epic", "frobnicate"], tmpdir());
     expect(r.code).toBe(2);
     expect(r.stderr).toContain(
-      "Usage: planctl epic [OPTIONS] COMMAND [ARGS]...",
+      "Usage: keeper plan epic [OPTIONS] COMMAND [ARGS]...",
     );
-    expect(r.stderr).toContain("Try 'planctl epic --help' for help.");
+    expect(r.stderr).toContain("Try 'keeper plan epic --help' for help.");
     expect(r.stderr).toContain("Error: No such command 'frobnicate'.");
   });
 });
@@ -96,7 +96,7 @@ describe.skipIf(!PROCESS_ENABLED)("task group help", () => {
     const r = run(["task", "--help"], tmpdir());
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(
-      "Usage: planctl task [OPTIONS] COMMAND [ARGS]...",
+      "Usage: keeper plan task [OPTIONS] COMMAND [ARGS]...",
     );
     expect(r.stdout).toContain("Manage tasks.");
     for (const sub of [

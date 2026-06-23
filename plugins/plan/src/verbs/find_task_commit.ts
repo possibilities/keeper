@@ -67,7 +67,7 @@ function resolveProjectForTask(
     if (!hasDataDir(projectRoot)) {
       emitFindTaskCommitError(
         "NOT_A_PROJECT",
-        `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
+        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
         format,
       );
     }

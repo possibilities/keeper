@@ -102,7 +102,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
     if (!hasDataDir(projectRoot)) {
       emitPreflightError(
         "NOT_A_PROJECT",
-        `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
+        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
         format,
       );
     }
@@ -213,8 +213,12 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
 
 /** click UsageError shape: usage + try-help on stderr, exit 2. */
 function usageError(message: string): never {
-  process.stderr.write("Usage: planctl close-preflight [OPTIONS] EPIC_ID\n");
-  process.stderr.write("Try 'planctl close-preflight --help' for help.\n\n");
+  process.stderr.write(
+    "Usage: keeper plan close-preflight [OPTIONS] EPIC_ID\n",
+  );
+  process.stderr.write(
+    "Try 'keeper plan close-preflight --help' for help.\n\n",
+  );
   process.stderr.write(`Error: ${message}\n`);
   process.exit(2);
 }

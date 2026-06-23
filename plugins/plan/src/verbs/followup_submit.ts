@@ -67,7 +67,7 @@ export function runFollowupSubmit(args: FollowupSubmitArgs): void {
       throw new SubmitError(
         "VERDICT_MISSING",
         `no verdict for ${epicId} at ${vp}; ` +
-          "run `planctl verdict submit` before the follow-up plan",
+          "run `keeper plan verdict submit` before the follow-up plan",
         { expected: vp },
       );
     }

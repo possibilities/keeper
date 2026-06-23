@@ -646,7 +646,9 @@ describe("set-primary-repo / set-touched-repos warnings", () => {
     const envelope = JSON.parse(r.stdout.trim().split("\n")[0] as string);
     expect((envelope.warnings as string[]).length).toBe(1);
     expect((envelope.warnings as string[])[0]).toContain("does not exist");
-    expect((envelope.warnings as string[])[0]).toContain("planctl validate");
+    expect((envelope.warnings as string[])[0]).toContain(
+      "keeper plan validate",
+    );
     expect(r.stderr).toContain("WARN:");
     expect(r.stderr).toContain("does not exist");
   });

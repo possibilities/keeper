@@ -140,7 +140,7 @@ describe("audit submit", () => {
     const msg = error.message as string;
     expect(msg).toContain(EID);
     expect(msg).not.toContain("{epic_id}");
-    expect(msg).toContain(`planctl close-preflight ${EID}`);
+    expect(msg).toContain(`keeper plan close-preflight ${EID}`);
   });
 
   // test_audit_submit.py::test_bad_risk_rejects_before_brief — click.Choice

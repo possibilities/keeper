@@ -98,7 +98,7 @@ function resolveFinalizeProject(
     if (!hasDataDir(projectRoot)) {
       emitFinalizeError(
         "NOT_A_PROJECT",
-        `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
+        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
         format,
       );
     }
@@ -354,7 +354,7 @@ function synthesizeVerdictIfZeroFindings(
   if (!existsSync(mp)) {
     emitFinalizeError(
       "VERDICT_MISSING",
-      `no verdict for ${epicId} at ${vp}; run \`planctl verdict submit\` ` +
+      `no verdict for ${epicId} at ${vp}; run \`keeper plan verdict submit\` ` +
         "(via /plan:close) before close-finalize",
       format,
       { expected: vp },
@@ -377,7 +377,7 @@ function synthesizeVerdictIfZeroFindings(
     emitFinalizeError(
       "VERDICT_MISSING",
       `no verdict for ${epicId} at ${vp}; audit reported ${auditFindings} ` +
-        "finding(s) but no verdict was submitted — run `planctl verdict " +
+        "finding(s) but no verdict was submitted — run `keeper plan verdict " +
         "submit` (via /plan:close) before close-finalize",
       format,
       { expected: vp, audit_findings: auditFindings },
@@ -545,7 +545,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
       "FOLLOWUP_MISSING",
       `no follow-up plan for ${epicId} at ${fp}, but the verdict has ` +
         `${expectedCount} surviving finding cluster(s); run ` +
-        "`planctl followup submit` (via /plan:close) before close-finalize",
+        "`keeper plan followup submit` (via /plan:close) before close-finalize",
       format,
       { expected: fp, expected_tasks: expectedCount },
     );
@@ -608,8 +608,8 @@ function emitOutcome(
 
 /** click UsageError shape: usage + try-help on stderr, exit 2. */
 function usageError(message: string): never {
-  process.stderr.write("Usage: planctl close-finalize [OPTIONS] EPIC_ID\n");
-  process.stderr.write("Try 'planctl close-finalize --help' for help.\n\n");
+  process.stderr.write("Usage: keeper plan close-finalize [OPTIONS] EPIC_ID\n");
+  process.stderr.write("Try 'keeper plan close-finalize --help' for help.\n\n");
   process.stderr.write(`Error: ${message}\n`);
   process.exit(2);
 }

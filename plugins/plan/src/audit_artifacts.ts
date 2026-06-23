@@ -57,7 +57,7 @@ export class ArtifactSchemaTooNewError extends Error {
   constructor(found: number, known: number = AUDIT_SCHEMA_VERSION) {
     super(
       `audit artifact schema_version ${found} is newer than this ` +
-        `planctl knows (${known}); upgrade planctl`,
+        `keeper plan knows (${known}); upgrade keeper plan`,
     );
     this.name = "ArtifactSchemaTooNewError";
     this.found = found;
