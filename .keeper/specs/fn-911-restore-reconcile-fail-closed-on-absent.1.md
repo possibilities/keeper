@@ -22,5 +22,5 @@ is false. Land the regression test the audit named as a Test Gap.
 - [ ] A test drives the absent-binary path (via the fakeable vcs seam) and asserts `tooling_error` survives.
 
 ## Done summary
-
+findSourceCommits now fail-closes on an absent git binary via a new gitBinaryPresent() facade probe (throws GitError), while git-present-but-not-a-work-tree still returns []. Added a regression test driving the absent-binary path through the fake vcs seam.
 ## Evidence

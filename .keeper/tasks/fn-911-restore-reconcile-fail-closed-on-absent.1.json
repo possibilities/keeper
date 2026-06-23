@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fail-close reconcile on absent git",
-  "updated_at": "2026-06-23T04:33:52.170000Z"
+  "updated_at": "2026-06-23T08:28:25.344000Z",
+  "worker_done_at": "2026-06-23T08:28:25.344000Z"
 }
