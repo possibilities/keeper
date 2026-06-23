@@ -30,7 +30,6 @@
  * timeout); 2 = arg fault (bad flags, missing prompt file).
  */
 
-import { randomUUID } from "node:crypto";
 import {
   existsSync,
   readFileSync,
@@ -47,6 +46,7 @@ import {
   buildPairOutput,
   buildShowLastMessageArgv,
   buildWaitForStopArgv,
+  DEFAULT_PAIR_SESSION,
   diffGitSnapshots,
   isSelfTranscriptCollision,
   loadRolePrompt,
@@ -57,6 +57,7 @@ import {
   parsePairLaunchJson,
   parseShowLastMessageJson,
   resolvePairAgentwrapPath,
+  resolvePairPersistSessions,
   stripClaudeEnv,
 } from "../src/pair-command";
 
@@ -252,13 +253,27 @@ export async function main(argv: string[]): Promise<void> {
   const cwd = process.cwd();
   const agentwrapPath = resolvePairAgentwrapPath();
 
+  // Partner tmux session + autoclose policy. A partner whose session opts out of
+  // autoclose (default-exempt: `panels` / `pair`) is left open + interactive for
+  // inspection — attach with `tmux attach -t <session>`; every other session is
+  // autoclosed, its window reaped once we have the answer (and on any failure /
+  // timeout path). agentwrap's race-safe launch lets concurrent partners share a
+  // named session without a create race, so a stable name is safe.
+  const sessionName = v.session ?? DEFAULT_PAIR_SESSION;
+  const shouldReap = !resolvePairPersistSessions().has(sessionName);
+
   // SIGTERM handler: a Monitor kills the process when its timeout_ms expires. We
   // MUST still emit a terminal line (so the orchestrating agent never hangs) AND
-  // reap the partner's tmux window (so no pane leaks). The pane id is captured
-  // into `reapPaneId` the moment the launch JSON is parsed.
+  // reap the partner's tmux window unless its session opts out of autoclose. The
+  // pane id is captured into `reapPaneId` the moment the launch JSON is parsed.
   let reapPaneId: string | null = null;
+  const reap = (): void => {
+    if (shouldReap) {
+      killWindow(reapPaneId);
+    }
+  };
   process.on("SIGTERM", () => {
-    killWindow(reapPaneId);
+    reap();
     if (!startedEmitted) {
       emitEvent("started", { cli, role, output });
     }
@@ -316,13 +331,11 @@ export async function main(argv: string[]): Promise<void> {
     readOnly,
     ...(v.model !== undefined ? { model: v.model } : {}),
     ...(v.effort !== undefined ? { effort: v.effort } : {}),
-    // Each partner gets its OWN tmux session (unique unless --session is given).
-    // Concurrent pair launches — e.g. /plan:panel fanning claude + codex out in
-    // one turn — would otherwise race to create the shared default `agentwrap`
-    // session and one fails with tmux "duplicate session" (a TOCTOU between
-    // has-session and new-session). A per-launch name sidesteps it entirely; the
-    // window is still reaped by pane id and tmux drops the emptied session.
-    session: v.session ?? `keeper-pair-${randomUUID().slice(0, 8)}`,
+    // Partners land in a stable named session (`pair` by default, `panels` for
+    // panel legs). Concurrent launches sharing the name are safe: agentwrap's
+    // launch recovers from the new-session "duplicate session" TOCTOU by adding a
+    // window to the now-existing session.
+    session: sessionName,
   });
   const startMs = Date.now();
   const launchRes = runAgentwrap(launchArgv, env, cwd);
@@ -351,7 +364,7 @@ export async function main(argv: string[]): Promise<void> {
     timeoutSeconds * 1000,
   );
   if (waitRes === null || waitRes.exitCode !== 0) {
-    killWindow(reapPaneId);
+    reap();
     const detail =
       waitRes === null
         ? "spawn failed / killed"
@@ -366,7 +379,7 @@ export async function main(argv: string[]): Promise<void> {
     cwd,
   );
   if (showRes === null || showRes.exitCode !== 0) {
-    killWindow(reapPaneId);
+    reap();
     const detail =
       showRes === null
         ? "spawn failed / killed"
@@ -375,12 +388,14 @@ export async function main(argv: string[]): Promise<void> {
   }
   const showParse = parseShowLastMessageJson(showRes.stdout);
   if (!showParse.ok) {
-    killWindow(reapPaneId);
+    reap();
     return fail(showParse.error);
   }
 
-  // The partner has stopped; reap its window now that we have the message.
-  killWindow(reapPaneId);
+  // The partner has stopped and we have the message; autoclose its window now
+  // (unless its session opted out, in which case `reap` is a no-op and the
+  // window stays open + interactive for inspection).
+  reap();
 
   // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
   // if the resolver fell back to newest-by-mtime and won the DRIVER's own

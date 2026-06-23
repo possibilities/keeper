@@ -63,14 +63,14 @@ gives directions and the verbatim task, never pre-read content.
 
 ```
 Monitor(
-    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
+    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
     description="panel opus",
     until="[keeper-pair] (completed|failed)",
     timeout_ms=3600000,
     persistent=false,
 )
 Monitor(
-    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
+    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
     description="panel codex",
     until="[keeper-pair] (completed|failed)",
     timeout_ms=1860000,
@@ -81,6 +81,9 @@ Monitor(
 - Neither panelist gets an assigned role or persona — both answer the human's task straight. The
   cross-family difference (Opus 4.8 vs GPT-5.5) is the diversity the panel harvests.
 - `--read-only` on both: claude strips its edit tools; codex carries read-only via its prompt directive.
+- `--session panels` on both: panelists land in a dedicated `panels` tmux session that stays open +
+  interactive after the run (exempt from autoclose), so you can `tmux attach -t panels` to inspect a
+  panelist's full session. Concurrent legs share it safely — agentwrap recovers from the create race.
 - `keeper pair` emits a strict two-line contract on stdout: one `[keeper-pair] started …` line, then one
   terminal line. When `started` arrives, do nothing until the terminal line for that run. On
   `[keeper-pair] completed …`, note the exact `--output` path you passed — **do not read its content into

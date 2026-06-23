@@ -608,3 +608,46 @@ export function resolvePairAgentwrapPath(
   }
   return entry;
 }
+
+// ---------------------------------------------------------------------------
+// tmux session naming + autoclose policy
+// ---------------------------------------------------------------------------
+
+/** Default tmux session for `keeper pair` partners when `--session` is absent.
+ *  A stable named session (not a per-launch unique name) so partners are easy to
+ *  find/attach; agentwrap's race-safe launch lets concurrent partners share it. */
+export const DEFAULT_PAIR_SESSION = "pair";
+
+/**
+ * tmux session names EXEMPT from autoclose. A partner whose session is exempt is
+ * left open + interactive after its turn (attach with `tmux attach -t <name>`)
+ * instead of having its window reaped; every other session autocloses. `panels`
+ * holds `/plan:panel` legs, `pair` holds default `keeper pair` partners — both
+ * kept open for inspection by default.
+ */
+export const DEFAULT_PAIR_PERSIST_SESSIONS: readonly string[] = [
+  "panels",
+  DEFAULT_PAIR_SESSION,
+];
+
+/**
+ * Resolve the set of tmux session names exempt from autoclose. Default is
+ * {@link DEFAULT_PAIR_PERSIST_SESSIONS}; `KEEPER_PAIR_PERSIST_SESSIONS` overrides
+ * with a comma-separated list (an empty value → autoclose everything). Mirrors
+ * {@link resolvePairAgentwrapPath}'s env-override pattern so this leaf stays
+ * dep-free of `src/db.ts`. `env` injectable for tests.
+ */
+export function resolvePairPersistSessions(
+  env: Record<string, string | undefined> = process.env,
+): Set<string> {
+  const override = env.KEEPER_PAIR_PERSIST_SESSIONS;
+  if (override === undefined) {
+    return new Set(DEFAULT_PAIR_PERSIST_SESSIONS);
+  }
+  return new Set(
+    override
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== ""),
+  );
+}

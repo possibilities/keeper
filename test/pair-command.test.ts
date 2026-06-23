@@ -13,6 +13,8 @@ import {
   buildPairOutput,
   buildShowLastMessageArgv,
   buildWaitForStopArgv,
+  DEFAULT_PAIR_PERSIST_SESSIONS,
+  DEFAULT_PAIR_SESSION,
   diffGitSnapshots,
   isPairRole,
   isSelfTranscriptCollision,
@@ -26,6 +28,7 @@ import {
   parseShowLastMessageJson,
   READ_ONLY_DIRECTIVE,
   resolvePairAgentwrapPath,
+  resolvePairPersistSessions,
   stripClaudeEnv,
 } from "../src/pair-command";
 
@@ -495,4 +498,28 @@ test("resolvePairAgentwrapPath: KEEPER_AGENTWRAP_PATH wins; tilde expands", () =
 
 test("schema version constant is pinned at 1 (cross-repo contract)", () => {
   expect(PAIR_AGENTWRAP_SCHEMA_VERSION).toBe(1);
+});
+
+test("resolvePairPersistSessions: default exempts panels + pair from autoclose", () => {
+  const def = resolvePairPersistSessions({});
+  expect(def.has("panels")).toBe(true);
+  expect(def.has(DEFAULT_PAIR_SESSION)).toBe(true);
+  expect(DEFAULT_PAIR_SESSION).toBe("pair");
+  expect([...DEFAULT_PAIR_PERSIST_SESSIONS]).toEqual(["panels", "pair"]);
+  // An unlisted session autocloses by default.
+  expect(def.has("agentwrap")).toBe(false);
+});
+
+test("resolvePairPersistSessions: env override replaces the default list", () => {
+  const set = resolvePairPersistSessions({
+    KEEPER_PAIR_PERSIST_SESSIONS: "panels, my-debug ,",
+  });
+  expect([...set].sort()).toEqual(["my-debug", "panels"]);
+  // `pair` is no longer exempt under an explicit override.
+  expect(set.has("pair")).toBe(false);
+});
+
+test("resolvePairPersistSessions: empty env value autocloses everything", () => {
+  const set = resolvePairPersistSessions({ KEEPER_PAIR_PERSIST_SESSIONS: "" });
+  expect(set.size).toBe(0);
 });
