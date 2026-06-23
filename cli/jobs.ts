@@ -657,16 +657,14 @@ export async function main(argv: string[]): Promise<void> {
       });
   }
 
-  // `v` (insert mode only) — focus the selected job's backend pane via the
-  // session-agnostic `ExecBackend.focusPane(session, paneId)` op. Looks up the
-  // row by `job_id` (the same resolution `space` uses for expand-toggle), reads
-  // `backend_exec_type` / `backend_exec_session_id` / `backend_exec_pane_id`;
-  // any missing → flash `[no backend pane]` and exit. The backend is resolved
-  // PER ROW from `backend_exec_type` (a historical DB may carry legacy tags);
-  // every type resolves to the tmux backend in
-  // `resolveExecBackend`, but a NULL session/pane skips before that. `noteLine`
-  // funnels backend warnings to the same lifecycle sidecar `view.noteLine`
-  // writes to. Otherwise stamp `[focusing…]` via setStatus (persistent until
+  // `v` (insert mode only) — focus the selected job's tmux pane via the direct
+  // `createTmuxPaneOps` seam (focusPane targets the server-global tmux ids the
+  // hook stamps, so no per-row backend resolution is needed). Looks up the row
+  // by `job_id` (the same resolution `space` uses for expand-toggle), reads
+  // `backend_exec_session_id` / `backend_exec_pane_id`; a NULL session/pane →
+  // flash `[no backend pane]` and exit before the seam call. `noteLine` funnels
+  // backend warnings to the same lifecycle sidecar `view.noteLine` writes to.
+  // Otherwise stamp `[focusing…]` via setStatus (persistent until
   // the RPC resolves — `flashStatus` would restore the banner too quickly),
   // then await `backend.focusPane(session, pane)` and flash the result
   // (`[focused]` / `[focus failed: <reason>]`). Single-flight guarded so a
