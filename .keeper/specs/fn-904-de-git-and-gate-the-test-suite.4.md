@@ -47,5 +47,5 @@ window stays race-free.
 - [ ] These files' isolated wall-time drops materially and they stay green under `--parallel`
 
 ## Done summary
-
+De-gitted git-boot-seed + session-state via injectable seams (buildSnapshotForRoot, buildSessionState gitRunner/attribution) driven by synthetic payloads + a faked git runner; quarantined the genuine real-git discovery path to a .slow file. daemon/events-writer/server-worker already prefer withInProcessDaemon + slow-quarantine their process-dependent spawns; all green under --parallel.
 ## Evidence

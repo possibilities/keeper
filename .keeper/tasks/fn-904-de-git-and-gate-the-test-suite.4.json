@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "De-git remaining tests and cut subprocess spawns",
-  "updated_at": "2026-06-23T00:59:49.672000Z"
+  "updated_at": "2026-06-23T02:48:47.393000Z",
+  "worker_done_at": "2026-06-23T02:48:47.393000Z"
 }
