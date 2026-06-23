@@ -69,5 +69,5 @@ test/builds-worker.test.ts: the existing "returns null for never-built" assertio
 - [ ] `bun run test:full` passes
 
 ## Done summary
-
+parseLatestBuild now mints an all-null placeholder (sentinel state_string + builder_id) ONLY for a parsed {builds:[]}; every other null shape and per-builder fetch failure stay silent. resolveStatus returns NEVER_BUILT for null build_number before the RUNNING check. Producer + render only, no schema/version bump, re-fold byte-identical; full suite green.
 ## Evidence
