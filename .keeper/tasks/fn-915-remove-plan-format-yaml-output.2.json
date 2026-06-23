@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Drop js-yaml from plan, declare in prompt",
-  "updated_at": "2026-06-23T07:58:41.694000Z"
+  "updated_at": "2026-06-23T10:24:53.073000Z",
+  "worker_done_at": "2026-06-23T10:24:53.073000Z"
 }

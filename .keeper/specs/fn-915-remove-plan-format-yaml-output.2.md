@@ -45,5 +45,5 @@ longer bundled and the prompt bundle-write path still works.
 - [ ] lockfiles reflect the change with no drift
 
 ## Done summary
-
+Dropped js-yaml + @types/js-yaml from the plan plugin (no longer imported) and declared them in the prompt plugin (its sole importer); root untouched. Clean frozen installs resolve for both plugins, the plan binary builds with zero js-yaml symbols, and the prompt yaml_dump byte-parity suite passes.
 ## Evidence
