@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "remove arthack pairctl package + shim",
-  "updated_at": "2026-06-23T00:24:53.534000Z"
+  "updated_at": "2026-06-23T00:35:17.055000Z",
+  "worker_done_at": "2026-06-23T00:35:17.055000Z"
 }

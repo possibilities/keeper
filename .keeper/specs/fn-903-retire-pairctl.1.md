@@ -35,5 +35,5 @@ arthack lint + test suites green after removal; `which pairctl` resolves to noth
 - [ ] arthack lint + test suite green; no dangling pairctl import
 
 ## Done summary
-
+Deleted the arthack apps/pairctl package (source, config, prompts, tests), removed the ~/.local/bin/pairctl shim and its source symlink, de-registered pairctl from the pyproject workspace, regenerated uv.lock + pnpm-lock.yaml, and rewrote codexctl cross-CLI comments forward-facing. arthack lint + full test suite green; which pairctl resolves to nothing.
 ## Evidence
