@@ -44,5 +44,5 @@ Fast-tier, synthetic (no real git/daemon). Cases: offline `planner@<epic>` → `
 - [ ] fast-tier tests cover all cases; `bun run test:full` green
 
 ## Done summary
-
+Durable wake-on-send queue: an offline planner@<epic> escalation persists as queued_for_wake keyed on the creator job_id and replays recipient-keyed on resubscribe (flipped to delivered_after_wake, namespace-safe, idempotent); surfaced as an exit-0 outcome on keeper bus chat send. No bus.db schema bump; bus worker stays pure.
 ## Evidence
