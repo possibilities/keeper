@@ -32,5 +32,5 @@ No behavior change; existing pair tests stay green. Grep confirms no live `pairc
 - [ ] no behavior change; pair tests green
 
 ## Done summary
-
+Rewrote the residual pairctl provenance comments in cli/pair.ts, src/pair-command.ts, and cli/await.ts to forward-facing prose, dropping the 'ported from'/'mirrors pairctl' tombstones while keeping behavioral invariants. Comment-only; 39 pair tests green.
 ## Evidence
