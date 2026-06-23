@@ -42,5 +42,5 @@ left in keeper-core are the frozen allowlist + the `.2`/`.3`/`.4` residue those 
 - [ ] one atomic mechanical commit; `bun run test:full` + plan slow suite green
 
 ## Done summary
-
+Allowlist-guided sweep retiring 'planctl' across src/** + incidental keeper test/**: renamed symbols (PLAN_STDOUT_CAP/PLAN_FILES_CAP, parsePlanOpTrailer/parsePlanTargetTrailer/filterPlanChanges, PLAN_EXCLUDE_PREFIXES), locals, and comments. Frozen trailer scrape, the planctl_op/planctl_target data keys + planctl-commit-changed wire kind (.3 owns), and db.ts/db.test/refold schema-history literals left UNCHANGED. test:full green (3691 pass).
 ## Evidence
