@@ -57,6 +57,7 @@
 import type { Database } from "bun:sqlite";
 import type { Stmts } from "./db";
 import { raiseGitProjectionFloor, setGitProjectionSeedRequired } from "./db";
+import { allGatedRootsSeeded, gatedGitRoots } from "./gated-roots";
 import {
   buildDiscoveryCandidates,
   buildGitSnapshot,
@@ -133,17 +134,37 @@ function readMaxEventId(db: Database): number {
 }
 
 /**
- * Enumerate the git roots to seed: the same candidate set the live git-worker
- * watches (`epics.project_dir` + `task.target_repo` + every `jobs.cwd`), resolved
- * to git toplevels. `runFullSweep: true` so a stale unpushed-but-clean repo is
- * covered. Failures resolve to "skip that candidate" (fail-safe).
+ * Enumerate the git roots to seed, scoped to PLAN-RELEVANT roots — NOT the full
+ * historical `jobs.cwd` sweep. The set is the FAST-PATH candidate build
+ * (`runFullSweep: false` → working + recently-updated jobs, plus every epic's
+ * `project_dir`/`task.target_repo`) UNIONED with the GATED roots (open-epic
+ * `project_dir` + each task's `target_repo`, including the close-row root). The
+ * gated union is the load-bearing guarantee: the readiness gate (task 2)
+ * consults `seed_required` per-root keyed on `effectiveRoot`, so the surface of
+ * EVERY root a readiness row can reference must be established at boot — even a
+ * clean, idle gated root with no recent job activity. Dropping the full sweep
+ * sheds the stale `/private/tmp` / `/Volumes/Scratch` roots that darkened the
+ * board for no plan reason.
+ *
+ * The git-worker's OWN watched-set call site shares `buildDiscoveryCandidates`
+ * but is a DIFFERENT caller (it keeps its sweep cadence) — this scoping is
+ * boot-seed-local.
+ *
+ * Failures resolve to "skip that candidate" (fail-safe). A gated root that
+ * fails to resolve here is still covered by the producer-only self-heal: main's
+ * above-floor fold clears `seed_required` once it acquires a row, and until then
+ * the per-root gate forces only THAT root `unknown`.
  */
 function discoverSeedRoots(db: Database, nowMs: number): string[] {
   const candidates = buildDiscoveryCandidates(db, {
     nowMs,
-    runFullSweep: true,
+    runFullSweep: false,
     watched: new Set<string>(),
   });
+  // Union in the gated roots so every root a readiness row can reference is
+  // seeded, even one with no working/recent job (the fast path would miss it).
+  for (const gated of gatedGitRoots(db)) candidates.add(gated);
+
   const roots = new Set<string>();
   for (const candidate of candidates) {
     let root: string | null = null;
@@ -293,8 +314,16 @@ export function seedGitProjection(
       const snapshot = buildSnapshotForRoot(root);
       if (snapshot == null) {
         // Time-bound git read failed/timed out for this root — skip it (the row
-        // it would have produced stays whatever it was; a later boot retries).
+        // it would have produced stays whatever it was; a later boot OR the live
+        // git-worker's emit retries). LOG it (root + best-effort reason) so a
+        // wedged/non-git root is not a silent gap — the prior behavior dropped
+        // it with no trace, leaving an unexplained `seed_required`.
         complete = false;
+        console.error(
+          `[keeperd] git boot-seed skipped root=${root}: readStatus returned ` +
+            `null (non-git dir, timed-out, or failed git read) — surface for ` +
+            `this root left to the live git-worker's emit`,
+        );
         continue;
       }
       resetRootGitRows(db, root);
@@ -310,10 +339,16 @@ export function seedGitProjection(
   }
 
   // 4. Persist the floor (monotonic raise) regardless of completeness — the
-  //    historical replay must stay skipped. Clear `seed_required` ONLY when every
-  //    targeted root seeded within budget; otherwise leave it set to retry.
+  //    historical replay must stay skipped. Clear `seed_required` once every
+  //    GATED root (open-epic `project_dir` + task `target_repo`) has an
+  //    above-floor `git_status` row — best-effort for stale, non-gated roots:
+  //    a failed `/Volumes/Scratch` root must NOT keep the flag set and dark the
+  //    whole board. A gated root the seed missed/failed is left to the
+  //    producer-only self-heal (main's above-floor fold clears the flag once
+  //    that root's live emit lands). `complete` (EVERY targeted root) still
+  //    rides the return for observability, but the clear gates on the gated set.
   raiseGitProjectionFloor(db, floor);
-  if (complete) {
+  if (allGatedRootsSeeded(db, floor)) {
     setGitProjectionSeedRequired(db, false);
   }
 

@@ -32,6 +32,7 @@ import {
   resolveEpicDep,
   usageIdForProfileName,
 } from "./epic-deps";
+import { allGatedRootsSeeded } from "./gated-roots";
 import {
   type ClassifierInvocation,
   deriveEpicLinks,
@@ -1815,6 +1816,21 @@ function readGitFloor(db: Database): number {
 }
 
 /**
+ * Read whether the boot gate `seed_required` is currently set. Returns false
+ * when the control row is absent (pre-v79 / mid-migrate) so the self-clear in
+ * `projectGitStatus` no-ops rather than firing a pointless UPDATE against a
+ * missing row. PURE — reads a control row only, no wall-clock / env / FS, so it
+ * does not break re-fold determinism (and `seed_required` is charter-excluded
+ * control state regardless).
+ */
+function gitSeedRequiredSet(db: Database): boolean {
+  const row = db
+    .query("SELECT seed_required FROM git_projection_state WHERE id = 1")
+    .get() as { seed_required: number } | null;
+  return row != null && row.seed_required !== 0;
+}
+
+/**
  * Threshold above which a GitSnapshot fold emits a per-pass `[gitfold-breakdown]`
  * line — high enough that normal folds stay silent; only the multi-second
  * outliers that hold the write lock and starve hook INSERTs matter.
@@ -2201,6 +2217,27 @@ function projectGitStatus(db: Database, event: Event): void {
       eventTs,
     ],
   );
+
+  // PRODUCER-ONLY SELF-HEAL: clear `seed_required` once every GATED root has an
+  // above-floor `git_status` row. This snapshot just wrote one (it is above the
+  // floor — the early return gated `id <= floor`), so a gated root the boot-seed
+  // missed/failed clears the flag THE MOMENT its live emit lands here. The clear
+  // is MAIN's fold, never a git-worker write — the git-worker only emits
+  // GitSnapshots; main folds them and owns `git_projection_state`, preserving the
+  // single-writer (producer-only) recovery path with no retry loop / no TOCTOU.
+  //
+  // Determinism: gated only by above-floor folds (re-fold replays pre-floor git
+  // folds, which return early), reads only `epics`+`git_status` projections (no
+  // wall-clock/fs/env), and `seed_required` is charter-excluded control state —
+  // so re-fold stays byte-identical for the deterministic projections.
+  if (gitSeedRequiredSet(db) && allGatedRootsSeeded(db, readGitFloor(db))) {
+    db.run(
+      `UPDATE git_projection_state
+          SET seed_required = 0, updated_at = ?
+        WHERE id = 1`,
+      [eventTs],
+    );
+  }
 
   // Slow-fold breakdown — localizes a [fold-slow] GitSnapshot to a pass. Only
   // emitted above the threshold so steady folds stay silent. nfiles/nsessions

@@ -27,6 +27,7 @@ import {
   readGitProjectionSeedRequired,
   SCHEMA_VERSION,
 } from "../src/db";
+import { allGatedRootsSeeded, gatedGitRoots } from "../src/gated-roots";
 import {
   DEFAULT_GIT_SEED_BUDGET_MS,
   seedGitProjection,
@@ -122,6 +123,36 @@ function gitStatusRow(
   return kdb.db
     .query("SELECT dirty_count, branch FROM git_status WHERE project_dir = ?")
     .get(projectDir) as { dirty_count: number; branch: string | null } | null;
+}
+
+/**
+ * Seed one OPEN epic whose tasks gate the given roots: a `target_repo` per root
+ * (and the epic's own `project_dir` as the close-row root). The `seed_required`
+ * lifecycle now gates on the GATED root set (open-epic `project_dir` +
+ * `task.target_repo`), so a test that wants a failing root to KEEP the flag set
+ * must make that root a GATED root — a stale, non-gated root self-clears.
+ */
+function seedOpenEpic(
+  epicId: string,
+  projectDir: string,
+  taskRepos: string[],
+): void {
+  const tasks = taskRepos.map((repo, i) => ({
+    task_id: `${epicId}.${i + 1}`,
+    epic_id: epicId,
+    task_number: i + 1,
+    target_repo: repo,
+  }));
+  kdb.db
+    .query(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, 1, 'gated', ?, 'open', 0, 1, ?)`,
+    )
+    .run(epicId, projectDir, JSON.stringify(tasks));
+}
+
+function seedRequired(): boolean {
+  return readGitProjectionSeedRequired(kdb.db);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,11 +324,122 @@ test("seed-freshness: the floor is raised to the captured max(events.id) and see
 });
 
 // ---------------------------------------------------------------------------
+// Per-root gating: gated-set scope + self-clear (boot AND fold paths)
+// ---------------------------------------------------------------------------
+
+test("gated-roots: gatedGitRoots derives open-epic project_dir + task target_repo (close-row root included), ignoring closed epics", () => {
+  const projOpen = fakeRoot("proj-open");
+  const repoA = fakeRoot("task-a");
+  const repoB = fakeRoot("task-b");
+  seedOpenEpic("fn-1-open", projOpen, [repoA, repoB]);
+  // A CLOSED/completed epic must contribute NO gated root (it dispatches
+  // nothing). Insert with a non-open status.
+  kdb.db
+    .query(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES ('fn-2-done', 2, 'done', ?, 'completed', 0, 1, ?)`,
+    )
+    .run(
+      fakeRoot("proj-done"),
+      JSON.stringify([
+        { task_id: "fn-2-done.1", target_repo: fakeRoot("task-done") },
+      ]),
+    );
+
+  const gated = gatedGitRoots(kdb.db);
+  // Open epic: its project_dir (close-row root) + both task repos.
+  expect(gated).toContain(projOpen);
+  expect(gated).toContain(repoA);
+  expect(gated).toContain(repoB);
+  // Closed epic contributes nothing.
+  expect(gated).not.toContain(fakeRoot("proj-done"));
+  expect(gated).not.toContain(fakeRoot("task-done"));
+});
+
+test("scoped discovery keeps every gated root and drops the stale historical sweep", () => {
+  // A gated root with NO job history at all (clean, idle) must still be in the
+  // seed set — the gated union covers it. A stale `jobs.cwd`-only root with no
+  // open epic and no recent activity must NOT (the full sweep is gone).
+  //
+  // The discovery path resolves candidates through `resolveGitToplevel` (real
+  // git), so we assert the DERIVATION (`gatedGitRoots`) directly rather than the
+  // resolved set — the real-git resolution is covered in the slow tier.
+  const gatedClean = fakeRoot("gated-clean-idle");
+  seedOpenEpic("fn-1-clean-idle", gatedClean, [gatedClean]);
+  // A stale cwd that is NOT a gated root.
+  kdb.db.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at, state, cwd) VALUES ('j-stale', 1, 1, 'stopped', ?)",
+    [fakeRoot("stale-volumes-scratch")],
+  );
+  const gated = gatedGitRoots(kdb.db);
+  expect(gated).toContain(gatedClean);
+  expect(gated).not.toContain(fakeRoot("stale-volumes-scratch"));
+});
+
+test("self-clear (fold path): a gated root seeded ONLY by a later above-floor GitSnapshot clears seed_required in main's fold", () => {
+  const seeded = fakeRoot("gated-seeded");
+  const missed = fakeRoot("gated-missed");
+  // Two gated roots; the boot-seed only covers `seeded` (the producer skips
+  // `missed`, mirroring a transient read failure). `seed_required` stays set.
+  seedOpenEpic("fn-1-two-gated", seeded, [seeded, missed]);
+  const result = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [seeded], // boot-seed misses `missed` entirely
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
+  });
+  expect(result.complete).toBe(true); // every TARGETED root seeded…
+  expect(seedRequired()).toBe(true); // …but the gated `missed` root has no row
+
+  // The floor is now the captured max(events.id) BEFORE the seed scan; the
+  // synthetic seed snapshot for `seeded` sits above it. A LATER live GitSnapshot
+  // for `missed` (id above the floor) is main's producer-only self-heal.
+  const floor = readGitProjectionFloor(kdb.db);
+  expect(allGatedRootsSeeded(kdb.db, floor)).toBe(false); // missed still bare
+
+  const snapshot = dirtySnapshot(missed);
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [missed, missed, JSON.stringify(snapshot)],
+  );
+  drainAll();
+
+  // The above-floor fold for `missed` lands its git_status row → every gated
+  // root now seeded → main's fold cleared `seed_required`. No git-worker write,
+  // no boot bounce, no retry loop.
+  expect(allGatedRootsSeeded(kdb.db, floor)).toBe(true);
+  expect(seedRequired()).toBe(false);
+});
+
+test("transiently-failing gated root leaves ONLY itself unseeded (sibling gated roots seed)", () => {
+  const ok = fakeRoot("gated-ok");
+  const flaky = fakeRoot("gated-flaky");
+  seedOpenEpic("fn-1-mixed", ok, [ok, flaky]);
+  const result = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [ok, flaky],
+    // `flaky` returns null (transient read failure); `ok` seeds.
+    buildSnapshotForRoot: (root) =>
+      root === flaky ? null : dirtySnapshot(root),
+  });
+  expect(result.seededRoots).toEqual([ok]);
+  // `ok` has its row; `flaky` does not — only the failing root is unseeded.
+  expect(gitStatusRow(ok)?.dirty_count).toBe(1);
+  expect(gitStatusRow(flaky)).toBeNull();
+  // The gated `flaky` root keeps the flag set until its own emit lands.
+  expect(seedRequired()).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
 // Crash-recovery + degrade-not-fatal
 // ---------------------------------------------------------------------------
 
-test("crash-recovery: a non-git root degrades (no throw) and leaves seed_required SET to retry", () => {
+test("crash-recovery: a GATED non-git root degrades (no throw) and leaves seed_required SET to retry", () => {
   const notARepo = fakeRoot("bare");
+  // Make the failing root a GATED root (an open epic targets it), so a null read
+  // leaves it unseeded and KEEPS `seed_required` set — the incident class the
+  // self-clear must NOT mis-clear.
+  seedOpenEpic("fn-1-gated-bare", notARepo, [notARepo]);
   // `buildSnapshotForRoot` returns null for a non-git dir (mirrors `readStatus`
   // returning null), so the root is skipped and the seed reports incomplete.
   const result = seedGitProjection(kdb.db, kdb.stmts, {
@@ -308,14 +450,30 @@ test("crash-recovery: a non-git root degrades (no throw) and leaves seed_require
 
   expect(result.complete).toBe(false);
   expect(result.seededRoots).toEqual([]);
-  // seed_required STAYS set so a later boot re-seeds.
-  expect(readGitProjectionSeedRequired(kdb.db)).toBe(true);
+  // seed_required STAYS set: the gated root never got an above-floor row.
+  expect(seedRequired()).toBe(true);
   // The floor is still raised (the historical replay must stay skipped).
   expect(readGitProjectionFloor(kdb.db)).toBe(0); // empty event log ⇒ floor 0
 });
 
+test("scope: with NO gated roots, a stale non-git root self-clears seed_required (never darks an empty board)", () => {
+  const stale = fakeRoot("stale-scratch");
+  // No open epics ⇒ no gated roots. A stale root that fails to read must NOT
+  // keep `seed_required` set — nothing references it, so the board stays lit.
+  const result = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [stale],
+    buildSnapshotForRoot: () => null,
+  });
+  expect(result.complete).toBe(false); // the root itself didn't seed
+  expect(seedRequired()).toBe(false); // …but no gated root is unseeded
+});
+
 test("degrade-not-fatal: a drain callback that throws is isolated per-root; the seed never throws and leaves seed_required set", () => {
   const repo = fakeRoot("drain-throw");
+  // Gated root: a throwing drain leaves it without an above-floor row, so
+  // `seed_required` must stay set.
+  seedOpenEpic("fn-1-gated-drain", repo, [repo]);
   let calls = 0;
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: () => {
@@ -328,12 +486,15 @@ test("degrade-not-fatal: a drain callback that throws is isolated per-root; the 
   expect(calls).toBeGreaterThan(0); // the drain was attempted
   expect(result.complete).toBe(false);
   expect(result.seededRoots).toEqual([]);
-  expect(readGitProjectionSeedRequired(kdb.db)).toBe(true);
+  expect(seedRequired()).toBe(true);
 });
 
 test("budget: an exhausted time budget stops issuing scans and leaves seed_required set", () => {
   const repo1 = fakeRoot("budget-1");
   const repo2 = fakeRoot("budget-2");
+  // Gated roots: budget exhaustion before either seeds leaves both gated roots
+  // without an above-floor row, so `seed_required` stays set to retry.
+  seedOpenEpic("fn-1-gated-budget", repo1, [repo1, repo2]);
   // A clock that jumps past the budget on the first elapsed-check.
   let t = 0;
   const result = seedGitProjection(kdb.db, kdb.stmts, {
@@ -348,7 +509,7 @@ test("budget: an exhausted time budget stops issuing scans and leaves seed_requi
     },
   });
   expect(result.complete).toBe(false);
-  expect(readGitProjectionSeedRequired(kdb.db)).toBe(true);
+  expect(seedRequired()).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
