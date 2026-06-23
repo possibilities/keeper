@@ -1,7 +1,7 @@
 {
-  "name": "planctl-hooks",
+  "name": "keeper-plan-hooks",
   "version": "0.0.0",
-  "description": "Bun TypeScript hook dispatchers enforcing the content-blind orchestrator contract for the planctl plugin",
+  "description": "Bun TypeScript hook dispatchers enforcing the content-blind orchestrator contract for the keeper plan plugin",
   "private": true,
   "scripts": {
     "build": "bun build --compile src/cli.ts --outfile dist/keeper-plan-bun && chmod +x dist/keeper-plan-bun",

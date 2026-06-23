@@ -24,10 +24,10 @@ let sessionsDir: string;
 let origHome: string | undefined;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "planctl-lib-test-"));
+  home = mkdtempSync(join(tmpdir(), "keeper-plan-lib-test-"));
   origHome = process.env.HOME;
   process.env.HOME = home;
-  sessionsDir = join(home, ".local", "state", "planctl", "sessions");
+  sessionsDir = join(home, ".local", "state", "keeper", "sessions");
   mkdirSync(sessionsDir, { recursive: true });
 });
 
@@ -115,25 +115,25 @@ describe("readMarker", () => {
 describe("isBypassed", () => {
   let orig: string | undefined;
   beforeEach(() => {
-    orig = process.env.PLANCTL_GUARD_BYPASS;
+    orig = process.env.KEEPER_PLAN_GUARD_BYPASS;
   });
   afterEach(() => {
-    if (orig === undefined) delete process.env.PLANCTL_GUARD_BYPASS;
-    else process.env.PLANCTL_GUARD_BYPASS = orig;
+    if (orig === undefined) delete process.env.KEEPER_PLAN_GUARD_BYPASS;
+    else process.env.KEEPER_PLAN_GUARD_BYPASS = orig;
   });
 
   test("true only for exactly '1'", () => {
-    process.env.PLANCTL_GUARD_BYPASS = "1";
+    process.env.KEEPER_PLAN_GUARD_BYPASS = "1";
     expect(isBypassed()).toBe(true);
   });
 
   test("false when unset", () => {
-    delete process.env.PLANCTL_GUARD_BYPASS;
+    delete process.env.KEEPER_PLAN_GUARD_BYPASS;
     expect(isBypassed()).toBe(false);
   });
 
   test("false for other truthy-looking values", () => {
-    process.env.PLANCTL_GUARD_BYPASS = "true";
+    process.env.KEEPER_PLAN_GUARD_BYPASS = "true";
     expect(isBypassed()).toBe(false);
   });
 });

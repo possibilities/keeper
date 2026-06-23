@@ -13,7 +13,7 @@ import {
   isBypassed,
   readMarker,
   readStdin,
-  runPlanctl,
+  runPlanCli,
   unlinkMarker,
 } from "./lib.ts";
 
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
   // a null envelope, a typed error (no `verdict` key), `tooling_error`, or a
   // terminal done/blocked verdict all fail open. Terminal verdicts also mean
   // the marker is stale, so unlink it on the way out.
-  const env = await runPlanctl(["reconcile", marker.task_id]);
+  const env = await runPlanCli(["reconcile", marker.task_id]);
   const verdict = env?.verdict;
   if (verdict === "done" || verdict === "blocked") {
     await unlinkMarker(sessionId);
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
   emitDeny(
     `Refusing to commit from the orchestrator's main context: task ${marker.task_id} ` +
       "is in-flight. Resume the worker — the orchestrator never commits. " +
-      "Set PLANCTL_GUARD_BYPASS=1 to override as a human.",
+      "Set KEEPER_PLAN_GUARD_BYPASS=1 to override as a human.",
   );
 }
 

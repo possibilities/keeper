@@ -17,7 +17,7 @@ import {
   isBypassed,
   readMarker,
   readStdin,
-  runPlanctl,
+  runPlanCli,
   unlinkMarker,
 } from "./lib.ts";
 
@@ -43,11 +43,11 @@ const TRANSCRIPT_READ_LIMIT = 256 * 1024;
 export const VERDICT_NUDGE: Record<string, (taskId: string) => string | null> =
   {
     in_progress_committed: (taskId) =>
-      `Source commit landed for ${taskId} — run planctl done ${taskId} --summary now.`,
+      `Source commit landed for ${taskId} — run keeper plan done ${taskId} --summary now.`,
     in_progress_uncommitted: (taskId) =>
-      `Resume ${taskId}: finish implementation, run tests within your two-full-pass budget, keeper commit-work, planctl done.`,
+      `Resume ${taskId}: finish implementation, run tests within your two-full-pass budget, keeper commit-work, keeper plan done.`,
     state_uncommitted: (taskId) =>
-      `Re-run planctl done ${taskId} --summary to land the state commit.`,
+      `Re-run keeper plan done ${taskId} --summary to land the state commit.`,
     not_started: () => null,
   };
 
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
 
   // Read-only live state — never trust the marker for a block. A null envelope,
   // a typed error (no `verdict` key), or `tooling_error` all fail open.
-  const env = await runPlanctl(["reconcile", taskId]);
+  const env = await runPlanCli(["reconcile", taskId]);
   const verdict = env?.verdict;
 
   // Terminal verdicts: the task is settled. `done` also retires the marker.

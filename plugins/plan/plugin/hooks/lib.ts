@@ -1,6 +1,6 @@
-// Shared primitives for the planctl guard dispatchers (commit-guard,
+// Shared primitives for the plan guard dispatchers (commit-guard,
 // subagent-stop-guard, stop-guard). Every dispatcher reads stdin once, makes at
-// most one read-only planctl call, and emits at most one JSON envelope.
+// most one read-only `keeper plan` call, and emits at most one JSON envelope.
 //
 // Fail open is the governing rule: any internal error, unparseable input, or
 // missing dependency must let the agent proceed (exit 0, no block). The deny
@@ -9,14 +9,14 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** Marker schema version — must track planctl/session_markers.py::SCHEMA_VERSION. */
+/** Marker schema version — must track the `keeper plan` session-marker writer. */
 export const SCHEMA_VERSION = 1;
 
 /** Markers older than this are unlinked on read (matches the Python 7-day window). */
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Parsed session marker. Field names are a cross-language contract with
- * planctl/session_markers.py — `kind` selects which id field is present. */
+/** Parsed session marker. Field names are a cross-language contract with the
+ * `keeper plan` session-marker writer — `kind` selects which id field is present. */
 export interface Marker {
   schema_version: number;
   session_id: string;
@@ -32,23 +32,23 @@ export async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
 }
 
-/** True when PLANCTL_GUARD_BYPASS disables all guards. Checked before any I/O. */
+/** True when KEEPER_PLAN_GUARD_BYPASS disables all guards. Checked before any I/O. */
 export function isBypassed(): boolean {
-  return process.env.PLANCTL_GUARD_BYPASS === "1";
+  return process.env.KEEPER_PLAN_GUARD_BYPASS === "1";
 }
 
 function sessionsDir(): string {
-  // Resolve via $HOME (falling back to the OS home) so this matches the Python
-  // side's `Path("~/...").expanduser()` semantics, which honor a mutated $HOME.
+  // Resolve via $HOME (falling back to the OS home) so this matches the writer
+  // side's home-expansion semantics, which honor a mutated $HOME.
   const home = process.env.HOME || homedir();
-  return join(home, ".local", "state", "planctl", "sessions");
+  return join(home, ".local", "state", "keeper", "sessions");
 }
 
 function markerPath(sessionId: string): string {
   return join(sessionsDir(), `${sessionId}.json`);
 }
 
-/** Read the marker for `sessionId`, or null. Mirrors the Python read side:
+/** Read the marker for `sessionId`, or null:
  * unlink-and-return-null for a marker older than 7 days or an unparseable /
  * non-object file; swallow every filesystem error (fail open). */
 export async function readMarker(sessionId: string): Promise<Marker | null> {
@@ -92,15 +92,15 @@ export async function unlinkMarker(sessionId: string): Promise<void> {
   await unlinkQuiet(markerPath(sessionId));
 }
 
-/** Run `planctl <args>` read-only and return its last-line JSON envelope, or
+/** Run `keeper plan <args>` read-only and return its last-line JSON envelope, or
  * null on any failure (binary missing, non-zero exit, timeout, malformed JSON).
  * Null is the fail-open signal — callers must allow when they get it. */
-export async function runPlanctl(
+export async function runPlanCli(
   args: string[],
   timeoutMs = 5000,
 ): Promise<Record<string, unknown> | null> {
   try {
-    const proc = Bun.spawn(["planctl", ...args], {
+    const proc = Bun.spawn(["keeper", "plan", ...args], {
       stdout: "pipe",
       stderr: "ignore",
       timeout: timeoutMs,
@@ -130,7 +130,7 @@ export async function runPlanctl(
 
 /** Run `keeper prompt <args>` and return its last-line JSON envelope, or null
  * on any failure (binary missing, non-zero exit, timeout, malformed JSON).
- * Mirrors runPlanctl but targets the generated-file guard's `check-generated`
+ * Mirrors runPlanCli but targets the generated-file guard's `check-generated`
  * envelope — callers read `marked` / `message` off the returned object. Null is
  * the fail-open signal: the generated-file hooks must allow the action whenever
  * a write/read could not be classified. */

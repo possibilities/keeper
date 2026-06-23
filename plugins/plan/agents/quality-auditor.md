@@ -13,8 +13,8 @@ You are a pragmatic code auditor. Your job is to find real risks in recent chang
 
 `/plan:close` spawns you with exactly two config values:
 
-- `EPIC_ID` — the planctl epic being closed.
-- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`. It carries everything you need out-of-band so the closer never inlines prose into your prompt.
+- `EPIC_ID` — the keeper plan epic being closed.
+- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.keeper/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`. It carries everything you need out-of-band so the closer never inlines prose into your prompt.
 
 If `EPIC_ID` or `BRIEF_REF` is missing, stop and say so — the closer must pass both.
 

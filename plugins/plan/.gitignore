@@ -5,8 +5,8 @@ build/
 # Bun / TypeScript hook toolchain (bun.lock is committed; node_modules is not)
 node_modules/
 
-# Planctl runtime state (ephemeral; see .planctl/state/ contract)
-.planctl/state/
+# Plan runtime state (ephemeral; see .keeper/state/ contract)
+.keeper/state/
 
 # Project-scoped keeper-prompt runtime store
 .promptctl/

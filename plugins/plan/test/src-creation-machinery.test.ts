@@ -451,7 +451,7 @@ describe("withEpicIdLock", () => {
 
     const fixtures = join(REPO_ROOT, "test", "fixtures", "creation");
     const bunWorkerPath = join(fixtures, "mint_worker.ts");
-    // HOME drives every worker to the same ~/.local/state/planctl/epic-id.lock,
+    // HOME drives every worker to the same ~/.local/state/keeper/epic-id.lock,
     // so all N concurrent bun mints serialize against the one shared lock.
     const env = { ...process.env, HOME: home };
 

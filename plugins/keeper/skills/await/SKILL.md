@@ -78,7 +78,7 @@ on (e.g. "wait for one of these"), ask. An explicit AND of distinct
 conditions ("wait for fn-X and the repo to be clean") is a single
 invocation, not an ambiguity.
 
-## Step 1 — Pre-check plan targets are on-board (planctl conditions only)
+## Step 1 — Pre-check plan targets are on-board (plan conditions only)
 
 This pre-check applies **only to `complete` / `started` / `unblocked`**. The
 `git-clean`, `agents-idle`, `server-up`, and `monitor-running` conditions
@@ -107,7 +107,7 @@ appear in a `keeper jobs` snapshot first, then wire the await.
 > Stop-time monitor-list capture — a separate concept from this output
 > mode, but the bare command is the right way to observe it.)
 
-For each planctl segment, verify the id exists and is awaitable before
+For each plan segment, verify the id exists and is awaitable before
 wiring Monitor. `keeper plan show` is read-only and fast.
 
 ```bash
@@ -184,11 +184,11 @@ Defaults and overrides:
 
 Monitor streams `keeper await`'s stdout to you, line by line. The
 `armed` line names the condition(s); its field shape depends on whether
-the wait is a single planctl id, a single git/jobs condition, or an AND
+the wait is a single plan id, a single git/jobs condition, or an AND
 aggregate:
 
 ```
-# single planctl condition
+# single plan condition
 [keeper-await] armed target=<id> kind=<epic|task> condition=<…> state=<…>
 [keeper-await] met target=<id> kind=<…> condition=<…> detail=<…> [followup=<id>[,<id>…]]
 
@@ -212,7 +212,7 @@ aggregate:
 [keeper-await] failed reason=<reason> conditions=<…> …   # aggregate
 ```
 
-For an AND aggregate, a planctl sub-condition that fails names which
+For an AND aggregate, a plan sub-condition that fails names which
 condition fired via a `from=<condition-label>` field on the `failed`
 line.
 
@@ -269,7 +269,7 @@ pick by context:
 
 ## Examples
 
-### Wait then review (planctl)
+### Wait then review (plan)
 
 > User: "Do a full review when fn-643-keeper-hook-dead-letters.4 is
 > complete."
@@ -337,7 +337,7 @@ it WITHOUT `--connect-timeout` so it waits forever.
 > User: "Wait until the project is clean and the other agents are done,
 > then commit."
 
-1. No planctl segment → no pre-check. Skip step 1.
+1. No plan segment → no pre-check. Skip step 1.
 2. `Monitor({ command: "keeper await git-clean and agents-idle",
    description: "wait for clean repo + idle agents then commit",
    persistent: true })`.
@@ -351,7 +351,7 @@ it WITHOUT `--connect-timeout` so it waits forever.
 - Do not run the `keeper plan show` pre-check for `git-clean` / `agents-idle`
   — they have no off-board state. The pre-check is for `complete` /
   `unblocked` only.
-- Do not wire a planctl Monitor without the `keeper plan show` pre-check — a
+- Do not wire a plan Monitor without the `keeper plan show` pre-check — a
   doomed Monitor that immediately exits `failed reason=not-found` is bad
   UX.
 - Do not pass an id to `git-clean` / `agents-idle` / `server-up` — they're

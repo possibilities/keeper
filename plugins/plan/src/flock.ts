@@ -1,13 +1,12 @@
-// flock(2) task locks via bun:ffi — the byte-compatible peer of Python's
-// fcntl.flock(fd, LOCK_EX) in planctl/store.py's lock_task. Both engines may
-// mutate the same .planctl/ state concurrently, so the lock has to be a real
-// advisory whole-file lock that interops with Python's fcntl across process
-// boundaries; nothing softer (a sidecar marker, a Bun-only mutex) would block a
-// Python peer.
+// flock(2) task locks via bun:ffi. Concurrent `keeper plan` processes may
+// mutate the same `.keeper/` state, so the lock has to be a real advisory
+// whole-file lock the kernel arbitrates across process boundaries; nothing
+// softer (a sidecar marker, a Bun-only mutex) would serialize separate
+// processes.
 //
 // dlopen resolves libc BY NAME with platform candidates (never an embedded
 // copy): the system libc owns the kernel's flock table, and only it can hand us
-// a lock a Python fcntl peer also sees. fds come from node:fs openSync — Bun.file
+// a real advisory lock across processes. fds come from node:fs openSync — Bun.file
 // fd handles are GC-hazardous (bun#8687, the fd can be closed under us), so we
 // hold a raw integer fd for the whole lock lifetime and closeSync it ourselves.
 //
@@ -130,15 +129,15 @@ export function flockOrThrow(fd: number, op: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// Global epic-id lock — the byte-compatible peer of run_epic_create._epic_id_lock.
+// Global epic-id lock.
 // ---------------------------------------------------------------------------
 
-// Same lock PATH Python uses so a bun create and a Python create serialize
-// against each other across process boundaries: `~/.local/state/planctl/...`,
-// honoring $HOME first (matching Python Path.expanduser).
+// A single host-wide lock PATH so concurrent `keeper plan` creates serialize
+// against each other across process boundaries: `~/.local/state/keeper/...`,
+// honoring $HOME first.
 function epicIdLockPath(): string {
   const home = process.env.HOME || homedir();
-  return join(home, ".local", "state", "planctl", "epic-id.lock");
+  return join(home, ".local", "state", "keeper", "epic-id.lock");
 }
 
 /** Run `fn` while holding the global epic-id lock (blocking LOCK_EX) over the
@@ -147,8 +146,7 @@ function epicIdLockPath(): string {
  * runs UNLOCKED rather than hard-breaking create — the per-project
  * epic-path-exists backstop is the degraded guard. The fd is unlocked + closed
  * in finally. NEVER routes through flockOrThrow: a contended blocking LOCK_EX
- * parks until granted, and any acquire error degrades to unlocked. Mirrors
- * run_epic_create._epic_id_lock. */
+ * parks until granted, and any acquire error degrades to unlocked. */
 export function withEpicIdLock<T>(fn: () => T): T {
   let fd: number | null = null;
   try {

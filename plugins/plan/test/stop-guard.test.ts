@@ -2,11 +2,11 @@
 //
 // Two layers: (1) the pure classifiers — the close typed-stop allow patterns and
 // the work/close block reason wording — exercised in-process; (2) the decision
-// ladder driven through a real subprocess against a temp HOME and a planctl shim
+// ladder driven through a real subprocess against a temp HOME and a keeper shim
 // on PATH, so the hot-path short-circuit, the work reconcile block/allow paths,
 // and the lenient close branch are covered with the true stdin/stdout
 // discipline. The shim touches a sentinel on every call, letting us assert "zero
-// planctl subprocesses" for the no-marker hot path and the close branch.
+// keeper subprocesses" for the no-marker hot path and the close branch.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -78,7 +78,7 @@ describe("workBlockReason", () => {
     const reason = workBlockReason("fn-1-x.2", "in_progress_uncommitted");
     expect(reason).toContain("fn-1-x.2");
     expect(reason).toContain("in_progress_uncommitted");
-    expect(reason).toContain("planctl worker resume fn-1-x.2");
+    expect(reason).toContain("keeper plan worker resume fn-1-x.2");
     expect(reason).toContain("never edit or commit");
   });
 });
@@ -93,7 +93,7 @@ describe("closeBlockReason", () => {
 });
 
 // ---------------------------------------------------------------------------
-// decision ladder — subprocess, temp HOME + planctl shim on PATH
+// decision ladder — subprocess, temp HOME + keeper shim on PATH
 // ---------------------------------------------------------------------------
 
 const GUARD = join(import.meta.dir, "..", "plugin", "hooks", "stop-guard.ts");
@@ -104,12 +104,12 @@ let binDir: string;
 let sentinel: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "planctl-stop-guard-"));
-  sessionsDir = join(home, ".local", "state", "planctl", "sessions");
+  home = mkdtempSync(join(tmpdir(), "keeper-plan-stop-guard-"));
+  sessionsDir = join(home, ".local", "state", "keeper", "sessions");
   mkdirSync(sessionsDir, { recursive: true });
   binDir = join(home, "bin");
   mkdirSync(binDir, { recursive: true });
-  sentinel = join(home, "planctl-called");
+  sentinel = join(home, "keeper-called");
 });
 
 afterEach(() => {
@@ -150,8 +150,8 @@ function writeCloseMarker(epicId: string): void {
   );
 }
 
-function writePlanctlShim(envelope: unknown, exitCode = 0): void {
-  const shim = join(binDir, "planctl");
+function writePlanCliShim(envelope: unknown, exitCode = 0): void {
+  const shim = join(binDir, "keeper");
   writeFileSync(
     shim,
     `#!/usr/bin/env bun\n` +
@@ -167,7 +167,7 @@ function writePlanctlShim(envelope: unknown, exitCode = 0): void {
 async function run(
   payload: unknown,
   extraEnv: Record<string, string> = {},
-): Promise<{ stdout: string; code: number; planctlCalled: boolean }> {
+): Promise<{ stdout: string; code: number; planCliCalled: boolean }> {
   const proc = Bun.spawn(["bun", GUARD], {
     stdin: "pipe",
     stdout: "pipe",
@@ -183,7 +183,7 @@ async function run(
   await proc.stdin.end();
   const stdout = await new Response(proc.stdout).text();
   const code = await proc.exited;
-  return { stdout, code, planctlCalled: existsSync(sentinel) };
+  return { stdout, code, planCliCalled: existsSync(sentinel) };
 }
 
 function stopPayload(extra: Record<string, unknown> = {}): unknown {
@@ -196,42 +196,42 @@ function stopPayload(extra: Record<string, unknown> = {}): unknown {
 }
 
 describe("stop-guard ladder", () => {
-  test("no marker → allow with zero planctl calls (hot path)", async () => {
-    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+  test("no marker → allow with zero keeper calls (hot path)", async () => {
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
 
-    const { stdout, code, planctlCalled } = await run(stopPayload());
+    const { stdout, code, planCliCalled } = await run(stopPayload());
     expect(code).toBe(0);
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
-  test("bypass allows before any I/O — no planctl call", async () => {
+  test("bypass allows before any I/O — no keeper call", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
 
-    const { stdout, planctlCalled } = await run(stopPayload(), {
-      PLANCTL_GUARD_BYPASS: "1",
+    const { stdout, planCliCalled } = await run(stopPayload(), {
+      KEEPER_PLAN_GUARD_BYPASS: "1",
     });
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   test("stop_hook_active true allows before any I/O (block-once)", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
 
-    const { stdout, planctlCalled } = await run(
+    const { stdout, planCliCalled } = await run(
       stopPayload({ stop_hook_active: true }),
     );
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   // --- work branch ---------------------------------------------------------
 
   test("work marker + in_progress_uncommitted → block with the checklist", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
 
     const { stdout, code } = await run(stopPayload());
     expect(code).toBe(0);
@@ -239,12 +239,12 @@ describe("stop-guard ladder", () => {
     expect(env.decision).toBe("block");
     expect(env.reason).toContain("fn-1-x.2");
     expect(env.reason).toContain("not finished");
-    expect(env.reason).toContain("planctl worker resume fn-1-x.2");
+    expect(env.reason).toContain("keeper plan worker resume fn-1-x.2");
   });
 
   test("work marker + done → allow AND unlink the stale marker", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "done" });
+    writePlanCliShim({ verdict: "done" });
 
     const { stdout } = await run(stopPayload());
     expect(stdout).toBe("");
@@ -253,7 +253,7 @@ describe("stop-guard ladder", () => {
 
   test("work marker + blocked → allow AND unlink the stale marker", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "blocked" });
+    writePlanCliShim({ verdict: "blocked" });
 
     const { stdout } = await run(stopPayload());
     expect(stdout).toBe("");
@@ -262,7 +262,7 @@ describe("stop-guard ladder", () => {
 
   test("work marker + tooling_error → allow (fail open)", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "tooling_error" });
+    writePlanCliShim({ verdict: "tooling_error" });
 
     const { stdout } = await run(stopPayload());
     expect(stdout).toBe("");
@@ -270,7 +270,7 @@ describe("stop-guard ladder", () => {
 
   test("work marker + typed-error envelope (no verdict key) → allow", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ success: false, error: "task_not_found" }, 1);
+    writePlanCliShim({ success: false, error: "task_not_found" }, 1);
 
     const { stdout } = await run(stopPayload());
     expect(stdout).toBe("");
@@ -280,9 +280,9 @@ describe("stop-guard ladder", () => {
 
   test("close marker + bare mid-saga stop → block with the mid-saga reason", async () => {
     writeCloseMarker("fn-1-x");
-    writePlanctlShim({ verdict: "ignored" });
+    writePlanCliShim({ verdict: "ignored" });
 
-    const { stdout, planctlCalled } = await run(
+    const { stdout, planCliCalled } = await run(
       stopPayload({
         last_assistant_message: "Audit phase done, agents returned.",
       }),
@@ -292,7 +292,7 @@ describe("stop-guard ladder", () => {
     expect(env.reason).toContain("fn-1-x");
     expect(env.reason).toContain("mid-saga");
     // The close branch never calls reconcile — its decision is message-only.
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   test("close marker + BLOCKED: last message → allow", async () => {

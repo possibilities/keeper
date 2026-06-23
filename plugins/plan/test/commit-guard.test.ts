@@ -2,10 +2,10 @@
 //
 // Two layers: (1) the commit-pattern regex true/false table — the load-bearing
 // classifier — exercised in-process; (2) the decision ladder driven through a
-// real subprocess against a temp HOME and a planctl shim on PATH, so the
+// real subprocess against a temp HOME and a keeper shim on PATH, so the
 // fail-open short-circuits and the reconcile deny/allow paths are covered with
 // the true stdin/stdout discipline. The shim touches a sentinel file on every
-// call, letting us assert "zero planctl subprocesses" for the short-circuits.
+// call, letting us assert "zero keeper subprocesses" for the short-circuits.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -64,7 +64,7 @@ describe("isCommitCommand", () => {
 });
 
 // ---------------------------------------------------------------------------
-// decision ladder — subprocess, temp HOME + planctl shim on PATH
+// decision ladder — subprocess, temp HOME + keeper shim on PATH
 // ---------------------------------------------------------------------------
 
 const GUARD = join(import.meta.dir, "..", "plugin", "hooks", "commit-guard.ts");
@@ -75,12 +75,12 @@ let binDir: string;
 let sentinel: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "planctl-commit-guard-"));
-  sessionsDir = join(home, ".local", "state", "planctl", "sessions");
+  home = mkdtempSync(join(tmpdir(), "keeper-plan-commit-guard-"));
+  sessionsDir = join(home, ".local", "state", "keeper", "sessions");
   mkdirSync(sessionsDir, { recursive: true });
   binDir = join(home, "bin");
   mkdirSync(binDir, { recursive: true });
-  sentinel = join(home, "planctl-called");
+  sentinel = join(home, "keeper-called");
 });
 
 afterEach(() => {
@@ -103,10 +103,10 @@ function writeWorkMarker(taskId: string): void {
   );
 }
 
-/** Drop a `planctl` shim that touches the sentinel and prints `envelope` as its
+/** Drop a `keeper` shim that touches the sentinel and prints `envelope` as its
  * last stdout line. `exitCode` lets a test model a non-zero reconcile. */
-function writePlanctlShim(envelope: unknown, exitCode = 0): void {
-  const shim = join(binDir, "planctl");
+function writePlanCliShim(envelope: unknown, exitCode = 0): void {
+  const shim = join(binDir, "keeper");
   writeFileSync(
     shim,
     `#!/usr/bin/env bun\n` +
@@ -122,7 +122,7 @@ function writePlanctlShim(envelope: unknown, exitCode = 0): void {
 async function run(
   payload: unknown,
   extraEnv: Record<string, string> = {},
-): Promise<{ stdout: string; code: number; planctlCalled: boolean }> {
+): Promise<{ stdout: string; code: number; planCliCalled: boolean }> {
   const proc = Bun.spawn(["bun", GUARD], {
     stdin: "pipe",
     stdout: "pipe",
@@ -138,7 +138,7 @@ async function run(
   await proc.stdin.end();
   const stdout = await new Response(proc.stdout).text();
   const code = await proc.exited;
-  return { stdout, code, planctlCalled: existsSync(sentinel) };
+  return { stdout, code, planCliCalled: existsSync(sentinel) };
 }
 
 function bashPayload(extra: Record<string, unknown> = {}): unknown {
@@ -154,7 +154,7 @@ function bashPayload(extra: Record<string, unknown> = {}): unknown {
 describe("commit-guard ladder", () => {
   test("denies main-context git commit while the task reconciles in_progress", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
@@ -170,7 +170,7 @@ describe("commit-guard ladder", () => {
 
   test("denies a compound `cd x && git commit` command", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "in_progress_committed", task_id: "fn-1-x.2" });
+    writePlanCliShim({ verdict: "in_progress_committed", task_id: "fn-1-x.2" });
 
     const { stdout, code } = await run(
       bashPayload({ tool_input: { command: "cd sub && git commit -m y" } }),
@@ -183,22 +183,22 @@ describe("commit-guard ladder", () => {
 
   test("passes when agent_id is present, regardless of marker/command", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
 
-    const { stdout, code, planctlCalled } = await run(
+    const { stdout, code, planCliCalled } = await run(
       bashPayload({ agent_id: "agent-7" }),
     );
     expect(code).toBe(0);
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   test("done reconcile allows AND unlinks the stale marker", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "done", task_id: "fn-1-x.2" });
+    writePlanCliShim({ verdict: "done", task_id: "fn-1-x.2" });
 
     const { stdout, code } = await run(bashPayload());
     expect(code).toBe(0);
@@ -208,7 +208,7 @@ describe("commit-guard ladder", () => {
 
   test("blocked reconcile allows AND unlinks the stale marker", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "blocked", task_id: "fn-1-x.2" });
+    writePlanCliShim({ verdict: "blocked", task_id: "fn-1-x.2" });
 
     const { stdout } = await run(bashPayload());
     expect(stdout).toBe("");
@@ -217,7 +217,7 @@ describe("commit-guard ladder", () => {
 
   test("tooling_error verdict fails open (allow, marker preserved)", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ verdict: "tooling_error", task_id: "fn-1-x.2" });
+    writePlanCliShim({ verdict: "tooling_error", task_id: "fn-1-x.2" });
 
     const { stdout } = await run(bashPayload());
     expect(stdout).toBe("");
@@ -226,62 +226,62 @@ describe("commit-guard ladder", () => {
 
   test("typed-error envelope (no verdict key) fails open", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({ success: false, error: "task_not_found" }, 1);
+    writePlanCliShim({ success: false, error: "task_not_found" }, 1);
 
     const { stdout } = await run(bashPayload());
     expect(stdout).toBe("");
   });
 
-  test("bypass allows before any I/O — no planctl call", async () => {
+  test("bypass allows before any I/O — no keeper call", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
 
-    const { stdout, planctlCalled } = await run(bashPayload(), {
-      PLANCTL_GUARD_BYPASS: "1",
+    const { stdout, planCliCalled } = await run(bashPayload(), {
+      KEEPER_PLAN_GUARD_BYPASS: "1",
     });
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
-  test("non-commit Bash payload produces zero planctl subprocesses", async () => {
+  test("non-commit Bash payload produces zero keeper subprocesses", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
 
-    const { stdout, planctlCalled } = await run(
+    const { stdout, planCliCalled } = await run(
       bashPayload({ tool_input: { command: "git status" } }),
     );
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
-  test("non-Bash tool passes without touching the marker or planctl", async () => {
+  test("non-Bash tool passes without touching the marker or keeper", async () => {
     writeWorkMarker("fn-1-x.2");
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
 
-    const { stdout, planctlCalled } = await run(
+    const { stdout, planCliCalled } = await run(
       bashPayload({ tool_name: "Read", tool_input: { file_path: "/x" } }),
     );
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
-  test("absent marker passes without a planctl call", async () => {
-    writePlanctlShim({
+  test("absent marker passes without a keeper call", async () => {
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
-    const { stdout, planctlCalled } = await run(bashPayload());
+    const { stdout, planCliCalled } = await run(bashPayload());
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   test("close-kind marker is ignored (work-only guard)", async () => {
@@ -296,13 +296,13 @@ describe("commit-guard ladder", () => {
       }),
       "utf-8",
     );
-    writePlanctlShim({
+    writePlanCliShim({
       verdict: "in_progress_uncommitted",
       task_id: "fn-1-x.2",
     });
-    const { stdout, planctlCalled } = await run(bashPayload());
+    const { stdout, planCliCalled } = await run(bashPayload());
     expect(stdout).toBe("");
-    expect(planctlCalled).toBe(false);
+    expect(planCliCalled).toBe(false);
   });
 
   test("unparseable stdin fails open", async () => {

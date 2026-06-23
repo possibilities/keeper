@@ -24,11 +24,11 @@ Seven readers; all stdlib-only and gated on
 - ``get_epic(epic_id)`` — one epic row as ``dict`` (with
   ``tasks`` / ``jobs`` JSON-TEXT cells defensively decoded to lists)
   or ``None`` when the row is absent.  Reads ``epics``.  Consumed by
-  ``planctl render-approve-context`` to pick a target job from the
+  ``keeper plan render-approve-context`` to pick a target job from the
   epic's embedded ``jobs`` / ``tasks[].jobs`` arrays.
 - ``get_job(job_id)`` — one job row as ``dict`` (real columns:
   ``job_id`` / ``transcript_path`` / ``cwd`` / ``state``) or ``None``
-  when the row is absent.  Reads ``jobs``.  Consumed by ``planctl
+  when the row is absent.  Reads ``jobs``.  Consumed by ``keeper plan
   render-approve-context`` to look up the target session's transcript
   path + cwd for the final-message read.
 
@@ -668,7 +668,7 @@ def get_epic(epic_id: str) -> dict | None:
     ``created_at`` the downstream freshest-pick relies on) ride opaque —
     the reader does not validate their inner shape.
 
-    Consumed by ``planctl render-approve-context`` to walk an epic's
+    Consumed by ``keeper plan render-approve-context`` to walk an epic's
     embedded ``jobs`` / ``tasks[].jobs`` arrays when picking a target job
     for the ``/plan:approve`` evidence read.
 
@@ -712,7 +712,7 @@ def get_job(job_id: str) -> dict | None:
     on ``CREATE_JOBS`` (no JSON decode); ``transcript_path`` / ``cwd`` are
     nullable, ``state`` is ``NOT NULL DEFAULT 'stopped'``.
 
-    Consumed by ``planctl render-approve-context`` to resolve the target
+    Consumed by ``keeper plan render-approve-context`` to resolve the target
     session's transcript file (read live, fresh) and project working dir
     for the ``/plan:approve`` final-message extract.
 

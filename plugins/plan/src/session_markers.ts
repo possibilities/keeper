@@ -1,8 +1,8 @@
-// Per-session marker files — the writer side of the cross-language guard
-// contract (planctl/session_markers.py). claim writes a work marker on its
-// success path; done/block clear it (only when it names their task).
+// Per-session marker files — the writer side of the guard contract. claim
+// writes a work marker on its success path; done/block clear it (only when it
+// names their task).
 //
-// One JSON file per session at `~/.local/state/planctl/sessions/<sid>.json`,
+// One JSON file per session at `~/.local/state/keeper/sessions/<sid>.json`,
 // schema_version 1: {schema_version, session_id, kind, task_id|epic_id,
 // created_at}. The TS hook dispatchers (plugin/hooks/lib.ts) read these files;
 // the field names + `kind` values are the contract.
@@ -31,11 +31,11 @@ function sessionId(): string | null {
   return process.env.CLAUDE_CODE_SESSION_ID || null;
 }
 
-/** `~/.local/state/planctl/sessions` honoring a mutated $HOME (tests). Mirrors
- * lib.ts sessionsDir + the Python expanduser semantics. */
+/** `~/.local/state/keeper/sessions` honoring a mutated $HOME (tests). Mirrors
+ * lib.ts sessionsDir + the home-expansion semantics. */
 function sessionsDir(): string {
   const home = process.env.HOME || homedir();
-  return join(home, ".local", "state", "planctl", "sessions");
+  return join(home, ".local", "state", "keeper", "sessions");
 }
 
 function markerPath(sid: string): string {
@@ -96,25 +96,24 @@ function clearIfMatches(idField: string, targetId: string): void {
 }
 
 /** Mark this session as actively working `taskId` (kind="work"). Called on the
- * success path of claim. Mirrors write_work_marker. */
+ * success path of claim. */
 export function writeWorkMarker(taskId: string): void {
   writeMarker("work", "task_id", taskId);
 }
 
 /** Mark this session as closing `epicId` (kind="close"). Called on the success
- * path of close-preflight. Mirrors write_close_marker. */
+ * path of close-preflight. */
 export function writeCloseMarker(epicId: string): void {
   writeMarker("close", "epic_id", epicId);
 }
 
-/** Clear the work marker, but only if it names `taskId`. Called by done/block.
- * Mirrors clear_work_marker. */
+/** Clear the work marker, but only if it names `taskId`. Called by done/block. */
 export function clearWorkMarker(taskId: string): void {
   clearIfMatches("task_id", taskId);
 }
 
 /** Clear the close marker, but only if it names `epicId`. Called by
- * close-finalize on every terminal outcome. Mirrors clear_close_marker. */
+ * close-finalize on every terminal outcome. */
 export function clearCloseMarker(epicId: string): void {
   clearIfMatches("epic_id", epicId);
 }

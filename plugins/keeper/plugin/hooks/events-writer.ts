@@ -648,7 +648,7 @@ async function main(): Promise<void> {
       : null;
   const skillName = extractSkillName(hookEvent, toolName, data);
 
-  // Index the planctl-CLI invocation footprint on PostToolUse:Bash by parsing
+  // Index the plan-CLI invocation footprint on PostToolUse:Bash by parsing
   // the `plan_invocation` envelope the plan CLI writes on every mutating call's
   // stdout. The deriver is pure, gated on hook event + tool name, and
   // defensive against any malformed `data.tool_response` shape — a null return
@@ -659,26 +659,20 @@ async function main(): Promise<void> {
   const planEpicId = planInvocation?.epic_id ?? null;
   const planTaskId = planInvocation?.task_id ?? null;
   // `subject_present` is 0/1 on disk to match the INTEGER column; NULL when
-  // the event is not a planctl invocation at all.
+  // the event is not a plan invocation at all.
   const planSubjectPresent =
-    planInvocation === null
-      ? null
-      : planInvocation.subject_present
-        ? 1
-        : 0;
+    planInvocation === null ? null : planInvocation.subject_present ? 1 : 0;
   // `queue_jump` mirrors the `subject_present` 0/1/null convention — INTEGER
-  // on disk, NULL when the event isn't a planctl invocation at all.
+  // on disk, NULL when the event isn't a plan invocation at all.
   const planQueueJump =
     planInvocation === null ? null : planInvocation.queue_jump ? 1 : 0;
   // The envelope's repo-relative `files[]` array, JSON-encoded for the SQLite
   // TEXT column. NULL when the deriver couldn't lift a non-empty string array
-  // (non-planctl events, read-only ops, or runaway-size payloads). Sparse
+  // (non-plan events, read-only ops, or runaway-size payloads). Sparse
   // JSON-or-NULL so a `WHERE plan_files IS NOT NULL` partial index stays
   // selective.
   const planFiles =
-    planInvocation?.files == null
-      ? null
-      : JSON.stringify(planInvocation.files);
+    planInvocation?.files == null ? null : JSON.stringify(planInvocation.files);
 
   // Index the Anthropic tool_use_id correlator on every event payload carrying
   // it. NOT gated on hook event or tool name — Pre/PostToolUse +

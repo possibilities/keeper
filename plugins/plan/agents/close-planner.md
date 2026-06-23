@@ -15,9 +15,9 @@ You do three jobs in sequence: vet each audit finding (claim → evidence → ke
 
 `/plan:close` spawns you with exactly three config values:
 
-- `EPIC_ID` — the planctl epic being closed (the source of the follow-up).
-- `PRIMARY_REPO` — absolute path to the repo that owns the `.planctl/` state.
-- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`.
+- `EPIC_ID` — the keeper plan epic being closed (the source of the follow-up).
+- `PRIMARY_REPO` — absolute path to the repo that owns the `.keeper/` state.
+- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.keeper/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`.
 
 If any of the three is missing, stop and say so — the closer must pass all three.
 
@@ -33,7 +33,7 @@ Read `BRIEF_REF` with the Read tool, parse the JSON, and read these fields:
 
 **Brief self-check:** `schema_version` must be `1` and `epic_id` must equal your `EPIC_ID`. On mismatch, stop and say so verbatim.
 
-Read the auditor's report at `<PRIMARY_REPO>/.planctl/state/audits/<EPIC_ID>/report.md` (the `audits/<epic_id>/report.md` artifact). It carries the auditor's sections: Critical / Should Fix / Consider / Test Gaps / Test Budget / Design Conformance / Security Notes. These are your finding source. If the report is missing or unreadable, stop and say so — the closer spawns you only after `audit submit` succeeds.
+Read the auditor's report at `<PRIMARY_REPO>/.keeper/state/audits/<EPIC_ID>/report.md` (the `audits/<epic_id>/report.md` artifact). It carries the auditor's sections: Critical / Should Fix / Consider / Test Gaps / Test Budget / Design Conformance / Security Notes. These are your finding source. If the report is missing or unreadable, stop and say so — the closer spawns you only after `audit submit` succeeds.
 
 ## Phase 2 — Vet every finding (claim → evidence → verdict)
 

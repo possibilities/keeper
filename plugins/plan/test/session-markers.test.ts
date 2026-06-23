@@ -3,7 +3,7 @@
 // (translated | cited | drop-with-reason). 28 inventory nodes.
 //
 // The marker file is one JSON per session at
-// <HOME>/.local/state/planctl/sessions/<sid>.json (schema_version 1). Every CLI
+// <HOME>/.local/state/keeper/sessions/<sid>.json (schema_version 1). Every CLI
 // call here pins CLAUDE_CODE_SESSION_ID to a fixed value via `cli()`, so the
 // writer side (claim / worker resume write a work marker; done / block /
 // close-finalize clear a matching one; close-preflight writes a close marker) is
@@ -49,7 +49,7 @@ function cli(args: string[], proj: Proj): CliResult {
 }
 
 function markerFile(home: string): string {
-  return join(home, ".local", "state", "planctl", "sessions", `${SID}.json`);
+  return join(home, ".local", "state", "keeper", "sessions", `${SID}.json`);
 }
 
 function markerPresent(home: string): boolean {
@@ -129,7 +129,7 @@ function preflightReady(proj: Proj, title: string): string {
 }
 
 describe("marker writer schema", () => {
-  const getProj = withProject("planctl-marker-write-");
+  const getProj = withProject("keeper-plan-marker-write-");
 
   // test_session_markers.py::test_write_work_marker_schema
   test("claim writes a schema-1 work marker naming the task", () => {
@@ -158,7 +158,7 @@ describe("marker writer schema", () => {
 });
 
 describe("work-marker clear-if-matches", () => {
-  const getProj = withProject("planctl-marker-clear-");
+  const getProj = withProject("keeper-plan-marker-clear-");
 
   // test_session_markers.py::test_clear_work_marker_matching +
   // test_session_markers.py::test_done_clears_matching_work_marker
@@ -223,7 +223,7 @@ describe("work-marker clear-if-matches", () => {
 });
 
 describe("close-marker clear via close-finalize", () => {
-  const getProj = withProject("planctl-marker-finalize-");
+  const getProj = withProject("keeper-plan-marker-finalize-");
 
   // test_session_markers.py::test_clear_close_marker_matching +
   // test_session_markers.py::test_close_finalize_clears_marker_on_every_outcome[closed_clean] +
@@ -292,7 +292,7 @@ describe("close-marker clear via close-finalize", () => {
 });
 
 describe("marker write-nothing on the error path", () => {
-  const getProj = withProject("planctl-marker-noop-");
+  const getProj = withProject("keeper-plan-marker-noop-");
 
   // test_session_markers.py::test_claim_typed_error_writes_nothing
   test("a bad-task-id claim writes no marker", () => {
@@ -314,7 +314,7 @@ describe("marker write-nothing on the error path", () => {
 });
 
 describe("worker resume marker", () => {
-  const getProj = withProject("planctl-marker-resume-");
+  const getProj = withProject("keeper-plan-marker-resume-");
 
   // test_session_markers.py::test_worker_resume_success_writes_work_marker
   test("worker resume writes the work marker", () => {

@@ -4,7 +4,7 @@
 // Fires on EVERY session stop machine-wide (the plugin is always loaded), so the
 // no-marker path must stay file-stat cheap: bypass or a missing marker for this
 // session short-circuits to exit 0 with zero subprocess spawns, before any
-// transcript read or planctl call. A claimed-but-unfinished work session, or a
+// transcript read or `keeper plan` call. A claimed-but-unfinished work session, or a
 // close session that never finalized, gets exactly one corrective block carrying
 // a resume checklist; every other outcome passes through.
 //
@@ -19,7 +19,7 @@ import {
   isBypassed,
   readMarker,
   readStdin,
-  runPlanctl,
+  runPlanCli,
   unlinkMarker,
 } from "./lib.ts";
 
@@ -56,7 +56,7 @@ export function workBlockReason(taskId: string, verdict: string): string {
     `Task ${taskId} is not finished (verdict: ${verdict}). Before stopping: ` +
     "is the task stamped done? Are the worker's session files committed? " +
     "Resume the worker (warm SendMessage to the pinned worker_agent_id, or " +
-    `cold \`planctl worker resume ${taskId}\`) — never edit or commit from ` +
+    `cold \`keeper plan worker resume ${taskId}\`) — never edit or commit from ` +
     "this context."
   );
 }
@@ -67,7 +67,7 @@ export function workBlockReason(taskId: string, verdict: string): string {
 export function closeBlockReason(epicId: string): string {
   return (
     `Close of ${epicId} is mid-saga: close-finalize has not run. Either run ` +
-    `\`planctl close-finalize ${epicId} --project <primary_repo>\` (after the ` +
+    `\`keeper plan close-finalize ${epicId} --project <primary_repo>\` (after the ` +
     "agents returned) or surface the typed stop verbatim. Never write or " +
     "commit from this context."
   );
@@ -100,7 +100,7 @@ async function main(): Promise<void> {
     // envelope, a typed error (no `verdict` key), or `tooling_error` all fail
     // open. Terminal verdicts settle the task; `done`/`blocked` allow and the
     // stale marker is unlinked.
-    const env = await runPlanctl(["reconcile", marker.task_id]);
+    const env = await runPlanCli(["reconcile", marker.task_id]);
     const verdict = env?.verdict;
     if (verdict === "done" || verdict === "blocked") {
       await unlinkMarker(sessionId);
