@@ -93,7 +93,7 @@ expected path.
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
-| `--session <s>` | Target tmux session for the partner window. Usually omit — it inherits a sane default. |
+| `--session <s>` | Target tmux session for the partner window. Defaults to `pair` (panel legs use `panels`). The `pair` and `panels` sessions stay **open + interactive** after the run for inspection (`tmux attach -t pair`); every other session autocloses (its window is reaped). Override the keep-open set with the `KEEPER_PAIR_PERSIST_SESSIONS` env var (comma-separated session names; empty = autoclose everything). Usually omit. |
 | `--timeout <s>` | Wait timeout in seconds (default 1800). On timeout the run emits `failed` and reaps the window. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a
