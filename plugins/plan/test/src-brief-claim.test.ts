@@ -29,7 +29,7 @@ import {
 } from "../src/models.ts";
 import { serializeStateJson } from "../src/store.ts";
 
-const BIN = join(import.meta.dir, "..", "dist", "planctl-bun");
+const BIN = join(import.meta.dir, "..", "dist", "keeper-plan-bun");
 if (!existsSync(BIN)) {
   throw new Error(
     `compiled binary missing at ${BIN}; run \`bun run build\` before \`bun test\``,
@@ -227,7 +227,7 @@ function runBin(
     env: {
       HOME: join(cwd, ".home"),
       PATH: process.env.PATH ?? "",
-      PLANCTL_ACTOR: "test@example.com",
+      KEEPER_PLAN_ACTOR: "test@example.com",
       CLAUDE_CODE_SESSION_ID: "e2e-session",
       ...env,
     },

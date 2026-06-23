@@ -83,10 +83,10 @@ describe("test_commit.py citation anchors (behavior owned by the cited targets)"
   });
 
   test("the cited nowIso surface is exported and shaped (now_iso citations)", () => {
-    // src-store.test.ts owns the full PLANCTL_NOW contract; this anchors the
+    // src-store.test.ts owns the full KEEPER_PLAN_NOW contract; this anchors the
     // 2 now_iso citations to the live nowIso symbol + the load-bearing
     // 6-digit-fraction wire shape.
-    delete process.env.PLANCTL_NOW;
+    delete process.env.KEEPER_PLAN_NOW;
     expect(nowIso()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
   });
 });

@@ -1,7 +1,7 @@
 // Unit tests for src/store.ts — the state-store spine. Pins the contracts the
 // read-only verbs lean on (loadJsonSafe silent-on-corrupt, loadRuntime
 // read-never-creates) plus the two spine utilities the verbs never invoke but
-// must carry to parity: nowIso's PLANCTL_NOW verbatim-or-reject contract with a
+// must carry to parity: nowIso's KEEPER_PLAN_NOW verbatim-or-reject contract with a
 // 6-digit wall-clock field, and getActor's resolution precedence.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -28,14 +28,14 @@ const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "planctl-store-test-"));
-  for (const k of ["PLANCTL_NOW", "PLANCTL_ACTOR", "USER"]) {
+  for (const k of ["KEEPER_PLAN_NOW", "KEEPER_PLAN_ACTOR", "USER"]) {
     savedEnv[k] = process.env[k];
   }
 });
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
-  for (const k of ["PLANCTL_NOW", "PLANCTL_ACTOR", "USER"]) {
+  for (const k of ["KEEPER_PLAN_NOW", "KEEPER_PLAN_ACTOR", "USER"]) {
     if (savedEnv[k] === undefined) {
       delete process.env[k];
     } else {
@@ -96,49 +96,49 @@ describe("LocalFileStateStore.loadRuntime", () => {
 //     these shape-class assertions).
 //   test_now_iso_contract.py::test_unset_returns_wall_clock -> "wall-clock fallback ... 6-digit"
 //   test_now_iso_contract.py::test_boundary_stamped_field_equals_frozen_value -> end-to-end stamp
-//     equality (a verb stamps last_validated_at == frozen PLANCTL_NOW) is pinned
+//     equality (a verb stamps last_validated_at == frozen KEEPER_PLAN_NOW) is pinned
 //     by verbs-query.test.ts "validate --epic stamps on the None transition" and
 //     verbs-restamp.test.ts "add-dep wires + restamps" (both == FROZEN).
-describe("nowIso PLANCTL_NOW contract", () => {
+describe("nowIso KEEPER_PLAN_NOW contract", () => {
   test("a well-formed override is returned verbatim (no round-trip)", () => {
-    process.env.PLANCTL_NOW = "2026-06-12T08:44:14.300970Z";
+    process.env.KEEPER_PLAN_NOW = "2026-06-12T08:44:14.300970Z";
     expect(nowIso()).toBe("2026-06-12T08:44:14.300970Z");
   });
 
   test("the microsecond field is preserved exactly (no Date truncation)", () => {
-    process.env.PLANCTL_NOW = "2026-01-02T03:04:05.000001Z";
+    process.env.KEEPER_PLAN_NOW = "2026-01-02T03:04:05.000001Z";
     expect(nowIso()).toBe("2026-01-02T03:04:05.000001Z");
   });
 
   test("a malformed override is a hard error, never a wall-clock fallback", () => {
-    process.env.PLANCTL_NOW = "2026-06-12T08:44:14Z"; // 3-digit fraction missing
+    process.env.KEEPER_PLAN_NOW = "2026-06-12T08:44:14Z"; // 3-digit fraction missing
     expect(() => nowIso()).toThrow();
   });
 
   test("a millisecond-precision override is rejected (must be 6 digits)", () => {
-    process.env.PLANCTL_NOW = "2026-06-12T08:44:14.300Z";
+    process.env.KEEPER_PLAN_NOW = "2026-06-12T08:44:14.300Z";
     expect(() => nowIso()).toThrow();
   });
 
   test("a calendar-impossible override is rejected", () => {
-    process.env.PLANCTL_NOW = "2026-13-12T08:44:14.300000Z";
+    process.env.KEEPER_PLAN_NOW = "2026-13-12T08:44:14.300000Z";
     expect(() => nowIso()).toThrow();
   });
 
   test("wall-clock fallback is shaped %Y-%m-%dT%H:%M:%S.%fZ with a 6-digit field", () => {
-    delete process.env.PLANCTL_NOW;
+    delete process.env.KEEPER_PLAN_NOW;
     expect(nowIso()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
   });
 });
 
 describe("getActor precedence", () => {
-  test("PLANCTL_ACTOR wins and is trimmed", () => {
-    process.env.PLANCTL_ACTOR = "  alice@example.com  ";
+  test("KEEPER_PLAN_ACTOR wins and is trimmed", () => {
+    process.env.KEEPER_PLAN_ACTOR = "  alice@example.com  ";
     expect(getActor()).toBe("alice@example.com");
   });
 
-  test("falls through to git config / USER / unknown when PLANCTL_ACTOR unset", () => {
-    delete process.env.PLANCTL_ACTOR;
+  test("falls through to git config / USER / unknown when KEEPER_PLAN_ACTOR unset", () => {
+    delete process.env.KEEPER_PLAN_ACTOR;
     // Without asserting the machine's git identity, the result must be a
     // non-empty string (one of: git email, git name, USER, or "unknown").
     const actor = getActor();

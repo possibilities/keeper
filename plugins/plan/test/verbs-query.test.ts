@@ -735,7 +735,10 @@ describe("validate --epic", () => {
 
     const r = runCli(["validate", "--epic", "fn-1-cafe"], {
       cwd: root,
-      env: { PLANCTL_NOW: FROZEN, CLAUDE_CODE_SESSION_ID: "test-query-verbs" },
+      env: {
+        KEEPER_PLAN_NOW: FROZEN,
+        CLAUDE_CODE_SESSION_ID: "test-query-verbs",
+      },
     });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.output);
@@ -753,7 +756,7 @@ describe("validate --epic", () => {
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
     const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
     const env = {
-      PLANCTL_NOW: FROZEN,
+      KEEPER_PLAN_NOW: FROZEN,
       CLAUDE_CODE_SESSION_ID: "test-query-verbs",
     };
 

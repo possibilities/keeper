@@ -4,7 +4,7 @@
   "description": "Bun TypeScript hook dispatchers enforcing the content-blind orchestrator contract for the planctl plugin",
   "private": true,
   "scripts": {
-    "build": "bun build --compile src/cli.ts --outfile dist/planctl-bun && chmod +x dist/planctl-bun",
+    "build": "bun build --compile src/cli.ts --outfile dist/keeper-plan-bun && chmod +x dist/keeper-plan-bun",
     "promote": "bash scripts/promote.sh",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check --no-errors-on-unmatched plugin/hooks test src",

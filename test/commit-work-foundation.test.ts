@@ -228,13 +228,12 @@ describe("getSessionDirtyFiles", () => {
 });
 
 describe("discoverSessionFiles", () => {
-  test("selects the cwd repo and drops board-dir paths client-side", () => {
+  test("selects the cwd repo and drops .keeper/ board-dir paths client-side", () => {
     const repo = "/repo/d";
     for (const f of [
       "src/a.ts",
       ".keeper/epics/fn-1.json",
       ".keeper/specs/fn-1.md",
-      ".planctl/epics/fn-1.json",
       "src/b.ts",
     ]) {
       seedAttribution({ projectDir: repo, sessionId: "s1", filePath: f });
@@ -247,14 +246,13 @@ describe("discoverSessionFiles", () => {
           "src/a.ts",
           ".keeper/epics/fn-1.json",
           ".keeper/specs/fn-1.md",
-          ".planctl/epics/fn-1.json",
           "src/b.ts",
         ]),
       gitRoot: () => repo,
     });
 
-    // .keeper/ (live board) and .planctl/ (vendored/legacy) paths excluded;
-    // remaining sorted (parity output order).
+    // .keeper/ (live board) paths excluded; remaining sorted (parity output
+    // order).
     expect(files).toEqual(["src/a.ts", "src/b.ts"]);
   });
 

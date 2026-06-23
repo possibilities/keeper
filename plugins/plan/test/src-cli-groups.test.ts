@@ -1,5 +1,5 @@
 // Nested-group dispatch tests for src/cli.ts + src/subgroup.ts, exercised
-// through the COMPILED binary (dist/planctl-bun). Covers: top-level help lists
+// through the COMPILED binary (dist/keeper-plan-bun). Covers: top-level help lists
 // the epic/task subgroups; `<group> --help` renders click's group-help shape;
 // an unknown subcommand exits 2 with the group usage; the in-wave leaf names are
 // listed (their runners land in later wave tasks, so invoking one exits non-zero
@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const BIN = join(import.meta.dir, "..", "dist", "planctl-bun");
+const BIN = join(import.meta.dir, "..", "dist", "keeper-plan-bun");
 
 if (!existsSync(BIN)) {
   throw new Error(

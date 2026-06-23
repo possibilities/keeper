@@ -87,7 +87,7 @@ describe("no-track commands bypass the invocation decorator", () => {
     // test_no_track_commands.py::test_validate_stdout_contract
     const env = {
       CLAUDE_CODE_SESSION_ID: "test-no-track",
-      PLANCTL_NOW: "2026-06-06T00:00:00.000000Z",
+      KEEPER_PLAN_NOW: "2026-06-06T00:00:00.000000Z",
     };
     const r = runCli(["validate", "--epic", "fn-7-real"], { cwd: root, env });
     expect(r.code).toBe(0);

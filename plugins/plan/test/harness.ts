@@ -36,18 +36,19 @@ import { serializeStateJson } from "../src/store.ts";
 // env override below lets a caller point elsewhere; absent override, this is it.
 // ---------------------------------------------------------------------------
 
-/** The compiled binary every spawn targets. PLANCTL_BIN overrides (the conftest
- * engine-selection env), else the dist artifact. Hard-fails if neither exists. */
+/** The compiled binary every spawn targets. KEEPER_PLAN_BIN overrides (the
+ * conftest engine-selection env), else the dist artifact. Hard-fails if neither
+ * exists. */
 export const BIN: string = (() => {
-  const override = process.env.PLANCTL_BIN;
+  const override = process.env.KEEPER_PLAN_BIN;
   const candidate =
     override && override.length > 0
       ? override
-      : join(import.meta.dir, "..", "dist", "planctl-bun");
+      : join(import.meta.dir, "..", "dist", "keeper-plan-bun");
   if (!existsSync(candidate)) {
     throw new Error(
-      `planctl binary missing at ${candidate}; run \`bun run build\` before \`bun test\`` +
-        (override ? " (PLANCTL_BIN override set)" : ""),
+      `keeper-plan binary missing at ${candidate}; run \`bun run build\` before \`bun test\`` +
+        (override ? " (KEEPER_PLAN_BIN override set)" : ""),
     );
   }
   return candidate;
@@ -68,8 +69,8 @@ export const SPAWN_TIMEOUT_MS = 15_000;
 // Env builder — the byte-faithful port of conftest's _subprocess_env (:580-613):
 // built from scratch, never environ.copy(); HOME + XDG_* under the tmp HOME,
 // GIT_CONFIG_GLOBAL -> a written temp gitconfig, GIT_CONFIG_SYSTEM=/dev/null,
-// PATH, PLANCTL_ACTOR, the forwarded CLAUDE_CODE_SESSION_ID/PLANCTL_NOW, then the
-// per-call override layered last.
+// PATH, KEEPER_PLAN_ACTOR, the forwarded CLAUDE_CODE_SESSION_ID/KEEPER_PLAN_NOW,
+// then the per-call override layered last.
 // ---------------------------------------------------------------------------
 
 /** Write the empty-but-identity-bearing global gitconfig the conftest writes
@@ -88,9 +89,9 @@ function writeGitConfig(home: string): string {
 
 /** Build the minimal explicit subprocess env for *home*, layering *override*
  * last. Mirrors conftest._subprocess_env: scratch-built, HOME + XDG_* +
- * GIT_CONFIG_GLOBAL/SYSTEM + PATH + PLANCTL_ACTOR, forwarding
- * CLAUDE_CODE_SESSION_ID + PLANCTL_NOW when set in the parent env. The default
- * session id is pre-set (mutating verbs fail closed without it). */
+ * GIT_CONFIG_GLOBAL/SYSTEM + PATH + KEEPER_PLAN_ACTOR, forwarding
+ * CLAUDE_CODE_SESSION_ID + KEEPER_PLAN_NOW when set in the parent env. The
+ * default session id is pre-set (mutating verbs fail closed without it). */
 export function buildEnv(
   home: string,
   override?: Record<string, string>,
@@ -105,7 +106,7 @@ export function buildEnv(
     GIT_CONFIG_GLOBAL: gitconfig,
     GIT_CONFIG_SYSTEM: "/dev/null",
     PATH: process.env.PATH ?? "",
-    PLANCTL_ACTOR: process.env.PLANCTL_ACTOR ?? "test@example.com",
+    KEEPER_PLAN_ACTOR: process.env.KEEPER_PLAN_ACTOR ?? "test@example.com",
     // Mutating verbs require a session id to build their commit envelope; the
     // conftest fixtures pre-set this fixed value, so default it here too.
     CLAUDE_CODE_SESSION_ID:
@@ -113,8 +114,8 @@ export function buildEnv(
   };
   // Forward an explicit clock override from the parent env (fixedClock sets it
   // process-wide for the in-process default; here it rides the subprocess env).
-  if (process.env.PLANCTL_NOW !== undefined) {
-    base.PLANCTL_NOW = process.env.PLANCTL_NOW;
+  if (process.env.KEEPER_PLAN_NOW !== undefined) {
+    base.KEEPER_PLAN_NOW = process.env.KEEPER_PLAN_NOW;
   }
   if (override) {
     Object.assign(base, override);
@@ -329,11 +330,11 @@ export function seedState(
   return [epicId, taskIds];
 }
 
-/** The PLANCTL_NOW-honoring clock the seed stamps use, mirroring store.nowIso's
- * %Y-%m-%dT%H:%M:%S.%fZ wire format. Honors the env override (so fixedClock pins
- * seeded stamps) exactly like the binary's nowIso. */
+/** The KEEPER_PLAN_NOW-honoring clock the seed stamps use, mirroring
+ * store.nowIso's %Y-%m-%dT%H:%M:%S.%fZ wire format. Honors the env override (so
+ * fixedClock pins seeded stamps) exactly like the binary's nowIso. */
 function nowStamp(): string {
-  const override = process.env.PLANCTL_NOW;
+  const override = process.env.KEEPER_PLAN_NOW;
   if (override !== undefined && override.length > 0) {
     return override;
   }
@@ -363,27 +364,28 @@ export function setRoots(home: string, roots: string[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// fixedClock — port of conftest.fixed_clock (:997): pin PLANCTL_NOW to the
+// fixedClock — port of conftest.fixed_clock (:997): pin KEEPER_PLAN_NOW to the
 // frozen microsecond-precision UTC stamp. Set on process.env so it drives both
-// nowStamp (seedState) and the subprocess env (buildEnv forwards PLANCTL_NOW).
+// nowStamp (seedState) and the subprocess env (buildEnv forwards
+// KEEPER_PLAN_NOW).
 // ---------------------------------------------------------------------------
 
 /** The frozen clock value conftest.fixed_clock pins. */
 export const FROZEN_CLOCK = "2026-06-06T00:00:00.000000Z";
 
-/** Pin PLANCTL_NOW to FROZEN_CLOCK for the duration of a test, restoring the
+/** Pin KEEPER_PLAN_NOW to FROZEN_CLOCK for the duration of a test, restoring the
  * prior value on teardown. Returns the frozen stamp. Registers its own
  * afterEach restore, so call it at module scope inside a describe block. */
 export function fixedClock(): string {
-  const prior = process.env.PLANCTL_NOW;
+  const prior = process.env.KEEPER_PLAN_NOW;
   beforeEach(() => {
-    process.env.PLANCTL_NOW = FROZEN_CLOCK;
+    process.env.KEEPER_PLAN_NOW = FROZEN_CLOCK;
   });
   afterEach(() => {
     if (prior === undefined) {
-      delete process.env.PLANCTL_NOW;
+      delete process.env.KEEPER_PLAN_NOW;
     } else {
-      process.env.PLANCTL_NOW = prior;
+      process.env.KEEPER_PLAN_NOW = prior;
     }
   });
   return FROZEN_CLOCK;
@@ -526,16 +528,16 @@ export function gitFilesInHead(repo: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Slow-bucket gate — port of the PLANCTL_RUN_SLOW visibility contract. A slow
-// test is skipped unless PLANCTL_RUN_SLOW is set; under CLAUDECODE per-test
-// lines are quiet, so the slow set's visibility is asserted via the run summary
-// skip counts, not per-line. test.skipIf is the gate.
+// Slow-bucket gate — port of the KEEPER_PLAN_RUN_SLOW visibility contract. A
+// slow test is skipped unless KEEPER_PLAN_RUN_SLOW is set; under CLAUDECODE
+// per-test lines are quiet, so the slow set's visibility is asserted via the run
+// summary skip counts, not per-line. test.skipIf is the gate.
 // ---------------------------------------------------------------------------
 
-/** True when the slow bucket is enabled (PLANCTL_RUN_SLOW set to a truthy
+/** True when the slow bucket is enabled (KEEPER_PLAN_RUN_SLOW set to a truthy
  * value). Pass to `test.skipIf(!SLOW_ENABLED)` to gate a slow test. */
 export const SLOW_ENABLED: boolean = ((): boolean => {
-  const v = process.env.PLANCTL_RUN_SLOW;
+  const v = process.env.KEEPER_PLAN_RUN_SLOW;
   return v !== undefined && v !== "" && v !== "0";
 })();
 

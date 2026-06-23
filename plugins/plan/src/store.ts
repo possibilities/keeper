@@ -16,10 +16,10 @@
 // fcntl.flock across engines.
 //
 // nowIso / getActor are spine utilities pinning the cross-implementation
-// contracts: KEEPER_PLAN_NOW (legacy fallback PLANCTL_NOW) returned verbatim
-// after a strict shape check, the wall-clock field padded to 6 fractional
-// digits, and the actor-resolution precedence (KEEPER_PLAN_ACTOR, legacy
-// fallback PLANCTL_ACTOR -> git user.email -> user.name -> USER -> unknown).
+// contracts: KEEPER_PLAN_NOW returned verbatim after a strict shape check, the
+// wall-clock field padded to 6 fractional digits, and the actor-resolution
+// precedence (KEEPER_PLAN_ACTOR -> git user.email -> user.name -> USER ->
+// unknown).
 
 import { randomBytes } from "node:crypto";
 import {
@@ -352,10 +352,9 @@ export class LocalFileStateStore {
 // wall-clock path.
 const NOW_ISO_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 
-/** The clock override: KEEPER_PLAN_NOW, with the transient legacy PLANCTL_NOW as
- * fallback during the migration window. Undefined when neither is set. */
+/** The clock override: KEEPER_PLAN_NOW. Undefined when unset. */
 function clockOverride(): string | undefined {
-  return process.env.KEEPER_PLAN_NOW ?? process.env.PLANCTL_NOW;
+  return process.env.KEEPER_PLAN_NOW;
 }
 
 /** Strict-shape check on a clock override: the exact strptime round-trip Python
@@ -381,7 +380,7 @@ function isValidNowIso(value: string): boolean {
 }
 
 /** Current UTC timestamp in `%Y-%m-%dT%H:%M:%S.%fZ` with microsecond
- * precision. KEEPER_PLAN_NOW (legacy fallback PLANCTL_NOW) overrides the clock
+ * precision. KEEPER_PLAN_NOW overrides the clock
  * and is returned VERBATIM after a strict shape check (no Date round-trip) — a
  * malformed value is a hard error, matching the Python contract that holds every
  * implementation to one format.
@@ -413,11 +412,11 @@ function gitConfig(key: string): string | null {
   return value ? value : null;
 }
 
-/** Current actor identity: KEEPER_PLAN_ACTOR (legacy fallback PLANCTL_ACTOR) ->
+/** Current actor identity: KEEPER_PLAN_ACTOR ->
  * git user.email -> git user.name -> USER -> "unknown". Mirrors get_actor's
  * precedence exactly. */
 export function getActor(): string {
-  const actor = process.env.KEEPER_PLAN_ACTOR ?? process.env.PLANCTL_ACTOR;
+  const actor = process.env.KEEPER_PLAN_ACTOR;
   if (actor) {
     return actor.trim();
   }

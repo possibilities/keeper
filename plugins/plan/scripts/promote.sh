@@ -10,7 +10,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-binary="${repo_root}/dist/planctl-bun"
+binary="${repo_root}/dist/keeper-plan-bun"
 dest_dir="${HOME}/.local/bin"
 dest="${dest_dir}/planctl"
 tmp="${dest_dir}/.planctl.tmp"
@@ -18,7 +18,7 @@ tmp="${dest_dir}/.planctl.tmp"
 cleanup() { rm -f "${tmp}"; }
 trap cleanup EXIT
 
-echo "promote: building dist/planctl-bun (hard prerequisite)"
+echo "promote: building dist/keeper-plan-bun (hard prerequisite)"
 ( cd "${repo_root}" && bun run build )
 
 [ -x "${binary}" ] || { echo "promote: build produced no executable at ${binary}" >&2; exit 1; }

@@ -1,5 +1,5 @@
 // Dispatch tests for src/cli.ts, exercised through the COMPILED binary
-// (dist/planctl-bun) via Bun.spawnSync — never `bun run`. The compiled artifact
+// (dist/keeper-plan-bun) via Bun.spawnSync — never `bun run`. The compiled artifact
 // is what the conformance gate runs, so quirks (virtual FS, env minimalism) are
 // covered here too. Run `bun run build` first; the suite hard-fails if the
 // binary is absent rather than silently passing.
@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const BIN = join(import.meta.dir, "..", "dist", "planctl-bun");
+const BIN = join(import.meta.dir, "..", "dist", "keeper-plan-bun");
 
 if (!existsSync(BIN)) {
   throw new Error(

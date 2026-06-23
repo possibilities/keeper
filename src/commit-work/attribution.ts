@@ -37,11 +37,9 @@ export interface SessionDirtyFiles {
  * they route through the plan-commit hook, not commit-work. keeper's
  * attribution surface is exclusion-agnostic, so the partition lives here.
  *
- * `.keeper/` is the live keeper board dir; `.planctl/` is retained as a
- * migration fallback for any repo or historical attribution row still keyed
- * under the old board path.
+ * `.keeper/` is the live keeper board dir.
  */
-const PLAN_EXCLUDE_PREFIXES = [".keeper/", ".planctl/"];
+const PLAN_EXCLUDE_PREFIXES = [".keeper/"];
 
 /** Inject a custom git runner / DB path / db-path resolver (tests). */
 export interface AttributionDeps {
