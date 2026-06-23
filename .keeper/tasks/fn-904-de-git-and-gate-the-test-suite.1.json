@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Concurrency gate for the test runner",
-  "updated_at": "2026-06-23T00:59:49.672000Z"
+  "updated_at": "2026-06-23T01:41:09.001000Z",
+  "worker_done_at": "2026-06-23T01:41:09.001000Z"
 }

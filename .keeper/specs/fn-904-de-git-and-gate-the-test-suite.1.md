@@ -58,5 +58,5 @@ in-process where possible (no real second `bun test`).
 - [ ] `KEEPER_TEST_NO_GATE` bypasses the lock only
 
 ## Done summary
-
+Added scripts/test-gate.ts, a fail-open host-wide flock + --parallel cap (KEEPER_TEST_PARALLEL, default 4) that test/test:full route through so concurrent agent runs serialize. KEEPER_TEST_NO_GATE bypasses the lock only; child exit code forwarded, stdio inherited, lock released on all exit paths.
 ## Evidence
