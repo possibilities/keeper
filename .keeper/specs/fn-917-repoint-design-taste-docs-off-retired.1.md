@@ -23,5 +23,5 @@ doc files):
 - [ ] `grep -rn pairctl apps/tastectl/tastectl/prompts/improve-taste.md scripts/CLAUDE.md` returns nothing
 
 ## Done summary
-
+Repointed the design-taste synthesis docs off the retired pairctl CLI: improve-taste.md Step 2 + Tools Reference now use 'keeper pair send', and scripts/CLAUDE.md drops the 'pairctl prompts' install clause. grep -rn pairctl across both files returns nothing.
 ## Evidence
