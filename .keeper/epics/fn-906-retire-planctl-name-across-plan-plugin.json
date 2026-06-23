@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-23T06:53:56.143000Z",
   "created_at": "2026-06-23T01:37:29.834000Z",
   "created_by_close_of": "fn-889-retire-planctl-name",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "retire planctl name across plan plugin and api docstrings",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-23T01:37:29.834000Z"
+  "updated_at": "2026-06-23T06:53:56.143000Z"
 }
