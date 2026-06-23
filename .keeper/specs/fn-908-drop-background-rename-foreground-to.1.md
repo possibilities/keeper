@@ -130,5 +130,5 @@ one-time manual operator step, explicitly out of scope.
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Dropped the background tmux session and renamed foreground to work across WORK_SESSIONS, SESSION_PRIORITY, and dispatch FALLBACK_SESSION plus all docstrings/docs/tests; collapsed the restore-offer matrix to one restorable session. Busy-classification and generic background prose left untouched.
 ## Evidence

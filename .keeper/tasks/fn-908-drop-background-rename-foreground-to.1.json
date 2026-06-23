@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Rename session constants and references",
-  "updated_at": "2026-06-23T02:57:01.603000Z"
+  "updated_at": "2026-06-23T09:42:12.681000Z",
+  "worker_done_at": "2026-06-23T09:42:12.681000Z"
 }
