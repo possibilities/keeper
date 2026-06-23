@@ -72,5 +72,5 @@ reproduces byte-identical rows for all non-live-only columns.
       stays byte-identical for non-live-only columns.
 
 ## Done summary
-
+Added foldTmuxTopologySnapshot as the sole owner of live tmux location: overwrites backend_exec_session_id + window_index for live jobs matched on (generation_id, pane_id), gated above the tmux skip-floor, recycle-guarded, preserving last-known on absent panes / NULL indices. Flipped the env arm to forensic birth_session_id and retired the TmuxPaneSnapshot + WindowIndexSnapshot folds to explicit no-op arms.
 ## Evidence
