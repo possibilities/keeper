@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-23T06:53:55.355000Z",
+  "depends_on": [],
+  "epic": "fn-913-sweep-residual-planctl-name-from-plan",
+  "id": "fn-913-sweep-residual-planctl-name-from-plan.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "sweep planctl from CLI output",
+  "updated_at": "2026-06-23T06:53:55.355000Z"
+}
