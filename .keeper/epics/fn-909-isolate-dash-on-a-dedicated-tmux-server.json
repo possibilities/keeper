@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-23T09:53:55.152000Z",
   "created_at": "2026-06-23T03:39:24.950000Z",
   "depends_on_epics": [
     "fn-908-drop-background-rename-foreground-to"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Isolate dash on a dedicated tmux server",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-23T03:39:44.853000Z"
+  "updated_at": "2026-06-23T09:53:55.152000Z"
 }
