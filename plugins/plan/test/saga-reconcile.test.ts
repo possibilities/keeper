@@ -4,7 +4,7 @@
 //
 // reconcile's verdict is computed from real Task:-trailer commits (git log),
 // HEAD-visibility (git cat-file), and an epic-progress tally over real history —
-// the real git IS the subject, so the verdict tests ride the PLANCTL_RUN_SLOW
+// the real git IS the subject, so the verdict tests ride the KEEPER_PLAN_RUN_SLOW
 // gate under withProject's real repo. The pure truth-table + the unborn-branch
 // guard are CITED to src-git-lookup.test.ts (computeVerdict / stateHeadVisible);
 // the tooling-error fail-closed node is python_only (drop). The comma-split,

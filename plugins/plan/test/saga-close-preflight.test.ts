@@ -7,7 +7,7 @@
 // gitignored audits/<epic_id>/brief.json, and emits a content-blind envelope
 // {primary_repo, tasks, all_done, brief_ref, commit_set_hash} — commit_groups
 // prose lives ONLY in the brief. The verb-level tests drive the real binary in a
-// withProject repo; the trailer-scan tests ride the PLANCTL_RUN_SLOW gate.
+// withProject repo; the trailer-scan tests ride the KEEPER_PLAN_RUN_SLOW gate.
 //
 // The TestCommitLookup unit class targets the shared commit_lookup.findCommitGroups
 // seam directly. Variants already pinned by src-git-lookup.test.ts are CITED;

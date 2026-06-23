@@ -15,7 +15,7 @@
 // claim resolves the owning project via roots discovery, never cwd — so the
 // precondition tests pass --project (the verbs-worker idiom) and the resolution
 // cluster drives real setRoots over real projects under one root. The
-// brief-gitignored node rides the PLANCTL_RUN_SLOW gate (git check-ignore is the
+// brief-gitignored node rides the KEEPER_PLAN_RUN_SLOW gate (git check-ignore is the
 // subject). The brief-write-failed node is python_only and dropped.
 
 import { describe, expect, test } from "bun:test";
@@ -43,8 +43,8 @@ import {
   withTmpdir,
 } from "./harness.ts";
 
-const ALICE = { PLANCTL_ACTOR: "alice@example.com" };
-const BOB = { PLANCTL_ACTOR: "bob@example.com" };
+const ALICE = { KEEPER_PLAN_ACTOR: "alice@example.com" };
+const BOB = { KEEPER_PLAN_ACTOR: "bob@example.com" };
 
 // Error code off an error envelope.
 function errCode(out: string): unknown {

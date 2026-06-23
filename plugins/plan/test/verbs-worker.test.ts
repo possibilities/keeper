@@ -353,7 +353,7 @@ describe("done", () => {
     // Frozen clock rides the subprocess env so worker_done_at == FROZEN.
     const r = runCli(["done", taskId, "--summary", "shipped it"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
 

@@ -457,7 +457,7 @@ describe("emit auto-commit boundary", () => {
     // test_emit.py::test_validate_emit_bypass_auto_commits
     const epicId = seedCommittedEpic();
     const before = gitLogCount(project.root);
-    const env = { ...SID, PLANCTL_NOW: FROZEN };
+    const env = { ...SID, KEEPER_PLAN_NOW: FROZEN };
 
     const r = runCli(["validate", "--epic", epicId], {
       cwd: project.root,

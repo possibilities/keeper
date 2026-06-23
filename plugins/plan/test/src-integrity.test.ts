@@ -329,7 +329,7 @@ interface HarnessResult {
 function runHarness(dataDir: string, scenario: string): HarnessResult {
   const proc = Bun.spawnSync(["bun", "run", HARNESS, dataDir, scenario], {
     cwd: REPO,
-    env: { ...process.env, PLANCTL_NOW: "2026-06-06T00:00:00.000000Z" },
+    env: { ...process.env, KEEPER_PLAN_NOW: "2026-06-06T00:00:00.000000Z" },
   });
   return { exitCode: proc.exitCode, stdout: proc.stdout.toString() };
 }

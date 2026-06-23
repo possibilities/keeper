@@ -190,7 +190,7 @@ describe("buildEnv", () => {
       expect(env.XDG_STATE_HOME).toBe(join(home, ".local", "state"));
       expect(env.GIT_CONFIG_SYSTEM).toBe("/dev/null");
       expect(env.GIT_CONFIG_GLOBAL).toBe(join(home, "gitconfig"));
-      expect(env.PLANCTL_ACTOR.length).toBeGreaterThan(0);
+      expect(env.KEEPER_PLAN_ACTOR.length).toBeGreaterThan(0);
       // A session id is always present — mutating verbs require it.
       expect(env.CLAUDE_CODE_SESSION_ID.length).toBeGreaterThan(0);
       // No leak of an arbitrary parent-env var.
@@ -230,13 +230,13 @@ describe("buildEnv", () => {
 
   test("per-call override is layered last", () => {
     const home = getTmp();
-    const env = buildEnv(home, { PLANCTL_ACTOR: "override@example.com" });
-    expect(env.PLANCTL_ACTOR).toBe("override@example.com");
+    const env = buildEnv(home, { KEEPER_PLAN_ACTOR: "override@example.com" });
+    expect(env.KEEPER_PLAN_ACTOR).toBe("override@example.com");
   });
 });
 
 // ===========================================================================
-// fixedClock — PLANCTL_NOW pin, drives both seedState stamps and the subprocess.
+// fixedClock — KEEPER_PLAN_NOW pin, drives both seedState stamps and the subprocess.
 // ===========================================================================
 
 describe("fixedClock pins seed timestamps", () => {
@@ -333,14 +333,14 @@ describe("git assertion helpers + withProject", () => {
 // ===========================================================================
 
 describe("slow-bucket gate", () => {
-  // Default (PLANCTL_RUN_SLOW unset) -> SLOW_ENABLED false -> this skips. With
+  // Default (KEEPER_PLAN_RUN_SLOW unset) -> SLOW_ENABLED false -> this skips. With
   // the env set it runs. The skip/run split is visible in the bun summary.
-  test.skipIf(!SLOW_ENABLED)("runs only under PLANCTL_RUN_SLOW", () => {
+  test.skipIf(!SLOW_ENABLED)("runs only under KEEPER_PLAN_RUN_SLOW", () => {
     expect(SLOW_ENABLED).toBe(true);
   });
 
-  test("SLOW_ENABLED reflects the PLANCTL_RUN_SLOW env exactly", () => {
-    const v = process.env.PLANCTL_RUN_SLOW;
+  test("SLOW_ENABLED reflects the KEEPER_PLAN_RUN_SLOW env exactly", () => {
+    const v = process.env.KEEPER_PLAN_RUN_SLOW;
     const expected = v !== undefined && v !== "" && v !== "0";
     expect(SLOW_ENABLED).toBe(expected);
   });

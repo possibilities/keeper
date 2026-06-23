@@ -120,7 +120,7 @@ describe("set-description / set-acceptance restamp", () => {
       ["task", "set-description", "fn-1-sd.1", "--file", descFile],
       {
         cwd: root,
-        env: { ...SID, PLANCTL_NOW: FROZEN },
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
       },
     );
     expect(r.code).toBe(0);
@@ -136,7 +136,7 @@ describe("set-description / set-acceptance restamp", () => {
     seedState(root, { epicId: "fn-1-sa", nTasks: 1 });
     const r = runCli(["task", "set-acceptance", "fn-1-sa.1"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
       input: "- [ ] new criterion from stdin\n",
     });
     expect(r.code).toBe(0);
@@ -152,7 +152,7 @@ describe("set-description / set-acceptance restamp", () => {
     const before = gitLogCount(root);
     const r = runCli(["task", "set-description", "fn-2-sd.1"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
       input: "body\n",
     });
     expect(r.code).toBe(0);
@@ -185,7 +185,7 @@ describe("reset", () => {
 
     const r = runCli(["task", "reset", "fn-1-rst.1"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
     expect(
@@ -232,7 +232,7 @@ describe("set-target-repo", () => {
 
     const r = runCli(
       ["task", "set-target-repo", "fn-1-str.1", "--path", repoB],
-      { cwd: root, env: { ...SID, PLANCTL_NOW: FROZEN } },
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
     );
     expect(r.code).toBe(0);
     expect(taskDef(root, "fn-1-str.1").target_repo).toBe(repoB);
@@ -275,7 +275,7 @@ describe("set-primary-repo / set-touched-repos", () => {
 
     const r = runCli(["epic", "set-primary-repo", "fn-1-spr", "--path", repo], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
     const payload = parseCliOutput(r.output);
@@ -331,7 +331,7 @@ describe("mv-repo", () => {
     const before = gitLogCount(root);
     const r = runCli(["mv-repo", oldRepo, newRepo], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
 
@@ -421,7 +421,7 @@ describe("non-restamp setters", () => {
     stampMarker(root, "fn-1-tier", STALE);
     const r = runCli(["task", "set-tier", "fn-1-tier.1", "--tier", "high"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).tier).toBe("high");
@@ -577,7 +577,7 @@ describe("epic add-dep", () => {
     seedState(root, { epicId: "fn-2-dep", nTasks: 1 });
     const r = runCli(["epic", "add-dep", "fn-1-dep", "fn-2-dep"], {
       cwd: root,
-      env: { ...SID, PLANCTL_NOW: FROZEN },
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
     });
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).depends_on_epics).toEqual(["fn-2-dep"]);

@@ -15,7 +15,7 @@
 // Every scaffold node is integration-marked in the Python suite (scaffold's mint-
 // time integrity gate runs check_filesystem_repos=true, needing a real .git/), so
 // every test here is gated behind SLOW_ENABLED (skipped in the fast `bun test`,
-// run under PLANCTL_RUN_SLOW=1) and fixtured on a real-git withProject.
+// run under KEEPER_PLAN_RUN_SLOW=1) and fixtured on a real-git withProject.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {

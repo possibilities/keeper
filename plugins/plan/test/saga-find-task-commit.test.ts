@@ -9,7 +9,7 @@
 // error envelope.
 //
 // Real Task:-trailer commits ARE the subject, so the trailer-scan tests ride
-// the PLANCTL_RUN_SLOW gate (test.skipIf(!SLOW_ENABLED)) under real git. Roots
+// the KEEPER_PLAN_RUN_SLOW gate (test.skipIf(!SLOW_ENABLED)) under real git. Roots
 // discovery is driven through setRoots; the colliding-id tests stand up two real
 // projects under one root. The all-repos-broken node is a python_only injection
 // (drop) whose AllReposBrokenError -> COMMIT_LOOKUP_FAILED mapping is unit-owned
