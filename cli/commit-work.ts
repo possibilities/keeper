@@ -35,7 +35,7 @@
 import { existsSync } from "node:fs";
 import { discoverSessionFiles } from "../src/commit-work/attribution";
 import { CommitWorkLock } from "../src/commit-work/flock";
-import { gitExec } from "../src/commit-work/git-exec";
+import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
 import { pushCommitted } from "../src/commit-work/push";
 import { resolveSessionId } from "../src/commit-work/session-id";
@@ -117,9 +117,19 @@ function pyCompact(value: unknown): string {
   return "null";
 }
 
+/**
+ * The stdout sink for every envelope. Defaults to `process.stdout.write`; the
+ * test suite swaps it for an in-memory buffer so it can assert the exact compact
+ * NDJSON / pretty bytes WITHOUT spawning the CLI binary. A single module-level
+ * seam keeps the byte-parity serializers (`printCompact`/`printPretty`) intact.
+ */
+let writeOut: (chunk: string) => void = (chunk) => {
+  process.stdout.write(chunk);
+};
+
 /** Emit a compact envelope (Python `print(json.dumps(...))` — adds `\n`). */
 function printCompact(value: unknown): void {
-  process.stdout.write(`${pyCompact(value)}\n`);
+  writeOut(`${pyCompact(value)}\n`);
 }
 
 /**
@@ -130,7 +140,7 @@ function printCompact(value: unknown): void {
  * ensure_ascii=False distinction never bites.
  */
 function printPretty(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  writeOut(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,10 +228,11 @@ function parseMaxFiles(raw: string | undefined): number {
 async function filterGitignored(
   files: string[],
   cwd: string,
+  run: GitRunner,
 ): Promise<string[]> {
   if (files.length === 0) return [];
   const stdin = new TextEncoder().encode(`${files.join("\0")}\0`);
-  const res = await gitExec(["check-ignore", "-z", "--stdin"], { cwd, stdin });
+  const res = await run(["check-ignore", "-z", "--stdin"], { cwd, stdin });
   if (res.code >= 128) return files;
   const raw = res.stdout.replace(/\0+$/, "");
   if (raw.length === 0) return [...files];
@@ -230,8 +241,8 @@ async function filterGitignored(
 }
 
 /** Git common dir (shared across worktrees), or `.git` on failure. */
-async function gitCommonDir(cwd: string): Promise<string> {
-  const res = await gitExec(["rev-parse", "--git-common-dir"], { cwd });
+async function gitCommonDir(cwd: string, run: GitRunner): Promise<string> {
+  const res = await run(["rev-parse", "--git-common-dir"], { cwd });
   return res.code === 0 ? res.stdout.trim() : ".git";
 }
 
@@ -241,8 +252,12 @@ async function gitCommonDir(cwd: string): Promise<string> {
  * files"; it is NOT a tree-wide `git add -A`. Returns a failure envelope-like
  * string on error, or `null` on success.
  */
-async function gitStage(files: string[], cwd: string): Promise<string | null> {
-  const res = await gitExec(["add", "-A", "--", ...files], { cwd });
+async function gitStage(
+  files: string[],
+  cwd: string,
+  run: GitRunner,
+): Promise<string | null> {
+  const res = await run(["add", "-A", "--", ...files], { cwd });
   if (res.code !== 0) return res.stderr.trim();
   return null;
 }
@@ -259,8 +274,8 @@ async function gitStage(files: string[], cwd: string): Promise<string | null> {
  * line-delimited form, so the common-case envelope is unchanged — this only
  * FIXES the unicode case (the Python source carried the latent quoting bug).
  */
-async function stagedFileNames(cwd: string): Promise<string[]> {
-  const res = await gitExec(
+async function stagedFileNames(cwd: string, run: GitRunner): Promise<string[]> {
+  const res = await run(
     ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRD"],
     { cwd },
   );
@@ -289,10 +304,14 @@ function resolveJobId(): string | null {
  * already rejected by {@link FORBIDDEN_TRAILER_RE}; this is the one legitimate
  * injection path.
  */
-async function appendJobIdTrailer(msg: string, cwd: string): Promise<string> {
+async function appendJobIdTrailer(
+  msg: string,
+  cwd: string,
+  run: GitRunner,
+): Promise<string> {
   const jobId = resolveJobId();
   if (!jobId) return msg;
-  const res = await gitExec(
+  const res = await run(
     [
       "-c",
       "trailer.job-id.ifExists=doNothing",
@@ -314,16 +333,17 @@ async function appendJobIdTrailer(msg: string, cwd: string): Promise<string> {
 async function gitCommitStaged(
   msg: string,
   cwd: string,
+  run: GitRunner,
 ): Promise<{ sha: string } | { error: string }> {
-  const withTrailer = await appendJobIdTrailer(msg, cwd);
-  const commit = await gitExec(["commit", "-F", "-"], {
+  const withTrailer = await appendJobIdTrailer(msg, cwd, run);
+  const commit = await run(["commit", "-F", "-"], {
     cwd,
     stdin: new TextEncoder().encode(withTrailer),
   });
   if (commit.code !== 0) {
     return { error: commit.stderr.trim() };
   }
-  const sha = await gitExec(["rev-parse", "--short", "HEAD"], { cwd });
+  const sha = await run(["rev-parse", "--short", "HEAD"], { cwd });
   return { sha: sha.stdout.trim() };
 }
 
@@ -331,19 +351,76 @@ async function gitCommitStaged(
 // orchestration
 // ---------------------------------------------------------------------------
 
-/** Print a compact failure envelope and exit 1 (the Python `sys.exit(1)`). */
+/**
+ * Sentinel thrown by {@link fail} to unwind to the {@link run} boundary with a
+ * fixed exit code, in place of an inline `process.exit`. `run` catches it and
+ * returns the code so the in-process test path never kills the test process and
+ * the production path still surfaces the same exit 1.
+ */
+class ExitError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super(`exit ${code}`);
+    this.name = "ExitError";
+    this.code = code;
+  }
+}
+
+/** Print a compact failure envelope and unwind to {@link run} with exit 1. */
 function fail(payload: Record<string, unknown>): never {
   printCompact(payload);
-  process.exit(1);
+  throw new ExitError(1);
+}
+
+/**
+ * Injectable seams for {@link run}. Every field defaults to the real production
+ * implementation; the test suite overrides them to exercise the commit-work
+ * DECISIONS (file discovery → gitignore filter → stage → lint gate → commit →
+ * push) IN-PROCESS with zero real git, no real linters, and no compiled binary
+ * spawn. Plain function params — no DI framework.
+ */
+export interface CommitWorkDeps {
+  /** Git runner threaded to every git boundary (default: real {@link gitExec}). */
+  gitRunner?: GitRunner;
+  /** Session-attributed dirty file discovery (default: real attribution read). */
+  discoverFiles?: (sessionId: string, cwd: string) => string[];
+  /** Lint matrix; throws {@link LintFailure} on a violation (default: real). */
+  runLint?: (stagedFiles: string[], cwd: string) => Promise<void>;
+  /** Commit-work flock acquire (default: real {@link CommitWorkLock.acquire}). */
+  acquireLock?: (lockPath: string) => { release: () => void };
 }
 
 /**
  * Run the commit-work pipeline. Returns the process exit code (0 success, 1
  * failure); never calls `process.exit` itself inside the lock window so the
  * `finally` lock-release always runs (Bun's `process.exit` skips `finally`).
+ * Catches the {@link ExitError} that the early-validation {@link fail} throws and
+ * returns its code — no `process.exit` ever fires inside the pipeline.
+ *
+ * `deps` injects the git runner, file discovery, lint matrix, and lock so the
+ * suite can drive the full decision pipeline with no real git / lint / binary.
  */
-async function run(args: ParsedArgs): Promise<number> {
+async function run(
+  args: ParsedArgs,
+  deps: CommitWorkDeps = {},
+): Promise<number> {
+  try {
+    return await runInner(args, deps);
+  } catch (err) {
+    if (err instanceof ExitError) return err.code;
+    throw err;
+  }
+}
+
+async function runInner(
+  args: ParsedArgs,
+  deps: CommitWorkDeps,
+): Promise<number> {
   const cwd = process.cwd();
+  const git = deps.gitRunner ?? gitExec;
+  const discoverFiles = deps.discoverFiles ?? discoverSessionFiles;
+  const runLint = deps.runLint ?? runScopedLint;
+  const acquireLock = deps.acquireLock ?? CommitWorkLock.acquire;
 
   const sessionId = resolveSessionId(args.sessionId);
   if (sessionId === null) {
@@ -359,8 +436,8 @@ async function run(args: ParsedArgs): Promise<number> {
   }
 
   // Discover + gitignore-filter OUTSIDE the lock (pure reads, no mutation).
-  let files = discoverSessionFiles(sessionId, cwd);
-  files = await filterGitignored(files, cwd);
+  let files = discoverFiles(sessionId, cwd);
+  files = await filterGitignored(files, cwd, git);
 
   // Hard-stop on a runaway POST-filter file list (the fn-684 incident shape).
   // `--max-files 0` disables the guard.
@@ -404,14 +481,14 @@ async function run(args: ParsedArgs): Promise<number> {
   // Acquire the per-repo commit lock for the full stage → lint → commit → push
   // window. The lock path is under the git common dir so every worktree of the
   // repo coordinates through the same lock.
-  let common = await gitCommonDir(cwd);
+  let common = await gitCommonDir(cwd, git);
   if (!common.startsWith("/")) common = `${cwd}/${common}`;
   const lockPath = `${common}/keeper-commit-work.lock`;
 
-  const lock = CommitWorkLock.acquire(lockPath);
+  const lock = acquireLock(lockPath);
   let exitCode = 0;
   try {
-    const stageErr = await gitStage(files, cwd);
+    const stageErr = await gitStage(files, cwd, git);
     if (stageErr !== null) {
       printCompact({ success: false, error: `git add failed: ${stageErr}` });
       return 1;
@@ -419,18 +496,18 @@ async function run(args: ParsedArgs): Promise<number> {
 
     // Unstage any stale carryover (a previous worker that died between stage
     // and commit) so the commit + lint see ONLY the caller's files.
-    const allStaged = new Set(await stagedFileNames(cwd));
+    const allStaged = new Set(await stagedFileNames(cwd, git));
     const callerFiles = new Set(files);
     const stale = [...allStaged].filter((f) => !callerFiles.has(f)).sort();
     if (stale.length > 0) {
-      await gitExec(["reset", "HEAD", "--", ...stale], { cwd });
+      await git(["reset", "HEAD", "--", ...stale], { cwd });
     }
     const stagedNames = [...allStaged].filter((f) => callerFiles.has(f)).sort();
 
     // Linters operate on file CONTENTS — skip paths deleted in this commit.
     const lintNames = stagedNames.filter((n) => existsSync(`${cwd}/${n}`));
     try {
-      await runScopedLint(lintNames, cwd);
+      await runLint(lintNames, cwd);
     } catch (err) {
       if (err instanceof LintFailure) {
         // Release the lock BEFORE printing (mirrors the Python finally-guard
@@ -449,7 +526,7 @@ async function run(args: ParsedArgs): Promise<number> {
       throw err;
     }
 
-    const committed = await gitCommitStaged(msg, cwd);
+    const committed = await gitCommitStaged(msg, cwd, git);
     if ("error" in committed) {
       printCompact({
         success: false,
@@ -466,7 +543,7 @@ async function run(args: ParsedArgs): Promise<number> {
     });
 
     // NDJSON line 2 — push envelope (COMPACT). Lock held through the push.
-    const pushResult = await pushCommitted(cwd);
+    const pushResult = await pushCommitted(cwd, git);
     printCompact(pushResult);
     if (!pushResult.success) exitCode = 1;
   } finally {
@@ -483,6 +560,31 @@ export async function main(argv: string[]): Promise<void> {
   }
   const code = await run(args);
   if (code !== 0) process.exit(code);
+}
+
+/**
+ * In-process test entry — parse `argv`, run the pipeline with injected `deps`,
+ * and return the captured stdout + exit code WITHOUT spawning the CLI binary,
+ * touching real git, or calling `process.exit`. Routes every envelope through an
+ * in-memory `writeOut` so the byte-parity serializers are still under test. The
+ * help path is exercised separately; this asserts the verb's decisions.
+ */
+export async function runForTest(
+  argv: string[],
+  deps: CommitWorkDeps = {},
+): Promise<{ code: number; stdout: string }> {
+  const args = parseArgs(argv);
+  const prevWrite = writeOut;
+  let buf = "";
+  writeOut = (chunk) => {
+    buf += chunk;
+  };
+  try {
+    const code = await run(args, deps);
+    return { code, stdout: buf };
+  } finally {
+    writeOut = prevWrite;
+  }
 }
 
 if (import.meta.main) {

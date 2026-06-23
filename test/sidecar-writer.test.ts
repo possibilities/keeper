@@ -29,6 +29,7 @@ import { join } from "node:path";
 
 import {
   buildSidecarFields,
+  decideDocsCommit,
   extractGistFileArgs,
   isDocsMarkdown,
   isoWithOffset,
@@ -40,7 +41,6 @@ import {
   serializeSidecar,
   stripDocSignature,
 } from "../src/sidecar.ts";
-import { initRepo } from "./helpers/git-repo.ts";
 import { sandboxEnv } from "./helpers/sandbox-env.ts";
 
 // ---------------------------------------------------------------------------
@@ -434,121 +434,120 @@ describe("sidecar-writer hook (subprocess)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Layer 2b — the fn-885 docs auto-committer, exercised through the real hook
-// against a `KEEPER_DOCS_DIR` that IS a git repo. (Real git; the hook commits
-// the doc + sidecar / edit / delete fail-open, always exiting 0.)
+// Layer 2b — the fn-885 docs auto-commit ROUTING decision (`decideDocsCommit`),
+// tested IN-PROCESS with zero real git (fn-904 `.3`). The decision is what the
+// hook would commit (paths + subject verb) before it shells git; the actual
+// commit machinery (`commitDocsPaths`) is exercised against a faked git runner
+// in test/doc-commit.test.ts. `exists` is injected so no filesystem read either.
 // ---------------------------------------------------------------------------
 
-/** Run a git command in `docsDir` synchronously; throw on a non-zero exit. */
-function gitDocs(...args: string[]): string {
-  const res = Bun.spawnSync(["git", "-C", docsDir, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (res.exitCode !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${res.stderr.toString().trim()}`,
+const DOCS = "/d/docs";
+/** An `exists` stub that says yes for the given set of paths only. */
+function existsFor(...present: string[]) {
+  const set = new Set(present);
+  return (p: string) => set.has(p);
+}
+
+describe("decideDocsCommit — commit routing", () => {
+  test("Write to a docs .md plans the doc + sidecar as a write commit", () => {
+    const md = `${DOCS}/w.md`;
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: md },
+      },
+      DOCS,
+      existsFor(md),
     );
-  }
-  return res.stdout.toString();
-}
-
-function headSubject(): string {
-  return gitDocs("log", "-1", "--format=%s").trim();
-}
-
-function commitCount(): number {
-  return Number(gitDocs("rev-list", "--count", "HEAD").trim());
-}
-
-describe("sidecar-writer hook — docs auto-commit (subprocess, real git)", () => {
-  beforeEach(() => {
-    // Re-make docsDir as a real git repo with an initial commit so HEAD
-    // resolves. (The outer beforeEach already created docsDir.)
-    initRepo(docsDir);
-    writeFileSync(join(docsDir, "seed.md"), "# seed\n");
-    gitDocs("add", "--", "seed.md");
-    gitDocs("commit", "-q", "-m", "init");
+    expect(plan).toEqual({ paths: [md, `${DOCS}/w.yaml`], verb: "write" });
   });
 
-  test("a Write under the docs repo commits the doc + sidecar with a write subject", async () => {
-    const md = join(docsDir, "w.md");
-    writeFileSync(md, "# W\n\nBody.\n");
-    const pre = commitCount();
-
-    const { code } = await run(writePayload(md));
-    expect(code).toBe(0);
-
-    // sidecar was written AND both files were committed
-    expect(existsSync(join(docsDir, "w.yaml"))).toBe(true);
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: write w.md");
-    // tree is clean — both the .md and .yaml landed
-    expect(gitDocs("status", "--porcelain").trim()).toBe("");
+  test("Edit to a docs .md plans just the .md as an update commit", () => {
+    const md = `${DOCS}/e.md`;
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        tool_input: { file_path: md },
+      },
+      DOCS,
+      existsFor(md),
+    );
+    expect(plan).toEqual({ paths: [md], verb: "update" });
   });
 
-  test("an Edit under the docs repo commits just the .md with an update subject", async () => {
-    const md = join(docsDir, "e.md");
-    writeFileSync(md, "# E\n");
-    gitDocs("add", "--", "e.md");
-    gitDocs("commit", "-q", "-m", "seed e");
-    writeFileSync(md, "# E edited\n");
-    const pre = commitCount();
-
-    const { code } = await run({
-      hook_event_name: "PostToolUse",
-      tool_name: "Edit",
-      session_id: "s",
-      cwd: "/repo",
-      tool_input: { file_path: md },
-    });
-    expect(code).toBe(0);
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: update e.md");
+  test("MultiEdit routes like Edit (update, .md only)", () => {
+    const md = `${DOCS}/m.md`;
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "MultiEdit",
+        tool_input: { file_path: md },
+      },
+      DOCS,
+      existsFor(md),
+    );
+    expect(plan).toEqual({ paths: [md], verb: "update" });
   });
 
-  test("a `rm` of a tracked doc commits the deletion", async () => {
-    const md = join(docsDir, "d.md");
-    writeFileSync(md, "# D\n");
-    gitDocs("add", "--", "d.md");
-    gitDocs("commit", "-q", "-m", "seed d");
-    rmSync(md);
-    const pre = commitCount();
-
-    const { code } = await run({
-      hook_event_name: "PostToolUse",
-      tool_name: "Bash",
-      session_id: "s",
-      cwd: docsDir,
-      tool_input: { command: `rm ${md}` },
-      tool_response: { stdout: "", stderr: "" },
-    });
-    expect(code).toBe(0);
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: delete d.md");
-    expect(gitDocs("ls-files", "d.md").trim()).toBe("");
+  test("a Bash rm of a tracked doc plans a delete commit", () => {
+    const md = `${DOCS}/d.md`;
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        cwd: DOCS,
+        tool_input: { command: `rm ${md}` },
+        tool_response: { stdout: "", stderr: "" },
+      },
+      DOCS,
+      // a delete target need not exist on disk; rm targets are resolved from argv
+      existsFor(),
+    );
+    expect(plan).toEqual({ paths: [md], verb: "delete" });
   });
 
-  test("a Write OUTSIDE the docs repo does not commit", async () => {
-    const outside = join(tmpDir, "outside.md");
-    writeFileSync(outside, "# X\n");
-    const pre = commitCount();
-
-    const { code } = await run(writePayload(outside));
-    expect(code).toBe(0);
-    expect(commitCount()).toBe(pre);
-    expect(existsSync(join(tmpDir, "outside.yaml"))).toBe(false);
+  test("a Write OUTSIDE the docs dir plans nothing (null)", () => {
+    const outside = "/elsewhere/x.md";
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: outside },
+      },
+      DOCS,
+      existsFor(outside),
+    );
+    expect(plan).toBeNull();
   });
 
-  test("exit 0 (no throw) when the docs dir is not a git repo", async () => {
-    const nonRepo = join(tmpDir, "plain-docs");
-    mkdirSync(nonRepo, { recursive: true });
-    const md = join(nonRepo, "p.md");
-    writeFileSync(md, "# P\n");
+  test("a Write to a docs .md that does not exist on disk plans nothing", () => {
+    const md = `${DOCS}/ghost.md`;
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: md },
+      },
+      DOCS,
+      existsFor(), // not present
+    );
+    expect(plan).toBeNull();
+  });
 
-    const { code } = await run(writePayload(md), nonRepo);
-    expect(code).toBe(0);
-    // sidecar still written (the commit no-ops on the non-repo, fail-open)
-    expect(existsSync(join(nonRepo, "p.yaml"))).toBe(true);
+  test("a Bash command touching no docs target plans nothing", () => {
+    const plan = decideDocsCommit(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        cwd: "/repo",
+        tool_input: { command: "rm /repo/other.txt" },
+        tool_response: { stdout: "", stderr: "" },
+      },
+      DOCS,
+      existsFor(),
+    );
+    expect(plan).toBeNull();
   });
 });

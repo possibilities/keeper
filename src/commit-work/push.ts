@@ -12,7 +12,7 @@
  * combined output before matching, exactly as the Python does.
  */
 
-import { gitExec } from "./git-exec";
+import { type GitRunner, gitExec } from "./git-exec";
 
 /** A push-error class. Unmatched stderr falls back to `"other"`. */
 export type PushErrorClass =
@@ -80,18 +80,21 @@ export function classifyPushError(stderr: string): PushErrorClass {
 }
 
 /** Current branch name via `git rev-parse --abbrev-ref HEAD`. */
-async function currentBranch(cwd: string): Promise<string> {
-  const r = await gitExec(["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+async function currentBranch(cwd: string, run: GitRunner): Promise<string> {
+  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
   return r.stdout.trim();
 }
 
 /** A push success envelope for the current branch. */
-async function pushSuccessEnvelope(cwd: string): Promise<PushSuccess> {
+async function pushSuccessEnvelope(
+  cwd: string,
+  run: GitRunner,
+): Promise<PushSuccess> {
   return {
     success: true,
     pushed: true,
     remote: "origin",
-    branch: await currentBranch(cwd),
+    branch: await currentBranch(cwd, run),
   };
 }
 
@@ -107,20 +110,27 @@ async function pushSuccessEnvelope(cwd: string): Promise<PushSuccess> {
  * `GIT_TERMINAL_PROMPT=0` is layered over the env so a credential prompt fails
  * fast (classified `auth`) instead of hanging. `--no-progress` suppresses the
  * progress meter so it never pollutes the captured `push_error` substring match.
+ *
+ * `run` is an injectable {@link GitRunner} — production passes the real
+ * {@link gitExec}; tests pass a fake that returns captured-from-real-git push
+ * stderr goldens so `classifyPushError`'s branches stay covered with no network.
  */
-export async function pushCommitted(cwd: string): Promise<PushEnvelope> {
+export async function pushCommitted(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<PushEnvelope> {
   const env = { GIT_TERMINAL_PROMPT: "0" };
 
   // 1. Detect missing upstream — exit 128 from @{u} resolution.
-  const check = await gitExec(
+  const check = await run(
     ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
     { cwd, env },
   );
   if (check.code === 128) {
-    const pushU = await gitExec(
-      ["push", "--no-progress", "-u", "origin", "HEAD"],
-      { cwd, env },
-    );
+    const pushU = await run(["push", "--no-progress", "-u", "origin", "HEAD"], {
+      cwd,
+      env,
+    });
     if (pushU.code !== 0) {
       const combined = (pushU.stdout + pushU.stderr).trim();
       return {
@@ -130,11 +140,11 @@ export async function pushCommitted(cwd: string): Promise<PushEnvelope> {
         push_error: combined,
       };
     }
-    return pushSuccessEnvelope(cwd);
+    return pushSuccessEnvelope(cwd, run);
   }
 
   // 2. Upstream configured — regular push.
-  const push = await gitExec(["push", "--no-progress"], { cwd, env });
+  const push = await run(["push", "--no-progress"], { cwd, env });
   if (push.code !== 0) {
     const combined = (push.stdout + push.stderr).trim();
     return {
@@ -144,5 +154,5 @@ export async function pushCommitted(cwd: string): Promise<PushEnvelope> {
       push_error: combined,
     };
   }
-  return pushSuccessEnvelope(cwd);
+  return pushSuccessEnvelope(cwd, run);
 }

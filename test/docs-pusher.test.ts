@@ -1,24 +1,23 @@
 /**
- * Unit tests for the dep-free `~/docs` Stop-hook pusher (fn-885 `.2`). Real git
- * is never mocked — `pushDocs` spawns `git` directly, so every assertion runs
- * against a real `initRepo` tmp repo wired to a real bare-`origin` fixture. The
- * `initRepo` helper disables gpgsign so seed commits never wedge on a host with
- * global `commit.gpgsign true`.
+ * Unit tests for the dep-free `~/docs` Stop-hook pusher (fn-885 `.2`), de-gitted
+ * for fn-904 `.3`: ZERO real git. `pushDocs` and `aheadOfUpstream` take an
+ * injectable {@link PusherGitRunner}; every test drives them with a recording
+ * fake that returns canned exit codes / captured-from-real-git push stderr
+ * goldens. The lockfile machinery (acquire/reclaim/release) is real filesystem
+ * code with no git, so it still runs against real files under a tmpdir.
  *
- * Covered (per the task's test notes):
- *  - pushes when local is ahead of `@{u}` (bare origin's main advances);
- *  - no-op when not ahead and when there is no upstream;
- *  - non-fast-forward → logged to the skip-log + skipped (no rebase, no commit
- *    rewrite; local HEAD unchanged);
- *  - a push failure returns cleanly (no throw — the hook would exit 0);
- *  - a held lockfile prevents a second concurrent push (and logs the skip);
- *  - an orphaned lock (holder pid gone, or older than the staleness threshold) is
- *    reclaimed so a hook-timeout kill never blocks every later push forever.
+ * The thing under test is the pusher's DECISIONS, not git's effect:
+ *  - the ahead / no-upstream / mid-op / detached guards each gate the push;
+ *  - a push failure is classified + logged to the skip-log and returns cleanly
+ *    (never throws — the Stop hook would exit 0);
+ *  - `classifyPushError` keys the skip-log class off captured real-git stderr;
+ *  - a live/orphaned/stale lock decides skip vs reclaim without touching git.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -32,42 +31,24 @@ import {
   aheadOfUpstream,
   pushDocs,
 } from "../plugins/keeper/plugin/hooks/docs-pusher";
-import { initRepo } from "./helpers/git-repo";
+import {
+  PUSH_AUTH_FAILED,
+  PUSH_NETWORK,
+  PUSH_NON_FAST_FORWARD,
+} from "./fixtures/git-push-goldens";
+import {
+  argvStartsWith,
+  type FakeGitRule,
+  fakePusherGit,
+} from "./helpers/fake-git.ts";
 
 let repo: string;
-let bare: string;
 let logFile: string;
 
-/** Run a git command in `repo` synchronously; throw on a non-zero exit. */
-function git(...args: string[]): string {
-  const res = Bun.spawnSync(["git", "-C", repo, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (res.exitCode !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${res.stderr.toString().trim()}`,
-    );
-  }
-  return res.stdout.toString();
-}
-
-/** Run a git command in an arbitrary dir; throw on a non-zero exit. */
-function gitIn(dir: string, ...args: string[]): string {
-  const res = Bun.spawnSync(["git", "-C", dir, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (res.exitCode !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${res.stderr.toString().trim()}`,
-    );
-  }
-  return res.stdout.toString();
-}
-
-function headSha(): string {
-  return git("rev-parse", "HEAD").trim();
+/** Find this repo's fake gitdir lockfile path (the pusher derives it via the
+ * injected runner's `rev-parse --git-dir`, which our fake answers with `.git`). */
+function lockPath(): string {
+  return join(repo, ".git", "keeper-push.lock");
 }
 
 /** A pid that is certainly gone: spawn `true`, wait for it to exit, reuse its
@@ -77,35 +58,11 @@ function findDeadPid(): number {
   return proc.pid ?? 999_999;
 }
 
-/** Remote-tracked SHA for the bare origin's main (after the local fetched it). */
-function originMainSha(): string {
-  return gitIn(bare, "rev-parse", "main").trim();
-}
-
-/** Create + commit a new doc in `repo`. */
-function addDoc(name: string, body: string): void {
-  writeFileSync(join(repo, name), body);
-  git("add", "--", name);
-  git("commit", "-q", "-m", `add ${name}`);
-}
-
-/** Wire a bare repo as `origin`; optionally set upstream by pushing main. */
-function addBareOrigin(setUpstream: boolean): string {
-  const b = realpathSync(mkdtempSync(join(tmpdir(), "keeper-docpush-bare-")));
-  Bun.spawnSync(["git", "init", "-q", "--bare", b]);
-  git("remote", "add", "origin", b);
-  if (setUpstream) {
-    git("push", "-q", "-u", "origin", "main");
-  }
-  return b;
-}
-
 beforeEach(() => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), "keeper-docs-pusher-")));
-  initRepo(repo);
-  writeFileSync(join(repo, "seed.md"), "# seed\n");
-  git("add", "--", "seed.md");
-  git("commit", "-q", "-m", "init");
+  // The pusher resolves the lockfile + skip-log under `<repo>/.git`; the fake
+  // runner answers `rev-parse --git-dir` with `.git`, so make the dir real.
+  mkdirSync(join(repo, ".git"), { recursive: true });
   logFile = join(repo, "skip.log");
   process.env.KEEPER_DOCS_PUSH_LOG = logFile;
 });
@@ -113,147 +70,191 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.KEEPER_DOCS_PUSH_LOG;
   rmSync(repo, { recursive: true, force: true });
-  if (bare) {
-    rmSync(bare, { recursive: true, force: true });
-    bare = "";
-  }
 });
 
-describe("pushDocs", () => {
+/**
+ * The standard runner rule set: HEAD attached, mid-op markers absent, `--git-dir`
+ * resolves to `.git`. The caller appends ahead-count + push rules.
+ */
+function baseRules(
+  aheadCount: string | null,
+  pushOutcome?: { exitCode: number; stdout?: string; stderr?: string },
+): FakeGitRule[] {
+  const rules: FakeGitRule[] = [
+    // mid-op probes: --git-path <marker> resolves a path, but it never exists on
+    // disk (the fake returns a path; existsSync(<tmp>/.git/MERGE_HEAD) is false).
+    {
+      when: (a: string[]) => argvStartsWith(a, "rev-parse", "--git-path"),
+      result: { exitCode: 0, stdout: `.git/${"marker"}` },
+    },
+    // attached HEAD
+    {
+      when: (a: string[]) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+      result: { exitCode: 0, stdout: "refs/heads/main" },
+    },
+    // gitdir resolution for the lockfile + skip-log
+    {
+      when: (a: string[]) => argvStartsWith(a, "rev-parse", "--git-dir"),
+      result: { exitCode: 0, stdout: ".git" },
+    },
+  ];
+  if (aheadCount === null) {
+    // No upstream → rev-list exits non-zero.
+    rules.push({
+      when: (a: string[]) => argvStartsWith(a, "rev-list", "--count"),
+      result: { exitCode: 128, stdout: "" },
+    });
+  } else {
+    rules.push({
+      when: (a: string[]) => argvStartsWith(a, "rev-list", "--count"),
+      result: { exitCode: 0, stdout: `${aheadCount}\n` },
+    });
+  }
+  if (pushOutcome) {
+    rules.push({
+      when: (a: string[]) => argvStartsWith(a, "push", "--no-progress"),
+      result: pushOutcome,
+    });
+  }
+  return rules;
+}
+
+describe("pushDocs — guards", () => {
   test("pushes when local is ahead of @{u}", () => {
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    const localHead = headSha();
-    expect(aheadOfUpstream(repo)).toBe(1);
-
-    expect(pushDocs(repo)).toBe("pushed");
-    // The bare origin's main now points at the local HEAD.
-    expect(originMainSha()).toBe(localHead);
-    expect(aheadOfUpstream(repo)).toBe(0);
+    const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    // The push was actually issued (decision: push, not skip).
+    expect(
+      fake.calls.some((c) => argvStartsWith(c.args, "push", "--no-progress")),
+    ).toBe(true);
+    // Lock released after a successful push.
+    expect(existsSync(lockPath())).toBe(false);
   });
 
-  test("no-op when not ahead", () => {
-    bare = addBareOrigin(true);
-    // Upstream set with main pushed; no new local commits → 0 ahead.
-    expect(aheadOfUpstream(repo)).toBe(0);
-    expect(pushDocs(repo)).toBe("not-ahead");
+  test("no-op when not ahead (0 commits) — no push issued", () => {
+    const fake = fakePusherGit(baseRules("0"));
+    expect(pushDocs(repo, fake.run)).toBe("not-ahead");
+    expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 
-  test("no-op when there is no upstream", () => {
-    bare = addBareOrigin(false);
-    addDoc("note.md", "# note\n");
-    // Remote exists but the branch has no upstream tracking ref.
-    expect(aheadOfUpstream(repo)).toBeNull();
-    expect(pushDocs(repo)).toBe("no-upstream");
+  test("no-op when there is no upstream — no push issued", () => {
+    const fake = fakePusherGit(baseRules(null));
+    expect(pushDocs(repo, fake.run)).toBe("no-upstream");
+    expect(aheadOfUpstream(repo, fake.run)).toBeNull();
+    expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 
-  test("non-fast-forward is logged and skipped (no rebase, HEAD unchanged)", () => {
-    bare = addBareOrigin(true);
-    // Advance the bare origin's main from a SECOND clone so our local is now
-    // behind+diverged: a local commit then makes the push a non-fast-forward.
-    const other = realpathSync(
-      mkdtempSync(join(tmpdir(), "keeper-docpush-other-")),
+  test("mid-operation repo skips before any push", () => {
+    // A --git-path marker that DOES exist on disk → mid-op guard fires.
+    writeFileSync(join(repo, ".git", "MERGE_HEAD"), "deadbeef\n");
+    const fake = fakePusherGit([
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path", "MERGE_HEAD"),
+        result: { exitCode: 0, stdout: ".git/MERGE_HEAD" },
+      },
+    ]);
+    expect(pushDocs(repo, fake.run)).toBe("mid-op");
+    expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+
+  test("detached HEAD skips before any push", () => {
+    const fake = fakePusherGit([
+      // mid-op probes all clean (no marker exists)
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: ".git/marker" },
+      },
+      // symbolic-ref fails → detached
+      {
+        when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+        result: { exitCode: 1, stdout: "" },
+      },
+    ]);
+    expect(pushDocs(repo, fake.run)).toBe("detached");
+    expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+});
+
+describe("pushDocs — push failure is classified, logged, and never throws", () => {
+  test("non-fast-forward → push-failed, skip-log carries non_fast_forward", () => {
+    const fake = fakePusherGit(
+      baseRules("1", { exitCode: 1, stderr: PUSH_NON_FAST_FORWARD }),
     );
-    gitIn(other, "clone", "-q", bare, ".");
-    gitIn(other, "config", "user.email", "test@example.com");
-    gitIn(other, "config", "user.name", "Test");
-    gitIn(other, "config", "commit.gpgsign", "false");
-    writeFileSync(join(other, "remote.md"), "# from other\n");
-    gitIn(other, "add", "--", "remote.md");
-    gitIn(other, "commit", "-q", "-m", "remote advance");
-    gitIn(other, "push", "-q", "origin", "main");
-    rmSync(other, { recursive: true, force: true });
-
-    // Local makes its own divergent commit — ahead of its (now-stale) @{u}.
-    addDoc("local.md", "# local\n");
-    const localHead = headSha();
-
-    expect(pushDocs(repo)).toBe("push-failed");
-    // Local HEAD is untouched (no rebase, no force) and the skip-log captured it.
-    expect(headSha()).toBe(localHead);
-    expect(existsSync(logFile)).toBe(true);
-    const log = readFileSync(logFile, "utf8");
-    expect(log).toContain("push-skipped");
-    expect(log).toContain("non_fast_forward");
-  });
-
-  test("push failure (unreachable remote) returns push-failed, never throws", () => {
-    // Wire origin to a bare repo (so @{u} resolves and we are ahead), then DELETE
-    // the bare so the actual push fails hard — exercising the log+skip arm.
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    expect(aheadOfUpstream(repo)).toBe(1);
-    rmSync(bare, { recursive: true, force: true });
-    bare = "";
-
     let outcome = "";
     expect(() => {
-      outcome = pushDocs(repo);
+      outcome = pushDocs(repo, fake.run);
     }).not.toThrow();
     expect(outcome).toBe("push-failed");
-    expect(existsSync(logFile)).toBe(true);
+    // No rebase / force ever issued — only the single push attempt.
+    expect(
+      fake.calls.filter((c) => argvStartsWith(c.args, "push")).length,
+    ).toBe(1);
+    expect(fake.calls.some((c) => argvHasForce(c.args))).toBe(false);
+    const log = readFileSync(logFile, "utf8");
+    expect(log).toContain("push-skipped");
+    expect(log).toContain("class=non_fast_forward");
+    // Lock released even on the failure path.
+    expect(existsSync(lockPath())).toBe(false);
   });
 
-  test("a live, fresh lockfile prevents a second push and logs the skip", () => {
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    // Pre-create the lockfile stamped with THIS (live) pid to simulate a
-    // concurrent session holding it — a live holder must still block.
-    const gitDir = git("rev-parse", "--git-dir").trim();
-    const lockPath = join(repo, gitDir, "keeper-push.lock");
-    writeFileSync(lockPath, `${process.pid}\n`);
+  test("auth failure → push-failed, skip-log carries auth", () => {
+    const fake = fakePusherGit(
+      baseRules("2", { exitCode: 128, stderr: PUSH_AUTH_FAILED }),
+    );
+    expect(pushDocs(repo, fake.run)).toBe("push-failed");
+    expect(readFileSync(logFile, "utf8")).toContain("class=auth");
+  });
 
-    expect(pushDocs(repo)).toBe("locked");
-    // Nothing was pushed — origin still at its initial main.
-    expect(aheadOfUpstream(repo)).toBe(1);
-    // The skip is visible in the skip-log so a stuck lock is diagnosable.
-    expect(existsSync(logFile)).toBe(true);
+  test("network failure → push-failed, skip-log carries network", () => {
+    const fake = fakePusherGit(
+      baseRules("1", { exitCode: 128, stderr: PUSH_NETWORK }),
+    );
+    expect(pushDocs(repo, fake.run)).toBe("push-failed");
+    expect(readFileSync(logFile, "utf8")).toContain("class=network");
+  });
+});
+
+describe("pushDocs — lockfile decision (real files, no git)", () => {
+  test("a live, fresh lock prevents the push and logs the skip", () => {
+    // Pre-create the lock stamped with THIS (live) pid — a live holder blocks.
+    writeFileSync(lockPath(), `${process.pid}\n`);
+    const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake.run)).toBe("locked");
+    // No push issued — the lock gated it.
+    expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
     expect(readFileSync(logFile, "utf8")).toContain("class=locked");
   });
 
   test("an orphaned lock (holder pid gone) is reclaimed and the push proceeds", () => {
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    const localHead = headSha();
-    const gitDir = git("rev-parse", "--git-dir").trim();
-    const lockPath = join(repo, gitDir, "keeper-push.lock");
-    // Stamp the lock with a pid that is certainly gone. process.kill(pid, 0)
-    // throws ESRCH for a non-existent pid → reclaimable even within the window.
-    writeFileSync(lockPath, `${findDeadPid()}\n`);
-
-    expect(pushDocs(repo)).toBe("pushed");
-    expect(originMainSha()).toBe(localHead);
-    // The reclaimed-then-acquired lock is released after the push completes.
-    expect(existsSync(lockPath)).toBe(false);
+    writeFileSync(lockPath(), `${findDeadPid()}\n`);
+    const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(existsSync(lockPath())).toBe(false);
   });
 
   test("an orphaned lock older than the staleness threshold is reclaimed", () => {
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    const localHead = headSha();
-    const gitDir = git("rev-parse", "--git-dir").trim();
-    const lockPath = join(repo, gitDir, "keeper-push.lock");
-    // Stamp with THIS live pid (liveness check alone would NOT reclaim) but
-    // backdate the mtime well past the >60s staleness threshold.
-    writeFileSync(lockPath, `${process.pid}\n`);
+    // Live pid (liveness alone would NOT reclaim), but mtime past >60s threshold.
+    writeFileSync(lockPath(), `${process.pid}\n`);
     const old = new Date(Date.now() - 120_000);
-    utimesSync(lockPath, old, old);
-
-    expect(pushDocs(repo)).toBe("pushed");
-    expect(originMainSha()).toBe(localHead);
-    expect(existsSync(lockPath)).toBe(false);
+    utimesSync(lockPath(), old, old);
+    const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(existsSync(lockPath())).toBe(false);
   });
 
-  test("released lockfile allows the next push", () => {
-    bare = addBareOrigin(true);
-    addDoc("note.md", "# note\n");
-    // First push acquires + releases the lock cleanly.
-    expect(pushDocs(repo)).toBe("pushed");
-    const gitDir = git("rev-parse", "--git-dir").trim();
-    const lockPath = join(repo, gitDir, "keeper-push.lock");
-    expect(existsSync(lockPath)).toBe(false);
-    // A second turn with new work pushes again (lock was released).
-    addDoc("note2.md", "# note2\n");
-    expect(pushDocs(repo)).toBe("pushed");
+  test("a released lock allows the next push", () => {
+    const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(existsSync(lockPath())).toBe(false);
+    // Second turn: lock is gone, push proceeds again.
+    const fake2 = fakePusherGit(baseRules("1", { exitCode: 0 }));
+    expect(pushDocs(repo, fake2.run)).toBe("pushed");
   });
 });
+
+/** True when argv contains a force-push flag (must never appear). */
+function argvHasForce(args: string[]): boolean {
+  return args.some(
+    (a) => a === "--force" || a === "-f" || a.startsWith("--force-with-lease"),
+  );
+}

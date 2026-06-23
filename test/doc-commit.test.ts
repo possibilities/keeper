@@ -1,73 +1,69 @@
 /**
- * Unit tests for the dep-free `~/docs` per-write committer (fn-885 `.1`). Real
- * git is never mocked — `commitDocsPaths` spawns `git` directly, so every
- * assertion runs against a real `initRepo` tmp repo with an initial commit. The
- * `initRepo` helper disables gpgsign (the committer also passes
- * `-c commit.gpgsign=false`, but the fixture's host could carry a global config
- * that wedges the seed commits otherwise).
+ * Unit tests for the dep-free `~/docs` per-write committer (fn-885 `.1`),
+ * de-gitted for fn-904 `.3`: ZERO real git. `commitDocsPaths` takes an
+ * injectable {@link DocGitRunner}; every test drives it with a recording fake so
+ * the assertions exercise the committer's DECISIONS — the staged pathspec, the
+ * mechanical `docs: <verb> <relpath>` subject, the mid-op / detached skip, and
+ * the bounded index.lock contention retry — never git's effect on a real repo.
  *
- * Covered (per the task's test notes):
- *  - a write/update/delete commits the right pathspec with a mechanical subject;
- *  - a clean tree is a no-op (null, no new commit);
- *  - a simulated index.lock retries on the backoff and then commits;
- *  - a persistent lock exhausts the bounded retry → CommitFailed(commit_contended);
- *  - a detached HEAD and a mid-merge repo skip cleanly (null, no commit);
- *  - the commit is pathspec-scoped — an unrelated dirty file is NOT swept in.
+ * `buildDocSubject` stays a pure-string unit test. The contention paths model
+ * git's lock-domain stderr (`index.lock` / `File exists` / `cannot lock ref`)
+ * via canned outcomes, exactly the substrings the committer matches on.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 import {
   buildDocSubject,
   CommitFailed,
   commitDocsPaths,
 } from "../src/doc-commit";
-import { initRepo } from "./helpers/git-repo";
+import {
+  argvStartsWith,
+  type FakeGitRule,
+  fakeDocGit,
+  type RecordedGitCall,
+} from "./helpers/fake-git.ts";
 
-let repo: string;
+const REPO = "/repo";
 
-/** Run a git command in `repo` synchronously; throw on a non-zero exit. */
-function git(...args: string[]): string {
-  const res = Bun.spawnSync(["git", "-C", repo, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (res.exitCode !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${res.stderr.toString().trim()}`,
-    );
-  }
-  return res.stdout.toString();
+/** Rules for a clean attached HEAD repo that is NOT mid-operation, with the
+ * given porcelain-v1 status output for the dirtiness probe. */
+function cleanRepoRules(porcelainStatus: string): FakeGitRule[] {
+  return [
+    // mid-op probes: a marker path that never "exists" — but the committer tests
+    // existence on disk via existsSync, and /repo/.git/MARKER doesn't exist, so
+    // returning a non-existent path keeps the repo "not mid-operation".
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+      result: { exitCode: 0, stdout: "/nonexistent/marker" },
+    },
+    // attached HEAD
+    {
+      when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+      result: { exitCode: 0, stdout: "refs/heads/main" },
+    },
+    // dirtiness probe
+    {
+      when: (a) => argvStartsWith(a, "status", "--porcelain=v1"),
+      result: { exitCode: 0, stdout: porcelainStatus },
+    },
+    // resulting HEAD after the commit
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "HEAD"),
+      result: { exitCode: 0, stdout: `${"a".repeat(40)}\n` },
+    },
+  ];
 }
 
-function commitCount(): number {
-  return Number(git("rev-list", "--count", "HEAD").trim());
+/** The commit call (`commit -F -`) recorded by a fake, or undefined. */
+function commitCall(calls: RecordedGitCall[]): RecordedGitCall | undefined {
+  return calls.find((c) => argvStartsWith(c.args, "-c"));
 }
 
-function headSubject(): string {
-  return git("log", "-1", "--format=%s").trim();
+/** The add call (`add -A -- ...`), or undefined. */
+function addCall(calls: RecordedGitCall[]): RecordedGitCall | undefined {
+  return calls.find((c) => argvStartsWith(c.args, "add", "-A", "--"));
 }
-
-beforeEach(() => {
-  repo = realpathSync(mkdtempSync(join(tmpdir(), "keeper-doc-commit-")));
-  initRepo(repo);
-  // Seed an initial commit so HEAD resolves (the committer skips an unborn HEAD).
-  writeFileSync(join(repo, "seed.md"), "# seed\n");
-  git("add", "--", "seed.md");
-  git("commit", "-q", "-m", "init");
-});
-
-afterEach(() => {
-  rmSync(repo, { recursive: true, force: true });
-});
 
 describe("buildDocSubject", () => {
   test("mechanical `docs: <verb> <relpath>` subject", () => {
@@ -77,194 +73,247 @@ describe("buildDocSubject", () => {
   });
 });
 
-describe("commitDocsPaths", () => {
-  test("a fresh doc + sidecar commits both, pathspec-scoped, with the write subject", () => {
-    const md = join(repo, "note.md");
-    const yaml = join(repo, "note.yaml");
-    writeFileSync(md, "# note\n");
-    writeFileSync(yaml, "path: note.md\ntype: doc\n");
-    const pre = commitCount();
-
-    const sha = commitDocsPaths({
-      paths: [md, yaml],
-      repoRoot: repo,
-      verb: "write",
-    });
-    expect(sha).not.toBeNull();
-    expect((sha as string).length).toBe(40);
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: write note.md");
-    // both files are now tracked & clean
-    expect(git("status", "--porcelain").trim()).toBe("");
-  });
-
-  test("an update to an existing doc commits just the dirty .md", () => {
-    const md = join(repo, "note.md");
-    writeFileSync(md, "# note\n");
-    git("add", "--", "note.md");
-    git("commit", "-q", "-m", "seed note");
-    writeFileSync(md, "# note edited\n");
-    const pre = commitCount();
-
-    const sha = commitDocsPaths({
-      paths: [md],
-      repoRoot: repo,
-      verb: "update",
-    });
-    expect(sha).not.toBeNull();
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: update note.md");
-  });
-
-  test("a deletion commits the removal", () => {
-    const md = join(repo, "gone.md");
-    writeFileSync(md, "# gone\n");
-    git("add", "--", "gone.md");
-    git("commit", "-q", "-m", "seed gone");
-    unlinkSync(md);
-    const pre = commitCount();
-
-    const sha = commitDocsPaths({
-      paths: [md],
-      repoRoot: repo,
-      verb: "delete",
-    });
-    expect(sha).not.toBeNull();
-    expect(commitCount()).toBe(pre + 1);
-    expect(headSubject()).toBe("docs: delete gone.md");
-    // the file is gone from the tree
-    expect(git("ls-files", "gone.md").trim()).toBe("");
-  });
-
-  test("a clean tree is a no-op (null, no new commit)", () => {
-    const md = join(repo, "seed.md"); // already committed, unchanged
-    const pre = commitCount();
-    const sha = commitDocsPaths({
-      paths: [md],
-      repoRoot: repo,
-      verb: "update",
-    });
-    expect(sha).toBeNull();
-    expect(commitCount()).toBe(pre);
-  });
-
-  test("an empty paths list is a no-op", () => {
-    const pre = commitCount();
-    expect(
-      commitDocsPaths({ paths: [], repoRoot: repo, verb: "write" }),
-    ).toBeNull();
-    expect(commitCount()).toBe(pre);
-  });
-
-  test("pathspec-scoped — an unrelated dirty file is not swept in", () => {
-    const md = join(repo, "scoped.md");
-    const other = join(repo, "unrelated.txt");
-    writeFileSync(md, "# scoped\n");
-    writeFileSync(other, "noise\n");
-
-    const sha = commitDocsPaths({ paths: [md], repoRoot: repo, verb: "write" });
-    expect(sha).not.toBeNull();
-    // only scoped.md was committed; unrelated.txt is still untracked & dirty
-    expect(git("ls-files", "scoped.md").trim()).toBe("scoped.md");
-    expect(git("status", "--porcelain", "unrelated.txt").trim()).toContain(
-      "unrelated.txt",
+describe("commitDocsPaths — decisions", () => {
+  test("a fresh doc + sidecar stages both and commits with the write subject", () => {
+    const fake = fakeDocGit(cleanRepoRules(" M note.md\n M note.yaml\n"));
+    const sha = commitDocsPaths(
+      {
+        paths: [`${REPO}/note.md`, `${REPO}/note.yaml`],
+        repoRoot: REPO,
+        verb: "write",
+      },
+      () => {},
+      fake.run,
     );
+    expect(sha).toBe("a".repeat(40));
+    // Staged the dirty subset reported by status, pathspec-scoped.
+    expect(addCall(fake.calls)?.args).toEqual([
+      "add",
+      "-A",
+      "--",
+      "note.md",
+      "note.yaml",
+    ]);
+    // Commit subject is the mechanical write subject; message via -F - stdin.
+    const commit = commitCall(fake.calls);
+    expect(commit?.args).toContain("commit");
+    expect(commit?.args).toContain("commit.gpgsign=false");
+    expect(commit?.stdin).toBe("docs: write note.md\n");
+    // The commit is pathspec-scoped to exactly the dirty files.
+    expect(commit?.args.slice(-3)).toEqual(["--", "note.md", "note.yaml"]);
   });
 
-  test("stale index.lock cleared on first backoff → bounded retry commits", () => {
-    const md = join(repo, "contend.md");
-    writeFileSync(md, "# contend\n");
-    const lockFile = join(repo, ".git", "index.lock");
-    writeFileSync(lockFile, ""); // git add will refuse: "File exists"
-    const pre = commitCount();
+  test("an update commits just the dirty .md with the update subject", () => {
+    const fake = fakeDocGit(cleanRepoRules(" M note.md\n"));
+    const sha = commitDocsPaths(
+      { paths: [`${REPO}/note.md`], repoRoot: REPO, verb: "update" },
+      () => {},
+      fake.run,
+    );
+    expect(sha).toBe("a".repeat(40));
+    expect(addCall(fake.calls)?.args).toEqual(["add", "-A", "--", "note.md"]);
+    expect(commitCall(fake.calls)?.stdin).toBe("docs: update note.md\n");
+  });
 
-    const backoffs: number[] = [];
-    const sleep = (ms: number): void => {
-      backoffs.push(ms);
-      try {
-        unlinkSync(lockFile); // clear the contention so the next attempt wins
-      } catch {
-        // already cleared
+  test("a deletion commits the removal with the delete subject", () => {
+    const fake = fakeDocGit(cleanRepoRules(" D gone.md\n"));
+    const sha = commitDocsPaths(
+      { paths: [`${REPO}/gone.md`], repoRoot: REPO, verb: "delete" },
+      () => {},
+      fake.run,
+    );
+    expect(sha).toBe("a".repeat(40));
+    expect(commitCall(fake.calls)?.stdin).toBe("docs: delete gone.md\n");
+  });
+
+  test("a clean tree is a no-op (null, no add/commit)", () => {
+    const fake = fakeDocGit(cleanRepoRules(""));
+    const sha = commitDocsPaths(
+      { paths: [`${REPO}/seed.md`], repoRoot: REPO, verb: "update" },
+      () => {},
+      fake.run,
+    );
+    expect(sha).toBeNull();
+    expect(addCall(fake.calls)).toBeUndefined();
+    expect(commitCall(fake.calls)).toBeUndefined();
+  });
+
+  test("an empty paths list is a no-op (never touches git)", () => {
+    const fake = fakeDocGit([]);
+    expect(
+      commitDocsPaths(
+        { paths: [], repoRoot: REPO, verb: "write" },
+        () => {},
+        fake.run,
+      ),
+    ).toBeNull();
+    expect(fake.calls.length).toBe(0);
+  });
+
+  test("pathspec-scoped — only the status-reported dirty files are staged", () => {
+    // status under the scoped pathspec reports only scoped.md; an unrelated file
+    // outside the pathspec never appears, so it is never staged.
+    const fake = fakeDocGit(cleanRepoRules(" M scoped.md\n"));
+    commitDocsPaths(
+      { paths: [`${REPO}/scoped.md`], repoRoot: REPO, verb: "write" },
+      () => {},
+      fake.run,
+    );
+    expect(addCall(fake.calls)?.args).toEqual(["add", "-A", "--", "scoped.md"]);
+    // The status probe was pathspec-scoped to scoped.md.
+    const statusCall = fake.calls.find((c) =>
+      argvStartsWith(c.args, "status", "--porcelain=v1"),
+    );
+    expect(statusCall?.args.slice(-2)).toEqual(["--", `${REPO}/scoped.md`]);
+  });
+});
+
+describe("commitDocsPaths — skip guards", () => {
+  test("a detached HEAD skips cleanly (null, no add/commit)", () => {
+    const fake = fakeDocGit([
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: "/nonexistent/marker" },
+      },
+      // symbolic-ref fails → detached
+      {
+        when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+        result: { exitCode: 1, stdout: "" },
+      },
+    ]);
+    const sha = commitDocsPaths(
+      { paths: [`${REPO}/detached.md`], repoRoot: REPO, verb: "write" },
+      () => {},
+      fake.run,
+    );
+    expect(sha).toBeNull();
+    expect(addCall(fake.calls)).toBeUndefined();
+  });
+});
+
+describe("commitDocsPaths — contention retry", () => {
+  test("a transient index.lock retries on the backoff and then commits", () => {
+    let addAttempts = 0;
+    const rules: FakeGitRule[] = [
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: "/nonexistent/marker" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+        result: { exitCode: 0, stdout: "refs/heads/main" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "status", "--porcelain=v1"),
+        result: { exitCode: 0, stdout: " M contend.md\n" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "HEAD"),
+        result: { exitCode: 0, stdout: `${"b".repeat(40)}\n` },
+      },
+    ];
+    // A stateful add rule: first attempt fails with "File exists" (index.lock
+    // contention), the second succeeds.
+    const fake = fakeDocGit(rules);
+    const baseRun = fake.run;
+    const run = (a: string[], cwd: string, input?: string) => {
+      if (argvStartsWith(a, "add", "-A", "--")) {
+        addAttempts += 1;
+        if (addAttempts === 1) {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "fatal: Unable to create '/repo/.git/index.lock': File exists",
+          };
+        }
       }
+      return baseRun(a, cwd, input);
     };
 
+    const backoffs: number[] = [];
     const sha = commitDocsPaths(
-      { paths: [md], repoRoot: repo, verb: "write" },
-      sleep,
+      { paths: [`${REPO}/contend.md`], repoRoot: REPO, verb: "write" },
+      (ms) => backoffs.push(ms),
+      run,
     );
-    expect(sha).not.toBeNull();
-    expect(commitCount()).toBe(pre + 1);
+    expect(sha).toBe("b".repeat(40));
+    expect(addAttempts).toBe(2);
     expect(backoffs.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("persistent index.lock across all attempts → CommitFailed(commit_contended)", () => {
-    const md = join(repo, "exhaust.md");
-    writeFileSync(md, "# exhaust\n");
-    const lockFile = join(repo, ".git", "index.lock");
-    writeFileSync(lockFile, "");
-    const sleep = (): void => {
-      // never clear — every stage attempt fails with "File exists"
-    };
+  test("a persistent index.lock across all attempts → CommitFailed(commit_contended)", () => {
+    const rules: FakeGitRule[] = [
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: "/nonexistent/marker" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+        result: { exitCode: 0, stdout: "refs/heads/main" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "status", "--porcelain=v1"),
+        result: { exitCode: 0, stdout: " M exhaust.md\n" },
+      },
+      // add always fails with the index.lock contention substring
+      {
+        when: (a) => argvStartsWith(a, "add", "-A", "--"),
+        result: {
+          exitCode: 1,
+          stderr:
+            "fatal: Unable to create '/repo/.git/index.lock': File exists",
+        },
+      },
+    ];
+    const fake = fakeDocGit(rules);
 
     let caught: CommitFailed | null = null;
     try {
-      commitDocsPaths({ paths: [md], repoRoot: repo, verb: "write" }, sleep);
+      commitDocsPaths(
+        { paths: [`${REPO}/exhaust.md`], repoRoot: REPO, verb: "write" },
+        () => {},
+        fake.run,
+      );
     } catch (e) {
       caught = e as CommitFailed;
-    } finally {
-      try {
-        unlinkSync(lockFile);
-      } catch {
-        // best-effort
-      }
     }
     expect(caught).toBeInstanceOf(CommitFailed);
     expect((caught as CommitFailed).error).toBe("commit_contended");
   });
 
-  test("a detached HEAD skips cleanly (null, no commit)", () => {
-    const head = git("rev-parse", "HEAD").trim();
-    git("checkout", "-q", head); // detach
-    const md = join(repo, "detached.md");
-    writeFileSync(md, "# detached\n");
-    const pre = commitCount();
-
-    const sha = commitDocsPaths({ paths: [md], repoRoot: repo, verb: "write" });
-    expect(sha).toBeNull();
-    expect(commitCount()).toBe(pre);
-  });
-
-  test("a mid-merge repo (MERGE_HEAD present) skips cleanly", () => {
-    // Hand-place a MERGE_HEAD marker — the committer probes via
-    // `git rev-parse --git-path MERGE_HEAD` + existence, no real merge needed.
-    writeFileSync(
-      join(repo, ".git", "MERGE_HEAD"),
-      `${git("rev-parse", "HEAD").trim()}\n`,
-    );
-    const md = join(repo, "midmerge.md");
-    writeFileSync(md, "# mid\n");
-    const pre = commitCount();
-
-    const sha = commitDocsPaths({ paths: [md], repoRoot: repo, verb: "write" });
-    expect(sha).toBeNull();
-    expect(commitCount()).toBe(pre);
-  });
-
-  test("a non-repo docs dir is a clean no-op (the symbolic-ref guard catches it)", () => {
-    const nonRepo = realpathSync(
-      mkdtempSync(join(tmpdir(), "keeper-nonrepo-")),
-    );
+  test("a genuine add failure (not contention) surfaces immediately", () => {
+    const rules: FakeGitRule[] = [
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: "/nonexistent/marker" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "symbolic-ref", "-q", "HEAD"),
+        result: { exitCode: 0, stdout: "refs/heads/main" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "status", "--porcelain=v1"),
+        result: { exitCode: 0, stdout: " M bad.md\n" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "add", "-A", "--"),
+        result: { exitCode: 128, stderr: "fatal: pathspec error" },
+      },
+    ];
+    const fake = fakeDocGit(rules);
+    let caught: CommitFailed | null = null;
     try {
-      const md = join(nonRepo, "x.md");
-      writeFileSync(md, "# x\n");
-      // Not a git repo: `git symbolic-ref -q HEAD` exits non-zero, so the
-      // detached/unborn-HEAD guard fires and the committer no-ops (null) rather
-      // than throwing — exactly the fail-open behavior the hook relies on.
-      expect(
-        commitDocsPaths({ paths: [md], repoRoot: nonRepo, verb: "write" }),
-      ).toBeNull();
-    } finally {
-      rmSync(nonRepo, { recursive: true, force: true });
+      commitDocsPaths(
+        { paths: [`${REPO}/bad.md`], repoRoot: REPO, verb: "write" },
+        () => {},
+        fake.run,
+      );
+    } catch (e) {
+      caught = e as CommitFailed;
     }
+    expect(caught).toBeInstanceOf(CommitFailed);
+    // Surfaced as the original git_add error, NOT retried into commit_contended.
+    expect((caught as CommitFailed).error).toBe("git_add");
   });
 });

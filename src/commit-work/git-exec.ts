@@ -34,14 +34,26 @@ export interface GitExecOptions {
 }
 
 /**
- * Run `git <args>` with both output streams drained concurrently.
+ * The function shape every commit-work git boundary depends on. Production uses
+ * {@link spawnGitExec} (a real `git` subprocess); tests inject a fake recording
+ * runner so the suite exercises keeper's DECISIONS (pathspec, subject, push
+ * skip/log) with zero real git. A plain function param — no DI framework.
+ */
+export type GitRunner = (
+  args: string[],
+  options?: GitExecOptions,
+) => Promise<GitExecResult>;
+
+/**
+ * Run `git <args>` as a real subprocess with both output streams drained
+ * concurrently.
  *
  * NEVER passes `--no-optional-locks` — see the module header. The caller is
  * responsible for never issuing tree-wide `git add -A/./*` (always pathspec-
  * scoped with a `--` separator per the epic's best-practices) and for holding
  * the commit-work flock around the stage→commit→push window.
  */
-export async function gitExec(
+export async function spawnGitExec(
   args: string[],
   options: GitExecOptions = {},
 ): Promise<GitExecResult> {
@@ -67,3 +79,11 @@ export async function gitExec(
 
   return { code, stdout, stderr };
 }
+
+/**
+ * The git runner the commit-work family calls. Defaults to the real
+ * {@link spawnGitExec}; kept as a named export so a single re-export point is
+ * available, but production callers thread an injectable {@link GitRunner}
+ * parameter (defaulting to this) rather than reaching for a mutable global.
+ */
+export const gitExec: GitRunner = spawnGitExec;

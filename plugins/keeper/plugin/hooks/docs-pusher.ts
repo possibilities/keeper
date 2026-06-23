@@ -61,17 +61,38 @@ const GIT_TIMEOUT_MS = 8000;
 // reclaimed out from under a slow push.
 const LOCK_STALE_MS = 60_000;
 
+/** Result of one git invocation — exit code + decoded stdout/stderr. */
+export interface GitRunResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * The synchronous git-runner shape {@link pushDocs} depends on. Production uses
+ * {@link spawnGit} (a real timeout-bounded `git` subprocess); tests inject a
+ * fake recording runner so the suite asserts the pusher's DECISIONS (the
+ * ahead/no-upstream/mid-op/detached guards, the push skip + classified skip-log
+ * line, the lock acquire) with zero real git and no network. A plain function
+ * type — no DI framework, and the hook's dep-free import set is unchanged.
+ */
+export type PusherGitRunner = (
+  args: string[],
+  cwd: string,
+  extraEnv?: Record<string, string>,
+) => GitRunResult;
+
 /**
  * Run git with the ambient env (plus any `extraEnv`), an explicit cwd, and a
  * wall-clock timeout. Returns exit code + decoded stdout/stderr. A timeout
  * surfaces as a non-zero exit code (Bun.spawnSync kills the child), treated as a
  * git failure by callers.
  */
-function runGit(
+function spawnGit(
   args: string[],
   cwd: string,
   extraEnv?: Record<string, string>,
-): { exitCode: number; stdout: string; stderr: string } {
+): GitRunResult {
   const proc = Bun.spawnSync(["git", ...args], {
     cwd,
     timeout: GIT_TIMEOUT_MS,
@@ -153,7 +174,7 @@ export function resolveDocsDir(): string {
  * `git rev-parse --git-path <marker>` (honors worktrees), tested on disk. Mirrors
  * the committer's `isMidOperation`. Any probe failure → "not mid-operation".
  */
-function isMidOperation(cwd: string): boolean {
+function isMidOperation(cwd: string, run: PusherGitRunner): boolean {
   const markers = [
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -162,7 +183,7 @@ function isMidOperation(cwd: string): boolean {
     "BISECT_LOG",
   ];
   for (const marker of markers) {
-    const result = runGit(["rev-parse", "--git-path", marker], cwd);
+    const result = run(["rev-parse", "--git-path", marker], cwd);
     if (result.exitCode !== 0) {
       continue;
     }
@@ -184,8 +205,8 @@ function isMidOperation(cwd: string): boolean {
  * -q HEAD` exits 0 on an attached HEAD, non-zero otherwise. Mirrors the
  * committer's `isDetachedHead`.
  */
-function isDetachedHead(cwd: string): boolean {
-  const result = runGit(["symbolic-ref", "-q", "HEAD"], cwd);
+function isDetachedHead(cwd: string, run: PusherGitRunner): boolean {
+  const result = run(["symbolic-ref", "-q", "HEAD"], cwd);
   return result.exitCode !== 0;
 }
 
@@ -196,8 +217,11 @@ function isDetachedHead(cwd: string): boolean {
  * configured (the `@{u}` resolution fails non-zero) — the caller treats both 0
  * and null as a clean no-op. A purely LOCAL count — no network, no `git fetch`.
  */
-export function aheadOfUpstream(cwd: string): number | null {
-  const result = runGit(
+export function aheadOfUpstream(
+  cwd: string,
+  run: PusherGitRunner = spawnGit,
+): number | null {
+  const result = run(
     ["rev-list", "--count", "@{u}..HEAD"],
     cwd,
     // GIT_TERMINAL_PROMPT not needed (local-only), but harmless to keep parity.
@@ -217,8 +241,8 @@ export function aheadOfUpstream(cwd: string): number | null {
  * `git rev-parse --git-dir`; falls back to `<cwd>/.git` when the probe fails
  * (the worktree-rare case — a plain repo).
  */
-function lockfilePath(cwd: string): string {
-  const result = runGit(["rev-parse", "--git-dir"], cwd);
+function lockfilePath(cwd: string, run: PusherGitRunner): string {
+  const result = run(["rev-parse", "--git-dir"], cwd);
   let gitDir = `${cwd}/.git`;
   if (result.exitCode === 0) {
     const raw = result.stdout.trim();
@@ -234,12 +258,12 @@ function lockfilePath(cwd: string): string {
  * tmp file); otherwise `<gitdir>/keeper-push.log`. Errors here are non-fatal —
  * the caller swallows a logging failure rather than letting it abort the Stop.
  */
-function logPath(cwd: string): string {
+function logPath(cwd: string, run: PusherGitRunner): string {
   const override = process.env.KEEPER_DOCS_PUSH_LOG;
   if (override && override.length > 0) {
     return override;
   }
-  const result = runGit(["rev-parse", "--git-dir"], cwd);
+  const result = run(["rev-parse", "--git-dir"], cwd);
   let gitDir = `${cwd}/.git`;
   if (result.exitCode === 0) {
     const raw = result.stdout.trim();
@@ -252,9 +276,9 @@ function logPath(cwd: string): string {
 
 /** Append a single timestamped line to the skip-log, swallowing any IO error
  * (a logging failure must never break the exit-0 contract). */
-function logSkip(cwd: string, line: string): void {
+function logSkip(cwd: string, line: string, run: PusherGitRunner): void {
   try {
-    appendFileSync(logPath(cwd), `${new Date().toISOString()} ${line}\n`);
+    appendFileSync(logPath(cwd, run), `${new Date().toISOString()} ${line}\n`);
   } catch {
     // best-effort; a logging failure is never fatal.
   }
@@ -361,24 +385,31 @@ function stampLock(lockPath: string): boolean {
 
 /**
  * The pure push decision + action for a resolved docs dir. Exported for tests so
- * they can drive it directly against an `initRepo` + bare-origin fixture without
- * the stdin/exit harness. Returns a short status token describing the outcome
- * (`pushed` / `not-ahead` / `no-upstream` / `mid-op` / `detached` / `locked` /
+ * they can drive it directly with an injected {@link PusherGitRunner} (zero real
+ * git). Returns a short status token describing the outcome (`pushed` /
+ * `not-ahead` / `no-upstream` / `mid-op` / `detached` / `locked` /
  * `push-failed` / `not-a-repo`) — purely informational; the hook ignores it and
  * always exits 0.
+ *
+ * `run` defaults to the real {@link spawnGit}; the test injects a fake returning
+ * captured-from-real-git push stderr goldens so the classified skip-log line and
+ * the exit-0 fail-open stay covered with no network.
  */
-export function pushDocs(docsDir: string): string {
+export function pushDocs(
+  docsDir: string,
+  run: PusherGitRunner = spawnGit,
+): string {
   if (!existsSync(docsDir)) {
     return "not-a-repo";
   }
   // A non-repo docs dir: `rev-parse` fails, the guards/ahead-check all no-op.
-  if (isMidOperation(docsDir)) {
+  if (isMidOperation(docsDir, run)) {
     return "mid-op";
   }
-  if (isDetachedHead(docsDir)) {
+  if (isDetachedHead(docsDir, run)) {
     return "detached";
   }
-  const ahead = aheadOfUpstream(docsDir);
+  const ahead = aheadOfUpstream(docsDir, run);
   if (ahead === null) {
     return "no-upstream";
   }
@@ -386,18 +417,19 @@ export function pushDocs(docsDir: string): string {
     return "not-ahead";
   }
 
-  const lockPath = lockfilePath(docsDir);
+  const lockPath = lockfilePath(docsDir, run);
   if (!tryAcquireLock(lockPath)) {
     // A live, fresh lock — a concurrent session is mid-push. Log so a stuck lock
     // (one that never clears across turns) is diagnosable from the skip-log.
     logSkip(
       docsDir,
       `push-skipped class=locked :: lockfile held at ${lockPath}`,
+      run,
     );
     return "locked";
   }
   try {
-    const result = runGit(["push", "--no-progress"], docsDir, {
+    const result = run(["push", "--no-progress"], docsDir, {
       GIT_TERMINAL_PROMPT: "0",
     });
     if (result.exitCode !== 0) {
@@ -405,7 +437,7 @@ export function pushDocs(docsDir: string): string {
       const klass = classifyPushError(combined);
       // Log + SKIP — never auto-rebase, never --force. A non-fast-forward means
       // the remote moved; the human reconciles manually.
-      logSkip(docsDir, `push-skipped class=${klass} :: ${combined}`);
+      logSkip(docsDir, `push-skipped class=${klass} :: ${combined}`, run);
       return "push-failed";
     }
     return "pushed";

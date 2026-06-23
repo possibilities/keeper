@@ -59,15 +59,33 @@ export class CommitFailed extends Error {
 // git plumbing — timeout-bounded spawn, status filter, stage, commit, guards.
 // ---------------------------------------------------------------------------
 
+/** Result of one git invocation — exit code + decoded stdout/stderr. */
+export interface GitRunResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * The synchronous git-runner shape the committer depends on. Production passes
+ * {@link spawnGit} (a real timeout-bounded `git` subprocess); tests inject a
+ * fake recording runner so the suite asserts the committer's DECISIONS (the
+ * staged pathspec, the `docs: <verb> <relpath>` subject, the mid-op/detached
+ * skip, the contention retry) with zero real git. A plain function type — no DI
+ * framework, and the hook's dep-free import set is unchanged (the runner is a
+ * caller-supplied param, never a new import).
+ */
+export type DocGitRunner = (
+  args: string[],
+  cwd: string,
+  input?: string,
+) => GitRunResult;
+
 /** Run git with the ambient env untouched, an explicit cwd, and a wall-clock
  * timeout. Returns exit code + decoded stdout/stderr. `input`, when given, is
  * fed to stdin (used for `commit -F -`). A timeout surfaces as a non-zero exit
  * code (Bun.spawnSync kills the child), which callers treat as a git failure. */
-function runGit(
-  args: string[],
-  cwd: string,
-  input?: string,
-): { exitCode: number; stdout: string; stderr: string } {
+function spawnGit(args: string[], cwd: string, input?: string): GitRunResult {
   const proc = Bun.spawnSync(["git", ...args], {
     cwd,
     timeout: GIT_TIMEOUT_MS,
@@ -89,7 +107,7 @@ function runGit(
  * test it on disk. Any probe failure → treated as "not mid-operation" (the
  * commit attempt itself is the backstop).
  */
-function isMidOperation(cwd: string): boolean {
+function isMidOperation(cwd: string, run: DocGitRunner): boolean {
   const markers = [
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -98,7 +116,7 @@ function isMidOperation(cwd: string): boolean {
     "BISECT_LOG",
   ];
   for (const marker of markers) {
-    const result = runGit(["rev-parse", "--git-path", marker], cwd);
+    const result = run(["rev-parse", "--git-path", marker], cwd);
     if (result.exitCode !== 0) {
       continue;
     }
@@ -123,8 +141,8 @@ function isMidOperation(cwd: string): boolean {
  * An unborn HEAD (fresh repo, no commits) also reports non-zero — treated as
  * detached and skipped, which is correct (nothing to parent a docs commit off).
  */
-function isDetachedHead(cwd: string): boolean {
-  const result = runGit(["symbolic-ref", "-q", "HEAD"], cwd);
+function isDetachedHead(cwd: string, run: DocGitRunner): boolean {
+  const result = run(["symbolic-ref", "-q", "HEAD"], cwd);
   return result.exitCode !== 0;
 }
 
@@ -133,8 +151,12 @@ function isDetachedHead(cwd: string): boolean {
  * so submodule/gitignore/pathspec interpretation matches the eventual `git add`
  * exactly. Empty list when nothing is dirty — callers short-circuit to the
  * no-op path. Throws CommitFailed("git_status") on a non-zero exit. */
-function dirtyFilesForPathspecs(pathspecs: string[], cwd: string): string[] {
-  const result = runGit(["status", "--porcelain=v1", "--", ...pathspecs], cwd);
+function dirtyFilesForPathspecs(
+  pathspecs: string[],
+  cwd: string,
+  run: DocGitRunner,
+): string[] {
+  const result = run(["status", "--porcelain=v1", "--", ...pathspecs], cwd);
   if (result.exitCode !== 0) {
     throw new CommitFailed(
       "git_status",
@@ -162,8 +184,8 @@ function dirtyFilesForPathspecs(pathspecs: string[], cwd: string): string[] {
  * plain `git add -- <deleted>` would not record the removal). Files are already
  * filtered to the dirty subset — only concrete paths, never wildcards. Throws
  * CommitFailed("git_add") on failure. */
-function gitStage(files: string[], cwd: string): void {
-  const result = runGit(["add", "-A", "--", ...files], cwd);
+function gitStage(files: string[], cwd: string, run: DocGitRunner): void {
+  const result = run(["add", "-A", "--", ...files], cwd);
   if (result.exitCode !== 0) {
     throw new CommitFailed(
       "git_add",
@@ -178,8 +200,13 @@ function gitStage(files: string[], cwd: string): void {
  * commit.gpgsign=false` keeps a global signing config from wedging this
  * non-interactive mechanical commit. Throws CommitFailed("git_commit") on
  * failure (hook reject, empty tree, ref-lock contention). */
-function gitCommit(msg: string, files: string[], cwd: string): string {
-  const commitResult = runGit(
+function gitCommit(
+  msg: string,
+  files: string[],
+  cwd: string,
+  run: DocGitRunner,
+): string {
+  const commitResult = run(
     ["-c", "commit.gpgsign=false", "commit", "-F", "-", "--", ...files],
     cwd,
     msg,
@@ -190,7 +217,7 @@ function gitCommit(msg: string, files: string[], cwd: string): string {
       `git commit failed: ${commitResult.stderr.trim()}`,
     );
   }
-  const shaResult = runGit(["rev-parse", "HEAD"], cwd);
+  const shaResult = run(["rev-parse", "HEAD"], cwd);
   return shaResult.stdout.trim();
 }
 
@@ -256,10 +283,14 @@ export interface DocCommitOptions {
  * it and exits 0 (fail-open).
  *
  * `sleep` is injectable so contention-retry tests run the attempts instantly.
+ * `run` is an injectable {@link DocGitRunner} — production uses the real
+ * timeout-bounded {@link spawnGit}; tests inject a fake so the suite asserts the
+ * committer's decisions (pathspec, subject, skip/retry) with zero real git.
  */
 export function commitDocsPaths(
   options: DocCommitOptions,
   sleep: (ms: number) => void = sleepMs,
+  run: DocGitRunner = spawnGit,
 ): string | null {
   const { paths, repoRoot, verb } = options;
   if (paths.length === 0) {
@@ -269,7 +300,7 @@ export function commitDocsPaths(
   // Skip cleanly on a half-finished operation or a detached/unborn HEAD —
   // committing the docs scope there would corrupt the in-flight op or orphan
   // the commit. These are guards, not failures: return null (no-op), not throw.
-  if (isMidOperation(repoRoot) || isDetachedHead(repoRoot)) {
+  if (isMidOperation(repoRoot, run) || isDetachedHead(repoRoot, run)) {
     return null;
   }
 
@@ -285,14 +316,14 @@ export function commitDocsPaths(
       // committed our paths (short-circuit to no-op rather than an empty
       // commit). `git status` reports a deletion as `D`, so a `git rm`'d doc is
       // still seen as dirty here.
-      const dirty = dirtyFilesForPathspecs(paths, repoRoot);
+      const dirty = dirtyFilesForPathspecs(paths, repoRoot, run);
       if (dirty.length === 0) {
         return null;
       }
 
-      gitStage(dirty, repoRoot);
+      gitStage(dirty, repoRoot, run);
       const msg = `${subject}\n`;
-      return gitCommit(msg, dirty, repoRoot);
+      return gitCommit(msg, dirty, repoRoot, run);
     } catch (exc) {
       if (!(exc instanceof CommitFailed)) {
         throw exc;

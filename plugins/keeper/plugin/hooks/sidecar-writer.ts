@@ -345,37 +345,72 @@ function commitDocsFailOpen(
   }
 }
 
+/** The commit-routing decision for a PostToolUse payload: which paths to commit
+ * under which subject verb, or null for no commit. Pure given `exists`. */
+export interface DocsCommitPlan {
+  paths: string[];
+  verb: DocCommitVerb;
+}
+
 /**
- * Handle a Bash delete/move under `~/docs`: `extractBashMutation` tags
- * `rm`/`mv`/`git rm`/`git mv` with resolved target paths; we filter to targets
- * physically under `docsDir` and commit the removal. The `__TREE__` sentinel
- * (pathspec-from-file / `:`-magic) is dropped — we only commit concrete docs
- * paths. A move's source (now-deleted) under docs is committed; the destination,
- * when also under docs, rides the same `dirtyFilesForPathspecs` scope.
+ * Decide what the sidecar-writer would commit for a PostToolUse `data` payload
+ * — the pure routing the hook applies BEFORE it shells git. Returns the commit
+ * plan (paths + subject verb) or null (no commit). `exists` is injected so the
+ * decision is testable in-process with zero filesystem reads and zero git:
+ *  - Write to a docs `.md` → commit `[md, sidecar]` as `write`;
+ *  - Edit/MultiEdit to a docs `.md` → commit `[md]` as `update`;
+ *  - Bash rm/mv/git-rm/git-mv of docs targets → commit them as `delete`;
+ *  - anything outside the docs dir, or a non-existent target → null.
+ * The gist-URL upsert is a sidecar-only side effect with no commit, so it is
+ * intentionally NOT part of this decision.
  */
-function handleDocsDelete(
+export function decideDocsCommit(
   data: Record<string, unknown>,
   docsDir: string,
-): void {
-  const cwd = strField(data, "cwd");
-  const mutation = extractBashMutation("PostToolUse", "Bash", data, cwd);
-  if (!mutation) {
-    return;
+  exists: (path: string) => boolean,
+): DocsCommitPlan | null {
+  const toolName = strField(data, "tool_name");
+
+  if (toolName === "Write") {
+    const filePath = extractMutationPath("PostToolUse", toolName, data);
+    if (!filePath || !isDocsMarkdown(filePath, docsDir) || !exists(filePath)) {
+      return null;
+    }
+    // Commit the doc + its sidecar together; `dirtyFilesForPathspecs` scopes to
+    // whatever is actually dirty. A Write reads as `write` regardless of whether
+    // the doc pre-existed — git's status distinguishes nothing useful here.
+    return { paths: [filePath, sidecarPathFor(filePath)], verb: "write" };
   }
-  if (
-    mutation.kind !== "fs-remove" &&
-    mutation.kind !== "fs-move" &&
-    mutation.kind !== "git-rm" &&
-    mutation.kind !== "git-mv"
-  ) {
-    return;
+
+  if (toolName === "Edit" || toolName === "MultiEdit") {
+    const filePath = extractMutationPath("PostToolUse", toolName, data);
+    if (!filePath || !isDocsMarkdown(filePath, docsDir) || !exists(filePath)) {
+      return null;
+    }
+    // Edit/MultiEdit do NOT (re)write the sidecar — only commit the modified
+    // `.md`; its unchanged sidecar drops out of `dirtyFilesForPathspecs`.
+    return { paths: [filePath], verb: "update" };
   }
-  const prefix = docsDir.endsWith("/") ? docsDir : `${docsDir}/`;
-  const docsTargets = mutation.targets.filter((t) => t.startsWith(prefix));
-  if (docsTargets.length === 0) {
-    return;
+
+  if (toolName === "Bash") {
+    const cwd = strField(data, "cwd");
+    const mutation = extractBashMutation("PostToolUse", "Bash", data, cwd);
+    if (
+      mutation &&
+      (mutation.kind === "fs-remove" ||
+        mutation.kind === "fs-move" ||
+        mutation.kind === "git-rm" ||
+        mutation.kind === "git-mv")
+    ) {
+      const prefix = docsDir.endsWith("/") ? docsDir : `${docsDir}/`;
+      const docsTargets = mutation.targets.filter((t) => t.startsWith(prefix));
+      if (docsTargets.length > 0) {
+        return { paths: docsTargets, verb: "delete" };
+      }
+    }
   }
-  commitDocsFailOpen(docsTargets, docsDir, "delete");
+
+  return null;
 }
 
 async function main(): Promise<void> {
@@ -388,42 +423,21 @@ async function main(): Promise<void> {
   const toolName = strField(data, "tool_name");
   const docsDir = resolveDocsDir();
 
+  // The sidecar write (Write) and gist-URL upsert (Bash gist) are file-only side
+  // effects; the git commit routing is the pure `decideDocsCommit`.
   if (toolName === "Write") {
     const filePath = extractMutationPath("PostToolUse", toolName, data);
-    if (!filePath || !isDocsMarkdown(filePath, docsDir)) {
-      return;
+    if (filePath && isDocsMarkdown(filePath, docsDir) && existsSync(filePath)) {
+      writeDocSidecar(filePath, data);
     }
-    if (!existsSync(filePath)) {
-      return;
-    }
-    writeDocSidecar(filePath, data);
-    // Commit the doc + its sidecar together; `dirtyFilesForPathspecs` scopes to
-    // whatever is actually dirty (both on a fresh write, just the .md if only it
-    // changed). A new doc reads as `write`; for an existing tracked doc the
-    // verb is still `write` — git's status distinguishes nothing useful for the
-    // subject and `write` is the right word for a Write tool call.
-    commitDocsFailOpen([filePath, sidecarPathFor(filePath)], docsDir, "write");
-    return;
   }
-
-  if (toolName === "Edit" || toolName === "MultiEdit") {
-    const filePath = extractMutationPath("PostToolUse", toolName, data);
-    if (!filePath || !isDocsMarkdown(filePath, docsDir)) {
-      return;
-    }
-    if (!existsSync(filePath)) {
-      return;
-    }
-    // Edit/MultiEdit do NOT (re)write the sidecar — fn-884 stamps it on Write
-    // only. Just commit the modified `.md`; its sidecar is unchanged so
-    // `dirtyFilesForPathspecs` naturally drops it.
-    commitDocsFailOpen([filePath], docsDir, "update");
-    return;
-  }
-
   if (toolName === "Bash") {
     handleGistCreate(data, docsDir);
-    handleDocsDelete(data, docsDir);
+  }
+
+  const plan = decideDocsCommit(data, docsDir, existsSync);
+  if (plan) {
+    commitDocsFailOpen(plan.paths, docsDir, plan.verb);
   }
 }
 
