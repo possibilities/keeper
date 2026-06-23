@@ -84,6 +84,9 @@ interface RepoState {
 
 const repos = new Map<string, RepoState>();
 let commitCounter = 0;
+/** Whether the fake reports a present git binary. A test arms absence via
+ * setGitBinaryPresent(false) to drive the fail-closed source-scan path. */
+let gitBinaryPresent = true;
 
 /** Normalize a repo path to its realpath when it exists (the harness tmpdirs are
  * realpath'd; production resolves the project root through realpathSync too), so
@@ -348,6 +351,14 @@ export function fakeCommitTaskJson(root: string, taskId: string): void {
 export function resetFakeVcs(): void {
   repos.clear();
   commitCounter = 0;
+  gitBinaryPresent = true;
+}
+
+/** Arm the fake to report git as absent (false) or present (true). Drives the
+ * findSourceCommits fail-closed-on-absent-binary path. Reset to true by
+ * resetFakeVcs. */
+export function setGitBinaryPresent(present: boolean): void {
+  gitBinaryPresent = present;
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +415,10 @@ export const fakeVcs: PlanVcs = {
     state.snapshot = tree;
     state.committedBlobs = new Map(tree);
     return { ...ok(), sha };
+  },
+
+  gitBinaryPresent(): boolean {
+    return gitBinaryPresent;
   },
 
   isGitRepo(repo): boolean {

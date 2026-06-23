@@ -79,6 +79,13 @@ export interface PlanVcs {
   // Read surface — the post-worker verbs' git archaeology.
   // -------------------------------------------------------------------------
 
+  /** True iff the `git` binary is invokable at all (a `git --version` spawn that
+   * did not ENOENT). Distinguishes "git absent" from "git present but not a work
+   * tree" — the absent case must fail closed (the repo-shape gates collapse both
+   * to a false isGitRepo, so the source scan probes this first to stay
+   * fail-closed). */
+  gitBinaryPresent(): boolean;
+
   /** True iff `repo` is an existing dir containing a git work tree. The repo-shape
    * gate commit_lookup / reconcile run before scanning. A missing git binary or a
    * non-repo dir reads false (NOT a throw) for the source scan. */
@@ -211,6 +218,14 @@ export const realGitVcs: PlanVcs = {
     }
     const shaResult = runGit(["rev-parse", "HEAD"], cwd);
     return { ...commitResult, sha: shaResult.stdout.trim() };
+  },
+
+  gitBinaryPresent(): boolean {
+    // A spawn that ENOENTs (no git binary on PATH) throws, caught by runReadGit
+    // → exitCode 1 with the ENOENT message in stderr. A present binary returns
+    // exit 0. Any non-ENOENT non-zero (impossible for `--version`) reads present.
+    const probe = runReadGit(["--version"], ".");
+    return probe.exitCode === 0;
   },
 
   isGitRepo(repo): boolean {

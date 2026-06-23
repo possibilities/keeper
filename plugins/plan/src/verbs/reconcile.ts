@@ -127,10 +127,17 @@ function resolveProjectForTask(
 
 /** Return shas in `repo` carrying a trailer-authentic `Task: <taskId>` via the
  * facade's %(trailers:valueonly) unit-sep scan. Returns [] when not a git work
- * tree or no born HEAD; any OTHER git failure throws GitError (fail closed).
- * Mirrors _find_source_commits. */
+ * tree or no born HEAD; an absent git binary or any OTHER git failure throws
+ * GitError (fail closed). Mirrors _find_source_commits. */
 export function findSourceCommits(taskId: string, repo: string): string[] {
   const vcs = getVcs();
+  if (!vcs.gitBinaryPresent()) {
+    // An absent git binary collapses isGitRepo to false indistinguishably from a
+    // genuine not-a-work-tree. The fail-closed contract requires the absent-binary
+    // case surface as tooling_error, never a clean empty verdict — only "git
+    // present, not a work tree" stays a clean [].
+    throw new GitError(`git binary not available for source scan in ${repo}`);
+  }
   if (!vcs.isGitRepo(repo)) {
     return [];
   }

@@ -21,6 +21,7 @@ import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   computeVerdict,
   findSourceCommits,
+  GitError,
   stateHeadVisible,
   VERDICTS,
 } from "../src/verbs/reconcile.ts";
@@ -30,6 +31,7 @@ import {
   fakeSourceCommit,
   fakeVcs,
   resetFakeVcs,
+  setGitBinaryPresent,
 } from "./fake-vcs.ts";
 
 let repo: string;
@@ -146,6 +148,16 @@ describe("findSourceCommits (trailer-authentic scan)", () => {
     } finally {
       rmSync(notRepo, { recursive: true, force: true });
     }
+  });
+
+  test("absent git binary → GitError, never a clean [] (fail closed)", () => {
+    // An absent git binary collapses isGitRepo to false indistinguishably from a
+    // genuine not-a-work-tree, so the source scan would silently return a clean
+    // "no source commit" verdict — violating the module-header fail-closed
+    // invariant (ANY unexpected git failure → tooling_error). The probe must
+    // surface the absent binary as a GitError, distinct from the clean [] above.
+    setGitBinaryPresent(false);
+    expect(() => findSourceCommits("fn-1-x.1", repo)).toThrow(GitError);
   });
 });
 
