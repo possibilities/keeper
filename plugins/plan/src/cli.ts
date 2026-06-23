@@ -1,7 +1,7 @@
 // planctl-bun CLI dispatch — the read-only-subset entry point.
 //
 // Hand-rolled dispatch reproducing the click conventions the conformance harness
-// pins: top-level `--format json|yaml|human` plumbed to every verb (both
+// pins: top-level `--format json|human` plumbed to every verb (both
 // positions), `--help` on stdout (exit 0) with a Commands section, and an
 // unknown-command error on stderr (exit 2) shaped like click's "No such command".
 //
@@ -736,11 +736,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function readFormat(value: string | undefined): OutputFormat {
-  if (value === "json" || value === "yaml" || value === "human") {
+  if (value === "json" || value === "human") {
     return value;
   }
   usageError(
-    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'human'.`,
   );
 }
 
@@ -770,7 +770,7 @@ function printHelp(): void {
   lines.push(`  ${DESCRIPTION}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|yaml|human]  Output format (default: json)");
+  lines.push("  --format [json|human]       Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("Commands:");

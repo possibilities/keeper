@@ -305,13 +305,13 @@ describe("cat", () => {
       nTasks: 1,
     });
     const plain = runCli(["cat", "fn-1-cafe"], { cwd: root });
-    const yaml = runCli(["--format", "yaml", "cat", "fn-1-cafe"], {
+    const human = runCli(["--format", "human", "cat", "fn-1-cafe"], {
       cwd: root,
     });
     expect(plain.code).toBe(0);
-    expect(yaml.code).toBe(0);
+    expect(human.code).toBe(0);
     expect(plain.output).toBe("## Overview\nbody\n");
-    expect(yaml.output).toBe("## Overview\nbody\n");
+    expect(human.output).toBe("## Overview\nbody\n");
   });
 
   test("task spec", () => {

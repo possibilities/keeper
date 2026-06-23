@@ -2,7 +2,7 @@
 // from tests/test_readonly_verbs.py, every node mapped by a source-comment.
 // state-path / detect / status / epics: byte-exact primary envelope + the
 // trailing plan_invocation NDJSON line, the schema_version asymmetry
-// (detect 0, status 1), --format yaml/human surfaces, and the missing-project
+// (detect 0, status 1), the --format human surface, and the missing-project
 // error. Each test seeds via the CLI-free seedState builder (the harness port)
 // + chdir, so only the verb-under-test crosses the compiled-binary boundary.
 //
@@ -230,25 +230,6 @@ describe("status", () => {
     expect(trailer).toBe(expectedTrailer("status", root));
   });
 
-  test("--format yaml block style", () => {
-    // test_readonly_verbs.py::test_status_yaml
-    seedMixed(root);
-    const name = basename(root);
-    const r = runCli(["--format", "yaml", "status"], { cwd: root });
-    expect(r.code).toBe(0);
-    const [primary, trailer] = split(r.stdout);
-    expect(primary).toBe(
-      "success: true\n" +
-        "project:\n" +
-        `  name: ${name}\n` +
-        `  path: ${root}\n` +
-        "  schema_version: 1\n" +
-        "epics:\n  total: 2\n  open: 2\n  done: 0\n" +
-        "tasks:\n  total: 3\n  todo: 1\n  in_progress: 1\n  done: 1\n  blocked: 0\n",
-    );
-    expect(trailer).toBe(expectedTrailer("status", root));
-  });
-
   test("--format human falls back to JSON bytes", () => {
     // test_readonly_verbs.py::test_status_human_falls_back_to_json
     seedMixed(root);
@@ -312,31 +293,6 @@ describe("epics", () => {
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe('{\n  "success": true,\n  "epics": []\n}\n');
-    expect(trailer).toBe(expectedTrailer("epics", root));
-  });
-
-  test("--format yaml", () => {
-    // test_readonly_verbs.py::test_epics_yaml
-    seedMixed(root);
-    const r = runCli(["--format", "yaml", "epics"], { cwd: root });
-    expect(r.code).toBe(0);
-    const [primary, trailer] = split(r.stdout);
-    expect(primary).toBe(
-      "success: true\n" +
-        "epics:\n" +
-        "- id: fn-1-cafe\n" +
-        "  title: Café résumé ☕\n" +
-        "  status: open\n" +
-        "  branch_name: main\n" +
-        "  task_summary:\n" +
-        "    total: 3\n    todo: 1\n    in_progress: 1\n    done: 1\n    blocked: 0\n" +
-        "- id: fn-zzz-weird\n" +
-        "  title: Weird\n" +
-        "  status: open\n" +
-        "  branch_name: main\n" +
-        "  task_summary:\n" +
-        "    total: 0\n    todo: 0\n    in_progress: 0\n    done: 0\n    blocked: 0\n",
-    );
     expect(trailer).toBe(expectedTrailer("epics", root));
   });
 

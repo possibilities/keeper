@@ -7,10 +7,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import yaml from "js-yaml";
 import { z } from "zod";
-import { yamlDump } from "../../plan/src/format.ts";
 import { atomicWriteRaw } from "../../plan/src/store.ts";
 import { type Bundle, parseBundle, zodErrorMessage } from "./bundle_schema.ts";
 import { ensureParent } from "./storage.ts";
+import { yamlDump } from "./yaml_dump.ts";
 
 /** Raised when a bundle YAML cannot be loaded or fails schema validation. */
 export class BundleIoError extends Error {

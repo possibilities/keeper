@@ -104,7 +104,7 @@ export function printGroupHelp(group: GroupSpec): void {
   lines.push(`  ${group.description}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|yaml|human]  Output format (default: json)");
+  lines.push("  --format [json|human]       Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("Commands:");
@@ -137,7 +137,7 @@ export function printLeafHelp(group: string, spec: SubcommandSpec): void {
   }
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|yaml|human]  Output format (default: json)");
+  lines.push("  --format [json|human]       Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   process.stdout.write(`${lines.join("\n")}\n`);
 }

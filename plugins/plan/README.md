@@ -5,7 +5,7 @@
 - Data lives in `.keeper/` inside the project directory, under version control.
 - Task runtime state is separated from task definitions.
 - Spec changes are written in place to `specs/{id}.md`. Git provides the audit trail.
-- Commands emit JSON by default. Pass `--format yaml` or `--format human` for alternate output. `cat` always emits raw markdown.
+- Commands emit JSON by default. Pass `--format human` for human-readable output. `cat` always emits raw markdown.
 
 ## Requirements
 
@@ -139,7 +139,7 @@ Commands emit JSON by default:
 - Failure: `{"success": false, "error": "..."}`
 - Non-JSON failures print `Error: ...` to stderr and exit non-zero.
 
-Pass `--format yaml` for YAML output or `--format human` for human-readable text/tables.
+Pass `--format human` for human-readable text/tables.
 `cat` always emits raw markdown regardless of `--format`.
 `validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). When `--epic <id>` is given and the epic has never been validated before, the runner manually invokes `auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and prints a second NDJSON document `{"plan_invocation": {...}}` describing the marker write. Re-validating an already-stamped epic produces only the one-line envelope (no second document, no commit).
 
