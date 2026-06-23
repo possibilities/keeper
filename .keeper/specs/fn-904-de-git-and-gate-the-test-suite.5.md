@@ -53,5 +53,5 @@ representative verb (init, scaffold, reconcile) returns the identical
 - [ ] Process/compiled-binary-specific tests are quarantined to `KEEPER_PLAN_RUN_PROCESS`; the rest pass in-process
 
 ## Done summary
-
+runCli now dispatches main(argv) in-process (no bun run build, zero binary spawns); env/cwd/stdout/stderr/exit captured+restored in finally, selfEmitted reset per call, a stdin-provider seam feeds opts.input to the fd-0 readers, and git/gh spawns get explicit env so the fixture identity/PATH-shim propagate. Process-boundary tests quarantined to KEEPER_PLAN_RUN_PROCESS.
 ## Evidence

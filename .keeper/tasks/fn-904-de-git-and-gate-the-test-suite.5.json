@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Run the plan suite in-process via main",
-  "updated_at": "2026-06-23T00:59:49.672000Z"
+  "updated_at": "2026-06-23T03:16:17.661000Z",
+  "worker_done_at": "2026-06-23T03:16:17.661000Z"
 }
