@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-23T18:59:05.515000Z",
+  "depends_on": [
+    "fn-918-wake-offline-planner-durable-bus.1"
+  ],
+  "epic": "fn-918-wake-offline-planner-durable-bus",
+  "id": "fn-918-wake-offline-planner-durable-bus.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "wake offline planner into agentbus session",
+  "updated_at": "2026-06-23T18:59:05.515000Z"
+}
