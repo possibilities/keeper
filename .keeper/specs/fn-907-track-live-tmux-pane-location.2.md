@@ -68,5 +68,5 @@ topology posts exactly one message; an unchanged topology (same hash) posts none
 - [ ] The probe goes through `defaultSpawnSync` (locale-defaulted, timeout-bounded).
 
 ## Done summary
-
+Restore-worker now probes whole-server tmux topology on a ~1s coalesced idle wake, hash-dedups, and posts a TmuxTopologySnapshot (generation_id + pane map) only on change; degraded probes (gone/transient/empty/no-generation) never wipe. Main mints exactly one TmuxTopologySnapshot event per posted change.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "tmux topology timer-poll producer",
-  "updated_at": "2026-06-23T01:45:25.559000Z"
+  "updated_at": "2026-06-23T08:55:12.155000Z",
+  "worker_done_at": "2026-06-23T08:55:12.155000Z"
 }
