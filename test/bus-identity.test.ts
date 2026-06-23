@@ -41,6 +41,23 @@ function seedJob(db: Database, job: JobSeed): void {
   );
 }
 
+interface EpicSeed {
+  epic_id: string;
+  /** Raw JSON-TEXT for `job_links`. A string is stored verbatim (lets a test
+   *  seed malformed JSON); an array is stringified. */
+  job_links: { kind: string; job_id: string }[] | string;
+}
+
+function seedEpic(db: Database, epic: EpicSeed): void {
+  const cell =
+    typeof epic.job_links === "string"
+      ? epic.job_links
+      : JSON.stringify(epic.job_links);
+  db.query(
+    `INSERT INTO epics (epic_id, updated_at, job_links) VALUES (?, ?, ?)`,
+  ).run(epic.epic_id, 1, cell);
+}
+
 function makeChannel(overrides: Partial<LiveChannel> = {}): LiveChannel {
   return {
     channel_id: "ch-1",
@@ -346,6 +363,241 @@ test("pid reuse: same pid different start_time maps to the correct distinct agen
   if (current.kind === "ok") {
     expect(current.identity?.job_id).toBe("sess-new");
     expect(current.channel?.channel_id).toBe("ch-new");
+  }
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// role addressing — planner@<epic_id> resolves the epic's creator session
+// ---------------------------------------------------------------------------
+
+test("planner@<epic> resolves the creator's live channel", () => {
+  const { db } = freshMemDb();
+  // The creator's job_id IS a session id — seed it as a jobs row + live channel.
+  seedJob(db, {
+    job_id: "sess-creator",
+    pid: 1000,
+    start_time: "t1",
+    title: "planner-session",
+  });
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [{ kind: "creator", job_id: "sess-creator" }],
+  });
+  const channels = [
+    makeChannel({
+      channel_id: "ch-creator",
+      pid: 1000,
+      start_time: "t1",
+      session_id: "sess-creator",
+    }),
+  ];
+  const r = resolveTarget(channels, db, "planner@fn-1-demo");
+  expect(r.kind).toBe("ok");
+  if (r.kind === "ok") {
+    expect(r.channel?.channel_id).toBe("ch-creator");
+    expect(r.identity?.job_id).toBe("sess-creator");
+  }
+  db.close();
+});
+
+test("planner@<epic> with the creator OFFLINE resolves identity, null channel (not_connected shape)", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-creator",
+    pid: 1000,
+    start_time: "t1",
+    title: "planner-session",
+  });
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [{ kind: "creator", job_id: "sess-creator" }],
+  });
+  // No live channel for the creator.
+  const r = resolveTarget([], db, "planner@fn-1-demo");
+  expect(r.kind).toBe("ok");
+  if (r.kind === "ok") {
+    expect(r.identity?.job_id).toBe("sess-creator");
+    expect(r.channel).toBeNull();
+  }
+  db.close();
+});
+
+test("planner@<epic> with NO creator edge (refiner-only job_links) → unknown", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [{ kind: "refiner", job_id: "sess-refiner" }],
+  });
+  const r = resolveTarget([], db, "planner@fn-1-demo");
+  expect(r.kind).toBe("unknown");
+  if (r.kind === "unknown") expect(r.target).toBe("planner@fn-1-demo");
+  db.close();
+});
+
+test("planner@<epic> with EMPTY job_links → unknown (just-scaffolded epic, fail-soft)", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, { epic_id: "fn-1-demo", job_links: [] });
+  const r = resolveTarget([], db, "planner@fn-1-demo");
+  expect(r.kind).toBe("unknown");
+  db.close();
+});
+
+test("planner@<unknown-epic> → unknown (epic id not in the projection)", () => {
+  const { db } = freshMemDb();
+  const r = resolveTarget([], db, "planner@fn-does-not-exist");
+  expect(r.kind).toBe("unknown");
+  if (r.kind === "unknown") expect(r.target).toBe("planner@fn-does-not-exist");
+  db.close();
+});
+
+test("planner@<epic> with MALFORMED job_links JSON → unknown, does NOT throw", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, { epic_id: "fn-1-demo", job_links: "{not valid json[" });
+  const r = resolveTarget([], db, "planner@fn-1-demo");
+  expect(r.kind).toBe("unknown");
+  db.close();
+});
+
+test("planner@<epic> with TWO creators, one connected → clean-picks the live one", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-a",
+    pid: 1,
+    start_time: "ta",
+    title: "creator-a",
+  });
+  seedJob(db, {
+    job_id: "sess-b",
+    pid: 2,
+    start_time: "tb",
+    title: "creator-b",
+  });
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [
+      { kind: "creator", job_id: "sess-a" },
+      { kind: "creator", job_id: "sess-b" },
+    ],
+  });
+  // Only sess-b is live.
+  const channels = [
+    makeChannel({
+      channel_id: "ch-b",
+      pid: 2,
+      start_time: "tb",
+      session_id: "sess-b",
+      connected: true,
+    }),
+  ];
+  const r = resolveTarget(channels, db, "planner@fn-1-demo");
+  expect(r.kind).toBe("ok");
+  if (r.kind === "ok") {
+    expect(r.identity?.job_id).toBe("sess-b");
+    expect(r.channel?.channel_id).toBe("ch-b");
+  }
+  db.close();
+});
+
+test("planner@<epic> with TWO creators, both connected → ambiguous", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-a",
+    pid: 1,
+    start_time: "ta",
+    title: "creator-a",
+  });
+  seedJob(db, {
+    job_id: "sess-b",
+    pid: 2,
+    start_time: "tb",
+    title: "creator-b",
+  });
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [
+      { kind: "creator", job_id: "sess-a" },
+      { kind: "creator", job_id: "sess-b" },
+    ],
+  });
+  const channels = [
+    makeChannel({
+      channel_id: "ch-a",
+      pid: 1,
+      start_time: "ta",
+      session_id: "sess-a",
+      connected: true,
+    }),
+    makeChannel({
+      channel_id: "ch-b",
+      pid: 2,
+      start_time: "tb",
+      session_id: "sess-b",
+      connected: true,
+    }),
+  ];
+  const r = resolveTarget(channels, db, "planner@fn-1-demo");
+  expect(r.kind).toBe("ambiguous");
+  if (r.kind === "ambiguous") {
+    expect(r.identities.map((i) => i.job_id).sort()).toEqual([
+      "sess-a",
+      "sess-b",
+    ]);
+  }
+  db.close();
+});
+
+test("refiner@<epic> → unknown (recognized but unwired in this task)", () => {
+  const { db } = freshMemDb();
+  // Even WITH a resolvable refiner edge + live channel, refiner stays unknown.
+  seedJob(db, { job_id: "sess-r", pid: 5, start_time: "tr", title: "ref" });
+  seedEpic(db, {
+    epic_id: "fn-1-demo",
+    job_links: [{ kind: "refiner", job_id: "sess-r" }],
+  });
+  const channels = [
+    makeChannel({
+      channel_id: "ch-r",
+      pid: 5,
+      start_time: "tr",
+      session_id: "sess-r",
+    }),
+  ];
+  const r = resolveTarget(channels, db, "refiner@fn-1-demo");
+  expect(r.kind).toBe("unknown");
+  if (r.kind === "unknown") expect(r.target).toBe("refiner@fn-1-demo");
+  db.close();
+});
+
+test("a TYPO role token (plannr@…) falls through to the name tiers", () => {
+  const { db } = freshMemDb();
+  // No role match → name tiers. With nothing named "plannr@fn-1-demo" → unknown,
+  // proving it took the name-tier path (not the role branch's clean unknown,
+  // which would carry the same kind — so assert it reached the tiers by also
+  // checking a literal-@ name DOES resolve below).
+  const r = resolveTarget([], db, "plannr@fn-1-demo");
+  expect(r.kind).toBe("unknown");
+  db.close();
+});
+
+test("a literal agent NAME containing @ (not a valid role) resolves via the name tiers", () => {
+  const { db } = freshMemDb();
+  // An agent literally named "build@host" — '@' present but not a role prefix.
+  seedJob(db, {
+    job_id: "sess-1",
+    pid: 1000,
+    start_time: "t1",
+    title: "build@host",
+    name_history: ["build@host"],
+  });
+  const channels = [
+    makeChannel({ session_id: "sess-1", current_name: "build@host" }),
+  ];
+  const r = resolveTarget(channels, db, "build@host");
+  expect(r.kind).toBe("ok");
+  if (r.kind === "ok") {
+    expect(r.method).toBe("jobs-exact");
+    expect(r.identity?.job_id).toBe("sess-1");
   }
   db.close();
 });

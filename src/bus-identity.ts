@@ -220,10 +220,132 @@ function collapseByLive(
   return { all: identities };
 }
 
+/** The closed set of role tokens a `role@epic` address may carry. */
+export type BusRole = "planner" | "refiner";
+
+/** Map a recognized role to the `JobLinkEntry.kind` it resolves through. */
+const ROLE_TO_LINK_KIND: Record<BusRole, "creator" | "refiner"> = {
+  planner: "creator",
+  refiner: "refiner",
+};
+
+/**
+ * Parse a `role@epic` address into its `{ role, epic }` parts, or `null` when
+ * the target is not a recognized role address. The role token is validated
+ * against the closed `{planner, refiner}` set: a typo (`plannr@…`) returns
+ * `null`, and a literal agent name that merely CONTAINS `@` returns `null` too —
+ * either way the caller falls through to the existing name tiers, so role
+ * ordering never hijacks a real name. Pure.
+ */
+export function parseRoleAddress(
+  target: string,
+): { role: BusRole; epic: string } | null {
+  const m = /^(planner|refiner)@(.+)$/.exec(target);
+  if (m === null) return null;
+  return { role: m[1] as BusRole, epic: m[2] };
+}
+
+/**
+ * Read the `epics.job_links` cell for ONE epic and return the `job_id`s of every
+ * entry whose `kind` matches. Reads `epics`, never `jobs` (the only resolver path
+ * that consults the `epics` projection). The JSON-TEXT cell is decoded
+ * DEFENSIVELY — a NULL/empty cell, a parse failure, or a non-array payload all
+ * yield `[]`, mirroring `rowToIdentity` / `decodeRow` so a malformed row never
+ * throws inside the live relay path. Bound param only — never interpolated. Pure
+ * over `(db, kind, epic)`.
+ */
+export function roleJobIds(
+  db: Database,
+  kind: "creator" | "refiner",
+  epic: string,
+): string[] {
+  const row = db
+    .query("SELECT job_links FROM epics WHERE epic_id = ?")
+    .get(epic) as { job_links: string | null } | null;
+  if (row == null) return [];
+  const cell = row.job_links;
+  if (typeof cell !== "string" || cell.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cell);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const ids: string[] = [];
+  for (const entry of parsed) {
+    if (
+      entry != null &&
+      typeof entry === "object" &&
+      (entry as { kind?: unknown }).kind === kind &&
+      typeof (entry as { job_id?: unknown }).job_id === "string"
+    ) {
+      ids.push((entry as { job_id: string }).job_id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Resolve a `role@epic` address (the role branch of {@link resolveTarget}, run
+ * BEFORE the name tiers). Collects every `kind`-matching `job_id` from the
+ * epic's `job_links` — an epic can carry more than one creator edge
+ * (cross-session edges are never suppressed) — and resolves each through the
+ * existing identity path (a creator `job_id` IS a session id, resolved by
+ * recursively re-entering {@link resolveTarget}; the bare `job_id` carries no
+ * role prefix, so the recursion terminates at the exact tier).
+ *
+ *  - 0 ids → `unknown`
+ *  - 1 id → the recursive resolution's result (`ok` with a live channel, or
+ *    `not_connected`-shaped `ok` with a null channel when the creator is offline)
+ *  - >1 ids → `collapseByLive` over the resolved identities (clean-pick the one
+ *    connected creator, else `ambiguous`)
+ *
+ * Pure over `(channels, db, role, epic)`.
+ */
+function resolveRoleAddress(
+  channels: LiveChannel[],
+  db: Database,
+  role: BusRole,
+  epic: string,
+  rawTarget: string,
+): BusResolveResult {
+  // `refiner@…` is recognized (so it never falls through to the name tiers) but
+  // UNWIRED in this task — a clean `unknown`, never a name-tier hijack.
+  if (role === "refiner") return { kind: "unknown", target: rawTarget };
+  const ids = roleJobIds(db, ROLE_TO_LINK_KIND[role], epic);
+  if (ids.length === 0) return { kind: "unknown", target: rawTarget };
+  if (ids.length === 1) return resolveTarget(channels, db, ids[0]);
+
+  // >1 creator edges — resolve each job_id to its identity, then collapse on the
+  // single connected one (else surface ambiguity), reusing the name-tier path.
+  const identities: ResolvedIdentity[] = [];
+  for (const id of ids) {
+    const r = resolveTarget(channels, db, id);
+    if (r.kind === "ok" && r.identity != null) identities.push(r.identity);
+    else if (r.kind === "ambiguous") identities.push(...r.identities);
+  }
+  if (identities.length === 0) return { kind: "unknown", target: rawTarget };
+  const collapsed = collapseByLive(identities, channels);
+  if ("picked" in collapsed) {
+    return {
+      kind: "ok",
+      method: "jobs-exact",
+      identity: collapsed.picked,
+      channel: collapsed.channel,
+    };
+  }
+  return { kind: "ambiguous", method: "jobs-exact", identities: collapsed.all };
+}
+
 /**
  * Resolve a target to a delivery channel and/or stable identity. The full
  * two-layer pipeline:
  *
+ *  0. Role branch — a `role@epic` address (`planner@<epic_id>`) resolves through
+ *     the epic's `job_links` creator edge(s) BEFORE the name tiers, so a role
+ *     address can never miss all three job-keyed tiers and fall to `unknown`. A
+ *     non-role `@`-bearing name falls through to the tiers unchanged.
  *  1. Layer 2 tiers over ALL `jobs` — exact → prefix → substring. First tier
  *     with a single identity (or a single LIVE one among several) wins.
  *  2. Layer 1 maps that identity to its current live channel (may be null — the
@@ -240,6 +362,11 @@ export function resolveTarget(
   db: Database,
   target: string,
 ): BusResolveResult {
+  const role = parseRoleAddress(target);
+  if (role !== null) {
+    return resolveRoleAddress(channels, db, role.role, role.epic, target);
+  }
+
   for (const tier of ["exact", "prefix", "substring"] as const) {
     const identities = jobsAtTier(db, target, tier);
     if (identities.length === 0) continue;
