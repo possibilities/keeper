@@ -53,5 +53,5 @@ the fake commit log. A faked non-zero commit still exercises `CommitFailed`.
 - [ ] no-op / idempotency / "exactly one commit" coverage preserved via snapshot diffing
 
 ## Done summary
-
+Added a PlanVcs facade seam (src/vcs.ts) routing commit.ts + invocation.ts git plumbing through getVcs(); the bun:test harness installs a snapshot-diffing fake per runCli call so default plan tests spawn zero real git on the write/dirty-discovery side, with assertion helpers + gitBaseline reading the fake commit log.
 ## Evidence
