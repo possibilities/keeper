@@ -48,5 +48,5 @@ non-collision case (normal output preserved). `bun test && bun lint && bun typec
 - [ ] `bun test`, `bun lint`, `bun typecheck` pass.
 
 ## Done summary
-
+Added a fail-loud self-transcript-collision guard: isSelfTranscriptCollision (pure predicate in src/pair-command.ts) wired at the output-assembly site in cli/pair.ts so a resolver fallback matching the driver's own transcript emits failed (error=self-transcript-collision) instead of a bogus completed. Covered by fast-tier unit tests; SKILL.md failure-mode list updated.
 ## Evidence
