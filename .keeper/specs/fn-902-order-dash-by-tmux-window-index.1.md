@@ -80,5 +80,5 @@ so the column flows through with NO decoder change once it is in `columns`.
 - [ ] `bun run typecheck` clean; `bun run test` (OpenTUI chain) and `bun run test:full` green; no `SCHEMA_VERSION` / `keeper/api.py` change.
 
 ## Done summary
-
+Exposed jobs.window_index on the read socket and made it the dash's primary intra-session-band sort key (known ASC, null/non-finite to tail, then created_at/job_id), mirroring restore-set's null convention. Updated stale created_at-order docstrings/README and added a reversed-index fast comparator proof.
 ## Evidence
