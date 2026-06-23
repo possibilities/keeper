@@ -61,5 +61,5 @@ Extend test/git-boot-seed.test.ts: scoped discovery drops stale roots while keep
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Scoped the git boot-seed to plan-relevant + gated roots (open-epic project_dir + task target_repo), dropping the full historical jobs.cwd sweep; made seed_required self-clear once all gated roots seed via the boot-seed AND main's above-floor GitSnapshot fold (producer-only, no git-worker write); logged the previously-silent readStatus→null per-root skip.
 ## Evidence
