@@ -21,10 +21,12 @@ agents (and humans driving them). Agents reach each other by session name,
 session id, ANY former name, or a role address `planner@<epic_id>` (resolved
 server-side to the epic's creator session) — resolved transparently, so a name
 that has since changed still lands while the agent is connected. A role address
-is just a resolution convenience: an unresolvable one (no creator / unknown
-epic / malformed links) reports `unknown_target`, and a resolved-but-offline
-one reports `not_connected` — the same outcomes as any other target, no new
-result code.
+is mostly a resolution convenience: an unresolvable one (no creator / unknown
+epic / malformed links) reports `unknown_target`. A resolved-but-offline target
+differs by KIND: a `planner@<epic_id>` send to a known-but-offline creator
+reports `queued_for_wake` (the escalation is durably persisted and replayed when
+that creator returns — and `keeper bus wake` can resume it now), whereas every
+OTHER offline target reports `not_connected` and is never queued.
 
 Presence is tri-state: an agent is **connected** (has an open socket — a
 send lands), **known but disconnected** (a former identity with no open
@@ -69,19 +71,48 @@ stdin (handy for a multi-line brief or a heredoc).
 
 The send returns an immediate, honest result and sets the exit code:
 
-- **`delivered`** — prints `delivered to <target>`, exit 0. The only success.
+- **`delivered`** — prints `delivered to <target>`, exit 0. Delivered live.
+- **`queued_for_wake`** — a `planner@<epic_id>` send whose creator is known but
+  OFFLINE: the escalation is durably persisted and replayed when that creator
+  resubscribes. Exit 0 (a success, NOT a miss). To resume the offline creator
+  NOW, run `keeper bus wake "planner@<epic_id>"` (see below). This is the ONLY
+  send outcome that queues to land later.
 - **`not_connected`** — the target is a known identity but has no open
-  socket; nothing was delivered. Exit 1. The message is NOT queued and will
-  NOT "land when they reconnect" — re-send once the agent is back.
+  socket; nothing was delivered. Exit 1. For a NON-role target this message is
+  NOT queued and will NOT "land when they reconnect" — re-send once the agent
+  is back. (A `planner@<epic_id>` creator offline reports `queued_for_wake`, not
+  this.)
 - **`unknown_target`** — the name resolves to no agent. Exit 1.
 - **`ambiguous_target`** — the name matches more than one agent; use a more
   specific name or id. Exit 1.
 - **`delivery_failed`** — the target was connected but the write did not
   complete. Exit 1.
 
-A miss is a LOUD exit-1 error on stderr — never a silent success. If a send
-fails, handle it (re-send, pick another target, or surface it); do not
-assume it landed.
+A miss (`not_connected` / `unknown_target` / `ambiguous_target` /
+`delivery_failed`) is a LOUD exit-1 error on stderr — never a silent success.
+If a send fails, handle it (re-send, pick another target, or surface it); do
+not assume it landed. `delivered` and `queued_for_wake` are the two exit-0
+successes.
+
+## Wake an offline planner
+
+When a `planner@<epic_id>` send returns `queued_for_wake`, the escalation is
+persisted but the creator is offline. Resume it so the queued message is
+redelivered and acted on:
+
+```sh
+keeper bus wake "planner@<epic_id>"
+```
+
+This runs CLIENT-SIDE in the verb (the bus relay never spawns): it resolves the
+epic's creator from trusted plan data and resumes it via `claude --resume` into
+a dedicated `agentbus` tmux session. It is single-flighted per session (no
+double-resume), skipped when the creator is already live, and cooldown-gated
+after repeated failures, so it is safe to call once on every `queued_for_wake`.
+Outcomes (all exit 0 except `unknown_creator`): `launched`, `already_live`,
+`in_flight`, `cooldown`, `launch_failed` (fail-open — the queued message
+remains), `unknown_creator` (exit 1). Reaping of the `agentbus` session is owned
+by a separate cleanup system, not this verb.
 
 To fan a message out to everyone on the bus:
 

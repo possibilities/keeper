@@ -114,6 +114,13 @@ export const DEFAULT_EXEC_BACKEND = "tmux" as const;
  *  Hardcoded — not configurable. */
 export const MANAGED_EXEC_SESSION = "autopilot" as const;
 
+/** The dedicated managed-session name `keeper bus wake` resumes an offline
+ *  planner@<epic> creator into. Hardcoded, distinct from {@link
+ *  MANAGED_EXEC_SESSION} so woken planners never share a window list with
+ *  autopilot dispatch. Window reaping for this session is owned by the orthogonal
+ *  cleanup system, NOT keeper — this constant only names the spawn target. */
+export const AGENTBUS_EXEC_SESSION = "agentbus" as const;
+
 /** Read a `ReadableStream` into a string. Returns `""` on null/empty. */
 async function streamToText(s: ReadableStream | null): Promise<string> {
   if (s == null) {
@@ -549,6 +556,24 @@ export function buildTmuxRenameWindowArgs(
  */
 export function buildTmuxKillWindowArgs(paneId: string): string[] {
   return ["tmux", "kill-window", "-t", paneId];
+}
+
+/**
+ * Build the tmux `set-option -w -t <target> <name> <value>` window-option argv.
+ * Pure — exported for tests. Targets the WINDOW scope (`-w`); the caller passes
+ * `=<session>:` (exact session, current window — the just-spawned window is
+ * current after a non-detached `new-window`) per the `setup-tmux.ts` precedent.
+ * Used to stamp the cleanup system's managed-window user-option marker on each
+ * `agentbus` spawn so the external reaper can identify + reap keeper's windows
+ * precisely and never touch a human's hand-opened window. keeper only SETS the
+ * marker here; it never reaps.
+ */
+export function buildTmuxSetWindowOptionArgs(
+  target: string,
+  name: string,
+  value: string,
+): string[] {
+  return ["tmux", "set-option", "-w", "-t", target, name, value];
 }
 
 /** Dep bag for {@link createTmuxPaneOps} — the direct session-agnostic pane

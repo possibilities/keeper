@@ -40,7 +40,9 @@ import {
   sendSuccessMessage,
   spillFileName,
   spillPointerLine,
+  wakeResultLine,
 } from "../cli/bus";
+import type { WakeResult } from "../src/bus-wake";
 
 describe("parseBusArgv routing", () => {
   test("list", () => {
@@ -119,6 +121,65 @@ describe("parseBusArgv routing", () => {
   test("--help anywhere → help", () => {
     expect(parseBusArgv(["--help"]).kind).toBe("help");
     expect(parseBusArgv(["chat", "send", "-h"]).kind).toBe("help");
+  });
+
+  test("wake <planner@epic>", () => {
+    expect(parseBusArgv(["wake", "planner@fn-1"])).toEqual({
+      kind: "wake",
+      target: "planner@fn-1",
+    });
+  });
+
+  test("wake without a target → usage", () => {
+    const r = parseBusArgv(["wake"]);
+    expect(r.kind).toBe("usage");
+    if (r.kind === "usage") expect(r.error).toContain("planner@");
+  });
+});
+
+describe("wakeResultLine (outcome → message + exit code)", () => {
+  function res(overrides: Partial<WakeResult>): WakeResult {
+    return {
+      outcome: "launched",
+      sessionId: "s1",
+      detail: "ok",
+      ...overrides,
+    };
+  }
+
+  test("only unknown_creator is exit 1; every other outcome is exit 0", () => {
+    expect(
+      wakeResultLine("planner@fn-1", res({ outcome: "launched" })).exitCode,
+    ).toBe(0);
+    expect(
+      wakeResultLine("planner@fn-1", res({ outcome: "already_live" })).exitCode,
+    ).toBe(0);
+    expect(
+      wakeResultLine("planner@fn-1", res({ outcome: "in_flight" })).exitCode,
+    ).toBe(0);
+    expect(
+      wakeResultLine("planner@fn-1", res({ outcome: "cooldown" })).exitCode,
+    ).toBe(0);
+    expect(
+      wakeResultLine("planner@fn-1", res({ outcome: "launch_failed" }))
+        .exitCode,
+    ).toBe(0);
+    expect(
+      wakeResultLine(
+        "planner@fn-1",
+        res({ outcome: "unknown_creator", sessionId: null }),
+      ).exitCode,
+    ).toBe(1);
+  });
+
+  test("the line carries the outcome + target + detail", () => {
+    const { line } = wakeResultLine(
+      "planner@fn-1",
+      res({ outcome: "launched", detail: "resumed s1" }),
+    );
+    expect(line).toContain("launched");
+    expect(line).toContain("planner@fn-1");
+    expect(line).toContain("resumed s1");
   });
 });
 

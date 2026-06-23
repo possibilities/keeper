@@ -3010,12 +3010,21 @@ name resolves to a known agent, but delivery is gated on that agent having an
 OPEN socket. A directed send is synchronous and honest: the server resolves +
 fans out and replies a single result frame
 (`{type:"ack",op:"publish",result,recipients}`) whose `result` is `delivered`
-(open socket, full frame accepted), `not_connected` (known identity, no open
-socket — delivered to no one, never silently queued), `unknown_target`,
-`ambiguous_target`, or `delivery_failed` (connected but the write was partial),
-and `messages.status` records that true outcome. The CLI exits 0 only on
-`delivered` and fails loud (exit 1, stderr) on every other result — a non-delivery
-is never a silent exit-0. Liveness is socket-close, NOT a heartbeat: a peer's
+(open socket, full frame accepted), `queued_for_wake` (a `planner@<epic_id>` role
+send whose creator is known-but-offline — durably persisted on `messages` and
+replayed recipient-keyed on that creator's resubscribe, fn-918), `not_connected`
+(any OTHER known identity with no open socket — delivered to no one, never
+silently queued), `unknown_target`, `ambiguous_target`, or `delivery_failed`
+(connected but the write was partial), and `messages.status` records that true
+outcome. The CLI exits 0 on the two successes (`delivered`, `queued_for_wake`)
+and fails loud (exit 1, stderr) on every other result — a non-delivery is never a
+silent exit-0. A `queued_for_wake` send can be RESUMED now by the CLIENT-SIDE
+`keeper bus wake "planner@<epic_id>"` verb (fn-918): it resolves the epic's
+creator from the trusted `job_links` edge and `claude --resume`s it into a
+dedicated `agentbus` tmux session (single-flighted per session, liveness- and
+cooldown-gated, fail-open). The relay itself NEVER spawns — wake is entirely the
+CLI verb — and reaping/autoclose of the `agentbus` session is owned by a separate
+cleanup system, NOT keeper. Liveness is socket-close, NOT a heartbeat: a peer's
 death closes its fd → kernel FIN → the relay drops the channel, with no periodic
 liveness timer; boot rehydration still drops dead pids. `keeper bus list` is
 informational only, never a send precondition (there is no `resolve` subcommand —

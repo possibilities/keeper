@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * `keeper bus <verb>` — the Agent Bus command surface (epic fn-875, task .3).
  *
@@ -35,17 +36,34 @@
  * tests exercise them without a socket; a real round-trip lives in the full tier.
  */
 
+import { Database } from "bun:sqlite";
 import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveBusSockPath } from "../src/db";
+import { loadChannels } from "../src/bus-db";
+import { parseRoleAddress, roleJobIds } from "../src/bus-identity";
+import {
+  runWake,
+  type WakeCooldownRecord,
+  type WakeCreator,
+  type WakeResult,
+} from "../src/bus-wake";
+import { CommitWorkLock } from "../src/commit-work/flock";
+import {
+  openDb,
+  resolveBusDbPath,
+  resolveBusSockPath,
+  resolveDbPath,
+} from "../src/db";
+import type { SpawnFn } from "../src/exec-backend";
 
 /** Reserved tenant namespace handled by the `chat` sub-verb. */
 export const CHAT_NAMESPACE = "chat";
@@ -69,6 +87,8 @@ Usage:
   keeper bus list                         Show who is on the bus (JSON, informational)
   keeper bus chat send <target> <msg|->   Message one agent (current or former name)
   keeper bus chat broadcast <msg|->       Message everyone on the chat namespace
+  keeper bus wake <planner@epic>          Resume an offline epic-creator session so a
+                                          queued escalation is redelivered (client-side)
   keeper bus watch                        Long-lived inbox subscriber (Monitor command)
 
 Your inbox is already open:
@@ -108,6 +128,22 @@ Send blindly:
   (queued_for_wake); a generic offline name never queues. 'keeper bus list' is
   informational only.
 
+Wake an offline planner:
+  'keeper bus wake <planner@epic>' resumes the epic's offline creator session via
+  'claude --resume' into a dedicated 'agentbus' tmux session, so a queued
+  escalation (queued_for_wake) is redelivered when the planner returns. The wake
+  runs CLIENT-SIDE in this verb — the bus relay never spawns. It is single-flighted
+  per session (no double-resume), skipped when the creator is already live, and
+  cooldown-gated after repeated failures. Outcomes (all exit 0 except a hard miss):
+    launched         → a resume was spawned into 'agentbus'
+    already_live     → the creator is on the bus / running; no resume needed
+    in_flight        → another wake of this session is already running
+    cooldown         → a recent failed wake is still cooling down
+    launch_failed    → the launch failed (fail-open; the queued message remains)
+    unknown_creator  → no creator session resolved for the epic, exit 1
+  '/work' Phase 2c auto-invokes this on a queued_for_wake send, then yields. Window
+  reaping of 'agentbus' is owned by the separate cleanup system, NOT this verb.
+
 Notes:
   - <msg> of '-' reads the message body from stdin.
   - 'chat' is the first tenant; the wire carries a namespace axis for future tenants.
@@ -127,7 +163,8 @@ export type BusCommand =
   | { kind: "list" }
   | { kind: "watch" }
   | { kind: "send"; target: string; message: string }
-  | { kind: "broadcast"; message: string };
+  | { kind: "broadcast"; message: string }
+  | { kind: "wake"; target: string };
 
 /**
  * Route a `keeper bus` argv (already stripped of the `bus` token) to a command.
@@ -149,6 +186,16 @@ export function parseBusArgv(argv: string[]): BusCommand {
       return { kind: "list" };
     case "watch":
       return { kind: "watch" };
+    case "wake": {
+      const target = argv[1];
+      if (target === undefined || target.length === 0) {
+        return {
+          kind: "usage",
+          error: "wake requires a <planner@epic> target",
+        };
+      }
+      return { kind: "wake", target };
+    }
     case "chat": {
       const sub = argv[1];
       if (sub === "send") {
@@ -339,6 +386,209 @@ export function isStaleSpill(
 /** The spill inbox directory: `<state>/bus/inbox/` (alongside bus.db/bus.sock). */
 export function resolveInboxDir(): string {
   return join(homedir(), ".local", "state", "keeper", "bus", "inbox");
+}
+
+/**
+ * The wake runtime dir holding the per-session single-flight lock files + cooldown
+ * records: `<state>/bus/wake/`. `KEEPER_BUS_WAKE_DIR` overrides it for tests. */
+export function resolveWakeDir(): string {
+  const override = process.env.KEEPER_BUS_WAKE_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "bus", "wake");
+}
+
+/** Sanitize a session id to a safe filename token (it is a Claude session id /
+ *  uuid in practice, but guard against any stray path char). */
+function wakeFileToken(sessionId: string): string {
+  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+// ---------------------------------------------------------------------------
+// wake — resume an offline planner@<epic> creator (client-side)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the live bus channel `session_id` set from the bus.db `channels` cache
+ * (best-effort persistence of the live registry). Opened READ-ONLY — the bus
+ * worker owns the sole writable connection; we never migrate or write it. Any
+ * failure (missing file, locked, schema) fails soft to an empty set: the
+ * `jobs.state` running-check is the authoritative liveness signal, this only adds
+ * the on-the-bus signal. */
+function readLiveSessionIds(): ReadonlySet<string> {
+  const ids = new Set<string>();
+  let db: Database | null = null;
+  try {
+    db = new Database(resolveBusDbPath(), { readonly: true });
+    for (const ch of loadChannels(db)) {
+      if (ch.session_id != null && ch.session_id.length > 0) {
+        ids.add(ch.session_id);
+      }
+    }
+  } catch {
+    // fail-soft — no on-bus signal, rely on jobs.state.
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // best-effort
+    }
+  }
+  return ids;
+}
+
+/**
+ * Resolve the epic's creator `jobs` rows for a `planner@<epic>` wake. Reads
+ * keeper.db READ-ONLY: `roleJobIds(db, "creator", epic)` derives the creator
+ * `job_id`s from `epics.job_links`, then each is fetched from `jobs`. The resume
+ * target is TRUSTED plan data (the creator edge), never a sender claim. Fails soft
+ * to `[]` on any read error. */
+function resolveCreatorJobs(epic: string): WakeCreator[] {
+  let db: ReturnType<typeof openDb> | null = null;
+  try {
+    db = openDb(resolveDbPath(), { readonly: true, prepareStmts: false });
+    const ids = roleJobIds(db.db, "creator", epic);
+    const rows: WakeCreator[] = [];
+    for (const id of ids) {
+      const row = db.db
+        .query(
+          "SELECT job_id, cwd, title, state, updated_at FROM jobs WHERE job_id = ?",
+        )
+        .get(id) as WakeCreator | null;
+      if (row != null) {
+        rows.push({
+          job_id: String(row.job_id),
+          cwd: row.cwd == null ? null : String(row.cwd),
+          title: row.title == null ? null : String(row.title),
+          state: String(row.state),
+          updated_at: Number(row.updated_at),
+        });
+      }
+    }
+    return rows;
+  } catch {
+    return [];
+  } finally {
+    try {
+      db?.db.close();
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/** Read the persisted cooldown record for a session, or null when absent/unparseable. */
+function readWakeCooldown(sessionId: string): WakeCooldownRecord | null {
+  const path = join(
+    resolveWakeDir(),
+    `${wakeFileToken(sessionId)}.cooldown.json`,
+  );
+  try {
+    if (!existsSync(path)) {
+      return null;
+    }
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const failures = Number(parsed.failures);
+    const last = Number(parsed.last_failure_ms);
+    if (!Number.isFinite(failures) || !Number.isFinite(last)) {
+      return null;
+    }
+    return { failures, last_failure_ms: last };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist (or, when `record` is null, clear) a session's cooldown record. */
+function writeWakeCooldown(
+  sessionId: string,
+  record: WakeCooldownRecord | null,
+): void {
+  const path = join(
+    resolveWakeDir(),
+    `${wakeFileToken(sessionId)}.cooldown.json`,
+  );
+  try {
+    if (record === null) {
+      rmSync(path, { force: true });
+      return;
+    }
+    mkdirSync(resolveWakeDir(), { recursive: true });
+    writeFileSync(path, JSON.stringify(record), "utf8");
+  } catch {
+    // best-effort — a lost cooldown record only risks one extra wake attempt.
+  }
+}
+
+/**
+ * Acquire the per-session single-flight lock NON-BLOCKING via `flock(LOCK_NB)`.
+ * Returns a release handle, or null when another concurrent wake of this session
+ * holds it (the TOCTOU double-spawn guard — `has-session` alone is racy). The lock
+ * file is per-session under the wake dir. A lock-infra error (FFI/open) fails OPEN
+ * by returning a no-op handle so a broken lock never wedges the wake — the
+ * liveness recheck + cooldown still bound double-spawn risk. */
+function tryWakeLock(sessionId: string): { release: () => void } | null {
+  const dir = resolveWakeDir();
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // best-effort — acquire below surfaces a real failure.
+  }
+  const lockPath = join(dir, `${wakeFileToken(sessionId)}.lock`);
+  try {
+    const held = CommitWorkLock.tryAcquire(lockPath);
+    if (held === null) {
+      return null; // another wake holds it.
+    }
+    return { release: () => held.release() };
+  } catch {
+    // Lock infra unavailable — fail OPEN (proceed without single-flight rather
+    // than wedge). Liveness recheck + cooldown still guard double-spawn.
+    return { release: () => {} };
+  }
+}
+
+/** Map a {@link WakeResult} to the one-line CLI message + exit code. Only an
+ *  `unknown_creator` miss is exit 1; every other verdict is an exit-0 outcome. */
+export function wakeResultLine(
+  target: string,
+  result: WakeResult,
+): {
+  line: string;
+  exitCode: number;
+} {
+  const exitCode = result.outcome === "unknown_creator" ? 1 : 0;
+  return { line: `${result.outcome} (${target}): ${result.detail}`, exitCode };
+}
+
+/** Run the `keeper bus wake <planner@epic>` verb: parse the role address, wire the
+ *  keeper.db / bus.db / lock / cooldown / launch deps, and run the pure pipeline. */
+async function runWakeVerb(target: string): Promise<{
+  line: string;
+  exitCode: number;
+}> {
+  const role = parseRoleAddress(target);
+  if (role === null || role.role !== "planner") {
+    return {
+      line: `wake target '${target}' is not a planner@<epic> address`,
+      exitCode: 1,
+    };
+  }
+  const result = await runWake(role.epic, {
+    resolveCreatorJobs,
+    liveSessionIds: readLiveSessionIds,
+    readCooldown: readWakeCooldown,
+    writeCooldown: writeWakeCooldown,
+    tryLock: tryWakeLock,
+    spawn: (cmd, options) => Bun.spawn(cmd, options) as ReturnType<SpawnFn>,
+    now: () => Date.now(),
+    noteLine: (l) => process.stderr.write(`${l}\n`),
+  });
+  return wakeResultLine(target, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +1073,17 @@ export async function main(argv: string[]): Promise<void> {
       }
       process.stdout.write(`broadcast to ${res.recipients} recipient(s)\n`);
       return process.exit(0);
+    }
+    case "wake": {
+      // Client-side resume — NOT the bus socket. Never throws (runWake degrades
+      // every edge to a verdict); a hard miss is exit 1, every other outcome exit 0.
+      const { line, exitCode } = await runWakeVerb(cmd.target);
+      if (exitCode === 0) {
+        process.stdout.write(`${line}\n`);
+      } else {
+        process.stderr.write(`keeper bus: ${line}\n`);
+      }
+      return process.exit(exitCode);
     }
     case "watch": {
       await runWatch(sockPath);

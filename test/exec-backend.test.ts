@@ -27,6 +27,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  AGENTBUS_EXEC_SESSION,
   AGENTWRAP_SCHEMA_VERSION,
   AGENTWRAP_TMUX_EXIT,
   agentwrapLaunch,
@@ -40,6 +41,7 @@ import {
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
   buildTmuxServerPidArgs,
+  buildTmuxSetWindowOptionArgs,
   classifyCloseKind,
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
@@ -272,6 +274,30 @@ test("buildTmuxKillWindowArgs: targets the %N pane id, exact argv", () => {
     "kill-window",
     "-t",
     "%42",
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// AGENTBUS_EXEC_SESSION + buildTmuxSetWindowOptionArgs — the wake managed
+// session + the cleanup-system managed-window marker
+// ---------------------------------------------------------------------------
+
+test("AGENTBUS_EXEC_SESSION is 'agentbus', distinct from the autopilot session", () => {
+  expect(AGENTBUS_EXEC_SESSION).toBe("agentbus");
+  expect(AGENTBUS_EXEC_SESSION).not.toBe(MANAGED_EXEC_SESSION);
+});
+
+test("buildTmuxSetWindowOptionArgs: window-scoped set-option with target/name/value", () => {
+  expect(
+    buildTmuxSetWindowOptionArgs("=agentbus:", "@keeper_managed", "agentbus"),
+  ).toEqual([
+    "tmux",
+    "set-option",
+    "-w",
+    "-t",
+    "=agentbus:",
+    "@keeper_managed",
+    "agentbus",
   ]);
 });
 

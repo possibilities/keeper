@@ -497,6 +497,99 @@ test("a send to a KNOWN-but-DISCONNECTED agent returns `not_connected` and deliv
   alice.socket.end();
 });
 
+/** Seed an open epic whose `job_links` carries a `creator` edge to `creatorJobId`,
+ *  so a `planner@<epicId>` send resolves to that creator. The creator job must
+ *  already exist in `jobs` (the beforeEach seeds `sess-bob`). */
+function seedEpicWithCreator(epicId: string, creatorJobId: string): void {
+  const kdb = openDb(dbPath, { migrate: false });
+  kdb.db
+    .query(
+      `INSERT INTO epics (epic_id, status, updated_at, job_links)
+       VALUES (?, 'open', 30, ?)`,
+    )
+    .run(epicId, JSON.stringify([{ kind: "creator", job_id: creatorJobId }]));
+  kdb.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  kdb.db.close();
+}
+
+// The resume→redeliver→act loop, real-relay half (epic fn-918 task .2). The
+// `claude --resume` SPAWN half cannot run in CI (no real claude/tmux), so the
+// MANUAL end-to-end verification is: with keeperd live, send
+// `keeper bus chat send "planner@<offline-epic>" -` → `queued_for_wake`, then
+// `keeper bus wake "planner@<offline-epic>"` → the creator resumes into the
+// `agentbus` tmux session, re-arms `keeper bus watch`, and the queued escalation
+// is redelivered as a notification that re-invokes its loop. THIS test proves the
+// machine-checkable half over the real worker + bus.db: an offline planner@<epic>
+// send persists `queued_for_wake`, the returning creator receives ONLY its own
+// queued row on resubscribe (flipped to `delivered_after_wake`), and a second
+// subscribe redelivers nothing (the flip IS the dedup).
+test("wake loop (redeliver half): an offline planner@<epic> send queues, redelivers to the returning creator once, dedups on a second subscribe", async () => {
+  seedEpicWithCreator("fn-int-wake", "sess-bob");
+  await bootBus();
+
+  // Alice is live; the creator (sess-bob) is OFFLINE (never connects this turn).
+  const alice = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+
+  // A role send to the known-but-offline creator persists queued_for_wake.
+  alice.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "planner@fn-int-wake",
+    payload: { media_type: "text/plain", text: "wake-escalation-body" },
+  });
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("queued_for_wake");
+  expect(await statusForBody("wake-escalation-body")).toBe("queued_for_wake");
+
+  // The creator returns (as if woken by `keeper bus wake`): registers with its
+  // own session_id and subscribes → the queued escalation is REDELIVERED.
+  const creator = await connectClient();
+  await registerAndSubscribe(creator, "bob", "sess-bob", "t-bob-return");
+  const redelivered = await waitFrame(
+    creator.frames,
+    (f) => f.event === "message",
+  );
+  expect((redelivered?.payload as { text?: string })?.text).toBe(
+    "wake-escalation-body",
+  );
+  // The flip to delivered_after_wake is the dedup.
+  expect(await statusForBody("wake-escalation-body")).toBe(
+    "delivered_after_wake",
+  );
+
+  // The creator reconnects and resubscribes → NO redelivery (the row is flipped).
+  creator.socket.end();
+  await retryUntil(
+    async () => {
+      const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+        name?: string;
+        subscribed?: boolean;
+      }>;
+      const ch = channels.find((c) => c.name === "bob");
+      return ch && ch.subscribed === false ? true : null;
+    },
+    3000,
+    25,
+  );
+  const creator2 = await connectClient();
+  await registerAndSubscribe(creator2, "bob", "sess-bob", "t-bob-return-2");
+  // Give the relay a beat; assert NO queued message lands on the second subscribe.
+  const second = await waitFrame(
+    creator2.frames,
+    (f) => f.event === "message",
+    600,
+  );
+  expect(second).toBeNull();
+
+  alice.socket.end();
+  creator2.socket.end();
+});
+
 test("a send to an UNKNOWN name returns `unknown_target`", async () => {
   await bootBus();
   const alice = await connectClient();

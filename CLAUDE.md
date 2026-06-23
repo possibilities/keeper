@@ -32,6 +32,15 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   separate from `hooks.json` — never fold it into the hooks file. That Monitor is
   invisible to the hook stream, so it does NOT populate `jobs.monitors` (correct —
   bus presence is the `bus.db` registry, not the hook-fed projection).
+- **The bus relay NEVER spawns — wake is the client-side `keeper bus wake` CLI
+  verb** (`cli/bus.ts` → `src/bus-wake.ts`, fn-918). A `planner@<epic>` send to a
+  known-but-offline creator persists `queued_for_wake` on `messages` (no bus.db
+  schema bump); `keeper bus wake` resumes that creator via `claude --resume` into
+  the dedicated `agentbus` tmux session — single-flighted per session, liveness-
+  and cooldown-gated, fail-open. It runs in the CLI process, NEVER the bus socket /
+  a daemon RPC / `src/wake-worker.ts` (the unrelated `data_version` pump — a
+  name-collision hazard). `agentbus` is a managed session keeper only SPAWNS into;
+  its reaping/autoclose is owned by a separate cleanup system, never this repo.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.

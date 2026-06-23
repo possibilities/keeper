@@ -31,7 +31,7 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * name and no id coerces to the empty string (the producer invariant says this
  * never happens). Pure.
  */
-export function resumeTarget(job: Job): string {
+export function resumeTarget(job: Pick<Job, "title" | "job_id">): string {
   const name = seg(job.title);
   return name !== "" ? name : seg(job.job_id);
 }
