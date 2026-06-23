@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "make the readiness seed gate per-root",
-  "updated_at": "2026-06-23T01:12:43.972000Z"
+  "updated_at": "2026-06-23T05:05:22.022000Z",
+  "worker_done_at": "2026-06-23T05:05:22.022000Z"
 }

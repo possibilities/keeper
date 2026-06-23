@@ -72,5 +72,5 @@ Extend test/readiness.test.ts: one unseeded root forces `unknown` ONLY on its ow
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Replaced the blanket gitSeedRequired overwrite with a per-root gate: computeReadiness now takes unseededRoots:Set<string> and forces {kind:unknown} only for rows whose effectiveRoot is unseeded, so a stale/failed root darks only its own rows while a seeded sibling dispatches. Autopilot + server-worker derive the set via new unseededGatedRoots (gated on seed_required); the set ships on BootStatus.git_unseeded_roots so the board renders the same per-root gate. No schema change; empty set keeps re-fold byte-identical.
 ## Evidence
