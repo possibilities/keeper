@@ -11,6 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Activate fn-891 builders and verify keeper builds",
-  "updated_at": "2026-06-23T08:15:23.375000Z",
-  "worker_done_at": null
+  "updated_at": "2026-06-23T08:15:53.541000Z",
+  "worker_done_at": "2026-06-23T08:15:53.541000Z"
 }
