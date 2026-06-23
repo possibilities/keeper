@@ -3,6 +3,7 @@ import {
   buildDashNewSessionArgs,
   buildDashSplitArgs,
   buildHasSessionArgs,
+  buildKillDashServerArgs,
   buildKillSessionArgs,
   buildListPanesArgs,
   buildListSessionsArgs,
@@ -12,6 +13,7 @@ import {
   buildSetMainPaneWidthArgs,
   buildWorkNewSessionArgs,
   dashPaneArgv,
+  dashTmux,
   isBusyCommand,
   main,
   parseBusyPanes,
@@ -76,6 +78,18 @@ describe("kill / has-session / list-sessions builders", () => {
     ]);
   });
 
+  test("dash teardown is EXACTLY tmux -L dash kill-server (never bare)", () => {
+    // The safety crux: a bare `kill-server` would destroy the default server
+    // where the human's `work` (and the daemon `autopilot`) live. -L dash is a
+    // GLOBAL flag, before the subcommand.
+    expect(buildKillDashServerArgs()).toEqual([
+      "tmux",
+      "-L",
+      "dash",
+      "kill-server",
+    ]);
+  });
+
   test("has-session uses =exact-match target", () => {
     expect(buildHasSessionArgs("autopilot")).toEqual([
       "tmux",
@@ -90,16 +104,38 @@ describe("kill / has-session / list-sessions builders", () => {
   });
 });
 
+describe("dashTmux helper", () => {
+  test("prefixes -L dash as a GLOBAL flag before the subcommand", () => {
+    expect(dashTmux("kill-server")).toEqual([
+      "tmux",
+      "-L",
+      "dash",
+      "kill-server",
+    ]);
+    expect(dashTmux("display", "-p")).toEqual([
+      "tmux",
+      "-L",
+      "dash",
+      "display",
+      "-p",
+    ]);
+  });
+});
+
 describe("dash build plan", () => {
-  test("new-session is detached, sized via -x/-y, cwd set, prints pane id, board triple after --", () => {
+  test("new-session: -L dash global flag, -e TMUX= clears inherited socket, detached, sized, board triple after --", () => {
     expect(buildDashNewSessionArgs(200, 50)).toEqual([
       "tmux",
+      "-L",
+      "dash",
       "new-session",
       "-d",
       "-s",
       "dash",
       "-c",
       KEEPER_DIR,
+      "-e",
+      "TMUX=",
       "-x",
       "200",
       "-y",
@@ -114,9 +150,11 @@ describe("dash build plan", () => {
     ]);
   });
 
-  test("set-option main-pane-width 50% on =dash: window target", () => {
+  test("set-option main-pane-width 50% on =dash: window target, -L dash", () => {
     expect(buildSetMainPaneWidthArgs()).toEqual([
       "tmux",
+      "-L",
+      "dash",
       "set-option",
       "-w",
       "-t",
@@ -126,9 +164,11 @@ describe("dash build plan", () => {
     ]);
   });
 
-  test("split-window is detached, prints pane id, carries the sub triple after --", () => {
+  test("split-window: -L dash, detached, prints pane id, sub triple after --", () => {
     expect(buildDashSplitArgs("git")).toEqual([
       "tmux",
+      "-L",
+      "dash",
       "split-window",
       "-d",
       "-t",
@@ -145,14 +185,29 @@ describe("dash build plan", () => {
     ]);
   });
 
-  test("select-layout is main-vertical on =dash:", () => {
+  test("select-layout is main-vertical on =dash:, -L dash", () => {
     expect(buildSelectLayoutArgs()).toEqual([
       "tmux",
+      "-L",
+      "dash",
       "select-layout",
       "-t",
       "=dash:",
       "main-vertical",
     ]);
+  });
+
+  test("every dash builder carries -L dash in global position (right after tmux)", () => {
+    for (const argv of [
+      buildDashNewSessionArgs(200, 50),
+      buildSetMainPaneWidthArgs(),
+      buildDashSplitArgs("jobs"),
+      buildSelectLayoutArgs(),
+      buildSelectPaneArgs("%7"),
+      buildKillDashServerArgs(),
+    ]) {
+      expect(argv.slice(0, 3)).toEqual(["tmux", "-L", "dash"]);
+    }
   });
 
   test("window/pane-target builders carry the trailing-colon target form", () => {
@@ -168,9 +223,11 @@ describe("dash build plan", () => {
     }
   });
 
-  test("select-pane targets a captured pane id (not positional)", () => {
+  test("select-pane targets a captured pane id (not positional), -L dash", () => {
     expect(buildSelectPaneArgs("%7")).toEqual([
       "tmux",
+      "-L",
+      "dash",
       "select-pane",
       "-t",
       "%7",
@@ -388,9 +445,16 @@ function makeKillGateStub(calls: string[][]): SyncSpawnFn {
   );
 }
 
-const KILL_VERBS = new Set(["kill-session", "kill-server"]);
+// A kill is either a default-server `kill-session` (c[1]) or the dash-server
+// teardown `tmux -L dash kill-server` (now keyed at c[1]==="-L", verb at c[3]).
+// The refuse branches must emit NEITHER — the dash kill-server runs only AFTER
+// the busy gate passes, so a refuse that emits it is a regression.
 const spawnedAnyKill = (calls: string[][]): boolean =>
-  calls.some((c) => c[0] === "tmux" && KILL_VERBS.has(c[1] ?? ""));
+  calls.some(
+    (c) =>
+      (c[0] === "tmux" && c[1] === "kill-session") ||
+      (c[0] === "tmux" && c[1] === "-L" && c[3] === "kill-server"),
+  );
 
 describe("main() --kill-sessions busy-pane gate", () => {
   test("non-TTY stdin with busy panes: exits 1, spawns no kill", async () => {
@@ -503,13 +567,15 @@ describe("main() --kill-sessions busy-pane gate", () => {
   test("empty busy sweep proceeds to setup without prompting", async () => {
     const calls: string[][] = [];
     // Server up, but every pane is an idle shell ⇒ no busy panes ⇒ no prompt.
+    // Dash calls now key on `tmux:-L` (the global flag), so the canned board
+    // pane id rides that key; the work-session mint keys on `tmux:new-session`.
     const spawn = makeSpawnStub(
       {
         "tmux:list-sessions": { stdout: "dash: 1 windows", exitCode: 0 },
         "tmux:list-panes": { stdout: "autopilot\t0\tzsh\tshell", exitCode: 0 },
-        // new-session captures a pane id; rebuildDash needs a non-empty one.
-        "tmux:new-session": { stdout: "%0", exitCode: 0 },
-        "tmux:split-window": { stdout: "%1", exitCode: 0 },
+        // Dash new-session/split capture pane ids; rebuildDash needs a
+        // non-empty board pane id (kill-server keys here too — harmless).
+        "tmux:-L": { stdout: "%0", exitCode: 0 },
       },
       calls,
     );
@@ -745,5 +811,165 @@ describe("main() restore-last-session offer", () => {
     });
     expect(spawnedRestoreFor(calls, "autopilot")).toBe(false);
     expect(spawnedAnyRestore(calls)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// main() provision / sweep / teardown roles. setup-tmux provisions ONLY `work`;
+// `autopilot` is swept-not-created; the dash server is torn down with
+// `tmux -L dash kill-server` on EVERY run regardless of --kill-sessions; a dash
+// rebuild failure is fail-open.
+// ---------------------------------------------------------------------------
+
+/** True iff `calls` contains a default-server `tmux new-session -s <session>`
+ *  (NOT the `-L dash` dash mint, which sits at c[1]==="-L"). */
+const mintedWorkSession = (calls: string[][], session: string): boolean =>
+  calls.some(
+    (c) =>
+      c[0] === "tmux" &&
+      c[1] === "new-session" &&
+      c[c.indexOf("-s") + 1] === session,
+  );
+
+/** True iff the exact dash teardown argv was spawned. */
+const spawnedDashKillServer = (calls: string[][]): boolean =>
+  calls.some(
+    (c) =>
+      c.length === 4 &&
+      c[0] === "tmux" &&
+      c[1] === "-L" &&
+      c[2] === "dash" &&
+      c[3] === "kill-server",
+  );
+
+/** Run main() with stdout/stdin pinned non-TTY (so the restore offer never
+ *  prompts) and the candidate-count injected empty, then restore globals.
+ *  `presentExits` controls each session's has-session exit (default ABSENT). */
+async function runProvision(opts: {
+  spawn: SyncSpawnFn;
+  argv?: string[];
+}): Promise<void> {
+  const savedStdinTTY = process.stdin.isTTY;
+  const savedStdoutTTY = process.stdout.isTTY;
+  const savedOut = process.stdout.write;
+  const savedErr = process.stderr.write;
+  Object.defineProperty(process.stdin, "isTTY", {
+    value: false,
+    configurable: true,
+  });
+  Object.defineProperty(process.stdout, "isTTY", {
+    value: false,
+    configurable: true,
+  });
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    await main(opts.argv ?? [], opts.spawn, () => ({}));
+  } finally {
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: savedStdinTTY,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      value: savedStdoutTTY,
+      configurable: true,
+    });
+    process.stdout.write = savedOut;
+    process.stderr.write = savedErr;
+  }
+}
+
+describe("main() provision / sweep / teardown roles", () => {
+  test("provisions ONLY work; never mints autopilot", async () => {
+    const calls: string[][] = [];
+    // All sessions absent (has-session default exit 1) so ensureWorkSessions
+    // mints whatever it provisions.
+    const spawn = makeOfferStub({}, calls);
+    await runProvision({ spawn });
+    expect(mintedWorkSession(calls, "work")).toBe(true);
+    expect(mintedWorkSession(calls, "autopilot")).toBe(false);
+  });
+
+  test("present work is left untouched (no new-session for work)", async () => {
+    const calls: string[][] = [];
+    // work present (has-session exit 0) ⇒ ensureWorkSessions must NOT mint it.
+    const spawn = makeOfferStub({ work: 0 }, calls);
+    await runProvision({ spawn });
+    expect(mintedWorkSession(calls, "work")).toBe(false);
+  });
+
+  test("dash kill-server runs even when --kill-sessions is NOT passed", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    await runProvision({ spawn });
+    expect(spawnedDashKillServer(calls)).toBe(true);
+    // No bare kill-server is ever emitted.
+    expect(calls.some((c) => c[0] === "tmux" && c[1] === "kill-server")).toBe(
+      false,
+    );
+  });
+
+  test("the sweep/kill set is [work, autopilot] under --kill-sessions", async () => {
+    const calls: string[][] = [];
+    // Server up, all panes idle shells ⇒ no busy gate ⇒ killAllSessions runs.
+    const spawn = makeSpawnStub(
+      {
+        "tmux:list-sessions": { stdout: "work: 1 windows", exitCode: 0 },
+        "tmux:list-panes": { stdout: "work\t0\tzsh\tshell", exitCode: 0 },
+        "tmux:-L": { stdout: "%0", exitCode: 0 },
+      },
+      calls,
+    );
+    await runProvision({ spawn, argv: ["--kill-sessions"] });
+    const killed = calls
+      .filter((c) => c[0] === "tmux" && c[1] === "kill-session")
+      .map((c) => c[3]);
+    expect(killed).toEqual(["=work", "=autopilot"]);
+    // dash is NOT in the default-server kill loop — it is torn down by the
+    // dedicated -L dash kill-server.
+    expect(killed).not.toContain("=dash");
+    // list-panes swept exactly the two sweep/kill sessions.
+    expect(calls.filter((c) => c[1] === "list-panes").map((c) => c[4])).toEqual(
+      ["=work", "=autopilot"],
+    );
+  });
+
+  test("a dash rebuild failure is fail-open: warns, still provisions work, exits 0", async () => {
+    const calls: string[][] = [];
+    let exited = false;
+    const savedExit = process.exit;
+    process.exit = ((code?: number) => {
+      exited = true;
+      throw new Error(`__exit_${code}`);
+    }) as typeof process.exit;
+    // The dash new-session (keyed tmux:-L) fails; rebuildDash throws TmuxError,
+    // which main must catch and continue past to ensureWorkSessions. `work` is
+    // ABSENT (has-session exit 1) so ensureWorkSessions tries to mint it.
+    const spawn: SyncSpawnFn = (cmd): SyncSpawnResult => {
+      calls.push([...cmd]);
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(""),
+        };
+      }
+      // Every dash call fails (the -L global flag); everything else succeeds.
+      const fail = cmd[1] === "-L";
+      return {
+        exitCode: fail ? 1 : 0,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from(fail ? "no server" : ""),
+      };
+    };
+    try {
+      await runProvision({ spawn });
+    } finally {
+      process.exit = savedExit;
+    }
+    // Never exited (no process.exit(1) from the dash failure).
+    expect(exited).toBe(false);
+    // work still provisioned despite the dash failure.
+    expect(mintedWorkSession(calls, "work")).toBe(true);
   });
 });

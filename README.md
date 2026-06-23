@@ -634,17 +634,20 @@ Keeper has no `install` verb. Wire it up manually:
    [Example clients](#example-clients).
 
 10. **(Optional) Provision the tmux control plane** — `keeper setup-tmux`
-    stands up the `dash` dashboard session (board + autopilot/jobs/git/builds/
-    usage panes, all in `~/code/keeper`) and ensures the `autopilot`
-    and `work` work sessions exist (one shell window each,
-    stamped with `KEEPER_TMUX_SESSION`). It rebuilds `dash` on every run, never
-    attaches or `switch-client`s (safe inside or outside tmux), and leaves
-    existing work sessions untouched. `--kill-sessions` tears all three down
-    first, prompting only when the work sessions hold busy panes:
+    rebuilds the deprecated `dash` dashboard on its OWN dedicated
+    `tmux -L dash` server (board + autopilot/jobs/git/builds/usage panes, all in
+    `~/code/keeper`) and provisions only the human `work` session on the default
+    server (one shell window, stamped with `KEEPER_TMUX_SESSION`). `autopilot`
+    is daemon-minted on demand, so it is not created here — but it is still swept
+    and torn down by `--kill-sessions`. It rebuilds the dash server on every run,
+    never attaches or `switch-client`s (safe inside or outside tmux), and leaves
+    an existing `work` session untouched. `--kill-sessions` tears the
+    `work`/`autopilot` default-server sessions down first, prompting only when
+    they hold busy panes. Attach the dashboard with `tmux -L dash attach`:
 
     ```sh
-    keeper setup-tmux                 # rebuild dash, ensure work sessions
-    keeper setup-tmux --kill-sessions # tear down all four first, then rebuild
+    keeper setup-tmux                 # rebuild dash server, ensure work session
+    keeper setup-tmux --kill-sessions # tear down work/autopilot first, then rebuild
     ```
 
 ## Example clients
@@ -1361,31 +1364,41 @@ unrelated to the managed dispatch path — and writes nothing to git or the even
 log.
 
 - `setup-tmux.ts` — stand up the human's tmux control plane. Rebuilds the
-  `dash` dashboard session every run (board main pane + autopilot/jobs/git/
-  builds/usage splits, `main-vertical`, each pane a `zsh -ic '…; exec $SHELL'`
-  triple sized to the real client/terminal) and ensures the `autopilot`
-  and `work` work sessions exist (one shell window each,
-  stamped `KEEPER_TMUX_SESSION=<name>` so hook attribution matches daemon-minted
-  sessions). Existing work sessions are never touched; it NEVER attaches or
-  `switch-client`s, so it is safe inside or outside tmux. `--kill-sessions`
-  tears all three sessions down first, prompting y/N only when the work sessions
-  hold busy (non-shell foreground) panes — non-TTY stdin with busy panes aborts
-  (exit 1) having killed nothing. When the human `work` session
-  is ABSENT (the first run after a crash), it offers to relaunch
+  deprecated `dash` dashboard every run on its OWN dedicated `tmux -L dash`
+  server — torn down wholesale with `tmux -L dash kill-server` and recreated
+  (board main pane + autopilot/jobs/git/builds/usage splits, `main-vertical`,
+  each pane a `zsh -ic '…; exec $SHELL'` triple sized to the real
+  client/terminal, the new-session stamped `-e TMUX=` so a bare `tmux` inside a
+  dash pane doesn't misroute to the default server) — and provisions only the
+  human `work` session on the default server (one shell window, stamped
+  `KEEPER_TMUX_SESSION=work` so hook attribution matches daemon-minted
+  sessions). `autopilot` is daemon-minted on demand on the default server, so
+  setup-tmux does not create it — but it is still swept for busy panes and torn
+  down by `--kill-sessions`. An existing `work` session is never touched; it
+  NEVER attaches or `switch-client`s, so it is safe inside or outside tmux.
+  `--kill-sessions` tears the `work`/`autopilot` default-server sessions down
+  first, prompting y/N only when they hold busy (non-shell foreground) panes —
+  non-TTY stdin with busy panes aborts (exit 1) having killed nothing; the dash
+  server is always rebuilt regardless of the flag, and a dash rebuild failure is
+  fail-open (warns and continues so `work` is still provisioned). When the human
+  `work` session is ABSENT (the first run after a crash), it offers to relaunch
   the last tmux-server generation's crashed agents for it — ONE combined y/N
   TTY-only prompt naming each absent session and its own candidate count (never
-  auto-restores; counts and absence probes computed BEFORE any session-creating
-  call so the fresh server doesn't shift the generation window), spawning
-  `restore-agents --apply --session <name> --last-generation` per offered
-  session on `y` (continue-on-error — one failure doesn't abort the other). The
-  reconciler-managed `autopilot` session is never offered. A present session,
-  zero candidates, or a non-TTY skips that session's offer. Reading `keeper.db`
-  read-only for the candidate counts is the only DB dependency; the relaunch is
-  a spawned subprocess (`restore-agents`), so `setup-tmux` owns no launch transport.
+  auto-restores; counts and absence probes computed BEFORE `ensureWorkSessions`
+  so minting `work` on the default server doesn't shift the generation window),
+  spawning `restore-agents --apply --session <name> --last-generation` per
+  offered session on `y` (continue-on-error — one failure doesn't abort the
+  other). The reconciler-managed `autopilot` session is never offered. A present
+  session, zero candidates, or a non-TTY skips that session's offer. Reading
+  `keeper.db` read-only for the candidate counts is the only DB dependency; the
+  relaunch is a spawned subprocess (`restore-agents`), so `setup-tmux` owns no
+  launch transport. The dash panes connect to the daemon over its UDS
+  (`KEEPER_SOCK`), independent of the tmux socket, so the `-L dash` move needs no
+  pane-command change.
 
   ```sh
-  keeper setup-tmux                 # rebuild dash, ensure work sessions
-  keeper setup-tmux --kill-sessions # tear down all four first (confirm if busy)
+  keeper setup-tmux                 # rebuild dash server, ensure work session
+  keeper setup-tmux --kill-sessions # tear down work/autopilot first (confirm if busy)
   ```
 
 ## Uninstall

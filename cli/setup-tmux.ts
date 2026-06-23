@@ -1,11 +1,16 @@
 #!/usr/bin/env bun
 /**
  * `keeper setup-tmux` — one-shot provisioner for the human's tmux control
- * plane. It rebuilds the `dash` dashboard session on every run and ensures the
- * `autopilot`/`work` work sessions exist (one shell window
- * each). It NEVER attaches or `switch-client`s, so it is safe to run inside or
- * outside tmux. `--kill-sessions` tears all three sessions down first, gated by
- * a busy-pane confirmation prompt.
+ * plane. It rebuilds the deprecated `dash` dashboard on every run on its OWN
+ * dedicated `tmux -L dash` server (blown away with `tmux -L dash kill-server`
+ * and recreated wholesale) and provisions only the human `work` session on the
+ * default server (one shell window). `autopilot` is daemon-minted on demand on
+ * the default server, so setup-tmux does not create it — but it is still swept
+ * for busy panes and torn down by `--kill-sessions`. It NEVER attaches or
+ * `switch-client`s, so it is safe to run inside or outside tmux.
+ * `--kill-sessions` tears the `work`/`autopilot` default-server sessions down
+ * first, gated by a busy-pane confirmation prompt; the dash server is always
+ * rebuilt regardless of the flag.
  *
  * tmux is driven by direct `Bun.spawnSync` calls — deliberately OUTSIDE the
  * ExecBackend seam (whose session-management API stays stable; this command is
@@ -31,17 +36,20 @@ import { openDb, resolveDbPath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import { deriveLastGenerationSet } from "../src/restore-set";
 
-export const HELP = `keeper setup-tmux — provision the tmux control plane (dash + work sessions)
+export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
 
 Usage:
   keeper setup-tmux [--kill-sessions]
   keeper setup-tmux --help
 
-Rebuilds the 'dash' dashboard session every run (board + autopilot/jobs/git/
-builds/usage panes, main-vertical) and ensures the work sessions 'autopilot'
-and 'work' exist (one shell window each, stamped with
-KEEPER_TMUX_SESSION). Existing work sessions are left untouched. NEVER attaches
-or switch-clients — safe to run inside or outside tmux.
+Rebuilds the deprecated 'dash' dashboard every run on its OWN dedicated
+'tmux -L dash' server (board + autopilot/jobs/git/builds/usage panes,
+main-vertical) and provisions only the human 'work' session on the default
+server (one shell window, stamped with KEEPER_TMUX_SESSION). 'autopilot' is
+daemon-minted on demand, so it is not created here — but it is still swept and
+torn down by --kill-sessions. An existing 'work' session is left untouched.
+NEVER attaches or switch-clients — safe to run inside or outside tmux. Attach
+the dashboard with: tmux -L dash attach.
 
 When the work session ('work') is ABSENT (the first run
 after a crash) and the last tmux-server generation left crashed agents for it,
@@ -51,10 +59,12 @@ via 'restore-agents --last-generation', per absent session. The managed
 non-TTY skips that session's offer.
 
 Options:
-  --kill-sessions  Kill all three sessions before setup. Prompts y/N only when
-                   the two work sessions hold busy (non-shell foreground)
-                   panes; with no busy panes it kills without prompting. Non-TTY
-                   stdin with busy panes aborts (exit 1) having killed nothing.
+  --kill-sessions  Kill the default-server 'work'/'autopilot' sessions before
+                   setup. Prompts y/N only when they hold busy (non-shell
+                   foreground) panes; with no busy panes it kills without
+                   prompting. Non-TTY stdin with busy panes aborts (exit 1)
+                   having killed nothing. The 'dash' server is always rebuilt
+                   regardless of this flag.
   --help           Show this help
 
 Busy-scan caveat: a pane is "busy" only by its FOREGROUND command
@@ -63,12 +73,18 @@ NOT busy and will not trigger the confirmation prompt.
 `;
 
 export const DASH_SESSION = "dash" as const;
-/** The two work sessions ensure-looped + swept for busy panes (NOT dash —
- *  dash always rebuilds). `autopilot` is the daemon's managed session; it is
- *  deliberately swept too so live workers surface in the confirm table. */
-export const WORK_SESSIONS = [MANAGED_EXEC_SESSION, "work"] as const;
-/** All three sessions a `--kill-sessions` confirmed run tears down. */
-export const ALL_SESSIONS = [DASH_SESSION, ...WORK_SESSIONS] as const;
+/** The session(s) setup-tmux PROVISIONS — ensure-looped, minted when absent.
+ *  Only the human `work` session: `autopilot` is daemon-minted on demand on the
+ *  default server, and dash lives on its own `-L dash` server (always
+ *  rebuilt). */
+export const PROVISION_SESSIONS = ["work"] as const;
+/** The sessions a `--kill-sessions` run sweeps for busy panes + tears down on
+ *  the DEFAULT server: the human `work` session plus the daemon-managed
+ *  `autopilot` — autopilot is not provisioned here but is swept/killed so live
+ *  workers surface in the confirm table and get torn down. Dash is NOT in this
+ *  set: it lives on its own `-L dash` server and is torn down unconditionally
+ *  by rebuildDash. */
+export const SWEEP_KILL_SESSIONS = ["work", MANAGED_EXEC_SESSION] as const;
 
 /** The five right-hand dash panes, in split order, after the board main pane. */
 export const DASH_SUB_PANES = [
@@ -116,6 +132,15 @@ const defaultSpawn: SyncSpawnFn = (cmd, options) =>
 // Pure argv builders — `zsh -ic` triples, never shell strings.
 // ===========================================================================
 
+/** Prefix dash-targeting argv with the `-L dash` GLOBAL flag so every dash call
+ *  hits the dedicated dash server, never the default one. `-L <name>` MUST
+ *  precede the subcommand (placed after, tmux silently treats it as a
+ *  subcommand option and targets the default server), so this helper is the
+ *  single guard against a missed/misplaced site. */
+export function dashTmux(...args: string[]): string[] {
+  return ["tmux", "-L", DASH_SESSION, ...args];
+}
+
 /** Wrap a keeper subcommand in the `zsh -ic` triple that survives the TUI
  *  quitting: the pane drops to an interactive shell instead of closing. The
  *  argv triple is passed to tmux verbatim — NEVER a single joined shell
@@ -128,6 +153,15 @@ export function dashPaneArgv(sub: string): string[] {
  *  fnmatch). Any non-zero exit means "nothing to kill" on the default path. */
 export function buildKillSessionArgs(session: string): string[] {
   return ["tmux", "kill-session", "-t", `=${session}`];
+}
+
+/** `tmux -L dash kill-server` — blow away the WHOLE dash server before rebuild.
+ *  NEVER a bare `kill-server` (that would destroy the default server where
+ *  `work` lives) and NEVER `kill-session` (kill-session leaves an empty server
+ *  so a later new-session lands stale). Routed through the tolerant `run` so a
+ *  first-ever run with no dash server yet is fine. */
+export function buildKillDashServerArgs(): string[] {
+  return dashTmux("kill-server");
 }
 
 /** `has-session -t =<session>` existence probe. Stderr is captured by the
@@ -154,24 +188,27 @@ export function buildTputArgs(cap: string): string[] {
 }
 
 /**
- * `new-session -d -s dash -c <dir> -x <W> -y <H> -P -F '#{pane_id}' --
- * <argv...>`. Detached, the board pane's `zsh -ic` triple after `--`,
- * explicitly sized so the detached session does not boot at tmux's 80x24
- * default. `-P -F '#{pane_id}'` prints the board pane's id so it can be
- * re-focused after the splits.
+ * `tmux -L dash new-session -d -s dash -c <dir> -e TMUX= -x <W> -y <H> -P -F
+ * '#{pane_id}' -- <argv...>`. Detached on the dedicated dash server, the board
+ * pane's `zsh -ic` triple after `--`, explicitly sized so the detached session
+ * does not boot at tmux's 80x24 default. `-e TMUX=` clears the inherited
+ * outer-server `$TMUX` so a bare `tmux` inside a dash pane doesn't misroute to
+ * the default server. `-P -F '#{pane_id}'` prints the board pane's id so it can
+ * be re-focused after the splits.
  */
 export function buildDashNewSessionArgs(
   width: number,
   height: number,
 ): string[] {
-  return [
-    "tmux",
+  return dashTmux(
     "new-session",
     "-d",
     "-s",
     DASH_SESSION,
     "-c",
     KEEPER_DIR,
+    "-e",
+    "TMUX=",
     "-x",
     String(width),
     "-y",
@@ -181,7 +218,7 @@ export function buildDashNewSessionArgs(
     "#{pane_id}",
     "--",
     ...dashPaneArgv("board"),
-  ];
+  );
 }
 
 /** `set-option -w -t =dash: main-pane-width '50%'`. Window/pane targets need
@@ -189,15 +226,14 @@ export function buildDashNewSessionArgs(
  *  only as a SESSION target; window-target commands reject it ("no such
  *  window"). */
 export function buildSetMainPaneWidthArgs(): string[] {
-  return [
-    "tmux",
+  return dashTmux(
     "set-option",
     "-w",
     "-t",
     `=${DASH_SESSION}:`,
     "main-pane-width",
     "50%",
-  ];
+  );
 }
 
 /**
@@ -207,8 +243,7 @@ export function buildSetMainPaneWidthArgs(): string[] {
  * `pane-base-index`.
  */
 export function buildDashSplitArgs(sub: string): string[] {
-  return [
-    "tmux",
+  return dashTmux(
     "split-window",
     "-d",
     "-t",
@@ -220,18 +255,20 @@ export function buildDashSplitArgs(sub: string): string[] {
     "#{pane_id}",
     "--",
     ...dashPaneArgv(sub),
-  ];
+  );
 }
 
 /** `select-layout -t =dash main-vertical` — re-run after EVERY split so the
  *  next split always has room ("no space for new pane" otherwise). */
 export function buildSelectLayoutArgs(): string[] {
-  return ["tmux", "select-layout", "-t", `=${DASH_SESSION}:`, "main-vertical"];
+  return dashTmux("select-layout", "-t", `=${DASH_SESSION}:`, "main-vertical");
 }
 
-/** `select-pane -t <paneId>` — focus the board pane by its captured id. */
+/** `select-pane -t <paneId>` — focus the board pane by its captured id. The
+ *  captured `#{pane_id}` is re-targetable only on the SAME server, so this must
+ *  carry `-L dash` too. */
 export function buildSelectPaneArgs(paneId: string): string[] {
-  return ["tmux", "select-pane", "-t", paneId];
+  return dashTmux("select-pane", "-t", paneId);
 }
 
 /**
@@ -418,12 +455,13 @@ function runChecked(
   return r;
 }
 
-/** Rebuild the dash session from scratch: unconditional kill, sized
- *  new-session, main-pane-width, the five splits each followed by a layout
- *  pass, then re-focus the board pane by its captured id. */
+/** Rebuild the dash session from scratch on its dedicated `-L dash` server:
+ *  unconditional kill-server, sized new-session, main-pane-width, the five
+ *  splits each followed by a layout pass, then re-focus the board pane by its
+ *  captured id. */
 function rebuildDash(spawn: SyncSpawnFn): void {
-  // Unconditional kill — any non-zero (no server / no session) is fine.
-  run(spawn, buildKillSessionArgs(DASH_SESSION));
+  // Unconditional dash-server kill — any non-zero (no server yet) is fine.
+  run(spawn, buildKillDashServerArgs());
 
   const { width, height } = resolveDashSize(spawn);
   const boardPane = runChecked(spawn, buildDashNewSessionArgs(width, height));
@@ -444,10 +482,10 @@ function rebuildDash(spawn: SyncSpawnFn): void {
   }
 }
 
-/** Ensure each work session exists (mint when absent, never touch when
+/** Ensure each provisioned session exists (mint when absent, never touch when
  *  present). `has-session` non-zero (no session OR no server) ⇒ absent. */
 function ensureWorkSessions(spawn: SyncSpawnFn): void {
-  for (const session of WORK_SESSIONS) {
+  for (const session of PROVISION_SESSIONS) {
     const probe = run(spawn, buildHasSessionArgs(session));
     if (probe.exitCode !== 0) {
       runChecked(spawn, buildWorkNewSessionArgs(session));
@@ -455,12 +493,12 @@ function ensureWorkSessions(spawn: SyncSpawnFn): void {
   }
 }
 
-/** Sweep the two work sessions for busy panes under a locale-defaulted env so
+/** Sweep the sweep/kill sessions for busy panes under a locale-defaulted env so
  *  a C-locale client doesn't sanitize the TAB delimiters. */
 export function sweepBusyPanes(spawn: SyncSpawnFn): BusyPane[] {
   const env = localeDefaultedEnv(process.env);
   const busy: BusyPane[] = [];
-  for (const session of WORK_SESSIONS) {
+  for (const session of SWEEP_KILL_SESSIONS) {
     const r = run(spawn, buildListPanesArgs(session), env);
     // A non-zero sweep (session absent) contributes no panes.
     if (r.exitCode === 0) {
@@ -470,9 +508,11 @@ export function sweepBusyPanes(spawn: SyncSpawnFn): BusyPane[] {
   return busy;
 }
 
-/** Kill all three sessions, tolerating any non-zero (already gone). */
+/** Kill the default-server sweep/kill sessions (`work` + `autopilot`),
+ *  tolerating any non-zero (already gone). Dash is NOT killed here — rebuildDash
+ *  tears down its dedicated `-L dash` server unconditionally. */
 function killAllSessions(spawn: SyncSpawnFn): void {
-  for (const session of ALL_SESSIONS) {
+  for (const session of SWEEP_KILL_SESSIONS) {
     run(spawn, buildKillSessionArgs(session));
   }
 }
@@ -494,10 +534,12 @@ async function confirm(
   }
 }
 
-/** Human work sessions eligible for the restore offer: every WORK_SESSION
- *  except the reconciler-managed `autopilot` (= [work],
- *  iterated in WORK_SESSIONS order for deterministic prompt/spawn output). */
-export const RESTORABLE = WORK_SESSIONS.filter(
+/** Human work sessions eligible for the restore offer: every sweep/kill session
+ *  except the reconciler-managed `autopilot` (= [work], iterated in
+ *  SWEEP_KILL_SESSIONS order for deterministic prompt/spawn output). Derived
+ *  from the sweep/kill set so the `!== MANAGED_EXEC_SESSION` filter stays
+ *  meaningful. */
+export const RESTORABLE = SWEEP_KILL_SESSIONS.filter(
   (s) => s !== MANAGED_EXEC_SESSION,
 );
 
@@ -595,14 +637,16 @@ export async function main(
       }
     }
 
-    // Restore-last-session offer — computed BEFORE any session-creating call
-    // (rebuildDash/ensureWorkSessions mint a NEW tmux server = a new generation,
-    // which would shift the kill-anchored window). A session is offered only
-    // when it is ABSENT (the first setup-tmux after a crash) AND has >0
-    // last-generation candidates; a present session means this run isn't a
-    // recovery for it and we skip silently. Counts are read ONCE up front, and
-    // RESTORABLE (not the count-map keys) is the iteration source so a stale or
-    // non-WORK_SESSIONS `backend_exec_session_id` can't leak into the prompt.
+    // Restore-last-session offer — computed BEFORE ensureWorkSessions, which
+    // mints `work` on the DEFAULT server (a new generation that would shift the
+    // kill-anchored window). rebuildDash lives on a SEPARATE `-L dash` server
+    // and no longer perturbs the default-server anchor, but the offer stays here
+    // ahead of provisioning regardless. A session is offered only when it is
+    // ABSENT (the first setup-tmux after a crash) AND has >0 last-generation
+    // candidates; a present session means this run isn't a recovery for it and
+    // we skip silently. Counts are read ONCE up front, and RESTORABLE (not the
+    // count-map keys) is the iteration source so a stale or non-provisioned
+    // `backend_exec_session_id` can't leak into the prompt.
     const counts = candidateCount();
     const offered = RESTORABLE.filter(
       (session) =>
@@ -622,10 +666,20 @@ export async function main(
       }
     }
 
-    rebuildDash(spawn);
+    // Fail-open: the deprecated dash server is isolated on its own socket, so a
+    // rebuild failure must not block provisioning the human's `work` session —
+    // warn and continue, exit 0.
+    try {
+      rebuildDash(spawn);
+    } catch (e) {
+      const detail = e instanceof TmuxError ? e.message : String(e);
+      process.stderr.write(
+        `keeper setup-tmux: dash rebuild failed, continuing — ${detail}\n`,
+      );
+    }
     ensureWorkSessions(spawn);
     process.stdout.write(
-      `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux attach -t ${DASH_SESSION}\n`,
+      `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux -L ${DASH_SESSION} attach\n`,
     );
 
     // Continue-on-error: each spawn is fire-and-forget via run() so one
