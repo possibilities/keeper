@@ -543,18 +543,23 @@ test("fn-816 fork happy path: first pid-bearing UserPromptSubmit with no Session
   expect(job?.title).toBe("fork-prompt-title");
 
   // Backend coords landed on the now-present row (REQUIRED for restore
-  // visibility).
+  // visibility). fn-907: the env session is FORENSIC — it lands in
+  // `backend_exec_birth_session_id`, NOT the live `backend_exec_session_id`
+  // (owned solely by the TmuxTopologySnapshot fold). type + pane stay pure env
+  // reads.
   const coords = db
     .query(
-      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
     )
     .get("fork-a") as {
     backend_exec_type: string | null;
     backend_exec_session_id: string | null;
+    backend_exec_birth_session_id: string | null;
     backend_exec_pane_id: string | null;
   };
   expect(coords.backend_exec_type).toBe("tmux");
-  expect(coords.backend_exec_session_id).toBe("tsess");
+  expect(coords.backend_exec_birth_session_id).toBe("tsess");
+  expect(coords.backend_exec_session_id).toBeNull();
   expect(coords.backend_exec_pane_id).toBe("%7");
 
   // Plan-fan-in columns stay NULL — a fork seed is a standalone job with no
@@ -6418,8 +6423,11 @@ test("Killed fold: a malformed payload folds to a safe no-op and still advances 
 
 // ---------------------------------------------------------------------------
 // Schema-v71 window_index — the visual window-order column the
-// WindowIndexSnapshot fold copies from the restore-worker's change-gated
-// `job_id → window_index` layout (fn-817 task .2).
+// WindowIndexSnapshot was RETIRED in fn-907: the standalone window-index fold
+// (fn-817) is subsumed by the TmuxTopologySnapshot live-location fold (which
+// carries window_index per pane). The dispatch arm is now an EXPLICIT no-op so
+// historical WindowIndexSnapshot events advance the cursor without routing into
+// projectJobsRow. These tests pin the no-op contract.
 // ---------------------------------------------------------------------------
 
 function getWindowIndex(jobId = "sess-a"): number | null {
@@ -6429,7 +6437,7 @@ function getWindowIndex(jobId = "sess-a"): number | null {
   return row?.window_index ?? null;
 }
 
-test("WindowIndexSnapshot fold copies window_index onto the matching jobs rows by job_id", () => {
+test("retired WindowIndexSnapshot folds to a no-op: window_index is NOT written", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
   insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
   insertEvent({
@@ -6442,78 +6450,43 @@ test("WindowIndexSnapshot fold copies window_index onto the matching jobs rows b
     }),
   });
   drainAll();
-  expect(getWindowIndex("sess-a")).toBe(0);
-  expect(getWindowIndex("sess-b")).toBe(2);
+  // The retired arm no-ops — window_index stays NULL (only TmuxTopologySnapshot
+  // writes it now).
+  expect(getWindowIndex("sess-a")).toBeNull();
+  expect(getWindowIndex("sess-b")).toBeNull();
 });
 
-test("WindowIndexSnapshot fold OVERWRITES an earlier index (reorder, not fill-only)", () => {
+test("retired WindowIndexSnapshot advances the cursor and leaves the jobs row byte-identical", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
-  insertEvent({
-    hook_event: "WindowIndexSnapshot",
-    data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 1 }] }),
-  });
-  insertEvent({
+  expect(drainAll()).toBe(1);
+  const before = db.query("SELECT * FROM jobs WHERE job_id = ?").get("sess-a");
+
+  const evId = insertEvent({
     hook_event: "WindowIndexSnapshot",
     data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 3 }] }),
   });
-  drainAll();
-  expect(getWindowIndex("sess-a")).toBe(3);
+  expect(drainAll()).toBe(1);
+  // Cursor advanced (event consumed), jobs row untouched (no fall-through to
+  // projectJobsRow).
+  expect(getCursor()).toBe(evId);
+  const after = db.query("SELECT * FROM jobs WHERE job_id = ?").get("sess-a");
+  expect(after).toEqual(before);
 });
 
-test("WindowIndexSnapshot fold: a killed job retains its last-known window_index", () => {
-  // The fold never nulls a row, so an index folded while a job was live
-  // survives the kill — exactly what the DB-only crash-restore derivation needs
-  // at restore time (the original tmux server is dead).
-  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-a",
-    ts: 5000,
-  });
-  insertEvent({
+test("retired WindowIndexSnapshot against a missing job mints NO jobs row", () => {
+  const evId = insertEvent({
     hook_event: "WindowIndexSnapshot",
-    data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 4 }] }),
-  });
-  // A later snapshot OMITS the about-to-die job (it left the live cache).
-  insertEvent({
-    hook_event: "WindowIndexSnapshot",
-    data: JSON.stringify({ entries: [] }),
-  });
-  insertEvent({
-    hook_event: "Killed",
-    session_id: "sess-a",
-    data: JSON.stringify({
-      pid: 4242,
-      start_time: null,
-      close_kind: "pid_died",
-    }),
+    session_id: "window-index-snapshot",
+    data: JSON.stringify({ entries: [{ job_id: "ghost", window_index: 1 }] }),
   });
   drainAll();
-  expect(getJob("sess-a")?.state).toBe("killed");
-  expect(getWindowIndex("sess-a")).toBe(4);
+  expect(getCursor()).toBe(evId);
+  // Neither the synthetic session id nor the entry's job_id mints a row.
+  expect(getJob("window-index-snapshot")).toBeNull();
+  expect(getJob("ghost")).toBeNull();
 });
 
-test("WindowIndexSnapshot fold drops a non-integer / garbage entry (never coerced)", () => {
-  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
-  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
-  insertEvent({ hook_event: "SessionStart", session_id: "sess-c" });
-  insertEvent({
-    hook_event: "WindowIndexSnapshot",
-    data: JSON.stringify({
-      entries: [
-        { job_id: "sess-a", window_index: 1.5 }, // float → dropped
-        { job_id: "sess-b", window_index: "2" }, // string → dropped
-        { job_id: "sess-c", window_index: 5 }, // valid
-      ],
-    }),
-  });
-  drainAll();
-  expect(getWindowIndex("sess-a")).toBeNull();
-  expect(getWindowIndex("sess-b")).toBeNull();
-  expect(getWindowIndex("sess-c")).toBe(5);
-});
-
-test("WindowIndexSnapshot fold: a malformed payload folds to a safe no-op and still advances the cursor", () => {
+test("retired WindowIndexSnapshot: a malformed payload folds to a safe no-op and still advances the cursor", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
   const evId = insertEvent({
     hook_event: "WindowIndexSnapshot",
@@ -6524,7 +6497,7 @@ test("WindowIndexSnapshot fold: a malformed payload folds to a safe no-op and st
   expect(getCursor()).toBeGreaterThanOrEqual(evId);
 });
 
-test("WindowIndexSnapshot re-fold determinism: a reorder stream re-folds byte-identical", () => {
+test("retired WindowIndexSnapshot re-fold determinism: a history with snapshots re-folds byte-identical", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
   insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
   insertEvent({
@@ -6550,9 +6523,9 @@ test("WindowIndexSnapshot re-fold determinism: a reorder stream re-folds byte-id
     .query("SELECT job_id, window_index FROM jobs ORDER BY job_id")
     .all() as { job_id: string; window_index: number | null }[];
 
-  // Rewind the cursor + wipe the projection, then re-fold from scratch. The fold
-  // reads only the event payload (no probe, no wall-clock), so the rebuilt rows
-  // must be byte-identical.
+  // Rewind the cursor + wipe the projection, then re-fold from scratch. The
+  // retired no-op arm never touches jobs, so the rebuilt rows must be
+  // byte-identical (window_index stays NULL throughout).
   db.run("DELETE FROM jobs");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   drainAll();
@@ -6561,8 +6534,8 @@ test("WindowIndexSnapshot re-fold determinism: a reorder stream re-folds byte-id
     .all() as { job_id: string; window_index: number | null }[];
 
   expect(refolded).toEqual(live);
-  expect(live.find((r) => r.job_id === "sess-a")?.window_index).toBe(1);
-  expect(live.find((r) => r.job_id === "sess-b")?.window_index).toBe(0);
+  expect(live.find((r) => r.job_id === "sess-a")?.window_index).toBeNull();
+  expect(live.find((r) => r.job_id === "sess-b")?.window_index).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

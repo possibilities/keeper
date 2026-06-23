@@ -16,6 +16,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { raiseTmuxProjectionFloor } from "../src/db";
 import {
   type BuildSnapshotPayload,
   drain,
@@ -3015,6 +3016,11 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
   // any subsequent event whose hook stamped a non-null type. Cover a
   // mix of hook_events (UserPromptSubmit, PreToolUse, Stop) to prove
   // the fold isn't gated to a single hook_event.
+  //
+  // fn-907 precedence flip: the env `backend_exec_session_id` now lands in the
+  // FORENSIC `backend_exec_birth_session_id` (COALESCE-fill, written once), NOT
+  // the LIVE `backend_exec_session_id` (owned solely by the TmuxTopologySnapshot
+  // fold). `backend_exec_type` + `backend_exec_pane_id` stay pure env reads.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-be",
@@ -3051,16 +3057,20 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
 
   const row = db
     .query(
-      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
     )
     .get("sess-be") as {
     backend_exec_type: string | null;
     backend_exec_session_id: string | null;
+    backend_exec_birth_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
   expect(row).not.toBeNull();
   expect(row?.backend_exec_type).toBe("tmux");
-  expect(row?.backend_exec_session_id).toBe("mike-main");
+  // The env session is FORENSIC now — it lands in birth, never the live column.
+  expect(row?.backend_exec_birth_session_id).toBe("mike-main");
+  // Live session stays NULL until a TmuxTopologySnapshot resolves it.
+  expect(row?.backend_exec_session_id).toBeNull();
   expect(row?.backend_exec_pane_id).toBe("11");
 });
 
@@ -3077,18 +3087,18 @@ test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture
     backend_exec_pane_id: "7",
   });
   drainAll();
-  // Confirm seed landed.
+  // Confirm seed landed (env session → birth column under fn-907).
   const seeded = db
     .query(
-      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+      "SELECT backend_exec_type, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
     )
     .get("sess-stick") as {
     backend_exec_type: string | null;
-    backend_exec_session_id: string | null;
+    backend_exec_birth_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
   expect(seeded?.backend_exec_type).toBe("tmux");
-  expect(seeded?.backend_exec_session_id).toBe("mike-main");
+  expect(seeded?.backend_exec_birth_session_id).toBe("mike-main");
   expect(seeded?.backend_exec_pane_id).toBe("7");
 
   // Now a NULL-carrying event — the fold's `type != null` gate skips
@@ -3104,23 +3114,27 @@ test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture
 
   const after = db
     .query(
-      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+      "SELECT backend_exec_type, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
     )
     .get("sess-stick") as {
     backend_exec_type: string | null;
-    backend_exec_session_id: string | null;
+    backend_exec_birth_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
   expect(after?.backend_exec_type).toBe("tmux");
-  expect(after?.backend_exec_session_id).toBe("mike-main");
+  expect(after?.backend_exec_birth_session_id).toBe("mike-main");
   expect(after?.backend_exec_pane_id).toBe("7");
 });
 
 test("partial backend_exec capture: COALESCE preserves the non-null field, advances the other", () => {
-  // A partial capture (type + session set, pane NULL) must advance
-  // the session if it changed and preserve the prior pane. This
-  // covers the "one sub-var temporarily absent" edge case the
-  // task spec explicitly calls out.
+  // A partial capture (type + session set, pane NULL) must preserve the
+  // prior pane. This covers the "one sub-var temporarily absent" edge case
+  // the task spec explicitly calls out.
+  //
+  // fn-907: the env session is birth-COALESCE-fill (write-once). A LATER env
+  // session change does NOT re-clobber birth (the env is constant per process,
+  // so a real change can only be a different process/job). Birth holds the FIRST
+  // env value; the live session column is untouched by this arm.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-part",
@@ -3128,8 +3142,8 @@ test("partial backend_exec capture: COALESCE preserves the non-null field, advan
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
-  // Partial: type set (gate fires), session changes, pane NULL —
-  // pane must remain '7' under COALESCE.
+  // Partial: type set (gate fires), session env differs, pane NULL —
+  // pane must remain '7' under COALESCE; birth holds the first value.
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: "sess-part",
@@ -3141,15 +3155,19 @@ test("partial backend_exec capture: COALESCE preserves the non-null field, advan
 
   const row = db
     .query(
-      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
     )
     .get("sess-part") as {
     backend_exec_type: string | null;
     backend_exec_session_id: string | null;
+    backend_exec_birth_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
   expect(row?.backend_exec_type).toBe("tmux");
-  expect(row?.backend_exec_session_id).toBe("mike-other");
+  // birth is write-once: the first env value wins, the second does not clobber.
+  expect(row?.backend_exec_birth_session_id).toBe("mike-main");
+  // live session never written by the env arm.
+  expect(row?.backend_exec_session_id).toBeNull();
   expect(row?.backend_exec_pane_id).toBe("7");
 });
 
@@ -3248,6 +3266,210 @@ test("config_dir fold unchanged: only SessionStart seeds it, subsequent events d
   // landed via the new arm — proves the two fold paths are independent.
   expect(row?.config_dir).toBe("/tmp/profile-x");
   expect(row?.backend_exec_type).toBe("tmux");
+});
+
+// ---------------------------------------------------------------------------
+// TmuxTopologySnapshot live-location fold (fn-907). The SOLE owner of
+// `backend_exec_session_id` + `window_index` — overwrites each matching LIVE
+// tmux job, recycle-guarded on `(generation_id, pane_id)`, gated above the tmux
+// skip-floor, preserving last-known on absent panes / NULL indices.
+// ---------------------------------------------------------------------------
+
+/** Seed a live tmux job (SessionStart with backend coords) and drain. The env
+ *  arm stamps `backend_exec_type='tmux'` + `backend_exec_pane_id`; the live
+ *  `backend_exec_session_id` + `backend_exec_generation_id` start NULL (only the
+ *  topology fold writes them). Returns the seeded job_id. */
+function seedTmuxJob(jobId: string, paneId: string): string {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: jobId,
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: paneId,
+  });
+  drainAll();
+  return jobId;
+}
+
+/** Insert one synthetic TmuxTopologySnapshot event carrying `{generation_id,
+ *  panes}`, mirroring what the daemon mints. Returns the event id. */
+function tmuxTopologyEvent(
+  generationId: string,
+  panes: Array<{
+    pane_id: string;
+    session_name: string;
+    window_index: number | null;
+  }>,
+): number {
+  return insertEvent({
+    hook_event: "TmuxTopologySnapshot",
+    session_id: "tmux-topology-snapshot",
+    data: JSON.stringify({ generation_id: generationId, panes }),
+  });
+}
+
+function getTmuxLocation(jobId: string) {
+  return db
+    .query(
+      "SELECT backend_exec_session_id, backend_exec_generation_id, window_index, state FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    backend_exec_session_id: string | null;
+    backend_exec_generation_id: string | null;
+    window_index: number | null;
+    state: string;
+  } | null;
+}
+
+test("TmuxTopologySnapshot overwrites a live job's session + window_index and adopts the generation", () => {
+  seedTmuxJob("topo-1", "%5");
+  // Pre-fold: live session NULL (env routes to birth), generation NULL.
+  const before = getTmuxLocation("topo-1");
+  expect(before?.backend_exec_session_id).toBeNull();
+  expect(before?.backend_exec_generation_id).toBeNull();
+
+  tmuxTopologyEvent("gen-100", [
+    { pane_id: "%5", session_name: "foreground", window_index: 3 },
+  ]);
+  drainAll();
+
+  const after = getTmuxLocation("topo-1");
+  // Live session overwritten, window index set, generation adopted on first match.
+  expect(after?.backend_exec_session_id).toBe("foreground");
+  expect(after?.window_index).toBe(3);
+  expect(after?.backend_exec_generation_id).toBe("gen-100");
+
+  // A second snapshot of the SAME generation moves the pane again — overwrite.
+  tmuxTopologyEvent("gen-100", [
+    { pane_id: "%5", session_name: "background", window_index: 7 },
+  ]);
+  drainAll();
+  const moved = getTmuxLocation("topo-1");
+  expect(moved?.backend_exec_session_id).toBe("background");
+  expect(moved?.window_index).toBe(7);
+  expect(moved?.backend_exec_generation_id).toBe("gen-100");
+});
+
+test("TmuxTopologySnapshot recycle guard: a NEW generation never overwrites a prior-generation job", () => {
+  seedTmuxJob("topo-recycle", "%9");
+  // First snapshot adopts generation gen-A and sets the location.
+  tmuxTopologyEvent("gen-A", [
+    { pane_id: "%9", session_name: "alpha", window_index: 1 },
+  ]);
+  drainAll();
+  const adopted = getTmuxLocation("topo-recycle");
+  expect(adopted?.backend_exec_session_id).toBe("alpha");
+  expect(adopted?.backend_exec_generation_id).toBe("gen-A");
+
+  // A recycled %9 in a NEW tmux server (gen-B) reuses the pane id but is a
+  // DIFFERENT pane. The recycle guard must reject the overwrite — gen-A's job
+  // keeps alpha/1.
+  tmuxTopologyEvent("gen-B", [
+    { pane_id: "%9", session_name: "stranger", window_index: 42 },
+  ]);
+  drainAll();
+  const guarded = getTmuxLocation("topo-recycle");
+  expect(guarded?.backend_exec_session_id).toBe("alpha");
+  expect(guarded?.window_index).toBe(1);
+  expect(guarded?.backend_exec_generation_id).toBe("gen-A");
+});
+
+test("TmuxTopologySnapshot preserves last-known on an absent pane and a NULL window_index", () => {
+  seedTmuxJob("topo-preserve", "%3");
+  tmuxTopologyEvent("gen-X", [
+    { pane_id: "%3", session_name: "home", window_index: 5 },
+  ]);
+  drainAll();
+  expect(getTmuxLocation("topo-preserve")?.window_index).toBe(5);
+
+  // A later snapshot whose pane is ABSENT (e.g. a transient probe that saw other
+  // panes but not this one) must NOT wipe the job — no matching pane, no UPDATE.
+  tmuxTopologyEvent("gen-X", [
+    { pane_id: "%99", session_name: "elsewhere", window_index: 0 },
+  ]);
+  drainAll();
+  const stillThere = getTmuxLocation("topo-preserve");
+  expect(stillThere?.backend_exec_session_id).toBe("home");
+  expect(stillThere?.window_index).toBe(5);
+
+  // A snapshot carrying the pane but a NULL window_index (the producer could not
+  // read a valid integer): session overwrites, window_index COALESCEs to the
+  // last-known good value — never wiped (crash-restore sorting depends on it).
+  tmuxTopologyEvent("gen-X", [
+    { pane_id: "%3", session_name: "relocated", window_index: null },
+  ]);
+  drainAll();
+  const coalesced = getTmuxLocation("topo-preserve");
+  expect(coalesced?.backend_exec_session_id).toBe("relocated");
+  expect(coalesced?.window_index).toBe(5);
+});
+
+test("TmuxTopologySnapshot does NOT touch a killed job (recycle-guard live-state filter)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "topo-dead",
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: "%4",
+  });
+  // Kill the job — the (pid, start_time) payload matches the seeded row.
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "topo-dead",
+    data: JSON.stringify({ pid: 4242, start_time: null }),
+  });
+  drainAll();
+  expect(getTmuxLocation("topo-dead")?.state).toBe("killed");
+
+  // A recycled %4 in a new server must NOT resurrect the dead row's location or
+  // let it adopt the new generation.
+  tmuxTopologyEvent("gen-new", [
+    { pane_id: "%4", session_name: "ghost", window_index: 9 },
+  ]);
+  drainAll();
+  const dead = getTmuxLocation("topo-dead");
+  expect(dead?.backend_exec_session_id).toBeNull();
+  expect(dead?.backend_exec_generation_id).toBeNull();
+  expect(dead?.window_index).toBeNull();
+});
+
+test("TmuxTopologySnapshot below the skip-floor folds to a no-op", () => {
+  seedTmuxJob("topo-floor", "%6");
+  const evId = tmuxTopologyEvent("gen-Z", [
+    { pane_id: "%6", session_name: "should-not-land", window_index: 8 },
+  ]);
+  // Raise the floor ABOVE this event so the fold gates it out — mirrors a
+  // historical snapshot replaying below the boot-seed floor.
+  raiseTmuxProjectionFloor(db, evId);
+  drainAll();
+
+  const gated = getTmuxLocation("topo-floor");
+  // The live location stayed unwritten (the fold no-oped below the floor).
+  expect(gated?.backend_exec_session_id).toBeNull();
+  expect(gated?.window_index).toBeNull();
+});
+
+test("TmuxTopologySnapshot with malformed / no-generation payload folds to a no-op", () => {
+  seedTmuxJob("topo-bad", "%2");
+  // No generation_id — the recycle guard cannot run, so the whole snapshot is
+  // dropped (no overwrite).
+  insertEvent({
+    hook_event: "TmuxTopologySnapshot",
+    session_id: "tmux-topology-snapshot",
+    data: JSON.stringify({
+      panes: [{ pane_id: "%2", session_name: "x", window_index: 1 }],
+    }),
+  });
+  // Garbage JSON.
+  insertEvent({
+    hook_event: "TmuxTopologySnapshot",
+    session_id: "tmux-topology-snapshot",
+    data: "not json{",
+  });
+  drainAll();
+  const row = getTmuxLocation("topo-bad");
+  expect(row?.backend_exec_session_id).toBeNull();
+  expect(row?.window_index).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -3361,10 +3583,10 @@ function tmuxPaneSnapshotEvent(
   });
 }
 
-test("TmuxPaneSnapshot fills backend_exec_session_id on a matching NULL-session tmux job", () => {
-  // A claude in a human-created tmux session: the hook stamped type + pane id
-  // (from TMUX/TMUX_PANE) but NO KEEPER_TMUX_SESSION, so the COALESCE arm
-  // leaves the session NULL.
+test("retired TmuxPaneSnapshot folds to a no-op: a matching tmux job is untouched", () => {
+  // fn-907 retired the fn-789 fill-only fold; the arm is now an explicit no-op
+  // (the TmuxTopologySnapshot fold owns live session). A historical
+  // TmuxPaneSnapshot must advance the cursor WITHOUT routing into projectJobsRow.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-tmux",
@@ -3372,67 +3594,38 @@ test("TmuxPaneSnapshot fills backend_exec_session_id on a matching NULL-session 
     backend_exec_session_id: null,
     backend_exec_pane_id: "%1",
   });
-  drainAll();
+  expect(drainAll()).toBe(1);
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-tmux");
+
+  const snapId = tmuxPaneSnapshotEvent([
+    { pane_id: "%1", session_name: "human-work" },
+  ]);
+  expect(drainAll()).toBe(1);
+  // Cursor advanced (the event is consumed) but the jobs row is byte-identical —
+  // proves the no-op arm did NOT fall through to projectJobsRow.
+  expect(getCursor()).toBe(snapId);
+  const after = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-tmux");
+  expect(after).toEqual(before);
+  // The live session stays NULL — only TmuxTopologySnapshot writes it now.
   expect(getBackendCoords("sess-tmux")?.backend_exec_session_id).toBeNull();
-
-  tmuxPaneSnapshotEvent([{ pane_id: "%1", session_name: "human-work" }]);
-  expect(drainAll()).toBe(1);
-
-  const row = getBackendCoords("sess-tmux");
-  expect(row?.backend_exec_type).toBe("tmux");
-  expect(row?.backend_exec_pane_id).toBe("%1");
-  expect(row?.backend_exec_session_id).toBe("human-work"); // filled
 });
 
-test("TmuxPaneSnapshot never overwrites a non-NULL backend_exec_session_id", () => {
-  // A managed launch: the hook injected KEEPER_TMUX_SESSION, so the session is
-  // already set. A snapshot pair for the same pane must NOT clobber it.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-managed",
-    backend_exec_type: "tmux",
-    backend_exec_session_id: "autopilot",
-    backend_exec_pane_id: "%1",
-  });
-  drainAll();
-
-  tmuxPaneSnapshotEvent([{ pane_id: "%1", session_name: "human-work" }]);
+test("retired TmuxPaneSnapshot against a missing job mints NO jobs row", () => {
+  // The no-op arm must not mint a row for the snapshot's synthetic session id —
+  // a fall-through to projectJobsRow would have.
+  const id = tmuxPaneSnapshotEvent([
+    { pane_id: "%1", session_name: "human-work" },
+  ]);
   expect(drainAll()).toBe(1);
-
-  // Fill-only guard: the prior non-NULL session sticks byte-identically.
-  expect(getBackendCoords("sess-managed")?.backend_exec_session_id).toBe(
-    "autopilot",
-  );
-});
-
-test("TmuxPaneSnapshot does not fill a non-tmux job or a pane-id mismatch", () => {
-  // A non-tmux job with a NULL session and a tmux job whose pane id no pair
-  // matches: neither must be touched.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-non-tmux",
-    backend_exec_type: "other",
-    backend_exec_session_id: null,
-    backend_exec_pane_id: "%1",
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-tmux-other",
-    backend_exec_type: "tmux",
-    backend_exec_session_id: null,
-    backend_exec_pane_id: "%9",
-  });
-  drainAll();
-
-  // Pair targets %1 — but %1 belongs to the NON-TMUX job (wrong type), and the
-  // tmux job is on %9.
-  tmuxPaneSnapshotEvent([{ pane_id: "%1", session_name: "human-work" }]);
-  expect(drainAll()).toBe(1);
-
-  expect(getBackendCoords("sess-non-tmux")?.backend_exec_session_id).toBeNull();
-  expect(
-    getBackendCoords("sess-tmux-other")?.backend_exec_session_id,
-  ).toBeNull();
+  expect(getCursor()).toBe(id);
+  const row = db
+    .query("SELECT job_id FROM jobs WHERE job_id = ?")
+    .get("tmux-snapshot");
+  expect(row).toBeNull();
 });
 
 test("TmuxPaneSnapshot with a malformed/empty payload folds to a no-op (cursor advances, jobs untouched)", () => {
@@ -3469,11 +3662,11 @@ test("TmuxPaneSnapshot with a malformed/empty payload folds to a no-op (cursor a
   expect(after).toEqual(before);
 });
 
-test("TmuxPaneSnapshot fold: cursor=0 re-fold reproduces byte-identical jobs rows", () => {
-  // The order-insensitive fill-only property is the load-bearing re-fold
-  // invariant: a SessionStart (tmux, NULL session) + a TmuxPaneSnapshot filling
-  // it, then a later non-snapshot event. A cursor=0 re-fold must rebuild the
-  // exact same jobs row — proves the fold reads only the frozen event payload.
+test("retired TmuxPaneSnapshot in a history: cursor=0 re-fold reproduces byte-identical jobs rows", () => {
+  // The retired no-op arm is the load-bearing re-fold invariant: historical
+  // TmuxPaneSnapshot events interleaved with real lifecycle events must replay
+  // byte-identically (the no-op never touches jobs, so the env-driven coords are
+  // the only writer). A cursor=0 re-fold must rebuild the exact same row.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-refold-tmux",
@@ -3485,8 +3678,6 @@ test("TmuxPaneSnapshot fold: cursor=0 re-fold reproduces byte-identical jobs row
     { pane_id: "%3", session_name: "human-A" },
     { pane_id: "%99", session_name: "unrelated" },
   ]);
-  // A SECOND snapshot for the now-filled pane — fill-only makes this a no-op
-  // both on the first drain and the re-fold (replay order-safety).
   tmuxPaneSnapshotEvent([{ pane_id: "%3", session_name: "human-B-stale" }]);
   insertEvent({
     hook_event: "UserPromptSubmit",
@@ -3501,10 +3692,13 @@ test("TmuxPaneSnapshot fold: cursor=0 re-fold reproduces byte-identical jobs row
     .query("SELECT * FROM jobs WHERE job_id = ?")
     .get("sess-refold-tmux");
   expect(before).not.toBeNull();
-  // The FIRST snapshot won (fill-only); the stale second never clobbered.
+  // The retired snapshots no-oped — the live session is NULL (env never wrote it
+  // and no TmuxTopologySnapshot ran). birth holds nothing here (env session was
+  // NULL on every event).
   expect(
-    (before as { backend_exec_session_id: string }).backend_exec_session_id,
-  ).toBe("human-A");
+    (before as { backend_exec_session_id: string | null })
+      .backend_exec_session_id,
+  ).toBeNull();
 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");

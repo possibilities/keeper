@@ -1831,6 +1831,30 @@ function gitSeedRequiredSet(db: Database): boolean {
 }
 
 /**
+ * Read the LIVE-ONLY tmux-projection skip-floor (`tmux_projection_state.floor`,
+ * fn-907). The tmux live-location surface — `jobs.backend_exec_session_id` +
+ * `jobs.window_index` — is a LIVE-PRODUCER-FED projection, NOT replayed from
+ * history: a boot-seed re-derives it on boot and the `TmuxTopologySnapshot` fold
+ * keeps it current. That fold NO-OPS for `event.id <= floor`, so re-folding the
+ * historical topology stream skips the live surface entirely (the location
+ * columns join the byte-identical re-fold charter's EXCLUSION set).
+ *
+ * Module-local twin of {@link readGitFloor} — mirrors db.ts's exported
+ * `readTmuxProjectionFloor` but kept inline so the fold stays a pure reducer
+ * read (matching the reducer's no-prepared-stmts convention). Returns 0 when the
+ * control row is missing (pre-v83 / mid-migrate) so folds run rather than
+ * silently gate — fail-open. PURE event-derived: reads a control row, never
+ * wall-clock / env / FS, so it does not break re-fold determinism for the
+ * deterministic projections (and the tmux surface it gates is charter-excluded).
+ */
+function readTmuxFloor(db: Database): number {
+  const row = db
+    .query("SELECT floor FROM tmux_projection_state WHERE id = 1")
+    .get() as { floor: number } | null;
+  return row?.floor ?? 0;
+}
+
+/**
  * Threshold above which a GitSnapshot fold emits a per-pass `[gitfold-breakdown]`
  * line — high enough that normal folds stay silent; only the multi-second
  * outliers that hold the write lock and starve hook INSERTs matter.
@@ -3107,181 +3131,187 @@ function retractUsageRow(db: Database, event: Event): void {
   db.run("DELETE FROM usage WHERE id = ?", [id]);
 }
 
-/** One `(pane_id, session_name)` pair decoded from a `TmuxPaneSnapshot` event
- *  payload. Both are validated non-empty strings; anything else is dropped. */
-interface TmuxPaneSnapshotPair {
+// fn-907 retired two folds the new `TmuxTopologySnapshot` live-location fold
+// (below) subsumes: the fn-789 fill-only `TmuxPaneSnapshot` session resolver and
+// the fn-817 standalone `WindowIndexSnapshot` fold. The topology fold is the SOLE
+// owner of `backend_exec_session_id` + `window_index`, so both old fold bodies
+// (and their decoders) are gone. Their `applyEvent` arms REMAIN as explicit
+// no-ops (NOT deleted) so historical `TmuxPaneSnapshot` / `WindowIndexSnapshot`
+// events keep advancing the cursor without routing into the final-`else`
+// `projectJobsRow` — that no-op is what holds re-fold determinism, not the fold
+// bodies. The producer (task 2) no longer posts either kind.
+
+/**
+ * One pane of a `TmuxTopologySnapshot` payload, post-decode: the durable `%N`
+ * `pane_id`, its current `#{session_name}`, and its `#{window_index}` (the
+ * window's left-to-right POSITION, or `null` when the producer could not read a
+ * valid integer). Keyed by `pane_id` within the snapshot's single server
+ * generation — `%N` is reused after a kill, so the generation handle rides
+ * alongside the panes (see {@link TmuxTopologySnapshot}), not inside each pane.
+ */
+interface TmuxTopologyPaneEntry {
   pane_id: string;
   session_name: string;
+  window_index: number | null;
 }
 
 /**
- * Null-safe decode of a `TmuxPaneSnapshot` event's `data` blob into the
- * validated `(pane_id, session_name)` pairs. Returns `[]` on a missing / empty /
- * malformed blob (the fold folds an empty list to a no-op); NEVER throws. Each
- * entry is type-narrowed independently so a partial / garbage entry is dropped
- * rather than poisoning the fill. Reads ONLY `event.data` — no probe, no env —
- * keeping the fold a pure function of the event payload (re-fold determinism).
+ * The decoded `TmuxTopologySnapshot` payload: the server `generation_id` (the
+ * tmux server pid — the recycle-guard handle) and the whole-server pane map.
+ * `generation_id` is a validated non-empty string; an absent / non-string
+ * generation drops the WHOLE snapshot (a paneless generation bump still has a
+ * generation, but without one the recycle guard cannot run, so the fold must not
+ * touch live location).
  */
-function extractTmuxPaneSnapshot(event: Event): TmuxPaneSnapshotPair[] {
+interface TmuxTopologySnapshot {
+  generation_id: string;
+  panes: TmuxTopologyPaneEntry[];
+}
+
+/**
+ * Null-safe decode of a `TmuxTopologySnapshot` event's `data` blob into the
+ * validated `{generation_id, panes}` snapshot (epic fn-907). Returns `null` on a
+ * missing / empty / malformed blob OR an absent / non-string / empty
+ * `generation_id` (the fold folds a null snapshot to a no-op); NEVER throws.
+ *
+ * Each pane entry is type-narrowed INDEPENDENTLY so a partial / garbage entry is
+ * dropped rather than poisoning the snapshot: `pane_id` + `session_name` MUST be
+ * non-empty strings (identity + the live session to write), and `window_index`
+ * is a finite integer OR explicitly `null` (a NULL / non-integer / NaN index is
+ * normalized to `null`, NEVER coerced — the fold preserves the last-known index
+ * on a null). Reads ONLY `event.data` — no probe, no env — keeping the fold a
+ * pure function of the event payload (re-fold determinism).
+ *
+ * Mirrors the never-throw, per-entry type-narrow skeleton of
+ * {@link extractWindowIndexSnapshot}; the one structural difference is the
+ * generation_id sidecar (validated once, snapshot-wide) the recycle guard needs.
+ */
+function extractTmuxTopologySnapshot(
+  event: Event,
+): TmuxTopologySnapshot | null {
   if (event.data == null || event.data.length === 0) {
-    return [];
+    return null;
   }
-  let parsed: { pairs?: unknown };
+  let parsed: { generation_id?: unknown; panes?: unknown };
   try {
-    parsed = JSON.parse(event.data) as { pairs?: unknown };
+    parsed = JSON.parse(event.data) as {
+      generation_id?: unknown;
+      panes?: unknown;
+    };
   } catch {
-    return [];
+    return null;
   }
-  if (!Array.isArray(parsed.pairs)) {
-    return [];
+  const generationId = parsed.generation_id;
+  if (typeof generationId !== "string" || generationId === "") {
+    return null;
   }
-  const out: TmuxPaneSnapshotPair[] = [];
-  for (const raw of parsed.pairs) {
-    if (raw == null || typeof raw !== "object") {
-      continue;
+  const panes: TmuxTopologyPaneEntry[] = [];
+  if (Array.isArray(parsed.panes)) {
+    for (const raw of parsed.panes) {
+      if (raw == null || typeof raw !== "object") {
+        continue;
+      }
+      const rec = raw as Record<string, unknown>;
+      const paneId = rec.pane_id;
+      const sessionName = rec.session_name;
+      if (
+        typeof paneId !== "string" ||
+        paneId === "" ||
+        typeof sessionName !== "string" ||
+        sessionName === ""
+      ) {
+        continue;
+      }
+      const rawIndex = rec.window_index;
+      const windowIndex =
+        typeof rawIndex === "number" && Number.isInteger(rawIndex)
+          ? rawIndex
+          : null;
+      panes.push({
+        pane_id: paneId,
+        session_name: sessionName,
+        window_index: windowIndex,
+      });
     }
-    const rec = raw as Record<string, unknown>;
-    const paneId = rec.pane_id;
-    const sessionName = rec.session_name;
-    if (
-      typeof paneId !== "string" ||
-      paneId === "" ||
-      typeof sessionName !== "string" ||
-      sessionName === ""
-    ) {
-      continue;
-    }
-    out.push({ pane_id: paneId, session_name: sessionName });
   }
-  return out;
+  return { generation_id: generationId, panes };
 }
 
 /**
- * Fold one synthetic `TmuxPaneSnapshot` event (epic fn-789). The restore-worker
- * self-gated + deduped a `tmux list-panes` probe and main minted this event
- * carrying the live `(pane_id, session_name)` pairs. For each pair, FILL
- * `backend_exec_session_id` on the matching tmux job whose session is still
- * NULL — closing the human-session gap (incl. the first pane of a human-created
- * session) for which no launch-time `KEEPER_TMUX_SESSION` env was injected.
+ * Fold one synthetic `TmuxTopologySnapshot` event (epic fn-907) — the SOLE owner
+ * of a tmux job's LIVE location (`backend_exec_session_id` + `window_index`). The
+ * restore-worker timer-poll producer hash-deduped a whole-server `tmux
+ * list-panes -a` probe and main minted this event carrying the server
+ * `generation_id` + the per-pane `(session_name, window_index)` map. For each
+ * pane, OVERWRITE the matching LIVE tmux job's session + window index — keyed on
+ * `(generation_id, pane_id)` so a recycled `%N` from a NEW server generation
+ * never re-targets a prior generation's job.
  *
- * FILL-ONLY: the `backend_exec_session_id IS NULL` guard means a non-NULL value
- * is NEVER overwritten. This preserves the staleness semantics (the
- * hook-fed COALESCE arm already owns live coords) AND makes the fold
- * ORDER-INSENSITIVE: replaying the same event after the COALESCE arm filled the
- * value is a no-op, so re-fold reproduces byte-identical rows regardless of
- * event interleaving.
+ * Match: `backend_exec_type = 'tmux'` AND `backend_exec_pane_id = pane_id` AND a
+ * live state (NOT ended/killed) AND the generation either EQUALS the snapshot's
+ * or is still NULL. A NULL-generation match ADOPTS the snapshot generation
+ * (first-match stamping) — the launch env never carried it. The live-state
+ * filter is load-bearing: a killed job must NOT adopt a new generation (the
+ * recycle-guard risk note), so a recycled pane in a fresh server can't resurrect
+ * a dead row's location.
  *
- * Reads ONLY the event payload + the in-transaction `jobs` rows — no probe, no
- * env, no wall-clock. An empty / malformed payload folds to a no-op with the
- * cursor still advancing (never throws). An UPDATE matching zero rows (the pane
- * id isn't a tracked tmux job, or it's already filled) is a correct no-op.
+ * OVERWRITE semantics (NOT fill-only, unlike {@link foldTmuxPaneSnapshot}): a
+ * pane MOVE re-points an already-resolved session, so a later snapshot must
+ * replace the earlier value. But location is only ever written with a PRESENT
+ * value — a pane absent from the snapshot leaves its job untouched (no UPDATE),
+ * and a NULL `window_index` in the payload COALESCEs to the prior index (never
+ * wipes a good value). The session is always present per validated pane, so it
+ * overwrites unconditionally for a matched live job.
+ *
+ * Gated above `tmux_projection_state.floor`: a historical TmuxTopologySnapshot
+ * (`id <= floor`) no-ops — the boot-seed re-derives the live surface, so the two
+ * location columns are LIVE-ONLY (excluded from the byte-identical re-fold
+ * charter). Pure: reads ONLY the event payload + in-transaction `jobs` rows — no
+ * probe, no env, no wall-clock. An empty / malformed payload folds to a no-op
+ * (null snapshot) with the cursor still advancing (NEVER throws). An UPDATE
+ * matching zero rows (no live tmux job for the pane, or a generation mismatch) is
+ * a correct no-op.
  */
-function foldTmuxPaneSnapshot(db: Database, event: Event): void {
-  const pairs = extractTmuxPaneSnapshot(event);
-  if (pairs.length === 0) {
+function foldTmuxTopologySnapshot(db: Database, event: Event): void {
+  // LIVE-ONLY skip-floor: the two location columns are producer-fed, not
+  // replayed. A historical snapshot (`id <= floor`) no-ops — the boot-seed
+  // re-derives the surface above the floor. The cursor still advances at the
+  // dispatch site, so the deterministic projections fold normally.
+  if (event.id <= readTmuxFloor(db)) {
     return;
   }
-  for (const pair of pairs) {
+  const snapshot = extractTmuxTopologySnapshot(event);
+  if (snapshot === null || snapshot.panes.length === 0) {
+    return;
+  }
+  for (const pane of snapshot.panes) {
+    // OVERWRITE session (always present per validated pane); COALESCE the
+    // window_index so a NULL-in-payload preserves the last-known good index
+    // (crash-restore sorting depends on it). ADOPT the snapshot generation on a
+    // first match (`backend_exec_generation_id IS NULL`); a non-NULL generation
+    // must EQUAL the snapshot's (recycle guard). Live-state filter blocks a
+    // killed job from adopting a recycled pane's new generation.
     db.run(
       `UPDATE jobs SET
          backend_exec_session_id = ?,
+         backend_exec_generation_id = ?,
+         window_index = COALESCE(?, window_index),
          last_event_id = ?,
          updated_at = ?
        WHERE backend_exec_type = 'tmux'
          AND backend_exec_pane_id = ?
-         AND backend_exec_session_id IS NULL`,
-      [pair.session_name, event.id, event.ts, pair.pane_id],
-    );
-  }
-}
-
-/** One `(job_id, window_index)` entry decoded from a `WindowIndexSnapshot`
- *  event payload. `job_id` is a validated non-empty string; `window_index` a
- *  validated finite integer; anything else is dropped. */
-interface WindowIndexEntry {
-  job_id: string;
-  window_index: number;
-}
-
-/**
- * Null-safe decode of a `WindowIndexSnapshot` event's `data` blob into the
- * validated `(job_id, window_index)` entries. Returns `[]` on a missing / empty /
- * malformed blob (the fold folds an empty list to a no-op); NEVER throws. Each
- * entry is type-narrowed independently so a partial / garbage entry is dropped
- * rather than poisoning the fold. `window_index` MUST be a finite integer — a
- * non-integer (float, NaN, string) drops the entry, never coerced. Reads ONLY
- * `event.data` — no probe, no env — keeping the fold a pure function of the
- * event payload (re-fold determinism).
- */
-function extractWindowIndexSnapshot(event: Event): WindowIndexEntry[] {
-  if (event.data == null || event.data.length === 0) {
-    return [];
-  }
-  let parsed: { entries?: unknown };
-  try {
-    parsed = JSON.parse(event.data) as { entries?: unknown };
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed.entries)) {
-    return [];
-  }
-  const out: WindowIndexEntry[] = [];
-  for (const raw of parsed.entries) {
-    if (raw == null || typeof raw !== "object") {
-      continue;
-    }
-    const rec = raw as Record<string, unknown>;
-    const jobId = rec.job_id;
-    const windowIndex = rec.window_index;
-    if (
-      typeof jobId !== "string" ||
-      jobId === "" ||
-      typeof windowIndex !== "number" ||
-      !Number.isInteger(windowIndex)
-    ) {
-      continue;
-    }
-    out.push({ job_id: jobId, window_index: windowIndex });
-  }
-  return out;
-}
-
-/**
- * Fold one synthetic `WindowIndexSnapshot` event (epic fn-817). The
- * restore-worker change-gated a `job_id → window_index` layout (the live tmux
- * `#{window_index}`, a window's left-to-right VISUAL position) and main minted
- * this event. For each entry, OVERWRITE `jobs.window_index` on the matching
- * `job_id` — a pure integer copy.
- *
- * Unlike {@link foldTmuxPaneSnapshot}, this is NOT fill-only: window order keeps
- * shifting, so a later snapshot must replace an earlier index. Keying on the
- * stable `job_id` (not a recyclable pane id) means an entry never re-targets
- * another agent. The fold NEVER nulls or deletes a row, so a job absent from this
- * snapshot (already ended / killed) KEEPS its last-folded value — the killed-job
- * window-order survival the DB-only crash-restore derivation needs at restore
- * time, when the original tmux server is dead.
- *
- * Reads ONLY the event payload + the in-transaction `jobs` rows — no probe, no
- * env, no wall-clock. An empty / malformed payload folds to a no-op with the
- * cursor still advancing (never throws). An UPDATE matching zero rows (the
- * `job_id` isn't a tracked job) is a correct no-op. Replaying the same event
- * re-writes the same integer (idempotent), so re-fold reproduces byte-identical
- * rows regardless of event interleaving.
- */
-function foldWindowIndexSnapshot(db: Database, event: Event): void {
-  const entries = extractWindowIndexSnapshot(event);
-  if (entries.length === 0) {
-    return;
-  }
-  for (const entry of entries) {
-    db.run(
-      `UPDATE jobs SET
-         window_index = ?,
-         last_event_id = ?,
-         updated_at = ?
-       WHERE job_id = ?`,
-      [entry.window_index, event.id, event.ts, entry.job_id],
+         AND state NOT IN ('${ENDED}','${KILLED}')
+         AND (backend_exec_generation_id = ?
+              OR backend_exec_generation_id IS NULL)`,
+      [
+        pane.session_name,
+        snapshot.generation_id,
+        pane.window_index,
+        event.id,
+        event.ts,
+        pane.pane_id,
+        snapshot.generation_id,
+      ],
     );
   }
 }
@@ -7332,22 +7362,30 @@ function projectJobsRow(db: Database, event: Event): void {
   // Backend-exec coordinates: latest-non-NULL-wins COALESCE fold from
   // `events.backend_exec_*` onto `jobs.backend_exec_*`. Fires on EVERY event
   // (the hook stamps the columns on every hook event as pure env reads), so a
-  // session that opens / moves panes mid-life lands the freshest coords on the
-  // next event. The ONE coordinate the hook cannot read is a tmux session name
-  // for a claude in a human-created session (no KEEPER_TMUX_SESSION env) — the
-  // `TmuxPaneSnapshot` fold arm fills that fill-only. Gated on
-  // `backend_exec_type != null` (the all-NULL non-pane case is a fast no-op); a
-  // partial capture still COALESCEs so a NULL field preserves the prior value.
-  // Reads only `event.backend_exec_*` + the persisted cell — re-fold
-  // deterministic. An UPDATE against a missing jobs row is a no-op — a row is
-  // minted first per session by either a SessionStart or the first pid-bearing
-  // UserPromptSubmit (the fork-attribution seed), so a live session always has
-  // one by the time backend coords arrive.
+  // session that opens panes mid-life lands the freshest coords on the next
+  // event. Gated on `backend_exec_type != null` (the all-NULL non-pane case is a
+  // fast no-op); a partial capture still COALESCEs so a NULL field preserves the
+  // prior value. Reads only `event.backend_exec_*` + the persisted cell —
+  // re-fold deterministic. An UPDATE against a missing jobs row is a no-op — a
+  // row is minted first per session by either a SessionStart or the first
+  // pid-bearing UserPromptSubmit (the fork-attribution seed), so a live session
+  // always has one by the time backend coords arrive.
+  //
+  // PRECEDENCE FLIP (fn-907): this arm NO LONGER writes the LIVE
+  // `backend_exec_session_id`. The frozen launch-time `KEEPER_TMUX_SESSION` env
+  // never rewrites when a pane MOVES, so re-asserting it on every hook event
+  // clobbered the live location. The env session value is now FORENSIC — it
+  // COALESCE-fills `backend_exec_birth_session_id` (written once, idempotent
+  // since the env is constant per process). The LIVE `backend_exec_session_id`
+  // (+ `window_index`) is owned SOLELY by the `TmuxTopologySnapshot` fold, which
+  // tracks reality across moves. Consumers fall back to birth when the live
+  // session is unresolved. `backend_exec_type` + `backend_exec_pane_id` stay as
+  // pure env reads (a pane's TYPE + `%N` identity don't move out from under it).
   if (event.backend_exec_type != null) {
     db.run(
       `UPDATE jobs SET
          backend_exec_type = COALESCE(?, backend_exec_type),
-         backend_exec_session_id = COALESCE(?, backend_exec_session_id),
+         backend_exec_birth_session_id = COALESCE(backend_exec_birth_session_id, ?),
          backend_exec_pane_id = COALESCE(?, backend_exec_pane_id),
          last_event_id = ?,
          updated_at = ?
@@ -7677,19 +7715,32 @@ export function applyEvent(
       // empty arm: the final `else` runs projectJobsRow, so deleting this
       // arm would route historical BackendExecSnapshot events into the jobs
       // projection and break re-fold determinism.
+    } else if (event.hook_event === "TmuxTopologySnapshot") {
+      // epic fn-907 — the LIVE-LOCATION fold (sole owner of
+      // `backend_exec_session_id` + `window_index`). Overwrites each matching
+      // LIVE tmux job's session + window index, recycle-guarded on
+      // `(generation_id, pane_id)` and gated above `tmux_projection_state.floor`.
+      // LIVE-ONLY: the two columns are boot-seeded + skip-floored (NOT replayed),
+      // so this fold no-ops below the floor and the columns are excluded from the
+      // byte-identical re-fold charter.
+      foldTmuxTopologySnapshot(db, event);
     } else if (event.hook_event === "TmuxPaneSnapshot") {
-      // epic fn-789 — fill-only session-name resolution for human-session tmux
-      // jobs the launch-time env injection couldn't cover. A NEW event name
-      // (NOT the retired BackendExecSnapshot above); the fold reads only the
-      // payload pairs and never overwrites a non-NULL session.
-      foldTmuxPaneSnapshot(db, event);
+      // retired fn-907 — the fill-only session resolver (epic fn-789) is
+      // superseded by the `TmuxTopologySnapshot` live-location fold above. Fold
+      // to NO-OP so historical TmuxPaneSnapshot events advance the cursor without
+      // touching the jobs projection. MUST stay an explicit empty arm: the final
+      // `else` runs projectJobsRow, so deleting this arm would route historical
+      // TmuxPaneSnapshot events into the jobs projection and break re-fold
+      // determinism. The producer no longer posts this kind, but the historical
+      // events remain in the log forever.
     } else if (event.hook_event === "WindowIndexSnapshot") {
-      // epic fn-817 — overwrite `jobs.window_index` from the restore-worker's
-      // change-gated `job_id → window_index` layout so the DB-only crash-restore
-      // derivation replays original visual order. A NEW event name; the fold
-      // reads only the payload entries (pure integer copy keyed by job_id), never
-      // probes, and never nulls a row (killed jobs keep their last index).
-      foldWindowIndexSnapshot(db, event);
+      // retired fn-907 — the standalone window-index fold (epic fn-817) is
+      // subsumed by the `TmuxTopologySnapshot` fold above (which carries
+      // window_index per pane). Fold to NO-OP so historical WindowIndexSnapshot
+      // events advance the cursor without touching the jobs projection. MUST stay
+      // an explicit empty arm for the same re-fold-determinism reason as the
+      // retired TmuxPaneSnapshot arm above — a deleted arm routes the historical
+      // events into projectJobsRow. The producer no longer posts this kind.
     } else if (event.hook_event === "BackendExecStart") {
       // epic fn-819 — a backend generation boundary (restore-worker mints one on
       // a server-pid change). NO-OP fold: the boundary lives in the event-log
