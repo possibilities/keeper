@@ -466,6 +466,53 @@ test("fn-905: unseededGatedRoots returns ONLY the gated roots lacking an above-f
   expect(allGatedRootsSeeded(kdb.db, floor)).toBe(true);
 });
 
+test("fn-921: a gated effectiveRoot keyed differently from its toplevel write key clears ONLY with a resolver", () => {
+  // The READ key is the raw effectiveRoot; the boot-seed/live git-worker WRITE the
+  // row under resolveGitToplevel(root). Simulate the mismatch: gate on a SUBDIR
+  // effectiveRoot but write the row under its toplevel. Without a resolver the
+  // gated root reads unseeded forever (the latent freeze the fn-921 fix targets);
+  // with the resolver (toplevel write key) it clears.
+  const toplevel = fakeRoot("repo-toplevel");
+  const subdir = `${toplevel}/packages/app`; // a target_repo pointing at a subdir
+  seedOpenEpic("fn-1-subdir", toplevel, [subdir]);
+  // Seed the row under the TOPLEVEL (the real write key), above the floor.
+  const floor = readGitProjectionFloor(kdb.db);
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [toplevel, toplevel, JSON.stringify(dirtySnapshot(toplevel))],
+  );
+  drainAll();
+
+  // The resolver maps the subdir effectiveRoot to its toplevel write key.
+  const resolver = (root: string): string =>
+    root === subdir ? toplevel : root;
+
+  // Raw key: the subdir has no row → still unseeded (the latent bug).
+  expect(unseededGatedRoots(kdb.db, floor).has(subdir)).toBe(true);
+  expect(allGatedRootsSeeded(kdb.db, floor)).toBe(false);
+
+  // Resolved key: the subdir maps to the toplevel row → seeded.
+  expect(unseededGatedRoots(kdb.db, floor, resolver).has(subdir)).toBe(false);
+  // The close-row root (the epic project_dir == toplevel) is keyed at the
+  // toplevel directly, so it is already seeded — every gated root now resolves.
+  expect(allGatedRootsSeeded(kdb.db, floor, resolver)).toBe(true);
+});
+
+test("fn-921: a resolver that throws falls back to the raw key (never throws into the read path)", () => {
+  const repo = fakeRoot("resolver-throws");
+  seedOpenEpic("fn-1-throws", repo, [repo]);
+  const floor = readGitProjectionFloor(kdb.db);
+  const throwing = (): string => {
+    throw new Error("git unavailable");
+  };
+  // The repo has no row; a throwing resolver must NOT propagate — it falls back to
+  // the raw key, so the verdict is the same as the no-resolver default.
+  expect(() => unseededGatedRoots(kdb.db, floor, throwing)).not.toThrow();
+  expect(unseededGatedRoots(kdb.db, floor, throwing).has(repo)).toBe(true);
+  expect(allGatedRootsSeeded(kdb.db, floor, throwing)).toBe(false);
+});
+
 test("fn-905: with NO gated roots, unseededGatedRoots is empty (the gate is off)", () => {
   // No open epics → no gated roots → empty set, even with a stale git_status row.
   kdb.db.run(

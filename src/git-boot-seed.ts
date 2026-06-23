@@ -58,6 +58,7 @@ import type { Database } from "bun:sqlite";
 import type { Stmts } from "./db";
 import { raiseGitProjectionFloor, setGitProjectionSeedRequired } from "./db";
 import { allGatedRootsSeeded, gatedGitRoots } from "./gated-roots";
+import { memoizedGitToplevel } from "./git-toplevel";
 import {
   buildDiscoveryCandidates,
   buildGitSnapshot,
@@ -348,7 +349,12 @@ export function seedGitProjection(
   //    that root's live emit lands). `complete` (EVERY targeted root) still
   //    rides the return for observability, but the clear gates on the gated set.
   raiseGitProjectionFloor(db, floor);
-  if (allGatedRootsSeeded(db, floor)) {
+  // fn-921: reconcile the gated read key with the toplevel write key — a
+  // subdir/symlink `target_repo` whose `git_status` row is written under
+  // resolveGitToplevel still clears here (memoized to one resolve per distinct
+  // gated root). The reducer's self-clear passes NO resolver (it cannot shell out
+  // to git); for the common `effectiveRoot === toplevel` case both agree.
+  if (allGatedRootsSeeded(db, floor, memoizedGitToplevel())) {
     setGitProjectionSeedRequired(db, false);
   }
 

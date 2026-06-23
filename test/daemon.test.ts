@@ -31,7 +31,10 @@ import {
   buildPendingDispatchSweepRecords,
   checkAgentwrapPresence,
   type DaemonHandle,
+  decideGitSeedWatchdog,
   drainToCompletion,
+  GIT_SEED_MAX_RESEED_ATTEMPTS,
+  GIT_SEED_STUCK_THRESHOLD_MS,
   isTransientBusyError,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -939,6 +942,108 @@ test("isTransientBusyError classifies writer-lock starvation as transient and ev
   expect(isTransientBusyError("SQLITE_BUSY")).toBe(false); // a bare string
   expect(isTransientBusyError(null)).toBe(false);
   expect(isTransientBusyError(undefined)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-921 — git seed-liveness watchdog pure verdict
+// ---------------------------------------------------------------------------
+
+const WD_BASE = {
+  seedRequired: true,
+  lastProgressAtMs: 0,
+  lastLivenessAtMs: 100_000,
+  nowMs: 100_000,
+  stuckThresholdMs: GIT_SEED_STUCK_THRESHOLD_MS,
+  livenessThresholdMs: 90_000,
+  reseedAttempts: 0,
+  maxReseedAttempts: GIT_SEED_MAX_RESEED_ATTEMPTS,
+};
+
+test("decideGitSeedWatchdog: seed cleared → ok (the healthy steady state)", () => {
+  expect(decideGitSeedWatchdog({ ...WD_BASE, seedRequired: false })).toBe("ok");
+});
+
+test("decideGitSeedWatchdog: worker never pulsed → ok (never trip mid-boot-seed)", () => {
+  // lastLivenessAtMs null = boot-seed may still be in flight. Even with a long-
+  // stale progress anchor, we must not act.
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      lastLivenessAtMs: null,
+      lastProgressAtMs: 0,
+      nowMs: 10_000_000,
+    }),
+  ).toBe("ok");
+});
+
+test("decideGitSeedWatchdog: recent progress → ok (staleness under the threshold)", () => {
+  // A snapshot landed 1s ago; seed_required set but not yet stuck.
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      lastProgressAtMs: 100_000,
+      lastLivenessAtMs: 100_500,
+      nowMs: 101_000,
+    }),
+  ).toBe("ok");
+});
+
+test("decideGitSeedWatchdog: stuck + worker alive + budget remaining → reseed", () => {
+  // No progress for > stuckThreshold, but the worker is still pulsing (alive),
+  // and we have not exhausted the re-seed budget → re-seed on main first.
+  const now = WD_BASE.lastProgressAtMs + GIT_SEED_STUCK_THRESHOLD_MS + 1;
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      nowMs: now,
+      lastLivenessAtMs: now, // pulsed just now → alive
+      reseedAttempts: 0,
+    }),
+  ).toBe("reseed");
+});
+
+test("decideGitSeedWatchdog: stuck + re-seed budget spent → escalate", () => {
+  const now = WD_BASE.lastProgressAtMs + GIT_SEED_STUCK_THRESHOLD_MS + 1;
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      nowMs: now,
+      lastLivenessAtMs: now,
+      reseedAttempts: GIT_SEED_MAX_RESEED_ATTEMPTS,
+    }),
+  ).toBe("escalate");
+});
+
+test("decideGitSeedWatchdog: mute worker (no pulse past livenessThreshold) → escalate, regardless of re-seed budget", () => {
+  // The worker stopped pulsing > livenessThreshold ago — a hung poll tick. A main
+  // re-seed would only momentarily clear the flag before the dead producer
+  // re-staled it, so restart is the correct recovery even with budget remaining.
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      lastLivenessAtMs: 0,
+      nowMs: 200_000, // 200s since last pulse, > 90s liveness threshold
+      reseedAttempts: 0,
+    }),
+  ).toBe("escalate");
+});
+
+test("decideGitSeedWatchdog: alive-but-never-seeding still grows stale from the arm baseline → reseed", () => {
+  // The stable progress anchor (the watchdog-arm baseline) grows stale even while
+  // the worker keeps pulsing — so a quiet repo whose force-emit never clears the
+  // flag is still recovered, not stuck forever. Pulse stays fresh (alive); the
+  // progress anchor is old (no snapshot ever landed).
+  const baseline = 0;
+  const now = baseline + GIT_SEED_STUCK_THRESHOLD_MS + 1;
+  expect(
+    decideGitSeedWatchdog({
+      ...WD_BASE,
+      lastProgressAtMs: baseline,
+      lastLivenessAtMs: now, // still pulsing → alive
+      nowMs: now,
+      reseedAttempts: 0,
+    }),
+  ).toBe("reseed");
 });
 
 test("usage-mint crash regression: a real insertEvent.run starved past busy_timeout throws an error isTransientBusyError catches", async () => {

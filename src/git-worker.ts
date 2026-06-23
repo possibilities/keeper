@@ -8,17 +8,22 @@
  * after a cooling dwell; `.keeper`-backed worktrees stay watched even when
  * clean and incur no probe spawn (short-circuit).
  *
- * EVENT-DRIVEN, not polled: a snapshot fires only on (1) a worktree FSEvents
- * change, (2) a git-common-dir FSEvents change (commit/checkout/branch/fetch —
- * ref/HEAD/index mutations the worktree sub ignores via `**\/.git/**`), (3) a
- * `PRAGMA data_version` bump (membership reconcile ONLY — it carries no root
- * attribution, so it must never fan a per-root snapshot out; that O(roots)
- * fan-out was a CPU-flood source), or (4) a 60s heartbeat backstop. The FSEvents
- * signals feed a per-root `RescanScheduler` (trailing-debounce + single-flight);
- * the per-root `lastByRoot` dedupe absorbs no-op snapshots.
+ * POLL-ONLY (fn-921): the git surface no longer holds an `@parcel/watcher`
+ * subscription. A snapshot fires on (1) a two-tier metadata poll delta — every
+ * ~{@link GIT_POLL_MS} the worker cheap-`stat()`s each watched root's `.git`
+ * metadata + worktree-root mtime ({@link readGitMetaSignature}); a changed
+ * signature ({@link decideGitPoll}) drives the per-root `RescanScheduler`
+ * (trailing-debounce + single-flight) — (2) a `PRAGMA data_version` bump
+ * (membership reconcile ONLY — it carries no root attribution, so it never fans a
+ * per-root snapshot out; that O(roots) fan-out was a CPU-flood source), or (3) a
+ * 60s heartbeat backstop (which ALSO clears a quiet-repo `seed_required`). The
+ * per-root `lastByRoot` dedupe absorbs no-op snapshots.
  *
- * Watchers on EXTERNAL trees (the worktree + git common-dir) are the sanctioned
- * carve-out; keeper's OWN DB is observed only via `PRAGMA data_version` polling.
+ * The poll producer is armed UNCONDITIONALLY at worker start, NOT inside a watcher
+ * `import().then()` — a watcher-load hang or a mute FSEvents stream can therefore
+ * never again leave the producer with no timers armed (the 2026-06-23 silent
+ * freeze). The poll `lstat` sweep is the sanctioned external-tree carve-out;
+ * keeper's OWN DB is observed only via `PRAGMA data_version` polling.
  *
  * PRODUCER only: owns no writable DB connection, never mutates projections. Main
  * mints every event; the reducer folds the persisted payload into `git_status`.
@@ -30,29 +35,39 @@ import type { Database } from "bun:sqlite";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import type { AsyncSubscription } from "@parcel/watcher";
 import {
   BackstopCounters,
   type BackstopMessage,
   buildMissedWakeRecord,
 } from "./backstop-telemetry";
-import { openDb } from "./db";
+import {
+  openDb,
+  readGitProjectionFloor,
+  readGitProjectionSeedRequired,
+} from "./db";
 import {
   parsePlanRef,
   parseSessionIdTrailer,
   parseTaskTrailers,
 } from "./derivers";
+import { unseededGatedRoots } from "./gated-roots";
+import {
+  memoizedGitToplevel,
+  resolveGitToplevel as resolveGitToplevelImpl,
+} from "./git-toplevel";
 import { normalizePlanOp } from "./plan-classifier";
-import { DEFAULT_DEBOUNCE_MS, isDropError, RescanScheduler } from "./rescan";
+import { DEFAULT_DEBOUNCE_MS, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
 export interface GitWorkerData {
   dbPath: string;
   /**
-   * When `true`, the worker NEVER `import()`s `@parcel/watcher` — it skips the
-   * live FSEvents subscribe + DB-poll/heartbeat reconcile and stays alive only
-   * for the shutdown handshake. The in-process daemon harness sets this so the
-   * slow-test tier never dlopens the NAPI addon in a worker thread.
+   * When `true`, the worker arms NO producer timers — it skips the two-tier git
+   * poll + DB-poll + heartbeat and stays alive only for the shutdown handshake.
+   * The in-process daemon harness sets this so the slow-test tier runs the fold
+   * pipeline without the git producer. (Named for the legacy `@parcel/watcher`
+   * disable; fn-921 made the git-worker poll-only, so the flag now gates the poll
+   * producer, not a watcher import.)
    */
   disableNativeWatcher?: boolean;
 }
@@ -243,11 +258,28 @@ export interface PlanCommitChangedMessage {
   changes: PlanChangedFile[];
 }
 
+/**
+ * fn-921 supervisor liveness pulse. The git-worker is POLL-ONLY now, so a mute
+ * `@parcel/watcher` stream can no longer silently freeze it — but a worker that is
+ * alive-yet-stuck (an unhandled hang inside a poll tick) is invisible to main's
+ * `onerror`/`close` supervision, which only catches a crash. This pulse is the
+ * additive signal: the worker posts one on every poll tick it completes, and the
+ * supervisor's seed-liveness watchdog reads the time since the last pulse together
+ * with `seed_required` to decide whether the surface is stuck. NOT folded into the
+ * event log — a pure worker→main side channel, like {@link BackstopMessage}.
+ */
+export interface GitLivenessMessage {
+  kind: "git-liveness";
+  /** Monotonic-ish wall-clock (`Date.now()`) at which the poll tick completed. */
+  at_ms: number;
+}
+
 export type GitWorkerMessage =
   | GitSnapshotMessage
   | GitRootDroppedMessage
   | CommitMessage
   | PlanCommitChangedMessage
+  | GitLivenessMessage
   // A backstop rescue/rollup record posted up to main (the sole sidecar writer).
   // NOT folded into the event log — routed straight to `handleBackstopMessage`.
   | BackstopMessage;
@@ -261,9 +293,20 @@ export interface ParsedGitStatus {
   files: GitFileStatus[];
 }
 
-/** `PRAGMA data_version` cadence. */
+/** `PRAGMA data_version` cadence (drives membership reconcile only). */
 const DB_POLL_MS = 100;
-/** Silent-watcher backstop. */
+/**
+ * Two-tier git-metadata poll cadence (fn-921). The git surface is POLL-ONLY: the
+ * git-worker no longer holds an `@parcel/watcher` subscription. Every ~300ms the
+ * worker cheap-`stat()`s each watched root's `.git` metadata + a shallow worktree
+ * mtime ({@link readGitMetaSignature}); a changed signature drives the existing
+ * per-root `RescanScheduler` (debounce + dedupe), so the git scan + `emitSnapshot`
+ * still runs only on a detected delta. Latency ~300ms (tunable); the stat sweep is
+ * negligible. Decoupling the producer from `@parcel/watcher` removes the
+ * watcher-load-hang / mute-stream silent-freeze class entirely.
+ */
+const GIT_POLL_MS = 300;
+/** Slow backstop (also clears a quiet-repo `seed_required`). */
 const HEARTBEAT_MS = 60_000;
 /**
  * Cadence at which the worker flushes its backstop counters as rollup records —
@@ -337,40 +380,6 @@ const HEAD_DIVERGENCE_GRACE_MS = 90_000;
  * the heartbeat backstop still recovers the projection.
  */
 export const COMMIT_ENUM_MAX_RETRIES = 5;
-
-/**
- * Positive ignore globs for `@parcel/watcher` — build outputs, vendored deps,
- * package caches that flood FSEvents under a broad watch root. Mirrors
- * `plan-worker.ts`'s `IGNORE_GLOBS`, duplicated so the two workers may diverge.
- */
-const GIT_IGNORE_GLOBS = [
-  "**/node_modules/**",
-  "**/.git/**",
-  "**/dist/**",
-  "**/build/**",
-  "**/.next/**",
-  "**/.cache/**",
-  "**/target/**",
-  "**/.venv/**",
-  "**/*.tmp",
-];
-
-/**
- * Positive ignore globs for the sibling git-common-dir subscription, which fires
- * on commit/checkout/branch-switch/fetch (HEAD / index / refs / packed-refs
- * mutations). Everything below is high-churn noise that doesn't affect
- * `git status`: object packs, reflogs, hooks, git-lfs storage, and transient
- * `*.lock` files. The debounce + dedupe would absorb them as no-ops, but pruning
- * at the watcher cuts the FSEvents pressure that causes drop-recovery storms.
- */
-const GIT_DIR_IGNORE_GLOBS = [
-  "**/objects/**",
-  "**/logs/**",
-  "**/hooks/**",
-  "**/lfs/**",
-  "**/info/**",
-  "**/*.lock",
-];
 
 function stringifyErr(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -528,12 +537,13 @@ function gitOutput(args: string[]): string | null {
  * or `null` if the path isn't inside a git worktree. cwd→toplevel is stable for
  * a session's lifetime, so its cache is permanent; the separate membership
  * verdict ({@link shouldWatchRoot}) re-runs per reconcile against a fresh probe.
+ *
+ * fn-921: the implementation lives in the dep-light `git-toplevel.ts` so the
+ * readiness read sites can normalize the gated key without importing this whole
+ * module. Re-exported here to preserve the existing public API + call sites.
  */
 export function resolveGitToplevel(path: string): string | null {
-  const out = gitOutput(["-C", path, "rev-parse", "--show-toplevel"]);
-  const root = out?.trim();
-  if (!root) return null;
-  return root;
+  return resolveGitToplevelImpl(path);
 }
 
 /**
@@ -1754,6 +1764,110 @@ export function decideDataVersionWake(
   return { reconcile: curVersion !== lastVersion };
 }
 
+/**
+ * The `.git`-metadata files the two-tier poll cheap-`stat()`s per root (fn-921).
+ * A change to any of these is the cheap proxy for "a commit / checkout / branch
+ * switch / index update happened": `HEAD` (current ref / detached oid), `index`
+ * (staging mutations), `logs/HEAD` (reflog — every ref move), `packed-refs` (gc /
+ * fetch). Paired with a shallow worktree-root mtime so a save in the worktree
+ * (which touches the worktree dir's mtime) is also caught. Resolved against the
+ * git COMMON-dir so a linked worktree's shared refs are covered (mirrors
+ * {@link gitCommonDirFor}). Missing files contribute `0` — the signature still
+ * changes when one appears/disappears.
+ */
+const GIT_META_FILES = ["HEAD", "index", "logs/HEAD", "packed-refs"] as const;
+
+/**
+ * Read the two-tier poll signature for a root: the worktree-root mtime plus each
+ * {@link GIT_META_FILES} mtime under the git common-dir, joined into one stable
+ * string. A changed signature ⇒ "rescan this root". IMPURE (fs `lstat`) — this is
+ * the producer's poll boundary, so it lives in the worker, never a fold. A stat
+ * that throws (vanished file) contributes `0`, so a delete still flips the
+ * signature. Returns `null` ONLY when the worktree root itself cannot be stat'd
+ * (vanished root) — the caller treats `null` as "no usable signature, skip".
+ *
+ * The git common-dir is resolved once and cached by the caller; here it is passed
+ * in so the per-tick cost is a handful of `lstat`s and no `git` spawn.
+ */
+export function readGitMetaSignature(
+  root: string,
+  gitCommonDir: string | null,
+): string | null {
+  let worktreeMtime: number;
+  try {
+    worktreeMtime = lstatSync(root).mtimeMs;
+  } catch {
+    return null;
+  }
+  const parts: string[] = [String(worktreeMtime)];
+  if (gitCommonDir != null) {
+    for (const rel of GIT_META_FILES) {
+      let mtime = 0;
+      try {
+        mtime = lstatSync(join(gitCommonDir, rel)).mtimeMs;
+      } catch {
+        mtime = 0;
+      }
+      parts.push(`${rel}:${mtime}`);
+    }
+  }
+  return parts.join("|");
+}
+
+/**
+ * Pure decision for the two-tier git poll (fn-921). Given the previously-seen
+ * metadata signature and the freshly-read one, decide whether to rescan:
+ *
+ *   - `prev == null` (first observation of this root) → rescan: we have no
+ *     baseline, so emit once to establish the surface (the per-root semantic
+ *     dedupe in `emitSnapshot` absorbs a no-op).
+ *   - `cur == null` (worktree vanished) → skip: no usable signature; the
+ *     vanished-root prune (full sweep) tombstones it separately.
+ *   - `cur !== prev` → rescan (a delta).
+ *   - else → skip (quiet — the negligible-cost steady state).
+ *
+ * PURE — string compare only, no I/O. Exported for unit reach (the
+ * {@link decideDataVersionWake} sibling model).
+ */
+export function decideGitPoll(
+  prev: string | null,
+  cur: string | null,
+): { rescan: boolean } {
+  if (cur == null) return { rescan: false };
+  if (prev == null) return { rescan: true };
+  return { rescan: cur !== prev };
+}
+
+/**
+ * Pure decision for the quiet-repo `seed_required` clear (fn-921). The boot-seed
+ * captures the floor at `max(events.id)` BEFORE its scan; if a gated root's last
+ * live snapshot sits AT/BELOW that floor (or the boot-seed missed the root), the
+ * root has no above-floor `git_status` row and `seed_required` stays set —
+ * FOREVER on a quiet repo, because the change-driven poll never fires with no
+ * file activity. The fix: while `seed_required` is set, FORCE-emit a snapshot for
+ * the unseeded gated roots (bypassing the semantic dedupe) so main folds an
+ * above-floor snapshot and clears the flag. This helper decides the per-root
+ * force-emit set: the intersection of the currently-WATCHED roots with the
+ * unseeded gated roots (a root the worker doesn't watch can't be force-emitted
+ * here — the boot-seed / membership reconcile owns establishing it).
+ *
+ * Returns the roots to force-emit (a subset of `watched`), or `[]` when
+ * `seedRequired` is false (the steady state — no work). PURE: set arithmetic
+ * only, no I/O; the caller owns the `seed_required` read + the emit.
+ */
+export function decideSeedRequiredEmit(
+  seedRequired: boolean,
+  watched: Iterable<string>,
+  unseededGated: ReadonlySet<string>,
+): string[] {
+  if (!seedRequired || unseededGated.size === 0) return [];
+  const out: string[] = [];
+  for (const root of watched) {
+    if (unseededGated.has(root)) out.push(root);
+  }
+  return out;
+}
+
 function startWorker(): void {
   if (parentPort == null) {
     console.error("[git-worker] no parentPort — not running as a Worker");
@@ -1803,17 +1917,19 @@ function startWorker(): void {
    * unsubscribe.
    */
   const headEnumFailuresByRoot = new Map<string, number>();
-  // Each watched root holds a worktree subscription and (best-effort) a
-  // git-common-dir subscription. The git-dir sub may be null if the
-  // common-dir lookup failed or the subscribe itself rejected (logged,
-  // non-fatal — the heartbeat backstop still covers commit/checkout for
-  // that root within 60s). Co-locating the two so unsubscribe + shutdown
-  // can release them as a unit.
-  interface RootSubscriptions {
-    worktree: AsyncSubscription;
-    gitDir: AsyncSubscription | null;
+  // fn-921 poll-only: each watched root holds a poll-watch entry instead of an
+  // `@parcel/watcher` subscription. `gitCommonDir` is resolved once (a single
+  // `git rev-parse --git-common-dir` spawn) and cached so each ~300ms poll tick
+  // is a handful of `lstat`s, never a `git` spawn; `lastSignature` is the prior
+  // {@link readGitMetaSignature} so {@link decideGitPoll} can flag a delta.
+  // `null` gitCommonDir means the common-dir resolve failed — the worktree-root
+  // mtime alone still flags worktree saves, and the heartbeat backstop covers
+  // commit/checkout for that root within 60s.
+  interface RootPollWatch {
+    gitCommonDir: string | null;
+    lastSignature: string | null;
   }
-  const subscriptions = new Map<string, RootSubscriptions>();
+  const subscriptions = new Map<string, RootPollWatch>();
   const schedulers = new Map<string, RescanScheduler>();
   /**
    * Epic fn-716: count of GitSnapshot emits coalesced away by the semantic
@@ -1856,23 +1972,6 @@ function startWorker(): void {
    */
   const extraCandidateRoots = new Set<string>();
   /**
-   * fn-771 missed-wake re-arm. Roots whose FSEvents subscription went mute and
-   * was rescued by the heartbeat backstop — flagged here so the NEXT
-   * level-triggered reconcile re-derives a FRESH subscription for each (a mute
-   * `@parcel/watcher` stream is replaced, not respawned). This is the existing
-   * reconcile mechanism with ONE extra trigger: the heartbeat NEVER
-   * unsubscribes/resubscribes directly (the no-self-heal invariant — no worker
-   * respawn), it only sets the flag and kicks a reconcile. The reconcile drains
-   * the set (bounded by {@link MAX_SUBSCRIBES_PER_CYCLE}), tears down each
-   * flagged root's FSEvents subs WITHOUT a `git-root-dropped` tombstone (a
-   * re-arm keeps the projection row + the HEAD-oid cache — it is not a drop),
-   * then the normal `toAdd` re-derivation re-subscribes any still-desired root
-   * exactly once. A subscribe failure follows the existing reconcile
-   * error-handling (`subscribeRoot` swallows + logs); nothing throws out of the
-   * heartbeat. No DB write, no synthetic event.
-   */
-  const pendingResubscribe = new Set<string>();
-  /**
    * Epic fn-690: wall-clock (`Date.now()`) timestamp of the last full-history sweep
    * (`runFullSweep: true`). `null` until the first reconcile fires.
    * Throttled to {@link FULL_SWEEP_INTERVAL_MS} so the heavy
@@ -1900,8 +1999,8 @@ function startWorker(): void {
    */
   const vanishedTombstoned = new Set<string>();
 
-  let watcherModule: typeof import("@parcel/watcher") | null = null;
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
+  let gitPollTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let lastDataVersion: number | null = null;
   let shuttingDown = false;
@@ -1947,9 +2046,18 @@ function startWorker(): void {
   // heartbeat then takes the worst-case (oldest) anchor across all rescued roots
   // for `now − committed_at_ms`. The fast-path callers (scheduler emit, initial
   // subscribe) pass nothing — only the slow backstop needs the latency.
+  //
+  // fn-921: `force` bypasses the per-root semantic dedupe so a quiet repo with
+  // `seed_required` set re-emits an UNCHANGED snapshot — the boot-seed may have
+  // captured a floor ABOVE this root's last live snapshot, leaving the surface
+  // unseeded yet the dedupe key identical. A forced emit lands an above-floor
+  // snapshot main folds to clear `seed_required`. Used ONLY by the seed-required
+  // backstop; every other caller leaves it false so the dedupe still suppresses
+  // no-op churn.
   function emitSnapshot(
     root: string,
     dischargedCommitAtMs?: number[],
+    force = false,
   ): boolean {
     if (shuttingDown) return false;
     let status: ParsedGitStatus | null;
@@ -2114,7 +2222,7 @@ function startWorker(): void {
     // the gate never fired (the GitSnapshot flood). mtime_ms + worktree_oid
     // stay in the EMITTED payload below — only the KEY drops mtime_ms.
     const key = semanticSnapshotKey(snapshot);
-    if (lastByRoot.get(root) === key) {
+    if (!force && lastByRoot.get(root) === key) {
       coalescedDrops++;
       return false;
     }
@@ -2135,13 +2243,11 @@ function startWorker(): void {
     // debounce alone re-arms forever under sustained edits and never flushes.
     s = new RescanScheduler(
       () => {
-        // fn-720: a debounced scheduler fire IS the fast path (an FSEvents
-        // worktree/git-dir change, or the drop-triggered rescan) — stamp
-        // `last_fast_path_at` so a later heartbeat measures staleness against
-        // it. The heartbeat calls
-        // `emitSnapshot` DIRECTLY (not through the scheduler), so it never
-        // stamps — exactly the fast-path/backstop distinction we want.
-        markFastPath();
+        // fn-720/fn-921: a debounced scheduler fire IS the fast path (a two-tier
+        // poll delta from `pollGitRoots`). `markFastPath` is stamped by the poll
+        // tick at schedule time; the heartbeat calls `emitSnapshot` DIRECTLY (not
+        // through the scheduler), so it never stamps — exactly the
+        // fast-path/backstop distinction we want.
         emitSnapshot(root);
       },
       DEFAULT_DEBOUNCE_MS,
@@ -2151,6 +2257,48 @@ function startWorker(): void {
     );
     schedulers.set(root, s);
     return s;
+  }
+
+  /**
+   * fn-921 quiet-repo `seed_required` clear. While the flag is set, force-emit a
+   * snapshot for each WATCHED + unseeded gated root (see {@link
+   * decideSeedRequiredEmit}) so main folds an above-floor `GitSnapshot` and clears
+   * the flag — even with zero file activity (the change-driven poll never fires on
+   * a quiet repo). The gated read key is normalized to the toplevel write key
+   * ({@link memoizedGitToplevel}) so a subdir/symlink `target_repo` is matched.
+   * Read-only DB access; the FORCE bypasses the semantic dedupe so an UNCHANGED
+   * snapshot still lands above the floor. Returns the count emitted (for the
+   * heartbeat's logging). Cheap + idempotent: once the flag clears (main's fold),
+   * the next call sees `seedRequired=false` and does nothing.
+   */
+  function emitForUnseededGatedRoots(): number {
+    let seedRequired: boolean;
+    try {
+      seedRequired = readGitProjectionSeedRequired(db);
+    } catch {
+      return 0;
+    }
+    if (!seedRequired) return 0;
+    let unseeded: ReadonlySet<string>;
+    try {
+      unseeded = unseededGatedRoots(
+        db,
+        readGitProjectionFloor(db),
+        memoizedGitToplevel(),
+      );
+    } catch {
+      return 0;
+    }
+    const toEmit = decideSeedRequiredEmit(
+      seedRequired,
+      subscriptions.keys(),
+      unseeded,
+    );
+    let emitted = 0;
+    for (const root of toEmit) {
+      if (emitSnapshot(root, undefined, /* force */ true)) emitted++;
+    }
+    return emitted;
   }
 
   /**
@@ -2209,86 +2357,54 @@ function startWorker(): void {
     return true;
   }
 
-  async function subscribeRoot(root: string): Promise<void> {
-    if (shuttingDown || watcherModule == null) return;
+  /**
+   * fn-921 poll-only: begin POLLING a newly-desired root. Resolves the git
+   * common-dir ONCE (one `git rev-parse` spawn; cached on the poll-watch entry so
+   * the steady poll is `lstat`-only), seeds the poll-watch with no baseline
+   * signature, and emits the initial snapshot. The next poll tick reads the first
+   * signature; subsequent ticks flag deltas via {@link decideGitPoll}. No
+   * `@parcel/watcher` subscription — there is nothing async to await and nothing
+   * to tear down, so this is synchronous and cannot leave a half-armed watcher.
+   */
+  function startWatchingRoot(root: string): void {
+    if (shuttingDown) return;
     if (subscriptions.has(root)) return;
-    const sched = schedulerFor(root);
-    const mod = watcherModule;
-    let worktreeSub: AsyncSubscription | null = null;
-    let gitDirSub: AsyncSubscription | null = null;
-    try {
-      worktreeSub = await mod.subscribe(
-        root,
-        (err) => {
-          if (err) {
-            console.error(
-              `[git-worker] watcher error for ${root}: ${stringifyErr(err)}`,
-            );
-            // A recoverable FSEvents drop: schedule a re-snapshot so the missed
-            // change isn't lost. Non-drop errors keep today's swallow-and-log.
-            if (isDropError(err)) sched.schedule();
-            return;
-          }
-          // Any worktree change → debounced re-snapshot. The per-root JSON
-          // dedupe absorbs no-ops, so over-firing is cheap.
-          sched.schedule();
-        },
-        { ignore: GIT_IGNORE_GLOBS },
-      );
-      if (shuttingDown) {
-        void worktreeSub.unsubscribe();
-        return;
-      }
+    const commonDir = gitCommonDirFor(root);
+    subscriptions.set(root, { gitCommonDir: commonDir, lastSignature: null });
+    // Initial snapshot for the newly-watched root.
+    emitSnapshot(root);
+  }
 
-      // Sibling subscription on the git common-dir. The worktree sub ignores
-      // `**/.git/**` (and even without that ignore, FSEvents wouldn't fire on
-      // refs/HEAD/index churn because git uses rename-replace and lockfile
-      // dance under the gitdir). Without this, a `git commit` (which only
-      // mutates `.git/index`, `.git/HEAD`, `.git/refs/...`, `.git/objects/...`)
-      // is invisible to the worker until the 60s heartbeat — the bug the
-      // human hit. A failure here is logged and tolerated: the root stays
-      // subscribed to its worktree, and the heartbeat still covers it.
-      const commonDir = gitCommonDirFor(root);
-      if (commonDir != null) {
-        try {
-          gitDirSub = await mod.subscribe(
-            commonDir,
-            (err) => {
-              if (err) {
-                console.error(
-                  `[git-worker] git-dir watcher error for ${commonDir}: ${stringifyErr(err)}`,
-                );
-                if (isDropError(err)) sched.schedule();
-                return;
-              }
-              sched.schedule();
-            },
-            { ignore: GIT_DIR_IGNORE_GLOBS },
-          );
-        } catch (err) {
-          console.error(
-            `[git-worker] failed to subscribe to git-dir ${commonDir}: ${stringifyErr(err)}`,
-          );
-        }
+  /**
+   * fn-921: the two-tier poll tick. For each watched root, cheap-`stat()` its
+   * metadata signature and schedule a debounced rescan on a delta. Negligible
+   * steady-state cost (a handful of `lstat`s per root, no `git` spawn). The
+   * per-root `RescanScheduler` + `lastByRoot` dedupe absorb over-firing. Posts a
+   * liveness pulse to main AFTER the sweep so the supervisor's seed watchdog can
+   * tell "alive and ticking" from "alive but stuck".
+   */
+  function pollGitRoots(): void {
+    if (shuttingDown) return;
+    for (const [root, watch] of subscriptions) {
+      const cur = readGitMetaSignature(root, watch.gitCommonDir);
+      const { rescan } = decideGitPoll(watch.lastSignature, cur);
+      // Advance the baseline whenever we have a usable signature, so a delta is
+      // detected exactly once. A `null` (vanished worktree) keeps the prior
+      // signature so a re-appearing root re-flags on its next read.
+      if (cur != null) watch.lastSignature = cur;
+      if (rescan) {
+        markFastPath();
+        schedulerFor(root).schedule();
       }
-      if (shuttingDown) {
-        if (gitDirSub != null) void gitDirSub.unsubscribe();
-        void worktreeSub.unsubscribe();
-        return;
-      }
-
-      subscriptions.set(root, { worktree: worktreeSub, gitDir: gitDirSub });
-      // Initial snapshot for the newly-watched root.
-      emitSnapshot(root);
-    } catch (err) {
-      // Only the worktree `await` can reach this catch — the git-dir branch
-      // has its own inner try/catch, and every subsequent step is sync &
-      // non-throwing. So `gitDirSub` is still null here; only `worktreeSub`
-      // needs best-effort teardown.
-      if (worktreeSub != null) void worktreeSub.unsubscribe();
-      console.error(
-        `[git-worker] failed to subscribe to ${root}: ${stringifyErr(err)}`,
-      );
+    }
+    // fn-921 liveness pulse — see GitLivenessMessage. Always posted (even on a
+    // fully-quiet sweep) so a missing pulse means a STUCK tick, not just a quiet
+    // repo. Shutdown-gated above. Cheap (a single postMessage per tick).
+    if (!shuttingDown) {
+      port.postMessage({
+        kind: "git-liveness",
+        at_ms: Date.now(),
+      } satisfies GitLivenessMessage);
     }
   }
 
@@ -2305,69 +2421,26 @@ function startWorker(): void {
         project_dir: root,
       } satisfies GitRootDroppedMessage);
     }
-    const sub = subscriptions.get(root);
-    if (sub != null) {
-      subscriptions.delete(root);
-      try {
-        await sub.worktree.unsubscribe();
-      } catch {
-        // best-effort
-      }
-      if (sub.gitDir != null) {
-        try {
-          await sub.gitDir.unsubscribe();
-        } catch {
-          // best-effort
-        }
-      }
-    }
+    // fn-921 poll-only: a watched root is just a map entry now — no async
+    // FSEvents teardown, only the delete.
+    subscriptions.delete(root);
     const sched = schedulers.get(root);
     if (sched != null) {
       sched.cancel();
       schedulers.delete(root);
     }
     lastByRoot.delete(root);
-    // Clear the HEAD-oid bootstrap cache too so a re-subscribe of the same
-    // root (`.keeper` dir re-created) re-seeds from the current head and
-    // doesn't emit a phantom delta against the pre-drop state. The fn-705
-    // enumeration-failure counter is per-root and meaningless across a
-    // re-subscribe, so drop it in lockstep.
+    // Clear the HEAD-oid bootstrap cache too so a re-watch of the same root
+    // (`.keeper` dir re-created) re-seeds from the current head and doesn't emit
+    // a phantom delta against the pre-drop state. The fn-705 enumeration-failure
+    // counter is per-root and meaningless across a re-watch, so drop it in
+    // lockstep.
     lastHeadOidByRoot.delete(root);
     headEnumFailuresByRoot.delete(root);
   }
 
-  /**
-   * fn-771 missed-wake re-arm teardown. Unlike {@link unsubscribeRoot} this is
-   * NOT a drop: it tears down ONLY the (possibly mute) FSEvents subscriptions
-   * and removes the root from the `subscriptions` map so the reconcile's normal
-   * `toAdd` re-derivation re-subscribes it with a fresh stream. It posts NO
-   * `git-root-dropped` tombstone (the projection row stays — the root is still
-   * desired) and PRESERVES `lastHeadOidByRoot` (so the re-subscribe does not
-   * emit a phantom HEAD delta against the pre-rearm state). The debounce
-   * scheduler is left in place — it is re-bound by `schedulerFor` inside the
-   * re-subscribe and carries no stale pending fire that matters. Best-effort
-   * teardown throughout; nothing throws.
-   */
-  async function tearDownForResubscribe(root: string): Promise<void> {
-    const sub = subscriptions.get(root);
-    if (sub == null) return;
-    subscriptions.delete(root);
-    try {
-      await sub.worktree.unsubscribe();
-    } catch {
-      // best-effort
-    }
-    if (sub.gitDir != null) {
-      try {
-        await sub.gitDir.unsubscribe();
-      } catch {
-        // best-effort
-      }
-    }
-  }
-
   async function reconcileRoots(): Promise<void> {
-    if (shuttingDown || watcherModule == null) return;
+    if (shuttingDown) return;
     if (reconciling) {
       reconcilePending = true;
       return;
@@ -2393,24 +2466,9 @@ function startWorker(): void {
         nowMs - lastFullSweepMs >= FULL_SWEEP_INTERVAL_MS;
       if (runFullSweep) lastFullSweepMs = nowMs;
 
-      // fn-771 missed-wake re-arm. Drain the heartbeat-flagged roots BEFORE
-      // computing `currentlyWatched` so a torn-down (re-armed) root falls into
-      // the `toAdd` re-derivation below and re-subscribes exactly once with a
-      // fresh FSEvents stream. Bounded by the same per-cycle cap as new
-      // subscribes; any overflow stays flagged for the next reconcile. The
-      // flag is cleared as it is drained (re-arm is one-shot per flag), so a
-      // root that re-goes-mute simply gets re-flagged by a later heartbeat.
-      if (pendingResubscribe.size > 0) {
-        const toRearm = [...pendingResubscribe].slice(
-          0,
-          MAX_SUBSCRIBES_PER_CYCLE,
-        );
-        for (const root of toRearm) {
-          pendingResubscribe.delete(root);
-          await tearDownForResubscribe(root);
-        }
-        if (pendingResubscribe.size > 0) reconcilePending = true;
-      }
+      // fn-921 poll-only: there is no mute-stream re-arm anymore — a poll never
+      // goes silent, so the fn-771 `pendingResubscribe` drain is gone. The
+      // membership reconcile below is the sole add/drop driver.
 
       const currentlyWatched = new Set(subscriptions.keys());
 
@@ -2456,12 +2514,13 @@ function startWorker(): void {
         WATCH_DROP_DWELL_MS,
       );
 
-      // Cap new subscribes per cycle so the first full sweep can't balloon
-      // FSEvents streams into `fseventsd` bad-state. Remaining joins land
-      // on subsequent reconciles (every DB-poll tick + heartbeat).
+      // Cap new watches per cycle so the first full sweep can't fire hundreds of
+      // `git rev-parse --git-common-dir` spawns at once. Remaining joins land on
+      // subsequent reconciles (every DB-poll tick + heartbeat). Poll-only: each
+      // watch is a synchronous `gitCommonDirFor` + map insert, no FSEvents stream.
       const capped = toAdd.slice(0, MAX_SUBSCRIBES_PER_CYCLE);
       for (const root of capped) {
-        await subscribeRoot(root);
+        startWatchingRoot(root);
       }
       // If we capped, request another reconcile cycle so the rest land
       // promptly without waiting for the next data_version bump.
@@ -2486,11 +2545,9 @@ function startWorker(): void {
     if (msg.type === "add-discovery-root") {
       // fn-705 discovery nudge: fold the plan-worker's repo root into the
       // candidate set and request an immediate reconcile so the `.keeper`
-      // short-circuit in `shouldWatchRoot` subscribes it now, not on the next
-      // full sweep. Idempotent (Set add) + convergent (reconcile is
-      // single-flighted). Tolerated no-op during the boot window where
-      // `watcherModule` is still null — `reconcileRoots` early-returns and the
-      // root stays queued for the boot reconcile.
+      // short-circuit in `shouldWatchRoot` starts watching it now, not on the
+      // next full sweep. Idempotent (Set add) + convergent (reconcile is
+      // single-flighted). A nudge during shutdown is a tolerated no-op.
       if (shuttingDown) return;
       extraCandidateRoots.add(msg.root);
       void reconcileRoots();
@@ -2499,6 +2556,7 @@ function startWorker(): void {
     if (msg.type !== "shutdown") return;
     shuttingDown = true;
     if (dbPollTimer != null) clearInterval(dbPollTimer);
+    if (gitPollTimer != null) clearInterval(gitPollTimer);
     if (heartbeatTimer != null) clearInterval(heartbeatTimer);
     // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
     // the denominator survives a clean stop. postMessage is synchronous; main
@@ -2508,178 +2566,164 @@ function startWorker(): void {
       rollupTimer = null;
     }
     flushBackstopRollups();
-    // Cancel every armed scheduler BEFORE unsubscribe + db.close so a queued
-    // re-scan can't fire against a closing connection. Mirrors plan-worker.
+    // Cancel every armed scheduler BEFORE db.close so a queued re-scan can't fire
+    // against a closing connection. Mirrors plan-worker.
     for (const sched of schedulers.values()) sched.cancel();
     schedulers.clear();
-    void (async () => {
-      const subs = [...subscriptions.values()];
-      subscriptions.clear();
-      for (const sub of subs) {
-        try {
-          await sub.worktree.unsubscribe();
-        } catch {
-          // best-effort
-        }
-        if (sub.gitDir != null) {
-          try {
-            await sub.gitDir.unsubscribe();
-          } catch {
-            // best-effort
-          }
-        }
-      }
-      try {
-        db.close();
-      } catch {
-        // best-effort
-      }
-      process.exit(0);
-    })();
+    // fn-921 poll-only: no FSEvents subscriptions to await — clearing the timers
+    // above stops the producer. Close the DB and exit synchronously.
+    subscriptions.clear();
+    try {
+      db.close();
+    } catch {
+      // best-effort
+    }
+    process.exit(0);
   });
 
-  // fn-747 watcher seam: skip the native addon dlopen entirely in the in-process
-  // tier. `reconcileRoots`/`subscribeRoot` early-return while `watcherModule`
-  // stays null, so the DB-poll + heartbeat timers (armed inside the `.then`
-  // below) never arm and no GitSnapshot work runs — git snapshots are not
-  // exercised by the in-process fold-pipeline tier. The worker stays alive (the
-  // parentPort listener keeps the event loop running) for the shutdown
-  // handshake.
+  // fn-747 seam: the in-process fold-pipeline tier arms NO producer timers — git
+  // snapshots are not exercised there. The worker stays alive (the parentPort
+  // listener keeps the event loop running) for the shutdown handshake.
   if (data.disableNativeWatcher) {
     return;
   }
 
-  void import("@parcel/watcher")
-    .then(async (mod) => {
-      watcherModule = mod;
-      await reconcileRoots();
+  // fn-921 POLL-ONLY producer, armed UNCONDITIONALLY at worker start — NOT inside
+  // a watcher `import().then()`. A watcher-load hang or a mute FSEvents stream can
+  // therefore never again leave the producer with zero timers armed (the
+  // 2026-06-23 silent freeze). No `@parcel/watcher` subscription is taken; every
+  // per-root snapshot comes from the two-tier metadata poll, the db-poll
+  // membership reconcile, or the heartbeat backstop.
 
-      // DB-wake trigger. Per CLAUDE.md DO-NOT, `PRAGMA data_version` is the
-      // ONLY sanctioned DB change primitive — `wake-worker.ts` uses the same
-      // pattern. A bump means SOMETHING committed (new tool event, new job
-      // row, new epic/task snapshot) and root membership may have changed.
-      //
-      // `data_version` carries NO root attribution, so it drives membership
-      // reconcile ONLY (cheap, O(1), idempotent — a foreign write may have
-      // changed which roots to watch). It does NOT fan a per-root snapshot out:
-      // that O(roots) fan-out was the CPU-flood source this epic removed. Every
-      // per-root snapshot now comes from the worktree + git-common-dir FSEvents
-      // subs (plus the drop-triggered rescan) with the 60s heartbeat as the
-      // single drop backstop. See {@link decideDataVersionWake}.
-      const dataVersionQuery = db.query("PRAGMA data_version");
-      lastDataVersion = (dataVersionQuery.get() as { data_version: number })
-        .data_version;
-      dbPollTimer = setInterval(() => {
-        if (shuttingDown) return;
-        const cur = (dataVersionQuery.get() as { data_version: number })
-          .data_version;
-        const decision = decideDataVersionWake(cur, lastDataVersion ?? cur);
-        if (!decision.reconcile) return;
-        lastDataVersion = cur;
-        void reconcileRoots();
-      }, DB_POLL_MS);
+  // Boot membership reconcile — derive the initial watched set + emit the first
+  // snapshot per root. Then the two-tier poll keeps each root current.
+  void reconcileRoots();
 
-      // Silent-watcher backstop, mirroring transcript-worker. If a watcher
-      // ever goes mute (observed parcel/watcher #174-style stalls under
-      // sibling-worker crashes), the heartbeat catches the missed snapshot
-      // within HEARTBEAT_MS. The per-root dedupe makes a healthy run free.
-      heartbeatTimer = setInterval(() => {
-        if (shuttingDown) return;
-        void reconcileRoots();
-        // emitSnapshot self-gates via snapshotSuppressedByDivergence, so the
-        // heartbeat doubles as the quiet-repo backstop for the wedge guard —
-        // even with no file/commit activity it re-checks divergence and drives
-        // the eventual restart. (The primary trigger is the live watcher/
-        // db-poll emit path, since this 60s timer proved unreliable mid-wedge.)
-        // fn-720: this IS the slow backstop — OR the per-root emitted-booleans
-        // into one `rescued` flag. A `true` means a watcher went mute and the
-        // heartbeat re-delivered a snapshot the FSEvents/db-poll fast paths
-        // missed. The shutdown guard above gates the telemetry emit too.
-        let rescued = false;
-        // fn-771: collect every discharged commit's time across the rescued
-        // roots so the record carries the TRUE change-to-rescue latency, and
-        // track WHICH roots rescued so each can be flagged for a watcher
-        // re-arm (a rescue means that root's FSEvents stream missed a change).
-        const dischargedCommitAtMs: number[] = [];
-        const rescuedRoots: string[] = [];
-        for (const root of subscriptions.keys()) {
-          if (emitSnapshot(root, dischargedCommitAtMs)) {
-            rescued = true;
-            rescuedRoots.push(root);
-          }
-        }
-        backstopCounters.bump("git-heartbeat", "missed-wake", rescued);
-        if (rescued) {
-          const now = Date.now();
-          // Worst-case (oldest) commit anchor across all roots rescued this
-          // tick → `now − oldest`. No commit anchor (dirty-tree-only rescue) →
-          // null. A negative latency (clock skew: committed_at_ms > now) is
-          // clamped to null by buildMissedWakeRecord, never emitted negative.
-          const changeToRescueMs = deriveChangeToRescueMs(
-            dischargedCommitAtMs,
-            now,
-          );
-          port.postMessage({
-            kind: "backstop",
-            record: buildMissedWakeRecord({
-              backstop: "git-heartbeat",
-              worker: "git-worker",
-              fastPath: "fsevents",
-              rescued: true,
-              now,
-              lastFastPathAt,
-              changeToRescueMs,
-            }),
-          } satisfies BackstopMessage);
-          // fn-771 re-arm: flag each rescued root for a fresh subscription and
-          // kick a reconcile to re-derive it. The heartbeat NEVER
-          // unsubscribes/resubscribes directly (no-self-heal); reconcile owns
-          // the teardown + re-subscribe, bounded by MAX_SUBSCRIBES_PER_CYCLE.
-          for (const root of rescuedRoots) {
-            pendingResubscribe.add(root);
-          }
-          void reconcileRoots();
-        }
-        // Epic fn-716: surface the flood reduction. Log + reset the count of
-        // snapshots the semantic dedupe gate coalesced away this window (mostly
-        // pure-mtime churn under continuous editing) so the throttle's effect is
-        // observable in keeperd's stderr without per-drop spam.
-        if (coalescedDrops > 0) {
-          console.error(
-            `[git-worker] coalesced ${coalescedDrops} no-op GitSnapshot emit(s) in the last ${HEARTBEAT_MS}ms (semantic dedupe)`,
-          );
-          coalescedDrops = 0;
-        }
-      }, HEARTBEAT_MS);
+  // Two-tier git-metadata poll (fast path). Every GIT_POLL_MS, cheap-`stat()`
+  // each watched root's `.git` metadata + worktree mtime and schedule a debounced
+  // rescan on a delta. Posts a liveness pulse per tick so the supervisor's seed
+  // watchdog can tell "alive + ticking" from "alive but stuck". See pollGitRoots.
+  gitPollTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      pollGitRoots();
+    } catch (err) {
+      // Never let a poll tick throw out of the interval — log + continue so the
+      // producer stays armed (the whole point of decoupling from the watcher).
+      console.error(`[git-worker] poll tick failed: ${stringifyErr(err)}`);
+    }
+  }, GIT_POLL_MS);
 
-      // fn-720: periodic backstop-rollup flush — checkpoint the denominator
-      // (fires_total / rescues_total) so the metric survives a crash without a
-      // line per no-op heartbeat. Cleared + final-flushed in the shutdown
-      // handler.
-      rollupTimer = setInterval(() => {
-        if (shuttingDown) return;
-        try {
-          flushBackstopRollups();
-        } catch (err) {
-          console.error(
-            `[git-worker] backstop rollup flush failed: ${stringifyErr(err)}`,
-          );
-        }
-      }, BACKSTOP_ROLLUP_FLUSH_MS);
-    })
-    .catch((err) => {
-      // Addon load failure is the sole unrecoverable surface. Exit non-zero →
-      // daemon `fatalExit` → launchd restart, the single recovery path.
-      console.error(
-        `[git-worker] failed to load @parcel/watcher: ${stringifyErr(err)}`,
-      );
-      try {
-        db.close();
-      } catch {
-        // best-effort
+  // DB-wake trigger. Per CLAUDE.md DO-NOT, `PRAGMA data_version` is the ONLY
+  // sanctioned DB change primitive — `wake-worker.ts` uses the same pattern. A
+  // bump means SOMETHING committed (new tool event, new job row, new epic/task
+  // snapshot) and root membership may have changed. `data_version` carries NO
+  // root attribution, so it drives membership reconcile ONLY (cheap, O(1),
+  // idempotent) — it does NOT fan a per-root snapshot out (that O(roots) fan-out
+  // was a CPU-flood source). See {@link decideDataVersionWake}.
+  const dataVersionQuery = db.query("PRAGMA data_version");
+  lastDataVersion = (dataVersionQuery.get() as { data_version: number })
+    .data_version;
+  dbPollTimer = setInterval(() => {
+    if (shuttingDown) return;
+    const cur = (dataVersionQuery.get() as { data_version: number })
+      .data_version;
+    const decision = decideDataVersionWake(cur, lastDataVersion ?? cur);
+    if (!decision.reconcile) return;
+    lastDataVersion = cur;
+    void reconcileRoots();
+  }, DB_POLL_MS);
+
+  // Heartbeat backstop (slow path). Re-reconciles membership, re-emits every
+  // watched root (the per-root dedupe makes a healthy run free), and clears a
+  // QUIET-repo `seed_required` via emitForUnseededGatedRoots — the change-driven
+  // poll never fires with no file activity, so this is the path that un-darks an
+  // idle gated root whose boot-seed missed the floor. emitSnapshot self-gates via
+  // snapshotSuppressedByDivergence, so the heartbeat doubles as the quiet-repo
+  // wedge-guard re-check.
+  heartbeatTimer = setInterval(() => {
+    if (shuttingDown) return;
+    void reconcileRoots();
+    // fn-720: OR the per-root emitted-booleans into one `rescued` flag. A `true`
+    // means the heartbeat re-delivered a snapshot the poll fast path missed.
+    let rescued = false;
+    // fn-771: collect every discharged commit's time across the rescued roots so
+    // the record carries the TRUE change-to-rescue latency.
+    const dischargedCommitAtMs: number[] = [];
+    for (const root of subscriptions.keys()) {
+      if (emitSnapshot(root, dischargedCommitAtMs)) {
+        rescued = true;
       }
-      process.exit(1);
-    });
+    }
+    backstopCounters.bump("git-heartbeat", "missed-wake", rescued);
+    if (rescued) {
+      const now = Date.now();
+      // Worst-case (oldest) commit anchor across all roots rescued this tick →
+      // `now − oldest`. No commit anchor (dirty-tree-only rescue) → null. A
+      // negative latency (clock skew) is clamped to null by buildMissedWakeRecord.
+      const changeToRescueMs = deriveChangeToRescueMs(
+        dischargedCommitAtMs,
+        now,
+      );
+      port.postMessage({
+        kind: "backstop",
+        record: buildMissedWakeRecord({
+          backstop: "git-heartbeat",
+          worker: "git-worker",
+          fastPath: "fsevents",
+          rescued: true,
+          now,
+          lastFastPathAt,
+          changeToRescueMs,
+        }),
+      } satisfies BackstopMessage);
+    }
+    // fn-921 quiet-repo seed_required clear. Independent of `rescued` — a quiet
+    // repo emits nothing above, yet a stuck `seed_required` must still clear. The
+    // FORCE in emitForUnseededGatedRoots bypasses the dedupe so an UNCHANGED
+    // snapshot lands above the floor; main's fold then clears the flag.
+    const seedEmits = emitForUnseededGatedRoots();
+    if (seedEmits > 0) {
+      console.error(
+        `[git-worker] force-emitted ${seedEmits} snapshot(s) to clear a quiet-repo seed_required`,
+      );
+    }
+    // Epic fn-716: surface the flood reduction. Log + reset the count of
+    // snapshots the semantic dedupe gate coalesced away this window.
+    if (coalescedDrops > 0) {
+      console.error(
+        `[git-worker] coalesced ${coalescedDrops} no-op GitSnapshot emit(s) in the last ${HEARTBEAT_MS}ms (semantic dedupe)`,
+      );
+      coalescedDrops = 0;
+    }
+  }, HEARTBEAT_MS);
+
+  // fn-720: periodic backstop-rollup flush — checkpoint the denominator
+  // (fires_total / rescues_total) so the metric survives a crash without a line
+  // per no-op heartbeat. Cleared + final-flushed in the shutdown handler.
+  rollupTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      flushBackstopRollups();
+    } catch (err) {
+      console.error(
+        `[git-worker] backstop rollup flush failed: ${stringifyErr(err)}`,
+      );
+    }
+  }, BACKSTOP_ROLLUP_FLUSH_MS);
+
+  // fn-921: clear a QUIET-repo seed_required promptly after boot too — the boot
+  // membership reconcile above emitted per-root, but a root whose live snapshot
+  // sat at/below the captured floor still has no above-floor row. Do one
+  // force-emit pass now so the un-dark doesn't wait a full heartbeat. Idempotent
+  // (no-op once main's fold clears the flag); wrapped so it never throws at boot.
+  try {
+    emitForUnseededGatedRoots();
+  } catch (err) {
+    console.error(
+      `[git-worker] initial seed_required clear failed: ${stringifyErr(err)}`,
+    );
+  }
 }
 
 if (!isMainThread) {

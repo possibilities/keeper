@@ -111,12 +111,19 @@ independent of board size.
 
 The architecture is deliberately small. Keeper is built on Bun + `bun:sqlite`
 with a single third-party runtime dependency: `@parcel/watcher` (a native
-FSEvents-backed file watcher), used by the transcript-title worker and the plan
-worker. It is the one place keeper watches files instead of polling
-`data_version` — because those files (transcript JSONL written by Claude Code,
-`.keeper` JSON written by `keeper plan`) are written by *another* process, so there is
-no keeper `data_version` to poll for them and the same-process-write blind spot
-that rules watchers out for keeper's own DB does not apply. The daemon detects new
+FSEvents-backed file watcher), used by the transcript-title worker, the plan
+worker, and the usage / dead-letter / events-ingest watchers. It is where keeper
+watches files instead of polling `data_version` — because those files (transcript
+JSONL written by Claude Code, `.keeper` JSON written by `keeper plan`) are written
+by *another* process, so there is no keeper `data_version` to poll for them and the
+same-process-write blind spot that rules watchers out for keeper's own DB does not
+apply. The **git-worker is the exception (fn-921): it is POLL-ONLY** — a two-tier
+metadata poll (cheap `stat()` of each watched root's `.git` `HEAD`/`index`/
+`logs/HEAD`/`packed-refs` + worktree mtime at ~300ms; on a detected delta it runs
+the same git scan + `emitSnapshot`) replaced its `@parcel/watcher` subscription.
+The poll producer arms unconditionally at worker start, so a watcher-load hang or a
+mute FSEvents stream can never again leave the git surface frozen with no producer
+(the 2026-06-23 wedge). The daemon detects new
 events in its own DB by polling SQLite's `PRAGMA data_version` on a read-only
 connection from a Worker thread (the only reliable change-detection primitive on
 macOS for keeper's DB — see [Architecture](#architecture)), then drains the log
@@ -150,7 +157,15 @@ rows while a seeded sibling root still dispatches. The board latches
 against; the coarse `git_seed_required` boolean drives `catching_up` and holds
 `keeper await git-clean` at `waiting`. `seed_required` self-clears in steady state
 once every gated root is seeded — via the boot-seed and main's above-floor
-`GitSnapshot` fold, never a daemon bounce, a git-worker write, or a retry loop.
+`GitSnapshot` fold, never a git-worker write. A QUIET repo (no file activity) is
+cleared by the git-worker's heartbeat force-emit, and a genuinely STUCK surface is
+recovered without a manual bounce by the supervisor-side seed-liveness watchdog
+(fn-921): it re-runs the boot-seed on main a capped number of times, then
+`fatalExit → LaunchAgent restart` as the last resort (a mute git-worker — no
+liveness pulse — escalates straight to restart). The gated read key is normalized to
+the toplevel write key (`resolveGitToplevel`) at every non-fold read site so a
+subdir/symlink `target_repo` un-darks correctly; the reducer's own self-clear keeps
+the raw key (it cannot shell out to git, and the keys agree for the common case).
 
 The end-of-boot WAL checkpoint is `TRUNCATE`. With the early read socket now
 attached during the drain, main's writer is no longer the SOLE connection — but
@@ -319,7 +334,10 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   The watchers keeper does run (`@parcel/watcher`, on the *external* transcript
   tree at the configured `claude_projects_root` and on the configured plan
   `roots`) are the scoped exception: those files are written by another process,
-  so the same-process-write blind spot does not apply.
+  so the same-process-write blind spot does not apply. The git surface, by
+  contrast, is now POLL-ONLY (fn-921 — a two-tier `.git`-metadata `stat()` poll),
+  NOT watched: a watcher-load hang / mute stream was the 2026-06-23 freeze class,
+  and a metadata poll is cheap enough to make the watcher unnecessary there.
 - **No caught-up barrier** and no in-process self-heal — a crash exits non-zero
   and the LaunchAgent restarts the single, well-tested recovery path. Two scoped
   exceptions handle a watcher that misbehaves without escalating. (1) A

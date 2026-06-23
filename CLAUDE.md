@@ -112,8 +112,24 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   leaves `seed_required` set so the next boot re-seeds. **Self-clearing in steady
   state:** for a root the boot-seed missed/failed, MAIN's above-floor `GitSnapshot`
   fold (`projectGitStatus`) clears `seed_required` once `allGatedRootsSeeded` holds —
-  the live producer's emit folded by main, never a git-worker write and never a retry
-  loop. The boot-seed runs AFTER drain, BEFORE the autopilot
+  the live producer's emit folded by main, never a git-worker write. The
+  "never a retry loop" rule has ONE bounded exception (fn-921): a SUPERVISOR-side
+  seed-liveness watchdog (`decideGitSeedWatchdog` in `daemon.ts`) recovers a STUCK
+  surface (`seed_required` held + no GitSnapshot progress past a threshold) without
+  a manual bounce — it re-runs the boot-seed on MAIN a CAPPED number of times, then
+  `fatalExit → LaunchAgent restart` as the last resort; a MUTE git-worker (no
+  liveness pulse past the threshold) escalates straight to restart. It never trips
+  mid-boot (no pulse yet ⇒ "ok") and never crash-loops a DETERMINISTIC-stuck (the
+  key-mismatch fix below removes the only such case). **Gated-root key
+  reconciliation (fn-921):** the readiness READ key is the raw `effectiveRoot`; the
+  boot-seed + live git-worker WRITE the `git_status` row under
+  `resolveGitToplevel(root)`. A subdir/symlink `target_repo` mismatches → the root
+  never clears `seed_required` and stays forced-`unknown` forever. Non-fold callers
+  (boot-seed, server-worker, autopilot) pass a memoized `resolveGitToplevel` to
+  `allGatedRootsSeeded`/`unseededGatedRoots` so the read key normalizes to the write
+  key; the REDUCER fold passes NO resolver (it cannot shell out to git — the
+  identity default is byte-identical for the common `effectiveRoot === toplevel`
+  case). The boot-seed runs AFTER drain, BEFORE the autopilot
   actuator + mutating-RPC gate opens (fn-897 split serving into TWO gates: the
   READ socket opens right after migrate during the drain; the boot-seed + drain
   reaching head + ephemeral-truncate gate the actuator + mutating RPCs). **Unseeded
@@ -242,7 +258,22 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **No in-process self-heal.** Any unrecoverable error calls `fatalExit` →
   `process.exit(1)`; the LaunchAgent restarts the single recovery path. Never respawn
   a worker in-process. Carve-out: closing a stale/EPIPE UDS client connection is
-  connection hygiene, not self-heal.
+  connection hygiene, not self-heal. Carve-out: the fn-921 git seed-liveness
+  watchdog may re-run the boot-seed on MAIN a CAPPED number of times before it
+  escalates to `fatalExit` — a supervisor-side re-arm of MAIN's own producer, never
+  a worker respawn.
+- **The git-worker is POLL-ONLY (fn-921).** It no longer holds an
+  `@parcel/watcher` subscription: a two-tier metadata poll (cheap `stat()` of `.git`
+  `HEAD`/`index`/`logs/HEAD`/`packed-refs` + worktree mtime at ~300ms,
+  `readGitMetaSignature`/`decideGitPoll`) drives the per-root `RescanScheduler` on a
+  detected delta. The poll producer arms UNCONDITIONALLY at worker start — NOT inside
+  a watcher `import().then()` — so a watcher-load hang / mute stream can never again
+  leave the producer with no timers armed (the 2026-06-23 silent freeze). The OTHER
+  watcher workers (transcript / plan / usage / dead-letter / events-ingest) still
+  dlopen `@parcel/watcher`, so it stays a dependency + the main-thread pre-warm
+  remains. A QUIET repo with `seed_required` set is cleared by the heartbeat's
+  force-emit (`emitForUnseededGatedRoots` — a forced snapshot bypasses the semantic
+  dedupe so an unchanged payload still lands above the floor).
 - **A `~/docs` hook may spawn a bounded git subprocess.** The sidecar-writer's inline
   committer and the Stop docs-pusher each shell out to `git` (timeout-bounded
   `Bun.spawnSync`) against the `~/docs` repo only — these are external-tree git calls,
@@ -270,6 +301,11 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **Supervisor-owned lifecycle** — main spawns after migrate+boot-drain and is the
   only one that terminates (`shutdown` → await close → terminate). A worker owning an
   external resource MUST release it in its own shutdown handler.
+- **Supervisor probes git-worker liveness (fn-921).** `onerror`/`close` only catch a
+  crash, not an alive-but-stuck worker. The poll-only git-worker posts a
+  `git-liveness` pulse per poll tick (a pure side channel, never folded); main's
+  seed-liveness watchdog reads the time since the last pulse (MUTE check) together
+  with `seed_required` + GitSnapshot progress to decide reseed-vs-restart.
 - **A worker may own resources beyond a read-only keeper.db connection** — the
   Agent Bus relay (`src/bus-worker.ts`) holds two new classes: a SECOND owned
   SQLite file (`bus.db`, writable, its OWN `PRAGMA user_version` ladder — NEVER

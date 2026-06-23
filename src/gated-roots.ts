@@ -76,6 +76,39 @@ export function gatedGitRoots(db: Database): string[] {
 }
 
 /**
+ * fn-921 gated-root key reconciliation. The READ key is the raw `effectiveRoot`
+ * (`target_repo ?? project_dir`); the boot-seed + live git-worker WRITE the
+ * `git_status` row under `resolveGitToplevel(root)`. The two agree only when
+ * `effectiveRoot === resolveGitToplevel(effectiveRoot)` — true for a repo
+ * registered at its own toplevel, but a `target_repo` pointing at a SUBDIR, or a
+ * symlinked/`/var`-vs-`/private/var` path, mismatches. Under fn-905's self-clear
+ * a mismatch is no longer a transient stall: the root never acquires an
+ * above-floor row under the read key, so `seed_required` never clears and the
+ * root stays forced-`unknown` FOREVER.
+ *
+ * `resolveRoot` lets a caller that MAY shell out to git (the server-worker /
+ * autopilot read sites, the boot-seed producer) normalize the read key to the
+ * write key via `resolveGitToplevel` (memoized). The reducer fold MUST NOT call
+ * git, so it passes no resolver — the identity default, byte-identical for the
+ * common `effectiveRoot === toplevel` case (every `.keeper`-backed epic/task
+ * root, which is what the fold's self-clear must handle). A non-fold caller
+ * supplies the resolver so a subdir/symlink `target_repo` still clears.
+ */
+function seededLookupKey(
+  root: string,
+  resolveRoot: ((root: string) => string) | undefined,
+): string {
+  if (resolveRoot == null) return root;
+  try {
+    return resolveRoot(root);
+  } catch {
+    // A resolve failure falls back to the raw key — no worse than the
+    // no-resolver default, never throws (this runs in producer + read paths).
+    return root;
+  }
+}
+
+/**
  * The subset of gated roots NOT yet seeded ABOVE the floor — a gated root with
  * NO `git_status` row whose `last_event_id > floor`. This is the per-root analog
  * of {@link allGatedRootsSeeded}: the readiness gate forces `{kind:unknown}` for
@@ -84,29 +117,32 @@ export function gatedGitRoots(db: Database): string[] {
  * gated root is seeded ⇔ the gate is fully off (byte-identical to the legacy
  * "seeded" path). Sorted for stable iteration.
  *
+ * The returned set holds the RAW `effectiveRoot`s (the readiness gate keys on
+ * those) even when `resolveRoot` is supplied — only the seeded-lookup is
+ * normalized; see {@link seededLookupKey}.
+ *
  * Callers gate the invocation on `seed_required`: while the flag is CLEAR the
  * gate is off entirely (pass an empty set, never call this) so a clean root that
  * `retractGitStatus` later DELETEd (going clean drops its `git_status` row) never
  * re-wedges — the gate is bounded to the `seed_required`-set window.
  *
- * PURE: reads only `epics` + `git_status` projections.
+ * PURE w.r.t. the DB (reads only `epics` + `git_status`); `resolveRoot`, when
+ * given, may shell out to git — so it is passed ONLY by non-fold callers.
  */
-export function unseededGatedRoots(db: Database, floor: number): Set<string> {
+export function unseededGatedRoots(
+  db: Database,
+  floor: number,
+  resolveRoot?: (root: string) => string,
+): Set<string> {
   const roots = gatedGitRoots(db);
   const unseeded = new Set<string>();
   if (roots.length === 0) return unseeded;
-  // INVARIANT: a gated root MUST already be its own git toplevel. We look it up
-  // by the RAW effectiveRoot, but the boot-seed / live git-worker WRITE the row
-  // under resolveGitToplevel(root) (`git-boot-seed.ts`). The two keys agree only
-  // when effectiveRoot === resolveGitToplevel(effectiveRoot); the per-root mutex
-  // assumes the same identity. Under fn-905's self-clear a key mismatch is no
-  // longer a transient stall — the root never clears seed_required and stays
-  // forced-`unknown` forever.
   const stmt = db.prepare(
     "SELECT 1 FROM git_status WHERE project_dir = ? AND last_event_id > ? LIMIT 1",
   );
   for (const root of roots) {
-    if (stmt.get(root, floor) == null) unseeded.add(root);
+    const key = seededLookupKey(root, resolveRoot);
+    if (stmt.get(key, floor) == null) unseeded.add(root);
   }
   return unseeded;
 }
@@ -118,20 +154,25 @@ export function unseededGatedRoots(db: Database, floor: number): Set<string> {
  * above-floor fold both consult this to decide whether `seed_required` may
  * clear. An empty gated set is vacuously satisfied (no work to gate).
  *
- * PURE: reads only `epics` + `git_status` projections.
+ * PURE w.r.t. the DB (reads only `epics` + `git_status`); `resolveRoot`, when
+ * given, may shell out to git (see {@link seededLookupKey}) — so the reducer
+ * fold passes NONE (identity, byte-identical for the common case) while the
+ * boot-seed producer passes `resolveGitToplevel` to reconcile a subdir/symlink
+ * gated key.
  */
-export function allGatedRootsSeeded(db: Database, floor: number): boolean {
+export function allGatedRootsSeeded(
+  db: Database,
+  floor: number,
+  resolveRoot?: (root: string) => string,
+): boolean {
   const roots = gatedGitRoots(db);
   if (roots.length === 0) return true;
-  // Same raw-key INVARIANT as unseededGatedRoots: the gated root MUST already be
-  // its own git toplevel (keyed identically to the boot-seed / live git-worker
-  // resolveGitToplevel write key), or it never seeds and seed_required never
-  // clears.
   const stmt = db.prepare(
     "SELECT 1 FROM git_status WHERE project_dir = ? AND last_event_id > ? LIMIT 1",
   );
   for (const root of roots) {
-    if (stmt.get(root, floor) == null) return false;
+    const key = seededLookupKey(root, resolveRoot);
+    if (stmt.get(key, floor) == null) return false;
   }
   return true;
 }

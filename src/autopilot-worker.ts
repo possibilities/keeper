@@ -59,6 +59,7 @@ import {
   type PaneInfo,
 } from "./exec-backend";
 import { unseededGatedRoots } from "./gated-roots";
+import { memoizedGitToplevel } from "./git-toplevel";
 import {
   computeReadiness,
   isRootOccupant,
@@ -1630,7 +1631,10 @@ export async function loadReconcileSnapshot(
   // `git_status` row with `last_event_id > floor`. The seed-read helper degrades
   // a missing control row to `true` (treat unknown as unseeded).
   const unseededRoots = readGitProjectionSeedRequired(db)
-    ? unseededGatedRoots(db, readGitProjectionFloor(db))
+    ? // fn-921: normalize the gated read key to the toplevel write key (memoized)
+      // so a subdir/symlink `target_repo` un-darks once its toplevel-keyed row
+      // lands.
+      unseededGatedRoots(db, readGitProjectionFloor(db), memoizedGitToplevel())
     : new Set<string>();
 
   return {

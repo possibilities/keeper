@@ -21,9 +21,11 @@ import {
   type DataVersionWakeDecision,
   type DiscoveryContext,
   decideDataVersionWake,
+  decideGitPoll,
   decideHeadCacheAdvance,
   decideHeadDivergence,
   decideReconcileTransitions,
+  decideSeedRequiredEmit,
   deriveChangeToRescueMs,
   discoverProjectRoots,
   type EnumeratedCommitFile,
@@ -36,6 +38,7 @@ import {
   type ParsedGitStatus,
   parseCommitFiles,
   parsePorcelainV2,
+  readGitMetaSignature,
   selectVanishedRoots,
   semanticSnapshotKey,
   shouldWatchRoot,
@@ -1919,17 +1922,15 @@ test("deriveChangeToRescueMs: clock skew (oldest commit AFTER now) returns the r
 });
 
 // ---------------------------------------------------------------------------
-// fn-771 — missed-wake re-arm via the reconcile path. The heartbeat NEVER
-// resubscribes directly; it tears the rescued root out of the subscription map
-// (modeled here as removing it from `currentlyWatched`) while the root stays
-// DESIRED, so the existing decideReconcileTransitions re-adds it to `toAdd`
-// exactly once. No worker respawn, no DB write — just one extra reconcile
-// trigger feeding the level-triggered membership re-derivation.
+// decideReconcileTransitions re-add. A root that left the watched set but is
+// still DESIRED by discovery re-enters `toAdd` exactly once on the next
+// reconcile — the level-triggered membership re-derivation that, post-fn-921
+// (poll-only, no FSEvents re-arm), is the sole add/drop driver.
 // ---------------------------------------------------------------------------
 
-test("re-arm: a torn-down-but-still-desired root re-enters toAdd exactly once via decideReconcileTransitions", () => {
-  // After the heartbeat's tearDownForResubscribe, /repo-rearmed is no longer in
-  // the subscription set but is still desired by discovery.
+test("a not-watched-but-still-desired root re-enters toAdd exactly once via decideReconcileTransitions", () => {
+  // /repo-rearmed is no longer in the watched set but is still desired by
+  // discovery, so the next reconcile re-adds it.
   const dwell = new Map<string, number>();
   const result = decideReconcileTransitions(
     new Set<string>(), // currentlyWatched: torn down → empty
@@ -2490,6 +2491,83 @@ test("decideDataVersionWake: first advance after boot reconciles", () => {
   expect(decideDataVersionWake(2, 1)).toEqual({
     reconcile: true,
   } satisfies DataVersionWakeDecision);
+});
+
+// ---------------------------------------------------------------------------
+// fn-921 — two-tier git poll pure decision + metadata signature
+// ---------------------------------------------------------------------------
+
+test("decideGitPoll: first observation (prev null) → rescan to establish baseline", () => {
+  expect(decideGitPoll(null, "sig-1")).toEqual({ rescan: true });
+});
+
+test("decideGitPoll: a changed signature → rescan", () => {
+  expect(decideGitPoll("sig-1", "sig-2")).toEqual({ rescan: true });
+});
+
+test("decideGitPoll: an unchanged signature → no rescan (the quiet steady state)", () => {
+  expect(decideGitPoll("sig-1", "sig-1")).toEqual({ rescan: false });
+});
+
+test("decideGitPoll: a vanished worktree (cur null) → skip (no usable signature)", () => {
+  expect(decideGitPoll("sig-1", null)).toEqual({ rescan: false });
+  expect(decideGitPoll(null, null)).toEqual({ rescan: false });
+});
+
+test("readGitMetaSignature: returns null when the worktree root cannot be stat'd", () => {
+  expect(
+    readGitMetaSignature("/synthetic/git-worker/does-not-exist", null),
+  ).toBeNull();
+});
+
+test("readGitMetaSignature: a real dir produces a stable, change-sensitive signature", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "keeper-gitmeta-")));
+  tmpDirs.push(dir);
+  // No common-dir → just the worktree mtime; deterministic across two reads.
+  const a = readGitMetaSignature(dir, null);
+  const b = readGitMetaSignature(dir, null);
+  expect(a).not.toBeNull();
+  expect(a).toBe(b as string);
+  // A missing common-dir file contributes `0` — the signature still includes the
+  // meta slots, so an appearing/disappearing HEAD flips it.
+  const withCommon = readGitMetaSignature(dir, dir);
+  expect(withCommon).not.toBeNull();
+  expect(withCommon).not.toBe(a as string); // common-dir slots widen the sig
+});
+
+// ---------------------------------------------------------------------------
+// fn-921 — quiet-repo seed_required force-emit decision
+// ---------------------------------------------------------------------------
+
+test("decideSeedRequiredEmit: seed clear → no force-emit (the steady state)", () => {
+  expect(decideSeedRequiredEmit(false, ["/a", "/b"], new Set(["/a"]))).toEqual(
+    [],
+  );
+});
+
+test("decideSeedRequiredEmit: empty unseeded set → no force-emit", () => {
+  expect(decideSeedRequiredEmit(true, ["/a", "/b"], new Set<string>())).toEqual(
+    [],
+  );
+});
+
+test("decideSeedRequiredEmit: emits the WATCHED ∩ unseeded-gated intersection", () => {
+  // Watched {/a,/b,/c}; unseeded gated {/b,/d}. Only /b is both watched AND
+  // unseeded — /d is gated-but-unwatched (the worker can't force-emit it), /a,/c
+  // are watched-but-seeded.
+  expect(
+    decideSeedRequiredEmit(true, ["/a", "/b", "/c"], new Set(["/b", "/d"])),
+  ).toEqual(["/b"]);
+});
+
+test("decideSeedRequiredEmit: preserves watched iteration order for a stable emit set", () => {
+  expect(
+    decideSeedRequiredEmit(
+      true,
+      ["/c", "/a", "/b"],
+      new Set(["/a", "/b", "/c"]),
+    ),
+  ).toEqual(["/c", "/a", "/b"]);
 });
 
 // ---------------------------------------------------------------------------

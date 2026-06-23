@@ -1,7 +1,8 @@
 /**
- * fn-701 task .3 boot-smoke fixture. A minimal stand-in for keeper's five
- * `@parcel/watcher`-loading workers (transcript / plan / git / usage /
- * dead-letter): it does the SAME `import("@parcel/watcher")`
+ * fn-701 task .3 boot-smoke fixture. A minimal stand-in for keeper's
+ * `@parcel/watcher`-loading workers (transcript / plan / usage / dead-letter /
+ * events-ingest — fn-921 made the git-worker poll-only, so it no longer loads
+ * the addon): it does the SAME `import("@parcel/watcher")`
  * then actually `subscribe()`s (forcing the full native N-API surface to
  * resolve, the path that exposed the `napi_register_module_v1` concurrent-dlopen
  * race), then reports success/failure back to the spawning test.

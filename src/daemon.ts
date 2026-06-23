@@ -44,6 +44,7 @@ import type { BusWorkerData } from "./bus-worker";
 import { countAbsentBlobs, retainColdPayloads } from "./compaction";
 import {
   openDb,
+  readGitProjectionSeedRequired,
   resolveAgentwrapPath,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
@@ -500,6 +501,89 @@ export function isTransientBusyError(err: unknown): boolean {
   }
   const errno = (err as { errno?: unknown }).errno;
   return errno === 5 || errno === 6;
+}
+
+// ── fn-921 git seed-liveness watchdog ──────────────────────────────────────────
+/** How often the supervisor checks the git seed-liveness verdict. */
+export const GIT_SEED_WATCHDOG_INTERVAL_MS = 30_000;
+/**
+ * How long `seed_required` may stay set (with no GitSnapshot landing to clear it)
+ * before the watchdog acts. Must comfortably exceed the worker's heartbeat
+ * (60s — its quiet-repo force-emit window) so a healthy boot-seed-then-clear never
+ * trips the watchdog: the force-emit clears the flag within ~one heartbeat, well
+ * inside this window.
+ */
+export const GIT_SEED_STUCK_THRESHOLD_MS = 3 * 60_000;
+/**
+ * How long since the last worker liveness pulse before the worker is judged
+ * MUTE (alive-but-stuck — a hung poll tick). Several poll ticks worth of slack
+ * (poll cadence is ~300ms) so transient scheduling jitter never reads as mute.
+ */
+export const GIT_LIVENESS_STUCK_THRESHOLD_MS = 90_000;
+/**
+ * How many MAIN-side re-seeds the watchdog tries before escalating to a process
+ * restart. The step-2 gated-root key-mismatch fix removes the only DETERMINISTIC
+ * stuck cause, so a re-seed is expected to clear a genuine wedge — the cap bounds
+ * a crash-loop if some new deterministic-stuck slips through (re-seed, re-seed,
+ * then restart, never an infinite re-seed spin).
+ */
+export const GIT_SEED_MAX_RESEED_ATTEMPTS = 2;
+
+/**
+ * Pure verdict for the git seed-liveness watchdog (fn-921). Mirrors
+ * {@link decideTranscriptResubscribe} — boolean/clock arithmetic only, no I/O —
+ * so the recovery decision is unit-testable with plain inputs.
+ *
+ * Returns:
+ *   - `"ok"`      — healthy: `seed_required` is clear, OR the worker has not yet
+ *     pulsed (boot-seed may be in flight — NEVER trip mid-boot), OR the surface
+ *     made progress recently enough (under `stuckThresholdMs`).
+ *   - `"reseed"`  — the surface made NO progress past `stuckThresholdMs` AND the
+ *     worker is still pulsing (alive) AND the re-seed budget remains: re-run the
+ *     boot-seed on main.
+ *   - `"escalate"` — the worker is MUTE (no pulse past `livenessThresholdMs`), OR
+ *     the re-seed budget is spent on a quiet-stuck surface: crash for a
+ *     LaunchAgent restart.
+ *
+ * `lastProgressAtMs` is the STABLE staleness anchor: the last GitSnapshot that
+ * landed (real progress), or the watchdog-arm baseline when none has landed
+ * yet — so "alive but never seeding" still grows stale and trips, while the
+ * latest liveness pulse (`lastLivenessAtMs`) is used ONLY for the mute check.
+ */
+export function decideGitSeedWatchdog(inputs: {
+  seedRequired: boolean;
+  lastProgressAtMs: number;
+  lastLivenessAtMs: number | null;
+  nowMs: number;
+  stuckThresholdMs: number;
+  livenessThresholdMs: number;
+  reseedAttempts: number;
+  maxReseedAttempts: number;
+}): "ok" | "reseed" | "escalate" {
+  const {
+    seedRequired,
+    lastProgressAtMs,
+    lastLivenessAtMs,
+    nowMs,
+    stuckThresholdMs,
+    livenessThresholdMs,
+    reseedAttempts,
+    maxReseedAttempts,
+  } = inputs;
+  // Healthy surface — nothing to recover.
+  if (!seedRequired) return "ok";
+  // Never trip mid-boot: a worker that has not pulsed yet may be mid-boot-seed
+  // (or the timer fired in the launch gap before the first tick).
+  if (lastLivenessAtMs == null) return "ok";
+  // Mute worker (alive-but-stuck — a hung poll tick) → restart. A main re-seed
+  // would clear the flag momentarily but the dead producer would re-stale it, so
+  // a fresh process is the right recovery.
+  if (nowMs - lastLivenessAtMs >= livenessThresholdMs) return "escalate";
+  // Quiet-stuck staleness measured from the last progress (snapshot / arm
+  // baseline) — a STABLE anchor that grows even while the worker keeps pulsing.
+  if (nowMs - lastProgressAtMs < stuckThresholdMs) return "ok";
+  // Genuinely stuck + worker alive: re-seed while budget remains, else escalate.
+  return reseedAttempts < maxReseedAttempts ? "reseed" : "escalate";
 }
 
 /**
@@ -1261,12 +1345,13 @@ export const ALL_WORKERS: readonly WorkerName[] = [
 /**
  * The watcher workers that dlopen `@parcel/watcher`. Decides whether the
  * main-thread pre-warm ({@link prewarmWatcherAddon}) is needed: it runs ONLY when
- * at least one of these is in the selected set.
+ * at least one of these is in the selected set. fn-921: the git-worker is now
+ * POLL-ONLY — it no longer imports `@parcel/watcher`, so it is dropped from this
+ * set (a git-only boot needs no pre-warm).
  */
 const WATCHER_WORKERS: readonly WorkerName[] = [
   "transcript",
   "plan",
-  "git",
   "usage",
   "deadLetter",
   "eventsIngest",
@@ -1655,6 +1740,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let wakePending = false;
   let draining = false;
   let shuttingDown = false;
+
+  // fn-921 git seed-liveness watchdog state. `lastGitLivenessAtMs` is stamped on
+  // every worker poll-tick pulse (and on every GitSnapshot) — the MUTE-check
+  // anchor. `lastGitProgressAtMs` is the STABLE staleness anchor: stamped at
+  // watchdog-arm (the baseline) and on every GitSnapshot the worker delivers (real
+  // progress), so "alive but never seeding" still grows stale. `gitSeedReseedAttempts`
+  // caps the MAIN-side re-seed before the watchdog escalates to a restart. The
+  // watchdog timer ({@link decideGitSeedWatchdog}) reads these.
+  let lastGitLivenessAtMs: number | null = null;
+  let lastGitProgressAtMs = Date.now();
+  let gitSeedReseedAttempts = 0;
+  let gitSeedWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   // Autopilot in-memory paused flag. Boots PAUSED (safety default). Lives ONLY
   // in main's memory — never persisted, never RPC-writable except via the
@@ -2752,10 +2849,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } satisfies PlanCommitChangedMessage);
         return;
       }
+      if (msg.kind === "git-liveness") {
+        // fn-921 supervisor liveness pulse — the seed-liveness watchdog reads the
+        // time since this to tell "alive + ticking" from "alive but stuck". Pure
+        // side channel; never folded.
+        lastGitLivenessAtMs = msg.at_ms;
+        return;
+      }
       let hookEvent: string;
       let data: string;
       if (msg.kind === "git-snapshot") {
         hookEvent = "GitSnapshot";
+        // fn-921: a delivered snapshot is the strongest liveness signal AND real
+        // progress (it may clear a stuck `seed_required`) — stamp both anchors so
+        // the watchdog re-measures staleness from here.
+        const now = Date.now();
+        lastGitProgressAtMs = now;
+        lastGitLivenessAtMs = now;
         const { kind: _kind, ...snapshot } = msg;
         data = JSON.stringify(snapshot);
       } else if (msg.kind === "git-root-dropped") {
@@ -4015,6 +4125,71 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     process.exit(1);
   }
 
+  // fn-921 seed-liveness watchdog. The git-worker is poll-only now, so a mute
+  // FSEvents stream can no longer freeze it — but a worker that is alive-but-stuck
+  // (a hung poll tick) OR a `seed_required` that a quiet repo never clears is still
+  // a wedge `onerror`/`close` supervision can't see. This timer reads the verdict
+  // (see {@link decideGitSeedWatchdog}) and recovers: re-run the boot-seed on MAIN
+  // FIRST (re-arm, capped), `fatalExit → LaunchAgent restart` only as a last
+  // resort. Gated on `want("git")` (no git surface otherwise) and disabled in the
+  // in-process tier (`disableNativeWatcher` — the worker arms no producer there).
+  if (gitWorker && want("git") && !opts.disableNativeWatcher) {
+    // Stamp the staleness baseline at arm time (boot-seed has just run), so the
+    // stuck-timer measures from a fresh anchor rather than the early declaration.
+    lastGitProgressAtMs = Date.now();
+    gitSeedWatchdogTimer = setInterval(() => {
+      if (shuttingDown) return;
+      let seedRequired: boolean;
+      try {
+        seedRequired = readGitProjectionSeedRequired(db);
+      } catch {
+        return; // a transient read failure is not a wedge signal
+      }
+      const verdict = decideGitSeedWatchdog({
+        seedRequired,
+        lastProgressAtMs: lastGitProgressAtMs,
+        lastLivenessAtMs: lastGitLivenessAtMs,
+        nowMs: Date.now(),
+        stuckThresholdMs: GIT_SEED_STUCK_THRESHOLD_MS,
+        livenessThresholdMs: GIT_LIVENESS_STUCK_THRESHOLD_MS,
+        reseedAttempts: gitSeedReseedAttempts,
+        maxReseedAttempts: GIT_SEED_MAX_RESEED_ATTEMPTS,
+      });
+      if (verdict === "ok") return;
+      if (verdict === "reseed") {
+        gitSeedReseedAttempts++;
+        console.error(
+          `[keeperd] git seed-liveness watchdog: seed_required stuck — re-running boot-seed (attempt ${gitSeedReseedAttempts}/${GIT_SEED_MAX_RESEED_ATTEMPTS})`,
+        );
+        try {
+          // Re-arm on MAIN, exactly like boot: re-derive the surface for
+          // currently-dirty/gated roots and clear the flag once every gated root
+          // has an above-floor row. The reducer self-clear + the worker's own
+          // force-emit may ALSO clear it; this is the supervisor-side belt. A
+          // reset baseline (lastGitSnapshotAtMs) lets the next tick re-measure
+          // staleness from the re-seed, not from the original wedge.
+          seedGitProjection(db, stmts, {
+            drainToCompletion: (handle) =>
+              drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
+          });
+          lastGitProgressAtMs = Date.now();
+        } catch (err) {
+          console.error(
+            `[keeperd] git seed-liveness watchdog re-seed failed: ${String(err)}`,
+          );
+        }
+        return;
+      }
+      // "escalate" — the re-seed budget is spent (or the worker is mute). A fresh
+      // process re-seeds HEAD correctly; this is the single recovery path.
+      console.error(
+        "[keeperd] git seed-liveness watchdog: surface stuck after " +
+          `${gitSeedReseedAttempts} re-seed attempt(s) (or worker mute) — exiting for LaunchAgent restart`,
+      );
+      if (!shuttingDown) fatalExit();
+    }, GIT_SEED_WATCHDOG_INTERVAL_MS);
+  }
+
   // Unrecoverable async errors that escape every guard also take the single
   // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
   // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
@@ -4059,6 +4234,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     clearInterval(retentionTimer);
     clearInterval(mutationPathBackfillTimer);
     clearInterval(walCheckpointTimer);
+    if (gitSeedWatchdogTimer != null) clearInterval(gitSeedWatchdogTimer);
 
     // The workers actually spawned this boot (filter out the `null`s). Teardown
     // iterates THIS list, so a minimal-set boot signals only what it spawned.

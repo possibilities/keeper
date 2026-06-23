@@ -56,6 +56,7 @@ import {
 import { openDb, readGitProjectionFloor, resolveSockPath } from "./db";
 import type { RetryDispatchVerb } from "./dispatch-command";
 import { unseededGatedRoots } from "./gated-roots";
+import { memoizedGitToplevel } from "./git-toplevel";
 import {
   type BootStatus,
   type ClientFrame,
@@ -1861,7 +1862,14 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
   if (seedRequired) {
     try {
       unseededRoots = Array.from(
-        unseededGatedRoots(db, readGitProjectionFloor(db)),
+        // fn-921: normalize the gated read key to the toplevel write key so a
+        // subdir/symlink `target_repo` is not falsely reported unseeded
+        // (memoized — one resolve per distinct gated root).
+        unseededGatedRoots(
+          db,
+          readGitProjectionFloor(db),
+          memoizedGitToplevel(),
+        ),
       );
     } catch {
       unseededRoots = [];
