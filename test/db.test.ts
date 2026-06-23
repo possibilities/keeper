@@ -2153,9 +2153,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // merge via a v80-shaped rewind-and-redrain, fn-888; v82 rewrites historical
   // Commit-event `events.data` keys `planctl_op`/`planctl_target` → `plan_op`/
   // `plan_target` + narrows the `file_attributions.source` CHECK to drop
-  // `'planctl'`, fn-889); the v62→v63 epics-shape migration this test exercises
+  // `'planctl'`, fn-889; v83 adds the `jobs.backend_exec_generation_id` +
+  // `backend_exec_birth_session_id` columns + the `tmux_projection_state`
+  // live-only control singleton + backfills birth_session from the frozen launch
+  // session, fn-907); the v62→v63 epics-shape migration this test exercises
   // is unchanged.
-  expect(SCHEMA_VERSION).toBe(82);
+  expect(SCHEMA_VERSION).toBe(83);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

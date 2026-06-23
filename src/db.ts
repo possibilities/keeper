@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 82;
+export const SCHEMA_VERSION = 83;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1213,6 +1213,31 @@ CREATE TABLE IF NOT EXISTS git_projection_state (
 `;
 
 /**
+ * LIVE-ONLY tmux topology skip-floor + seed flag (fn-907) — the twin of
+ * {@link CREATE_GIT_PROJECTION_STATE}, governing the two live-owned `jobs`
+ * location columns `backend_exec_session_id` + `window_index`. A keeperd
+ * timer-poll producer reads `tmux list-panes -a` and mints one
+ * `TmuxTopologySnapshot`; the live fold overwrites the two columns for events
+ * `id > floor` only, while the boot-seed re-derives the surface and raises the
+ * floor to the current `max(events.id)`.
+ *
+ * Both columns are PRODUCER/live-owned — DELIBERATELY excluded from the re-fold
+ * byte-identical charter (they join {@link LIVE_ONLY_JOBS_COLUMNS}). A class-aware
+ * rewind that wipes the live surface MUST reset `floor` to 0 and set
+ * `seed_required = 1` (enforced by {@link rewindLiveProjection}), or the
+ * historical snapshots self-gate below the stale floor and the location stays
+ * frozen forever.
+ */
+const CREATE_TMUX_PROJECTION_STATE = `
+CREATE TABLE IF NOT EXISTS tmux_projection_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    floor INTEGER NOT NULL DEFAULT 0,
+    seed_required INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+)
+`;
+
+/**
  * Projection-class taxonomy (Marten's "Live projection lifecycle"). The central
  * source of truth for which projection tables are LIVE-PRODUCER-FED — re-derived
  * by a boot-seed producer + kept current by incremental folds ABOVE a skip-floor,
@@ -1272,16 +1297,25 @@ export function truncateEphemeralProjections(db: Database): void {
 }
 
 /**
- * The git-derived counter columns embedded in the otherwise-deterministic `jobs`
- * projection. Live-producer-fed (re-seeded by the boot-seed's per-root reset),
- * so the charter byte-identical comparison of `jobs` MUST blank these columns
- * before comparing. fn-867 deleted the readiness predicate that read them, so
- * they are now display-only.
+ * The live-producer-fed columns embedded in the otherwise-deterministic `jobs`
+ * projection, so the charter byte-identical comparison of `jobs` MUST blank these
+ * columns before comparing. Two live surfaces share the list:
+ *   - the 3 git-derived counters (fn-867: display-only since the readiness
+ *     predicate that read them was deleted), re-seeded by the git boot-seed's
+ *     per-root reset; and
+ *   - the 2 tmux LOCATION columns (fn-907): `backend_exec_session_id` +
+ *     `window_index`, re-derived by the `TmuxTopologySnapshot` live fold above
+ *     `tmux_projection_state.floor` + the tmux boot-seed. These were
+ *     deterministic-replayed before v83; flipping them live-only takes them OUT
+ *     of the byte-identical charter (the frozen launch env now writes the
+ *     forensic `backend_exec_birth_session_id` instead).
  */
 export const LIVE_ONLY_JOBS_COLUMNS = [
   "git_dirty_count",
   "git_unattributed_to_live_count",
   "git_orphan_count",
+  "backend_exec_session_id",
+  "window_index",
 ] as const;
 
 /**
@@ -1306,18 +1340,56 @@ function rewindLiveProjection(db: Database): void {
   for (const table of LIVE_ONLY_PROJECTIONS) {
     db.run(`DELETE FROM ${table}`);
   }
-  // Zero the embedded jobs git-counters (the boot-seed/live folds re-derive
+  // Zero the embedded live-only jobs columns (the boot-seed/live folds re-derive
   // them). A `jobs` rewind that DELETEs the whole table covers this too, but the
-  // counters are live-owned so we reset them explicitly here for the case where
-  // `jobs` is NOT being wiped alongside.
+  // columns are live-owned so we reset them explicitly here for the case where
+  // `jobs` is NOT being wiped alongside. The 3 git counters live in `CREATE_JOBS`
+  // (always present) and reset to 0.
   db.run(
     `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
   );
+  // The 2 tmux location columns (fn-907) are added by LATER migration ALTERs
+  // (`backend_exec_session_id` at v48, `window_index` at v71), so an EARLY
+  // rewinding step in the 0→latest ladder runs this helper BEFORE they exist.
+  // Reset them only when present — NULL is the "unknown location" zero-value the
+  // boot-seed + `TmuxTopologySnapshot` fold overwrite. Same guard for
+  // `tmux_projection_state` (created at v83): a pre-v83 rewind step must not throw
+  // on a missing control table.
+  const jobsCols = new Set(
+    (db.query("PRAGMA table_info(jobs)").all() as { name: string }[]).map(
+      (c) => c.name,
+    ),
+  );
+  if (jobsCols.has("backend_exec_session_id")) {
+    db.run(`UPDATE jobs SET backend_exec_session_id = NULL`);
+  }
+  if (jobsCols.has("window_index")) {
+    db.run(`UPDATE jobs SET window_index = NULL`);
+  }
   db.run(
     `UPDATE git_projection_state
         SET floor = 0, seed_required = 1, updated_at = unixepoch('now', 'subsec')
       WHERE id = 1`,
   );
+  // The tmux live surface is reset in lockstep with the git surface: a rewind
+  // that wipes the live location columns WITHOUT resetting the tmux floor would
+  // leave them frozen — every historical TmuxTopologySnapshot self-gates below
+  // the stale floor. Guarded on table existence for the same pre-v83-ladder reason.
+  const tmuxStateExists =
+    (
+      db
+        .query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tmux_projection_state'",
+        )
+        .all() as { name: string }[]
+    ).length > 0;
+  if (tmuxStateExists) {
+    db.run(
+      `UPDATE tmux_projection_state
+          SET floor = 0, seed_required = 1, updated_at = unixepoch('now', 'subsec')
+        WHERE id = 1`,
+    );
+  }
 }
 
 /**
@@ -1373,6 +1445,65 @@ export function setGitProjectionSeedRequired(
 export function raiseGitProjectionFloor(db: Database, newFloor: number): void {
   db.run(
     `UPDATE git_projection_state
+        SET floor = max(floor, ?), updated_at = unixepoch('now', 'subsec')
+      WHERE id = 1`,
+    [newFloor],
+  );
+}
+
+/**
+ * Read the LIVE-ONLY tmux-projection skip-floor (fn-907). The `TmuxTopologySnapshot`
+ * fold no-ops for `event.id <= floor`. Returns 0 when the control row is missing
+ * (a pre-v83 / mid-migrate read) so folds run unconditionally rather than silently
+ * gating — fail-open on the floor, never fail-empty. Twin of
+ * {@link readGitProjectionFloor}.
+ */
+export function readTmuxProjectionFloor(db: Database): number {
+  const row = db
+    .query("SELECT floor FROM tmux_projection_state WHERE id = 1")
+    .get() as { floor: number } | null;
+  return row?.floor ?? 0;
+}
+
+/**
+ * Read whether the boot-seed must (re-)derive the tmux location surface before
+ * serving. `true` when the control row says so OR when the row is absent (treat a
+ * missing control row as "needs seeding" — fail-safe toward re-deriving). Twin of
+ * {@link readGitProjectionSeedRequired}.
+ */
+export function readTmuxProjectionSeedRequired(db: Database): boolean {
+  const row = db
+    .query("SELECT seed_required FROM tmux_projection_state WHERE id = 1")
+    .get() as { seed_required: number } | null;
+  return row == null ? true : row.seed_required !== 0;
+}
+
+/**
+ * Set the tmux `seed_required` flag. The boot-seed producer sets it `true` before
+ * its re-derive and clears it `false` after the synthetic snapshot folds, so a
+ * crash mid-seed leaves it set and the next boot re-seeds. Twin of
+ * {@link setGitProjectionSeedRequired}.
+ */
+export function setTmuxProjectionSeedRequired(
+  db: Database,
+  required: boolean,
+): void {
+  db.run(
+    `UPDATE tmux_projection_state
+        SET seed_required = ?, updated_at = unixepoch('now', 'subsec')
+      WHERE id = 1`,
+    [required ? 1 : 0],
+  );
+}
+
+/**
+ * Raise the tmux skip-floor to `max(floor, newFloor)`. Monotonic — never lowers
+ * the floor (a stale producer can't reopen the historical replay). Twin of
+ * {@link raiseGitProjectionFloor}.
+ */
+export function raiseTmuxProjectionFloor(db: Database, newFloor: number): void {
+  db.run(
+    `UPDATE tmux_projection_state
         SET floor = max(floor, ?), updated_at = unixepoch('now', 'subsec')
       WHERE id = 1`,
     [newFloor],
@@ -1829,6 +1960,7 @@ function migrate(db: Database): void {
       db.run(CREATE_USAGE);
       db.run(CREATE_REDUCER_STATE);
       db.run(CREATE_GIT_PROJECTION_STATE);
+      db.run(CREATE_TMUX_PROJECTION_STATE);
       db.run(CREATE_META);
       db.run(CREATE_SUBAGENT_INVOCATIONS);
       for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
@@ -1879,6 +2011,12 @@ function migrate(db: Database): void {
       // the floor moves up to current `max(events.id)` once it does).
       db.run(
         "INSERT OR IGNORE INTO git_projection_state (id, floor, seed_required, updated_at) VALUES (1, 0, 1, unixepoch('now', 'subsec'))",
+      );
+      // Seed the live-only tmux-projection control singleton (fn-907), mirroring
+      // the git seed above: `floor = 0` + `seed_required = 1` so the boot-seed
+      // re-derives the live pane location surface before serving.
+      db.run(
+        "INSERT OR IGNORE INTO tmux_projection_state (id, floor, seed_required, updated_at) VALUES (1, 0, 1, unixepoch('now', 'subsec'))",
       );
 
       // Forward-only schema changes run on EVERY boot, NOT gated on the stored
@@ -4542,6 +4680,59 @@ function migrate(db: Database): void {
         for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
           db.run(sql);
         }
+      }
+
+      // v82→v83 (fn-907 task .1): the schema foundation for tracking a worker
+      // pane's LIVE tmux location (session NAME + window index) after an
+      // out-of-band `break-pane`/`move-window`. The two location columns flip
+      // from deterministic-replayed to LIVE-ONLY (boot-seeded + skip-floored like
+      // the git surface), and the FROZEN launch env is demoted to a forensic
+      // `backend_exec_birth_session_id`. No producer/fold logic here — just the
+      // columns, the `tmux_projection_state` control table, and the one-time
+      // birth-session backfill the later tasks build on.
+      //
+      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
+      // socket, not these projection internals) — this bump MUST add 83 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      //
+      // NO cursor rewind-and-redrain: the two columns become live-only
+      // (boot-seeded, not replayed), so history is never re-folded for them — the
+      // backfill below + the boot-seed cover the existing rows. This deliberately
+      // avoids re-arming the `computeRepoBashWindows` O(history) re-fold time-bomb.
+      //
+      // The two column adds are idempotent (`addColumnIfMissing`), so they run
+      // unconditionally; `CREATE_TMUX_PROJECTION_STATE` is `IF NOT EXISTS` and
+      // also runs unconditionally so an upgraded DB gets the table even though the
+      // fresh-schema block above only fires on a cold first boot. The seed +
+      // backfill are NON-idempotent (the backfill would re-clobber a later live
+      // value), so they are VERSION-GUARDED to fire once per upgrade.
+      addColumnIfMissing(db, "jobs", "backend_exec_generation_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "backend_exec_birth_session_id", "TEXT");
+      db.run(CREATE_TMUX_PROJECTION_STATE);
+      if (preMigrateStoredVersion < 83) {
+        // Seed the control singleton with `seed_required = 1` so the boot-seed
+        // re-derives the live location surface on the very next boot. `floor`
+        // stays 0 here — the boot-seed raises it to current `max(events.id)` once
+        // it runs (mirrors the v79 git floor-init's deferral to the boot-seed).
+        db.run(
+          "INSERT OR IGNORE INTO tmux_projection_state (id, floor, seed_required, updated_at) VALUES (1, 0, 1, unixepoch('now', 'subsec'))",
+        );
+        db.run(
+          `UPDATE tmux_projection_state
+              SET seed_required = 1, updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
+        // One-time backfill: the FROZEN `backend_exec_session_id` IS the launch
+        // (birth) session env for every pre-v83 row — copy it into the forensic
+        // birth column so consumers can fall back to it once the live session
+        // becomes the authoritative (and possibly-relocated) value. Scoped to
+        // rows whose birth column is still NULL so a re-run is a no-op.
+        db.run(
+          `UPDATE jobs
+              SET backend_exec_birth_session_id = backend_exec_session_id
+            WHERE backend_exec_birth_session_id IS NULL`,
+        );
       }
 
       db.prepare(

@@ -16,9 +16,13 @@ import {
   LIVE_ONLY_JOBS_COLUMNS,
   LIVE_ONLY_PROJECTIONS,
   raiseGitProjectionFloor,
+  raiseTmuxProjectionFloor,
   readGitProjectionFloor,
   readGitProjectionSeedRequired,
+  readTmuxProjectionFloor,
+  readTmuxProjectionSeedRequired,
   setGitProjectionSeedRequired,
+  setTmuxProjectionSeedRequired,
 } from "../src/db";
 import { drain } from "../src/reducer";
 import { freshMemDb } from "./helpers/template-db";
@@ -106,7 +110,7 @@ function gitStatusRow(projectDir: string): { dirty_count: number } | null {
 // Registry
 // ---------------------------------------------------------------------------
 
-test("registry: LIVE_ONLY_PROJECTIONS names exactly git_status + file_attributions, and the 3 jobs git-counters", () => {
+test("registry: LIVE_ONLY_PROJECTIONS names exactly git_status + file_attributions, and the 5 live-only jobs columns (3 git counters + 2 tmux location)", () => {
   expect([...LIVE_ONLY_PROJECTIONS]).toEqual([
     "git_status",
     "file_attributions",
@@ -115,6 +119,8 @@ test("registry: LIVE_ONLY_PROJECTIONS names exactly git_status + file_attributio
     "git_dirty_count",
     "git_unattributed_to_live_count",
     "git_orphan_count",
+    "backend_exec_session_id",
+    "window_index",
   ]);
 });
 
@@ -133,6 +139,28 @@ test("the live-only tables + 3 jobs columns all exist in the migrated schema (re
   for (const col of LIVE_ONLY_JOBS_COLUMNS) {
     expect(jobsCols.has(col)).toBe(true);
   }
+});
+
+test("fn-907 v83 schema: fresh DB has tmux_projection_state + the two new forensic jobs columns", () => {
+  const tmuxState = db
+    .query("PRAGMA table_info(tmux_projection_state)")
+    .all() as { name: string }[];
+  const tmuxCols = new Set(tmuxState.map((c) => c.name));
+  expect(tmuxCols.has("floor")).toBe(true);
+  expect(tmuxCols.has("seed_required")).toBe(true);
+  // The singleton control row is seeded on a fresh DB.
+  const seedRow = db
+    .query("SELECT seed_required FROM tmux_projection_state WHERE id = 1")
+    .get() as { seed_required: number } | null;
+  expect(seedRow).not.toBeNull();
+
+  const jobsCols = new Set(
+    (db.query("PRAGMA table_info(jobs)").all() as { name: string }[]).map(
+      (c) => c.name,
+    ),
+  );
+  expect(jobsCols.has("backend_exec_generation_id")).toBe(true);
+  expect(jobsCols.has("backend_exec_birth_session_id")).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -156,6 +184,24 @@ test("floor accessors: fresh template seeds floor=0 + seed_required=true; raise 
   expect(readGitProjectionSeedRequired(db)).toBe(false);
   setGitProjectionSeedRequired(db, true);
   expect(readGitProjectionSeedRequired(db)).toBe(true);
+});
+
+test("tmux floor accessors (fn-907): fresh template seeds floor=0 + seed_required=true; raise is monotonic; seed_required toggles", () => {
+  expect(readTmuxProjectionFloor(db)).toBe(0);
+  expect(readTmuxProjectionSeedRequired(db)).toBe(true);
+
+  raiseTmuxProjectionFloor(db, 100);
+  expect(readTmuxProjectionFloor(db)).toBe(100);
+  // Monotonic — a lower raise never lowers it.
+  raiseTmuxProjectionFloor(db, 50);
+  expect(readTmuxProjectionFloor(db)).toBe(100);
+  raiseTmuxProjectionFloor(db, 150);
+  expect(readTmuxProjectionFloor(db)).toBe(150);
+
+  setTmuxProjectionSeedRequired(db, false);
+  expect(readTmuxProjectionSeedRequired(db)).toBe(false);
+  setTmuxProjectionSeedRequired(db, true);
+  expect(readTmuxProjectionSeedRequired(db)).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
