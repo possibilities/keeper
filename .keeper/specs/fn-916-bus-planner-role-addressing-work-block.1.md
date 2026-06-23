@@ -66,5 +66,5 @@ Fast-tier, synthetic only (no real git, no subprocess — guarded by `bun run te
 - [ ] New fast-tier tests cover all cases above and pass under `bun test test/bus-identity.test.ts`; `bun run test:full` green
 
 ## Done summary
-
+Added parseRoleAddress + roleJobIds pure helpers and wired a role-address branch into resolveTarget so planner@<epic_id> resolves to the epic's creator session(s) via job_links, collapsing multi-creator edges by live channel and mapping every outcome onto the existing PublishOutcome vocabulary; refiner is recognized but unwired.
 ## Evidence
