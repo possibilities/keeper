@@ -33,5 +33,5 @@ Render check via the plugin's skill tooling if present; otherwise manual frontma
 - [ ] Documents driving `keeper pair` incl. the Monitor-in-main pattern, read-only, and reading `--output`.
 
 ## Done summary
-
+Authored plugins/keeper/skills/pair/SKILL.md — an auto-discovered, model-invocable /keeper:pair skill documenting the Monitor-in-main pairing pattern, --cli/--role/--read-only selection, reading the --output YAML, and the detection-not-prevention read-only caveat.
 ## Evidence
