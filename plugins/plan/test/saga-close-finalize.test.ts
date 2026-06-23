@@ -25,7 +25,10 @@ import {
   writeArtifact,
   writeBriefArtifact,
 } from "../src/audit_artifacts.ts";
-import { CLOSE_OUTCOMES, type CloseOutcome } from "../src/verbs/close_finalize.ts";
+import {
+  CLOSE_OUTCOMES,
+  type CloseOutcome,
+} from "../src/verbs/close_finalize.ts";
 import {
   firstJsonPayload,
   gitInit,
