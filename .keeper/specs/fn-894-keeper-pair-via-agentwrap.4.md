@@ -49,5 +49,5 @@ Grep the repo for residual `pairctl` references after the change (only the follo
 - [ ] No residual keeper-side `pairctl` references outside the follow-on's scope; all prose forward-facing.
 
 ## Done summary
-
+Pointed /plan:panel + /hack and the CLAUDE.md/README skill inventories at keeper pair: panel SKILL.md + references/panel.md now describe the keeper pair send Monitor transport ([keeper-pair] event contract, --output YAML, transcript_path reveal), hack frontmatter + second-opinion refs flip to /keeper:pair with the advisory/authoritative distinction intact, and keeper:pair joins both inventories. No residual keeper-side pairctl prose remains outside the follow-on package deletion.
 ## Evidence
