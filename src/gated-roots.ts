@@ -95,6 +95,13 @@ export function unseededGatedRoots(db: Database, floor: number): Set<string> {
   const roots = gatedGitRoots(db);
   const unseeded = new Set<string>();
   if (roots.length === 0) return unseeded;
+  // INVARIANT: a gated root MUST already be its own git toplevel. We look it up
+  // by the RAW effectiveRoot, but the boot-seed / live git-worker WRITE the row
+  // under resolveGitToplevel(root) (`git-boot-seed.ts`). The two keys agree only
+  // when effectiveRoot === resolveGitToplevel(effectiveRoot); the per-root mutex
+  // assumes the same identity. Under fn-905's self-clear a key mismatch is no
+  // longer a transient stall — the root never clears seed_required and stays
+  // forced-`unknown` forever.
   const stmt = db.prepare(
     "SELECT 1 FROM git_status WHERE project_dir = ? AND last_event_id > ? LIMIT 1",
   );
@@ -116,6 +123,10 @@ export function unseededGatedRoots(db: Database, floor: number): Set<string> {
 export function allGatedRootsSeeded(db: Database, floor: number): boolean {
   const roots = gatedGitRoots(db);
   if (roots.length === 0) return true;
+  // Same raw-key INVARIANT as unseededGatedRoots: the gated root MUST already be
+  // its own git toplevel (keyed identically to the boot-seed / live git-worker
+  // resolveGitToplevel write key), or it never seeds and seed_required never
+  // clears.
   const stmt = db.prepare(
     "SELECT 1 FROM git_status WHERE project_dir = ? AND last_event_id > ? LIMIT 1",
   );
