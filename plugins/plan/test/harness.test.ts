@@ -330,12 +330,9 @@ describe("git assertion helpers + withProject", () => {
 // ===========================================================================
 
 describe("slow-bucket gate", () => {
-  // Default (KEEPER_PLAN_RUN_SLOW unset) -> SLOW_ENABLED false -> this skips. With
-  // the env set it runs. The skip/run split is visible in the bun summary.
-  test.skipIf(!SLOW_ENABLED)("runs only under KEEPER_PLAN_RUN_SLOW", () => {
-    expect(SLOW_ENABLED).toBe(true);
-  });
-
+  // SLOW_ENABLED gates the real-git src-commit.test.ts bucket, run by the wired
+  // `bun run test:slow` (KEEPER_PLAN_RUN_SLOW=1). This pins the constant to its
+  // env source so the gate stays honest.
   test("SLOW_ENABLED reflects the KEEPER_PLAN_RUN_SLOW env exactly", () => {
     const v = process.env.KEEPER_PLAN_RUN_SLOW;
     const expected = v !== undefined && v !== "" && v !== "0";

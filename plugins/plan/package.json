@@ -8,7 +8,8 @@
     "promote": "bash scripts/promote.sh",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check --no-errors-on-unmatched plugin/hooks test src",
-    "test": "bun test --timeout 30000"
+    "test": "bun test --timeout 30000",
+    "test:slow": "KEEPER_PLAN_RUN_SLOW=1 bun test --timeout 30000"
   },
   "dependencies": {
     "js-yaml": "4.2.0",

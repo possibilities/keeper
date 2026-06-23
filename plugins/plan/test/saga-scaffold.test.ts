@@ -12,10 +12,9 @@
 // epic.queue_jump riding the envelope; the dup-slug guard + --allow-duplicate +
 // the suffix false-positive regression + atomicity.
 //
-// Every scaffold node is integration-marked in the Python suite (scaffold's mint-
-// time integrity gate runs check_filesystem_repos=true, needing a real .git/), so
-// every test here is gated behind SLOW_ENABLED (skipped in the fast `bun test`,
-// run under KEEPER_PLAN_RUN_SLOW=1) and fixtured on a real-git withProject.
+// Runs in the default tier: the harness withProject + gitInit fixture the repo
+// through the fake VCS facade (a bare `.git/` dir satisfies scaffold's mint-time
+// integrity gate's git-root resolution), so every node here spawns ZERO real git.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -34,11 +33,8 @@ import {
   gitLogCount,
   type ProjectHandle,
   runCli,
-  SLOW_ENABLED,
   withProject,
 } from "./harness.ts";
-
-const slow = test.skipIf(!SLOW_ENABLED);
 
 const VALID_TASK_SPEC = [
   "## Description",
@@ -139,7 +135,7 @@ function seedEpic(title = "seed epic"): string {
 // ---------------------------------------------------------------------------
 
 describe("scaffold happy path", () => {
-  slow("emits exactly one invocation covering the full tree", () => {
+  test("emits exactly one invocation covering the full tree", () => {
     // test_scaffold.py::test_scaffold_happy_path_emits_one_invocation
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -168,7 +164,7 @@ describe("scaffold happy path", () => {
     }
   });
 
-  slow("writes verbatim specs, not skeletons", () => {
+  test("writes verbatim specs, not skeletons", () => {
     // test_scaffold.py::test_scaffold_writes_verbatim_specs_not_skeletons
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -181,7 +177,7 @@ describe("scaffold happy path", () => {
     expect(spec1).toContain("- [ ] It works.");
   });
 
-  slow("1-based ordinal dep resolves to fn-N.M", () => {
+  test("1-based ordinal dep resolves to fn-N.M", () => {
     // test_scaffold.py::test_scaffold_dep_resolves_to_fn_n_m
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -191,7 +187,7 @@ describe("scaffold happy path", () => {
     ]);
   });
 
-  slow("forward ref (task1 deps [2]) resolves via two-pass allocation", () => {
+  test("forward ref (task1 deps [2]) resolves via two-pass allocation", () => {
     // test_scaffold.py::test_scaffold_forward_ref_resolves
     const yaml =
       "epic:\n  title: forward ref test\n  spec: |\n    ## Overview\n    forward ref.\n" +
@@ -205,7 +201,7 @@ describe("scaffold happy path", () => {
     ]);
   });
 
-  slow("epic + task carry snippets/bundles + fresh validated marker", () => {
+  test("epic + task carry snippets/bundles + fresh validated marker", () => {
     // test_scaffold.py::test_scaffold_epic_carries_snippets_bundles
     const yaml =
       "epic:\n  title: snippet metadata\n  snippets: [snip-a, snip-b]\n" +
@@ -229,7 +225,7 @@ describe("scaffold happy path", () => {
     expect(taskDef.bundles).toEqual(["bundle/dev-env"]);
   });
 
-  slow("no epic branch defaults branch_name to main", () => {
+  test("no epic branch defaults branch_name to main", () => {
     // test_scaffold.py::test_scaffold_no_branch_defaults_to_main
     const yaml =
       "epic:\n  title: no branch given\n  spec: |\n    ## Overview\n    yes.\n" +
@@ -240,7 +236,7 @@ describe("scaffold happy path", () => {
     expect(readJson(`epics/${epicId}.json`).branch_name).toBe("main");
   });
 
-  slow("no substrate emits no advisory + single invocation", () => {
+  test("no substrate emits no advisory + single invocation", () => {
     // test_scaffold.py::test_scaffold_no_substrate_emits_no_advisory
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -263,7 +259,7 @@ describe("scaffold epic deps", () => {
     );
   }
 
-  slow("happy path preserves declared order", () => {
+  test("happy path preserves declared order", () => {
     // test_scaffold.py::test_scaffold_epic_dep_happy_path_preserves_order
     const first = seedEpic("seed epic first");
     const second = seedEpic("seed epic second");
@@ -280,7 +276,7 @@ describe("scaffold epic deps", () => {
     ]);
   });
 
-  slow("absent field coerces to []", () => {
+  test("absent field coerces to []", () => {
     // test_scaffold.py::test_scaffold_no_epic_deps_yields_empty_list
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -288,7 +284,7 @@ describe("scaffold epic deps", () => {
     expect(readJson(`epics/${epicId}.json`).depends_on_epics).toEqual([]);
   });
 
-  slow("non-list epic dep is typed epic_dep_invalid", () => {
+  test("non-list epic dep is typed epic_dep_invalid", () => {
     // test_scaffold.py::test_scaffold_epic_dep_non_list_is_typed
     const r = run([
       "scaffold",
@@ -302,7 +298,7 @@ describe("scaffold epic deps", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("list of non-strings is typed", () => {
+  test("list of non-strings is typed", () => {
     // test_scaffold.py::test_scaffold_epic_dep_list_of_non_strings_is_typed
     const r = run([
       "scaffold",
@@ -316,7 +312,7 @@ describe("scaffold epic deps", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("malformed id is typed", () => {
+  test("malformed id is typed", () => {
     // test_scaffold.py::test_scaffold_epic_dep_malformed_id_is_typed
     const r = run([
       "scaffold",
@@ -330,7 +326,7 @@ describe("scaffold epic deps", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("nonexistent dep is typed with a does-not-exist detail", () => {
+  test("nonexistent dep is typed with a does-not-exist detail", () => {
     // test_scaffold.py::test_scaffold_epic_dep_nonexistent_is_typed
     const r = run([
       "scaffold",
@@ -346,7 +342,7 @@ describe("scaffold epic deps", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("duplicate dep is typed", () => {
+  test("duplicate dep is typed", () => {
     // test_scaffold.py::test_scaffold_epic_dep_duplicate_is_typed
     const first = seedEpic();
     const r = run([
@@ -368,7 +364,7 @@ describe("scaffold epic deps", () => {
 // ---------------------------------------------------------------------------
 
 describe("scaffold failure shapes", () => {
-  slow("non-mapping doc is bad_yaml", () => {
+  test("non-mapping doc is bad_yaml", () => {
     // test_scaffold.py::test_scaffold_bad_yaml_non_mapping_doc
     const r = run(["scaffold", "--file", writeYaml("just a string\n")]);
     expect(r.code).not.toBe(0);
@@ -378,7 +374,7 @@ describe("scaffold failure shapes", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("empty tasks list is bad_yaml", () => {
+  test("empty tasks list is bad_yaml", () => {
     // test_scaffold.py::test_scaffold_empty_tasks_list_is_bad_yaml
     const yaml =
       "epic:\n  title: no tasks\n  spec: |\n    ## Overview\n    x.\ntasks: []\n";
@@ -394,7 +390,7 @@ describe("scaffold failure shapes", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("spec_invalid lists the offending task #2", () => {
+  test("spec_invalid lists the offending task #2", () => {
     // test_scaffold.py::test_scaffold_spec_invalid_lists_offending_task
     const badSpec = "## Description\n\n## Acceptance\n\n## Done summary\n";
     const yaml =
@@ -411,7 +407,7 @@ describe("scaffold failure shapes", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("out-of-range dep ordinal is dep_invalid", () => {
+  test("out-of-range dep ordinal is dep_invalid", () => {
     // test_scaffold.py::test_scaffold_dep_out_of_range_is_typed
     const yaml =
       "epic:\n  title: bad ordinal\n  spec: |\n    ## Overview\n    x.\n" +
@@ -424,7 +420,7 @@ describe("scaffold failure shapes", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("self-ref dep is dep_invalid", () => {
+  test("self-ref dep is dep_invalid", () => {
     // test_scaffold.py::test_scaffold_dep_self_ref_is_typed
     const yaml =
       "epic:\n  title: self ref\n  spec: |\n    ## Overview\n    x.\n" +
@@ -436,7 +432,7 @@ describe("scaffold failure shapes", () => {
     ).toBe("dep_invalid");
   });
 
-  slow("dep cycle is dep_cycle", () => {
+  test("dep cycle is dep_cycle", () => {
     // test_scaffold.py::test_scaffold_dep_cycle_is_typed
     const yaml =
       "epic:\n  title: cycle\n  spec: |\n    ## Overview\n    cycle.\n" +
@@ -474,26 +470,23 @@ describe("scaffold target_repo", () => {
     return [realpathSync(a), realpathSync(b)];
   }
 
-  slow(
-    "default-omit: every task targets primary, single-element rollup",
-    () => {
-      // test_scaffold.py::test_scaffold_default_target_repo_unchanged
-      const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
-      expect(r.code).toBe(0);
-      const payload = parseEnvelope(r.output);
-      const epicId = payload.epic_id as string;
-      const primary = realpathSync(project.root);
-      expect(payload.repo_distribution).toEqual({ [primary]: 2 });
-      const epicDef = readJson(`epics/${epicId}.json`);
-      expect(epicDef.touched_repos).toEqual([primary]);
-      expect(epicDef.primary_repo).toBe(primary);
-      for (const i of [1, 2]) {
-        expect(readJson(`tasks/${epicId}.${i}.json`).target_repo).toBe(primary);
-      }
-    },
-  );
+  test("default-omit: every task targets primary, single-element rollup", () => {
+    // test_scaffold.py::test_scaffold_default_target_repo_unchanged
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    const epicId = payload.epic_id as string;
+    const primary = realpathSync(project.root);
+    expect(payload.repo_distribution).toEqual({ [primary]: 2 });
+    const epicDef = readJson(`epics/${epicId}.json`);
+    expect(epicDef.touched_repos).toEqual([primary]);
+    expect(epicDef.primary_repo).toBe(primary);
+    for (const i of [1, 2]) {
+      expect(readJson(`tasks/${epicId}.${i}.json`).target_repo).toBe(primary);
+    }
+  });
 
-  slow("two distinct target_repos persist + sorted rollup", () => {
+  test("two distinct target_repos persist + sorted rollup", () => {
     // test_scaffold.py::test_scaffold_per_task_target_repo
     const [a, b] = twoForeignRepos();
     const yaml =
@@ -514,7 +507,7 @@ describe("scaffold target_repo", () => {
     expect(readJson(`tasks/${epicId}.2.json`).target_repo).toBe(b);
   });
 
-  slow("mixed target_repo dedups, omitted task falls to primary", () => {
+  test("mixed target_repo dedups, omitted task falls to primary", () => {
     // test_scaffold.py::test_scaffold_mixed_target_repo_dedup
     const [a, b] = twoForeignRepos();
     const yaml =
@@ -534,7 +527,7 @@ describe("scaffold target_repo", () => {
     expect(readJson(`tasks/${epicId}.3.json`).target_repo).toBe(primary);
   });
 
-  slow("relative target_repo is rejected with repo_invalid", () => {
+  test("relative target_repo is rejected with repo_invalid", () => {
     // test_scaffold.py::test_scaffold_target_repo_relative_rejected
     const yaml =
       "epic:\n  title: relative path\n  spec: |\n    ## Overview\n    x.\n" +
@@ -549,7 +542,7 @@ describe("scaffold target_repo", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("non-string target_repo is bad_yaml", () => {
+  test("non-string target_repo is bad_yaml", () => {
     // test_scaffold.py::test_scaffold_target_repo_not_string_rejected
     const yaml =
       "epic:\n  title: bad target_repo type\n  spec: |\n    ## Overview\n    x.\n" +
@@ -566,7 +559,7 @@ describe("scaffold target_repo", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("empty-after-strip target_repo is repo_invalid", () => {
+  test("empty-after-strip target_repo is repo_invalid", () => {
     // test_scaffold.py::test_scaffold_target_repo_empty_string_rejected
     const yaml =
       "epic:\n  title: empty target_repo\n  spec: |\n    ## Overview\n    x.\n" +
@@ -593,7 +586,7 @@ describe("scaffold target_repo", () => {
 // ---------------------------------------------------------------------------
 
 describe("scaffold mint boundary", () => {
-  slow("fresh epic carries a microsecond-precise validated marker", () => {
+  test("fresh epic carries a microsecond-precise validated marker", () => {
     // test_scaffold.py::test_scaffold_fresh_epic_carries_validated_marker
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -604,7 +597,7 @@ describe("scaffold mint boundary", () => {
     expect(stamped.includes(".") && stamped.endsWith("Z")).toBe(true);
   });
 
-  slow("the invocation covers the whole tree (one commit)", () => {
+  test("the invocation covers the whole tree (one commit)", () => {
     // test_scaffold.py::test_scaffold_fresh_epic_emit_covers_one_commit
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -625,7 +618,7 @@ describe("scaffold mint boundary", () => {
     }
   });
 
-  slow("missing session id fails closed before any write or commit", () => {
+  test("missing session id fails closed before any write or commit", () => {
     // test_scaffold.py::test_scaffold_missing_session_id_writes_nothing
     const logBefore = gitLogCount(project.root);
     const r = runCli(["scaffold", "--file", writeYaml(twoTaskYaml())], {
@@ -653,7 +646,7 @@ describe("scaffold mint boundary", () => {
 // ---------------------------------------------------------------------------
 
 describe("scaffold stdin", () => {
-  slow("--file - reads YAML from stdin", () => {
+  test("--file - reads YAML from stdin", () => {
     // test_scaffold.py::test_scaffold_reads_yaml_from_stdin
     const r = run(["scaffold", "--file", "-"], { input: twoTaskYaml() });
     expect(r.code).toBe(0);
@@ -665,7 +658,7 @@ describe("scaffold stdin", () => {
     expect(countInvocationLines(r.output)).toBe(1);
   });
 
-  slow("the 1 MiB cap fires on stdin pre-decode", () => {
+  test("the 1 MiB cap fires on stdin pre-decode", () => {
     // test_scaffold.py::test_scaffold_stdin_byte_cap_enforced
     const bigComment = `# ${"x".repeat(1024 * 1024 + 100)}\n`;
     const r = run(["scaffold", "--file", "-"], {
@@ -685,7 +678,7 @@ describe("scaffold stdin", () => {
 // ---------------------------------------------------------------------------
 
 describe("scaffold per-task tier", () => {
-  slow("tier persists per task", () => {
+  test("tier persists per task", () => {
     // test_scaffold.py::test_scaffold_per_task_tier_persists
     const yaml =
       "epic:\n  title: per task tier\n  spec: |\n    ## Overview\n    tier per task.\n" +
@@ -705,7 +698,7 @@ describe("scaffold per-task tier", () => {
     );
   }
 
-  slow("missing tier field is tier_invalid with the allowlist", () => {
+  test("missing tier field is tier_invalid with the allowlist", () => {
     // test_scaffold.py::test_scaffold_missing_tier_field_rejected
     const yaml =
       "epic:\n  title: missing tier\n  spec: |\n    ## Overview\n    no tier.\n" +
@@ -722,7 +715,7 @@ describe("scaffold per-task tier", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("unknown tier value is tier_invalid", () => {
+  test("unknown tier value is tier_invalid", () => {
     // test_scaffold.py::test_scaffold_tier_invalid_value_rejected
     const r = run([
       "scaffold",
@@ -738,7 +731,7 @@ describe("scaffold per-task tier", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("'low' is rejected with the allowlist in the message", () => {
+  test("'low' is rejected with the allowlist in the message", () => {
     // test_scaffold.py::test_scaffold_tier_low_rejected_with_allowlist_in_message
     const r = run([
       "scaffold",
@@ -755,7 +748,7 @@ describe("scaffold per-task tier", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("non-string tier is bad_yaml", () => {
+  test("non-string tier is bad_yaml", () => {
     // test_scaffold.py::test_scaffold_tier_non_string_is_bad_yaml
     const r = run([
       "scaffold",
@@ -773,7 +766,7 @@ describe("scaffold per-task tier", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  slow("every TASK_TIERS member is accepted", () => {
+  test("every TASK_TIERS member is accepted", () => {
     // test_scaffold.py::test_scaffold_tier_all_valid_values_accepted
     const tiers = ["medium", "high", "xhigh", "max"];
     const tasksBlock = tiers
@@ -793,7 +786,7 @@ describe("scaffold per-task tier", () => {
     });
   });
 
-  slow("tier_invalid collects all offenders", () => {
+  test("tier_invalid collects all offenders", () => {
     // test_scaffold.py::test_scaffold_tier_invalid_collects_all_offenders
     const yaml =
       "epic:\n  title: two bad tiers\n  spec: |\n    ## Overview\n    x.\n" +
@@ -827,7 +820,7 @@ describe("scaffold queue_jump", () => {
     );
   }
 
-  slow("queue_jump: true rides the envelope + JSON", () => {
+  test("queue_jump: true rides the envelope + JSON", () => {
     // test_scaffold.py::test_scaffold_queue_jump_true_rides_envelope
     const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("true"))]);
     expect(r.code).toBe(0);
@@ -840,7 +833,7 @@ describe("scaffold queue_jump", () => {
     expect(readJson(`epics/${epicId}.json`).queue_jump).toBe(true);
   });
 
-  slow("queue_jump: false (explicit) rides the envelope + JSON", () => {
+  test("queue_jump: false (explicit) rides the envelope + JSON", () => {
     // test_scaffold.py::test_scaffold_queue_jump_false_explicit_rides_envelope
     const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("false"))]);
     expect(r.code).toBe(0);
@@ -851,7 +844,7 @@ describe("scaffold queue_jump", () => {
     expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
   });
 
-  slow("omitted queue_jump defaults to false on the envelope + JSON", () => {
+  test("omitted queue_jump defaults to false on the envelope + JSON", () => {
     // test_scaffold.py::test_scaffold_queue_jump_omitted_defaults_false
     const r = run(["scaffold", "--file", writeYaml(queueJumpYaml(null))]);
     expect(r.code).toBe(0);
@@ -863,7 +856,7 @@ describe("scaffold queue_jump", () => {
     // normalize_epic queue_jump default is pinned by src-models.test.ts (CITED).
   });
 
-  slow("non-bool queue_jump is bad_yaml", () => {
+  test("non-bool queue_jump is bad_yaml", () => {
     // test_scaffold.py::test_scaffold_queue_jump_non_bool_is_bad_yaml
     const r = run(["scaffold", "--file", writeYaml(queueJumpYaml('"yes"'))]);
     expect(r.code).not.toBe(0);
@@ -888,7 +881,7 @@ describe("scaffold dup guard + atomicity", () => {
     );
   }
 
-  slow("same-slug scaffold is rejected with duplicate_epic", () => {
+  test("same-slug scaffold is rejected with duplicate_epic", () => {
     // test_scaffold.py::test_scaffold_dup_slug_rejected_with_duplicate_epic
     const firstId = seedEpic("duplicate guard");
     const r = run([
@@ -904,7 +897,7 @@ describe("scaffold dup guard + atomicity", () => {
     expect(blob).toContain("status:");
   });
 
-  slow("--allow-duplicate mints a distinct fn-N with the same slug", () => {
+  test("--allow-duplicate mints a distinct fn-N with the same slug", () => {
     // test_scaffold.py::test_scaffold_dup_slug_allow_duplicate_mints_distinct_fn_n
     const firstId = seedEpic("allow duplicate");
     const r = run([
@@ -920,7 +913,7 @@ describe("scaffold dup guard + atomicity", () => {
     expect(firstId.endsWith("-allow-duplicate")).toBe(true);
   });
 
-  slow("unrelated-slug second scaffold proceeds normally", () => {
+  test("unrelated-slug second scaffold proceeds normally", () => {
     // test_scaffold.py::test_scaffold_dup_slug_unrelated_slug_unaffected
     const firstId = seedEpic("first slug");
     const secondId = seedEpic("second slug different");
@@ -929,7 +922,7 @@ describe("scaffold dup guard + atomicity", () => {
     expect(secondId.endsWith("-second-slug-different")).toBe(true);
   });
 
-  slow("dup-guard does not false-match a suffix slug", () => {
+  test("dup-guard does not false-match a suffix slug", () => {
     // test_scaffold.py::test_scaffold_dup_slug_suffix_false_positive_regression
     const fooBarId = seedEpic("foo bar");
     expect(fooBarId.endsWith("-foo-bar")).toBe(true);
@@ -954,7 +947,7 @@ describe("scaffold dup guard + atomicity", () => {
     expect(blob.includes(barId)).toBe(false);
   });
 
-  slow("the normal path still succeeds + commits the whole tree", () => {
+  test("the normal path still succeeds + commits the whole tree", () => {
     // test_scaffold.py::test_scaffold_normal_path_still_succeeds_post_atomicity_fix
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
@@ -1073,70 +1066,58 @@ describe("scaffold cross-repo follow-up guard (mint seam)", () => {
     return true;
   }
 
-  slow(
-    "multi-repo source + omitted target_repo -> repo_required, no write",
-    () => {
-      const [a, b] = twoForeignRepos();
-      const sourceId = seedMultiRepoSource(a, b);
-      const { code, output } = mintFollowup(followupYaml(null), sourceId);
-      expect(code).toBe(1);
-      const err = parseEnvelope(output).error as Record<string, unknown>;
-      expect(err.code).toBe("repo_required");
-      expect((err.details as string[]).some((d) => d.includes("task #1"))).toBe(
-        true,
-      );
-      expect(noFollowupLanded(sourceId)).toBe(true);
-    },
-  );
+  test("multi-repo source + omitted target_repo -> repo_required, no write", () => {
+    const [a, b] = twoForeignRepos();
+    const sourceId = seedMultiRepoSource(a, b);
+    const { code, output } = mintFollowup(followupYaml(null), sourceId);
+    expect(code).toBe(1);
+    const err = parseEnvelope(output).error as Record<string, unknown>;
+    expect(err.code).toBe("repo_required");
+    expect((err.details as string[]).some((d) => d.includes("task #1"))).toBe(
+      true,
+    );
+    expect(noFollowupLanded(sourceId)).toBe(true);
+  });
 
-  slow(
-    "multi-repo source + explicit in-set target_repo -> mints cleanly",
-    () => {
-      const [a, b] = twoForeignRepos();
-      const sourceId = seedMultiRepoSource(a, b);
-      const { code, output } = mintFollowup(followupYaml(a), sourceId);
-      expect(code).toBe(0);
-      const payload = parseEnvelope(output);
-      const newEpicId = payload.epic_id as string;
-      expect(newEpicId).not.toBe(sourceId);
-      expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(a);
-      void b;
-    },
-  );
+  test("multi-repo source + explicit in-set target_repo -> mints cleanly", () => {
+    const [a, b] = twoForeignRepos();
+    const sourceId = seedMultiRepoSource(a, b);
+    const { code, output } = mintFollowup(followupYaml(a), sourceId);
+    expect(code).toBe(0);
+    const payload = parseEnvelope(output);
+    const newEpicId = payload.epic_id as string;
+    expect(newEpicId).not.toBe(sourceId);
+    expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(a);
+    void b;
+  });
 
-  slow(
-    "multi-repo source + out-of-set target_repo -> repo_required, no write",
-    () => {
-      const [a, b] = twoForeignRepos();
-      void b;
-      const sourceId = seedMultiRepoSource(a, b);
-      // A third foreign repo, not in the source's touched_repos.
-      const c = join(project.root, "foreign-c");
-      mkdirSync(c, { recursive: true });
-      gitInit(c);
-      const cReal = realpathSync(c);
-      const { code, output } = mintFollowup(followupYaml(cReal), sourceId);
-      expect(code).toBe(1);
-      const err = parseEnvelope(output).error as Record<string, unknown>;
-      expect(err.code).toBe("repo_required");
-      expect(
-        (err.details as string[]).some((d) => d.includes("not in the source")),
-      ).toBe(true);
-      expect(noFollowupLanded(sourceId)).toBe(true);
-    },
-  );
+  test("multi-repo source + out-of-set target_repo -> repo_required, no write", () => {
+    const [a, b] = twoForeignRepos();
+    void b;
+    const sourceId = seedMultiRepoSource(a, b);
+    // A third foreign repo, not in the source's touched_repos.
+    const c = join(project.root, "foreign-c");
+    mkdirSync(c, { recursive: true });
+    gitInit(c);
+    const cReal = realpathSync(c);
+    const { code, output } = mintFollowup(followupYaml(cReal), sourceId);
+    expect(code).toBe(1);
+    const err = parseEnvelope(output).error as Record<string, unknown>;
+    expect(err.code).toBe("repo_required");
+    expect(
+      (err.details as string[]).some((d) => d.includes("not in the source")),
+    ).toBe(true);
+    expect(noFollowupLanded(sourceId)).toBe(true);
+  });
 
-  slow(
-    "single-repo source + omitted target_repo -> mints, defaults to primary",
-    () => {
-      // The source epic touches only primary_repo (no foreign target_repo), so the
-      // guard does NOT fire — the existing default-to-primary behavior stands.
-      const sourceId = seedEpic("single repo source");
-      const { code, output } = mintFollowup(followupYaml(null), sourceId);
-      expect(code).toBe(0);
-      const newEpicId = parseEnvelope(output).epic_id as string;
-      const primary = realpathSync(project.root);
-      expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(primary);
-    },
-  );
+  test("single-repo source + omitted target_repo -> mints, defaults to primary", () => {
+    // The source epic touches only primary_repo (no foreign target_repo), so the
+    // guard does NOT fire — the existing default-to-primary behavior stands.
+    const sourceId = seedEpic("single repo source");
+    const { code, output } = mintFollowup(followupYaml(null), sourceId);
+    expect(code).toBe(0);
+    const newEpicId = parseEnvelope(output).epic_id as string;
+    const primary = realpathSync(project.root);
+    expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(primary);
+  });
 });

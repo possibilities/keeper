@@ -73,10 +73,13 @@ function makeDirty(rel: string, content = "dirty\n"): string {
 }
 
 // Real-git repo setup runs ONLY in the slow tier — src-commit drives the REAL
-// commit path (realGitVcs) directly, so it is a genuine real-git subject. The
-// pure buildSubject / buildMessageWithTrailers describes below need no repo and
-// run in the default tier; the autoCommitFromInvocation describes are
-// describe.skipIf(!SLOW_ENABLED) and only they touch `repo`.
+// commit path (realGitVcs) directly (the real index.lock contention-retry +
+// prev-sha resolution have no fake-VCS analogue), so it is a genuine real-git
+// subject. The pure buildSubject / buildMessageWithTrailers describes below need
+// no repo and run in the default tier; the autoCommitFromInvocation describes are
+// describe.skipIf(!SLOW_ENABLED) — the wired `bun run test:slow`
+// (KEEPER_PLAN_RUN_SLOW=1) is the only command that runs them — and only they
+// touch `repo`.
 beforeEach(() => {
   if (!SLOW_ENABLED) {
     return;

@@ -173,48 +173,6 @@ export function fakeCommand(
 }
 
 // ---------------------------------------------------------------------------
-// Binary resolution — the default `bun test` runs runCli IN-PROCESS (it
-// dispatches main(argv) directly, never spawning the binary), so the compiled
-// artifact is NOT required for the default tier. Only the KEEPER_PLAN_RUN_PROCESS
-// slow bucket spawns it, and resolveBin() is its lazy resolver: it hard-fails on
-// a missing binary at the spawn site, not at module load, so the default tier
-// neither needs nor builds the binary.
-// ---------------------------------------------------------------------------
-
-/** Resolve the compiled binary for a spawning (slow-bucket) caller.
- * KEEPER_PLAN_BIN overrides (the conftest engine-selection env), else the dist
- * artifact. Hard-fails if neither exists. Lazy — the default in-process tier
- * never calls this. */
-export function resolveBin(): string {
-  const override = process.env.KEEPER_PLAN_BIN;
-  const candidate =
-    override && override.length > 0
-      ? override
-      : join(import.meta.dir, "..", "dist", "keeper-plan-bun");
-  if (!existsSync(candidate)) {
-    throw new Error(
-      `keeper-plan binary missing at ${candidate}; run \`bun run build\` before \`bun test\`` +
-        (override ? " (KEEPER_PLAN_BIN override set)" : ""),
-    );
-  }
-  return candidate;
-}
-
-// ---------------------------------------------------------------------------
-// Per-call + global timeout floor. The slow-bucket spawn carries a per-call
-// timeout; the global floor is the package.json test-script --timeout. The
-// default in-process runCli has no spawn to time out — a runaway loop is caught
-// by the package.json --timeout. A spawning CLI call that hangs must fail the
-// test, never wedge the suite.
-// ---------------------------------------------------------------------------
-
-/** Per-spawn timeout (ms) for the slow process bucket. A single spawned CLI
- * invocation that exceeds this is killed and surfaces as a non-zero/empty result
- * the assertion catches. Kept well under the package.json global --timeout floor
- * so a hung spawn fails its own test. */
-export const SPAWN_TIMEOUT_MS = 15_000;
-
-// ---------------------------------------------------------------------------
 // Env builder — the byte-faithful port of conftest's _subprocess_env (:580-613):
 // built from scratch, never environ.copy(); HOME + XDG_* under the tmp HOME,
 // GIT_CONFIG_GLOBAL -> a written temp gitconfig, GIT_CONFIG_SYSTEM=/dev/null,
@@ -279,9 +237,8 @@ export function buildEnv(
 // process.stdout/stderr.write into strings, and makes process.exit throw an
 // ExitCode carrier — then restores every global in `finally`. A verb that exits
 // mid-run unwinds cleanly via the thrown ExitCode so the harness still returns
-// {code, stdout, stderr, output}. Eliminates the ~414 process spawns + the
-// `bun run build` dependency. The slow process bucket (runCliProcess) keeps the
-// spawn for the handful of tests that genuinely exercise the binary boundary.
+// {code, stdout, stderr, output}. Every test tier dispatches in-process — no
+// test spawns the compiled binary, so the suite never needs `bun run build`.
 // ---------------------------------------------------------------------------
 
 export interface CliResult {
@@ -300,8 +257,6 @@ export interface RunOptions {
   input?: string;
   /** HOME for the env build. Defaults to <cwd>/.home; withProject sets a real one. */
   home?: string;
-  /** Per-call timeout override (ms) — honored only by the slow process bucket. */
-  timeoutMs?: number;
 }
 
 /** Private carrier the patched process.exit throws so an exiting verb unwinds to
@@ -421,40 +376,8 @@ function setTTY(stream: NodeJS.WriteStream, value: boolean | undefined): void {
   (stream as unknown as { isTTY: boolean | undefined }).isTTY = value;
 }
 
-/** Spawn the COMPILED binary once and return its decoded result — the slow
- * process bucket's runner (gated on KEEPER_PLAN_RUN_PROCESS). Built env, pipe
- * stdio, per-call timeout, explicit Uint8Array decode. Resolves the binary
- * lazily so the default in-process tier never needs `bun run build`. */
-export function runCliProcess(args: string[], opts: RunOptions): CliResult {
-  const home = opts.home ?? join(opts.cwd, ".home");
-  mkdirSync(home, { recursive: true });
-  const proc = Bun.spawnSync([resolveBin(), ...args], {
-    cwd: opts.cwd,
-    env: buildEnv(home, opts.env),
-    stdin:
-      opts.input !== undefined ? Buffer.from(opts.input, "utf-8") : "ignore",
-    timeout: opts.timeoutMs ?? SPAWN_TIMEOUT_MS,
-  });
-  const stdout = decode(proc.stdout);
-  const stderr = decode(proc.stderr);
-  return {
-    code: proc.exitCode ?? -1,
-    stdout,
-    stderr,
-    output: stdout + stderr,
-  };
-}
-
-/** True when the slow process bucket is enabled (KEEPER_PLAN_RUN_PROCESS set to
- * a truthy value). Pass to `describe.skipIf(!PROCESS_ENABLED)` to gate the
- * compiled-binary / process-boundary tests. */
-export const PROCESS_ENABLED: boolean = ((): boolean => {
-  const v = process.env.KEEPER_PLAN_RUN_PROCESS;
-  return v !== undefined && v !== "" && v !== "0";
-})();
-
-/** Decode a spawn stream (Uint8Array | Buffer | string) to a UTF-8 string —
- * explicit, never an implicit toString on a raw buffer. */
+/** Decode a captured write chunk (Uint8Array | Buffer | string) to a UTF-8
+ * string — explicit, never an implicit toString on a raw buffer. */
 function decode(stream: Uint8Array | Buffer | string | null): string {
   if (stream == null) {
     return "";
@@ -796,14 +719,15 @@ export function gitFilesInHead(repo: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Slow-bucket gate — port of the KEEPER_PLAN_RUN_SLOW visibility contract. A
-// slow test is skipped unless KEEPER_PLAN_RUN_SLOW is set; under CLAUDECODE
-// per-test lines are quiet, so the slow set's visibility is asserted via the run
-// summary skip counts, not per-line. test.skipIf is the gate.
+// Slow-bucket gate — the real-git tier. The default `bun test` skips
+// src-commit.test.ts's real-git autoCommitFromInvocation blocks (they spawn the
+// `git` binary, the one tier that does); the wired `bun run test:slow`
+// (KEEPER_PLAN_RUN_SLOW=1) runs them. src-commit is the sole consumer.
 // ---------------------------------------------------------------------------
 
-/** True when the slow bucket is enabled (KEEPER_PLAN_RUN_SLOW set to a truthy
- * value). Pass to `test.skipIf(!SLOW_ENABLED)` to gate a slow test. */
+/** True when the real-git slow tier is enabled (KEEPER_PLAN_RUN_SLOW set to a
+ * truthy value). The wired `bun run test:slow` sets it; src-commit.test.ts gates
+ * its real-git blocks on `describe.skipIf(!SLOW_ENABLED)`. */
 export const SLOW_ENABLED: boolean = ((): boolean => {
   const v = process.env.KEEPER_PLAN_RUN_SLOW;
   return v !== undefined && v !== "" && v !== "0";

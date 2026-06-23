@@ -50,6 +50,6 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `keeper plan
 |------|---------|
 | Lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
 | Typecheck | `bun run typecheck` — `tsc --noEmit` |
-| Test (fast gate) | `bun test` — the living suite; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
-| Test (full suite) | `KEEPER_PLAN_RUN_SLOW=1 bun test` — runs everything incl. the slow bucket (real git/wire machinery) |
+| Test (fast gate) | `bun test` — the living suite, fully in-process + zero real git; the only skips are src-commit.test.ts's real-git `autoCommitFromInvocation` blocks (gated `describe.skipIf(!SLOW_ENABLED)`) |
+| Test (real-git slow tier) | `bun run test:slow` (`KEEPER_PLAN_RUN_SLOW=1 bun test`) — adds src-commit.test.ts's real-git commit blocks (index.lock contention-retry + prev-sha resolution, the only behaviors with no fake-VCS analogue). No `bun run build` needed — no test spawns the compiled binary |
 | Build | `bun run build` — compiles `dist/keeper-plan-bun` via `bun build --compile` (Bun pinned at 1.3.14) |
