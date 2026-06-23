@@ -125,12 +125,16 @@ test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () 
   expect(args).toEqual([
     "--print",
     "-p",
-    "--dangerously-skip-permissions",
     "--disallowed-tools",
     "Edit,Write,NotebookEdit",
+    "--dangerously-skip-permissions",
   ]);
   // No acceptEdits in read-only.
   expect(args).not.toContain("acceptEdits");
+  // Regression guard: the variadic `--disallowed-tools` must never be the last
+  // flag (it would swallow the prompt `buildPairLaunchArgv` appends). The
+  // trailing flag must be the boolean `--dangerously-skip-permissions`.
+  expect(args.at(-1)).toBe("--dangerously-skip-permissions");
 });
 
 test("nativeClaudeArgs: --model appended when supplied", () => {

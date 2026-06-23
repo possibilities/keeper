@@ -209,10 +209,17 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
 export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
   const args = ["--print", "-p"];
   if (opts.readOnly) {
+    // `--disallowed-tools` is variadic — it consumes every following token up to
+    // the next flag. It must NOT be the last flag before the trailing prompt
+    // positional (`buildPairLaunchArgv` appends the prompt last), or the prompt
+    // is swallowed as bogus tool-deny rules and the partner aborts with "Input
+    // must be provided … when using --print". Keep the boolean
+    // `--dangerously-skip-permissions` last so the prompt survives as a clean
+    // positional.
     args.push(
-      "--dangerously-skip-permissions",
       "--disallowed-tools",
       "Edit,Write,NotebookEdit",
+      "--dangerously-skip-permissions",
     );
   } else {
     args.push(
