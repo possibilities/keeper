@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-23T03:39:24.950000Z",
+  "depends_on": [],
+  "epic": "fn-909-isolate-dash-on-a-dedicated-tmux-server",
+  "id": "fn-909-isolate-dash-on-a-dedicated-tmux-server.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Dedicated dash server and work-only provisioning",
+  "updated_at": "2026-06-23T03:39:24.950000Z"
+}
