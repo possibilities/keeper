@@ -23,12 +23,15 @@ and writes the partner's final answer to a `--output` file. It is keeper's
 pairing surface: a second opinion, a cross-vendor cross-check, a code review or
 co-plan from a different model, or a read-only audit.
 
-You drive it from **this session's Monitor tool**, not a plain Bash call. The
-partner runs in its own detached window for as long as its turn takes; a
-Monitor lets you launch it and then go genuinely idle until it finishes,
-instead of blocking a Bash call for minutes. `keeper pair` emits a strict
-two-line event contract on stdout — exactly one `[keeper-pair] started …` line,
-then exactly one terminal line — which is precisely what a Monitor consumes.
+How you drive it depends on where you run. From the **main session**, use the
+**Monitor tool** (below): the partner runs in its own detached window for as
+long as its turn takes, and a Monitor lets you launch it and go genuinely idle
+until it finishes instead of blocking a Bash call for minutes. From a
+**subagent** — which has no Monitor tool — drive the same command with a single
+**blocking Bash call** instead (see *From a subagent*). Either way `keeper pair`
+emits a strict two-line event contract on stdout — exactly one
+`[keeper-pair] started …` line, then exactly one terminal line — and writes the
+answer to `--output`.
 
 ## The Monitor-in-main pattern
 
@@ -59,6 +62,25 @@ This is the whole flow. Do it from the orchestrating (main) session:
 5. **On `completed`, read `--output`.** Only then. The file is written
    atomically (temp-then-rename) and `completed` fires only after the rename,
    so the moment you see it the file is complete.
+
+## From a subagent (blocking Bash)
+
+A subagent cannot use the Monitor tool — but it does not need to. Run the SAME
+`keeper pair send` as a single **foreground blocking Bash call**: it blocks for
+the partner's whole turn, returns when the partner stops, and you read the
+answer from `--output` exactly as above.
+
+```
+keeper pair send /tmp/ask.md --cli codex --read-only --output /tmp/ans.yaml
+# blocks until the partner stops, then exits 0 — read /tmp/ans.yaml
+```
+
+The `[keeper-pair]` event lines print to stdout and are harmless to ignore — the
+answer lands in `--output`. One bound to respect: the Bash tool caps a single
+call at 10 minutes, while `keeper pair --timeout` defaults to 30. For a partner
+that may run longer than ~10 minutes, launch `keeper pair send` in the
+**background** and poll the `--output` file for the answer (it appears
+atomically, only once complete) rather than holding one blocking call open.
 
 ## Reading the answer
 
@@ -119,8 +141,10 @@ guarantee is best-effort.
 
 ## What NOT to do
 
-- Do NOT run `keeper pair send` as a plain blocking Bash call — drive it
-  through the **Monitor** tool so you can go idle while the partner works.
+- From the **main session**, do NOT run `keeper pair send` as a plain blocking
+  Bash call — drive it through the **Monitor** tool so you can go idle while the
+  partner works. (A **subagent** has no Monitor and correctly DOES use a blocking
+  Bash call — see *From a subagent*.)
 - Do NOT poll, tail, or `cat` the `--output` file before the `completed`
   event. It may be absent or half-written until the rename; the event is your
   go-signal.
