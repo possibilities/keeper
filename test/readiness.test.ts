@@ -410,6 +410,48 @@ test("fn-671 regression: T1 done+approved with session-still-working; T2 depends
   );
 });
 
+test("fn-889 regression: forward depends_on (upstream evaluated later) resolves order-independently", () => {
+  // The fn-889 incident: a refined epic where tasks 2/3/4 `depends_on` the
+  // HIGHER-numbered tasks 6/7/8 (all done). Pre-fix, predicate 8 read the
+  // upstream's in-progress `perTask` verdict, which is `undefined` while
+  // walking tasks in ascending `task_number` order (6/7/8 not yet evaluated
+  // when 2 is) → tasks 2/3/4 falsely `blocked:dep-on-task ...6`, the epic had
+  // zero `ready` rows, and autopilot skipped it. Post-fix, predicate 8 reads
+  // each upstream's OWN terminal-completed state from `taskById`, so the deps
+  // resolve regardless of traversal order: task 2 (first unblocked) reads
+  // `ready`; tasks 3/4 are demoted by the per-epic mutex to
+  // `single-task-per-epic` (NOT `dep-on-task`), the proof the dep resolved.
+  const upstreams = [6, 7, 8].map((n) =>
+    makeTask({
+      task_id: `fn-1-foo.${n}`,
+      task_number: n,
+      worker_phase: "done",
+    }),
+  );
+  const downstream = [2, 3, 4].map((n) =>
+    makeTask({
+      task_id: `fn-1-foo.${n}`,
+      task_number: n,
+      depends_on: ["fn-1-foo.6", "fn-1-foo.7", "fn-1-foo.8"],
+    }),
+  );
+  // Iteration order is ascending task_number (the reducer/db fold sort), so the
+  // downstream tasks are visited BEFORE their upstreams — the exact hazard.
+  const epic = makeEpic({ tasks: [...downstream, ...upstreams] });
+  const snap = run([epic]);
+
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.3")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.4")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+  for (const n of [6, 7, 8]) {
+    expect(snap.perTask.get(`fn-1-foo.${n}`)).toEqual({ tag: "completed" });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // fn-719: live-worker-monitor occupancy. A work session that backgrounded a
 // test suite and yielded its turn flips its embedded job to `stopped` (so

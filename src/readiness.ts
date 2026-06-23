@@ -400,10 +400,11 @@ export function computeReadiness(
     }
   }
 
-  // Build a tasks-by-id index spanning every epic, so cross-epic `depends_on`
-  // lookups hit O(1). Predicate 9 reads `epic.resolved_epic_deps` (maintained
-  // by the reducer's forward-stamp + reverse fan-out), so the readiness pass
-  // no longer resolves cross-epic deps live.
+  // Build a tasks-by-id index spanning every epic, so predicate 8's
+  // `dep-on-task` upstream lookups hit O(1) and resolve order-independently
+  // (forward refs included). Predicate 9 reads `epic.resolved_epic_deps`
+  // (maintained by the reducer's forward-stamp + reverse fan-out), so the
+  // readiness pass no longer resolves cross-epic EPIC deps live.
   const taskById = new Map<string, Task>();
   // epic_id → Epic, so predicate 9's `satisfied` branch can probe the upstream's
   // raw liveness (see `epicHasLiveCloseScopeWork`). A `satisfied` projection
@@ -431,16 +432,17 @@ export function computeReadiness(
   const diagnostics: ResolutionDiagnostic[] = [];
 
   for (const epic of epicsArr) {
-    // Per-task pass. The pre-sorted tasks array is dependency-safe for the
-    // typical case; we still look up the upstream from `taskById` so a
-    // forward-reference in depends_on works as long as both ends are present.
+    // Per-task pass. Predicate 8 resolves each `depends_on` upstream from
+    // `taskById` and tests its own terminal-completed state, so a forward
+    // reference (upstream with a higher task_number, evaluated later in this
+    // pass) resolves correctly regardless of traversal order.
     for (const task of epic.tasks) {
       const verdict = evaluateTask(
         task,
         epic,
         jobs,
         subRunningByJobId,
-        perTask,
+        taskById,
         perCloseRow,
         epicsById,
         gitStatusByProjectDir,
@@ -518,6 +520,31 @@ export function computeReadiness(
 // Predicate pipeline — per-row
 // ---------------------------------------------------------------------------
 
+/**
+ * Terminal-completed test for a task — predicate 1's condition, factored so the
+ * `dep-on-task` upstream check (predicate 8) can ask the SAME question of an
+ * arbitrary upstream task directly, ORDER-INDEPENDENTLY. `worker_phase==="done"`
+ * is the administrative signal; the three liveness clauses hold a done-but-live
+ * task off `completed` until its session is idle (see predicate 1's note).
+ *
+ * Pure over the task's own fields + the running-subagent index + injected `now`
+ * — it never reads another row's in-progress verdict, so a forward dependency
+ * (`task.depends_on` pointing at a HIGHER-numbered, not-yet-evaluated task)
+ * resolves identically regardless of board-traversal order.
+ */
+function isTaskTerminalCompleted(
+  task: Task,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+  now: number,
+): boolean {
+  return (
+    task.worker_phase === "done" &&
+    !anyEmbeddedJobWorking(task.jobs) &&
+    !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
+    !embeddedMonitorOccupies(task.jobs, now)
+  );
+}
+
 function evaluateTask(
   task: Task,
   epic: Epic,
@@ -526,7 +553,12 @@ function evaluateTask(
   // `computeReadiness`'s public surface is unchanged.
   _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
-  perTask: Map<string, Verdict>,
+  // task_id → Task spanning EVERY epic (built once in `computeReadiness`), so
+  // predicate 8's `dep-on-task` upstream check reads the upstream task's OWN
+  // terminal-completed state instead of its in-progress verdict — order-
+  // independent, mirroring how predicate 9 reads raw epic state. A forward
+  // `depends_on` (upstream not yet evaluated) therefore resolves correctly.
+  taskById: Map<string, Task>,
   // Unused: predicate 9 reads `epic.resolved_epic_deps` instead of resolving
   // live, so it no longer touches `perCloseRow`. Kept for call-site symmetry.
   _perCloseRow: Map<string, Verdict>,
@@ -582,12 +614,7 @@ function evaluateTask(
   // no such backstop, so the `sub-agent-stale` verdict keeps occupying the
   // mutex by design — correctness over throughput, cleared by autopilot pause
   // + manual replay.
-  if (
-    task.worker_phase === "done" &&
-    !anyEmbeddedJobWorking(task.jobs) &&
-    !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
-    !embeddedMonitorOccupies(task.jobs, now)
-  ) {
+  if (isTaskTerminalCompleted(task, subRunningByJobId, now)) {
     return { tag: "completed" };
   }
 
@@ -657,12 +684,20 @@ function evaluateTask(
     return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
-  // 8. dep-on-task — any upstream NOT `completed`. An upstream absent from
-  // `perTask` (cross-epic dep not yet folded, malformed id) counts as NOT
-  // completed → blocks.
+  // 8. dep-on-task — any upstream NOT terminal-completed. Resolves the upstream
+  // from `taskById` and tests its OWN completion (`isTaskTerminalCompleted`),
+  // NOT its in-progress `perTask` verdict — so a forward `depends_on` (an
+  // upstream with a HIGHER task_number, evaluated LATER in this pass) resolves
+  // correctly instead of reading as not-yet-computed. An upstream absent from
+  // `taskById` (cross-epic dep not yet folded, malformed id) counts as NOT
+  // completed → blocks. Mirrors predicate 9's raw-state read for the same
+  // board-sort-independence reason.
   for (const upstream of task.depends_on) {
-    const upstreamVerdict = perTask.get(upstream);
-    if (upstreamVerdict === undefined || upstreamVerdict.tag !== "completed") {
+    const upstreamTask = taskById.get(upstream);
+    if (
+      upstreamTask === undefined ||
+      !isTaskTerminalCompleted(upstreamTask, subRunningByJobId, now)
+    ) {
       return {
         tag: "blocked",
         reason: { kind: "dep-on-task", upstream },
