@@ -57,5 +57,5 @@ drive all other cases synthetically.
 - [ ] Golden fixtures are captured-from-real-git strings, not hand-authored
 
 ## Done summary
-
+Extracted pure enumerateCommitsFromLog/buildGitSnapshotFrom/parseCommitFiles seams (production byte-identical via impure-wrapper delegation), rewrote test/git-worker.test.ts to drive them with synthetic payloads + captured-from-real-git goldens, and slow-quarantined the genuinely git-coupled tests. test/git-worker.test.ts + git.test.ts now invoke zero real git.
 ## Evidence

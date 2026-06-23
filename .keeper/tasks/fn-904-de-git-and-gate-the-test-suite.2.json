@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "De-git the git-worker producer tests",
-  "updated_at": "2026-06-23T00:59:49.672000Z"
+  "updated_at": "2026-06-23T02:17:28.121000Z",
+  "worker_done_at": "2026-06-23T02:17:28.121000Z"
 }
