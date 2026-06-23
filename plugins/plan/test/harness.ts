@@ -36,6 +36,27 @@ import {
   setStdinProvider,
 } from "../src/stdin.ts";
 import { serializeStateJson } from "../src/store.ts";
+import { resetVcs, setVcs } from "../src/vcs.ts";
+import {
+  baselineRepo,
+  initRepo as fakeInitRepo,
+  fakeLog,
+  fakeVcs,
+  resetFakeVcs,
+} from "./fake-vcs.ts";
+
+// The fake VCS facade is installed around each in-process runCli(main(argv)) call
+// (see runCli) and torn down right after, so the verb auto-commit + dirty
+// discovery route through the fake — the default plan tier spawns zero real git
+// for the WRITE side — while leaving the production facade real OUTSIDE runCli.
+// Scoping the install to the runCli call (not the module top level) is required:
+// bun:test shares mutable module state across files in the process, so a leaked
+// global install would corrupt a sibling unit file that drives the REAL git commit
+// path directly (src-commit.test.ts). resetFakeVcs (per test) clears the per-repo
+// fake state so a reused tmpdir path never carries a stale fake repo.
+beforeEach(() => {
+  resetFakeVcs();
+});
 
 // ---------------------------------------------------------------------------
 // Binary resolution — the default `bun test` runs runCli IN-PROCESS (it
@@ -198,6 +219,9 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
   // call or the prior verb's self-emit leaks into the dispatcher's trailer gate.
   resetSelfEmit();
   setStdinProvider(makeStdinProvider(opts.input));
+  // Route this verb's auto-commit + dirty-discovery through the fake (restored in
+  // finally) so no real git runs and no global install leaks to a sibling file.
+  setVcs(fakeVcs);
 
   try {
     process.env = buildEnv(home, opts.env);
@@ -238,6 +262,7 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
     process.exit = priorExit;
     setTTY(process.stdout, priorStdoutTTY);
     resetStdinProvider();
+    resetVcs();
   }
 
   return { code, stdout, stderr, output: stdout + stderr };
@@ -536,7 +561,10 @@ export function fixedClock(): string {
 // ---------------------------------------------------------------------------
 
 /** Run git with a local identity in *cwd*, throwing on failure. The bun analogue
- * of the conftest git subprocess calls. */
+ * of the conftest git subprocess calls — used only to stand up the real `.git/`
+ * the in-verb git READS still consult (commit_lookup / reconcile / worker-resume,
+ * de-gitted by a later task). The auto-commit WRITE side routes through the fake
+ * facade, not this. */
 function git(args: string[], cwd: string): string {
   const proc = Bun.spawnSync(["git", ...args], { cwd });
   if ((proc.exitCode ?? -1) !== 0) {
@@ -545,14 +573,18 @@ function git(args: string[], cwd: string): string {
   return decode(proc.stdout);
 }
 
-/** Real `git init` + local committer identity in *dir* (the real-init branch of
- * the conftest fixtures). gpgsign off, hooks disabled. */
+/** Stand up a repo in *dir*: a real `git init` + local committer identity (so the
+ * in-verb git READS still resolve a real repo) AND a registered fake repo (so the
+ * auto-commit WRITE side + the harness assertion helpers track the fake log). The
+ * verb auto-commit lands in the fake, never real git; real git stays at an unborn
+ * HEAD unless a test seeds a real commit itself. */
 export function gitInit(dir: string): void {
   git(["init", "-q"], dir);
   git(["config", "user.email", "test@example.com"], dir);
   git(["config", "user.name", "Test User"], dir);
   git(["config", "commit.gpgsign", "false"], dir);
   git(["config", "core.hooksPath", "/dev/null"], dir);
+  fakeInitRepo(dir);
 }
 
 /** Make a fresh realpath'd tmpdir under the OS temp root. */
@@ -630,38 +662,37 @@ export function withProject(prefix = "planctl-project-"): () => ProjectHandle {
 
 // ---------------------------------------------------------------------------
 // Git assertion helpers — port of conftest's _git_log_count / _git_head_sha /
-// _git_head_message / _git_files_in_head (:1076-1145). Subprocess git reads.
+// _git_head_message / _git_files_in_head (:1076-1145). Reads the fake commit log
+// installed via fakeVcs instead of spawning real git, so the "before + 1 commit"
+// assertions stay byte-for-byte the same against a git-free engine.
 // ---------------------------------------------------------------------------
 
-/** Number of commits on the current branch (0 on a fresh repo with no HEAD). */
-export function gitLogCount(repo: string): number {
-  const proc = Bun.spawnSync(["git", "rev-list", "--count", "HEAD"], {
-    cwd: repo,
-  });
-  if ((proc.exitCode ?? -1) !== 0) {
-    return 0;
-  }
-  return Number.parseInt(decode(proc.stdout).trim(), 10);
+/** The fake HEAD commit (last log entry) for *repo*, or null when none. */
+function headCommit(repo: string) {
+  const log = fakeLog(repo);
+  return log.length > 0 ? log[log.length - 1] : null;
 }
 
-/** Current HEAD short sha. */
+/** Number of commits recorded for *repo* (0 on a repo with no commits). */
+export function gitLogCount(repo: string): number {
+  return fakeLog(repo).length;
+}
+
+/** Current HEAD short sha (the fake sha, truncated to git's 7-char short form),
+ * or "" when no commit exists. */
 export function gitHeadSha(repo: string): string {
-  return git(["rev-parse", "--short", "HEAD"], repo).trim();
+  return headCommit(repo)?.sha.slice(0, 7) ?? "";
 }
 
 /** HEAD commit full message. */
 export function gitHeadMessage(repo: string): string {
-  return git(["log", "-1", "--format=%B"], repo).trim();
+  return (headCommit(repo)?.message ?? "").trim();
 }
 
-/** Repo-relative paths changed in the HEAD commit. Uses `git show` (not
- * `diff-tree`) so a root commit — which has no parent to diff against — still
- * reports its files; `planctl init` lands as a root commit in a fresh repo. */
+/** Repo-relative paths changed in the HEAD commit (the recorded committed file
+ * set), or [] when no commit exists. */
 export function gitFilesInHead(repo: string): string[] {
-  return git(["show", "--name-only", "--format=", "HEAD"], repo)
-    .split("\n")
-    .map((f) => f.trim())
-    .filter(Boolean);
+  return [...(headCommit(repo)?.files ?? [])];
 }
 
 // ---------------------------------------------------------------------------
@@ -679,21 +710,18 @@ export const SLOW_ENABLED: boolean = ((): boolean => {
 })();
 
 // ---------------------------------------------------------------------------
-// gitBaseline — turn a seedState tree into a clean committed git baseline.
-// Port of the test_worker_verbs / test_restamp_verbs `_git_seed` helper: real
-// `git init` + commit the `.keeper/` tree so any later dirty state is the
-// verb-under-test's. Used by the ZERO-commit / exactly-one-commit assertions.
+// gitBaseline — turn a seedState tree into a clean committed baseline.
+// Port of the test_worker_verbs / test_restamp_verbs `_git_seed` helper: a fake
+// `.git/` repo whose snapshot adopts the seeded `.keeper/` tree so any later
+// dirty state is the verb-under-test's. Used by the ZERO-commit /
+// exactly-one-commit assertions.
 // ---------------------------------------------------------------------------
 
-/** `git init` + commit the seeded `.keeper/` tree in *dir*, returning the repo
- * path. Identity/gpgsign/hooks come from gitInit. The single baseline commit
- * means a follow-up `git rev-list --count HEAD` delta isolates the verb's
- * commit. */
+/** Register a fake repo in *dir* whose committed baseline IS the current
+ * `.keeper/` tree (no recorded log entry — gitLogCount starts at 0), returning
+ * the repo path. A follow-up gitLogCount delta then isolates the verb's commit. */
 export function gitBaseline(dir: string): string {
-  gitInit(dir);
-  git(["add", ".keeper/"], dir);
-  git(["commit", "-q", "-m", "chore: seed keeper tree"], dir);
-  return dir;
+  return baselineRepo(dir);
 }
 
 // ---------------------------------------------------------------------------

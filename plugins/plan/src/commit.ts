@@ -16,6 +16,13 @@
 // CLAUDE_CODE_SESSION_ID all ride through. Never set GIT_DIR/GIT_WORK_TREE and
 // never substitute a sanitized env: the conformance harness rides these vars and
 // stripping them makes every commit fail or diverge.
+//
+// Every git operation routes through the PlanVcs facade (vcs.ts): production gets
+// realGitVcs (the verbatim spawns), the bun:test harness installs a fake that
+// records commits + snapshot-diffs the data dir, so the default test tier spawns
+// zero real git.
+
+import { getVcs } from "./vcs.ts";
 
 // Bounded retry over git's own lock domains (index.lock + ref-lock). Sized so
 // the worst case (8 x 2s cap ~= 16s) fits the test timeout with margin.
@@ -61,77 +68,38 @@ export class CommitFailed extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// git plumbing — current head, status filter, stage, commit.
+// git plumbing — current head, status filter, stage, commit. Each routes through
+// the installed PlanVcs facade (real git in production, fake in tests).
 // ---------------------------------------------------------------------------
-
-/** Run git with the live process env and an explicit cwd. Returns exit code +
- * decoded stdout/stderr. `input`, when given, is fed to stdin (used for
- * `commit -F -`). The env is passed explicitly (not left to the default-snapshot
- * inheritance) so an in-process caller that reassigned `process.env` — the
- * bun:test harness installing the fixture's GIT_CONFIG_GLOBAL / committer
- * identity / gpgsign=false / hooksPath=/dev/null — reaches git's config
- * resolution; the default-env spawn would otherwise see only the frozen startup
- * snapshot and commit under the wrong identity. */
-function runGit(
-  args: string[],
-  cwd: string,
-  input?: string,
-): { exitCode: number; stdout: string; stderr: string } {
-  const proc = Bun.spawnSync(["git", ...args], {
-    cwd,
-    env: process.env,
-    ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
-  });
-  return {
-    exitCode: proc.exitCode,
-    stdout: proc.stdout.toString(),
-    stderr: proc.stderr.toString(),
-  };
-}
 
 /** Current HEAD sha, or "unknown" on failure (fresh repo / corrupt HEAD).
  * Matches Python's _current_head sentinel so trailer forensics render the same
  * string across both engines. */
 function currentHead(cwd: string): string {
-  const result = runGit(["rev-parse", "HEAD"], cwd);
-  return result.exitCode === 0 ? result.stdout.trim() : "unknown";
+  return getVcs().currentHead(cwd);
 }
 
 /** Repo-relative paths under `pathspecs` that git would stage (modified OR
- * already-staged-but-uncommitted). Uses `git status --porcelain=v1 -- <specs>`
- * so submodule/gitignore/pathspec interpretation matches the eventual
- * `git add` exactly. Empty list when nothing is dirty — callers short-circuit
- * to the no-op path. Throws CommitFailed("git_status") on a non-zero exit. */
+ * already-staged-but-uncommitted), via `status --porcelain=v1 -- <specs>` so
+ * submodule/gitignore/pathspec interpretation matches the eventual `git add`
+ * exactly. Empty list when nothing is dirty — callers short-circuit to the no-op
+ * path. Throws CommitFailed("git_status") on a non-zero exit. */
 function dirtyFilesForPathspecs(pathspecs: string[], cwd: string): string[] {
-  const result = runGit(["status", "--porcelain=v1", "--", ...pathspecs], cwd);
+  const result = getVcs().dirtyFilesForPathspecs(pathspecs, cwd);
   if (result.exitCode !== 0) {
     throw new CommitFailed(
       "git_status",
       `git status failed: ${result.stderr.trim()}`,
     );
   }
-  const files: string[] = [];
-  for (const line of result.stdout.split("\n")) {
-    if (line.length < 4) {
-      continue;
-    }
-    // Porcelain v1: `XY <path>` (first 3 chars are status + space). Either
-    // non-space means git has something to stage or commit. The path-as-printed
-    // is what gets passed back to `git add`, so the rename-arrow split is left
-    // alone (atomic-rename .planctl/ writes show as M, not R).
-    const path = line.slice(3).trim();
-    if (path) {
-      files.push(path);
-    }
-  }
-  return files;
+  return result.files;
 }
 
 /** Stage `files` (`git add -- <files>`). Files are already filtered to the
  * dirty subset — only concrete paths, never raw wildcards, so cross-epic /
  * cross-task leakage cannot occur. Throws CommitFailed("git_add") on failure. */
 function gitStage(files: string[], cwd: string): void {
-  const result = runGit(["add", "--", ...files], cwd);
+  const result = getVcs().stage(files, cwd);
   if (result.exitCode !== 0) {
     throw new CommitFailed(
       "git_add",
@@ -148,15 +116,14 @@ function gitStage(files: string[], cwd: string): void {
  * CommitFailed("git_commit") on failure (hook reject, empty tree, signing,
  * ref-lock contention — the caller distinguishes contention and retries). */
 function gitCommit(msg: string, files: string[], cwd: string): string {
-  const commitResult = runGit(["commit", "-F", "-", "--", ...files], cwd, msg);
-  if (commitResult.exitCode !== 0) {
+  const result = getVcs().commit(msg, files, cwd);
+  if (result.exitCode !== 0) {
     throw new CommitFailed(
       "git_commit",
-      `git commit failed: ${commitResult.stderr.trim()}`,
+      `git commit failed: ${result.stderr.trim()}`,
     );
   }
-  const shaResult = runGit(["rev-parse", "HEAD"], cwd);
-  return shaResult.stdout.trim();
+  return result.sha;
 }
 
 // ---------------------------------------------------------------------------

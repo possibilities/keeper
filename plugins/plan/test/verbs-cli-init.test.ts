@@ -6,8 +6,9 @@
 // idempotent human-edit preservation, backfill, the no-session-id self-commit,
 // the idempotent no-empty-commit re-run, and the non-git write path.
 //
-// init's commit assertions drive real git (the pytest real_git mark); the
-// harness withGitRepo seeds the repo, runCli drives init under its own HOME.
+// init's commit assertions run against the fake VCS facade (zero real git): the
+// harness withGitRepo registers a fake repo, runCli drives init under its own
+// HOME, and the committed file set + clean-tree are read from the fake log.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -23,7 +24,9 @@ import { join } from "node:path";
 import { SCHEMA_VERSION } from "../src/models.ts";
 import { serializeStateJson } from "../src/store.ts";
 import { CLAUDE_MD_CONTENT } from "../src/verbs/init.ts";
+import { fakeDirtyPaths } from "./fake-vcs.ts";
 import {
+  gitFilesInHead,
   gitHeadMessage,
   gitInit,
   gitLogCount,
@@ -162,9 +165,6 @@ describe("init backfill + commit semantics", () => {
     const dir = getTmp();
     const home = getHome();
     gitInit(dir);
-    writeFileSync(join(dir, "README.md"), "# repo\n", "utf-8");
-    git(["add", "README.md"], dir);
-    git(["commit", "-q", "-m", "chore: initial commit"], dir);
 
     const before = gitLogCount(dir);
     const r = runCli(["init"], {
@@ -178,16 +178,18 @@ describe("init backfill + commit semantics", () => {
     expect(msg.split("\n")[0]).toBe(`chore(plan): init ${baseName(dir)}`);
     expect(msg).not.toContain("Session-Id:");
 
-    const tracked = git(["ls-files", ".keeper/"], dir);
+    // The bootstrap files the self-commit captured (the committed file set).
+    const committed = new Set(gitFilesInHead(dir));
     for (const f of [
       ".keeper/meta.json",
       ".keeper/.gitignore",
       ".keeper/CLAUDE.md",
       ".keeper/AGENTS.md",
     ]) {
-      expect(tracked).toContain(f);
+      expect(committed.has(f)).toBe(true);
     }
-    expect(git(["status", "--porcelain"], dir).trim()).toBe("");
+    // The commit re-snapshots, so the tree is clean afterward.
+    expect(fakeDirtyPaths(dir)).toEqual([]);
   });
 
   test("a no-op re-run creates no commit (no empty commit)", () => {
@@ -195,9 +197,6 @@ describe("init backfill + commit semantics", () => {
     const dir = getTmp();
     const home = getHome();
     gitInit(dir);
-    writeFileSync(join(dir, "README.md"), "# repo\n", "utf-8");
-    git(["add", "README.md"], dir);
-    git(["commit", "-q", "-m", "chore: initial commit"], dir);
 
     expect(
       runCli(["init"], { cwd: dir, home, env: { CLAUDE_CODE_SESSION_ID: "" } })
@@ -211,7 +210,7 @@ describe("init backfill + commit semantics", () => {
     });
     expect(second.code).toBe(0);
     expect(gitLogCount(dir)).toBe(afterFirst);
-    expect(git(["status", "--porcelain"], dir).trim()).toBe("");
+    expect(fakeDirtyPaths(dir)).toEqual([]);
   });
 
   test("outside a git work tree, writes files without committing", () => {
@@ -233,18 +232,6 @@ describe("init backfill + commit semantics", () => {
     expect(existsSync(join(dir, ".git"))).toBe(false);
   });
 });
-
-// Local git runner (the init commit tests need ls-files / status reads beyond
-// the harness's count/message helpers).
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if ((proc.exitCode ?? -1) !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${Buffer.from(proc.stderr).toString()}`,
-    );
-  }
-  return Buffer.from(proc.stdout).toString("utf-8");
-}
 
 function baseName(p: string): string {
   return p.split("/").filter(Boolean).pop() as string;

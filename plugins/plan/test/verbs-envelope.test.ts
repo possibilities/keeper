@@ -17,7 +17,9 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { fakeDirtyPaths } from "./fake-vcs.ts";
 import {
+  gitBaseline,
   gitHeadMessage,
   gitLogCount,
   runCli,
@@ -239,7 +241,8 @@ describe("files set exclusion", () => {
     const srcDir = join(project.root, "src");
     mkdirSync(srcDir, { recursive: true });
     writeFileSync(join(srcDir, "foo.py"), "x = 1\n", "utf-8");
-    runGit(["add", "src/foo.py"], project.root);
+    // A non-data-dir file is never in the dirty-discovery scope (it walks only
+    // `.keeper/`), so it cannot reach the files set regardless of staging.
 
     const r = create("Dirty tree test");
     expect(r.code).toBe(0);
@@ -262,7 +265,8 @@ describe("files set exclusion", () => {
       '{"id": "fn-peer-inject", "status": "open"}\n',
       "utf-8",
     );
-    runGit(["add", peer], project.root);
+    // The peer file is dirty in the data dir but absent from THIS session's
+    // touched-log, so the files = touched ∩ dirty intersection drops it.
 
     const r = runCli(
       ["epic", "set-title", epicId, "--title", "Session A renamed"],
@@ -410,8 +414,9 @@ describe("emit auto-commit boundary", () => {
     data.touched_repos = null;
     data.last_validated_at = null;
     writeFileSync(ep, JSON.stringify(data), "utf-8");
-    runGit(["add", ".keeper/"], project.root);
-    runGit(["commit", "-q", "-m", "chore: seed planctl tree"], project.root);
+    // Re-adopt the (manually mutated) tree as the committed baseline so a later
+    // verb's commit delta isolates only ITS change.
+    gitBaseline(project.root);
     return epicId;
   }
 
@@ -430,9 +435,8 @@ describe("emit auto-commit boundary", () => {
     expect("plan_invocation" in env).toBe(true);
     expect(gitLogCount(project.root)).toBe(before + 1);
     expect(headSubject(project.root)).toBe(`chore(plan): set-title ${epicId}`);
-    expect(
-      runGit(["status", "--porcelain", "--", ".keeper/"], project.root).trim(),
-    ).toBe("");
+    // The commit re-snapshots, so the data dir is clean afterward.
+    expect(fakeDirtyPaths(project.root)).toEqual([]);
   });
 
   test("no-op clean tree: runtime-only verb prints success, no commit", () => {
@@ -506,14 +510,3 @@ describe("emit auto-commit boundary", () => {
   //   test_emit.py::test_emit_commit_failure_emits_structured_envelope_and_exits_1
   //   test_emit.py::test_validate_emit_bypass_commit_failure_aborts_invocation_line
 });
-
-// Local git runner for the staging/status reads the emit tests need.
-function runGit(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if ((proc.exitCode ?? -1) !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed: ${Buffer.from(proc.stderr).toString()}`,
-    );
-  }
-  return Buffer.from(proc.stdout).toString("utf-8");
-}

@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import { buildSubject } from "./commit.ts";
 import { DATA_DIR_NAMES, resolveDataDirOrDefault } from "./state_path.ts";
+import { getVcs } from "./vcs.ts";
 
 export interface ReadonlyInvocation {
   files: null;
@@ -182,33 +183,8 @@ function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
  * --porcelain --untracked-files=all -- <data dirs>` (the flag is load-bearing —
  * without it new files show as a directory-level `?? .keeper/epics/` and the
  * intersection returns empty). The parse matches Python exactly: line[3:].strip(),
- * rename "a -> b" takes b. */
+ * rename "a -> b" takes b. Routes through the PlanVcs facade — real git in
+ * production, the snapshot-diffing fake in tests. */
 function dirtyDataDirPaths(repoRoot: string): Set<string> {
-  const proc = Bun.spawnSync(
-    [
-      "git",
-      "status",
-      "--porcelain",
-      "--untracked-files=all",
-      "--",
-      ...DATA_DIR_NAMES.map((name) => `${name}/`),
-    ],
-    { cwd: repoRoot },
-  );
-  const paths = new Set<string>();
-  for (const line of proc.stdout.toString().split("\n")) {
-    if (line.length < 4) {
-      continue;
-    }
-    // git status --porcelain: XY <path> (first 3 chars are status + space).
-    let rel = line.slice(3).trim();
-    // Handle renames: "old -> new" — take the new path.
-    if (rel.includes(" -> ")) {
-      rel = rel.split(" -> ", 2)[1] as string;
-    }
-    if (rel) {
-      paths.add(rel);
-    }
-  }
-  return paths;
+  return getVcs().dirtyDataDirPaths(repoRoot, DATA_DIR_NAMES);
 }
