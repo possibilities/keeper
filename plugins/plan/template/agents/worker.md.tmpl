@@ -11,24 +11,24 @@ variants: [medium, high, xhigh, max]
 
 # Task Implementation Worker
 
-You implement one planctl task end-to-end and return a concise summary to the parent `work` skill. You do not spawn subagents. You do not decide what task to run — that's the parent's job.
+You implement one plan task end-to-end and return a concise summary to the parent `work` skill. You do not spawn subagents. You do not decide what task to run — that's the parent's job.
 
 **Configuration from prompt** (your caller passes these):
 
-- `TASK_ID` — planctl task id, e.g. `fn-1-add-oauth.3`
+- `TASK_ID` — plan task id, e.g. `fn-1-add-oauth.3`
 - `EPIC_ID` — parent epic id, e.g. `fn-1-add-oauth`
-- `PLANCTL` — the plan-CLI command prefix (usually `keeper plan`)
+- `PLAN_CLI` — the plan-CLI command prefix (usually `keeper plan`)
 - `TARGET_REPO` — absolute path to the repo where source lives (cwd should already match)
-- `PRIMARY_REPO` — absolute path to the repo where planctl state lives
-- `BRIEF_REF` — absolute path to your brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). Read this file in Phase 1; it carries the task spec and epic spec out-of-band so the parent never inlines prose into your prompt.
+- `PRIMARY_REPO` — absolute path to the repo where plan state lives
+- `BRIEF_REF` — absolute path to your brief JSON (`<primary_repo>/.keeper/state/briefs/<task_id>.json`). Read this file in Phase 1; it carries the task spec and epic spec out-of-band so the parent never inlines prose into your prompt.
 
-If `TASK_ID`, `EPIC_ID`, `PLANCTL`, or `BRIEF_REF` are missing, stop and ask the parent. `TARGET_REPO` / `PRIMARY_REPO` may be absent on single-repo spawns — treat missing as "same as cwd".
+If `TASK_ID`, `EPIC_ID`, `PLAN_CLI`, or `BRIEF_REF` are missing, stop and ask the parent. `TARGET_REPO` / `PRIMARY_REPO` may be absent on single-repo spawns — treat missing as "same as cwd".
 
 ---
 
 ## Resume directives outrank everything below
 
-Your turn may open with a `SendMessage` directive from the parent rather than the standard `Implement a planctl task.` template. That happens when an earlier turn of yours was cut short and the parent is telling you what's left.
+Your turn may open with a `SendMessage` directive from the parent rather than the standard `Implement a plan task.` template. That happens when an earlier turn of yours was cut short and the parent is telling you what's left.
 
 When you see a parent directive:
 
@@ -63,11 +63,11 @@ Then load runtime state:
 keeper session-state
 ```
 
-From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLANCTL show $TASK_ID` only if you need the runtime status — usually you don't.
+From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID` only if you need the runtime status — usually you don't.
 
 **Never create or switch branches.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Branch management is out of scope — the keeper branch-guard hook hard-blocks it.
 
-**Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the planctl envelope; you do not need to chdir for them.
+**Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the plan envelope; you do not need to chdir for them.
 
 Parse the task spec for what matters: **Acceptance** (the bar you must clear), **Approach** (hints), **Investigation targets** (files to look at), **Files** (expected paths). The epic's `## Quick commands` are smoke tests you'll run later.
 
@@ -153,10 +153,10 @@ If you reach this phase with a clean tree (a predecessor already shipped the sou
 
 ## Phase 5 — Mark done
 
-Last step before returning. `keeper plan done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands the moment the verb returns success.
+Last step before returning. `keeper plan done` patches the spec, emits a `plan_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.keeper/` state commit (commit #2 of the pair) lands the moment the verb returns success.
 
 ```bash
-$PLANCTL done $TASK_ID --summary "<1-2 sentence summary>"
+$PLAN_CLI done $TASK_ID --summary "<1-2 sentence summary>"
 ```
 
 The invocation above is complete — run it as-is. Running `keeper plan done --help` first is a wasted call.
@@ -227,4 +227,4 @@ The parent stops the loop and surfaces this verbatim.
   - **Trust git over envelopes.** On a suspect `keeper commit-work` / `keeper plan done` envelope, run `git log` ground truth, side with git, retry the verb once, then `BLOCKED: TOOLING_FAILURE` carrying both outputs.
   - **Return cap: 5 template lines + at most 3 note lines,** evidence by reference, no self-check narration.
 - **`keeper commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — read the named files, fix per stderr, re-stage, re-invoke. Don't patch the tool you're calling.
-- **No `TodoWrite`.** Planctl tracks tasks.
+- **No `TodoWrite`.** The plan tooling tracks tasks.

@@ -1,7 +1,7 @@
 ---
 name: close
 description: >-
-  Close a planctl epic — run the quality audit, address any findings, then
+  Close a plan epic — run the quality audit, address any findings, then
   finalize the close. Use when the human types `/plan:close <epic_id>` once
   every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
@@ -12,7 +12,7 @@ disable-model-invocation: true
 
 # Close
 
-Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the verdict JSON, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.planctl/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents.
+Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the verdict JSON, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.keeper/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents.
 
 The human types `/plan:close <epic_id>` once every task in the epic is `done`. The session is named `close::<epic_id>`.
 
@@ -32,8 +32,8 @@ keeper plan close-preflight "$ARGUMENTS"
 
 **On success**, pin these envelope fields — process facts only, no prose:
 
-- `primary_repo` — planctl state repo; passed to the close-planner and to `close-finalize --project`.
-- `brief_ref` — close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`). Both agents read it themselves; the closer never opens it. It carries the task list, done summaries, and commit groups out-of-band.
+- `primary_repo` — plan state repo; passed to the close-planner and to `close-finalize --project`.
+- `brief_ref` — close-phase brief JSON (`<primary_repo>/.keeper/state/audits/<epic_id>/brief.json`). Both agents read it themselves; the closer never opens it. It carries the task list, done summaries, and commit groups out-of-band.
 - `commit_set_hash` — canonical pin of the source commit set; the closer does not act on it (the submit verbs stamp it; `close-finalize` re-checks it for staleness).
 - `epic_id` — the parent epic id (echo of the validated input).
 

@@ -165,7 +165,7 @@ peers + lifecycle-swept `unknown` orphans)), `git` (per-watched-worktree
 git status — watch gate is `.keeper present || dirty || ahead of upstream > 0`,
 recomputed each reconcile (epic fn-690); branch, ahead/behind, and a file-centric `dirty_files` list where
 each entry carries a per-file `attributions[]` array with `source` badges
-(`tool` / `bash` / `inferred` / `planctl`) naming every session that mutated the file
+(`tool` / `bash` / `inferred` / `plan`) naming every session that mutated the file
 since its last commit; a session is attributed iff it has mutated the file
 AND has not committed it more recently than its last mutation, so commit
 discharges attribution and a re-edit reinstates it; as of schema v45 /
@@ -1063,7 +1063,7 @@ event-log/reducer/hook touch. Run any of them with
   per-session `attributions[]`, each rendered with a colored source
   badge (`tool` = direct Edit/Write/MultiEdit, `bash` = derived from a
   Bash mutation event, `inferred` = time-bracketed against the
-  session's Bash intervals, `planctl` = lifted from a `keeper plan`
+  session's Bash intervals, `plan` = lifted from a `keeper plan`
   invocation envelope's `files[]` — so `.keeper/{epics,tasks}/*.json`
   and `.keeper/specs/*.md` attribute to the session that ran
   `keeper plan scaffold/done/...`); a single file can carry multiple
@@ -1615,7 +1615,7 @@ write and no `recheck-pending` post — the broad recursive watch IGNORES
 `.git` (`IGNORE_GLOBS`), so the per-repo reflog watch is the only FSEvents
 commit signal. As of fn-737 the worker reconciles those external reflog
 watches against the UNION of its live `pending` repo set AND every repo that
-holds a `.keeper` tree under the configured roots (`discoverPlanctlDirs`),
+holds a `.keeper` tree under the configured roots (`discoverProjectRoots`),
 not just the pending ones — fn-705 armed a watch only while a repo held a
 pending path, so a commit in a plan repo with NO pending path (a
 steady-state `.keeper` change whose file-write FSEvent was a no-op or
@@ -1624,8 +1624,8 @@ coalesced) had no realtime signal and fell to the git-worker's 60s heartbeat
 bounded — the watch count is the number of plan-tracked repos under the
 roots, and since the broad watch ignores `.git` these per-repo `.git/logs`
 watches don't overlap it (no fseventsd bad-state). On the reflog append the
-worker runs the repo-SCOPED gated `recheckPending(root)` PLUS a change-gated
-`scanPlanctlDir` re-scan of that repo's `.keeper` dir (the latter recovers a
+worker runs the repo-SCOPED gated pending recheck PLUS a change-gated
+`RescanScheduler` re-scan of that repo's `.keeper` dir (the latter recovers a
 committed change that was never gated into `pending`); neither writes the DB.
 The two remaining drain
 triggers are main's `recheck-pending` post on every `GitSnapshot` / `Commit`
@@ -1751,23 +1751,22 @@ envelope's `files[]` array (every `.keeper/{epics,tasks}/*.json` and
 new sparse `events.plan_files TEXT` column by `extractPlanInvocation`
 (Array.isArray + per-element string filter + runaway-size guard; NULL
 on miss / non-array / empty / oversized), and the reducer's
-`plan_op != null` fold seam mints one `source='planctl'`
+`plan_op != null` fold seam mints one `source='plan'`
 `file_attributions` row per path under `project_dir = state_repo` (the
 absolute repo path, extracted in-fold from the stored envelope) +
 `event.session_id` + the repo-relative path + `event.ts` + the verb
 (`scaffold` / `done` / …) as `op`. The
-`file_attributions.source` CHECK widens to include `'planctl'` via a
-row-preserving table rebuild; pass-2's inferred-guard widens to
-`source IN ('tool','bash','planctl')` so a `'planctl'`-source file does NOT also
-get a spurious inferred attribution; pass-3 renders `'planctl'` as a
-honest badge. Discharge flows through the SAME `foldCommit` path as
+`file_attributions.source` CHECK includes `'plan'`; pass-2's
+inferred-guard reads `source IN ('tool','bash','plan')` so a `'plan'`-source
+file does NOT also get a spurious inferred attribution; pass-3 renders
+`'plan'` as an honest badge. Discharge flows through the SAME `foldCommit` path as
 `'tool'`/`'bash'`/`'inferred'` — a `chore(plan)` commit clears
 the row via the same `last_commit_at` UPDATE; no per-source branch.
 Fixes the 559-orphan spike (`.keeper/{epics,tasks}/*.json` and
 `.keeper/specs/*.md` were strict-mystery orphans the instant they
 flashed dirty, since `keeper plan` writes them outside any Claude
 Write/Edit / bash mutation deriver match). This envelope `files[]` scrape
-remains the SOLE driver of the `'planctl'`-source `file_attributions` rows — epic
+remains the SOLE driver of the `'plan'`-source `file_attributions` rows — epic
 fn-695 added a SECOND, independent use of the commit channel (the
 creator/refiner edge below) but did NOT touch the attribution mint; the
 two are orthogonal. As of schema v49 / fn-670
@@ -1825,7 +1824,7 @@ from the persisted JSON. The push guard collapses the persisted set
 from a monotonically ratcheting one to the currently-dirty set, and
 the fn-679 bound collapses the ITERATED pass-4 set from the entire
 undischarged set under `project_dir` (dominated by non-discharging
-`'planctl'`-source attributions, 288 in production) to the same event-relevant
+`'plan'`-source attributions, 288 in production) to the same event-relevant
 union. Pass 1 (explicit attribution) was the dominant GitSnapshot cost,
 not pass 4: its tool-mutation arms, bash exact-match scan, and
 git-rm/git-mv deletion scan run inside a per-dirty-file loop, so fn-787
@@ -3138,7 +3137,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
-# Git projection — one row per watched worktree (membership gate `.keeper present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's plan_op fold from the envelope's files[] array so .keeper/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
+# Git projection — one row per watched worktree (membership gate `.keeper present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|plan (the plan badge is minted by the reducer's plan_op fold from the envelope's files[] array so .keeper/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
 

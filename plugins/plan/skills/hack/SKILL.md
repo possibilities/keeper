@@ -51,7 +51,7 @@ Mode-specific moves:
 
 <!-- Canonical source: keeper prompt render engineering/keeper-history-forensics -->
 
-Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, planctl op, file mutation, and subagent run. Query it with `sqlite3 -readonly` only — the keeper daemon is the sole writer. Large `data` payloads may live in the `event_blobs` side table, so read payloads as `COALESCE(e.data, b.data)` via `LEFT JOIN event_blobs b ON b.event_id = e.id`.
+Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Query it with `sqlite3 -readonly` only — the keeper daemon is the sole writer. Large `data` payloads may live in the `event_blobs` side table, so read payloads as `COALESCE(e.data, b.data)` via `LEFT JOIN event_blobs b ON b.event_id = e.id`.
 
 **Who last touched a file** — then replay that session:
 
@@ -226,7 +226,7 @@ Never ask "anything else?" or "should I close?" — answering that for the human
 
 ### Orchestration is yours to shape
 
-You have standing license to conform planctl tooling to the workflow that best delivers, across a closed set: epic right-sizing, multi-repo-root epics (per-task `target_repo`), queue/defer shapes, and awaits and daisy-chains. Confident the shape serves the work → act and inform. Unsure, or the move is off this list → ask first. This discretion never overrides the wait-for-plain-text-greenlight beat before code edits: the greenlight rule elsewhere in this file stays exactly as binding.
+You have standing license to conform the plan tooling to the workflow that best delivers, across a closed set: epic right-sizing, multi-repo-root epics (per-task `target_repo`), queue/defer shapes, and awaits and daisy-chains. Confident the shape serves the work → act and inform. Unsure, or the move is off this list → ask first. This discretion never overrides the wait-for-plain-text-greenlight beat before code edits: the greenlight rule elsewhere in this file stays exactly as binding.
 
 If genuinely torn between two endpoints, ask one short plain-text question.
 
