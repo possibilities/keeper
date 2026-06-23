@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "v81 migration: Commit-event keys, badge, wire-kind",
-  "updated_at": "2026-06-22T22:42:19.071000Z"
+  "updated_at": "2026-06-23T01:13:40.246000Z",
+  "worker_done_at": "2026-06-23T01:13:40.246000Z"
 }

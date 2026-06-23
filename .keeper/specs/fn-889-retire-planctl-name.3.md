@@ -36,5 +36,5 @@ Bump SCHEMA_VERSION and add the new version to `SUPPORTED_SCHEMA_VERSIONS` in ke
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+v82 migration retires the last live planctl residue: rewrites historical Commit-event events.data keys planctl_op/planctl_target → plan_op/plan_target (idempotent, value-preserving), flips producer+reader single-path with a spelling-tolerant v67 backfill, narrows the file_attributions.source CHECK to drop 'planctl', and collapses the planctl-commit-changed wire-kind dual-accept. SCHEMA_VERSION 82 + SUPPORTED_SCHEMA_VERSIONS; refold-equivalence extended + green; full suite green.
 ## Evidence
