@@ -1145,16 +1145,16 @@ export interface CommitPayload {
   /**
    * The plan op from the `Planctl-Op:` trailer, normalized at producer time
    * so it shares the scrape path's vocabulary. `null` on no trailer, empty, or
-   * a legacy event. The edge fold needs `planctl_op` + {@link planctl_target} +
+   * a legacy event. The edge fold needs `plan_op` + {@link plan_target} +
    * {@link committer_session_id} all non-null to mint an edge.
    */
-  planctl_op: string | null;
+  plan_op: string | null;
   /**
    * The plan target ref from the `Planctl-Target:` trailer, validated via
    * {@link parsePlanRef} (a task-form ref folds up to its epic). `null` on a
    * missing / malformed trailer or a legacy event.
    */
-  planctl_target: string | null;
+  plan_target: string | null;
   committed_at_ms: number;
 }
 
@@ -1275,14 +1275,17 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
   } else {
     taskIds = [];
   }
-  // Defensively decode `planctl_op` / `planctl_target` — a legacy event lacking
-  // both defaults each to `null` (the no-op edge-fold input). A type-gate
-  // re-check of producer-validated facts: non-empty string for the op,
-  // `parsePlanRef`-valid ref for the target; anything else folds to `null`.
-  const rawOp = obj.planctl_op;
+  // Defensively decode `plan_op` / `plan_target` — a legacy event lacking
+  // both defaults each to `null` (the no-op edge-fold input). Single-path read
+  // of the `plan_*` keys: the v82 migration rewrote every historical Commit
+  // record's legacy `planctl_op` / `planctl_target` data keys forward, so no
+  // canonical event carries the old spelling. A type-gate re-check of
+  // producer-validated facts: non-empty string for the op, `parsePlanRef`-valid
+  // ref for the target; anything else folds to `null`.
+  const rawOp = obj.plan_op;
   const planOp: string | null =
     typeof rawOp === "string" && rawOp.length > 0 ? rawOp : null;
-  const rawTarget = obj.planctl_target;
+  const rawTarget = obj.plan_target;
   const planTarget: string | null =
     typeof rawTarget === "string" && parsePlanRef(rawTarget) !== null
       ? rawTarget
@@ -1299,8 +1302,8 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
     files,
     committer_session_id: committerSessionId,
     task_ids: taskIds,
-    planctl_op: planOp,
-    planctl_target: planTarget,
+    plan_op: planOp,
+    plan_target: planTarget,
     committed_at_ms: committedAtMs,
   };
 }

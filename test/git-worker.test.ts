@@ -564,12 +564,12 @@ test("extractCommit accepts a well-formed v45+ payload (files: [{path, blob_oid,
     // the round-trip case (the producer would emit [] for a commit
     // carrying no Task: trailer).
     task_ids: [],
-    // Epic fn-695: `planctl_op` / `planctl_target` join the payload.
+    // Epic fn-695: `plan_op` / `plan_target` join the payload.
     // Both null here — a source commit (no `Planctl-Op:`/`Planctl-Target:`
     // trailer). The dedicated decode cases below exercise present/legacy/
     // malformed shapes.
-    planctl_op: null,
-    planctl_target: null,
+    plan_op: null,
+    plan_target: null,
     committed_at_ms: 1_700_000_000_000,
   };
   expect(extractCommit({ data: JSON.stringify(payload) })).toEqual(payload);
@@ -957,7 +957,7 @@ test("decideHeadDivergence: a transient blip (commit race) that re-agrees never 
 // decideHeadCacheAdvance — epic fn-705 (T2). The pure policy gating whether
 // emitSnapshot advances `lastHeadOidByRoot` after `enumerateCommitsInDelta`.
 // The bug: a transient enumeration throw used to advance the cache anyway,
-// permanently skipping (dropping) the failed commit's `planctl-commit-changed`
+// permanently skipping (dropping) the failed commit's `plan-commit-changed`
 // + `Commit` discharge. The fix holds the cache so the next observation
 // re-enumerates — bounded by COMMIT_ENUM_MAX_RETRIES so a permanently corrupt
 // range can't hot-spin.
@@ -1033,7 +1033,7 @@ test("decideHeadCacheAdvance: COMMIT_ENUM_MAX_RETRIES holds for N-1 throws then 
 // fn-705 (T2) re-enumeration integration: model the emitSnapshot HEAD-oid
 // delta loop against a real git repo and assert that a transient enumeration
 // throw does NOT skip the commit — the held cache re-enumerates it on the next
-// (clean) observation, re-emitting its `planctl-commit-changed` payload. Also
+// (clean) observation, re-emitting its `plan-commit-changed` payload. Also
 // covers the divergence-wedge window (suppression holds the cache → re-enumerates
 // on clear), since both share the same "don't advance `prev`" mechanism.
 // ---------------------------------------------------------------------------
@@ -1081,7 +1081,7 @@ function stepHeadDelta(
   return { planEmits, loud };
 }
 
-test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-changed on the next clean observation", () => {
+test("emitSnapshot delta: a transient enumeration throw re-emits plan-commit-changed on the next clean observation", () => {
   const root = mkTmpWorktree();
   gitInit(root);
   const cache = new Map<string, string | null>();
@@ -1501,8 +1501,8 @@ test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, o
   });
   const commits = enumerateCommitsInDelta(root, null, oid);
   expect(commits).toHaveLength(1);
-  expect(commits[0].planctl_op).toBe("scaffold");
-  expect(commits[0].planctl_target).toBe(VALID_EPIC);
+  expect(commits[0].plan_op).toBe("scaffold");
+  expect(commits[0].plan_target).toBe(VALID_EPIC);
   // The fn-670 fields still parse alongside (stride holds).
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([]);
@@ -1521,11 +1521,11 @@ test("enumerateCommitsInDelta: a task-form Planctl-Target validates and rides ve
   });
   const commits = enumerateCommitsInDelta(root, null, oid);
   expect(commits).toHaveLength(1);
-  expect(commits[0].planctl_op).toBe("done");
-  expect(commits[0].planctl_target).toBe(VALID_TASK_1);
+  expect(commits[0].plan_op).toBe("done");
+  expect(commits[0].plan_target).toBe(VALID_TASK_1);
 });
 
-test("enumerateCommitsInDelta: no Planctl-* trailers → planctl_op/target null", () => {
+test("enumerateCommitsInDelta: no Planctl-* trailers → plan_op/target null", () => {
   // A source commit (`feat(...)`) carrying Session-Id + Task but no
   // Planctl-* trailers — both new fields stay null (the no-commit-edge
   // input to the T3 fold).
@@ -1537,8 +1537,8 @@ test("enumerateCommitsInDelta: no Planctl-* trailers → planctl_op/target null"
   });
   const commits = enumerateCommitsInDelta(root, null, oid);
   expect(commits).toHaveLength(1);
-  expect(commits[0].planctl_op).toBeNull();
-  expect(commits[0].planctl_target).toBeNull();
+  expect(commits[0].plan_op).toBeNull();
+  expect(commits[0].plan_target).toBeNull();
   // Adjacent fields still parse — the absent Planctl-* fields don't drift
   // the stride.
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
@@ -1547,7 +1547,7 @@ test("enumerateCommitsInDelta: no Planctl-* trailers → planctl_op/target null"
 
 test("enumerateCommitsInDelta: malformed Planctl-Target → null, op still lifts", () => {
   // A garbage target ref must not poison the edge fold: parsePlanRef
-  // rejects it and the producer folds planctl_target to null. The op
+  // rejects it and the producer folds plan_target to null. The op
   // (a valid shape) still lifts independently.
   const root = mkTmpWorktree();
   gitInit(root);
@@ -1557,8 +1557,8 @@ test("enumerateCommitsInDelta: malformed Planctl-Target → null, op still lifts
   });
   const commits = enumerateCommitsInDelta(root, null, oid);
   expect(commits).toHaveLength(1);
-  expect(commits[0].planctl_op).toBe("close");
-  expect(commits[0].planctl_target).toBeNull();
+  expect(commits[0].plan_op).toBe("close");
+  expect(commits[0].plan_target).toBeNull();
 });
 
 test("enumerateCommitsInDelta: ALL eight fields together → stride parser holds (no off-by-one)", () => {
@@ -1579,8 +1579,8 @@ test("enumerateCommitsInDelta: ALL eight fields together → stride parser holds
   expect(commits[0].commit_oid).toBe(oid);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
-  expect(commits[0].planctl_op).toBe("done");
-  expect(commits[0].planctl_target).toBe(VALID_TASK_1);
+  expect(commits[0].plan_op).toBe("done");
+  expect(commits[0].plan_target).toBe(VALID_TASK_1);
   expect(commits[0].committed_at_ms).toBeGreaterThan(0);
 });
 
@@ -1604,15 +1604,15 @@ test("enumerateCommitsInDelta: multi-commit delta — Planctl-* parse per-commit
   expect(second).toHaveLength(1);
   expect(second[0].commit_oid).toBe(oid2);
   expect(second[0].committer_session_id).toBe(REAL_UUID_B);
-  expect(second[0].planctl_op).toBe("done");
-  expect(second[0].planctl_target).toBe(VALID_TASK_2);
+  expect(second[0].plan_op).toBe("done");
+  expect(second[0].plan_target).toBe(VALID_TASK_2);
 
   // Re-enumerate oid1 alone — its own op/target, no bleed from oid2.
   const first = enumerateCommitsInDelta(root, null, oid1);
   expect(first).toHaveLength(1);
   expect(first[0].commit_oid).toBe(oid1);
-  expect(first[0].planctl_op).toBe("scaffold");
-  expect(first[0].planctl_target).toBe(VALID_EPIC);
+  expect(first[0].plan_op).toBe("scaffold");
+  expect(first[0].plan_target).toBe(VALID_EPIC);
   expect(first[0].committer_session_id).toBeNull();
 });
 
@@ -1699,12 +1699,12 @@ test("extractCommit normalizes non-array task_ids to []", () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractCommit — fn-695 planctl_op / planctl_target defensive decode.
+// extractCommit — fn-695 plan_op / plan_target defensive decode.
 // Mirrors the task_ids decode cases: well-formed round-trip, legacy-null
 // (pre-feature event), and bad-shape per-field fold-to-null.
 // ---------------------------------------------------------------------------
 
-test("extractCommit decodes planctl_op / planctl_target when present", () => {
+test("extractCommit decodes plan_op / plan_target when present", () => {
   const res = extractCommit({
     data: JSON.stringify({
       project_dir: "/repo",
@@ -1713,18 +1713,16 @@ test("extractCommit decodes planctl_op / planctl_target when present", () => {
       files: ["src/a.ts"],
       committer_session_id: VALID_UUID,
       task_ids: [],
-      planctl_op: "scaffold",
-      planctl_target: "fn-695-durable-commit-derived-creatorrefiner",
+      plan_op: "scaffold",
+      plan_target: "fn-695-durable-commit-derived-creatorrefiner",
       committed_at_ms: 1000,
     }),
   });
-  expect(res?.planctl_op).toBe("scaffold");
-  expect(res?.planctl_target).toBe(
-    "fn-695-durable-commit-derived-creatorrefiner",
-  );
+  expect(res?.plan_op).toBe("scaffold");
+  expect(res?.plan_target).toBe("fn-695-durable-commit-derived-creatorrefiner");
 });
 
-test("extractCommit defaults planctl_op / planctl_target to null on pre-fn-695 events", () => {
+test("extractCommit defaults plan_op / plan_target to null on pre-fn-695 events", () => {
   // Re-fold determinism: every historical Commit event lacks BOTH fields;
   // the deriver must decode each as null so the T3 edge fold sees the same
   // "no commit-derived edge" input as the scrape-only legacy semantic.
@@ -1739,11 +1737,11 @@ test("extractCommit defaults planctl_op / planctl_target to null on pre-fn-695 e
       committed_at_ms: 1000,
     }),
   });
-  expect(res?.planctl_op).toBeNull();
-  expect(res?.planctl_target).toBeNull();
+  expect(res?.plan_op).toBeNull();
+  expect(res?.plan_target).toBeNull();
 });
 
-test("extractCommit folds a malformed planctl_target to null (parsePlanRef gate)", () => {
+test("extractCommit folds a malformed plan_target to null (parsePlanRef gate)", () => {
   // A bad-shape target ref must not reach the edge fold. The op (a
   // non-empty string) survives independently — per-field gating, not
   // all-or-nothing.
@@ -1755,16 +1753,16 @@ test("extractCommit folds a malformed planctl_target to null (parsePlanRef gate)
       files: ["src/a.ts"],
       committer_session_id: VALID_UUID,
       task_ids: [],
-      planctl_op: "close",
-      planctl_target: "not-a-plan-ref",
+      plan_op: "close",
+      plan_target: "not-a-plan-ref",
       committed_at_ms: 0,
     }),
   });
-  expect(res?.planctl_op).toBe("close");
-  expect(res?.planctl_target).toBeNull();
+  expect(res?.plan_op).toBe("close");
+  expect(res?.plan_target).toBeNull();
 });
 
-test("extractCommit folds non-string / empty planctl_op / planctl_target to null", () => {
+test("extractCommit folds non-string / empty plan_op / plan_target to null", () => {
   // Object/scalar/empty-string instead of a string — each folds to null
   // without failing the whole payload.
   for (const bad of [{ foo: 1 }, 42, "", null] as const) {
@@ -1776,13 +1774,13 @@ test("extractCommit folds non-string / empty planctl_op / planctl_target to null
         files: ["src/a.ts"],
         committer_session_id: VALID_UUID,
         task_ids: [],
-        planctl_op: bad,
-        planctl_target: bad,
+        plan_op: bad,
+        plan_target: bad,
         committed_at_ms: 0,
       }),
     });
-    expect(res?.planctl_op).toBeNull();
-    expect(res?.planctl_target).toBeNull();
+    expect(res?.plan_op).toBeNull();
+    expect(res?.plan_target).toBeNull();
   }
 });
 

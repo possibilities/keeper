@@ -1841,7 +1841,7 @@ test("reconcilePlanDirs: an in-sync reconcile emits nothing (change-gate)", () =
 test("reconcilePlanDirs: ADDITIVE — does NOT retract existing epics (no false tombstones)", () => {
   // The load-bearing safety property: the periodic reconcile must NEVER
   // emit a `plan-epic-deleted` or `plan-task-deleted`. Deletions stay
-  // owned exclusively by the commit path (`planctl-commit-changed`,
+  // owned exclusively by the commit path (`plan-commit-changed`,
   // `git rm` → zero-oid sentinel), the live `onDelete` FSEvents arm, and
   // the one-shot boot {@link PlanScanner.sweep}. A reconcile run with the
   // file still present (or temporarily missing) must not produce a
@@ -2869,7 +2869,7 @@ test("onDelete: a previously-committed file emits a real tombstone (gate doesn't
 
 // ---------------------------------------------------------------------------
 // fn-681 — commit-driven plan ingest (the consumer side). The inbound
-// `planctl-commit-changed` message handler in the live worker iterates
+// `plan-commit-changed` message handler in the live worker iterates
 // the changes array and calls `scanner.onChange(absPath)` /
 // `scanner.onDelete(absPath)` per entry. These tests exercise that exact
 // contract against the pure `PlanScanner` core — no Worker, no watcher —
@@ -2878,7 +2878,7 @@ test("onDelete: a previously-committed file emits a real tombstone (gate doesn't
 // ---------------------------------------------------------------------------
 
 /**
- * Drive the scanner the way `plan-worker`'s inbound `planctl-commit-changed`
+ * Drive the scanner the way `plan-worker`'s inbound `plan-commit-changed`
  * handler does: join each repo-relative path with the repo root and dispatch
  * to onChange (upsert) or onDelete (delete). One-to-one with the live
  * handler so a regression in the handler is visible from the consumer-
@@ -2900,12 +2900,12 @@ function applyPlanCommitChanges(
 }
 
 /**
- * Mirror the live worker's inbound-message dispatch INCLUDING the name-tolerant
- * type guard: a commit-changed message is folded iff its `type` is one of the
- * accepted event-type names (legacy `planctl-commit-changed` or post-flip
- * `plan-commit-changed`). Returns whether the message matched — so a test can
- * assert an unaccepted name is NOT folded and a regression that drops a name
- * from the handler's set is caught from the consumer side.
+ * Mirror the live worker's inbound-message dispatch INCLUDING the type guard: a
+ * commit-changed message is folded iff its `type` is `plan-commit-changed` (the
+ * retired `planctl-commit-changed` name is no longer accepted — fn-889 collapsed
+ * the dual-accept). Returns whether the message matched — so a test can assert an
+ * unaccepted name is NOT folded and a regression that drops the name from the
+ * handler's set is caught from the consumer side.
  */
 function dispatchCommitChanged(
   scanner: PlanScanner,
@@ -2915,17 +2915,14 @@ function dispatchCommitChanged(
     changes: { path: string; op: "upsert" | "delete" }[];
   },
 ): boolean {
-  if (
-    msg.type !== "planctl-commit-changed" &&
-    msg.type !== "plan-commit-changed"
-  ) {
+  if (msg.type !== "plan-commit-changed") {
     return false;
   }
   applyPlanCommitChanges(scanner, msg.repo, msg.changes);
   return true;
 }
 
-test("planctl-commit-changed: upsert batch ingests committed bytes via onChange", () => {
+test("plan-commit-changed: upsert batch ingests committed bytes via onChange", () => {
   gitInit(tmpDir);
 
   const emitted: PlanMessage[] = [];
@@ -2981,12 +2978,12 @@ test("planctl-commit-changed: upsert batch ingests committed bytes via onChange"
   expect(emitted.length).toBe(before);
 });
 
-test("plan-commit-changed: the post-flip event-type name folds identically to planctl-commit-changed", () => {
-  // Cascade-safety keystone: the daemon-internal consumer must fold the
-  // post-flip `plan-commit-changed` name identically to the legacy
-  // `planctl-commit-changed`, so the later producer flip lands with zero
-  // in-flight breakage. Drive the SAME scaffold through both names and assert
-  // identical emissions; assert an unrelated type is NOT folded.
+test("plan-commit-changed: the wire kind folds; the retired planctl-commit-changed name is NOT accepted", () => {
+  // fn-889 collapsed the dual-accept: the consumer now folds ONLY
+  // `plan-commit-changed`. The producer already emits only that name (the emit
+  // flip shipped a generation earlier), so dropping the legacy alias is safe.
+  // Assert the live name folds, and BOTH the retired alias and an unrelated type
+  // are rejected by the handler's guard.
   gitInit(tmpDir);
 
   writeEpic("fn-9-flip", { title: "Flip", primary_repo: tmpDir });
@@ -2999,22 +2996,7 @@ test("plan-commit-changed: the post-flip event-type name folds identically to pl
     { path: ".keeper/tasks/fn-9-flip.1.json", op: "upsert" as const },
   ];
 
-  // Legacy name.
-  const legacyEmitted: PlanMessage[] = [];
-  const legacyScanner = new PlanScanner(
-    (m) => legacyEmitted.push(m),
-    () => {},
-    isPathInHead,
-  );
-  expect(
-    dispatchCommitChanged(legacyScanner, {
-      type: "planctl-commit-changed",
-      repo: tmpDir,
-      changes,
-    }),
-  ).toBe(true);
-
-  // Post-flip name — same fold.
+  // The live `plan-commit-changed` name folds.
   const flipEmitted: PlanMessage[] = [];
   const flipScanner = new PlanScanner(
     (m) => flipEmitted.push(m),
@@ -3028,32 +3010,33 @@ test("plan-commit-changed: the post-flip event-type name folds identically to pl
       changes,
     }),
   ).toBe(true);
-
-  expect(flipEmitted).toEqual(legacyEmitted);
   expect(flipEmitted).toHaveLength(2);
   expect(flipEmitted.map((m) => m.kind).sort()).toEqual([
     "plan-epic",
     "plan-task",
   ]);
 
-  // An unrelated/unaccepted type is NOT folded (the handler's guard rejects it).
-  const strayEmitted: PlanMessage[] = [];
-  const strayScanner = new PlanScanner(
-    (m) => strayEmitted.push(m),
-    () => {},
-    isPathInHead,
-  );
-  expect(
-    dispatchCommitChanged(strayScanner, {
-      type: "something-else",
-      repo: tmpDir,
-      changes,
-    }),
-  ).toBe(false);
-  expect(strayEmitted).toHaveLength(0);
+  // Both the retired alias and an unrelated type are NOT folded (the handler's
+  // guard rejects each).
+  for (const stray of ["planctl-commit-changed", "something-else"]) {
+    const strayEmitted: PlanMessage[] = [];
+    const strayScanner = new PlanScanner(
+      (m) => strayEmitted.push(m),
+      () => {},
+      isPathInHead,
+    );
+    expect(
+      dispatchCommitChanged(strayScanner, {
+        type: stray,
+        repo: tmpDir,
+        changes,
+      }),
+    ).toBe(false);
+    expect(strayEmitted).toHaveLength(0);
+  }
 });
 
-test("planctl-commit-changed: FSEvents-dropped scenario — commit batch alone drives correct ingest", () => {
+test("plan-commit-changed: FSEvents-dropped scenario — commit batch alone drives correct ingest", () => {
   // The real FSEvents-overrun bug this epic fixes: the live FSEvent for
   // the scaffold burst is dropped, so the only signal reaching keeper is
   // the commit. The commit-driven channel alone must produce the same
@@ -3089,7 +3072,7 @@ test("planctl-commit-changed: FSEvents-dropped scenario — commit batch alone d
   });
 });
 
-test("planctl-commit-changed: delete op emits tombstone via the commit path (no FSEvents dependency)", () => {
+test("plan-commit-changed: delete op emits tombstone via the commit path (no FSEvents dependency)", () => {
   gitInit(tmpDir);
 
   const emitted: PlanMessage[] = [];
@@ -3124,7 +3107,7 @@ test("planctl-commit-changed: delete op emits tombstone via the commit path (no 
   expect(emitted[1]).toEqual({ kind: "plan-epic-deleted", id: "fn-3-rm" });
 });
 
-test("planctl-commit-changed: mid-batch ingest failure does NOT stall the rest of the batch", () => {
+test("plan-commit-changed: mid-batch ingest failure does NOT stall the rest of the batch", () => {
   // The handler's per-path try/catch — one malformed file in a many-file
   // batch is skip-and-logged, the rest still ingest. This mirrors the
   // live FSEvents path's discipline.

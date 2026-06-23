@@ -1386,12 +1386,11 @@ function commitTrailerEvent(args: {
       committer_session_id: args.committerSessionId,
       task_ids: [],
       // Commit-event `data` payload keys — written by the git-worker trailer
-      // layer (Decision B, out of scope for the v78 rename) and read back by
-      // `extractCommit` via `obj.planctl_op` / `obj.planctl_target`. STAY
-      // `plan_*` even though the `commit_trailer_facts` columns they feed are
-      // now `plan_*`.
-      planctl_op: args.planOp,
-      planctl_target: args.planTarget,
+      // layer and read back by `extractCommit` via `obj.plan_op` /
+      // `obj.plan_target` (the v82 migration rewrote the historical events to
+      // the `plan_*` spelling).
+      plan_op: args.planOp,
+      plan_target: args.planTarget,
       committed_at_ms: args.committedAtMs,
     }),
   });

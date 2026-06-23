@@ -51,7 +51,7 @@
  * live delete.
  *
  * Multi-layer ingest: the authoritative path is the commit-trigger
- * (`planctl-commit-changed` → re-ingest the committed bytes, drop-proof and free
+ * (`plan-commit-changed` → re-ingest the committed bytes, drop-proof and free
  * of the mid-write partial-read race); the fast `data_version` poll drives a
  * gated {@link PlanScanner.recheckPending} drain plus a change-gated
  * {@link reconcilePlanDirs} re-scan, collapsing close→emit for any repo
@@ -323,14 +323,11 @@ export interface PlanCommitChange {
  */
 export interface PlanCommitChangedMessage {
   /**
-   * Name-tolerant during the daemon name-erasure: the consumer folds BOTH the
-   * legacy `planctl-commit-changed` and the post-flip `plan-commit-changed`
-   * event-type names identically. No producer emits the new name yet (the flip
-   * is a later epic); accepting both here is the cascade-safety keystone so the
-   * producer can flip with zero in-flight breakage. This is a worker-IPC
-   * TRIGGER, not minted projection data, so re-fold determinism is unaffected.
+   * The commit-driven ingest trigger main forwards from the git-worker. A
+   * worker-IPC TRIGGER, not minted projection data, so re-fold determinism is
+   * unaffected.
    */
-  type: "planctl-commit-changed" | "plan-commit-changed";
+  type: "plan-commit-changed";
   repo: string;
   changes: PlanCommitChange[];
 }
@@ -1312,7 +1309,7 @@ export class PlanScanner {
    *
    * `triggeredByCommit` (default `false`): when `true`, the `isTracked`
    * observation gate at the epic/task arm is BYPASSED — the
-   * `planctl-commit-changed` signal already proves the path is in HEAD (the
+   * `plan-commit-changed` signal already proves the path is in HEAD (the
    * git-worker enumerated it from a landed commit), so re-running the
    * fail-closed `git cat-file -e HEAD` probe is redundant and (on its 1s
    * timeout fail-closed window) is exactly what silently bounced a
@@ -1469,7 +1466,7 @@ export class PlanScanner {
     // `() => true`, so a gateless scanner emits unconditionally.
     //
     // a commit-driven ingest (`triggeredByCommit === true`) BYPASSES
-    // the gate entirely — the `planctl-commit-changed` signal already proves
+    // the gate entirely — the `plan-commit-changed` signal already proves
     // the path is in HEAD (the git-worker enumerated it from a landed commit),
     // so re-running the fail-closed probe is redundant and (on its 1s
     // fail-closed timeout) is the silent-bounce-to-pending bug this epic
@@ -1517,7 +1514,7 @@ export class PlanScanner {
    * `git cat-file` PER pending path across ALL repos on EVERY trigger; a
    * cross-repo pending set of ~1292 abandoned `.keeper` files turned each
    * trigger into a synchronous git storm that starved the single-threaded
-   * worker so the realtime `planctl-commit-changed` bypass queued behind it
+   * worker so the realtime `plan-commit-changed` bypass queued behind it
    * for tens of seconds. Two levers collapse it:
    * - **Scope.** With `root`, drain ONLY the pending paths in that repo (main
    *   stamps the originating `GitSnapshot`/`Commit`'s `project_dir`); without
@@ -2449,7 +2446,7 @@ export function scanRepoDataDirs(
  * {@link PlanScanner.sweep}, so a transient read failure / mid-rewrite
  * parse miss / file that hasn't shown up yet can NOT produce a false
  * tombstone. Deletions stay owned exclusively by (1) the live FSEvents
- * `onDelete`, (2) the commit-trigger `planctl-commit-changed` arm
+ * `onDelete`, (2) the commit-trigger `plan-commit-changed` arm
  * (`git rm` is a `committed_mode: 0` zero-oid sentinel), and (3) the
  * one-shot boot sweep — none of which run on this code path.
  *
@@ -3198,13 +3195,8 @@ function main(): void {
       }
       return;
     }
-    if (
-      msg.type === "planctl-commit-changed" ||
-      msg.type === "plan-commit-changed"
-    ) {
-      // authoritative ingest trigger. Name-tolerant: the legacy
-      // `planctl-commit-changed` and post-flip `plan-commit-changed` event-type
-      // names fold identically (the producer flip is a later epic). The
+    if (msg.type === "plan-commit-changed") {
+      // authoritative ingest trigger. The
       // git-worker just observed a commit landing in `msg.repo` carrying
       // changed `.keeper/**` paths; re-ingest each from the COMMITTED worktree
       // bytes via the existing idempotent `onChange` / `onDelete` paths.
@@ -3560,7 +3552,7 @@ function main(): void {
     //
     // scoped to `.keeper` dirs (O(#projects)), NOT the full
     // recursive walk over the whole `~/code` tree the boot scan does.
-    // The commit path (`planctl-commit-changed`) + the boot sweep
+    // The commit path (`plan-commit-changed`) + the boot sweep
     // continue to handle deletions, so an additive shallow rescan is
     // sufficient for the live drop-recovery window and dramatically
     // cheaper than re-walking the entire root.

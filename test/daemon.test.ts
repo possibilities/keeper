@@ -2647,11 +2647,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `mergeJobLinkSlice` merge — the fold is byte-identical to the old per event, so
   // this rewind-and-redrain is a convergence + self-validation pass, mirroring v80's
   // rewind/wipe block exactly: cursor→0, deterministic projections wiped,
-  // `commit_trailer_facts` preserved, git skip-floor RAISED not reset). This pin tracks
-  // the LIVE schema version: the guard it provides is "an accidental reducer/schema
-  // change must surface as a failing whitelist + this pin", which still holds —
-  // bump both together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(81);
+  // `commit_trailer_facts` preserved, git skip-floor RAISED not reset). And to 82
+  // via fn-889 task .3 (retiring the last live `planctl` residue: rewriting the
+  // historical Commit-event `events.data` keys `planctl_op`/`planctl_target` →
+  // `plan_op`/`plan_target` + narrowing the `file_attributions.source` CHECK to
+  // drop `'planctl'` — value-preserving, NO cursor rewind, `commit_trailer_facts`
+  // re-folds byte-identical under the new keys). This pin tracks the LIVE schema
+  // version: the guard it provides is "an accidental reducer/schema change must
+  // surface as a failing whitelist + this pin", which still holds — bump both
+  // together when the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(82);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

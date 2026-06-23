@@ -4602,10 +4602,11 @@ function seedBlobReadStream(): { dischargedPostToolUseId: number } {
       files: [],
       committer_session_id: TEST_UUID,
       committed_at_ms: 210_000,
-      // Commit `data` payload keys (git-worker trailer layer, Decision B) read
-      // by `extractCommit` via `obj.planctl_op` — STAY `plan_*`.
-      planctl_op: "create",
-      planctl_target: "fn-1-demo",
+      // Commit `data` payload keys (git-worker trailer layer) read by
+      // `extractCommit` via `obj.plan_op` (v82 rewrote the historical events to
+      // the `plan_*` spelling).
+      plan_op: "create",
+      plan_target: "fn-1-demo",
       session_id_trailer: TEST_UUID,
     }),
   });

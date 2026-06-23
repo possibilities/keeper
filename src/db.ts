@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 81;
+export const SCHEMA_VERSION = 82;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1141,7 +1141,7 @@ CREATE TABLE IF NOT EXISTS file_attributions (
     last_mutation_at REAL NOT NULL,
     last_commit_at REAL,
     op TEXT NOT NULL,
-    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl','plan')),
+    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','plan')),
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     worktree_oid TEXT,
@@ -3730,10 +3730,22 @@ function migrate(db: Database): void {
         // in the JSON payload), and `parsePlanRef` cannot be replicated in SQL.
         // `COALESCE(events.data, event_blobs.data)` resolves relocated cold
         // blobs (src/compaction.ts) so they backfill too. The row condition —
-        // committer_session_id + planctl_op + planctl_target all non-null —
-        // equals the commit-trailer loader / live-fold INSERT condition exactly,
-        // so backfilled and re-folded rows are identical by construction. No
+        // committer_session_id + op + target all non-null — equals the
+        // commit-trailer loader / live-fold INSERT condition exactly, so
+        // backfilled and re-folded rows are identical by construction. No
         // cursor rewind: the projection derives from `Commit` events alone.
+        //
+        // ORDERING NOTE (fn-889 v82): this backfill runs HERE (the `< 67` step),
+        // BEFORE the v82 Commit-data-key rewrite below flips the historical
+        // `events.data` `planctl_op`/`planctl_target` keys → `plan_op`/`plan_target`.
+        // `extractCommit` now reads ONLY the `plan_*` spelling (single-path), so
+        // a v66-era DB whose Commit data still spells the keys `planctl_*` would
+        // backfill ZERO op/target here if we leaned on `extractCommit` for them.
+        // We therefore lift the op/target from the raw payload tolerating BOTH
+        // spellings (the v82 rewrite hasn't run yet at this point in the ladder),
+        // and still use `extractCommit` for the session-id + timestamp gates
+        // (those keys never changed). This keeps the one-time historical backfill
+        // correct for every upgrade path while the live read stays single-path.
         const commitRows = db
           .prepare(
             `SELECT events.id AS id,
@@ -3754,19 +3766,37 @@ function migrate(db: Database): void {
           if (row.data == null) continue;
           const commit = extractCommit({ data: row.data });
           if (commit == null) continue;
+          // Spelling-tolerant op/target read from the raw payload (pre-v82-rewrite
+          // bodies spell them `planctl_*`; post-rewrite bodies spell them
+          // `plan_*`). Mirror `extractCommit`'s gates: non-empty string for the
+          // op, `parsePlanRef`-valid ref for the target.
+          let rawData: Record<string, unknown>;
+          try {
+            rawData = JSON.parse(row.data) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          const rawOp = rawData.plan_op ?? rawData.planctl_op;
+          const op =
+            typeof rawOp === "string" && rawOp.length > 0 ? rawOp : null;
+          const rawTarget = rawData.plan_target ?? rawData.planctl_target;
+          const target =
+            typeof rawTarget === "string" && parsePlanRef(rawTarget) !== null
+              ? rawTarget
+              : null;
           if (
             commit.committer_session_id == null ||
-            commit.planctl_op == null ||
-            commit.planctl_target == null
+            op == null ||
+            target == null
           ) {
             continue;
           }
           insertFact.run(
             row.id,
             commit.committer_session_id,
-            commit.planctl_op,
-            commit.planctl_target,
-            parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+            op,
+            target,
+            parsePlanRef(target)?.epic_id ?? null,
             commit.committed_at_ms,
           );
         }
@@ -4376,6 +4406,142 @@ function migrate(db: Database): void {
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
+      }
+
+      // v81→v82 (fn-889 task .3): retire the last live `planctl` residue in the
+      // event stream + schema — the synthetic `Commit`-event `events.data` keys
+      // `planctl_op` / `planctl_target` and the `file_attributions.source` badge
+      // CHECK's `'planctl'` member. Two version-guarded steps, both
+      // VALUE-PRESERVING (NO cursor rewind):
+      //
+      // 1. Rewrite the historical `Commit` records' top-level `events.data`
+      //    `planctl_op` / `planctl_target` keys → `plan_op` / `plan_target`
+      //    (mirrors the v78 envelope rewrite at the top of this block). The
+      //    daemon already emits the new keys (the `CommitMessage` field rename)
+      //    and `extractCommit` already reads ONLY `obj.plan_op` / `obj.plan_target`
+      //    single-path, so this rewrite is the migration that makes the historical
+      //    corpus match the flipped producer/reader. The deriver lifts the SAME
+      //    plan op/target value from the new key as it did from the old, so
+      //    `commit_trailer_facts` (deterministic-replayed) re-folds byte-identical
+      //    — no rewind. App-level parse / swap-key / re-embed (NOT `json_set`, to
+      //    preserve surrounding byte order); per-row try/catch (a malformed body
+      //    is skipped, never thrown — a throw rolls back the whole tx).
+      //    Idempotent: a re-run finds no top-level `planctl_op`. SCOPED to
+      //    `hook_event = 'Commit'` so incidental `planctl_op` TEXT in Bash command
+      //    lines / file bodies is never touched. The frozen git-log trailer scrape
+      //    (`src/git-worker.ts` `%(trailers:key=Planctl-Op...)`) reads immutable
+      //    git history and is UNCHANGED.
+      // 2. Narrow the `file_attributions.source` CHECK to drop `'planctl'` via a
+      //    table rebuild (mirrors the v72 rebuild). 0 live `'planctl'` rows (the
+      //    fold mints `'plan'` post-fn-831; no fold path can mint `'planctl'` under
+      //    the narrowed CHECK), so the byte-faithful copy can't violate it.
+      //
+      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
+      // socket, not these projection internals) — this bump MUST add 82 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      if (preMigrateStoredVersion < 82) {
+        // Step 1 — rewrite the historical Commit-event data keys.
+        const commitRows = db
+          .prepare(
+            `SELECT id, data FROM events
+              WHERE hook_event = 'Commit'
+                AND data LIKE '%planctl_op%'`,
+          )
+          .all() as { id: number; data: string | null }[];
+        const commitRewriteStmt = db.prepare(
+          "UPDATE events SET data = ? WHERE id = ?",
+        );
+        for (const row of commitRows) {
+          if (row.data == null) continue;
+          try {
+            const obj = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof obj !== "object" || obj === null) continue;
+            let mutated = false;
+            if (Object.hasOwn(obj, "planctl_op")) {
+              obj.plan_op = obj.planctl_op;
+              delete obj.planctl_op;
+              mutated = true;
+            }
+            if (Object.hasOwn(obj, "planctl_target")) {
+              obj.plan_target = obj.planctl_target;
+              delete obj.planctl_target;
+              mutated = true;
+            }
+            if (mutated) {
+              commitRewriteStmt.run(JSON.stringify(obj), row.id);
+            }
+          } catch {
+            // Malformed body — leave it; `extractCommit` folds it to null anyway.
+          }
+        }
+        // Hard assertion: no `Commit` event the DERIVER reads may still carry the
+        // legacy top-level `plan` keys' old spelling after the rewrite, or the
+        // single-path `obj.plan_op` read would silently NULL that commit's plan
+        // link. SCOPED to the deriver's read location (`json_extract($.planctl_op)`
+        // on a valid-JSON Commit body) — NOT a raw `data` substring, which would
+        // false-positive on incidental command-line / file-body text. A residual
+        // > 0 is a real missed shape: throw and roll the whole v82 tx back to v81.
+        const commitResidual = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM events
+                WHERE hook_event = 'Commit'
+                  AND json_valid(data)
+                  AND (
+                    json_type(data, '$.planctl_op') IS NOT NULL
+                    OR json_type(data, '$.planctl_target') IS NOT NULL
+                  )`,
+            )
+            .get() as { n: number }
+        ).n;
+        if (commitResidual > 0) {
+          throw new Error(
+            `v82 Commit-event key rewrite incomplete: ${commitResidual} Commit events still carry a planctl_op/planctl_target data key`,
+          );
+        }
+
+        // Step 2 — narrow the `file_attributions.source` CHECK (drop 'planctl').
+        // Table rebuild (the only way to change a CHECK in SQLite). Drop any
+        // leftover temp from an interrupted prior attempt.
+        db.run("DROP TABLE IF EXISTS file_attributions_v82_tmp");
+        db.run(`
+        CREATE TABLE file_attributions_v82_tmp (
+            project_dir TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            last_mutation_at REAL NOT NULL,
+            last_commit_at REAL,
+            op TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','plan')),
+            last_event_id INTEGER,
+            updated_at REAL NOT NULL DEFAULT 0,
+            worktree_oid TEXT,
+            worktree_mode TEXT,
+            PRIMARY KEY (project_dir, session_id, file_path)
+        )
+      `);
+        // Byte-faithful copy, ORDER BY rowid for stable physical order. 0 live
+        // 'planctl' rows, so the narrowed CHECK can't reject a copied row.
+        db.run(`
+        INSERT INTO file_attributions_v82_tmp
+            (project_dir, session_id, file_path, last_mutation_at,
+             last_commit_at, op, source, last_event_id, updated_at,
+             worktree_oid, worktree_mode)
+          SELECT project_dir, session_id, file_path, last_mutation_at,
+                 last_commit_at, op, source, last_event_id, updated_at,
+                 worktree_oid, worktree_mode
+            FROM file_attributions
+        ORDER BY rowid
+      `);
+        db.run("DROP TABLE file_attributions");
+        db.run(
+          "ALTER TABLE file_attributions_v82_tmp RENAME TO file_attributions",
+        );
+        // Re-create the indexes (SQLite drops them with their base table).
+        for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
+          db.run(sql);
+        }
       }
 
       db.prepare(

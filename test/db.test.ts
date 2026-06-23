@@ -838,15 +838,15 @@ test("v73→v74 shed: relocated shed-class mutation_path captured from event_blo
   expect(blobsGone).toBe(true);
 });
 
-test("v74→v75 source rename then v77 rewind: file_attributions is wiped (no surviving 'planctl' or 'plan' seed rows)", () => {
-  // The fn-831 producer-flip companion (v74→v75) rewrites stored
-  // `source='planctl'` rows to `'plan'`. As of v77 (fn-856) the migration ALSO
-  // rewinds the cursor and wipes the canonical projection list, which includes
-  // `file_attributions` — so a seeded row (with no backing event to re-fold it)
-  // does not survive to the migrated end state. The v74→v75 rewrite step still
-  // runs in-ladder; its row-level effect is simply overwritten by the later
-  // wipe. Build a current DB, insert one planctl row + one tool row, rewind to
-  // v74, re-migrate, and confirm the table is empty + version stamped current.
+test("v77 rewind wipes file_attributions (no surviving 'plan' or 'tool' seed rows)", () => {
+  // As of v77 (fn-856) the migration rewinds the cursor and wipes the canonical
+  // projection list, which includes `file_attributions` — so a seeded row (with
+  // no backing event to re-fold it) does not survive to the migrated end state.
+  // (The fn-831 v74→v75 step that once rewrote `source='planctl'` → `'plan'` is
+  // moot here: fn-889 v82 narrowed the CHECK to drop `'planctl'`, so the current
+  // schema can no longer hold a `'planctl'` row to seed.) Build a current DB,
+  // insert one plan row + one tool row, rewind to v74, re-migrate, and confirm
+  // the table is empty + version stamped current.
   {
     const { db } = openDb(dbPath);
     db.run(
@@ -854,7 +854,7 @@ test("v74→v75 source rename then v77 rewind: file_attributions is wiped (no su
          (project_dir, session_id, file_path, last_mutation_at, op, source,
           last_event_id, updated_at)
        VALUES ('/repo', 's1', '.planctl/epics/fn-1.json', 100, 'scaffold',
-               'planctl', 7, 100)`,
+               'plan', 7, 100)`,
     );
     db.run(
       `INSERT INTO file_attributions
@@ -880,8 +880,8 @@ test("v74→v75 source rename then v77 rewind: file_attributions is wiped (no su
   db.close();
 
   expect(ver).toBe(String(SCHEMA_VERSION));
-  // The v77 rewind wiped every seeded row (neither 'plan' nor 'planctl' nor the
-  // tool row survives — none had a backing event to re-fold).
+  // The v77 rewind wiped every seeded row (neither the 'plan' nor the 'tool' row
+  // survives — none had a backing event to re-fold).
   expect(total).toBe(0);
 });
 
@@ -2150,9 +2150,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v80 excludes the worker's `done` + closer's `close` op from the plan-link
   // classifier + rewinds the cursor with a git-floor-raise (not reset), fn-881;
   // v81 converges `epics.job_links` under the cheap per-session `mergeJobLinkSlice`
-  // merge via a v80-shaped rewind-and-redrain, fn-888); the v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(81);
+  // merge via a v80-shaped rewind-and-redrain, fn-888; v82 rewrites historical
+  // Commit-event `events.data` keys `planctl_op`/`planctl_target` → `plan_op`/
+  // `plan_target` + narrows the `file_attributions.source` CHECK to drop
+  // `'planctl'`, fn-889); the v62→v63 epics-shape migration this test exercises
+  // is unchanged.
+  expect(SCHEMA_VERSION).toBe(82);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -6160,14 +6163,18 @@ test("fresh v31 DB has file_attributions table with the right PK + indexes", () 
   expect(byName.get("file_path")?.pk).toBe(3);
 
   // CHECK constraint on `source` is enforced — verify an invalid value throws
-  // and every valid one is accepted. fn-826 widened the CHECK to admit the
-  // renamed `'plan'` alongside legacy `'planctl'` (additive, both allowed).
-  expect(() => {
-    db.run(
-      "INSERT INTO file_attributions (project_dir, session_id, file_path, last_mutation_at, op, source) VALUES ('/r', 's', 'f', 0, 'edit', 'NOT_AN_ENUM')",
-    );
-  }).toThrow();
-  for (const src of ["tool", "bash", "inferred", "planctl", "plan"]) {
+  // and every valid one is accepted. fn-889 (v82) narrowed the CHECK to drop the
+  // retired `'planctl'` member (0 live rows; the fold mints `'plan'`), so the
+  // legacy spelling now rejects alongside any other non-enum value.
+  for (const bad of ["NOT_AN_ENUM", "planctl"]) {
+    expect(() => {
+      db.run(
+        "INSERT INTO file_attributions (project_dir, session_id, file_path, last_mutation_at, op, source) VALUES ('/r', 's', ?, 0, 'edit', ?)",
+        [`bad-${bad}`, bad],
+      );
+    }).toThrow();
+  }
+  for (const src of ["tool", "bash", "inferred", "plan"]) {
     db.run(
       "INSERT INTO file_attributions (project_dir, session_id, file_path, last_mutation_at, op, source) VALUES (?, 's', ?, 0, 'edit', ?)",
       ["/r", `f-${src}`, src],
@@ -8649,8 +8656,8 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
   const commitData = (
     oid: string,
     committerSessionId: string,
-    planctlOp: string,
-    planctlTarget: string,
+    planOp: string,
+    planTarget: string,
   ): string =>
     JSON.stringify({
       project_dir: "/repo",
@@ -8661,8 +8668,8 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
       ],
       committer_session_id: committerSessionId,
       task_ids: [],
-      planctl_op: planctlOp,
-      planctl_target: planctlTarget,
+      plan_op: planOp,
+      plan_target: planTarget,
       committed_at_ms: 5_000_000,
     });
 

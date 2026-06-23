@@ -312,8 +312,8 @@ test("commit-split: a Commit at id <= floor STILL inserts commit_trailer_facts b
       files: [{ path: "x.ts" }],
       committer_session_id: SESS,
       committed_at_ms: 9_000_000,
-      planctl_op: "done",
-      planctl_target: "fn-1-x.1",
+      plan_op: "done",
+      plan_target: "fn-1-x.1",
     }),
   });
   raiseGitProjectionFloor(db, commitId);

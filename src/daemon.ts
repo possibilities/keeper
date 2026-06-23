@@ -2411,7 +2411,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // producer-worker instance. `roots` come from `resolvePlanRoots()` (config →
   // absolute, existing dirs); an empty list means there is nothing to watch.
   // Gated on the selector. Cross-referenced by the git-worker handler (the
-  // planctl-commit-changed forward) via `planWorker?.postMessage` — null-safe
+  // plan-commit-changed forward) via `planWorker?.postMessage` — null-safe
   // when unselected.
   const planWorker = want("plan")
     ? new Worker(new URL("./plan-worker.ts", import.meta.url).href, {
@@ -2715,18 +2715,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         handleBackstopMessage(msg);
         return;
       }
-      if (
-        msg.kind === "planctl-commit-changed" ||
-        msg.kind === "plan-commit-changed"
-      ) {
+      if (msg.kind === "plan-commit-changed") {
         // Authoritative commit-driven plan ingest: the git-worker observed a
         // commit carrying changed `.keeper/**` paths; forward them to plan-worker
         // so it re-ingests each from the COMMITTED worktree bytes via its
-        // idempotent `onChange`/`onDelete`. Name-tolerant on the kind (legacy
-        // `planctl-commit-changed` / post-flip `plan-commit-changed` fold
-        // identically; the producer flip is a later epic) and the forwarded
-        // `type` preserves the inbound name so the plan-worker's equally
-        // tolerant handler dispatches it. NOT written to the event log — this
+        // idempotent `onChange`/`onDelete`. NOT written to the event log — this
         // channel drives a producer worker, not a projection. The `?.` is
         // null-safe for a git-only boot (no plan worker).
         planWorker?.postMessage({

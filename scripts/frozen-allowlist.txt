@@ -56,34 +56,33 @@ anchor|cli/commit-work.ts|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[
 # v66→v78 sequence (the v78 rename block depends on the older `planctl_*` names
 # existing exactly as written, version-guarded so a post-v78 boot never
 # resurrects a zombie column). Every `planctl` token in src/db.ts is one of
-# these schema-history literals — so the whole file is count-pinned.
-count|src/db.ts|163
+# these schema-history literals — so the whole file is count-pinned. The v82
+# migration (fn-889 task .3) added the Commit-event data-key rewrite (`planctl_op`
+# / `planctl_target` → `plan_op` / `plan_target`) plus the v67 backfill's
+# spelling-tolerant read of those keys; those literals are themselves frozen
+# schema-history (a fresh-DB walk + a v66 upgrade replay them to rewrite / read
+# the historical corpus), so they count toward the pin.
+count|src/db.ts|184
 
 # =========================================================================
-# CLASS 3 — Commit-event data keys + wire kind (frozen FOR NOW; .3 migrates)
+# CLASS 3 — Commit-event data keys + wire kind: RETIRED by fn-889 task .3
 # =========================================================================
 # The synthetic Commit-event `events.data` keys `planctl_op` / `planctl_target`
-# (4,409 live events) and the `planctl-commit-changed` wire kind. Task .3's v81
-# migration rewrites the historical events and flips producer + reader to the
-# new keys; until then these stay verbatim. .3 owns removing these anchors.
-anchor|src/git-worker.ts|planctl_op: c.planctl_op,
-anchor|src/git-worker.ts|planctl_target: c.planctl_target,
-anchor|src/git-worker.ts|"planctl-commit-changed" | "plan-commit-changed"
-anchor|src/derivers.ts|const rawOp = obj.planctl_op;
-anchor|src/derivers.ts|const rawTarget = obj.planctl_target;
-anchor|src/daemon.ts|msg.kind === "planctl-commit-changed" ||
-anchor|src/reducer.ts|commit.planctl_op != null &&
-anchor|src/reducer.ts|commit.planctl_target != null
+# (the v82 migration rewrote the historical events → `plan_op` / `plan_target`)
+# and the `planctl-commit-changed` wire kind (collapsed to `plan-commit-changed`)
+# are GONE from live code — producer, reader, and the reducer's commit-trailer
+# fold all read the new spelling single-path. No anchors remain for this class.
 
 # =========================================================================
 # Renamable residue (mixed files; NOT count-pinned) — .6/.7/.8/.5 own these
 # =========================================================================
-# These files carry both frozen literals (anchored above) and incidental
-# symbols / comments / `PLANCTL_*` env fallbacks a later sweep renames. Listed
-# so a sweep knows the guard already accounts for them; each sweep removes its
-# file from this block as it lands.
+# These files carry both frozen literals (the CLASS 1 trailer anchors above) and
+# incidental symbols / comments / `PLANCTL_*` env fallbacks a later sweep
+# renames. Listed so a sweep knows the guard already accounts for them; each
+# sweep removes its file from this block as it lands. (src/daemon.ts dropped its
+# last `planctl` token in task .3's wire-kind collapse, so it is no longer
+# listed.)
 exempt|plugins/plan/src/commit.ts
 exempt|src/git-worker.ts
 exempt|src/derivers.ts
 exempt|src/reducer.ts
-exempt|src/daemon.ts

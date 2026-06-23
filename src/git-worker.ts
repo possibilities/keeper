@@ -208,8 +208,8 @@ export interface CommitMessage {
    * commit. The reducer's edge fold defaults both to `null` for pre-existing
    * events (re-fold determinism).
    */
-  planctl_op: string | null;
-  planctl_target: string | null;
+  plan_op: string | null;
+  plan_target: string | null;
   committed_at_ms: number;
 }
 
@@ -233,14 +233,11 @@ export interface PlanChangedFile {
 
 export interface PlanCommitChangedMessage {
   /**
-   * Name-tolerant during the daemon name-erasure: main folds BOTH the legacy
-   * `planctl-commit-changed` and the post-flip `plan-commit-changed` kinds
-   * identically. The git-worker producer still emits the legacy name (the flip
-   * is a later epic); accepting both at the consumer is the cascade-safety
-   * keystone. This is a worker-IPC TRIGGER, not minted projection data, so
-   * re-fold determinism is unaffected.
+   * The git-worker observed a commit landing plan-shaped `.keeper/**` paths and
+   * signals main to re-ingest them. A worker-IPC TRIGGER, not minted projection
+   * data, so re-fold determinism is unaffected.
    */
-  kind: "planctl-commit-changed" | "plan-commit-changed";
+  kind: "plan-commit-changed";
   project_dir: string;
   commit_oid: string;
   changes: PlanChangedFile[];
@@ -718,7 +715,7 @@ export function decideHeadDivergence(
  * Pure decision for whether `emitSnapshot` may advance the per-root HEAD-oid
  * cache after attempting `enumerateCommitsInDelta`. A transient enumeration
  * throw must NOT skip the failed range (that would permanently drop the commit's
- * `planctl-commit-changed` + `Commit` discharge):
+ * `plan-commit-changed` + `Commit` discharge):
  *
  * - `enumOk === true`: advance, reset the failure counter.
  * - `enumOk === false` AND `priorFailures + 1 < maxRetries`: HOLD the cache so
@@ -807,8 +804,8 @@ export interface EnumeratedCommit {
    * `null` on a non-plan / malformed commit. Frozen at producer time, read
    * back unchanged by the reducer's edge fold (re-fold determinism).
    */
-  planctl_op: string | null;
-  planctl_target: string | null;
+  plan_op: string | null;
+  plan_target: string | null;
   committed_at_ms: number;
 }
 
@@ -1026,8 +1023,8 @@ export function enumerateCommitsInDelta(
       files,
       committer_session_id: committerSessionId,
       task_ids: taskIds,
-      planctl_op: planOp,
-      planctl_target: planTarget,
+      plan_op: planOp,
+      plan_target: planTarget,
       committed_at_ms: committedAtMs,
     });
   }
@@ -1928,7 +1925,7 @@ function startWorker(): void {
         // Epic fn-705 (T2): track whether enumeration succeeded so the
         // head-cache advance below is gated on it — a transient throw must
         // NOT skip the failed range (which would permanently drop the
-        // commit's `planctl-commit-changed` + `Commit` discharge), so we hold
+        // commit's `plan-commit-changed` + `Commit` discharge), so we hold
         // the cache and re-enumerate on the next HEAD-oid observation. Bounded
         // by COMMIT_ENUM_MAX_RETRIES so a permanently corrupt range doesn't
         // hot-spin. See decideHeadCacheAdvance.
@@ -1958,8 +1955,8 @@ function startWorker(): void {
               // `committer_session_id`) to mint the commit-derived
               // creator/refiner edge, deduped against the legacy stdout
               // scrape in `syncPlanLinks`.
-              planctl_op: c.planctl_op,
-              planctl_target: c.planctl_target,
+              plan_op: c.plan_op,
+              plan_target: c.plan_target,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
             // fn-771: collect this discharged commit's time so the heartbeat
@@ -1996,7 +1993,7 @@ function startWorker(): void {
           // worker; log to stderr and continue. Unlike the pre-fn-705 code we
           // do NOT advance the head cache past this range below — `enumOk`
           // gates the advance so the next HEAD-oid observation re-enumerates
-          // and re-emits the dropped commit's `planctl-commit-changed`.
+          // and re-emits the dropped commit's `plan-commit-changed`.
           enumOk = false;
           console.error(
             `[git-worker] commit enumeration failed for ${root}: ${stringifyErr(err)}`,

@@ -1577,13 +1577,14 @@ function insertPlanEvent(args: {
 /**
  * Insert a synthetic `Commit` carrying the durable plan trailer the git-worker
  * freezes — the commit channel of `syncPlanLinks`. `committerSessionId` is a
- * valid UUID; `planctlOp` is already normalized (`scaffold`, not
- * `epic-scaffold`).
+ * valid UUID; `planOp` is already normalized (`scaffold`, not `epic-scaffold`).
+ * The `events.data` carries the `plan_op` / `plan_target` keys `extractCommit`
+ * reads (the v82 migration rewrote the historical events to this spelling).
  */
 function insertCommitTrailer(args: {
   committerSessionId: string;
-  planctlOp: string;
-  planctlTarget: string;
+  planOp: string;
+  planTarget: string;
   committedAtMs: number;
   ts?: number;
 }): number {
@@ -1601,8 +1602,8 @@ function insertCommitTrailer(args: {
       ],
       committer_session_id: args.committerSessionId,
       task_ids: [],
-      planctl_op: args.planctlOp,
-      planctl_target: args.planctlTarget,
+      plan_op: args.planOp,
+      plan_target: args.planTarget,
       committed_at_ms: args.committedAtMs,
     }),
   });
@@ -1757,8 +1758,8 @@ test("merge byte-identity: commit-only creator session (scrape NULL) mints via t
   // No scrape event for A's creator — only the durable commit trailer.
   insertCommitTrailer({
     committerSessionId: PLAN_SESS_A,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-4-commit",
+    planOp: "scaffold",
+    planTarget: "fn-4-commit",
     committedAtMs: 5_000_000,
   });
   drainAll();
@@ -2375,6 +2376,281 @@ test("v77→v78 MERGE GATE: legacy `planctl_invocation`-only + `plan_invocation`
           again
             .query(
               "SELECT COUNT(*) AS n FROM events WHERE data LIKE '%planctl_invocation%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(0);
+    } finally {
+      again.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v81→v82 (fn-889 task .3) — the Commit-event data-key rewrite + badge-CHECK
+// narrow MIGRATION GATE.
+//
+// Proves the last live `planctl` residue in the event stream retires
+// value-preservingly: a v81-shaped DB carrying historical `Commit` events whose
+// `events.data` spells the trailer keys `planctl_op`/`planctl_target` migrates to
+// v82 such that (a) no `Commit` event still carries the legacy data-key spelling,
+// (b) `commit_trailer_facts` (deterministic-replayed) populates off the rewritten
+// keys, (c) the `file_attributions.source` CHECK narrowed to reject `'planctl'`,
+// and (d) the migrated projection is byte-identical to a from-scratch re-fold of
+// the rewritten corpus (the same plan link mints with no null op/target). NO
+// cursor rewind (value-preserving). Idempotent (re-migrate finds nothing). The
+// frozen git-log trailer scrape is out of scope (it reads immutable git history,
+// not `events.data`).
+// ---------------------------------------------------------------------------
+
+/** Reverse a fresh v82 DB to the v81 shape: stamp version 81, rewrite any seeded
+ * `Commit` data keys back to the legacy `planctl_*` spelling, and widen the
+ * `file_attributions.source` CHECK back to include `'planctl'` (so the next open
+ * drives the v82 narrow). Only the parts v82 changes need reversing. */
+function downgradeToV81Shape(d: Database): void {
+  // Rewrite seeded Commit events' `plan_op`/`plan_target` data keys → the legacy
+  // `planctl_*` spelling (simulate the pre-v82 historical corpus).
+  const rows = d
+    .prepare(
+      "SELECT id, data FROM events WHERE hook_event = 'Commit' AND data LIKE '%plan_op%'",
+    )
+    .all() as { id: number; data: string }[];
+  const upd = d.prepare("UPDATE events SET data = ? WHERE id = ?");
+  for (const row of rows) {
+    const obj = JSON.parse(row.data) as Record<string, unknown>;
+    if (Object.hasOwn(obj, "plan_op")) {
+      obj.planctl_op = obj.plan_op;
+      delete obj.plan_op;
+    }
+    if (Object.hasOwn(obj, "plan_target")) {
+      obj.planctl_target = obj.plan_target;
+      delete obj.plan_target;
+    }
+    upd.run(JSON.stringify(obj), row.id);
+  }
+  // Widen the badge CHECK back to the v81 shape (a table rebuild — the only way
+  // to change a CHECK in SQLite).
+  d.run("DROP TABLE IF EXISTS file_attributions_v81_down");
+  d.run(`
+    CREATE TABLE file_attributions_v81_down (
+        project_dir TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        last_mutation_at REAL NOT NULL,
+        last_commit_at REAL,
+        op TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl','plan')),
+        last_event_id INTEGER,
+        updated_at REAL NOT NULL DEFAULT 0,
+        worktree_oid TEXT,
+        worktree_mode TEXT,
+        PRIMARY KEY (project_dir, session_id, file_path)
+    )
+  `);
+  d.run(`
+    INSERT INTO file_attributions_v81_down
+      SELECT * FROM file_attributions
+  `);
+  d.run("DROP TABLE file_attributions");
+  d.run("ALTER TABLE file_attributions_v81_down RENAME TO file_attributions");
+  d.run("UPDATE meta SET value = '81' WHERE key = 'schema_version'");
+}
+
+test("v81→v82 MIGRATION GATE: historical Commit data keys rewrite planctl_*→plan_*; commit_trailer_facts re-folds identical; badge CHECK narrows", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-v82-proof-"));
+  const dbPath = join(dir, "keeper.db");
+  const SESS_PLAN = "33333333-3333-3333-3333-333333333333";
+  const PLAN_OID = "abcabcabcabcabcabcabcabcabcabcabcabcabc0";
+  try {
+    // 1. Build a fresh v82 DB, downgrade it to the v81 shape, and seed a
+    // SessionStart + one `Commit` carrying the durable plan trailer in its
+    // `events.data` (epic-form target so the link mints). `downgradeToV81Shape`
+    // then rewrites the Commit data keys to the legacy `planctl_*` spelling.
+    {
+      const { db: seed } = openDb(dbPath);
+      seed.run(
+        `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+           VALUES (900, ?, 1, 'SessionStart', 'session_start', ?, '{}')`,
+        [SESS_PLAN, REPO],
+      );
+      seed.run(
+        `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+           VALUES (901, ?, 1, 'Commit', 'commit', ?, ?)`,
+        [
+          REPO,
+          REPO,
+          JSON.stringify({
+            project_dir: REPO,
+            commit_oid: PLAN_OID,
+            parent_oid: null,
+            files: [
+              {
+                path: ".planctl/epics/fn-1-x.json",
+                blob_oid: null,
+                committed_mode: null,
+              },
+            ],
+            committer_session_id: SESS_PLAN,
+            task_ids: [],
+            plan_op: "scaffold",
+            plan_target: "fn-1-x",
+            committed_at_ms: 5_000_000,
+          }),
+        ],
+      );
+      downgradeToV81Shape(seed);
+      // Sanity: the v81 fixture genuinely carries the legacy data-key spelling.
+      expect(
+        (
+          seed
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Commit' AND data LIKE '%planctl_op%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(1);
+      seed.close();
+    }
+
+    // 2. Reopen — migrate() drives v81→v82 (Commit-key rewrite + residual==0
+    // assert + badge-CHECK narrow), then the boot drain folds the rewritten
+    // corpus.
+    const { db } = openDb(dbPath);
+    try {
+      expect(
+        (
+          db
+            .query("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string }
+        ).value,
+      ).toBe(String(SCHEMA_VERSION));
+
+      // (a) No `Commit` event carries the legacy data-key spelling; the renamed
+      // keys are present.
+      expect(
+        (
+          db
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Commit' AND json_type(data, '$.planctl_op') IS NOT NULL",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(0);
+      expect(
+        (
+          db
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Commit' AND json_type(data, '$.plan_op') IS NOT NULL",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(1);
+
+      // (b) Lower the live-only git skip-floor so the historical Commit fold
+      // replays (production never replays it — but this test asserts the
+      // deterministic commit_trailer_facts + link fold off the rewritten keys).
+      db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
+      let n: number;
+      do {
+        n = drain(db);
+      } while (n > 0);
+
+      // commit_trailer_facts populated off the rewritten `plan_*` keys — no null
+      // op/target.
+      const facts = db
+        .query(
+          "SELECT committer_session_id, plan_op, plan_target, plan_epic_id FROM commit_trailer_facts ORDER BY event_id",
+        )
+        .all() as {
+        committer_session_id: string;
+        plan_op: string;
+        plan_target: string;
+        plan_epic_id: string | null;
+      }[];
+      expect(facts).toEqual([
+        {
+          committer_session_id: SESS_PLAN,
+          plan_op: "scaffold",
+          plan_target: "fn-1-x",
+          plan_epic_id: "fn-1-x",
+        },
+      ]);
+
+      // (c) The badge CHECK narrowed — a `source='planctl'` insert now rejects.
+      expect(() =>
+        db.run(
+          `INSERT INTO file_attributions
+             (project_dir, session_id, file_path, last_mutation_at, op, source, updated_at)
+           VALUES ('/r', 's', 'f', 1, 'tool', 'planctl', 0)`,
+        ),
+      ).toThrow();
+      // A `source='plan'` insert still succeeds (the kept member).
+      db.run(
+        `INSERT INTO file_attributions
+           (project_dir, session_id, file_path, last_mutation_at, op, source, updated_at)
+         VALUES ('/r', 's', 'f', 1, 'tool', 'plan', 0)`,
+      );
+      db.run("DELETE FROM file_attributions WHERE project_dir = '/r'");
+
+      // (d) Byte-identity: capture the migrated commit_trailer_facts + link
+      // projections, then a from-scratch re-fold reproduces them exactly.
+      const migrated = {
+        ctf: db
+          .query("SELECT * FROM commit_trailer_facts ORDER BY event_id")
+          .all(),
+        jobs: db
+          .query("SELECT job_id, epic_links FROM jobs ORDER BY job_id")
+          .all(),
+        epics: db
+          .query("SELECT epic_id, job_links FROM epics ORDER BY epic_id")
+          .all(),
+      };
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM commit_trailer_facts");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM file_attributions");
+      db.run("DELETE FROM git_status");
+      db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
+      do {
+        n = drain(db);
+      } while (n > 0);
+      const refolded = {
+        ctf: db
+          .query("SELECT * FROM commit_trailer_facts ORDER BY event_id")
+          .all(),
+        jobs: db
+          .query("SELECT job_id, epic_links FROM jobs ORDER BY job_id")
+          .all(),
+        epics: db
+          .query("SELECT epic_id, job_links FROM epics ORDER BY epic_id")
+          .all(),
+      };
+      expect(JSON.stringify(refolded)).toBe(JSON.stringify(migrated));
+      // The re-fold over the rewritten Commit corpus yielded a non-null fact.
+      expect((refolded.ctf as unknown[]).length).toBe(1);
+    } finally {
+      db.close();
+    }
+
+    // 3. Idempotency: a second open re-runs migrate() with no legacy key left —
+    // the rewrite finds zero Commit rows, the version holds at v82.
+    const { db: again } = openDb(dbPath);
+    try {
+      expect(
+        (
+          again
+            .query("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string }
+        ).value,
+      ).toBe(String(SCHEMA_VERSION));
+      expect(
+        (
+          again
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Commit' AND json_type(data, '$.planctl_op') IS NOT NULL",
             )
             .get() as { n: number }
         ).n,

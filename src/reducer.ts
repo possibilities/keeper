@@ -2346,15 +2346,15 @@ function foldCommit(db: Database, event: Event): void {
   // empty-files early-return: the commit-trailer loader / migration backfill key
   // off the trailer facts ALONE (never the file list), so a plan Commit that
   // happened to carry zero files must still land its fact row for the two views
-  // to agree. The condition — committer_session_id + planctl_op + planctl_target
+  // to agree. The condition — committer_session_id + plan_op + plan_target
   // all non-null — is exactly the loader/backfill keep condition (DELIBERATELY
   // wider than the syncPlanLinks trigger gate below, which additionally
   // requires `parsePlanRef(target).kind != null`). `INSERT OR IGNORE` keys on the
   // `event_id` PK so a re-fold over the same `Commit` event is idempotent.
   if (
     commit.committer_session_id != null &&
-    commit.planctl_op != null &&
-    commit.planctl_target != null
+    commit.plan_op != null &&
+    commit.plan_target != null
   ) {
     db.run(
       `INSERT OR IGNORE INTO commit_trailer_facts (
@@ -2364,9 +2364,9 @@ function foldCommit(db: Database, event: Event): void {
       [
         event.id,
         commit.committer_session_id,
-        commit.planctl_op,
-        commit.planctl_target,
-        parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+        commit.plan_op,
+        commit.plan_target,
+        parsePlanRef(commit.plan_target)?.epic_id ?? null,
         commit.committed_at_ms,
       ],
     );
@@ -2509,7 +2509,7 @@ function foldCommit(db: Database, event: Event): void {
     // the epic's `epics.job_links` from the union of the stdout scrape and this
     // commit-trailer fact. We TRIGGER (never write the edge cells directly) so
     // `syncPlanLinks` stays the sole writer. A non-plan commit has NULL
-    // `planctl_op` and no-ops, preserving re-fold determinism over the log.
+    // `plan_op` and no-ops, preserving re-fold determinism over the log.
     const _cfT2 = performance.now();
     // Arm the syncPlanLinks fan-out accumulator so the breakdown line can
     // carry the plan cardinality (touched epics / swept sessions / trailer
@@ -2522,9 +2522,9 @@ function foldCommit(db: Database, event: Event): void {
       factsLoadMs: 0,
     };
     if (
-      commit.planctl_op != null &&
-      commit.planctl_target != null &&
-      parsePlanRef(commit.planctl_target)?.kind != null
+      commit.plan_op != null &&
+      commit.plan_target != null &&
+      parsePlanRef(commit.plan_target)?.kind != null
     ) {
       syncPlanLinks(db, commit.committer_session_id, eventId, eventTs);
     }
