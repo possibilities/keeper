@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-23T01:45:25.559000Z",
+  "depends_on_epics": [
+    "fn-904-de-git-and-gate-the-test-suite",
+    "fn-905-per-root-git-boot-seed-gate"
+  ],
+  "id": "fn-907-track-live-tmux-pane-location",
+  "last_validated_at": "2026-06-23T01:45:25.616000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Track live tmux pane location",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-23T01:45:25.559000Z"
+}
