@@ -53,5 +53,5 @@ Fast-tier: the wake verb resolves the creator + builds the correct `bash -lc` re
 - [ ] fast-tier tests pass + an integration check of the resume→redeliver→act loop; `bun run test:full` green
 
 ## Done summary
-
+Added the client-side 'keeper bus wake planner@<epic>' verb (cli/bus.ts + src/bus-wake.ts) that resumes an offline epic creator via claude --resume into a dedicated 'agentbus' tmux session — single-flighted per session, liveness- and cooldown-gated, fail-open, stamping the @keeper_managed window marker for the external reaper. /work Phase 2c auto-invokes it on a queued_for_wake send then yields; docs updated across bus SKILL.md, cli HELP, README, and CLAUDE.md.
 ## Evidence

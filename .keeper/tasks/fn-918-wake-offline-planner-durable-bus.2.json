@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "wake offline planner into agentbus session",
-  "updated_at": "2026-06-23T19:01:33.802000Z"
+  "updated_at": "2026-06-23T19:33:39.760000Z",
+  "worker_done_at": "2026-06-23T19:33:39.760000Z"
 }
