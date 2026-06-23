@@ -119,6 +119,7 @@ import type {
   SetEpicArmedRequestMessage,
   SetEpicArmedResultMessage,
 } from "./server-worker";
+import { seedTmuxProjection } from "./tmux-boot-seed";
 import type {
   ApiErrorMessage,
   InputRequestMessage,
@@ -1600,6 +1601,27 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // a git-unselected boot (`want("git")` false) — no git surface to seed.
     if (want("git")) {
       seedGitProjection(db, stmts, {
+        drainToCompletion: (handle) =>
+          drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
+      });
+    }
+
+    // Step 2a.5b — LIVE-ONLY tmux location boot-seed (epic fn-907). The v83
+    // skip-floor makes every historical `TmuxTopologySnapshot` fold no-op, so the
+    // tmux location surface (`jobs.backend_exec_session_id` + `jobs.window_index`)
+    // is stale after the boot drain. Re-derive the WHOLE-SERVER pane topology here
+    // — AFTER `seedKilledSweep` + `seedGitProjection` (job rows must exist so the
+    // synthetic snapshot matches them) and BEFORE the actuator/RPC gate
+    // (`boot-complete`), so a worker pane's live location is correct from the first
+    // board read and no consumer acts on an unseeded surface. DEGRADE-NOT-FATAL:
+    // the probe is time-bound and never throws; a degraded probe (server gone /
+    // transient / unresolvable generation) seeds nothing and leaves `seed_required`
+    // set for the next boot — it never wipes a job's last-known good location. The
+    // topology PRODUCER lives in the restore worker, so this is gated on
+    // `want("restore")`; a restore-unselected boot has no producer to keep the
+    // surface fresh, so seeding it would only stale.
+    if (want("restore")) {
+      seedTmuxProjection(db, stmts, {
         drainToCompletion: (handle) =>
           drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
       });
