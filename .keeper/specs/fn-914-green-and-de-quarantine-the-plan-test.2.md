@@ -53,5 +53,5 @@ returns only gates a wired script runs (or nothing). Default
 - [ ] Keeper-root `.slow.test.ts` reachability via `test:full` confirmed and noted
 
 ## Done summary
-
+De-quarantined the plan SLOW/PROCESS test buckets: un-gated saga-scaffold (51 fake-VCS nodes now in the default tier), converted src-cli-groups to in-process, deleted redundant src-cli + the src-brief-claim PROCESS block, and kept src-commit's real-git blocks wired via a new test:slow script. Default bun test is 0 fail with the only skips reachable via test:slow; typecheck/lint/hygiene all clean.
 ## Evidence

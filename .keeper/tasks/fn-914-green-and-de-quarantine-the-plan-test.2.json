@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Resolve never-run quarantined plan tests",
-  "updated_at": "2026-06-23T07:22:00.890000Z"
+  "updated_at": "2026-06-23T10:08:40.541000Z",
+  "worker_done_at": "2026-06-23T10:08:40.541000Z"
 }
