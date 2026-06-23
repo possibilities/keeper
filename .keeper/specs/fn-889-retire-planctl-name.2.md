@@ -32,5 +32,5 @@ Plan slow suite under the new `KEEPER_PLAN_RUN_SLOW` name must pass; `bun run te
 - [ ] `bun run test:full` + plan slow suite green
 
 ## Done summary
-
+Dropped the .planctl/ commit-work exclude-prefix, removed the PLANCTL_NOW/PLANCTL_ACTOR legacy env fallbacks (KEEPER_PLAN_* only), renamed the slow-gate to KEEPER_PLAN_RUN_SLOW and the build artifact to dist/keeper-plan-bun, and flipped all plan test env setters + binary-spawn paths. keeper test:full + all 303 touched plan tests green under the slow gate.
 ## Evidence
