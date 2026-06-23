@@ -76,8 +76,13 @@ This is the whole flow. Do it from the orchestrating (main) session:
   read-only run; see below.
 
 A terminal `failed` means no usable answer — surface the `error=…` field from
-the event line (launch failure, wait timeout, or a partner that produced no
-final message) to the human rather than reading a stale/absent output file.
+the event line (launch failure, wait timeout, a partner that produced no
+final message, or `self-transcript-collision` — the resolver matched the
+DRIVER's own transcript instead of the partner's, so the answer is rejected
+rather than returned as a bogus `completed`) to the human rather than reading a
+stale/absent output file. The partner always gets a pinned, non-colliding
+transcript, so `self-transcript-collision` is a fail-loud backstop, not an
+expected path.
 
 ## Choosing the partner
 
