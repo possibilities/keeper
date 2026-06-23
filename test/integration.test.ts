@@ -64,7 +64,7 @@ afterEach(() => {
  * fn-629 observation-gate helper: initialize a git repo in `dir` (so HEAD
  * resolves) with one empty commit. The plan-worker's fn-629 gate suppresses
  * snapshot emission for any `.keeper/*.json` not in HEAD — every
- * integration test that pre-writes plan files (mimicking what planctl
+ * integration test that pre-writes plan files (mimicking what plan
  * eventually commits at the seam) must init + commit, or the gate
  * (correctly) keeps them out of the projection.
  */
@@ -511,7 +511,7 @@ test("end-to-end: plan worker → .keeper write → synthetic event → fold →
     JSON.stringify({
       id: epicId,
       title: "Keeper E2E Plans Epic",
-      // planctl epic statuses are open|done (EPIC_STATUSES); "open" keeps it in
+      // plan epic statuses are open|done (EPIC_STATUSES); "open" keeps it in
       // the epics collection's default scope so the unfiltered subscribe sees it.
       status: "open",
       primary_repo: "/tmp/keeper-e2e-repo",
@@ -534,7 +534,7 @@ test("end-to-end: plan worker → .keeper write → synthetic event → fold →
   );
 
   // fn-629 observation gate: plan-worker suppresses snapshot emission for
-  // any .keeper/*.json not yet in git HEAD. Mirror the planctl
+  // any .keeper/*.json not yet in git HEAD. Mirror the plan
   // `output.emit()` contract by initializing a repo and committing the
   // plan tree before the daemon boots — otherwise the boot scan correctly
   // gates these files into the pending set and no synthetic event lands.
@@ -606,7 +606,7 @@ test("end-to-end: plan worker → .keeper write → synthetic event → fold →
           title: string | null;
           target_repo: string | null;
           // Schema v19: legacy `status` was renamed to `worker_phase` (derived
-          // worker-phase binary) to free up `runtime_status` (planctl-native
+          // worker-phase binary) to free up `runtime_status` (plan-native
           // enum) as a sibling field. Both ride inside the embedded element.
           worker_phase: string | null;
           runtime_status: string;

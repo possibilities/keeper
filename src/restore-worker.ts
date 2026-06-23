@@ -441,7 +441,7 @@ function tierForHash(
  * `captured_at` so the informational timestamp doesn't churn the hash on every
  * pulse, then runs the same `sortObjectKeys` → `JSON.stringify(_, null, 2)` →
  * ASCII-escape → trailing-`\n` pipeline `serializePlanJson` uses for
- * `.planctl` files. Exported for unit reach (the tests drive the "did content
+ * `.keeper` files. Exported for unit reach (the tests drive the "did content
  * change" gate directly).
  *
  * The hash scope covers the whole file (`current` + `schema_version`, sans

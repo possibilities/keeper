@@ -385,7 +385,7 @@ test("subscribeCollection: dispose() is idempotent and writes one unsubscribe fr
 
 // ---------------------------------------------------------------------------
 // renderRowBlocks: pure-function coverage — empty-row drop, per-row block
-// shape, nested job/dirty/planctl lines.
+// shape, nested job/dirty/plan lines.
 // ---------------------------------------------------------------------------
 
 test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row", () => {

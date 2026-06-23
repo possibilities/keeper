@@ -409,7 +409,7 @@ test("epics descriptor: version is last_event_id; filters include pk + status; t
 
 test("epics default sort is sort_path asc (schema v29)", () => {
   // Schema v29: flipped from `epic_number asc` to `sort_path asc` — the
-  // materialized-path key the reducer's `syncPlanctlLinks` derives. Slots
+  // materialized-path key the reducer's `syncPlanLinks` derives. Slots
   // closer-created children directly below their parent in the default
   // page; the prefix-sort invariant `"000003" < "000003.000007" < "000004"`
   // holds under SQLite BINARY collation.
@@ -667,9 +667,9 @@ test("runQuery decodes the embedded jobs JSON-array column into a real array", (
   db.close();
 });
 
-test("runQuery decodes the jobs.epic_links JSON-array column into a real array (creator/refiner cross-references stamped by syncPlanctlLinks)", () => {
+test("runQuery decodes the jobs.epic_links JSON-array column into a real array (creator/refiner cross-references stamped by syncPlanLinks)", () => {
   // Schema v14: each `jobs` row carries an `epic_links` JSON-TEXT array
-  // (`JOBS_DESCRIPTOR.jsonColumns`) — the per-session view of the planctl
+  // (`JOBS_DESCRIPTOR.jsonColumns`) — the per-session view of the plan
   // invocation classifier's output. The read boundary parses it to a real
   // array so `result`/`patch` frames serve the decoded shape (consumers
   // never see a JSON string).
@@ -700,7 +700,7 @@ test("runQuery decodes the jobs.epic_links JSON-array column into a real array (
 test("runQuery decodes the epics.job_links JSON-array column into a real array (symmetric per-epic view)", () => {
   // Schema v14: each `epics` row carries a `job_links` JSON-TEXT array
   // (`EPICS_DESCRIPTOR.jsonColumns`) — the per-epic view of the same
-  // invocation classifier output (every session whose planctl-CLI footprint
+  // invocation classifier output (every session whose plan-CLI footprint
   // created or refined this epic inside a `/plan:plan` window).
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const links = JSON.stringify([

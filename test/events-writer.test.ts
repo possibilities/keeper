@@ -786,7 +786,7 @@ test("skill_name stays NULL on a PreToolUse non-Skill tool", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Hook process integration (v14): planctl_* columns end-to-end
+// Hook process integration (v14): plan_* columns end-to-end
 // ---------------------------------------------------------------------------
 
 test("hook writes plan_* columns on PostToolUse:Bash with a plan envelope on stdout", async () => {
@@ -803,7 +803,7 @@ test("hook writes plan_* columns on PostToolUse:Bash with a plan envelope on std
   });
   const code = await fireViaLauncher("my-session", {
     hook_event_name: "PostToolUse",
-    session_id: "sess-planctl-create",
+    session_id: "sess-plan-create",
     cwd: "/tmp/work",
     tool_name: "Bash",
     tool_input: { command: 'keeper plan epic-create fn-42-foo "the subject"' },
@@ -811,7 +811,7 @@ test("hook writes plan_* columns on PostToolUse:Bash with a plan envelope on std
   });
   expect(code).toBe(0);
 
-  const b = readEventBinding("sess-planctl-create");
+  const b = readEventBinding("sess-plan-create");
   expect(b?.plan_op).toBe("epic-create");
   expect(b?.plan_target).toBe("fn-42-foo");
   expect(b?.plan_epic_id).toBe("fn-42-foo");
@@ -852,10 +852,10 @@ test("extractPlanInvocation returns null when stdout carries no envelope", () =>
 
 test("extractPlanInvocation is gated to PostToolUse (PreToolUse → null)", () => {
   // PreToolUse:Bash carries no tool_response envelope — the gate keeps the
-  // columns NULL even on a planctl command.
+  // columns NULL even on a plan command.
   expect(
     extractPlanInvocation("PreToolUse", "Bash", {
-      tool_input: { command: "planctl epic-create fn-1-bar" },
+      tool_input: { command: "keeper plan epic-create fn-1-bar" },
     }),
   ).toBeNull();
 });
@@ -866,15 +866,15 @@ test("hook exits 0 on PostToolUse:Bash with a malformed tool_response.stdout (de
   // that the row landed with planctl_op NULL.
   const code = await fireViaLauncher("my-session", {
     hook_event_name: "PostToolUse",
-    session_id: "sess-planctl-malformed",
+    session_id: "sess-plan-malformed",
     cwd: "/tmp/work",
     tool_name: "Bash",
-    tool_input: { command: "planctl epic-create fn-1-bar" },
+    tool_input: { command: "keeper plan epic-create fn-1-bar" },
     tool_response: { stdout: { not: "a string" } },
   });
   expect(code).toBe(0);
 
-  const b = readEventBinding("sess-planctl-malformed");
+  const b = readEventBinding("sess-plan-malformed");
   expect(b).not.toBeNull();
   expect(b?.plan_op).toBeNull();
 });

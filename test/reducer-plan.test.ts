@@ -97,10 +97,10 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a planctl
+    // Schema v30: queue-jump sparse column; NULL unless this is a plan
     // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other planctl event (stamped 0). The test helper defaults to NULL so
-    // every non-planctl event lands NULL — matches the live hook's stamping
+    // other plan event (stamped 0). The test helper defaults to NULL so
+    // every non-plan event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
     plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
@@ -110,8 +110,8 @@ function insertEvent(
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
     // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
-    // the envelope's repo-relative `files` array. NULL on every non-planctl
-    // event; planctl-mint tests pass this explicitly via overrides.
+    // the envelope's repo-relative `files` array. NULL on every non-plan
+    // event; plan-mint tests pass this explicitly via overrides.
     plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every non-zellij
@@ -1384,7 +1384,7 @@ test("fold is batch-size-invariant — same log, same projection + cursor (fn-74
   const seed = (): void => {
     // A SessionStart + lifecycle on one session, plus the two expensive arms the
     // .1 finding fingered (GitSnapshot re-fans git-status, Commit re-fans
-    // planctl-links) so the invariance covers the costly multi-table folds, not
+    // plan-links) so the invariance covers the costly multi-table folds, not
     // just the cheap jobs upsert.
     insertEvent({ hook_event: "SessionStart" });
     insertEvent({ hook_event: "UserPromptSubmit" });
@@ -1550,7 +1550,7 @@ function getEpic(epicId: string) {
 /**
  * The element shape stored in `epics.tasks` as of schema v19. Schema v7
  * introduced the embedded array; v19 renamed `status` to `worker_phase` and
- * added the planctl-native `runtime_status` sibling (defaults to `"todo"`).
+ * added the plan-native `runtime_status` sibling (defaults to `"todo"`).
  * (fn-756 dropped the `approval` element field.)
  */
 interface EmbeddedTask {
@@ -1560,7 +1560,7 @@ interface EmbeddedTask {
   title: string | null;
   target_repo: string | null;
   /**
-   * Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
+   * Plan-native effort tier (fn-602): rides FREE in the embedded JSON
    * (no schema column, no SCHEMA_VERSION bump). Optional on the test
    * interface because pre-fn-602 events / serialised arrays lack the key;
    * the reducer reads `snapshot.tier ?? null` so a missing field folds to
@@ -1626,15 +1626,15 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     depends_on_epics: "[]",
     // No `plan_ref`-bearing jobs have folded into this epic yet → defaults to "[]".
     jobs: "[]",
-    // No planctl-invocation classifier edges have been folded yet → defaults to "[]".
+    // No plan-invocation classifier edges have been folded yet → defaults to "[]".
     job_links: "[]",
     // No `last_validated_at` in the blob → folds to NULL (the schema column is
     // a plain nullable TEXT, no DEFAULT).
     last_validated_at: null,
-    // Schema v29: created_by_closer_of stays NULL (no planctl links yet);
+    // Schema v29: created_by_closer_of stays NULL (no plan links yet);
     // sort_path is derived immediately when epic_number is known (the
     // EpicSnapshot fold now computes it on first sight so parent chains
-    // resolve without requiring a planctl event on the parent epic).
+    // resolve without requiring a plan event on the parent epic).
     created_by_closer_of: null,
     sort_path: "000001",
     // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
@@ -1669,13 +1669,13 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
-    // fn-602: the producer ships `tier` (planctl `medium|high|xhigh|max`)
+    // fn-602: the producer ships `tier` (plan `medium|high|xhigh|max`)
     // verbatim from the task-def file's top-level `tier` field. Stored
     // opaque — the reducer never branches on the value.
     tier: "high",
     // Schema v19: the producer (plan-worker → daemon → synthetic event)
     // ships BOTH `worker_phase` (renamed from `status`) and `runtime_status`
-    // (planctl-native enum). The legacy `status` is still read defensively
+    // (plan-native enum). The legacy `status` is still read defensively
     // (`worker_phase ?? status`) for re-fold determinism across the v18→v19
     // boundary, but new events ship the new key shape.
     worker_phase: "done",

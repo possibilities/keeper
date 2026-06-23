@@ -1,6 +1,6 @@
 /**
  * Reducer tests — shard 3 of 4 (fn-769 fast-tier split of the former
- * monolithic reducer.test.ts). Theme: embedded jobs, planctl-link fan-out, subagent / input-request / notification projections.
+ * monolithic reducer.test.ts). Theme: embedded jobs, plan-link fan-out, subagent / input-request / notification projections.
  *
  * Each test clones the per-process migrated `:memory:` template via
  * `freshMemDb` (`Database.deserialize` ~0.2ms vs the ~28ms migration
@@ -97,10 +97,10 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a planctl
+    // Schema v30: queue-jump sparse column; NULL unless this is a plan
     // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other planctl event (stamped 0). The test helper defaults to NULL so
-    // every non-planctl event lands NULL — matches the live hook's stamping
+    // other plan event (stamped 0). The test helper defaults to NULL so
+    // every non-plan event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
     plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
@@ -110,8 +110,8 @@ function insertEvent(
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
     // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
-    // the envelope's repo-relative `files` array. NULL on every non-planctl
-    // event; planctl-mint tests pass this explicitly via overrides.
+    // the envelope's repo-relative `files` array. NULL on every non-plan
+    // event; plan-mint tests pass this explicitly via overrides.
     plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every non-zellij
@@ -254,7 +254,7 @@ interface EmbeddedTask {
   title: string | null;
   target_repo: string | null;
   /**
-   * Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
+   * Plan-native effort tier (fn-602): rides FREE in the embedded JSON
    * (no schema column, no SCHEMA_VERSION bump). Optional on the test
    * interface because pre-fn-602 events / serialised arrays lack the key;
    * the reducer reads `snapshot.tier ?? null` so a missing field folds to
@@ -677,7 +677,7 @@ test("TaskSnapshot reducer defensively folds a legacy `status` blob (no `worker_
   // log carries pre-v19 TaskSnapshot blobs that have `status: "open"` and
   // NO `worker_phase` / `runtime_status` keys. The reducer reads
   // `worker_phase ?? status` (= "open") and defaults `runtime_status` to
-  // "todo" per planctl's `merge_task_state` convention. Without those
+  // "todo" per plan's `merge_task_state` convention. Without those
   // defensive reads, a from-scratch re-fold of an existing DB would either
   // throw or land NULL on the embedded element, breaking the byte-identical
   // re-fold invariant.
@@ -857,7 +857,7 @@ test("a job with no plan_ref does not create an epic row (no fan-out)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// syncPlanctlLinks fan-out (schema v14: jobs.epic_links + epics.job_links)
+// syncPlanLinks fan-out (schema v14: jobs.epic_links + epics.job_links)
 // ---------------------------------------------------------------------------
 
 /**
@@ -878,12 +878,12 @@ function planPlanOpener(sessionId: string, ts?: number): number {
 }
 
 /**
- * Insert a stamped planctl invocation event. Mirrors what the hook +
- * `extractPlanctlInvocation` deriver would write — the test bypasses the
+ * Insert a stamped plan invocation event. Mirrors what the hook +
+ * `extractPlanInvocation` deriver would write — the test bypasses the
  * Bash-command parser and stamps the derived columns directly so the
  * fan-out test stays independent of the parser's edge cases.
  */
-function planctlEvent(args: {
+function planEvent(args: {
   sessionId: string;
   op: string;
   target: string | null;
@@ -897,7 +897,7 @@ function planctlEvent(args: {
   // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
   // `events.plan_files` AND inline into the envelope's `state_repo`
   // payload (so the reducer's mint can read `state_repo` from event.data).
-  // Defaults `undefined` — existing tests keep their old null-on-planctl
+  // Defaults `undefined` — existing tests keep their old null-on-plan
   // shape and the mint becomes a no-op for them.
   files?: string[];
   stateRepo?: string;
@@ -906,7 +906,7 @@ function planctlEvent(args: {
   // When mint-test args (`files` + `stateRepo`) are passed, also inline the
   // canonical envelope `{tool_response:{stdout:JSON({planctl_invocation:
   // {state_repo, files, op, target, ...}})}}` into `data` so the reducer's
-  // `extractPlanctlStateRepo` can lift `state_repo` at fold time. Existing
+  // `extractPlanStateRepo` can lift `state_repo` at fold time. Existing
   // tests pass neither and get the default empty `data: '{}'` (mint no-ops).
   const data =
     args.files != null && args.stateRepo != null
@@ -980,10 +980,10 @@ function getJobLinks(epicId: string): {
   return JSON.parse(row.job_links);
 }
 
-test("syncPlanctlLinks: single-session single-window one creator emits creator edge in both directions", () => {
+test("syncPlanLinks: single-session single-window one creator emits creator edge in both directions", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-creator" });
   planPlanOpener("sess-creator");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-creator",
     op: "epic-create",
     target: "fn-1-new",
@@ -1010,7 +1010,7 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
   ]);
 });
 
-test("syncPlanctlLinks: single-session create-then-refine same epic emits ONE creator edge (per-session suppression)", () => {
+test("syncPlanLinks: single-session create-then-refine same epic emits ONE creator edge (per-session suppression)", () => {
   // Windowless (schema v77): a session that creates an epic and later refines
   // the SAME epic emits exactly one `creator` edge — the creator-of-X
   // suppresses the later refiner-of-X within the session. The `/plan:plan`
@@ -1018,7 +1018,7 @@ test("syncPlanctlLinks: single-session create-then-refine same epic emits ONE cr
   // realistic event log.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-cr" });
   planPlanOpener("sess-cr");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-cr",
     op: "epic-create",
     target: "fn-2-foo",
@@ -1026,7 +1026,7 @@ test("syncPlanctlLinks: single-session create-then-refine same epic emits ONE cr
     subjectPresent: true,
   });
   planPlanOpener("sess-cr");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-cr",
     op: "epic-set-title",
     target: "fn-2-foo",
@@ -1054,12 +1054,12 @@ test("syncPlanctlLinks: single-session create-then-refine same epic emits ONE cr
   ]);
 });
 
-test("syncPlanctlLinks: read-only verb in a window emits no edges", () => {
+test("syncPlanLinks: read-only verb in a window emits no edges", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-readonly" });
   planPlanOpener("sess-readonly");
-  // A `planctl cat` is a read-only verb; `subject_present: false` mirrors the
+  // A `keeper plan cat` is a read-only verb; `subject_present: false` mirrors the
   // jobctl `subject is None` skip gate.
-  planctlEvent({
+  planEvent({
     sessionId: "sess-readonly",
     op: "cat",
     target: "fn-3-bar",
@@ -1076,11 +1076,11 @@ test("syncPlanctlLinks: read-only verb in a window emits no edges", () => {
   expect(epicRow).toBeNull();
 });
 
-test("syncPlanctlLinks: two sessions touching the same epic both appear in job_links", () => {
+test("syncPlanLinks: two sessions touching the same epic both appear in job_links", () => {
   // Session A creates the epic.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-a-fan" });
   planPlanOpener("sess-a-fan");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-a-fan",
     op: "epic-create",
     target: "fn-4-multi",
@@ -1090,7 +1090,7 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
   // Session B refines it.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-b-fan" });
   planPlanOpener("sess-b-fan");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-b-fan",
     op: "epic-set-title",
     target: "fn-4-multi",
@@ -1132,7 +1132,7 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
   ]);
 });
 
-test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_links across every session that ever touched it", () => {
+test("syncPlanLinks: cross-session sweep re-derives a touched epic's job_links across every session that ever touched it", () => {
   // Coverage for the cross-session expansion at `src/reducer.ts:1192` (the
   // `SELECT DISTINCT session_id ... WHERE plan_op IS NOT NULL AND
   // (plan_epic_id IN (...) OR plan_target IN (...))` sweep). Without it
@@ -1170,7 +1170,7 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
     ts: 80,
   });
   planPlanOpener("sess-A-xs", 90);
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-xs",
     op: "epic-set-title",
     target: "fn-7-xs",
@@ -1184,7 +1184,7 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
     ts: 190,
   });
   planPlanOpener("sess-B-xs", 200);
-  planctlEvent({
+  planEvent({
     sessionId: "sess-B-xs",
     op: "epic-set-title",
     target: "fn-7-xs",
@@ -1230,7 +1230,7 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
   // Follow-up in session A — backdated `epic-create` at t=100 lands BEFORE
   // the refiner at t=110, so re-classification emits creator-X first which
   // suppresses the refiner via per-window-creator-of-X rule.
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-xs",
     op: "epic-create",
     target: "fn-7-xs",
@@ -1283,11 +1283,11 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
   ]);
 });
 
-test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out works)", () => {
+test("syncPlanLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out works)", () => {
   // Seed a creator edge via the fan-out → a shell epic with job_links.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-carveout" });
   planPlanOpener("sess-carveout");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-carveout",
     op: "epic-create",
     target: "fn-5-survive",
@@ -1344,7 +1344,7 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
 });
 
 // ---------------------------------------------------------------------------
-// Schema v54 / fn-695 (T3): syncPlanctlLinks unions the durable commit-
+// Schema v54 / fn-695 (T3): syncPlanLinks unions the durable commit-
 // trailer facts (Planctl-Op / Planctl-Target / Session-Id, frozen on the
 // `Commit` payload by task .2) with the legacy stdout-scrape rows. A
 // scaffold whose stdout scrape NULLed out still mints a creator edge via
@@ -1355,17 +1355,17 @@ test("syncPlanctlLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out 
 /**
  * Insert a synthetic `Commit` event carrying the fn-695 trailer facts the
  * git-worker freezes on the payload. `committerSessionId` MUST be a valid
- * UUID (extractCommit gates it via UUID_RE) and `planctlOp` is already
+ * UUID (extractCommit gates it via UUID_RE) and `planOp` is already
  * normalized (`scaffold`, not `epic-scaffold`) — mirroring the producer's
- * `normalizePlanctlOp` lift at git-worker time. `committedAtMs/1000` is the
+ * `normalizePlanOp` lift at git-worker time. `committedAtMs/1000` is the
  * classifier ts the `/plan:plan` windows compare against.
  */
 function commitTrailerEvent(args: {
   projectDir: string;
   commitOid: string;
   committerSessionId: string;
-  planctlOp: string | null;
-  planctlTarget: string | null;
+  planOp: string | null;
+  planTarget: string | null;
   committedAtMs: number;
   ts?: number;
 }): number {
@@ -1378,7 +1378,7 @@ function commitTrailerEvent(args: {
       project_dir: args.projectDir,
       commit_oid: args.commitOid,
       parent_oid: null,
-      // A `chore(planctl)` commit names the .planctl JSON it wrote — one
+      // A `chore(plan)` commit names the .planctl JSON it wrote — one
       // file is enough for foldCommit's `files.length === 0` guard to pass.
       files: [
         { path: ".planctl/epics/x.json", blob_oid: null, committed_mode: null },
@@ -1388,10 +1388,10 @@ function commitTrailerEvent(args: {
       // Commit-event `data` payload keys — written by the git-worker trailer
       // layer (Decision B, out of scope for the v78 rename) and read back by
       // `extractCommit` via `obj.planctl_op` / `obj.planctl_target`. STAY
-      // `planctl_*` even though the `commit_trailer_facts` columns they feed are
+      // `plan_*` even though the `commit_trailer_facts` columns they feed are
       // now `plan_*`.
-      planctl_op: args.planctlOp,
-      planctl_target: args.planctlTarget,
+      planctl_op: args.planOp,
+      planctl_target: args.planTarget,
       committed_at_ms: args.committedAtMs,
     }),
   });
@@ -1399,18 +1399,18 @@ function commitTrailerEvent(args: {
 
 test("fn-695: commit-only scaffold (scrape NULL) still mints a creator edge via the commit trailer", () => {
   // The fn-635-class fix-forward proof. The session opened /plan:plan and
-  // ran `planctl scaffold` BUT its stdout was piped through grep, so the
+  // ran `keeper plan scaffold` BUT its stdout was piped through grep, so the
   // envelope scrape never landed (`events.plan_op` is NULL — we insert
-  // NO planctlEvent at all). The durable commit trailer carries the op.
+  // NO planEvent at all). The durable commit trailer carries the op.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
-  // No planctlEvent — the scrape NULLed out (the whole point of fn-695).
+  // No planEvent — the scrape NULLed out (the whole point of fn-695).
   commitTrailerEvent({
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-1-commitonly",
+    planOp: "scaffold",
+    planTarget: "fn-1-commitonly",
     committedAtMs: 5_000_000, // ts=5000, inside the open-ended window
   });
   drainAll();
@@ -1440,7 +1440,7 @@ test("fn-695: scrape + commit for the same (epic, kind, job) dedup to one creato
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
   // Scrape channel: the stdout envelope DID land this time.
-  planctlEvent({
+  planEvent({
     sessionId: TEST_UUID,
     op: "epic-scaffold",
     target: "fn-2-dedup",
@@ -1453,8 +1453,8 @@ test("fn-695: scrape + commit for the same (epic, kind, job) dedup to one creato
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-2-dedup",
+    planOp: "scaffold",
+    planTarget: "fn-2-dedup",
     committedAtMs: 5_000_000,
   });
   drainAll();
@@ -1485,7 +1485,7 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
   // commitTrailerSessionsForEpics widening).
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
-  planctlEvent({
+  planEvent({
     sessionId: TEST_UUID,
     op: "epic-create",
     target: "fn-3-refine",
@@ -1500,8 +1500,8 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID_2,
-    planctlOp: "set-title",
-    planctlTarget: "fn-3-refine",
+    planOp: "set-title",
+    planTarget: "fn-3-refine",
     committedAtMs: 6_000_000,
   });
   drainAll();
@@ -1542,7 +1542,7 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
 });
 
 test("fn-695: pre-feature Commit event (NULL plan_op/target) mints no edge", () => {
-  // A historical / non-planctl Commit (a source commit, or a pre-fn-695
+  // A historical / non-plan Commit (a source commit, or a pre-fn-695
   // chore commit whose payload predates the trailer fields). extractCommit
   // defaults plan_op/target to null → the foldCommit trigger gate is
   // closed → no edge. Re-fold no-op over the historical log.
@@ -1552,8 +1552,8 @@ test("fn-695: pre-feature Commit event (NULL plan_op/target) mints no edge", () 
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: null,
-    planctlTarget: null,
+    planOp: null,
+    planTarget: null,
     committedAtMs: 5_000_000,
   });
   drainAll();
@@ -1576,8 +1576,8 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-9-refold",
+    planOp: "scaffold",
+    planTarget: "fn-9-refold",
     committedAtMs: 5_000_000,
   });
   // Pre-feature Commit — re-fold no-op.
@@ -1585,8 +1585,8 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID,
-    planctlOp: null,
-    planctlTarget: null,
+    planOp: null,
+    planTarget: null,
     committedAtMs: 6_000_000,
   });
   expect(drainAll()).toBeGreaterThan(0);
@@ -1617,7 +1617,7 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
 
 // ---------------------------------------------------------------------------
 // fn-807.1: the commit-trailer channel now performs ONE scan per
-// syncPlanctlLinks call (loadAllCommitTrailerFacts) instead of the old ~2 +
+// syncPlanLinks call (loadAllCommitTrailerFacts) instead of the old ~2 +
 // one-per-swept-session blob scans, and no SQL json_extract rides the WHERE —
 // every survivor parses in JS via extractCommit (never throws). These cover
 // the two load-bearing equivalences: malformed Commit data folds to no-facts
@@ -1641,8 +1641,8 @@ test("fn-807.1: a malformed Commit data blob folds to no trailer facts without t
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-1-ok",
+    planOp: "scaffold",
+    planTarget: "fn-1-ok",
     committedAtMs: 5_000_000,
   });
   // A malformed Commit blob (not valid JSON). extractCommit returns null →
@@ -1662,7 +1662,7 @@ test("fn-807.1: a malformed Commit data blob folds to no trailer facts without t
 
 test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (scrape + inline + commit-only session + malformed)", () => {
   // The whole-task equivalence proof. Seed the full mix the single-scan loader
-  // must reproduce: a scrape-side planctl creator, a commit dedup of that same
+  // must reproduce: a scrape-side plan creator, a commit dedup of that same
   // op, an inline trailer Commit (Commit is keep-set post-shed), a commit-only
   // session whose scrape NULLed out, and one malformed Commit blob (a no-fact
   // no-throw). The re-fold from cursor=0 must reproduce byte-identical jobs / epics.
@@ -1671,7 +1671,7 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
   // SAME op — the channels dedup to one creator edge.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
-  planctlEvent({
+  planEvent({
     sessionId: TEST_UUID,
     op: "epic-scaffold",
     target: "fn-1-mix",
@@ -1683,8 +1683,8 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-1-mix",
+    planOp: "scaffold",
+    planTarget: "fn-1-mix",
     committedAtMs: 5_000_000,
   });
 
@@ -1698,8 +1698,8 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID_2,
-    planctlOp: "set-title",
-    planctlTarget: "fn-1-mix",
+    planOp: "set-title",
+    planTarget: "fn-1-mix",
     committedAtMs: 6_000_000,
   });
 
@@ -1711,8 +1711,8 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
     projectDir: "/repo",
     commitOid: TEST_OID_3,
     committerSessionId: TEST_UUID_3,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-2-only",
+    planOp: "scaffold",
+    planTarget: "fn-2-only",
     committedAtMs: 7_000_000,
   });
 
@@ -1793,8 +1793,8 @@ test("fn-807.2: foldCommit writes a commit_trailer_facts row in the same transac
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "set-title",
-    planctlTarget: "fn-5-fact.2",
+    planOp: "set-title",
+    planTarget: "fn-5-fact.2",
     committedAtMs: 5_000_000,
   });
   drainAll();
@@ -1817,7 +1817,7 @@ test("fn-807.2: foldCommit writes a commit_trailer_facts row in the same transac
   ]);
 });
 
-test("fn-807.2: a non-planctl / pre-feature Commit writes no fact row", () => {
+test("fn-807.2: a non-plan / pre-feature Commit writes no fact row", () => {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
   // NULL op/target — the foldCommit fact-write condition is closed.
@@ -1825,27 +1825,27 @@ test("fn-807.2: a non-planctl / pre-feature Commit writes no fact row", () => {
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: null,
-    planctlTarget: null,
+    planOp: null,
+    planTarget: null,
     committedAtMs: 5_000_000,
   });
   drainAll();
   expect(getCommitTrailerFacts()).toEqual([]);
 });
 
-test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identically (inline + malformed + non-planctl in the log)", () => {
-  // Session 1: an inline planctl-trailer scaffold → one fact row + creator edge.
+test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identically (inline + malformed + non-plan in the log)", () => {
+  // Session 1: an inline plan-trailer scaffold → one fact row + creator edge.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
   commitTrailerEvent({
     projectDir: "/repo",
     commitOid: TEST_OID,
     committerSessionId: TEST_UUID,
-    planctlOp: "scaffold",
-    planctlTarget: "fn-1-ctf",
+    planOp: "scaffold",
+    planTarget: "fn-1-ctf",
     committedAtMs: 5_000_000,
   });
-  // Session 2: a second planctl trailer (Commit is keep-set post-shed, body
+  // Session 2: a second plan trailer (Commit is keep-set post-shed, body
   // inline) → fact row via the loader. foldCommit writes the fact from
   // events.data at fold time; the re-fold reproduces it from the same inline body.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
@@ -1854,8 +1854,8 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID_2,
-    planctlOp: "set-title",
-    planctlTarget: "fn-1-ctf",
+    planOp: "set-title",
+    planTarget: "fn-1-ctf",
     committedAtMs: 6_000_000,
   });
   // A malformed Commit blob → no fact, no throw.
@@ -1864,13 +1864,13 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
     session_id: "/repo",
     data: "}{garbage",
   });
-  // A non-planctl Commit → no fact.
+  // A non-plan Commit → no fact.
   commitTrailerEvent({
     projectDir: "/repo",
     commitOid: TEST_OID_3,
     committerSessionId: TEST_UUID_3,
-    planctlOp: null,
-    planctlTarget: null,
+    planOp: null,
+    planTarget: null,
     committedAtMs: 7_000_000,
   });
   expect(drainAll()).toBeGreaterThan(0);
@@ -1904,7 +1904,7 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
 });
 
 // ---------------------------------------------------------------------------
-// Schema v29: syncPlanctlLinks computes `created_by_closer_of` + `sort_path`
+// Schema v29: syncPlanLinks computes `created_by_closer_of` + `sort_path`
 // + transitive cascade on the epics projection
 // ---------------------------------------------------------------------------
 
@@ -1925,14 +1925,14 @@ function getEpicSortFields(
   } | null;
 }
 
-test("syncPlanctlLinks v29: plain epic with no closer ancestry → created_by_closer_of=NULL, sort_path=zeroPad6(epic_number)", () => {
+test("syncPlanLinks v29: plain epic with no closer ancestry → created_by_closer_of=NULL, sort_path=zeroPad6(epic_number)", () => {
   // Seed: a plain creator session (not a closer) creates fn-1-plain. The
   // creator's plan_verb is null (no spawn_name parsing), so
   // `created_by_closer_of` resolves to NULL and sort_path falls to the
   // zero-padded epic_number.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-plain-v29" });
   planPlanOpener("sess-plain-v29");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plain-v29",
     op: "epic-create",
     target: "fn-1-plain",
@@ -1951,9 +1951,9 @@ test("syncPlanctlLinks v29: plain epic with no closer ancestry → created_by_cl
       status: "open",
     }),
   });
-  // Trigger one more planctl event so syncPlanctlLinks re-runs with the
+  // Trigger one more plan event so syncPlanLinks re-runs with the
   // epic_number now visible.
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plain-v29",
     op: "epic-set-title",
     target: "fn-1-plain",
@@ -1967,7 +1967,7 @@ test("syncPlanctlLinks v29: plain epic with no closer ancestry → created_by_cl
   });
 });
 
-test("syncPlanctlLinks v77: closer session with NO /plan:plan opener produces the creator edge AND populates created_by_closer_of", () => {
+test("syncPlanLinks v77: closer session with NO /plan:plan opener produces the creator edge AND populates created_by_closer_of", () => {
   // The headline windowless win (fn-856). A `close::fn-3-parent` closer
   // session scaffolds its follow-up epic fn-9-followup WITHOUT ever invoking
   // `/plan:plan` — exactly the population the time-window gate silently
@@ -1992,7 +1992,7 @@ test("syncPlanctlLinks v77: closer session with NO /plan:plan opener produces th
     }),
   });
   // The closer scaffolds its follow-up — no /plan:plan window in this session.
-  planctlEvent({
+  planEvent({
     sessionId: "sess-closer-noopener",
     op: "epic-scaffold",
     target: "fn-9-followup",
@@ -2009,8 +2009,8 @@ test("syncPlanctlLinks v77: closer session with NO /plan:plan opener produces th
       status: "open",
     }),
   });
-  // One more mutation so syncPlanctlLinks re-runs with epic_number known.
-  planctlEvent({
+  // One more mutation so syncPlanLinks re-runs with epic_number known.
+  planEvent({
     sessionId: "sess-closer-noopener",
     op: "epic-set-title",
     target: "fn-9-followup",
@@ -2045,7 +2045,7 @@ test("syncPlanctlLinks v77: closer session with NO /plan:plan opener produces th
   });
 });
 
-test("syncPlanctlLinks v29: closer-created epic single level → created_by_closer_of=parent, sort_path=parent.zeroPad6(epic_number)", () => {
+test("syncPlanLinks v29: closer-created epic single level → created_by_closer_of=parent, sort_path=parent.zeroPad6(epic_number)", () => {
   // Closer session for fn-3-foo (plan_verb='close', plan_ref='fn-3-foo')
   // creates fn-7-bar via /plan:plan + epic-create. The derivation
   // resolves `created_by_closer_of` to the closer's plan_ref ('fn-3-foo')
@@ -2069,7 +2069,7 @@ test("syncPlanctlLinks v29: closer-created epic single level → created_by_clos
   });
   // The closer session now opens a plan window and creates fn-7-bar.
   planPlanOpener("sess-closer-fn3");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-closer-fn3",
     op: "epic-create",
     target: "fn-7-bar",
@@ -2077,7 +2077,7 @@ test("syncPlanctlLinks v29: closer-created epic single level → created_by_clos
     subjectPresent: true,
   });
   // EpicSnapshot for fn-7-bar so its epic_number is visible to the
-  // syncPlanctlLinks derivation.
+  // syncPlanLinks derivation.
   insertEvent({
     hook_event: "EpicSnapshot",
     session_id: "fn-7-bar",
@@ -2088,9 +2088,9 @@ test("syncPlanctlLinks v29: closer-created epic single level → created_by_clos
       status: "open",
     }),
   });
-  // One more planctl event in the closer session to re-trigger
-  // syncPlanctlLinks with the epic_number now known.
-  planctlEvent({
+  // One more plan event in the closer session to re-trigger
+  // syncPlanLinks with the epic_number now known.
+  planEvent({
     sessionId: "sess-closer-fn3",
     op: "epic-set-title",
     target: "fn-7-bar",
@@ -2104,13 +2104,13 @@ test("syncPlanctlLinks v29: closer-created epic single level → created_by_clos
   });
 });
 
-test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 000003.000007.000011", () => {
-  // Parent fn-3-foo: a plain planning session creates it. A planctl event
+test("syncPlanLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 000003.000007.000011", () => {
+  // Parent fn-3-foo: a plain planning session creates it. A plan event
   // targeting an epic is what wakes the derivation — an EpicSnapshot alone
   // does not.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-plan-fn3" });
   planPlanOpener("sess-plan-fn3");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plan-fn3",
     op: "epic-create",
     target: "fn-3-foo",
@@ -2127,7 +2127,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plan-fn3",
     op: "epic-set-title",
     target: "fn-3-foo",
@@ -2141,7 +2141,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
     spawn_name: "close::fn-3-foo",
   });
   planPlanOpener("sess-c3");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-c3",
     op: "epic-create",
     target: "fn-7-bar",
@@ -2158,7 +2158,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-c3",
     op: "epic-set-title",
     target: "fn-7-bar",
@@ -2172,7 +2172,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
     spawn_name: "close::fn-7-bar",
   });
   planPlanOpener("sess-c7");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-c7",
     op: "epic-create",
     target: "fn-11-baz",
@@ -2189,7 +2189,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-c7",
     op: "epic-set-title",
     target: "fn-11-baz",
@@ -2208,7 +2208,7 @@ test("syncPlanctlLinks v29: chain depth 2 → fn-3 → fn-7 → fn-11 composes 0
   });
 });
 
-test("syncPlanctlLinks v29: chain depth 3 has no truncation", () => {
+test("syncPlanLinks v29: chain depth 3 has no truncation", () => {
   // fn-2 → fn-4 → fn-8 → fn-16, each level via a closer session.
   const levels: [string, number, string | null][] = [
     ["fn-2-l0", 2, null],
@@ -2225,7 +2225,7 @@ test("syncPlanctlLinks v29: chain depth 3 has no truncation", () => {
         spawn_name: `close::${parent}`,
       });
       planPlanOpener(sess);
-      planctlEvent({
+      planEvent({
         sessionId: sess,
         op: "epic-create",
         target: id,
@@ -2244,7 +2244,7 @@ test("syncPlanctlLinks v29: chain depth 3 has no truncation", () => {
       }),
     });
     if (parent != null) {
-      planctlEvent({
+      planEvent({
         sessionId: `sess-${id}`,
         op: "epic-set-title",
         target: id,
@@ -2260,10 +2260,10 @@ test("syncPlanctlLinks v29: chain depth 3 has no truncation", () => {
   });
 });
 
-test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeholder, parent EpicSnapshot triggers cascade re-stamp", () => {
+test("syncPlanLinks v29: parent-missing event ordering → child gets placeholder, parent EpicSnapshot triggers cascade re-stamp", () => {
   // Child folds first: its parent fn-3-foo has no EpicSnapshot yet. The
   // derivation falls back to `zeroPad6(child.epic_number)` (placeholder).
-  // Then the parent's EpicSnapshot lands AND a follow-up planctl event in
+  // Then the parent's EpicSnapshot lands AND a follow-up plan event in
   // the parent's session triggers the cascade re-stamp to the canonical
   // value.
   insertEvent({
@@ -2272,7 +2272,7 @@ test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeho
     spawn_name: "close::fn-3-missing",
   });
   planPlanOpener("sess-closer-missing");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-closer-missing",
     op: "epic-create",
     target: "fn-7-orphan",
@@ -2289,9 +2289,9 @@ test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeho
       status: "open",
     }),
   });
-  // One more planctl event to re-trigger syncPlanctlLinks now that
+  // One more plan event to re-trigger syncPlanLinks now that
   // epic_number is visible.
-  planctlEvent({
+  planEvent({
     sessionId: "sess-closer-missing",
     op: "epic-set-title",
     target: "fn-7-orphan",
@@ -2320,12 +2320,12 @@ test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeho
   });
   drainAll();
   // The parent itself is plain (no closer creator); just inserting the
-  // EpicSnapshot doesn't trigger a syncPlanctlLinks pass on the parent
-  // (only a planctl event does). Fire a planctl event in some session
+  // EpicSnapshot doesn't trigger a syncPlanLinks pass on the parent
+  // (only a plan event does). Fire a plan event in some session
   // touching the parent to wake the fan-out — a refiner edit suffices.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-edit-parent" });
   planPlanOpener("sess-edit-parent");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-edit-parent",
     op: "epic-set-title",
     target: "fn-3-missing",
@@ -2342,7 +2342,7 @@ test("syncPlanctlLinks v29: parent-missing event ordering → child gets placeho
   });
 });
 
-test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among multiple closers", () => {
+test("syncPlanLinks v29: creator tie-break picks lowest job_id ASC among multiple closers", () => {
   // Two closer sessions BOTH create the same child epic. (Pathological
   // but possible: two arthack-spawned closers running in parallel against
   // the same `close::fn-2-tie` window before one wins.) The tie-break
@@ -2381,7 +2381,7 @@ test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among mult
   });
   // Both sessions create the same child.
   planPlanOpener("sess-A-tie");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-tie",
     op: "epic-create",
     target: "fn-5-tied-child",
@@ -2389,7 +2389,7 @@ test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among mult
     subjectPresent: true,
   });
   planPlanOpener("sess-B-tie");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-B-tie",
     op: "epic-create",
     target: "fn-5-tied-child",
@@ -2406,8 +2406,8 @@ test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among mult
       status: "open",
     }),
   });
-  // Wake a fresh syncPlanctlLinks pass with the child's epic_number known.
-  planctlEvent({
+  // Wake a fresh syncPlanLinks pass with the child's epic_number known.
+  planEvent({
     sessionId: "sess-A-tie",
     op: "epic-set-title",
     target: "fn-5-tied-child",
@@ -2421,7 +2421,7 @@ test("syncPlanctlLinks v29: creator tie-break picks lowest job_id ASC among mult
   );
 });
 
-test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer_of + sort_path (carve-out v29)", () => {
+test("syncPlanLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer_of + sort_path (carve-out v29)", () => {
   // Closer creates child, sort_path resolves. Then an EpicSnapshot for the
   // child re-folds (e.g. an approval RPC round-trip). Both new columns
   // MUST survive the ON CONFLICT — without the carve-out the
@@ -2442,7 +2442,7 @@ test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer
     }),
   });
   planPlanOpener("sess-carve29");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-carve29",
     op: "epic-create",
     target: "fn-7-c29",
@@ -2459,7 +2459,7 @@ test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-carve29",
     op: "epic-set-title",
     target: "fn-7-c29",
@@ -2494,7 +2494,7 @@ test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer
   });
 });
 
-test("syncPlanctlLinks v29: epic_number >= 1_000_000 safe-folds to sort_path='' (no throw, cursor advances)", () => {
+test("syncPlanLinks v29: epic_number >= 1_000_000 safe-folds to sort_path='' (no throw, cursor advances)", () => {
   // Synthetic event with an absurd epic_number — the documented ceiling
   // is 999,999. Reducer must never throw inside BEGIN IMMEDIATE; the
   // safe-fold writes sort_path=''.
@@ -2510,7 +2510,7 @@ test("syncPlanctlLinks v29: epic_number >= 1_000_000 safe-folds to sort_path='' 
     }),
   });
   planPlanOpener("sess-overflow");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-overflow",
     op: "epic-set-title",
     target: "fn-x-overflow",
@@ -2525,7 +2525,7 @@ test("syncPlanctlLinks v29: epic_number >= 1_000_000 safe-folds to sort_path='' 
   });
 });
 
-test("syncPlanctlLinks v29: re-fold determinism preserves byte-identical (created_by_closer_of, sort_path) on every epic", () => {
+test("syncPlanLinks v29: re-fold determinism preserves byte-identical (created_by_closer_of, sort_path) on every epic", () => {
   // Build a non-trivial state via a closer-driven chain, capture every
   // epic row, rewind + DELETE + drain, capture again, byte-compare.
   insertEvent({
@@ -2544,7 +2544,7 @@ test("syncPlanctlLinks v29: re-fold determinism preserves byte-identical (create
     spawn_name: "close::fn-3-r29",
   });
   planPlanOpener("sess-r29");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-r29",
     op: "epic-create",
     target: "fn-7-r29",
@@ -2561,7 +2561,7 @@ test("syncPlanctlLinks v29: re-fold determinism preserves byte-identical (create
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-r29",
     op: "epic-set-title",
     target: "fn-7-r29",
@@ -2602,14 +2602,14 @@ function getEpicQueueState(
     .get(epicId) as { queue_jump: number; sort_path: string } | null;
 }
 
-test("syncPlanctlLinks v30: root epic with queue_jump=true → epics.queue_jump=1, sort_path='!<padded>'", () => {
+test("syncPlanLinks v30: root epic with queue_jump=true → epics.queue_jump=1, sort_path='!<padded>'", () => {
   // The canonical `/plan:queue` flow: scaffold envelope carries
   // `queue_jump: true`; hook stamps `plan_queue_jump = 1` on the event;
   // reducer projects `epics.queue_jump = 1` AND prepends `!` to the
   // sort_path (root → `created_by_closer_of IS NULL`).
   insertEvent({ hook_event: "SessionStart", session_id: "sess-queued-root" });
   planPlanOpener("sess-queued-root");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-root",
     op: "scaffold",
     target: "fn-700-queued",
@@ -2627,8 +2627,8 @@ test("syncPlanctlLinks v30: root epic with queue_jump=true → epics.queue_jump=
       status: "open",
     }),
   });
-  // Re-trigger syncPlanctlLinks with the epic_number now visible.
-  planctlEvent({
+  // Re-trigger syncPlanLinks with the epic_number now visible.
+  planEvent({
     sessionId: "sess-queued-root",
     op: "epic-set-title",
     target: "fn-700-queued",
@@ -2642,13 +2642,13 @@ test("syncPlanctlLinks v30: root epic with queue_jump=true → epics.queue_jump=
   });
 });
 
-test("syncPlanctlLinks v30: root epic with queue_jump=false → queue_jump=0, plain padded sort_path", () => {
+test("syncPlanLinks v30: root epic with queue_jump=false → queue_jump=0, plain padded sort_path", () => {
   // The `/plan:defer` and every other non-queue scaffold path: envelope
   // either omits queue_jump or sets it to `false`. Reducer projects
   // queue_jump=0 and stamps a plain (no `!` prefix) sort_path.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-defer-root" });
   planPlanOpener("sess-defer-root");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-defer-root",
     op: "scaffold",
     target: "fn-701-deferred",
@@ -2666,7 +2666,7 @@ test("syncPlanctlLinks v30: root epic with queue_jump=false → queue_jump=0, pl
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-defer-root",
     op: "epic-set-title",
     target: "fn-701-deferred",
@@ -2680,7 +2680,7 @@ test("syncPlanctlLinks v30: root epic with queue_jump=false → queue_jump=0, pl
   });
 });
 
-test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children via parentPath string concat", () => {
+test("syncPlanLinks v30: cascade propagates `!`-prefix to closer-of children via parentPath string concat", () => {
   // A queue-jumped parent's `!`-prefix MUST propagate to every transitive
   // closer-of descendant. The cascade has no separate queue-jump awareness
   // — the prefix is already baked into the parent's sort_path string and
@@ -2690,7 +2690,7 @@ test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children 
     session_id: "sess-queued-parent",
   });
   planPlanOpener("sess-queued-parent");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-parent",
     op: "scaffold",
     target: "fn-720-queued-parent",
@@ -2708,7 +2708,7 @@ test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children 
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-parent",
     op: "epic-set-title",
     target: "fn-720-queued-parent",
@@ -2722,7 +2722,7 @@ test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children 
     spawn_name: "close::fn-720-queued-parent",
   });
   planPlanOpener("sess-child-of-queued");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-child-of-queued",
     op: "epic-create",
     target: "fn-721-child",
@@ -2739,7 +2739,7 @@ test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children 
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-child-of-queued",
     op: "epic-set-title",
     target: "fn-721-child",
@@ -2760,7 +2760,7 @@ test("syncPlanctlLinks v30: cascade propagates `!`-prefix to closer-of children 
   });
 });
 
-test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path verbatim (no double-prefix)", () => {
+test("syncPlanLinks v30: non-root queue-jumped epic inherits parent's path verbatim (no double-prefix)", () => {
   // A queue-jumped epic with `created_by_closer_of` set (non-root) still
   // projects queue_jump=1 for symmetry, but its sort_path follows the
   // standard `<parent.sort_path>.<padded>` derivation — NO extra `!`
@@ -2771,7 +2771,7 @@ test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path ve
     session_id: "sess-plain-parent-v30",
   });
   planPlanOpener("sess-plain-parent-v30");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plain-parent-v30",
     op: "epic-create",
     target: "fn-730-plain-parent",
@@ -2788,7 +2788,7 @@ test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path ve
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-plain-parent-v30",
     op: "epic-set-title",
     target: "fn-730-plain-parent",
@@ -2802,7 +2802,7 @@ test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path ve
     spawn_name: "close::fn-730-plain-parent",
   });
   planPlanOpener("sess-queued-nonroot-child");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-nonroot-child",
     op: "scaffold",
     target: "fn-731-queued-nonroot",
@@ -2820,7 +2820,7 @@ test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path ve
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-nonroot-child",
     op: "epic-set-title",
     target: "fn-731-queued-nonroot",
@@ -2841,7 +2841,7 @@ test("syncPlanctlLinks v30: non-root queue-jumped epic inherits parent's path ve
   });
 });
 
-test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLICT carve-out)", () => {
+test("syncPlanLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLICT carve-out)", () => {
   // The mandatory snapshot carve-out: a re-folded EpicSnapshot (e.g. an
   // approval RPC round-trip) MUST NOT wipe `queue_jump` back to 0. Set up
   // a queued root, then re-fold its snapshot with a different status /
@@ -2851,7 +2851,7 @@ test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLI
     session_id: "sess-carve30",
   });
   planPlanOpener("sess-carve30");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-carve30",
     op: "scaffold",
     target: "fn-740-carve30",
@@ -2869,7 +2869,7 @@ test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLI
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-carve30",
     op: "epic-set-title",
     target: "fn-740-carve30",
@@ -2905,7 +2905,7 @@ test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLI
   });
 });
 
-test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_jump + sort_path", () => {
+test("syncPlanLinks v30: re-fold determinism preserves byte-identical queue_jump + sort_path", () => {
   // Drive a queue-jumped state, capture every epic row, rewind + DELETE
   // + drain, capture again, byte-compare. Mirrors the v29 re-fold test.
   insertEvent({
@@ -2913,7 +2913,7 @@ test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_j
     session_id: "sess-queued-r30",
   });
   planPlanOpener("sess-queued-r30");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-r30",
     op: "scaffold",
     target: "fn-750-r30",
@@ -2931,7 +2931,7 @@ test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_j
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-queued-r30",
     op: "epic-set-title",
     target: "fn-750-r30",
@@ -2945,7 +2945,7 @@ test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_j
     spawn_name: "close::fn-750-r30",
   });
   planPlanOpener("sess-r30-child");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-r30-child",
     op: "epic-create",
     target: "fn-751-r30-child",
@@ -2962,7 +2962,7 @@ test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_j
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-r30-child",
     op: "epic-set-title",
     target: "fn-751-r30-child",
@@ -2986,7 +2986,7 @@ test("syncPlanctlLinks v30: re-fold determinism preserves byte-identical queue_j
   expect(epicsAfter).toBe(epicsBefore);
 });
 
-test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number under shared `!` prefix", () => {
+test("syncPlanLinks v30: multiple queue-jumped roots sort FIFO by epic_number under shared `!` prefix", () => {
   // FIFO semantics (chosen design — see epic spec §"Alternatives"): three
   // queue-jumped roots stamped at different epic_numbers should sort in
   // ascending epic_number order. The shared `!` prefix lifts them above
@@ -2996,7 +2996,7 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
     const sess = `sess-fifo-${num}`;
     insertEvent({ hook_event: "SessionStart", session_id: sess });
     planPlanOpener(sess);
-    planctlEvent({
+    planEvent({
       sessionId: sess,
       op: "scaffold",
       target: `fn-${num}-fifo`,
@@ -3014,7 +3014,7 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
         status: "open",
       }),
     });
-    planctlEvent({
+    planEvent({
       sessionId: sess,
       op: "epic-set-title",
       target: `fn-${num}-fifo`,
@@ -3026,7 +3026,7 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
   // queued roots — `!` (0x21) < `0` (0x30) under BINARY collation.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-fifo-plain" });
   planPlanOpener("sess-fifo-plain");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-fifo-plain",
     op: "epic-create",
     target: "fn-769-plain-after",
@@ -3043,7 +3043,7 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
       status: "open",
     }),
   });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-fifo-plain",
     op: "epic-set-title",
     target: "fn-769-plain-after",
@@ -3067,14 +3067,14 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
   ]);
 });
 
-test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
+test("syncPlanLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
   // Drive a full session: a creator + a same-session task-create (the refiner
   // is suppressed by per-session creator-suppression), plus a cross-session
   // refiner so both projections accumulate. The re-fold must reproduce the same
   // rows byte-for-byte regardless of the suppression outcome.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-A-det" });
   planPlanOpener("sess-A-det");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-det",
     op: "epic-create",
     target: "fn-6-det",
@@ -3082,7 +3082,7 @@ test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces 
     subjectPresent: true,
   });
   planPlanOpener("sess-A-det");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-det",
     op: "task-create",
     target: "fn-6-det.1",
@@ -3092,7 +3092,7 @@ test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces 
   });
   insertEvent({ hook_event: "SessionStart", session_id: "sess-B-det" });
   planPlanOpener("sess-B-det");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-B-det",
     op: "epic-set-title",
     target: "fn-6-det",
@@ -3122,7 +3122,7 @@ test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces 
 // ---------------------------------------------------------------------------
 
 test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded state on every linked epic", () => {
-  // Seed: a planctl creator edge → epic gets a job_links entry whose
+  // Seed: a plan creator edge → epic gets a job_links entry whose
   // initial enriched state is "stopped" (the jobs row's default after
   // SessionStart). A subsequent UserPromptSubmit flips state to
   // "working" and the reverse fan-out must re-stamp the entry. The fold
@@ -3130,7 +3130,7 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
   // [working]` job-link line; no readiness predicate consumes it.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-flip" });
   planPlanOpener("sess-flip");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-flip",
     op: "epic-create",
     target: "fn-12-flip",
@@ -3182,7 +3182,7 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
 test("syncJobLinksOnJobWrite: title update on TranscriptTitle re-stamps embedded title on every linked epic", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-title" });
   planPlanOpener("sess-title");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-title",
     op: "epic-create",
     target: "fn-13-title",
@@ -3209,7 +3209,7 @@ test("syncJobLinksOnJobWrite: RateLimited (legacy alias) sets last_api_error_at 
   // Set up a working session linked to an epic.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-rl" });
   planPlanOpener("sess-rl");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-rl",
     op: "epic-create",
     target: "fn-14-rl",
@@ -3263,7 +3263,7 @@ test("syncJobLinksOnJobWrite: ApiError (new mint) with data.kind='rate_limit' fo
   // folded through ONE api-error event of the opposite arm.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-rl-legacy" });
   planPlanOpener("sess-rl-legacy");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-rl-legacy",
     op: "epic-create",
     target: "fn-16-rl-legacy",
@@ -3281,7 +3281,7 @@ test("syncJobLinksOnJobWrite: ApiError (new mint) with data.kind='rate_limit' fo
 
   insertEvent({ hook_event: "SessionStart", session_id: "sess-rl-new" });
   planPlanOpener("sess-rl-new");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-rl-new",
     op: "epic-create",
     target: "fn-16-rl-new",
@@ -3488,7 +3488,7 @@ test("ApiError fold: terminal-row guard preserved — ApiError on an 'ended' / '
 });
 
 test("syncJobLinksOnJobWrite: short-circuits when jobs.epic_links is '[]' (no fan-out)", () => {
-  // A bare SessionStart with no planctl footprint — `jobs.epic_links`
+  // A bare SessionStart with no plan footprint — `jobs.epic_links`
   // is `'[]'` and the reverse fan-out short-circuits on the
   // pre-parse byte-compare. Sanity check: no epic row is created and
   // no error is raised.
@@ -3510,7 +3510,7 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
   // would silently lose B's edge on every A jobs-write.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-A-carve" });
   planPlanOpener("sess-A-carve");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-A-carve",
     op: "epic-create",
     target: "fn-15-carve",
@@ -3519,7 +3519,7 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
   });
   insertEvent({ hook_event: "SessionStart", session_id: "sess-B-carve" });
   planPlanOpener("sess-B-carve");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-B-carve",
     op: "epic-set-title",
     target: "fn-15-carve",
@@ -3577,7 +3577,7 @@ test("syncJobLinksOnJobWrite: Killed state flip propagates to epics.job_links", 
   // Seed: SessionStart with explicit (pid, start_time) so the Killed
   // event's strict-match path fires (the loose pid-only branch is the
   // legacy-row exception, not what we want to exercise). Then drive a
-  // planctl creator edge so `jobs.epic_links` is non-empty and the
+  // plan creator edge so `jobs.epic_links` is non-empty and the
   // reverse fan-out has a target.
   insertEvent({
     hook_event: "SessionStart",
@@ -3586,7 +3586,7 @@ test("syncJobLinksOnJobWrite: Killed state flip propagates to epics.job_links", 
     start_time: "macos:Wed May 26 12:00:00 2026",
   });
   planPlanOpener("sess-kill");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-kill",
     op: "epic-create",
     target: "fn-17-kill",
@@ -3612,19 +3612,19 @@ test("syncJobLinksOnJobWrite: Killed state flip propagates to epics.job_links", 
   expect(getJobLinks("fn-17-kill")[0]?.state).toBe("killed");
 });
 
-test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (no throw inside fold)", () => {
+test("syncPlanLinks: missing jobs row at enrichment defaults to safe values (no throw inside fold)", () => {
   // The classifier's deriveJobLinks runs OVER the events log directly
   // and can emit edges for sessions that have NO backing jobs row
-  // (planctl invocation without a SessionStart — an orphan). The
+  // (plan invocation without a SessionStart — an orphan). The
   // enrichment helper must fold the missing row to defaults rather
   // than throw; rolling back the cursor would wedge the reducer.
   //
-  // Drive an orphan planctl invocation: no SessionStart for the
-  // session, just a window opener + a planctl create event. The
+  // Drive an orphan plan invocation: no SessionStart for the
+  // session, just a window opener + a plan create event. The
   // backing jobs row never gets inserted; the epic's job_links entry
   // for this session must land with `enrichJobLink`'s defaults.
   planPlanOpener("sess-orphan");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-orphan",
     op: "epic-create",
     target: "fn-16-orphan",
@@ -3655,7 +3655,7 @@ test("syncPlanctlLinks: missing jobs row at enrichment defaults to safe values (
   ]);
 });
 
-test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank enriched fields", () => {
+test("syncPlanLinks: widened-shape EpicSnapshot ON CONFLICT does not blank enriched fields", () => {
   // Mirror the classic carve-out test but assert the WIDENED-shape
   // payload survives. Without the carve-out, an approval RPC → file
   // write → file-watcher → EpicSnapshot fold would wipe the entry's
@@ -3663,7 +3663,7 @@ test("syncPlanctlLinks: widened-shape EpicSnapshot ON CONFLICT does not blank en
   // for the v21 shape.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-wide" });
   planPlanOpener("sess-wide");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-wide",
     op: "epic-create",
     target: "fn-17-wide",
@@ -4790,12 +4790,12 @@ test("subagent_invocations re-fold is byte-identical (rewind + DELETE + drain)",
   expect(after).toEqual(before);
 });
 
-test("subagent_invocations coexists with planctl_links fan-out — both projections populate, both deterministic on re-fold", () => {
-  // fn-598 + fn-600 coexistence: a session that runs both planctl invocations
+test("subagent_invocations coexists with plan_links fan-out — both projections populate, both deterministic on re-fold", () => {
+  // fn-598 + fn-600 coexistence: a session that runs both plan invocations
   // and Agent calls keeps both projections populated; both reproduce on
   // re-fold.
   insertEvent({ hook_event: "SessionStart" });
-  // A planctl invocation (fn-598 fan-out into jobs.epic_links /
+  // A plan invocation (fn-598 fan-out into jobs.epic_links /
   // epics.job_links).
   insertEvent({
     hook_event: "PreToolUse",
@@ -4805,7 +4805,7 @@ test("subagent_invocations coexists with planctl_links fan-out — both projecti
     plan_epic_id: "fn-1-foo",
     plan_subject_present: 1,
   });
-  // /plan:plan opener (PreToolUse:Skill) — opens the window for the planctl
+  // /plan:plan opener (PreToolUse:Skill) — opens the window for the plan
   // event above to be classified as a creator edge.
   insertEvent({
     hook_event: "PreToolUse",
@@ -5307,7 +5307,7 @@ test("syncJobLinksOnJobWrite: InputRequest stamp propagates to epics.job_links; 
   // the paired clear back into the link entry.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-link" });
   planPlanOpener("sess-ir-link");
-  planctlEvent({
+  planEvent({
     sessionId: "sess-ir-link",
     op: "epic-create",
     target: "fn-15-ir",

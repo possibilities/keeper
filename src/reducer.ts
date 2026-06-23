@@ -423,7 +423,7 @@ interface PlanSnapshot {
   project_dir?: string | null;
   target_repo?: string | null;
   /**
-   * Planctl-native effort tier on TaskSnapshot blobs. Stored opaque (the
+   * plan-native effort tier on TaskSnapshot blobs. Stored opaque (the
    * reducer never branches on the value). Read defensively
    * (`snapshot.tier ?? null`) so an older blob folds to a null tier. Rides
    * free in the embedded-tasks JSON; no schema column.
@@ -439,17 +439,17 @@ interface PlanSnapshot {
    */
   worker_phase?: string | null;
   /**
-   * Planctl-native runtime status (`"todo" | "in_progress" | "done" |
+   * plan-native runtime status (`"todo" | "in_progress" | "done" |
    * "blocked"`). Read defensively (`runtime_status ?? "todo"`) so an older blob
    * still folds deterministically.
    */
   runtime_status?: string | null;
-  /** Epic-level deps (EpicSnapshot blob) — the planctl `depends_on_epics` ids. */
+  /** Epic-level deps (EpicSnapshot blob) — the plan `depends_on_epics` ids. */
   depends_on_epics?: string[] | null;
-  /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
+  /** Task-level deps (TaskSnapshot blob) — the plan `depends_on` task ids. */
   depends_on?: string[] | null;
   /**
-   * Planctl-native `last_validated_at` (EpicSnapshot blob, epic-level only).
+   * plan-native `last_validated_at` (EpicSnapshot blob, epic-level only).
    * Absent / NULL folds to `null` so an older blob reproduces the same row
    * across re-fold.
    */
@@ -535,7 +535,7 @@ function projectPlanRow(db: Database, event: Event): void {
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
     // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
     // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries none of
-    // that data, and a shell row inserted by a task/job/planctl-event before
+    // that data, and a shell row inserted by a task/job/plan-event before
     // the epic already holds those columns. Without the carve-out, an
     // EpicSnapshot re-fold would wipe the provenance, closer-link, sort-path,
     // queue-jump, and resolved-deps projections.
@@ -567,7 +567,7 @@ function projectPlanRow(db: Database, event: Event): void {
     );
     // If `sort_path` is still '' but `epic_number` is now known, derive it so
     // child epics can inherit a non-empty parent path (an EpicSnapshot for a
-    // root epic unblocks the chain without a planctl event). Prepend `!` for
+    // root epic unblocks the chain without a plan event). Prepend `!` for
     // ROOT epics whose `queue_jump = 1`: `!` (ASCII 33) sorts strictly below
     // the digits under SQLite BINARY collation, lifting a queue-jumped root
     // above non-queued roots. A non-root queue-jumped epic inherits its
@@ -705,7 +705,7 @@ function projectPlanRow(db: Database, event: Event): void {
       // whichever is present so a re-fold reproduces the same value.
       worker_phase: snapshot.worker_phase ?? snapshot.status ?? null,
       // Absent on older blobs / never-observed state files → folds to `"todo"`
-      // per planctl's `merge_task_state` convention.
+      // per plan's `merge_task_state` convention.
       runtime_status: snapshot.runtime_status ?? "todo",
       depends_on: snapshot.depends_on ?? [],
       jobs: [],
@@ -2344,7 +2344,7 @@ function foldCommit(db: Database, event: Event): void {
   }
   // Record the durable commit-trailer fact (the fn-807 projection) BEFORE the
   // empty-files early-return: the commit-trailer loader / migration backfill key
-  // off the trailer facts ALONE (never the file list), so a planctl Commit that
+  // off the trailer facts ALONE (never the file list), so a plan Commit that
   // happened to carry zero files must still land its fact row for the two views
   // to agree. The condition — committer_session_id + planctl_op + planctl_target
   // all non-null — is exactly the loader/backfill keep condition (DELIBERATELY
@@ -2508,11 +2508,11 @@ function foldCommit(db: Database, event: Event): void {
     // session's edge rebuild — `syncPlanLinks` re-derives `jobs.epic_links` +
     // the epic's `epics.job_links` from the union of the stdout scrape and this
     // commit-trailer fact. We TRIGGER (never write the edge cells directly) so
-    // `syncPlanLinks` stays the sole writer. A non-planctl commit has NULL
+    // `syncPlanLinks` stays the sole writer. A non-plan commit has NULL
     // `planctl_op` and no-ops, preserving re-fold determinism over the log.
     const _cfT2 = performance.now();
     // Arm the syncPlanLinks fan-out accumulator so the breakdown line can
-    // carry the planctl cardinality (touched epics / swept sessions / trailer
+    // carry the plan cardinality (touched epics / swept sessions / trailer
     // facts). Pure instrumentation; the value is read only by console.error.
     _syncPlanLinksAccum = {
       calls: 0,
@@ -2528,11 +2528,11 @@ function foldCommit(db: Database, event: Event): void {
     ) {
       syncPlanLinks(db, commit.committer_session_id, eventId, eventTs);
     }
-    const _cfPlanctlAccum = _syncPlanLinksAccum;
+    const _cfPlanAccum = _syncPlanLinksAccum;
     _syncPlanLinksAccum = null;
     // Slow-fold breakdown — localizes a [fold-slow] Commit (per-session arm) to
-    // a sub-step. nfiles/ntasks give the fan-out cardinality; the planctl_*
-    // counters split the trailer-fact load + sweep shape out of planctl_fanout.
+    // a sub-step. nfiles/ntasks give the fan-out cardinality; the plan_*
+    // counters split the trailer-fact load + sweep shape out of plan_fanout.
     // Only emitted above threshold so steady folds stay silent. Pure side-effect.
     const _cfTotal = performance.now() - _cfT0;
     if (_cfTotal >= COMMIT_FOLD_BREAKDOWN_MS) {
@@ -2541,8 +2541,8 @@ function foldCommit(db: Database, event: Event): void {
           `nfiles=${commit.files.length} ntasks=${commit.task_ids.length} ` +
           `discharge_loop=${(_cfT1 - _cfT0).toFixed(0)}ms ` +
           `task_links=${(_cfT2 - _cfT1).toFixed(0)}ms ` +
-          `planctl_fanout=${(performance.now() - _cfT2).toFixed(0)}ms ` +
-          formatSyncPlanFanout(_cfPlanctlAccum),
+          `plan_fanout=${(performance.now() - _cfT2).toFixed(0)}ms ` +
+          formatSyncPlanFanout(_cfPlanAccum),
       );
     }
     return;
@@ -2594,7 +2594,7 @@ function foldCommit(db: Database, event: Event): void {
       `[commitfold-breakdown] id=${eventId} arm=global total=${_cfgTotal.toFixed(0)}ms ` +
         `nfiles=${commit.files.length} ntasks=${commit.task_ids.length} ` +
         `discharge_loop=${_cfgTotal.toFixed(0)}ms ` +
-        `task_links=0ms planctl_fanout=0ms`,
+        `task_links=0ms plan_fanout=0ms`,
     );
   }
 }
@@ -4972,7 +4972,7 @@ function syncJobIntoEpic(
     title: string | null;
     target_repo: string | null;
     /**
-     * Planctl-native effort tier. Optional because older stored elements lack
+     * plan-native effort tier. Optional because older stored elements lack
      * the key; the OLD-element carve-out spread below preserves whatever was
      * there. A shell element initialises `tier: null`.
      */
@@ -5026,7 +5026,7 @@ function syncJobIntoEpic(
           target_repo: null,
           tier: null,
           worker_phase: null,
-          // Shell element gets the planctl `"todo"` default (zero-event
+          // Shell element gets the plan `"todo"` default (zero-event
           // projection / `merge_task_state` convention).
           runtime_status: "todo",
           depends_on: [],
@@ -5105,7 +5105,7 @@ let _syncIfPlanRefAccumMs: number | null = null;
  * (touched epics, swept sessions) and the commit-trailer load cost into this
  * object. Armed ONLY around the dispatch sites in {@link applyEvent} (the
  * commit, PostToolUse, and PreToolUse breakdown arms) so the breakdown lines can
- * carry the planctl fan-out shape without threading a param through the two fixed
+ * carry the plan fan-out shape without threading a param through the two fixed
  * `syncPlanLinks` call sites. `calls` counts invocations so a fold that fires
  * the fan-out more than once still reports a faithful total. Pure
  * instrumentation: never read into a projection write, never influences a branch
@@ -5123,18 +5123,18 @@ let _syncPlanLinksAccum: SyncPlanLinksAccum | null = null;
 
 /**
  * Render the armed {@link SyncPlanLinksAccum} as a single breakdown segment
- * (the `planctl_fanout=` field shared across the commit / PostToolUse /
+ * (the `plan_fanout=` field shared across the commit / PostToolUse /
  * PreToolUse breakdown lines). `calls=0` means the fold never reached
  * `syncPlanLinks`, so the cardinality counters are all zero — still emitted
  * verbatim so the absence is legible. Pure formatter; reads only the accumulator.
  */
 function formatSyncPlanFanout(acc: SyncPlanLinksAccum): string {
   return (
-    `planctl_calls=${acc.calls} ` +
-    `planctl_touched_epics=${acc.touchedEpics} ` +
-    `planctl_swept_sessions=${acc.sweptSessions} ` +
-    `planctl_facts_rows=${acc.factsRows} ` +
-    `planctl_facts_load_ms=${acc.factsLoadMs.toFixed(0)}`
+    `plan_calls=${acc.calls} ` +
+    `plan_touched_epics=${acc.touchedEpics} ` +
+    `plan_swept_sessions=${acc.sweptSessions} ` +
+    `plan_facts_rows=${acc.factsRows} ` +
+    `plan_facts_load_ms=${acc.factsLoadMs.toFixed(0)}`
   );
 }
 
@@ -5310,7 +5310,7 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
 
 /**
  * Reverse fan-out from a jobs-write that may have changed display / annotation
- * fields on a session whose planctl footprint already produced epic-link edges.
+ * fields on a session whose plan footprint already produced epic-link edges.
  * For each epic referencing this `jobId` via the symmetric `jobs.epic_links`
  * array, re-stamp the matching `epics.job_links` entry with fresh enrichment,
  * preserving every OTHER entry verbatim (the OLD-element carve-out — without it
@@ -5336,7 +5336,7 @@ function syncJobLinksOnJobWrite(
     return; // no backing jobs row — orphan, nothing to fan from.
   }
   // `'[]'` short-circuit: a cheap pre-parse skip for the common case (a session
-  // with no planctl footprint); the schema default and the reducer's empty
+  // with no plan footprint); the schema default and the reducer's empty
   // write both produce `'[]'` exactly.
   if (jobRow.epic_links === null || jobRow.epic_links === "[]") {
     return;
@@ -5403,8 +5403,8 @@ function syncJobLinksOnJobWrite(
 }
 
 /**
- * Extract the envelope's `state_repo` (the absolute path planctl wrote
- * `.planctl/...` into) from the stored event payload. Pure parse; a malformed
+ * Extract the envelope's `state_repo` (the absolute path plan wrote
+ * `.keeper/...` into) from the stored event payload. Pure parse; a malformed
  * payload / missing envelope / non-string `state_repo` folds to `null` (the
  * mint is a no-op then), keeping the fold tx sacred.
  */
@@ -5468,8 +5468,8 @@ function extractPlanStateRepo(event: Event): string | null {
 /**
  * Mint one `source='plan'` `file_attributions` row per path in the event's
  * `plan_files` array, keyed under the envelope's `state_repo` +
- * `event.session_id` + the repo-relative path. Without it, `.planctl/...` files
- * (written by the planctl CLI, not a Claude Write/Edit or recognized bash
+ * `event.session_id` + the repo-relative path. Without it, `.keeper/...` files
+ * (written by the plan CLI, not a Claude Write/Edit or recognized bash
  * mutation) would appear as strict-mystery orphans on the next `GitSnapshot`.
  *
  * The `(project_dir, file_path)` tuple MUST match the
@@ -5507,7 +5507,7 @@ function mintPlanFileAttributions(db: Database, event: Event): void {
   }
   // Same UPSERT shape as projectGitStatus pass-1. `worktree_oid` /
   // `worktree_mode` ride NULL (stamped by the next GitSnapshot). The newest-wins
-  // UPDATE gate keeps a stale planctl event from overwriting a newer attribution.
+  // UPDATE gate keeps a stale plan event from overwriting a newer attribution.
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
        (project_dir, session_id, file_path, last_mutation_at,
@@ -5524,7 +5524,7 @@ function mintPlanFileAttributions(db: Database, event: Event): void {
   );
   for (const rawPath of files) {
     if (typeof rawPath !== "string" || rawPath.length === 0) continue;
-    // Skip absolute paths (planctl emits relative; an absolute path would never
+    // Skip absolute paths (plan emits relative; an absolute path would never
     // match the `dirty_files[].path` tuple and strand as an orphan).
     if (rawPath.startsWith("/")) continue;
     // Skip `..` traversal — defensive against a corrupt envelope.
@@ -5542,7 +5542,7 @@ function mintPlanFileAttributions(db: Database, event: Event): void {
 }
 
 /**
- * Fan a planctl-CLI invocation into the `jobs.epic_links` +
+ * Fan a plan-CLI invocation into the `jobs.epic_links` +
  * per-touched-epic `epics.job_links` projections. Parallel to
  * {@link syncJobIntoEpic} but with a disjoint trigger, so the two helpers do
  * NOT share code. Re-derives from scratch on every triggering event
@@ -5724,7 +5724,7 @@ function syncPlanLinks(
   eventId: number,
   ts: number,
 ): void {
-  // The backing jobs row must exist for an epic_links UPDATE to land. A planctl
+  // The backing jobs row must exist for an epic_links UPDATE to land. A plan
   // invocation in a session with no SessionStart is an orphan; skip the
   // jobs-side write but still re-derive every touched epic's job_links so
   // symmetry holds. This row's presence ALSO selects the per-epic strategy: the
@@ -5763,7 +5763,7 @@ function syncPlanLinks(
     _syncPlanLinksAccum.factsRows += _factsRows;
   }
 
-  // Load this session's planctl invocations (ASC by event id — the `id`
+  // Load this session's plan invocations (ASC by event id — the `id`
   // doubles as the classifier's total-order tiebreak on `ts`-ties); the
   // partial composite index serves this without a full-table scan.
   const invRows = db
@@ -6006,7 +6006,7 @@ function syncPlanLinks(
     // path; missing/placeholder parent → fall back to root-level (the cascade
     // re-stamps when the parent resolves); `epic_number >= 1_000_000` → `''` +
     // note (never throws). `epic_number` is read off the touched row, so a shell
-    // row (planctl event before the EpicSnapshot) has NULL → folds to
+    // row (plan event before the EpicSnapshot) has NULL → folds to
     // `"000000"`; the next EpicSnapshot recomputes against the known number.
     const ownRow = db
       .query("SELECT epic_number FROM epics WHERE epic_id = ?")
@@ -6082,7 +6082,7 @@ function syncPlanLinks(
       // columns are stamped (sort_path typically the `"000000"` placeholder
       // until an EpicSnapshot supplies `epic_number`); the ON CONFLICT carve-out
       // preserves them. Routed through the tombstone-checking helper — a
-      // planctl-event-before-epic shell for a deleted epic is suppressed.
+      // plan-event-before-epic shell for a deleted epic is suppressed.
       insertEpicShellIfNotTombstoned(
         db,
         epicId,
@@ -7326,7 +7326,7 @@ function projectJobsRow(db: Database, event: Event): void {
     );
   }
 
-  // Planctl-CLI invocation fan-out. Re-derive the session's epic_links +
+  // plan-CLI invocation fan-out. Re-derive the session's epic_links +
   // every touched epic's job_links from scratch via the pure classifier in
   // `src/plan-classifier.ts`. Gated on:
   //   `plan_op != NULL`        — this event is a plan-CLI Bash invocation
@@ -7347,7 +7347,7 @@ function projectJobsRow(db: Database, event: Event): void {
   //
   // The two seams are disjoint from `syncJobIntoEpic` (jobs-write trigger):
   // a hook event like a SessionStart with `plan_ref` fires syncIfPlanRef but
-  // not syncPlanLinks; a PostToolUse:Bash with a planctl envelope fires
+  // not syncPlanLinks; a PostToolUse:Bash with a plan envelope fires
   // syncPlanLinks but no jobs-side write happens (default switch arm).
   //
   // Post-switch placement matches the title-precedence precedent below: the
@@ -7360,7 +7360,7 @@ function projectJobsRow(db: Database, event: Event): void {
     syncPlanLinks(db, jobId, event.id, ts);
   }
 
-  // Planctl-written tracked files get a `source='plan'` attribution row per
+  // plan-written tracked files get a `source='plan'` attribution row per
   // path the envelope's `files` array names — without this mint they appear as
   // strict-mystery orphans the instant they flash dirty.
   if (event.plan_op != null && event.plan_files != null) {
@@ -7668,7 +7668,7 @@ export function applyEvent(
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the
       // module-scoped syncIfPlanRef accumulator so its fan-out splits out of
       // the jobs-arm total. The syncPlanLinks accumulator (armed alongside)
-      // adds the planctl fan-out cardinality. Pure instrumentation — no
+      // adds the plan fan-out cardinality. Pure instrumentation — no
       // projection write reads either accumulator.
       _syncIfPlanRefAccumMs = 0;
       _syncPlanLinksAccum = {
@@ -7692,19 +7692,19 @@ export function applyEvent(
       const _ptuT2 = performance.now();
       const _ptuSyncMs = _syncIfPlanRefAccumMs;
       _syncIfPlanRefAccumMs = null;
-      const _ptuPlanctlAccum = _syncPlanLinksAccum;
+      const _ptuPlanAccum = _syncPlanLinksAccum;
       _syncPlanLinksAccum = null;
       const _ptuTotal = _ptuT2 - _ptuT0;
       if (_ptuTotal >= PTU_FOLD_BREAKDOWN_MS) {
         // jobs_arm includes its own syncIfPlanRef cost; sync_fanout breaks it
         // out so jobs_arm−sync_fanout is the pure state-machine write. The
-        // planctl_* counters localize the syncPlanLinks fan-out shape.
+        // plan_* counters localize the syncPlanLinks fan-out shape.
         console.error(
           `[ptufold-breakdown] id=${event.id} total=${_ptuTotal.toFixed(0)}ms ` +
             `jobs_arm=${(_ptuT1 - _ptuT0).toFixed(0)}ms ` +
             `subagent_arm=${(_ptuT2 - _ptuT1).toFixed(0)}ms ` +
             `sync_fanout=${_ptuSyncMs.toFixed(0)}ms ` +
-            formatSyncPlanFanout(_ptuPlanctlAccum),
+            formatSyncPlanFanout(_ptuPlanAccum),
         );
       }
     } else {
@@ -7739,19 +7739,19 @@ export function applyEvent(
         const _ptueT2 = performance.now();
         const _ptueSyncMs = _syncIfPlanRefAccumMs ?? 0;
         _syncIfPlanRefAccumMs = null;
-        const _ptuePlanctlAccum = _syncPlanLinksAccum;
+        const _ptuePlanAccum = _syncPlanLinksAccum;
         _syncPlanLinksAccum = null;
         const _ptueTotal = _ptueT2 - _ptueT0;
-        if (_ptueTotal >= PTU_FOLD_BREAKDOWN_MS && _ptuePlanctlAccum != null) {
+        if (_ptueTotal >= PTU_FOLD_BREAKDOWN_MS && _ptuePlanAccum != null) {
           // Same shape as [ptufold-breakdown]; subagent_arm is ~0 on PreToolUse
-          // (never an Agent tool_use) but kept for line symmetry. planctl_* is
+          // (never an Agent tool_use) but kept for line symmetry. plan_* is
           // the segment that would have convicted the 437s opener fold.
           console.error(
             `[pretufold-breakdown] id=${event.id} total=${_ptueTotal.toFixed(0)}ms ` +
               `jobs_arm=${(_ptueT1 - _ptueT0).toFixed(0)}ms ` +
               `subagent_arm=${(_ptueT2 - _ptueT1).toFixed(0)}ms ` +
               `sync_fanout=${_ptueSyncMs.toFixed(0)}ms ` +
-              formatSyncPlanFanout(_ptuePlanctlAccum),
+              formatSyncPlanFanout(_ptuePlanAccum),
           );
         }
       }

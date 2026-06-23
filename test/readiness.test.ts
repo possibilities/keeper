@@ -53,7 +53,7 @@ function makeTask(overrides: Partial<Task>): Task {
     target_repo: null,
     tier: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
-    // open|done) and `runtime_status` added (planctl-native enum, default
+    // open|done) and `runtime_status` added (plan-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's
     // `tasks` array.
     worker_phase: "open",
@@ -266,7 +266,7 @@ test("isRootOccupant: non-occupying verdicts do NOT claim the root", () => {
 test("predicate 5 (own-progress-main) wins over 1 (terminal-completed): done+approved with working job → job-running (fn-671)", () => {
   // fn-671: the per-task predicate 1 now guards on worker liveness — a
   // `done+approved` task whose embedded session is still `working`
-  // (planctl stamped `worker_done_at` and the human approved before the
+  // (plan stamped `worker_done_at` and the human approved before the
   // Claude Stop/SessionEnd landed) must NOT collapse to `completed`,
   // because that would free both the per-epic and per-root mutex while
   // the worker is still alive and let the autopilot dispatch a sibling
@@ -295,7 +295,7 @@ test("predicate 5 (own-progress-main) wins over 1 (terminal-completed): done+app
 // ---------------------------------------------------------------------------
 
 test("fn-671: done+approved task with working embedded job → running:job-running, occupies per-root mutex AND blocks sibling on same root", () => {
-  // The exact incident: T1 is administratively complete (planctl done +
+  // The exact incident: T1 is administratively complete (plan done +
   // human approved) but the Claude session hasn't Stopped yet. T2 lives
   // on the same project root and would otherwise be `ready`. The
   // per-task guard holds T1 at `running:job-running`, which is a root
@@ -423,7 +423,7 @@ test("fn-671 regression: T1 done+approved with session-still-working; T2 depends
 
 test("fn-719: done+approved task with live worker monitor → running:monitor-running, NOT completed (fn-715.2 repro+fix)", () => {
   // The exact fn-715.2 incident: the work session Stopped (embedded job
-  // `stopped`, no running sub-agent), planctl `done` + human approved, but
+  // `stopped`, no running sub-agent), plan `done` + human approved, but
   // the backgrounded `bash-bg` suite is still running. Pre-fn-719 predicate
   // 1 collapsed this to `completed`, freeing the mutex; approve dispatched
   // ~7s later while the suite ran. Post-fn-719 predicate 1's third liveness
@@ -883,7 +883,7 @@ test("fn-779 predicate 9: forward-reference order (consumer BEFORE live upstream
 // fn-835 (a): runtime_status="blocked" is never dispatched
 // ---------------------------------------------------------------------------
 //
-// `computeReadiness` now consults planctl `runtime_status` as the LAST per-row
+// `computeReadiness` now consults plan `runtime_status` as the LAST per-row
 // predicate (rank 10.6): a `runtime_status="blocked"` task converts from the
 // erroneous `ready` to `blocked:runtime-blocked`. Placed last so terminal-
 // completed / running / dispatch-pending still WIN — a done-but-stale-blocked
@@ -2396,7 +2396,7 @@ test("predicate 9: projection state=dangling → dep-on-epic-dangling carries ra
   // `state === "dangling"` on the projection. Predicate 9 emits the
   // `dep-on-epic-dangling` BlockReason carrying the raw `dep_token`
   // verbatim (so the renderer's `[?#N]` extraction works on the same
-  // string the planctl file carries).
+  // string the plan file carries).
   const t = makeTask({ task_id: "fn-1-foo.1" });
   const epic = makeEpic({
     tasks: [t],

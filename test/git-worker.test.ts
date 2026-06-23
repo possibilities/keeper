@@ -36,7 +36,7 @@ import {
   deriveChangeToRescueMs,
   discoverProjectRoots,
   enumerateCommitsInDelta,
-  filterPlanctlChanges,
+  filterPlanChanges,
   type GitDirtyFile,
   type GitSnapshotPayload,
   isPlanChangedPath,
@@ -1040,7 +1040,7 @@ test("decideHeadCacheAdvance: COMMIT_ENUM_MAX_RETRIES holds for N-1 throws then 
 
 // Faithful re-creation of emitSnapshot's HEAD-oid delta + advance arms, driving
 // the same `decideHeadCacheAdvance` policy + `enumerateCommitsInDelta` /
-// `filterPlanctlChanges` the worker uses. `enumThrows` lets a test simulate a
+// `filterPlanChanges` the worker uses. `enumThrows` lets a test simulate a
 // transient enumeration failure for one observation.
 function stepHeadDelta(
   root: string,
@@ -1048,12 +1048,12 @@ function stepHeadDelta(
   failures: Map<string, number>,
   currentHeadOid: string | null,
   enumThrows: boolean,
-): { planctlEmits: string[][]; loud: boolean } {
-  const planctlEmits: string[][] = [];
+): { planEmits: string[][]; loud: boolean } {
+  const planEmits: string[][] = [];
   let loud = false;
   if (!cache.has(root)) {
     cache.set(root, currentHeadOid);
-    return { planctlEmits, loud };
+    return { planEmits, loud };
   }
   const prev = cache.get(root) ?? null;
   if (currentHeadOid !== null && currentHeadOid !== prev) {
@@ -1062,8 +1062,8 @@ function stepHeadDelta(
       if (enumThrows) throw new Error("simulated enumeration failure");
       const commits = enumerateCommitsInDelta(root, prev, currentHeadOid);
       for (const c of commits) {
-        const changes = filterPlanctlChanges(c.files);
-        if (changes.length > 0) planctlEmits.push(changes.map((ch) => ch.path));
+        const changes = filterPlanChanges(c.files);
+        if (changes.length > 0) planEmits.push(changes.map((ch) => ch.path));
       }
     } catch {
       enumOk = false;
@@ -1078,7 +1078,7 @@ function stepHeadDelta(
     loud = decision.loudBackstop;
     if (decision.advance) cache.set(root, currentHeadOid);
   }
-  return { planctlEmits, loud };
+  return { planEmits, loud };
 }
 
 test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-changed on the next clean observation", () => {
@@ -1091,10 +1091,10 @@ test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-
   // emit) — mirrors emitSnapshot's bootstrap arm.
   const seedOid = gitCommit(root, "init.ts", "init\n", {});
   const seed = stepHeadDelta(root, cache, failures, seedOid, false);
-  expect(seed.planctlEmits).toEqual([]);
+  expect(seed.planEmits).toEqual([]);
 
   // A plan-shaped commit lands.
-  const planctlOid = gitCommit(
+  const planOid = gitCommit(
     root,
     ".keeper/epics/fn-999-demo.json",
     "scaffold\n",
@@ -1103,18 +1103,18 @@ test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-
 
   // Observation #1: enumeration THROWS transiently. The pre-fn-705 bug would
   // advance the cache past this commit and drop it forever.
-  const obs1 = stepHeadDelta(root, cache, failures, planctlOid, true);
-  expect(obs1.planctlEmits).toEqual([]); // nothing emitted — the throw ate it
+  const obs1 = stepHeadDelta(root, cache, failures, planOid, true);
+  expect(obs1.planEmits).toEqual([]); // nothing emitted — the throw ate it
   expect(cache.get(root)).toBe(seedOid); // cache HELD at the pre-commit head
   expect(failures.get(root)).toBe(1); // one failure recorded
 
   // Observation #2: same (or any newer) head, enumeration succeeds. Because the
   // cache was held, the SAME range re-enumerates and the dropped commit's
-  // planctl change re-emits — drop-proof.
-  const obs2 = stepHeadDelta(root, cache, failures, planctlOid, false);
-  expect(obs2.planctlEmits).toHaveLength(1);
-  expect(obs2.planctlEmits[0]).toContain(".keeper/epics/fn-999-demo.json");
-  expect(cache.get(root)).toBe(planctlOid); // advanced now that it succeeded
+  // plan change re-emits — drop-proof.
+  const obs2 = stepHeadDelta(root, cache, failures, planOid, false);
+  expect(obs2.planEmits).toHaveLength(1);
+  expect(obs2.planEmits[0]).toContain(".keeper/epics/fn-999-demo.json");
+  expect(cache.get(root)).toBe(planOid); // advanced now that it succeeded
   expect(failures.has(root)).toBe(false); // counter reset on success
 });
 
@@ -1168,7 +1168,7 @@ test("emitSnapshot delta: divergence-wedge window holds the cache → commits re
   // Wedge clears: the next clean observation re-enumerates the WHOLE window
   // (seed..headDuringWedge), re-emitting both plan commits.
   const cleared = stepHeadDelta(root, cache, failures, headDuringWedge, false);
-  const flatPaths = cleared.planctlEmits.flat();
+  const flatPaths = cleared.planEmits.flat();
   expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.1.json");
   expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.2.json");
   expect(cache.get(root)).toBe(headDuringWedge);
@@ -1488,7 +1488,7 @@ test("enumerateCommitsInDelta: multi-commit delta — each commit's trailers par
 const VALID_EPIC = "fn-670-deterministic-committing-session";
 
 test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, op normalized", () => {
-  // The canonical `chore(planctl)` scaffold commit: planctl stamps
+  // The canonical `chore(plan)` scaffold commit: plan stamps
   // `Planctl-Op: epic-scaffold` + `Planctl-Target: <epic>`. The op
   // normalizes (`epic-scaffold` → `scaffold`) exactly like the scrape
   // path's classifier input; the target validates via parsePlanRef.
@@ -1511,7 +1511,7 @@ test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, o
 test("enumerateCommitsInDelta: a task-form Planctl-Target validates and rides verbatim", () => {
   // A `task-done` commit stamps a task-form target. parsePlanRef accepts
   // it; we store the raw validated ref (the edge fold folds it up to the
-  // parent epic downstream, exactly as extractPlanctlInvocation does).
+  // parent epic downstream, exactly as extractPlanInvocation does).
   const root = mkTmpWorktree();
   gitInit(root);
   const oid = gitCommit(root, "a.ts", "msg\n", {
@@ -1787,7 +1787,7 @@ test("extractCommit folds non-string / empty planctl_op / planctl_target to null
 });
 
 // ---------------------------------------------------------------------------
-// fn-681 — commit-driven planctl ingest. Pure-helper coverage first
+// fn-681 — commit-driven plan ingest. Pure-helper coverage first
 // (classifier + filter), then a real-git round-trip pinning that the
 // `git rm` path produces the `delete` op (the FSEvents-bypass
 // correctness gate). The cross-worker message wiring is exercised by
@@ -1821,12 +1821,12 @@ test("isPlanChangedPath: epics/tasks json + state-tasks/state-epics state.json a
   expect(isPlanChangedPath(".keeper/epics/fn-822.json")).toBe(true);
 });
 
-test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel", () => {
+test("filterPlanChanges: tags add/update vs delete by blob_oid null sentinel", () => {
   // The producer's commitFiles already lifts a zero-oid diff-tree record
   // to {blob_oid: null, committed_mode: null} — the filter reads that
-  // shape as "delete" and every other shape as "upsert". A non-planctl
+  // shape as "delete" and every other shape as "upsert". A non-plan
   // file in the same commit drops out of the result list entirely.
-  const out = filterPlanctlChanges([
+  const out = filterPlanChanges([
     {
       path: ".keeper/epics/fn-1-x.json",
       blob_oid: "0123456789abcdef0123456789abcdef01234567",
@@ -1858,12 +1858,12 @@ test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel"
   ]);
 });
 
-test("filterPlanctlChanges: a commit with no planctl files returns []", () => {
+test("filterPlanChanges: a commit with no plan files returns []", () => {
   // The common case for source commits — none of the changed files match
-  // the planctl shapes, so the producer suppresses the message entirely
+  // the plan shapes, so the producer suppresses the message entirely
   // (the live worker checks `result.length > 0` before posting).
   expect(
-    filterPlanctlChanges([
+    filterPlanChanges([
       {
         path: "src/a.ts",
         blob_oid: "abc1234567890abc1234567890abc1234567890a",
@@ -1878,7 +1878,7 @@ test("filterPlanctlChanges: a commit with no planctl files returns []", () => {
   ).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: a `git rm` of a plan json → filterPlanctlChanges tags it 'delete'", () => {
+test("enumerateCommitsInDelta: a `git rm` of a plan json → filterPlanChanges tags it 'delete'", () => {
   // End-to-end producer round-trip: scaffold a plan file under a real
   // tmp repo, commit it (commit 1), then `git rm` it + commit (commit 2),
   // and assert the delta-enumeration → filter chain surfaces the
@@ -1933,12 +1933,12 @@ test("enumerateCommitsInDelta: a `git rm` of a plan json → filterPlanctlChange
   // filter reads as op='delete'.
   const commits = enumerateCommitsInDelta(root, oid1, oid2);
   expect(commits).toHaveLength(1);
-  expect(filterPlanctlChanges(commits[0].files)).toEqual([
+  expect(filterPlanChanges(commits[0].files)).toEqual([
     { path: ".keeper/epics/fn-1-x.json", op: "delete" },
   ]);
 });
 
-test("enumerateCommitsInDelta: an `add` of plan files → filterPlanctlChanges tags every entry 'upsert'", () => {
+test("enumerateCommitsInDelta: an `add` of plan files → filterPlanChanges tags every entry 'upsert'", () => {
   // The 9-file scaffold-burst shape the epic spec calls out: one commit
   // touching several plan paths, every one of them tagged upsert.
   // The plan-worker receives the message and re-ingests from the
@@ -2001,7 +2001,7 @@ test("enumerateCommitsInDelta: an `add` of plan files → filterPlanctlChanges t
 
   const commits = enumerateCommitsInDelta(root, oidSeed, oid);
   expect(commits).toHaveLength(1);
-  const changes = filterPlanctlChanges(commits[0].files);
+  const changes = filterPlanChanges(commits[0].files);
   // Order is the producer's diff-tree output order; just assert the set.
   expect(new Set(changes.map((c) => c.path))).toEqual(
     new Set([

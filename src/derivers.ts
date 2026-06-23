@@ -335,7 +335,7 @@ export function isKilledTaskNotification(prompt: unknown): boolean {
 }
 
 /**
- * Anchored planctl-ref → `{kind, epic_id, task_id?}` match:
+ * Anchored plan-ref → `{kind, epic_id, task_id?}` match:
  * `fn-\d+-[a-z0-9-]+(.\d+)?`. Mirrors the ref-body half of
  * {@link SPAWN_VERB_REF_RE} — same kebab-only class and `$` anchor so an
  * uppercase/`_`-bearing ref or a trailing token rejects rather than
@@ -379,9 +379,9 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
 
 /**
  * The shape returned by {@link extractPlanInvocation}. A `null` return
- * signals "not a planctl invocation we care about". `target` / `epic_id` /
+ * signals "not a plan invocation we care about". `target` / `epic_id` /
  * `task_id` may individually be `null` when the verb takes no argument or its
- * argument is not a parseable planctl ref.
+ * argument is not a parseable plan ref.
  *
  * `subject_present` mirrors the envelope's `subject != null` (the verb carries
  * human subject text); drives creator/refiner classification downstream.
@@ -399,8 +399,8 @@ export interface PlanInvocation {
   subject_present: boolean;
   queue_jump: boolean;
   /**
-   * Repo-relative paths planctl wrote during this op. NULL (NOT an empty array)
-   * when absent, non-array, filtered to zero strings, or over PLANCTL_FILES_CAP
+   * Repo-relative paths plan wrote during this op. NULL (NOT an empty array)
+   * when absent, non-array, filtered to zero strings, or over PLAN_FILES_CAP
    * — keeping the partial-index `IS NOT NULL` predicate selective. Non-empty
    * string arrays only, so a re-fold reproduces the same value.
    */
@@ -408,33 +408,33 @@ export interface PlanInvocation {
 }
 
 /**
- * Length cap on the stdout buffer we attempt to `JSON.parse`. planctl envelopes
+ * Length cap on the stdout buffer we attempt to `JSON.parse`. plan envelopes
  * are sub-kilobyte; a larger buffer is almost certainly not one and would burn
  * cold-start budget on the parse.
  */
-const PLANCTL_STDOUT_CAP = 64_000;
+const PLAN_STDOUT_CAP = 64_000;
 
 /**
  * Cap on entries lifted from the envelope's `files` array. A runaway op past
  * this is almost certainly a bug or corrupt envelope, so we drop the lift
  * entirely (NULL) rather than store an outsized blob.
  */
-const PLANCTL_FILES_CAP = 500;
+const PLAN_FILES_CAP = 500;
 
 /**
- * Extract a planctl-CLI invocation envelope from a `PostToolUse:Bash`'s
+ * Extract a plan-CLI invocation envelope from a `PostToolUse:Bash`'s
  * `data.tool_response.stdout`. Gated EXACTLY on `(PostToolUse, Bash)`
  * (`PostToolUseFailure` has no `tool_response` and must not match); the buffer
  * must parse as JSON carrying a top-level `plan_invocation` envelope key (the
  * v78 migration rewrote every legacy `planctl_invocation` envelope forward).
  *
- * The envelope is the AUTHORITATIVE mutation sentinel — planctl writes it on
+ * The envelope is the AUTHORITATIVE mutation sentinel — plan writes it on
  * every mutating call and no other, regardless of how it was invoked.
- * Envelope-less mutations from older planctl silently drop edges (acceptable;
- * planctl is internally controlled).
+ * Envelope-less mutations from older plan silently drop edges (acceptable;
+ * plan is internally controlled).
  *
  * The `target → (epic_id, task_id)` split reuses {@link parsePlanRef}: the
- * spawn-name ref shape and the planctl-target ref shape MUST agree byte-for-byte
+ * spawn-name ref shape and the plan-target ref shape MUST agree byte-for-byte
  * so a re-fold reproduces the same epic links. NEVER throws — every
  * shape-mismatch path returns `null`.
  */
@@ -454,10 +454,10 @@ export function extractPlanInvocation(
   if (typeof stdout !== "string" || stdout.length === 0) {
     return null;
   }
-  if (stdout.length > PLANCTL_STDOUT_CAP) {
+  if (stdout.length > PLAN_STDOUT_CAP) {
     return null;
   }
-  // Fast pre-parse hint: a planctl envelope is a JSON object, so the first
+  // Fast pre-parse hint: a plan envelope is a JSON object, so the first
   // non-whitespace char is `{` (0x7B). Most PostToolUse:Bash rows are not JSON;
   // short-circuit them without a parse, allowing a leading-whitespace prefix.
   const head = stdout.charCodeAt(0);
@@ -512,7 +512,7 @@ export function extractPlanInvocation(
   if (
     Array.isArray(rawFiles) &&
     rawFiles.length > 0 &&
-    rawFiles.length <= PLANCTL_FILES_CAP
+    rawFiles.length <= PLAN_FILES_CAP
   ) {
     const filtered = rawFiles.filter(
       (v): v is string => typeof v === "string" && v.length > 0,
@@ -1070,7 +1070,7 @@ export function parseSessionIdTrailer(raw: unknown): string | null {
 }
 
 /**
- * Anchored planctl TASK-id pattern. Tighter than {@link PLAN_REF_RE} on purpose
+ * Anchored plan TASK-id pattern. Tighter than {@link PLAN_REF_RE} on purpose
  * — an epic-form ref (no `.N` tail) is malformed and drops, because the
  * epic→committing-session link fold keys on a task id, not an epic id.
  */
@@ -1135,7 +1135,7 @@ export interface CommitPayload {
   files: CommitFileEntry[];
   committer_session_id: string | null;
   /**
-   * Validated planctl-shaped `Task:` trailer values — union-of-ALL (a commit
+   * Validated plan-shaped `Task:` trailer values — union-of-ALL (a commit
    * may close multiple tasks), NOT take-last like {@link committer_session_id}.
    * `[]` on no trailer, all-malformed, or a legacy event. The link fold reads
    * this AND `committer_session_id`; either array-empty or session-null
@@ -1143,14 +1143,14 @@ export interface CommitPayload {
    */
   task_ids: string[];
   /**
-   * The planctl op from the `Planctl-Op:` trailer, normalized at producer time
+   * The plan op from the `Planctl-Op:` trailer, normalized at producer time
    * so it shares the scrape path's vocabulary. `null` on no trailer, empty, or
    * a legacy event. The edge fold needs `planctl_op` + {@link planctl_target} +
    * {@link committer_session_id} all non-null to mint an edge.
    */
   planctl_op: string | null;
   /**
-   * The planctl target ref from the `Planctl-Target:` trailer, validated via
+   * The plan target ref from the `Planctl-Target:` trailer, validated via
    * {@link parsePlanRef} (a task-form ref folds up to its epic). `null` on a
    * missing / malformed trailer or a legacy event.
    */
@@ -1280,10 +1280,10 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
   // re-check of producer-validated facts: non-empty string for the op,
   // `parsePlanRef`-valid ref for the target; anything else folds to `null`.
   const rawOp = obj.planctl_op;
-  const planctlOp: string | null =
+  const planOp: string | null =
     typeof rawOp === "string" && rawOp.length > 0 ? rawOp : null;
   const rawTarget = obj.planctl_target;
-  const planctlTarget: string | null =
+  const planTarget: string | null =
     typeof rawTarget === "string" && parsePlanRef(rawTarget) !== null
       ? rawTarget
       : null;
@@ -1299,8 +1299,8 @@ export function extractCommit(event: { data: string }): CommitPayload | null {
     files,
     committer_session_id: committerSessionId,
     task_ids: taskIds,
-    planctl_op: planctlOp,
-    planctl_target: planctlTarget,
+    planctl_op: planOp,
+    planctl_target: planTarget,
     committed_at_ms: committedAtMs,
   };
 }

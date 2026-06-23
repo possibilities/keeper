@@ -41,7 +41,7 @@ export interface SessionDirtyFiles {
  * migration fallback for any repo or historical attribution row still keyed
  * under the old board path.
  */
-const PLANCTL_EXCLUDE_PREFIXES = [".keeper/", ".planctl/"];
+const PLAN_EXCLUDE_PREFIXES = [".keeper/", ".planctl/"];
 
 /** Inject a custom git runner / DB path / db-path resolver (tests). */
 export interface AttributionDeps {
@@ -264,8 +264,8 @@ export function discoverSessionFiles(
     return [];
   }
   return filesByRepo[cwdRepo].filter(
-    (p) => !PLANCTL_EXCLUDE_PREFIXES.some((pfx) => p.startsWith(pfx)),
+    (p) => !PLAN_EXCLUDE_PREFIXES.some((pfx) => p.startsWith(pfx)),
   );
 }
 
-export { PLANCTL_EXCLUDE_PREFIXES };
+export { PLAN_EXCLUDE_PREFIXES };

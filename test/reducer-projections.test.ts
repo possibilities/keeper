@@ -1,6 +1,6 @@
 /**
  * Reducer tests — shard 4 of 4 (fn-769 fast-tier split of the former
- * monolithic reducer.test.ts). Theme: autopilot, dispatch, name-history, planctl-file, backend-exec, monitors projections.
+ * monolithic reducer.test.ts). Theme: autopilot, dispatch, name-history, plan-file, backend-exec, monitors projections.
  *
  * Each test clones the per-process migrated `:memory:` template via
  * `freshMemDb` (`Database.deserialize` ~0.2ms vs the ~28ms migration
@@ -102,10 +102,10 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a planctl
+    // Schema v30: queue-jump sparse column; NULL unless this is a plan
     // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other planctl event (stamped 0). The test helper defaults to NULL so
-    // every non-planctl event lands NULL — matches the live hook's stamping
+    // other plan event (stamped 0). The test helper defaults to NULL so
+    // every non-plan event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
     plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
@@ -115,8 +115,8 @@ function insertEvent(
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
     // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
-    // the envelope's repo-relative `files` array. NULL on every non-planctl
-    // event; planctl-mint tests pass this explicitly via overrides.
+    // the envelope's repo-relative `files` array. NULL on every non-plan
+    // event; plan-mint tests pass this explicitly via overrides.
     plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every event outside a
@@ -257,7 +257,7 @@ interface EmbeddedTask {
   title: string | null;
   target_repo: string | null;
   /**
-   * Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
+   * Plan-native effort tier (fn-602): rides FREE in the embedded JSON
    * (no schema column, no SCHEMA_VERSION bump). Optional on the test
    * interface because pre-fn-602 events / serialised arrays lack the key;
    * the reducer reads `snapshot.tier ?? null` so a missing field folds to
@@ -310,7 +310,7 @@ function getTask(taskId: string): EmbeddedTask | null {
   return null;
 }
 
-function planctlEvent(args: {
+function planEvent(args: {
   sessionId: string;
   op: string;
   target: string | null;
@@ -324,7 +324,7 @@ function planctlEvent(args: {
   // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
   // `events.plan_files` AND inline into the envelope's `state_repo`
   // payload (so the reducer's mint can read `state_repo` from event.data).
-  // Defaults `undefined` — existing tests keep their old null-on-planctl
+  // Defaults `undefined` — existing tests keep their old null-on-plan
   // shape and the mint becomes a no-op for them.
   files?: string[];
   stateRepo?: string;
@@ -2520,16 +2520,16 @@ test("from-scratch re-fold over [EpicArmed X true, EpicSnapshot X done] leaves z
 });
 
 // ---------------------------------------------------------------------------
-// Schema v46 / fn-666 — planctl-file attribution mint
+// Schema v46 / fn-666 — plan-file attribution mint
 // ---------------------------------------------------------------------------
 
-test("planctl mint: scaffold envelope mints source='plan' file_attributions for every named file", () => {
-  // A planctl scaffold envelope carries a `files[]` of the JSON/spec paths
-  // planctl wrote. The reducer's mint fold lands one file_attributions row
+test("plan mint: scaffold envelope mints source='plan' file_attributions for every named file", () => {
+  // A keeper plan scaffold envelope carries a `files[]` of the JSON/spec paths
+  // plan wrote. The reducer's mint fold lands one file_attributions row
   // per path, keyed under (state_repo, session, path), source='plan',
   // last_mutation_at=event.ts.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-mint" });
-  const eventId = planctlEvent({
+  const eventId = planEvent({
     sessionId: "sess-mint",
     op: "scaffold",
     target: "fn-1-foo",
@@ -2579,7 +2579,7 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
   // file_attributions. Single-path post-v78: the deriver reads only
   // `plan_invocation`; the migration rewrote any pre-flip stored row to match.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-mint-renamed" });
-  const eventId = planctlEvent({
+  const eventId = planEvent({
     sessionId: "sess-mint-renamed",
     op: "scaffold",
     target: "fn-2-bar",
@@ -2617,11 +2617,11 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
   ]);
 });
 
-test("planctl mint: null plan_files (read-only verb) mints no rows", () => {
-  // A read-only verb (`planctl epics`) writes no files — the envelope's
+test("plan mint: null plan_files (read-only verb) mints no rows", () => {
+  // A read-only verb (`keeper plan epics`) writes no files — the envelope's
   // `files` field is null, the deriver lifts to null, the mint is a no-op.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-readonly" });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-readonly",
     op: "epics",
     target: null,
@@ -2638,7 +2638,7 @@ test("planctl mint: null plan_files (read-only verb) mints no rows", () => {
   expect(count).toBe(0);
 });
 
-test("planctl mint: empty plan_files array mints no rows (defensive)", () => {
+test("plan mint: empty plan_files array mints no rows (defensive)", () => {
   // Should never happen at hook write time (the deriver folds empty to
   // null), but a backfill bug could theoretically write `[]` — the
   // reducer's `length > 0` guard catches it.
@@ -2674,8 +2674,8 @@ test("planctl mint: empty plan_files array mints no rows (defensive)", () => {
   expect(count).toBe(0);
 });
 
-test("planctl mint: missing state_repo (corrupt envelope) mints no rows", () => {
-  // Defensive: a planctl event whose envelope payload doesn't carry
+test("plan mint: missing state_repo (corrupt envelope) mints no rows", () => {
+  // Defensive: a plan event whose envelope payload doesn't carry
   // state_repo (corrupt envelope or pre-fn-666 historical row) lands no
   // attributions. The mint silently no-ops, cursor still advances.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-norepo" });
@@ -2711,7 +2711,7 @@ test("planctl mint: missing state_repo (corrupt envelope) mints no rows", () => 
   expect(count).toBe(0);
 });
 
-test("planctl mint: malformed event.data folds to no-op (safe value invariant)", () => {
+test("plan mint: malformed event.data folds to no-op (safe value invariant)", () => {
   // CLAUDE.md "a malformed `data` blob folds to a safe value" — the mint
   // catches the JSON.parse exception, falls to null state_repo, no-ops.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-garbage" });
@@ -2736,7 +2736,7 @@ test("planctl mint: malformed event.data folds to no-op (safe value invariant)",
   expect(count).toBe(0);
 });
 
-test("planctl mint: malformed plan_files JSON folds to no-op", () => {
+test("plan mint: malformed plan_files JSON folds to no-op", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-badjson" });
   insertEvent({
     hook_event: "PostToolUse",
@@ -2765,13 +2765,13 @@ test("planctl mint: malformed plan_files JSON folds to no-op", () => {
   expect(count).toBe(0);
 });
 
-test("planctl mint: absolute path in files[] is filtered out", () => {
-  // Defensive: planctl emits repo-relative paths, but a corrupt envelope
+test("plan mint: absolute path in files[] is filtered out", () => {
+  // Defensive: plan emits repo-relative paths, but a corrupt envelope
   // might carry an absolute path. The mint skips it (would never match the
   // dirty_files[].path tuple downstream, would strand as an orphan
   // attribution forever).
   insertEvent({ hook_event: "SessionStart", session_id: "sess-abs" });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-abs",
     op: "scaffold",
     target: "fn-1-foo",
@@ -2790,9 +2790,9 @@ test("planctl mint: absolute path in files[] is filtered out", () => {
   expect(rows.map((r) => r.file_path)).toEqual([".keeper/epics/fn-1-foo.json"]);
 });
 
-test("planctl mint: path with `..` traversal is filtered out (defensive)", () => {
+test("plan mint: path with `..` traversal is filtered out (defensive)", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-trav" });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-trav",
     op: "scaffold",
     target: "fn-1-foo",
@@ -2808,13 +2808,13 @@ test("planctl mint: path with `..` traversal is filtered out (defensive)", () =>
   expect(rows.map((r) => r.file_path)).toEqual([".keeper/specs/fn-1-foo.md"]);
 });
 
-test("planctl mint: GitSnapshot following a mint renders the planctl-source attribution (not orphan)", () => {
-  // The end-to-end orphan-fix proof. A planctl mint lands the
+test("plan mint: GitSnapshot following a mint renders the plan-source attribution (not orphan)", () => {
+  // The end-to-end orphan-fix proof. A plan mint lands the
   // file_attributions row; the next GitSnapshot on a dirty .planctl file
   // surfaces it through pass-3 render (source='plan' badge), NOT
   // through the orphan_count rollup.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-snap" });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-snap",
     op: "scaffold",
     target: "fn-1-foo",
@@ -2846,7 +2846,7 @@ test("planctl mint: GitSnapshot following a mint renders the planctl-source attr
     }),
   });
   drainAll();
-  // The git_status row's attributions array carries the planctl mint.
+  // The git_status row's attributions array carries the plan mint.
   // orphaned_count is the project-wide rollup of zero-attribution files
   // (the strict-mystery semantic) — with the mint live, it stays 0 on a
   // .planctl file that's dirty.
@@ -2874,7 +2874,7 @@ test("planctl mint: GitSnapshot following a mint renders the planctl-source attr
   );
 });
 
-test("planctl mint: a planctl file does NOT also get an inferred attribution (guard widened)", () => {
+test("plan mint: a plan file does NOT also get an inferred attribution (guard widened)", () => {
   // The pass-2 inferred-guard covers `IN ('tool','bash','plan')`
   // so a plan-attributed file is NOT also bracketed against this
   // session's Bash windows. Without that, the file would receive
@@ -2897,8 +2897,8 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
     cwd: "/repo-both",
     ts: 1100,
   });
-  // Planctl event INSIDE the window, mints the file_attributions row.
-  planctlEvent({
+  // Plan event INSIDE the window, mints the file_attributions row.
+  planEvent({
     sessionId: "sess-both",
     op: "scaffold",
     target: "fn-1-foo",
@@ -2908,7 +2908,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
     files: [".keeper/epics/fn-1-foo.json"],
     ts: 1000,
   });
-  // GitSnapshot triggers pass-2 inference; the planctl row should suppress
+  // GitSnapshot triggers pass-2 inference; the plan row should suppress
   // the inferred attribution on this file.
   insertEvent({
     hook_event: "GitSnapshot",
@@ -2947,13 +2947,13 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
   expect(rows).toEqual([{ source: "plan", op: "scaffold" }]);
 });
 
-test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical file_attributions", () => {
-  // Drive a planctl-op + snapshot + commit sequence, capture the
+test("plan mint: re-fold determinism — cursor=0 reproduces byte-identical file_attributions", () => {
+  // Drive a plan-op + snapshot + commit sequence, capture the
   // projection, rewind cursor + wipe table, re-fold from scratch, assert
   // byte-identical rows. The re-fold determinism invariant for the new
   // mint path.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-rd", ts: 100 });
-  planctlEvent({
+  planEvent({
     sessionId: "sess-rd",
     op: "scaffold",
     target: "fn-1-foo",
@@ -4536,7 +4536,7 @@ function snapshotBlobDrivenProjections() {
 // Seed one mixed stream exercising EVERY `data`-driven read site: PostToolUse
 // mutations (drain SELECT + the `mutation_path` file-attribution scan), a
 // GitSnapshot + Commit pair that discharges the attribution (drain SELECT), and
-// a `chore(planctl)` Commit carrying planctl trailers (loadCommitTrailer{
+// a `chore(plan)` Commit carrying plan trailers (loadCommitTrailer{
 // Invocations,SessionsForEpics}). Returns the discharged PostToolUse event id so
 // a test can NULL its now-cold body in place (post-shed retention).
 function seedBlobReadStream(): { dischargedPostToolUseId: number } {
@@ -4588,7 +4588,7 @@ function seedBlobReadStream(): { dischargedPostToolUseId: number } {
       committed_at_ms: 200_000,
     }),
   });
-  // A `chore(planctl)` Commit carrying the fn-695 trailer facts so the
+  // A `chore(plan)` Commit carrying the fn-695 trailer facts so the
   // commit-trailer reads (loadCommitTrailer*) have a row to resolve.
   insertEvent({
     hook_event: "Commit",
@@ -4603,7 +4603,7 @@ function seedBlobReadStream(): { dischargedPostToolUseId: number } {
       committer_session_id: TEST_UUID,
       committed_at_ms: 210_000,
       // Commit `data` payload keys (git-worker trailer layer, Decision B) read
-      // by `extractCommit` via `obj.planctl_op` — STAY `planctl_*`.
+      // by `extractCommit` via `obj.planctl_op` — STAY `plan_*`.
       planctl_op: "create",
       planctl_target: "fn-1-demo",
       session_id_trailer: TEST_UUID,

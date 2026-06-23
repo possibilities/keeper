@@ -15,7 +15,7 @@
  *
  * The end-to-end "CLI → daemon → RPC → file" smoke lives in
  * `test/integration.test.ts`. These tests prove the handler's contract
- * against the canonical planctl serializer (`serializePlanctlJson` in
+ * against the canonical plan serializer (`serializePlanJson` in
  * `src/db.ts`).
  */
 

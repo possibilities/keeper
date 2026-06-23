@@ -1175,8 +1175,8 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     tier: null,
     // Schema v19: the legacy `status` column was renamed to `worker_phase`
     // (derived worker-phase binary) and a sibling `runtime_status` field
-    // surfaces the planctl-native enum. A TaskSnapshot blob without a state
-    // file folds `runtime_status` to the planctl `"todo"` default.
+    // surfaces the plan-native enum. A TaskSnapshot blob without a state
+    // file folds `runtime_status` to the plan `"todo"` default.
     worker_phase: "open",
     runtime_status: "todo",
     depends_on: [],
@@ -2603,7 +2603,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `idx_events_pretooluse_agent_session` for the SubagentStart fold's
   // pending-PreToolUse bridge), to 67 via fn-807 task .2 (the
   // `commit_trailer_facts` projection table that de-blobs the commit-trailer
-  // channel of `syncPlanctlLinks`), to 68 via fn-813 task .1 (the
+  // channel of `syncPlanLinks`), to 68 via fn-813 task .1 (the
   // `scheduled_tasks` projection table folding the CronCreate/CronDelete
   // PostToolUse pair onto the jobs surface), to 69 via fn-38 task .2 (the
   // `subagent_invocations.last_disposition` column feeding the SILENT_STREAM_CUT
@@ -2628,7 +2628,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // model — the fold output changed, so the migration REWINDS the cursor and
   // wipes the canonical projection list to repopulate from the corrected derive,
   // re-fold byte-identical via the classifier's `(ts, event_id)` total order),
-  // and to 78 via fn-864 task .1 (renaming the `planctl_*` schema surface →
+  // and to 78 via fn-864 task .1 (renaming the `plan_*` schema surface →
   // `plan_*` + rewriting historical `planctl_invocation` envelopes → forward —
   // value-preserving, NO cursor rewind, re-fold byte-identical across the
   // rename), each of which bumped SCHEMA_VERSION AND added its version to

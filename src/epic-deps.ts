@@ -43,7 +43,7 @@ export const BARE_FN_PATTERN = /^fn-(\d+)$/;
  *
  * Strips trailing slashes, takes the segment after the last `/`. Equivalent
  * to `node:path` basename for POSIX paths; this module never sees Windows
- * paths (planctl is POSIX-only by design). An `arthack`-prefixed pill
+ * paths (plan is POSIX-only by design). An `arthack`-prefixed pill
  * matches an `arthack/...` project dir but not `arthack-fork/...`.
  */
 export function projectBasename(dir: string | null): string {
@@ -152,7 +152,7 @@ export type EpicDepResolution =
 
 /**
  * Resolve one `depends_on_epics` entry against the in-snapshot index, mirroring
- * planctl's fn-600 cwd-then-global semantics. Two id shapes are accepted:
+ * plan's fn-600 cwd-then-global semantics. Two id shapes are accepted:
  *
  *   - Full id (`fn-100-foo`) — direct `epicById` lookup. Miss → dangling.
  *   - Bare id (`fn-100`) — `epicsByNumber` lookup. Zero matches → dangling;

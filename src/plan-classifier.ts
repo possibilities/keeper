@@ -2,7 +2,7 @@
  * Windowless creator/refiner classifier for keeper's plan-link projection.
  * Two exports, both pure (no I/O, no clock, no DB access):
  *
- * - {@link deriveEpicLinks} — classify one session's planctl invocations and
+ * - {@link deriveEpicLinks} — classify one session's plan invocations and
  *   return a deduped, sorted list of `{kind: "creator" | "refiner", target:
  *   <epic_id>}` entries. Every epic-mutating op links regardless of time, EXCEPT
  *   the two autopilot-op exclusions below; the read-only
@@ -39,7 +39,7 @@
  * **isEpicId rule.** Reuses {@link parsePlanRef} from `src/derivers.ts` —
  * `parsePlanRef(target)?.kind === 'epic'` is the single source of truth (no
  * second copy of the regex). The spawn-name ref shape (`SPAWN_VERB_REF_RE` in
- * `src/derivers.ts`) and the planctl-target ref shape MUST agree byte-for-byte
+ * `src/derivers.ts`) and the plan-target ref shape MUST agree byte-for-byte
  * so a re-fold from scratch reproduces the same epic links.
  *
  * **Re-fold determinism.** Every function here is a pure function of its
@@ -60,7 +60,7 @@
 import { parsePlanRef } from "./derivers";
 
 /**
- * Normalize a keeper-side raw planctl CLI verb (`epic-create`, `task-create`,
+ * Normalize a keeper-side raw plan CLI verb (`epic-create`, `task-create`,
  * `epic-set-title`, `task-set-description`) into the namespace-stripped form
  * the classifier reads (`create`, `set-title`, `set-description`).
  *
@@ -74,7 +74,7 @@ import { parsePlanRef } from "./derivers";
  *
  * Pure function of the input. NEVER throws. Unknown / non-prefixed verbs pass
  * through unchanged — `cat` stays `cat`, `done` stays `done`, `scaffold` stays
- * `scaffold`, `close` stays `close`, etc. — so a future planctl CLI verb that
+ * `scaffold`, `close` stays `close`, etc. — so a future plan CLI verb that
  * doesn't follow the `<kind>-<op>` shape rides through deterministically.
  */
 export function normalizePlanOp(rawOp: string): string {
@@ -107,9 +107,9 @@ export interface ClassifierInvocation {
   /** Unix epoch seconds (matches `events.ts` REAL). */
   ts: number;
   op: string;
-  /** Bash-parsed planctl target; null when the verb takes no argument. */
+  /** Bash-parsed plan target; null when the verb takes no argument. */
   target: string | null;
-  /** Parsed-out epic id ({@link parsePlanRef}); null when target is not a planctl ref. */
+  /** Parsed-out epic id ({@link parsePlanRef}); null when target is not a plan ref. */
   epic_id: string | null;
   /** False for read-only verbs (`epics`, `tasks`, `cat`, etc.); true for mutations. */
   subject_present: boolean;
@@ -184,7 +184,7 @@ function sortValidInvocations(
 /**
  * Classify one entry into a `(kind, target)` link, or null when it is not an
  * epic-mutating op. `scaffold` is keeper's canonical epic-create path (the
- * planctl CLI's `scaffold` verb writes a fresh `.keeper/epics/<id>.json`); it
+ * plan CLI's `scaffold` verb writes a fresh `.keeper/epics/<id>.json`); it
  * carries an epic-shaped target and is a creator alongside `create`. A
  * mutating op that names an epic (via `epic_id`) but is not a create/scaffold
  * is a refiner — EXCEPT the autopilot-op exclusions (`op === "done"` /
@@ -229,7 +229,7 @@ function classifyEntry(
 }
 
 /**
- * Classify one session's planctl invocations and return a deduped, sorted list
+ * Classify one session's plan invocations and return a deduped, sorted list
  * of `{kind, target}` link entries. Every epic-mutating op links regardless of
  * time — there is no `/plan:plan` window gate.
  *

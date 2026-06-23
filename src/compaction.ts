@@ -21,9 +21,9 @@
  * defaults to KEPT (the fail-safe direction). Its complement IS the keep-set:
  * every class a live fold reads (snapshot/synthetic folds, session/prompt folds,
  * the subagent PreToolUse:Agent bridge, search-history's UserPromptSubmit
- * `$.prompt`, the legacy Agent `tool_response.agentId` fallback, planctl Bash
+ * `$.prompt`, the legacy Agent `tool_response.agentId` fallback, plan Bash
  * `tool_response.stdout`, …). The shed-set spans PostToolUse
- * Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch, non-planctl
+ * Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch, non-plan
  * PostToolUse:Bash, modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`),
  * non-Agent PreToolUse / PostToolUseFailure tool bodies, and
  * SubagentStart/SubagentStop/BackendExecSnapshot/Notification. Every keep-set
@@ -122,7 +122,7 @@ export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
  * shed). The complement of this set IS the keep-set: every class a live fold
  * parses (snapshot / synthetic folds, session / prompt folds, the subagent
  * PreToolUse:Agent bridge, the legacy Agent `tool_response.agentId` fallback,
- * planctl Bash `tool_response.stdout`, the cron `tool_response.id`, …).
+ * plan Bash `tool_response.stdout`, the cron `tool_response.id`, …).
  *
  * The shed-set, each clause justified by an exhaustive fold-read audit:
  *  - PostToolUse Write/Edit/MultiEdit/NotebookEdit — the four mutation tools

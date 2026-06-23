@@ -97,7 +97,7 @@ function makeTask(overrides: Partial<Task>): Task {
     // tests that care about a real tier override via `...overrides`.
     tier: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
-    // open|done) and `runtime_status` added (planctl-native enum, default
+    // open|done) and `runtime_status` added (plan-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's
     // `tasks` array.
     worker_phase: "open",
@@ -888,9 +888,9 @@ test("renderJobLinkLines: multiple entries iterate in provided order (projection
   ]);
 });
 
-// Epic fn-695 (T4): the durable commit-trailer union (`syncPlanctlLinks`) can
+// Epic fn-695 (T4): the durable commit-trailer union (`syncPlanLinks`) can
 // land MANY creator + refiner edges on one epic's `job_links` — one entry per
-// session whose planctl footprint (scrape OR commit trailer) created/refined
+// session whose plan footprint (scrape OR commit trailer) created/refined
 // the epic inside a `/plan:plan` window. `renderJobLinkLines` must emit one
 // line per entry, unchanged: no field change, no per-source branch. Pins that
 // N creator + M refiner edges render N+M lines in projection order.
@@ -1193,7 +1193,7 @@ test("colorizePillsInLine: empty string yields empty string", () => {
 
 // ---------------------------------------------------------------------------
 // fn-635: epicNumFromIdOrBare — handles BOTH full `name-N-slug` form and the
-// bare `fn-N` form planctl emits for cross-project epic deps.
+// bare `fn-N` form plan emits for cross-project epic deps.
 // ---------------------------------------------------------------------------
 
 test("epicNumFromIdOrBare: full-id form (`name-N-slug`) returns N", () => {

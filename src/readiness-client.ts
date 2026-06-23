@@ -1422,7 +1422,7 @@ export function subscribeReadiness(
       limit: SUBAGENT_INVOCATIONS_PAGE_LIMIT,
     },
   );
-  // The `git` collection — one row per planctl-backed git worktree, keyed by
+  // The `git` collection — one row per plan-backed git worktree, keyed by
   // `project_dir`. RETAINED-BUT-UNREAD by readiness (the sole consumer was the
   // deleted predicate 6.5), but still projected onto the snapshot for renderers.
   // The live `git_status` row is the honest source of truth (per-job dirty

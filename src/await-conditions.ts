@@ -94,7 +94,7 @@ import type { Epic, GitStatus, Job, Task } from "./types";
 export type TargetKind = "epic" | "task";
 
 /**
- * The planctl-board condition families — each takes exactly one planctl id
+ * The plan-board condition families — each takes exactly one plan id
  * (`fn-N-slug` epic or `fn-N-slug.M` task). Distinguished from
  * {@link GitJobCondition} (which take NO id and read git/jobs rows
  * directly) so the grammar's per-condition arity is type-driven.
@@ -106,8 +106,8 @@ export type TargetKind = "epic" | "task";
 export type PlanCondition = "complete" | "unblocked" | "started";
 
 /**
- * The two non-planctl condition families (fn-713). Neither carries a
- * planctl id — `git-clean` reads the cwd's `git_status` row, `agents-idle`
+ * The two non-plan condition families (fn-713). Neither carries a
+ * plan id — `git-clean` reads the cwd's `git_status` row, `agents-idle`
  * reads the `jobs` rows. Evaluated by {@link gitCleanState} /
  * {@link agentsIdleState}, NOT {@link evaluateAwaitCondition}.
  */
@@ -120,7 +120,7 @@ export type AwaitCondition = PlanCondition | GitJobCondition;
  * Discriminator the command hands to {@link evaluateAwaitCondition}. The
  * `kind` field decides which projection arm the predicate reads off; the
  * `condition` selects between the "complete" and "unblocked" semantics
- * defined in the module docblock. Only the planctl families carry an
+ * defined in the module docblock. Only the plan families carry an
  * {@link AwaitTarget}; `git-clean` / `agents-idle` use the dedicated
  * predicates and need no id/kind.
  */

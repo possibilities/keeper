@@ -175,7 +175,7 @@ interface Envelope {
   // check with non-boolean values too (the string `"true"`, `1`, an object,
   // etc., all of which MUST fold to `false`).
   queue_jump?: unknown;
-  // Schema v46 / fn-666: the repo-relative `files` array planctl emits on
+  // Schema v46 / fn-666: the repo-relative `files` array plan emits on
   // every mutating verb. Optional + arbitrary type (`unknown`) so tests can
   // drive the deriver's `Array.isArray` + per-element-string filter against
   // non-array, non-string-element, and size-cap edges.
@@ -445,7 +445,7 @@ test("extractPlanInvocation parses envelope with null target (bare-verb mutation
 });
 
 test("extractPlanInvocation treats non-ref target as parseable but unresolved", () => {
-  // `planctl scaffold spec.json` — target is captured but parsePlanRef yields null.
+  // `keeper plan scaffold spec.json` — target is captured but parsePlanRef yields null.
   const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
@@ -492,7 +492,7 @@ test("extractPlanInvocation marks subject_present:true when subject is any non-n
 });
 
 test("extractPlanInvocation lifts queue_jump:true from the envelope (schema v30)", () => {
-  // The canonical `/plan:queue` scaffold path — planctl emits the literal
+  // The canonical `/plan:queue` scaffold path — plan emits the literal
   // boolean `true` on the envelope, the deriver lifts to `queue_jump: true`.
   const got = extractPlanInvocation(
     "PostToolUse",
@@ -531,7 +531,7 @@ test("extractPlanInvocation folds queue_jump:false from the envelope (defer / no
   );
   expect(explicit?.queue_jump).toBe(false);
 
-  // Absent key (legacy planctl envelope predating v30) — `=== true` is
+  // Absent key (legacy plan envelope predating v30) — `=== true` is
   // false, so queue_jump folds to `false`. This is the re-fold determinism
   // gate: every historical event lacking the field reproduces `false`.
   const absent = extractPlanInvocation(
@@ -549,7 +549,7 @@ test("extractPlanInvocation folds queue_jump:false from the envelope (defer / no
 test("extractPlanInvocation defensive: non-boolean queue_jump values fold to false", () => {
   // The `=== true` check is intentionally strict — any non-boolean value
   // (string "true", `1`, an object, `null`) folds to `false`. Protects
-  // against a buggy planctl emitting the wrong shape.
+  // against a buggy plan emitting the wrong shape.
   const cases: { label: string; value: unknown }[] = [
     { label: "string 'true'", value: "true" },
     { label: "number 1", value: 1 },
@@ -573,7 +573,7 @@ test("extractPlanInvocation defensive: non-boolean queue_jump values fold to fal
 
 test("extractPlanInvocation widens to absolute-path and bash -c invocations (envelope is authoritative)", () => {
   // The old regex rejected these; the envelope-based deriver accepts them
-  // because the envelope rides on stdout regardless of how planctl was
+  // because the envelope rides on stdout regardless of how plan was
   // invoked. The hook just sees a Bash command whose stdout is JSON.
   const got = extractPlanInvocation(
     "PostToolUse",
@@ -610,7 +610,7 @@ test("extractPlanInvocation rejects an envelope with empty-string op", () => {
 });
 
 test("extractPlanInvocation tolerates leading whitespace before the JSON body", () => {
-  // planctl envelopes are JSON; tolerate trailing newlines from upstream
+  // plan envelopes are JSON; tolerate trailing newlines from upstream
   // wrappers and leading whitespace from CLI prefix lines.
   const got = extractPlanInvocation(
     "PostToolUse",
@@ -650,7 +650,7 @@ test("extractPlanInvocation never throws on arbitrary garbage", () => {
 
 test("extractPlanInvocation lifts non-empty files array from the envelope (schema v46)", () => {
   // Canonical scaffold envelope shape — `files` carries repo-relative
-  // paths planctl wrote (every .planctl/{epics,tasks,specs}/...).
+  // paths plan wrote (every .planctl/{epics,tasks,specs}/...).
   const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
@@ -675,7 +675,7 @@ test("extractPlanInvocation lifts non-empty files array from the envelope (schem
 });
 
 test("extractPlanInvocation folds an absent files key to null", () => {
-  // Read-only verbs and legacy planctl envelopes omit the field entirely.
+  // Read-only verbs and legacy plan envelopes omit the field entirely.
   // The deriver folds the absence to `null` so the `events.planctl_files`
   // column's partial-index `WHERE planctl_files IS NOT NULL` stays
   // selective. Re-fold determinism: every legacy event reproduces null.
@@ -688,7 +688,7 @@ test("extractPlanInvocation folds an absent files key to null", () => {
 });
 
 test("extractPlanInvocation folds an explicit null files field to null", () => {
-  // The planctl CLI's emit() writes `files: null` on read-only ops
+  // The plan CLI's emit() writes `files: null` on read-only ops
   // (`epics`, `cat`, etc.). Same null-fold path as the absent-key test.
   const got = extractPlanInvocation(
     "PostToolUse",
@@ -713,7 +713,7 @@ test("extractPlanInvocation folds an empty files array to null", () => {
 test("extractPlanInvocation filters non-string elements out of files", () => {
   // Defensive — `extractPlanInvocation` mirrors `bash_mutation_targets`'s
   // Array.isArray + per-element string filter. Mixed-type entries (a buggy
-  // planctl) are dropped; valid strings ride through. If filtering empties
+  // plan) are dropped; valid strings ride through. If filtering empties
   // the array entirely, the result folds to `null` (no mint).
   const got = extractPlanInvocation(
     "PostToolUse",

@@ -381,7 +381,7 @@ test("commit-split: a Commit ABOVE floor discharges file_attributions normally",
 
 test("charter: re-folding the full log with the floor RAISED leaves the deterministic projections identical and the live surface EMPTY", () => {
   // Seed a mixed corpus: a SessionStart (jobs — deterministic) + a GitSnapshot
-  // (live) + a planctl Commit (trailer-facts deterministic, discharge live).
+  // (live) + a plan Commit (trailer-facts deterministic, discharge live).
   insertEvent({
     hook_event: "SessionStart",
     session_id: "44444444-4444-4444-4444-444444444444",

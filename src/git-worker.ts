@@ -195,7 +195,7 @@ export interface CommitMessage {
   files: CommitMessageFile[];
   committer_session_id: string | null;
   /**
-   * The validated, planctl-shaped `Task:` trailer values for this commit.
+   * The validated, plan-shaped `Task:` trailer values for this commit.
    * Multi-valued (collect-all, unlike the take-last {@link
    * committer_session_id}) so one `keeper commit-work` closing two tasks lights
    * both. Empty `[]` when no valid `Task:` trailer is present. The reducer's link
@@ -203,8 +203,8 @@ export interface CommitMessage {
    */
   task_ids: string[];
   /**
-   * The normalized planctl op + validated target ref lifted from this commit's
-   * `Planctl-Op:` / `Planctl-Target:` trailers. Both `null` on a non-planctl
+   * The normalized plan op + validated target ref lifted from this commit's
+   * `Planctl-Op:` / `Planctl-Target:` trailers. Both `null` on a non-plan
    * commit. The reducer's edge fold defaults both to `null` for pre-existing
    * events (re-fold determinism).
    */
@@ -220,9 +220,9 @@ export interface CommitMessage {
  * reducer never sees it (re-fold determinism — the plan files are re-read from
  * committed worktree state on every ingest, never from this payload).
  *
- * The producer filters to planctl-shaped paths so the worker needs no
+ * The producer filters to plan-shaped paths so the worker needs no
  * re-classification. One message per commit; {@link changes} is non-empty by
- * construction (emission is suppressed when no planctl path moved).
+ * construction (emission is suppressed when no plan path moved).
  */
 export interface PlanChangedFile {
   /** Repo-relative path (forward-slash on POSIX). */
@@ -802,9 +802,9 @@ export interface EnumeratedCommit {
   committer_session_id: string | null;
   task_ids: string[];
   /**
-   * The normalized planctl op (`Planctl-Op:` trailer → {@link normalizePlanOp})
+   * The normalized plan op (`Planctl-Op:` trailer → {@link normalizePlanOp})
    * and validated target ref (`Planctl-Target:` → {@link parsePlanRef}). Both
-   * `null` on a non-planctl / malformed commit. Frozen at producer time, read
+   * `null` on a non-plan / malformed commit. Frozen at producer time, read
    * back unchanged by the reducer's edge fold (re-fold determinism).
    */
   planctl_op: string | null;
@@ -825,7 +825,7 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * - `.keeper/state/tasks/<id>.state.json` (4-segment)
  * - `.keeper/state/epics/<id>.state.json` (4-segment)
  *
- * The sole gate for {@link filterPlanctlChanges}: only a commit touching one of
+ * The sole gate for {@link filterPlanChanges}: only a commit touching one of
  * these `.keeper/` shapes is forwarded to the plan-worker.
  */
 export function isPlanChangedPath(path: string): boolean {
@@ -851,11 +851,11 @@ export function isPlanChangedPath(path: string): boolean {
 }
 
 /**
- * Filter a commit's enumerated file list to planctl-shaped paths, pairing each
+ * Filter a commit's enumerated file list to plan-shaped paths, pairing each
  * with an upsert/delete tag. A null `blob_oid` (the producer's zero-oid
  * "removed" marker) is `"delete"`; everything else is `"upsert"`.
  */
-export function filterPlanctlChanges(
+export function filterPlanChanges(
   files: EnumeratedCommitFile[],
 ): PlanChangedFile[] {
   const out: PlanChangedFile[] = [];
@@ -1017,8 +1017,8 @@ export function enumerateCommitsInDelta(
       oid,
     );
     const taskIds = parseTaskTrailers(taskTrailers);
-    const planctlOp = parsePlanctlOpTrailer(opTrailers);
-    const planctlTarget = parsePlanctlTargetTrailer(targetTrailers);
+    const planOp = parsePlanOpTrailer(opTrailers);
+    const planTarget = parsePlanTargetTrailer(targetTrailers);
     const files = commitFiles(root, oid);
     commits.push({
       commit_oid: oid,
@@ -1026,8 +1026,8 @@ export function enumerateCommitsInDelta(
       files,
       committer_session_id: committerSessionId,
       task_ids: taskIds,
-      planctl_op: planctlOp,
-      planctl_target: planctlTarget,
+      planctl_op: planOp,
+      planctl_target: planTarget,
       committed_at_ms: committedAtMs,
     });
   }
@@ -1066,13 +1066,13 @@ function coalesceCommitterSessionId(
 }
 
 /**
- * Lift the planctl operation from a commit's `Planctl-Op:` trailer and
+ * Lift the plan operation from a commit's `Planctl-Op:` trailer and
  * NORMALIZE it via {@link normalizePlanOp} (same vocabulary as the legacy
  * scrape path, so the reducer's `syncPlanLinks` union compares both on one
  * vocabulary). Take-last on the unfolded block. Returns `null` on empty /
  * non-string input (no such trailer).
  */
-function parsePlanctlOpTrailer(raw: string): string | null {
+function parsePlanOpTrailer(raw: string): string | null {
   if (typeof raw !== "string" || raw.length === 0) {
     return null;
   }
@@ -1086,14 +1086,14 @@ function parsePlanctlOpTrailer(raw: string): string | null {
 }
 
 /**
- * Lift the planctl target ref from a commit's `Planctl-Target:` trailer and
+ * Lift the plan target ref from a commit's `Planctl-Target:` trailer and
  * validate it against the SAME epic-ref shape gate the legacy scrape path uses
  * ({@link parsePlanRef}). Take-last on the unfolded block; returns the raw
  * validated ref (`fn-1-foo` or `fn-1-foo.3`). `null` on empty / non-string input
  * AND on a value `parsePlanRef` rejects (so a garbage trailer never poisons the
  * edge fold).
  */
-function parsePlanctlTargetTrailer(raw: string): string | null {
+function parsePlanTargetTrailer(raw: string): string | null {
   if (typeof raw !== "string" || raw.length === 0) {
     return null;
   }
@@ -1943,7 +1943,7 @@ function startWorker(): void {
               parent_oid: c.parent_oid,
               files: c.files,
               committer_session_id: c.committer_session_id,
-              // Epic fn-670 (T1): the validated, planctl-shaped `Task:`
+              // Epic fn-670 (T1): the validated, plan-shaped `Task:`
               // trailer values the git-worker collected for this
               // commit. Empty `[]` on the common path (no Task trailer,
               // or all values malformed). The reducer's T2 link fold
@@ -1951,9 +1951,9 @@ function startWorker(): void {
               // to stamp the per-task `last_commit_for_task_at` on the
               // embedded job element under each named task.
               task_ids: c.task_ids,
-              // Epic fn-695: the normalized planctl op + validated target
+              // Epic fn-695: the normalized plan op + validated target
               // ref lifted from this commit's `Planctl-Op:` /
-              // `Planctl-Target:` trailers. Both null on a non-planctl
+              // `Planctl-Target:` trailers. Both null on a non-plan
               // commit. The reducer's edge fold reads them (with
               // `committer_session_id`) to mint the commit-derived
               // creator/refiner edge, deduped against the legacy stdout
@@ -1970,24 +1970,24 @@ function startWorker(): void {
             if (dischargedCommitAtMs !== undefined && c.committed_at_ms > 0) {
               dischargedCommitAtMs.push(c.committed_at_ms);
             }
-            // Epic fn-681: authoritative commit-driven planctl ingest.
-            // Filter the commit's enumerated file list to planctl-shaped
+            // Epic fn-681: authoritative commit-driven plan ingest.
+            // Filter the commit's enumerated file list to plan-shaped
             // paths (epics / tasks / state-tasks) and post one
             // {@link PlanCommitChangedMessage} per commit carrying any
-            // such paths. Suppressed when the commit touched no planctl
+            // such paths. Suppressed when the commit touched no plan
             // files — the common case for source commits. Main forwards
             // the message verbatim to plan-worker, which re-ingests each
             // path from the committed worktree via the existing
             // `onChange` / `onDelete` pipeline (drop-proof; no partial-
             // read race). The reducer never sees this message — it lives
             // entirely on the worker→main→worker side channel.
-            const planctlChanges = filterPlanctlChanges(c.files);
-            if (planctlChanges.length > 0) {
+            const planChanges = filterPlanChanges(c.files);
+            if (planChanges.length > 0) {
               port.postMessage({
                 kind: "plan-commit-changed",
                 project_dir: root,
                 commit_oid: c.commit_oid,
-                changes: planctlChanges,
+                changes: planChanges,
               } satisfies PlanCommitChangedMessage);
             }
           }

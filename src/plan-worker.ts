@@ -118,7 +118,7 @@ export interface PlanWorkerData {
 /** Snapshot message for one `.keeper/epics/*.json` file. */
 export interface PlanEpicMessage {
   kind: "plan-epic";
-  /** Planctl epic id (the projection pk; rides in the synthetic event's session_id). */
+  /** Plan epic id (the projection pk; rides in the synthetic event's session_id). */
   id: string;
   /** Epic number parsed from the id (`fn-N-…` → N), or null when unparseable. */
   number: number | null;
@@ -126,10 +126,10 @@ export interface PlanEpicMessage {
   /** The epic's `primary_repo` — stored opaque, never used to drive FS reads. */
   projectDir: string | null;
   status: string | null;
-  /** Epic-level deps: the planctl `depends_on_epics` ids (string array). */
+  /** Epic-level deps: the plan `depends_on_epics` ids (string array). */
   dependsOnEpics: string[];
   /**
-   * Planctl-native validation timestamp (top-level `last_validated_at` field
+   * Plan-native validation timestamp (top-level `last_validated_at` field
    * on `.keeper/epics/<id>.json`). Plain ISO-8601 string when present; a
    * missing / empty / non-string value collapses to `null` via {@link asString}
    * — the CLAUDE.md "safe value" invariant. Drives the board UI's
@@ -141,9 +141,9 @@ export interface PlanEpicMessage {
 /** Snapshot message for one `.keeper/tasks/*.json` file. */
 export interface PlanTaskMessage {
   kind: "plan-task";
-  /** Planctl task id (the projection pk; rides in the synthetic event's session_id). */
+  /** Plan task id (the projection pk; rides in the synthetic event's session_id). */
   id: string;
-  /** Parent epic id (planctl `epic` field). */
+  /** Parent epic id (plan `epic` field). */
   epicId: string | null;
   /** Task number parsed from the id (`….M` → M), or null when unparseable. */
   number: number | null;
@@ -151,7 +151,7 @@ export interface PlanTaskMessage {
   /** The task's `target_repo` — stored opaque, never used to drive FS reads. */
   targetRepo: string | null;
   /**
-   * Planctl-native effort tier — the top-level `tier` field on the task-def file.
+   * Plan-native effort tier — the top-level `tier` field on the task-def file.
    * Stored opaque — keeper never branches on the value, so a tier widening rides
    * through with no code change. Null on absent/legacy files (folds to `null`
    * deterministically).
@@ -159,19 +159,19 @@ export interface PlanTaskMessage {
   tier: string | null;
   /**
    * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
-   * `"open"`. Kept distinct from the planctl-native `runtime_status` enum below.
+   * `"open"`. Kept distinct from the plan-native `runtime_status` enum below.
    */
   workerPhase: string;
   /**
-   * Planctl-native runtime status ingested from
+   * Plan-native runtime status ingested from
    * `.keeper/state/tasks/<task_id>.state.json` (top-level `status` field):
    * `"todo" | "in_progress" | "done" | "blocked"`. Absent / missing file /
-   * unrecognized value safe-defaults to `"todo"` per planctl's
+   * unrecognized value safe-defaults to `"todo"` per plan's
    * `merge_task_state` convention (a fresh clone with no `state/` tree reads
    * every task as `todo`).
    */
   runtimeStatus: string;
-  /** Task-level deps: the planctl `depends_on` task ids (string array). */
+  /** Task-level deps: the plan `depends_on` task ids (string array). */
   dependsOn: string[];
 }
 
@@ -181,7 +181,7 @@ export interface PlanTaskMessage {
  */
 export interface PlanEpicDeletedMessage {
   kind: "plan-epic-deleted";
-  /** Planctl epic id (the projection pk; rides in the synthetic event's session_id). */
+  /** Plan epic id (the projection pk; rides in the synthetic event's session_id). */
   id: string;
 }
 
@@ -194,7 +194,7 @@ export interface PlanEpicDeletedMessage {
  */
 export interface PlanTaskDeletedMessage {
   kind: "plan-task-deleted";
-  /** Planctl task id. */
+  /** Plan task id. */
   id: string;
   /** Parent epic id, recovered from the last-emitted task snapshot. */
   epicId: string | null;
@@ -346,7 +346,7 @@ export type InboundMessage =
  * Cap a plan file's size before `JSON.parse`. Plan JSONs live under a
  * user-editable HOME; a pathological/oversize file is skip-and-logged so a bad
  * file never balloons memory or stalls the callback. 1 MiB is far above any real
- * planctl epic/task JSON.
+ * plan epic/task JSON.
  */
 const MAX_PLAN_FILE_BYTES = 1024 * 1024;
 
@@ -448,7 +448,7 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
 
 /**
  * Classify a watched path as an epic file, a task file, a task runtime-state
- * file, or neither, by matching the planctl layout. Uses the platform path
+ * file, or neither, by matching the plan layout. Uses the platform path
  * separator so it works under any root depth. A path NOT matching one of the
  * shapes returns `null` — the callback then skips it (the in-callback filter
  * the ignore globs can't express).
@@ -461,8 +461,8 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
  *
  * The 3-segment check is tried first so an `.json`-suffixed file under a
  * 3-tail layout never falls through to the 4-tail probe. The 4-tail probes
- * match the planctl `LocalFileStateStore` shape (see
- * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
+ * match the plan `LocalFileStateStore` shape (see
+ * `apps/plan/plan/store.py:151`); files there end in `.state.json` so a
  * stray `*.json` (non-state) under `<data-dir>/state/{tasks,epics}/` rejects.
  * The epic-state sidecar classifies as `"epic-state"` so its path is
  * recognized, but keeper ingests no field from it — no change/delete arm acts
@@ -490,7 +490,7 @@ export function classifyPlanPath(path: string): PlanKind | null {
     return null;
   }
   // 4-segment tail: `<data-dir>/state/tasks/<id>.state.json`. The filename MUST
-  // end in `.state.json` (the planctl LocalFileStateStore convention); a
+  // end in `.state.json` (the plan LocalFileStateStore convention); a
   // stray `*.json` (non-state) under this subtree rejects.
   if (
     n >= 4 &&
@@ -512,7 +512,7 @@ export function classifyPlanPath(path: string): PlanKind | null {
 }
 
 /**
- * Parse the leading `fn-N-…` epic number from a planctl id. Returns N (the first
+ * Parse the leading `fn-N-…` epic number from a plan id. Returns N (the first
  * integer group) or null for a non-matching id.
  *
  * Pure. Exported for unit reach.
@@ -527,7 +527,7 @@ export function epicNumberFromId(id: string): number | null {
 }
 
 /**
- * Parse the trailing `.M` task number from a planctl task id
+ * Parse the trailing `.M` task number from a plan task id
  * (`fn-N-slug.M` → M). Returns M or null for a non-matching id.
  *
  * Pure. Exported for unit reach.
@@ -541,7 +541,7 @@ export function taskNumberFromId(id: string): number | null {
   return Number.isNaN(n) ? null : n;
 }
 
-/** Raw planctl epic JSON shape — only the fields we project. */
+/** Raw plan epic JSON shape — only the fields we project. */
 interface RawEpic {
   id?: unknown;
   title?: unknown;
@@ -551,16 +551,16 @@ interface RawEpic {
   last_validated_at?: unknown;
 }
 
-/** Raw planctl task JSON shape — only the fields we project. */
+/** Raw plan task JSON shape — only the fields we project. */
 interface RawTask {
   id?: unknown;
   epic?: unknown;
   title?: unknown;
   target_repo?: unknown;
   /**
-   * Planctl-native effort tier: top-level field on the task-def file,
-   * read by `planctl resolve-task` from `task_def.get("tier")`. Planctl's own
-   * vocabulary is `medium | high | xhigh | max` (planctl `TASK_TIERS`), but
+   * Plan-native effort tier: top-level field on the task-def file,
+   * read by `keeper plan resolve-task` from `task_def.get("tier")`. Plan's own
+   * vocabulary is `medium | high | xhigh | max` (plan `TASK_TIERS`), but
    * keeper stores the field opaque — never branches on the value — so any
    * future tier widening rides through with no code change. Absent on legacy
    * task files / unset on newer ones; coerced to `null` by `asString`.
@@ -571,9 +571,9 @@ interface RawTask {
 }
 
 /**
- * Raw planctl runtime-state JSON shape — only the fields we project. The state
- * file (`.keeper/state/tasks/<task_id>.state.json`) is written by planctl
- * `LocalFileStateStore` (`apps/planctl/planctl/store.py:151`) and carries
+ * Raw plan runtime-state JSON shape — only the fields we project. The state
+ * file (`.keeper/state/tasks/<task_id>.state.json`) is written by plan
+ * `LocalFileStateStore` (`apps/plan/plan/store.py:151`) and carries
  * `assignee` / `claim_note` / `claimed_at` / `evidence` / `status` /
  * `updated_at`; keeper ingests only `status`.
  */
@@ -587,7 +587,7 @@ function asString(v: unknown): string | null {
 }
 
 /**
- * Derive the planctl task id from a state-file path:
+ * Derive the plan task id from a state-file path:
  * `.../.keeper/state/tasks/<task_id>.state.json` → `<task_id>`. Returns null
  * if the basename does not end in `.state.json` (caller has already
  * classified — this stays a pure transform on the matched shape).
@@ -693,7 +693,7 @@ function asStringArray(v: unknown): string[] {
 }
 
 /**
- * The fixed set of valid planctl runtime-status enum values
+ * The fixed set of valid plan runtime-status enum values
  * (`.keeper/state/tasks/<id>.state.json`'s top-level `status` field).
  */
 const RUNTIME_STATUS_VALUES: ReadonlySet<string> = new Set([
@@ -706,7 +706,7 @@ const RUNTIME_STATUS_VALUES: ReadonlySet<string> = new Set([
 /**
  * Coerce a value off a state file to the runtime-status enum. A valid enum
  * string passes through; a missing field defaults silently to `"todo"`
- * (mirrors planctl's `merge_task_state` convention — a task with no state file
+ * (mirrors plan's `merge_task_state` convention — a task with no state file
  * reads `todo` everywhere); any other value (wrong type, typo, garbage)
  * coerces to `"todo"` with a stderr log via `onInvalid` — the CLAUDE.md "safe
  * value" invariant. The fold stays a pure function of the persisted file
@@ -761,7 +761,7 @@ function parseStringArrayColumn(text: string | null): string[] {
  *   snapshot (the parent link is gone with the file). A path that was never
  *   folded (no change-gate entry) emits nothing — there is nothing to retract.
  *
- * The change-gate is keyed by the planctl id (the projection pk) and holds the
+ * The change-gate is keyed by the plan id (the projection pk) and holds the
  * last-emitted serialized snapshot. `seedFromDb` (below) primes it from the
  * `epics`/`tasks` projection so a daemon restart full-scan does not re-emit a
  * synthetic event per plan file every boot.
@@ -771,7 +771,7 @@ function parseStringArrayColumn(text: string | null): string[] {
  * (untracked, or staged-but-not-committed). Suppressed paths land in the
  * {@link pending} set. The reducer continues to fold ONLY committed
  * snapshots, so the autopilot cannot dispatch against an uncommitted epic.
- * A planctl `git commit` does not change the file content, so FSEvents will
+ * A plan `git commit` does not change the file content, so FSEvents will
  * NOT re-fire on commit — the caller (the worker, driven by git-worker
  * snapshot pulses) drives {@link recheckPending} to drain the set. The
  * predicate is a producer-side gate; the reducer NEVER reads git/fs/wallclock
@@ -794,7 +794,7 @@ export class PlanScanner {
    * (nothing to retract, since the reducer never saw it).
    *
    * NOT tracked for `task-state` (sidecar) paths — those bypass the gate
-   * entirely (state files are runtime data, planctl's `.gitignore` excludes
+   * entirely (state files are runtime data, plan's `.gitignore` excludes
    * them). A state-file change re-emits a TaskSnapshot through the
    * still-gated def-file path; if the def file is pending, the state-file
    * change is effectively pending too (the re-emit lands in `pending`
@@ -804,20 +804,20 @@ export class PlanScanner {
   /**
    * Per-task cache of the latest runtime-status enum value observed in
    * `.keeper/state/tasks/<task_id>.state.json` (top-level `status` field).
-   * Keyed by planctl task id. A task that has never been observed in the
-   * cache reads `"todo"` (planctl's `merge_task_state` default — a fresh
+   * Keyed by plan task id. A task that has never been observed in the
+   * cache reads `"todo"` (plan's `merge_task_state` default — a fresh
    * clone with no `state/` tree shows every task as `todo`); the
    * {@link buildTaskMessage} caller passes this default.
    *
    * Updated by an `onChange` over a `task-state` path AFTER the file
    * coerce-parses cleanly, and re-derived to `"todo"` by `onDelete` over the
    * same path (so a state-file vanish flips the task back to `todo`, matching
-   * planctl's "no state file → todo" convention). NEVER mutated from a `task`
+   * plan's "no state file → todo" convention). NEVER mutated from a `task`
    * (definition) path — the cache is the state file's projection.
    */
   private readonly runtimeStatusCache = new Map<string, string>();
   /**
-   * The set of planctl ids whose backing `.json` file was actually enumerated
+   * The set of plan ids whose backing `.json` file was actually enumerated
    * on disk by a boot scan ({@link markSeen}, called from `scanPlanDir` for
    * EVERY file regardless of parse outcome). The boot-reconciliation
    * {@link sweep} diffs the projection against this census to retract ghosts —
@@ -1143,7 +1143,7 @@ export class PlanScanner {
    * synthetic-event pipeline as the snapshot messages.
    *
    * `task-state` (sidecar) deletes do NOT emit a tombstone — they flip the
-   * runtime-status cache back to the planctl default `"todo"` and re-emit a
+   * runtime-status cache back to the plan default `"todo"` and re-emit a
    * TaskSnapshot from the still-present task-definition file. The definition
    * file is the projection's identity; a sidecar vanishing reverts state, it
    * does not retract the task.
@@ -1152,7 +1152,7 @@ export class PlanScanner {
     const kind = classifyPlanPath(path);
     if (kind === "task-state") {
       // Sidecar delete: drop the runtime-status cache entry (reverts the task
-      // to the planctl default "todo") and re-emit a TaskSnapshot from the
+      // to the plan default "todo") and re-emit a TaskSnapshot from the
       // still-present task-definition file. A state-file path is NOT tracked in
       // `pathToId` (the cache key is the task id directly), so there is no
       // entry to drop there.
@@ -1183,7 +1183,7 @@ export class PlanScanner {
     if (id === undefined) {
       // Never folded this path. If the path was held in the observation
       // gate's pending set (uncommitted epic/task whose file
-      // got removed before it ever made HEAD — e.g. a planctl scaffold
+      // got removed before it ever made HEAD — e.g. a plan scaffold
       // unwind on commit_failed), drop it: there's nothing to retract
       // since the reducer never saw the entity. Either way, no tombstone.
       this.deletePending(path);
@@ -1210,7 +1210,7 @@ export class PlanScanner {
       }
       this.onSnapshot({ kind: "plan-task-deleted", id, epicId });
       // Definition file is gone: drop the runtime-status cache so a re-created
-      // task file starts from the planctl "todo" default rather than a stale
+      // task file starts from the plan "todo" default rather than a stale
       // cached value.
       this.runtimeStatusCache.delete(id);
     }
@@ -1665,7 +1665,7 @@ export class PlanScanner {
    * regardless of whether the snapshot parsed or was change-gate-suppressed.
    *
    * The id is derived from the filename (basename minus `.json`), which equals
-   * the planctl id — keying off the name (not a parse) means a file mid-rewrite
+   * the plan id — keying off the name (not a parse) means a file mid-rewrite
    * that momentarily fails to parse is still "seen" and never spuriously
    * retracted. A non-`.json` path is ignored.
    */
@@ -1821,10 +1821,10 @@ export function buildEpicMessage(
  * - `workerPhase` is DERIVED from the task definition: `worker_done_at`
  *   present → `"done"` else `"open"`. Surfaces the same compressed signal the
  *   field used to carry under the legacy `status` name.
- * - `runtimeStatus` is the planctl-native enum carried by the state file —
+ * - `runtimeStatus` is the plan-native enum carried by the state file —
  *   passed in by the caller (the {@link PlanScanner}, which caches the last
  *   per-task value). When absent / never-observed, the caller passes `"todo"`
- *   (planctl's `merge_task_state` default).
+ *   (plan's `merge_task_state` default).
  *
  * The OBJECT-LITERAL SLOT ORDER below is load-bearing — the change-gate
  * compares `JSON.stringify` output byte-for-byte, and the seed reconstruction
@@ -1871,10 +1871,10 @@ function stringifyErr(err: unknown): string {
  * root to run `git cat-file -e HEAD:<relpath>` against without a per-path
  * shell-out (`git rev-parse --show-toplevel` per call would be a
  * 100ms-class per-file cost on a `~/code` storm). The data dir IS
- * always at the repo root — planctl writes via `_resolve_repo_root` which
+ * always at the repo root — plan writes via `_resolve_repo_root` which
  * calls `git rev-parse --show-toplevel` and refuses to operate on a
  * non-git tree — so the data-dir parent equals the repo root by
- * construction. A future subtree-planctl layout would need to switch to
+ * construction. A future subtree-plan layout would need to switch to
  * `git rev-parse`.
  */
 export function repoRootFromPlanPath(path: string): string | null {
@@ -1901,12 +1901,12 @@ export function repoRootFromPlanPath(path: string): string | null {
 /**
  * observation gate predicate: is `path` in git HEAD (committed)?
  * Returns `false` for untracked paths AND for staged-but-not-committed
- * paths (the planctl commit-failed window the gate exists to close).
+ * paths (the plan commit-failed window the gate exists to close).
  *
  * Implementation: `git -C <root> cat-file -e HEAD:<relpath>` — exits 0 iff
  * the path exists in the HEAD tree. Hits the object DB without scanning
  * the index or worktree, so it's fast (~5-10ms per call) and cannot block
- * the watcher callback for long even under a churning planctl tree. The
+ * the watcher callback for long even under a churning plan tree. The
  * subprocess is bounded by {@link GIT_CHECK_TIMEOUT_MS}.
  *
  * Edge cases handled by returning `false` (fail closed — never wrongly
@@ -2068,7 +2068,7 @@ export const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
  * `git-worker.ts` `DB_POLL_MS` / `wake-worker.ts` so all producer/reader
  * workers share one schedule. A bump means SOMETHING committed to keeper's DB
  * (a hook event, a fold, a `Commit` discharge); since the close→approve flow
- * that makes a planctl file "ready" IS such a write, polling the DB collapses
+ * that makes a plan file "ready" IS such a write, polling the DB collapses
  * close→emit to ~50ms for any repo keeper already watches — no longer bound by
  * the 60s heartbeat. 25ms is the documented floor (don't poll faster, it can
  * interfere with @parcel/watcher's kqueue subscription on macOS); 100ms is
@@ -2198,7 +2198,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * would reset runtime_status to "todo" for the whole boot window.
  *
  * For the runtime-status case: a state file existing at
- * daemon boot (planctl's `LocalFileStateStore` writes `<id>.state.json` on
+ * daemon boot (plan's `LocalFileStateStore` writes `<id>.state.json` on
  * every status transition) would otherwise be ignored until the next live
  * write touched it, and the projection's `runtime_status` would silently
  * read the cache-miss default `"todo"` for the entire window. Priming
@@ -2297,7 +2297,7 @@ function scanPlanDir(
     const coerced = coerceRuntimeStatus(raw.status, (bad) => {
       // Match the live onChange arm: an invalid value logs and is SKIPPED
       // (no cache write), so the cache only holds the four-value vocabulary.
-      // The cache miss reads as the planctl default "todo" downstream.
+      // The cache miss reads as the plan default "todo" downstream.
       console.error(
         `[plan-worker] boot scan invalid runtime status in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
       );
@@ -2455,7 +2455,7 @@ export function scanRepoDataDirs(
  *
  * Steady-state cost: one shallow `readdirSync` per root + one `statSync`
  * per top-level entry + one shallow `readdirSync` per `.keeper/{epics,tasks,
- * state/tasks}` + one bounded read + parse per planctl file. The
+ * state/tasks}` + one bounded read + parse per plan file. The
  * change-gate (`PlanScanner.lastEmitted`) suppresses re-emits for unchanged
  * files, so a quiescent repo emits nothing across heartbeats.
  *
@@ -2588,7 +2588,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: string | null;
       target_repo: string | null;
       /**
-       * Planctl-native effort tier. Absent on legacy stored
+       * Plan-native effort tier. Absent on legacy stored
        * task elements; read defensively (`?? null`) so the reconstructed
        * `PlanTaskMessage.tier` matches `buildTaskMessage`'s output on a
        * fresh re-scan and the change-gate suppresses correctly across the
@@ -2624,7 +2624,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         number: taskNumberFromId(t.task_id),
         title: t.title,
         targetRepo: t.target_repo,
-        // Planctl-native effort tier. Pre-tier stored elements
+        // Plan-native effort tier. Pre-tier stored elements
         // lack the key — `?? null` matches `buildTaskMessage`'s
         // `asString(raw.tier)` on a tier-less task file so the change-gate
         // byte-compare suppresses on restart.
@@ -2634,10 +2634,10 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         // read whichever is present and default to "open" for a NULL so the
         // reconstructed seed matches a fresh scan.
         workerPhase: t.worker_phase ?? t.status ?? "open",
-        // The projection stores the planctl-native runtime status under
+        // The projection stores the plan-native runtime status under
         // `runtime_status`; default to "todo" for a (legacy / pre-bump) NULL
         // so the reconstructed seed matches a fresh scan whose state file
-        // hasn't been read yet (planctl's `merge_task_state` convention).
+        // hasn't been read yet (plan's `merge_task_state` convention).
         runtimeStatus: t.runtime_status ?? "todo",
         // Same coercion as buildTaskMessage so the seed is byte-identical; a
         // (legacy) task element without `depends_on` reconstructs to [].
@@ -2669,7 +2669,7 @@ export function resolveReflogTarget(repoRoot: string): string | null {
 }
 
 /**
- * the discovered planctl-repo set — every `<root>/<project>` that
+ * the discovered plan-repo set — every `<root>/<project>` that
  * holds a `.keeper` tree under the configured roots, via the same
  * {@link discoverPlanDirs} walk the heartbeat reconcile uses (a shallow
  * readdir+stat per root, no DB read, no emission). Each `.keeper` dir's
@@ -2835,7 +2835,7 @@ function main(): void {
   //
   // Widening. The pending-only watch set left the epic's confirmed slow
   // path open: a commit in a repo that holds a `.keeper` tree but NO currently-
-  // pending path (a steady-state planctl change — e.g. a `done`/`reset` that
+  // pending path (a steady-state plan change — e.g. a `done`/`reset` that
   // edits then commits, or any `.keeper` mutation whose file-write FSEvent the
   // kernel coalesced so it never bounced into `pending`). With no pending path
   // no reflog watch was armed, the broad recursive watch IGNORES `.git`
@@ -2843,9 +2843,9 @@ function main(): void {
   // in-HEAD change was invisible until the git-worker's 60s heartbeat (task .1's
   // measured diagnosis: that is the dominant production fold-latency tail). Fix:
   // arm a `.git/logs/HEAD` reflog watch for EVERY repo that holds a `.keeper`
-  // tree under the configured roots — `pendingRepos()` ∪ the discovered planctl-
+  // tree under the configured roots — `pendingRepos()` ∪ the discovered plan-
   // repo set — not just the pending ones. Bounded + safe: the watch count is the
-  // number of planctl-tracked repos under the roots (a handful), the broad watch
+  // number of plan-tracked repos under the roots (a handful), the broad watch
   // already ignores `.git` so these per-repo `.git/logs` watches do NOT overlap
   // it (no fseventsd bad-state from overlapping subtree watches), and the
   // callback stays repo-SCOPED (`recheckPending(root)` + one `scanPlanDir` —
@@ -2972,7 +2972,7 @@ function main(): void {
           // Lost-the-race teardown: shutdown, or the repo left the desired union
           // (its pending set drained AND it no longer holds a `.keeper` tree)
           // while we were subscribing — release immediately. check the
-          // FULL desired union (pending ∪ discovered planctl repos), not just
+          // FULL desired union (pending ∪ discovered plan repos), not just
           // `pendingRepos()`, or a freshly-discovered no-pending repo's watch
           // would be torn down the instant it resolved.
           const stillDesired =
@@ -3002,7 +3002,7 @@ function main(): void {
   // FSEvents signal, not a coverage gap), and `undefined` when nothing is
   // pending (no per-repo notion to attribute). Pure read of the live watch set;
   // producer-side only, never consulted in a fold. Post-widening: every
-  // discovered planctl repo arms a watch, so `absent` should now be RARE — a
+  // discovered plan repo arms a watch, so `absent` should now be RARE — a
   // sustained run of `present` (or no rescue at all) is the evidence the
   // coverage gap closed.
   const reflogWatchAttribution = (): "present" | "absent" | undefined => {
@@ -3033,7 +3033,7 @@ function main(): void {
       root: repoRoot,
     } satisfies PlanDiscoveryNudgeMessage);
   };
-  // The planctl-dir callback `reconcilePlanDirs` invokes per discovered
+  // The plan-dir callback `reconcilePlanDirs` invokes per discovered
   // `.keeper` dir — derive the repo root and nudge if new.
   const nudgeFromPlanDir = (planDir: string): void => {
     // `planDir` is `<root>/.keeper`; its parent is the repo root. Reuse the
@@ -3210,7 +3210,7 @@ function main(): void {
       // bytes via the existing idempotent `onChange` / `onDelete` paths.
       // Drop-proof
       // (independent of the broad `~/code` FSEvents subscription) and
-      // free of the mid-write partial-read race (planctl commits
+      // free of the mid-write partial-read race (plan commits
       // atomically). Duplicate fires from a live FSEvent are no-ops via
       // the change-gate. The per-path try/catch mirrors `onChange`'s own
       // skip-and-log discipline so one malformed file in a many-file
@@ -3373,7 +3373,7 @@ function main(): void {
       // loaded yet (the drain null-guards `mainTreeWatcherModule`).
       if (flaggedAny) onWake();
       // re-reconcile the reflog watches against the live union (pending
-      // ∪ discovered planctl repos). `onPendingChange` only fires on a pending
+      // ∪ discovered plan repos). `onPendingChange` only fires on a pending
       // mutation, so a brand-new `.keeper` repo that never accrues a pending
       // path (a foreign commit lands its files already-in-HEAD before any
       // FSEvent gated them) would otherwise never arm its watch. This periodic
@@ -3403,7 +3403,7 @@ function main(): void {
 
   // Fast `data_version` poll — the realtime trigger that collapses
   // close→emit to ~50ms. A bump means SOMETHING committed to keeper's DB; the
-  // close→approve `Commit` fold that makes a planctl file "ready" IS such a
+  // close→approve `Commit` fold that makes a plan file "ready" IS such a
   // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
   //
   // The poll is a TRIGGER, not a data source: on a bump it runs a change-gated
@@ -3635,7 +3635,7 @@ function main(): void {
             // classifyPlanPath, applied inside onChange) is what guarantees
             // only real plan files reach the read path — the positive ignore
             // globs are belt-and-suspenders perf, not the correctness gate.
-            // Route on path+existence, NOT event.type (planctl writes via
+            // Route on path+existence, NOT event.type (plan writes via
             // atomic os.replace, so an update may surface as create/rename).
             if (ev.type === "delete") {
               scanner.onDelete(ev.path);

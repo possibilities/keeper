@@ -109,9 +109,9 @@ const SHED_MUTATION_TOOLS = new Set([
  *  - PostToolUse: body is keep-set for `tool_name='Agent'` only on a LEGACY row
  *    (`subagent_agent_id IS NULL` → `resolveBridgeAgentId` reads
  *    `tool_response.agentId`); modern Agent rows shed. Also keep for the cron
- *    tools (`tool_response.id` / `tool_input.id`) and planctl-op Bash rows
- *    (`extractPlanctlStateRepo` reads `tool_response.stdout`). The eight
- *    SHED_POSTTOOLUSE tools + non-planctl Bash + modern Agent are the carve-OUT.
+ *    tools (`tool_response.id` / `tool_input.id`) and plan-op Bash rows
+ *    (`extractPlanStateRepo` reads `tool_response.stdout`). The eight
+ *    SHED_POSTTOOLUSE tools + non-plan Bash + modern Agent are the carve-OUT.
  *  - PreToolUse: body keep-set for `tool_name='Agent'` (the bridge); every other
  *    PreToolUse tool body sheds.
  *  - PostToolUseFailure: body keep-set for `tool_name='Agent'` (legacy
@@ -1253,8 +1253,8 @@ function seedWidenedShedCorpus(): void {
   insertEvent({ hook_event: "SessionStart", session_id: SESS_C });
   insertEvent({ hook_event: "SessionStart", session_id: SESS_D });
 
-  // --- planctl Bash (KEEP) beside non-planctl Bash (SHED) ---
-  // planctl Bash: extractPlanctlStateRepo reads tool_response.stdout → KEEP.
+  // --- plan Bash (KEEP) beside non-plan Bash (SHED) ---
+  // plan Bash: extractPlanStateRepo reads tool_response.stdout → KEEP.
   insertEvent({
     hook_event: "PostToolUse",
     tool_name: "Bash",

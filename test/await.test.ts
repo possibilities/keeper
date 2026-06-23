@@ -440,7 +440,7 @@ function argsFor(
   };
 }
 
-const planctlSeg = (
+const planSeg = (
   condition: "complete" | "unblocked" | "started",
   id: string,
   kind: "task" | "epic",
@@ -499,7 +499,7 @@ test("parseAwaitArgs: complete + task id classifies as task", () => {
   expect(r.args.segments).toHaveLength(1);
   const seg = r.args.segments[0];
   if (seg?.condition !== "complete" || !("target" in seg)) {
-    throw new Error("expected a planctl complete segment");
+    throw new Error("expected a plan complete segment");
   }
   expect(seg.target.id).toBe("fn-1-foo.1");
   expect(seg.target.kind).toBe("task");
@@ -516,7 +516,7 @@ test("parseAwaitArgs: unblocked + bare epic id", () => {
   }
   const seg = r.args.segments[0];
   if (seg?.condition !== "unblocked" || !("target" in seg)) {
-    throw new Error("expected a planctl unblocked segment");
+    throw new Error("expected a plan unblocked segment");
   }
   expect(seg.target.kind).toBe("epic");
 });
@@ -528,7 +528,7 @@ test("parseAwaitArgs: started + task id classifies as task", () => {
   }
   const seg = r.args.segments[0];
   if (seg?.condition !== "started" || !("target" in seg)) {
-    throw new Error("expected a planctl started segment");
+    throw new Error("expected a plan started segment");
   }
   expect(seg.target.id).toBe("fn-1-foo.1");
   expect(seg.target.kind).toBe("task");
@@ -541,7 +541,7 @@ test("parseAwaitArgs: started + bare epic id classifies as epic", () => {
   }
   const seg = r.args.segments[0];
   if (seg?.condition !== "started" || !("target" in seg)) {
-    throw new Error("expected a planctl started segment");
+    throw new Error("expected a plan started segment");
   }
   expect(seg.target.kind).toBe("epic");
 });
@@ -575,7 +575,7 @@ test("parseAwaitArgs: bad condition → usage error", () => {
   expect(r.ok).toBe(false);
 });
 
-test("parseAwaitArgs: missing positional id for planctl → usage error", () => {
+test("parseAwaitArgs: missing positional id for plan → usage error", () => {
   const r = parseAwaitArgs(["complete"]);
   expect(r.ok).toBe(false);
 });
@@ -657,7 +657,7 @@ test("parseAwaitArgs: AND of two families parses both segments", () => {
   ]);
 });
 
-test("parseAwaitArgs: AND of planctl + git parses id + nullary", () => {
+test("parseAwaitArgs: AND of plan + git parses id + nullary", () => {
   const r = parseAwaitArgs(["complete", "fn-1-foo.1", "and", "git-clean"]);
   if (!r.ok) {
     throw new Error(`expected ok, got ${r.message}`);
@@ -665,7 +665,7 @@ test("parseAwaitArgs: AND of planctl + git parses id + nullary", () => {
   expect(r.args.segments).toHaveLength(2);
   const first = r.args.segments[0];
   if (first?.condition !== "complete" || !("target" in first)) {
-    throw new Error("expected planctl first segment");
+    throw new Error("expected plan first segment");
   }
   expect(first.target.id).toBe("fn-1-foo.1");
   expect(r.args.segments[1]?.condition).toBe("git-clean");
@@ -706,7 +706,7 @@ test("parseAwaitArgs: duplicate nullary condition → usage error", () => {
   expect(r.ok).toBe(false);
 });
 
-test("parseAwaitArgs: duplicate planctl condition+id → usage error", () => {
+test("parseAwaitArgs: duplicate plan condition+id → usage error", () => {
   const r = parseAwaitArgs([
     "complete",
     "fn-1-foo.1",
@@ -759,13 +759,13 @@ test("parseAwaitArgs: server-up AND another condition → usage error (either or
     expect(right.message).toContain("cannot be combined");
   }
 
-  const withPlanctl = parseAwaitArgs([
+  const withPlan = parseAwaitArgs([
     "complete",
     "fn-1-foo.1",
     "and",
     "server-up",
   ]);
-  expect(withPlanctl.ok).toBe(false);
+  expect(withPlan.ok).toBe(false);
 });
 
 test("parseAwaitArgs: duplicate server-up → usage error", () => {
@@ -1633,7 +1633,7 @@ test("fn-857: complete-epic met with NO child stays byte-identical (no followup 
   const met = h.stdout.find((l) => l.includes("[keeper-await] met"));
   expect(met).toBeDefined();
   expect(met).not.toContain("followup");
-  // Byte-identical to the pre-fn-857 single-planctl complete met shape: the
+  // Byte-identical to the pre-fn-857 single-plan complete met shape: the
   // field set ends at `detail`, no trailing `followup` token.
   expect(met).toBe(
     "[keeper-await] met target=fn-1-foo kind=epic condition=complete detail=target dropped off board (re-query hit → complete)\n",
@@ -2548,7 +2548,7 @@ test("monitor-running AND git-clean: met only after monitor ends AND repo clean"
   const { factory, socketsAll } = makeMockConnect();
   const h = makeHarness(factory);
   h.deps.ownSessionId = "me";
-  // monitor-running + git-clean → planctl-less combo opens BOTH dedicated
+  // monitor-running + git-clean → plan-less combo opens BOTH dedicated
   // collection streams (git + jobs); the aggregate first-paint gate holds
   // armed until BOTH have painted.
   const idPrefix = `await-${process.pid}`;
@@ -2676,8 +2676,8 @@ test("AND git-clean + agents-idle: met only after both paint and hold", async ()
 });
 
 // ---------------------------------------------------------------------------
-// AND with a planctl segment: reads git off the readiness snapshot (no
-// extra git subscribe), and a planctl `deleted` short-circuits the aggregate.
+// AND with a plan segment: reads git off the readiness snapshot (no
+// extra git subscribe), and a plan `deleted` short-circuits the aggregate.
 // ---------------------------------------------------------------------------
 
 test("AND complete + git-clean: rides readiness snapshot (one connection, no extra git sub)", async () => {
@@ -2687,7 +2687,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
 
   await runAndCatch(
     argsFor([
-      planctlSeg("complete", "fn-1-foo.1", "task"),
+      planSeg("complete", "fn-1-foo.1", "task"),
       { condition: "git-clean" },
     ]),
     h.deps,
@@ -2697,7 +2697,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A planctl-bearing combo rides subscribeReadiness only — its nine
+  // A plan-bearing combo rides subscribeReadiness only — its nine
   // collections (fn-721 added `pending_dispatches`; fn-770 added
   // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`), NOT a
   // separate dedicated git sub.
@@ -2743,14 +2743,14 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   );
 });
 
-test("AND complete + git-clean: planctl not-found short-circuits aggregate (exit 1)", async () => {
+test("AND complete + git-clean: plan not-found short-circuits aggregate (exit 1)", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
     argsFor([
-      planctlSeg("complete", "fn-999-missing.1", "task"),
+      planSeg("complete", "fn-999-missing.1", "task"),
       { condition: "git-clean" },
     ]),
     h.deps,
@@ -2762,7 +2762,7 @@ test("AND complete + git-clean: planctl not-found short-circuits aggregate (exit
   }
   sock.takeOutbound();
 
-  // First paint: empty board (task absent) + clean git → the planctl
+  // First paint: empty board (task absent) + clean git → the plan
   // not-found short-circuits the whole aggregate, NO armed line.
   deliverFiveWith(sock, idPrefix, {
     epics: [],

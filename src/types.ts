@@ -2,7 +2,7 @@
 
 /**
  * One entry in {@link Job.epic_links} — a per-job cross-reference to an epic
- * the job's planctl footprint touched inside a `/plan:plan` window. `kind`:
+ * the job's plan footprint touched inside a `/plan:plan` window. `kind`:
  * `"creator"` for a `keeper plan epic-create` mutation; `"refiner"` for every
  * other epic-touching mutation inside a window.
  *
@@ -75,7 +75,7 @@ export type PermissionPromptKind = "permission" | "elicitation";
 
 /**
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
- * {@link Link}. `job_id` identifies the session whose planctl footprint
+ * {@link Link}. `job_id` identifies the session whose plan footprint
  * touched this epic. `syncPlanLinks` is the sole writer.
  *
  * Enrichment boundary: the classifier's `JobLink` shape stays thin
@@ -281,7 +281,7 @@ export interface Job {
    */
   start_time: string | null;
   /**
-   * Spawn-derived planctl verb on the strict whitelist
+   * Spawn-derived plan verb on the strict whitelist
    * `{plan, work, close, approve}`, extracted from `Event.spawn_name` at
    * SessionStart by {@link import("./derivers").planVerbRefFromSpawnName}.
    * NULL when the spawn name didn't match the `{verb}::<ref>` shape. Paired
@@ -290,13 +290,13 @@ export interface Job {
    */
   plan_verb: string | null;
   /**
-   * Spawn-derived planctl ref (epic or task id), extracted alongside
+   * Spawn-derived plan ref (epic or task id), extracted alongside
    * {@link Job.plan_verb}. Backed by `idx_jobs_plan_ref WHERE plan_ref IS NOT
    * NULL`; `plan_verb` filters ride this partial index plus a post-seek check.
    */
   plan_ref: string | null;
   /**
-   * Cross-references derived from this job's planctl-CLI invocations,
+   * Cross-references derived from this job's plan-CLI invocations,
    * classified against its `/plan:plan` windows: the epic this job CREATED or
    * REFINED. Distinct from the spawn-name pair (`plan_verb`/`plan_ref`, the
    * job's OWN spawn role).
@@ -654,7 +654,7 @@ export interface ScheduledTask {
 }
 
 /**
- * One row of the `epics` projection. `epic_id` is the planctl epic id (pk).
+ * One row of the `epics` projection. `epic_id` is the plan epic id (pk).
  * The reducer folds synthetic `EpicSnapshot` events into this table via
  * idempotent upsert; columns are nullable matching the zero-event reading.
  * `project_dir` is an untrusted foreign-process JSON field — stored opaque,
@@ -676,12 +676,12 @@ export interface Epic {
   status: string | null;
   last_event_id: number | null;
   updated_at: number;
-  /** Planctl `depends_on_epics` ids. JSON-TEXT, decoded at the read boundary. */
+  /** Plan `depends_on_epics` ids. JSON-TEXT, decoded at the read boundary. */
   depends_on_epics: string[];
   tasks: Task[];
   jobs: EmbeddedJob[];
   /**
-   * Symmetric per-epic view of {@link Job.epic_links}: every job whose planctl
+   * Symmetric per-epic view of {@link Job.epic_links}: every job whose plan
    * footprint CREATED or REFINED this epic. JSON-TEXT, decoded at the read
    * boundary; sorted ASC on `(kind, job_id)` — total-order tiebreaker. The ON
    * CONFLICT clause preserves it across an `EpicSnapshot` round-trip so a
@@ -689,7 +689,7 @@ export interface Epic {
    */
   job_links: JobLinkEntry[];
   /**
-   * Planctl-native validation timestamp (`last_validated_at` on the epic
+   * Plan-native validation timestamp (`last_validated_at` on the epic
    * file). ISO-8601 string when present; `null` when absent/non-string.
    * Drives the board's `[validated]`/`[unvalidated]` pill.
    */
@@ -810,7 +810,7 @@ export interface GitStatus {
 }
 
 /**
- * One task — the element shape of {@link Epic.tasks}. `task_id` is the planctl
+ * One task — the element shape of {@link Epic.tasks}. `task_id` is the plan
  * task id; `epic_id` links it to its parent epic. The reducer folds each
  * synthetic `TaskSnapshot` into its parent epic's embedded `tasks` array
  * (deterministic `(task_number, task_id)` sort). `target_repo` is an untrusted
@@ -824,7 +824,7 @@ export interface Task {
   title: string | null;
   target_repo: string | null;
   /**
-   * Planctl-native effort tier. Stored opaque — keeper never branches on the
+   * Plan-native effort tier. Stored opaque — keeper never branches on the
    * value, so a future tier widening rides through with no code change. Null
    * on legacy task files / shell elements.
    */
@@ -836,13 +836,13 @@ export interface Task {
    */
   worker_phase: string | null;
   /**
-   * Planctl-native runtime status (`"todo" | "in_progress" | "done" |
+   * Plan-native runtime status (`"todo" | "in_progress" | "done" |
    * "blocked"`). Absent / missing state file / unrecognized value folds to
-   * `"todo"` per planctl's `merge_task_state` convention. Never null — the
-   * planctl default is always meaningful.
+   * `"todo"` per plan's `merge_task_state` convention. Never null — the
+   * plan default is always meaningful.
    */
   runtime_status: string;
-  /** Planctl `depends_on` task ids. */
+  /** Plan `depends_on` task ids. */
   depends_on: string[];
   /**
    * Task-level embedded jobs: `jobs` rows whose `plan_ref` equals this

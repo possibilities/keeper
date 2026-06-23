@@ -139,7 +139,7 @@ test("classifyPlanPath: epics/tasks json under .keeper, else null", () => {
 });
 
 test("classifyPlanPath: .keeper/state/tasks/*.state.json → task-state, else null", () => {
-  // Positive: the planctl LocalFileStateStore shape — 4-segment tail with the
+  // Positive: the plan LocalFileStateStore shape — 4-segment tail with the
   // `.state.json` suffix on the basename.
   expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json")).toBe(
     "task-state",
@@ -180,7 +180,7 @@ test("taskIdFromStatePath / taskDefPathFromStatePath: pure path arithmetic", () 
 });
 
 test("classifyPlanPath: .keeper/state/epics/*.state.json → epic-state (fn-732)", () => {
-  // Positive: the planctl LocalFileStateStore shape for the epic runtime-state
+  // Positive: the plan LocalFileStateStore shape for the epic runtime-state
   // sidecar — 4-segment tail under `state/epics/` with `.state.json` suffix.
   // Keeper ingests no field from this sidecar, but the path classifies so it
   // is recognized, not mis-routed.
@@ -268,16 +268,16 @@ test("scanRoot: a .keeper/ epic folds; a .planctl/ dir is ignored", () => {
   // Two sibling projects under the same configured root — one on `.keeper/`,
   // one on `.planctl/`. Only the `.keeper/` epic folds.
   const keeperProj = join(tmpDir, "on-keeper");
-  const planctlProj = join(tmpDir, "on-planctl");
+  const planProj = join(tmpDir, "on-plan");
   writeEpicIn(keeperProj, ".keeper", "fn-900-keeper-dir", {
     title: "keeper-dir epic",
     status: "open",
     primary_repo: keeperProj,
   });
-  writeEpicIn(planctlProj, ".planctl", "fn-901-planctl-dir", {
-    title: "planctl-dir epic",
+  writeEpicIn(planProj, ".planctl", "fn-901-plan-dir", {
+    title: "plan-dir epic",
     status: "open",
-    primary_repo: planctlProj,
+    primary_repo: planProj,
   });
 
   scanRoot(tmpDir, scanner);
@@ -286,7 +286,7 @@ test("scanRoot: a .keeper/ epic folds; a .planctl/ dir is ignored", () => {
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toContain("fn-900-keeper-dir");
-  expect(epicIds).not.toContain("fn-901-planctl-dir");
+  expect(epicIds).not.toContain("fn-901-plan-dir");
 });
 
 test("scanRoot: a repo holding both dir names folds only the .keeper/ epic", () => {
@@ -305,7 +305,7 @@ test("scanRoot: a repo holding both dir names folds only the .keeper/ epic", () 
     primary_repo: proj,
   });
   writeEpicIn(proj, ".planctl", "fn-902-both", {
-    title: "from planctl",
+    title: "from plan",
     status: "open",
     primary_repo: proj,
   });
@@ -322,21 +322,21 @@ test("scanRoot: a repo holding both dir names folds only the .keeper/ epic", () 
 
 test("discoverPlanDirs: surfaces .keeper/ dirs only; reconcilePlanDirs folds them", () => {
   const keeperProj = join(tmpDir, "k");
-  const planctlProj = join(tmpDir, "p");
+  const planProj = join(tmpDir, "p");
   writeEpicIn(keeperProj, ".keeper", "fn-903-k", {
     title: "k",
     status: "open",
     primary_repo: keeperProj,
   });
-  writeEpicIn(planctlProj, ".planctl", "fn-904-p", {
+  writeEpicIn(planProj, ".planctl", "fn-904-p", {
     title: "p",
     status: "open",
-    primary_repo: planctlProj,
+    primary_repo: planProj,
   });
 
   const dirs = discoverPlanDirs([tmpDir]);
   expect(dirs).toContain(join(keeperProj, ".keeper"));
-  expect(dirs).not.toContain(join(planctlProj, ".planctl"));
+  expect(dirs).not.toContain(join(planProj, ".planctl"));
 
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
@@ -399,7 +399,7 @@ test("coerceRuntimeStatus: enum passes through; missing → 'todo' silently; inv
   for (const v of ["todo", "in_progress", "done", "blocked"]) {
     expect(coerceRuntimeStatus(v, (bad) => logs.push(bad))).toBe(v);
   }
-  // Missing / null silently defaults to "todo" (planctl's merge_task_state
+  // Missing / null silently defaults to "todo" (plan's merge_task_state
   // convention — a fresh clone with no `state/` tree reads every task as
   // `todo`); the onInvalid callback is NOT fired for absent fields.
   expect(coerceRuntimeStatus(undefined, (bad) => logs.push(bad))).toBe("todo");
@@ -1429,10 +1429,10 @@ test("scanRoot: primes runtimeStatusCache from state/tasks/ BEFORE the tasks/ lo
 
   // Set up the state file FIRST (mirrors the boot path: state file already
   // exists on disk when the daemon comes up).
-  const planctl = join(tmpDir, ".keeper");
-  mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
+  const plan = join(tmpDir, ".keeper");
+  mkdirSync(join(plan, "state", "tasks"), { recursive: true });
   writeFileSync(
-    join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
+    join(plan, "state", "tasks", "fn-1-x.1.state.json"),
     JSON.stringify({ status: "in_progress" }),
   );
 
@@ -1453,7 +1453,7 @@ test("scanRoot: primes runtimeStatusCache from state/tasks/ BEFORE the tasks/ lo
 test("scanRoot: invalid runtime_status in a state file skips the cache prime (task reads default 'todo')", () => {
   // Mirrors the live `task-state` onChange arm's safe-value discipline:
   // a bad value is logged and NOT written to the cache, so the task falls
-  // through to the planctl default "todo" rather than absorbing garbage.
+  // through to the plan default "todo" rather than absorbing garbage.
   const emitted: PlanMessage[] = [];
   const logs: string[] = [];
   const scanner = new PlanScanner(
@@ -1461,10 +1461,10 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
     (msg) => logs.push(msg),
   );
 
-  const planctl = join(tmpDir, ".keeper");
-  mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
+  const plan = join(tmpDir, ".keeper");
+  mkdirSync(join(plan, "state", "tasks"), { recursive: true });
   writeFileSync(
-    join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
+    join(plan, "state", "tasks", "fn-1-x.1.state.json"),
     JSON.stringify({ status: "garbage" }),
   );
   writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T" });
@@ -1592,7 +1592,7 @@ test("discoverPlanRepos: returns the repo roots (parents of discovered .keeper d
   expect([...repos].sort()).toEqual([projA, projB].sort());
 });
 
-test("desiredReflogRepos: the union of pending repos and discovered planctl repos", () => {
+test("desiredReflogRepos: the union of pending repos and discovered plan repos", () => {
   // The fn-737 widening: watch every pending repo UNION every discovered
   // `.keeper` repo. A repo present in BOTH inputs appears once (set union).
   const pending = new Set(["/r/a", "/r/b"]);
@@ -1773,7 +1773,7 @@ test("reconcilePlanDirs(emittedRoots): only the configured root whose scan emitt
 });
 
 test("reconcilePlanDirs: a new-repo first scaffold converges on one call (no FSEvents, no DB row)", () => {
-  // The exact bug fn-681 fixes: a fresh repo's first `planctl scaffold` is
+  // The exact bug fn-681 fixes: a fresh repo's first `keeper plan scaffold` is
   // dropped by FSEvents AND git-worker isn't yet watching the repo's
   // `.git` (no epic row drives `discoverProjectRoots`). The periodic
   // reconcile must converge it from disk alone, on a single tick.
@@ -1783,7 +1783,7 @@ test("reconcilePlanDirs: a new-repo first scaffold converges on one call (no FSE
     () => {},
   );
 
-  // Layout: <root>/freshrepo/.keeper/epics/<id>.json — what `planctl
+  // Layout: <root>/freshrepo/.keeper/epics/<id>.json — what `plan
   // scaffold` writes on first use.
   const proj = join(tmpDir, "freshrepo");
   mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
@@ -1877,7 +1877,7 @@ test("reconcilePlanDirs: on-drop callback is `.keeper`-scoped (visits only proje
   // The on-drop {@link RescanScheduler} callback was repointed from
   // `scanRoot(root, scanner)` (whole-tree walk) to
   // `reconcilePlanDirs([root], scanner)` (`.keeper` dirs only).
-  // Confirm the semantic difference: a heavy non-planctl subtree under
+  // Confirm the semantic difference: a heavy non-plan subtree under
   // the root must NOT be visited by the reconcile path. The proof: an
   // epic NOT under any `.keeper/epics/` is invisible to the reconcile,
   // while the same epic in a real `.keeper` IS picked up. This is the
@@ -1888,7 +1888,7 @@ test("reconcilePlanDirs: on-drop callback is `.keeper`-scoped (visits only proje
     () => {},
   );
 
-  // A real planctl-bearing project (the reconcile target).
+  // A real plan-bearing project (the reconcile target).
   const proj = join(tmpDir, "real");
   mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
   writeFileSync(
@@ -1994,7 +1994,7 @@ test("isPathInHead: untracked file → false; committed file → true", () => {
   expect(isPathInHead(path)).toBe(false);
 
   // Staged but not committed — the very window the fn-629 gate exists to
-  // close (planctl writes the file, then commits in a separate step).
+  // close (plan writes the file, then commits in a separate step).
   git(tmpDir, "add", path);
   expect(isPathInHead(path)).toBe(false);
 
@@ -2005,7 +2005,7 @@ test("isPathInHead: untracked file → false; committed file → true", () => {
 
 test("isPathInHead: path outside any .keeper tree → false (fail closed)", () => {
   gitInit(tmpDir);
-  const path = join(tmpDir, "not-planctl.json");
+  const path = join(tmpDir, "not-plan.json");
   writeFileSync(path, "{}");
   git(tmpDir, "add", path);
   git(tmpDir, "commit", "-q", "-m", "add file");
@@ -2275,7 +2275,7 @@ test("onChange: multi-file tree — epic committed before its task lands → onl
   expect(emitted).toEqual([]);
   expect(scanner.pendingSize()).toBe(2);
 
-  // Commit ONLY the epic (the partial-tree case — a planctl `epic_create`
+  // Commit ONLY the epic (the partial-tree case — a plan `epic_create`
   // could finish its commit while `task_create` is still pre-commit).
   git(tmpDir, "add", epicPath);
   git(tmpDir, "commit", "-q", "-m", "add epic only");
@@ -2818,8 +2818,8 @@ test("onDelete: a pending uncommitted file that gets removed drops from pending 
     isPathInHead,
   );
 
-  // Simulates the planctl scaffold unwind path: write tree, gate fires,
-  // commit fails, planctl removes the tree. The gate suppressed the
+  // Simulates the keeper plan scaffold unwind path: write tree, gate fires,
+  // commit fails, plan removes the tree. The gate suppressed the
   // snapshot, so there's nothing to retract.
   const epicPath = writeEpic("fn-6-orphan", {
     title: "Orphan",
@@ -2868,7 +2868,7 @@ test("onDelete: a previously-committed file emits a real tombstone (gate doesn't
 });
 
 // ---------------------------------------------------------------------------
-// fn-681 — commit-driven planctl ingest (the consumer side). The inbound
+// fn-681 — commit-driven plan ingest (the consumer side). The inbound
 // `planctl-commit-changed` message handler in the live worker iterates
 // the changes array and calls `scanner.onChange(absPath)` /
 // `scanner.onDelete(absPath)` per entry. These tests exercise that exact
@@ -2948,7 +2948,7 @@ test("planctl-commit-changed: upsert batch ingests committed bytes via onChange"
   git(tmpDir, "commit", "-q", "-m", "scaffold");
 
   // The git-worker would emit a {repo: tmpDir, changes: [...]} message with
-  // three upsert entries (one per planctl file). The handler joins each
+  // three upsert entries (one per plan file). The handler joins each
   // path with repo and dispatches to onChange — equivalently:
   applyPlanCommitChanges(scanner, tmpDir, [
     { path: ".keeper/epics/fn-1-demo.json", op: "upsert" },

@@ -97,10 +97,10 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a planctl
+    // Schema v30: queue-jump sparse column; NULL unless this is a plan
     // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other planctl event (stamped 0). The test helper defaults to NULL so
-    // every non-planctl event lands NULL — matches the live hook's stamping
+    // other plan event (stamped 0). The test helper defaults to NULL so
+    // every non-plan event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
     plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
@@ -110,8 +110,8 @@ function insertEvent(
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
     // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
-    // the envelope's repo-relative `files` array. NULL on every non-planctl
-    // event; planctl-mint tests pass this explicitly via overrides.
+    // the envelope's repo-relative `files` array. NULL on every non-plan
+    // event; plan-mint tests pass this explicitly via overrides.
     plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every non-zellij

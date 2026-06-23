@@ -1642,7 +1642,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // handlers capture these via closure. Until a worker is constructed, a bridge
   // request resolves `ok:false` — a tolerated no-op for the boot-window race.
   let autopilotWorker: Worker | null = null;
-  // The plan-worker posts a `nudge-discovery` the first time it sees a `.planctl`
+  // The plan-worker posts a `nudge-discovery` the first time it sees a `.keeper`
   // tree; main relays it to the git-worker as an `add-discovery-root`. `null`
   // until the git worker is constructed — a nudge during that window is a no-op
   // (the next discovery sweep recovers it).
@@ -2406,7 +2406,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   } // end `if (transcriptWorker)`
 
   // Spawn the plan worker in the SAME post-migration window. It watches each
-  // configured project root's `.planctl/{epics,tasks}` trees and posts a
+  // configured project root's `.keeper/{epics,tasks}` trees and posts a
   // `plan-epic`/`plan-task` snapshot message on each change — the second
   // producer-worker instance. `roots` come from `resolvePlanRoots()` (config →
   // absolute, existing dirs); an empty list means there is nothing to watch.
@@ -2442,7 +2442,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "nudge-discovery") {
-        // Discovery nudge: the plan-worker first saw a `.planctl` tree in
+        // Discovery nudge: the plan-worker first saw a `.keeper` tree in
         // `msg.root`. Forward to the git-worker so it watches that repo's `.git`
         // immediately. NOT written to the event log — it drives a producer
         // worker. The forward-ref null-guards the boot window before the git
@@ -2472,14 +2472,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           task_number: msg.number,
           title: msg.title,
           target_repo: msg.targetRepo,
-          // Planctl-native effort tier — rides FREE in the embedded-tasks JSON
+          // plan-native effort tier — rides FREE in the embedded-tasks JSON
           // (no schema column). An older blob lacks this key and the reducer
           // reads `snapshot.tier ?? null` (graceful degradation).
           tier: msg.tier,
           // Derived worker-phase binary (`worker_done_at` present → "done", else
-          // "open"), kept distinct from `runtime_status` (planctl's native enum).
+          // "open"), kept distinct from `runtime_status` (plan's native enum).
           worker_phase: msg.workerPhase,
-          // Planctl-native runtime status (`todo|in_progress|done|blocked`).
+          // plan-native runtime status (`todo|in_progress|done|blocked`).
           runtime_status: msg.runtimeStatus,
           depends_on: msg.dependsOn,
         });
@@ -2720,7 +2720,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         msg.kind === "plan-commit-changed"
       ) {
         // Authoritative commit-driven plan ingest: the git-worker observed a
-        // commit carrying changed `.planctl/**` paths; forward them to plan-worker
+        // commit carrying changed `.keeper/**` paths; forward them to plan-worker
         // so it re-ingests each from the COMMITTED worktree bytes via its
         // idempotent `onChange`/`onDelete`. Name-tolerant on the kind (legacy
         // `planctl-commit-changed` / post-flip `plan-commit-changed` fold
@@ -2795,7 +2795,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       });
       // A `git-snapshot` or `commit` is the cross-worker "HEAD may have moved"
       // signal a plan-worker cannot observe on its own (a `git commit` leaves the
-      // `.planctl/*.json` bytes identical, so FSEvents won't re-fire). Fire
+      // `.keeper/*.json` bytes identical, so FSEvents won't re-fire). Fire
       // `recheck-pending` so the scanner re-runs its tracked-in-HEAD predicate.
       // Cheap (no-op when the set is empty); idempotent.
       if (msg.kind === "git-snapshot" || msg.kind === "commit") {
