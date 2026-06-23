@@ -39,6 +39,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { flockOrThrow, LOCK_EX, LOCK_UN } from "./flock.ts";
 import { resolveDataDir } from "./state_path.ts";
+import { readStdinText } from "./stdin.ts";
 
 /** Parse JSON at `path`; null on missing OR corrupt (never throws). Mirrors
  * load_json_safe — the silent-on-corrupt read every verb relies on. */
@@ -59,11 +60,12 @@ export function loadJson(path: string): Record<string, unknown> {
 }
 
 /** Read a payload from `fileArg` (a path), or from stdin when it is null or
- * `"-"`. Mirrors read_file_or_stdin: stdin is read via fd 0 so a piped or
+ * `"-"`. Mirrors read_file_or_stdin: stdin is read via the stdin-provider seam
+ * (fd 0 in a compiled run; the harness override in-process) so a piped or
  * heredoc body works the same across engines. */
 export function readFileOrStdin(fileArg: string | null): string {
   if (fileArg === null || fileArg === "-") {
-    return readFileSync(0, "utf-8");
+    return readStdinText();
   }
   return readFileSync(fileArg, "utf-8");
 }

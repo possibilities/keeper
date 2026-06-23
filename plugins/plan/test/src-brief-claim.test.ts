@@ -1,11 +1,12 @@
-// Unit tests for src/brief.ts (assemble + byte-parity write), the
-// workerAgentForTier / isTaskId / epicIdFromTask gate helpers, and end-to-end
-// claim/block proofs against the compiled binary: ZERO commits, runtime field
-// sets byte-equal to the frozen serialization on disk, and the brief_ref handle.
+// Unit tests for src/brief.ts (assemble + byte-parity write) and the
+// workerAgentForTier / isTaskId / epicIdFromTask gate helpers — these run
+// in-process by default. The end-to-end claim/block proofs against the COMPILED
+// binary (ZERO commits, byte-equal runtime sidecar, brief_ref handle) are the
+// PROCESS-BOUNDARY bucket: they spawn the artifact + real git, so they run only
+// when KEEPER_PLAN_RUN_PROCESS is set (after `bun run build`).
 
 import { describe, expect, test } from "bun:test";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -28,13 +29,7 @@ import {
   workerAgentForTier,
 } from "../src/models.ts";
 import { serializeStateJson } from "../src/store.ts";
-
-const BIN = join(import.meta.dir, "..", "dist", "keeper-plan-bun");
-if (!existsSync(BIN)) {
-  throw new Error(
-    `compiled binary missing at ${BIN}; run \`bun run build\` before \`bun test\``,
-  );
-}
+import { PROCESS_ENABLED, resolveBin } from "./harness.ts";
 
 function tmp(prefix: string): string {
   return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -222,7 +217,7 @@ function runBin(
   cwd: string,
   env: Record<string, string>,
 ): RunResult {
-  const proc = Bun.spawnSync([BIN, ...args], {
+  const proc = Bun.spawnSync([resolveBin(), ...args], {
     cwd,
     env: {
       HOME: join(cwd, ".home"),
@@ -246,61 +241,68 @@ function runtimeOnDisk(repo: string, taskId: string): string {
   );
 }
 
-describe("claim/block end-to-end (compiled binary, real git)", () => {
-  test("claim produces ZERO commits and a byte-equal runtime sidecar", () => {
-    const repo = seedGitProject("fn-1-claim");
-    try {
-      const before = commitCount(repo);
-      const r = runBin(["claim", "fn-1-claim.1", "--project", repo], repo, {});
-      expect(r.code).toBe(0);
-      const payload = JSON.parse(r.stdout.trim());
-      expect(payload.success).toBe(true);
-      expect(payload.task_state.outcome).toBe("CLAIMED");
-      expect(payload.brief_ref).toBe(
-        join(repo, ".keeper", "state", "briefs", "fn-1-claim.1.json"),
-      );
-      // Zero commits — claim mutates only gitignored state/.
-      expect(commitCount(repo)).toBe(before);
+describe.skipIf(!PROCESS_ENABLED)(
+  "claim/block end-to-end (compiled binary, real git)",
+  () => {
+    test("claim produces ZERO commits and a byte-equal runtime sidecar", () => {
+      const repo = seedGitProject("fn-1-claim");
+      try {
+        const before = commitCount(repo);
+        const r = runBin(
+          ["claim", "fn-1-claim.1", "--project", repo],
+          repo,
+          {},
+        );
+        expect(r.code).toBe(0);
+        const payload = JSON.parse(r.stdout.trim());
+        expect(payload.success).toBe(true);
+        expect(payload.task_state.outcome).toBe("CLAIMED");
+        expect(payload.brief_ref).toBe(
+          join(repo, ".keeper", "state", "briefs", "fn-1-claim.1.json"),
+        );
+        // Zero commits — claim mutates only gitignored state/.
+        expect(commitCount(repo)).toBe(before);
 
-      // Runtime sidecar is byte-identical to the frozen serialization of the same
-      // field set (the claimed_at value is dynamic, so re-serialize the parsed
-      // dict rather than pinning a literal).
-      const onDisk = runtimeOnDisk(repo, "fn-1-claim.1");
-      const parsed = JSON.parse(onDisk);
-      expect(parsed.status).toBe("in_progress");
-      expect(parsed.assignee).toBe("test@example.com");
-      expect(parsed.blocked_reason).toBeNull();
-      expect(onDisk).toBe(serializeStateJson(parsed));
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  });
+        // Runtime sidecar is byte-identical to the frozen serialization of the same
+        // field set (the claimed_at value is dynamic, so re-serialize the parsed
+        // dict rather than pinning a literal).
+        const onDisk = runtimeOnDisk(repo, "fn-1-claim.1");
+        const parsed = JSON.parse(onDisk);
+        expect(parsed.status).toBe("in_progress");
+        expect(parsed.assignee).toBe("test@example.com");
+        expect(parsed.blocked_reason).toBeNull();
+        expect(onDisk).toBe(serializeStateJson(parsed));
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    });
 
-  test("block produces ZERO commits and writes blocked + reason byte-equal", () => {
-    const repo = seedGitProject("fn-1-block");
-    try {
-      // Pre-claim so there is an in_progress runtime to block.
-      runBin(["claim", "fn-1-block.1", "--project", repo], repo, {});
-      const before = commitCount(repo);
-      // block resolves cwd-based (no --project), so run from the repo root.
-      const r = runBin(
-        ["block", "fn-1-block.1", "--reason", "waiting"],
-        repo,
-        {},
-      );
-      expect(r.code).toBe(0);
-      const payload = JSON.parse(r.stdout.trim());
-      expect(payload.status).toBe("blocked");
-      expect(payload.blocked_reason).toBe("waiting");
-      expect(commitCount(repo)).toBe(before);
+    test("block produces ZERO commits and writes blocked + reason byte-equal", () => {
+      const repo = seedGitProject("fn-1-block");
+      try {
+        // Pre-claim so there is an in_progress runtime to block.
+        runBin(["claim", "fn-1-block.1", "--project", repo], repo, {});
+        const before = commitCount(repo);
+        // block resolves cwd-based (no --project), so run from the repo root.
+        const r = runBin(
+          ["block", "fn-1-block.1", "--reason", "waiting"],
+          repo,
+          {},
+        );
+        expect(r.code).toBe(0);
+        const payload = JSON.parse(r.stdout.trim());
+        expect(payload.status).toBe("blocked");
+        expect(payload.blocked_reason).toBe("waiting");
+        expect(commitCount(repo)).toBe(before);
 
-      const onDisk = runtimeOnDisk(repo, "fn-1-block.1");
-      const parsed = JSON.parse(onDisk);
-      expect(parsed.status).toBe("blocked");
-      expect(parsed.blocked_reason).toBe("waiting");
-      expect(onDisk).toBe(serializeStateJson(parsed));
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  });
-});
+        const onDisk = runtimeOnDisk(repo, "fn-1-block.1");
+        const parsed = JSON.parse(onDisk);
+        expect(parsed.status).toBe("blocked");
+        expect(parsed.blocked_reason).toBe("waiting");
+        expect(onDisk).toBe(serializeStateJson(parsed));
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    });
+  },
+);

@@ -25,9 +25,11 @@
 // over-cap stream always reports the truncated-read count MAX+1 regardless of how
 // many bytes were piped. A TTY stdin is rejected (no silent keyboard hang).
 
-import { readFileSync, readSync } from "node:fs";
+import { readFileSync } from "node:fs";
 
 import { parse as parseYaml } from "yaml";
+
+import { readStdinBytes, stdinIsTTY } from "./stdin.ts";
 
 /** Pre-decode byte cap for any YAML input source. Mirrors
  * run_scaffold._MAX_YAML_BYTES / run_refine_apply._MAX_YAML_BYTES. */
@@ -63,7 +65,7 @@ export function readYamlBytes(fileArg: string): Buffer {
   const label = fileArg;
   let raw: Buffer;
   if (fileArg === "-") {
-    if (process.stdin.isTTY) {
+    if (stdinIsTTY()) {
       throw new YamlInputError(
         "bad_yaml",
         "stdin is a TTY — pass `--file <path>` or pipe YAML on stdin",
@@ -71,9 +73,9 @@ export function readYamlBytes(fileArg: string): Buffer {
       );
     }
     try {
-      // Read MAX+1 bytes; fd 0 with a length cap gives the truncated read so an
-      // over-cap stream reports got=MAX+1 (matching sys.stdin.buffer.read(N)).
-      raw = readCappedFd(0, MAX_YAML_BYTES + 1);
+      // Read MAX+1 bytes; the cap gives the truncated read so an over-cap stream
+      // reports got=MAX+1 (matching sys.stdin.buffer.read(N)).
+      raw = readStdinBytes(MAX_YAML_BYTES + 1);
     } catch (exc) {
       throw new YamlInputError(
         "bad_yaml",
@@ -135,45 +137,6 @@ export function parseYamlInput(raw: Buffer, fileLabel: string): unknown {
  * point for config.loadRoots and any non-mutating YAML reader. */
 export function loadYamlInput(fileArg: string): unknown {
   return parseYamlInput(readYamlBytes(fileArg), fileArg);
-}
-
-/** Read up to ``cap`` bytes from ``fd`` by chunked accumulation, concatenating
- * once at the end (never per-chunk). Stops at EOF or once ``cap`` bytes are in
- * hand — the reject-don't-truncate contract: an over-cap source yields exactly
- * ``cap`` bytes, which the caller's length check then rejects. */
-function readCappedFd(fd: number, cap: number): Buffer {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  const bufSize = 64 * 1024;
-  const buf = Buffer.allocUnsafe(bufSize);
-  while (total < cap) {
-    const want = Math.min(bufSize, cap - total);
-    let n: number;
-    try {
-      n = readSync(fd, buf, 0, want, null);
-    } catch (exc) {
-      // EOF on a pipe can surface as EAGAIN/EOF depending on platform; treat a
-      // genuine end-of-input as a clean stop, re-raise anything else.
-      if (isEof(exc)) {
-        break;
-      }
-      throw exc;
-    }
-    if (n === 0) {
-      break;
-    }
-    chunks.push(Buffer.from(buf.subarray(0, n)));
-    total += n;
-  }
-  return Buffer.concat(chunks, total);
-}
-
-function isEof(exc: unknown): boolean {
-  return (
-    typeof exc === "object" &&
-    exc !== null &&
-    (exc as { code?: string }).code === "EOF"
-  );
 }
 
 function describeError(exc: unknown): string {

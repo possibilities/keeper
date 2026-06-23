@@ -13,7 +13,7 @@
 // the brief loader + schema gate, the project resolver, and the typed error
 // emitter. Each verb's own run module owns its payload validation + envelope.
 
-import { existsSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 import {
@@ -29,6 +29,7 @@ import {
   resolveProject,
 } from "./project.ts";
 import { hasDataDir } from "./state_path.ts";
+import { readStdinBytes, stdinIsTTY } from "./stdin.ts";
 
 /** Same 1 MiB stdin cap scaffold uses against a YAML billion-laughs DoS. A real
  * audit report / verdict / follow-up plan is a few KB; 1 MiB is generous.
@@ -80,17 +81,17 @@ export function emitSubmitError(
 export function readPayloadCapped(fileArg: string, label: string): string {
   let raw: Buffer;
   if (fileArg === "-") {
-    if (process.stdin.isTTY) {
+    if (stdinIsTTY()) {
       throw new SubmitError(
         "NO_STDIN",
         `stdin is a TTY — pipe the ${label} on stdin (pass \`--file -\`)`,
       );
     }
     try {
-      // Read MAX+1 bytes off fd 0 (reject-don't-truncate): an over-cap stream
+      // Read MAX+1 bytes off stdin (reject-don't-truncate): an over-cap stream
       // reports got=MAX+1 no matter how much was piped, matching
       // sys.stdin.buffer.read(MAX_STDIN_BYTES + 1).
-      raw = readCappedFd(0, MAX_STDIN_BYTES + 1);
+      raw = readStdinBytes(MAX_STDIN_BYTES + 1);
     } catch (exc) {
       throw new SubmitError(
         "NO_STDIN",
@@ -218,41 +219,6 @@ export function resolveAuditContext(
     typeof primaryRaw === "string" && primaryRaw ? primaryRaw : ctx.projectPath,
   );
   return { primaryRepo, brief };
-}
-
-/** Read up to `cap` bytes from `fd` by chunked accumulation. Stops at EOF or
- * once `cap` bytes are in hand — the reject-don't-truncate contract. */
-function readCappedFd(fd: number, cap: number): Buffer {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  const bufSize = 64 * 1024;
-  const buf = Buffer.allocUnsafe(bufSize);
-  while (total < cap) {
-    const want = Math.min(bufSize, cap - total);
-    let n: number;
-    try {
-      n = readSync(fd, buf, 0, want, null);
-    } catch (exc) {
-      if (isEof(exc)) {
-        break;
-      }
-      throw exc;
-    }
-    if (n === 0) {
-      break;
-    }
-    chunks.push(Buffer.from(buf.subarray(0, n)));
-    total += n;
-  }
-  return Buffer.concat(chunks, total);
-}
-
-function isEof(exc: unknown): boolean {
-  return (
-    typeof exc === "object" &&
-    exc !== null &&
-    (exc as { code?: string }).code === "EOF"
-  );
 }
 
 function expandUser(pathArg: string): string {

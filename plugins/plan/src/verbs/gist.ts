@@ -132,7 +132,11 @@ export function runGist(args: GistArgs): void {
     }
     cmd.push(...filePaths);
 
-    const proc = Bun.spawnSync(["gh", ...cmd]);
+    // Pass the live env explicitly (not the default-snapshot inheritance) so an
+    // in-process caller that reassigned process.env — the bun:test harness
+    // prepending a fake-`gh` shim dir onto PATH — reaches `gh` resolution; the
+    // default-env spawn would otherwise see only the frozen startup snapshot.
+    const proc = Bun.spawnSync(["gh", ...cmd], { env: process.env });
     if (proc.exitCode !== 0) {
       const stderr = proc.stderr.toString();
       const stdout = proc.stdout.toString();
@@ -175,7 +179,7 @@ export function runGist(args: GistArgs): void {
 function openInBrowser(url: string): void {
   const opener = process.platform === "darwin" ? "open" : "xdg-open";
   try {
-    Bun.spawnSync([opener, url]);
+    Bun.spawnSync([opener, url], { env: process.env });
   } catch {
     // No opener available — ignore.
   }

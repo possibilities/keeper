@@ -26,20 +26,31 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
+import { main } from "../src/cli.ts";
+import { resetSelfEmit } from "../src/emit.ts";
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
 import { resolveDataDirOrDefault } from "../src/state_path.ts";
+import {
+  resetStdinProvider,
+  type StdinProvider,
+  setStdinProvider,
+} from "../src/stdin.ts";
 import { serializeStateJson } from "../src/store.ts";
 
 // ---------------------------------------------------------------------------
-// Binary resolution — the landed src-cli idiom: resolve the compiled artifact
-// from the dist path and hard-fail if absent rather than silently passing. The
-// env override below lets a caller point elsewhere; absent override, this is it.
+// Binary resolution — the default `bun test` runs runCli IN-PROCESS (it
+// dispatches main(argv) directly, never spawning the binary), so the compiled
+// artifact is NOT required for the default tier. Only the KEEPER_PLAN_RUN_PROCESS
+// slow bucket spawns it, and resolveBin() is its lazy resolver: it hard-fails on
+// a missing binary at the spawn site, not at module load, so the default tier
+// neither needs nor builds the binary.
 // ---------------------------------------------------------------------------
 
-/** The compiled binary every spawn targets. KEEPER_PLAN_BIN overrides (the
- * conftest engine-selection env), else the dist artifact. Hard-fails if neither
- * exists. */
-export const BIN: string = (() => {
+/** Resolve the compiled binary for a spawning (slow-bucket) caller.
+ * KEEPER_PLAN_BIN overrides (the conftest engine-selection env), else the dist
+ * artifact. Hard-fails if neither exists. Lazy — the default in-process tier
+ * never calls this. */
+export function resolveBin(): string {
   const override = process.env.KEEPER_PLAN_BIN;
   const candidate =
     override && override.length > 0
@@ -52,17 +63,20 @@ export const BIN: string = (() => {
     );
   }
   return candidate;
-})();
+}
 
 // ---------------------------------------------------------------------------
-// Per-call + global timeout floor. Every spawn carries a per-call timeout; the
-// global floor is the package.json test-script --timeout. A subprocess CLI call
-// that hangs must fail the test, never wedge the suite.
+// Per-call + global timeout floor. The slow-bucket spawn carries a per-call
+// timeout; the global floor is the package.json test-script --timeout. The
+// default in-process runCli has no spawn to time out — a runaway loop is caught
+// by the package.json --timeout. A spawning CLI call that hangs must fail the
+// test, never wedge the suite.
 // ---------------------------------------------------------------------------
 
-/** Per-spawn timeout (ms). A single CLI invocation that exceeds this is killed
- * and surfaces as a non-zero/empty result the assertion catches. Kept well under
- * the package.json global --timeout floor so a hung spawn fails its own test. */
+/** Per-spawn timeout (ms) for the slow process bucket. A single spawned CLI
+ * invocation that exceeds this is killed and surfaces as a non-zero/empty result
+ * the assertion catches. Kept well under the package.json global --timeout floor
+ * so a hung spawn fails its own test. */
 export const SPAWN_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -124,9 +138,15 @@ export function buildEnv(
 }
 
 // ---------------------------------------------------------------------------
-// runCli — Bun.spawnSync against the binary with the built env, pipe stdio,
-// stdin ignored, per-call timeout. Decodes stdout/stderr explicitly (Uint8Array
-// -> string). Merged-output + split accessors plus the payload extractors.
+// runCli — IN-PROCESS dispatch of main(argv). The compiled binary is never
+// spawned here: instead the harness sets process.env to buildEnv(...), chdirs to
+// opts.cwd, installs the stdin-provider override (feeding opts.input), captures
+// process.stdout/stderr.write into strings, and makes process.exit throw an
+// ExitCode carrier — then restores every global in `finally`. A verb that exits
+// mid-run unwinds cleanly via the thrown ExitCode so the harness still returns
+// {code, stdout, stderr, output}. Eliminates the ~414 process spawns + the
+// `bun run build` dependency. The slow process bucket (runCliProcess) keeps the
+// spawn for the handful of tests that genuinely exercise the binary boundary.
 // ---------------------------------------------------------------------------
 
 export interface CliResult {
@@ -141,21 +161,130 @@ export interface RunOptions {
   cwd: string;
   /** Per-call env override, layered over buildEnv's base. */
   env?: Record<string, string>;
-  /** Text piped to the process stdin (default: ignored). */
+  /** Text fed to the verb's stdin readers (default: empty / no stdin). */
   input?: string;
   /** HOME for the env build. Defaults to <cwd>/.home; withProject sets a real one. */
   home?: string;
-  /** Per-call timeout override (ms). */
+  /** Per-call timeout override (ms) — honored only by the slow process bucket. */
   timeoutMs?: number;
 }
 
-/** Run the binary once and return its decoded result. Built env, pipe stdio,
- * per-call timeout, explicit Uint8Array decode. The default HOME is <cwd>/.home;
- * pass `home` (or use withProject) for a dedicated tmp HOME. */
+/** Private carrier the patched process.exit throws so an exiting verb unwinds to
+ * runCli's catch with its intended code rather than killing the test process. */
+class ExitCode {
+  constructor(readonly code: number) {}
+}
+
+/** Dispatch `main(args)` in-process under a fully captured + restored global
+ * environment. Returns the decoded {code, stdout, stderr, output}. The default
+ * HOME is <cwd>/.home; pass `home` (or use withProject) for a dedicated tmp
+ * HOME. */
 export function runCli(args: string[], opts: RunOptions): CliResult {
   const home = opts.home ?? join(opts.cwd, ".home");
   mkdirSync(home, { recursive: true });
-  const proc = Bun.spawnSync([BIN, ...args], {
+
+  const priorEnv = process.env;
+  const priorCwd = process.cwd();
+  const priorStdoutWrite = process.stdout.write;
+  const priorStderrWrite = process.stderr.write;
+  const priorExit = process.exit;
+  const priorStdoutTTY = process.stdout.isTTY;
+
+  let stdout = "";
+  let stderr = "";
+  let code = 0;
+
+  // The patched process.exit throws ExitCode; selfEmitted must start clean per
+  // call or the prior verb's self-emit leaks into the dispatcher's trailer gate.
+  resetSelfEmit();
+  setStdinProvider(makeStdinProvider(opts.input));
+
+  try {
+    process.env = buildEnv(home, opts.env);
+    process.chdir(opts.cwd);
+    // The spawned binary ran with piped (non-TTY) stdio; pin isTTY false so the
+    // format auto-upgrade-to-human branch never fires in-process either.
+    setTTY(process.stdout, false);
+    process.stdout.write = captureWrite((s) => {
+      stdout += s;
+    }) as typeof process.stdout.write;
+    process.stderr.write = captureWrite((s) => {
+      stderr += s;
+    }) as typeof process.stderr.write;
+    process.exit = ((c?: number): never => {
+      throw new ExitCode(c ?? 0);
+    }) as typeof process.exit;
+
+    try {
+      code = main(args);
+    } catch (exc) {
+      if (exc instanceof ExitCode) {
+        code = exc.code;
+      } else {
+        // An uncaught throw out of main() is exactly the spawned binary's
+        // uncaught-exception path: Bun prints the error to stderr and exits 1.
+        // Mirror it (code 1, message on stderr) so the harness still returns a
+        // result and the "fails closed" tests see a non-zero code rather than a
+        // crashed test process.
+        stderr += `${exc instanceof Error ? (exc.stack ?? exc.message) : String(exc)}\n`;
+        code = 1;
+      }
+    }
+  } finally {
+    process.env = priorEnv;
+    process.chdir(priorCwd);
+    process.stdout.write = priorStdoutWrite;
+    process.stderr.write = priorStderrWrite;
+    process.exit = priorExit;
+    setTTY(process.stdout, priorStdoutTTY);
+    resetStdinProvider();
+  }
+
+  return { code, stdout, stderr, output: stdout + stderr };
+}
+
+/** Build the stdin provider feeding an in-process call: a defined `input` is
+ * piped (non-TTY); an undefined `input` is empty + non-TTY (the spawned default
+ * was `stdin: "ignore"`, an immediate EOF — empty bytes, never a keyboard). */
+function makeStdinProvider(input: string | undefined): StdinProvider {
+  const buf = Buffer.from(input ?? "", "utf-8");
+  return {
+    readText: () => buf.toString("utf-8"),
+    readBytes: (cap: number) => buf.subarray(0, cap),
+    isTTY: () => false,
+  };
+}
+
+/** A process.std*.write replacement that decodes (string | Uint8Array) and
+ * forwards to a sink, honoring the optional encoding/callback signatures so a
+ * caller passing a completion callback still proceeds. Always reports success. */
+function captureWrite(
+  sink: (s: string) => void,
+): (chunk: unknown, ...rest: unknown[]) => boolean {
+  return (chunk: unknown, ...rest: unknown[]): boolean => {
+    sink(typeof chunk === "string" ? chunk : decode(chunk as Uint8Array));
+    const cb = rest.find((r) => typeof r === "function") as
+      | ((err?: Error | null) => void)
+      | undefined;
+    cb?.(null);
+    return true;
+  };
+}
+
+/** Set a stream's isTTY without tripping the readonly type — the in-process
+ * faithful-to-spawn pin and its restore. */
+function setTTY(stream: NodeJS.WriteStream, value: boolean | undefined): void {
+  (stream as unknown as { isTTY: boolean | undefined }).isTTY = value;
+}
+
+/** Spawn the COMPILED binary once and return its decoded result — the slow
+ * process bucket's runner (gated on KEEPER_PLAN_RUN_PROCESS). Built env, pipe
+ * stdio, per-call timeout, explicit Uint8Array decode. Resolves the binary
+ * lazily so the default in-process tier never needs `bun run build`. */
+export function runCliProcess(args: string[], opts: RunOptions): CliResult {
+  const home = opts.home ?? join(opts.cwd, ".home");
+  mkdirSync(home, { recursive: true });
+  const proc = Bun.spawnSync([resolveBin(), ...args], {
     cwd: opts.cwd,
     env: buildEnv(home, opts.env),
     stdin:
@@ -171,6 +300,14 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
     output: stdout + stderr,
   };
 }
+
+/** True when the slow process bucket is enabled (KEEPER_PLAN_RUN_PROCESS set to
+ * a truthy value). Pass to `describe.skipIf(!PROCESS_ENABLED)` to gate the
+ * compiled-binary / process-boundary tests. */
+export const PROCESS_ENABLED: boolean = ((): boolean => {
+  const v = process.env.KEEPER_PLAN_RUN_PROCESS;
+  return v !== undefined && v !== "" && v !== "0";
+})();
 
 /** Decode a spawn stream (Uint8Array | Buffer | string) to a UTF-8 string —
  * explicit, never an implicit toString on a raw buffer. */

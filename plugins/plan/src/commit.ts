@@ -64,9 +64,14 @@ export class CommitFailed extends Error {
 // git plumbing — current head, status filter, stage, commit.
 // ---------------------------------------------------------------------------
 
-/** Run git with the ambient env untouched and an explicit cwd. Returns
- * exit code + decoded stdout/stderr. `input`, when given, is fed to stdin
- * (used for `commit -F -`). */
+/** Run git with the live process env and an explicit cwd. Returns exit code +
+ * decoded stdout/stderr. `input`, when given, is fed to stdin (used for
+ * `commit -F -`). The env is passed explicitly (not left to the default-snapshot
+ * inheritance) so an in-process caller that reassigned `process.env` — the
+ * bun:test harness installing the fixture's GIT_CONFIG_GLOBAL / committer
+ * identity / gpgsign=false / hooksPath=/dev/null — reaches git's config
+ * resolution; the default-env spawn would otherwise see only the frozen startup
+ * snapshot and commit under the wrong identity. */
 function runGit(
   args: string[],
   cwd: string,
@@ -74,6 +79,7 @@ function runGit(
 ): { exitCode: number; stdout: string; stderr: string } {
   const proc = Bun.spawnSync(["git", ...args], {
     cwd,
+    env: process.env,
     ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
   });
   return {

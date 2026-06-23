@@ -1,22 +1,17 @@
 // Nested-group dispatch tests for src/cli.ts + src/subgroup.ts, exercised
-// through the COMPILED binary (dist/keeper-plan-bun). Covers: top-level help lists
-// the epic/task subgroups; `<group> --help` renders click's group-help shape;
-// an unknown subcommand exits 2 with the group usage; the in-wave leaf names are
-// listed (their runners land in later wave tasks, so invoking one exits non-zero
-// rather than the unknown-command exit-2).
+// through the COMPILED binary (dist/keeper-plan-bun) — the PROCESS-BOUNDARY
+// bucket. The default `bun test` covers dispatch in-process via the harness;
+// this file proves the same shapes survive the compiled artifact (help rendering,
+// exit codes, group usage), so it runs only when KEEPER_PLAN_RUN_PROCESS is set
+// (after `bun run build`). Covers: top-level help lists the epic/task subgroups;
+// `<group> --help` renders click's group-help shape; an unknown subcommand exits
+// 2 with the group usage; the leaf names are listed.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const BIN = join(import.meta.dir, "..", "dist", "keeper-plan-bun");
-
-if (!existsSync(BIN)) {
-  throw new Error(
-    `compiled binary missing at ${BIN}; run \`bun run build\` before \`bun test\``,
-  );
-}
+import { PROCESS_ENABLED, resolveBin } from "./harness.ts";
 
 interface RunResult {
   code: number;
@@ -25,7 +20,7 @@ interface RunResult {
 }
 
 function run(args: string[], cwd: string): RunResult {
-  const proc = Bun.spawnSync([BIN, ...args], {
+  const proc = Bun.spawnSync([resolveBin(), ...args], {
     cwd,
     env: { HOME: join(cwd, ".home"), PATH: process.env.PATH ?? "" },
   });
@@ -36,7 +31,7 @@ function run(args: string[], cwd: string): RunResult {
   };
 }
 
-describe("top-level --help lists subgroups", () => {
+describe.skipIf(!PROCESS_ENABLED)("top-level --help lists subgroups", () => {
   test("epic and task appear in the Commands section", () => {
     const r = run(["--help"], tmpdir());
     expect(r.code).toBe(0);
@@ -46,7 +41,7 @@ describe("top-level --help lists subgroups", () => {
   });
 });
 
-describe("epic group help", () => {
+describe.skipIf(!PROCESS_ENABLED)("epic group help", () => {
   test("--help: Usage + description + Options + Commands, exit 0", () => {
     const r = run(["epic", "--help"], tmpdir());
     expect(r.code).toBe(0);
@@ -96,7 +91,7 @@ describe("epic group help", () => {
   });
 });
 
-describe("task group help", () => {
+describe.skipIf(!PROCESS_ENABLED)("task group help", () => {
   test("--help lists the in-wave task leaves, exit 0", () => {
     const r = run(["task", "--help"], tmpdir());
     expect(r.code).toBe(0);
@@ -122,7 +117,7 @@ describe("task group help", () => {
   });
 });
 
-describe("unknown top-level group", () => {
+describe.skipIf(!PROCESS_ENABLED)("unknown top-level group", () => {
   test("config -> exit 2 (no such command)", () => {
     const r = run(["config", "show"], tmpdir());
     expect(r.code).toBe(2);

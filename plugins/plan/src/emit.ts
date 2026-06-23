@@ -41,6 +41,14 @@ export function didSelfEmit(): boolean {
   return selfEmitted;
 }
 
+/** Reset the self-emit sentinel. A compiled-binary run never needs this (the
+ * sentinel lives one process), but an in-process caller (the bun:test harness's
+ * runCli, which dispatches main(argv) directly) must clear it before each call
+ * or the prior verb's self-emit leaks into the next. */
+export function resetSelfEmit(): void {
+  selfEmitted = false;
+}
+
 /** Mark that the running verb self-emitted its invocation envelope. */
 function markSelfEmitted(): void {
   selfEmitted = true;
