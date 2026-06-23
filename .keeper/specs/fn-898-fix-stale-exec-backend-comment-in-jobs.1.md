@@ -16,5 +16,5 @@ names a deleted symbol.
 - [ ] The comment accurately describes the direct `createTmuxPaneOps` seam and the NULL session/pane skip
 
 ## Done summary
-
+Trimmed the stale v-focus comment in cli/jobs.ts to the direct createTmuxPaneOps seam reality, removing the deleted resolveExecBackend symbol and per-row backend_exec_type resolution references.
 ## Evidence
