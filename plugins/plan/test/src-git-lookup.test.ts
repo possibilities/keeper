@@ -1,86 +1,68 @@
 // Unit tests for the git-reading quartet's two trailer techniques —
-// src/commit_lookup.ts (the `git log --grep` + `git interpret-trailers --parse`
-// confirmation scan find-task-commit wraps) and src/reconcile.ts's
-// findSourceCommits (the `%(trailers:key=Task,valueonly=true)` unit-separator
-// split reconcile uses). Both must extract the SAME logical answer from a
-// `Task:`-trailer commit while rejecting prose false-matches and fn-N.1/fn-N.10
-// substring collisions.
+// src/commit_lookup.ts (find-task-commit's grouped trailer scan) and
+// src/reconcile.ts's findSourceCommits (the source-commit scan) — plus the
+// reconcile verdict truth table + stateHeadVisible unborn-branch guard.
 //
-// The 4-way trailer round-trip: a commit carrying a real `Task:` trailer (the
-// shape every worker's source commit lands, engine-independent) is read back
-// through BOTH bun lookup techniques and BOTH must agree — the bun half of the
-// cross-engine parity the conformance suite pins against the Python reference.
-// Plus the reconcile verdict truth table + stateHeadVisible unborn-branch guard.
+// keeper's DECISIONS are the subject here, not git's execution: the tests install
+// the fake VCS facade and seed source commits / committed task JSON through it
+// (fakeSourceCommit / fakeCommitTaskJson), so both lookup techniques run git-free.
+// The fake's trailer matcher reproduces git's interpret-trailers all-or-nothing
+// block rule, so a prose `Task:` mention and an fn-N.1/fn-N.10 substring sibling
+// are rejected exactly as real git rejects them. The real-git cross-engine
+// trailer-parsing parity is owned by the slow tier (git-lookup-realgit.slow).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AllReposBrokenError, findCommitGroups } from "../src/commit_lookup.ts";
+import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   computeVerdict,
   findSourceCommits,
   stateHeadVisible,
   VERDICTS,
 } from "../src/verbs/reconcile.ts";
+import {
+  fakeCommitTaskJson,
+  initRepo as fakeInitRepo,
+  fakeSourceCommit,
+  fakeVcs,
+  resetFakeVcs,
+} from "./fake-vcs.ts";
 
 let repo: string;
-// The realpath-resolved repo path — findCommitGroups / findSourceCommits
-// resolve symlinks (macOS /var -> /private/var), so group results carry the
-// resolved form. Expectations compare against this, not the raw mkdtemp path.
+// The realpath-resolved repo path — findCommitGroups / findSourceCommits resolve
+// symlinks (macOS /var -> /private/var), so group results carry the resolved
+// form. Expectations compare against this, not the raw mkdtemp path.
 let resolvedRepo: string;
 
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-/** Land an empty commit carrying `body` (incl. any trailer block); return the
- * full %H. Workers create source commits with a plain `git commit` whose message
- * ends in a `Task: <id>` trailer — engine-independent, so this is the shared
- * "both engines write" half of the round-trip. */
+/** Seed a fake source commit carrying `body` (incl. any trailer block); return
+ * the full fake sha. A worker's source commit is a plain commit whose message
+ * ends in a `Task: <id>` trailer — modeled here without real git. */
 function commit(body: string, cwd: string): string {
-  const proc = Bun.spawnSync(["git", "commit", "--allow-empty", "-F", "-"], {
-    cwd,
-    stdin: Buffer.from(body),
-  });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git commit failed: ${proc.stderr.toString()}`);
-  }
-  return git(["rev-parse", "HEAD"], cwd).trim();
+  return fakeSourceCommit(cwd, body);
 }
 
 beforeEach(() => {
-  repo = mkdtempSync(join(tmpdir(), "planctl-git-lookup-"));
-  git(["init", "-q"], repo);
-  git(["config", "user.email", "test@planctl.local"], repo);
-  git(["config", "user.name", "Planctl Test"], repo);
-  git(["config", "commit.gpgsign", "false"], repo);
-  writeFileSync(join(repo, "README"), "seed\n");
-  git(["add", "README"], repo);
-  git(["commit", "-q", "-m", "seed"], repo);
-  resolvedRepo = realpathSync(repo);
+  resetFakeVcs();
+  setVcs(fakeVcs);
+  repo = realpathSync(mkdtempSync(join(tmpdir(), "planctl-git-lookup-")));
+  fakeInitRepo(repo);
+  resolvedRepo = repo;
 });
 
 afterEach(() => {
+  resetVcs();
   rmSync(repo, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
-// commit_lookup.findCommitGroups — the grep + interpret-trailers technique.
+// commit_lookup.findCommitGroups — the grouped confirmed-trailer scan.
 // ---------------------------------------------------------------------------
 
-describe("findCommitGroups (grep + interpret-trailers --parse)", () => {
+describe("findCommitGroups (confirmed trailer scan)", () => {
   test("a real Task: trailer commit is grouped under its repo", () => {
     const sha = commit("feat: work\n\nTask: fn-1-x.1\n", repo);
     const groups = findCommitGroups(["fn-1-x.1"], repo, null);
@@ -113,7 +95,9 @@ describe("findCommitGroups (grep + interpret-trailers --parse)", () => {
   });
 
   test("every repo missing/non-git → AllReposBrokenError", () => {
-    const broken = mkdtempSync(join(tmpdir(), "planctl-not-a-repo-"));
+    const broken = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-not-a-repo-")),
+    );
     try {
       expect(() => findCommitGroups(["fn-1-x.1"], repo, [broken])).toThrow(
         AllReposBrokenError,
@@ -125,10 +109,10 @@ describe("findCommitGroups (grep + interpret-trailers --parse)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reconcile.findSourceCommits — the %(trailers:…valueonly) unit-sep technique.
+// reconcile.findSourceCommits — the source-commit scan.
 // ---------------------------------------------------------------------------
 
-describe("findSourceCommits (%(trailers) valueonly + unit-sep split)", () => {
+describe("findSourceCommits (trailer-authentic scan)", () => {
   test("a real Task: trailer commit is returned", () => {
     const sha = commit("feat: work\n\nTask: fn-1-x.1\n", repo);
     expect(findSourceCommits("fn-1-x.1", repo)).toContain(sha);
@@ -154,7 +138,9 @@ describe("findSourceCommits (%(trailers) valueonly + unit-sep split)", () => {
   });
 
   test("not a git work tree → [] (not an error for the source scan)", () => {
-    const notRepo = mkdtempSync(join(tmpdir(), "planctl-not-a-repo-"));
+    const notRepo = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-not-a-repo-")),
+    );
     try {
       expect(findSourceCommits("fn-1-x.1", notRepo)).toEqual([]);
     } finally {
@@ -168,17 +154,17 @@ describe("findSourceCommits (%(trailers) valueonly + unit-sep split)", () => {
 // ---------------------------------------------------------------------------
 
 describe("4-way trailer round-trip", () => {
-  test("both bun lookup techniques find the same Task: trailer commit", () => {
+  test("both lookup techniques find the same Task: trailer commit", () => {
     const sha = commit(
       "feat(x): the work\n\nbody.\n\nTask: fn-7-feat.3\n",
       repo,
     );
 
-    // Technique A: grep + interpret-trailers (find-task-commit's path).
+    // Technique A: find-task-commit's grouped scan.
     const groups = findCommitGroups(["fn-7-feat.3"], repo, null);
     expect(groups).toEqual([{ repo: resolvedRepo, shas: [sha] }]);
 
-    // Technique B: %(trailers) valueonly + unit-sep split (reconcile's path).
+    // Technique B: reconcile's source-commit scan.
     expect(findSourceCommits("fn-7-feat.3", repo)).toEqual([sha]);
 
     // Both reject the substring sibling and a prose false-match identically.
@@ -197,9 +183,9 @@ describe("4-way trailer round-trip", () => {
 
 describe("stateHeadVisible", () => {
   test("unborn branch (no born HEAD) → false, not a throw", () => {
-    const unborn = mkdtempSync(join(tmpdir(), "planctl-unborn-"));
+    const unborn = realpathSync(mkdtempSync(join(tmpdir(), "planctl-unborn-")));
     try {
-      git(["init", "-q"], unborn);
+      fakeInitRepo(unborn);
       expect(stateHeadVisible(unborn, "fn-1-x.1")).toBe(false);
     } finally {
       rmSync(unborn, { recursive: true, force: true });
@@ -209,16 +195,17 @@ describe("stateHeadVisible", () => {
   test("committed task JSON with worker_done_at → true", () => {
     const rel = ".keeper/tasks/fn-1-x.1.json";
     mkdirSync(join(repo, ".keeper", "tasks"), { recursive: true });
-    writeFileSync(
+    require("node:fs").writeFileSync(
       join(repo, rel),
       `${JSON.stringify({ id: "fn-1-x.1", worker_done_at: "2026-01-01T00:00:00Z" })}\n`,
     );
-    git(["add", rel], repo);
-    git(["commit", "-q", "-m", "chore(planctl): done fn-1-x.1"], repo);
+    fakeCommitTaskJson(repo, "fn-1-x.1");
     expect(stateHeadVisible(repo, "fn-1-x.1")).toBe(true);
   });
 
   test("path absent from HEAD → false", () => {
+    // A born HEAD (a source commit exists) but no committed task JSON blob.
+    commit("feat: seed\n\nTask: fn-1-x.1\n", repo);
     expect(stateHeadVisible(repo, "fn-1-x.1")).toBe(false);
   });
 });

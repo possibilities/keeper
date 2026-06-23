@@ -37,6 +37,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
+import { getExec } from "./exec.ts";
 import { flockOrThrow, LOCK_EX, LOCK_UN } from "./flock.ts";
 import { resolveDataDir } from "./state_path.ts";
 import { readStdinText } from "./stdin.ts";
@@ -403,14 +404,16 @@ export function nowIso(): string {
   return new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");
 }
 
-/** Run a git config lookup, returning the trimmed value or null on any failure
- * (non-zero exit, git absent). Mirrors get_actor's subprocess.run + except. */
+/** Run a git config lookup through the external-command facade, returning the
+ * trimmed value or null on any failure (non-zero exit, git absent). Mirrors
+ * get_actor's subprocess.run + except. Production runs verbatim git; the test
+ * harness drives a faked result so getActor's precedence is git-free. */
 function gitConfig(key: string): string | null {
-  const proc = Bun.spawnSync(["git", "config", key]);
+  const proc = getExec().run("git", ["config", key]);
   if (proc.exitCode !== 0) {
     return null;
   }
-  const value = proc.stdout.toString().trim();
+  const value = proc.stdout.trim();
   return value ? value : null;
 }
 

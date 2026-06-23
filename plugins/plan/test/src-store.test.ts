@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { resetExec, setExec } from "../src/exec.ts";
 import {
   getActor,
   LocalFileStateStore,
@@ -132,17 +133,56 @@ describe("nowIso KEEPER_PLAN_NOW contract", () => {
 });
 
 describe("getActor precedence", () => {
+  // Drive the git-config probe through a faked exec so the precedence ladder
+  // runs git-free. config(map) returns map[key] for `git config <key>`, null
+  // (exit 1) for an unmapped key.
+  function config(map: Record<string, string>): void {
+    setExec({
+      run(command, argv) {
+        if (command === "git" && argv[0] === "config") {
+          const key = argv[1] as string;
+          const v = map[key];
+          return v !== undefined
+            ? { exitCode: 0, stdout: `${v}\n`, stderr: "" }
+            : { exitCode: 1, stdout: "", stderr: "" };
+        }
+        return { exitCode: 127, stdout: "", stderr: "no driver" };
+      },
+    });
+  }
+  afterEach(() => {
+    resetExec();
+  });
+
   test("KEEPER_PLAN_ACTOR wins and is trimmed", () => {
     process.env.KEEPER_PLAN_ACTOR = "  alice@example.com  ";
     expect(getActor()).toBe("alice@example.com");
   });
 
-  test("falls through to git config / USER / unknown when KEEPER_PLAN_ACTOR unset", () => {
+  test("git user.email is next when KEEPER_PLAN_ACTOR unset", () => {
     delete process.env.KEEPER_PLAN_ACTOR;
-    // Without asserting the machine's git identity, the result must be a
-    // non-empty string (one of: git email, git name, USER, or "unknown").
-    const actor = getActor();
-    expect(typeof actor).toBe("string");
-    expect(actor.length).toBeGreaterThan(0);
+    config({ "user.email": "git-email@example.com", "user.name": "Git Name" });
+    expect(getActor()).toBe("git-email@example.com");
+  });
+
+  test("falls to git user.name when email absent", () => {
+    delete process.env.KEEPER_PLAN_ACTOR;
+    config({ "user.name": "Git Name" });
+    expect(getActor()).toBe("Git Name");
+  });
+
+  test("falls to USER, then 'unknown', when git config empty", () => {
+    delete process.env.KEEPER_PLAN_ACTOR;
+    config({});
+    const savedUser = process.env.USER;
+    process.env.USER = "shell-user";
+    expect(getActor()).toBe("shell-user");
+    delete process.env.USER;
+    expect(getActor()).toBe("unknown");
+    if (savedUser === undefined) {
+      delete process.env.USER;
+    } else {
+      process.env.USER = savedUser;
+    }
   });
 });

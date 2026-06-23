@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { emitReadonlyData } from "../emit.ts";
+import { getExec } from "../exec.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { isEpicId, parseId } from "../ids.ts";
 import { resolveProject } from "../project.ts";
@@ -132,20 +133,17 @@ export function runGist(args: GistArgs): void {
     }
     cmd.push(...filePaths);
 
-    // Pass the live env explicitly (not the default-snapshot inheritance) so an
-    // in-process caller that reassigned process.env — the bun:test harness
-    // prepending a fake-`gh` shim dir onto PATH — reaches `gh` resolution; the
-    // default-env spawn would otherwise see only the frozen startup snapshot.
-    const proc = Bun.spawnSync(["gh", ...cmd], { env: process.env });
+    // Route through the external-command facade so the bun:test harness drives a
+    // canned `gh` result without a PATH-shim binary; production runs verbatim gh
+    // with the live env.
+    const proc = getExec().run("gh", cmd, { env: process.env });
     if (proc.exitCode !== 0) {
-      const stderr = proc.stderr.toString();
-      const stdout = proc.stdout.toString();
-      const err = (stderr || stdout).trim() || "gh gist create failed";
+      const err =
+        (proc.stderr || proc.stdout).trim() || "gh gist create failed";
       emitError(`gh gist create failed: ${err}`, format);
     }
 
     const stdoutLines = proc.stdout
-      .toString()
       .trim()
       .split("\n")
       .filter((ln) => ln.trim().length > 0);
@@ -173,16 +171,12 @@ export function runGist(args: GistArgs): void {
 }
 
 /** Best-effort browser open via the platform opener (macOS `open`, else
- * `xdg-open`). Never throws — a missing opener is silently ignored, mirroring
- * webbrowser.open's tolerance. Tests always pass --no-open, so this never fires
- * in the suite. */
+ * `xdg-open`), routed through the external-command facade. Never throws — a
+ * missing opener is silently ignored, mirroring webbrowser.open's tolerance.
+ * Tests always pass --no-open, so this never fires in the suite. */
 function openInBrowser(url: string): void {
   const opener = process.platform === "darwin" ? "open" : "xdg-open";
-  try {
-    Bun.spawnSync([opener, url], { env: process.env });
-  } catch {
-    // No opener available — ignore.
-  }
+  getExec().run(opener, [url], { env: process.env });
 }
 
 /** GitHub gist in-page anchor for a filename: lowercase, non-alphanumerics →

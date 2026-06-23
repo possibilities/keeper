@@ -8,12 +8,12 @@
 // (BAD_TASK_ID / TASK_NOT_FOUND / NOT_A_PROJECT / AMBIGUOUS_TASK_ID) ride the
 // error envelope.
 //
-// Real Task:-trailer commits ARE the subject, so the trailer-scan tests ride
-// the KEEPER_PLAN_RUN_SLOW gate (test.skipIf(!SLOW_ENABLED)) under real git. Roots
-// discovery is driven through setRoots; the colliding-id tests stand up two real
-// projects under one root. The all-repos-broken node is a python_only injection
-// (drop) whose AllReposBrokenError -> COMMIT_LOOKUP_FAILED mapping is unit-owned
-// by src-git-lookup.test.ts.
+// keeper's grouping DECISION is the subject, so the trailer-scan tests seed fake
+// source commits through the VCS fixture (fakeSourceCommit) and run git-free in
+// the default tier. Roots discovery is driven through setRoots; the colliding-id
+// tests stand up two fake projects under one root. The all-repos-broken node is a
+// python_only injection (drop) whose AllReposBrokenError -> COMMIT_LOOKUP_FAILED
+// mapping is unit-owned by src-git-lookup.test.ts.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -26,11 +26,14 @@ import {
 import { join } from "node:path";
 
 import {
+  fakeSourceCommit,
   firstJsonPayload,
+  gitHeadMessage,
+  gitHeadSha,
   gitInit,
+  gitLogCount,
   parseCliOutput,
   runCli,
-  SLOW_ENABLED,
   scaffoldEpic,
   scaffoldPlanYaml,
   setRoots,
@@ -38,19 +41,10 @@ import {
   withTmpdir,
 } from "./harness.ts";
 
-// Land an empty commit carrying `body` in `repo`; return the full %H. Workers
-// land source commits with a plain `git commit` ending in a Task: trailer.
+// Seed a fake source commit carrying `body` in `repo`; return the fake %H. A
+// worker's source commit is a plain commit ending in a Task: trailer.
 function seedCommit(repo: string, taskId: string, body?: string): string {
-  const msg = body ?? `feat: work\n\nTask: ${taskId}\n`;
-  const c = Bun.spawnSync(["git", "commit", "--allow-empty", "-F", "-"], {
-    cwd: repo,
-    stdin: Buffer.from(msg),
-  });
-  if ((c.exitCode ?? -1) !== 0) {
-    throw new Error(`seed commit failed: ${c.stderr.toString()}`);
-  }
-  const rev = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repo });
-  return rev.stdout.toString().trim();
+  return fakeSourceCommit(repo, body ?? `feat: work\n\nTask: ${taskId}\n`);
 }
 
 // The error code off an error envelope.
@@ -65,93 +59,81 @@ function errCode(out: string): unknown {
 describe("find-task-commit trailer scan", () => {
   const getProj = withProject("planctl-ftc-");
 
-  test.skipIf(!SLOW_ENABLED)(
-    "happy path: real Task: trailer -> flat commits:[{sha,repo}]",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_happy_path
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
-      const taskId = taskIds[0] as string;
-      const sha = seedCommit(proj.root, taskId);
+  test("happy path: real Task: trailer -> flat commits:[{sha,repo}]", () => {
+    // test_find_task_commit.py::test_find_task_commit_happy_path
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const sha = seedCommit(proj.root, taskId);
 
-      const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      const obj = parseCliOutput(r.output);
-      expect(obj.success).toBe(true);
-      const commits = obj.commits as Array<Record<string, unknown>>;
-      expect(commits).toEqual([{ sha, repo: realpathSync(proj.root) }]);
-      expect(new Set(Object.keys(commits[0] as object))).toEqual(
-        new Set(["sha", "repo"]),
-      );
-      expect((commits[0]?.sha as string).length).toBe(40);
-      expect((commits[0]?.repo as string).startsWith("/")).toBe(true);
-    },
-  );
+    const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const obj = parseCliOutput(r.output);
+    expect(obj.success).toBe(true);
+    const commits = obj.commits as Array<Record<string, unknown>>;
+    expect(commits).toEqual([{ sha, repo: realpathSync(proj.root) }]);
+    expect(new Set(Object.keys(commits[0] as object))).toEqual(
+      new Set(["sha", "repo"]),
+    );
+    expect((commits[0]?.sha as string).length).toBe(40);
+    expect((commits[0]?.repo as string).startsWith("/")).toBe(true);
+  });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "two trailer commits for one task flatten newest-first",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_flatten_order
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
-      const taskId = taskIds[0] as string;
-      const older = seedCommit(proj.root, taskId);
-      const newer = seedCommit(proj.root, taskId);
+  test("two trailer commits for one task flatten newest-first", () => {
+    // test_find_task_commit.py::test_find_task_commit_flatten_order
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const older = seedCommit(proj.root, taskId);
+    const newer = seedCommit(proj.root, taskId);
 
-      const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      const repo = realpathSync(proj.root);
-      expect(parseCliOutput(r.output).commits as unknown[]).toEqual([
-        { sha: newer, repo },
-        { sha: older, repo },
-      ]);
-    },
-  );
+    const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const repo = realpathSync(proj.root);
+    expect(parseCliOutput(r.output).commits as unknown[]).toEqual([
+      { sha: newer, repo },
+      { sha: older, repo },
+    ]);
+  });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "clean miss -> commits:[], success, exit 0",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_clean_miss_empty_success
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
-      const taskId = taskIds[0] as string;
-      const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      const obj = parseCliOutput(r.output);
-      expect(obj.success).toBe(true);
-      expect(obj.commits).toEqual([]);
-    },
-  );
+  test("clean miss -> commits:[], success, exit 0", () => {
+    // test_find_task_commit.py::test_find_task_commit_clean_miss_empty_success
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const obj = parseCliOutput(r.output);
+    expect(obj.success).toBe(true);
+    expect(obj.commits).toEqual([]);
+  });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "prose Task: mention dropped by the trailer post-filter",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_prose_false_match_dropped
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
-      const taskId = taskIds[0] as string;
-      seedCommit(
-        proj.root,
-        taskId,
-        `chore: note\n\nfixes the Task: ${taskId} issue in prose\n`,
-      );
-      const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      expect(parseCliOutput(r.output).commits).toEqual([]);
-    },
-  );
+  test("prose Task: mention dropped by the trailer post-filter", () => {
+    // test_find_task_commit.py::test_find_task_commit_prose_false_match_dropped
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    seedCommit(
+      proj.root,
+      taskId,
+      `chore: note\n\nfixes the Task: ${taskId} issue in prose\n`,
+    );
+    const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    expect(parseCliOutput(r.output).commits).toEqual([]);
+  });
 
   // test_find_task_commit.py::test_find_task_commit_all_repos_broken
   //   -> DROP (python_only): monkeypatches planctl.store.load_json in-process to
@@ -279,49 +261,43 @@ describe("find-task-commit --project disambiguation", () => {
     return { projA, projB, taskId };
   }
 
-  test.skipIf(!SLOW_ENABLED)(
-    "same id in two projects -> AMBIGUOUS_TASK_ID",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_ambiguous
-      const { projA, projB, taskId } = twoProjectsSameTask();
-      const home = getHome();
-      const r = runCli(["find-task-commit", taskId], { cwd: getRoot(), home });
-      expect(r.code).not.toBe(0);
-      expect(errCode(r.output)).toBe("AMBIGUOUS_TASK_ID");
-      const candidates = (
-        (parseCliOutput(r.output).error as Record<string, unknown>)
-          .details as Record<string, unknown>
-      ).candidates as string[];
-      expect(candidates.length).toBe(2);
-      expect(candidates).toContain(projA);
-      expect(candidates).toContain(projB);
-    },
-  );
+  test("same id in two projects -> AMBIGUOUS_TASK_ID", () => {
+    // test_find_task_commit.py::test_find_task_commit_ambiguous
+    const { projA, projB, taskId } = twoProjectsSameTask();
+    const home = getHome();
+    const r = runCli(["find-task-commit", taskId], { cwd: getRoot(), home });
+    expect(r.code).not.toBe(0);
+    expect(errCode(r.output)).toBe("AMBIGUOUS_TASK_ID");
+    const candidates = (
+      (parseCliOutput(r.output).error as Record<string, unknown>)
+        .details as Record<string, unknown>
+    ).candidates as string[];
+    expect(candidates.length).toBe(2);
+    expect(candidates).toContain(projA);
+    expect(candidates).toContain(projB);
+  });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "--project disambiguates to the seeded commit",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_project_disambiguates
-      const { projA, projB, taskId } = twoProjectsSameTask();
-      const home = getHome();
-      const sha = seedCommit(projA, taskId);
-      const expected = [{ sha, repo: realpathSync(projA) }];
+  test("--project disambiguates to the seeded commit", () => {
+    // test_find_task_commit.py::test_find_task_commit_project_disambiguates
+    const { projA, projB, taskId } = twoProjectsSameTask();
+    const home = getHome();
+    const sha = seedCommit(projA, taskId);
+    const expected = [{ sha, repo: realpathSync(projA) }];
 
-      const ra = runCli(["find-task-commit", taskId, "--project", projA], {
-        cwd: getRoot(),
-        home,
-      });
-      expect(ra.code).toBe(0);
-      expect(parseCliOutput(ra.output).commits).toEqual(expected);
+    const ra = runCli(["find-task-commit", taskId, "--project", projA], {
+      cwd: getRoot(),
+      home,
+    });
+    expect(ra.code).toBe(0);
+    expect(parseCliOutput(ra.output).commits).toEqual(expected);
 
-      const rb = runCli(["find-task-commit", taskId, "--project", projB], {
-        cwd: getRoot(),
-        home,
-      });
-      expect(rb.code).toBe(0);
-      expect(parseCliOutput(rb.output).commits).toEqual(expected);
-    },
-  );
+    const rb = runCli(["find-task-commit", taskId, "--project", projB], {
+      cwd: getRoot(),
+      home,
+    });
+    expect(rb.code).toBe(0);
+    expect(parseCliOutput(rb.output).commits).toEqual(expected);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -331,32 +307,26 @@ describe("find-task-commit --project disambiguation", () => {
 describe("find-task-commit read-only contract", () => {
   const getProj = withProject("planctl-ftc-ro-");
 
-  test.skipIf(!SLOW_ENABLED)(
-    "read-only: HEAD unchanged, no find-task-commit subject",
-    () => {
-      // test_find_task_commit.py::test_find_task_commit_lands_no_commit
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
-      const taskId = taskIds[0] as string;
-      seedCommit(proj.root, taskId);
+  test("read-only: HEAD unchanged, no find-task-commit subject", () => {
+    // test_find_task_commit.py::test_find_task_commit_lands_no_commit
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    seedCommit(proj.root, taskId);
 
-      const head = () =>
-        Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: proj.root })
-          .stdout.toString()
-          .trim();
-      const before = head();
-      const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      expect(head()).toBe(before);
-      const log = Bun.spawnSync(["git", "log", "-5", "--pretty=%s"], {
-        cwd: proj.root,
-      }).stdout.toString();
-      expect(log.includes("find-task-commit")).toBe(false);
-    },
-  );
+    const before = gitHeadSha(proj.root);
+    const beforeCount = gitLogCount(proj.root);
+    const r = runCli(["find-task-commit", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    expect(gitHeadSha(proj.root)).toBe(before);
+    expect(gitLogCount(proj.root)).toBe(beforeCount);
+    expect(
+      gitHeadMessage(proj.root).includes("chore(plan): find-task-commit"),
+    ).toBe(false);
+  });
 
   test("envelope carries readonly plan_invocation footer", () => {
     // test_find_task_commit.py::test_find_task_commit_envelope_carries_readonly_invocation

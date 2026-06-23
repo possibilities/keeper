@@ -3,17 +3,17 @@
 // an epic's TOC + epic spec + every task spec into a temp dir and shells
 // `gh gist create --desc <desc> [--public] <files...>`, taking the last stdout
 // line as the URL. The gh dependency is the whole contract, so every test stubs
-// gh with a PATH-shim fake binary (the harness pathShim util — the conftest
-// _make_fake_gh port) that records its argv and emits a controlled URL/exit.
+// gh through the external-command driver registry (fakeCommand) that records its
+// argv and returns a controlled URL/exit — no PATH shim, no real binary.
 //
-// --no-open on every call so no browser opens. Slow bucket in pytest (wire); a
-// fake-binary test runs by default here against the compiled binary.
+// --no-open on every call so no browser opens. Runs in the default tier
+// in-process; zero real git, zero binary spawn.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { pathShim, runCli, seedState, withTmpdir } from "./harness.ts";
+import { fakeCommand, runCli, seedState, withTmpdir } from "./harness.ts";
 
 // First JSON object on stdout carrying a gist/error/success key. Port of the
 // pytest _envelope raw-decode scan (format_output pretty-prints, so the
@@ -60,14 +60,9 @@ function seed(nTasks = 2): string {
 describe("gist", () => {
   test("success envelope pins {gist_url, epic_id, file_count, public}", () => {
     // test_gist.py::test_gist_success_envelope
-    const shim = pathShim(root, "gh", {
-      stdout: "https://gist.github.com/deadbeef",
-    });
+    fakeCommand("gh", { stdout: "https://gist.github.com/deadbeef" });
     const epicId = seed(2);
-    const r = runCli(["gist", epicId, "--no-open"], {
-      cwd: root,
-      env: shim.env,
-    });
+    const r = runCli(["gist", epicId, "--no-open"], { cwd: root });
     expect(r.code).toBe(0);
     const env = envelope(r.output);
     expect(env.gist_url).toBe("https://gist.github.com/deadbeef");
@@ -79,18 +74,11 @@ describe("gist", () => {
 
   test("file set passed to gh: `gist create --desc <desc> <files...>`", () => {
     // test_gist.py::test_gist_file_set_passed_to_gh
-    const shim = pathShim(root, "gh", {
-      stdout: "https://gist.github.com/abc123",
-    });
+    const gh = fakeCommand("gh", { stdout: "https://gist.github.com/abc123" });
     const epicId = seed(2);
-    const r = runCli(["gist", epicId, "--no-open"], {
-      cwd: root,
-      env: shim.env,
-    });
+    const r = runCli(["gist", epicId, "--no-open"], { cwd: root });
     expect(r.code).toBe(0);
-    const argv = readFileSync(shim.argvPath, "utf-8")
-      .split("\n")
-      .filter(Boolean);
+    const argv = gh.lastArgv();
     expect(argv.slice(0, 3)).toEqual(["gist", "create", "--desc"]);
     expect(argv).not.toContain("--public");
     const files = argv.slice(4).filter((a) => a.endsWith(".md"));
@@ -100,32 +88,22 @@ describe("gist", () => {
 
   test("--public rides into the gh argv and the envelope", () => {
     // test_gist.py::test_gist_public_flag
-    const shim = pathShim(root, "gh", {
-      stdout: "https://gist.github.com/abc123",
-    });
+    const gh = fakeCommand("gh", { stdout: "https://gist.github.com/abc123" });
     const epicId = seed(1);
-    const r = runCli(["gist", epicId, "--public", "--no-open"], {
-      cwd: root,
-      env: shim.env,
-    });
+    const r = runCli(["gist", epicId, "--public", "--no-open"], { cwd: root });
     expect(r.code).toBe(0);
     expect(envelope(r.output).public).toBe(true);
-    expect(readFileSync(shim.argvPath, "utf-8").split("\n")).toContain(
-      "--public",
-    );
+    expect(gh.lastArgv()).toContain("--public");
   });
 
   test("the rendered TOC carries no Branch line", () => {
     const captureDir = join(root, "captured");
-    const shim = pathShim(root, "gh", {
+    fakeCommand("gh", {
       stdout: "https://gist.github.com/abc123",
       captureDir,
     });
     const epicId = seed(1);
-    const r = runCli(["gist", epicId, "--no-open"], {
-      cwd: root,
-      env: shim.env,
-    });
+    const r = runCli(["gist", epicId, "--no-open"], { cwd: root });
     expect(r.code).toBe(0);
     const toc = readFileSync(join(captureDir, "00-TOC.md"), "utf-8");
     expect(toc).not.toContain("**Branch:**");
@@ -133,12 +111,9 @@ describe("gist", () => {
 
   test("a non-zero gh exit surfaces an error envelope, not a URL", () => {
     // test_gist.py::test_gist_gh_failure
-    const shim = pathShim(root, "gh", { exitCode: 1 });
+    fakeCommand("gh", { exitCode: 1 });
     const epicId = seed(1);
-    const r = runCli(["gist", epicId, "--no-open"], {
-      cwd: root,
-      env: shim.env,
-    });
+    const r = runCli(["gist", epicId, "--no-open"], { cwd: root });
     expect(r.code).not.toBe(0);
     const env = envelope(r.output);
     const errMsg =

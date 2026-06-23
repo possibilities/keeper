@@ -6,8 +6,9 @@
 // done summaries, the canonical commit_set_hash), persists it commit-free under
 // gitignored audits/<epic_id>/brief.json, and emits a content-blind envelope
 // {primary_repo, tasks, all_done, brief_ref, commit_set_hash} — commit_groups
-// prose lives ONLY in the brief. The verb-level tests drive the real binary in a
-// withProject repo; the trailer-scan tests ride the KEEPER_PLAN_RUN_SLOW gate.
+// prose lives ONLY in the brief. The verb-level tests drive the verb in a
+// withProject repo (git-free); the trailer-scan tests seed fake source commits
+// through the VCS fixture.
 //
 // The TestCommitLookup unit class targets the shared commit_lookup.findCommitGroups
 // seam directly. Variants already pinned by src-git-lookup.test.ts are CITED;
@@ -29,33 +30,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { briefPath, computeCommitSetHash } from "../src/audit_artifacts.ts";
 import { AllReposBrokenError, findCommitGroups } from "../src/commit_lookup.ts";
+import { resetVcs, setVcs } from "../src/vcs.ts";
+import { initRepo as fakeInitRepo, fakeVcs } from "./fake-vcs.ts";
 import {
+  fakeSourceCommit,
+  gitHeadSha,
+  gitInit,
+  gitLogCount,
   parseCliOutput,
   runCli,
-  SLOW_ENABLED,
   scaffoldEpic,
   withProject,
 } from "./harness.ts";
 
-function git(args: string[], cwd: string): string {
-  const p = Bun.spawnSync(["git", ...args], { cwd });
-  if ((p.exitCode ?? -1) !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${p.stderr.toString()}`);
-  }
-  return p.stdout.toString().trim();
-}
-
-// Land an empty commit carrying `body`; return the full sha.
+// Seed a fake source commit carrying `body` in `repo`; return the fake sha.
 function seedCommit(repo: string, taskId: string, body?: string): string {
-  const msg = body ?? `feat: work\n\nTask: ${taskId}\n`;
-  const c = Bun.spawnSync(["git", "commit", "--allow-empty", "-F", "-"], {
-    cwd: repo,
-    stdin: Buffer.from(msg),
-  });
-  if ((c.exitCode ?? -1) !== 0) {
-    throw new Error(`seed commit failed: ${c.stderr.toString()}`);
-  }
-  return git(["rev-parse", "HEAD"], repo);
+  return fakeSourceCommit(repo, body ?? `feat: work\n\nTask: ${taskId}\n`);
 }
 
 // Scaffold an epic with N tasks, driving `statuses[i] === "done"` to done.
@@ -179,25 +169,25 @@ describe("close-preflight success envelope + brief", () => {
     }
   });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "brief write is commit-free: HEAD unmoved, nothing tracked",
-    () => {
-      // test_close_preflight.py::TestBriefShape::test_brief_no_commit_lands
-      const proj = getProj();
-      const { epicId } = makeEpic(proj, ["done"]);
-      const before = git(["rev-parse", "HEAD"], proj.root);
-      const r = runCli(["close-preflight", epicId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      expect(git(["rev-parse", "HEAD"], proj.root)).toBe(before);
-      const porcelain = Bun.spawnSync(["git", "status", "--porcelain"], {
-        cwd: proj.root,
-      }).stdout.toString();
-      expect(porcelain.includes(".keeper/state/audits")).toBe(false);
-    },
-  );
+  test("brief write is commit-free: HEAD unmoved, nothing tracked", () => {
+    // test_close_preflight.py::TestBriefShape::test_brief_no_commit_lands
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    const before = gitHeadSha(proj.root);
+    const beforeCount = gitLogCount(proj.root);
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    expect(gitHeadSha(proj.root)).toBe(before);
+    expect(gitLogCount(proj.root)).toBe(beforeCount);
+    // The brief lands under gitignored state/audits/, never in the data-dir
+    // commit scope.
+    expect(existsSync(join(proj.root, ".keeper", "state", "audits"))).toBe(
+      true,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -257,50 +247,44 @@ describe("close-preflight commit_groups", () => {
     expect(loadBrief(proj.root, epicId).commit_groups).toEqual([]);
   });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "native scan groups both tasks' real commits in primary",
-    () => {
-      // test_close_preflight.py::TestCommitGroups::test_groups_real_commits_in_primary_repo
-      const proj = getProj();
-      const { epicId, taskIds } = makeEpic(proj, ["done", "done"]);
-      const sha0 = seedCommit(proj.root, taskIds[0] as string);
-      const sha1 = seedCommit(proj.root, taskIds[1] as string);
-      const r = runCli(["close-preflight", epicId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      const env = parseCliOutput(r.output);
-      const brief = loadBrief(proj.root, epicId);
-      const primary = realpathSync(proj.root);
-      expect(brief.commit_groups).toEqual([
-        { repo: primary, shas: [sha0, sha1] },
-      ]);
-      expect(env.commit_set_hash).toBe(
-        computeCommitSetHash(brief.commit_groups as never),
-      );
-    },
-  );
+  test("native scan groups both tasks' source commits in primary", () => {
+    // test_close_preflight.py::TestCommitGroups::test_groups_real_commits_in_primary_repo
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done", "done"]);
+    const sha0 = seedCommit(proj.root, taskIds[0] as string);
+    const sha1 = seedCommit(proj.root, taskIds[1] as string);
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.output);
+    const brief = loadBrief(proj.root, epicId);
+    const primary = realpathSync(proj.root);
+    expect(brief.commit_groups).toEqual([
+      { repo: primary, shas: [sha0, sha1] },
+    ]);
+    expect(env.commit_set_hash).toBe(
+      computeCommitSetHash(brief.commit_groups as never),
+    );
+  });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "prose Task: mention dropped by the post-filter",
-    () => {
-      // test_close_preflight.py::TestCommitGroups::test_prose_false_match_is_dropped
-      const proj = getProj();
-      const { epicId, taskIds } = makeEpic(proj, ["done"]);
-      seedCommit(
-        proj.root,
-        taskIds[0] as string,
-        `chore: note\n\nfixes the Task: ${taskIds[0]} issue in prose\n`,
-      );
-      const r = runCli(["close-preflight", epicId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-      });
-      expect(r.code).toBe(0);
-      expect(loadBrief(proj.root, epicId).commit_groups).toEqual([]);
-    },
-  );
+  test("prose Task: mention dropped by the post-filter", () => {
+    // test_close_preflight.py::TestCommitGroups::test_prose_false_match_is_dropped
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done"]);
+    seedCommit(
+      proj.root,
+      taskIds[0] as string,
+      `chore: note\n\nfixes the Task: ${taskIds[0]} issue in prose\n`,
+    );
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    expect(loadBrief(proj.root, epicId).commit_groups).toEqual([]);
+  });
 
   // test_close_preflight.py::TestCommitGroups::test_all_repos_broken_is_fail_loud
   //   -> DROP (python_only): monkeypatches planctl.api.load_epic in-process to
@@ -434,10 +418,7 @@ describe("close-preflight --project flag", () => {
     const projName = "tilde-cpf-proj";
     const tildeRoot = join(proj.home, projName);
     mkdirSync(tildeRoot, { recursive: true });
-    git(["init", "-q"], tildeRoot);
-    git(["config", "user.email", "t@p.local"], tildeRoot);
-    git(["config", "user.name", "T"], tildeRoot);
-    git(["config", "commit.gpgsign", "false"], tildeRoot);
+    gitInit(tildeRoot);
     const initRes = runCli(["init"], { cwd: tildeRoot, home: proj.home });
     expect(initRes.code).toBe(0);
     const { epicId } = makeEpic({ root: tildeRoot, home: proj.home }, ["done"]);
@@ -471,19 +452,18 @@ describe("close-preflight --project flag", () => {
 describe("findCommitGroups unit (test_close_preflight.py TestCommitLookup)", () => {
   let repoRoot: string;
   beforeEach(() => {
+    setVcs(fakeVcs);
     repoRoot = realpathSync(mkdtempSync(join(tmpdir(), "planctl-cpf-lookup-")));
   });
   afterEach(() => {
+    resetVcs();
     rmSync(repoRoot, { recursive: true, force: true });
   });
 
   function gitRepo(name: string): string {
     const p = join(repoRoot, name);
     mkdirSync(p, { recursive: true });
-    git(["init", "-q"], p);
-    git(["config", "user.email", "t@p.local"], p);
-    git(["config", "user.name", "T"], p);
-    git(["config", "commit.gpgsign", "false"], p);
+    fakeInitRepo(p);
     return realpathSync(p);
   }
 

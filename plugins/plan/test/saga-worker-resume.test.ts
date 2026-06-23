@@ -17,7 +17,13 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { runCli, scaffoldEpic, withProject } from "./harness.ts";
+import {
+  gitHeadSha,
+  gitLogCount,
+  runCli,
+  scaffoldEpic,
+  withProject,
+} from "./harness.ts";
 
 function briefPath(root: string, taskId: string): string {
   return join(root, ".keeper", "state", "briefs", `${taskId}.json`);
@@ -116,17 +122,15 @@ describe("worker resume", () => {
     const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
     const taskId = taskIds[0] as string;
 
-    const head = () =>
-      Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: proj.root })
-        .stdout.toString()
-        .trim();
-    const before = head();
+    const before = gitHeadSha(proj.root);
+    const beforeCount = gitLogCount(proj.root);
     const r = runCli(["worker", "resume", taskId], {
       cwd: proj.root,
       home: proj.home,
     });
     expect(r.code).toBe(0);
-    expect(head()).toBe(before);
+    expect(gitHeadSha(proj.root)).toBe(before);
+    expect(gitLogCount(proj.root)).toBe(beforeCount);
   });
 
   // test_worker_resume.py::test_worker_resume_source_commit_sha_in_nudge

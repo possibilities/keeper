@@ -8,7 +8,7 @@
 // pin, payload extractors, and git helpers carry their own focused coverage.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
@@ -122,11 +122,8 @@ describe("seedState round-trip zero drift", () => {
   test("seedState mints no .git side effect", () => {
     const root = getTmp();
     seedState(root, { epicId: "fn-4-seed" });
-    // No git init happened — withTmpdir does not init, seedState must not either.
-    const proc = Bun.spawnSync(["git", "rev-parse", "--git-dir"], {
-      cwd: root,
-    });
-    expect(proc.exitCode).not.toBe(0);
+    // No init happened — withTmpdir does not init, seedState must not either.
+    expect(existsSync(join(root, ".git"))).toBe(false);
   });
 });
 

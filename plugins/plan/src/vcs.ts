@@ -1,20 +1,34 @@
-// The git facade seam for plan-state persistence. Every git operation the
-// auto-commit machinery performs — the dirty-path discovery buildPlanInvocation
-// runs (`git status` over the data dirs), and the status/stage/commit the
-// auto-commit itself runs — routes through the single PlanVcs installed here.
+// The git facade seam for plan-state persistence AND the in-verb git reads.
+// Every git operation the auto-commit machinery performs — the dirty-path
+// discovery buildPlanInvocation runs (`git status` over the data dirs), and the
+// status/stage/commit the auto-commit itself runs — plus every read the
+// post-worker verbs perform (the trailer scans, source-commit finds, HEAD
+// visibility, status/diff snapshots) routes through the single PlanVcs installed
+// here.
 //
 // Production installs nothing: getVcs() returns realGitVcs, the verbatim
 // Bun.spawnSync(["git", ...]) implementation, so the binary's behavior is
 // untouched. The bun:test harness installs a fake facade (setVcs) that records
-// commits + diffs the .keeper/ tree against a snapshot, so the default test tier
-// spawns zero real git. resetVcs() restores the real facade.
+// commits + diffs the .keeper/ tree against a snapshot and answers the reads
+// from seeded fake source commits, so the default test tier spawns zero real
+// git. resetVcs() restores the real facade.
 //
-// The interface is the minimal surface the two production call sites need:
+// The WRITE surface is the minimal set the two persistence call sites need:
 //  - dirtyDataDirPaths: invocation.ts's pre-commit dirty discovery (status over
 //    the data dirs, untracked-files=all),
 //  - currentHead / dirtyFilesForPathspecs / stage / commit: commit.ts's
 //    auto-commit plumbing (the real implementation surfaces the contention
 //    stderr the retry loop matches, so the fake can simulate it too).
+//
+// The READ surface is the set the post-worker verbs consult:
+//  - isGitRepo / hasHead: the repo-shape gates,
+//  - trailerCommitShas: commit_lookup.ts's grep + interpret-trailers confirmed
+//    scan (find-task-commit),
+//  - sourceCommitShas: reconcile.ts's %(trailers:valueonly) unit-sep scan,
+//  - committedTaskJson: reconcile.ts's HEAD:<task.json> cat-file blob,
+//  - shortStatusAndDiff / firstSourceShaShort: worker_resume.ts's nudge probes.
+
+import { statSync } from "node:fs";
 
 /** Result of a git invocation the auto-commit plumbing inspects: exit code plus
  * decoded stdout/stderr. The contention-retry loop matches stderr substrings, so
@@ -60,6 +74,52 @@ export interface PlanVcs {
     files: string[],
     cwd: string,
   ): GitResult & { sha: string };
+
+  // -------------------------------------------------------------------------
+  // Read surface — the post-worker verbs' git archaeology.
+  // -------------------------------------------------------------------------
+
+  /** True iff `repo` is an existing dir containing a git work tree. The repo-shape
+   * gate commit_lookup / reconcile run before scanning. A missing git binary or a
+   * non-repo dir reads false (NOT a throw) for the source scan. */
+  isGitRepo(repo: string): boolean;
+
+  /** True when `repo`'s HEAD points at a real commit (born branch). An unborn /
+   * orphan branch reads false (a distinct signal, NOT an error). */
+  hasHead(repo: string): boolean;
+
+  /** Full %H shas in `repo` carrying a confirmed `Task: <taskId>` trailer via the
+   * commit_lookup technique (`git log --grep` prefilter +
+   * `git interpret-trailers --parse` confirmation), newest-first. A clean miss is
+   * []. Used by find-task-commit. */
+  trailerCommitShas(taskId: string, repo: string): string[];
+
+  /** Full %H shas in `repo` carrying a trailer-authentic `Task: <taskId>` via the
+   * reconcile technique (`%(trailers:key=Task,valueonly=true)` + unit-sep split,
+   * exact-equality match), newest-first. [] when not a work tree / no born HEAD.
+   * THROWS on an unexpected git failure (the caller fails closed to
+   * tooling_error). */
+  sourceCommitShas(taskId: string, repo: string): string[];
+
+  /** The committed `HEAD:<dataDir>/tasks/<taskId>.json` parsed object for the
+   * FIRST data dir under which it resolves, or null when the path is absent from
+   * HEAD under every data dir (or HEAD is unborn). THROWS on an unexpected git
+   * failure or invalid JSON. Used by reconcile.stateHeadVisible. */
+  committedTaskJson(
+    stateRepo: string,
+    taskId: string,
+    dataDirNames: readonly string[],
+  ): Record<string, unknown> | null;
+
+  /** `git status --short` + `git diff HEAD --stat` joined (non-empty parts), or ""
+   * when git is unavailable / produced nothing. Run in `cwd`. Used by worker
+   * resume's dirty-file nudge. */
+  shortStatusAndDiff(cwd: string): string;
+
+  /** The SHORT sha (%h) of `taskId`'s first source commit found via a cheap
+   * `git log -1 --format=%h --grep="Task: <id>" --fixed-strings` in `cwd`, or
+   * null on any failure / miss. Used by worker resume's nudge. */
+  firstSourceShaShort(taskId: string, cwd: string): string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +212,202 @@ export const realGitVcs: PlanVcs = {
     const shaResult = runGit(["rev-parse", "HEAD"], cwd);
     return { ...commitResult, sha: shaResult.stdout.trim() };
   },
+
+  isGitRepo(repo): boolean {
+    let isDir = false;
+    try {
+      isDir = statSync(repo).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (!isDir) {
+      return false;
+    }
+    return runReadGit(["rev-parse", "--git-dir"], repo).exitCode === 0;
+  },
+
+  hasHead(repo): boolean {
+    return runReadGit(["rev-parse", "--verify", "HEAD"], repo).exitCode === 0;
+  },
+
+  trailerCommitShas(taskId, repo): string[] {
+    // Stage 1: `git log --grep` fixed-string prefilter; non-zero exit → [].
+    const grep = runReadGit(
+      ["log", `--grep=Task: ${taskId}`, "-F", "--pretty=format:%H"],
+      repo,
+    );
+    if (grep.exitCode !== 0) {
+      return [];
+    }
+    const candidates = grep.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    // Stage 2: per candidate, confirm a REAL `Task:` trailer via interpret-trailers.
+    const confirmed: string[] = [];
+    for (const sha of candidates) {
+      if (hasRealTrailerValue(sha, taskId, repo)) {
+        confirmed.push(sha);
+      }
+    }
+    return confirmed;
+  },
+
+  sourceCommitShas(taskId, repo): string[] {
+    const fmt = `--format=%H${FIELD_SEP}%(trailers:key=Task,valueonly=true)`;
+    const proc = runReadGit(["log", fmt], repo);
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `git log failed in ${repo} (exit ${proc.exitCode}): ${proc.stderr.trim()}`,
+      );
+    }
+    const shas: string[] = [];
+    for (const record of proc.stdout.split("\n")) {
+      if (!record.includes(FIELD_SEP)) {
+        continue;
+      }
+      const sepIdx = record.indexOf(FIELD_SEP);
+      const sha = record.slice(0, sepIdx).trim();
+      const trailerBlob = record.slice(sepIdx + 1);
+      if (!sha) {
+        continue;
+      }
+      const values = trailerBlob.replace(/,/g, "\n").split("\n");
+      if (values.some((v) => v.trim() === taskId)) {
+        shas.push(sha);
+      }
+    }
+    return shas;
+  },
+
+  committedTaskJson(stateRepo, taskId, dataDirNames) {
+    for (const dataDirName of dataDirNames) {
+      const relpath = `${dataDirName}/tasks/${taskId}.json`;
+      const proc = runReadGit(
+        ["cat-file", "blob", `HEAD:${relpath}`],
+        stateRepo,
+      );
+      if (proc.exitCode !== 0) {
+        // Path not present in HEAD under this data dir — try the next.
+        continue;
+      }
+      try {
+        return JSON.parse(proc.stdout) as Record<string, unknown>;
+      } catch (exc) {
+        throw new Error(
+          `HEAD:${relpath} is not valid JSON: ${(exc as Error).message}`,
+        );
+      }
+    }
+    return null;
+  },
+
+  shortStatusAndDiff(cwd): string {
+    const parts: string[] = [];
+    for (const argv of [
+      ["status", "--short"],
+      ["diff", "HEAD", "--stat"],
+    ]) {
+      try {
+        const proc = Bun.spawnSync(["git", ...argv], { cwd });
+        const out = proc.stdout.toString().trim();
+        if (out) {
+          parts.push(out);
+        }
+      } catch {
+        // git binary absent — skip this probe.
+      }
+    }
+    return parts.join("\n");
+  },
+
+  firstSourceShaShort(taskId, cwd): string | null {
+    try {
+      const proc = Bun.spawnSync(
+        [
+          "git",
+          "log",
+          "-1",
+          "--format=%h",
+          `--grep=Task: ${taskId}`,
+          "--fixed-strings",
+        ],
+        { cwd },
+      );
+      if (proc.exitCode !== 0) {
+        return null;
+      }
+      const sha = proc.stdout.toString().trim();
+      return sha || null;
+    } catch {
+      return null;
+    }
+  },
 };
+
+// %x1f (ASCII unit separator) field delimiter for sourceCommitShas — cannot
+// appear in a sha or trailer value, so the split is unambiguous.
+const FIELD_SEP = "\x1f";
+
+/** Run a read-only git probe in `repo`, never throwing on a non-zero exit; a
+ * missing git binary surfaces as a non-zero exit (Bun's spawn throws on ENOENT —
+ * caught here). No explicit env: the in-verb reads always ran under the default
+ * snapshot env, preserved here. */
+function runReadGit(args: string[], repo: string, input?: string): GitResult {
+  try {
+    const proc = Bun.spawnSync(["git", ...args], {
+      cwd: repo,
+      ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
+    });
+    return {
+      exitCode: proc.exitCode,
+      stdout: proc.stdout.toString(),
+      stderr: proc.stderr.toString(),
+    };
+  } catch (exc) {
+    return { exitCode: 1, stdout: "", stderr: (exc as Error).message };
+  }
+}
+
+/** Confirm a real `Task: <taskId>` trailer on `sha` via
+ * `git log -1 --format=%B <sha>` piped to `git interpret-trailers --parse`,
+ * exact-equality on the parsed value. Mirrors commit_lookup's _has_real_task_trailer
+ * (the isTaskId gate is applied by the caller's candidate set / the seeding path).
+ */
+function hasRealTrailerValue(
+  sha: string,
+  taskId: string,
+  repo: string,
+): boolean {
+  const body = runReadGit(["log", "-1", "--format=%B", sha], repo);
+  if (body.exitCode !== 0) {
+    return false;
+  }
+  const parsed = runReadGit(
+    ["interpret-trailers", "--parse"],
+    repo,
+    body.stdout,
+  );
+  if (parsed.exitCode !== 0) {
+    return false;
+  }
+  for (const rawLine of parsed.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    const sep = line.indexOf(":");
+    if (sep < 0) {
+      continue;
+    }
+    const key = line.slice(0, sep).trim();
+    const value = line.slice(sep + 1).trim();
+    if (key === "Task" && value === taskId) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Installed-facade seam. Production never calls setVcs, so getVcs() returns the

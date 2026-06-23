@@ -25,53 +25,21 @@ import { resolveProject } from "../project.ts";
 import { expectedWorkerCwd } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { LocalFileStateStore, loadJsonSafe } from "../store.ts";
+import { getVcs } from "../vcs.ts";
 
-/** Capture git status --short + diff HEAD --stat once. Returns the joined
- * non-empty parts, or "" when git is unavailable / produced nothing. A missing
- * git binary is tolerated (Bun's spawn throws on ENOENT — caught and skipped),
- * mirroring the Python FileNotFoundError pass. Mirrors _read_git_state. */
+/** Capture git status --short + diff HEAD --stat in the cwd via the facade.
+ * Returns the joined non-empty parts, or "" when git is unavailable / produced
+ * nothing. Mirrors _read_git_state. */
 function readGitState(): string {
-  const parts: string[] = [];
-  for (const argv of [
-    ["status", "--short"],
-    ["diff", "HEAD", "--stat"],
-  ]) {
-    try {
-      const proc = Bun.spawnSync(["git", ...argv]);
-      const out = proc.stdout.toString().trim();
-      if (out) {
-        parts.push(out);
-      }
-    } catch {
-      // git binary absent — skip this probe.
-    }
-  }
-  return parts.join("\n");
+  return getVcs().shortStatusAndDiff(process.cwd());
 }
 
-/** Return the short sha of `taskId`'s source commit, or null if none. Cheap
- * local `git log -1 --format=%h --grep="Task: <id>" --fixed-strings` lookup; no
- * keeper shell-out (a resume must work when keeper is down). Any git failure
- * (missing binary, not a repo, non-zero exit) yields null. Mirrors
+/** Return the short sha of `taskId`'s source commit (cwd-local), or null if none.
+ * Cheap `git log -1 --grep` lookup via the facade; no keeper shell-out (a resume
+ * must work when keeper is down). Any git failure yields null. Mirrors
  * _find_source_commit_sha. */
 function findSourceCommitSha(taskId: string): string | null {
-  try {
-    const proc = Bun.spawnSync([
-      "git",
-      "log",
-      "-1",
-      "--format=%h",
-      `--grep=Task: ${taskId}`,
-      "--fixed-strings",
-    ]);
-    if (proc.exitCode !== 0) {
-      return null;
-    }
-    const sha = proc.stdout.toString().trim();
-    return sha || null;
-  } catch {
-    return null;
-  }
+  return getVcs().firstSourceShaShort(taskId, process.cwd());
 }
 
 /** realpath(p), falling back to the absolute path when it can't be resolved. */

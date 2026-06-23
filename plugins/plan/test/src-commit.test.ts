@@ -25,6 +25,7 @@ import {
   buildSubject,
   CommitFailed,
 } from "../src/commit.ts";
+import { SLOW_ENABLED } from "./harness.ts";
 
 // ---------------------------------------------------------------------------
 // git tmp-repo harness + assertion helpers (the bun analogue of conftest's
@@ -71,7 +72,15 @@ function makeDirty(rel: string, content = "dirty\n"): string {
   return rel;
 }
 
+// Real-git repo setup runs ONLY in the slow tier — src-commit drives the REAL
+// commit path (realGitVcs) directly, so it is a genuine real-git subject. The
+// pure buildSubject / buildMessageWithTrailers describes below need no repo and
+// run in the default tier; the autoCommitFromInvocation describes are
+// describe.skipIf(!SLOW_ENABLED) and only they touch `repo`.
 beforeEach(() => {
+  if (!SLOW_ENABLED) {
+    return;
+  }
   repo = mkdtempSync(join(tmpdir(), "planctl-commit-test-"));
   git(["init", "-q"], repo);
   git(["config", "user.email", "test@planctl.local"], repo);
@@ -84,6 +93,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (!SLOW_ENABLED || !repo) {
+    return;
+  }
   rmSync(repo, { recursive: true, force: true });
 });
 
@@ -153,7 +165,7 @@ describe("buildMessageWithTrailers", () => {
 // no-op paths.
 // ---------------------------------------------------------------------------
 
-describe("autoCommitFromInvocation no-op paths", () => {
+describe.skipIf(!SLOW_ENABLED)("autoCommitFromInvocation no-op paths", () => {
   test("files=null is a no-op return — no git ops", () => {
     const pre = commitCount(repo);
     const sha = autoCommitFromInvocation({
@@ -206,7 +218,7 @@ describe("autoCommitFromInvocation no-op paths", () => {
 // happy path.
 // ---------------------------------------------------------------------------
 
-describe("autoCommitFromInvocation happy path", () => {
+describe.skipIf(!SLOW_ENABLED)("autoCommitFromInvocation happy path", () => {
   test("dirty files → commit lands, returns long sha, payload subject + trailers", () => {
     const rel = makeDirty(".keeper/epics/test_marker.txt");
     const pre = commitCount(repo);
@@ -339,149 +351,155 @@ describe("autoCommitFromInvocation happy path", () => {
 // state_repo / subject fallbacks + failures.
 // ---------------------------------------------------------------------------
 
-describe("autoCommitFromInvocation failure shapes", () => {
-  test("missing state_repo but repo_root present → works + warns to stderr", () => {
-    const rel = makeDirty(".keeper/epics/fallback.txt");
-    const sha = autoCommitFromInvocation({
-      files: [rel],
-      op: "approve",
-      target: "fn-587-fb",
-      subject: "chore(plan): approve fn-587-fb",
-      repo_root: repo,
-    });
-    expect(sha).not.toBeNull();
-  });
-
-  test("no state_repo and no repo_root → CommitFailed(missing_state_repo)", () => {
-    let caught: CommitFailed | null = null;
-    try {
-      autoCommitFromInvocation({
-        files: [".keeper/epics/no_repo.txt"],
-        op: "approve",
-        target: "fn-587-nr",
-        subject: "chore(plan): approve fn-587-nr",
-      });
-    } catch (e) {
-      caught = e as CommitFailed;
-    }
-    expect(caught).toBeInstanceOf(CommitFailed);
-    expect((caught as CommitFailed).error).toBe("missing_state_repo");
-  });
-
-  test("missing subject → CommitFailed(missing_subject)", () => {
-    const rel = makeDirty(".keeper/epics/no_subject.txt");
-    let caught: CommitFailed | null = null;
-    try {
-      autoCommitFromInvocation({
+describe.skipIf(!SLOW_ENABLED)(
+  "autoCommitFromInvocation failure shapes",
+  () => {
+    test("missing state_repo but repo_root present → works + warns to stderr", () => {
+      const rel = makeDirty(".keeper/epics/fallback.txt");
+      const sha = autoCommitFromInvocation({
         files: [rel],
         op: "approve",
-        target: "fn-587-ns",
-        state_repo: repo,
+        target: "fn-587-fb",
+        subject: "chore(plan): approve fn-587-fb",
         repo_root: repo,
       });
-    } catch (e) {
-      caught = e as CommitFailed;
-    }
-    expect(caught).toBeInstanceOf(CommitFailed);
-    expect((caught as CommitFailed).error).toBe("missing_subject");
-  });
-});
+      expect(sha).not.toBeNull();
+    });
+
+    test("no state_repo and no repo_root → CommitFailed(missing_state_repo)", () => {
+      let caught: CommitFailed | null = null;
+      try {
+        autoCommitFromInvocation({
+          files: [".keeper/epics/no_repo.txt"],
+          op: "approve",
+          target: "fn-587-nr",
+          subject: "chore(plan): approve fn-587-nr",
+        });
+      } catch (e) {
+        caught = e as CommitFailed;
+      }
+      expect(caught).toBeInstanceOf(CommitFailed);
+      expect((caught as CommitFailed).error).toBe("missing_state_repo");
+    });
+
+    test("missing subject → CommitFailed(missing_subject)", () => {
+      const rel = makeDirty(".keeper/epics/no_subject.txt");
+      let caught: CommitFailed | null = null;
+      try {
+        autoCommitFromInvocation({
+          files: [rel],
+          op: "approve",
+          target: "fn-587-ns",
+          state_repo: repo,
+          repo_root: repo,
+        });
+      } catch (e) {
+        caught = e as CommitFailed;
+      }
+      expect(caught).toBeInstanceOf(CommitFailed);
+      expect((caught as CommitFailed).error).toBe("missing_subject");
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // sequential commits + lock-domain retry classification.
 // ---------------------------------------------------------------------------
 
-describe("autoCommitFromInvocation sequential + retry", () => {
-  test("two back-to-back commits both land with distinct shas", () => {
-    const rel = makeDirty(".keeper/epics/seq1.txt");
-    const sha1 = autoCommitFromInvocation({
-      files: [rel],
-      op: "approve",
-      target: "fn-587-l1",
-      subject: "chore(plan): approve fn-587-l1",
-      state_repo: repo,
-      repo_root: repo,
-    });
-    expect(sha1).not.toBeNull();
-    const rel2 = makeDirty(".keeper/epics/seq2.txt");
-    const sha2 = autoCommitFromInvocation({
-      files: [rel2],
-      op: "approve",
-      target: "fn-587-l2",
-      subject: "chore(plan): approve fn-587-l2",
-      state_repo: repo,
-      repo_root: repo,
-    });
-    expect(sha2).not.toBeNull();
-    expect(sha2).not.toBe(sha1);
-  });
-
-  test("stale index.lock cleared on first backoff → bounded retry commits", () => {
-    const rel = makeDirty(".keeper/epics/contend.txt");
-    const pre = commitCount(repo);
-    const lockFile = join(repo, ".git", "index.lock");
-    writeFileSync(lockFile, ""); // git add will refuse: "File exists"
-
-    const backoffs: number[] = [];
-    const sleep = (_ms: number): void => {
-      backoffs.push(_ms);
-      // First backoff: clear the contention so the next attempt succeeds.
-      try {
-        unlinkSync(lockFile);
-      } catch {
-        // already cleared
-      }
-    };
-
-    const sha = autoCommitFromInvocation(
-      {
+describe.skipIf(!SLOW_ENABLED)(
+  "autoCommitFromInvocation sequential + retry",
+  () => {
+    test("two back-to-back commits both land with distinct shas", () => {
+      const rel = makeDirty(".keeper/epics/seq1.txt");
+      const sha1 = autoCommitFromInvocation({
         files: [rel],
         op: "approve",
-        target: "fn-640-retry",
-        subject: "chore(plan): approve fn-640-retry",
+        target: "fn-587-l1",
+        subject: "chore(plan): approve fn-587-l1",
         state_repo: repo,
         repo_root: repo,
-      },
-      sleep,
-    );
+      });
+      expect(sha1).not.toBeNull();
+      const rel2 = makeDirty(".keeper/epics/seq2.txt");
+      const sha2 = autoCommitFromInvocation({
+        files: [rel2],
+        op: "approve",
+        target: "fn-587-l2",
+        subject: "chore(plan): approve fn-587-l2",
+        state_repo: repo,
+        repo_root: repo,
+      });
+      expect(sha2).not.toBeNull();
+      expect(sha2).not.toBe(sha1);
+    });
 
-    expect(sha).not.toBeNull();
-    expect((sha as string).length).toBe(40);
-    expect(commitCount(repo)).toBe(pre + 1);
-    expect(backoffs.length).toBeGreaterThanOrEqual(1);
-  });
+    test("stale index.lock cleared on first backoff → bounded retry commits", () => {
+      const rel = makeDirty(".keeper/epics/contend.txt");
+      const pre = commitCount(repo);
+      const lockFile = join(repo, ".git", "index.lock");
+      writeFileSync(lockFile, ""); // git add will refuse: "File exists"
 
-  test("persistent index.lock across all attempts → CommitFailed(commit_contended)", () => {
-    const rel = makeDirty(".keeper/epics/exhaust.txt");
-    const lockFile = join(repo, ".git", "index.lock");
-    writeFileSync(lockFile, "");
-    const sleep = (_ms: number): void => {
-      // never clear the lock — every stage attempt fails with "File exists"
-    };
+      const backoffs: number[] = [];
+      const sleep = (_ms: number): void => {
+        backoffs.push(_ms);
+        // First backoff: clear the contention so the next attempt succeeds.
+        try {
+          unlinkSync(lockFile);
+        } catch {
+          // already cleared
+        }
+      };
 
-    let caught: CommitFailed | null = null;
-    try {
-      autoCommitFromInvocation(
+      const sha = autoCommitFromInvocation(
         {
           files: [rel],
           op: "approve",
-          target: "fn-640-exhaust",
-          subject: "chore(plan): approve fn-640-exhaust",
+          target: "fn-640-retry",
+          subject: "chore(plan): approve fn-640-retry",
           state_repo: repo,
           repo_root: repo,
         },
         sleep,
       );
-    } catch (e) {
-      caught = e as CommitFailed;
-    } finally {
+
+      expect(sha).not.toBeNull();
+      expect((sha as string).length).toBe(40);
+      expect(commitCount(repo)).toBe(pre + 1);
+      expect(backoffs.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test("persistent index.lock across all attempts → CommitFailed(commit_contended)", () => {
+      const rel = makeDirty(".keeper/epics/exhaust.txt");
+      const lockFile = join(repo, ".git", "index.lock");
+      writeFileSync(lockFile, "");
+      const sleep = (_ms: number): void => {
+        // never clear the lock — every stage attempt fails with "File exists"
+      };
+
+      let caught: CommitFailed | null = null;
       try {
-        unlinkSync(lockFile);
-      } catch {
-        // best-effort
+        autoCommitFromInvocation(
+          {
+            files: [rel],
+            op: "approve",
+            target: "fn-640-exhaust",
+            subject: "chore(plan): approve fn-640-exhaust",
+            state_repo: repo,
+            repo_root: repo,
+          },
+          sleep,
+        );
+      } catch (e) {
+        caught = e as CommitFailed;
+      } finally {
+        try {
+          unlinkSync(lockFile);
+        } catch {
+          // best-effort
+        }
       }
-    }
-    expect(caught).toBeInstanceOf(CommitFailed);
-    expect((caught as CommitFailed).error).toBe("commit_contended");
-  });
-});
+      expect(caught).toBeInstanceOf(CommitFailed);
+      expect((caught as CommitFailed).error).toBe("commit_contended");
+    });
+  },
+);

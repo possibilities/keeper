@@ -15,7 +15,6 @@
 
 import { afterEach, beforeEach } from "bun:test";
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -24,10 +23,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 
 import { main } from "../src/cli.ts";
 import { resetSelfEmit } from "../src/emit.ts";
+import {
+  type ExecResult,
+  type PlanExec,
+  resetExec,
+  setExec,
+} from "../src/exec.ts";
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
 import { resolveDataDirOrDefault } from "../src/state_path.ts";
 import {
@@ -39,11 +44,18 @@ import { serializeStateJson } from "../src/store.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   baselineRepo,
+  fakeCommitTaskJson,
+  fakeDirtyPaths,
   initRepo as fakeInitRepo,
   fakeLog,
+  fakeSourceCommit,
   fakeVcs,
   resetFakeVcs,
 } from "./fake-vcs.ts";
+
+// Re-export the fake source-commit seeders + dirty-path probe so saga tests reach
+// the in-verb-read fixtures from the one harness import.
+export { fakeCommitTaskJson, fakeDirtyPaths, fakeSourceCommit };
 
 // The fake VCS facade is installed around each in-process runCli(main(argv)) call
 // (see runCli) and torn down right after, so the verb auto-commit + dirty
@@ -56,7 +68,109 @@ import {
 // fake state so a reused tmpdir path never carries a stale fake repo.
 beforeEach(() => {
   resetFakeVcs();
+  resetCommandDrivers();
 });
+
+// ---------------------------------------------------------------------------
+// External-command driver registry — replaces the executable PATH shim. A test
+// registers a driver per command name (fakeCommand) carrying a canned
+// {stdout, exitCode}; the installed PlanExec (execDriver) matches the spawned
+// command name, records its argv, and returns the canned result. No PATH entry,
+// no executable script, no real binary. Reset per test in the global beforeEach.
+// ---------------------------------------------------------------------------
+
+interface CommandDriver {
+  stdout: string;
+  exitCode: number;
+  /** Captured argv from each invocation (one entry per call), newest last. */
+  calls: string[][];
+  /** Optional capture sink: each invocation copies any `.md` argv path here. */
+  captureDir?: string;
+}
+
+const commandDrivers = new Map<string, CommandDriver>();
+
+function resetCommandDrivers(): void {
+  commandDrivers.clear();
+}
+
+/** The PlanExec the harness installs: matches a spawned command to its registered
+ * driver, records the argv, and returns the canned result. An unregistered
+ * command surfaces as a non-zero "command not found" — a test that spawns an
+ * unstubbed binary fails loudly rather than reaching the real one. */
+const execDriver: PlanExec = {
+  run(command, argv): ExecResult {
+    const driver = commandDrivers.get(command);
+    if (!driver) {
+      return {
+        exitCode: 127,
+        stdout: "",
+        stderr: `fake exec: no driver registered for '${command}'\n`,
+      };
+    }
+    driver.calls.push([...argv]);
+    if (driver.captureDir) {
+      mkdirSync(driver.captureDir, { recursive: true });
+      for (const a of argv) {
+        if (a.endsWith(".md") && existsSync(a)) {
+          try {
+            require("node:fs").copyFileSync(
+              a,
+              join(driver.captureDir, basenameOf(a)),
+            );
+          } catch {
+            // best-effort capture
+          }
+        }
+      }
+    }
+    if (driver.exitCode !== 0) {
+      return {
+        exitCode: driver.exitCode,
+        stdout: "",
+        stderr: `fake ${command}: simulated failure\n`,
+      };
+    }
+    return { exitCode: 0, stdout: `${driver.stdout}\n`, stderr: "" };
+  },
+};
+
+function basenameOf(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? p : p.slice(i + 1);
+}
+
+/** Handle a test reads back after running the verb: the recorded argv of the
+ * LAST invocation (one string per arg). Returns [] until the command runs. */
+export interface CommandFake {
+  /** All recorded invocations (argv per call), newest last. */
+  calls: () => string[][];
+  /** The argv of the LAST invocation, or [] if not yet run. */
+  lastArgv: () => string[];
+}
+
+/** Register a driver for external command `name`: subsequent spawns of `name`
+ * record their argv and return `stdout` + `exitCode` (a non-zero exit also emits
+ * a stderr line). `captureDir` mirrors any `.md` argv path into that dir (the
+ * gist TOC-capture case). Replaces the executable PATH shim — no PATH, no script.
+ */
+export function fakeCommand(
+  name: string,
+  opts: { stdout?: string; exitCode?: number; captureDir?: string } = {},
+): CommandFake {
+  const driver: CommandDriver = {
+    stdout: opts.stdout ?? "",
+    exitCode: opts.exitCode ?? 0,
+    calls: [],
+    captureDir: opts.captureDir,
+  };
+  commandDrivers.set(name, driver);
+  return {
+    calls: () => driver.calls.map((c) => [...c]),
+    lastArgv: () =>
+      driver.calls.length > 0 ? [...(driver.calls.at(-1) as string[])] : [],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Binary resolution — the default `bun test` runs runCli IN-PROCESS (it
@@ -219,9 +333,13 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
   // call or the prior verb's self-emit leaks into the dispatcher's trailer gate.
   resetSelfEmit();
   setStdinProvider(makeStdinProvider(opts.input));
-  // Route this verb's auto-commit + dirty-discovery through the fake (restored in
-  // finally) so no real git runs and no global install leaks to a sibling file.
+  // Route this verb's auto-commit + dirty-discovery + in-verb git reads through
+  // the fake (restored in finally) so no real git runs and no global install
+  // leaks to a sibling file.
   setVcs(fakeVcs);
+  // Route external-command spawns (gist's gh / opener) through the driver
+  // registry so no real binary or PATH shim runs.
+  setExec(execDriver);
 
   try {
     process.env = buildEnv(home, opts.env);
@@ -263,6 +381,7 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
     setTTY(process.stdout, priorStdoutTTY);
     resetStdinProvider();
     resetVcs();
+    resetExec();
   }
 
   return { code, stdout, stderr, output: stdout + stderr };
@@ -560,30 +679,11 @@ export function fixedClock(): string {
 // inside its body (the value is minted fresh per test).
 // ---------------------------------------------------------------------------
 
-/** Run git with a local identity in *cwd*, throwing on failure. The bun analogue
- * of the conftest git subprocess calls — used only to stand up the real `.git/`
- * the in-verb git READS still consult (commit_lookup / reconcile / worker-resume,
- * de-gitted by a later task). The auto-commit WRITE side routes through the fake
- * facade, not this. */
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if ((proc.exitCode ?? -1) !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${decode(proc.stderr)}`);
-  }
-  return decode(proc.stdout);
-}
-
-/** Stand up a repo in *dir*: a real `git init` + local committer identity (so the
- * in-verb git READS still resolve a real repo) AND a registered fake repo (so the
- * auto-commit WRITE side + the harness assertion helpers track the fake log). The
- * verb auto-commit lands in the fake, never real git; real git stays at an unborn
- * HEAD unless a test seeds a real commit itself. */
+/** Stand up a fake repo in *dir*: a bare `.git/` dir (satisfies findGitRoot /
+ * validateRepoPath / init's git-work-tree gate + the fake isGitRepo read) and a
+ * registered fake repo (the auto-commit WRITE side, the in-verb READS, and the
+ * harness assertion helpers all route through the fake facade). Zero real git. */
 export function gitInit(dir: string): void {
-  git(["init", "-q"], dir);
-  git(["config", "user.email", "test@example.com"], dir);
-  git(["config", "user.name", "Test User"], dir);
-  git(["config", "commit.gpgsign", "false"], dir);
-  git(["config", "core.hooksPath", "/dev/null"], dir);
   fakeInitRepo(dir);
 }
 
@@ -746,68 +846,6 @@ export function seedRuntime(
     serializeStateJson(state),
     "utf-8",
   );
-}
-
-// ---------------------------------------------------------------------------
-// pathShim — drop an executable fake binary on PATH. Port of the conftest
-// fake-binary pattern (test_gist's _make_fake_gh, test_generated_guard_hook):
-// an executable temp script that records its argv and emits a controlled
-// stdout/exit. Returns {binDir, env, argvPath} so the caller layers env into
-// runCli and reads the recorded argv back.
-// ---------------------------------------------------------------------------
-
-export interface PathShim {
-  /** Directory holding the shim, prepended to PATH. */
-  binDir: string;
-  /** Env fragment to spread into runCli: PATH with binDir first. */
-  env: Record<string, string>;
-  /** File the shim writes its argv to (one arg per line), or null until run. */
-  argvPath: string;
-}
-
-/** Drop an executable *name* in a fresh dir under *root* that records its argv
- * to `<binDir>/<name>-argv` (one arg per line) then prints *stdout* and exits
- * *exitCode* (a non-zero exit also writes a stderr line). Mirrors
- * _make_fake_gh: a `#!/usr/bin/env bun` script so the shim runs without a
- * system python. Returns the handle to layer into runCli's env. */
-export function pathShim(
-  root: string,
-  name: string,
-  opts: { stdout?: string; exitCode?: number; captureDir?: string } = {},
-): PathShim {
-  const { stdout = "", exitCode = 0, captureDir } = opts;
-  const binDir = join(root, `shim-${name}`);
-  mkdirSync(binDir, { recursive: true });
-  if (captureDir) {
-    mkdirSync(captureDir, { recursive: true });
-  }
-  const argvPath = join(binDir, `${name}-argv`);
-  const capture = captureDir
-    ? `import { copyFileSync } from "node:fs";\n` +
-      `import { basename } from "node:path";\n` +
-      `for (const a of process.argv.slice(2)) {\n` +
-      `  if (a.endsWith(".md")) {\n` +
-      `    try { copyFileSync(a, ${JSON.stringify(captureDir)} + "/" + basename(a)); } catch {}\n` +
-      `  }\n` +
-      `}\n`
-    : "";
-  const script =
-    "#!/usr/bin/env bun\n" +
-    `import { writeFileSync } from "node:fs";\n` +
-    capture +
-    `writeFileSync(${JSON.stringify(argvPath)}, process.argv.slice(2).join("\\n") + "\\n");\n` +
-    `if (${exitCode} !== 0) {\n` +
-    `  process.stderr.write("fake ${name}: simulated failure\\n");\n` +
-    `  process.exit(${exitCode});\n` +
-    `}\n` +
-    `process.stdout.write(${JSON.stringify(stdout)} + "\\n");\n`;
-  writeFileSync(join(binDir, name), script, "utf-8");
-  chmodSync(join(binDir, name), 0o755);
-  return {
-    binDir,
-    env: { PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}` },
-    argvPath,
-  };
 }
 
 // ---------------------------------------------------------------------------

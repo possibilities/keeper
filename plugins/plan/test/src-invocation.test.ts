@@ -5,24 +5,30 @@
 // state_repo precedence (primaryRepo over repoRoot).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildPlanInvocation } from "../src/invocation.ts";
+import { resetVcs, setVcs } from "../src/vcs.ts";
+import {
+  baselineRepo,
+  initRepo as fakeInitRepo,
+  fakeVcs,
+  resetFakeVcs,
+} from "./fake-vcs.ts";
 
 let repo: string;
 const savedSid = process.env.CLAUDE_CODE_SESSION_ID;
 
-function git(args: string[], cwd: string): void {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-}
-
 /** Seed a touched-log record for `sid` naming `relPath`, and write the file so
- * git sees it dirty. Returns relPath. */
+ * the fake dirty-discovery sees it dirty. Returns relPath. */
 function seedTouched(sid: string, relPath: string, content = "x\n"): string {
   const touchedDir = join(repo, ".keeper", "state", "sessions", sid, "touched");
   mkdirSync(touchedDir, { recursive: true });
@@ -39,14 +45,15 @@ function seedTouched(sid: string, relPath: string, content = "x\n"): string {
 }
 
 beforeEach(() => {
-  repo = mkdtempSync(join(tmpdir(), "planctl-inv-test-"));
-  git(["init", "-q"], repo);
-  git(["config", "user.email", "t@p.local"], repo);
-  git(["config", "user.name", "T"], repo);
+  resetFakeVcs();
+  setVcs(fakeVcs);
+  repo = realpathSync(mkdtempSync(join(tmpdir(), "planctl-inv-test-")));
+  fakeInitRepo(repo);
   mkdirSync(join(repo, ".keeper"), { recursive: true });
 });
 
 afterEach(() => {
+  resetVcs();
   rmSync(repo, { recursive: true, force: true });
   if (savedSid === undefined) {
     delete process.env.CLAUDE_CODE_SESSION_ID;
@@ -75,12 +82,14 @@ describe("buildPlanctlInvocation session-id (fail-closed)", () => {
 describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
   test("only touched paths that are also dirty appear, sorted", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-int";
-    // Two touched+dirty paths (out of order), one touched-but-clean (committed).
+    // Seed the touched+clean file, baseline it (the fake analogue of committing
+    // it so it diffs clean), THEN seed the two touched+dirty paths.
+    const clean = seedTouched("sid-int", ".keeper/epics/clean.json");
+    baselineRepo(repo);
+    expect(clean).toBe(".keeper/epics/clean.json");
+    // Two touched+dirty paths (out of order); the clean one stays committed.
     const b = seedTouched("sid-int", ".keeper/epics/b.json");
     const a = seedTouched("sid-int", ".keeper/epics/a.json");
-    const clean = seedTouched("sid-int", ".keeper/epics/clean.json");
-    git(["add", clean], repo);
-    git(["commit", "-q", "-m", "commit clean"], repo);
 
     const inv = buildPlanInvocation("done", "fn-9-x.1", null, {
       repoRoot: repo,

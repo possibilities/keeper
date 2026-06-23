@@ -14,9 +14,9 @@
 //
 // claim resolves the owning project via roots discovery, never cwd — so the
 // precondition tests pass --project (the verbs-worker idiom) and the resolution
-// cluster drives real setRoots over real projects under one root. The
-// brief-gitignored node rides the KEEPER_PLAN_RUN_SLOW gate (git check-ignore is the
-// subject). The brief-write-failed node is python_only and dropped.
+// cluster drives setRoots over fake projects under one root. The
+// brief-gitignored node asserts the brief lands under the state/ subtree the fake
+// dirty-discovery excludes. The brief-write-failed node is python_only and dropped.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -28,14 +28,14 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 import {
+  fakeDirtyPaths,
   firstJsonPayload,
   gitInit,
   parseCliOutput,
   runCli,
-  SLOW_ENABLED,
   scaffoldEpic,
   scaffoldPlanYaml,
   setRoots,
@@ -152,36 +152,34 @@ describe("claim happy path + brief schema", () => {
     expect(payload.worker_agent).toBeNull();
   });
 
-  test.skipIf(!SLOW_ENABLED)(
-    "brief lands under gitignored state/ — git never tracks it",
-    () => {
-      // test_claim.py::test_claim_brief_file_is_gitignored
-      const proj = getProj();
-      const { taskIds } = scaffoldEpic(proj, {
-        title: "Claim epic",
-        nTasks: 1,
-      });
-      const taskId = taskIds[0] as string;
-      const r = runCli(["claim", taskId, "--project", proj.root], {
-        cwd: proj.root,
-        home: proj.home,
-        env: ALICE,
-      });
-      expect(r.code).toBe(0);
-      const briefRef = parseCliOutput(r.output).brief_ref as string;
-      expect(existsSync(briefRef)).toBe(true);
-
-      const status = Bun.spawnSync(
-        ["git", "status", "--porcelain", "--", briefRef],
-        { cwd: proj.root },
-      );
-      expect(status.stdout.toString().trim()).toBe("");
-      const ignored = Bun.spawnSync(["git", "check-ignore", briefRef], {
-        cwd: proj.root,
-      });
-      expect(ignored.exitCode).toBe(0);
-    },
-  );
+  test("brief lands under gitignored state/ — never tracked", () => {
+    // test_claim.py::test_claim_brief_file_is_gitignored
+    // The inner `.gitignore` excludes `.keeper/state/`; the brief lands there,
+    // so it is never tracked. The fake's dirty-discovery mirrors that exclusion
+    // (state/ is skipped), so the brief never shows up dirty.
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, {
+      title: "Claim epic",
+      nTasks: 1,
+    });
+    const taskId = taskIds[0] as string;
+    const r = runCli(["claim", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: ALICE,
+    });
+    expect(r.code).toBe(0);
+    const briefRef = parseCliOutput(r.output).brief_ref as string;
+    expect(existsSync(briefRef)).toBe(true);
+    // The brief lives under the gitignored state/ subtree.
+    expect(
+      briefRef.includes(`${sep}.keeper${sep}state${sep}briefs${sep}`),
+    ).toBe(true);
+    // The fake dirty-discovery (mirroring the inner .gitignore) never reports it.
+    expect(fakeDirtyPaths(proj.root).some((p) => p.startsWith("state/"))).toBe(
+      false,
+    );
+  });
 
   test("ALREADY_MINE re-claim regenerates a missing brief (repair-on-reclaim)", () => {
     // test_claim.py::test_claim_already_mine_regenerates_brief
