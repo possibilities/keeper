@@ -1,7 +1,7 @@
 // Consistency checks for the hand-written source skills (next / defer / close)
 // and the work/worker templates against the live CLI surface and the canon's
 // prose invariants. Translated from the markdown-consistency pytest modules:
-// every `planctl <verb>` in a fenced bash block must resolve to a real command
+// every `keeper plan <verb>` in a fenced bash block must resolve to a real command
 // (--help exit 0); frontmatter `name:` is the bare verb; the agentId capture
 // regex is `re.search`-shaped; the close coordinator's finalize switch is total
 // over CLOSE_OUTCOMES and carries no stale pointers; the work template spawns
@@ -19,7 +19,7 @@ import { runCli } from "./harness.ts";
 const REPO = join(import.meta.dir, "..");
 const CWD = mkdtempSync(join(tmpdir(), "planctl-consistency-"));
 
-// Multi-word verb prefixes the CLI exposes as nested groups. When a `planctl
+// Multi-word verb prefixes the CLI exposes as nested groups. When a `keeper plan
 // <words…>` reference starts with one of these, both words form the verb path.
 const MULTIWORD_PREFIXES = new Set([
   "epic",
@@ -77,7 +77,7 @@ function parseFrontmatter(block: string): Record<string, string> {
   return fm;
 }
 
-/** Every `planctl <verb>` argv tuple in the text's fenced bash blocks, sorted. */
+/** Every `keeper plan <verb>` argv tuple in the text's fenced bash blocks, sorted. */
 function extractPlanctlVerbs(text: string): string[][] {
   const verbs = new Set<string>();
   let inBash = false;
@@ -94,7 +94,7 @@ function extractPlanctlVerbs(text: string): string[][] {
     if (!inBash) {
       continue;
     }
-    for (const m of line.matchAll(/planctl\s+([\w-]+(?:\s+[\w-]+)*)/g)) {
+    for (const m of line.matchAll(/keeper\s+plan\s+([\w-]+(?:\s+[\w-]+)*)/g)) {
       const words = (m[1] as string).split(/\s+/).filter(Boolean);
       if (words.length === 0) {
         continue;
@@ -159,19 +159,19 @@ const BARE_VERB_SKILLS: BareVerbSkill[] = [
     label: "next",
     path: join(REPO, "skills", "next", "SKILL.md"),
     name: "next",
-    mutatingVerb: "planctl epic queue-jump",
+    mutatingVerb: "keeper plan epic queue-jump",
   },
   {
     label: "defer",
     path: join(REPO, "skills", "defer", "SKILL.md"),
     name: "defer",
-    mutatingVerb: "planctl scaffold",
+    mutatingVerb: "keeper plan scaffold",
   },
   {
     label: "close",
     path: join(REPO, "skills", "close", "SKILL.md"),
     name: "close",
-    mutatingVerb: "planctl",
+    mutatingVerb: "keeper plan",
   },
 ];
 
@@ -190,12 +190,12 @@ for (const skill of BARE_VERB_SKILLS) {
       expect(readFileSync(skill.path, "utf-8")).toContain(skill.mutatingVerb);
     });
 
-    test("extracts at least one planctl verb from a fenced bash block", () => {
+    test("extracts at least one keeper plan verb from a fenced bash block", () => {
       const verbs = extractPlanctlVerbs(readFileSync(skill.path, "utf-8"));
       expect(verbs.length).toBeGreaterThan(0);
     });
 
-    test("every extracted planctl verb responds to --help (exit 0)", () => {
+    test("every extracted keeper plan verb responds to --help (exit 0)", () => {
       const verbs = extractPlanctlVerbs(readFileSync(skill.path, "utf-8"));
       for (const parts of verbs) {
         const r = runCli([...parts, "--help"], { cwd: CWD });
@@ -316,13 +316,13 @@ const WORK_AGENT_ID_SAMPLE =
   "to continue this agent)";
 
 describe("work.md.tmpl verb-existence guard", () => {
-  test("extracts at least one planctl verb", () => {
+  test("extracts at least one keeper plan verb", () => {
     expect(
       extractPlanctlVerbs(readFileSync(WORK_TMPL, "utf-8")).length,
     ).toBeGreaterThan(0);
   });
 
-  test("every extracted planctl verb responds to --help (exit 0)", () => {
+  test("every extracted keeper plan verb responds to --help (exit 0)", () => {
     for (const parts of extractPlanctlVerbs(readFileSync(WORK_TMPL, "utf-8"))) {
       const r = runCli([...parts, "--help"], { cwd: CWD });
       expect(r.code).toBe(0);
@@ -374,7 +374,7 @@ describe("work.md.tmpl spawn shape", () => {
     expect(tmpl).not.toContain("plugin-dir");
     expect(tmpl).toContain("plan:worker-<tier>");
     expect(tmpl).not.toContain('subagent_type=f"plan:worker-{tier}"');
-    expect(tmpl).not.toContain("planctl task set-tier");
+    expect(tmpl).not.toContain("keeper plan task set-tier");
     for (const block of spawnBlocks) {
       expect(block).not.toContain("model=");
     }
@@ -451,9 +451,14 @@ describe("worker.md.tmpl doc & comment discipline block", () => {
 // field absence — every checked-in epic JSON is clean of retired fields
 // ---------------------------------------------------------------------------
 
-const EPICS_DIR = join(REPO, ".planctl", "epics");
+// Plan state lives in the keeper repo-root `.keeper/`, two levels above the
+// plugin (`plugins/plan/`); the plugin dir carries no data dir of its own.
+const EPICS_DIR = join(REPO, "..", "..", ".keeper", "epics");
 
 function epicFiles(): string[] {
+  if (!existsSync(EPICS_DIR)) {
+    return [];
+  }
   return readdirSync(EPICS_DIR)
     .filter((f) => f.endsWith(".json"))
     .sort();
