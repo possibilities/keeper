@@ -66,5 +66,5 @@ gate and no `keeper commit-work` — standard git commit).
 - [ ] `bun lint`, `bun typecheck`, `bun test` pass
 
 ## Done summary
-
+agentwrap wait-for-stop now accepts --stop-timeout-ms <n>/=<n> (both orderings); parsed in resolveHandle as a positive-int ms (malformed → BAD_ARGS, never a silent 600s fallback), threaded into waitForTranscriptStop, with a self-reporting timed-out error (caller vs default). Documented in dispatch help + CLAUDE.md.
 ## Evidence

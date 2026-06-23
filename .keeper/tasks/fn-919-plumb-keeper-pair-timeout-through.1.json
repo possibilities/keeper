@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/agentwrap",
   "tier": "xhigh",
   "title": "Add --stop-timeout-ms to agentwrap wait-for-stop",
-  "updated_at": "2026-06-23T19:07:52.331000Z"
+  "updated_at": "2026-06-23T19:11:54.466000Z",
+  "worker_done_at": "2026-06-23T19:11:54.466000Z"
 }
