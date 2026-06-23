@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix planctl-rename test stragglers",
-  "updated_at": "2026-06-23T07:22:00.890000Z"
+  "updated_at": "2026-06-23T09:56:57.249000Z",
+  "worker_done_at": "2026-06-23T09:56:57.249000Z"
 }

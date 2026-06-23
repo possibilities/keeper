@@ -43,5 +43,5 @@ against the real `keeper plan` CLI.
 - [ ] No real git reintroduced (`bun run test:hygiene` still passes)
 
 ## Done summary
-
+Fixed the planctl→keeper rename stragglers in consistency-skills.test.ts (verb-extraction regex now matches 'keeper plan <verb>', mutatingVerb constants, tier-set guard literal, and EPICS_DIR pointed at the repo-root .keeper/epics). Plan suite now reports 0 fail / 0 error; typecheck, lint, and test:hygiene stay clean. src-invocation.test.ts already used .keeper/ paths so needed no change.
 ## Evidence
