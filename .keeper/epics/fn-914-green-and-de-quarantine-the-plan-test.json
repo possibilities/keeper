@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-23T10:12:02.103000Z",
   "created_at": "2026-06-23T07:22:00.890000Z",
   "depends_on_epics": [],
   "id": "fn-914-green-and-de-quarantine-the-plan-test",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Green and de-quarantine the plan test suite",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-23T07:22:00.890000Z"
+  "updated_at": "2026-06-23T10:12:02.103000Z"
 }
