@@ -31,5 +31,5 @@ after the sweep — it must stay green.
 - [ ] `keeper run test:full` green (touches hook/plugin paths)
 
 ## Done summary
-
+Retired the planctl name across the residual plan-plugin surface: renamed the promoted binary (planctl->keeper-plan), package (planctl-hooks->keeper-plan-hooks), guard env gate (PLANCTL_GUARD_BYPASS->KEEPER_PLAN_GUARD_BYPASS), session-marker + epic-id-lock state dir (planctl->keeper), and the guard dispatchers now spawn 'keeper plan' (runPlanctl->runPlanCli). Swept residual planctl prose in api.py live docstrings, events-writer.ts, await/SKILL.md, flock.ts, and the agent prompts. Frozen Planctl-* trailer literals and historical migration comments preserved; lint-retired-name guard green.
 ## Evidence
