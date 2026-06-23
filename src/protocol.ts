@@ -89,10 +89,16 @@ export type Row = Record<string, unknown>;
  *   the git surface is unseeded. The client treats a snapshot read while
  *   `catching_up` is true as provisional (it MUST NOT cache an empty projection
  *   as ground truth — the header rides EVERY reply, not just the first).
- * - `git_seed_required` — `git_projection_state.seed_required !== 0`: the
- *   live-only git surface (`git_status` + attributions) has not been boot-seeded
- *   yet, so it reads EMPTY. A consumer of git cleanliness must treat unseeded as
- *   "unknown", never "clean".
+ * - `git_seed_required` — `git_projection_state.seed_required !== 0`: the COARSE
+ *   "any gated root unseeded" boolean. Drives `catching_up`; a consumer of the
+ *   coarse git-clean gate treats unseeded as "unknown", never "clean".
+ * - `git_unseeded_roots` (fn-905) — the PER-ROOT refinement: the `effectiveRoot`s
+ *   (`target_repo ?? project_dir`) that lack a seeded `git_status` row above the
+ *   floor. EMPTY whenever `git_seed_required` is false. The board latches this and
+ *   forces `{kind:unknown}` per-root, so it renders the SAME per-root gate the
+ *   autopilot dispatches against (the `[::ready]`-while-autopilot-dark divergence
+ *   is gone). Optional/additive — an older client ignoring it falls back to no
+ *   per-root gating, which over-dispatches only in the brief unseeded window.
  *
  * Forward-compat: an older client ignores the unknown `boot` field (the
  * "unknown frame fields ignored" rule), so adding it is wire-safe.
@@ -102,6 +108,7 @@ export interface BootStatus {
   head_event_id: number;
   catching_up: boolean;
   git_seed_required: boolean;
+  git_unseeded_roots?: string[];
 }
 
 // ---------------------------------------------------------------------------

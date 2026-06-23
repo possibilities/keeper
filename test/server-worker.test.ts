@@ -1506,6 +1506,75 @@ test("fn-897 B1: a real query during catch-up carries the boot-status header (re
   db.close();
 });
 
+test("fn-905: the boot-status header ships git_unseeded_roots for an unseeded gated root", async () => {
+  // An OPEN epic gates /repo-x; the surface is unseeded (no above-floor
+  // git_status row) → /repo-x rides the per-root set on the boot header.
+  {
+    const { db: w } = openDb(dbPath, { readonly: false, migrate: false });
+    setWorldRev(w, 3);
+    for (let i = 1; i <= 3; i++) {
+      w.run(
+        "INSERT INTO events (id, ts, session_id, hook_event, event_type) VALUES (?, ?, 's', 'X', 'x')",
+        [i, i],
+      );
+    }
+    w.run(
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+         VALUES ('fn-1-x', 1, 'x', '/repo-x', 'open', 0, 1, '[]')`,
+    );
+    w.run(
+      "UPDATE git_projection_state SET seed_required = 1, floor = 0 WHERE id = 1",
+    );
+    w.close();
+  }
+  const { db } = openDb(dbPath, { readonly: true });
+  const gate: BootGate = { ready: false };
+  const server = startServer(
+    db,
+    sockPath,
+    lockPath,
+    undefined,
+    undefined,
+    gate,
+  );
+
+  const frames: ServerFrame[] = [];
+  let buf = "";
+  const client = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk) {
+        buf += chunk.toString("utf8");
+        let nl = buf.indexOf("\n");
+        while (nl !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim().length > 0) frames.push(JSON.parse(line));
+          nl = buf.indexOf("\n");
+        }
+      },
+      error() {},
+    },
+  });
+  client.write(
+    `${JSON.stringify({ type: "query", id: "q1", collection: "jobs" })}\n`,
+  );
+
+  const result = await retryUntil(
+    () =>
+      (frames.find((f) => f.type === "result") as ResultFrame | undefined) ??
+      null,
+    5000,
+  );
+  expect(result).not.toBeNull();
+  expect(result?.boot?.git_seed_required).toBe(true);
+  expect(result?.boot?.git_unseeded_roots).toEqual(["/repo-x"]);
+
+  client.end();
+  server.stop();
+  db.close();
+});
+
 test("fn-897 B1: once the gate is ready and rev==head, catching_up settles and mutating RPCs pass the gate", async () => {
   {
     const { db: w } = openDb(dbPath, { readonly: false, migrate: false });

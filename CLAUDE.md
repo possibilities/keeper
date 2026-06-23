@@ -87,16 +87,29 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   drain SQL (the global cursor must still advance for the deterministic projections).
   Above the floor a live fold stays pure (no git/clock/fs reads — those belong to the
   producer only). **Boot-producer contract:** capture `floor = max(events.id)` BEFORE
-  the git scan, set `seed_required`, scan + populate the surface, then persist the
-  floor + clear `seed_required` atomically; a crash mid-seed leaves `seed_required` set
-  so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE the autopilot
+  the git scan, set `seed_required`, scan the GATED roots (open-epic `project_dir` +
+  task `target_repo`, derived by `gatedGitRoots` in `src/gated-roots.ts` — NOT the
+  full historical `jobs.cwd` sweep, so a stale `/Volumes/Scratch` root never gates),
+  populate the surface, then persist the floor + clear `seed_required` once every
+  gated root is seeded (best-effort for a root the seed missed); a crash mid-seed
+  leaves `seed_required` set so the next boot re-seeds. **Self-clearing in steady
+  state:** for a root the boot-seed missed/failed, MAIN's above-floor `GitSnapshot`
+  fold (`projectGitStatus`) clears `seed_required` once `allGatedRootsSeeded` holds —
+  the live producer's emit folded by main, never a git-worker write and never a retry
+  loop. The boot-seed runs AFTER drain, BEFORE the autopilot
   actuator + mutating-RPC gate opens (fn-897 split serving into TWO gates: the
   READ socket opens right after migrate during the drain; the boot-seed + drain
   reaching head + ephemeral-truncate gate the actuator + mutating RPCs). **Unseeded
-  git reads as UNKNOWN, never CLEAN** (`seed_required=1` forces every readiness row
-  to `{kind:"unknown"}` and holds `keeper await git-clean` at `waiting`) — a
-  consumer must never treat the empty surface a not-yet-seeded boot produces as a
-  clean repo.
+  git reads as UNKNOWN, never CLEAN — PER-ROOT** (fn-905): while `seed_required` is
+  set the readiness gate forces `{kind:"unknown"}` ONLY for rows whose `effectiveRoot`
+  (`target_repo ?? project_dir`, keyed identically to the per-root mutex) lacks a
+  `git_status` row above the floor — `unseededGatedRoots` derives the set. A
+  stale/failed root darks only ITS own rows; a seeded sibling root still dispatches
+  (bulkhead). The set rides `BootStatus.git_unseeded_roots` so the board renders the
+  SAME per-root gate the autopilot dispatches against; the coarse `seed_required`
+  boolean (still on `BootStatus.git_seed_required`) drives `catching_up` and holds
+  `keeper await git-clean` at `waiting`. A consumer must never treat the empty
+  surface a not-yet-seeded root produces as a clean repo.
 - **A fold whose per-event cost grows with history — OR with board / projection
   size — is a re-fold time-bomb.** Any projection whose per-event fold cost scales
   with history length (the git fold's pass-1 explicit-attribution `buildExplicitAttribHoist`

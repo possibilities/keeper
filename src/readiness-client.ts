@@ -1372,11 +1372,12 @@ export function subscribeReadiness(
   opts: SubscribeOptions,
 ): ReadinessClientHandle {
   const { sockPath, idPrefix, onSnapshot, onLifecycle } = opts;
-  // fn-897 B1: latch the latest git-seed state off the boot-status header so the
-  // readiness pass forces UNKNOWN while the surface is unseeded (the autopilot
-  // never dispatches against a not-yet-seeded git surface). Defaults `false`
-  // (steady state / a server that stamps no header → assume seeded).
-  let gitSeedRequired = false;
+  // fn-905: latch the PER-ROOT unseeded set off the boot-status header so the
+  // readiness pass forces UNKNOWN only for rows whose `effectiveRoot` is unseeded
+  // — the board renders the SAME per-root gate the autopilot dispatches against.
+  // Defaults EMPTY (steady state / a server that stamps no header / an older
+  // server omitting the field → assume every root seeded, no per-root gating).
+  let unseededRoots: Set<string> = new Set<string>();
   const onFatal = opts.onFatal ?? defaultOnFatal;
   const connect = opts.connect ?? defaultConnect;
 
@@ -1603,9 +1604,9 @@ export function subscribeReadiness(
       // Armed-mode eligibility in `armed` mode, `undefined` in `yolo`. Makes
       // the board's per-root tiebreak agree with the reconciler's dispatch.
       eligibleEpicIds,
-      // fn-897 B1: unseeded git surface → every row forced UNKNOWN (no dispatch
-      // against a not-yet-seeded surface).
-      gitSeedRequired,
+      // fn-905: the per-root unseeded set → only rows whose `effectiveRoot` is
+      // unseeded are forced UNKNOWN (a seeded sibling root still renders ready).
+      unseededRoots,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
     // Read from `state.rows` (not `byId.values()`) — the composite
@@ -1638,11 +1639,13 @@ export function subscribeReadiness(
       ? {}
       : { giveUpPolicy: opts.giveUpPolicy }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
-    // fn-897 B1: latch the git-seed state for the readiness pass AND forward to a
-    // caller-supplied `onBootStatus` (the readiness pass reads the latch on its
-    // NEXT emit, which fires on the same frame).
+    // fn-905: latch the per-root unseeded set for the readiness pass AND forward
+    // to a caller-supplied `onBootStatus` (the readiness pass reads the latch on
+    // its NEXT emit, which fires on the same frame). An older server omitting the
+    // field latches EMPTY (no per-root gating) — falling back to over-dispatch
+    // only in the brief unseeded window, never to a clean-read-as-dirty hazard.
     onBootStatus: (boot: BootStatus): void => {
-      gitSeedRequired = boot.git_seed_required;
+      unseededRoots = new Set(boot.git_unseeded_roots ?? []);
       opts.onBootStatus?.(boot);
     },
   });

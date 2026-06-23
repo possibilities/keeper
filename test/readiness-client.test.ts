@@ -321,16 +321,20 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine c
 });
 
 // ---------------------------------------------------------------------------
-// (a.1b) fn-897 B1 — the boot-status header on a `result` frame fires
-//        `onBootStatus` AND, when `git_seed_required`, forces the next snapshot's
-//        readiness to UNKNOWN (the autopilot must not dispatch against an
-//        unseeded git surface).
+// (a.1b) fn-905 — the boot-status header on a `result` frame fires
+//        `onBootStatus` AND latches `git_unseeded_roots`, forcing the next
+//        snapshot's readiness to UNKNOWN ONLY for rows whose `effectiveRoot` is
+//        unseeded (the board renders the SAME per-root gate the autopilot
+//        dispatches against).
 // ---------------------------------------------------------------------------
 
-test("subscribeReadiness: boot-status header fires onBootStatus and forces readiness UNKNOWN when git unseeded", () => {
+test("subscribeReadiness: boot-status header fires onBootStatus and forces readiness UNKNOWN per-root when git unseeded", () => {
   const { factory, socketRef } = makeMockConnect();
   const snapshots: ReadinessClientSnapshot[] = [];
-  const boots: { git_seed_required: boolean }[] = [];
+  const boots: {
+    git_seed_required: boolean;
+    git_unseeded_roots?: string[];
+  }[] = [];
   const handle = subscribeReadiness({
     sockPath: "/tmp/keeper-mock.sock",
     idPrefix: "test-boot",
@@ -387,12 +391,16 @@ test("subscribeReadiness: boot-status header fires onBootStatus and forces readi
       head_event_id: 9,
       catching_up: true,
       git_seed_required: true,
+      // The epic's /repo root is unseeded → its rows gate UNKNOWN.
+      git_unseeded_roots: ["/repo"],
     },
   };
   sock.deliver([epicsFrame]);
-  // onBootStatus fired with the unseeded flag, even before the gate clears.
+  // onBootStatus fired with the unseeded flag + the per-root set, even before
+  // the gate clears.
   expect(boots.length).toBeGreaterThanOrEqual(1);
   expect(boots.at(-1)?.git_seed_required).toBe(true);
+  expect(boots.at(-1)?.git_unseeded_roots).toEqual(["/repo"]);
 
   // Deliver the rest so the first-paint gate clears.
   for (const c of [

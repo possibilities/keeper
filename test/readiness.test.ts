@@ -3791,14 +3791,16 @@ test("PENDING_DISPATCH_STALE_CEILING_SEC is 2× the TTL (240s) — pure backstop
 });
 
 // ---------------------------------------------------------------------------
-// fn-897 B1: unseeded git surface → every row UNKNOWN (never dispatch)
+// fn-905: PER-ROOT unseeded-git gate → force UNKNOWN only on the unseeded root's
+// own rows; a seeded sibling root still dispatches.
 // ---------------------------------------------------------------------------
 
-test("fn-897 B1: gitSeedRequired=true forces every task + close row to blocked:unknown", () => {
+test("fn-905: empty unseededRoots (default) → no gating (re-fold byte-identical)", () => {
   const t1 = makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" });
   const t2 = makeTask({ task_id: "fn-1-foo.2", worker_phase: "open" });
-  const epic = makeEpic({ tasks: [t1, t2] });
-  // Seeded (default): the tasks compute their normal verdicts (at least one ready).
+  const epic = makeEpic({ project_dir: "/repo", tasks: [t1, t2] });
+  // No trailing arg ⇔ empty set ⇔ today's "seeded" path: normal verdicts (at
+  // least one ready).
   const seeded = computeReadiness(
     [epic],
     new Map(),
@@ -3807,16 +3809,13 @@ test("fn-897 B1: gitSeedRequired=true forces every task + close row to blocked:u
     Number.NEGATIVE_INFINITY,
     [],
     undefined,
-    false,
   );
   expect(seeded.perTask.get("fn-1-foo.1")).not.toEqual({
     tag: "blocked",
     reason: { kind: "unknown" },
   });
-
-  // Unseeded: EVERY row is forced to blocked:unknown so the autopilot dispatches
-  // nothing against a not-yet-seeded git surface.
-  const unseeded = computeReadiness(
+  // An explicit empty set is the same as omitting it.
+  const seededExplicit = computeReadiness(
     [epic],
     new Map(),
     [],
@@ -3824,20 +3823,128 @@ test("fn-897 B1: gitSeedRequired=true forces every task + close row to blocked:u
     Number.NEGATIVE_INFINITY,
     [],
     undefined,
-    true,
+    new Set<string>(),
   );
-  expect(unseeded.perTask.get("fn-1-foo.1")).toEqual({
+  expect(seededExplicit.perTask.get("fn-1-foo.1")).toEqual(
+    seeded.perTask.get("fn-1-foo.1"),
+  );
+});
+
+test("fn-905: an unseeded root forces UNKNOWN on its own task + close rows", () => {
+  const t1 = makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", worker_phase: "open" });
+  const epic = makeEpic({ project_dir: "/repo", tasks: [t1, t2] });
+  const gated = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    new Set(["/repo"]),
+  );
+  expect(gated.perTask.get("fn-1-foo.1")).toEqual({
     tag: "blocked",
     reason: { kind: "unknown" },
   });
-  expect(unseeded.perTask.get("fn-1-foo.2")).toEqual({
+  expect(gated.perTask.get("fn-1-foo.2")).toEqual({
     tag: "blocked",
     reason: { kind: "unknown" },
   });
-  expect(unseeded.perCloseRow.get("fn-1-foo")).toEqual({
+  expect(gated.perCloseRow.get("fn-1-foo")).toEqual({
     tag: "blocked",
     reason: { kind: "unknown" },
   });
   // The epic header rolls up to blocked too (no ready/running row left).
-  expect(unseeded.perEpic.get("fn-1-foo")?.tag).toBe("blocked");
+  expect(gated.perEpic.get("fn-1-foo")?.tag).toBe("blocked");
+});
+
+test("fn-905: an unseeded root blocks ONLY its own rows; a seeded sibling stays ready", () => {
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo-a",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo-b",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  // Only /repo-a is unseeded → only its task is UNKNOWN; /repo-b stays ready.
+  const snap = computeReadiness(
+    [epicA, epicB],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    new Set(["/repo-a"]),
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("fn-905: a task's target_repo override is gated by its OWN root, not the epic's", () => {
+  // Task overrides into /repo-task; the epic's own project_dir (/repo-epic) is
+  // seeded but /repo-task is not → the task is gated, the close row is not.
+  const epic = makeEpic({
+    project_dir: "/repo-epic",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "open",
+        target_repo: "/repo-task",
+      }),
+    ],
+  });
+  const snap = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    new Set(["/repo-task"]),
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+  // The close row keys on the epic's /repo-epic (seeded) → NOT gated.
+  expect(snap.perCloseRow.get("fn-1-foo")).not.toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+});
+
+test("fn-905: a rootless row (no target_repo, no project_dir) is never gated", () => {
+  const epic = makeEpic({
+    project_dir: null,
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" })],
+  });
+  // A non-empty unseeded set must not touch the `""` rootless bucket.
+  const snap = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    new Set(["/some-other-root"]),
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).not.toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
 });

@@ -134,10 +134,18 @@ gated behind drain-reaches-head + git-seed + ephemeral-truncate: the autopilot
 actuator arms only after that point, and a mutating RPC issued during the drain
 is rejected with a `server_booting` error. Reads are served throughout, and every
 reply carries a **boot-status header** (`rev` / `head_event_id` / `catching_up` /
-`git_seed_required`) so a client can tell it is seeing provisional catch-up state
-and never caches an empty mid-drain projection as ground truth. The unseeded git
-surface reads as "unknown", never "clean" (readiness forces every row unknown and
-`keeper await git-clean` holds `waiting` until the boot-seed runs).
+the coarse `git_seed_required` boolean / the per-root `git_unseeded_roots` set) so
+a client can tell it is seeing provisional catch-up state and never caches an empty
+mid-drain projection as ground truth. The unseeded git surface reads as "unknown",
+never "clean" — **per-root** (fn-905): while `seed_required` is set, readiness forces
+`{kind:"unknown"}` ONLY for rows whose `effectiveRoot` (`target_repo ?? project_dir`)
+lacks a `git_status` row above the floor, so a stale/failed root darks only its own
+rows while a seeded sibling root still dispatches. The board latches
+`git_unseeded_roots` and renders the SAME per-root gate the autopilot dispatches
+against; the coarse `git_seed_required` boolean drives `catching_up` and holds
+`keeper await git-clean` at `waiting`. `seed_required` self-clears in steady state
+once every gated root is seeded — via the boot-seed and main's above-floor
+`GitSnapshot` fold, never a daemon bounce, a git-worker write, or a retry loop.
 
 The end-of-boot WAL checkpoint is `TRUNCATE`. With the early read socket now
 attached during the drain, main's writer is no longer the SOLE connection — but
@@ -1870,8 +1878,11 @@ counters (`git_dirty_count` / `git_unattributed_to_live_count` /
 replayed from history. A monotonic `events.id` SKIP-FLOOR
 (`git_projection_state.floor`) no-ops every `GitSnapshot` / `Commit` / discharge
 git fold for `id <= floor`, and a **boot-seed producer** (`src/git-boot-seed.ts`)
-re-derives the surface for currently-dirty roots before the daemon serves; live
-events above the floor keep it current. The carve-out exists because the
+re-derives the surface for the GATED roots (open-epic `project_dir` + task
+`target_repo`, via `gatedGitRoots` — not the full historical `jobs.cwd` sweep)
+before the daemon serves; live events above the floor keep it current and clear
+`seed_required` once every gated root is seeded (the per-root self-heal, fn-905).
+The carve-out exists because the
 `projectGitStatus` git fold historically re-scanned the WHOLE event log per
 `GitSnapshot` (the pass-1 bash + git-rm/git-mv scans, now memoized incrementally
 by fn-892; `computeRepoBashWindows`'s pass-2 self-join stays bounded by

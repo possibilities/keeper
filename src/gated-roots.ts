@@ -76,6 +76,35 @@ export function gatedGitRoots(db: Database): string[] {
 }
 
 /**
+ * The subset of gated roots NOT yet seeded ABOVE the floor — a gated root with
+ * NO `git_status` row whose `last_event_id > floor`. This is the per-root analog
+ * of {@link allGatedRootsSeeded}: the readiness gate forces `{kind:unknown}` for
+ * a verdict ONLY when its `effectiveRoot` is in this set, so one stale/failed
+ * root darks only ITS own rows, never the whole board. The empty set ⇔ every
+ * gated root is seeded ⇔ the gate is fully off (byte-identical to the legacy
+ * "seeded" path). Sorted for stable iteration.
+ *
+ * Callers gate the invocation on `seed_required`: while the flag is CLEAR the
+ * gate is off entirely (pass an empty set, never call this) so a clean root that
+ * `retractGitStatus` later DELETEd (going clean drops its `git_status` row) never
+ * re-wedges — the gate is bounded to the `seed_required`-set window.
+ *
+ * PURE: reads only `epics` + `git_status` projections.
+ */
+export function unseededGatedRoots(db: Database, floor: number): Set<string> {
+  const roots = gatedGitRoots(db);
+  const unseeded = new Set<string>();
+  if (roots.length === 0) return unseeded;
+  const stmt = db.prepare(
+    "SELECT 1 FROM git_status WHERE project_dir = ? AND last_event_id > ? LIMIT 1",
+  );
+  for (const root of roots) {
+    if (stmt.get(root, floor) == null) unseeded.add(root);
+  }
+  return unseeded;
+}
+
+/**
  * True iff every gated root has a `git_status` row seeded ABOVE the floor
  * (`last_event_id > floor`) — i.e. a fresh snapshot from this boot's seed or a
  * post-boot live emit, not a stale pre-floor row. The boot-seed and the

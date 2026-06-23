@@ -53,8 +53,9 @@ import {
   selectByIdsChunked,
   selectVersionsByIdsChunked,
 } from "./collections";
-import { openDb, resolveSockPath } from "./db";
+import { openDb, readGitProjectionFloor, resolveSockPath } from "./db";
 import type { RetryDispatchVerb } from "./dispatch-command";
+import { unseededGatedRoots } from "./gated-roots";
 import {
   type BootStatus,
   type ClientFrame,
@@ -1851,6 +1852,21 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
   } catch {
     seedRequired = true;
   }
+  // fn-905: the per-root refinement. Only compute the unseeded set while the
+  // coarse flag is SET — clear ⇒ empty (the gate is fully off, bounded to the
+  // `seed_required`-set window). Defensive: a probe failure degrades to an empty
+  // set, which only over-dispatches in the brief unseeded window — never throws
+  // into the read path (the caller is no-self-heal).
+  let unseededRoots: string[] = [];
+  if (seedRequired) {
+    try {
+      unseededRoots = Array.from(
+        unseededGatedRoots(db, readGitProjectionFloor(db)),
+      );
+    } catch {
+      unseededRoots = [];
+    }
+  }
   return {
     rev,
     head_event_id: head,
@@ -1859,7 +1875,11 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // gate (`!ready`) is the authoritative main-owned signal; the rev<head and
     // seed checks are belt-and-suspenders for the window before boot-complete.
     catching_up: !gate.ready || rev < head || seedRequired,
+    // Coarse boolean (drives `catching_up` + the coarse git-clean consumer).
     git_seed_required: seedRequired,
+    // Per-root refinement so the board renders the SAME per-root `unknown` the
+    // autopilot dispatches against.
+    git_unseeded_roots: unseededRoots,
   };
 }
 

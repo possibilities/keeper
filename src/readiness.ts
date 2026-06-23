@@ -353,14 +353,20 @@ export function computeReadiness(
   // LEAF and never derives it. Appended LAST so default-reliant call sites stay
   // valid.
   eligibleEpicIds?: Set<string>,
-  // fn-897 B1: `git_projection_state.seed_required`. While the live-only git
-  // surface is UNSEEDED (the daemon restarted and the boot-seed hasn't run yet),
-  // it reads EMPTY — so a dispatch decision would race against a surface that
-  // can't yet report dirtiness/orphans. When `true`, EVERY row is forced to
+  // fn-905: the PER-ROOT git-seed gate. While the live-only git surface is
+  // UNSEEDED for a given root (the daemon restarted and the boot-seed hasn't
+  // established a `git_status` row above the floor for it yet), it reads EMPTY —
+  // so a dispatch decision into that root would race against a surface that
+  // can't yet report dirtiness/orphans. Each member is an `effectiveRoot` (keyed
+  // IDENTICALLY to the per-root mutex below) whose surface is unseeded; a row
+  // whose `effectiveRoot` is in the set is forced to
   // `{tag:"blocked", reason:{kind:"unknown"}}` so the autopilot never dispatches
-  // against an unknown surface. Default `false` so steady-state / test / simulator
-  // callers (and the byte-identical re-fold simulator) behave exactly as before.
-  gitSeedRequired = false,
+  // against an unknown surface — but a SEEDED sibling root still dispatches
+  // (bulkhead / fault-isolation), and `""` (rootless) rows are never gated. The
+  // EMPTY set is today's "seeded" path: no row is gated, so steady-state / test /
+  // simulator callers (and the byte-identical re-fold simulator) behave exactly
+  // as before. Producers pass an empty set whenever `seed_required` is CLEAR.
+  unseededRoots: ReadonlySet<string> = new Set<string>(),
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
@@ -498,14 +504,32 @@ export function computeReadiness(
     eligibleEpicIds,
   );
 
-  // fn-897 B1: unseeded git surface → force every row UNKNOWN so the autopilot
-  // can't dispatch against a surface that reads empty only because the boot-seed
-  // hasn't run. Applied AFTER the normal pass (cheaper to overwrite than to gate
-  // every predicate) and BEFORE the header rollup so epics roll up to blocked too.
-  if (gitSeedRequired) {
+  // fn-905: PER-ROOT unseeded-git gate. Force UNKNOWN only for a row whose
+  // `effectiveRoot` is unseeded, so the autopilot can't dispatch into a root
+  // that reads empty merely because the boot-seed hasn't established it — while a
+  // seeded sibling root still dispatches (the coupling is gone). Keyed on the
+  // canonical `effectiveRoot` (task.target_repo ?? epic.project_dir), IDENTICAL
+  // to the per-root mutex above, so the gate and dispatch root-resolution never
+  // drift. `""` (rootless) rows are ungated. Applied AFTER the normal pass
+  // (cheaper to overwrite than to gate every predicate) and BEFORE the header
+  // rollup so a fully-gated epic rolls up to blocked too. Empty set → no-op
+  // (byte-identical to the legacy seeded path).
+  if (unseededRoots.size > 0) {
     const unknown: Verdict = { tag: "blocked", reason: { kind: "unknown" } };
-    for (const key of perTask.keys()) perTask.set(key, unknown);
-    for (const key of perCloseRow.keys()) perCloseRow.set(key, unknown);
+    for (const epic of epicsArr) {
+      const projectDir = stringOrNull(epic.project_dir);
+      for (const task of epic.tasks) {
+        const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
+        if (root !== "" && unseededRoots.has(root)) {
+          perTask.set(task.task_id, unknown);
+        }
+      }
+      // The close row keys on the epic's own project_dir (no per-row override).
+      const closeRoot = effectiveRoot(null, projectDir);
+      if (closeRoot !== "" && unseededRoots.has(closeRoot)) {
+        perCloseRow.set(epic.epic_id, unknown);
+      }
+    }
   }
 
   // Epic header rollup.

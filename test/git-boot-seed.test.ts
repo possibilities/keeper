@@ -27,7 +27,11 @@ import {
   readGitProjectionSeedRequired,
   SCHEMA_VERSION,
 } from "../src/db";
-import { allGatedRootsSeeded, gatedGitRoots } from "../src/gated-roots";
+import {
+  allGatedRootsSeeded,
+  gatedGitRoots,
+  unseededGatedRoots,
+} from "../src/gated-roots";
 import {
   DEFAULT_GIT_SEED_BUDGET_MS,
   seedGitProjection,
@@ -428,6 +432,49 @@ test("transiently-failing gated root leaves ONLY itself unseeded (sibling gated 
   expect(gitStatusRow(flaky)).toBeNull();
   // The gated `flaky` root keeps the flag set until its own emit lands.
   expect(seedRequired()).toBe(true);
+});
+
+test("fn-905: unseededGatedRoots returns ONLY the gated roots lacking an above-floor git_status row", () => {
+  const ok = fakeRoot("gated-ok");
+  const flaky = fakeRoot("gated-flaky");
+  seedOpenEpic("fn-1-mixed", ok, [ok, flaky]);
+  const result = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [ok, flaky],
+    buildSnapshotForRoot: (root) =>
+      root === flaky ? null : dirtySnapshot(root),
+  });
+  expect(result.seededRoots).toEqual([ok]);
+  const floor = readGitProjectionFloor(kdb.db);
+
+  // Only `flaky` (no above-floor row) is unseeded; the seeded `ok` + the
+  // close-row root (`ok` again, the epic's project_dir) are not.
+  const unseeded = unseededGatedRoots(kdb.db, floor);
+  expect(unseeded.has(flaky)).toBe(true);
+  expect(unseeded.has(ok)).toBe(false);
+  // This is exactly the complement of `allGatedRootsSeeded`.
+  expect(allGatedRootsSeeded(kdb.db, floor)).toBe(false);
+
+  // A later above-floor GitSnapshot for `flaky` clears it from the set.
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [flaky, flaky, JSON.stringify(dirtySnapshot(flaky))],
+  );
+  drainAll();
+  expect(unseededGatedRoots(kdb.db, floor).size).toBe(0);
+  expect(allGatedRootsSeeded(kdb.db, floor)).toBe(true);
+});
+
+test("fn-905: with NO gated roots, unseededGatedRoots is empty (the gate is off)", () => {
+  // No open epics → no gated roots → empty set, even with a stale git_status row.
+  kdb.db.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at, state, cwd) VALUES ('j-stale', 1, 1, 'stopped', ?)",
+    [fakeRoot("stale")],
+  );
+  expect(unseededGatedRoots(kdb.db, readGitProjectionFloor(kdb.db)).size).toBe(
+    0,
+  );
 });
 
 // ---------------------------------------------------------------------------

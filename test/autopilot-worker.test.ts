@@ -180,10 +180,10 @@ function makeSnapshot(
     // armed-mode tests override these.
     mode: "yolo",
     armedIds: new Set(),
-    // fn-897 B1: git boot-seed flag. Default `false` (seeded) so every
-    // pre-fn-897 test sees the normal dispatch behavior; the unseeded-gate test
-    // overrides it to `true`.
-    gitSeedRequired: false,
+    // fn-905: the per-root unseeded-git set. Default EMPTY (every root seeded)
+    // so every pre-fn-905 test sees the normal dispatch behavior; the
+    // unseeded-gate tests override it with the roots to gate.
+    unseededRoots: new Set<string>(),
     ...overrides,
   };
 }
@@ -641,15 +641,46 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
   );
 });
 
-test("fn-897 B1: reconcile dispatches NOTHING while the git surface is unseeded", () => {
+test("fn-905: reconcile dispatches NOTHING into an unseeded root", () => {
   const epic = makeEpic({
+    project_dir: "/repo",
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
   });
-  // Same ready epic, but the git surface is unseeded (post-restart, pre-seed):
-  // every readiness row is forced UNKNOWN, so no `work` is dispatched.
-  const snap = makeSnapshot({ epics: [epic], gitSeedRequired: true });
+  // The ready epic's root is unseeded (post-restart, pre-seed): its readiness
+  // row is forced UNKNOWN, so no `work` is dispatched into it.
+  const snap = makeSnapshot({
+    epics: [epic],
+    unseededRoots: new Set(["/repo"]),
+  });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
+});
+
+test("fn-905: an unseeded root blocks only its own rows; a seeded sibling dispatches", () => {
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo-a",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo-b",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  // Only /repo-a is unseeded → only its task is gated UNKNOWN; the seeded
+  // /repo-b sibling still dispatches (the coupling is gone).
+  const snap = makeSnapshot({
+    epics: [epicA, epicB],
+    unseededRoots: new Set(["/repo-a"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const ids = decision.launches.map((l) => l.id);
+  expect(ids).toContain("fn-2-bar.1");
+  expect(ids).not.toContain("fn-1-foo.1");
 });
 
 test("reconcile: ready close row → planned `close` launch", () => {

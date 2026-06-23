@@ -45,7 +45,11 @@ import {
   type BackstopMessage,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import { openDb, readGitProjectionSeedRequired } from "./db";
+import {
+  openDb,
+  readGitProjectionFloor,
+  readGitProjectionSeedRequired,
+} from "./db";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
   agentwrapLaunch,
@@ -54,6 +58,7 @@ import {
   MANAGED_EXEC_SESSION,
   type PaneInfo,
 } from "./exec-backend";
+import { unseededGatedRoots } from "./gated-roots";
 import {
   computeReadiness,
   isRootOccupant,
@@ -394,14 +399,17 @@ export interface ReconcileSnapshot {
    */
   armedIds: Set<string>;
   /**
-   * fn-897 B1: `git_projection_state.seed_required`. While the live-only git
-   * surface is unseeded (post-restart, before the boot-seed), it reads EMPTY —
-   * so `reconcile` forces every row UNKNOWN via `computeReadiness` and dispatches
-   * NOTHING until it seeds. On a normal boot the autopilot worker spawns AFTER the
-   * boot-seed, so this is `false`; it guards the re-fold-migration / restart-race
-   * window where the reconciler could otherwise read an unseeded surface.
+   * fn-905: the PER-ROOT unseeded-git set. While `git_projection_state.seed_required`
+   * is set (post-restart, before the boot-seed establishes every gated root), this
+   * holds each `effectiveRoot` lacking a `git_status` row above the floor — so
+   * `reconcile` forces UNKNOWN (via `computeReadiness`) and dispatches NOTHING into
+   * THOSE roots, while a seeded sibling root still dispatches. While `seed_required`
+   * is CLEAR the set is EMPTY (the gate is fully off — byte-identical to a normal
+   * boot, where the autopilot worker spawns AFTER the boot-seed). Bounding the set
+   * to the `seed_required`-set window keeps a clean root that `retractGitStatus`
+   * later DELETEd from re-wedging.
    */
-  gitSeedRequired: boolean;
+  unseededRoots: Set<string>;
 }
 
 /**
@@ -920,9 +928,10 @@ export function reconcile(
     // mutex's pass-2 tiebreak so an armed epic claims a free root over an
     // earlier-sorted unarmed sibling.
     eligible,
-    // fn-897 B1: unseeded git surface → force every row UNKNOWN (dispatch nothing
-    // until the boot-seed populates the surface).
-    snapshot.gitSeedRequired,
+    // fn-905: the per-root unseeded-git set → force UNKNOWN only for rows whose
+    // `effectiveRoot` is unseeded (dispatch nothing into an unseeded root, while a
+    // seeded sibling root still dispatches). Empty whenever `seed_required` is clear.
+    snapshot.unseededRoots,
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second
@@ -1612,10 +1621,17 @@ export async function loadReconcileSnapshot(
     }
   }
 
-  // fn-897 B1: read the git boot-seed flag so `reconcile` dispatches nothing while
-  // the surface is unseeded. The read connection is the autopilot's own; the
-  // helper degrades a missing row to `true` (treat unknown as unseeded).
-  const gitSeedRequired = readGitProjectionSeedRequired(db);
+  // fn-905: compute the PER-ROOT unseeded set so `reconcile` forces UNKNOWN only
+  // for rows whose `effectiveRoot` is unseeded (a stale/failed root never darks
+  // the whole board). The read connection is the autopilot's own. The gate is
+  // bounded to the `seed_required`-set window: while the flag is CLEAR the set is
+  // EMPTY (the gate is fully off), so a clean root that `retractGitStatus` later
+  // DELETEd never re-wedges. While SET, a root is unseeded iff it has no
+  // `git_status` row with `last_event_id > floor`. The seed-read helper degrades
+  // a missing control row to `true` (treat unknown as unseeded).
+  const unseededRoots = readGitProjectionSeedRequired(db)
+    ? unseededGatedRoots(db, readGitProjectionFloor(db))
+    : new Set<string>();
 
   return {
     epics,
@@ -1628,7 +1644,7 @@ export async function loadReconcileSnapshot(
     pendingDispatches,
     mode,
     armedIds,
-    gitSeedRequired,
+    unseededRoots,
   };
 }
 
