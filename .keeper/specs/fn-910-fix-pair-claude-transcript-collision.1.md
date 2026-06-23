@@ -82,5 +82,5 @@ claude receives `--session-id` matching run.json `transcriptSessionId`. Run
 - [ ] `bun test`, `bun lint`, `bun typecheck` pass.
 
 ## Done summary
-
+Pinned the claude/pi partner transcript end-to-end: the AGENTWRAP_TMUX_SESSION_ID carrier is now forwarded into the pane via -e so the inner re-exec uses the same uuid as run.json transcriptSessionId; strict pinned resolution returns exact-or-null (no newest-by-mtime collision; codex unchanged); waitForTranscriptStop is bounded by a 600s deadline mapped to the retryable exit. Added decoy-collision and bounded-wait regression tests.
 ## Evidence
