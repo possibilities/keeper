@@ -29,5 +29,5 @@ this is a contract-coherence fix, not a behavior change.
 - [ ] keeper-side `parseShowLastMessageJson` / `buildPairOutput` remain correct under the chosen resolution (verified, not just assumed).
 
 ## Done summary
-
+Resolved the empty-turn found contract via resolution (b): a claude tool-only final turn reads as found:false, and the findLastMessage JSDoc, two test names, and the line-357 comment now all state that. Verified keeper-side parseShowLastMessageJson/buildPairOutput map both null cases to message:"", benign under this story.
 ## Evidence

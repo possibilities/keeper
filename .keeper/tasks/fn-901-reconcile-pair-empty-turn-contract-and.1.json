@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/agentwrap",
   "tier": "medium",
   "title": "Reconcile empty-turn found contract",
-  "updated_at": "2026-06-23T00:18:29.502000Z"
+  "updated_at": "2026-06-23T00:33:19.806000Z",
+  "worker_done_at": "2026-06-23T00:33:19.806000Z"
 }
