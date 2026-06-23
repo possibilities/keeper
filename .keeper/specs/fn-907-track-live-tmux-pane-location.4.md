@@ -51,5 +51,5 @@ interrupted seed re-seeds on the next boot (`seed_required` stays 1).
 - [ ] An interrupted seed leaves `seed_required=1` and re-seeds next boot.
 
 ## Done summary
-
+Add seedTmuxProjection (src/tmux-boot-seed.ts): boot-seeds the whole-server tmux pane topology before serving, overwriting each live tmux job's session + window_index, raising the tmux skip-floor, and clearing seed_required only on a successful probe (degrade-not-fatal). Wired into serveBootDrain after seedGitProjection, gated on want(restore), before the actuator/RPC gate.
 ## Evidence
