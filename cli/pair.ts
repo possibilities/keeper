@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
  * `keeper pair send` — fan a task out to another model CLI (claude / codex) via
- * agentwrap, driven from the orchestrating session's Monitor tool. Ports
- * pairctl's pairing ergonomics into keeper, delegating the tmux transport +
- * model/effort selection to agentwrap.
+ * agentwrap, driven from the orchestrating session's Monitor tool. Owns the
+ * pairing ergonomics, delegating the tmux transport + model/effort selection to
+ * agentwrap.
  *
  * STDOUT IS THE MONITOR EVENT CHANNEL. Every run emits exactly one
  * `[keeper-pair] started ...` line followed by exactly one terminal line —

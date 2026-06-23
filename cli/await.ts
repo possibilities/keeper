@@ -133,8 +133,7 @@ skills/await/SKILL.md.
 
 /**
  * Strip CR/LF from a value so an embedded newline can't spoof an
- * adjacent `[keeper-await] …` event. Mirrors the pairctl `emit_event`
- * convention.
+ * adjacent `[keeper-await] …` event.
  */
 function sanitizeValue(v: string): string {
   return v.replace(/[\r\n]/g, " ");

@@ -1,10 +1,10 @@
 /**
  * Pure, dep-free plumbing for `keeper pair` — the pairing helper that fans a
  * task out to another model CLI (claude / codex) via agentwrap as the spawn
- * transport, driven from the orchestrating session's Monitor tool. Ports
- * pairctl's pairing ergonomics (role prompts, read-only posture, output
- * normalization, the Monitor two-line stdout contract) into keeper, delegating
- * the tmux transport + model/effort selection to agentwrap.
+ * transport, driven from the orchestrating session's Monitor tool. Owns the
+ * pairing ergonomics — role prompts, read-only posture, output normalization,
+ * the Monitor two-line stdout contract — and delegates the tmux transport +
+ * model/effort selection to agentwrap.
  *
  * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module holds
  * the pure builders only — role loading, prompt assembly, the per-CLI agentwrap
@@ -34,8 +34,8 @@ import yaml from "js-yaml";
 // CLIs, roles, read-only directive
 // ---------------------------------------------------------------------------
 
-/** The partner CLIs `keeper pair` can fan out to. Mirrors agentwrap's agent
- *  kinds minus `pi` (no pairctl posture is ported for pi). */
+/** The partner CLIs `keeper pair` can fan out to — agentwrap's agent kinds
+ *  minus `pi` (no pairing posture is defined for pi). */
 export type PairCli = "claude" | "codex";
 
 export const PAIR_CLIS: ReadonlySet<string> = new Set<PairCli>([
@@ -59,10 +59,9 @@ export function isPairRole(value: string): value is PairRole {
 
 /**
  * The read-only directive prepended to the prompt when `--read-only` is set.
- * Ported verbatim from pairctl (`helpers.py:READ_ONLY_DIRECTIVE`). The directive
- * is the PRIMARY read-only mechanism — purpose-built and visible in the
- * partner's transcript — because the tool strip (`--disallowed-tools`) is leaky
- * (Bash `>` redirection, git, `sed -i` all escape it). The git changed-files
+ * The directive is the PRIMARY read-only mechanism — purpose-built and visible
+ * in the partner's transcript — because the tool strip (`--disallowed-tools`) is
+ * leaky (Bash `>` redirection, git, `sed -i` all escape it). The git changed-files
  * snapshot backstops the directive: detection, not prevention.
  */
 export const READ_ONLY_DIRECTIVE =
@@ -120,11 +119,10 @@ export function loadRolePrompt(
 // ---------------------------------------------------------------------------
 
 /**
- * Build the full prompt the partner receives, mirroring pairctl's turn-1
- * `format_prompt`: prepend the read-only directive (when set), then the role's
- * system prompt, then the user message. Each block is separated by a blank
- * line. `keeper pair` is single-turn (no resume), so this is always the turn-1
- * shape. Pure — exported for tests.
+ * Build the full prompt the partner receives: prepend the read-only directive
+ * (when set), then the role's system prompt, then the user message. Each block
+ * is separated by a blank line. `keeper pair` is single-turn (no resume), so
+ * this is always the turn-1 shape. Pure — exported for tests.
  */
 export function assemblePrompt(args: {
   message: string;
@@ -203,8 +201,7 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
  * headless; the read-only posture strips the edit tools via `--disallowed-tools`
  * (the directive is the primary guard, the strip reinforces it). The write
  * posture accepts edits + skips permission prompts so the partner can edit.
- * Ported from pairctl's `config/claude.yaml` permission_args. Pure — exported
- * for tests.
+ * Pure — exported for tests.
  */
 export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
   const args = ["--print", "-p"];
@@ -240,8 +237,8 @@ export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
  * search. codex read-only is carried by the directive ONLY (no native codex
  * flag fits "politely explore" — `-s read-only` would also disable web search),
  * so read-only KEEPS the same exec flags as write and KEEPS `--enable
- * web_search_request`. The git changed-files snapshot backstops it. Ported from
- * pairctl's `config/codex.yaml`. Pure — exported for tests.
+ * web_search_request`. The git changed-files snapshot backstops it. Pure —
+ * exported for tests.
  */
 export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
   const args = [
@@ -421,8 +418,7 @@ export function parseShowLastMessageJson(stdout: string): ParseShowResult {
  * Diff two `git status --porcelain` snapshots (each a set of porcelain lines)
  * into the sorted list of changed file paths. A `null` snapshot (not a git repo
  * / git unavailable) yields an empty diff — we cannot detect a violation, so we
- * report none. Mirrors pairctl's `_compute_changed_files`. Pure — exported for
- * tests.
+ * report none. Pure — exported for tests.
  */
 export function diffGitSnapshots(
   before: ReadonlySet<string> | null,
@@ -449,8 +445,8 @@ export function diffGitSnapshots(
 
 /**
  * Parse `git status --porcelain` stdout into a set of lines. Does NOT strip
- * leading spaces — they are part of the porcelain status format. Mirrors
- * pairctl's `_git_status_snapshot`. Pure — exported for tests.
+ * leading spaces — they are part of the porcelain status format. Pure —
+ * exported for tests.
  */
 export function parseGitPorcelain(stdout: string): Set<string> {
   const trimmed = stdout.replace(/\n+$/, "");
@@ -465,8 +461,8 @@ export function parseGitPorcelain(stdout: string): Set<string> {
 // ---------------------------------------------------------------------------
 
 /**
- * Strip every `CLAUDE`-prefixed env var from a copy of the base env, mirroring
- * pairctl's env scrub. The partner runs as its own session — leaking the
+ * Strip every `CLAUDE`-prefixed env var from a copy of the base env. The
+ * partner runs as its own session — leaking the
  * orchestrator's `CLAUDE*` env (config dir, session ids, project context) would
  * cross-contaminate its identity. Returns a fresh object; the input is never
  * mutated. Pure — exported for tests.
@@ -484,7 +480,7 @@ export function stripClaudeEnv(
 }
 
 // ---------------------------------------------------------------------------
-// Output-YAML assembly — pairctl's `--output` contract
+// Output-YAML assembly — the `--output` result contract
 // ---------------------------------------------------------------------------
 
 /** Inputs to {@link buildPairOutput}. */
@@ -509,8 +505,8 @@ export interface PairOutputOpts {
 }
 
 /**
- * Assemble the `--output` payload mirroring pairctl's result contract: a top
- * `message` (the partner's final answer), the cli/role echo, the transcript +
+ * Assemble the `--output` payload: a top `message` (the partner's final
+ * answer), the cli/role echo, the transcript +
  * session drill-down keys, and — on a read-only run that touched the tree — a
  * `read_only_violation` list flagging the leak. Returns the structured object;
  * the caller serializes it to YAML. Pure — exported for tests.
