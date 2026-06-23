@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-23T01:37:29.834000Z",
+  "depends_on": [],
+  "epic": "fn-906-retire-planctl-name-across-plan-plugin",
+  "id": "fn-906-retire-planctl-name-across-plan-plugin.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "retire planctl name from plan plugin and api docs",
+  "updated_at": "2026-06-23T01:37:29.834000Z"
+}
