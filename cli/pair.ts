@@ -47,6 +47,7 @@ import {
   buildShowLastMessageArgv,
   buildWaitForStopArgv,
   diffGitSnapshots,
+  isSelfTranscriptCollision,
   loadRolePrompt,
   PAIR_CLIS,
   type PairCli,
@@ -373,6 +374,20 @@ export async function main(argv: string[]): Promise<void> {
 
   // The partner has stopped; reap its window now that we have the message.
   killWindow(reapPaneId);
+
+  // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
+  // if the resolver fell back to newest-by-mtime and won the DRIVER's own
+  // concurrently-written transcript, never surface that as a `completed` carrying
+  // a bogus answer — fail loud. Read the driver's session id from the orchestrator
+  // env (before stripClaudeEnv scrubbed it for the partner).
+  if (
+    isSelfTranscriptCollision(
+      showParse.result.transcriptPath,
+      process.env.CLAUDE_CODE_SESSION_ID,
+    )
+  ) {
+    return fail("self-transcript-collision");
+  }
 
   const afterSnapshot = readOnly ? gitSnapshot(cwd) : null;
   const changedFiles = diffGitSnapshots(beforeSnapshot, afterSnapshot);

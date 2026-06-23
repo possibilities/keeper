@@ -543,6 +543,35 @@ export function pairOutputYaml(output: Record<string, unknown>): string {
   return yaml.dump(output, { lineWidth: -1 });
 }
 
+/**
+ * Self-collision guard: true when the partner's resolved transcript belongs to
+ * the DRIVER, not the spawned partner. claude-code transcripts are
+ * `<session-uuid>.jsonl`; when the resolver falls back to newest-by-mtime it can
+ * win the driver's concurrently-written transcript, so its basename (minus the
+ * `.jsonl` suffix) equals the driver's `CLAUDE_CODE_SESSION_ID`. On a match the
+ * caller must emit `failed` (`error=self-transcript-collision`) rather than a
+ * bogus `completed` carrying the driver's own answer. `null`/empty inputs never
+ * collide. Pure — exported for tests.
+ */
+export function isSelfTranscriptCollision(
+  transcriptPath: string | null,
+  driverSessionId: string | null | undefined,
+): boolean {
+  if (
+    transcriptPath == null ||
+    transcriptPath === "" ||
+    driverSessionId == null ||
+    driverSessionId === ""
+  ) {
+    return false;
+  }
+  const base = transcriptPath.slice(transcriptPath.lastIndexOf("/") + 1);
+  const sessionId = base.endsWith(".jsonl")
+    ? base.slice(0, -".jsonl".length)
+    : base;
+  return sessionId === driverSessionId;
+}
+
 // ---------------------------------------------------------------------------
 // agentwrap path resolution (tilde-expanded; mirrors src/db.ts)
 // ---------------------------------------------------------------------------

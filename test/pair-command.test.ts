@@ -15,6 +15,7 @@ import {
   buildWaitForStopArgv,
   diffGitSnapshots,
   isPairRole,
+  isSelfTranscriptCollision,
   loadRolePrompt,
   nativeClaudeArgs,
   nativeCodexArgs,
@@ -435,6 +436,37 @@ test("buildPairOutput: null message serializes to an empty string message", () =
     handle: "h",
   });
   expect(out.message).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// self-transcript-collision guard
+// ---------------------------------------------------------------------------
+
+test("isSelfTranscriptCollision: basename == driver session id collides", () => {
+  const sid = "abc123-uuid";
+  expect(
+    isSelfTranscriptCollision(
+      `/home/u/.claude/projects/encoded-cwd/${sid}.jsonl`,
+      sid,
+    ),
+  ).toBe(true);
+});
+
+test("isSelfTranscriptCollision: partner transcript (different uuid) does not collide", () => {
+  expect(
+    isSelfTranscriptCollision(
+      "/home/u/.claude/projects/encoded-cwd/partner-uuid.jsonl",
+      "driver-uuid",
+    ),
+  ).toBe(false);
+});
+
+test("isSelfTranscriptCollision: null/empty inputs never collide", () => {
+  expect(isSelfTranscriptCollision(null, "driver")).toBe(false);
+  expect(isSelfTranscriptCollision("/p/driver.jsonl", null)).toBe(false);
+  expect(isSelfTranscriptCollision("/p/driver.jsonl", undefined)).toBe(false);
+  expect(isSelfTranscriptCollision("", "driver")).toBe(false);
+  expect(isSelfTranscriptCollision("/p/driver.jsonl", "")).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
