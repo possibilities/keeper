@@ -74,7 +74,7 @@ Optional flags (both forms unless noted):
 | Flag | Meaning |
 |---|---|
 | `--dry-run` | Print the resolved launch plan (`session` / `cwd` / `key` / `prompt-from` / `argv`) and launch NOTHING. Run this first to preview. |
-| `--session <s>` | Target tmux session (overrides every fallback). Default precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX` current > `foreground`. |
+| `--session <s>` | Target tmux session (overrides every fallback). Default precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX` current > `work`. |
 | `--cwd <dir>` | Free form only: working dir (defaults to `process.cwd()`). Plan form resolves cwd from the board. |
 | `--model <m>` | Pass `--model` through to claude. |
 | `--effort <e>` | Pass `--effort` through to claude. |
@@ -137,7 +137,7 @@ keeper dispatch work::fn-N-slug.M
 
 On success it prints `dispatched <label> → session <session>` and exits 0
 (plus a `tmux attach -t <session>` hint when launched outside tmux into the
-`foreground` session). Surface that line to the user.
+`work` session). Surface that line to the user.
 
 ### The race-guard refusal (plan form)
 

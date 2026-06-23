@@ -286,13 +286,13 @@ test("deriveRestoreSet: a NULL live session falls back to the birth session for 
     job_id: "born",
     close_kind: "server_gone",
     backend_exec_session_id: null,
-    backend_exec_birth_session_id: "background",
+    backend_exec_birth_session_id: "work",
   });
   const candidates = derive().candidates;
   expect(candidates.map((c) => c.job_id)).toEqual(["born"]);
   // The resolved session is the birth session, so the restore offer groups it
   // under its launch session rather than dropping it.
-  expect(candidates[0]?.backend_exec_session_id).toBe("background");
+  expect(candidates[0]?.backend_exec_session_id).toBe("work");
 });
 
 test("deriveRestoreSet: autopilot workers (plan_verb='work') are excluded", () => {
@@ -458,14 +458,14 @@ test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by w
     state: "stopped",
     title: "second",
     window_index: 2,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "work",
   });
   seedJob(kdb.db, {
     job_id: "w1",
     state: "working",
     title: "first",
     window_index: 1,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "work",
   });
   // A killed row is NOT a current-live snapshot member.
   seedJob(kdb.db, {
@@ -494,7 +494,7 @@ test("deriveCurrentSet: a never-named live session falls back to its job_id", ()
     job_id: "unnamed-uuid",
     state: "working",
     title: null,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "work",
   });
   const cur = deriveCurrentSet(kdb.db);
   expect(cur).toHaveLength(1);

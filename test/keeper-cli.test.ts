@@ -418,18 +418,18 @@ describe("cli/dispatch resolveSession", () => {
     expect(r).toEqual({ session: "current", attachHint: false });
   });
 
-  test("foreground fallback + attach hint when outside tmux", () => {
+  test("work fallback + attach hint when outside tmux", () => {
     const r = resolveSession({ sessionFlag: undefined, env: {} });
-    expect(r).toEqual({ session: "foreground", attachHint: true });
+    expect(r).toEqual({ session: "work", attachHint: true });
   });
 
-  test("inside tmux but probe fails → foreground, NO attach hint", () => {
+  test("inside tmux but probe fails → work, NO attach hint", () => {
     const r = resolveSession({
       sessionFlag: undefined,
       env: { TMUX: "/tmp/tmux" },
       probeCurrentSession: () => null,
     });
-    expect(r).toEqual({ session: "foreground", attachHint: false });
+    expect(r).toEqual({ session: "work", attachHint: false });
   });
 
   test("empty $KEEPER_TMUX_SESSION is skipped (falls through to tmux probe)", () => {

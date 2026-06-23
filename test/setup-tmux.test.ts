@@ -180,16 +180,16 @@ describe("dash build plan", () => {
 
 describe("work-session mint", () => {
   test("new-session detached, cwd set, KEEPER_TMUX_SESSION stamped via -e", () => {
-    expect(buildWorkNewSessionArgs("background")).toEqual([
+    expect(buildWorkNewSessionArgs("work")).toEqual([
       "tmux",
       "new-session",
       "-d",
       "-s",
-      "background",
+      "work",
       "-c",
       KEEPER_DIR,
       "-e",
-      "KEEPER_TMUX_SESSION=background",
+      "KEEPER_TMUX_SESSION=work",
     ]);
   });
 });
@@ -234,13 +234,13 @@ describe("isBusyCommand", () => {
 describe("parseBusyPanes", () => {
   test("classifies shell vs non-shell across a canned sweep", () => {
     const sweep = [
-      "background\t0\tzsh\tshell-window",
-      "background\t1\tnvim\teditor",
-      "background\t2\t-bash\tlogin-shell",
+      "work\t0\tzsh\tshell-window",
+      "work\t1\tnvim\teditor",
+      "work\t2\t-bash\tlogin-shell",
     ].join("\n");
     expect(parseBusyPanes(sweep)).toEqual([
       {
-        session: "background",
+        session: "work",
         windowIndex: "1",
         command: "nvim",
         windowName: "editor",
@@ -249,10 +249,10 @@ describe("parseBusyPanes", () => {
   });
 
   test("embedded TAB in window_name is absorbed by the bounded split", () => {
-    const sweep = "foreground\t3\tclaude\tname\twith\ttab";
+    const sweep = "work\t3\tclaude\tname\twith\ttab";
     expect(parseBusyPanes(sweep)).toEqual([
       {
-        session: "foreground",
+        session: "work",
         windowIndex: "3",
         command: "claude",
         windowName: "name\twith\ttab",
@@ -338,7 +338,7 @@ describe("resolveDashSize", () => {
 // ---------------------------------------------------------------------------
 
 describe("sweepBusyPanes", () => {
-  test("aggregates busy panes across the three work sessions, skips absent", () => {
+  test("aggregates busy panes across the two work sessions, skips absent", () => {
     const calls: string[][] = [];
     // list-panes returns the same canned table for every session here; the
     // session arg differs but the stub keys on cmd[0]:cmd[1].
@@ -352,9 +352,9 @@ describe("sweepBusyPanes", () => {
       calls,
     );
     const busy = sweepBusyPanes(spawn);
-    // Three sessions swept.
-    expect(calls.filter((c) => c[1] === "list-panes")).toHaveLength(3);
-    expect(busy).toHaveLength(3);
+    // Two sessions swept.
+    expect(calls.filter((c) => c[1] === "list-panes")).toHaveLength(2);
+    expect(busy).toHaveLength(2);
     expect(busy.every((p) => p.command === "nvim")).toBe(true);
   });
 
@@ -543,24 +543,23 @@ describe("main() --kill-sessions busy-pane gate", () => {
 
 describe("buildRestoreAgentsArgv", () => {
   test("spawns restore-agents --apply --session <name> --last-generation per session", () => {
-    for (const session of ["foreground", "background"]) {
-      const argv = buildRestoreAgentsArgv(session);
-      expect(argv[0]).toBe("bun");
-      expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
-      expect(argv.slice(2)).toEqual([
-        "--apply",
-        "--session",
-        session,
-        "--last-generation",
-      ]);
-    }
+    const session = "work";
+    const argv = buildRestoreAgentsArgv(session);
+    expect(argv[0]).toBe("bun");
+    expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
+    expect(argv.slice(2)).toEqual([
+      "--apply",
+      "--session",
+      session,
+      "--last-generation",
+    ]);
   });
 });
 
 // ---------------------------------------------------------------------------
 // main() restore-last-session offer. The offer must be computed BEFORE any
 // session-creating call (rebuildDash/ensureWorkSessions mint a new server =
-// new generation) and fire ONLY when foreground is absent AND count>0 AND TTY.
+// new generation) and fire ONLY when `work` is absent AND count>0 AND TTY.
 // ---------------------------------------------------------------------------
 
 /** True iff `calls` contains the exact restore-agents argv for `session`. */
@@ -572,7 +571,7 @@ const spawnedRestoreFor = (calls: string[][], session: string): boolean => {
 };
 /** True iff ANY restore-agents argv (any session) was spawned. */
 const spawnedAnyRestore = (calls: string[][]): boolean =>
-  ["foreground", "background"].some((s) => spawnedRestoreFor(calls, s));
+  ["work"].some((s) => spawnedRestoreFor(calls, s));
 
 /**
  * Spawn stub for the offer path: `has-session` returns the per-session exit from
@@ -658,67 +657,50 @@ async function runWithTTY(opts: {
 }
 
 describe("main() restore-last-session offer", () => {
-  test("both absent + counts>0 + TTY + y ⇒ spawns restore-agents per session", async () => {
+  test("work absent + count>0 + TTY + y ⇒ spawns restore-agents for work", async () => {
     const calls: string[][] = [];
-    // foreground + background both absent (has-session exits 1, the default).
+    // work absent (has-session exits 1, the default).
     const spawn = makeOfferStub({}, calls);
     await runWithTTY({
       spawn,
-      counts: { foreground: 2, background: 3 },
+      counts: { work: 2 },
       tty: true,
       answer: "y",
     });
 
-    // Both offered sessions spawn their own restore-agents argv.
-    expect(spawnedRestoreFor(calls, "foreground")).toBe(true);
-    expect(spawnedRestoreFor(calls, "background")).toBe(true);
-    // Ordering: BOTH has-session absence probes precede the first
+    // The offered session spawns its restore-agents argv.
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
+    // Ordering: the has-session absence probe precedes the first
     // session-creating call (dash new-session), so the kill-anchored generation
     // window isn't shifted before the counts/probes are read.
     const newSessionIdx = calls.findIndex((c) => c[1] === "new-session");
     expect(newSessionIdx).toBeGreaterThanOrEqual(0);
-    for (const session of ["foreground", "background"]) {
-      const probeIdx = calls.findIndex(
-        (c) => c[1] === "has-session" && c[3] === `=${session}`,
-      );
-      expect(probeIdx).toBeGreaterThanOrEqual(0);
-      expect(newSessionIdx).toBeGreaterThan(probeIdx);
-    }
+    const probeIdx = calls.findIndex(
+      (c) => c[1] === "has-session" && c[3] === "=work",
+    );
+    expect(probeIdx).toBeGreaterThanOrEqual(0);
+    expect(newSessionIdx).toBeGreaterThan(probeIdx);
   });
 
-  test("foreground present + background absent ⇒ only background offered/spawned", async () => {
+  test("work present ⇒ no offer, no spawn", async () => {
     const calls: string[][] = [];
-    // foreground present (exit 0), background absent (default exit 1).
-    const spawn = makeOfferStub({ foreground: 0 }, calls);
+    const spawn = makeOfferStub({ work: 0 }, calls);
+    // count>0 and TTY would otherwise prompt — presence must short-circuit.
     await runWithTTY({
       spawn,
-      counts: { foreground: 2, background: 3 },
-      tty: true,
-      answer: "y",
-    });
-    expect(spawnedRestoreFor(calls, "foreground")).toBe(false);
-    expect(spawnedRestoreFor(calls, "background")).toBe(true);
-  });
-
-  test("both present ⇒ no offer, no spawn", async () => {
-    const calls: string[][] = [];
-    const spawn = makeOfferStub({ foreground: 0, background: 0 }, calls);
-    // counts>0 and TTY would otherwise prompt — presence must short-circuit.
-    await runWithTTY({
-      spawn,
-      counts: { foreground: 5, background: 5 },
+      counts: { work: 5 },
       tty: true,
       answer: "y",
     });
     expect(spawnedAnyRestore(calls)).toBe(false);
   });
 
-  test("both absent + counts>0 + TTY + N (EOF) ⇒ no spawn", async () => {
+  test("work absent + count>0 + TTY + N (EOF) ⇒ no spawn", async () => {
     const calls: string[][] = [];
     const spawn = makeOfferStub({}, calls);
     await runWithTTY({
       spawn,
-      counts: { foreground: 2, background: 3 },
+      counts: { work: 2 },
       tty: true,
       answer: "",
     });
@@ -728,25 +710,23 @@ describe("main() restore-last-session offer", () => {
   test("absent but count-0 ⇒ dropped, no offer/spawn", async () => {
     const calls: string[][] = [];
     const spawn = makeOfferStub({}, calls);
-    // foreground absent with candidates, background absent but count 0 ⇒ only
-    // foreground is offered; background is dropped.
+    // work absent but count 0 ⇒ not offered.
     await runWithTTY({
       spawn,
-      counts: { foreground: 2, background: 0 },
+      counts: { work: 0 },
       tty: true,
       answer: "y",
     });
-    expect(spawnedRestoreFor(calls, "foreground")).toBe(true);
-    expect(spawnedRestoreFor(calls, "background")).toBe(false);
+    expect(spawnedRestoreFor(calls, "work")).toBe(false);
   });
 
   test("non-TTY ⇒ never auto-restores, no spawn", async () => {
     const calls: string[][] = [];
     const spawn = makeOfferStub({}, calls);
-    // counts>0 but non-TTY must skip silently (never auto-yes).
+    // count>0 but non-TTY must skip silently (never auto-yes).
     await runWithTTY({
       spawn,
-      counts: { foreground: 3, background: 3 },
+      counts: { work: 3 },
       tty: false,
       answer: "y",
     });

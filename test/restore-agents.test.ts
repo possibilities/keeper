@@ -150,7 +150,7 @@ test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-
       label: "first-name",
       cwd: "/repo/a",
       window_index: 1,
-      backend_exec_session_id: "foreground",
+      backend_exec_session_id: "work",
     }),
     fakeCandidate({
       job_id: "j2",
@@ -158,7 +158,7 @@ test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-
       label: "second-name",
       cwd: "/repo/b",
       window_index: 2,
-      backend_exec_session_id: "foreground",
+      backend_exec_session_id: "work",
     }),
   ];
   const script = renderSnapshotScript(
@@ -170,8 +170,8 @@ test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-
   expect(script.startsWith("#!/usr/bin/env bash\n")).toBe(true);
   expect(script).toContain("set -euo pipefail");
   // Get-or-create the session before its windows (every argv token single-quoted).
-  expect(script).toContain("'tmux' 'has-session' '-t' '=foreground'");
-  expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'foreground'");
+  expect(script).toContain("'tmux' 'has-session' '-t' '=work'");
+  expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'work'");
   // Resume by the LATEST name, never the job_id UUID.
   expect(script).toContain('claude --resume "first-name"');
   expect(script).toContain('claude --resume "second-name"');
@@ -188,7 +188,7 @@ test("renderSnapshotScript --session filter narrows to one bucket", () => {
       job_id: "a",
       resume_target: "a-name",
       label: "a-name",
-      backend_exec_session_id: "foreground",
+      backend_exec_session_id: "work",
     }),
     fakeCandidate({
       job_id: "b",
@@ -607,14 +607,14 @@ test("loadLastGenerationSet bounds to the last generation; the full set offers m
     close_kind: "server_gone",
     window_index: 0,
     last_event_id: 150,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "work",
   });
   seedJob(kdb.db, {
     job_id: "last-gen-a",
     close_kind: "server_gone",
     window_index: 1,
     last_event_id: 250,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "work",
   });
   seedJob(kdb.db, {
     job_id: "last-gen-b",
@@ -636,15 +636,15 @@ test("loadLastGenerationSet bounds to the last generation; the full set offers m
   );
 });
 
-test("loadLastGenerationSet composes with the --session foreground filter", () => {
+test("loadLastGenerationSet composes with the --session filter", () => {
   // Two last-generation kills in different sessions; planRestore narrows to one.
   seedBackendExecStart(kdb.db, 100);
   seedJob(kdb.db, {
-    job_id: "fg-agent",
+    job_id: "legacy-agent",
     close_kind: "server_gone",
     window_index: 0,
     last_event_id: 150,
-    backend_exec_session_id: "foreground",
+    backend_exec_session_id: "legacy",
   });
   seedJob(kdb.db, {
     job_id: "work-agent",
@@ -657,11 +657,11 @@ test("loadLastGenerationSet composes with the --session foreground filter", () =
 
   const { candidates } = loadLastGenerationSet(dbPath);
   expect(candidates.map((c) => c.job_id).sort()).toEqual([
-    "fg-agent",
+    "legacy-agent",
     "work-agent",
   ]);
-  // --session foreground narrows to the foreground bucket only.
-  const plan = planRestore(candidates, "foreground");
+  // --session work narrows to the work bucket only.
+  const plan = planRestore(candidates, "work");
   expect(plan).toHaveLength(1);
-  expect(plan[0].candidate.job_id).toBe("fg-agent");
+  expect(plan[0].candidate.job_id).toBe("work-agent");
 });

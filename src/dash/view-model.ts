@@ -14,7 +14,7 @@
  * `ACTIVE_THEME` / `FA_CLASSIC` (the board/jobs `fa-classic` glyphs) are untouched.
  *
  * Lines group by tmux session (`backend_exec_session_id`) — the priority
- * sessions `foreground` / `background` / `autopilot` first, then any other named
+ * sessions `work` / `autopilot` first, then any other named
  * session alphabetically, then the `detached` band (no recorded session) last.
  * Within a band, lines sort by live tmux `window_index` (the window's
  * left-to-right VISUAL position) ascending so the board matches the operator's
@@ -144,11 +144,7 @@ export type BandKey = string;
 /** The session bands ranked first, in this render order, whenever present. Any
  * other named session follows them alphabetically; {@link DETACHED_KEY} is
  * always last. */
-const SESSION_PRIORITY: readonly string[] = [
-  "foreground",
-  "background",
-  "autopilot",
-];
+const SESSION_PRIORITY: readonly string[] = ["work", "autopilot"];
 
 /** The band key for a job with no recorded tmux session (NULL/blank
  * `backend_exec_session_id`). Empty so an all-ESC/blank session name folds here

@@ -635,11 +635,11 @@ Keeper has no `install` verb. Wire it up manually:
 
 10. **(Optional) Provision the tmux control plane** — `keeper setup-tmux`
     stands up the `dash` dashboard session (board + autopilot/jobs/git/builds/
-    usage panes, all in `~/code/keeper`) and ensures the `autopilot`,
-    `background`, and `foreground` work sessions exist (one shell window each,
+    usage panes, all in `~/code/keeper`) and ensures the `autopilot`
+    and `work` work sessions exist (one shell window each,
     stamped with `KEEPER_TMUX_SESSION`). It rebuilds `dash` on every run, never
     attaches or `switch-client`s (safe inside or outside tmux), and leaves
-    existing work sessions untouched. `--kill-sessions` tears all four down
+    existing work sessions untouched. `--kill-sessions` tears all three down
     first, prompting only when the work sessions hold busy panes:
 
     ```sh
@@ -1051,14 +1051,14 @@ event-log/reducer/hook touch. Run any of them with
   still bind to that plan row; excluding dispatch names from keeper's
   correlation/renaming is a deeper hook change, not done here.) The target tmux
   session resolves `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX`-gated current
-  session > the managed `foreground`. The plan form runs a best-effort race
+  session > the managed `work`. The plan form runs a best-effort race
   guard (a pending dispatch, an unpaused autopilot, or a live job for the key
   refuses unless `--force`; the read↔launch TOCTOU is inherent and accepted for
   a manual hatch).
 
   ```sh
-  keeper dispatch work::fn-1-foo.2                       # plan form → current/foreground session
-  keeper dispatch close::fn-1-foo --session background   # plan form, explicit session
+  keeper dispatch work::fn-1-foo.2                       # plan form → current/work session
+  keeper dispatch close::fn-1-foo --session work         # plan form, explicit session
   keeper dispatch work::fn-1-foo.2 --dry-run             # print the launch plan, launch nothing
   keeper dispatch --prompt 'investigate the flaky X test'         # free form, no --name
   keeper dispatch --prompt 'investigate X' --name scratch         # --name forwarded to claude verbatim
@@ -1363,15 +1363,15 @@ log.
 - `setup-tmux.ts` — stand up the human's tmux control plane. Rebuilds the
   `dash` dashboard session every run (board main pane + autopilot/jobs/git/
   builds/usage splits, `main-vertical`, each pane a `zsh -ic '…; exec $SHELL'`
-  triple sized to the real client/terminal) and ensures the `autopilot`,
-  `background`, and `foreground` work sessions exist (one shell window each,
+  triple sized to the real client/terminal) and ensures the `autopilot`
+  and `work` work sessions exist (one shell window each,
   stamped `KEEPER_TMUX_SESSION=<name>` so hook attribution matches daemon-minted
   sessions). Existing work sessions are never touched; it NEVER attaches or
   `switch-client`s, so it is safe inside or outside tmux. `--kill-sessions`
-  tears all four sessions down first, prompting y/N only when the work sessions
+  tears all three sessions down first, prompting y/N only when the work sessions
   hold busy (non-shell foreground) panes — non-TTY stdin with busy panes aborts
-  (exit 1) having killed nothing. When a human work session (`foreground` or
-  `background`) is ABSENT (the first run after a crash), it offers to relaunch
+  (exit 1) having killed nothing. When the human `work` session
+  is ABSENT (the first run after a crash), it offers to relaunch
   the last tmux-server generation's crashed agents for it — ONE combined y/N
   TTY-only prompt naming each absent session and its own candidate count (never
   auto-restores; counts and absence probes computed BEFORE any session-creating

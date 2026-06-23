@@ -1263,17 +1263,17 @@ test("agentwrapLaunch: a per-call session targets that session, not the managed 
   const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
-    session: "foreground",
+    session: "work",
     cwd: "/proj",
-    label: "session=foreground",
+    label: "session=work",
     spec: { prompt: "/plan:work fn-1-x.1", claudeName: "work::fn-1-x.1" },
     spawn,
   });
   expect(res).toEqual({ ok: true });
   expect(records[0]?.cmd[0]).toBe(AWP);
   // Per-call session targeted, not the managed default.
-  expect(records[0]?.cmd).toContain("foreground");
-  expect(records[0]?.cmd).toContain("KEEPER_TMUX_SESSION=foreground");
+  expect(records[0]?.cmd).toContain("work");
+  expect(records[0]?.cmd).toContain("KEEPER_TMUX_SESSION=work");
 });
 
 // ---------------------------------------------------------------------------

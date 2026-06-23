@@ -31,8 +31,8 @@
  * failure), arg fault → 2 (mode misuse, bad prompt), `--help` → 0.
  *
  * Session resolution order: `--session` > `$KEEPER_TMUX_SESSION` (non-empty) >
- * `$TMUX`-gated current session > `foreground`. The resolved session is echoed;
- * a `foreground` fallback outside tmux prints a `tmux attach` hint.
+ * `$TMUX`-gated current session > `work`. The resolved session is echoed;
+ * a `work` fallback outside tmux prints a `tmux attach` hint.
  *
  * TOCTOU between the race-guard read and the launch is inherent for a
  * client-side manual hatch and is accepted — the guard is a courtesy, not a
@@ -133,10 +133,10 @@ Options:
   --sock <path>        Daemon socket path override
   --help, -h           Show this help
 
-Session resolution: --session > $KEEPER_TMUX_SESSION > $TMUX current > foreground.
+Session resolution: --session > $KEEPER_TMUX_SESSION > $TMUX current > work.
 `;
 
-const FALLBACK_SESSION = "foreground";
+const FALLBACK_SESSION = "work";
 
 function die(message: string): never {
   process.stderr.write(`dispatch: ${message}\n`);
@@ -305,8 +305,8 @@ function probeCurrentTmuxSession(): string | null {
 /**
  * Resolve the target tmux session per the documented precedence:
  * `--session` > `$KEEPER_TMUX_SESSION` (non-empty) > `$TMUX`-gated current
- * session > `foreground`. Returns the session plus whether we fell back to
- * `foreground` while OUTSIDE tmux (so the caller can print an attach hint).
+ * session > `work`. Returns the session plus whether we fell back to
+ * `work` while OUTSIDE tmux (so the caller can print an attach hint).
  */
 export function resolveSession(deps: ResolveSessionDeps): {
   session: string;
@@ -328,7 +328,7 @@ export function resolveSession(deps: ResolveSessionDeps): {
       return { session: name, attachHint: false };
     }
   }
-  // Outside tmux (or the probe failed) → the managed foreground session.
+  // Outside tmux (or the probe failed) → the managed work session.
   return { session: FALLBACK_SESSION, attachHint: !inTmux };
 }
 

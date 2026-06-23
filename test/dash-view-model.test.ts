@@ -277,12 +277,12 @@ test("bands: empty board emits no bands (no empty bands)", () => {
 
 test("bands: jobs group by tmux session (backend_exec_session_id)", () => {
   const jobs = [
-    makeJob({ job_id: "fg1", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "fg1", backend_exec_session_id: "work" }),
     makeJob({ job_id: "ap1", backend_exec_session_id: "autopilot" }),
-    makeJob({ job_id: "fg2", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "fg2", backend_exec_session_id: "work" }),
   ];
   const m = build(jobs);
-  expect(cardKeys(m, "foreground").sort()).toEqual(["job:fg1", "job:fg2"]);
+  expect(cardKeys(m, "work").sort()).toEqual(["job:fg1", "job:fg2"]);
   expect(cardKeys(m, "autopilot")).toEqual(["job:ap1"]);
 });
 
@@ -291,17 +291,18 @@ test("bands: render order — priority sessions first, others alpha, detached la
     makeJob({ job_id: "z", backend_exec_session_id: "zeta" }),
     makeJob({ job_id: "ap", backend_exec_session_id: "autopilot" }),
     makeJob({ job_id: "det", backend_exec_session_id: null }),
-    makeJob({ job_id: "fg", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "fg", backend_exec_session_id: "work" }),
     makeJob({ job_id: "ctl", backend_exec_session_id: "control" }),
     makeJob({ job_id: "bg", backend_exec_session_id: "background" }),
   ];
   const m = build(jobs);
-  // foreground/background/autopilot (priority order) → other named sessions
-  // alphabetically (control, zeta) → detached last.
+  // work/autopilot (priority order) → other named sessions alphabetically
+  // (background, control, zeta — a leftover `background` job now sorts in the
+  // alphabetical zone, not a priority slot) → detached last.
   expect(m.bands.map((b) => b.key)).toEqual([
-    "foreground",
-    "background",
+    "work",
     "autopilot",
+    "background",
     "control",
     "zeta",
     "",
@@ -313,7 +314,7 @@ test("bands: a NULL live session falls back to the birth session for grouping", 
     // Live session resolved — groups under the live name, NOT birth.
     makeJob({
       job_id: "live",
-      backend_exec_session_id: "foreground",
+      backend_exec_session_id: "work",
       backend_exec_birth_session_id: "autopilot",
     }),
     // Live session unresolved — falls back to the birth session, so it does
@@ -331,18 +332,18 @@ test("bands: a NULL live session falls back to the birth session for grouping", 
     }),
   ];
   const m = build(jobs);
-  expect(cardKeys(m, "foreground")).toEqual(["job:live"]);
+  expect(cardKeys(m, "work")).toEqual(["job:live"]);
   expect(cardKeys(m, "background")).toEqual(["job:born"]);
   expect(cardKeys(m, "")).toEqual(["job:det"]);
 });
 
 test("bands: title is the session name; the no-session band is titled 'detached'", () => {
   const jobs = [
-    makeJob({ job_id: "fg", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "fg", backend_exec_session_id: "work" }),
     makeJob({ job_id: "det", backend_exec_session_id: null }),
   ];
   const m = build(jobs);
-  expect(band(m, "foreground").title).toBe("foreground");
+  expect(band(m, "work").title).toBe("work");
   expect(band(m, "").title).toBe("detached");
 });
 
@@ -384,7 +385,7 @@ test("bands: ended/killed land in their session band when shown", () => {
 // ---------------------------------------------------------------------------
 
 test("sort: all-null window_index falls through to created_at ASC, job_id tiebreak", () => {
-  const s = "foreground";
+  const s = "work";
   const jobs = [
     makeJob({ job_id: "c", created_at: 30, backend_exec_session_id: s }),
     makeJob({ job_id: "a", created_at: 10, backend_exec_session_id: s }),
@@ -397,7 +398,7 @@ test("sort: all-null window_index falls through to created_at ASC, job_id tiebre
 });
 
 test("sort: known window_index ASC is the PRIMARY key, beating created_at", () => {
-  const s = "foreground";
+  const s = "work";
   // Reversed: the lowest window_index carries the LATEST created_at, so a
   // stable sort or a created_at-primary comparator would produce the opposite
   // order. Final order MUST track window_index ASC.
@@ -426,7 +427,7 @@ test("sort: known window_index ASC is the PRIMARY key, beating created_at", () =
 });
 
 test("sort: unknown window_index sorts AFTER all known ones, then by created_at", () => {
-  const s = "foreground";
+  const s = "work";
   const jobs = [
     // Two unknown-index jobs tail the band, ordered by created_at ASC between
     // themselves.
@@ -460,7 +461,7 @@ test("sort: unknown window_index sorts AFTER all known ones, then by created_at"
 });
 
 test("sort: non-finite window_index is treated as unknown (NaN sorts to tail)", () => {
-  const s = "foreground";
+  const s = "work";
   const jobs = [
     makeJob({
       job_id: "nan",
@@ -481,7 +482,7 @@ test("sort: non-finite window_index is treated as unknown (NaN sorts to tail)", 
 });
 
 test("sort: order is independent of input map insertion order", () => {
-  const s = "foreground";
+  const s = "work";
   const m = build([
     makeJob({ job_id: "z", created_at: 99, backend_exec_session_id: s }),
     makeJob({ job_id: "y", created_at: 1, backend_exec_session_id: s }),

@@ -248,19 +248,19 @@ test("bands: a session-band rule precedes its job lines, in priority order", asy
       makeJob({
         job_id: "fg",
         state: "working",
-        backend_exec_session_id: "foreground",
+        backend_exec_session_id: "work",
       }),
     ]),
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // foreground outranks autopilot. Match the band RULE rows by their leading
+  // work outranks autopilot. Match the band RULE rows by their leading
   // `──`.
-  expect(frameLineOf(frame, "──foreground")).toBeLessThan(
+  expect(frameLineOf(frame, "──work")).toBeLessThan(
     frameLineOf(frame, "──autopilot"),
   );
   // Both band rules render.
-  expect(frameLineOf(frame, "──foreground")).toBeGreaterThanOrEqual(0);
+  expect(frameLineOf(frame, "──work")).toBeGreaterThanOrEqual(0);
   expect(frameLineOf(frame, "──autopilot")).toBeGreaterThanOrEqual(0);
 });
 
@@ -392,7 +392,7 @@ test("selection cursor: survives a re-sort (keyed on job_id, not position)", asy
   setup.mockInput.pressKey("j"); // alpha → beta
   await setup.renderOnce();
 
-  // Now s2 moves to the foreground session → its band outranks autopilot, so it
+  // Now s2 moves to the work session → its band outranks autopilot, so it
   // jumps above alpha (re-sort). The focus must follow the CARD (s2), not the
   // old position.
   app.render(
@@ -409,13 +409,13 @@ test("selection cursor: survives a re-sort (keyed on job_id, not position)", asy
         state: "working",
         title: "beta",
         created_at: 2,
-        backend_exec_session_id: "foreground",
+        backend_exec_session_id: "work",
       }),
     ]),
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // beta (s2) now sits in the foreground band above alpha; the caret followed
+  // beta (s2) now sits in the work band above alpha; the caret followed
   // the line (keyed on job_id), and beta's line is above alpha's.
   expect(frameLineOf(frame, "beta")).toBeLessThan(frameLineOf(frame, "alpha"));
   expect(selectedLine(frame)).toContain("beta");

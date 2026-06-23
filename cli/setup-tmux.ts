@@ -2,9 +2,9 @@
 /**
  * `keeper setup-tmux` — one-shot provisioner for the human's tmux control
  * plane. It rebuilds the `dash` dashboard session on every run and ensures the
- * `autopilot`/`background`/`foreground` work sessions exist (one shell window
+ * `autopilot`/`work` work sessions exist (one shell window
  * each). It NEVER attaches or `switch-client`s, so it is safe to run inside or
- * outside tmux. `--kill-sessions` tears all four sessions down first, gated by
+ * outside tmux. `--kill-sessions` tears all three sessions down first, gated by
  * a busy-pane confirmation prompt.
  *
  * tmux is driven by direct `Bun.spawnSync` calls — deliberately OUTSIDE the
@@ -16,7 +16,7 @@
  * exported and unit-tested through an injectable sync-spawn seam; this file's
  * `main` is the thin spawn-and-act layer.
  *
- * When a human work session (`foreground` or `background`) is ABSENT after a
+ * When the human `work` session is ABSENT after a
  * crash and the last tmux-server generation left crashed agents for it, the
  * first `setup-tmux` offers — one combined y/N TTY prompt — to relaunch them;
  * the reconciler-managed `autopilot` session is never offered.
@@ -38,12 +38,12 @@ Usage:
   keeper setup-tmux --help
 
 Rebuilds the 'dash' dashboard session every run (board + autopilot/jobs/git/
-builds/usage panes, main-vertical) and ensures the work sessions 'autopilot',
-'background', and 'foreground' exist (one shell window each, stamped with
+builds/usage panes, main-vertical) and ensures the work sessions 'autopilot'
+and 'work' exist (one shell window each, stamped with
 KEEPER_TMUX_SESSION). Existing work sessions are left untouched. NEVER attaches
 or switch-clients — safe to run inside or outside tmux.
 
-When a work session ('foreground' or 'background') is ABSENT (the first run
+When the work session ('work') is ABSENT (the first run
 after a crash) and the last tmux-server generation left crashed agents for it,
 it offers — ONE combined y/N prompt on a TTY only, never auto — to relaunch them
 via 'restore-agents --last-generation', per absent session. The managed
@@ -51,8 +51,8 @@ via 'restore-agents --last-generation', per absent session. The managed
 non-TTY skips that session's offer.
 
 Options:
-  --kill-sessions  Kill all four sessions before setup. Prompts y/N only when
-                   the three work sessions hold busy (non-shell foreground)
+  --kill-sessions  Kill all three sessions before setup. Prompts y/N only when
+                   the two work sessions hold busy (non-shell foreground)
                    panes; with no busy panes it kills without prompting. Non-TTY
                    stdin with busy panes aborts (exit 1) having killed nothing.
   --help           Show this help
@@ -63,15 +63,11 @@ NOT busy and will not trigger the confirmation prompt.
 `;
 
 export const DASH_SESSION = "dash" as const;
-/** The three work sessions ensure-looped + swept for busy panes (NOT dash —
+/** The two work sessions ensure-looped + swept for busy panes (NOT dash —
  *  dash always rebuilds). `autopilot` is the daemon's managed session; it is
  *  deliberately swept too so live workers surface in the confirm table. */
-export const WORK_SESSIONS = [
-  MANAGED_EXEC_SESSION,
-  "background",
-  "foreground",
-] as const;
-/** All four sessions a `--kill-sessions` confirmed run tears down. */
+export const WORK_SESSIONS = [MANAGED_EXEC_SESSION, "work"] as const;
+/** All three sessions a `--kill-sessions` confirmed run tears down. */
 export const ALL_SESSIONS = [DASH_SESSION, ...WORK_SESSIONS] as const;
 
 /** The five right-hand dash panes, in split order, after the board main pane. */
@@ -459,7 +455,7 @@ function ensureWorkSessions(spawn: SyncSpawnFn): void {
   }
 }
 
-/** Sweep the three work sessions for busy panes under a locale-defaulted env so
+/** Sweep the two work sessions for busy panes under a locale-defaulted env so
  *  a C-locale client doesn't sanitize the TAB delimiters. */
 export function sweepBusyPanes(spawn: SyncSpawnFn): BusyPane[] {
   const env = localeDefaultedEnv(process.env);
@@ -474,7 +470,7 @@ export function sweepBusyPanes(spawn: SyncSpawnFn): BusyPane[] {
   return busy;
 }
 
-/** Kill all four sessions, tolerating any non-zero (already gone). */
+/** Kill all three sessions, tolerating any non-zero (already gone). */
 function killAllSessions(spawn: SyncSpawnFn): void {
   for (const session of ALL_SESSIONS) {
     run(spawn, buildKillSessionArgs(session));
@@ -499,7 +495,7 @@ async function confirm(
 }
 
 /** Human work sessions eligible for the restore offer: every WORK_SESSION
- *  except the reconciler-managed `autopilot` (= [background, foreground],
+ *  except the reconciler-managed `autopilot` (= [work],
  *  iterated in WORK_SESSIONS order for deterministic prompt/spawn output). */
 export const RESTORABLE = WORK_SESSIONS.filter(
   (s) => s !== MANAGED_EXEC_SESSION,
