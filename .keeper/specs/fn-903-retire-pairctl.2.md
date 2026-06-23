@@ -31,5 +31,5 @@ arthack hook tests green after the pairctl assertions are removed.
 - [ ] remaining hook logic + tests intact and green
 
 ## Done summary
-
+Removed the pairctl->Monitor enforcement advice from the arthack pre/post tool-use hooks and dropped its covering test. Remaining hook logic and the full 63-test bun suite stay green.
 ## Evidence
