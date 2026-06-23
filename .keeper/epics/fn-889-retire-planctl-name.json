@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-23T01:37:30.066000Z",
   "created_at": "2026-06-22T16:33:42.038000Z",
   "depends_on_epics": [
     "fn-884-docs-metadata-sidecar-migration",
@@ -11,11 +12,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "retire planctl name",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-22T22:43:22.912000Z"
+  "updated_at": "2026-06-23T01:37:30.066000Z"
 }
