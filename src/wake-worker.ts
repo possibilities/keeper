@@ -80,17 +80,29 @@ interface DataVersionRow {
  * Polls `PRAGMA data_version` every `pollMs`; on any change from the last seen
  * value, invokes `onWake`. `isShutdown` is checked each iteration so the loop
  * tears down cleanly. Resolves once `isShutdown()` returns true.
+ *
+ * `maxIdleMs` (default 0 = disabled) adds a coalesced IDLE wake: when set, the
+ * loop also fires `onWake` once at least `maxIdleMs` of wall time has passed
+ * since the last `onWake` (whether that wake came from a data_version change or
+ * a prior idle tick). This lets a consumer whose work is NOT triggered by a DB
+ * commit (the restore-worker's whole-server tmux topology probe — a pane move
+ * happens out-of-band, with no keeper write) still pulse on a periodic cadence.
+ * It COALESCES by construction: a data_version change resets the idle clock, so
+ * a fresh commit and an overdue idle tick never both fire in one iteration —
+ * one `onWake` per loop turn, never two.
  */
 export async function watchLoop(
   db: Database,
   onWake: () => void,
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
+  maxIdleMs = 0,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
   const query = db.query("PRAGMA data_version");
   let last = (query.get() as DataVersionRow).data_version;
+  let lastWakeAt = Date.now();
 
   while (!isShutdown()) {
     await Bun.sleep(interval);
@@ -99,7 +111,14 @@ export async function watchLoop(
     }
     const cur = (query.get() as DataVersionRow).data_version;
     if (cur !== last) {
+      // A real commit — fire and reset the idle clock so an overdue idle tick
+      // doesn't also fire this turn (the coalesce).
       last = cur;
+      lastWakeAt = Date.now();
+      onWake();
+    } else if (maxIdleMs > 0 && Date.now() - lastWakeAt >= maxIdleMs) {
+      // No commit, but the idle budget elapsed — pulse anyway.
+      lastWakeAt = Date.now();
       onWake();
     }
   }

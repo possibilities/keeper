@@ -43,6 +43,7 @@ import {
   buildRestoreTier,
   probeServerGeneration,
   probeTmuxPanes,
+  probeTmuxTopology,
   RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
   type RestoreTier,
@@ -52,6 +53,7 @@ import {
   serializeForHash,
   serializeForWrite,
   type TmuxPaneSnapshotMessage,
+  type TmuxTopologySnapshotMessage,
   type WindowIndexSnapshotMessage,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
@@ -65,6 +67,7 @@ function freshState(): {
   lastWindowIndexByJobId: Map<string, number>;
   lastWindowIndexHash: string | null;
   lastGenerationHash: string | null;
+  lastTopologyHash: string | null;
 } {
   return {
     lastHash: null,
@@ -73,6 +76,7 @@ function freshState(): {
     lastWindowIndexByJobId: new Map(),
     lastWindowIndexHash: null,
     lastGenerationHash: null,
+    lastTopologyHash: null,
   };
 }
 
@@ -106,6 +110,57 @@ function stubTmux(opts: { pid: string | null; panes?: string[] }): SpawnSyncFn {
       success: true,
       exitCode: 0,
       stdout: Buffer.from((opts.panes ?? []).join("\n")),
+    };
+  };
+}
+
+/**
+ * A `SpawnSyncFn` for the topology arm: a `display-message` probe returns `pid`
+ * (the generation handle); a `list-panes` probe returns the configured outcome
+ * — `panes` (success with lines), `gone` (non-zero + a server-gone stderr),
+ * `transient` (non-zero + an unrelated stderr), or `empty` (exit0, no stdout).
+ */
+function stubTopology(opts: {
+  pid: string | null;
+  listPanes:
+    | { kind: "panes"; lines: string[] }
+    | { kind: "gone" }
+    | { kind: "transient" }
+    | { kind: "empty" };
+}): SpawnSyncFn {
+  return (cmd: string[]) => {
+    if (cmd.includes("display-message")) {
+      if (opts.pid == null) {
+        return { success: false, exitCode: 1, stdout: Buffer.from("") };
+      }
+      return { success: true, exitCode: 0, stdout: Buffer.from(opts.pid) };
+    }
+    // list-panes
+    const lp = opts.listPanes;
+    if (lp.kind === "panes") {
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: Buffer.from(lp.lines.join("\n")),
+      };
+    }
+    if (lp.kind === "empty") {
+      return { success: true, exitCode: 0, stdout: Buffer.from("") };
+    }
+    if (lp.kind === "gone") {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from("no server running on /tmp/tmux-501/default"),
+      };
+    }
+    // transient
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from("lost server"),
     };
   };
 }
@@ -1301,4 +1356,215 @@ test("restorePulse generation arm is independent of the window-index / pane arms
   expect(wi[0].entries).toEqual([{ job_id: "j1", window_index: 0 }]);
   expect(bes).toHaveLength(1);
   expect(bes[0].generation_id).toBe("321");
+});
+
+// ---------------------------------------------------------------------------
+// probeTmuxTopology — classify panes / gone / transient (epic fn-907)
+// ---------------------------------------------------------------------------
+
+test("probeTmuxTopology classifies a successful probe as panes (panes may be empty)", () => {
+  const ok = probeTmuxTopology(
+    stubTopology({
+      pid: "1",
+      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+    }),
+  );
+  expect(ok).toEqual({
+    kind: "panes",
+    panes: [{ pane_id: "%1", session_name: "work", window_index: 0 }],
+  });
+  // Server up with no panes is still a SUCCESS (not gone/transient).
+  const empty = probeTmuxTopology(
+    stubTopology({ pid: "1", listPanes: { kind: "empty" } }),
+  );
+  expect(empty).toEqual({ kind: "panes", panes: [] });
+});
+
+test("probeTmuxTopology classifies a server-gone stderr as gone, an unrelated stderr as transient", () => {
+  expect(
+    probeTmuxTopology(stubTopology({ pid: "1", listPanes: { kind: "gone" } })),
+  ).toEqual({ kind: "gone" });
+  // "failed to connect" is also a gone marker.
+  const gone2 = probeTmuxTopology(() => ({
+    success: false,
+    exitCode: 1,
+    stdout: Buffer.from(""),
+    stderr: Buffer.from("error connecting to ...: failed to connect to server"),
+  }));
+  expect(gone2).toEqual({ kind: "gone" });
+  expect(
+    probeTmuxTopology(
+      stubTopology({ pid: "1", listPanes: { kind: "transient" } }),
+    ),
+  ).toEqual({ kind: "transient" });
+});
+
+test("probeTmuxTopology classifies a non-zero exit with NO stderr as transient, and a thrown spawn (ENOENT) as transient", () => {
+  const noStderr = probeTmuxTopology(() => ({
+    success: false,
+    exitCode: 143, // SIGTERM/timeout — no stderr captured
+    stdout: Buffer.from(""),
+  }));
+  expect(noStderr).toEqual({ kind: "transient" });
+  const thrown = probeTmuxTopology(() => {
+    throw new Error("ENOENT: no tmux binary");
+  });
+  expect(thrown).toEqual({ kind: "transient" });
+});
+
+// ---------------------------------------------------------------------------
+// restorePulse — TmuxTopologySnapshot live-location post (epic fn-907)
+// ---------------------------------------------------------------------------
+
+test("restorePulse posts ONE TmuxTopologySnapshot on a change, deduped on no change, re-fired on a pane move", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "autopilot",
+  });
+  const topo: TmuxTopologySnapshotMessage[] = [];
+  const state = freshState();
+  const pulse = (
+    listPanes: Parameters<typeof stubTopology>[0]["listPanes"],
+    now: number,
+  ): void => {
+    restorePulse(db, restorePath, state, () => now, {
+      topologySpawnSync: stubTopology({ pid: "900", listPanes }),
+      postTopology: (m) => topo.push(m),
+    });
+  };
+  // First observation → ONE post carrying generation_id + the pane map.
+  pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1000);
+  expect(topo).toHaveLength(1);
+  expect(topo[0]).toEqual({
+    kind: "tmux-topology-snapshot",
+    generation_id: "900",
+    panes: [{ pane_id: "%1", session_name: "autopilot", window_index: 2 }],
+  });
+  // Unchanged topology → deduped.
+  pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1500);
+  expect(topo).toHaveLength(1);
+  // The pane MOVED to a new session + window — a real change re-fires.
+  pulse({ kind: "panes", lines: ["%1\t0\tforeground"] }, 2000);
+  expect(topo).toHaveLength(2);
+  expect(topo[1].panes).toEqual([
+    { pane_id: "%1", session_name: "foreground", window_index: 0 },
+  ]);
+});
+
+test("restorePulse posts NO TmuxTopologySnapshot on a degraded probe (gone / transient / empty / no-generation)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "autopilot",
+  });
+  const topo: TmuxTopologySnapshotMessage[] = [];
+  const state = freshState();
+  const pulseWith = (spawn: SpawnSyncFn, now: number): void => {
+    restorePulse(db, restorePath, state, () => now, {
+      topologySpawnSync: spawn,
+      postTopology: (m) => topo.push(m),
+    });
+  };
+  // Transient probe → no post, hash untouched.
+  pulseWith(
+    stubTopology({ pid: "900", listPanes: { kind: "transient" } }),
+    1000,
+  );
+  // Server gone → no post.
+  pulseWith(stubTopology({ pid: "900", listPanes: { kind: "gone" } }), 1100);
+  // Empty-but-success (server up, no panes) → no wiping post.
+  pulseWith(stubTopology({ pid: "900", listPanes: { kind: "empty" } }), 1200);
+  // No resolvable generation → can't stamp the recycle key → no post.
+  pulseWith(
+    stubTopology({
+      pid: null,
+      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+    }),
+    1300,
+  );
+  expect(topo).toHaveLength(0);
+  expect(state.lastTopologyHash).toBeNull();
+  // A subsequent real probe still posts (the degraded pulses didn't poison the gate).
+  pulseWith(
+    stubTopology({
+      pid: "900",
+      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+    }),
+    1400,
+  );
+  expect(topo).toHaveLength(1);
+});
+
+test("restorePulse topology arm is quiescent when no live tmux job exists", () => {
+  // A non-tmux live job does NOT arm the topology probe.
+  insertJob({ job_id: "j1", backend_exec_type: null });
+  const topo: TmuxTopologySnapshotMessage[] = [];
+  let probed = false;
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    topologySpawnSync: (cmd) => {
+      probed = true;
+      return stubTopology({
+        pid: "900",
+        listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+      })(cmd);
+    },
+    postTopology: (m) => topo.push(m),
+  });
+  expect(probed).toBe(false);
+  expect(topo).toHaveLength(0);
+});
+
+test("restorePulse topology arm is disabled when no postTopology is wired (pure-pulse path)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  let probed = false;
+  // No `postTopology` → the topology arm never spawns.
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    topologySpawnSync: (cmd) => {
+      probed = true;
+      return stubTopology({
+        pid: "900",
+        listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+      })(cmd);
+    },
+  });
+  expect(probed).toBe(false);
+});
+
+test("restorePulse topology post re-fires on a server-generation flip even when the pane map is unchanged", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const topo: TmuxTopologySnapshotMessage[] = [];
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    topologySpawnSync: stubTopology({
+      pid: "100",
+      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+    }),
+    postTopology: (m) => topo.push(m),
+  });
+  // Same pane map, but the server respawned (new generation) — %1 is now a
+  // DIFFERENT pane, so the snapshot must re-fire so the fold's recycle guard sees
+  // the new generation.
+  restorePulse(db, restorePath, state, () => 2000, {
+    topologySpawnSync: stubTopology({
+      pid: "200",
+      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
+    }),
+    postTopology: (m) => topo.push(m),
+  });
+  expect(topo).toHaveLength(2);
+  expect(topo[0].generation_id).toBe("100");
+  expect(topo[1].generation_id).toBe("200");
 });

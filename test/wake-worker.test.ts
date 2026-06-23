@@ -119,6 +119,96 @@ test("watchLoop resolves once isShutdown flips with no writes", async () => {
   reader.close();
 });
 
+test("watchLoop maxIdleMs fires an idle wake with no commits (epic fn-907)", async () => {
+  // No writer commits at all — only the idle timer drives wakes. The restore
+  // worker rides this so the out-of-band tmux topology probe pulses ~1s even
+  // when keeper.db is idle.
+  const reader = openDb(dbPath, { readonly: true }).db;
+  let wakes = 0;
+  let shutdown = false;
+
+  const loop = watchLoop(
+    reader,
+    () => {
+      wakes += 1;
+    },
+    () => shutdown,
+    25, // poll cadence
+    40, // maxIdleMs — fire an idle wake every ~40ms with no commit
+  );
+
+  // ~200ms of pure idle should yield several idle wakes (no DB writes).
+  await Bun.sleep(220);
+  shutdown = true;
+  await loop;
+
+  expect(wakes).toBeGreaterThanOrEqual(2);
+  reader.close();
+});
+
+test("watchLoop maxIdleMs=0 (default) fires NO idle wake without a commit", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  let wakes = 0;
+  let shutdown = false;
+
+  // maxIdleMs omitted → 0 → the idle path is disabled; a commit-less loop stays
+  // silent (the wake worker's contract is unchanged).
+  const loop = watchLoop(
+    reader,
+    () => {
+      wakes += 1;
+    },
+    () => shutdown,
+    25,
+  );
+
+  await Bun.sleep(120);
+  shutdown = true;
+  await loop;
+
+  expect(wakes).toBe(0);
+  reader.close();
+});
+
+test("watchLoop coalesces a commit and an overdue idle tick (one wake per turn)", async () => {
+  // A commit resets the idle clock, so a fresh commit and an overdue idle wake
+  // never both fire in the same loop iteration — one onWake per turn.
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const wakeTimes: number[] = [];
+  let shutdown = false;
+
+  const loop = watchLoop(
+    reader,
+    () => {
+      wakeTimes.push(Date.now());
+    },
+    () => shutdown,
+    25,
+    50,
+  );
+
+  // Commit once mid-flight; the rest of the wakes come from the idle timer.
+  const writer = openDb(dbPath).db;
+  await Bun.sleep(60);
+  writer
+    .query(
+      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
+    )
+    .run();
+  await Bun.sleep(160);
+  shutdown = true;
+  await loop;
+
+  // Consecutive wakes are always at least ~one poll interval apart — never two
+  // in the same iteration (the coalesce). Allow a small scheduling slop floor.
+  for (let i = 1; i < wakeTimes.length; i++) {
+    expect(wakeTimes[i] - wakeTimes[i - 1]).toBeGreaterThanOrEqual(20);
+  }
+  expect(wakeTimes.length).toBeGreaterThanOrEqual(2);
+  writer.close();
+  reader.close();
+});
+
 test("spawned Worker shuts down cleanly on shutdown message", async () => {
   // `workerData` is a Bun/Node worker_threads option not present in the DOM
   // `WorkerOptions` lib type; cast to reach it.

@@ -100,6 +100,7 @@ import type {
   BackendExecStartMessage,
   RestoreWorkerData,
   TmuxPaneSnapshotMessage,
+  TmuxTopologySnapshotMessage,
   WindowIndexSnapshotMessage,
 } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
@@ -3786,7 +3787,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (restoreWorker) {
     const rw = restoreWorker;
-    // Worker → main: two restore-worker posts, both on this one port. Main is the
+    // Worker → main: the restore-worker posts, all on this one port. Main is the
     // SOLE synthetic-event writer — mint ONE row carrying the post's payload in
     // `data`. Discriminate on `msg.kind`:
     //  - `tmux-pane-snapshot` → `TmuxPaneSnapshot` carrying the probed
@@ -3795,6 +3796,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     //  - `window-index-snapshot` → `WindowIndexSnapshot` carrying the
     //    `(job_id, window_index)` layout; the reducer folds each index onto the
     //    matching `jobs` row (pure integer copy keyed by `job_id`).
+    //  - `backend-exec-start` → `BackendExecStart` carrying the backend type +
+    //    server-pid generation boundary (folded via an explicit no-op arm).
+    //  - `tmux-topology-snapshot` → `TmuxTopologySnapshot` carrying the
+    //    whole-server `{generation_id, panes}` map (epic fn-907); the task-3
+    //    live-only fold OVERWRITES each tmux job's live session + window_index.
     // The restore file write path stays a pure consumer (no message). The worker
     // self-gates + dedups, so a post here always carries a changed payload.
     rw.onmessage = (
@@ -3802,6 +3808,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | TmuxPaneSnapshotMessage
         | WindowIndexSnapshotMessage
         | BackendExecStartMessage
+        | TmuxTopologySnapshotMessage
         | undefined
       >,
     ): void => {
@@ -3835,6 +3842,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         data = JSON.stringify({
           backend_type: msg.backend_type,
           generation_id: msg.generation_id,
+        });
+      } else if (msg.kind === "tmux-topology-snapshot") {
+        // epic fn-907 — the LIVE-LOCATION channel. The payload (generation_id +
+        // the whole-server pane map) rides `$data`; the task-3 live-only fold
+        // OVERWRITES each matching tmux job's `backend_exec_session_id` +
+        // `window_index`, gated above `tmux_projection_state.floor` and
+        // recycle-guarded on `(generation_id, pane_id)`. Stable synthetic
+        // session_id per kind, as above.
+        hookEvent = "TmuxTopologySnapshot";
+        eventType = "tmux_topology_snapshot";
+        sessionId = "tmux-topology-snapshot";
+        data = JSON.stringify({
+          generation_id: msg.generation_id,
+          panes: msg.panes,
         });
       } else {
         return;
