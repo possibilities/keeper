@@ -1,0 +1,37 @@
+# Real-git allowlist for the no-real-git test convention (fn-904).
+#
+# The fn-904 epic drives ZERO real git out of the DEFAULT test tiers: producers
+# are tested via synthetic porcelain/snapshot fixtures and commit/push surfaces
+# via a faked git runner, so `bun test` / `bun run test:full` / the plan suite
+# spawn no real `git`. The regression guard (scripts/lint-no-real-git.ts) scans
+# every top-level `test/*.test.ts` for a real-git signature — a `Bun.spawnSync`
+# / `Bun.spawn` on the `git` binary, an `initRepo`/`gitInit` import, or a
+# `mkdtemp`+`git init` pair — and FAILS on a match unless the file is listed
+# here.
+#
+# This file is the single source of truth for the slow/integration tier that
+# LEGITIMATELY keeps real git: tests whose contract genuinely IS reading git's
+# own execution (ref resolution, the `git status` probe, the boot-seed
+# discovery-toplevel resolve, the wrapper-script trailer injection, the
+# commit/push plumbing end-to-end). Those cannot be made synthetic without
+# testing a fabrication instead of git. Per CLAUDE.md "Test isolation", the
+# `*.slow.test.ts` members are also excluded from the fast tier's
+# `--path-ignore-patterns` list.
+#
+# Format: one repo-relative path per line. Blank lines and `#` comments are
+# ignored. The path is matched against the lint's scanned file argument as a
+# fixed string. Keep this list MINIMAL — every entry is a test still paying the
+# real-git CPU cost the epic exists to remove. Remove a file the moment its
+# real-git dependency is retired.
+
+# Slow/integration tier — named `*.slow.test.ts` and excluded from the fast tier.
+test/git-worker-realgit.slow.test.ts
+test/git-boot-seed-realgit.slow.test.ts
+test/git-wrapper.slow.test.ts
+
+# Integration / contract tier — exercise the commit/push and plan plumbing
+# against a real repo end-to-end; run by `test:full`, ignored by the fast tier.
+test/commit-work-foundation.test.ts
+test/integration.test.ts
+test/plan-contract.test.ts
+test/plan-worker.test.ts

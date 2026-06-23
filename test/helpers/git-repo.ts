@@ -3,10 +3,15 @@
  * (`git init -q -b main` + `config user.email/name` + `config commit.gpgsign
  * false`) is repeated across every fixture; centralize it here.
  *
- * Real git is NEVER mocked in this suite (the `Task:`-trailer parsing and the
- * fn-629 HEAD gate both depend on real plumbing). The `commit.gpgsign false`
- * config is load-bearing — a host with global `commit.gpgsign true` would
- * otherwise wedge the non-interactive `git commit` in fixtures.
+ * Real git runs ONLY in the slow/integration tier (fn-904) — the de-gitted
+ * default tiers test keeper's git-boundary DECISIONS with synthetic
+ * porcelain/snapshot fixtures and a faked runner instead. The remaining real-git
+ * fixtures (the `Task:`-trailer parsing and the fn-629 HEAD gate) depend on real
+ * plumbing and live in files enumerated in `scripts/test-real-git-allowlist.txt`;
+ * `bun run test:hygiene` fails if a non-allowlisted test reintroduces real git.
+ * The `commit.gpgsign false` config is load-bearing — a host with global
+ * `commit.gpgsign true` would otherwise wedge the non-interactive `git commit`
+ * in fixtures.
  *
  * PATH STANCE: `initRepo` runs against `dir` verbatim and does NOT realpath it.
  * macOS resolves `tmpdir()` (`/var/...`) to `/private/var/...`; tests that

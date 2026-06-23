@@ -568,7 +568,15 @@ Keeper has no `install` verb. Wire it up manually:
    are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). A
    third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
    async worker/daemon condition holds and is the canonical replacement for a
-   fixed `Bun.sleep` deadline race. The restore worker (epic fn-677) writes
+   fixed `Bun.sleep` deadline race. Both `bun run test` and `bun run test:full`
+   route through the concurrency gate `scripts/test-gate.ts` (fn-904), which caps
+   per-run parallelism (`KEEPER_TEST_PARALLEL`, default 4) and serializes
+   concurrent agent runs behind a host-wide `flock` so they queue instead of
+   thrashing the CPU; the default tiers also spawn ZERO real git (producers test
+   against synthetic porcelain/snapshot fixtures, commit/push surfaces against a
+   faked runner), enforced by `bun run test:hygiene`
+   (`scripts/lint-no-real-git.ts` + `scripts/test-real-git-allowlist.txt`). The
+   restore worker (epic fn-677) writes
    `~/.local/state/keeper/restore.json` as a dumb single-tier
    `{schema_version, current}` live mirror — a DISASTER FALLBACK only, since the
    live crash-restore set is now derived at read time from `keeper.db`'s

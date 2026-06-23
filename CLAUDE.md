@@ -289,7 +289,22 @@ probe, the boot-seed discovery-toplevel resolve, the wrapper-script trailer
 injection) cannot be made synthetic — name it
 `*.slow.test.ts` and add it to the fast-tier `--path-ignore-patterns` list (see
 `test/git-worker-realgit.slow.test.ts`, `test/git-boot-seed-realgit.slow.test.ts`,
-`test/git-wrapper.slow.test.ts`).
+`test/git-wrapper.slow.test.ts`). The convention is guarded: `bun run test:hygiene`
+(`scripts/lint-no-real-git.ts`) scans every top-level `test/*.test.ts` for a
+real-git signature (a `git`-binary spawn, an `initRepo`/`gitInit`, a bare `git init`)
+and FAILS on a non-allowlisted match — `scripts/test-real-git-allowlist.txt` is the
+single source of truth for the slow/integration tier that legitimately keeps real
+git (the three `*.slow.test.ts` files above plus the commit/plan integration
+suites). Add a file there ONLY when its contract genuinely IS git's own execution.
+
+**Run the suite through the gate, not raw.** `bun test` / `bun run test:full`
+route through `scripts/test-gate.ts`, which caps per-run parallelism
+(`KEEPER_TEST_PARALLEL`, default 4) and takes a host-wide `flock` so concurrent
+agents serialize instead of thrashing the CPU. Invoke the package.json scripts
+(`bun run test` / `bun run test:full`) — a raw `bun test` bypasses the gate and
+oversubscribes the host. `KEEPER_TEST_NO_GATE` skips only the lock (the cap +
+ignore-list still apply); the gate fails open on lock timeout so it can never
+wedge an agent.
 
 **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
 `retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` — a fixed
