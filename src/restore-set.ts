@@ -108,6 +108,10 @@ interface KilledJobRow {
   close_kind: string | null;
   window_index: number | null;
   cwd: string | null;
+  /** The live tmux session, falling back to the forensic birth session — the
+   * SELECT resolves `COALESCE(backend_exec_session_id,
+   * backend_exec_birth_session_id)` so a job whose live location has not yet been
+   * resolved by a `TmuxTopologySnapshot` still restores under its launch session. */
   backend_exec_session_id: string | null;
   plan_verb: string | null;
   /** The Killed event's rowid — the burst-cluster sort key. */
@@ -270,7 +274,10 @@ function loadRows(db: Database): {
   const killed = db
     .query(
       `SELECT job_id, created_at, updated_at, title, state, close_kind,
-              window_index, cwd, backend_exec_session_id, plan_verb, last_event_id
+              window_index, cwd,
+              COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
+                AS backend_exec_session_id,
+              plan_verb, last_event_id
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -517,11 +524,15 @@ export function deriveLastGenerationSet(
 export function deriveCurrentSet(db: Database): RestoreCandidate[] {
   const rows = db
     .query(
-      `SELECT job_id, created_at, title, window_index, cwd, backend_exec_session_id
+      `SELECT job_id, created_at, title, window_index, cwd,
+              COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
+                AS backend_exec_session_id
          FROM jobs
         WHERE state IN ('working', 'stopped')
-          AND backend_exec_session_id IS NOT NULL
-          AND backend_exec_session_id != ''`,
+          AND COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
+                IS NOT NULL
+          AND COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
+                != ''`,
     )
     .all() as {
     job_id: string;

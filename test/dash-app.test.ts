@@ -81,6 +81,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     git_orphan_count: 0,
     backend_exec_type: null,
     backend_exec_session_id: null,
+    backend_exec_birth_session_id: null,
     backend_exec_pane_id: null,
     monitors: null,
     window_index: null,

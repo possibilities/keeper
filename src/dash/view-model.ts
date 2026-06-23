@@ -158,10 +158,16 @@ const DETACHED_KEY = "";
 /** The human title of the {@link DETACHED_KEY} band. */
 const DETACHED_TITLE = "detached";
 
-/** The tmux session band a job sorts into: its sanitized
- * `backend_exec_session_id`, or {@link DETACHED_KEY} when NULL/blank. Pure. */
+/** The tmux session band a job sorts into: its sanitized LIVE
+ * `backend_exec_session_id`, falling back to the forensic
+ * `backend_exec_birth_session_id` when the live session is unresolved, or
+ * {@link DETACHED_KEY} when both are NULL/blank. Pure. */
 function sessionBand(job: Job): BandKey {
-  return sanitize(str(job.backend_exec_session_id)).trim();
+  const live = sanitize(str(job.backend_exec_session_id)).trim();
+  if (live !== DETACHED_KEY) {
+    return live;
+  }
+  return sanitize(str(job.backend_exec_birth_session_id)).trim();
 }
 
 /** The display title for a band key — the session name itself, or

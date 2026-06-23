@@ -328,7 +328,9 @@ export interface JobsRenderOptions {
 }
 
 /**
- * Group jobs by `backend_exec_session_id` in first-seen wire order.
+ * Group jobs by tmux session in first-seen wire order — the LIVE
+ * `backend_exec_session_id`, falling back to the forensic
+ * `backend_exec_birth_session_id` when the live session is unresolved.
  * Jobs with a null/empty session id collect under the sentinel
  * `NO_SESSION_KEY`. Shared by `renderJobsBody` and `selectableJobIds`
  * so render order and selection order stay in lockstep.
@@ -346,7 +348,11 @@ export function groupJobsBySession(
   const groups = new Map<string, Array<[string, Record<string, unknown>]>>();
   for (const [id, row] of jobs) {
     const r = row as Record<string, unknown>;
-    const sid = r.backend_exec_session_id;
+    const live = r.backend_exec_session_id;
+    const sid =
+      live != null && typeof live === "string" && live !== ""
+        ? live
+        : r.backend_exec_birth_session_id;
     const key =
       sid == null || typeof sid !== "string" || sid === ""
         ? NO_SESSION_KEY

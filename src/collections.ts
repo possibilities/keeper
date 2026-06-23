@@ -101,6 +101,11 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // Display-only.
     "backend_exec_type",
     "backend_exec_session_id",
+    // `backend_exec_birth_session_id`: the FROZEN launch session
+    // (`KEEPER_TMUX_SESSION` at spawn). Forensic fallback consumers COALESCE onto
+    // when the LIVE `backend_exec_session_id` (re-derived by the
+    // `TmuxTopologySnapshot` fold) is not yet resolved. Display-only.
+    "backend_exec_birth_session_id",
     "backend_exec_pane_id",
     // `monitors`: JSON-TEXT array snapshot-replaced each Stop. The renderer
     // parses the raw string itself, so this stays a raw TEXT scalar at the wire

@@ -343,6 +343,28 @@ test("renderJobsBody: jobs with null session collect under '--- (no session) ---
   );
 });
 
+test("renderJobsBody: a NULL live session groups under the birth session", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "working",
+        // Live session unresolved; the forensic birth session carries the group.
+        backend_exec_session_id: null,
+        backend_exec_birth_session_id: "ada",
+      },
+    ],
+  ]);
+  const body = renderJobsBody(jobs, new Map(), new Map());
+  expect(body).toBe(
+    ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
+  );
+});
+
 test("renderJobsBody: multiple sessions render in first-seen wire order", () => {
   // Wire order: session-b first (one job), then session-a (one job).
   // Sections must appear in that order — first-seen — independent of

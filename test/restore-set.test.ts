@@ -61,6 +61,7 @@ interface SeedJob {
   created_at?: number;
   updated_at?: number;
   backend_exec_session_id?: string | null;
+  backend_exec_birth_session_id?: string | null;
   plan_verb?: string | null;
   last_event_id?: number | null;
 }
@@ -71,8 +72,9 @@ function seedJob(db: Database, j: SeedJob): void {
   db.run(
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, close_kind, window_index,
-       cwd, backend_exec_session_id, plan_verb, last_event_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
+       last_event_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -87,6 +89,7 @@ function seedJob(db: Database, j: SeedJob): void {
       "backend_exec_session_id" in j
         ? (j.backend_exec_session_id ?? null)
         : "work",
+      j.backend_exec_birth_session_id ?? null,
       j.plan_verb ?? null,
       j.last_event_id ?? null,
     ],
@@ -276,6 +279,20 @@ test("deriveRestoreSet: a row with no backend coords is excluded", () => {
     backend_exec_session_id: null,
   });
   expect(derive().candidates).toEqual([]);
+});
+
+test("deriveRestoreSet: a NULL live session falls back to the birth session for candidacy", () => {
+  seedJob(kdb.db, {
+    job_id: "born",
+    close_kind: "server_gone",
+    backend_exec_session_id: null,
+    backend_exec_birth_session_id: "background",
+  });
+  const candidates = derive().candidates;
+  expect(candidates.map((c) => c.job_id)).toEqual(["born"]);
+  // The resolved session is the birth session, so the restore offer groups it
+  // under its launch session rather than dropping it.
+  expect(candidates[0]?.backend_exec_session_id).toBe("background");
 });
 
 test("deriveRestoreSet: autopilot workers (plan_verb='work') are excluded", () => {

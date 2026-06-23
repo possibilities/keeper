@@ -66,10 +66,17 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   central registries `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` /
   `EPHEMERAL_PROJECTIONS` in `src/db.ts`).
   Four classes: **deterministic-replayed** (the sacred default above — byte-identical
-  re-fold), **live-producer-fed** (the git surface: `git_status`, `file_attributions`,
-  and the three `jobs` git-counters — NOT replayed from history; boot-seeded then kept
+  re-fold), **live-producer-fed** (TWO surfaces: the git surface — `git_status`,
+  `file_attributions`, and the three `jobs` git-counters — and the tmux LIVE-LOCATION
+  surface — `jobs.backend_exec_session_id` + `jobs.window_index`, re-derived by the
+  `TmuxTopologySnapshot` fold keyed on `(generation_id, pane_id)` and gated above
+  `tmux_projection_state.floor`. NOT replayed from history; boot-seeded then kept
   current by incremental folds ABOVE a skip-floor; DELIBERATELY excluded from the
-  byte-identical charter), **ephemeral** (`EPHEMERAL_PROJECTIONS` — currently just
+  byte-identical charter. The frozen `KEEPER_TMUX_SESSION` env folds onto the forensic
+  `jobs.backend_exec_birth_session_id`, which crash-restore + dash grouping COALESCE
+  onto when the live session is unresolved; the retired `WindowIndexSnapshot` +
+  `TmuxPaneSnapshot` folds are explicit no-op arms so the OTHER columns still re-fold
+  byte-identically), **ephemeral** (`EPHEMERAL_PROJECTIONS` — currently just
   `pending_dispatches`, the in-flight launch-window set; folded by the boot drain like
   any projection so the global cursor advances, but `truncateEphemeralProjections`
   runs AFTER the drain and BEFORE the actuator + mutating-RPC gate opens (fn-897 — the
@@ -81,7 +88,8 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   cursor-rewind migration carries (e.g. the v80/fn-881 classifier-exclusion rewind);
   DELIBERATELY excluded from the byte-identical charter, NOT in the re-fold wipe list),
   and **control**
-  (`reducer_state`, plus `git_projection_state`'s `floor` + `seed_required`). The skip-floor
+  (`reducer_state`, plus `git_projection_state`'s and `tmux_projection_state`'s
+  `floor` + `seed_required`). The skip-floor
   (`git_projection_state.floor`, a monotonic `events.id`) makes every git fold no-op
   for `id <= floor` — the gate lives INSIDE `applyEvent` by event type, never in the
   drain SQL (the global cursor must still advance for the deterministic projections).
@@ -177,7 +185,11 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
   `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event:
   `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION`/`KEEPER_TMUX_PANE` env reads
-  (synchronous, no fork/fs). No other scraping, no env read in a fold.
+  (synchronous, no fork/fs). The frozen `KEEPER_TMUX_SESSION` env maps to the
+  forensic `jobs.backend_exec_birth_session_id` (the launch coordinate), NOT the
+  LIVE `jobs.backend_exec_session_id` — that live location is owned by the keeperd
+  `TmuxTopologySnapshot` timer-poll producer, never the hook env. No other
+  scraping, no env read in a fold.
 
 ## Migrations
 

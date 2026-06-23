@@ -67,6 +67,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     git_orphan_count: 0,
     backend_exec_type: null,
     backend_exec_session_id: null,
+    backend_exec_birth_session_id: null,
     backend_exec_pane_id: null,
     monitors: null,
     window_index: null,
@@ -305,6 +306,34 @@ test("bands: render order — priority sessions first, others alpha, detached la
     "zeta",
     "",
   ]);
+});
+
+test("bands: a NULL live session falls back to the birth session for grouping", () => {
+  const jobs = [
+    // Live session resolved — groups under the live name, NOT birth.
+    makeJob({
+      job_id: "live",
+      backend_exec_session_id: "foreground",
+      backend_exec_birth_session_id: "autopilot",
+    }),
+    // Live session unresolved — falls back to the birth session, so it does
+    // NOT land in the detached band.
+    makeJob({
+      job_id: "born",
+      backend_exec_session_id: null,
+      backend_exec_birth_session_id: "background",
+    }),
+    // Neither live nor birth — genuinely detached.
+    makeJob({
+      job_id: "det",
+      backend_exec_session_id: null,
+      backend_exec_birth_session_id: null,
+    }),
+  ];
+  const m = build(jobs);
+  expect(cardKeys(m, "foreground")).toEqual(["job:live"]);
+  expect(cardKeys(m, "background")).toEqual(["job:born"]);
+  expect(cardKeys(m, "")).toEqual(["job:det"]);
 });
 
 test("bands: title is the session name; the no-session band is titled 'detached'", () => {

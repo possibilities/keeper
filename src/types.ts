@@ -408,10 +408,19 @@ export interface Job {
    */
   backend_exec_type: string | null;
   /**
-   * Backend session name (`KEEPER_TMUX_SESSION`). NULL paired with
-   * {@link Job.backend_exec_type}.
+   * LIVE backend session name — the pane's CURRENT tmux session, re-derived by
+   * the `TmuxTopologySnapshot` live fold (boot-seeded + skip-floored, live-only).
+   * NULL paired with {@link Job.backend_exec_type}, or until the first topology
+   * snapshot resolves the pane; consumers COALESCE onto
+   * {@link Job.backend_exec_birth_session_id} for the fallback.
    */
   backend_exec_session_id: string | null;
+  /**
+   * FROZEN launch session (`KEEPER_TMUX_SESSION` at spawn) — the forensic
+   * birth-session fallback crash-restore + dash grouping COALESCE onto when the
+   * live {@link Job.backend_exec_session_id} is unresolved.
+   */
+  backend_exec_birth_session_id: string | null;
   /**
    * Backend pane id (raw `TMUX_PANE` TEXT). NULL paired with
    * {@link Job.backend_exec_type}. Surfaced as a `p<pane>` segment in the
