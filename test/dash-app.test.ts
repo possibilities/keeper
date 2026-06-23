@@ -6,8 +6,9 @@
  * growing `<caret><icon>  <job name>` left side + a right-justified dim project,
  * no box, no border), band rules fence the tmux-session bands, the SELECTION
  * cursor (keyed on job_id, surviving re-sort) marks the current line with a
- * caret — moved by `j`/`k`/arrows, seeded first/last from nothing, cleared by
- * ESC, and settable by a click — a narrow row truncates the job name first, the
+ * caret — moved by `j`/`k`/arrows (wrapping at the ends), seeded first/last from
+ * nothing, cleared by ESC, and settable by a click — a narrow row clips the job
+ * name at the end first, the
  * `t` keybind fires the terminal-visibility toggle, terminal lines gate on
  * `showTerminal`, and the row map is structurally pruned/reordered when the line
  * set changes. Boots via `createTestRenderer` (no `--isolate`; see
@@ -439,6 +440,30 @@ test("selection cursor: ↓ from nothing seeds the first line, ↑ the last", as
   setup.mockInput.pressArrow("up");
   await setup.renderOnce();
   expect(selectedLine(setup.captureCharFrame())).toContain("bot");
+});
+
+test("selection cursor: j/k wrap around at the ends", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([
+      makeJob({ job_id: "a", state: "working", title: "top", created_at: 1 }),
+      makeJob({ job_id: "b", state: "working", title: "mid", created_at: 2 }),
+      makeJob({ job_id: "c", state: "working", title: "bot", created_at: 3 }),
+    ]),
+  );
+  await setup.renderOnce();
+  // j from nothing → first line.
+  setup.mockInput.pressKey("j");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("top");
+  // k from the first line wraps to the last.
+  setup.mockInput.pressKey("k");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("bot");
+  // j from the last line wraps back to the first.
+  setup.mockInput.pressKey("j");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("top");
 });
 
 test("selection cursor: ESC clears the selection back to nothing", async () => {

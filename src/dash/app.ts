@@ -11,13 +11,13 @@
  *   `job:<id>` — a growing `<caret><icon>  <job name>` Text on the left and a
  *   right-justified, dimmer `<project>` Text on the right. The leading robot icon
  *   carries the status color (face + hue dual-encode status); when the row is
- *   narrow the job name TRUNCATES (char-level ellipsis) before the project does.
+ *   narrow the job name CLIPS at the end (no ellipsis) before the project does.
  *   The SELECTION cursor (keyed on `job_id`, surviving a re-sort) marks the
  *   current line with a full-bleed background bar + a cyan caret + bold, and
- *   `scrollChildIntoView`s it; `j`/`k`/arrows move it (and a click on a line
- *   selects it directly), selection starts EMPTY on load (j/↓ seeds the first
- *   line, k/↑ the last) and ESC clears it. There is no border and no card.
- *   Nodes are MUTATED in place
+ *   `scrollChildIntoView`s it; `j`/`k`/arrows move it and WRAP at the ends (and a
+ *   click on a line selects it directly), selection starts EMPTY on load (j/↓
+ *   seeds the first line, k/↑ the last) and ESC clears it. There is no border and
+ *   no card. Nodes are MUTATED in place
  *   across frames (Text content); structural detach-then-append fires ONLY when
  *   the keyed line order changes, so Yoga recalc rides structure, not content.
  *   The runtime OpenTUI ctors are THREADED IN so this module carries
@@ -242,10 +242,10 @@ export function attachDashApp(
       height: 1,
       flexDirection: "row",
     });
-    // The job-name side grows into the slack. `wrapMode:"none"` + `truncate`
-    // clip with a char-level ellipsis (OpenTUI's built-in middle-ellipsis); a
-    // far higher flexShrink than the project means the job name gives way FIRST
-    // when the row is narrow.
+    // The job-name side grows into the slack. `wrapMode:"none"` + `truncate:false`
+    // clip it at the END (no ellipsis — OpenTUI's only native end-positioned
+    // truncation; `truncate:true` would middle-ellipsis). A far higher flexShrink
+    // than the project means the job name gives way FIRST when the row is narrow.
     const left = new runtime.TextRenderable(renderer, {
       id: `dash-row-${key}-l`,
       flexGrow: 1,
@@ -253,19 +253,19 @@ export function attachDashApp(
       minWidth: 0,
       overflow: "hidden",
       wrapMode: "none",
-      truncate: true,
+      truncate: false,
       height: 1,
       content: "",
     });
-    // The right-justified project truncates the SAME way (char-level ellipsis),
-    // but only once the job name has fully given way (tiny flexShrink weight).
+    // The right-justified project clips the SAME way (end, no ellipsis), but only
+    // once the job name has fully given way (tiny flexShrink weight).
     const right = new runtime.TextRenderable(renderer, {
       id: `dash-row-${key}-r`,
       flexShrink: 1,
       minWidth: 0,
       overflow: "hidden",
       wrapMode: "none",
-      truncate: true,
+      truncate: false,
       height: 1,
       content: "",
     });
@@ -445,18 +445,16 @@ export function attachDashApp(
 
   // Move the selection cursor by `delta` steps through the rendered line order
   // (keyed on job_id, so it survives a re-sort). From "nothing selected", j/↓
-  // lands on the first line, k/↑ on the last.
+  // lands on the first line, k/↑ on the last; from a selection it WRAPS at the
+  // ends (j past the last → first, k past the first → last).
   function moveSelection(delta: number): void {
-    if (lineOrder.length === 0) {
+    const len = lineOrder.length;
+    if (len === 0) {
       return;
     }
     const cur = selectedKey === null ? -1 : lineOrder.indexOf(selectedKey);
     const next =
-      cur === -1
-        ? delta > 0
-          ? 0
-          : lineOrder.length - 1
-        : Math.min(Math.max(cur + delta, 0), lineOrder.length - 1);
+      cur === -1 ? (delta > 0 ? 0 : len - 1) : (cur + delta + len) % len;
     const nextKey = lineOrder[next];
     if (nextKey !== undefined) {
       selectByKey(nextKey);
