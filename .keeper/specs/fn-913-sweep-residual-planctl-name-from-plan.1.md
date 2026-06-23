@@ -25,5 +25,5 @@ CLI src strings), landing as one commit:
 - [ ] Plan CLI + guard test suites green.
 
 ## Done summary
-
+Renamed PROG to 'keeper plan' in cli.ts + subgroup.ts and substituted the retired planctl name across all user-facing usage/help/error/hint strings (project resolution, close-preflight/finalize, verdict/followup hints, audit upgrade message, set-repos hint); updated the pinning test assertions.
 ## Evidence
