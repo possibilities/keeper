@@ -72,5 +72,5 @@ fresh `freshDb()` has `tmux_projection_state` and the two new jobs columns; asse
       test/git-live-projection.test.ts test/schema-version.test.ts` green.
 
 ## Done summary
-
+v83 schema foundation: added jobs.backend_exec_generation_id + backend_exec_birth_session_id columns + tmux_projection_state control singleton, flipped backend_exec_session_id + window_index to LIVE-ONLY (LIVE_ONLY_JOBS_COLUMNS + rewindLiveProjection), added tmux floor/seed accessors, backfilled birth_session, bumped SCHEMA_VERSION=83 + SUPPORTED_SCHEMA_VERSIONS.
 ## Evidence
