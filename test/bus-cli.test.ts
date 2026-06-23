@@ -36,6 +36,8 @@ import {
   renderDecision,
   SPILL_MAX_AGE_MS,
   senderLabel,
+  sendResultIsSuccess,
+  sendSuccessMessage,
   spillFileName,
   spillPointerLine,
 } from "../cli/bus";
@@ -390,5 +392,30 @@ describe("watch frame handling (no heartbeat)", () => {
       "/tmp/ignored",
     );
     expect(w.writes).toEqual([]);
+  });
+});
+
+describe("send result disposition (exit-0 successes vs exit-1 misses)", () => {
+  test("delivered and queued_for_wake are the exit-0 successes", () => {
+    expect(sendResultIsSuccess("delivered")).toBe(true);
+    expect(sendResultIsSuccess("queued_for_wake")).toBe(true);
+  });
+
+  test("every non-delivery outcome is a loud miss", () => {
+    for (const r of [
+      "not_connected",
+      "unknown_target",
+      "ambiguous_target",
+      "delivery_failed",
+    ] as const) {
+      expect(sendResultIsSuccess(r)).toBe(false);
+    }
+  });
+
+  test("sendSuccessMessage distinguishes a live delivery from a wake-queue", () => {
+    expect(sendSuccessMessage("delivered", "bob")).toBe("delivered to bob");
+    expect(sendSuccessMessage("queued_for_wake", "planner@fn-1")).toBe(
+      "queued_for_wake for planner@fn-1",
+    );
   });
 });

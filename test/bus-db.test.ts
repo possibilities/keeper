@@ -15,12 +15,15 @@ import {
   appendMessage,
   BUS_SCHEMA_VERSION,
   type ChannelRow,
+  DELIVERED_AFTER_WAKE,
   deleteChannel,
   loadChannels,
   maxMessageId,
   migrateBusDb,
   openBusDb,
+  QUEUED_FOR_WAKE,
   replayFromCursor,
+  selectQueuedForWake,
   upsertChannel,
 } from "../src/bus-db";
 
@@ -263,5 +266,84 @@ test("appendMessage persists the full forensic envelope including reply_to + nam
   expect(rootRow.from_name).toBe("alpha");
   expect(rootRow.resolved_session_id).toBe("sess-b");
   expect(rootRow.status).toBe("delivered");
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// selectQueuedForWake — recipient-keyed durable wake-on-send replay
+// ---------------------------------------------------------------------------
+
+/** Append one `queued_for_wake` escalation addressed to a creator session. */
+function queueForWake(
+  db: Database,
+  resolvedSessionId: string,
+  overrides: Partial<Parameters<typeof appendMessage>[1]> = {},
+): number {
+  return appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    to_target: "planner@fn-1",
+    resolved_session_id: resolvedSessionId,
+    body: "escalation",
+    status: QUEUED_FOR_WAKE,
+    ...overrides,
+  });
+}
+
+test("selectQueuedForWake returns only the queued_for_wake rows for one session, oldest-first", () => {
+  const db = openBusDb(":memory:");
+  const a1 = queueForWake(db, "creator-a", { body: "first" });
+  queueForWake(db, "creator-b", { body: "other recipient" });
+  const a2 = queueForWake(db, "creator-a", { body: "second" });
+  const rows = selectQueuedForWake(db, "creator-a");
+  expect(rows.map((r) => r.id)).toEqual([a1, a2]);
+  expect(rows.map((r) => r.body)).toEqual(["first", "second"]);
+  db.close();
+});
+
+test("selectQueuedForWake never leaks another recipient's rows", () => {
+  const db = openBusDb(":memory:");
+  queueForWake(db, "creator-a");
+  queueForWake(db, "creator-b");
+  expect(
+    selectQueuedForWake(db, "creator-b").map((r) => r.resolved_session_id),
+  ).toEqual(["creator-b"]);
+  expect(selectQueuedForWake(db, "creator-c")).toHaveLength(0);
+  db.close();
+});
+
+test("selectQueuedForWake excludes rows already flipped to delivered_after_wake (the dedup)", () => {
+  const db = openBusDb(":memory:");
+  const id = queueForWake(db, "creator-a");
+  expect(selectQueuedForWake(db, "creator-a")).toHaveLength(1);
+  db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(
+    DELIVERED_AFTER_WAKE,
+    id,
+  );
+  // A second subscribe re-queries and finds nothing — the flip is the dedup.
+  expect(selectQueuedForWake(db, "creator-a")).toHaveLength(0);
+  db.close();
+});
+
+test("selectQueuedForWake ignores non-send events and other statuses for the same session", () => {
+  const db = openBusDb(":memory:");
+  // A delivered live message + a broadcast to the same session id must not appear.
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    resolved_session_id: "creator-a",
+    body: "already delivered",
+    status: "delivered",
+  });
+  appendMessage(db, {
+    namespace: "chat",
+    event: "broadcast",
+    resolved_session_id: "creator-a",
+    body: "broadcast",
+    status: QUEUED_FOR_WAKE,
+  });
+  const queued = queueForWake(db, "creator-a", { body: "the real one" });
+  const rows = selectQueuedForWake(db, "creator-a");
+  expect(rows.map((r) => r.id)).toEqual([queued]);
   db.close();
 });

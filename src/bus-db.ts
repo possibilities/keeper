@@ -337,6 +337,40 @@ export function maxMessageId(db: Database): number {
 }
 
 /**
+ * The status a `planner@<epic>` escalation carries while it waits for its offline
+ * creator to return, and the status it flips to once redelivered on resubscribe.
+ * Both are free-text values on the existing `messages.status` column — NO schema
+ * bump (bus.db keeps its `user_version` ladder untouched).
+ */
+export const QUEUED_FOR_WAKE = "queued_for_wake";
+export const DELIVERED_AFTER_WAKE = "delivered_after_wake";
+
+/**
+ * Recipient-keyed durable replay: the `queued_for_wake` `send` rows addressed to
+ * ONE returning session, oldest-first. Keyed on the creator's `resolved_session_id`
+ * (its stable `job_id`, not the ephemeral channel id), so a resubscribing session
+ * receives ONLY its own queued escalations — never another recipient's, never an
+ * unrelated chat row from a shared namespace. Distinct from {@link replayFromCursor}
+ * (namespace-only, the live reconnect-gap recovery): this query is the wake-on-send
+ * durable queue. A row already flipped to `delivered_after_wake` is excluded by the
+ * status filter, so the flip IS the dedup and a second subscribe finds none. Pure
+ * over `(db, sessionId)`.
+ */
+export function selectQueuedForWake(
+  db: Database,
+  sessionId: string,
+): MessageRow[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages
+         WHERE resolved_session_id = ? AND status = ? AND event = 'send'
+         ORDER BY id ASC`,
+    )
+    .all(sessionId, QUEUED_FOR_WAKE);
+  return (rows as Record<string, unknown>[]).map(rowToMessage);
+}
+
+/**
  * Replay messages strictly AFTER `afterId`, oldest-first — the reconnect-recovery
  * path. A subscriber that drops at cursor C calls this with `afterId = C` to
  * recover everything it missed, optionally narrowed to one tenant `namespace`.

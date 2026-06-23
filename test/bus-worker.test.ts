@@ -20,6 +20,7 @@
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import type { ChannelRow } from "../src/bus-db";
+import type { BusResolveResult, ResolvedIdentity } from "../src/bus-identity";
 import {
   authoritativeFrom,
   backpressureDecision,
@@ -29,6 +30,7 @@ import {
   type JobIdentity,
   liveChannelsAtBoot,
   MAX_CLIENT_QUEUE,
+  offlineSendPersist,
   publishOutcome,
   type RegistryEntry,
   requeueTail,
@@ -473,4 +475,84 @@ test("requeueTail returns an empty tail when the whole frame was accepted", () =
   expect(requeueTail(bytes, bytes.length).length).toBe(0);
   // A spurious over-accept clamps to empty, never a negative-offset view.
   expect(requeueTail(bytes, bytes.length + 5).length).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// offlineSendPersist — the durable wake-on-send persist decision
+// ---------------------------------------------------------------------------
+
+/** An offline `ok` resolution: identity known, no live channel (creator off-bus). */
+function okResolution(identity: ResolvedIdentity | null): BusResolveResult {
+  return { kind: "ok", method: "jobs-exact", channel: null, identity };
+}
+
+function makeIdentity(jobId: string): ResolvedIdentity {
+  return {
+    job_id: jobId,
+    pid: null,
+    start_time: null,
+    title: null,
+    name_history: [],
+  };
+}
+
+test("offlineSendPersist queues a planner@<epic> role send to a known offline creator", () => {
+  const res = okResolution(makeIdentity("fn-1-creator-job"));
+  const { resolvedSessionId, status } = offlineSendPersist(
+    res,
+    "planner@fn-1",
+    "not_connected",
+  );
+  expect(resolvedSessionId).toBe("fn-1-creator-job");
+  expect(status).toBe("queued_for_wake");
+});
+
+test("offlineSendPersist keeps a generic offline name send as not_connected (never queued)", () => {
+  const res = okResolution(makeIdentity("bob-job"));
+  const { resolvedSessionId, status } = offlineSendPersist(
+    res,
+    "bob",
+    "not_connected",
+  );
+  // The resolved identity's job_id is still persisted as the recipient key …
+  expect(resolvedSessionId).toBe("bob-job");
+  // … but a non-role address is NOT turned into a durable queue.
+  expect(status).toBe("not_connected");
+});
+
+test("offlineSendPersist never queues a role send whose creator identity is unknown", () => {
+  // Keeper-miss live-fallback resolves identity:null → no durable recipient key.
+  const res: BusResolveResult = {
+    kind: "ok",
+    method: "live-fallback",
+    channel: null,
+    identity: null,
+  };
+  const { resolvedSessionId, status } = offlineSendPersist(
+    res,
+    "planner@fn-9",
+    "not_connected",
+  );
+  expect(resolvedSessionId).toBeNull();
+  expect(status).toBe("not_connected");
+});
+
+test("offlineSendPersist carries the honest miss outcome for unknown / ambiguous targets", () => {
+  const unknown: BusResolveResult = { kind: "unknown", target: "ghost" };
+  expect(offlineSendPersist(unknown, "ghost", "unknown_target")).toEqual({
+    resolvedSessionId: null,
+    status: "unknown_target",
+  });
+  const ambiguous: BusResolveResult = {
+    kind: "ambiguous",
+    method: "jobs-substring",
+    identities: [makeIdentity("a"), makeIdentity("b")],
+  };
+  // Even a role-shaped ambiguous target is never queued (no single creator id).
+  expect(
+    offlineSendPersist(ambiguous, "planner@fn-2", "ambiguous_target"),
+  ).toEqual({
+    resolvedSessionId: null,
+    status: "ambiguous_target",
+  });
 });

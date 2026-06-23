@@ -44,15 +44,20 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
   appendMessage,
   type ChannelRow,
+  DELIVERED_AFTER_WAKE,
   deleteChannel,
   loadChannels,
+  type MessageRow,
   maxMessageId,
   openBusDb,
+  QUEUED_FOR_WAKE,
+  selectQueuedForWake,
   upsertChannel,
 } from "./bus-db";
 import {
   type BusResolveResult,
   type LiveChannel,
+  parseRoleAddress,
   resolveTarget,
 } from "./bus-identity";
 import { openDb, resolveBusDbPath, resolveBusSockPath } from "./db";
@@ -291,6 +296,38 @@ export function publishOutcome(
   if (resolveKind === "ambiguous") return "ambiguous_target";
   if (!resolvedConnected) return "not_connected";
   return deliveredCount >= 1 ? "delivered" : "delivery_failed";
+}
+
+/**
+ * Decide what an OFFLINE directed send persists (the no-delivery branch: target
+ * unknown/ambiguous, or known-but-disconnected). Two axes:
+ *
+ *  - `resolvedSessionId` — the durable recipient key. On an `ok` resolution the
+ *    resolved IDENTITY carries the creator's stable `job_id` even when no live
+ *    channel exists (`channel:null` offline); persist THAT, not the always-null
+ *    `channel?.session_id`. A keeper-miss live-fallback resolves `identity:null`,
+ *    which correctly yields `null` → not durably queued. Non-`ok` → `null`.
+ *  - `status` — `queued_for_wake` ONLY for a `planner@<epic>`-shaped role address
+ *    whose creator identity is known (a resolvable `job_id`); the returning
+ *    creator replays it on resubscribe. EVERY other offline send keeps its honest
+ *    {@link publishOutcome} verdict (`not_connected` / `unknown_target` /
+ *    `ambiguous_target`) — a generic offline name is NOT turned into a durable
+ *    queue.
+ *
+ * Pure over `(res, toTarget, fallbackOutcome)` — the impure resolve + outcome run
+ * first and hand their results in.
+ */
+export function offlineSendPersist(
+  res: BusResolveResult,
+  toTarget: string,
+  fallbackOutcome: string,
+): { resolvedSessionId: string | null; status: string } {
+  const resolvedSessionId =
+    res.kind === "ok" ? (res.identity?.job_id ?? null) : null;
+  const isRole = parseRoleAddress(toTarget) !== null;
+  const status =
+    isRole && resolvedSessionId !== null ? QUEUED_FOR_WAKE : fallbackOutcome;
+  return { resolvedSessionId, status };
 }
 
 /**
@@ -861,6 +898,53 @@ export function startBusServer(
       last_message_id: maxMessageId(busDb),
       namespaces: entry.namespaces,
     });
+    replayQueuedForWake(entry);
+  };
+
+  /**
+   * Durable wake-on-send replay: a returning creator session receives the
+   * `planner@<epic>` escalations queued while it was offline. Recipient-keyed on
+   * the channel's stable `session_id` (the creator's job_id) so a session only ever
+   * gets its OWN queued rows — never another recipient's, never an unrelated chat
+   * row. Each accepted row flips to `delivered_after_wake`; the flip IS the dedup,
+   * so a second subscribe re-queries and finds none. A row not accepted (the socket
+   * just bound is full/closing — should not happen on a fresh bind) stays
+   * `queued_for_wake` for the next resubscribe.
+   */
+  const replayQueuedForWake = (entry: RegistryEntry): void => {
+    const sessionId = entry.channel.session_id;
+    if (sessionId === null) return;
+    let rows: MessageRow[];
+    try {
+      rows = selectQueuedForWake(busDb, sessionId);
+    } catch (err) {
+      console.error(
+        "[bus-worker] selectQueuedForWake failed (non-fatal):",
+        err,
+      );
+      return;
+    }
+    for (const row of rows) {
+      const envelope = buildEnvelope(
+        row.namespace,
+        row.id,
+        {
+          channel_id: row.from_channel_id ?? "",
+          pid: row.from_pid ?? 0,
+          session_id: null,
+          name: row.from_name,
+        },
+        row.to_target,
+        row.resolved_channel_id,
+        row.resolved_session_id,
+        { media_type: "text/plain", text: row.body ?? "" },
+        row.reply_to,
+      );
+      const line = `${JSON.stringify(envelope)}\n`;
+      if (deliver(entry, line)) {
+        setMessageStatus(busDb, row.id, DELIVERED_AFTER_WAKE);
+      }
+    }
   };
 
   const opPublish = (
@@ -905,6 +989,15 @@ export function startBusServer(
           channel?.connected ?? false,
           0,
         );
+        // A `planner@<epic>` escalation to a KNOWN-but-offline creator is made
+        // durable: persist the creator's stable job_id as the recipient key and
+        // flag it `queued_for_wake` so the creator's resubscribe replays it. Every
+        // other offline send keeps its honest non-delivery outcome.
+        const { resolvedSessionId, status } = offlineSendPersist(
+          res,
+          toTarget,
+          outcome,
+        );
         appendMessage(busDb, {
           namespace,
           event,
@@ -913,12 +1006,12 @@ export function startBusServer(
           from_name: from.name,
           to_target: toTarget,
           resolved_channel_id: channel?.channel_id ?? null,
-          resolved_session_id: channel?.session_id ?? null,
+          resolved_session_id: resolvedSessionId,
           body: payload.text,
-          status: outcome,
+          status,
           reply_to: op.reply_to ?? null,
         });
-        sendAck(sock, "publish", { result: outcome, recipients: 0 });
+        sendAck(sock, "publish", { result: status, recipients: 0 });
         return;
       }
 

@@ -96,13 +96,17 @@ Send blindly:
   name, session id, channel id, ANY former name, or a role address
   'planner@<epic_id>' (the epic's creator session). A send is synchronous and
   honest: it prints the outcome and sets the exit code.
-    delivered          → printed, exit 0 (the only success)
+    delivered          → printed, exit 0 (delivered live)
+    queued_for_wake    → planner@<epic> creator known but offline; the escalation
+                         is persisted and replayed when the creator returns, exit 0
     not_connected      → target known but offline; nothing delivered, exit 1
     unknown_target     → name resolves to no agent, exit 1
     ambiguous_target   → name matches >1 agent, exit 1
     delivery_failed    → connected but the write did not complete, exit 1
-  A miss is an immediate exit-1 error on stderr — never a silent exit-0, and a
-  message is NEVER queued to land later. 'keeper bus list' is informational only.
+  A miss is an immediate exit-1 error on stderr — never a silent exit-0. Only a
+  'planner@<epic>' role send to a known-but-offline creator queues to land later
+  (queued_for_wake); a generic offline name never queues. 'keeper bus list' is
+  informational only.
 
 Notes:
   - <msg> of '-' reads the message body from stdin.
@@ -476,6 +480,7 @@ function registerFrame(): object {
  *  `delivered`, carrying the recipient count. */
 export type PublishResult =
   | "delivered"
+  | "queued_for_wake"
   | "not_connected"
   | "unknown_target"
   | "ambiguous_target"
@@ -519,6 +524,26 @@ async function runSend(
       send(registerFrame());
     },
   );
+}
+
+/**
+ * Disposition of a directed-send result: the exit-0 successes vs the exit-1
+ * misses. `delivered` (landed live) and `queued_for_wake` (a `planner@<epic>`
+ * escalation persisted for the offline creator) are both successes; every other
+ * outcome is a loud miss the caller `die()`s on. Pure.
+ */
+export function sendResultIsSuccess(result: PublishResult): boolean {
+  return result === "delivered" || result === "queued_for_wake";
+}
+
+/** The exit-0 success line for a directed send (delivered vs queued-for-wake). */
+export function sendSuccessMessage(
+  result: "delivered" | "queued_for_wake",
+  target: string,
+): string {
+  return result === "queued_for_wake"
+    ? `queued_for_wake for ${target}`
+    : `delivered to ${target}`;
 }
 
 /** Human-facing one-liner for a non-delivered send result (the `die()` text). */
@@ -777,11 +802,15 @@ export async function main(argv: string[]): Promise<void> {
       } catch (err) {
         return die((err as Error).message);
       }
-      // delivered is the only success; every other result is a loud exit-1.
-      if (res.result !== "delivered") {
+      // `delivered` (live) and `queued_for_wake` (a planner@<epic> escalation
+      // persisted for the offline creator) are the exit-0 successes; every other
+      // result is a loud exit-1 miss.
+      if (!sendResultIsSuccess(res.result)) {
         return die(sendErrorMessage(res.result, cmd.target));
       }
-      process.stdout.write(`delivered to ${cmd.target}\n`);
+      process.stdout.write(
+        `${sendSuccessMessage(res.result as "delivered" | "queued_for_wake", cmd.target)}\n`,
+      );
       return process.exit(0);
     }
     case "broadcast": {
