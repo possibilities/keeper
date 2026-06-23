@@ -228,6 +228,17 @@ test("JOBS_DESCRIPTOR serves monitors for the expanded-row Monitors section (v51
   expect(JOBS_DESCRIPTOR.jsonColumns.has("monitors")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves window_index for the dash intra-band sort", () => {
+  // `window_index` (DB v71) is the live tmux `#{window_index}` folded onto the
+  // row from `WindowIndexSnapshot`; the dash sorts cards within a session band
+  // on it CLIENT-side. A plain INTEGER scalar — display/sort-only, so it is out
+  // of sortable / filters / jsonColumns, same as the `backend_exec_*` cluster.
+  expect(JOBS_DESCRIPTOR.columns).toContain("window_index");
+  expect(JOBS_DESCRIPTOR.sortable.has("window_index")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.window_index).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("window_index")).toBe(false);
+});
+
 test("getCollection resolves the profiles collection (fn-639)", () => {
   expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
   expect(PROFILES_DESCRIPTOR.table).toBe("profiles");

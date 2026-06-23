@@ -1168,7 +1168,9 @@ event-log/reducer/hook touch. Run any of them with
   0.3.0 has no `titleColor`, so the project name in the border inherits border
   color). Cards group into three urgency BANDS — needs-you / in-motion / idle —
   each fenced by a dim inline-titled rule (an empty band collapses); within a
-  band, stable `created_at` ASC (`job_id` tiebreak) so a live card never
+  band, cards sort by live tmux `window_index` ASC (the window's left-to-right
+  VISUAL position; an unknown index sorts last, then `created_at`/`job_id`) so
+  the board matches the operator's tmux window order and a live card never
   teleports on a metadata tick. The robots make the board calm when idle and the
   few jobs that need attention pop.
   **Keybinds:** `j`/`k`/`↓`/`↑` drive a focus cursor keyed on `job_id` (survives
@@ -2154,9 +2156,9 @@ stopped/terminal→working restart and HOLDS through mid-run churn (the explicit
 `ELSE active_since` branch). The migration adds the column NULL with NO backfill
 — backfilling from `updated_at` ("last touched") would conflate it with "run
 started" and is non-deterministic; a never-prompted job stays NULL. It seeded
-the original `keeper dash` AGENTS timeline ordering; the fn-841 robot job-card
-dash orders cards by `created_at` within urgency bands and no longer reads it, so
-the column is now display/sort metadata only. keeper-py's
+the original `keeper dash` AGENTS timeline ordering; the robot job-card dash
+orders cards by live tmux `window_index` within session bands and no longer reads
+it, so the column is now display/sort metadata only. keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `65` (whitelist-only; keeper-py does
 not read `active_since`).
 As of schema v67 (fn-807), the `commit_trailer_facts` reducer projection

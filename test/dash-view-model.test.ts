@@ -5,7 +5,8 @@
  * tier). Asserts the SETTLED robot-line semantics: the six-rung status ladder
  * (each rung → its dash-local robot codepoint + icon role; annotations outrank
  * base state), band assignment by tmux session (priority order + detached
- * fallback), stable intra-band `created_at` sort, the `showTerminal` toggle
+ * fallback), intra-band sort by live tmux `window_index` (known ASC, unknown to
+ * tail, then `created_at`/`job_id`), the `showTerminal` toggle
  * gating, per-field projection (project basename, never-blank label), ESC
  * sanitization, and the never-throw fold on a malformed `state`. Also asserts
  * the shared `fa-classic` board/jobs glyph map is UNCHANGED (the dash robot map
@@ -68,6 +69,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     backend_exec_session_id: null,
     backend_exec_pane_id: null,
     monitors: null,
+    window_index: null,
     ...overrides,
   };
 }
@@ -352,7 +354,7 @@ test("bands: ended/killed land in their session band when shown", () => {
 // Intra-band sort
 // ---------------------------------------------------------------------------
 
-test("sort: stable created_at ASC within a band, job_id ASC tiebreak", () => {
+test("sort: all-null window_index falls through to created_at ASC, job_id tiebreak", () => {
   const s = "foreground";
   const jobs = [
     makeJob({ job_id: "c", created_at: 30, backend_exec_session_id: s }),
@@ -363,6 +365,90 @@ test("sort: stable created_at ASC within a band, job_id ASC tiebreak", () => {
   ];
   const m = build(jobs);
   expect(cardKeys(m, s)).toEqual(["job:a", "job:eq-a", "job:eq-b", "job:c"]);
+});
+
+test("sort: known window_index ASC is the PRIMARY key, beating created_at", () => {
+  const s = "foreground";
+  // Reversed: the lowest window_index carries the LATEST created_at, so a
+  // stable sort or a created_at-primary comparator would produce the opposite
+  // order. Final order MUST track window_index ASC.
+  const jobs = [
+    makeJob({
+      job_id: "late",
+      created_at: 300,
+      window_index: 0,
+      backend_exec_session_id: s,
+    }),
+    makeJob({
+      job_id: "mid",
+      created_at: 200,
+      window_index: 1,
+      backend_exec_session_id: s,
+    }),
+    makeJob({
+      job_id: "early",
+      created_at: 100,
+      window_index: 2,
+      backend_exec_session_id: s,
+    }),
+  ];
+  const m = build(jobs);
+  expect(cardKeys(m, s)).toEqual(["job:late", "job:mid", "job:early"]);
+});
+
+test("sort: unknown window_index sorts AFTER all known ones, then by created_at", () => {
+  const s = "foreground";
+  const jobs = [
+    // Two unknown-index jobs tail the band, ordered by created_at ASC between
+    // themselves.
+    makeJob({
+      job_id: "null-late",
+      created_at: 50,
+      window_index: null,
+      backend_exec_session_id: s,
+    }),
+    makeJob({
+      job_id: "null-early",
+      created_at: 40,
+      window_index: null,
+      backend_exec_session_id: s,
+    }),
+    // A known window 0 — a real leftmost slot — must front-rank, NOT be
+    // confused with "unknown" by a `?? 0` coercion.
+    makeJob({
+      job_id: "win0",
+      created_at: 999,
+      window_index: 0,
+      backend_exec_session_id: s,
+    }),
+  ];
+  const m = build(jobs);
+  expect(cardKeys(m, s)).toEqual([
+    "job:win0",
+    "job:null-early",
+    "job:null-late",
+  ]);
+});
+
+test("sort: non-finite window_index is treated as unknown (NaN sorts to tail)", () => {
+  const s = "foreground";
+  const jobs = [
+    makeJob({
+      job_id: "nan",
+      created_at: 1,
+      window_index: Number.NaN,
+      backend_exec_session_id: s,
+    }),
+    makeJob({
+      job_id: "known",
+      created_at: 999,
+      window_index: 7,
+      backend_exec_session_id: s,
+    }),
+  ];
+  const m = build(jobs);
+  // A NaN index must not poison the sort or front-rank — it tails the known one.
+  expect(cardKeys(m, s)).toEqual(["job:known", "job:nan"]);
 });
 
 test("sort: order is independent of input map insertion order", () => {

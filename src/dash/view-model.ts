@@ -15,10 +15,13 @@
  *
  * Lines group by tmux session (`backend_exec_session_id`) — the priority
  * sessions `foreground` / `background` / `autopilot` first, then any other named
- * session alphabetically, then the `detached` band (no recorded session) last —
- * stable `created_at` ASC within a band (`job_id` tiebreak) so a live line never
- * teleports on a metadata tick. Ended/killed jobs are terminal and hidden unless
- * `showTerminal` is set.
+ * session alphabetically, then the `detached` band (no recorded session) last.
+ * Within a band, lines sort by live tmux `window_index` (the window's
+ * left-to-right VISUAL position) ascending so the board matches the operator's
+ * tmux window order and reflects manual swaps on the next pulse; an unknown
+ * index (null / non-tmux / not-yet-probed) sorts last, then `created_at` ASC and
+ * `job_id` ASC keep a live line from teleporting on a metadata tick. Ended/killed
+ * jobs are terminal and hidden unless `showTerminal` is set.
  *
  * Pure — no I/O, no wall-clock, no `@opentui` import anywhere in this file. That
  * last property is load-bearing: it keeps `test/dash-view-model.test.ts` on the
@@ -297,7 +300,8 @@ function buildCard(job: Job, rung: RobotRung): CardVM {
  *
  * Returns `{ bands }`: one band per active tmux session in render order (priority
  * sessions first, the rest alphabetical, `detached` last), each carrying its job
- * lines in stable `created_at` ASC (`job_id` tiebreak) order. Pure, never throws.
+ * lines ordered by live tmux `window_index` ASC (known precedes unknown, then
+ * `created_at`/`job_id`). Pure, never throws.
  */
 export function buildDashModel(
   jobs: Map<string, Job> | Iterable<Job>,
@@ -310,9 +314,13 @@ export function buildDashModel(
   // Only sessions that contribute a line get a bucket, so there are no empty
   // bands.
   const buckets = new Map<BandKey, CardVM[]>();
-  // Parallel sort keys so the intra-band sort can read created_at / job_id off
-  // the source row without threading them onto the immutable CardVM.
-  const sortKey = new Map<string, { created: number; id: string }>();
+  // Parallel sort keys so the intra-band sort can read window_index /
+  // created_at / job_id off the source row without threading them onto the
+  // immutable CardVM.
+  const sortKey = new Map<
+    string,
+    { window: number | null; created: number; id: string }
+  >();
 
   for (const job of jobList) {
     const rung = robotRung(job);
@@ -327,14 +335,34 @@ export function buildDashModel(
     } else {
       bucket.push(card);
     }
-    sortKey.set(card.key, { created: job.created_at, id: job.job_id });
+    sortKey.set(card.key, {
+      window: job.window_index,
+      created: job.created_at,
+      id: job.job_id,
+    });
   }
 
-  // Stable intra-band sort: created_at ASC, job_id ASC tiebreak — a live line
-  // never teleports on a metadata tick.
-  const byCreated = (a: CardVM, b: CardVM): number => {
+  // Stable intra-band sort: known tmux `window_index` ASC (the window's
+  // left-to-right VISUAL position) precedes any unknown one, then `created_at`
+  // ASC, then `job_id` ASC. A null/non-finite index sorts LAST via an explicit
+  // `Number.isFinite` guard — window 0 is a real leftmost slot, so it must NOT
+  // coerce to unknown. Mirrors `compareCandidates` in `src/restore-set.ts` (a
+  // separate impl, not a shared helper). The final `job_id` tiebreak keeps a
+  // live line from teleporting on a metadata tick.
+  const byWindow = (a: CardVM, b: CardVM): number => {
     const ka = sortKey.get(a.key);
     const kb = sortKey.get(b.key);
+    const wa = ka?.window;
+    const wb = kb?.window;
+    const aKnown = typeof wa === "number" && Number.isFinite(wa);
+    const bKnown = typeof wb === "number" && Number.isFinite(wb);
+    if (aKnown && bKnown) {
+      if (wa !== wb) {
+        return wa - wb;
+      }
+    } else if (aKnown !== bKnown) {
+      return aKnown ? -1 : 1;
+    }
     const ca = ka?.created ?? 0;
     const cb = kb?.created ?? 0;
     if (ca !== cb) {
@@ -351,7 +379,7 @@ export function buildDashModel(
     .sort(byBand)
     .map((key) => {
       const cards = buckets.get(key) ?? [];
-      cards.sort(byCreated);
+      cards.sort(byWindow);
       return { key, title: bandTitle(key), cards };
     });
 

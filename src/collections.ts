@@ -106,9 +106,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // parses the raw string itself, so this stays a raw TEXT scalar at the wire
     // layer — OUT of `jsonColumns`.
     "monitors",
-    // `active_since`: Unix-seconds stamped on the rising edge into `working`;
-    // the recency key for the unified dash AGENTS timeline. Display/sort-only.
+    // `active_since`: Unix-seconds stamped on the rising edge into `working`.
+    // Display/sort-only.
     "active_since",
+    // `window_index`: live tmux `#{window_index}` (a window's left-to-right
+    // VISUAL position), folded from `WindowIndexSnapshot`. The dash sorts cards
+    // within a session band on it client-side. Display/sort-only.
+    "window_index",
   ],
   pk: "job_id",
   version: "last_event_id",

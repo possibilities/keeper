@@ -429,6 +429,15 @@ export interface Job {
    * at the wire layer.
    */
   monitors: string | null;
+  /**
+   * Live tmux `#{window_index}` — the window's left-to-right VISUAL position —
+   * folded onto the row from each `WindowIndexSnapshot` the restore-worker
+   * posts on a `data_version` pulse. The `keeper dash` view-model orders cards
+   * within a session band by this index (known ASC, then `created_at`/`job_id`;
+   * a null/non-tmux/not-yet-probed index sorts last). Display/sort-only; NULL
+   * when no window position is known.
+   */
+  window_index: number | null;
 }
 
 /**
