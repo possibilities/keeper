@@ -3000,7 +3000,10 @@ plus a DEDICATED Unix-domain socket at `~/.local/state/keeper/bus.sock`
 (op-discriminated NDJSON pub/sub, not the collection query/subscribe surface),
 and a different purpose (agent-to-agent relay, not projection streaming). Agents
 register by pid, then send/broadcast to each other by current name, session id,
-or ANY former name — append-only `name_history` makes a since-dead name resolve
+ANY former name, or a role address `planner@<epic_id>` (resolved server-side
+through the epic's `job_links` creator edge → job_id → channel, reusing the
+job-keyed identity tiers and `PublishOutcome` vocabulary — no new result code or
+schema) — append-only `name_history` makes a since-dead name resolve
 deterministically to the same agent, symmetric for reach and reply. Presence is
 tri-state (fn-886): identity resolution and connectivity are SEPARATE axes — a
 name resolves to a known agent, but delivery is gated on that agent having an

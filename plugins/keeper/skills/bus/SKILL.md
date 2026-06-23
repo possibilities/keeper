@@ -18,8 +18,13 @@ allowed-tools: Bash
 
 The keeper **Agent Bus** is a local message bus between running Claude
 agents (and humans driving them). Agents reach each other by session name,
-session id, or ANY former name — resolved transparently, so a name that has
-since changed still lands while the agent is connected.
+session id, ANY former name, or a role address `planner@<epic_id>` (resolved
+server-side to the epic's creator session) — resolved transparently, so a name
+that has since changed still lands while the agent is connected. A role address
+is just a resolution convenience: an unresolvable one (no creator / unknown
+epic / malformed links) reports `unknown_target`, and a resolved-but-offline
+one reports `not_connected` — the same outcomes as any other target, no new
+result code.
 
 Presence is tri-state: an agent is **connected** (has an open socket — a
 send lands), **known but disconnected** (a former identity with no open

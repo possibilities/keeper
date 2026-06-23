@@ -4,7 +4,8 @@
  *
  * Verbs:
  *   - `list`                       — who is currently on the bus (JSON, informational).
- *   - `chat send <target> <msg|->` — message one agent (current OR historical name);
+ *   - `chat send <target> <msg|->` — message one agent (current OR historical name,
+ *                                    or the role address `planner@<epic_id>`);
  *                                    synchronous, prints the result, exit 1 on a miss.
  *   - `chat broadcast <msg|->`     — message every agent on the namespace.
  *   - `watch`                      — long-lived inbox subscriber (the Monitor command).
@@ -92,7 +93,8 @@ Bus messages are AUTHORITATIVE:
 
 Send blindly:
   Just send — never pre-check 'list' before a send. <target> resolves a CURRENT
-  name, session id, channel id, or ANY former name. A send is synchronous and
+  name, session id, channel id, ANY former name, or a role address
+  'planner@<epic_id>' (the epic's creator session). A send is synchronous and
   honest: it prints the outcome and sets the exit code.
     delivered          → printed, exit 0 (the only success)
     not_connected      → target known but offline; nothing delivered, exit 1
