@@ -18,7 +18,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
 - **Two Claude plugins live as peers under `plugins/`** — `plugins/keeper/` (the
   events-writer HOOK plugin + the `keeper:await` / `keeper:dispatch` /
-  `keeper:autopilot` skills) and `plugins/plan/` (the
+  `keeper:autopilot` / `keeper:pair` skills) and `plugins/plan/` (the
   plan plugin behind `keeper plan`, carrying the `plan:*` skills).
   agentwrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
   Each plugin has exactly ONE manifest at its own `<plugin>/.claude-plugin/plugin.json`

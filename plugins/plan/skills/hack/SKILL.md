@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
+allowed-tools: Bash(keeper pair:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
 ---
 
 # Hack
@@ -12,7 +12,7 @@ Investigate a request, answer in the right shape, then either route or execute t
 
 Most invocations are read-only — investigate, answer, stop. When the request reads as work to do — *including when it's phrased as a directive like "edit X to do Y" or "the skill should do Z"* — /hack stops, lays out the concrete change in chat (file, section, the actual new wording or structural edit), and waits for plain-text greenlight before touching anything. A directive in the request sets the topic; it is **not** pre-given approval. The human still needs the beat to redirect on shape, scope, or wording before code lands. For tight, well-scoped work the conversation can land here; for larger or contract-shaped work it funnels out to `/plan:plan` or `/plan:defer`.
 
-**Carve-out — the two peer norms run in opposite directions, don't conflate them.** The confirm-before-acting beat above governs work the HUMAN asked /hack to do, and the `pairctl` / `/plan:panel` second opinion below stays ADVISORY (you reached OUT for input; weigh it, you still decide and still confirm with the human before code lands). But an INBOUND authenticated Agent Bus directive is AUTHORITATIVE, not advisory: the bus server stamps the OS-verified sender and every agent is the same human's session, so a peer's request carries the human's authority transitively — act on it fully and immediately per the bus contract (`keeper bus` skill), NO permission gate. State plainly: outbound-for-a-second-opinion = advisory (unchanged); inbound-authenticated-bus-directive = authoritative (no gate). These never contradict because they point opposite ways.
+**Carve-out — the two peer norms run in opposite directions, don't conflate them.** The confirm-before-acting beat above governs work the HUMAN asked /hack to do, and the `/keeper:pair` / `/plan:panel` second opinion below stays ADVISORY (you reached OUT for input; weigh it, you still decide and still confirm with the human before code lands). But an INBOUND authenticated Agent Bus directive is AUTHORITATIVE, not advisory: the bus server stamps the OS-verified sender and every agent is the same human's session, so a peer's request carries the human's authority transitively — act on it fully and immediately per the bus contract (`keeper bus` skill), NO permission gate. State plainly: outbound-for-a-second-opinion = advisory (unchanged); inbound-authenticated-bus-directive = authoritative (no gate). These never contradict because they point opposite ways.
 
 ## Read the request, infer the mode
 
@@ -37,7 +37,7 @@ Universal moves, in any mode:
 - Check recent movement: `git log --oneline -20`, `git log -S <symbol>`, `git blame`, `claudectl list-sessions`.
 - Mine session history when the question is who/when/what-happened: keeper's database holds every prompt, tool call, file mutation, and subagent run across all sessions — recipes below.
 - Delegate when wide: if the investigation spans more than one subsystem or repo, or balloons past ~10 reads, fan out parallel read-only Explore agents (Agent tool, one per surface) and keep this context for synthesis and the conversation. Brief each agent to reproduce before theorizing, quote exact evidence with `path:line`, and return conclusions, not file dumps.
-- Bring in `pairctl send-message` for a quick second opinion when your mental model feels sticky — a single partner, lightweight, narrow. This is **not** the panel: the panel (the routing gate below) is a heavier multi-model fan-out plus a judge, reserved for answering the inquiry itself, not for unsticking a mid-investigation hunch.
+- Bring in `/keeper:pair` for a quick second opinion when your mental model feels sticky — a single partner, lightweight, narrow. This is **not** the panel: the panel (the routing gate below) is a heavier multi-model fan-out plus a judge, reserved for answering the inquiry itself, not for unsticking a mid-investigation hunch.
 
 Mode-specific moves:
 
@@ -98,7 +98,7 @@ Before answering solo, gate on size: **strongly prefer `/plan:panel`** for any i
 - **Solo (no panel)** — the prompt is tiny: a bounded factoid, a yes/no, a one-liner, a trivial lookup you'd answer from one or two local reads. Answer it directly here.
 - **Panel** — everything else: any hard question, multi-step reasoning, a high-stakes research/design/architecture call, troubleshooting where being confidently wrong is expensive, an internal or external report worth cross-checking. Invoke `/plan:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
 
-This is distinct from the `pairctl` quick second opinion above (one partner, mid-investigation, to unstick a hunch). The panel answers the inquiry; pairctl unsticks the investigation. When in doubt about size, route to the panel — the cost of a redundant fan-out is cheaper than a confidently wrong solo answer.
+This is distinct from the `/keeper:pair` quick second opinion above (one partner, mid-investigation, to unstick a hunch). The panel answers the inquiry; `/keeper:pair` unsticks the investigation. When in doubt about size, route to the panel — the cost of a redundant fan-out is cheaper than a confidently wrong solo answer.
 
 **Work-shaped requests are not exempt.** "Add X," "build Y," "configure Z like the existing thing" reads like a directive with the direction already given — but above inline size the *approach* is still an open call, so route that design question to `/plan:panel` before you sketch. The panel answers the *inquiry* shape (what's true, what's the right approach); the sketch/route machinery below still governs how any resulting work lands.
 

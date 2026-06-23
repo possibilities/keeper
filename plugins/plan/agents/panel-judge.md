@@ -17,7 +17,7 @@ You run in a subagent so the fan-out transcripts stay off the caller's context. 
 
 You receive, in your prompt:
 - The **original question** verbatim (the same text every panelist got).
-- **Answer-file paths** — one path per panelist, each labeled with its panelist source (e.g. `opus run A → /tmp/panel-xxx/opus.md`, `gpt-5.5 → /tmp/panel-xxx/codex.md`). Optionally a scratch dir for Track A.
+- **Answer-file paths** — one path per panelist, each labeled with its panelist source (e.g. `opus run A → /tmp/panel-xxx/opus.yaml`, `gpt-5.5 → /tmp/panel-xxx/codex.yaml`). Each is a YAML whose `message` field is that panelist's final answer. Optionally a scratch dir for Track A.
 
 Read every answer file in full, in your own context, before judging. If reading any panelist file trips `stop_reason: model_context_window_exceeded`, say so explicitly in your output, read what you can in chunks, and mark any section you could not fully ground as **partial / unverified** rather than guessing.
 

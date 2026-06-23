@@ -25,9 +25,9 @@ answers meet. Cross-pollination before the judge defeats the entire mechanism.
 
 Two panelists answer **in parallel**, then the `plan:panel-judge` subagent fuses them:
 
-- **Opus 4.8** via `pairctl send-message --cli claude --read-only`. `--read-only` strips its edit tools
+- **Opus 4.8** via `keeper pair send --cli claude --read-only`. `--read-only` strips its edit tools
   and prepends an explore-only directive — it reads, greps, and runs bash to research, then reports.
-- **GPT-5.5** via `pairctl send-message --cli codex --read-only`. The non-Claude panelist is the
+- **GPT-5.5** via `keeper pair send --cli codex --read-only`. The non-Claude panelist is the
   cross-family diversity the panel is built to harvest. Codex's read-only posture is carried by the prompt
   directive plus a changed-files backstop.
 
@@ -41,6 +41,6 @@ both answer files fresh in its own context rather than defending an answer it wr
 
 Each panelist receives the human's task **verbatim**, plus a short instruction: *research with web search
 and bash, then return a complete, self-contained answer; you are one of several independent experts and
-will not see the others' work.* Nothing more — no lens, no framing that nudges the conclusion. pairctl
+will not see the others' work.* Nothing more — no lens, no framing that nudges the conclusion. keeper-pair
 partners have full filesystem access, so the prompt gives directions and the verbatim task, not pre-read
 content.

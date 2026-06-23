@@ -23,7 +23,7 @@ paths, tool calls, and sources. So there are no assigned "lenses" or personas �
 human's task verbatim and answers it straight. Read `references/panel.md` for the independence rules.
 
 **Architecture (read before you start).** You — the orchestrator — run in the MAIN session because the
-Monitor tool that drives pairctl works only here, never in a subagent (verified). So you do the fan-out in
+Monitor tool that drives `keeper pair` works only here, never in a subagent (verified). So you do the fan-out in
 your own context, then hand the judging to the `plan:panel-judge` subagent. You **never read panelist
 answer content into your context**: you collect only the answer-file PATHS from the completed events and
 pass those paths to the judge. That keeps you lean — the full transcripts live in files the judge reads in
@@ -58,19 +58,21 @@ independence the panel runs on.
 ## Step 2 — Fan out, in parallel and blind
 
 Launch **both panelists in a single turn** (two Monitor calls in one message) so they run concurrently.
-Each writes to its own output file. pairctl partners have full filesystem access — the prompt gives
-directions and the verbatim task, never pre-read content.
+Each writes to its own `--output` file. keeper-pair partners have full filesystem access — the prompt
+gives directions and the verbatim task, never pre-read content.
 
 ```
 Monitor(
-    command='pairctl send-message /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --output-file /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
+    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
     description="panel opus",
+    until="[keeper-pair] (completed|failed)",
     timeout_ms=3600000,
     persistent=false,
 )
 Monitor(
-    command='pairctl send-message /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --output-file /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
+    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
     description="panel codex",
+    until="[keeper-pair] (completed|failed)",
     timeout_ms=1860000,
     persistent=false,
 )
@@ -79,12 +81,15 @@ Monitor(
 - Neither panelist gets an assigned role or persona — both answer the human's task straight. The
   cross-family difference (Opus 4.8 vs GPT-5.5) is the diversity the panel harvests.
 - `--read-only` on both: claude strips its edit tools; codex carries read-only via its prompt directive.
-- When a `[pairctl] started` notification arrives, do nothing until the next notification for that run.
-  When `[pairctl] completed` arrives, note the exact `output_file` path from the notification — **do not
-  read its content into your context**.
+- `keeper pair` emits a strict two-line contract on stdout: one `[keeper-pair] started …` line, then one
+  terminal line. When `started` arrives, do nothing until the terminal line for that run. On
+  `[keeper-pair] completed …`, note the exact `--output` path you passed — **do not read its content into
+  your context**. On `[keeper-pair] failed …`, surface the `error=…` field; that panelist produced no
+  usable answer.
 
-The pairctl `output_file` is a YAML whose `message` is the panelist's own final answer. That file IS the
-answer-file path you hand to the judge — the judge reads it in its own context, not you.
+The `--output` file is a YAML whose `message` is the panelist's own final answer; `completed` fires only
+after its atomic temp-then-rename, so the moment you see it the file is whole. That file IS the answer-file
+path you hand to the judge — the judge reads it in its own context, not you.
 
 ## Step 3 — Spawn the judge subagent
 
@@ -108,15 +113,17 @@ five-section audit, never add a composition note, and don't name the panel by de
 invoked `/plan:panel`, answer the question in its natural shape as your own answer.
 
 **Reveal on demand.** If the human asks how you reached the answer / what contributed / to see the panel,
-*then* surface the audit and composition and point to `pairctl show-chat` / `claudectl show-session` for
-the full runs. A substance follow-up ("are you sure?", "why?") is not that trigger — answer it
+*then* surface the audit and composition and point to each panelist's `transcript_path` (from its
+`--output` YAML) / `claudectl show-session` for the full runs. A substance follow-up ("are you sure?",
+"why?") is not that trigger — answer it
 substantively in your own voice, not with a panel reveal.
 
 **Hedge as yourself.** When the judge's contradictions or blind spots tell you the answer is genuinely
 uncertain, express that low confidence in your own voice — you are unsure, not "the panel disagreed."
 
 Never paste panelist transcripts. The judge's audit is retained for the reveal path; the full panelist
-runs are one `pairctl show-chat` / `claudectl show-session` call away if the human wants to dig in.
+runs are one `transcript_path` read (from the `--output` YAML) / `claudectl show-session` call away if the
+human wants to dig in.
 
 ## Cost & latency note
 

@@ -411,7 +411,8 @@ Keeper has no `install` verb. Wire it up manually:
    the docs-pusher hook that pushes `~/docs` to its remote once per turn on `Stop`,
    + the
    `keeper:await` /
-   `keeper:dispatch` / `keeper:autopilot` gateway skills,
+   `keeper:dispatch` / `keeper:autopilot` gateway skills + the `keeper:pair`
+   pairing skill,
    manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
