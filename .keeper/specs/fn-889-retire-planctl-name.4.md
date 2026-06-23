@@ -32,5 +32,5 @@ Grep done-gate over docs returns only allowlisted trailer-literal references.
 - [ ] no planctl prose residue outside the allowlist
 
 ## Done summary
-
+Swept the planctl name from prose/skills/templates: renamed docs/planctl-strip.md to docs/plan-name-retirement.md as a closed note, swept plan README/CLAUDE.md/skills/templates to keeper plan/.keeper, dropped the vestigial binary runbook, updated keeper README badge prose to the 'plan' source value, and preserved the grandfathered Planctl-* trailer-wire refs.
 ## Evidence
