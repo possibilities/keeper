@@ -32,5 +32,5 @@ deliverable.
       to `git_status.project_dir`.
 
 ## Done summary
-
+Added the raw-key toplevel-identity invariant comment at both lookup sites in src/gated-roots.ts (unseededGatedRoots and allGatedRootsSeeded), stating gated roots MUST already be git toplevels keyed identically to git_status.project_dir, since fn-905's self-clear turns a key mismatch into a permanent forced-unknown wedge.
 ## Evidence
