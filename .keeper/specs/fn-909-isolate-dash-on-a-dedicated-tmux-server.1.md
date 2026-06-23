@@ -137,5 +137,5 @@ no change-history narration (forward-facing docs rule).
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Isolated the dash dashboard onto a dedicated tmux -L dash server (dashTmux helper + buildKillDashServerArgs teardown, -e TMUX= on new-session, fail-open rebuild) and split setup-tmux into PROVISION_SESSIONS [work] vs SWEEP_KILL_SESSIONS [work,autopilot].
 ## Evidence
