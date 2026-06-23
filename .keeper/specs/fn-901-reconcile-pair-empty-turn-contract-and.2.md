@@ -20,5 +20,5 @@ reap assertion is desirable if reachable without flake.
 - [ ] The test sandboxes its state per the repo's test-isolation rules and polls rather than sleeps for any async wait.
 
 ## Done summary
-
+Added test/pair-cli.test.ts driving cli/pair.ts main() launch-failure path; asserts the two-line Monitor contract (exactly one started + one failed, started before failed, no completed leak) with sandboxed state and no real tmux/git/daemon.
 ## Evidence
