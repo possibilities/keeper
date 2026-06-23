@@ -50,5 +50,5 @@ deliberately reverted file (it must fail) to prove the guard bites.
 - [ ] README test-helper paragraph and `test/helpers/git-repo.ts` header updated to match the new reality
 
 ## Done summary
-
+Added scripts/lint-no-real-git.ts + scripts/test-real-git-allowlist.txt wired as bun run test:hygiene (scans top-level test/*.test.ts for real-git signatures, fails on non-allowlisted matches). Documented the no-real-git rule + gate + lint in CLAUDE.md/README and narrowed the git-repo.ts header.
 ## Evidence
