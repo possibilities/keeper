@@ -55,5 +55,5 @@ No unit test for skill prose; verification is the early proof point (a live `/wo
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added /work Phase 2c: a semantic block escalates once to planner@<epic_id> over the bus, falls back to surface-BLOCKED-and-stop on any non-delivered send, and resumes the worker via the existing Phase 2b machinery (never editing code). Documented the planner@<epic_id> role address in the bus SKILL.md, keeper bus help + cli/bus.ts JSDoc, and the README bus-relay prose; re-rendered work/SKILL.md.
 ## Evidence
