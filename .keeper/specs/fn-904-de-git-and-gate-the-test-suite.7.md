@@ -52,5 +52,5 @@ run with no `dist/` build present.
 - [ ] Residual real-process / real-git tests live behind `KEEPER_PLAN_RUN_PROCESS` / `KEEPER_PLAN_RUN_SLOW`
 
 ## Done summary
-
+Routed the remaining in-verb git reads (commit_lookup/reconcile/worker_resume) through an extended PlanVcs facade and gist's gh/opener spawns through a new PlanExec facade; replaced the executable PATH shim with an in-memory command-driver registry and seeded source commits/committed task JSON via the fake VCS. Default plugins/plan bun test now spawns zero real git, zero binary, zero shim (verified no dist/), with residual real-git behind KEEPER_PLAN_RUN_SLOW/KEEPER_PLAN_RUN_PROCESS.
 ## Evidence
