@@ -267,6 +267,22 @@ integration files. **`bun run test:full` is mandatory before landing any change
 touching daemon / worker / db / hook / git process paths or any slow-tier file** —
 the fast run does NOT cover those. When in doubt, run `test:full`.
 
+**No real git in the default tiers (fn-904).** A default-tier test MUST NOT spawn
+real `git` (no `Bun.spawnSync(["git", …])`, no `initRepo`/`git init`). Test
+keeper's DECISIONS at the git boundary with synthetic inputs, never git's
+execution: extract a PURE seam (mirror `parsePorcelainV2` → `buildGitSnapshotFrom`,
+`enumerateCommitsFromLog`, `parseCommitFiles` in `src/git-worker.ts` — the impure
+`buildGitSnapshot` / `enumerateCommitsInDelta` keep their `gitOutput`/`hash-object`/
+`lstat` calls at the producer call site, then delegate to the pure core so
+production stays byte-identical) and drive it with synthetic payloads or with
+golden `git log -z` / `diff-tree -z` strings CAPTURED FROM REAL GIT ONCE
+(`test/fixtures/git-log-goldens.ts` — never hand-author them, or the stride parser
+validates against a fabrication; re-capture on a format change). A test whose
+contract genuinely IS reading git's own state (fs ref resolution, the `git status`
+probe, the wrapper-script trailer injection) cannot be made synthetic — name it
+`*.slow.test.ts` and add it to the fast-tier `--path-ignore-patterns` list (see
+`test/git-worker-realgit.slow.test.ts`, `test/git-wrapper.slow.test.ts`).
+
 **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
 `retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` — a fixed
 sleep can silently resolve under host contention and flake the suite.

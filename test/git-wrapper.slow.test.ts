@@ -1,3 +1,11 @@
+/**
+ * SLOW real-git quarantine (fn-904.2). This is an END-TO-END test of the
+ * `plugins/keeper/plugin/bin/git` WRAPPER shell script: it spawns the wrapper,
+ * which execs REAL git, and asserts the injected `Session-Id` trailer actually
+ * landed in a real commit. The wrapper is a shell script, not TS — there is no
+ * pure seam to extract; the whole point is wrapper-against-real-git behavior. So
+ * it stays a real-git test, slow-quarantined out of the fast tier.
+ */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

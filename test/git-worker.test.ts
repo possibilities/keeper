@@ -1,14 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import {
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,7 +16,7 @@ import {
 } from "../src/derivers";
 import {
   buildDiscoveryCandidates,
-  buildGitSnapshot,
+  buildGitSnapshotFrom,
   COMMIT_ENUM_MAX_RETRIES,
   type DataVersionWakeDecision,
   type DiscoveryContext,
@@ -35,20 +26,26 @@ import {
   decideReconcileTransitions,
   deriveChangeToRescueMs,
   discoverProjectRoots,
-  enumerateCommitsInDelta,
+  type EnumeratedCommitFile,
+  enumerateCommitsFromLog,
   filterPlanChanges,
   type GitDirtyFile,
+  type GitFileStatus,
   type GitSnapshotPayload,
   isPlanChangedPath,
+  type ParsedGitStatus,
+  parseCommitFiles,
   parsePorcelainV2,
-  probeWatchMembership,
-  resolveHeadOidViaFs,
   selectVanishedRoots,
   semanticSnapshotKey,
   shouldWatchRoot,
 } from "../src/git-worker";
 import { RescanScheduler, type SchedulerTimers } from "../src/rescan";
-import { initRepo as initGitRepo } from "./helpers/git-repo";
+import {
+  GIT_DIFF_TREE_GOLDENS,
+  GIT_LOG_GOLDENS,
+  GOLDEN_OIDS,
+} from "./fixtures/git-log-goldens";
 
 // ---------------------------------------------------------------------------
 // parsePorcelainV2 — kept verbatim from pre-fn-633.5; the producer's
@@ -112,11 +109,17 @@ test("parsePorcelainV2 captures branch metadata and dirty file statuses", () => 
 });
 
 // ---------------------------------------------------------------------------
-// buildGitSnapshot — fn-633.5 file-centric payload. The producer's contract
-// narrows to: enumerate dirty files from the porcelain-v2 parse, `lstat`
-// each for `mtime_ms`, emit a flat per-file list. NO event-log join, NO
-// per-job rollup, NO project-wide orphan filter — those derivations move to
-// the reducer in fn-633.6.
+// buildGitSnapshotFrom — fn-633.5 file-centric payload, PURE core (fn-904.2).
+// The producer's contract narrows to: enumerate dirty files from the
+// porcelain-v2 parse, attach per-file `worktree_oid` + `mtime_ms`, emit a flat
+// per-file list. NO event-log join, NO per-job rollup, NO project-wide orphan
+// filter — those derivations live in the reducer (fn-633.6).
+//
+// `buildGitSnapshot` (production) calls the two impure helpers
+// (`batchHashObjectOids` + per-file `lstatMtimeMs`) then delegates to this pure
+// builder, so production behavior is byte-identical (epic acceptance). The pure
+// builder takes the two impure inputs as maps and is driven here with synthetic
+// payloads — zero git, zero fs.
 // ---------------------------------------------------------------------------
 
 const tmpDirs: string[] = [];
@@ -130,29 +133,48 @@ afterAll(() => {
   }
 });
 
+/** A plain tmp dir (NOT a git repo) for the `.keeper`-on-disk discovery tests. */
 function mkTmpWorktree(): string {
   const dir = mkdtempSync(join(tmpdir(), "keeper-git-snapshot-"));
   tmpDirs.push(dir);
   return dir;
 }
 
-/** Stamp a fixed mtime so the test can assert an exact `mtime_ms` value. */
-function stampMtime(absPath: string, unixSeconds: number): void {
-  utimesSync(absPath, unixSeconds, unixSeconds);
+/** Synthetic porcelain-parse file entry with sensible defaults. */
+function fileStatus(over: Partial<GitFileStatus> = {}): GitFileStatus {
+  return {
+    path: "a.ts",
+    xy: ".M",
+    index: ".",
+    worktree: "M",
+    kind: "ordinary",
+    index_oid: null,
+    worktree_mode: null,
+    ...over,
+  };
 }
 
-test("buildGitSnapshot on a clean worktree emits an empty dirty_files list", () => {
-  const root = mkTmpWorktree();
-  const snapshot = buildGitSnapshot(root, {
+function parsed(over: Partial<ParsedGitStatus> = {}): ParsedGitStatus {
+  return {
     branch: "main",
     head_oid: "abc123",
     upstream: "origin/main",
     ahead: 0,
     behind: 0,
     files: [],
-  });
+    ...over,
+  };
+}
+
+test("buildGitSnapshotFrom on a clean worktree emits an empty dirty_files list", () => {
+  const snapshot = buildGitSnapshotFrom(
+    "/repo",
+    parsed({ files: [] }),
+    new Map(),
+    new Map(),
+  );
   expect(snapshot).toEqual({
-    project_dir: root,
+    project_dir: "/repo",
     branch: "main",
     head_oid: "abc123",
     upstream: "origin/main",
@@ -166,41 +188,47 @@ test("buildGitSnapshot on a clean worktree emits an empty dirty_files list", () 
   expect(snapshot).not.toHaveProperty("jobs");
 });
 
-test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () => {
-  const root = mkTmpWorktree();
-  writeFileSync(join(root, "a.ts"), "modified\n");
-  stampMtime(join(root, "a.ts"), 1_700_000_000); // unix seconds
-  writeFileSync(join(root, "b.ts"), "renamed-content\n");
-  stampMtime(join(root, "b.ts"), 1_700_000_100);
-
-  const snapshot = buildGitSnapshot(root, {
-    branch: "main",
-    head_oid: "deadbeef",
-    upstream: null,
-    ahead: null,
-    behind: null,
-    files: [
-      {
-        path: "a.ts",
-        xy: ".M",
-        index: ".",
-        worktree: "M",
-        kind: "ordinary",
-        index_oid: "1111111111111111111111111111111111111111",
-        worktree_mode: "100644",
-      },
-      {
-        path: "b.ts",
-        xy: "R.",
-        index: "R",
-        worktree: ".",
-        kind: "renamed",
-        orig_path: "a-old.ts",
-        index_oid: "2222222222222222222222222222222222222222",
-        worktree_mode: "100644",
-      },
-    ],
-  });
+test("buildGitSnapshotFrom on a mixed dirty worktree stamps mtime_ms + worktree_oid per file", () => {
+  const oidByPath = new Map<string, string | null>([
+    ["a.ts", "aa".repeat(20)],
+    ["b.ts", "bb".repeat(20)],
+  ]);
+  const mtimeByPath = new Map<string, number | null>([
+    ["a.ts", 1_700_000_000_000],
+    ["b.ts", 1_700_000_100_000],
+  ]);
+  const snapshot = buildGitSnapshotFrom(
+    "/repo",
+    parsed({
+      head_oid: "deadbeef",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      files: [
+        fileStatus({
+          path: "a.ts",
+          xy: ".M",
+          index: ".",
+          worktree: "M",
+          kind: "ordinary",
+          index_oid: "1".repeat(40),
+          worktree_mode: "100644",
+        }),
+        fileStatus({
+          path: "b.ts",
+          xy: "R.",
+          index: "R",
+          worktree: ".",
+          kind: "renamed",
+          orig_path: "a-old.ts",
+          index_oid: "2".repeat(40),
+          worktree_mode: "100644",
+        }),
+      ],
+    }),
+    oidByPath,
+    mtimeByPath,
+  );
 
   expect(snapshot.dirty_files).toHaveLength(2);
   const a = snapshot.dirty_files[0] as GitDirtyFile;
@@ -209,13 +237,11 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
   expect(a.xy).toBe(".M");
   expect(a.mtime_ms).toBe(1_700_000_000_000);
   expect(a).not.toHaveProperty("orig_path");
-  // v44 / fn-664: per-file content axes — `index_oid` + `worktree_mode`
-  // pass through from the porcelain parse; `worktree_oid` is the
-  // filter-correct hash of the actual bytes, validated as a 40-hex SHA-1
-  // (git hash-object produced it).
-  expect(a.index_oid).toBe("1111111111111111111111111111111111111111");
+  // Per-file content axes — `index_oid` + `worktree_mode` pass through from the
+  // porcelain parse; `worktree_oid` comes from the producer's batched hash map.
+  expect(a.index_oid).toBe("1".repeat(40));
   expect(a.worktree_mode).toBe("100644");
-  expect(a.worktree_oid).toMatch(/^[0-9a-f]{40}$/);
+  expect(a.worktree_oid).toBe("aa".repeat(20));
 
   const b = snapshot.dirty_files[1] as GitDirtyFile;
   expect(b.path).toBe("b.ts");
@@ -223,49 +249,52 @@ test("buildGitSnapshot on a mixed dirty worktree stamps mtime_ms per file", () =
   expect(b.xy).toBe("R.");
   expect(b.orig_path).toBe("a-old.ts");
   expect(b.mtime_ms).toBe(1_700_000_100_000);
-  expect(b.index_oid).toBe("2222222222222222222222222222222222222222");
+  expect(b.index_oid).toBe("2".repeat(40));
   expect(b.worktree_mode).toBe("100644");
-  expect(b.worktree_oid).toMatch(/^[0-9a-f]{40}$/);
-  // Different bytes → different worktree oid (the whole point — content
-  // equality is what task .2's discharge gate reads).
+  expect(b.worktree_oid).toBe("bb".repeat(20));
+  // Distinct content → distinct worktree oid (the discharge gate reads this).
   expect(b.worktree_oid).not.toBe(a.worktree_oid);
 });
 
-test("buildGitSnapshot on an all-untracked worktree returns the untracked list with mtimes", () => {
-  const root = mkTmpWorktree();
-  mkdirSync(join(root, "sub"), { recursive: true });
-  writeFileSync(join(root, "sub/new file.ts"), "x\n");
-  stampMtime(join(root, "sub/new file.ts"), 1_650_000_000);
-  writeFileSync(join(root, "another.md"), "y\n");
-  stampMtime(join(root, "another.md"), 1_650_001_000);
-
-  const snapshot = buildGitSnapshot(root, {
-    branch: null,
-    head_oid: null,
-    upstream: null,
-    ahead: null,
-    behind: null,
-    files: [
-      {
-        path: "another.md",
-        xy: "??",
-        index: "?",
-        worktree: "?",
-        kind: "untracked",
-        index_oid: null,
-        worktree_mode: null,
-      },
-      {
-        path: "sub/new file.ts",
-        xy: "??",
-        index: "?",
-        worktree: "?",
-        kind: "untracked",
-        index_oid: null,
-        worktree_mode: null,
-      },
-    ],
-  });
+test("buildGitSnapshotFrom on an all-untracked worktree preserves null index_oid/mode + carries worktree_oid", () => {
+  const oidByPath = new Map<string, string | null>([
+    ["another.md", "cc".repeat(20)],
+    ["sub/new file.ts", "dd".repeat(20)],
+  ]);
+  const mtimeByPath = new Map<string, number | null>([
+    ["another.md", 1_650_001_000_000],
+    ["sub/new file.ts", 1_650_000_000_000],
+  ]);
+  // The porcelain parse yields a stable total order (it sorts by path); pass
+  // the files in that order so the payload order is deterministic.
+  const snapshot = buildGitSnapshotFrom(
+    "/repo",
+    parsed({
+      branch: null,
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      files: [
+        fileStatus({
+          path: "another.md",
+          xy: "??",
+          index: "?",
+          worktree: "?",
+          kind: "untracked",
+        }),
+        fileStatus({
+          path: "sub/new file.ts",
+          xy: "??",
+          index: "?",
+          worktree: "?",
+          kind: "untracked",
+        }),
+      ],
+    }),
+    oidByPath,
+    mtimeByPath,
+  );
 
   expect(snapshot.branch).toBeNull();
   expect(snapshot.head_oid).toBeNull();
@@ -277,213 +306,103 @@ test("buildGitSnapshot on an all-untracked worktree returns the untracked list w
   expect(snapshot.dirty_files.map((f) => f.mtime_ms)).toEqual([
     1_650_001_000_000, 1_650_000_000_000,
   ]);
-  // v44 / fn-664: untracked porcelain records carry no `hI`/`mW`, so the
-  // parse and payload preserve `null` for both — but the worktree blob
-  // hash IS available (the bytes are on disk), so `worktree_oid` still
-  // parses as a valid 40-hex SHA-1.
+  // Untracked porcelain records carry no `hI`/`mW`, so index_oid/worktree_mode
+  // stay null — but the worktree blob hash IS available (bytes on disk), so
+  // worktree_oid rides through from the producer's hash map.
   expect(snapshot.dirty_files.every((f) => f.index_oid === null)).toBe(true);
   expect(snapshot.dirty_files.every((f) => f.worktree_mode === null)).toBe(
     true,
   );
-  expect(
-    snapshot.dirty_files.every(
-      (f) => f.worktree_oid != null && /^[0-9a-f]{40}$/.test(f.worktree_oid),
-    ),
-  ).toBe(true);
+  expect(snapshot.dirty_files.map((f) => f.worktree_oid)).toEqual([
+    "cc".repeat(20),
+    "dd".repeat(20),
+  ]);
 });
 
-test("buildGitSnapshot tolerates a stat race (file gone) by stamping mtime_ms: null", () => {
-  const root = mkTmpWorktree();
-  // `gone.ts` is in the porcelain-v2 parse but never written to disk — this
-  // is the documented stat race: `git status` enumerated it, then it
-  // disappeared before our per-file `lstat`. The producer must emit
-  // `mtime_ms: null` for the file and NOT crash.
-  writeFileSync(join(root, "real.ts"), "exists\n");
-  stampMtime(join(root, "real.ts"), 1_700_000_200);
-
-  const snapshot = buildGitSnapshot(root, {
-    branch: "main",
-    head_oid: "abc",
-    upstream: null,
-    ahead: null,
-    behind: null,
-    files: [
-      {
-        path: "gone.ts",
-        xy: ".M",
-        index: ".",
-        worktree: "M",
-        kind: "ordinary",
-        index_oid: "3333333333333333333333333333333333333333",
-        worktree_mode: "100644",
-      },
-      {
-        path: "real.ts",
-        xy: ".M",
-        index: ".",
-        worktree: "M",
-        kind: "ordinary",
-        index_oid: "4444444444444444444444444444444444444444",
-        worktree_mode: "100644",
-      },
-    ],
-  });
+test("buildGitSnapshotFrom tolerates a stat race (file gone) by stamping mtime_ms: null", () => {
+  // `gone.ts` is in the porcelain-v2 parse but absent from BOTH the oid map and
+  // the mtime map — the documented producer-side stat race: `git status`
+  // enumerated it, then it vanished before the batched `hash-object` + `lstat`.
+  // The pure builder must read both as `null` for that file and NOT crash.
+  const oidByPath = new Map<string, string | null>([
+    ["real.ts", "ee".repeat(20)],
+  ]);
+  const mtimeByPath = new Map<string, number | null>([
+    ["real.ts", 1_700_000_200_000],
+  ]);
+  const snapshot = buildGitSnapshotFrom(
+    "/repo",
+    parsed({
+      head_oid: "abc",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      files: [
+        fileStatus({
+          path: "gone.ts",
+          index_oid: "3".repeat(40),
+          worktree_mode: "100644",
+        }),
+        fileStatus({
+          path: "real.ts",
+          index_oid: "4".repeat(40),
+          worktree_mode: "100644",
+        }),
+      ],
+    }),
+    oidByPath,
+    mtimeByPath,
+  );
 
   expect(snapshot.dirty_files).toHaveLength(2);
   expect(snapshot.dirty_files[0].path).toBe("gone.ts");
   expect(snapshot.dirty_files[0].mtime_ms).toBeNull();
-  // v44 / fn-664: the producer-side stat race extends to `worktree_oid` —
-  // a file that vanished between `git status` and the batched
-  // `hash-object` call gets `worktree_oid: null` without wedging the
-  // snapshot. `index_oid` / `worktree_mode` came off the porcelain parse
-  // (no fs probe) so they survive. `real.ts` was hashable, so its
-  // `worktree_oid` is a valid 40-hex SHA-1.
+  // The stat race extends to `worktree_oid` — a file missing from the producer's
+  // hash map reads null without wedging the snapshot. `index_oid` /
+  // `worktree_mode` came off the porcelain parse (no fs probe) so they survive.
   expect(snapshot.dirty_files[0].worktree_oid).toBeNull();
-  expect(snapshot.dirty_files[0].index_oid).toBe(
-    "3333333333333333333333333333333333333333",
-  );
+  expect(snapshot.dirty_files[0].index_oid).toBe("3".repeat(40));
   expect(snapshot.dirty_files[0].worktree_mode).toBe("100644");
   expect(snapshot.dirty_files[1].path).toBe("real.ts");
   expect(snapshot.dirty_files[1].mtime_ms).toBe(1_700_000_200_000);
-  expect(snapshot.dirty_files[1].worktree_oid).toMatch(/^[0-9a-f]{40}$/);
-  expect(snapshot.dirty_files[1].index_oid).toBe(
-    "4444444444444444444444444444444444444444",
-  );
+  expect(snapshot.dirty_files[1].worktree_oid).toBe("ee".repeat(20));
+  expect(snapshot.dirty_files[1].index_oid).toBe("4".repeat(40));
   expect(snapshot.dirty_files[1].worktree_mode).toBe("100644");
 });
 
-test("buildGitSnapshot uses lstat so a symlink reports the link's own mtime, not the target's", () => {
-  const root = mkTmpWorktree();
-  // Target file: stamped at T1, OUTSIDE the worktree so its mtime can't be
-  // confused with anything in the snapshot.
-  const externalTarget = mkdtempSync(
-    join(tmpdir(), "keeper-git-snapshot-target-"),
+test("buildGitSnapshotFrom reads each file's mtime from the per-path map (lstat semantics live in the producer)", () => {
+  // The producer's per-file `lstatMtimeMs` does the lstat (so a symlink reports
+  // the link's own mtime, not the target's — verified end-to-end in the slow
+  // real-git quarantine). The pure builder just reads whatever the producer put
+  // in the map for that path; assert that pass-through is exact and per-path.
+  const linkMtime = 1_777_000_000_123;
+  const oidByPath = new Map<string, string | null>([
+    ["link.ts", "ff".repeat(20)],
+  ]);
+  const mtimeByPath = new Map<string, number | null>([["link.ts", linkMtime]]);
+  const snapshot = buildGitSnapshotFrom(
+    "/repo",
+    parsed({
+      head_oid: "abc",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      files: [
+        fileStatus({
+          path: "link.ts",
+          xy: "??",
+          index: "?",
+          worktree: "?",
+          kind: "untracked",
+        }),
+      ],
+    }),
+    oidByPath,
+    mtimeByPath,
   );
-  tmpDirs.push(externalTarget);
-  const targetPath = join(externalTarget, "target.ts");
-  writeFileSync(targetPath, "target\n");
-  stampMtime(targetPath, 1_500_000_000); // way older
-
-  // Symlink inside the worktree pointing at the external target. The link
-  // itself gets its own mtime when created (most filesystems stamp it at
-  // creation). Then explicitly bump the symlink mtime to T2 so we have two
-  // distinctly-recognizable values — if `buildGitSnapshot` used `stat()` it
-  // would follow the link and report T1; if it correctly uses `lstat` it
-  // reports the link's own T2.
-  const linkPath = join(root, "link.ts");
-  symlinkSync(targetPath, linkPath);
-  // `utimesSync` on a symlink path follows the link, so use `lutimes` via
-  // the `node:fs` promises API... but Bun's `fs.lutimesSync` exists. Fall
-  // back to a brute-force "delete + recreate" if needed — but the
-  // assertion is "link mtime != target mtime", not "link mtime == fixed
-  // T2". Read the link's actual current mtime via `lstatSync` and assert
-  // the snapshot reports that exact value.
-  const linkMtimeMs = lstatSync(linkPath).mtimeMs;
-  const targetMtimeMs = lstatSync(targetPath).mtimeMs;
-  // Sanity: link and target have different mtimes (so the test is
-  // meaningful — if the test environment happened to make them identical,
-  // skip rather than false-pass).
-  if (linkMtimeMs === targetMtimeMs) {
-    return; // environment couldn't differentiate; skip without failing
-  }
-
-  const snapshot = buildGitSnapshot(root, {
-    branch: "main",
-    head_oid: "abc",
-    upstream: null,
-    ahead: null,
-    behind: null,
-    files: [
-      {
-        path: "link.ts",
-        xy: "??",
-        index: "?",
-        worktree: "?",
-        kind: "untracked",
-        index_oid: null,
-        worktree_mode: null,
-      },
-    ],
-  });
-
   expect(snapshot.dirty_files).toHaveLength(1);
-  expect(snapshot.dirty_files[0].mtime_ms).toBe(linkMtimeMs);
-  expect(snapshot.dirty_files[0].mtime_ms).not.toBe(targetMtimeMs);
-});
-
-// ---------------------------------------------------------------------------
-// v44 / fn-664: filter-correct worktree_oid via `git hash-object`. The whole
-// point of omitting `--no-filters` is so the result equals `git`'s own
-// stored blob — the discharge gate in task .2 compares this against the
-// `Commit` event's `blob_oid` (which IS the stored hash). Verify equality
-// by initializing a real repo, staging the file, and reading `git
-// hash-object -w` / `ls-files -s` for the stored oid.
-// ---------------------------------------------------------------------------
-
-function gitInit(root: string): void {
-  // Minimal config so `git add` / `git commit` work without a global git
-  // identity, plus `commit.gpgsign false` so signed-by-default hosts don't
-  // wedge — the shared helper centralizes the exact init+config sequence.
-  initGitRepo(root);
-}
-
-function gitHashObjectStored(root: string, relPath: string): string {
-  // Use `git hash-object` (no `-w`, no `--no-filters`) to compute the SAME
-  // filter-correct oid the producer would compute. Used as the ground
-  // truth in the equality test below.
-  const res = Bun.spawnSync(["git", "-C", root, "hash-object", relPath], {
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-  if (!res.success || res.exitCode !== 0) {
-    throw new Error(`git hash-object failed for ${relPath}`);
-  }
-  return res.stdout.toString().trim();
-}
-
-test("buildGitSnapshot worktree_oid matches git's stored blob oid (filter-correct)", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
-  // Two distinct files so we exercise the batched path with >1 entry.
-  writeFileSync(join(root, "a.ts"), "alpha contents\n");
-  writeFileSync(join(root, "b.md"), "# Beta\n\nsome markdown\n");
-
-  const expectedA = gitHashObjectStored(root, "a.ts");
-  const expectedB = gitHashObjectStored(root, "b.md");
-
-  const snapshot = buildGitSnapshot(root, {
-    branch: "main",
-    head_oid: null,
-    upstream: null,
-    ahead: null,
-    behind: null,
-    files: [
-      {
-        path: "a.ts",
-        xy: "??",
-        index: "?",
-        worktree: "?",
-        kind: "untracked",
-        index_oid: null,
-        worktree_mode: null,
-      },
-      {
-        path: "b.md",
-        xy: "??",
-        index: "?",
-        worktree: "?",
-        kind: "untracked",
-        index_oid: null,
-        worktree_mode: null,
-      },
-    ],
-  });
-
-  expect(snapshot.dirty_files).toHaveLength(2);
-  // Both oids equal git's own ground-truth — i.e. the producer's batched
-  // hash-object call is producing the exact bytes git would store.
-  expect(snapshot.dirty_files[0].worktree_oid).toBe(expectedA);
-  expect(snapshot.dirty_files[1].worktree_oid).toBe(expectedB);
+  expect(snapshot.dirty_files[0].mtime_ms).toBe(linkMtime);
+  expect(snapshot.dirty_files[0].worktree_oid).toBe("ff".repeat(20));
 });
 
 // ---------------------------------------------------------------------------
@@ -798,101 +717,9 @@ test("extractCommit clamps non-positive / non-numeric committed_at_ms to 0", () 
   }
 });
 
-// ---------------------------------------------------------------------------
-// resolveHeadOidViaFs — the divergence watchdog's fs-only HEAD ground truth.
-// Must match `git rev-parse HEAD` across regular repos, packed-refs, detached
-// HEAD, and linked worktrees, WITHOUT shelling git — that independence is the
-// whole point (it stays correct when the worker's git subprocess view wedges).
-// ---------------------------------------------------------------------------
-
-function git(cwd: string, ...args: string[]): string {
-  const r = Bun.spawnSync(["git", "-C", cwd, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "t",
-      GIT_AUTHOR_EMAIL: "t@t.t",
-      GIT_COMMITTER_NAME: "t",
-      GIT_COMMITTER_EMAIL: "t@t.t",
-    },
-  });
-  if (!r.success) {
-    throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
-  }
-  return r.stdout.toString().trim();
-}
-
-function initRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "keeper-headfs-"));
-  initGitRepo(dir);
-  writeFileSync(join(dir, "a.txt"), "hello\n");
-  git(dir, "add", "-A");
-  git(dir, "commit", "-qm", "init");
-  return dir;
-}
-
-test("resolveHeadOidViaFs matches git rev-parse on a regular repo (loose ref)", () => {
-  const dir = initRepo();
-  try {
-    expect(resolveHeadOidViaFs(dir)).toBe(git(dir, "rev-parse", "HEAD"));
-    // A second commit advances HEAD; the fs read must track it.
-    writeFileSync(join(dir, "b.txt"), "world\n");
-    git(dir, "add", "-A");
-    git(dir, "commit", "-qm", "second");
-    expect(resolveHeadOidViaFs(dir)).toBe(git(dir, "rev-parse", "HEAD"));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveHeadOidViaFs resolves a packed ref (no loose ref file)", () => {
-  const dir = initRepo();
-  try {
-    const head = git(dir, "rev-parse", "HEAD");
-    git(dir, "pack-refs", "--all");
-    // refs/heads/main is now only in packed-refs; the loose file is gone.
-    expect(resolveHeadOidViaFs(dir)).toBe(head);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveHeadOidViaFs returns the oid for a detached HEAD", () => {
-  const dir = initRepo();
-  try {
-    const head = git(dir, "rev-parse", "HEAD");
-    git(dir, "checkout", "-q", "--detach", head);
-    expect(resolveHeadOidViaFs(dir)).toBe(head);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveHeadOidViaFs resolves a linked worktree's own HEAD", () => {
-  const dir = initRepo();
-  const wt = mkdtempSync(join(tmpdir(), "keeper-headfs-wt-"));
-  rmSync(wt, { recursive: true, force: true }); // git worktree add wants a fresh path
-  try {
-    git(dir, "branch", "feature");
-    git(dir, "worktree", "add", "-q", wt, "feature");
-    // The linked worktree's `.git` is a `gitdir:` pointer file, refs live in
-    // the main repo's common-dir — the resolver must follow both hops.
-    expect(resolveHeadOidViaFs(wt)).toBe(git(wt, "rev-parse", "HEAD"));
-  } finally {
-    rmSync(wt, { recursive: true, force: true });
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveHeadOidViaFs returns null on a non-repo path (fail-safe)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "keeper-headfs-bare-"));
-  try {
-    expect(resolveHeadOidViaFs(dir)).toBeNull();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+// resolveHeadOidViaFs (fs-only HEAD ground truth) needs REAL git to produce the
+// ground-truth oids it must match — slow-quarantined in
+// `test/git-worker-realgit.slow.test.ts` (fn-904.2).
 
 // ---------------------------------------------------------------------------
 // decideHeadDivergence — pure decision for the emitSnapshot wedge guard. Suppress
@@ -1039,16 +866,29 @@ test("decideHeadCacheAdvance: COMMIT_ENUM_MAX_RETRIES holds for N-1 throws then 
 // ---------------------------------------------------------------------------
 
 // Faithful re-creation of emitSnapshot's HEAD-oid delta + advance arms, driving
-// the same `decideHeadCacheAdvance` policy + `enumerateCommitsInDelta` /
-// `filterPlanChanges` the worker uses. `enumThrows` lets a test simulate a
-// transient enumeration failure for one observation.
+// the same `decideHeadCacheAdvance` policy + `enumerateCommitsFromLog` /
+// `filterPlanChanges` the worker uses. `logFor(prev,next)` stands in for the
+// `git log -z` shell-out — it returns a synthetic `-z` log string (or throws to
+// simulate a transient enumeration failure). `filesFor(oid)` is the synthetic
+// `diff-tree` resolver. Both are pure, so this test exercises the policy machine
+// with zero real git (fn-904.2).
+const SYNTH_ROOT = "/repo";
+
+/** Build a one-commit synthetic `git log -z` field string for the given oid,
+ *  no trailers (the policy tests only care about the per-commit FILE list). */
+function synthLog(oid: string): string {
+  // 8 fields per commit, trailing empty element — matches COMMIT_LOG_FORMAT.
+  return `${oid}\0\0\0\0\0\0\0\0`;
+}
+
 function stepHeadDelta(
-  root: string,
   cache: Map<string, string | null>,
   failures: Map<string, number>,
   currentHeadOid: string | null,
-  enumThrows: boolean,
+  logFor: (prev: string | null, next: string) => string,
+  filesFor: (oid: string) => EnumeratedCommitFile[],
 ): { planEmits: string[][]; loud: boolean } {
+  const root = SYNTH_ROOT;
   const planEmits: string[][] = [];
   let loud = false;
   if (!cache.has(root)) {
@@ -1059,8 +899,8 @@ function stepHeadDelta(
   if (currentHeadOid !== null && currentHeadOid !== prev) {
     let enumOk = true;
     try {
-      if (enumThrows) throw new Error("simulated enumeration failure");
-      const commits = enumerateCommitsInDelta(root, prev, currentHeadOid);
+      const rawZ = logFor(prev, currentHeadOid);
+      const commits = enumerateCommitsFromLog(rawZ, filesFor);
       for (const c of commits) {
         const changes = filterPlanChanges(c.files);
         if (changes.length > 0) planEmits.push(changes.map((ch) => ch.path));
@@ -1081,65 +921,80 @@ function stepHeadDelta(
   return { planEmits, loud };
 }
 
+const planFile = (path: string): EnumeratedCommitFile[] => [
+  { path, blob_oid: "a".repeat(40), committed_mode: "100644" },
+];
+const throwLog = (): string => {
+  throw new Error("simulated enumeration failure");
+};
+
 test("emitSnapshot delta: a transient enumeration throw re-emits plan-commit-changed on the next clean observation", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
   const cache = new Map<string, string | null>();
   const failures = new Map<string, number>();
 
-  // Initial commit so HEAD resolves, then seed the cache on first sighting (no
-  // emit) — mirrors emitSnapshot's bootstrap arm.
-  const seedOid = gitCommit(root, "init.ts", "init\n", {});
-  const seed = stepHeadDelta(root, cache, failures, seedOid, false);
-  expect(seed.planEmits).toEqual([]);
-
-  // A plan-shaped commit lands.
-  const planOid = gitCommit(
-    root,
-    ".keeper/epics/fn-999-demo.json",
-    "scaffold\n",
-    {},
+  // Seed the cache on first sighting (no emit) — mirrors emitSnapshot's
+  // bootstrap arm.
+  const seedOid = "1".repeat(40);
+  const planOid = "2".repeat(40);
+  const seed = stepHeadDelta(
+    cache,
+    failures,
+    seedOid,
+    (_p, next) => synthLog(next),
+    () => [],
   );
+  expect(seed.planEmits).toEqual([]);
 
   // Observation #1: enumeration THROWS transiently. The pre-fn-705 bug would
   // advance the cache past this commit and drop it forever.
-  const obs1 = stepHeadDelta(root, cache, failures, planOid, true);
+  const obs1 = stepHeadDelta(cache, failures, planOid, throwLog, () =>
+    planFile(".keeper/epics/fn-999-demo.json"),
+  );
   expect(obs1.planEmits).toEqual([]); // nothing emitted — the throw ate it
-  expect(cache.get(root)).toBe(seedOid); // cache HELD at the pre-commit head
-  expect(failures.get(root)).toBe(1); // one failure recorded
+  expect(cache.get(SYNTH_ROOT)).toBe(seedOid); // cache HELD at the pre-commit head
+  expect(failures.get(SYNTH_ROOT)).toBe(1); // one failure recorded
 
   // Observation #2: same (or any newer) head, enumeration succeeds. Because the
   // cache was held, the SAME range re-enumerates and the dropped commit's
   // plan change re-emits — drop-proof.
-  const obs2 = stepHeadDelta(root, cache, failures, planOid, false);
+  const obs2 = stepHeadDelta(
+    cache,
+    failures,
+    planOid,
+    (_prev, next) => synthLog(next),
+    () => planFile(".keeper/epics/fn-999-demo.json"),
+  );
   expect(obs2.planEmits).toHaveLength(1);
   expect(obs2.planEmits[0]).toContain(".keeper/epics/fn-999-demo.json");
-  expect(cache.get(root)).toBe(planOid); // advanced now that it succeeded
-  expect(failures.has(root)).toBe(false); // counter reset on success
+  expect(cache.get(SYNTH_ROOT)).toBe(planOid); // advanced now that it succeeded
+  expect(failures.has(SYNTH_ROOT)).toBe(false); // counter reset on success
 });
 
 test("emitSnapshot delta: persistent enumeration failure force-advances after COMMIT_ENUM_MAX_RETRIES (no hot spin)", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
   const cache = new Map<string, string | null>();
   const failures = new Map<string, number>();
-  const seedOid = gitCommit(root, "init.ts", "init\n", {});
-  stepHeadDelta(root, cache, failures, seedOid, false); // seed
-
-  const nextOid = gitCommit(root, "a.ts", "src\n", {});
+  const seedOid = "1".repeat(40);
+  const nextOid = "2".repeat(40);
+  stepHeadDelta(
+    cache,
+    failures,
+    seedOid,
+    (_p, next) => synthLog(next),
+    () => [],
+  ); // seed
 
   // Throw on every observation. For the first MAX-1 the cache holds (the range
   // keeps re-enumerating); on the MAX-th it force-advances with a loud alarm so
   // the worker can't spin forever on a poisoned range.
   for (let i = 0; i < COMMIT_ENUM_MAX_RETRIES - 1; i++) {
-    const obs = stepHeadDelta(root, cache, failures, nextOid, true);
+    const obs = stepHeadDelta(cache, failures, nextOid, throwLog, () => []);
     expect(obs.loud).toBe(false);
-    expect(cache.get(root)).toBe(seedOid); // still held
+    expect(cache.get(SYNTH_ROOT)).toBe(seedOid); // still held
   }
-  const final = stepHeadDelta(root, cache, failures, nextOid, true);
+  const final = stepHeadDelta(cache, failures, nextOid, throwLog, () => []);
   expect(final.loud).toBe(true); // loud backstop alarm
-  expect(cache.get(root)).toBe(nextOid); // force-advanced past the poison
-  expect(failures.has(root)).toBe(false); // counter reset post force-advance
+  expect(cache.get(SYNTH_ROOT)).toBe(nextOid); // force-advanced past the poison
+  expect(failures.has(SYNTH_ROOT)).toBe(false); // counter reset post force-advance
 });
 
 test("emitSnapshot delta: divergence-wedge window holds the cache → commits re-enumerate on clear", () => {
@@ -1147,31 +1002,40 @@ test("emitSnapshot delta: divergence-wedge window holds the cache → commits re
   // the cache is never touched. Model that as "skip the step entirely while
   // suppressed" and assert the post-clear observation re-enumerates the full
   // window — the same drop-proof property as the throw path.
-  const root = mkTmpWorktree();
-  gitInit(root);
   const cache = new Map<string, string | null>();
   const failures = new Map<string, number>();
-  const seedOid = gitCommit(root, "init.ts", "init\n", {});
-  stepHeadDelta(root, cache, failures, seedOid, false); // seed
+  const seedOid = "1".repeat(40);
+  stepHeadDelta(
+    cache,
+    failures,
+    seedOid,
+    (_p, next) => synthLog(next),
+    () => [],
+  ); // seed
 
   // Two plan commits land DURING a divergence-suppression window — emitSnapshot
   // returns early, so we run NO step for them (the cache stays at seedOid).
-  gitCommit(root, ".keeper/tasks/fn-999-demo.1.json", "task 1\n", {});
-  const headDuringWedge = gitCommit(
-    root,
-    ".keeper/tasks/fn-999-demo.2.json",
-    "task 2\n",
-    {},
-  );
-  expect(cache.get(root)).toBe(seedOid); // untouched through the wedge
+  const headDuringWedge = "3".repeat(40);
+  const wedgeOid1 = "2".repeat(40);
+  expect(cache.get(SYNTH_ROOT)).toBe(seedOid); // untouched through the wedge
 
   // Wedge clears: the next clean observation re-enumerates the WHOLE window
-  // (seed..headDuringWedge), re-emitting both plan commits.
-  const cleared = stepHeadDelta(root, cache, failures, headDuringWedge, false);
+  // (seed..headDuringWedge), re-emitting both plan commits. The synthetic log
+  // emits BOTH commits in the delta (two 8-field strides).
+  const cleared = stepHeadDelta(
+    cache,
+    failures,
+    headDuringWedge,
+    () => synthLog(headDuringWedge) + synthLog(wedgeOid1),
+    (oid) =>
+      oid === headDuringWedge
+        ? planFile(".keeper/tasks/fn-999-demo.2.json")
+        : planFile(".keeper/tasks/fn-999-demo.1.json"),
+  );
   const flatPaths = cleared.planEmits.flat();
   expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.1.json");
   expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.2.json");
-  expect(cache.get(root)).toBe(headDuringWedge);
+  expect(cache.get(SYNTH_ROOT)).toBe(headDuringWedge);
 });
 
 // ---------------------------------------------------------------------------
@@ -1230,121 +1094,54 @@ test("parseTaskTrailers preserves order across multiple values", () => {
 });
 
 // ---------------------------------------------------------------------------
-// enumerateCommitsInDelta — real-git round-trip for Session-Id, Job-Id, and
-// Task trailers. Pins the widened format string + stride parser against a
-// concrete commit so an off-by-one regression in the 6-field consume loop is
-// caught at the trailer assertion (rather than silently misaligning fields).
+// enumerateCommitsFromLog — the PURE `git log -z` stride parser (fn-904.2),
+// split out of `enumerateCommitsInDelta` (which keeps the impure `gitOutput` +
+// `commitFiles` calls). Driven here against GOLDEN `git log -z` strings
+// CAPTURED FROM REAL GIT (test/fixtures/git-log-goldens.ts) so the widened
+// format string + 8-field stride parser are validated against a real sample
+// WITHOUT spawning git on every run. An off-by-one in the stride surfaces at
+// the trailer assertion. `noFiles` is the synthetic file resolver (the trailer
+// cases don't assert the per-commit FILE list — the diff-tree round-trips
+// below cover that).
 // ---------------------------------------------------------------------------
-
-function gitCommit(
-  root: string,
-  filename: string,
-  body: string,
-  trailers: Record<string, string[]>,
-): string {
-  // `filename` may be a nested repo-relative path (e.g. `.keeper/epics/x.json`
-  // for the fn-705 re-enumeration tests); ensure its parent dir exists. A flat
-  // name leaves `dirname` === `root`, so the recursive mkdir is a no-op there.
-  mkdirSync(join(root, filename, ".."), { recursive: true });
-  writeFileSync(join(root, filename), `${filename} contents\n`);
-  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git add failed");
-  // Build the message via `git interpret-trailers` so the trailers land
-  // in the canonical kebab-case + colon-space shape the producer's
-  // format string keys on. `-c` top-level overrides must come BEFORE the
-  // subcommand; one `--trailer` per value (multi-`Task:` is supported
-  // via `addIfDifferent`).
-  const topConfig: string[] = [];
-  const trailerArgs: string[] = [];
-  for (const [key, values] of Object.entries(trailers)) {
-    topConfig.push(
-      "-c",
-      `trailer.${key.toLowerCase()}.ifExists=addIfDifferent`,
-    );
-    for (const v of values) {
-      trailerArgs.push("--trailer", `${key}=${v}`);
-    }
-  }
-  const it = Bun.spawnSync(
-    ["git", ...topConfig, "-C", root, "interpret-trailers", ...trailerArgs],
-    {
-      stdin: new TextEncoder().encode(body),
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  if (!it.success) {
-    throw new Error(`git interpret-trailers failed: ${it.stderr.toString()}`);
-  }
-  const msg = it.stdout.toString();
-  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-F", "-"], {
-    stdin: new TextEncoder().encode(msg),
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git commit failed");
-  const rev = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-  if (!rev.success) throw new Error("git rev-parse HEAD failed");
-  return rev.stdout.toString().trim();
-}
 
 const REAL_UUID_A = "01234567-89ab-cdef-0123-456789abcdef";
 const REAL_UUID_B = "fedcba98-7654-3210-fedc-ba9876543210";
 
-test("enumerateCommitsInDelta: Session-Id-only commit → committer_session_id set, task_ids=[]", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+const noFiles = (): EnumeratedCommitFile[] => [];
+
+test("enumerateCommitsFromLog: Session-Id-only commit → committer_session_id set, task_ids=[]", () => {
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.sessionOnly, noFiles);
   expect(commits).toHaveLength(1);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: Job-Id-only commit → committer_session_id coalesces from Job-Id", () => {
+test("enumerateCommitsFromLog: Job-Id-only commit → committer_session_id coalesces from Job-Id", () => {
   // This is the load-bearing case: a jobctl-stamped commit (no Session-Id,
   // Job-Id only). Pre-fn-670 this commit's committer_session_id was NULL
   // and the v45 per-session discharge arm in foldCommit lay dormant.
   // Post-fn-670 the coalesce lifts Job-Id into committer_session_id, so
   // the per-session arm finally fires for jobctl commits.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Job-Id": [REAL_UUID_A],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.jobIdOnly, noFiles);
   expect(commits).toHaveLength(1);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: Session-Id + Job-Id equal → Session-Id wins (no warn)", () => {
+test("enumerateCommitsFromLog: Session-Id + Job-Id equal → Session-Id wins (no warn)", () => {
   // The canonical commit-work commit: jobctl stamps Job-Id == Session-Id
   // (keeper invariant). The coalesce takes Session-Id and emits NO warn.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Job-Id": [REAL_UUID_A],
-  });
-  // Capture stderr by spying on console.error. The producer's only stderr
-  // surface in this path is the both-differing warn; equality must not
-  // trip it.
   const errs: unknown[] = [];
   const orig = console.error;
   console.error = (...args: unknown[]) => {
     errs.push(args);
   };
   try {
-    const commits = enumerateCommitsInDelta(root, null, oid);
+    const commits = enumerateCommitsFromLog(
+      GIT_LOG_GOLDENS.sessionJobEqual,
+      noFiles,
+    );
     expect(commits).toHaveLength(1);
     expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   } finally {
@@ -1353,24 +1150,21 @@ test("enumerateCommitsInDelta: Session-Id + Job-Id equal → Session-Id wins (no
   expect(errs).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: Session-Id + Job-Id DIFFER → Session-Id wins AND stderr warn fires", () => {
+test("enumerateCommitsFromLog: Session-Id + Job-Id DIFFER → Session-Id wins AND stderr warn fires", () => {
   // Bug-signal case: the keeper invariant `job_id === session_id` is
   // violated. We don't fail the commit (the producer-only liveness
   // invariant + hook exit-0 contract forbid escalating from a trailer
   // mismatch), but we log a stderr warn so a forensic grep can find it.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Job-Id": [REAL_UUID_B],
-  });
   const errs: string[] = [];
   const orig = console.error;
   console.error = (...args: unknown[]) => {
     errs.push(args.map((a) => String(a)).join(" "));
   };
   try {
-    const commits = enumerateCommitsInDelta(root, null, oid);
+    const commits = enumerateCommitsFromLog(
+      GIT_LOG_GOLDENS.sessionJobDiffer,
+      noFiles,
+    );
     expect(commits).toHaveLength(1);
     // Session-Id wins per take-last canonical policy.
     expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
@@ -1383,123 +1177,96 @@ test("enumerateCommitsInDelta: Session-Id + Job-Id DIFFER → Session-Id wins AN
   expect(errs[0]).toContain(REAL_UUID_B);
 });
 
-test("enumerateCommitsInDelta: no trailers → committer_session_id=null, task_ids=[]", () => {
+test("enumerateCommitsFromLog: no trailers → committer_session_id=null, task_ids=[]", () => {
   // The historical-shape commit: human commit / CI commit / pre-jobctl
   // commit. Global-discharge semantic preserved (foldCommit's null arm).
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {});
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.noTrailers, noFiles);
   expect(commits).toHaveLength(1);
   expect(commits[0].committer_session_id).toBeNull();
   expect(commits[0].task_ids).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: one Task: trailer → task_ids carries one entry", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+test("enumerateCommitsFromLog: one Task: trailer → task_ids carries one entry", () => {
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.sessionOneTask,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([VALID_TASK_1]);
 });
 
-test("enumerateCommitsInDelta: multiple Task: trailers → task_ids collects ALL entries", () => {
+test("enumerateCommitsFromLog: multiple Task: trailers → task_ids collects ALL entries", () => {
   // The multi-close case: one commit closes two tasks. Both must land on
   // the link fold; take-last would lose one.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1, VALID_TASK_2],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.sessionTwoTasks,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
 });
 
-test("enumerateCommitsInDelta: all three trailers together → stride parser holds (no off-by-one)", () => {
-  // The full-fan-out case. If the 6-field stride parser is off by one,
+test("enumerateCommitsFromLog: all three trailers together → stride parser holds (no off-by-one)", () => {
+  // The full-fan-out case. If the 8-field stride parser is off by one,
   // task_ids would silently swap with another field and one of the
   // assertions below would fail.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Job-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1, VALID_TASK_2],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.allThree, noFiles);
   expect(commits).toHaveLength(1);
-  expect(commits[0].commit_oid).toBe(oid);
+  expect(commits[0].commit_oid).toBe(
+    "df8b8529946d342e298b11c4e5ac4fc12a31eed2",
+  );
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
   expect(commits[0].committed_at_ms).toBeGreaterThan(0);
 });
 
-test("enumerateCommitsInDelta: multi-commit delta — each commit's trailers parse independently", () => {
+test("enumerateCommitsFromLog: multi-commit delta — each commit's trailers parse independently", () => {
   // Stride parser exercise across N>1 commits. A regression that drifts
   // the field offset would surface as one commit reading the next
-  // commit's session/tasks.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid1 = gitCommit(root, "a.ts", "first\n", {
-    "Job-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1],
-  });
-  const oid2 = gitCommit(root, "b.ts", "second\n", {
-    "Session-Id": [REAL_UUID_B],
-    Task: [VALID_TASK_2],
-  });
-  // `oid1..oid2` walks commits strictly after oid1; oid2 is included.
-  const commits = enumerateCommitsInDelta(root, oid1, oid2);
-  // Just the second commit in the delta.
+  // commit's session/tasks. The `multiTrailerDelta` golden is an
+  // `oid1..oid2` log: only oid2 (Session-Id B, Task 2) is in the delta.
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.multiTrailerDelta,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
-  expect(commits[0].commit_oid).toBe(oid2);
+  expect(commits[0].commit_oid).toBe(GOLDEN_OIDS.multiTrailerOid2);
+  expect(commits[0].parent_oid).toBe(GOLDEN_OIDS.multiTrailerOid1);
   expect(commits[0].committer_session_id).toBe(REAL_UUID_B);
   expect(commits[0].task_ids).toEqual([VALID_TASK_2]);
 
-  // Full-delta walk: null prev → both commits emitted (newest-first).
-  const fullCommits = enumerateCommitsInDelta(root, null, oid2);
-  expect(fullCommits).toHaveLength(1); // fallback path is `-1 <next>` only
-  expect(fullCommits[0].commit_oid).toBe(oid2);
-
-  // Walk the whole history via the parent of oid1 → null prev fallback
-  // covers only HEAD; assert independent re-enumeration of oid1.
-  const firstAlone = enumerateCommitsInDelta(root, null, oid1);
+  // oid1 alone (the `-1 oid1` fallback golden): its own Job-Id A + Task 1, no
+  // bleed from oid2.
+  const firstAlone = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.multiTrailerOid1Alone,
+    noFiles,
+  );
   expect(firstAlone).toHaveLength(1);
-  expect(firstAlone[0].commit_oid).toBe(oid1);
+  expect(firstAlone[0].commit_oid).toBe(GOLDEN_OIDS.multiTrailerOid1);
   expect(firstAlone[0].committer_session_id).toBe(REAL_UUID_A);
   expect(firstAlone[0].task_ids).toEqual([VALID_TASK_1]);
 });
 
 // ---------------------------------------------------------------------------
-// enumerateCommitsInDelta — fn-695 Planctl-Op / Planctl-Target trailer lift.
+// enumerateCommitsFromLog — fn-695 Planctl-Op / Planctl-Target trailer lift.
 // The stride parser widened from 6 fields to 8; these cases pin that the
 // new fields land on the right commit (no off-by-one) and normalize/validate
-// identically to the legacy stdout-scrape path.
+// identically to the legacy stdout-scrape path. Goldens captured from real git.
 // ---------------------------------------------------------------------------
 
 const VALID_EPIC = "fn-670-deterministic-committing-session";
 
-test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, op normalized", () => {
+test("enumerateCommitsFromLog: Planctl-Op + Planctl-Target present → lifted, op normalized", () => {
   // The canonical `chore(plan)` scaffold commit: plan stamps
   // `Planctl-Op: epic-scaffold` + `Planctl-Target: <epic>`. The op
   // normalizes (`epic-scaffold` → `scaffold`) exactly like the scrape
   // path's classifier input; the target validates via parsePlanRef.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Planctl-Op": ["epic-scaffold"],
-    "Planctl-Target": [VALID_EPIC],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.planOpTarget,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
   expect(commits[0].plan_op).toBe("scaffold");
   expect(commits[0].plan_target).toBe(VALID_EPIC);
@@ -1508,34 +1275,24 @@ test("enumerateCommitsInDelta: Planctl-Op + Planctl-Target present → lifted, o
   expect(commits[0].task_ids).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: a task-form Planctl-Target validates and rides verbatim", () => {
+test("enumerateCommitsFromLog: a task-form Planctl-Target validates and rides verbatim", () => {
   // A `task-done` commit stamps a task-form target. parsePlanRef accepts
   // it; we store the raw validated ref (the edge fold folds it up to the
   // parent epic downstream, exactly as extractPlanInvocation does).
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Planctl-Op": ["task-done"],
-    "Planctl-Target": [VALID_TASK_1],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.planTaskForm,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
   expect(commits[0].plan_op).toBe("done");
   expect(commits[0].plan_target).toBe(VALID_TASK_1);
 });
 
-test("enumerateCommitsInDelta: no Planctl-* trailers → plan_op/target null", () => {
+test("enumerateCommitsFromLog: no Planctl-* trailers → plan_op/target null", () => {
   // A source commit (`feat(...)`) carrying Session-Id + Task but no
   // Planctl-* trailers — both new fields stay null (the no-commit-edge
   // input to the T3 fold).
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.noPlanctl, noFiles);
   expect(commits).toHaveLength(1);
   expect(commits[0].plan_op).toBeNull();
   expect(commits[0].plan_target).toBeNull();
@@ -1545,38 +1302,28 @@ test("enumerateCommitsInDelta: no Planctl-* trailers → plan_op/target null", (
   expect(commits[0].task_ids).toEqual([VALID_TASK_1]);
 });
 
-test("enumerateCommitsInDelta: malformed Planctl-Target → null, op still lifts", () => {
+test("enumerateCommitsFromLog: malformed Planctl-Target → null, op still lifts", () => {
   // A garbage target ref must not poison the edge fold: parsePlanRef
   // rejects it and the producer folds plan_target to null. The op
   // (a valid shape) still lifts independently.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Planctl-Op": ["epic-close"],
-    "Planctl-Target": ["not-a-plan-ref"],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.planMalformedTarget,
+    noFiles,
+  );
   expect(commits).toHaveLength(1);
   expect(commits[0].plan_op).toBe("close");
   expect(commits[0].plan_target).toBeNull();
 });
 
-test("enumerateCommitsInDelta: ALL eight fields together → stride parser holds (no off-by-one)", () => {
+test("enumerateCommitsFromLog: ALL eight fields together → stride parser holds (no off-by-one)", () => {
   // The full-fan-out case across the widened 8-field stride. If the
   // 6→8 widening drifted the offsets, one of these assertions would
   // read a neighboring field and fail.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid = gitCommit(root, "a.ts", "msg\n", {
-    "Session-Id": [REAL_UUID_A],
-    "Job-Id": [REAL_UUID_A],
-    Task: [VALID_TASK_1, VALID_TASK_2],
-    "Planctl-Op": ["task-done"],
-    "Planctl-Target": [VALID_TASK_1],
-  });
-  const commits = enumerateCommitsInDelta(root, null, oid);
+  const commits = enumerateCommitsFromLog(GIT_LOG_GOLDENS.allEight, noFiles);
   expect(commits).toHaveLength(1);
-  expect(commits[0].commit_oid).toBe(oid);
+  expect(commits[0].commit_oid).toBe(
+    "0341f2603e15fc6f2391e7ff58d1bbd8892d4401",
+  );
   expect(commits[0].committer_session_id).toBe(REAL_UUID_A);
   expect(commits[0].task_ids).toEqual([VALID_TASK_1, VALID_TASK_2]);
   expect(commits[0].plan_op).toBe("done");
@@ -1584,33 +1331,29 @@ test("enumerateCommitsInDelta: ALL eight fields together → stride parser holds
   expect(commits[0].committed_at_ms).toBeGreaterThan(0);
 });
 
-test("enumerateCommitsInDelta: multi-commit delta — Planctl-* parse per-commit (no field bleed)", () => {
+test("enumerateCommitsFromLog: multi-commit delta — Planctl-* parse per-commit (no field bleed)", () => {
   // Stride exercise across N>1 commits with the new fields. A regression
   // that drifts the 8-field offset would surface as one commit reading
-  // the next commit's op/target.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  const oid1 = gitCommit(root, "a.ts", "first\n", {
-    "Planctl-Op": ["epic-scaffold"],
-    "Planctl-Target": [VALID_EPIC],
-  });
-  const oid2 = gitCommit(root, "b.ts", "second\n", {
-    "Session-Id": [REAL_UUID_B],
-    "Planctl-Op": ["task-done"],
-    "Planctl-Target": [VALID_TASK_2],
-  });
-  // `oid1..oid2` includes only oid2.
-  const second = enumerateCommitsInDelta(root, oid1, oid2);
+  // the next commit's op/target. `multiPlanDelta` is an `oid1..oid2` log —
+  // only oid2 (Session B, task-done, task 2) is in the delta.
+  const second = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.multiPlanDelta,
+    noFiles,
+  );
   expect(second).toHaveLength(1);
-  expect(second[0].commit_oid).toBe(oid2);
+  expect(second[0].commit_oid).toBe(GOLDEN_OIDS.multiPlanOid2);
+  expect(second[0].parent_oid).toBe(GOLDEN_OIDS.multiPlanOid1);
   expect(second[0].committer_session_id).toBe(REAL_UUID_B);
   expect(second[0].plan_op).toBe("done");
   expect(second[0].plan_target).toBe(VALID_TASK_2);
 
-  // Re-enumerate oid1 alone — its own op/target, no bleed from oid2.
-  const first = enumerateCommitsInDelta(root, null, oid1);
+  // oid1 alone (the `-1 oid1` fallback golden): its own op/target, no bleed.
+  const first = enumerateCommitsFromLog(
+    GIT_LOG_GOLDENS.multiPlanOid1Alone,
+    noFiles,
+  );
   expect(first).toHaveLength(1);
-  expect(first[0].commit_oid).toBe(oid1);
+  expect(first[0].commit_oid).toBe(GOLDEN_OIDS.multiPlanOid1);
   expect(first[0].plan_op).toBe("scaffold");
   expect(first[0].plan_target).toBe(VALID_EPIC);
   expect(first[0].committer_session_id).toBeNull();
@@ -1876,131 +1619,25 @@ test("filterPlanChanges: a commit with no plan files returns []", () => {
   ).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: a `git rm` of a plan json → filterPlanChanges tags it 'delete'", () => {
-  // End-to-end producer round-trip: scaffold a plan file under a real
-  // tmp repo, commit it (commit 1), then `git rm` it + commit (commit 2),
-  // and assert the delta-enumeration → filter chain surfaces the
-  // deletion as op='delete'. This is the path that gives commit-driven
-  // tombstones without relying on FSEvents.
-  const root = mkTmpWorktree();
-  gitInit(root);
-  // Commit 1 — add the plan file.
-  mkdirSync(join(root, ".keeper", "epics"), { recursive: true });
-  writeFileSync(
-    join(root, ".keeper", "epics", "fn-1-x.json"),
-    JSON.stringify({ id: "fn-1-x", title: "demo" }),
-  );
-  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git add (1) failed");
-  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "add epic"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git commit (1) failed");
-  const oid1 = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-    .stdout.toString()
-    .trim();
-
-  // Commit 2 — `git rm` the plan file.
-  res = Bun.spawnSync(
-    ["git", "-C", root, "rm", "-q", ".keeper/epics/fn-1-x.json"],
-    { stdout: "ignore", stderr: "ignore" },
-  );
-  if (!res.success) throw new Error("git rm failed");
-  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "drop epic"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git commit (2) failed");
-  const oid2 = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-    .stdout.toString()
-    .trim();
-
-  // Enumerate the oid1..oid2 delta (the live worker's HEAD-oid delta
-  // path) and filter. The deletion lands with blob_oid=null on
-  // EnumeratedCommitFile (the diff-tree zero-sentinel), which the
-  // filter reads as op='delete'.
-  const commits = enumerateCommitsInDelta(root, oid1, oid2);
-  expect(commits).toHaveLength(1);
-  expect(filterPlanChanges(commits[0].files)).toEqual([
+test("parseCommitFiles → filterPlanChanges: a `git rm` of a plan json tags it 'delete'", () => {
+  // The producer round-trip: a `git rm` commit's `diff-tree -z` lands the
+  // deletion with blob_oid=null (the all-zeros sentinel), which the filter
+  // reads as op='delete' — the commit-driven tombstone path (no FSEvents).
+  // Golden `diff-tree` output CAPTURED FROM REAL GIT (planDelete fixture).
+  const files = parseCommitFiles(GIT_DIFF_TREE_GOLDENS.planDelete);
+  expect(filterPlanChanges(files)).toEqual([
     { path: ".keeper/epics/fn-1-x.json", op: "delete" },
   ]);
 });
 
-test("enumerateCommitsInDelta: an `add` of plan files → filterPlanChanges tags every entry 'upsert'", () => {
-  // The 9-file scaffold-burst shape the epic spec calls out: one commit
-  // touching several plan paths, every one of them tagged upsert.
-  // The plan-worker receives the message and re-ingests from the
-  // committed worktree — drop-proof for the FSEvents storm scenario.
-  //
-  // We use a seed commit + a scaffold commit so the delta has a parent
-  // (git diff-tree of a parentless commit emits no file list — that's
-  // the "bootstrap-from-null" producer fallback, and not the shape the
-  // live worker hits in steady state).
-  const root = mkTmpWorktree();
-  gitInit(root);
-  writeFileSync(join(root, "README.md"), "seed\n");
-  let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git add (seed) failed");
-  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "seed"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git commit (seed) failed");
-  const oidSeed = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-    .stdout.toString()
-    .trim();
-
-  mkdirSync(join(root, ".keeper", "epics"), { recursive: true });
-  mkdirSync(join(root, ".keeper", "tasks"), { recursive: true });
-  writeFileSync(
-    join(root, ".keeper", "epics", "fn-1-x.json"),
-    JSON.stringify({ id: "fn-1-x", title: "epic" }),
-  );
-  writeFileSync(
-    join(root, ".keeper", "tasks", "fn-1-x.1.json"),
-    JSON.stringify({ id: "fn-1-x.1", epic: "fn-1-x", title: "t1" }),
-  );
-  writeFileSync(
-    join(root, ".keeper", "tasks", "fn-1-x.2.json"),
-    JSON.stringify({ id: "fn-1-x.2", epic: "fn-1-x", title: "t2" }),
-  );
-  res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git add failed");
-  res = Bun.spawnSync(["git", "-C", root, "commit", "-q", "-m", "scaffold"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!res.success) throw new Error("git commit failed");
-  const oid = Bun.spawnSync(["git", "-C", root, "rev-parse", "HEAD"], {
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-    .stdout.toString()
-    .trim();
-
-  const commits = enumerateCommitsInDelta(root, oidSeed, oid);
-  expect(commits).toHaveLength(1);
-  const changes = filterPlanChanges(commits[0].files);
-  // Order is the producer's diff-tree output order; just assert the set.
+test("parseCommitFiles → filterPlanChanges: an `add` of plan files tags every entry 'upsert'", () => {
+  // The scaffold-burst shape the epic spec calls out: one commit touching
+  // several plan paths (plus a non-plan src file), every plan path tagged
+  // upsert. Golden `diff-tree` output CAPTURED FROM REAL GIT (planAdd fixture:
+  // 3 plan json + 1 src file).
+  const files = parseCommitFiles(GIT_DIFF_TREE_GOLDENS.planAdd);
+  const changes = filterPlanChanges(files);
+  // The non-plan `src-a.ts` is filtered out; only the three plan paths remain.
   expect(new Set(changes.map((c) => c.path))).toEqual(
     new Set([
       ".keeper/epics/fn-1-x.json",
@@ -2020,64 +1657,16 @@ test("enumerateCommitsInDelta: an `add` of plan files → filterPlanChanges tags
 // producer side; the reducer is untouched so re-fold determinism holds.
 // ---------------------------------------------------------------------------
 
-function gitCommitSimple(root: string, message: string): void {
-  const add = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!add.success) throw new Error("git add failed");
-  const commit = Bun.spawnSync(
-    ["git", "-C", root, "commit", "-q", "-m", message],
-    { stdout: "ignore", stderr: "ignore" },
-  );
-  if (!commit.success) throw new Error("git commit failed");
-}
-
-/**
- * Set up a real-git tmp repo with an upstream tracking branch, so the
- * watch-membership probe's `# branch.ab +N -M` parse has something to
- * read. Uses a local bare repo as the remote so no network is required.
- * Returns the resolved worktree path (symlinks resolved via realpathSync,
- * matching what `git rev-parse --show-toplevel` reports — necessary on
- * macOS where /tmp → /private/tmp).
- */
-function mkTmpRepoWithUpstream(): string {
-  const bare = mkdtempSync(join(tmpdir(), "keeper-git-bare-"));
-  tmpDirs.push(bare);
-  // `git init --bare` directly inside the tmp dir.
-  const initBare = Bun.spawnSync(["git", "init", "--bare", "-q", bare], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  if (!initBare.success) throw new Error("git init --bare failed");
-
-  const root = realpathSync(mkTmpWorktree());
-  gitInit(root);
-  // Seed a commit so we have a HEAD to push.
-  writeFileSync(join(root, "seed.txt"), "seed\n");
-  gitCommitSimple(root, "seed");
-  // Configure the bare repo as `origin` and push main to set up tracking.
-  for (const args of [
-    ["remote", "add", "origin", bare],
-    ["push", "-q", "-u", "origin", "main"],
-  ] as const) {
-    const res = Bun.spawnSync(["git", "-C", root, ...args], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    if (!res.success) throw new Error(`git ${args.join(" ")} failed`);
-  }
-  return root;
-}
-
 // ---------------------------------------------------------------------------
-// shouldWatchRoot — pure verdict helper. Exercised against real-git tmpdir
-// fixtures the same way buildGitSnapshot is, so probe behavior + .keeper
-// short-circuit are tested without mocks.
+// shouldWatchRoot — PURE verdict helper (the probe verdict is an argument). The
+// only fs touch is the `.keeper`-on-disk short-circuit, so these run git-free:
+// a plain tmp dir (with or without a real `.keeper` subdir) + a SYNTHETIC probe
+// verdict (fn-904.2). The real `probeWatchMembership` git spawn is exercised in
+// the slow real-git quarantine.
 // ---------------------------------------------------------------------------
 
 test("shouldWatchRoot: .keeper present → watch without probe (short-circuit)", () => {
-  const root = mkTmpRepoWithUpstream();
+  const root = mkTmpWorktree();
   mkdirSync(join(root, ".keeper"), { recursive: true });
   // Pass a probe verdict that would otherwise say "skip" — `.keeper`
   // wins anyway. The whole point: a plan-backed clean repo stays watched.
@@ -2094,8 +1683,7 @@ test("shouldWatchRoot: .keeper present → watch without probe (short-circuit)",
 });
 
 test("shouldWatchRoot: clean + pushed (no .keeper) → don't watch", () => {
-  const root = mkTmpRepoWithUpstream();
-  // Probe verdict from a real git status: clean, ahead 0.
+  const root = mkTmpWorktree(); // no `.keeper` subdir created
   expect(
     shouldWatchRoot(
       root,
@@ -2106,7 +1694,7 @@ test("shouldWatchRoot: clean + pushed (no .keeper) → don't watch", () => {
 });
 
 test("shouldWatchRoot: dirty worktree (no .keeper) → watch", () => {
-  const root = mkTmpRepoWithUpstream();
+  const root = mkTmpWorktree();
   expect(
     shouldWatchRoot(
       root,
@@ -2117,7 +1705,7 @@ test("shouldWatchRoot: dirty worktree (no .keeper) → watch", () => {
 });
 
 test("shouldWatchRoot: ahead > 0 clean (no .keeper) → watch", () => {
-  const root = mkTmpRepoWithUpstream();
+  const root = mkTmpWorktree();
   expect(
     shouldWatchRoot(
       root,
@@ -2130,8 +1718,6 @@ test("shouldWatchRoot: ahead > 0 clean (no .keeper) → watch", () => {
 test("shouldWatchRoot: no-upstream dirty (no .keeper) → watch", () => {
   // No `# branch.ab` line means ahead=0 by convention; dirty alone is enough.
   const root = mkTmpWorktree();
-  gitInit(root);
-  writeFileSync(join(root, "x.ts"), "untracked\n");
   expect(
     shouldWatchRoot(
       root,
@@ -2146,9 +1732,6 @@ test("shouldWatchRoot: no-upstream clean-with-commits (no .keeper) → don't wat
   // The whole point of the new gate — a quiescent repo with no work in flight
   // isn't keeper's business.
   const root = mkTmpWorktree();
-  gitInit(root);
-  writeFileSync(join(root, "x.ts"), "seed\n");
-  gitCommitSimple(root, "seed");
   expect(
     shouldWatchRoot(
       root,
@@ -2161,66 +1744,20 @@ test("shouldWatchRoot: no-upstream clean-with-commits (no .keeper) → don't wat
 test("shouldWatchRoot: null probe + currentlyWatched=true → retain (fail-open)", () => {
   // Probe timeout / spawn error on an already-watched root: fail OPEN.
   // Don't drop a watched root because one probe stuttered.
-  const root = mkTmpRepoWithUpstream();
+  const root = mkTmpWorktree();
   expect(shouldWatchRoot(root, null, { currentlyWatched: true })).toBe(true);
 });
 
 test("shouldWatchRoot: null probe + currentlyWatched=false → skip (fail-closed)", () => {
   // Probe failure on a cold candidate: skip. Don't join on a broken probe.
-  const root = mkTmpRepoWithUpstream();
+  const root = mkTmpWorktree();
   expect(shouldWatchRoot(root, null, { currentlyWatched: false })).toBe(false);
 });
 
-// ---------------------------------------------------------------------------
-// probeWatchMembership — combined `git status --porcelain=v2 --branch` parse
-// for dirty + ahead. Critically uses default `-unormal`, not `-uall`.
-// ---------------------------------------------------------------------------
-
-test("probeWatchMembership: clean + pushed → {dirty:false, ahead:0}", () => {
-  const root = mkTmpRepoWithUpstream();
-  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 0 });
-});
-
-test("probeWatchMembership: dirty (untracked file) → dirty:true", () => {
-  const root = mkTmpRepoWithUpstream();
-  writeFileSync(join(root, "untracked.ts"), "x\n");
-  const probe = probeWatchMembership(root);
-  expect(probe?.dirty).toBe(true);
-});
-
-test("probeWatchMembership: dirty (tracked + modified) → dirty:true", () => {
-  const root = mkTmpRepoWithUpstream();
-  writeFileSync(join(root, "seed.txt"), "modified\n");
-  const probe = probeWatchMembership(root);
-  expect(probe?.dirty).toBe(true);
-});
-
-test("probeWatchMembership: ahead of upstream by 2 → ahead:2", () => {
-  const root = mkTmpRepoWithUpstream();
-  // Make two local commits past the pushed HEAD.
-  writeFileSync(join(root, "a.ts"), "a\n");
-  gitCommitSimple(root, "a");
-  writeFileSync(join(root, "b.ts"), "b\n");
-  gitCommitSimple(root, "b");
-  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 2 });
-});
-
-test("probeWatchMembership: no upstream → ahead:0 (no `# branch.ab` line)", () => {
-  const root = mkTmpWorktree();
-  gitInit(root);
-  writeFileSync(join(root, "x.ts"), "seed\n");
-  gitCommitSimple(root, "seed");
-  // No remote configured → no `# branch.ab` line in porcelain output;
-  // probe reports ahead 0.
-  expect(probeWatchMembership(root)).toEqual({ dirty: false, ahead: 0 });
-});
-
-test("probeWatchMembership: returns null on a non-git path (timeout / error)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "keeper-probe-noegit-"));
-  tmpDirs.push(dir);
-  // No `.git/` here — `git status` exits non-zero, gitOutput returns null.
-  expect(probeWatchMembership(dir)).toBeNull();
-});
+// probeWatchMembership (the combined `git status --porcelain=v2 --branch` spawn)
+// is exercised against REAL git in `test/git-worker-realgit.slow.test.ts` —
+// it spawns git by definition, so it can't be made git-free with a synthetic
+// verdict (fn-904.2).
 
 // ---------------------------------------------------------------------------
 // decideReconcileTransitions — cooling-hysteresis pure decision. The drop
@@ -2501,8 +2038,10 @@ function fakeProbe(
 }
 
 test("discoverProjectRoots: .keeper repo always watched without probe spawn", () => {
+  // The `.keeper` short-circuit reads the dir off disk (existsSync) — a plain
+  // tmp dir, NOT a git repo. The injected probe is a fake whose spawn counter
+  // proves the short-circuit fires BEFORE any probe (fn-904.2).
   const root = realpathSync(mkTmpWorktree());
-  gitInit(root);
   mkdirSync(join(root, ".keeper"), { recursive: true });
   const db = makeDiscoveryDb();
   db.run(
@@ -2511,7 +2050,9 @@ test("discoverProjectRoots: .keeper repo always watched without probe spawn", ()
   );
   const probeSpawnCount = { n: 0 };
   const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
+    // Pre-seed cwd→toplevel so resolution is a cache hit (git-free) — the
+    // candidate IS the root; no `git rev-parse --show-toplevel` spawn.
+    cwdRootCache: new Map([[root, root]]),
     watchProbeCache: new Map(),
     currentlyWatched: new Set(),
     nowMs: 1000,
@@ -2525,53 +2066,15 @@ test("discoverProjectRoots: .keeper repo always watched without probe spawn", ()
   db.close();
 });
 
-test("discoverProjectRoots: dirty non-.keeper repo joins desired set", () => {
-  const root = mkTmpRepoWithUpstream();
-  // Make the worktree dirty so a real probe would say "watch".
-  writeFileSync(join(root, "untracked.ts"), "x\n");
-  const db = makeDiscoveryDb();
-  db.run(
-    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
-    ["sess-a", root],
-  );
-  const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
-    watchProbeCache: new Map(),
-    currentlyWatched: new Set(),
-    nowMs: 1000,
-    runFullSweep: true,
-    probe: probeWatchMembership, // real probe via spawnSync
-  };
-  const desired = discoverProjectRoots(db, ctx);
-  expect(desired).toContain(root);
-  db.close();
-});
-
-test("discoverProjectRoots: clean+pushed non-.keeper repo drops out of desired set", () => {
-  const root = mkTmpRepoWithUpstream();
-  const db = makeDiscoveryDb();
-  db.run(
-    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
-    ["sess-a", root],
-  );
-  const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
-    watchProbeCache: new Map(),
-    currentlyWatched: new Set(),
-    nowMs: 1000,
-    runFullSweep: true,
-    probe: probeWatchMembership,
-  };
-  const desired = discoverProjectRoots(db, ctx);
-  expect(desired).not.toContain(root);
-  db.close();
-});
+// The dirty/clean-non-.keeper + monotonicity + clean+pushed-watched-drops cases
+// drive the REAL `probeWatchMembership` git spawn against a real upstream repo —
+// slow-quarantined in `test/git-worker-realgit.slow.test.ts` (fn-904.2).
 
 test("discoverProjectRoots: TTL memo prevents repeated probe spawns in steady state", () => {
   // A dirty repo's verdict is cached at the hot TTL when watched; calling
   // discoverProjectRoots again within the TTL should NOT re-spawn the probe.
-  const root = mkTmpRepoWithUpstream();
-  writeFileSync(join(root, "untracked.ts"), "x\n");
+  // Driven with a SYNTHETIC root + fake probe — the memo logic is git-free.
+  const root = "/tmp/keeper-fn904-ttl-root";
   const db = makeDiscoveryDb();
   db.run(
     "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
@@ -2580,7 +2083,7 @@ test("discoverProjectRoots: TTL memo prevents repeated probe spawns in steady st
   const probeSpawnCount = { n: 0 };
   const fakeVerdicts = new Map([[root, { dirty: true, ahead: 0 }]]);
   const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
+    cwdRootCache: new Map([[root, root]]), // git-free cwd→toplevel cache hit
     watchProbeCache: new Map(),
     currentlyWatched: new Set([root]), // already watched → hot tier
     nowMs: 1000,
@@ -2601,66 +2104,12 @@ test("discoverProjectRoots: TTL memo prevents repeated probe spawns in steady st
   db.close();
 });
 
-test("discoverProjectRoots: monotonicity — already-watched root retained even when slow sweep is throttled", () => {
-  // The bug this prevents: a watched root's cwd ages out of the recent
-  // window, the fast path doesn't include it, and a throttled slow sweep
-  // (runFullSweep=false) would otherwise shrink `desired` below the
-  // watched set. The monotonicity floor in buildDiscoveryCandidates
-  // always includes currentlyWatched, so this can't happen.
-  const root = mkTmpRepoWithUpstream();
-  writeFileSync(join(root, "untracked.ts"), "x\n");
-  const db = makeDiscoveryDb();
-  // Job's `updated_at` is way in the past (before the recent window) AND
-  // state isn't 'working' — fast path would normally exclude it.
-  db.run(
-    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'stopped', 0)",
-    ["sess-a", root],
-  );
-  const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
-    watchProbeCache: new Map(),
-    currentlyWatched: new Set([root]), // root is already watched
-    nowMs: Date.now(), // wall-clock-ish so cutoffSec is well past the row's 0
-    runFullSweep: false, // slow sweep throttled
-    probe: probeWatchMembership,
-  };
-  const desired = discoverProjectRoots(db, ctx);
-  // Monotonicity floor: still desired despite fast-path skip.
-  expect(desired).toContain(root);
-  db.close();
-});
-
-test("discoverProjectRoots: clean+pushed watched root drops from desired (caller layers dwell)", () => {
-  // discoverProjectRoots gives the moment-in-time verdict; the cooling
-  // dwell is decideReconcileTransitions' job. Here we verify the verdict:
-  // a clean+pushed watched root is NOT in `desired`, and the caller's
-  // dwell logic (tested above) converts that into a delayed drop.
-  const root = mkTmpRepoWithUpstream();
-  const db = makeDiscoveryDb();
-  db.run(
-    "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
-    ["sess-a", root],
-  );
-  const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
-    watchProbeCache: new Map(),
-    currentlyWatched: new Set([root]), // was watched
-    nowMs: 1000,
-    runFullSweep: true,
-    probe: probeWatchMembership,
-  };
-  const desired = discoverProjectRoots(db, ctx);
-  // Verdict: clean + pushed + no .keeper → not desired.
-  expect(desired).not.toContain(root);
-  db.close();
-});
-
 test("discoverProjectRoots: epic.project_dir + task.target_repo always candidates (plan-backed)", () => {
+  // Both roots carry a real `.keeper` dir (existsSync short-circuit), so the
+  // injected probe is never consulted — a plain tmp dir, no git (fn-904.2).
   const planRoot = realpathSync(mkTmpWorktree());
-  gitInit(planRoot);
   mkdirSync(join(planRoot, ".keeper"), { recursive: true });
   const targetRoot = realpathSync(mkTmpWorktree());
-  gitInit(targetRoot);
   mkdirSync(join(targetRoot, ".keeper"), { recursive: true });
   const db = makeDiscoveryDb();
   db.run(`INSERT INTO epics (epic_id, project_dir, tasks) VALUES (?, ?, ?)`, [
@@ -2670,12 +2119,16 @@ test("discoverProjectRoots: epic.project_dir + task.target_repo always candidate
   ]);
   // No jobs row — only epic-derived candidates exist.
   const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
+    // Both epic-derived dirs resolve to themselves (git-free cache hit).
+    cwdRootCache: new Map([
+      [planRoot, planRoot],
+      [targetRoot, targetRoot],
+    ]),
     watchProbeCache: new Map(),
     currentlyWatched: new Set(),
     nowMs: 1000,
     runFullSweep: false, // even on the fast path, epic dirs are in
-    probe: probeWatchMembership,
+    probe: fakeProbe(new Map()),
   };
   const desired = new Set(discoverProjectRoots(db, ctx));
   expect(desired.has(planRoot)).toBe(true);
@@ -2686,14 +2139,15 @@ test("discoverProjectRoots: epic.project_dir + task.target_repo always candidate
 test("discoverProjectRoots: null probe + currentlyWatched → fail-open retains the root", () => {
   // A timeout / spawn failure on the probe must NOT immediately drop an
   // already-watched root. shouldWatchRoot fails-open under currentlyWatched.
-  const root = mkTmpRepoWithUpstream();
+  // Synthetic root + a probe that always returns null — git-free (fn-904.2).
+  const root = "/tmp/keeper-fn904-failopen-root";
   const db = makeDiscoveryDb();
   db.run(
     "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
     ["sess-a", root],
   );
   const ctx: DiscoveryContext = {
-    cwdRootCache: new Map(),
+    cwdRootCache: new Map([[root, root]]), // git-free cwd→toplevel cache hit
     watchProbeCache: new Map(),
     currentlyWatched: new Set([root]),
     nowMs: 1000,

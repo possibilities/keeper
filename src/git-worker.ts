@@ -252,7 +252,7 @@ export type GitWorkerMessage =
   // NOT folded into the event log — routed straight to `handleBackstopMessage`.
   | BackstopMessage;
 
-interface ParsedGitStatus {
+export interface ParsedGitStatus {
   branch: string | null;
   head_oid: string | null;
   upstream: string | null;
@@ -780,7 +780,7 @@ export function readStatus(root: string): ParsedGitStatus | null {
  * wrongly discharged. Either folds to `null` on a parse miss (discharge gate
  * falls back to timestamp).
  */
-interface EnumeratedCommitFile {
+export interface EnumeratedCommitFile {
   path: string;
   blob_oid: string | null;
   committed_mode: string | null;
@@ -878,21 +878,17 @@ export function filterPlanChanges(
  * falls back to timestamp). Empty array on any non-zero exit / parse miss (a
  * failed shell-out can't wedge the worker; the next snapshot re-attempts).
  */
-function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
-  const out = gitOutput([
-    "-C",
-    root,
-    "diff-tree",
-    "-r",
-    "--no-commit-id",
-    "--no-renames",
-    "-z",
-    oid,
-  ]);
-  if (out == null) return [];
-  // `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` per file — split on NUL, consume
-  // in pairs (the trailing NUL yields an empty tail element).
-  const fields = out.split("\0");
+/**
+ * PURE parse of a `git diff-tree -r --no-commit-id --no-renames -z` output
+ * string into the per-file {@link EnumeratedCommitFile} list. Split out of
+ * {@link commitFiles} (whose only impurity is the `gitOutput` spawn) so the
+ * filter round-trips unit-test against a captured diff-tree golden.
+ *
+ * `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` per file — split on NUL, consume in
+ * pairs (the trailing NUL yields an empty tail element).
+ */
+export function parseCommitFiles(rawZ: string): EnumeratedCommitFile[] {
+  const fields = rawZ.split("\0");
   const files: EnumeratedCommitFile[] = [];
   for (let i = 0; i + 1 < fields.length; i += 2) {
     const meta = fields[i] ?? "";
@@ -922,73 +918,66 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
   return files;
 }
 
+function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
+  const out = gitOutput([
+    "-C",
+    root,
+    "diff-tree",
+    "-r",
+    "--no-commit-id",
+    "--no-renames",
+    "-z",
+    oid,
+  ]);
+  if (out == null) return [];
+  return parseCommitFiles(out);
+}
+
 /**
- * Enumerate the commits in a `<prev>..<new>` HEAD-oid delta via `git log -z`,
- * parsing each commit's NUL-delimited field record. Falls back to single-commit
- * emission against `<new>` when the range is empty (force-push / non-descendant)
- * or `<prev>` is null (bootstrap / initial commit). A sibling per-commit
- * `diff-tree` populates the file list.
+ * The `git log -z --format=<COMMIT_LOG_FORMAT>` field format consumed by
+ * {@link enumerateCommitsFromLog}. Exported so the golden-fixture capture script
+ * uses the EXACT same format the parser keys on — a drift between the two would
+ * make a captured golden validate against a different stride than production.
  *
- * Returns the per-commit array newest-first (git's default ordering); the
- * reducer fold on `last_commit_at` is commutative, so iteration order doesn't
- * affect the projection.
+ * Session-Id / Job-Id / Planctl-Op / Planctl-Target use `valueonly,only,unfold`
+ * (take-last single value); Task uses `valueonly,unfold` with the DEFAULT `\n`
+ * separator — a newline-separated block inside ONE field so the outer `%x00`
+ * delimiter survives (a `%x00` Task separator would collide with the field
+ * boundary and realign the parser).
+ *
+ * FIELD ORDER IS LOAD-BEARING: {@link enumerateCommitsFromLog}'s stride loop
+ * consumes fields in groups of EIGHT in this exact order. Adding / reordering /
+ * dropping a `%x00` MUST move the stride (`i += 8`) + every `fields[i+N]` offset
+ * in lockstep, or every field realigns off-by-one for EVERY commit.
  */
-export function enumerateCommitsInDelta(
-  root: string,
-  prev: string | null,
-  next: string,
+export const COMMIT_LOG_FORMAT =
+  "%H%x00%P%x00%ct%x00" +
+  "%(trailers:key=Session-Id,valueonly,only,unfold)%x00" +
+  "%(trailers:key=Job-Id,valueonly,only,unfold)%x00" +
+  "%(trailers:key=Task,valueonly,unfold)%x00" +
+  "%(trailers:key=Planctl-Op,valueonly,only,unfold)%x00" +
+  "%(trailers:key=Planctl-Target,valueonly,only,unfold)";
+
+/**
+ * PURE parse of a `git log -z --format=<COMMIT_LOG_FORMAT>` output string into
+ * the per-commit {@link EnumeratedCommit} array. Mirrors {@link parsePorcelainV2}:
+ * no git, no fs, no clock — every input arrives as an argument so the function
+ * is fully unit-testable against captured-from-real-git goldens.
+ *
+ * The per-commit file list is the ONE thing this parser cannot derive from the
+ * log output (it comes from a sibling `git diff-tree`); the caller supplies it
+ * via `resolveFiles(oid)`. Production passes `(oid) => commitFiles(root, oid)`
+ * (the impure helper); a unit test passes a synthetic resolver.
+ *
+ * With `-z` plus the `%x00` format separators, N commits emit a flat sequence
+ * of 8N NUL-delimited fields (OID, P, CT, Session, Job-Id, Task, Planctl-Op,
+ * Planctl-Target per commit) with a trailing empty element. Consume in 8s.
+ */
+export function enumerateCommitsFromLog(
+  rawZ: string,
+  resolveFiles: (oid: string) => EnumeratedCommitFile[],
 ): EnumeratedCommit[] {
-  // Session-Id / Job-Id / Planctl-Op / Planctl-Target use
-  // `valueonly,only,unfold` (take-last single value); Task uses
-  // `valueonly,unfold` with the DEFAULT `\n` separator — a newline-separated
-  // block inside ONE field so the outer `%x00` delimiter survives (a `%x00` Task
-  // separator would collide with the field boundary and realign the parser).
-  //
-  // FIELD ORDER IS LOAD-BEARING: the stride loop consumes fields in groups of
-  // EIGHT in this exact order. Adding / reordering / dropping a `%x00` MUST move
-  // the stride (`i += 8`) + every `fields[i+N]` offset in lockstep, or every
-  // field realigns off-by-one for EVERY commit.
-  const format =
-    "%H%x00%P%x00%ct%x00" +
-    "%(trailers:key=Session-Id,valueonly,only,unfold)%x00" +
-    "%(trailers:key=Job-Id,valueonly,only,unfold)%x00" +
-    "%(trailers:key=Task,valueonly,unfold)%x00" +
-    "%(trailers:key=Planctl-Op,valueonly,only,unfold)%x00" +
-    "%(trailers:key=Planctl-Target,valueonly,only,unfold)";
-  let out: string | null = null;
-  if (prev !== null) {
-    out = gitOutput([
-      "-C",
-      root,
-      "log",
-      `${prev}..${next}`,
-      `--format=${format}`,
-      "--no-patch",
-      "-z",
-    ]);
-  }
-  if (out == null || out.length === 0) {
-    // Fallback (force-push / non-descendant / bootstrap / initial commit): a
-    // single-commit log against `<next>` gives at least the HEAD commit's
-    // attribution; earlier non-descendant commits are an accepted loss.
-    out = gitOutput([
-      "-C",
-      root,
-      "log",
-      "-1",
-      next,
-      `--format=${format}`,
-      "--no-patch",
-      "-z",
-    ]);
-  }
-  if (out == null || out.length === 0) {
-    return [];
-  }
-  // With `-z` plus the `%x00` format separators, N commits emit a flat sequence
-  // of 8N NUL-delimited fields (OID, P, CT, Session, Job-Id, Task, Planctl-Op,
-  // Planctl-Target per commit) with a trailing empty element. Consume in 8s.
-  const fields = out.split("\0");
+  const fields = rawZ.split("\0");
   const commits: EnumeratedCommit[] = [];
   for (let i = 0; i + 7 < fields.length; i += 8) {
     const oid = (fields[i] ?? "").trim();
@@ -1016,7 +1005,7 @@ export function enumerateCommitsInDelta(
     const taskIds = parseTaskTrailers(taskTrailers);
     const planOp = parsePlanOpTrailer(opTrailers);
     const planTarget = parsePlanTargetTrailer(targetTrailers);
-    const files = commitFiles(root, oid);
+    const files = resolveFiles(oid);
     commits.push({
       commit_oid: oid,
       parent_oid: parentOid,
@@ -1029,6 +1018,58 @@ export function enumerateCommitsInDelta(
     });
   }
   return commits;
+}
+
+/**
+ * Enumerate the commits in a `<prev>..<new>` HEAD-oid delta via `git log -z`,
+ * parsing each via the pure {@link enumerateCommitsFromLog}. Falls back to a
+ * single-commit log against `<new>` when the range is empty (force-push /
+ * non-descendant) or `<prev>` is null (bootstrap / initial commit). The impure
+ * `git log` spawn + the per-commit `diff-tree` resolver ({@link commitFiles})
+ * live here; the parse is pure.
+ *
+ * Returns the per-commit array newest-first (git's default ordering); the
+ * reducer fold on `last_commit_at` is commutative, so iteration order doesn't
+ * affect the projection.
+ */
+export function enumerateCommitsInDelta(
+  root: string,
+  prev: string | null,
+  next: string,
+): EnumeratedCommit[] {
+  let out: string | null = null;
+  if (prev !== null) {
+    out = gitOutput([
+      "-C",
+      root,
+      "log",
+      `${prev}..${next}`,
+      `--format=${COMMIT_LOG_FORMAT}`,
+      "--no-patch",
+      "-z",
+    ]);
+  }
+  if (out == null || out.length === 0) {
+    // Fallback (force-push / non-descendant / bootstrap / initial commit): a
+    // single-commit log against `<next>` gives at least the HEAD commit's
+    // attribution; earlier non-descendant commits are an accepted loss.
+    out = gitOutput([
+      "-C",
+      root,
+      "log",
+      "-1",
+      next,
+      `--format=${COMMIT_LOG_FORMAT}`,
+      "--no-patch",
+      "-z",
+    ]);
+  }
+  if (out == null || out.length === 0) {
+    return [];
+  }
+  // Production passes the impure per-commit `diff-tree` helper as the file
+  // resolver; the pure parser does the rest.
+  return enumerateCommitsFromLog(out, (oid) => commitFiles(root, oid));
 }
 
 /**
@@ -1542,43 +1583,32 @@ function lstatMtimeMs(projectDir: string, relPath: string): number | null {
 }
 
 /**
- * Build the file-centric `GitSnapshot` payload. Pure composition of the
- * `git status --porcelain=v2` parse with a per-file `lstat` for `mtime_ms` —
- * no event-log join, no `jobs` join, no per-(session, file) derivation.
- * Per-job rollup, per-file attribution, and the project-wide orphan set are
- * computed by the reducer in `projectGitStatus` (task fn-633.6) inside
- * `BEGIN IMMEDIATE` against the persisted event log + `file_attributions`
- * table — moving the join there restores re-fold determinism (a producer
- * runs without the writer lock, so an event-log join here would see a
- * different mid-fold projection on every re-fold).
+ * PURE composition of the porcelain-v2 parse with per-file `worktree_oid` and
+ * `mtime_ms` lookups — no git, no fs probe. Both impure inputs arrive as maps so
+ * the builder is fully unit-testable with synthetic payloads:
+ *   - `oidByPath`: the filter-correct worktree blob oid per dirty-file path
+ *     (production: {@link batchHashObjectOids}). Missing key → `null`.
+ *   - `mtimeByPath`: the file's lstat mtime in unix-epoch ms per path
+ *     (production: per-file {@link lstatMtimeMs}). Missing key → `null` (the
+ *     documented producer-side stat race).
  *
- * The renamed-path case keeps the renamed entry's `path` (the NEW path —
- * what's currently in the worktree); `orig_path` rides along when set so
- * the reducer can dereference both halves of the rename pair against the
- * event log. `lstat` always targets `path` (the new name); `orig_path`
- * doesn't exist on disk anymore.
+ * {@link buildGitSnapshot} calls the two impure helpers then delegates here, so
+ * production behavior is byte-identical. The renamed-path case keeps the renamed
+ * entry's `path` (the NEW path); `orig_path` rides along when set.
  */
-export function buildGitSnapshot(
+export function buildGitSnapshotFrom(
   projectDir: string,
   status: ParsedGitStatus,
+  oidByPath: Map<string, string | null>,
+  mtimeByPath: Map<string, number | null>,
 ): GitSnapshotPayload {
-  // v44 / fn-664: ONE batched `git hash-object --stdin-paths` call per
-  // snapshot, covering every dirty file. Untracked/unmerged entries are
-  // included — `hash-object` of an untracked file is a meaningful oid; the
-  // discharge gate just won't have an `index_oid`/`worktree_mode` to pair
-  // it with from the porcelain side, which is fine. The single spawn keeps
-  // the producer latency budget tight (a dirty-heavy tree on a slow disk
-  // would otherwise pay N spawn costs).
-  const oidPaths = status.files.map((f) => f.path);
-  const worktreeOidByPath = batchHashObjectOids(projectDir, oidPaths);
-
   const dirty: GitDirtyFile[] = status.files.map((file) => {
     const entry: GitDirtyFile = {
       path: file.path,
       xy: file.xy,
       kind: file.kind,
-      mtime_ms: lstatMtimeMs(projectDir, file.path),
-      worktree_oid: worktreeOidByPath.get(file.path) ?? null,
+      mtime_ms: mtimeByPath.get(file.path) ?? null,
+      worktree_oid: oidByPath.get(file.path) ?? null,
       index_oid: file.index_oid,
       worktree_mode: file.worktree_mode,
     };
@@ -1595,6 +1625,43 @@ export function buildGitSnapshot(
     behind: status.behind,
     dirty_files: dirty,
   };
+}
+
+/**
+ * Production entry point: the IMPURE wrapper around {@link buildGitSnapshotFrom}.
+ * Runs the two impure helpers — one batched `git hash-object --stdin-paths`
+ * ({@link batchHashObjectOids}) + a per-file `lstat` ({@link lstatMtimeMs}) — then
+ * delegates to the pure builder. No event-log join, no `jobs` join: per-job
+ * rollup, per-file attribution, and the orphan set are the reducer's job
+ * (`projectGitStatus`, fn-633.6) so re-fold determinism holds.
+ */
+export function buildGitSnapshot(
+  projectDir: string,
+  status: ParsedGitStatus,
+): GitSnapshotPayload {
+  // v44 / fn-664: ONE batched `git hash-object --stdin-paths` call per
+  // snapshot, covering every dirty file. Untracked/unmerged entries are
+  // included — `hash-object` of an untracked file is a meaningful oid; the
+  // discharge gate just won't have an `index_oid`/`worktree_mode` to pair
+  // it with from the porcelain side, which is fine. The single spawn keeps
+  // the producer latency budget tight (a dirty-heavy tree on a slow disk
+  // would otherwise pay N spawn costs).
+  const oidPaths = status.files.map((f) => f.path);
+  const worktreeOidByPath = batchHashObjectOids(projectDir, oidPaths);
+
+  // Per-file `lstat` for `mtime_ms`; a missed stat (the documented producer
+  // stat race) leaves the path out of the map so the pure builder reads `null`.
+  const mtimeByPath = new Map<string, number | null>();
+  for (const file of status.files) {
+    mtimeByPath.set(file.path, lstatMtimeMs(projectDir, file.path));
+  }
+
+  return buildGitSnapshotFrom(
+    projectDir,
+    status,
+    worktreeOidByPath,
+    mtimeByPath,
+  );
 }
 
 /**
