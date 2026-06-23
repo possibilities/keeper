@@ -60,6 +60,7 @@ import { raiseGitProjectionFloor, setGitProjectionSeedRequired } from "./db";
 import {
   buildDiscoveryCandidates,
   buildGitSnapshot,
+  type GitSnapshotPayload,
   readStatus,
   resolveGitToplevel,
 } from "./git-worker";
@@ -88,6 +89,27 @@ export interface SeedGitProjectionOptions {
    * Tests pass explicit roots; production omits it.
    */
   roots?: string[];
+  /**
+   * The per-root snapshot builder — the ONLY git-touching step. Defaults to the
+   * real producer path (`readStatus` → `buildGitSnapshot`, both shelling out to
+   * `git`). Returns `null` for a root that is not a git repo / whose time-bound
+   * read failed (the row stays whatever it was; a later boot retries). Injectable
+   * so tests drive the seed's fold/floor/reset/seed_required logic with synthetic
+   * `GitSnapshotPayload`s — NEVER a real git invocation (the no-real-git tier).
+   */
+  buildSnapshotForRoot?: (root: string) => GitSnapshotPayload | null;
+}
+
+/**
+ * The default {@link SeedGitProjectionOptions.buildSnapshotForRoot}: the real
+ * producer path. `readStatus` is the time-bound `git status` probe (returns
+ * `null` for a non-repo / timeout), `buildGitSnapshot` runs the batched
+ * `hash-object` + per-file `lstat`. This is the seed's ONLY git boundary.
+ */
+function defaultBuildSnapshotForRoot(root: string): GitSnapshotPayload | null {
+  const status = readStatus(root);
+  if (status == null) return null;
+  return buildGitSnapshot(root, status);
 }
 
 export interface SeedGitProjectionResult {
@@ -240,6 +262,8 @@ export function seedGitProjection(
 ): SeedGitProjectionResult {
   const now = options.now ?? (() => performance.now());
   const budgetMs = options.timeBudgetMs ?? DEFAULT_GIT_SEED_BUDGET_MS;
+  const buildSnapshotForRoot =
+    options.buildSnapshotForRoot ?? defaultBuildSnapshotForRoot;
   const startedAt = now();
 
   // 1. Capture the floor FIRST (before any git scan), so events arriving during
@@ -266,14 +290,13 @@ export function seedGitProjection(
       break;
     }
     try {
-      const status = readStatus(root);
-      if (status == null) {
+      const snapshot = buildSnapshotForRoot(root);
+      if (snapshot == null) {
         // Time-bound git read failed/timed out for this root — skip it (the row
         // it would have produced stays whatever it was; a later boot retries).
         complete = false;
         continue;
       }
-      const snapshot = buildGitSnapshot(root, status);
       resetRootGitRows(db, root);
       insertSyntheticGitSnapshot(stmts, root, JSON.stringify(snapshot));
       // Fold the just-appended snapshot (id > floor → full-fidelity re-derive).

@@ -277,11 +277,19 @@ execution: extract a PURE seam (mirror `parsePorcelainV2` → `buildGitSnapshotF
 production stays byte-identical) and drive it with synthetic payloads or with
 golden `git log -z` / `diff-tree -z` strings CAPTURED FROM REAL GIT ONCE
 (`test/fixtures/git-log-goldens.ts` — never hand-author them, or the stride parser
-validates against a fabrication; re-capture on a format change). A test whose
+validates against a fabrication; re-capture on a format change). A producer whose
+only git boundary is one call (the boot-seed's `readStatus` → `buildGitSnapshot`)
+takes an INJECTABLE runner instead — `seedGitProjection`'s `buildSnapshotForRoot`
+seam defaults to the real path; tests pass a synthetic `GitSnapshotPayload`
+builder so the fold / floor / seed_required DECISIONS run git-free. The same
+shape as the commit-work `GitRunner` and `cli/session-state.ts`'s
+`buildSessionState({ gitRunner, attribution })` seam. A test whose
 contract genuinely IS reading git's own state (fs ref resolution, the `git status`
-probe, the wrapper-script trailer injection) cannot be made synthetic — name it
+probe, the boot-seed discovery-toplevel resolve, the wrapper-script trailer
+injection) cannot be made synthetic — name it
 `*.slow.test.ts` and add it to the fast-tier `--path-ignore-patterns` list (see
-`test/git-worker-realgit.slow.test.ts`, `test/git-wrapper.slow.test.ts`).
+`test/git-worker-realgit.slow.test.ts`, `test/git-boot-seed-realgit.slow.test.ts`,
+`test/git-wrapper.slow.test.ts`).
 
 **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
 `retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` — a fixed

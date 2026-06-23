@@ -5,14 +5,19 @@
  * the skip-floor to the captured `max(events.id)`, and manages the
  * `seed_required` lifecycle (crash-recovery + degrade-not-fatal).
  *
- * SLOW TIER: shells out to real `git` over real temp repos (git is never mocked
- * in this suite). Uses `freshDbFile`/`freshMemDb` for a migrated DB carrying the
- * prepared `stmts.insertEvent` the seed reuses, and the shared `initRepo` fixture.
+ * NO REAL GIT (fn-904): the seed's ONLY git boundary is its injectable
+ * `buildSnapshotForRoot` seam (defaulting to the real `readStatus` →
+ * `buildGitSnapshot` producer). These tests drive the seed's fold / floor /
+ * reset / seed_required DECISIONS with synthetic `GitSnapshotPayload`s — a
+ * one-dirty-file snapshot stands in for a real dirty repo, a `null` return
+ * stands in for a non-repo / timed-out read, and a throwing builder stands in
+ * for a hard per-root failure. `freshMemDb` supplies a migrated DB carrying the
+ * prepared `stmts.insertEvent` the seed reuses.
  */
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { KeeperDb } from "../src/db";
@@ -26,9 +31,8 @@ import {
   DEFAULT_GIT_SEED_BUDGET_MS,
   seedGitProjection,
 } from "../src/git-boot-seed";
-import { buildGitSnapshot, readStatus } from "../src/git-worker";
+import type { GitSnapshotPayload } from "../src/git-worker";
 import { drain } from "../src/reducer";
-import { initRepo } from "./helpers/git-repo";
 import { freshMemDb } from "./helpers/template-db";
 
 let kdb: KeeperDb;
@@ -49,13 +53,59 @@ afterEach(() => {
   }
 });
 
-/** Make a real git repo with one dirty (untracked) file; return its realpath. */
-function dirtyRepo(): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "keeper-bootseed-")));
-  tmpDirs.push(dir);
-  initRepo(dir);
-  writeFileSync(join(dir, "dirty.ts"), "export const x = 1;\n");
-  return dir;
+// ---------------------------------------------------------------------------
+// Synthetic snapshot builders — what `buildSnapshotForRoot` returns for a root.
+// A "dirty repo" is just a one-untracked-file snapshot on `main`; the seed never
+// sees git, only this payload.
+// ---------------------------------------------------------------------------
+
+/**
+ * The synthetic payload a dirty repo (one untracked `dirty.ts`) would produce.
+ * `dirtyPath` defaults to a repo-relative `dirty.ts`; pass an absolute path when
+ * a test attributes the dirty file to a live job (the mutation event's
+ * `mutation_path` must match the snapshot file path the reducer attributes).
+ */
+function dirtySnapshot(
+  projectDir: string,
+  dirtyPath = "dirty.ts",
+): GitSnapshotPayload {
+  return {
+    project_dir: projectDir,
+    branch: "main",
+    head_oid: null,
+    upstream: null,
+    ahead: 0,
+    behind: 0,
+    dirty_files: [
+      {
+        path: dirtyPath,
+        xy: "??",
+        kind: "untracked",
+        mtime_ms: null,
+        worktree_oid: null,
+        index_oid: null,
+        worktree_mode: null,
+      },
+    ],
+  };
+}
+
+/** A clean repo: a snapshot on `main` with an empty dirty set. */
+function cleanSnapshot(projectDir: string): GitSnapshotPayload {
+  return {
+    project_dir: projectDir,
+    branch: "main",
+    head_oid: "a".repeat(40),
+    upstream: null,
+    ahead: 0,
+    behind: 0,
+    dirty_files: [],
+  };
+}
+
+/** A synthetic-root path stand-in (no real dir is created — the seed never stats it). */
+function fakeRoot(name: string): string {
+  return `/synthetic/keeper-bootseed/${name}`;
 }
 
 /** Drain-to-completion over this test's db (the callback the seed needs). */
@@ -79,10 +129,11 @@ function gitStatusRow(
 // ---------------------------------------------------------------------------
 
 test("boot-seed re-derives git_status + file_attributions for a currently-dirty repo (before serving)", () => {
-  const repo = dirtyRepo();
+  const repo = fakeRoot("dirty");
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [repo],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
   });
 
   expect(result.seededRoots).toEqual([repo]);
@@ -107,19 +158,11 @@ test("boot-seed re-derives git_status + file_attributions for a currently-dirty 
 });
 
 test("tail-equivalence: a clean repo seeds an empty/clean git_status (dirty_count 0)", () => {
-  const dir = realpathSync(
-    mkdtempSync(join(tmpdir(), "keeper-bootseed-clean-")),
-  );
-  tmpDirs.push(dir);
-  initRepo(dir);
-  // Commit the one file so the tree is clean.
-  writeFileSync(join(dir, "tracked.ts"), "export const y = 1;\n");
-  Bun.spawnSync(["git", "-C", dir, "add", "-A"]);
-  Bun.spawnSync(["git", "-C", dir, "commit", "-q", "-m", "init"]);
-
+  const dir = fakeRoot("clean");
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [dir],
+    buildSnapshotForRoot: (root) => cleanSnapshot(root),
   });
   expect(result.complete).toBe(true);
   const row = gitStatusRow(dir);
@@ -136,8 +179,9 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
   // the git-boot-seed.ts header). Bookkeeping columns (last_event_id /
   // updated_at) DO advance on the re-fold and are excluded; the OBSERVABLE git
   // surface must not move.
-  const repo = dirtyRepo();
+  const repo = fakeRoot("idempotent");
   const sess = "11111111-1111-1111-1111-111111111111";
+  const dirtyPath = `${repo}/dirty.ts`;
 
   // A live job that edited the now-dirty file, so the seed attributes dirty.ts
   // to a live toucher — populating file_attributions AND the job's git-counters
@@ -146,12 +190,17 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
     "INSERT INTO jobs (job_id, created_at, updated_at, state) VALUES (?, 1000, 1000, 'working')",
     [sess],
   );
-  const dirtyPath = join(repo, "dirty.ts");
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, tool_name, cwd, data, mutation_path)
        VALUES (1001, ?, NULL, 'PostToolUse', 'post_tool_use', 'Write', ?, ?, ?)`,
     [sess, repo, JSON.stringify({ file_path: dirtyPath }), dirtyPath],
   );
+
+  // The snapshot reports a REPO-RELATIVE dirty path (`dirty.ts`); the reducer
+  // anchors it onto `project_dir` and matches the resulting absolute path
+  // against the mutation event's absolute `mutation_path` — so the two join
+  // into a live attribution.
+  const snapshotForRoot = (root: string) => dirtySnapshot(root, "dirty.ts");
 
   const stripVolatile = (
     row: Record<string, unknown> | null,
@@ -186,6 +235,7 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
   const seed = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [repo],
+    buildSnapshotForRoot: snapshotForRoot,
   });
   expect(seed.complete).toBe(true);
 
@@ -200,11 +250,7 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
   // 2. Live re-emit: the git-worker's first scan emits a GitSnapshot for the
   //    SAME dirty set, folded ABOVE the floor with NO reset (its id is the
   //    highest in the log — appended after the boot-seed's synthetic snapshot).
-  const status = readStatus(repo);
-  if (status === null) {
-    throw new Error("readStatus returned null for a known-dirty repo");
-  }
-  const snapshot = buildGitSnapshot(repo, status);
+  const snapshot = snapshotForRoot(repo);
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
        VALUES (2000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
@@ -232,10 +278,11 @@ test("seed-freshness: the floor is raised to the captured max(events.id) and see
     kdb.db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
   ).m;
 
-  const repo = dirtyRepo();
+  const repo = fakeRoot("freshness");
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [repo],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
   });
 
   // The persisted floor equals the max id captured BEFORE the scan (the
@@ -250,15 +297,13 @@ test("seed-freshness: the floor is raised to the captured max(events.id) and see
 // ---------------------------------------------------------------------------
 
 test("crash-recovery: a non-git root degrades (no throw) and leaves seed_required SET to retry", () => {
-  const notARepo = realpathSync(
-    mkdtempSync(join(tmpdir(), "keeper-bootseed-bare-")),
-  );
-  tmpDirs.push(notARepo);
-  // No initRepo — `readStatus` returns null for a non-git dir, so the root is
-  // skipped and the seed reports incomplete.
+  const notARepo = fakeRoot("bare");
+  // `buildSnapshotForRoot` returns null for a non-git dir (mirrors `readStatus`
+  // returning null), so the root is skipped and the seed reports incomplete.
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [notARepo],
+    buildSnapshotForRoot: () => null,
   });
 
   expect(result.complete).toBe(false);
@@ -270,7 +315,7 @@ test("crash-recovery: a non-git root degrades (no throw) and leaves seed_require
 });
 
 test("degrade-not-fatal: a drain callback that throws is isolated per-root; the seed never throws and leaves seed_required set", () => {
-  const repo = dirtyRepo();
+  const repo = fakeRoot("drain-throw");
   let calls = 0;
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: () => {
@@ -278,6 +323,7 @@ test("degrade-not-fatal: a drain callback that throws is isolated per-root; the 
       throw new Error("simulated drain failure");
     },
     roots: [repo],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
   });
   expect(calls).toBeGreaterThan(0); // the drain was attempted
   expect(result.complete).toBe(false);
@@ -286,13 +332,14 @@ test("degrade-not-fatal: a drain callback that throws is isolated per-root; the 
 });
 
 test("budget: an exhausted time budget stops issuing scans and leaves seed_required set", () => {
-  const repo1 = dirtyRepo();
-  const repo2 = dirtyRepo();
+  const repo1 = fakeRoot("budget-1");
+  const repo2 = fakeRoot("budget-2");
   // A clock that jumps past the budget on the first elapsed-check.
   let t = 0;
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
     roots: [repo1, repo2],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
     timeBudgetMs: 10,
     now: () => {
       const v = t;
@@ -305,21 +352,23 @@ test("budget: an exhausted time budget stops issuing scans and leaves seed_requi
 });
 
 // ---------------------------------------------------------------------------
-// Discovery path (no explicit roots): finds a repo from jobs.cwd
+// Multi-root: every explicit root is seeded from its own snapshot
 // ---------------------------------------------------------------------------
+//
+// (The DISCOVERY path — no explicit roots, `jobs.cwd` → git toplevel resolve —
+// genuinely needs real git and lives in git-boot-seed-realgit.slow.test.ts.)
 
-test("discovery: with no explicit roots, the seed discovers a repo from jobs.cwd", () => {
-  const repo = dirtyRepo();
-  // A jobs row whose cwd is inside the repo makes it a discovery candidate.
-  kdb.db.run(
-    "INSERT INTO jobs (job_id, created_at, cwd, state, updated_at) VALUES ('j1', 1000, ?, 'working', 1000)",
-    [repo],
-  );
+test("multi-root: each explicit root is seeded independently from its own snapshot", () => {
+  const repoA = fakeRoot("multi-a");
+  const repoB = fakeRoot("multi-b");
   const result = seedGitProjection(kdb.db, kdb.stmts, {
     drainToCompletion: drainAll,
+    roots: [repoA, repoB],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root),
   });
-  expect(result.seededRoots).toContain(repo);
-  expect(gitStatusRow(repo)?.dirty_count).toBe(1);
+  expect(result.seededRoots.sort()).toEqual([repoA, repoB].sort());
+  expect(gitStatusRow(repoA)?.dirty_count).toBe(1);
+  expect(gitStatusRow(repoB)?.dirty_count).toBe(1);
 });
 
 test("default budget constant is a sane positive value", () => {
@@ -332,12 +381,13 @@ test("default budget constant is a sane positive value", () => {
 // ---------------------------------------------------------------------------
 
 test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical GitSnapshots skipped) + correct for currently-dirty files + downgrade-guarded", () => {
-  const repo = dirtyRepo();
-  const dbPath = join(
-    realpathSync(mkdtempSync(join(tmpdir(), "keeper-copyproof-"))),
-    "v78.db",
-  );
-  tmpDirs.push(join(dbPath, ".."));
+  const repo = fakeRoot("copyproof");
+  // An on-disk SQLite path the test reopens across migrate cycles. It is a DB
+  // file only — no git repo is created, and the seed runs via the synthetic
+  // `buildSnapshotForRoot` injection, so this test touches no real git.
+  const dbDir = realpathSync(mkdtempSync(join(tmpdir(), "keeper-copyproof-")));
+  tmpDirs.push(dbDir);
+  const dbPath = join(dbDir, "v78.db");
 
   // 1. Build a v78-shaped DB: migrate to current, then regress the stamp to 78
   //    and DROP the v79 control table so the reopen genuinely runs v78→v79.
@@ -413,12 +463,13 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
     const result = seedGitProjection(db, stmts, {
       drainToCompletion: seedDrain,
       roots: [repo],
+      // The CURRENT dirty set is one untracked `dirty.ts` — NOT the historical
+      // `historical.ts` that only ever existed in the synthetic event payloads.
+      buildSnapshotForRoot: (root) => dirtySnapshot(root),
     });
     expect(result.complete).toBe(true);
     const row = kdbStatus(db, repo);
     expect(row).not.toBeNull();
-    // The repo is dirty with the ONE untracked `dirty.ts` (NOT the historical
-    // `historical.ts` that only ever existed in the synthetic event payloads).
     expect(row?.dirty_count).toBe(1);
     expect(readGitProjectionSeedRequired(db)).toBe(false); // seed cleared it
 

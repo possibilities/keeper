@@ -18,9 +18,24 @@
  * `branch` are JSON `null`, NOT `""` and NOT a throw.
  */
 
+import type { AttributionDeps } from "../src/commit-work/attribution";
 import { discoverSessionFiles } from "../src/commit-work/attribution";
-import { gitExec } from "../src/commit-work/git-exec";
+import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { resolveSessionId } from "../src/commit-work/session-id";
+
+/**
+ * Injectable seams for {@link run} / {@link buildSessionState}. Production omits
+ * them (the real `git` runner + DB-backed attribution); tests inject a faked git
+ * runner + synthetic `discoverSessionFiles` deps so the verb's DECISIONS (null
+ * parity, the envelope shape, the attribution swallow) are exercised in-process
+ * with ZERO real git.
+ */
+export interface SessionStateDeps {
+  /** Git runner threaded into every git read. Defaults to the real {@link gitExec}. */
+  gitRunner?: GitRunner;
+  /** Attribution deps forwarded to {@link discoverSessionFiles}. */
+  attribution?: AttributionDeps;
+}
 
 const HELP = `keeper session-state [options]
 
@@ -93,8 +108,8 @@ function printPretty(value: unknown): void {
 }
 
 /** Full HEAD SHA, or `null` in an empty repo (no commits yet). */
-async function getHeadSha(cwd: string): Promise<string | null> {
-  const res = await gitExec(["rev-parse", "HEAD"], { cwd });
+async function getHeadSha(git: GitRunner, cwd: string): Promise<string | null> {
+  const res = await git(["rev-parse", "HEAD"], { cwd });
   if (res.code !== 0) return null;
   return res.stdout.trim() || null;
 }
@@ -104,25 +119,52 @@ async function getHeadSha(cwd: string): Promise<string | null> {
  * HEAD` exits non-zero on a detached HEAD (and an empty repo before the first
  * commit, which keeps the same null shape).
  */
-async function getBranch(cwd: string): Promise<string | null> {
-  const res = await gitExec(["symbolic-ref", "--short", "HEAD"], { cwd });
+async function getBranch(git: GitRunner, cwd: string): Promise<string | null> {
+  const res = await git(["symbolic-ref", "--short", "HEAD"], { cwd });
   if (res.code !== 0) return null;
   return res.stdout.trim() || null;
 }
 
 /** Raw `git status --porcelain=v2 --branch` stdout. */
-async function getStatusPorcelain(cwd: string): Promise<string> {
-  const res = await gitExec(["status", "--porcelain=v2", "--branch"], { cwd });
+async function getStatusPorcelain(
+  git: GitRunner,
+  cwd: string,
+): Promise<string> {
+  const res = await git(["status", "--porcelain=v2", "--branch"], { cwd });
   return res.stdout;
 }
 
 /** Raw `git log -<count> --oneline` stdout. */
-async function getLogOneline(cwd: string, count: number): Promise<string> {
-  const res = await gitExec(["log", `-${count}`, "--oneline"], { cwd });
+async function getLogOneline(
+  git: GitRunner,
+  cwd: string,
+  count: number,
+): Promise<string> {
+  const res = await git(["log", `-${count}`, "--oneline"], { cwd });
   return res.stdout;
 }
 
-async function run(args: ParsedArgs): Promise<number> {
+/** The JSON envelope `session-state` emits. */
+export interface SessionStateEnvelope {
+  success: true;
+  status_porcelain: string;
+  log_oneline: string;
+  head_sha: string | null;
+  branch: string | null;
+  session_files: string[];
+}
+
+/**
+ * Build the session-state envelope. The git boundary is the threaded
+ * {@link GitRunner} (defaulting to the real {@link gitExec}); attribution reads
+ * the sandboxed DB via {@link discoverSessionFiles} (injectable deps). Exported
+ * so tests assert the verb's decisions in-process with a faked runner.
+ */
+export async function buildSessionState(
+  args: { sessionId: string | null; logCount: number },
+  deps: SessionStateDeps = {},
+): Promise<SessionStateEnvelope> {
+  const git = deps.gitRunner ?? gitExec;
   const cwd = process.cwd();
   const sessionId = resolveSessionId(args.sessionId);
 
@@ -132,25 +174,34 @@ async function run(args: ParsedArgs): Promise<number> {
   let sessionFiles: string[] = [];
   if (sessionId !== null) {
     try {
-      sessionFiles = discoverSessionFiles(sessionId, cwd);
+      sessionFiles = discoverSessionFiles(sessionId, cwd, deps.attribution);
     } catch {
       sessionFiles = [];
     }
   }
 
-  const headSha = await getHeadSha(cwd);
-  const branch = await getBranch(cwd);
-  const statusPorcelain = await getStatusPorcelain(cwd);
-  const logOneline = await getLogOneline(cwd, args.logCount);
+  const headSha = await getHeadSha(git, cwd);
+  const branch = await getBranch(git, cwd);
+  const statusPorcelain = await getStatusPorcelain(git, cwd);
+  const logOneline = await getLogOneline(git, cwd, args.logCount);
 
-  printPretty({
+  return {
     success: true,
     status_porcelain: statusPorcelain,
     log_oneline: logOneline,
     head_sha: headSha,
     branch,
     session_files: sessionFiles,
-  });
+  };
+}
+
+async function run(args: ParsedArgs): Promise<number> {
+  printPretty(
+    await buildSessionState({
+      sessionId: args.sessionId,
+      logCount: args.logCount,
+    }),
+  );
   return 0;
 }
 
