@@ -8,16 +8,15 @@
  *   - `chat send <target> <msg|->` — message one agent (current OR historical name,
  *                                    or the role address `planner@<epic_id>`);
  *                                    synchronous, prints the result, exit 1 on a miss.
- *   - `chat broadcast <msg|->`     — message every agent on the namespace.
  *   - `watch`                      — long-lived inbox subscriber (the Monitor command).
  *
  * `chat` is a reserved SUB-NAMESPACE token so a future `bus pair …` tenant slots in
  * without a routing change; the wire envelope already carries the `namespace` axis.
  *
- * Transport: send/broadcast/list use a ONE-SHOT UDS client (connect → register →
+ * Transport: send/list use a ONE-SHOT UDS client (connect → register →
  * op → close), modeled on `cli/control-rpc.ts` `roundTrip` but framed for the bus's
  * op-discriminated protocol (acks are keyed on `{type:"ack",op}`, not `id`). A
- * `send`/`broadcast` awaits the server's synchronous publish ack
+ * `send` awaits the server's synchronous publish ack
  * (`{type:"ack",op:"publish",result,recipients}`) so the result is honest. `watch`
  * is the exception — a LONG-LIVED streaming subscriber that stays open across
  * reconnects with no heartbeat traffic (the server keys liveness on socket-close),
@@ -86,7 +85,6 @@ const HELP = `keeper bus — Agent Bus command surface
 Usage:
   keeper bus list                         Show who is on the bus (JSON, informational)
   keeper bus chat send <target> <msg|->   Message one agent (current or former name)
-  keeper bus chat broadcast <msg|->       Message everyone on the chat namespace
   keeper bus wake <planner@epic>          Resume an offline epic-creator session so a
                                           queued escalation is redelivered (client-side)
   keeper bus watch                        Long-lived inbox subscriber (Monitor command)
@@ -163,7 +161,6 @@ export type BusCommand =
   | { kind: "list" }
   | { kind: "watch" }
   | { kind: "send"; target: string; message: string }
-  | { kind: "broadcast"; message: string }
   | { kind: "wake"; target: string };
 
 /**
@@ -209,19 +206,9 @@ export function parseBusArgv(argv: string[]): BusCommand {
         }
         return { kind: "send", target, message };
       }
-      if (sub === "broadcast") {
-        const message = argv[2];
-        if (message === undefined) {
-          return {
-            kind: "usage",
-            error: "chat broadcast requires a <message|->",
-          };
-        }
-        return { kind: "broadcast", message };
-      }
       return {
         kind: "usage",
-        error: `unknown chat verb '${sub ?? ""}' (want send|broadcast)`,
+        error: `unknown chat verb '${sub ?? ""}' (want send)`,
       };
     }
     default:
@@ -238,26 +225,23 @@ export interface ChatPayload {
 /** A publish op frame (client → server). */
 export interface PublishFrame {
   op: "publish";
-  event: "send" | "broadcast";
+  event: "send";
   namespace: string;
   to?: string;
   payload: ChatPayload;
 }
 
 /**
- * Build the publish op frame for a `chat send`/`chat broadcast`. The namespace is
- * `chat`; a directed send carries `to`, a broadcast omits it. The server overwrites
- * any `from` we might claim (anti-spoof) so we never set one. Pure.
+ * Build the publish op frame for a `chat send`. The namespace is `chat` and the
+ * directed send carries `to`. The server overwrites any `from` we might claim
+ * (anti-spoof) so we never set one. Pure.
  */
 export function buildPublishFrame(
-  event: "send" | "broadcast",
+  event: "send",
   text: string,
   target?: string,
 ): PublishFrame {
   const payload: ChatPayload = { media_type: "text/markdown", text };
-  if (event === "broadcast") {
-    return { op: "publish", event, namespace: CHAT_NAMESPACE, payload };
-  }
   return {
     op: "publish",
     event,
@@ -625,7 +609,7 @@ async function runWakeVerb(target: string): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// One-shot UDS client (send / broadcast / list)
+// One-shot UDS client (send / list)
 // ---------------------------------------------------------------------------
 
 function die(message: string): never {
@@ -657,7 +641,7 @@ async function resolveMessage(arg: string): Promise<string> {
  * frames and resolves when its terminal condition is met against the parsed frame
  * stream), then close. Rejects on connect failure, transport error, server close,
  * or timeout. Generic over the resolved value so `list` returns its ack body while
- * `send`/`broadcast` resolve on the synchronous publish ack.
+ * `send` resolves on the synchronous publish ack.
  */
 async function busRoundTrip<T>(
   sockPath: string,
@@ -748,7 +732,7 @@ async function busRoundTrip<T>(
 
 /** The register frame this CLI sends. Identity is enriched server-side from the
  *  peer pid; we pass our own pid as the resume-gap floor. `sendOnly` marks a
- *  transient `send`/`broadcast` register so the relay binds the `from` identity
+ *  transient `send` register so the relay binds the `from` identity
  *  WITHOUT joining the registry or taking over the agent's live `watch` channel
  *  (which shares the same `(pid, start_time)` identity). A `watch` registers
  *  with `sendOnly:false` so it owns a durable, subscribable channel. */
@@ -764,8 +748,7 @@ function registerFrame(sendOnly = false): object {
 
 /** The synchronous publish result the server replies with (mirrors the server's
  *  `PublishOutcome`). `delivered` is the only success; every other value is a
- *  fail-loud non-delivery the CLI exits 1 on. Broadcast only ever yields
- *  `delivered`, carrying the recipient count. */
+ *  fail-loud non-delivery the CLI exits 1 on. */
 export type PublishResult =
   | "delivered"
   | "queued_for_wake"
@@ -781,15 +764,15 @@ export interface SendResult {
 }
 
 /**
- * Send a directed/broadcast message. Connect → register (await ack so the server
- * has bound our authoritative identity) → publish → await the synchronous publish
- * ack → close. The server resolves + fans out and replies a single result frame
+ * Send a directed message. Connect → register (await ack so the server has bound
+ * our authoritative identity) → publish → await the synchronous publish ack →
+ * close. The server resolves + delivers and replies a single result frame
  * (`{type:"ack",op:"publish",result,recipients}`); we return that outcome so the
  * caller can print an honest result and pick the exit code — no silent exit-0.
  */
 async function runSend(
   sockPath: string,
-  event: "send" | "broadcast",
+  event: "send",
   text: string,
   target?: string,
 ): Promise<SendResult> {
@@ -1101,17 +1084,6 @@ export async function main(argv: string[]): Promise<void> {
       process.stdout.write(
         `${sendSuccessMessage(res.result as "delivered" | "queued_for_wake", cmd.target)}\n`,
       );
-      return process.exit(0);
-    }
-    case "broadcast": {
-      const text = await resolveMessage(cmd.message);
-      let res: SendResult;
-      try {
-        res = await runSend(sockPath, "broadcast", text);
-      } catch (err) {
-        return die((err as Error).message);
-      }
-      process.stdout.write(`broadcast to ${res.recipients} recipient(s)\n`);
       return process.exit(0);
     }
     case "wake": {

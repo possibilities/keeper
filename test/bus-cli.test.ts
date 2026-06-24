@@ -87,24 +87,10 @@ describe("parseBusArgv routing", () => {
     if (r.kind === "usage") expect(r.error).toContain("target");
   });
 
-  test("chat broadcast <msg>", () => {
-    expect(parseBusArgv(["chat", "broadcast", "all hands"])).toEqual({
-      kind: "broadcast",
-      message: "all hands",
-    });
-  });
-
-  test("chat broadcast '-' verbatim", () => {
-    expect(parseBusArgv(["chat", "broadcast", "-"])).toEqual({
-      kind: "broadcast",
-      message: "-",
-    });
-  });
-
   test("chat with an unknown sub-verb → usage", () => {
     const r = parseBusArgv(["chat", "yell", "hi"]);
     expect(r.kind).toBe("usage");
-    if (r.kind === "usage") expect(r.error).toContain("send|broadcast");
+    if (r.kind === "usage") expect(r.error).toContain("send");
   });
 
   test("unknown verb → usage naming the verb", () => {
@@ -195,13 +181,6 @@ describe("buildPublishFrame", () => {
     });
     // Anti-spoof: the CLI never claims a `from` — the server stamps it.
     expect((f as unknown as Record<string, unknown>).from).toBeUndefined();
-  });
-
-  test("broadcast omits to", () => {
-    const f = buildPublishFrame("broadcast", "all hands");
-    expect(f.to).toBeUndefined();
-    expect(f.event).toBe("broadcast");
-    expect(f.namespace).toBe(CHAT_NAMESPACE);
   });
 });
 

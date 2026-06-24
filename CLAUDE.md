@@ -44,7 +44,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   stopped tracked windows are autoclosed by the reaper's managed-session arm
   (`src/reaper-worker.ts`) past an idle grace, alongside `pair`/`panels`.
 - **Bus presence = a SUBSCRIBED channel; a pure send is EPHEMERAL (fn-921).** A
-  `keeper bus chat send`/`broadcast` registers with `send_only:true` (`cli/bus.ts`
+  `keeper bus chat send` registers with `send_only:true` (`cli/bus.ts`
   `registerFrame(true)`): `opRegister` binds the authoritative `from` identity on
   `conn.entry` ONLY — it does NOT join the live `registry`, run `takeoverVictim`,
   `upsertChannel`, or `publishControl("join")`, and `opDeregister` skips the

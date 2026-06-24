@@ -6,9 +6,8 @@ description: >-
   Monitor before your first prompt), so you never start a listener — you
   just send and wait. Send blindly to another agent with `keeper bus chat
   send <name-or-id> "msg"` (resolves a current OR any former name; prints the
-  result and exits non-zero on a miss), fan out with `keeper bus chat
-  broadcast "msg"`, see who is on the bus with `keeper bus list`. Use when
-  you need to message another running agent, or when a human
+  result and exits non-zero on a miss), see who is on the bus with `keeper bus
+  list`. Use when you need to message another running agent, or when a human
   says someone will message you / to message someone — even when they never
   say "keeper" or "bus".
 allowed-tools: Bash
@@ -80,9 +79,8 @@ The send returns an immediate, honest result and sets the exit code:
 - **`not_connected`** — the target is a known identity but has no open
   socket; nothing was delivered. Exit 1. For a NON-role target this message is
   NOT queued and will NOT "land when they reconnect" — re-send once the agent
-  is back. **Do NOT fall back to `broadcast`** — that reaches every connected
-  agent, not the offline target. (A `planner@<epic_id>` creator offline reports
-  `queued_for_wake`, not this.)
+  is back. (A `planner@<epic_id>` creator offline reports `queued_for_wake`,
+  not this.)
 - **`unknown_target`** — the name resolves to no agent. Exit 1.
 - **`ambiguous_target`** — the name matches more than one agent; use a more
   specific name or id. Exit 1.
@@ -114,22 +112,6 @@ Outcomes (all exit 0 except `unknown_creator`): `launched`, `already_live`,
 `in_flight`, `cooldown`, `launch_failed` (fail-open — the queued message
 remains), `unknown_creator` (exit 1). Reaping of the `agentbus` session is owned
 by a separate cleanup system, not this verb.
-
-To fan a message out to everyone on the bus:
-
-```sh
-keeper bus chat broadcast "your message"
-```
-
-Broadcast prints the recipient count and exits 0.
-
-**Broadcast is NOT a delivery fallback. NEVER retry a missed directed send
-via `broadcast`.** A directed send that returns `not_connected` /
-`unknown_target` reached no one — but `broadcast` reaches EVERY connected
-agent, not the one you meant, spraying the whole fleet with a message
-intended for a single peer. On a miss: surface it, re-target the correct
-agent, or (for a `planner@<epic_id>` creator) leave it to `queued_for_wake`.
-Broadcast is only for a message that genuinely belongs to everyone.
 
 ## See who is on the bus
 

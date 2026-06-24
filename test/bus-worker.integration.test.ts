@@ -7,7 +7,6 @@
  *
  *  - register → subscribe → publish fan-out lands on the directed peer (and the
  *    subscribe ack carries the `last_message_id` replay cursor),
- *  - broadcast reaches all live subscribers except the sender,
  *  - a FORMER name (keeper.db `jobs.name_history`) resolves to the agent's
  *    CURRENT live channel — the dead-name proof,
  *  - the server OVERWRITES the sender-claimed `from` with the peer-resolved
@@ -245,48 +244,6 @@ test("two live agents exchange a directed message end-to-end; the subscribe ack 
 
   alice.socket.end();
   bob.socket.end();
-});
-
-test("broadcast reaches all live subscribers except the sender", async () => {
-  await bootBus();
-  const alice = await connectClient();
-  const bob = await connectClient();
-  const carol = await connectClient();
-
-  for (const [c, name, sid, st] of [
-    [alice, "alice", "sess-alice", "t-alice"],
-    [bob, "bob", "sess-bob", "t-bob"],
-    [carol, "carol", "sess-carol", "t-carol"],
-  ] as const) {
-    c.send({
-      op: "register",
-      namespace: "chat",
-      name,
-      session_id: sid,
-      start_time: st,
-    });
-    await waitFrame(c.frames, (f) => f.type === "ack" && f.op === "register");
-    c.send({ op: "subscribe", namespaces: ["chat"] });
-    await waitFrame(c.frames, (f) => f.type === "ack" && f.op === "subscribe");
-  }
-
-  alice.send({
-    op: "publish",
-    event: "broadcast",
-    namespace: "chat",
-    payload: { media_type: "text/plain", text: "all hands" },
-  });
-  const bobGot = await waitFrame(bob.frames, (f) => f.event === "message");
-  const carolGot = await waitFrame(carol.frames, (f) => f.event === "message");
-  expect(bobGot).not.toBeNull();
-  expect(carolGot).not.toBeNull();
-  // The sender is never echoed its own broadcast.
-  await retryUntil(() => true, 200, 50);
-  expect(alice.frames.find((f) => f.event === "message")).toBeUndefined();
-
-  alice.socket.end();
-  bob.socket.end();
-  carol.socket.end();
 });
 
 test("dead-name resolution: a FORMER name reaches the agent's CURRENT live channel", async () => {
@@ -747,13 +704,27 @@ test("CLI `keeper bus chat send` does not evict a live watcher that shares its i
     (f) => f.type === "ack" && f.op === "subscribe",
   );
 
-  // The CLI send shares the harness identity; before the fix it evicted the watch.
-  const sent = await runBusCli(["chat", "broadcast", "from the CLI"]);
+  // A CLI `chat send` registers send_only, sharing the SAME (pid, start_time)
+  // harness identity as the live watch — the exact takeover hazard the send_only
+  // flag guards. The send_only register joins NO registry, so it gets a distinct
+  // channel id: a directed send to the watch's OWN current name resolves to the
+  // live watch (the only registry member with that name) and delivers there
+  // (sender = the send_only channel id, excluded). Before the fix the send_only
+  // register would have EVICTED the live watch (same (pid, start_time) takeover).
+  const sent = await runBusCli([
+    "chat",
+    "send",
+    "harness-live",
+    "from the CLI",
+  ]);
   expect(sent.code).toBe(0);
 
-  // The watch is still subscribed (not taken over) and received the broadcast.
+  // The live watch received the directed send (it was not evicted).
   const arrived = await waitFrame(watcher.frames, (f) => f.event === "message");
   expect((arrived?.payload as { text?: string })?.text).toBe("from the CLI");
+
+  // The send_only register did NOT take over the live watch: a single
+  // harness-live channel remains and it is still subscribed.
   const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
     name?: string;
     subscribed?: boolean;
@@ -921,18 +892,6 @@ test("CLI send to an UNKNOWN name fails loud: exit 1 + `unknown_target` on stder
   expect(sent.stdout).toBe("");
 });
 
-test("CLI broadcast prints a recipient count and exits 0", async () => {
-  await bootBus();
-  const bob = await connectClient();
-  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
-
-  const sent = await runBusCli(["chat", "broadcast", "all hands"]);
-  expect(sent.code).toBe(0);
-  expect(sent.stdout).toMatch(/broadcast to \d+ recipient/);
-
-  bob.socket.end();
-});
-
 test("`keeper bus resolve` is gone — the CLI rejects it as an unknown verb (exit 1)", async () => {
   await bootBus();
   const r = await runBusCli(["resolve", "bob"]);
@@ -979,11 +938,11 @@ test("live registration resolves the channel identity to the keeper HARNESS titl
 test("live registration: a harness-resolved channel's published `from` carries the harness identity", async () => {
   seedHarnessJob();
   await bootBus();
-  // ONE client; it resolves to the harness, subscribes to a namespace it does
-  // NOT publish into, then broadcasts on `chat`. We can't add a SECOND distinct
-  // same-process receiver (every in-process peer resolves to the SAME harness
-  // identity → takeover), so we read the harness `from` off the message the
-  // server persists for the broadcast (which is fanned to no one but recorded).
+  // ONE client; it resolves to the harness, then directs a send at its OWN
+  // current name on `chat`. We can't add a SECOND distinct same-process receiver
+  // (every in-process peer resolves to the SAME harness identity → takeover), so
+  // we read the harness `from` off the message the server persists for the send
+  // (which routes back to the sender → fanned to no one but recorded).
   const sender = await connectClient();
   sender.send({ op: "register", namespace: "chat" });
   const reg = await waitFrame(

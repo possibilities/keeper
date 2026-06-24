@@ -110,25 +110,15 @@ test("directed send routes to the single resolved channel, excluding the sender"
   expect(targets.map((t) => t.channel.channel_id)).toEqual(["ch-b"]);
 });
 
-test("broadcast (null target) reaches every namespace subscriber except the sender", () => {
-  const a = makeEntry({ channel_id: "ch-a", namespaces: ["chat"] });
-  const b = makeEntry({ channel_id: "ch-b", namespaces: ["chat"] });
-  const c = makeEntry({ channel_id: "ch-c", namespaces: ["chat"] });
-  const targets = selectFanoutTargets([a, b, c], "chat", null, "ch-a");
-  expect(targets.map((t) => t.channel.channel_id).sort()).toEqual([
-    "ch-b",
-    "ch-c",
-  ]);
-});
-
-test("fan-out is namespace-scoped: a channel not subscribed to the namespace is skipped", () => {
+test("fan-out is namespace-scoped: a directed send only reaches a target subscribed to the namespace", () => {
   const chatter = makeEntry({ channel_id: "ch-chat", namespaces: ["chat"] });
   const pairer = makeEntry({ channel_id: "ch-pair", namespaces: ["pair"] });
-  // A broadcast in `chat` reaches the chat subscriber only — proving the core
-  // routes tenant-agnostically (a future `pair` tenant rides the same path).
-  const chat = selectFanoutTargets([chatter, pairer], "chat", null, null);
+  // A directed send to ch-chat in `chat` reaches it; the same channel id in the
+  // `pair` namespace reaches no one — proving the core routes tenant-agnostically
+  // (a future `pair` tenant rides the same path).
+  const chat = selectFanoutTargets([chatter, pairer], "chat", "ch-chat", null);
   expect(chat.map((t) => t.channel.channel_id)).toEqual(["ch-chat"]);
-  const pair = selectFanoutTargets([chatter, pairer], "pair", null, null);
+  const pair = selectFanoutTargets([chatter, pairer], "pair", "ch-pair", null);
   expect(pair.map((t) => t.channel.channel_id)).toEqual(["ch-pair"]);
 });
 
@@ -173,14 +163,6 @@ test("fan-out excludes a known-but-disconnected channel (sock === null)", () => 
   expect(
     selectFanoutTargets([connected, disconnected], "chat", "ch-off", "ch-on"),
   ).toEqual([]);
-  // A broadcast skips it too — only the connected peer receives.
-  const bcast = selectFanoutTargets(
-    [connected, disconnected],
-    "chat",
-    null,
-    null,
-  );
-  expect(bcast.map((t) => t.channel.channel_id)).toEqual(["ch-on"]);
 });
 
 // ---------------------------------------------------------------------------

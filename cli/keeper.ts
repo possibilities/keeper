@@ -74,7 +74,7 @@ Subcommands:
   pair                Fan a task to another model CLI (claude/codex) via agentwrap (\`keeper pair send\`)
   agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded agentwrap launcher)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
-  bus                 Agent Bus: \`keeper bus <list|resolve|chat send|chat broadcast|watch>\`
+  bus                 Agent Bus: \`keeper bus <list|resolve|chat send|watch>\`
 
 Flags:
   --help, -h     Show this help

@@ -23,7 +23,7 @@
  * Wire (2-axis NDJSON, epic Architecture). The core routes ONLY on
  * `(namespace, resolved-target)`; the payload is opaque, so a future `pair`
  * tenant needs no core change. Op-discriminated socket frames: client →
- * register / subscribe / publish(send|broadcast) / list / deregister; server →
+ * register / subscribe / publish(send) / list / deregister; server →
  * ack / event / presence / error. A `subscribe` ack carries the
  * `last_message_id` replay cursor. A `publish` ack carries the synchronous
  * delivery result. Peer liveness is socket-close (a kill/crash FINs the fd);
@@ -174,7 +174,7 @@ export type ClientOp =
   | { op: "subscribe"; namespaces?: string[]; after_id?: number }
   | {
       op: "publish";
-      event?: "send" | "broadcast";
+      event?: "send";
       namespace?: string;
       to?: string;
       payload?: Payload;
@@ -209,23 +209,22 @@ export function authoritativeFrom(
 
 /**
  * Fan-out target selection: the CONNECTED channels that should receive a message
- * in `namespace` addressed to `resolvedChannelId`. A `broadcast` (null target)
- * goes to every CONNECTED channel SUBSCRIBED to the namespace except the sender;
- * a directed send goes to the single resolved channel (when it is connected +
- * subscribed). A channel with no open socket (`sock === null` — a rehydrated
- * cache row or a closed-but-kept identity) is NEVER a delivery target, so the
- * fanned-out count matches what actually got written. The sender is never echoed
- * its own message. Pure over the registry snapshot.
+ * in `namespace` addressed to `resolvedChannelId`. A directed send goes to the
+ * single resolved channel (when it is connected + subscribed). A channel with no
+ * open socket (`sock === null` — a rehydrated cache row or a closed-but-kept
+ * identity) is NEVER a delivery target, so the fanned-out count matches what
+ * actually got written. The sender is never echoed its own message. Pure over the
+ * registry snapshot.
  *
  * @param registry          all registry entries (the routing universe).
  * @param namespace         the tenant axis.
- * @param resolvedChannelId the directed target's channel id, or `null` for broadcast.
+ * @param resolvedChannelId the directed target's channel id.
  * @param senderChannelId   the publisher's channel id (excluded from delivery).
  */
 export function selectFanoutTargets(
   registry: RegistryEntry[],
   namespace: string,
-  resolvedChannelId: string | null,
+  resolvedChannelId: string,
   senderChannelId: string | null,
 ): RegistryEntry[] {
   const out: RegistryEntry[] = [];
@@ -233,12 +232,7 @@ export function selectFanoutTargets(
     if (e.sock === null) continue;
     if (e.channel.channel_id === senderChannelId) continue;
     if (!e.namespaces.includes(namespace)) continue;
-    if (
-      resolvedChannelId !== null &&
-      e.channel.channel_id !== resolvedChannelId
-    ) {
-      continue;
-    }
+    if (e.channel.channel_id !== resolvedChannelId) continue;
     out.push(e);
   }
   return out;
@@ -264,8 +258,7 @@ export function backpressureDecision(
 
 /**
  * The synchronous result vocabulary a publish replies with (and persists to
- * `messages.status`). A directed send resolves to exactly one of these; a
- * broadcast only ever yields `delivered` (with a recipient count).
+ * `messages.status`). A directed send resolves to exactly one of these.
  *
  *  - `delivered`       — the resolved target had an OPEN socket and the full
  *                        frame was accepted (a directed send: 1 recipient).
@@ -671,7 +664,7 @@ export function startBusServer(
    */
   const fanout = (
     namespace: string,
-    resolvedChannelId: string | null,
+    resolvedChannelId: string,
     senderChannelId: string | null,
     envelope: EventEnvelope,
   ): number => {
@@ -1030,98 +1023,59 @@ export function startBusServer(
     );
 
     // -- directed send: resolve, then gate DELIVERY on a connected socket -----
-    if (event === "send") {
-      const toTarget = op.to ?? "";
-      const res = resolve(toTarget);
-      // The resolved live channel (present only on an `ok` resolution) carries
-      // the presence axis: a delivery needs `connected === true`.
-      const channel = res.kind === "ok" ? res.channel : null;
-      // Resolution that yields no DELIVERY (unknown / ambiguous / known-but-
-      // disconnected) persists the true outcome and replies; it fans out to no
-      // one. A resolved-but-disconnected identity is `not_connected`, NOT
-      // `unknown` — the seam for a future wake-on-send.
-      if (channel === null || !channel.connected) {
-        const outcome = publishOutcome(
-          res.kind,
-          channel?.connected ?? false,
-          0,
-        );
-        // A `planner@<epic>` escalation to a KNOWN-but-offline creator is made
-        // durable: persist the creator's stable job_id as the recipient key and
-        // flag it `queued_for_wake` so the creator's resubscribe replays it. Every
-        // other offline send keeps its honest non-delivery outcome.
-        const { resolvedSessionId, status } = offlineSendPersist(
-          res,
-          toTarget,
-          outcome,
-        );
-        appendMessage(busDb, {
-          namespace,
-          event,
-          from_channel_id: from.channel_id,
-          from_pid: from.pid,
-          from_name: from.name,
-          to_target: toTarget,
-          resolved_channel_id: channel?.channel_id ?? null,
-          resolved_session_id: resolvedSessionId,
-          body: payload.text,
-          status,
-          reply_to: op.reply_to ?? null,
-        });
-        sendAck(sock, "publish", { result: status, recipients: 0 });
-        return;
-      }
-
-      const resolvedChannelId = channel.channel_id;
-      const resolvedSessionId = channel.session_id;
-      // Persist provisionally so the envelope id (the replay cursor) is minted
-      // BEFORE fanout, then compute the TRUE outcome from what fanout actually
-      // wrote and reconcile the status. No unconditional pre-fanout `delivered`.
-      const id = appendMessage(busDb, {
+    // Every publish is a directed send. A degenerate `to`-less frame resolves to
+    // `""` → `unknown_target` → loud non-delivery, never a silent drop.
+    const toTarget = op.to ?? "";
+    const res = resolve(toTarget);
+    // The resolved live channel (present only on an `ok` resolution) carries
+    // the presence axis: a delivery needs `connected === true`.
+    const channel = res.kind === "ok" ? res.channel : null;
+    // Resolution that yields no DELIVERY (unknown / ambiguous / known-but-
+    // disconnected) persists the true outcome and replies; it fans out to no
+    // one. A resolved-but-disconnected identity is `not_connected`, NOT
+    // `unknown` — the seam for a future wake-on-send.
+    if (channel === null || !channel.connected) {
+      const outcome = publishOutcome(res.kind, channel?.connected ?? false, 0);
+      // A `planner@<epic>` escalation to a KNOWN-but-offline creator is made
+      // durable: persist the creator's stable job_id as the recipient key and
+      // flag it `queued_for_wake` so the creator's resubscribe replays it. Every
+      // other offline send keeps its honest non-delivery outcome.
+      const { resolvedSessionId, status } = offlineSendPersist(
+        res,
+        toTarget,
+        outcome,
+      );
+      appendMessage(busDb, {
         namespace,
         event,
         from_channel_id: from.channel_id,
         from_pid: from.pid,
         from_name: from.name,
         to_target: toTarget,
-        resolved_channel_id: resolvedChannelId,
+        resolved_channel_id: channel?.channel_id ?? null,
         resolved_session_id: resolvedSessionId,
         body: payload.text,
-        status: "pending",
+        status,
         reply_to: op.reply_to ?? null,
       });
-      const envelope = buildEnvelope(
-        namespace,
-        id,
-        from,
-        toTarget,
-        resolvedChannelId,
-        resolvedSessionId,
-        payload,
-        op.reply_to ?? null,
-      );
-      const delivered = fanout(
-        namespace,
-        resolvedChannelId,
-        from.channel_id,
-        envelope,
-      );
-      const outcome = publishOutcome("ok", true, delivered);
-      setMessageStatus(busDb, id, outcome);
-      sendAck(sock, "publish", { result: outcome, recipients: delivered });
+      sendAck(sock, "publish", { result: status, recipients: 0 });
       return;
     }
 
-    // -- broadcast: fan out to every connected namespace subscriber -----------
+    const resolvedChannelId = channel.channel_id;
+    const resolvedSessionId = channel.session_id;
+    // Persist provisionally so the envelope id (the replay cursor) is minted
+    // BEFORE fanout, then compute the TRUE outcome from what fanout actually
+    // wrote and reconcile the status. No unconditional pre-fanout `delivered`.
     const id = appendMessage(busDb, {
       namespace,
       event,
       from_channel_id: from.channel_id,
       from_pid: from.pid,
       from_name: from.name,
-      to_target: null,
-      resolved_channel_id: null,
-      resolved_session_id: null,
+      to_target: toTarget,
+      resolved_channel_id: resolvedChannelId,
+      resolved_session_id: resolvedSessionId,
       body: payload.text,
       status: "pending",
       reply_to: op.reply_to ?? null,
@@ -1130,17 +1084,21 @@ export function startBusServer(
       namespace,
       id,
       from,
-      null,
-      null,
-      null,
+      toTarget,
+      resolvedChannelId,
+      resolvedSessionId,
       payload,
       op.reply_to ?? null,
     );
-    const delivered = fanout(namespace, null, from.channel_id, envelope);
-    // A broadcast is always `delivered` (with a recipient count); it never
-    // yields unknown/ambiguous (there is no single target to resolve).
-    setMessageStatus(busDb, id, "delivered");
-    sendAck(sock, "publish", { result: "delivered", recipients: delivered });
+    const delivered = fanout(
+      namespace,
+      resolvedChannelId,
+      from.channel_id,
+      envelope,
+    );
+    const outcome = publishOutcome("ok", true, delivered);
+    setMessageStatus(busDb, id, outcome);
+    sendAck(sock, "publish", { result: outcome, recipients: delivered });
   };
 
   /** Build one delivered-message event envelope (the 2-axis wire shape). */

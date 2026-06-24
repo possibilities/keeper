@@ -327,7 +327,8 @@ test("selectQueuedForWake excludes rows already flipped to delivered_after_wake 
 
 test("selectQueuedForWake ignores non-send events and other statuses for the same session", () => {
   const db = openBusDb(":memory:");
-  // A delivered live message + a broadcast to the same session id must not appear.
+  // A delivered live message + a non-`send` event to the same session id must
+  // not appear (the value-filter pins `event = 'send'`).
   appendMessage(db, {
     namespace: "chat",
     event: "send",
@@ -337,9 +338,9 @@ test("selectQueuedForWake ignores non-send events and other statuses for the sam
   });
   appendMessage(db, {
     namespace: "chat",
-    event: "broadcast",
+    event: "other",
     resolved_session_id: "creator-a",
-    body: "broadcast",
+    body: "other event",
     status: QUEUED_FOR_WAKE,
   });
   const queued = queueForWake(db, "creator-a", { body: "the real one" });

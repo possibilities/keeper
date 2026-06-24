@@ -3225,7 +3225,7 @@ plus a DEDICATED Unix-domain socket at `~/.local/state/keeper/bus.sock`
 `keeperd.sock` above — a different path, a different wire protocol
 (op-discriminated NDJSON pub/sub, not the collection query/subscribe surface),
 and a different purpose (agent-to-agent relay, not projection streaming). Agents
-register by pid, then send/broadcast to each other by current name, session id,
+register by pid, then send to each other by current name, session id,
 ANY former name, or a role address `planner@<epic_id>` (resolved server-side
 through the epic's `job_links` creator edge → job_id → channel, reusing the
 job-keyed identity tiers and `PublishOutcome` vocabulary — no new result code or
