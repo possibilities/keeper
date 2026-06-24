@@ -33,5 +33,5 @@ No code. Verify the documented `disable-autoclose` config-key name matches the i
 - [ ] pair + panel skills reflect fire-and-forget + idle-grace autoclose + `disable-autoclose`.
 
 ## Done summary
-
+Updated CLAUDE.md/AGENTS.md, README, and the pair + panel skills to document the generalized window-reaper managed-session autoclose arm (pair/panels/agentbus past an idle grace), the disable_autoclose config opt-out (default empty), and the claude-fire-and-forget vs codex/pi-synchronous reap split.
 ## Evidence
