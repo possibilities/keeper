@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-24T20:54:37.340000Z",
   "created_at": "2026-06-24T18:19:43.961000Z",
   "depends_on_epics": [
     "fn-938-strip-agent-bus-chat-broadcast"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Make resume launch alias-independent",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T18:19:50.890000Z"
+  "updated_at": "2026-06-24T20:54:37.340000Z"
 }
