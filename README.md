@@ -1769,8 +1769,8 @@ plan repo root, bounded by a 1s timeout and fail-closed (any git
 failure reads as not-in-HEAD). When the predicate returns false, the
 path lands in a per-scanner `pending` set and NO `EpicSnapshot` /
 `TaskSnapshot` is emitted — so the reducer never folds an uncommitted
-epic and the autopilot dispatch gate (see CLAUDE.md § Autopilot
-dispatch gates) cannot observe it. As of fn-759 the cheap in-memory
+epic and the autopilot dispatch gate (`src/readiness.ts`
+`computeReadiness`) cannot observe it. As of fn-759 the cheap in-memory
 **change-gate runs BEFORE this probe**: `onChange` first compares the
 new serialization against the per-id `lastEmitted` it already holds, and
 on a match suppresses with NO `isTracked` fork — so the ~99% of scans
@@ -3028,6 +3028,15 @@ is KEPT, `inFlight` releases, and the 120s TTL sweep
 (`PENDING_DISPATCH_TTL_MS > ceilingMs (60s)`, an invariant pinned by a test)
 emits `DispatchExpired` only if the bind truly never lands.
 
+The **`cli/pair.ts` codex pre-launch trust-seed** is the ONLY keeper surface that
+writes codex's own config dir (`${CODEX_HOME:-~/.codex}/config.toml`). Before a
+codex pair/panel partner launches as an interactive TUI, `ensureCodexDirTrust`
+(`src/codex-trust.ts`, a dep-free leaf) seeds `[projects."<realpath(cwd)>"]
+trust_level = "trusted"` so the detached window does not hang on codex's
+directory-trust prompt. It is exact-header idempotent (trust is NOT inherited), takes
+an O_EXCL lock + post-acquire re-check for concurrent launches, and FAIL-OPEN (never
+throws, never blocks the launch; `KEEPER_CODEX_TRUST_LOG` overrides the log path).
+
 keeper closes a managed window ONLY through the window-reaper worker (epic
 fn-802), via one of its two disjoint arms. The autopilot arm closes a window
 only when the work is VERIFIABLY complete: an autopilot-dispatched
@@ -3445,8 +3454,9 @@ the intentional shed NULLs, and never an absent no-op-snapshot ROW (a gone row
 carries no record, so it never surfaces as a NULL body), and never re-parsing an
 already-NULL body.
 
-For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
-list, see [CLAUDE.md](./CLAUDE.md).
+The event-sourcing invariants above are the rationale; their terse imperative
+form — the fold/migration/write-scoping guardrails and the "DO NOT widen them"
+list — lives in [CLAUDE.md](./CLAUDE.md).
 
 ## Inspect
 
