@@ -1,6 +1,7 @@
 {
   "branch_name": "de-flake-uds-subscribe-e2e",
   "bundles": [],
+  "closer_done_at": "2026-06-24T14:58:16.779000Z",
   "created_at": "2026-06-24T14:23:13.083000Z",
   "depends_on_epics": [],
   "id": "fn-931-de-flake-uds-subscribe-e2e-test",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "de-flake uds subscribe e2e test",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T14:23:13.083000Z"
+  "updated_at": "2026-06-24T14:58:16.779000Z"
 }
