@@ -43,5 +43,5 @@ tombstone note.
 - [ ] Committed via `keeper commit-work`.
 
 ## Done summary
-
+Removed invalid until= param from panel (both fan-out blocks) and pair Monitor examples; rounded out the pair example to a complete schema-valid call.
 ## Evidence
