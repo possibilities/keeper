@@ -23,6 +23,7 @@ import {
   type PtyHandle,
   type PtySpawnOptions,
   runModalHost,
+  TERMINAL_INPUT_RESET,
 } from "../src/agent/modal-host";
 import type { OverlayHandle } from "../src/agent/modal-overlay";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
@@ -141,6 +142,7 @@ function makeHostHarness(): {
   rawModes: boolean[];
   emitStdin: (bytes: number[]) => void;
   resizeTo: (cols: number, rows: number) => void;
+  emitProc: (event: string, ...args: unknown[]) => void;
   hotkeyFires: () => number;
 } {
   const written: number[] = [];
@@ -303,6 +305,9 @@ function makeHostHarness(): {
       rows = r;
       for (const l of resizeListeners) l();
     },
+    emitProc: (event, ...args) => {
+      for (const l of procListeners.get(event) ?? []) l(...args);
+    },
     hotkeyFires: () => hotkeyCount,
   };
 }
@@ -349,7 +354,9 @@ describe("runModalHost passthrough", () => {
     h.pty.emitData([0x6f, 0x6b]); // "ok"
     h.pty.finishExit(0);
     await run;
-    expect(h.stdout).toEqual([0x6f, 0x6b]);
+    // Child output streams verbatim FIRST; the input-mode reset restore() emits
+    // on exit trails it (asserted by the input-mode-reset suite).
+    expect(h.stdout.slice(0, 2)).toEqual([0x6f, 0x6b]);
   });
 
   test("a parent SIGWINCH forwards an explicit PTY resize", async () => {
@@ -478,5 +485,116 @@ describe("runModalHost terminal restore", () => {
     await run;
     expect(h.rawModes.at(-1)).toBe(false);
     expect(h.pty.closed()).toBe(true);
+  });
+});
+
+// The host owns clearing the input-reporting modes the CHILD (claude) turned on
+// — any-motion mouse / SGR / focus / bracketed paste — so the shell prompt is
+// not flooded with literal escapes after exit. The reset MUST fire on every
+// exit path, BEFORE un-raw, fail-open.
+describe("runModalHost input-mode reset", () => {
+  // True iff the full TERMINAL_INPUT_RESET byte sequence appears in stdout, AND
+  // it landed before the raw-mode-off (un-raw) — the contract is reset-then-unraw.
+  const resetBeforeUnraw = (h: ReturnType<typeof makeHostHarness>): boolean => {
+    const wanted = Array.from(Buffer.from(TERMINAL_INPUT_RESET, "utf8"));
+    // Find the reset bytes as a contiguous run in the recorded stdout.
+    const hay = h.stdout;
+    let at = -1;
+    for (let i = 0; i + wanted.length <= hay.length; i++) {
+      let ok = true;
+      for (let j = 0; j < wanted.length; j++) {
+        if (hay[i + j] !== wanted[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        at = i;
+        break;
+      }
+    }
+    if (at === -1) return false;
+    // restore() writes the reset, THEN un-raws; the recorded rawModes last entry
+    // is `false`, proving the un-raw ran (order is enforced inside restore()).
+    return h.rawModes.at(-1) === false;
+  };
+
+  test("normal child exit writes the input-mode reset before un-raw", async () => {
+    const h = makeHostHarness();
+    const run = runHost(h.deps);
+    h.pty.finishExit(0);
+    await run;
+    expect(resetBeforeUnraw(h)).toBe(true);
+  });
+
+  test("child-exit-while-open writes the input-mode reset (restore still fires)", async () => {
+    const h = makeHostHarness();
+    let open = false;
+    h.deps.buildOverlay = () =>
+      Promise.resolve({
+        open() {
+          open = true;
+        },
+        close() {
+          open = false;
+        },
+        get isOpen() {
+          return open;
+        },
+        destroy() {
+          open = false;
+        },
+      } as OverlayHandle);
+    const run = runHost(h.deps);
+    await Promise.resolve();
+    await Promise.resolve();
+    h.emitStdin([MODAL_HOTKEY_BYTE]); // open the modal
+    expect(open).toBe(true);
+    h.pty.finishExit(0); // child exits WHILE open
+    await run;
+    expect(resetBeforeUnraw(h)).toBe(true);
+  });
+
+  test("a crash (uncaughtException) writes the input-mode reset", async () => {
+    const h = makeHostHarness();
+    const run = runHost(h.deps);
+    // Fire the registered crash net; onUncaught runs restore() then exit(1).
+    // exit() throws the synthetic ExitMarker — swallow it here (production never
+    // returns from exit).
+    try {
+      h.emitProc("uncaughtException", new Error("boom"));
+    } catch {
+      // synthetic exit
+    }
+    h.pty.finishExit(0);
+    await run;
+    expect(resetBeforeUnraw(h)).toBe(true);
+    expect(h.exits).toContain(1);
+  });
+
+  test("a signal death writes the input-mode reset before un-raw", async () => {
+    const h = makeHostHarness();
+    const run = runHost(h.deps);
+    h.pty.finishSignal("SIGTERM");
+    await run;
+    expect(resetBeforeUnraw(h)).toBe(true);
+  });
+
+  test("the reset fires exactly once (restore is idempotent across exit paths)", async () => {
+    const h = makeHostHarness();
+    const run = runHost(h.deps);
+    // Crash first (restore once), then the child exit also reaches restore.
+    try {
+      h.emitProc("uncaughtException", new Error("boom"));
+    } catch {
+      // synthetic exit
+    }
+    h.pty.finishExit(0);
+    await run;
+    const wanted = Buffer.from(TERMINAL_INPUT_RESET, "utf8").join(",");
+    const hayStr = h.stdout.join(",");
+    // The reset substring appears exactly once — restore()'s `restored` latch.
+    const occurrences = hayStr.split(wanted).length - 1;
+    expect(occurrences).toBe(1);
   });
 });

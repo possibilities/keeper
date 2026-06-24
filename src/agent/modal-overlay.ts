@@ -38,6 +38,11 @@ const SYNC_END = "\x1b[?2026l";
 
 /** Disable the child's focus reporting (`?1004l`) while the modal owns input. */
 const FOCUS_REPORTING_OFF = "\x1b[?1004l";
+/** Re-enable focus reporting (`?1004h`) on close — symmetric to the open-side
+ * disable, so the child's focus events survive the modal cycle. The host owns
+ * the SAME mode the child enabled at startup; the modal-close redraw alone is
+ * not guaranteed to make the child re-assert it. */
+const FOCUS_REPORTING_ON = "\x1b[?1004h";
 
 /** Scrim dim: black at half alpha, alpha-blended over whatever sits behind. */
 const SCRIM_ALPHA = 0.55;
@@ -362,8 +367,11 @@ export function attachModalOverlay(deps: OverlayDeps): OverlayHandle {
     drawFrame(() => {
       teardownLayers();
     });
-    // Release the kitty-keyboard level we pushed at open.
+    // Release the kitty-keyboard level we pushed at open, and re-enable the
+    // child's focus reporting we silenced — symmetric to open, so the child's
+    // focus events survive the open→close cycle (no mid-session desync).
     termWrite(KITTY_KEYBOARD_POP);
+    termWrite(FOCUS_REPORTING_ON);
     renderer.suspend();
     // ATOMIC STDIN HANDOFF: re-add keeper's listener AFTER suspend so OpenTUI has
     // already released stdin.

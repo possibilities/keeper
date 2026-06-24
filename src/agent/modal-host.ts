@@ -44,6 +44,22 @@ import {
  */
 export const MODAL_HOTKEY_BYTE = 0x1d;
 
+/**
+ * The input-reporting reset the host (the terminal owner) emits on EVERY exit
+ * path. Passthrough pipes the child's (claude's) own mode-enables verbatim to
+ * the real terminal — any-motion mouse (`?1003h`), button-event mouse
+ * (`?1002h`), SGR mouse (`?1006h`), focus reporting (`?1004h`), bracketed paste
+ * (`?2004h`) — but `overlay?.destroy()` only reverses OpenTUI's OWN modes, so on
+ * teardown nothing disables what the CHILD turned on. Without this reset the
+ * shell prompt is flooded with literal `CSI <35;…M` mouse-motion and `^[[I`/
+ * `^[[O` focus escapes after exit. This turns every input-reporting mode OFF
+ * (`?1000l`/`?1002l`/`?1003l` mouse, `?1006l` SGR, `?1004l` focus, `?2004l`
+ * bracketed paste) and restores a visible cursor (`?25h`) — standard PTY-host
+ * hygiene, what `reset(1)` / tmux-on-detach do.
+ */
+export const TERMINAL_INPUT_RESET =
+  "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?25h";
+
 /** The Bun PTY surface the host drives — the injectable seam for tests. */
 export interface PtyHandle {
   /** Write raw bytes (or a string) into the PTY master. */
@@ -153,6 +169,15 @@ export async function runModalHost(
       return;
     }
     restored = true;
+    // Disable the input-reporting modes the CHILD turned on (mouse/focus/
+    // bracketed-paste) BEFORE un-rawing — overlay?.destroy() only reverses
+    // OpenTUI's own modes, so the host owns clearing what the child left on.
+    // Fail-open: a write to a gone TTY must never block the restore tail.
+    try {
+      stdout.write(TERMINAL_INPUT_RESET);
+    } catch {
+      // TTY already gone — nothing to reset.
+    }
     try {
       stdin.setRawMode?.(false);
     } catch {

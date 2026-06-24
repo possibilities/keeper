@@ -221,6 +221,27 @@ test("destroy() while open auto-dismisses and balances the handoff (child-exit-w
   expect(log.attach).toBe(1);
 });
 
+test("focus reporting is silenced on open and re-enabled on close (no mid-session desync)", async () => {
+  const { setup, overlay, log } = await bootOverlay();
+  overlay.open();
+  await setup.renderOnce();
+  // Open silenced the child's focus reporting.
+  expect(log.termWrites).toContain("\x1b[?1004l");
+
+  setup.mockInput.pressEscape();
+  await waitUntil(setup, () => !overlay.isOpen);
+
+  // Close re-enabled it — symmetric to open, so the child's focus events survive
+  // the modal open→close cycle. The agent redraw is also forced.
+  expect(log.termWrites).toContain("\x1b[?1004h");
+  expect(log.redraw).toBe(1);
+  // Balanced: focus-off precedes focus-on in write order.
+  const off = log.termWrites.indexOf("\x1b[?1004l");
+  const on = log.termWrites.indexOf("\x1b[?1004h");
+  expect(off).toBeGreaterThanOrEqual(0);
+  expect(on).toBeGreaterThan(off);
+});
+
 test("the resting state mounts nothing (renderer suspended, no layers)", async () => {
   const { setup } = await bootOverlay();
   // Before any open, neither layer exists — the modal-closed period is bare.
