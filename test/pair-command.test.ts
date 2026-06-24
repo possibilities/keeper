@@ -29,10 +29,16 @@ import {
   READ_ONLY_DIRECTIVE,
   resolvePairAgentwrapPath,
   resolvePairPersistSessions,
+  stopTimeoutMsFromSeconds,
   stripClaudeEnv,
 } from "../src/pair-command";
 
 const AW = "/abs/agentwrap";
+
+// Subprocess-kill margin over the stop budget, mirrored from cli/pair.ts
+// (PATH_CEILING_MS 30s + SLOP_MS 5s). Asserted here so the kill-margin invariant
+// is pinned alongside the flag-emission seam.
+const KILL_MARGIN_MS = 35_000;
 
 // ---------------------------------------------------------------------------
 // roles
@@ -235,16 +241,47 @@ test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session suppli
 });
 
 test("buildWaitForStopArgv / buildShowLastMessageArgv: handle composition", () => {
-  expect(buildWaitForStopArgv(AW, "tmux-abc")).toEqual([
+  expect(buildWaitForStopArgv(AW, "tmux-abc", 1_800_000)).toEqual([
     AW,
     "wait-for-stop",
     "tmux-abc",
+    "--stop-timeout-ms",
+    "1800000",
   ]);
   expect(buildShowLastMessageArgv(AW, "tmux-abc")).toEqual([
     AW,
     "show-last-message",
     "tmux-abc",
   ]);
+});
+
+test("stopTimeoutMsFromSeconds: integer seconds → exact ms", () => {
+  expect(stopTimeoutMsFromSeconds(1800)).toBe(1_800_000);
+  expect(stopTimeoutMsFromSeconds(1)).toBe(1000);
+});
+
+test("stopTimeoutMsFromSeconds: fractional seconds round UP to ms", () => {
+  expect(stopTimeoutMsFromSeconds(0.5)).toBe(500);
+  expect(stopTimeoutMsFromSeconds(1.0009)).toBe(1001);
+  expect(stopTimeoutMsFromSeconds(599.9999)).toBe(600_000);
+});
+
+test("buildWaitForStopArgv emits --stop-timeout-ms <Math.ceil(secs*1000)>", () => {
+  // A fractional --timeout still emits an integer-ms flag (the same one tested
+  // seam the kill margin uses) — never a fractional ms.
+  const argv = buildWaitForStopArgv(AW, "h", stopTimeoutMsFromSeconds(1.0009));
+  const idx = argv.indexOf("--stop-timeout-ms");
+  expect(idx).toBeGreaterThanOrEqual(0);
+  expect(argv[idx + 1]).toBe("1001");
+});
+
+test("kill margin = stopTimeoutMs + 35_000, strictly above the stop budget", () => {
+  for (const secs of [1, 600, 1800, 0.5]) {
+    const stopMs = stopTimeoutMsFromSeconds(secs);
+    const killMs = stopMs + KILL_MARGIN_MS;
+    expect(killMs).toBe(stopMs + 35_000);
+    expect(killMs).toBeGreaterThan(stopMs);
+  }
 });
 
 // ---------------------------------------------------------------------------

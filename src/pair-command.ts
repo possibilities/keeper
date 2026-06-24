@@ -260,12 +260,30 @@ export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
   return args;
 }
 
-/** Build the `agentwrap wait-for-stop <handle>` argv. Pure — exported for tests. */
+/** keeper's `--timeout` (seconds) → the stop-wait budget in ms, the single value
+ *  driving BOTH the emitted `--stop-timeout-ms` flag and the subprocess-kill
+ *  margin. A fractional `--timeout` rounds UP to ms granularity so the partner is
+ *  never short-changed. Pure — exported for tests + the kill-margin calc. */
+export function stopTimeoutMsFromSeconds(timeoutSeconds: number): number {
+  return Math.ceil(timeoutSeconds * 1000);
+}
+
+/** Build the `agentwrap wait-for-stop <handle> --stop-timeout-ms <ms>` argv. The
+ *  `stopTimeoutMs` forwards keeper's resolved `--timeout` budget so agentwrap's
+ *  stop-wait honors it instead of its own 600s default — keeper is authoritative.
+ *  Pure — exported for tests. */
 export function buildWaitForStopArgv(
   agentwrapPath: string,
   handle: string,
+  stopTimeoutMs: number,
 ): string[] {
-  return [agentwrapPath, "wait-for-stop", handle];
+  return [
+    agentwrapPath,
+    "wait-for-stop",
+    handle,
+    "--stop-timeout-ms",
+    String(stopTimeoutMs),
+  ];
 }
 
 /** Build the `agentwrap show-last-message <handle>` argv. Pure — exported for

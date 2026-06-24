@@ -116,7 +116,7 @@ expected path.
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 | `--session <s>` | Target tmux session for the partner window. Defaults to `pair` (panel legs use `panels`). The `pair` and `panels` sessions stay **open + interactive** after the run for inspection (`tmux attach -t pair`); every other session autocloses (its window is reaped). Override the keep-open set with the `KEEPER_PAIR_PERSIST_SESSIONS` env var (comma-separated session names; empty = autoclose everything). Usually omit. |
-| `--timeout <s>` | Wait timeout in seconds (default 1800). On timeout the run emits `failed` and reaps the window. |
+| `--timeout <s>` | Wait timeout in seconds (default 1800). It is authoritative for the partner stop wait: keeper forwards it to agentwrap as `wait-for-stop … --stop-timeout-ms <ms>` (overriding agentwrap's 600s subcommand default) and widens the subprocess-kill margin to sit strictly above agentwrap's worst-case clean return, so a 10–30 min turn no longer dies at 10 min. On timeout the run emits `failed` and reaps the window. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a
 sensible default (a cross-vendor partner, `default` role) and say what you

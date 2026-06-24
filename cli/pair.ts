@@ -60,6 +60,7 @@ import {
   parseShowLastMessageJson,
   resolvePairAgentwrapPath,
   resolvePairPersistSessions,
+  stopTimeoutMsFromSeconds,
   stripClaudeEnv,
 } from "../src/pair-command";
 
@@ -88,6 +89,16 @@ Options:
 `;
 
 const DEFAULT_TIMEOUT_SECONDS = 1800;
+
+// Subprocess-kill margin over the stop-wait budget. agentwrap runs its ≤30s
+// path-discovery wait SEQUENTIALLY before the stop-wait clock starts, so its
+// worst-case clean (retryable exit-4) return is ~`stopTimeoutMs + 30s`. The kill
+// MUST sit strictly above that, or a slow start SIGKILLs agentwrap mid-wait —
+// yielding a raw `waitRes === null` "killed" instead of the clean retryable exit.
+// PATH_CEILING_MS mirrors agentwrap's `DEFAULT_PATH_TIMEOUT_MS` (loose coupling,
+// NOT a cross-repo import): a future bump there prompts a glance here.
+const PATH_CEILING_MS = 30_000;
+const SLOP_MS = 5_000;
 
 /** Emit one Monitor event line. The event name + key=value fields render in a
  *  stable order so a Monitor regex never has to tolerate reordering. */
@@ -246,6 +257,10 @@ export async function main(argv: string[]): Promise<void> {
     );
     process.exit(2);
   }
+  // keeper's `--timeout` is authoritative for the partner stop wait. Compute the
+  // ms budget ONCE so the emitted `--stop-timeout-ms` flag and the kill margin
+  // are provably consistent (a fractional `--timeout` rounds up to ms).
+  const stopTimeoutMs = stopTimeoutMsFromSeconds(timeoutSeconds);
   if (v.effort !== undefined && cli !== "codex") {
     process.stderr.write("pair: --effort is only supported for codex\n");
     process.exit(2);
@@ -359,11 +374,15 @@ export async function main(argv: string[]): Promise<void> {
   reapPaneId = launchParse.handle.paneId;
 
   // ---- 2. wait for the partner to stop ----
+  // keeper's `--timeout` drives `--stop-timeout-ms` (agentwrap's stop-wait budget,
+  // overriding its 600s default) AND a widened subprocess-kill margin sitting
+  // strictly above agentwrap's worst-case clean return (stop budget + ≤30s path
+  // discovery + slop) so a slow agentwrap start never gets SIGKILLed mid-wait.
   const waitRes = runAgentwrap(
-    buildWaitForStopArgv(agentwrapPath, handle),
+    buildWaitForStopArgv(agentwrapPath, handle, stopTimeoutMs),
     env,
     cwd,
-    timeoutSeconds * 1000,
+    stopTimeoutMs + PATH_CEILING_MS + SLOP_MS,
   );
   if (waitRes === null || waitRes.exitCode !== 0) {
     reap();
