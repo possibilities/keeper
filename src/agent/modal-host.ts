@@ -29,11 +29,18 @@
  * `{...process.env}` view reaches the child (mirrors run.ts `defaultSpawn`).
  */
 
+import {
+  attachModalOverlay,
+  defaultBuildOverlayBundle,
+  type OverlayHandle,
+  type OverlayHostSeam,
+} from "./modal-overlay";
+
 /**
  * The reserved hotkey byte that opens the modal. `0x1d` is ctrl-] (GS, group
  * separator) — outside the bytes claude's TUI consumes and the same key telnet
- * reserves as its escape, so it is a safe, memorable host-reserved chord. The
- * modal wiring in `.2` swaps the stub callback for the real open.
+ * reserves as its escape, so it is a safe, memorable host-reserved chord. When
+ * `buildOverlay` is wired the host opens the OpenTUI overlay on this byte.
  */
 export const MODAL_HOTKEY_BYTE = 0x1d;
 
@@ -104,11 +111,20 @@ export interface ModalHostDeps {
   env: NodeJS.ProcessEnv;
   exit: (code: number) => never;
   /**
-   * Fired when the reserved hotkey byte is seen in the passthrough stream. The
-   * stub is a no-op; `.2` replaces it with the modal open. The host swallows the
-   * hotkey byte so it never reaches the child.
+   * Fired when the reserved hotkey byte is seen in the passthrough stream AND no
+   * `buildOverlay` is wired (the .1 stub path / tests). When `buildOverlay` is
+   * present the host opens the overlay on the hotkey instead and `onHotkey` is
+   * ignored. The host swallows the hotkey byte either way.
    */
   onHotkey?: () => void;
+  /**
+   * Build the OpenTUI modal overlay (.2). Given the host seam (stdin handoff, PTY
+   * redraw, raw terminal write, tmux flag), returns the open/close/destroy handle
+   * AFTER suspending the freshly-built renderer. Absent → the legacy stub
+   * `onHotkey` path (no renderer is ever built, so the no-flag/test paths stay
+   * byte-identical). Async because building the renderer is async.
+   */
+  buildOverlay?: (seam: OverlayHostSeam) => Promise<OverlayHandle>;
 }
 
 /** Default terminal dimensions when stdout reports none (never observed on a TTY). */
@@ -149,7 +165,20 @@ export async function runModalHost(
     }
   };
 
+  // The OpenTUI overlay handle, built once below the listener setup when
+  // `buildOverlay` is wired (.2). null on the legacy stub path (no renderer is
+  // ever built, so the no-flag/test paths stay byte-identical). Declared here so
+  // the crash net and the passthrough closures can reference it.
+  let overlay: OverlayHandle | null = null;
+
   const onUncaught = (err: unknown): void => {
+    // Destroy the overlay FIRST (renderer.destroy() restores alt-screen/raw), THEN
+    // un-raw the parent — never leave the terminal corrupted on a crash.
+    try {
+      overlay?.destroy();
+    } catch {
+      // best-effort
+    }
     restore();
     try {
       pty.close();
@@ -166,8 +195,14 @@ export async function runModalHost(
   const rows = stdout.rows ?? FALLBACK_ROWS;
 
   // Child → parent passthrough, with hotkey interception. The hotkey byte is
-  // swallowed (never forwarded onward); everything else streams verbatim.
+  // swallowed (never forwarded onward); everything else streams verbatim — EXCEPT
+  // while the overlay owns the screen, where child output is dropped so it cannot
+  // scribble over the modal (v0 has no faithful backdrop; the dismiss SIGWINCH
+  // redraw repaints the agent).
   const onData = (data: Uint8Array): void => {
+    if (overlay?.isOpen) {
+      return;
+    }
     stdout.write(data);
   };
 
@@ -189,8 +224,9 @@ export async function runModalHost(
       chunk.byteOffset,
       chunk.byteLength,
     );
-    // Scan for the reserved hotkey byte; fire the stub and drop just that byte,
-    // forwarding the surrounding bytes so a chord mid-paste does not eat input.
+    // Scan for the reserved hotkey byte; open the overlay (or fire the stub) and
+    // drop just that byte, forwarding the surrounding bytes so a chord mid-paste
+    // does not eat input.
     const hotkeyAt = bytes.indexOf(MODAL_HOTKEY_BYTE);
     if (hotkeyAt === -1) {
       pty.write(bytes);
@@ -199,10 +235,17 @@ export async function runModalHost(
     if (hotkeyAt > 0) {
       pty.write(bytes.subarray(0, hotkeyAt));
     }
-    onHotkey();
+    // overlay.open() runs the atomic stdin handoff (detaches THIS listener before
+    // resuming the renderer), so anything after the hotkey in this same chunk
+    // would race the handoff — forward it to the PTY BEFORE opening.
     const rest = bytes.subarray(hotkeyAt + 1);
     if (rest.byteLength > 0) {
       pty.write(rest);
+    }
+    if (overlay) {
+      overlay.open();
+    } else {
+      onHotkey();
     }
   };
 
@@ -238,6 +281,32 @@ export async function runModalHost(
   proc.on("SIGTERM", onTerm as (...a: unknown[]) => void);
   proc.on("SIGHUP", onHup as (...a: unknown[]) => void);
 
+  // Build the OpenTUI overlay ONCE and keep it suspended (the resting state).
+  // The host seam: the stdin mutex handoff is THIS listener's off/on; the agent
+  // redraw is the PTY resize; the raw terminal sink is stdout; tmux is detected
+  // off the parent's env. A build failure is non-fatal — fall back to the stub
+  // hotkey so a renderer fault never wedges the passthrough.
+  if (deps.buildOverlay) {
+    const seam: OverlayHostSeam = {
+      stdinHandoff: {
+        detach: () => stdin.off("data", onStdin),
+        attach: () => stdin.on("data", onStdin),
+      },
+      requestAgentRedraw: () => onResize(),
+      termWrite: (data) => void stdout.write(data),
+      underTmux: Boolean(env.TMUX),
+    };
+    try {
+      overlay = await deps.buildOverlay(seam);
+    } catch (err) {
+      process.stderr.write(
+        `agentwrap modal host: overlay build failed (${String(err)}); ` +
+          "modal disabled for this session\n",
+      );
+      overlay = null;
+    }
+  }
+
   // Read the child's REAL exit disposition out-of-band (Subprocess.exited),
   // never the terminal.exit PTY-lifecycle status.
   let exitCode: number | null = null;
@@ -258,6 +327,14 @@ export async function runModalHost(
       "uncaughtException",
       onUncaught as (...a: unknown[]) => void,
     );
+    // Child exited (possibly WHILE the modal was open): destroy the overlay FIRST
+    // so renderer.destroy() restores the alt-screen/raw state, THEN un-raw the
+    // parent. destroy() is idempotent and safe when the overlay was never opened.
+    try {
+      overlay?.destroy();
+    } catch {
+      // best-effort — overlay teardown must never block the parent restore.
+    }
     restore();
     try {
       pty.close();
@@ -320,6 +397,21 @@ export const defaultPtySpawn: PtySpawnFn = (
   };
 };
 
+/**
+ * Production `buildOverlay`: build the suspended OpenTUI renderer, IMMEDIATELY
+ * suspend it (the resting state — the modal-closed period is byte-identical to a
+ * normal launch), then attach the modal overlay onto it with the host seam.
+ */
+const defaultBuildOverlay = async (
+  seam: OverlayHostSeam,
+): Promise<OverlayHandle> => {
+  const bundle = await defaultBuildOverlayBundle();
+  // The renderer auto-starts on build; suspend it at once so it sits dormant
+  // until the hotkey resumes it. open()/close() own the resume/suspend cycle.
+  bundle.renderer.suspend();
+  return attachModalOverlay({ ...seam, bundle });
+};
+
 /** Production deps for the modal host, wired to the real process surfaces. */
 export function defaultModalHostDeps(onHotkey?: () => void): ModalHostDeps {
   return {
@@ -330,5 +422,6 @@ export function defaultModalHostDeps(onHotkey?: () => void): ModalHostDeps {
     env: process.env,
     exit: (code) => process.exit(code),
     onHotkey,
+    buildOverlay: defaultBuildOverlay,
   };
 }

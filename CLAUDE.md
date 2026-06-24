@@ -61,6 +61,18 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   verbatim match (fn-933) — a mismatch/unreadable probe fails closed (returns null,
   the ancestry walk climbs to the true parent), so an OS-recycled pid carrying a
   dead agent's lingering row never misattributes the sender.
+- **The `--agentwrap-modal` host (claude-only, experiment-flagged) is keeper's
+  SECOND OpenTUI surface** (`src/agent/modal-overlay.ts` + `src/agent/modal-host.ts`,
+  fn-935): claude runs in a Bun PTY with an OpenTUI renderer built ONCE but kept
+  SUSPENDED as the resting state, so the modal-closed period is a raw passthrough,
+  byte-identical to a normal launch. stdin is a strict single-owner mutex — keeper's
+  passthrough listener is detached BEFORE `renderer.resume()` and re-attached AFTER
+  `suspend()` (both reading = split escapes). The modal host MUST `renderer.destroy()`
+  (restore alt-screen/raw, off `?2026`) BEFORE propagating the child's disposition on
+  EVERY exit path — dismiss, child-exit-while-open, crash, signal — mirroring the dash
+  destroy-before-exit invariant. Each frame is `?2026`-bracketed (skipped under tmux).
+  The OpenTUI tests ride the SERIAL `test:opentui` chain + are path-ignored from the
+  parallel fast tier (the native-loader TDZ).
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.

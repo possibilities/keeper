@@ -1322,6 +1322,25 @@ event-log/reducer/hook touch. Run any of them with
   echo | keeper dash          # non-TTY → 'keeper dash: requires a TTY', exit 1
   ```
 
+  The dash is the FIRST of two OpenTUI host surfaces; the SECOND is the
+  experiment-flagged `--agentwrap-modal` modal overlay (fn-935,
+  `src/agent/modal-overlay.ts` + `src/agent/modal-host.ts`), reached via
+  `keeper agent claude --agentwrap-modal`. It hosts claude in a Bun PTY and keeps
+  an OpenTUI renderer built ONCE but SUSPENDED as the resting state — so the
+  modal-closed period is a raw passthrough, byte-identical to a normal launch. A
+  reserved hotkey (ctrl-], the GS byte) resumes the renderer and floats a
+  placeholder test modal (`BoxRenderable`) over a dim alpha-blended scrim
+  (`FrameBufferRenderable` + `setCellWithAlphaBlending`); Esc or a click on the
+  scrim suspends it and forces a SIGWINCH redraw of the agent. stdin is a strict
+  single-owner mutex (keeper's passthrough listener is detached BEFORE
+  `renderer.resume()` and re-attached AFTER `suspend()`), each frame is bracketed
+  in `?2026` (skipped under tmux), and — sharing the dash invariant — the modal
+  host MUST `renderer.destroy()` (restoring alt-screen/raw) BEFORE propagating the
+  child's disposition on EVERY exit path, including child-exit-while-open and a
+  crash. v0 is the scrim only; the faithful libghostty-vt grid backdrop is a
+  deferred follow-on. The flag is claude-only and rejected for codex/pi, `-p`/
+  `--print`, and any non-TTY invocation.
+
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,
   `server-up` + `reason=unreachable` added in fn-750.2, give-up made
