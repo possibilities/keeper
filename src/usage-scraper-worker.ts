@@ -1,0 +1,1120 @@
+/**
+ * Usage-scraper PRODUCER worker (fn-930 `.4`). keeperd's in-process port of
+ * agentusage's retired `daemon.py` — it owns the ORCHESTRATION that scrapes each
+ * Claude/Codex account's `/usage`|`/status` panel and writes the per-account
+ * `~/.local/state/agentusage/<id>.json` envelopes the existing
+ * {@link import("./usage-worker")} CONSUMER folds into the `usage` projection.
+ *
+ * This worker writes ONLY its own external surface — the envelope files, the
+ * `<id>.error.json` sidecars, and the `events.jsonl` audit log under the resolved
+ * agentusage root. It NEVER writes keeper.db (main stays the sole event writer;
+ * the existing usage-worker mints `UsageSnapshot` events FROM these files). It
+ * opens a read-only keeper.db connection only to satisfy the worker contract's
+ * `openDb` convention (it holds no live keeper state); the scrape state is all on
+ * disk.
+ *
+ * **Structural model: the builds-worker poll producer, NOT a watcher.** N
+ * CONCURRENT per-account async loops (one per configured Claude profile + the
+ * codex account) share a GLOBAL profile-gate (launches >= 60s apart) and a
+ * PER-TARGET mutex (same-target claude TUI spawns serialize so parallel Ink
+ * processes don't starve each other). Each loop runs the builds-worker discipline:
+ * setTimeout-after-completion (`scheduleNext` after the cycle settles, never
+ * setInterval), a per-cycle NO-THROW guard so a scrape bug degrades to a `stale`
+ * envelope + an `events.jsonl` line and NEVER reaches `onerror`/`fatalExit` (an
+ * unguarded throw → LaunchAgent restart loop), and an `inFlight` skip.
+ *
+ * **The scrape itself shells out via `.3`'s {@link ScrapeRunner}** — a single
+ * `<uv> run --directory <agentusage> python -m agentusage.scrape_cli …`
+ * subprocess that `pexpect`-spawns the real TUI and prints one discriminated JSON
+ * object. Production threads `runScrape`; tests inject a fake returning a canned
+ * {@link ScrapeResult}. The runtime resolution (uv path + project dir) is the
+ * SPAWN GATE in `daemon.ts`: an unresolved runtime un-spawns the worker (+ warns,
+ * never `fatalExit`), so by the time `main()` runs the runtime is present.
+ *
+ * **Producer-side wall-clock owns the envelope assembly** (multiplier,
+ * `next_fetch_at = now + uniform(60,180)s`, `last_*_fetch_at`, `lift_at` carry).
+ * The Python parser's `derive_lift_at` is ported here ({@link deriveLiftAt}) — the
+ * success path derives `lift_at` fresh, never carrying the prior. The tier ↔
+ * multiplier resolution + account discovery (config profiles + codex) move TS-side
+ * ({@link resolveMultiplierOrNull} / {@link buildAccounts}). A tier-read failure
+ * KEEPS THE PRIOR multiplier (the mutable account record is the carrier) so a Max
+ * account never silently downgrades to 1x.
+ *
+ * `isMainThread`-guarded body — a plain import (tests driving the pure helpers +
+ * the {@link AccountLoop} with a stub runner + sandboxed root) is inert.
+ */
+
+import {
+  closeSync,
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { openDb } from "./db";
+import { FileLock } from "./usage-flock";
+import {
+  runScrape,
+  type ScrapeAccount,
+  type ScrapeResult,
+  type ScrapeRunner,
+  type ScrapeUsage,
+} from "./usage-scrape-runner";
+import type { ShutdownMessage } from "./wake-worker";
+
+/**
+ * Envelope schema version. Mirrors agentusage's `ENVELOPE_SCHEMA_VERSION` — the
+ * consumer (usage-worker) + the vendored picker read this. NOT the scrape-contract
+ * schema version (that one lives in `usage-scrape-runner.ts`; the worker owns the
+ * envelope, the util owns the scrape contract).
+ */
+export const ENVELOPE_SCHEMA_VERSION = 1;
+
+/** Idle window: skip the scrape when no agent session log moved within this. */
+const IDLE_THRESHOLD_S = 15 * 60;
+
+/** Min interval between profile launches — the global profile-gate cadence. */
+const MIN_PROFILE_USE_INTERVAL_S = 60.0;
+
+/** Cap a `.claude.json` read so a pathological file never balloons boot memory. */
+const MAX_CLAUDE_JSON_BYTES = 1024 * 1024;
+
+/**
+ * Plan-tier string → multiplier. Source of truth:
+ * `~/.claude-profiles/<p>/.claude.json:oauthAccount.organizationRateLimitTier`.
+ * Pro (1x), Max-5x, Max-20x. Codex has no tier — treated as 1x.
+ */
+const TIER_MULTIPLIERS: Record<string, number> = {
+  default_claude_ai: 1,
+  default_claude_max_5x: 5,
+  default_claude_max_20x: 20,
+};
+
+/** One account the worker scrapes: a stable id + the TUI target + its multiplier. */
+export interface Account {
+  /** Stable account id — also the envelope filename stem; MUST pass `isUsageFilename`. */
+  id: string;
+  target: "claude" | "codex";
+  /** Profile name forwarded to the scrape util (claude); "" for codex. */
+  profile: string;
+  /** Mutable multiplier — the keep-prior carrier across a failed tier re-resolve. */
+  multiplier: number;
+}
+
+/** Canonical envelope key order — every variant emits exactly these keys. */
+export interface Envelope {
+  schema_version: number;
+  id: string;
+  target: string;
+  multiplier: number;
+  status: "active" | "idle" | "stale";
+  subscription_active: boolean | null;
+  last_successful_fetch_at: string | null;
+  last_skipped_fetch_at: string | null;
+  last_failed_fetch_at: string | null;
+  next_fetch_at: string;
+  usage: ScrapeUsage | null;
+  lift_at: string | null;
+  error: { type: string; message: string; at: string } | null;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function stringifyErr(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ---------- account discovery + tier resolution (TS-side) -------------------
+
+/** Resolve the XDG config base dir, honoring `XDG_CONFIG_HOME`. */
+function xdgConfigHome(): string {
+  const env = process.env.XDG_CONFIG_HOME;
+  return env && env.length > 0 ? env : join(homedir(), ".config");
+}
+
+/**
+ * Configured Claude profile names from agentusage's `config.yaml`
+ * (`profiles: [name1, ...]`). Fail-open: any missing/malformed config returns
+ * `[]` (the worker then runs codex-only). Mirrors the picker's `listProfiles`
+ * and the daemon's `_load_profile_names`.
+ */
+export function loadProfileNames(): string[] {
+  const path = join(xdgConfigHome(), "agentusage", "config.yaml");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  let data: unknown;
+  try {
+    data = Bun.YAML.parse(text);
+  } catch {
+    return [];
+  }
+  if (!isRecord(data) || !Array.isArray(data.profiles)) {
+    return [];
+  }
+  return data.profiles.filter(
+    (e): e is string => typeof e === "string" && e.length > 0,
+  );
+}
+
+/**
+ * Resolve a profile's multiplier from its `.claude.json` tier string, or `null`
+ * on EVERY failure path (oversize file, read/parse error, missing/unknown tier).
+ * The `null` is load-bearing — the per-cycle re-resolve KEEPS the prior multiplier
+ * on `null` so a transient blip never downgrades a Max account. Mirrors the
+ * daemon's `_resolve_multiplier_or_none`. Pure-ish (reads the fs); never throws.
+ */
+export function resolveMultiplierOrNull(profile: string): number | null {
+  const path = join(homedir(), ".claude-profiles", profile, ".claude.json");
+  let data: unknown;
+  try {
+    const st = statSync(path);
+    if (st.size > MAX_CLAUDE_JSON_BYTES) {
+      return null;
+    }
+    data = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!isRecord(data) || !isRecord(data.oauthAccount)) {
+    return null;
+  }
+  const tier = data.oauthAccount.organizationRateLimitTier;
+  if (typeof tier !== "string") {
+    return null;
+  }
+  const mult = TIER_MULTIPLIERS[tier];
+  return mult ?? null;
+}
+
+/** Boot-time multiplier with a 1x fallback (no prior to keep at boot). */
+function resolveMultiplier(profile: string): number {
+  return resolveMultiplierOrNull(profile) ?? 1;
+}
+
+/**
+ * Build the runtime account registry: one claude `Account` per configured profile
+ * (multiplier derived from its tier) + the always-appended codex account (no tier,
+ * 1x). A profile whose name would NOT pass {@link import("./usage-worker").isUsageFilename}
+ * — i.e. it would produce an envelope filename the consumer silently ignores — is
+ * DROPPED with a warning, so a misnamed profile never produces an invisible file.
+ * Mirrors the daemon's `_build_accounts`.
+ */
+export function buildAccounts(): Account[] {
+  const accounts: Account[] = [];
+  const seen = new Set<string>();
+  for (const name of loadProfileNames()) {
+    if (!isUsageId(name)) {
+      console.error(
+        `[usage-scraper] profile ${JSON.stringify(name)} is not a valid envelope id (must match [a-z0-9-]+); skipping`,
+      );
+      continue;
+    }
+    if (seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    accounts.push({
+      id: name,
+      target: "claude",
+      profile: name,
+      multiplier: resolveMultiplier(name),
+    });
+  }
+  if (!seen.has("codex")) {
+    accounts.push({ id: "codex", target: "codex", profile: "", multiplier: 1 });
+  }
+  return accounts;
+}
+
+/**
+ * The envelope-id predicate — the SAME shape the consumer's `isUsageFilename`
+ * applies to `<id>.json` (anchored `^[a-z0-9-]+$` on the stem). Kept local (a
+ * leaf must not import the db-bearing usage-worker), asserted parity in tests.
+ */
+export function isUsageId(id: string): boolean {
+  return /^[a-z0-9-]+$/.test(id);
+}
+
+// ---------- idle / cooldown gates -------------------------------------------
+
+/**
+ * Newest mtime (epoch seconds) across claude + codex session logs; 0 if none.
+ * Claude profiles all symlink `projects/` to `~/.claude/projects`, so one walk
+ * covers every claude account; codex writes per-session rollouts under
+ * `~/.codex/sessions`. Paths containing `agentusage-scrape-` are filtered (a
+ * future scrape change must not keep the worker awake). Bounded: never throws —
+ * an unreadable entry is skipped. Pure over its `roots` arg for tests.
+ */
+export function latestAgentActivity(
+  roots: string[] = [
+    join(homedir(), ".claude", "projects"),
+    join(homedir(), ".codex", "sessions"),
+  ],
+): number {
+  let newest = 0;
+  for (const root of roots) {
+    walkJsonlMtimes(root, (mtimeMs) => {
+      const sec = mtimeMs / 1000;
+      if (sec > newest) newest = sec;
+    });
+  }
+  return newest;
+}
+
+/** Recursively visit `*.jsonl` mtimes under `root`; skip scrape artifacts + errors. */
+function walkJsonlMtimes(root: string, visit: (mtimeMs: number) => void): void {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return; // missing / unreadable root — nothing to contribute.
+  }
+  for (const entry of entries) {
+    const full = join(root, entry.name);
+    if (entry.isDirectory()) {
+      walkJsonlMtimes(full, visit);
+      continue;
+    }
+    if (!entry.name.endsWith(".jsonl")) {
+      continue;
+    }
+    if (full.includes("agentusage-scrape-")) {
+      continue;
+    }
+    try {
+      visit(statSync(full).mtimeMs);
+    } catch {
+      // unreadable file — skip.
+    }
+  }
+}
+
+/**
+ * True iff `raw` parses as a tz-AWARE ISO instant strictly after `now`. Mirrors
+ * the picker's `isRateLimitedNow` / the daemon's `_parse_aware_isoformat` + `>
+ * now` check: a naive (offset-less) stamp is rejected (a corrupted envelope), so
+ * a cooldown is never derived from garbage. Pure.
+ */
+export function liftIsInFuture(raw: unknown, now: Date): boolean {
+  if (typeof raw !== "string" || !hasTimezone(raw)) {
+    return false;
+  }
+  const lift = new Date(raw);
+  if (Number.isNaN(lift.getTime())) {
+    return false;
+  }
+  return lift.getTime() > now.getTime();
+}
+
+/** True iff an ISO stamp carries an explicit `Z` or `±HH:MM`/`±HHMM` offset. */
+function hasTimezone(stamp: string): boolean {
+  if (stamp.endsWith("Z") || stamp.endsWith("z")) {
+    return true;
+  }
+  const timePart = stamp.slice(stamp.indexOf("T") + 1);
+  return /[+-]\d{2}:?\d{2}$/.test(timePart);
+}
+
+// ---------- lift_at derivation (ported from parse_claude_usage) -------------
+
+/**
+ * The binding rate-limit lift instant for a parsed `usage` dict: the soonest
+ * `resets_at` among windows whose `percent_used >= 100`. `null` when usage is
+ * absent, no window is at >=100%, or every >=100% window lacks `resets_at`.
+ * Ported 1:1 from agentusage's `derive_lift_at`. Pure.
+ */
+export function deriveLiftAt(
+  usage: ScrapeUsage | null | undefined,
+): string | null {
+  if (!usage) {
+    return null;
+  }
+  let soonest: string | null = null;
+  for (const window of Object.values(usage)) {
+    if (!isRecord(window)) {
+      continue;
+    }
+    const percent = window.percent_used;
+    const resetsAt = window.resets_at;
+    if (
+      typeof percent !== "number" ||
+      typeof resetsAt !== "string" ||
+      percent < 100
+    ) {
+      continue;
+    }
+    if (soonest === null || resetsAt < soonest) {
+      soonest = resetsAt;
+    }
+  }
+  return soonest;
+}
+
+// ---------- wall-clock / jitter (injectable for tests) ----------------------
+
+/** Clock + RNG the loop reads — injectable so tests pin instants + jitter. */
+export interface LoopClock {
+  /** Current wall-clock instant. */
+  now: () => Date;
+  /** Monotonic seconds (the profile-gate cadence reference). */
+  monotonic: () => number;
+  /** Uniform jitter in `[lo, hi)`. */
+  uniform: (lo: number, hi: number) => number;
+  /** Sleep `ms`, resolving early when `signal` aborts. */
+  sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+/** Production clock: real `Date`, `performance.now`, `Math.random`, timer-sleep. */
+export const REAL_CLOCK: LoopClock = {
+  now: () => new Date(),
+  monotonic: () => performance.now() / 1000,
+  uniform: (lo, hi) => lo + Math.random() * (hi - lo),
+  sleep: (ms, signal) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const t = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      const onAbort = (): void => {
+        clearTimeout(t);
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }),
+};
+
+/**
+ * Format a Date as local-time ISO 8601 with an explicit `±HH:MM` offset — the
+ * SAME shape Python's `datetime.now().astimezone().isoformat()` writes (NOT
+ * `toISOString()`'s `Z` form). The consumer + picker reject naive stamps, so the
+ * offset-bearing local form is the cross-runtime canonical envelope shape.
+ */
+export function localIsoWithOffset(d: Date): string {
+  const pad = (n: number, w = 2): string => String(n).padStart(w, "0");
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const offset = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  const ms = pad(d.getMilliseconds(), 3);
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${ms}${offset}`
+  );
+}
+
+// ---------- on-disk I/O (state dir, atomic write, events log) ---------------
+
+/** Per-account paths under the resolved agentusage state root. */
+function statePath(stateDir: string, id: string): string {
+  return join(stateDir, `${id}.json`);
+}
+function errorPath(stateDir: string, id: string): string {
+  return join(stateDir, `${id}.error.json`);
+}
+
+/**
+ * Atomically replace `path` with `payload` serialized as pretty JSON + a trailing
+ * newline — byte-compatible with Python's `json.dump(payload, f, indent=2)` + the
+ * `f.write("\n")`. Temp file in the same dir, then `rename` (same-fs atomic swap).
+ */
+function writeAtomicJson(path: string, payload: unknown): void {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(tmp, "w");
+  try {
+    writeSync(fd, `${JSON.stringify(payload, null, 2)}\n`);
+    closeSync(fd);
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      // already closed
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort
+    }
+    throw err;
+  }
+  renameSync(tmp, path);
+}
+
+/** Read a prior envelope; empty object on missing/corrupt. Mirrors `_load_envelope`. */
+export function loadEnvelope(path: string): Record<string, unknown> {
+  if (!existsSync(path)) {
+    return {};
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+  return isRecord(data) ? data : {};
+}
+
+/** Append one event line to `events.jsonl`. Failures are logged, never raised. */
+function appendEvent(stateDir: string, payload: Record<string, unknown>): void {
+  const path = join(stateDir, "events.jsonl");
+  try {
+    const fd = openSync(path, "a");
+    try {
+      writeSync(fd, `${JSON.stringify(payload)}\n`);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    console.error(
+      `[usage-scraper] failed to append event: ${stringifyErr(err)}`,
+    );
+  }
+}
+
+// ---------- envelope builder ------------------------------------------------
+
+/** Build a canonical-shape envelope. Every writer routes through here. */
+export function buildEnvelope(
+  acct: Account,
+  fields: {
+    status: "active" | "idle" | "stale";
+    subscription_active: boolean | null;
+    usage: ScrapeUsage | null;
+    lift_at: string | null;
+    last_successful_fetch_at: string | null;
+    last_skipped_fetch_at: string | null;
+    last_failed_fetch_at: string | null;
+    next_fetch_at: string;
+    error: Envelope["error"];
+  },
+): Envelope {
+  return {
+    schema_version: ENVELOPE_SCHEMA_VERSION,
+    id: acct.id,
+    target: acct.target,
+    multiplier: acct.multiplier,
+    status: fields.status,
+    subscription_active: fields.subscription_active,
+    last_successful_fetch_at: fields.last_successful_fetch_at,
+    last_skipped_fetch_at: fields.last_skipped_fetch_at,
+    last_failed_fetch_at: fields.last_failed_fetch_at,
+    next_fetch_at: fields.next_fetch_at,
+    usage: fields.usage,
+    lift_at: fields.lift_at,
+    error: fields.error,
+  };
+}
+
+/** Read a string field off a prior envelope record, else null. */
+function priorStr(prior: Record<string, unknown>, key: string): string | null {
+  const v = prior[key];
+  return typeof v === "string" ? v : null;
+}
+
+/** Read the prior `usage` sub-object, else null. */
+function priorUsage(prior: Record<string, unknown>): ScrapeUsage | null {
+  return isRecord(prior.usage) ? (prior.usage as ScrapeUsage) : null;
+}
+
+/** Read the prior `subscription_active`, else null. */
+function priorSubscription(prior: Record<string, unknown>): boolean | null {
+  const v = prior.subscription_active;
+  return v === true ? true : v === false ? false : null;
+}
+
+/** Read the prior `error` object, else null. */
+function priorError(prior: Record<string, unknown>): Envelope["error"] {
+  const e = prior.error;
+  if (
+    isRecord(e) &&
+    typeof e.type === "string" &&
+    typeof e.message === "string" &&
+    typeof e.at === "string"
+  ) {
+    return { type: e.type, message: e.message, at: e.at };
+  }
+  return null;
+}
+
+// ---------- profile gate ----------------------------------------------------
+
+/**
+ * The shared global launch gate — keeps profile launches >= 60s apart AND (held
+ * with the per-target mutex) serializes live TUI processes globally. Held across
+ * a `waitTurn()` await per the daemon's `_wait_for_profile_gate`.
+ */
+export class ProfileGate {
+  private nextAllowedAt = 0;
+  // A simple FIFO mutex so only one loop is inside `waitTurn` at a time.
+  private chain: Promise<void> = Promise.resolve();
+
+  constructor(private readonly clock: LoopClock) {}
+
+  /**
+   * Acquire the gate, sleep out any remaining `MIN_PROFILE_USE_INTERVAL_S`, bump
+   * the next-allowed instant, and return a release fn. The caller MUST call the
+   * returned release in a `finally`. Aborts cooperatively on `signal`.
+   */
+  async acquire(signal: AbortSignal): Promise<() => void> {
+    let release!: () => void;
+    const mine = new Promise<void>((r) => {
+      release = r;
+    });
+    const prior = this.chain;
+    this.chain = this.chain.then(() => mine);
+    await prior;
+    const now = this.clock.monotonic();
+    const waitFor = this.nextAllowedAt - now;
+    if (waitFor > 0) {
+      await this.clock.sleep(waitFor * 1000, signal);
+    }
+    this.nextAllowedAt = this.clock.monotonic() + MIN_PROFILE_USE_INTERVAL_S;
+    return release;
+  }
+}
+
+/** Per-target serialization: same-target scrapes never overlap. */
+export class TargetMutex {
+  private readonly chains = new Map<string, Promise<void>>();
+
+  /** Run `fn` exclusively per `target`. Returns `fn`'s result. */
+  async run<T>(target: string, fn: () => Promise<T>): Promise<T> {
+    const prior = this.chains.get(target) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => {
+      release = r;
+    });
+    this.chains.set(
+      target,
+      prior.then(() => mine),
+    );
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+// ---------- per-account loop ------------------------------------------------
+
+/** Dependencies one {@link AccountLoop} runs against — injectable for tests. */
+export interface AccountLoopDeps {
+  stateDir: string;
+  clock: LoopClock;
+  gate: ProfileGate;
+  targets: TargetMutex;
+  runScrape: ScrapeRunner;
+  shutdownSignal: AbortSignal;
+  /** Latest agent activity (epoch seconds) — injectable so tests force idle/active. */
+  latestActivity?: () => number;
+}
+
+/**
+ * One account's scheduling loop — the ported `account_loop`. Runs CONTINUOUSLY
+ * until `shutdownSignal` aborts. Each cycle: re-resolve the multiplier
+ * (keep-prior on failure), run the cooldown + idle gates (writing an `idle`
+ * envelope + an `events.jsonl` line on a skip), else scrape behind the per-target
+ * mutex + profile gate, assemble + atomically write the envelope. The WHOLE cycle
+ * is no-throw: a scrape/IO failure writes a `stale` envelope + `.error.json` + an
+ * event and continues — it NEVER escapes to the worker's error path.
+ *
+ * Exported + dependency-injected so a test drives a full cycle with a stub
+ * `runScrape`, a pinned clock, and a sandboxed `stateDir` — no real `uv`/PTY.
+ */
+export class AccountLoop {
+  constructor(
+    private readonly acct: Account,
+    private readonly deps: AccountLoopDeps,
+  ) {}
+
+  /** Restart-cheap initial delay: sleep out a prior future `next_fetch_at`. */
+  initialDelaySeconds(): number {
+    const { clock } = this.deps;
+    const path = statePath(this.deps.stateDir, this.acct.id);
+    if (!existsSync(path)) {
+      return clock.uniform(0, 60);
+    }
+    const prior = loadEnvelope(path);
+    const raw = prior.next_fetch_at;
+    if (typeof raw !== "string") {
+      return clock.uniform(0, 60);
+    }
+    const next = new Date(raw);
+    if (Number.isNaN(next.getTime())) {
+      return clock.uniform(0, 60);
+    }
+    const remaining = (next.getTime() - clock.now().getTime()) / 1000;
+    return remaining > 0 ? remaining : clock.uniform(0, 60);
+  }
+
+  /** Run forever (until shutdown). Each iteration is internally no-throw. */
+  async run(): Promise<void> {
+    const { clock, shutdownSignal } = this.deps;
+    const initial = this.initialDelaySeconds();
+    if (initial > 0) {
+      await clock.sleep(initial * 1000, shutdownSignal);
+    }
+    while (!shutdownSignal.aborted) {
+      const sleepSec = await this.runCycleNoThrow();
+      if (shutdownSignal.aborted) {
+        return;
+      }
+      if (sleepSec > 0) {
+        await clock.sleep(sleepSec * 1000, shutdownSignal);
+      }
+    }
+  }
+
+  /**
+   * One cycle. Returns the seconds to sleep before the next. Wraps {@link cycle}
+   * so a throw NEVER escapes — defense in depth on top of `cycle`'s own internal
+   * handling; the worker's `onerror`/`fatalExit` must never see a scrape bug.
+   */
+  async runCycleNoThrow(): Promise<number> {
+    try {
+      return await this.cycle();
+    } catch (err) {
+      console.error(
+        `[usage-scraper] ${this.acct.id} cycle threw (non-fatal): ${stringifyErr(err)}`,
+      );
+      // Defensive cadence so a wedged cycle still backs off.
+      return this.deps.clock.uniform(60, 180);
+    }
+  }
+
+  /** The cycle body — see {@link run}. Internally handles scrape failure. */
+  private async cycle(): Promise<number> {
+    const { acct } = this;
+    const { clock, stateDir } = this.deps;
+    const path = statePath(stateDir, acct.id);
+    const now = clock.now();
+
+    // Re-resolve the tier multiplier every cycle (a mid-run plan change reaches
+    // the envelope within one window). KEEP THE PRIOR on a null read — the
+    // mutable `acct.multiplier` is the carrier, so a Max account never downgrades.
+    if (acct.target === "claude") {
+      const resolved = resolveMultiplierOrNull(acct.profile);
+      if (resolved !== null) {
+        acct.multiplier = resolved;
+      }
+    }
+
+    // Idle / cooldown gates — only when a prior envelope exists AND it is not
+    // `stale` (a failing account must keep retrying through quiet periods).
+    if (existsSync(path)) {
+      const prior = loadEnvelope(path);
+      if (prior.status !== "stale") {
+        const cooldown = this.maybeCooldownSkip(prior, now);
+        if (cooldown !== null) {
+          return cooldown;
+        }
+        const idle = this.maybeIdleSkip(prior, now);
+        if (idle !== null) {
+          return idle;
+        }
+      }
+    }
+
+    // Scrape behind the per-target mutex + global profile gate.
+    const result = await this.deps.targets.run(acct.target, async () => {
+      const release = await this.deps.gate.acquire(this.deps.shutdownSignal);
+      try {
+        return await this.deps.runScrape(this.scrapeAccount());
+      } finally {
+        release();
+      }
+    });
+
+    return this.handleResult(result, now);
+  }
+
+  /** Translate the account into the scrape util's request shape. */
+  private scrapeAccount(): ScrapeAccount {
+    return { target: this.acct.target, profile: this.acct.profile };
+  }
+
+  /**
+   * Cooldown gate: if the prior envelope's `lift_at` is a future instant, skip the
+   * scrape and re-check at/after the lift (+ jitter so a cohort doesn't hammer the
+   * upstream at the same instant). Writes an `idle` envelope + an event. Returns
+   * the seconds to sleep, or null when no cooldown applies.
+   */
+  private maybeCooldownSkip(
+    prior: Record<string, unknown>,
+    now: Date,
+  ): number | null {
+    const { clock } = this.deps;
+    if (!liftIsInFuture(prior.lift_at, now)) {
+      return null;
+    }
+    const liftMs = new Date(prior.lift_at as string).getTime();
+    const wakeupMs = liftMs + clock.uniform(0, 60) * 1000;
+    const wakeup = new Date(wakeupMs);
+    const envelope = buildEnvelope(this.acct, {
+      status: "idle",
+      subscription_active: priorSubscription(prior),
+      usage: priorUsage(prior),
+      lift_at: priorStr(prior, "lift_at"),
+      last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
+      last_skipped_fetch_at: localIsoWithOffset(now),
+      last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
+      next_fetch_at: localIsoWithOffset(wakeup),
+      error: priorError(prior),
+    });
+    this.writeState(envelope);
+    appendEvent(this.deps.stateDir, {
+      ts: localIsoWithOffset(now),
+      id: this.acct.id,
+      target: this.acct.target,
+      event: "rate_limited_skipped",
+      lift_at: priorStr(prior, "lift_at"),
+      next_fetch_at: envelope.next_fetch_at,
+    });
+    const sleepFor = (wakeupMs - clock.now().getTime()) / 1000;
+    return sleepFor > 0 ? sleepFor : 0;
+  }
+
+  /**
+   * Idle gate: if no agent session log moved within `IDLE_THRESHOLD_S`, skip the
+   * scrape (the prior usage values are still current — no quota burned). Writes an
+   * `idle` heartbeat envelope + an event. Returns the seconds to sleep, or null.
+   */
+  private maybeIdleSkip(
+    prior: Record<string, unknown>,
+    now: Date,
+  ): number | null {
+    const { clock } = this.deps;
+    const latest = (this.deps.latestActivity ?? latestAgentActivity)();
+    const idleFor = clock.now().getTime() / 1000 - latest;
+    if (idleFor <= IDLE_THRESHOLD_S) {
+      return null;
+    }
+    const delay = clock.uniform(60, 180);
+    const nextFetch = new Date(now.getTime() + delay * 1000);
+    const envelope = buildEnvelope(this.acct, {
+      status: "idle",
+      subscription_active: priorSubscription(prior),
+      usage: priorUsage(prior),
+      lift_at: priorStr(prior, "lift_at"),
+      last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
+      last_skipped_fetch_at: localIsoWithOffset(now),
+      last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
+      next_fetch_at: localIsoWithOffset(nextFetch),
+      error: priorError(prior),
+    });
+    this.writeState(envelope);
+    appendEvent(this.deps.stateDir, {
+      ts: localIsoWithOffset(now),
+      id: this.acct.id,
+      target: this.acct.target,
+      event: "idle_skipped",
+      idle_for_s: Math.round(idleFor * 10) / 10,
+      next_fetch_at: envelope.next_fetch_at,
+    });
+    return delay;
+  }
+
+  /** Branch the scrape result into success / no-sub / failure envelope writes. */
+  private handleResult(result: ScrapeResult, now: Date): number {
+    if (result.kind === "ok") {
+      return this.handleSuccess(result, now);
+    }
+    // Both `error` (parse drift / panel never rendered) and `runner_failure`
+    // (spawn/timeout/contract miss) write the `stale` failure envelope.
+    return this.handleFailure(result, now);
+  }
+
+  /** Success arm: a fresh `active` envelope. lift_at is derived fresh, never carried. */
+  private handleSuccess(
+    result: Extract<ScrapeResult, { kind: "ok" }>,
+    _now: Date,
+  ): number {
+    const { acct } = this;
+    const { clock, stateDir } = this.deps;
+    const fetchedAt = clock.now();
+    const delay = clock.uniform(60, 180);
+    const nextFetch = new Date(fetchedAt.getTime() + delay * 1000);
+    const prior = loadEnvelope(statePath(stateDir, acct.id));
+
+    const noSubscription = result.no_subscription;
+    const usage: ScrapeUsage | null = noSubscription ? null : result.usage;
+    let subscriptionActive: boolean | null;
+    if (acct.target === "claude") {
+      subscriptionActive = !noSubscription;
+    } else {
+      // Codex has no subscription concept; carry whatever the contract said.
+      subscriptionActive = noSubscription ? null : result.subscription_active;
+    }
+    const liftAt = deriveLiftAt(usage);
+
+    const envelope = buildEnvelope(acct, {
+      status: "active",
+      subscription_active: subscriptionActive,
+      usage,
+      lift_at: liftAt,
+      last_successful_fetch_at: localIsoWithOffset(fetchedAt),
+      last_skipped_fetch_at: priorStr(prior, "last_skipped_fetch_at"),
+      last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
+      next_fetch_at: localIsoWithOffset(nextFetch),
+      error: null,
+    });
+    this.writeState(envelope);
+    // Clear the verbose error sidecar on success.
+    try {
+      unlinkSync(errorPath(stateDir, acct.id));
+    } catch {
+      // missing — fine.
+    }
+    appendEvent(stateDir, {
+      ts: localIsoWithOffset(fetchedAt),
+      id: acct.id,
+      target: acct.target,
+      event: "scraped",
+      next_fetch_at: envelope.next_fetch_at,
+      usage,
+      subscription_active: subscriptionActive,
+    });
+    const sleepFor = (nextFetch.getTime() - clock.now().getTime()) / 1000;
+    return sleepFor > 0 ? sleepFor : 0;
+  }
+
+  /**
+   * Failure arm: write the verbose `<id>.error.json` sidecar (keeps the screen
+   * excerpt) AND the concise `stale` main envelope (preserving last-good usage /
+   * subscription / last_successful from prior). Never throws.
+   */
+  private handleFailure(
+    result: Exclude<ScrapeResult, { kind: "ok" }>,
+    _now: Date,
+  ): number {
+    const { acct } = this;
+    const { clock, stateDir } = this.deps;
+    const failedAt = clock.now();
+    const delay = clock.uniform(60, 180);
+    const nextFetch = new Date(failedAt.getTime() + delay * 1000);
+
+    const { errorType, message, screenExcerpt } = describeFailure(result);
+
+    const errorEnvelope: Record<string, unknown> = {
+      id: acct.id,
+      target: acct.target,
+      multiplier: acct.multiplier,
+      failed_at: localIsoWithOffset(failedAt),
+      error_type: errorType,
+      message,
+    };
+    if (screenExcerpt.length > 0) {
+      errorEnvelope.screen_excerpt = screenExcerpt;
+    }
+    try {
+      writeAtomicJson(errorPath(stateDir, acct.id), errorEnvelope);
+    } catch (err) {
+      console.error(
+        `[usage-scraper] ${acct.id} failed to write error file: ${stringifyErr(err)}`,
+      );
+    }
+
+    const prior = loadEnvelope(statePath(stateDir, acct.id));
+    const envelope = buildEnvelope(acct, {
+      status: "stale",
+      subscription_active: priorSubscription(prior),
+      usage: priorUsage(prior),
+      lift_at: priorStr(prior, "lift_at"),
+      last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
+      last_skipped_fetch_at: priorStr(prior, "last_skipped_fetch_at"),
+      last_failed_fetch_at: localIsoWithOffset(failedAt),
+      next_fetch_at: localIsoWithOffset(nextFetch),
+      error: {
+        type: errorType,
+        message,
+        at: localIsoWithOffset(failedAt),
+      },
+    });
+    this.writeState(envelope);
+    appendEvent(stateDir, {
+      ts: localIsoWithOffset(failedAt),
+      id: acct.id,
+      target: acct.target,
+      event: "scrape_failed",
+      error_type: errorType,
+      message,
+      ...(screenExcerpt.length > 0 ? { screen_excerpt: screenExcerpt } : {}),
+    });
+    return delay;
+  }
+
+  /** Atomic state write, logged-not-raised on failure. */
+  private writeState(envelope: Envelope): void {
+    try {
+      writeAtomicJson(statePath(this.deps.stateDir, this.acct.id), envelope);
+    } catch (err) {
+      console.error(
+        `[usage-scraper] ${this.acct.id} failed to write envelope: ${stringifyErr(err)}`,
+      );
+    }
+  }
+}
+
+/** Normalize the two failure arms into `(errorType, message, screenExcerpt)`. */
+function describeFailure(result: Exclude<ScrapeResult, { kind: "ok" }>): {
+  errorType: string;
+  message: string;
+  screenExcerpt: string[];
+} {
+  if (result.kind === "error") {
+    return {
+      errorType: result.error_type,
+      message: result.message,
+      screenExcerpt: result.screen_excerpt,
+    };
+  }
+  return {
+    errorType: `runner_failure:${result.reason}`,
+    message: result.message,
+    screenExcerpt: [],
+  };
+}
+
+// ---------- worker data + entrypoint ----------------------------------------
+
+/** Data the parent passes via `new Worker(url, { workerData })`. */
+export interface UsageScraperWorkerData {
+  dbPath: string;
+  /** Resolved agentusage state root (the sandbox seam threads through here). */
+  stateDir: string;
+}
+
+/**
+ * Worker entrypoint. Opens a read-only keeper.db connection (worker-contract
+ * convention; it holds no live keeper state), mkdirs the state root, acquires a
+ * singleton FileLock on it so two producers never race the same files, builds the
+ * accounts, and runs N concurrent {@link AccountLoop}s sharing one
+ * {@link ProfileGate} + {@link TargetMutex}. Shutdown aborts every loop's sleep +
+ * any in-flight scrape child (the scrape runner SIGKILLs its `uv` child on the
+ * aborted-sleep deadline; the util `killpg`s its TUI grandchild), releases the
+ * lock, closes the db, and exits 0.
+ */
+function main(): void {
+  if (!parentPort) {
+    console.error("[usage-scraper] no parentPort — not running as a Worker");
+    process.exit(1);
+  }
+  const data = workerData as UsageScraperWorkerData | undefined;
+  if (
+    !data ||
+    typeof data.dbPath !== "string" ||
+    typeof data.stateDir !== "string" ||
+    data.stateDir.length === 0
+  ) {
+    console.error("[usage-scraper] missing dbPath/stateDir in workerData");
+    process.exit(1);
+  }
+
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
+
+  const stateDir = data.stateDir;
+  let lock: FileLock | null = null;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    lock = FileLock.acquire(join(stateDir, "scraper.lock"));
+  } catch (err) {
+    // A held lock (another producer) or an unwritable root: warn + un-arm, never
+    // crash-loop. Close the db and exit 0 — the daemon boots normally without us.
+    console.error(
+      `[usage-scraper] could not acquire state-dir lock at ${stateDir} (${stringifyErr(err)}); not producing`,
+    );
+    try {
+      db.close();
+    } catch {
+      // best-effort
+    }
+    return;
+  }
+
+  const shutdownController = new AbortController();
+  const clock = REAL_CLOCK;
+  const gate = new ProfileGate(clock);
+  const targets = new TargetMutex();
+
+  const accounts = buildAccounts();
+  if (accounts.length === 0) {
+    console.error("[usage-scraper] no accounts resolved; idling");
+  }
+
+  const loops = accounts.map((acct) =>
+    new AccountLoop(acct, {
+      stateDir,
+      clock,
+      gate,
+      targets,
+      runScrape,
+      shutdownSignal: shutdownController.signal,
+    }).run(),
+  );
+  // The loops run forever (until shutdown aborts their sleeps). A rejection is
+  // already swallowed per-cycle; this is belt-and-suspenders so an unexpected
+  // throw outside a cycle never surfaces as an unhandled rejection.
+  Promise.all(loops).catch((err) => {
+    console.error(
+      `[usage-scraper] loop set settled unexpectedly: ${stringifyErr(err)}`,
+    );
+  });
+
+  const releaseLock = (): void => {
+    if (lock) {
+      try {
+        lock.release();
+      } catch {
+        // best-effort
+      }
+      lock = null;
+    }
+  };
+
+  parentPort.on("message", (msg: ShutdownMessage | undefined) => {
+    if (msg && msg.type === "shutdown") {
+      // Abort every loop's sleep + any in-flight scrape child (the runner's
+      // sleep-bound deadline SIGKILLs the `uv` child), release the lock, close
+      // the db, exit clean.
+      shutdownController.abort();
+      releaseLock();
+      try {
+        db.close();
+      } catch {
+        // best-effort
+      }
+      process.exit(0);
+    }
+  });
+}
+
+// Only run inside a real Worker; a plain import on the main thread (tests driving
+// the pure helpers + AccountLoop with a stub runner) is inert.
+if (!isMainThread) {
+  main();
+}

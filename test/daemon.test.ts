@@ -3358,6 +3358,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "git-worker.ts": "git",
   "usage-worker.ts": "usage",
   "builds-worker.ts": "builds",
+  "usage-scraper-worker.ts": "usageScraper",
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
   "autopilot-worker.ts": "autopilot",
@@ -3413,7 +3414,16 @@ function spawnedWorkerNames(opts?: {
   // config carrying it so this boot is deterministic regardless of the live
   // `~/.config/keeper/config.yaml` — `builds` is in ALL_WORKERS and must spawn.
   const configPath = join(tmpDir, "keeper-config.yaml");
-  writeFileSync(configPath, "buildbot_url: http://localhost:8010\n");
+  // `builds` is gated on `buildbot_url`; `usageScraper` is gated on BOTH a
+  // resolvable `uv` path + agentusage project dir. Both workers are in
+  // ALL_WORKERS and must spawn, so pin all three keys (the values are never
+  // dereferenced under the Worker spy — the gate only checks they resolve).
+  writeFileSync(
+    configPath,
+    "buildbot_url: http://localhost:8010\n" +
+      `usage_scraper_uv_path: ${join(tmpDir, "uv")}\n` +
+      `usage_scraper_project_dir: ${tmpDir}\n`,
+  );
   const sandbox: Record<string, string> = {
     KEEPER_DB: dbPath,
     KEEPER_CONFIG: configPath,
@@ -3446,7 +3456,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL sixteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL seventeen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -3455,10 +3465,13 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL sixteen wor
   // fn-801 added `renamer` (the tmux window-namer; no watcher, no message minter);
   // fn-802 added `reaper` (the autopilot window-reaper; no watcher, no message minter);
   // fn-875 added `bus` (the Agent Bus UDS relay; no watcher, no message minter —
-  // owns its own bus.db + bus.sock, reads keeper.db read-only).
+  // owns its own bus.db + bus.sock, reads keeper.db read-only); fn-930 added
+  // `usageScraper` (the in-process agentusage producer, gated on a resolvable `uv`
+  // runtime — `spawnedWorkerNames` pins the config keys; no watcher, no message
+  // minter — writes only on-disk envelopes the `usage` consumer folds).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(16);
+  expect(spawned).toHaveLength(17);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -3470,6 +3483,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL sixteen wor
     "git",
     "usage",
     "builds",
+    "usageScraper",
     "deadLetter",
     "eventsIngest",
     "autopilot",

@@ -56,6 +56,7 @@ import {
   resolvePlanRoots,
   resolveSockPath,
   resolveUsageRoot,
+  resolveUsageScraperRuntime,
   truncateEphemeralProjections,
 } from "./db";
 import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
@@ -129,6 +130,7 @@ import type {
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
+import type { UsageScraperWorkerData } from "./usage-scraper-worker";
 import type {
   UsageMessage,
   UsageSnapshotMessage,
@@ -1310,6 +1312,7 @@ export type WorkerName =
   | "git"
   | "usage"
   | "builds"
+  | "usageScraper"
   | "deadLetter"
   | "eventsIngest"
   | "autopilot"
@@ -1333,6 +1336,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "git",
   "usage",
   "builds",
+  "usageScraper",
   "deadLetter",
   "eventsIngest",
   "autopilot",
@@ -3149,6 +3153,48 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (buildsWorker)`
 
+  // Spawn the usage-scraper PRODUCER worker (fn-930) — the in-process port of
+  // agentusage's retired daemon.py. It runs N per-account scrape loops and writes
+  // ONLY the on-disk `<id>.json` / `.error.json` / `events.jsonl` envelopes under
+  // the agentusage state root; the existing `usage` CONSUMER worker watches that
+  // same dir and mints the events, so the scraper posts NO messages to main and
+  // needs no `onmessage` minting. NOT a file-watcher (not in WATCHER_WORKERS).
+  // Gated like `builds`: the selector AND a resolvable runtime (absolute `uv` path
+  // + agentusage project dir). An unresolved runtime leaves the worker un-spawned
+  // and the daemon boots normally (rollback = unset the config key) — never a
+  // `fatalExit`. The state dir is resolved on main via `resolveUsageRoot()` so the
+  // `KEEPER_AGENTUSAGE_ROOT` sandbox seam moves the producer + the consumer
+  // together.
+  const usageScraperRuntime = resolveUsageScraperRuntime();
+  const usageScraperWorker =
+    want("usageScraper") && usageScraperRuntime !== null
+      ? new Worker(new URL("./usage-scraper-worker.ts", import.meta.url).href, {
+          workerData: {
+            dbPath,
+            stateDir: resolveUsageRoot(),
+          } satisfies UsageScraperWorkerData,
+        } as WorkerOptions & { workerData: unknown })
+      : null;
+
+  if (usageScraperWorker) {
+    const usw = usageScraperWorker;
+    // No message minting — the producer's only output is its on-disk envelopes
+    // (the consumer worker turns those into events). Wire only the crash guards:
+    // a producer crash is fatal like every other worker (the `!shuttingDown`
+    // gate keeps an orderly teardown quiet).
+    usw.onerror = (err: ErrorEvent): void => {
+      console.error(
+        "[keeperd] usage-scraper worker error:",
+        err.message ?? err,
+      );
+      if (!shuttingDown) fatalExit();
+    };
+
+    usw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // end `if (usageScraperWorker)`
+
   // Watches the dead-letters dir and posts a contentless
   // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
   // sole writer; on each message main re-runs `scanDeadLetterDir` (the boot-scan
@@ -4264,6 +4310,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       gitWorker,
       usageWorker,
       buildsWorker,
+      usageScraperWorker,
       deadLetterWorker,
       eventsIngestWorker,
       autopilotWorkerInstance,
