@@ -63,7 +63,7 @@ import {
   resolveBusSockPath,
   resolveDbPath,
 } from "../src/db";
-import type { SpawnFn } from "../src/exec-backend";
+import { createTmuxPaneOps, type SpawnFn } from "../src/exec-backend";
 
 /** Reserved tenant namespace handled by the `chat` sub-verb. */
 export const CHAT_NAMESPACE = "chat";
@@ -439,6 +439,30 @@ function readLiveSessionIds(): ReadonlySet<string> {
 }
 
 /**
+ * Probe the LIVE tmux pane-id set for the wake liveness recheck — a server-wide
+ * `list-panes -a` sweep via the shared {@link createTmuxPaneOps} `listPanes`
+ * seam. A `stopped` creator whose `backend_exec_pane_id` is in this set is alive
+ * (its pane held open by the launch wrapper's login shell) even when it never
+ * re-armed `keeper bus watch`. Returns `null` when the probe was UNAVAILABLE
+ * (degraded / missing tmux) so the recheck falls back to "on doubt, treat as
+ * live and SKIP"; otherwise the (possibly empty) live-pane id set. NEVER throws —
+ * the underlying `listPanes` degrades to `null`. */
+async function readLivePaneIds(): Promise<ReadonlySet<string> | null> {
+  const ops = createTmuxPaneOps({ noteLine: () => {} });
+  const panes = await ops.listPanes();
+  if (panes === null) {
+    return null;
+  }
+  const ids = new Set<string>();
+  for (const pane of panes) {
+    if (pane.paneId.length > 0) {
+      ids.add(pane.paneId);
+    }
+  }
+  return ids;
+}
+
+/**
  * Resolve the epic's creator `jobs` rows for a `planner@<epic>` wake. Reads
  * keeper.db READ-ONLY: `roleJobIds(db, "creator", epic)` derives the creator
  * `job_id`s from `epics.job_links`, then each is fetched from `jobs`. The resume
@@ -453,7 +477,7 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
     for (const id of ids) {
       const row = db.db
         .query(
-          "SELECT job_id, cwd, title, state, updated_at FROM jobs WHERE job_id = ?",
+          "SELECT job_id, cwd, title, state, backend_exec_pane_id, updated_at FROM jobs WHERE job_id = ?",
         )
         .get(id) as WakeCreator | null;
       if (row != null) {
@@ -462,6 +486,10 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
           cwd: row.cwd == null ? null : String(row.cwd),
           title: row.title == null ? null : String(row.title),
           state: String(row.state),
+          backend_exec_pane_id:
+            row.backend_exec_pane_id == null
+              ? null
+              : String(row.backend_exec_pane_id),
           updated_at: Number(row.updated_at),
         });
       }
@@ -578,9 +606,14 @@ async function runWakeVerb(target: string): Promise<{
       exitCode: 1,
     };
   }
+  // Probe the live-pane sweep ONCE up front (it is async; the `livePaneIds` dep
+  // is a sync getter the recheck calls). A `stopped`+live-pane creator reads as
+  // live off this set; a `null` probe falls back to "on doubt, SKIP".
+  const livePaneIds = await readLivePaneIds();
   const result = await runWake(role.epic, {
     resolveCreatorJobs,
     liveSessionIds: readLiveSessionIds,
+    livePaneIds: () => livePaneIds,
     readCooldown: readWakeCooldown,
     writeCooldown: writeWakeCooldown,
     tryLock: tryWakeLock,

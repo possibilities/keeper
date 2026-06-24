@@ -17,6 +17,7 @@ import {
   creatorIsLive,
   inCooldown,
   isRunningState,
+  isStoppedPaneLive,
   MANAGED_WINDOW_OPTION,
   MANAGED_WINDOW_VALUE,
   pickCreatorJob,
@@ -34,6 +35,7 @@ function creator(overrides: Partial<WakeCreator> = {}): WakeCreator {
     cwd: "/abs/repo",
     title: "planner",
     state: "stopped",
+    backend_exec_pane_id: null,
     updated_at: 100,
     ...overrides,
   };
@@ -59,6 +61,7 @@ function makeDeps(
   overrides: Partial<WakeDeps> & {
     jobs?: WakeCreator[];
     live?: Set<string>;
+    livePanes?: ReadonlySet<string> | null;
     launchResult?: LaunchResult;
     nowMs?: number;
     cooldowns?: Map<string, WakeCooldownRecord>;
@@ -75,6 +78,12 @@ function makeDeps(
       overrides.resolveCreatorJobs ?? (() => overrides.jobs ?? [creator()]),
     liveSessionIds:
       overrides.liveSessionIds ?? (() => overrides.live ?? new Set<string>()),
+    livePaneIds:
+      overrides.livePaneIds ??
+      (() =>
+        overrides.livePanes !== undefined
+          ? overrides.livePanes
+          : new Set<string>()),
     readCooldown: overrides.readCooldown ?? ((id) => cooldowns.get(id) ?? null),
     writeCooldown:
       overrides.writeCooldown ??
@@ -105,13 +114,47 @@ test("isRunningState: only 'working' is running", () => {
   expect(isRunningState(null)).toBe(false);
 });
 
-test("creatorIsLive: true when on the bus OR working; false otherwise", () => {
-  const job = creator({ job_id: "s1", state: "stopped" });
-  expect(creatorIsLive(job, new Set(["s1"]))).toBe(true); // on the bus
+test("creatorIsLive: true when on the bus OR working OR stopped+live-pane; false otherwise", () => {
+  const job = creator({
+    job_id: "s1",
+    state: "stopped",
+    backend_exec_pane_id: "%5",
+  });
+  expect(creatorIsLive(job, new Set(["s1"]), new Set())).toBe(true); // on the bus
   expect(
-    creatorIsLive(creator({ job_id: "s1", state: "working" }), new Set()),
+    creatorIsLive(
+      creator({ job_id: "s1", state: "working" }),
+      new Set(),
+      new Set(),
+    ),
   ).toBe(true); // running
-  expect(creatorIsLive(job, new Set())).toBe(false); // offline + stopped
+  // stopped + pane listed in the live-pane set, absent from the bus → live (the
+  // F1 hazard case: a redundant resume would double-attach).
+  expect(creatorIsLive(job, new Set(), new Set(["%5"]))).toBe(true);
+  // genuinely gone: stopped, pane not listed, not on the bus → wakes.
+  expect(creatorIsLive(job, new Set(), new Set())).toBe(false);
+});
+
+test("isStoppedPaneLive: only a stopped row with its pane listed is live", () => {
+  const stopped = creator({ state: "stopped", backend_exec_pane_id: "%5" });
+  expect(isStoppedPaneLive(stopped, new Set(["%5"]))).toBe(true);
+  expect(isStoppedPaneLive(stopped, new Set(["%9"]))).toBe(false);
+  // No recorded pane → not live-provable.
+  expect(
+    isStoppedPaneLive(
+      creator({ state: "stopped", backend_exec_pane_id: null }),
+      new Set(["%5"]),
+    ),
+  ).toBe(false);
+  // A working row never consults the pane set here (it short-circuits upstream).
+  expect(
+    isStoppedPaneLive(
+      creator({ state: "working", backend_exec_pane_id: "%5" }),
+      new Set(["%5"]),
+    ),
+  ).toBe(false);
+  // null probe (unavailable) → treat stopped as live (on doubt, SKIP the resume).
+  expect(isStoppedPaneLive(stopped, null)).toBe(true);
 });
 
 test("inCooldown: a recent failure gates; old/absent/zero-failure does not", () => {
@@ -197,6 +240,46 @@ test("runWake: already_live skips when jobs.state is working", async () => {
     makeDeps({ jobs: [creator({ job_id: "s1", state: "working" })] }),
   );
   expect(res.outcome).toBe("already_live");
+});
+
+test("runWake: already_live skips a stopped creator whose pane is live but off the bus", async () => {
+  let launched = false;
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({ job_id: "s1", state: "stopped", backend_exec_pane_id: "%7" }),
+      ],
+      live: new Set<string>(), // NOT on the bus (never re-armed `keeper bus watch`)
+      livePanes: new Set(["%7"]), // but its tmux pane is still listed
+      launch: async () => {
+        launched = true;
+        return { ok: true };
+      },
+    }),
+  );
+  expect(res.outcome).toBe("already_live");
+  expect(launched).toBe(false);
+});
+
+test("runWake: a stopped creator with no live pane and off the bus still wakes", async () => {
+  let launched = false;
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({ job_id: "s1", state: "stopped", backend_exec_pane_id: "%7" }),
+      ],
+      live: new Set<string>(),
+      livePanes: new Set(["%99"]), // some OTHER pane, not the creator's
+      launch: async () => {
+        launched = true;
+        return { ok: true };
+      },
+    }),
+  );
+  expect(res.outcome).toBe("launched");
+  expect(launched).toBe(true);
 });
 
 test("runWake: in_flight when the per-session lock is held by another wake", async () => {

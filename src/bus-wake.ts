@@ -35,15 +35,17 @@ import { buildResumeCommand, resumeTarget } from "./resume-descriptor";
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
  * import("./types").Job} so the resolve/liveness/launch pipeline unit-tests with a
  * tiny synthetic row. `title`/`job_id` feed {@link resumeTarget}; `cwd` is the
- * resume `cd`; `state` is the running-liveness signal; `updated_at` is the
- * newest-creator tiebreaker. Field names + types match `Job` so a real `jobs` row
- * is assignable directly.
+ * resume `cd`; `state` is the running-liveness signal; `backend_exec_pane_id` is
+ * the live-pane liveness signal (a `stopped` row whose pane is still listed is
+ * live); `updated_at` is the newest-creator tiebreaker. Field names + types match
+ * `Job` so a real `jobs` row is assignable directly.
  */
 export interface WakeCreator {
   job_id: string;
   cwd: string | null;
   title: string | null;
   state: string;
+  backend_exec_pane_id: string | null;
   updated_at: number;
 }
 
@@ -102,27 +104,65 @@ export interface WakeResult {
 
 /**
  * Is the creator already live — so a `claude --resume` would be a redundant (and
- * hazardous) double-attach to a session already running? Two independent signals,
- * EITHER positive means skip: (1) a live bus channel keyed on the creator's stable
- * `session_id` (the creator returned and re-armed `keeper bus watch`), or (2) the
- * `jobs.state` reads as a running state. On doubt, treat as live and SKIP — a
- * double `claude --resume` of a live id is the hazard the recheck guards against.
- * Pure over `(job, liveSessionIds)`.
+ * hazardous) double-attach to a session already running? Three independent
+ * signals, ANY positive means skip: (1) a live bus channel keyed on the creator's
+ * stable `session_id` (the creator returned and re-armed `keeper bus watch`), (2)
+ * the `jobs.state` reads as a running state, or (3) the creator is `stopped` but
+ * its `backend_exec_pane_id` is still listed in the live-pane set — a stopped
+ * session whose tmux pane is alive (held open by the launch wrapper's trailing
+ * login shell) that has NOT re-armed `keeper bus watch`, the exact case the bus +
+ * state signals miss. This mirrors the autopilot's `isStoppedJobLive`
+ * (`src/autopilot-worker.ts`). On doubt, treat as live and SKIP — a double
+ * `claude --resume` of a live id is the hazard the recheck guards against: a
+ * `null` `livePaneIds` (probe unavailable) is therefore NOT consulted here (the
+ * caller passes the empty set only when the probe genuinely returned an empty
+ * sweep). Pure over `(job, liveSessionIds, livePaneIds)`.
  */
 export function creatorIsLive(
   job: WakeCreator,
   liveSessionIds: ReadonlySet<string>,
+  livePaneIds: ReadonlySet<string> | null,
 ): boolean {
   if (liveSessionIds.has(job.job_id)) {
     return true;
   }
-  return isRunningState(job.state);
+  if (isRunningState(job.state)) {
+    return true;
+  }
+  return isStoppedPaneLive(job, livePaneIds);
 }
 
 /** The `jobs.state` values that mean "this session is currently alive". A wake
  *  targets a session that has stopped/ended/been killed — never a working one. */
 export function isRunningState(state: string | null | undefined): boolean {
   return state === "working";
+}
+
+/**
+ * Is a `stopped` creator's backend pane still LIVE — the pane is listed in
+ * `livePaneIds` so the session is alive despite not being on the bus? Mirrors the
+ * autopilot's `isStoppedJobLive`: a `null` `livePaneIds` (probe unavailable) is
+ * treated as live (the conservative "on doubt, SKIP the resume" fallback — never
+ * trade a probe failure for a double-attach), and a row with no recorded
+ * `backend_exec_pane_id` is not live-provable so reads as not-live here. Only a
+ * `stopped` row consults the pane set — a `working` row already short-circuits to
+ * live, and any other state is genuinely gone. Pure over `(job, livePaneIds)`.
+ */
+export function isStoppedPaneLive(
+  job: WakeCreator,
+  livePaneIds: ReadonlySet<string> | null,
+): boolean {
+  if (job.state !== "stopped") {
+    return false;
+  }
+  if (livePaneIds === null) {
+    return true;
+  }
+  const paneId = job.backend_exec_pane_id;
+  if (paneId == null || paneId === "") {
+    return false;
+  }
+  return livePaneIds.has(paneId);
 }
 
 /**
@@ -184,6 +224,11 @@ export interface WakeDeps {
   readonly resolveCreatorJobs: (epic: string) => WakeCreator[];
   /** The set of session_ids currently connected to the bus (liveness signal). */
   readonly liveSessionIds: () => ReadonlySet<string>;
+  /** The set of LIVE tmux pane ids from a read-time `list-panes -a` sweep — the
+   *  live-pane liveness signal for a `stopped` creator. `null` means the probe
+   *  was UNAVAILABLE (degraded / missing tmux); a stopped row then reads as live
+   *  (the conservative "on doubt, SKIP the resume" fallback). */
+  readonly livePaneIds: () => ReadonlySet<string> | null;
   /** Read the persisted cooldown record for a session, or null when none. */
   readonly readCooldown: (sessionId: string) => WakeCooldownRecord | null;
   /** Persist (or clear, when `record` is null) the cooldown record for a session. */
@@ -213,9 +258,9 @@ export interface WakeDeps {
  *
  *  1. Resolve the creator `jobs` row from the epic's `job_links` creator edge(s)
  *     ({@link pickCreatorJob}). No row → `unknown_creator`.
- *  2. Liveness recheck ({@link creatorIsLive}): the creator is on the bus or
- *     running → `already_live`, SKIP (a double `claude --resume` of a live id is
- *     the hazard).
+ *  2. Liveness recheck ({@link creatorIsLive}): the creator is on the bus,
+ *     running, or `stopped` with a live tmux pane → `already_live`, SKIP (a double
+ *     `claude --resume` of a live id is the hazard).
  *  3. Single-flight: acquire the per-session NON-BLOCKING lock. Held by another
  *     concurrent wake → `in_flight`, SKIP (TOCTOU double-spawn guard — `has-session`
  *     alone is racy).
@@ -245,7 +290,7 @@ export async function runWake(
   }
   const sessionId = job.job_id;
 
-  if (creatorIsLive(job, deps.liveSessionIds())) {
+  if (creatorIsLive(job, deps.liveSessionIds(), deps.livePaneIds())) {
     return {
       outcome: "already_live",
       sessionId,
