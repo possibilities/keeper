@@ -60,5 +60,5 @@ preset resolution to the task-1 launcher rather than re-deriving model/effort.
 - [ ] Both SKILL flag tables + cli usage strings document `--preset`.
 
 ## Done summary
-
+Added --preset to keeper pair (alone-valid, harness/role from preset, forwards --agentwrap-preset, output events carry preset=) and keeper dispatch (claude-only, plan form defaults to the worker preset, --model/--effort override). SKILLs + usage strings updated; KEEPER_PRESETS_CONFIG sandboxes the registry path.
 ## Evidence
