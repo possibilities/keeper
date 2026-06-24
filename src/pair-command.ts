@@ -191,10 +191,11 @@ export interface PairLaunchOpts {
  * the `jobs` projection as a tracked job — the launcher injects it into the pane
  * env via tmux `-e`, so the SessionStart hook stamps the session name as the
  * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). codex
- * fires no keeper hooks, so it never becomes a tracked job and omits the carrier
- * (it stays a headless one-shot reaped CLI-side). The carrier needs a session to
- * name, so it is added only when `session` is present. Pure — exported for
- * byte-pin tests.
+ * also launches as an interactive TUI now, but fires no keeper hooks, so it never
+ * becomes a tracked job and omits the carrier (it stays UNTRACKED and is reaped
+ * CLI-side via the synchronous `shouldReap = pairCli !== "claude"` path). The
+ * carrier needs a session to name, so it is added only when `session` is present.
+ * Pure — exported for byte-pin tests.
  */
 export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
   const wrapperFlags: string[] = [
@@ -261,22 +262,22 @@ export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
 }
 
 /**
- * Native codex flags for a headless one-shot pairing turn. `exec
- * --skip-git-repo-check --enable web_search_request` runs the partner with web
- * search. codex read-only is carried by the directive ONLY (no native codex
- * flag fits "politely explore" — `-s read-only` would also disable web search),
- * so read-only KEEPS the same exec flags as write and KEEPS `--enable
- * web_search_request`. The git changed-files snapshot backstops it. Pure —
+ * Native codex flags for a one-turn pairing partner launched as an INTERACTIVE
+ * TUI (not the headless `codex exec` one-shot). `--dangerously-bypass-approvals
+ * -and-sandbox` runs the turn in YOLO mode so it never stalls on an approval
+ * prompt; `-m`/`-c model_reasoning_effort` are valid global/interactive flags.
+ * Web search is ON by default in the interactive TUI, so the deprecated `--enable
+ * web_search_request` is dropped (and `exec`/`--skip-git-repo-check` are
+ * exec-only with no interactive analog). codex read-only is carried by the
+ * directive ONLY (no native codex flag fits "politely explore" — `-s read-only`
+ * would also disable web search), so read-only KEEPS the same flags as write; the
+ * git changed-files snapshot backstops it. The detached interactive window does
+ * not hang on codex's directory-trust prompt because `keeper pair` pre-seeds the
+ * cwd's trust (cli/pair.ts → src/codex-trust.ts, fail-open) before launch. Pure —
  * exported for tests.
  */
 export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
-  const args = [
-    "exec",
-    "--skip-git-repo-check",
-    "--enable",
-    "web_search_request",
-    "--dangerously-bypass-approvals-and-sandbox",
-  ];
+  const args = ["--dangerously-bypass-approvals-and-sandbox"];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("-m", opts.model);
   }

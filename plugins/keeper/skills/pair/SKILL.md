@@ -18,10 +18,12 @@ argument-hint: <what to ask> [--cli claude|codex] [--role …] [--read-only]
 # pair
 
 `keeper pair send` fans ONE task out to another model CLI — `claude` or
-`codex` — launched as a detached partner via `keeper agent`, waits for it to stop,
-and writes the partner's final answer to a `--output` file. It is keeper's
-pairing surface: a second opinion, a cross-vendor cross-check, a code review or
-co-plan from a different model, or a read-only audit.
+`codex` — launched as a detached **interactive TUI** partner via `keeper agent`,
+waits for it to stop, and writes the partner's final answer to a `--output` file.
+It is keeper's pairing surface: a second opinion, a cross-vendor cross-check, a
+code review or co-plan from a different model, or a read-only audit. For a codex
+partner keeper seeds the cwd's codex directory-trust before launch (fail-open) so
+the interactive window never hangs on codex's "trust this directory?" prompt.
 
 How you drive it depends on where you run. From the **main session**, use the
 **Monitor tool** (below): the partner runs in its own detached window for as
@@ -113,7 +115,7 @@ expected path.
 
 | Flag | Meaning |
 |---|---|
-| `--cli claude\|codex` | The partner CLI. **Required.** Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--cli claude\|codex` | The partner CLI. **Required.** Both launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open) so it never stalls on the trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
 | `--model <m>` | Native model id, passed through (`claude --model` / `codex -m`). Omit for the CLI's default. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |

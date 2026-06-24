@@ -79,6 +79,8 @@ Monitor(
 - Neither panelist gets an assigned role or persona — both answer the human's task straight. The
   cross-family difference (Opus 4.8 vs GPT-5.5) is the diversity the panel harvests.
 - `--read-only` on both: claude strips its edit tools; codex carries read-only via its prompt directive.
+  Both panelists run as an interactive TUI; the codex panelist's cwd directory-trust is pre-seeded
+  (fail-open) so its window never hangs on the trust prompt.
 - `--session panels` on both: panelists land in a dedicated `panels` tmux session. A claude panelist
   registers as a tracked job; its stopped window is autoclosed by keeperd's daemon reaper past an idle
   grace, so attach promptly (`tmux attach -t panels`) to inspect a panelist's full session. To keep the

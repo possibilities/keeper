@@ -29,7 +29,8 @@ Two panelists answer **in parallel**, then the `plan:panel-judge` subagent fuses
   and prepends an explore-only directive — it reads, greps, and runs bash to research, then reports.
 - **GPT-5.5** via `keeper pair send --cli codex --read-only`. The non-Claude panelist is the
   cross-family diversity the panel is built to harvest. Codex's read-only posture is carried by the prompt
-  directive plus a changed-files backstop.
+  directive plus a changed-files backstop. The codex panelist runs as an interactive TUI with its cwd
+  directory-trust pre-seeded (fail-open), so its window never hangs on codex's trust prompt.
 
 Neither panelist gets an assigned role or persona — both answer the human's task straight, and the
 diversity comes from running two different frontier models cold (see "No lenses, no personas" above).

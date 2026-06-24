@@ -282,6 +282,14 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   (its sidecars + commits/pushes), never keeper's DB. The
   events-log ingester is the sole writer of hook-sourced `events` rows; main writes
   all synthetic events + `dead_letters` + the replay path; workers feed via main.
+- **The cli/pair.ts codex pre-launch trust-seed is the ONLY keeper surface that
+  writes codex's own config dir** (`${CODEX_HOME:-~/.codex}/config.toml`). Before a
+  codex pair/panel partner launches as an interactive TUI, `ensureCodexDirTrust`
+  (`src/codex-trust.ts`, dep-free leaf) seeds `[projects."<realpath(cwd)>"]
+  trust_level = "trusted"` so the detached window does not hang on codex's
+  directory-trust prompt — exact-header idempotent (trust is NOT inherited), O_EXCL
+  lock + post-acquire re-check for concurrent launches, and FAIL-OPEN (never throws,
+  never blocks the launch; `KEEPER_CODEX_TRUST_LOG` overrides the log path).
 
 ## Process & DB-watch invariants
 

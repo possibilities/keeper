@@ -42,6 +42,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { ensureCodexDirTrust } from "../src/codex-trust";
 import { resolveConfig } from "../src/db";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import {
@@ -368,6 +369,16 @@ export async function main(argv: string[]): Promise<void> {
   // once the partner has stopped; the diff is the changed-files set. Detection,
   // not prevention — the directive + tool strip are the guards (see module doc).
   const beforeSnapshot = readOnly ? gitSnapshot(cwd) : null;
+
+  // codex launches as an interactive TUI, which would hang on codex's
+  // "Do you trust the contents of this directory?" prompt in a never-trusted cwd.
+  // Pre-seed the cwd's per-directory trust into codex's own config dir. Fail-open
+  // by contract (never throws, never blocks): if it can't seed, codex merely
+  // re-prompts and the wait-for-stop timeout reaps the window — never worse than
+  // the headless past. claude fires no trust prompt, so this is codex-only.
+  if (pairCli === "codex") {
+    ensureCodexDirTrust({ cwd, env: process.env });
+  }
 
   // ---- 1. launch the partner detached ----
   const launchArgv = buildPairLaunchArgv({

@@ -162,7 +162,7 @@ test("nativeClaudeArgs: --model appended when supplied", () => {
 // native flag sets — codex
 // ---------------------------------------------------------------------------
 
-test("nativeCodexArgs: keeps web search in BOTH write and read-only", () => {
+test("nativeCodexArgs: interactive YOLO flags in BOTH write and read-only", () => {
   for (const readOnly of [false, true]) {
     const args = nativeCodexArgs({
       launcherArgvPrefix: LAP,
@@ -170,10 +170,16 @@ test("nativeCodexArgs: keeps web search in BOTH write and read-only", () => {
       prompt: "p",
       readOnly,
     });
-    expect(args).toContain("--enable");
-    expect(args).toContain("web_search_request");
-    // codex read-only is carried by the directive — same exec flags as write.
+    // Interactive TUI shape — never the headless `exec` one-shot or its exec-only
+    // `--skip-git-repo-check`, and web search is on by default so the deprecated
+    // `--enable web_search_request` is gone.
+    expect(args).not.toContain("exec");
+    expect(args).not.toContain("--skip-git-repo-check");
+    expect(args).not.toContain("--enable");
+    expect(args).not.toContain("web_search_request");
+    // YOLO mode so the single-turn partner never stalls on an approval prompt.
     expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+    // codex read-only is carried by the directive — same flags as write.
     // codex must NEVER strip tools the way claude does.
     expect(args).not.toContain("--disallowed-tools");
   }
@@ -239,7 +245,7 @@ test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION b
   expect(argv[sessIdx + 1]).toBe("panels");
 });
 
-test("buildPairLaunchArgv: codex never gets the binding carrier (stays headless)", () => {
+test("buildPairLaunchArgv: codex never gets the binding carrier (stays untracked)", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "codex",
@@ -253,7 +259,7 @@ test("buildPairLaunchArgv: codex never gets the binding carrier (stays headless)
   expect(argv).toContain("--agentwrap-tmux-session");
 });
 
-test("buildPairLaunchArgv: codex — agent token is codex, exec native flags present", () => {
+test("buildPairLaunchArgv: codex — agent token is codex, interactive native flags, prompt last", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "codex",
@@ -262,8 +268,11 @@ test("buildPairLaunchArgv: codex — agent token is codex, exec native flags pre
     effort: "medium",
   });
   expect(argv[LAP.length]).toBe("codex");
-  expect(argv).toContain("exec");
-  expect(argv).toContain("web_search_request");
+  // Interactive TUI — never the headless `exec` one-shot or the deprecated web
+  // search flag.
+  expect(argv).not.toContain("exec");
+  expect(argv).not.toContain("web_search_request");
+  expect(argv).toContain("--dangerously-bypass-approvals-and-sandbox");
   expect(argv.at(-1)).toBe("P");
 });
 
