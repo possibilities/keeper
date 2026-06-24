@@ -27,5 +27,5 @@ list per the OpenTUI native-loader convention.
 - [ ] No production code change; existing assertions unweakened.
 
 ## Done summary
-
+Added two in-process tests in test/agent-modal-host.test.ts pinning the modal-host resilience invariants: a rejecting buildOverlay falls back to overlay=null (hotkey stub fires, child exits cleanly) and child output is dropped while overlay.isOpen then resumes when closed. Test-only, no production change.
 ## Evidence
