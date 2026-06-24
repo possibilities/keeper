@@ -53,5 +53,5 @@ Drive the producer with synthetic `block_escalations` rows + an injected helper/
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added the daemon block-escalation producer: a heartbeat sweep (runBlockEscalationSweep) that walks pending block_escalations latch rows, gates by cancellation guard + TOOLING_FAILURE denylist, coalesces per planner@<epic>, and mints Requested->notify-bus->Attempted; fail-open, spawn lives only in the producer so re-fold never re-fires.
 ## Evidence

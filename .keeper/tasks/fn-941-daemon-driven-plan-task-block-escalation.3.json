@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Daemon escalation producer and one-way bus actuator",
-  "updated_at": "2026-06-24T18:27:21.978000Z"
+  "updated_at": "2026-06-24T21:22:31.399000Z",
+  "worker_done_at": "2026-06-24T21:22:31.399000Z"
 }
