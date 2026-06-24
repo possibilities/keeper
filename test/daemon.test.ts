@@ -2856,8 +2856,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `TaskSnapshot` / `BlockEscalation*` stream). This pin tracks the LIVE schema
   // version: the guard it provides is "an accidental reducer/schema change must
   // surface as a failing whitelist + this pin", which still holds — bump both
-  // together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(86);
+  // together when the schema genuinely moves. And to 87 via fn-946 task .1
+  // (adding the `handoffs` durable `keeper handoff` projection table — comment-
+  // only no-op, NO cursor rewind: the projection re-folds byte-identical from
+  // the `HandoffRequested` / dispatcher / bind stream, empty on a pre-feature
+  // log).
+  expect(SCHEMA_VERSION).toBe(87);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

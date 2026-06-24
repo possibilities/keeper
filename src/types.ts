@@ -106,6 +106,38 @@ export interface JobLinkEntry {
 }
 
 /**
+ * One entry in the rendered handoff edge — the per-job view of the
+ * handoff-er→handoff-ee relationship folded purely from `HandoffRequested` +
+ * the callee's `SessionStart` bind. Sibling of {@link JobLinkEntry}, but the
+ * edge is a job→job relationship (NOT epic-anchored, unlike `creator`/`refiner`):
+ * `kind` distinguishes the direction (`handoff-from` on the initiator's row,
+ * `handoff-to` on the handoff-ee's), `handoff_id` keys the `handoffs` row, and
+ * `peer_job_id` identifies the OTHER endpoint of the edge (the handoff-ee on a
+ * `handoff-from` entry, the initiator on a `handoff-to`).
+ *
+ * Enrichment boundary mirrors `JobLinkEntry`: the display fields are
+ * denormalized off the peer `jobs` row at the reducer's write boundary so
+ * renderers read off the projection with no live-jobs join; a missing `jobs`
+ * row at enrichment time defaults to the re-fold-safe `{title: null, state:
+ * "stopped", <all pair fields>: null}`. The paired-NULL invariant
+ * (`last_*_at` / `last_*_kind` move together) holds identically.
+ */
+export interface HandoffLinkEntry {
+  kind: "handoff-from" | "handoff-to";
+  handoff_id: string;
+  peer_job_id: string;
+  status: string;
+  title: string | null;
+  state: string;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
+  last_input_request_at: number | null;
+  last_input_request_kind: string | null;
+  last_permission_prompt_at: number | null;
+  last_permission_prompt_kind: string | null;
+}
+
+/**
  * One row of the `events` table. `id` is the rowid (monotonic per DB); `ts`
  * is unix-epoch seconds as a REAL; optional columns are `NULL` when not
  * provided by the hook payload.

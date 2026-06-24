@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 86;
+export const SCHEMA_VERSION = 87;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -140,6 +140,12 @@ export interface KeeperConfig {
   // with NO default: absent/empty/garbage → undefined → no prefix applied.
   // Plan-form dispatches are never prefixed.
   dispatchPromptPrefix?: string;
+  // Global prompt prefix for `keeper handoff` dispatches: when set (e.g.
+  // `/hack`), it boots each fire-and-forget handoff-ee worker into the prefix
+  // skill before it reads its brief. Independent best-effort key with NO
+  // default: absent/empty/garbage → undefined → no prefix applied. Mirrors
+  // `dispatchPromptPrefix`.
+  handoffPromptPrefix?: string;
   // Absolute path to the agentwrap binary keeper launches workers through.
   // Independent best-effort key with NO default at the parse layer (absent →
   // undefined here); `resolveAgentwrapPath()` supplies the `~/.bun/bin/agentwrap`
@@ -208,6 +214,9 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
+  // No default — absent leaves `handoffPromptPrefix` undefined so no prefix is
+  // applied to `keeper handoff` dispatches.
+  let handoffPromptPrefix: string | undefined;
   // No default at the parse layer — absent leaves `agentwrapPath` undefined so
   // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
   let agentwrapPath: string | undefined;
@@ -276,6 +285,14 @@ export function resolveConfig(): KeeperConfig {
         .dispatch_prompt_prefix;
       if (typeof dpp === "string" && dpp.length > 0) {
         dispatchPromptPrefix = dpp;
+      }
+      // Independent best-effort key — non-empty string only; garbage/absent
+      // leaves `handoffPromptPrefix` undefined and no handoff prompt prefix is
+      // applied.
+      const hpp = (raw as { handoff_prompt_prefix?: unknown })
+        .handoff_prompt_prefix;
+      if (typeof hpp === "string" && hpp.length > 0) {
+        handoffPromptPrefix = hpp;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `agentwrapPath` undefined and `resolveAgentwrapPath()` falls
@@ -355,6 +372,7 @@ export function resolveConfig(): KeeperConfig {
     usageScraperUvPath,
     usageScraperProjectDir,
     dispatchPromptPrefix,
+    handoffPromptPrefix,
     agentwrapPath,
     keeperAgentPath,
     maxConcurrentJobs,
@@ -1182,6 +1200,46 @@ const CREATE_EPIC_TOMBSTONES = `
 CREATE TABLE IF NOT EXISTS epic_tombstones (
     epic_id TEXT PRIMARY KEY,
     deleted_at_event_id INTEGER NOT NULL
+)
+`;
+
+/**
+ * `handoffs` projection table — the durable record of a `keeper handoff`
+ * enqueue (`HandoffRequested` → this row) plus the dispatcher's transactional-
+ * outbox lifecycle. One row per handoff, keyed on `handoff_id`. `doc` carries
+ * the contextful brief the dispatched fire-and-forget worker reads back via
+ * `keeper handoff show <id>` — it rides inline in `events.data` (the canonical
+ * fold source), so it MUST be capped at WRITE time (task .2), never re-truncated
+ * here. `target_session` is the resolved tmux session the handoff-ee launches
+ * into; `initiator_session` / `initiator_pane` are the raw initiator coords.
+ * `initiator_job_id` / `callee_job_id` model the job→job handoff edge (NOT
+ * epic-anchored): the callee is filled from the `handoff::<id>` `SessionStart`
+ * bind. `claimed_at` is lifted from the dispatcher's marker event TS (an event
+ * ts, never wall-clock) so the fold stays re-fold-deterministic;
+ * `never_bound_count` is the consecutive-dispatch-without-bind counter the
+ * level-triggered boot-recovery bind check (`handoff::<id>` SessionStart exists?)
+ * resets on a successful bind.
+ *
+ * DETERMINISTIC-REPLAYED reducer projection: in EVERY rewind-and-redrain DELETE
+ * block, NOT in `EPHEMERAL_PROJECTIONS` or `LIVE_ONLY_PROJECTIONS`. A
+ * from-scratch re-fold replays the same `HandoffRequested` / dispatcher / bind
+ * stream and re-derives byte-identical rows (empty on a pre-feature log).
+ * `claimed_at` / `last_event_id` are event ids/ts, never wall-clock.
+ */
+const CREATE_HANDOFFS = `
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    doc TEXT NOT NULL,
+    title TEXT,
+    target_session TEXT,
+    initiator_session TEXT,
+    initiator_pane TEXT,
+    initiator_job_id TEXT,
+    callee_job_id TEXT,
+    claimed_at REAL,
+    never_bound_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL
 )
 `;
 
@@ -2210,6 +2268,7 @@ function migrate(db: Database): void {
       db.run(CREATE_DISPATCH_NEVER_BOUND);
       db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
+      db.run(CREATE_HANDOFFS);
       // `event_blobs` is HISTORICAL (fn-836.4 shed): NOT created in the
       // steady-state schema-setup block, so a post-shed boot never resurrects
       // it. A fresh 0→latest walk still materializes it transiently at the v57
@@ -3577,6 +3636,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4470,6 +4530,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4721,6 +4782,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4787,6 +4849,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -5104,6 +5167,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -5123,6 +5187,21 @@ function migrate(db: Database): void {
       // read (keeper-py never reads this table) — this bump MUST add 86 to
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or every
       // keeper-py read fails host-wide; test/schema-version.test.ts enforces this.
+
+      // v86→v87 (fn-946 task .1): the `keeper handoff` foundation — comment-only
+      // no-op. The `handoffs` reducer projection (the durable `HandoffRequested`
+      // → row + the dispatcher's transactional-outbox lifecycle, keyed on
+      // `handoff_id`) is created above via `CREATE_HANDOFFS` in the steady-state
+      // schema-setup block and populates from the fold arms (tasks .2/.3); the
+      // version stamp needs a slot. A DETERMINISTIC-replayed reducer projection
+      // (in every rewind-and-redrain DELETE list). NO cursor rewind: a
+      // from-scratch re-fold replays the same `HandoffRequested` / dispatcher /
+      // bind stream and re-derives byte-identical rows (empty on a pre-feature
+      // log; the doc body rides inline in `events.data`, capped at WRITE time in
+      // task .2). Whitelist-only Python read (keeper-py never reads this table) —
+      // this bump MUST add 87 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
+      // in the SAME commit, or every keeper-py read fails host-wide;
+      // test/schema-version.test.ts enforces this.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -358,6 +358,10 @@ from pathlib import Path
 # the fast logic and self-validates (the ~15-min replay now runs in ~1-2 min).
 # keeper-py reads ``jobs`` / ``epics`` over the socket, not these internals, so only the
 # version whitelist gains 81.
+#
+# v87 (fn-946 task .1) adds the ``handoffs`` reducer projection — the durable
+# ``keeper handoff`` enqueue + dispatcher transactional-outbox record. keeper-py
+# never reads this table, so only the version whitelist gains 87.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -416,6 +420,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         84,
         85,
         86,
+        87,
     }
 )
 

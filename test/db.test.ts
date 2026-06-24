@@ -75,6 +75,82 @@ test("openDb creates events, jobs, reducer_state, meta tables", () => {
   db.close();
 });
 
+test("openDb creates the handoffs table with the documented columns (fn-946)", () => {
+  // A real openDb migration exercise: the v86→v87 step (the `CREATE_HANDOFFS`
+  // run in the steady-state schema-setup block) must materialize the table and
+  // every documented column so the durable `keeper handoff` projection has a
+  // home before its fold arms (tasks .2/.3) populate it.
+  const { db } = openDb(dbPath);
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all() as { name: string }[];
+  expect(new Set(tables.map((t) => t.name)).has("handoffs")).toBe(true);
+
+  const cols = db.prepare("PRAGMA table_info(handoffs)").all() as {
+    name: string;
+    notnull: number;
+  }[];
+  const colNames = new Set(cols.map((c) => c.name));
+  for (const c of [
+    "handoff_id",
+    "status",
+    "doc",
+    "title",
+    "target_session",
+    "initiator_session",
+    "initiator_pane",
+    "initiator_job_id",
+    "callee_job_id",
+    "claimed_at",
+    "never_bound_count",
+    "last_event_id",
+  ]) {
+    expect(colNames.has(c)).toBe(true);
+  }
+
+  // Round-trips a row — proves the PK + the NOT NULL columns (`status`, `doc`,
+  // `last_event_id`) accept a real insert and read back identically. The doc
+  // body rides inline forever (it is read by a fold's keep-set); the WRITE-time
+  // cap lives in task .2, not the schema.
+  db.run(
+    `INSERT INTO handoffs (handoff_id, status, doc, last_event_id)
+       VALUES ('h-1', 'requested', 'context: explore X', 7)`,
+  );
+  const row = db
+    .prepare(
+      "SELECT handoff_id, status, doc, never_bound_count, last_event_id FROM handoffs WHERE handoff_id = 'h-1'",
+    )
+    .get() as {
+    handoff_id: string;
+    status: string;
+    doc: string;
+    never_bound_count: number;
+    last_event_id: number;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.handoff_id).toBe("h-1");
+  expect(row?.status).toBe("requested");
+  expect(row?.doc).toBe("context: explore X");
+  // `never_bound_count` defaults to 0 when omitted.
+  expect(row?.never_bound_count).toBe(0);
+  expect(row?.last_event_id).toBe(7);
+  db.close();
+});
+
+test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
+  // The schema default matches the zero-event projection: a fresh DB with no
+  // `HandoffRequested` events drains to an empty `handoffs` table. (Folds land
+  // in tasks .2/.3; here the deterministic-replayed default must be empty so a
+  // pre-feature log re-folds byte-identically.)
+  const { db } = openDb(dbPath);
+  drainAll(db);
+  const count = db.prepare("SELECT COUNT(*) AS n FROM handoffs").get() as {
+    n: number;
+  };
+  expect(count.n).toBe(0);
+  db.close();
+});
+
 test("all expected indexes are present", () => {
   const { db } = openDb(":memory:");
   const indexes = db
@@ -2131,9 +2207,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `queue_jump` / `created_by_closer_of` + `events.plan_queue_jump`, fn-936;
   // v86 adds the `block_escalations` escalate-once latch projection table, fn-941
   // (comment-only no-op — created via CREATE_BLOCK_ESCALATIONS, populated from
-  // the fold arms). The v62→v63 epics-shape migration this test exercises is
-  // unchanged.
-  expect(SCHEMA_VERSION).toBe(86);
+  // the fold arms); v87 adds the `handoffs` durable `keeper handoff` projection
+  // table, fn-946 (comment-only no-op — created via CREATE_HANDOFFS, populated
+  // from the fold arms in tasks .2/.3). The v62→v63 epics-shape migration this
+  // test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(87);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
