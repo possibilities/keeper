@@ -652,6 +652,110 @@ test("takeover late-close: a victim socket's straggling close does not null the 
   bob2.socket.end();
 });
 
+test("send-only register does NOT take over a live watch sharing the same identity, leaves no list ghost, and keeps the watcher reachable", async () => {
+  await bootBus();
+  // Bob has a durable, SUBSCRIBED watch channel.
+  const watcher = await connectClient();
+  await registerAndSubscribe(watcher, "bob", "sess-bob", "t-bob-shared");
+
+  // Bob also fires a one-shot directed SEND — same (pid, start_time) identity as
+  // the watch. A non-send-only register would TAKE OVER (evict) the watch; the
+  // send-only flag must keep the watch alive and never join the registry.
+  const sender = await connectClient();
+  sender.send({
+    op: "register",
+    namespace: "chat",
+    name: "bob",
+    session_id: "sess-bob",
+    start_time: "t-bob-shared",
+    send_only: true,
+  });
+  await waitFrame(
+    sender.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  // The send-only sender publishes to alice (no live alice → not_connected is
+  // fine; the point is the send path completes without evicting the watch).
+  sender.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "ghost-nobody",
+    payload: { media_type: "text/plain", text: "one-shot" },
+  });
+  await waitFrame(sender.frames, (f) => f.type === "ack" && f.op === "publish");
+  sender.socket.end();
+  await retryUntil(() => true, 150, 50);
+
+  // The watcher is STILL the only bob channel and STILL subscribed — the
+  // send-only register neither evicted it nor left a second `sock=null` ghost.
+  const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+    name?: string;
+    subscribed?: boolean;
+  }>;
+  const bobChannels = channels.filter((c) => c.name === "bob");
+  expect(bobChannels.length).toBe(1);
+  expect(bobChannels[0].subscribed).toBe(true);
+
+  // And a directed send to "bob" still lands on the live watch (reachable).
+  const alice = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+  alice.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "bob",
+    payload: { media_type: "text/plain", text: "still-reachable" },
+  });
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("delivered");
+  const arrived = await waitFrame(watcher.frames, (f) => f.event === "message");
+  expect((arrived?.payload as { text?: string })?.text).toBe("still-reachable");
+
+  alice.socket.end();
+  watcher.socket.end();
+});
+
+test("CLI `keeper bus chat send` does not evict a live watcher that shares its identity", async () => {
+  seedHarnessJob();
+  await bootBus();
+  // A real harness-resolved watch: the client sends no name/session_id, so the
+  // relay resolves identity from this process's seeded harness job. A subsequent
+  // CLI send from the SAME process resolves to the SAME harness identity — the
+  // exact takeover hazard the send-only flag guards.
+  const watcher = await connectClient();
+  watcher.send({ op: "register", namespace: "chat" });
+  await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  watcher.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "subscribe",
+  );
+
+  // The CLI send shares the harness identity; before the fix it evicted the watch.
+  const sent = await runBusCli(["chat", "broadcast", "from the CLI"]);
+  expect(sent.code).toBe(0);
+
+  // The watch is still subscribed (not taken over) and received the broadcast.
+  const arrived = await waitFrame(watcher.frames, (f) => f.event === "message");
+  expect((arrived?.payload as { text?: string })?.text).toBe("from the CLI");
+  const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+    name?: string;
+    subscribed?: boolean;
+  }>;
+  const live = channels.filter((c) => c.name === "harness-live");
+  expect(live.length).toBe(1);
+  expect(live[0].subscribed).toBe(true);
+
+  watcher.socket.end();
+});
+
 test("a send racing a peer disconnect cannot crash the worker (no SIGPIPE)", async () => {
   await bootBus();
   const alice = await connectClient();

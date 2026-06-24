@@ -747,13 +747,18 @@ async function busRoundTrip<T>(
 }
 
 /** The register frame this CLI sends. Identity is enriched server-side from the
- *  peer pid; we pass our own pid as the resume-gap floor. */
-function registerFrame(): object {
+ *  peer pid; we pass our own pid as the resume-gap floor. `sendOnly` marks a
+ *  transient `send`/`broadcast` register so the relay binds the `from` identity
+ *  WITHOUT joining the registry or taking over the agent's live `watch` channel
+ *  (which shares the same `(pid, start_time)` identity). A `watch` registers
+ *  with `sendOnly:false` so it owns a durable, subscribable channel. */
+function registerFrame(sendOnly = false): object {
   return {
     op: "register",
     namespace: CHAT_NAMESPACE,
     namespaces: [CHAT_NAMESPACE],
     pid: process.pid,
+    send_only: sendOnly,
   };
 }
 
@@ -804,7 +809,9 @@ async function runSend(
           reject(new Error(`${f.code}: ${f.message}`));
         }
       });
-      send(registerFrame());
+      // Send-only: bind identity for the `from` stamp without joining the
+      // registry or evicting the agent's live `watch` channel.
+      send(registerFrame(true));
     },
   );
 }

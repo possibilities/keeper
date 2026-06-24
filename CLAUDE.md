@@ -42,6 +42,19 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   name-collision hazard). `agentbus` is a managed session keeper SPAWNS into; its
   stopped tracked windows are autoclosed by the reaper's managed-session arm
   (`src/reaper-worker.ts`) past an idle grace, alongside `pair`/`panels`.
+- **Bus presence = a SUBSCRIBED channel; a pure send is EPHEMERAL (fn-921).** A
+  `keeper bus chat send`/`broadcast` registers with `send_only:true` (`cli/bus.ts`
+  `registerFrame(true)`): `opRegister` binds the authoritative `from` identity on
+  `conn.entry` ONLY — it does NOT join the live `registry`, run `takeoverVictim`,
+  `upsertChannel`, or `publishControl("join")`, and `opDeregister` skips the
+  shared-`(pid, start_time)` `deleteChannel`. Without this a transient send TAKES
+  OVER (evicts) the agent's live `watch` channel — same identity — AND leaves a
+  `sock=null` ghost that reads `not_connected`/absent-from-`list` (the 2026-06-23
+  unreachable-live-agent bug). Only `keeper bus watch` (`send_only:false`,
+  `runWatch`'s reconnect loop re-subscribes after a bounce) owns a durable,
+  subscribable, list-visible channel. fn-918 wake-on-send is unaffected — it is
+  recipient-side (`queued_for_wake` for an offline creator), never the sender's
+  registration.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.

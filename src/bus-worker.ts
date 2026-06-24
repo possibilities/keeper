@@ -160,6 +160,15 @@ export type ClientOp =
       session_id?: string;
       pid?: number;
       start_time?: string;
+      /**
+       * A pure-send registration (e.g. `keeper bus chat send`): bind the
+       * authoritative identity for the `from` stamp, but do NOT join the live
+       * registry, take over the agent's live `watch` channel, or persist a
+       * `bus.db` cache row. Without this a transient send would evict the agent's
+       * subscribed watch channel (same `(pid, start_time)` takeover) AND leave a
+       * `sock=null` ghost that reads as a reachable-but-disconnected target.
+       */
+      send_only?: boolean;
     }
   | { op: "subscribe"; namespaces?: string[]; after_id?: number }
   | {
@@ -402,6 +411,14 @@ export interface RegistryEntry {
    * {@link closeOwnsBinding}.
    */
   generation: number;
+  /**
+   * A pure-send registration not in the live `registry`: it carries the
+   * authoritative `from` identity for `opPublish` but is never a delivery
+   * target, never takes over the agent's live `watch` channel, and never writes
+   * a `bus.db` cache row. So `opDeregister` must NOT delete the agent's real
+   * persisted channel (keyed on the shared `(pid, start_time)`) on its behalf.
+   */
+  ephemeral?: boolean;
 }
 
 /**
@@ -811,23 +828,30 @@ export function startBusServer(
     const namespaces = normalizeNamespaces(op.namespaces, op.namespace);
 
     const channelId = `ch-${crypto.randomUUID()}`;
-    // Takeover: a prior live channel for the SAME (pid, start_time) is superseded.
-    const victim = takeoverVictim(
-      registryList(),
-      identityPid,
-      startTime,
-      channelId,
-    );
-    if (victim !== null) {
-      const v = registry.get(victim);
-      if (v) {
-        publishControl(
-          busDb,
-          "takeover",
-          v.channel,
-          namespaces[0] ?? DEFAULT_NAMESPACE,
-        );
-        evict(v, "takeover");
+    const sendOnly = op.send_only === true;
+
+    // Takeover: a prior live channel for the SAME (pid, start_time) is
+    // superseded. A send-only registration NEVER takes over — a transient send
+    // shares the agent's `(pid, start_time)` identity, so taking over here would
+    // evict its live `watch` channel (the reachability regression this guards).
+    if (!sendOnly) {
+      const victim = takeoverVictim(
+        registryList(),
+        identityPid,
+        startTime,
+        channelId,
+      );
+      if (victim !== null) {
+        const v = registry.get(victim);
+        if (v) {
+          publishControl(
+            busDb,
+            "takeover",
+            v.channel,
+            namespaces[0] ?? DEFAULT_NAMESPACE,
+          );
+          evict(v, "takeover");
+        }
       }
     }
 
@@ -848,15 +872,28 @@ export function startBusServer(
       sock: null,
       queue: [],
       generation: 0,
+      ephemeral: sendOnly,
     };
-    registry.set(channelId, entry);
     conn.entry = entry;
-    try {
-      upsertChannel(busDb, channel);
-    } catch (err) {
-      console.error("[bus-worker] upsertChannel failed (non-fatal):", err);
+    // A send-only registration binds the `from` identity on `conn.entry` ONLY: it
+    // is kept out of the live `registry` (invisible to list/resolve/fanout — no
+    // `sock=null` ghost), writes no `bus.db` cache row, and emits no `join` (a
+    // pure send is not a presence event). All other registrations join the
+    // registry + persist + announce.
+    if (!sendOnly) {
+      registry.set(channelId, entry);
+      try {
+        upsertChannel(busDb, channel);
+      } catch (err) {
+        console.error("[bus-worker] upsertChannel failed (non-fatal):", err);
+      }
+      publishControl(
+        busDb,
+        "join",
+        channel,
+        namespaces[0] ?? DEFAULT_NAMESPACE,
+      );
     }
-    publishControl(busDb, "join", channel, namespaces[0] ?? DEFAULT_NAMESPACE);
     sendAck(sock, "register", {
       channel_id: channelId,
       session_id: sessionId,
@@ -1127,6 +1164,14 @@ export function startBusServer(
   const opDeregister = (conn: BusConnState): void => {
     if (conn.entry === null) return;
     const entry = conn.entry;
+    // A send-only ephemeral entry never joined the registry and never wrote a
+    // cache row; deleting on its behalf would drop the agent's REAL persisted
+    // channel (shared `(pid, start_time)` key) and emit a spurious `part`. Just
+    // detach the connection.
+    if (entry.ephemeral === true) {
+      conn.entry = null;
+      return;
+    }
     publishControl(
       busDb,
       "part",
