@@ -56,5 +56,5 @@ Real-tmux launch tests → `*.slow.test.ts`. Run `bun run test:hygiene` +
 - [ ] byte-pin test asserts `keeper agent` native argv == retired agentwrap argv
 
 ## Done summary
-
+Vendored agentwrap's 17 src modules into src/agent/, added cli/agent.ts + registered `keeper agent` via lazy (db.ts-free) import, and added agentusage as keeper's first file: dep. `keeper agent claude|codex|pi` runs the folded launcher standalone; ported test suite + a native-argv byte-pin pass under test:full, hygiene green.
 ## Evidence
