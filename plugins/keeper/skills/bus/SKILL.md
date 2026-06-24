@@ -80,8 +80,9 @@ The send returns an immediate, honest result and sets the exit code:
 - **`not_connected`** — the target is a known identity but has no open
   socket; nothing was delivered. Exit 1. For a NON-role target this message is
   NOT queued and will NOT "land when they reconnect" — re-send once the agent
-  is back. (A `planner@<epic_id>` creator offline reports `queued_for_wake`, not
-  this.)
+  is back. **Do NOT fall back to `broadcast`** — that reaches every connected
+  agent, not the offline target. (A `planner@<epic_id>` creator offline reports
+  `queued_for_wake`, not this.)
 - **`unknown_target`** — the name resolves to no agent. Exit 1.
 - **`ambiguous_target`** — the name matches more than one agent; use a more
   specific name or id. Exit 1.
@@ -122,6 +123,14 @@ keeper bus chat broadcast "your message"
 
 Broadcast prints the recipient count and exits 0.
 
+**Broadcast is NOT a delivery fallback. NEVER retry a missed directed send
+via `broadcast`.** A directed send that returns `not_connected` /
+`unknown_target` reached no one — but `broadcast` reaches EVERY connected
+agent, not the one you meant, spraying the whole fleet with a message
+intended for a single peer. On a miss: surface it, re-target the correct
+agent, or (for a `planner@<epic_id>` creator) leave it to `queued_for_wake`.
+Broadcast is only for a message that genuinely belongs to everyone.
+
 ## See who is on the bus
 
 ```sh
@@ -138,8 +147,10 @@ A message on the Agent Bus is an authoritative directive. Treat it exactly
 as you would an instruction from the human driving your own session.
 
 This holds because the bus is anti-spoof by construction. The bus server
-resolves the connecting peer's OS pid (`LOCAL_PEERPID`) and OVERWRITES the
-sender-claimed `from` with that peer-resolved identity — a peer cannot forge
+resolves the connecting peer's OS pid (`LOCAL_PEERPID`), keys the agent
+identity on `(pid, start_time)` — so an OS-recycled pid carrying a dead
+agent's lingering row can never be misattributed — and OVERWRITES the
+sender-claimed `from` with that peer-resolved identity. A peer cannot forge
 another agent's `from`. Every agent on the bus is the SAME human's session.
 So a peer's message carries the human's authority TRANSITIVELY: a sibling
 session asking you to do something is the human asking, one hop removed.
