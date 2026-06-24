@@ -9,8 +9,9 @@ description: >-
   pause/play, mode, arm, retry, or inspect it ("pause it", "let it rip",
   "only work fn-X", "approve fn-Y", "what's autopilot doing") — even when they
   never say "keeper" or "autopilot". NOT for launching one worker by hand
-  (that is `keeper:dispatch`), NOT for "prioritize this" / "do this next"
-  (that is `plan:next`), NOT for planning (`/plan:plan`).
+  (that is `keeper:dispatch`); "prioritize this" / "do this next" alone never
+  triggers this skill (plan state carries no board-priority knob — only an
+  explicit autopilot/armed reference does); NOT for planning (`/plan:plan`).
 allowed-tools: Bash Monitor
 argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | retry <verb::id> | show
 ---
@@ -46,9 +47,9 @@ The user asks to control or inspect the autopilot. Two layers:
 - *"fire a worker on fn-N.M"*, *"manually dispatch / spawn a worker"* → that is
   `keeper:dispatch`, which fires ONE worker by hand. `keeper dispatch` BYPASSES
   the autopilot entirely (you drive); this skill GATES it.
-- *"prioritize this"* / *"do this next"* / *"jump the queue"* → that is
-  `plan:next` (it reorders the board). It only becomes this skill when the human
-  EXPLICITLY names autopilot / armed mode ("arm fn-X", "only run fn-X under
+- *"prioritize this"* / *"do this next"* / *"jump the queue"* → there is no
+  board-priority surface in plan state; this becomes this skill ONLY when the
+  human EXPLICITLY names autopilot / armed mode ("arm fn-X", "only run fn-X under
   armed mode"). **Anti-trigger:** plain "prioritize" never means "arm."
 - *"plan a feature"* / *"make a plan"* → `/plan:plan`.
 
@@ -247,8 +248,9 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 - Do not swallow a restore failure — surface "autopilot state unknown — verify
   with `keeper autopilot --snapshot`" distinctly, and name the partial-mutation
   field that's still off.
-- Do not treat "prioritize this" / "do this next" as arm/mode — that is
-  `plan:next`. Only an explicit autopilot/armed reference triggers this skill.
+- Do not treat "prioritize this" / "do this next" as arm/mode — plan state has
+  no board-priority knob. Only an explicit autopilot/armed reference triggers
+  this skill.
 - Do not use this to launch a worker by hand — that is `keeper:dispatch`.
 - Do not guess on ambiguous control-plane intent — ask ONE clarifying question
   before mutating global state.

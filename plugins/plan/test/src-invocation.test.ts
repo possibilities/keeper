@@ -121,7 +121,6 @@ describe("buildPlanctlInvocation wire field order", () => {
       "touched_path_files",
       "repo_root",
       "state_repo",
-      "queue_jump",
       "session_id",
     ]);
   });

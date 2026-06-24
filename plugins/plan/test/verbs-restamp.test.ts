@@ -4,7 +4,7 @@
 // (set-description / set-acceptance from file AND stdin, reset incl. --cascade,
 // set-target-repo's touched_repos recompute, the warn-and-write
 // set-primary-repo / set-touched-repos), the non-restamp setters (set-tier,
-// set-branch, set-title), the short-circuiting verbs (invalidate / queue-jump /
+// set-branch, set-title), the short-circuiting verbs (invalidate /
 // refine-context --invalidate), the dep editors (add-dep fn-N normalization,
 // cross-project via roots, cycle rollback, idempotent rm-dep), add-deps
 // (skip-invalid statuses, error priority), and the fail-forward restamp-failure.
@@ -488,46 +488,6 @@ describe("epic invalidate", () => {
     expect(epicDef(root, "fn-2-inv").last_validated_at).toBeNull();
     expect(gitLogCount(root)).toBe(before + 1);
     expect(headSubject(root)).toBe("chore(plan): invalidate fn-2-inv");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// epic queue-jump — short-circuit / write
-// ---------------------------------------------------------------------------
-
-describe("epic queue-jump", () => {
-  test("sets the flag + commits", () => {
-    // test_restamp_verbs.py::test_queue_jump_sets_flag_and_commits
-    seedState(root, { epicId: "fn-1-qj", nTasks: 1 });
-    gitBaseline(root);
-    const before = gitLogCount(root);
-    const r = runCli(["epic", "queue-jump", "fn-1-qj"], {
-      cwd: root,
-      env: SID,
-    });
-    expect(r.code).toBe(0);
-    expect(parseCliOutput(r.output).short_circuited).toBe(false);
-    expect(epicDef(root, "fn-1-qj").queue_jump).toBe(true);
-    expect(gitLogCount(root)).toBe(before + 1);
-    expect(headSubject(root)).toBe("chore(plan): queue-jump fn-1-qj");
-  });
-
-  test("short-circuits when already true (ZERO commits)", () => {
-    // test_restamp_verbs.py::test_queue_jump_short_circuit_when_already_true
-    seedState(root, { epicId: "fn-2-qj", nTasks: 1 });
-    const p = join(root, ".keeper", "epics", "fn-2-qj.json");
-    const ed = loadJson(p);
-    ed.queue_jump = true;
-    atomicWriteJson(p, ed);
-    gitBaseline(root);
-    const before = gitLogCount(root);
-    const r = runCli(["epic", "queue-jump", "fn-2-qj"], {
-      cwd: root,
-      env: SID,
-    });
-    expect(r.code).toBe(0);
-    expect(parseCliOutput(r.output).short_circuited).toBe(true);
-    expect(gitLogCount(root)).toBe(before);
   });
 });
 

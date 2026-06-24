@@ -41,9 +41,6 @@ export function normalizeEpic(
   if (!("bundles" in data)) {
     data.bundles = [];
   }
-  if (!("queue_jump" in data)) {
-    data.queue_jump = false;
-  }
   if (!("created_by_close_of" in data)) {
     data.created_by_close_of = null;
   }

@@ -9,7 +9,7 @@
 // guards; the fresh-epic last_validated_at stamp + one-commit coverage; the
 // missing-session-id fail-closed; stdin (--file -) + the 1 MiB cap; per-task tier
 // persistence + the tier_invalid / bad_yaml tier guards + collect-all-offenders;
-// epic.queue_jump riding the envelope; the dup-slug guard + --allow-duplicate +
+// the dup-slug guard + --allow-duplicate +
 // the suffix false-positive regression + atomicity.
 //
 // Runs in the default tier: the harness withProject + gitInit fixture the repo
@@ -802,68 +802,6 @@ describe("scaffold per-task tier", () => {
     ).toBe(true);
     expect(
       details.some((d) => d.includes("task #2") && d.includes("'extreme'")),
-    ).toBe(true);
-    expect(noEpicsOrTasksLanded()).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// epic.queue_jump rides the envelope
-// ---------------------------------------------------------------------------
-
-describe("scaffold queue_jump", () => {
-  function queueJumpYaml(valueLiteral: string | null): string {
-    const line = valueLiteral !== null ? `  queue_jump: ${valueLiteral}\n` : "";
-    return (
-      `epic:\n  title: queue jump test\n${line}  spec: |\n    ## Overview\n    queue jump.\n` +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
-    );
-  }
-
-  test("queue_jump: true rides the envelope + JSON", () => {
-    // test_scaffold.py::test_scaffold_queue_jump_true_rides_envelope
-    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("true"))]);
-    expect(r.code).toBe(0);
-    const payload = parseEnvelope(r.output);
-    expect(payload.success).toBe(true);
-    expect(
-      (payload.plan_invocation as Record<string, unknown>).queue_jump,
-    ).toBe(true);
-    const epicId = payload.epic_id as string;
-    expect(readJson(`epics/${epicId}.json`).queue_jump).toBe(true);
-  });
-
-  test("queue_jump: false (explicit) rides the envelope + JSON", () => {
-    // test_scaffold.py::test_scaffold_queue_jump_false_explicit_rides_envelope
-    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("false"))]);
-    expect(r.code).toBe(0);
-    const payload = parseEnvelope(r.output);
-    expect(
-      (payload.plan_invocation as Record<string, unknown>).queue_jump,
-    ).toBe(false);
-    expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
-  });
-
-  test("omitted queue_jump defaults to false on the envelope + JSON", () => {
-    // test_scaffold.py::test_scaffold_queue_jump_omitted_defaults_false
-    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml(null))]);
-    expect(r.code).toBe(0);
-    const payload = parseEnvelope(r.output);
-    const pc = payload.plan_invocation as Record<string, unknown>;
-    expect("queue_jump" in pc).toBe(true);
-    expect(pc.queue_jump).toBe(false);
-    expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
-    // normalize_epic queue_jump default is pinned by src-models.test.ts (CITED).
-  });
-
-  test("non-bool queue_jump is bad_yaml", () => {
-    // test_scaffold.py::test_scaffold_queue_jump_non_bool_is_bad_yaml
-    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml('"yes"'))]);
-    expect(r.code).not.toBe(0);
-    const err = parseEnvelope(r.output).error as Record<string, unknown>;
-    expect(err.code).toBe("bad_yaml");
-    expect(
-      (err.details as string[]).some((d) => d.includes("queue_jump")),
     ).toBe(true);
     expect(noEpicsOrTasksLanded()).toBe(true);
   });

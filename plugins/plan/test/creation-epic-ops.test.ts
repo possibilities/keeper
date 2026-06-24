@@ -1,20 +1,19 @@
 // Engine-agnostic conformance spec for the epic-graph + task-attribute mutating
 // verbs — translated from tests/test_epic_add_dep.py, tests/test_epic_add_deps.py,
-// tests/test_epic_close.py, tests/test_run_epic_queue_jump.py,
-// tests/test_task_set_tier.py, and tests/test_set_primary_repo_warning.py. Every
-// node is mapped by a source-comment (translated | cited bun unit | drop-with-
-// reason).
+// tests/test_epic_close.py, tests/test_task_set_tier.py, and
+// tests/test_set_primary_repo_warning.py. Every node is mapped by a
+// source-comment (translated | cited bun unit | drop-with-reason).
 //
 // epic add-dep / add-deps: cycle rejection + rollback, per-edge status results
 // (WIRED / ALREADY_PRESENT / SKIPPED_*), assert-all-no-partial-write, bare-fn-N
 // normalization + the fn-1-vs-fn-10 prefix trap. epic close: closer_done_at-only
-// stamp, the removed --no-audit-required flag, op=close envelope. queue-jump +
-// set-tier core behavior is already pinned in verbs-restamp.test.ts — here only
-// the error/validation/envelope nodes those files add are translated, the rest
+// stamp, the removed --no-audit-required flag, op=close envelope. set-tier core
+// behavior is already pinned in verbs-restamp.test.ts — here only the
+// error/validation/envelope nodes those files add are translated, the rest
 // cited. set-primary-repo / set-touched-repos: the non-blocking warning contract
 // (envelope.warnings + WARN: on stderr, write still lands, exit 0).
 //
-// Graph + close + queue-jump + set-tier run on the withProject handle (real git
+// Graph + close + set-tier run on the withProject handle (real git
 // + planctl init) so the auto-commit is exercised honestly; the set-primary-repo
 // / set-touched-repos warning tests run on a git-FREE planctl project (mirroring
 // the Python _create_project, which never `git init`s) so the non-blocking
@@ -398,65 +397,6 @@ describe("epic close", () => {
     expect(inv.op).toBe("close");
     expect(inv.target).toBe(epicId);
   });
-});
-
-// ---------------------------------------------------------------------------
-// epic queue-jump — false→true + already-true short-circuit are pinned in
-// verbs-restamp.test.ts (test_queue_jump_sets_flag_and_commits /
-// test_queue_jump_short_circuit_when_already_true). Here the error path + the
-// VALIDATION_RESTAMP_VERBS membership + the richer envelope assertions.
-// ---------------------------------------------------------------------------
-
-describe("epic queue-jump (errors + envelope)", () => {
-  test("false→true sets the flag + envelope carries queue_jump:true", () => {
-    // test_run_epic_queue_jump.py::test_queue_jump_false_to_true_sets_flag_and_envelope
-    const epicId = createEpic("Jumpable epic");
-    expect(readEpic(epicId).queue_jump).not.toBe(true);
-
-    const r = run(["epic", "queue-jump", epicId]);
-    expect(r.code).toBe(0);
-    const payload = firstJsonPayload(r.output);
-    expect(payload.epic_id).toBe(epicId);
-    expect(payload.short_circuited).toBe(false);
-    expect(readEpic(epicId).queue_jump).toBe(true);
-
-    const inv = (payload.plan_invocation ?? {}) as Record<string, unknown>;
-    expect(inv.op).toBe("queue-jump");
-    expect(inv.target).toBe(epicId);
-    expect(inv.queue_jump).toBe(true);
-  });
-
-  test("already-true short-circuits read-only: no rewrite, null subject/files", () => {
-    // test_run_epic_queue_jump.py::test_queue_jump_already_true_short_circuits_readonly
-    const epicId = createEpic("Jumpable epic");
-    expect(run(["epic", "queue-jump", epicId]).code).toBe(0);
-    const first = readEpic(epicId);
-    expect(first.queue_jump).toBe(true);
-
-    const r = run(["epic", "queue-jump", epicId]);
-    expect(r.code).toBe(0);
-    const payload = firstJsonPayload(r.output);
-    expect(payload.short_circuited).toBe(true);
-    expect(readEpic(epicId)).toStrictEqual(first);
-
-    const inv = (payload.plan_invocation ?? {}) as Record<string, unknown>;
-    expect(inv.op).toBe("queue-jump");
-    expect(inv.subject).toBeNull();
-    expect(inv.files).toBeNull();
-  });
-
-  test("missing epic errors", () => {
-    // test_run_epic_queue_jump.py::test_queue_jump_missing_epic_errors
-    const r = run(["epic", "queue-jump", "fn-9999-no-epic"]);
-    expect(r.code).not.toBe(0);
-    const out = r.output.toLowerCase();
-    expect(out.includes("not found") || out.includes("fn-9999")).toBe(true);
-  });
-
-  // test_queue_jump_not_in_validation_restamp_verbs — CITED: the
-  // VALIDATION_RESTAMP_VERBS membership (queue-jump absent) is pinned by
-  // verbs-restamp.test.ts's queue-jump-leaves-marker assertion; the Python
-  // node imports planctl.validation_restamp in-process (python_only surface).
 });
 
 // ---------------------------------------------------------------------------

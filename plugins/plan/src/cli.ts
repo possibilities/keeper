@@ -35,10 +35,7 @@ import {
   runEpicSetPrimaryRepo,
   runEpicSetTouchedRepos,
 } from "./verbs/epic_set_repos.ts";
-import {
-  runEpicInvalidate,
-  runEpicQueueJump,
-} from "./verbs/epic_short_circuit.ts";
+import { runEpicInvalidate } from "./verbs/epic_short_circuit.ts";
 import { runEpics } from "./verbs/epics.ts";
 import { runFindTaskCommit } from "./verbs/find_task_commit.ts";
 import { runFollowupSubmit } from "./verbs/followup_submit.ts";
@@ -376,15 +373,6 @@ const EPIC_GROUP: GroupSpec = {
       run: (rest, format) => {
         const [epicId] = leafPositionals(rest, new Set());
         runEpicInvalidate({ epicId: epicId ?? "", format });
-      },
-    },
-    {
-      name: "queue-jump",
-      shortHelp:
-        "Flip queue_jump=true so the epic sorts to the front of the board (/plan:next).",
-      run: (rest, format) => {
-        const [epicId] = leafPositionals(rest, new Set());
-        runEpicQueueJump({ epicId: epicId ?? "", format });
       },
     },
     {

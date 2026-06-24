@@ -2,7 +2,7 @@
 //
 // Field order is the wire contract and must match Python exactly:
 //   files, op, target, subject, touched_path_files, repo_root, state_repo
-//   (mutating adds queue_jump, session_id after state_repo).
+//   (mutating adds session_id after state_repo).
 //
 // buildPlanInvocationReadonly: read-only verbs touch nothing, so files/subject
 // are null and touched_path_files is empty; repo_root === state_repo.
@@ -10,7 +10,7 @@
 // buildPlanInvocation (mutating): session id fail-CLOSED (throws when
 // CLAUDE_CODE_SESSION_ID is absent); files = the sorted intersection of the
 // session's touched-paths log with git's dirty data-dir set; subject from
-// buildSubject; queue_jump + session_id ride after state_repo.
+// buildSubject; session_id rides after state_repo.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -53,7 +53,6 @@ export interface MutatingInvocation {
   touched_path_files: string[];
   repo_root: string;
   state_repo: string;
-  queue_jump: boolean;
   session_id: string;
 }
 
@@ -74,10 +73,9 @@ export function buildPlanInvocation(
   opts: {
     repoRoot: string;
     primaryRepo?: string | null;
-    queueJump?: boolean;
   },
 ): MutatingInvocation {
-  const { repoRoot, primaryRepo = null, queueJump = false } = opts;
+  const { repoRoot, primaryRepo = null } = opts;
   const dataDir = resolveDataDirOrDefault(repoRoot);
 
   // Session id — CLAUDE_CODE_SESSION_ID is the sole source. Fail-closed on
@@ -113,7 +111,6 @@ export function buildPlanInvocation(
     touched_path_files: touchedPathFiles,
     repo_root: repoRoot,
     state_repo: stateRepo,
-    queue_jump: queueJump,
     session_id: sessionId,
   };
 }

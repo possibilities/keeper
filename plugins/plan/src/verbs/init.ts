@@ -145,7 +145,6 @@ export function runInit(_args: InitArgs): void {
       touched_path_files: [] as string[],
       repo_root: projectRoot,
       state_repo: projectRoot,
-      queue_jump: false,
     };
     // Runs the auto-commit, prints the structured commit_failed envelope + exits
     // 1 on a commit failure, and embeds the literal invocation on success.

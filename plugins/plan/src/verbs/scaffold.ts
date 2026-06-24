@@ -306,14 +306,6 @@ export function validateScaffoldYaml(
     errors.push("epic: `spec` must be a string (use a `|` block scalar)");
   }
 
-  let epicQueueJump = "queue_jump" in epic ? epic.queue_jump : false;
-  if (typeof epicQueueJump !== "boolean") {
-    errors.push(
-      "epic: `queue_jump` must be a boolean (true|false) when present",
-    );
-    epicQueueJump = false;
-  }
-
   const epicDepErrors: string[] = [];
   let dependsOnEpics: string[] = [];
   const dependsOnRaw = "depends_on_epics" in epic ? epic.depends_on_epics : [];
@@ -638,14 +630,6 @@ export function runScaffold(args: ScaffoldArgs): number {
   // Dormant-seam pass-through: snippets/bundles persist verbatim, unvalidated.
   const epicSnippets = "snippets" in epic ? epic.snippets : [];
   const epicBundles = "bundles" in epic ? epic.bundles : [];
-
-  let epicQueueJump = "queue_jump" in epic ? epic.queue_jump : false;
-  if (typeof epicQueueJump !== "boolean") {
-    errors.push(
-      "epic: `queue_jump` must be a boolean (true|false) when present",
-    );
-    epicQueueJump = false;
-  }
 
   // --- Epic-dep validation (type / id-shape / dup; existence deferred) ----
   const epicDepErrors: string[] = [];
@@ -1051,7 +1035,6 @@ export function runScaffold(args: ScaffoldArgs): number {
       touched_repos: touchedRepos,
       snippets: toArray(epicSnippets),
       bundles: toArray(epicBundles),
-      queue_jump: epicQueueJump,
       last_validated_at: null,
       created_at: now,
       updated_at: now,
@@ -1232,7 +1215,6 @@ export function runScaffold(args: ScaffoldArgs): number {
       target: epicId,
       repoRoot: ctx.projectPath,
       primaryRepo,
-      queueJump: epicQueueJump as boolean,
     },
   );
   return 0;

@@ -106,7 +106,7 @@ Wait for human direction. Do not proceed past this gate without an explicit go-s
 
 ## Phase 4 — Scaffold a one-task YAML
 
-Build a single-task scaffold YAML. Omit `epic.queue_jump` — defaults to `false` and the epic sorts in normal `epic_number` order on the board.
+Build a single-task scaffold YAML. The epic sorts in normal `epic_number` order on the board.
 
 **Epic title** — 3–6 words, slugifies cleanly (lowercase letters, digits, hyphens). Derive from the subject.
 
@@ -173,7 +173,7 @@ The success envelope carries `epic_id` (the freshly-minted `fn-N-slug`) and `tas
 
 One-line summary citing the new epic id and the defer status:
 
-> *deferred `<epic_id>` (queue_jump=false): <epic title> — sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
+> *deferred `<epic_id>`: <epic title> — sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
 
 No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer never proactively offers to drive execution (no `/plan:work`, no surprise-launch). The operator skills stay reachable on explicit user intent, never from this flow on its own.
 
@@ -188,4 +188,4 @@ No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer 
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** the plan tooling tracks all tasks.
 - **No cross-epic deps.** Single-task scaffolds emit no `epic.depends_on_epics`. Use `/plan:plan` when the new work has a real upstream dep on another open epic.
-- **Defer is the default and only shape.** `epic.queue_jump` is omitted from the YAML and defaults to `false` — the epic sorts in normal `epic_number` order. To flip board priority on an *existing* epic, use `/plan:next`.
+- **Defer is the default and only shape.** The epic sorts in normal `epic_number` order on the board; there is no board-priority knob in plan state.

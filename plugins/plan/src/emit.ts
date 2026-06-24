@@ -92,13 +92,11 @@ export function emitMutating(
     detail?: string | null;
     repoRoot: string;
     primaryRepo?: string | null;
-    queueJump?: boolean;
   },
 ): void {
   const invocation = buildPlanInvocation(opts.verb, opts.target, opts.detail, {
     repoRoot: opts.repoRoot,
     primaryRepo: opts.primaryRepo,
-    queueJump: opts.queueJump,
   });
 
   try {

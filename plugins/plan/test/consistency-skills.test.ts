@@ -156,12 +156,6 @@ interface BareVerbSkill {
 
 const BARE_VERB_SKILLS: BareVerbSkill[] = [
   {
-    label: "next",
-    path: join(REPO, "skills", "next", "SKILL.md"),
-    name: "next",
-    mutatingVerb: "keeper plan epic queue-jump",
-  },
-  {
     label: "defer",
     path: join(REPO, "skills", "defer", "SKILL.md"),
     name: "defer",
@@ -206,31 +200,16 @@ for (const skill of BARE_VERB_SKILLS) {
 }
 
 // ---------------------------------------------------------------------------
-// defer-specific: omits queue_jump: true (board priority lives in /plan:next)
+// defer-specific: carries no board-priority knob
 // ---------------------------------------------------------------------------
 
 describe("defer skill board-priority discipline", () => {
-  test("omits the `queue_jump: true` literal entirely", () => {
+  test("carries no `queue_jump` literal", () => {
     const text = readFileSync(
       join(REPO, "skills", "defer", "SKILL.md"),
       "utf-8",
     );
-    expect(text).not.toContain("queue_jump: true");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// next-specific: the epic queue-jump verb path surfaces from extraction
-// ---------------------------------------------------------------------------
-
-describe("next skill verb extraction", () => {
-  test("`epic queue-jump` surfaces from the fenced-bash extraction", () => {
-    const verbs = extractPlanctlVerbs(
-      readFileSync(join(REPO, "skills", "next", "SKILL.md"), "utf-8"),
-    );
-    expect(verbs.some((v) => v[0] === "epic" && v[1] === "queue-jump")).toBe(
-      true,
-    );
+    expect(text).not.toContain("queue_jump");
   });
 });
 

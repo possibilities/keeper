@@ -1,11 +1,8 @@
-// epic invalidate / queue-jump — the port of run_epic_invalidate.py and
-// run_epic_queue_jump.py. Both implement the short-circuit pattern: when the
-// epic is already in the target state (last_validated_at already null /
-// queue_jump already true), emit a readonly envelope and write NOTHING (zero
-// commits). Otherwise write the field + bump updated_at and route through the
-// mutating seam so one chore(plan): <verb> <epic> commit lands. queue-jump
-// rides queue_jump=true on its invocation so keeper folds the priority signal.
-// Neither is a restamp member.
+// epic invalidate — the short-circuit pattern: when the epic is already in the
+// target state (last_validated_at already null), emit a readonly envelope and
+// write NOTHING (zero commits). Otherwise null the marker + bump updated_at and
+// route through the mutating seam so one chore(plan): <verb> <epic> commit
+// lands. Not a restamp member.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -59,46 +56,6 @@ export function runEpicInvalidate(args: ShortCircuitArgs): void {
       target: epicId,
       repoRoot: ctx.projectPath,
       primaryRepo,
-    },
-  );
-}
-
-export function runEpicQueueJump(args: ShortCircuitArgs): void {
-  const { epicId, format } = args;
-
-  const ctx = resolveProject(format);
-  const epicPath = join(ctx.dataDir, "epics", `${epicId}.json`);
-  if (!existsSync(epicPath)) {
-    emitError(`Epic not found: ${epicId}`, format);
-  }
-
-  const epicDef = loadJson(epicPath);
-  const primaryRepo =
-    (epicDef.primary_repo as string | null | undefined) ?? null;
-
-  // Short-circuit: priority already set -> readonly envelope only, no write.
-  if (epicDef.queue_jump === true) {
-    const pc = buildPlanInvocationReadonly(
-      "queue-jump",
-      ctx.projectPath,
-      epicId,
-    );
-    emitReadonly({ epic_id: epicId, short_circuited: true }, pc);
-    return;
-  }
-
-  epicDef.queue_jump = true;
-  epicDef.updated_at = nowIso();
-  atomicWriteJson(epicPath, epicDef, ctx.dataDir);
-
-  emitMutating(
-    { epic_id: epicId, short_circuited: false },
-    {
-      verb: "queue-jump",
-      target: epicId,
-      repoRoot: ctx.projectPath,
-      primaryRepo,
-      queueJump: true,
     },
   );
 }

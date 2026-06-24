@@ -40,7 +40,6 @@ describe("epic group help", () => {
       "add-dep",
       "add-deps",
       "invalidate",
-      "queue-jump",
       "set-touched-repos",
     ]) {
       expect(r.stdout).toMatch(new RegExp(`^  ${sub}\\b`, "m"));

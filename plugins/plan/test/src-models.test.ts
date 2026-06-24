@@ -44,7 +44,7 @@ describe("normalizeEpic", () => {
     const e = normalizeEpic({ id: "fn-1-x", draft: true });
     expect(e.branch_name).toBe("main");
     expect("draft" in e).toBe(false);
-    expect(e.queue_jump).toBe(false);
+    expect("queue_jump" in e).toBe(false);
     expect(e.last_validated_at).toBeNull();
   });
 });
