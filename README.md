@@ -2390,6 +2390,12 @@ session binds its `(plan_verb, plan_ref)` pair — on the spawn-INSERT or on a
 NULL->non-NULL heal of a fork-seed row, but never on a genuine resume whose
 pair was already bound (that must not clear a re-pending dispatch); a
 `DispatchExpired` synthetic event DELETEs the key when the TTL sweep fires.
+The SAME discharge-on-bind fold that DELETEs the pending row SEEDS the bound
+worker's `state='stopped'`, `plan_verb`-bearing `jobs` row, which readiness reads
+as the `bound-pending` occupancy continuation (fn-924) — so the per-epic/per-root
+mutex hold passes unbroken from `dispatch-pending` (pre-bind) to `bound-pending`
+(bound, not-yet-active) to a `running` verdict (first activity), closing the
+launch-window leak where a same-root sibling co-dispatched during the discharge.
 `DispatchFailed` also DELETEs the pending row so a failed dispatch does not
 block the failure as permanently occupied. As of fn-870, `pending_dispatches`
 is an EPHEMERAL projection (`EPHEMERAL_PROJECTIONS`): it is folded by the boot
@@ -2765,14 +2771,28 @@ NOT a standalone `reconcile()` suppression arm outside the mutex: a launched
 but not-yet-SessionStart-bound worker has no `jobs` row, so readiness reads
 the pending rows (via the shared `projectPendingDispatches` helper, the same
 input the board's `subscribeReadiness` consumes — no board/autopilot
-divergence) and stamps `dispatch-pending` at a late per-row rank. The verdict
-self-clears when the worker's `SessionStart` binds its `(plan_verb, plan_ref)`
-pair and discharges the pending row — including the fold-order case where the
-worker's `UserPromptSubmit` folded first and minted a NULL-pair fork-seed row,
-which COALESCE-heals on the SessionStart (so the slot never strands). It holds
-BOTH the per-epic and per-root mutex (`isLiveWorkOccupant` → auto-covers
-`isRootOccupant`), demoting a same-epic OR same-root ready sibling. A pending
-row matching no snapshot row occupies its root via its own `dir` column
+divergence) and stamps `dispatch-pending` at a late per-row rank. When the
+worker's `SessionStart` binds its `(plan_verb, plan_ref)` pair it discharges the
+pending row — including the fold-order case where the worker's
+`UserPromptSubmit` folded first and minted a NULL-pair fork-seed row, which
+COALESCE-heals on the SessionStart (so the slot never strands). **fn-924 closes
+the launch-window leak across that discharge:** the bind drops the
+`dispatch-pending` signal, but the worker's `running` hold only engages at FIRST
+ACTIVITY (its first `UserPromptSubmit` flips the `jobs` row `stopped → working`),
+so a same-root sibling used to slip through the ~sub-second gap and race the one
+shared working tree (pinned 2026-06-23 via event-replay). The SAME atomic
+SessionStart fold that discharges the pending row SEEDS a `state='stopped'`,
+`plan_verb`-bearing `jobs` row, so a read-time `bound-pending` per-row verdict
+(ranked immediately after `dispatch-pending`) takes over the hold the instant
+`dispatch-pending` vanishes — every snapshot shows EITHER `dispatch-pending` OR
+`bound-pending` (or, once active, a `running` verdict), never a gap. The
+disambiguator against over-holding a stopped-after-working / dead worker is
+`jobs.active_since` (carried free on the embedded element, JSON-cell-only): it is
+NULL only until the first `stopped → working` edge, so `bound-pending` fires
+exclusively for a never-yet-active bound worker. Both `dispatch-pending` and
+`bound-pending` hold the per-epic AND per-root mutex (`isLiveWorkOccupant` →
+auto-covers `isRootOccupant`), demoting a same-epic OR same-root ready sibling. A
+pending row matching no snapshot row occupies its root via its own `dir` column
 (root-fallback). The pre-existing same-`(verb, id)` `liveTabKeys.has(key)`
 suppression arm (sitting alongside the `isOccupyingJob` arm) is PRESERVED for
 same-key re-dispatch — orthogonal to the cross-sibling demotion the occupant

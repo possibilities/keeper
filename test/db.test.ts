@@ -2156,9 +2156,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `'planctl'`, fn-889; v83 adds the `jobs.backend_exec_generation_id` +
   // `backend_exec_birth_session_id` columns + the `tmux_projection_state`
   // live-only control singleton + backfills birth_session from the frozen launch
-  // session, fn-907); the v62→v63 epics-shape migration this test exercises
-  // is unchanged.
-  expect(SCHEMA_VERSION).toBe(83);
+  // session, fn-907; v84 carries the existing `jobs.active_since` fact on the
+  // embedded `epics.jobs` element — a JSON-cell-only add, fix-forward (no column,
+  // no rewind, absent ≡ null), so readiness can hold a freshly-bound `stopped`
+  // worker's root across the bind → first-activity handoff, fn-924); the
+  // v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(84);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

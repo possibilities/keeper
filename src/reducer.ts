@@ -4846,6 +4846,16 @@ interface EmbeddedJobElement {
   // Strict-mystery semantic: files with no attribution from any session.
   git_orphan_count: number;
   /**
+   * Mirror of `jobs.active_since` (`null` until the first `stopped → working`
+   * transition, then frozen). A pure jobs-row fact — lifted fresh by
+   * {@link buildEmbeddedJob} each re-sync, NO clobber-guard carry needed.
+   * Readiness reads it to keep a freshly-bound `stopped` worker holding its
+   * root across the bind → first-activity handoff without over-holding a
+   * stopped-after-working one. Optional + absent ≡ `null` for a pre-v90 stored
+   * element.
+   */
+  active_since?: number | null;
+  /**
    * Per-(task, job) task→committing-session link, stamped by {@link foldCommit}
    * on the embedded element whose `job_id == committer_session_id`. `null` on
    * every job that hasn't committed for this task and on every older stored
@@ -4903,6 +4913,11 @@ interface JobsRowForSync {
   git_unattributed_to_live_count: number;
   // Schema v31: new strict-mystery column.
   git_orphan_count: number;
+  // `null` until the first `stopped → working` transition (stamped once, then
+  // frozen). Lifted onto the embedded element so readiness can tell a
+  // freshly-bound `stopped` worker (never active) from a stopped-after-working
+  // one. Pure function of event order — re-fold byte-stable.
+  active_since: number | null;
 }
 
 /**
@@ -4978,6 +4993,7 @@ function buildEmbeddedJob(
     git_dirty_count: row.git_dirty_count,
     git_unattributed_to_live_count: row.git_unattributed_to_live_count,
     git_orphan_count: row.git_orphan_count,
+    active_since: row.active_since,
     last_commit_for_task_at: lastCommitForTaskAt,
     has_live_worker_monitor: hasLiveWorkerMonitor,
   };
@@ -5241,7 +5257,7 @@ function syncIfPlanRef(
   const _siprT0 = _syncIfPlanRefAccumMs != null ? performance.now() : 0;
   const row = db
     .query(
-      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count, active_since FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {

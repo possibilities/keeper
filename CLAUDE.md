@@ -438,7 +438,17 @@ at K=3 it mints a sticky `dispatch_failures(reason='never-bound')` the existing
 `failedKeys` arm suppresses. A bind (discharge-on-bind) and a `DispatchCleared`
 (`keeper autopilot retry`) each reset it — bump/reset come PURELY from the event
 stream (never wall-clock), and `dispatch_never_bound` joins the re-fold wipe list,
-so re-fold stays byte-identical. Do NOT carry the count on the `pending_dispatches`
+so re-fold stays byte-identical. **The per-root mutex hold is continuous across
+the discharge (fn-924):** the launch-window occupancy passes unbroken from
+`dispatch-pending` (open `pending_dispatches` row, pre-bind) to `bound-pending`
+(the bound worker's seeded `state='stopped'`, `plan_verb`-bearing `jobs` row,
+gated on `active_since IS NULL` so a stopped-after-working/dead worker doesn't
+over-hold) to a `running` verdict (first activity). The SAME atomic SessionStart
+fold both DELETEs the pending row AND seeds the stopped jobs row, so every
+snapshot shows exactly one occupancy signal — never a gap a same-root sibling
+could co-dispatch into. `bound-pending` is a READ-TIME readiness verdict (the
+`active_since` mirror rides FREE on the embedded `epics.jobs` element, JSON-cell-
+only — no fold change, no version-fence), so re-fold determinism is untouched. Do NOT carry the count on the `pending_dispatches`
 row: that row is DELETEd on expire to release the re-dispatch slot, AND
 `pending_dispatches` is EPHEMERAL (boot-truncated, never replayed — see the
 projection-class taxonomy), so a counter on it would not survive boot. The TTL

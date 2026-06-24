@@ -166,15 +166,17 @@ export function classifyTargetId(id: string): TargetKind | null {
  * Every other `blocked` kind — including `epic-not-validated`,
  * `git-uncommitted`, `git-orphans`, `dep-on-task`, `dep-on-epic`,
  * `dep-on-epic-dangling`, `job-pending`, `job-rejected`,
- * `dispatch-pending`, `unknown` — is NOT workable. `running` verdicts are
- * never workable (the row is already in motion). `completed` is the
- * terminal positive for `complete` checks and is also not workable (it's
+ * `dispatch-pending`, `bound-pending`, `unknown` — is NOT workable. `running`
+ * verdicts are never workable (the row is already in motion). `completed` is
+ * the terminal positive for `complete` checks and is also not workable (it's
  * done, not "available to start").
  *
- * fn-721 note: `dispatch-pending` on the DISPATCHED row is NOT workable —
- * a worker has already been launched against it (the row is effectively in
- * motion, just not yet SessionStart-bound), so it self-resolves and is
- * `waiting`, NOT actionable. Its DEMOTED siblings, however, render
+ * fn-721 / fn-924 note: `dispatch-pending` AND its post-bind twin
+ * `bound-pending` on the DISPATCHED row are NOT workable — a worker has already
+ * been launched against it (the row is effectively in motion: `dispatch-pending`
+ * before the SessionStart bind, `bound-pending` after the bind but before first
+ * activity), so each self-resolves and is `waiting`, NOT actionable. Its DEMOTED
+ * siblings, however, render
  * `single-task-per-*` (the occupant claimed their mutex slot), so they
  * KEEP their workable status — the await semantics for "held back only by
  * the concurrency mutex" are unchanged.

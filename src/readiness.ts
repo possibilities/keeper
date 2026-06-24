@@ -24,6 +24,9 @@
  *   9.5. epic-no-tasks            — close-row only: the epic has ZERO tasks
  *  10.   dep-on-task-synth-close  — close-row: any non-completed task
  *  10.5. dispatch-pending         — launched-but-unbound worker holds the slot
+ * 10.55. bound-pending            — BOUND-but-not-yet-active worker holds the slot
+ *                                   (stopped + plan_verb + active_since IS NULL;
+ *                                   the post-bind half of dispatch-pending)
  *  10.6. runtime-blocked          — task: keeper plan `runtime_status==="blocked"`
  *                                   (last per-row predicate; converts only the
  *                                   erroneous `ready`, never holds a mutex)
@@ -124,6 +127,20 @@ export function resolveEpicDep(
  *                                        it occupies both mutexes via `isLiveWorkOccupant`.
  *                                        Non-dispatchable and self-resolving (discharges on SessionStart
  *                                        bind / DispatchFailed / DispatchExpired). Payload-less.
+ * - `bound-pending`                    — a worker BOUND (its SessionStart folded a `jobs` row at
+ *                                        `state='stopped'` carrying a real `plan_verb`) but not yet ACTIVE
+ *                                        (`active_since IS NULL` — never transitioned into `working`). The
+ *                                        SAME atomic SessionStart fold that mints this row DELETEs the
+ *                                        `pending_dispatches` row, so every snapshot shows EITHER
+ *                                        `dispatch-pending` OR `bound-pending` — never neither — closing
+ *                                        the launch → bind → first-activity occupancy gap. Ranked
+ *                                        immediately after `dispatch-pending` and before the post-pass
+ *                                        mutexes so it occupies both via `isLiveWorkOccupant`. The
+ *                                        `active_since IS NULL` gate disambiguates a freshly-bound worker
+ *                                        (occupy) from a stopped-after-working / dead one (do NOT
+ *                                        over-hold). Non-dispatchable, self-resolving (the first
+ *                                        UserPromptSubmit flips state → `working` → pred-5 takes over).
+ *                                        Payload-less.
  * - `runtime-blocked`                  — keeper plan stamped the task `runtime_status="blocked"` (e.g. a
  *                                        killed worker). Without this gate the task still computes `ready`
  *                                        (its `worker_phase` stays `open`) and the reconciler dispatches a
@@ -148,6 +165,7 @@ export type BlockReason =
   | { kind: "single-task-per-root" }
   | { kind: "epic-no-tasks" }
   | { kind: "dispatch-pending" }
+  | { kind: "bound-pending" }
   | { kind: "runtime-blocked" }
   | { kind: "unknown" };
 
@@ -812,6 +830,22 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "dispatch-pending" } };
   }
 
+  // 10.55. bound-pending — the post-bind continuation of dispatch-pending. The
+  // SessionStart fold that binds a worker SEEDS a `state='stopped'`,
+  // `plan_verb`-bearing `jobs` row AND DELETEs the `pending_dispatches` row in
+  // ONE atomic transaction, so the instant 10.5 stops firing THIS predicate
+  // takes over — closing the launch → bind → first-activity occupancy gap with
+  // no fold change and no version-fence. The `active_since IS NULL` gate (see
+  // `anyEmbeddedJobBoundPending`) keeps a stopped-after-working / dead worker
+  // from over-holding the root. Ranked AFTER dispatch-pending (so a still-open
+  // pending row's verdict wins when both somehow coexist) and BEFORE the
+  // post-pass mutexes, so pass-1 of both mutexes sees it as an occupant via
+  // `isLiveWorkOccupant`. Non-dispatchable, self-resolving (the first
+  // UserPromptSubmit flips state → `working`, and pred-5 takes the hold).
+  if (anyEmbeddedJobBoundPending(task.jobs)) {
+    return { tag: "blocked", reason: { kind: "bound-pending" } };
+  }
+
   // 10.6. runtime-blocked — keeper plan stamped `runtime_status="blocked"` (e.g. a
   // killed worker). Placed LAST, immediately before the `ready` fall-through, is
   // load-bearing: terminal-completed (1), every running verdict (3/5/6/6.6), and
@@ -1012,6 +1046,18 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "dispatch-pending" } };
   }
 
+  // 10.55. bound-pending — close-row twin of the task-path predicate. A
+  // `close::<epic_id>` closer that BOUND (its SessionStart seeded a
+  // `state='stopped'`, `plan_verb='close'` epic-level `jobs` row and DELETEd the
+  // `pending_dispatches` row in the SAME atomic fold) but is not yet ACTIVE
+  // (`active_since IS NULL`) holds BOTH mutexes through the bind →
+  // first-activity window. Same `active_since` over-hold guard as the task path,
+  // ranked AFTER dispatch-pending and BEFORE the post-pass mutexes so it
+  // occupies via `isLiveWorkOccupant`.
+  if (anyEmbeddedJobBoundPending(epic.jobs)) {
+    return { tag: "blocked", reason: { kind: "bound-pending" } };
+  }
+
   // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
   // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
@@ -1048,11 +1094,21 @@ function evaluateCloseRow(
 function isLiveWorkOccupant(verdict: Verdict): boolean {
   return (
     verdict.tag === "running" ||
-    // The sole blocked-but-occupying signal: a launched-but-not-yet-bound
-    // worker holding the mutex through the launch → SessionStart blind window.
+    // The TWO blocked-but-occupying signals span the unbroken occupancy hold
+    // from dispatch-decision through first-confirmed-activity:
+    //   - `dispatch-pending`: a launched-but-not-yet-bound worker holding the
+    //     mutex through the launch → SessionStart blind window (open
+    //     `pending_dispatches` row, no `jobs` row yet).
+    //   - `bound-pending`: a BOUND-but-not-yet-active worker (its SessionStart
+    //     folded a `state='stopped'`, `plan_verb`-bearing `jobs` row and DELETEd
+    //     the `pending_dispatches` row in the SAME atomic fold). Without it the
+    //     root frees the instant the worker binds — the launch-window leak where
+    //     a same-root sibling co-dispatches before first activity flips the row
+    //     to `working`.
+    // Every snapshot shows EITHER kind or a `running` verdict — never a gap.
     (verdict.tag === "blocked" &&
-      // open `pending_dispatches` row — the slot is taken before a `jobs` row.
-      verdict.reason.kind === "dispatch-pending")
+      (verdict.reason.kind === "dispatch-pending" ||
+        verdict.reason.kind === "bound-pending"))
   );
 }
 
@@ -1430,6 +1486,43 @@ function anyEmbeddedJobWorking(
   }
   for (const job of embedded) {
     if (job.state === "working") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Predicate 10.55 helper — a FRESHLY-BOUND but not-yet-active worker. True iff
+ * an embedded job is `state='stopped'`, carries a real `plan_verb` (the
+ * spawn-name dispatch correlator the `(plan|work|close)` whitelist sets), AND
+ * has never been active (`active_since` is null/absent — the reducer stamps it
+ * once on the first `stopped → working` edge and freezes it).
+ *
+ * This is the post-bind half of the unbroken occupancy hold: the SessionStart
+ * fold that mints this row DELETEs the worker's `pending_dispatches` row in the
+ * SAME atomic transaction, so the moment the `dispatch-pending` signal vanishes,
+ * THIS one appears — no gap. The `active_since` gate is the disambiguator: a
+ * worker that ran then stopped (or was killed) has a non-null `active_since`, so
+ * it does NOT over-hold the root; only a never-yet-active bound worker occupies.
+ *
+ * Distinct from `anyEmbeddedJobWorking` (pred-5) so pred-5's verdict semantics
+ * are untouched — a `stopped` job is never `working`, so the two never overlap.
+ */
+function anyEmbeddedJobBoundPending(
+  embedded:
+    | { state: string; plan_verb: string; active_since?: number | null }[]
+    | undefined,
+): boolean {
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    if (
+      job.state === "stopped" &&
+      job.plan_verb !== "" &&
+      job.active_since == null
+    ) {
       return true;
     }
   }
@@ -1861,6 +1954,8 @@ function formatReasonShort(reason: BlockReason): string {
       return "epic-no-tasks";
     case "dispatch-pending":
       return "dispatch-pending";
+    case "bound-pending":
+      return "bound-pending";
     case "runtime-blocked":
       return "runtime-blocked";
     case "unknown":

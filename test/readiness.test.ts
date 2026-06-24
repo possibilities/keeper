@@ -130,6 +130,13 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,
     git_orphan_count: 0,
+    // fn-924: default a NON-null `active_since` so the default fixture models a
+    // job that HAS been active (the default `state: "working"` always carries
+    // it set, and a stopped-after-working job does too). Only the freshly-bound
+    // `bound-pending` cases override it to `null` to model "bound but never yet
+    // active". Keeps every pre-fn-924 `state: "stopped"` fixture inert (it does
+    // NOT trigger the `bound-pending` occupancy predicate).
+    active_since: 1,
     // fn-719 (task 2): the task-1 live-worker-monitor occupancy fact.
     // Default `false` (no backgrounded worker suite) so existing fixtures
     // keep their pre-fn-719 verdicts; the monitor-occupancy tests below
@@ -246,6 +253,15 @@ test("fn-756: the approval-pending occupants (job-pending / git verdicts) NO LON
 
 test("isRootOccupant: a launch-window dispatch-pending row occupies (fn-721)", () => {
   expect(isRootOccupant(blocked({ kind: "dispatch-pending" }))).toBe(true);
+});
+
+test("isRootOccupant: a bound-but-not-yet-active worker occupies (fn-924)", () => {
+  // The post-bind continuation of dispatch-pending — a worker whose SessionStart
+  // folded a `state='stopped'`, `plan_verb`-bearing jobs row (and DELETEd the
+  // pending_dispatches row in the SAME fold) but hasn't yet flipped to working.
+  // It MUST hold the root across the bind → first-activity handoff so a same-root
+  // sibling can't slip through the gap (the 2026-06-23 launch-window leak).
+  expect(isRootOccupant(blocked({ kind: "bound-pending" }))).toBe(true);
 });
 
 test("isRootOccupant: non-occupying verdicts do NOT claim the root", () => {
@@ -567,6 +583,177 @@ test("fn-719: live worker monitor in epic A occupies the root, demotes a same-ro
   );
   expect(snap.perTask.get(b1.task_id)).toEqual(
     blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-924: bound-pending — the launch-window occupancy gap. A worker's per-root
+// hold is dropped the instant it BINDS (its SessionStart DELETEs the
+// pending_dispatches row that fed `dispatch-pending`), but the `running` hold
+// only engages at FIRST ACTIVITY (state flips → working). The
+// `bound-pending` predicate spans that gap: a `state='stopped'`,
+// `plan_verb`-bearing job with `active_since IS NULL` (never yet active) holds
+// the root, and the `active_since` gate keeps a stopped-after-working / dead
+// worker from over-holding.
+// ---------------------------------------------------------------------------
+
+test("fn-924: a freshly-bound (stopped + plan_verb + active_since NULL) job → bound-pending", () => {
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        plan_verb: "work",
+        state: "stopped",
+        active_since: null,
+      }),
+    ],
+  });
+  const epic = makeEpic({ epic_id: "fn-1-foo", tasks: [t1] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    blocked({ kind: "bound-pending" }),
+  );
+});
+
+test("fn-924 over-hold guard: a stopped-AFTER-working job (active_since set) does NOT bound-pending — stays ready", () => {
+  // A worker that ran then stopped (or was killed) carries a non-null
+  // `active_since`, so it must NOT hold the root indefinitely. With no other
+  // occupancy signal it falls through to `ready`.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        plan_verb: "work",
+        state: "stopped",
+        active_since: 1700,
+      }),
+    ],
+  });
+  const epic = makeEpic({ epic_id: "fn-1-foo", tasks: [t1] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "ready" });
+});
+
+test("fn-924: a stopped job with NO plan_verb (not a dispatched worker) does NOT bound-pending", () => {
+  // A non-plan session (empty plan_verb) is not a dispatched worker, so it must
+  // not hold the root. Falls through to ready.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        plan_verb: "",
+        state: "stopped",
+        active_since: null,
+      }),
+    ],
+  });
+  const epic = makeEpic({ epic_id: "fn-1-foo", tasks: [t1] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "ready" });
+});
+
+test("fn-924 handoff window: a bound-but-stopped, plan_verb-bearing job occupies its root and demotes a same-root ready sibling (the leak)", () => {
+  // The pinned 2026-06-23 leak: fn-919.2 binds (state → stopped, pending_dispatches
+  // discharged) but hasn't hit first activity yet; fn-923.1 (SAME root) was about
+  // to co-dispatch. With bound-pending, T1 holds /repo and T2 is demoted to
+  // `single-task-per-root` — the gap is closed.
+  const a1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-a",
+        plan_verb: "work",
+        state: "stopped",
+        active_since: null,
+      }),
+    ],
+  });
+  const epicA = makeEpic({ epic_id: "fn-1-foo", tasks: [a1] });
+  const b1 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    // Same project_dir → same root.
+    project_dir: "/repo",
+    tasks: [b1],
+  });
+  const snap = run([epicA, epicB]);
+  expect(snap.perTask.get(a1.task_id)).toEqual(
+    blocked({ kind: "bound-pending" }),
+  );
+  expect(snap.perTask.get(b1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-924: bound-pending holds the root in ARMED two-pass too (eligible same-root sibling still demoted)", () => {
+  // The pass-1 occupancy seed is shared by the legacy single-pass (yolo) and the
+  // armed two-pass — a bound-pending occupant claims the root before pass-2 runs,
+  // so even an ELIGIBLE same-root task is demoted.
+  const a1 = makeTask({
+    task_id: "fn-1-foo.1",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-a",
+        plan_verb: "work",
+        state: "stopped",
+        active_since: null,
+      }),
+    ],
+  });
+  const epicA = makeEpic({ epic_id: "fn-1-foo", tasks: [a1] });
+  const b1 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [b1],
+  });
+  const perTask = new Map<string, Verdict>([
+    [a1.task_id, blocked({ kind: "bound-pending" })],
+    [b1.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>();
+  applySingleTaskPerRootMutex(
+    [epicA, epicB],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(),
+    // Armed mode: epic B is eligible — still demoted by the pass-1 occupant.
+    new Set(["fn-2-bar"]),
+  );
+  expect(perTask.get(a1.task_id)).toEqual(blocked({ kind: "bound-pending" }));
+  expect(perTask.get(b1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-924 close-row twin: a bound-but-stopped closer (epic.jobs plan_verb=close, active_since NULL) renders bound-pending", () => {
+  // A `close::<epic_id>` closer that BOUND but hasn't hit first activity. All
+  // tasks completed so the close row reads through to the late-rank predicates.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    status: "open",
+    tasks: [t1],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+        active_since: null,
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    blocked({ kind: "bound-pending" }),
   );
 });
 

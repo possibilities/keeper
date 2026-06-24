@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 83;
+export const SCHEMA_VERSION = 84;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -4754,6 +4754,20 @@ function migrate(db: Database): void {
             WHERE backend_exec_birth_session_id IS NULL`,
         );
       }
+
+      // v83→v84 (fn-924 task .1): carry the existing `jobs.active_since` fact on
+      // the embedded `epics.jobs` / `epics.tasks[].jobs[]` element. NO new column
+      // — like the v58→v59 `has_live_worker_monitor` add, it rides FREE inside
+      // the JSON cell, fix-forward (no rewind), with a safe absent ≡ `null`
+      // default. `buildEmbeddedJob` lifts it fresh on every job-tick re-sync, so
+      // live rows heal forward without a re-fold. Readiness reads it to keep a
+      // freshly-bound `stopped` worker holding its root across the bind →
+      // first-activity handoff (`bound-pending`) without over-holding a
+      // stopped-after-working one.
+      //
+      // Whitelist-only Python read — this bump MUST add 84 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

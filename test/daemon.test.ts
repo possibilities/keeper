@@ -2762,11 +2762,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // columns + the `tmux_projection_state` live-only control singleton, flipping
   // `backend_exec_session_id` + `window_index` to LIVE-ONLY, and backfilling the
   // birth session from the frozen launch env — NO cursor rewind, the two columns
-  // become boot-seeded/live so history is never re-folded for them). This pin
-  // tracks the LIVE schema version: the guard it provides is "an accidental
-  // reducer/schema change must surface as a failing whitelist + this pin", which
-  // still holds — bump both together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(83);
+  // become boot-seeded/live so history is never re-folded for them). And to 84
+  // via fn-924 task .1 (carrying the existing `jobs.active_since` fact on the
+  // embedded `epics.jobs` element — a JSON-cell-only add, fix-forward: no column,
+  // no rewind, absent ≡ null — so readiness's new `bound-pending` predicate holds
+  // a freshly-bound `stopped` worker's root across the bind → first-activity
+  // handoff). This pin tracks the LIVE schema version: the guard it provides is
+  // "an accidental reducer/schema change must surface as a failing whitelist +
+  // this pin", which still holds — bump both together when the schema genuinely
+  // moves.
+  expect(SCHEMA_VERSION).toBe(84);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

@@ -1615,6 +1615,126 @@ test("fn-721 reconcile: without the pending row the sibling is NOT demoted (cont
 });
 
 // ---------------------------------------------------------------------------
+// fn-924 — bound-pending: the post-bind launch-window occupant. A worker BOUND
+// (SessionStart folded a stopped + plan_verb jobs row, discharging the pending
+// row) but not yet ACTIVE holds its root across the bind → first-activity
+// handoff, so reconcile never co-dispatches a same-root sibling into the gap.
+// ---------------------------------------------------------------------------
+
+test("fn-924 reconcile: a bound-but-not-yet-active worker (stopped+plan_verb, active_since NULL) demotes a same-root ready sibling — no co-dispatch", () => {
+  // The pinned 2026-06-23 leak through the full reconcile path: epic A's task is
+  // bound (its pending row already discharged on SessionStart, so NO
+  // `pendingDispatches` entry) but its embedded job is still `stopped`,
+  // `active_since: null` — bound-pending. Epic B's same-root ready task must be
+  // demoted to `single-task-per-root`, so reconcile launches NOTHING for it.
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    sort_path: "fn-1-foo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        epic_id: "fn-1-foo",
+        jobs: [
+          {
+            job_id: "worker-a",
+            plan_verb: "work",
+            state: "stopped",
+            active_since: null,
+          } as unknown as EmbeddedJob,
+        ],
+      }),
+    ],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    sort_path: "fn-2-bar",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  const snap = makeSnapshot({ epics: [epicA, epicB], pendingDispatches: [] });
+  const decision = reconcile(snap, makeState(), 0);
+  // The bound worker's own row is non-dispatchable (bound-pending → no verb),
+  // and the same-root sibling is demoted — zero launches.
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-924 control: a stopped-AFTER-working worker (active_since set) does NOT over-hold — the root frees and a task on it launches", () => {
+  // Over-hold guard: epic A's worker ran then stopped (`active_since` set), so its
+  // open task is NOT bound-pending — it falls through to `ready` and the root is
+  // free. Proves the demotion in the test above is driven by bound-pending (the
+  // `active_since IS NULL` gate), not the bare presence of a stopped job: with
+  // `active_since` set the first-on-root task (epic A, sorts first) launches.
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    sort_path: "fn-1-foo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        epic_id: "fn-1-foo",
+        jobs: [
+          {
+            job_id: "worker-a",
+            plan_verb: "work",
+            state: "stopped",
+            active_since: 1700,
+          } as unknown as EmbeddedJob,
+        ],
+      }),
+    ],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    sort_path: "fn-2-bar",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  const snap = makeSnapshot({ epics: [epicA, epicB], pendingDispatches: [] });
+  const decision = reconcile(snap, makeState(), 0);
+  // Root NOT held by bound-pending → the first-on-root ready task launches.
+  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
+test("fn-924 cap: a bound-pending worker counts as ONE occupant (cap not double-counted, not starved)", () => {
+  // The cap counts `isRootOccupant` over perTask ∪ perCloseRow. A bound-pending
+  // worker is a real in-flight worker consuming exactly ONE slot — counted once,
+  // not double-counted (it is not also a pendingDispatches entry, since the row
+  // discharged on bind). With cap=2 and one bound-pending occupant in its own
+  // root, a ready task in a DISTINCT root still gets the remaining slot.
+  const boundEpic = makeEpic({
+    epic_id: "fn-1-a",
+    epic_number: 1,
+    project_dir: "/repo-a",
+    sort_path: "fn-1-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-a.1",
+        epic_id: "fn-1-a",
+        jobs: [
+          {
+            job_id: "worker-a",
+            plan_verb: "work",
+            state: "stopped",
+            active_since: null,
+          } as unknown as EmbeddedJob,
+        ],
+      }),
+    ],
+  });
+  const ready = readyEpic("fn-2-b", "/repo-b");
+  const snap = makeSnapshot({ epics: [boundEpic, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 2 }), 0);
+  // occupied = 1 (the bound-pending worker), budget = 1 → the distinct-root
+  // ready task launches.
+  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-2-b.1"]);
+});
+
+// ---------------------------------------------------------------------------
 // fn-725 — global max_concurrent_jobs budget gate
 // ---------------------------------------------------------------------------
 //
