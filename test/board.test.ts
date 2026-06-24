@@ -35,10 +35,12 @@ import {
   renderDeadLetterPill,
   renderEpicDepPills,
   renderJobLinkLines,
+  taskVerdictPill,
 } from "../cli/board";
 import {
   armedPill,
   epicHeaderLabel,
+  iconizePills,
   pill,
   pillOrEmpty,
   renderClosePills,
@@ -1027,6 +1029,55 @@ test("formatPill: epic-no-tasks blocked verdict renders [blocked:epic-no-tasks]"
 test("colorizePillsInLine: blocked:epic-no-tasks takes the warn bucket", () => {
   expect(colorizePillsInLine("[blocked:epic-no-tasks]")).toBe(
     `[${WARN}blocked:epic-no-tasks${RESET}]`,
+  );
+});
+
+// fn-941: an escalated runtime-blocked task renders `[blocked:escalated]` —
+// distinct from the plain `[blocked:runtime-blocked]` pill — so a human sees
+// "escalation pending / planner notified". The flag is read coarsely (a
+// `block_escalations` latch row's presence for the task id), and the `blocked:`
+// prefix keeps it in the amber warn family.
+test("taskVerdictPill: runtime-blocked + escalated → [blocked:escalated] (distinct from plain blocked)", () => {
+  const verdict: Verdict = {
+    tag: "blocked",
+    reason: { kind: "runtime-blocked" },
+  };
+  const escalated = taskVerdictPill(
+    verdict,
+    "fn-1-foo.1",
+    new Set(["fn-1-foo.1"]),
+  );
+  const plain = taskVerdictPill(verdict, "fn-1-foo.1", new Set<string>());
+  // The escalated pill carries the `blocked:escalated` token; the plain one
+  // carries `blocked:runtime-blocked`. Both iconize, so assert on the contained
+  // token text and that they differ.
+  expect(escalated).toContain("blocked:escalated");
+  expect(plain).toContain("blocked:runtime-blocked");
+  expect(escalated).not.toBe(plain);
+});
+
+test("taskVerdictPill: non-runtime-blocked verdict ignores escalation set (standard formatPill)", () => {
+  const ready: Verdict = { tag: "ready" };
+  // Even if the id is in the escalated set, only a runtime-blocked verdict
+  // gets the escalated pill — a ready row renders the standard pill.
+  expect(taskVerdictPill(ready, "fn-1-foo.1", new Set(["fn-1-foo.1"]))).toBe(
+    iconizePills(formatPill(ready)),
+  );
+});
+
+test("taskVerdictPill: runtime-blocked but NOT escalated → standard [blocked:runtime-blocked]", () => {
+  const verdict: Verdict = {
+    tag: "blocked",
+    reason: { kind: "runtime-blocked" },
+  };
+  expect(taskVerdictPill(verdict, "fn-1-foo.1", new Set<string>())).toBe(
+    iconizePills(formatPill(verdict)),
+  );
+});
+
+test("colorizePillsInLine: blocked:escalated takes the warn bucket via prefix fallback", () => {
+  expect(colorizePillsInLine("[blocked:escalated]")).toBe(
+    `[${WARN}blocked:escalated${RESET}]`,
   );
 });
 

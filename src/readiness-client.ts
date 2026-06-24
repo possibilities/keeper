@@ -74,6 +74,7 @@ import {
   type ReadinessSnapshot,
 } from "./readiness";
 import type {
+  BlockEscalation,
   DeadLetter,
   Epic,
   GitStatus,
@@ -102,6 +103,9 @@ const PENDING_DISPATCHES_PAGE_LIMIT = 0;
 const AUTOPILOT_STATE_PAGE_LIMIT = 0;
 const ARMED_EPICS_PAGE_LIMIT = 0;
 const SCHEDULED_TASKS_PAGE_LIMIT = 0;
+// One row per currently-blocked plan task — intrinsically bounded by the board's
+// blocked-task count, so unbounded (0) like the other latch collections.
+const BLOCK_ESCALATIONS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -164,6 +168,16 @@ export interface ReadinessClientSnapshot {
   // occupant; rides on the snapshot for a renderer that wants the in-flight
   // launch list.
   readonly pendingDispatches: PendingDispatch[];
+  // fn-941: the `block_escalations` latch rows — one per currently-blocked plan
+  // task the daemon producer has armed. The board renders an escalated task
+  // distinctly and `keeper await` reads it (with `autopilotPaused`) to soften an
+  // escalated-but-paused stall from `stuck` to `waiting`.
+  readonly blockEscalations: BlockEscalation[];
+  // fn-941: the autopilot reconciler's paused flag, read off the `autopilot_state`
+  // singleton (number column coerced to boolean; a missing/malformed row defaults
+  // to PAUSED, mirroring `cli/autopilot.ts`'s coercion). Pairs with
+  // `blockEscalations` for the escalated-but-paused await softening.
+  readonly autopilotPaused: boolean;
   readonly readiness: ReadinessSnapshot;
 }
 
@@ -1395,6 +1409,7 @@ export function subscribeReadiness(
   const autopilotStateSubId = `${idPrefix}-autopilot-state`;
   const armedEpicsSubId = `${idPrefix}-armed-epics`;
   const scheduledTasksSubId = `${idPrefix}-scheduled-tasks`;
+  const blockEscalationsSubId = `${idPrefix}-block-escalations`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1505,6 +1520,21 @@ export function subscribeReadiness(
       limit: SCHEDULED_TASKS_PAGE_LIMIT,
     },
   );
+  // `block_escalations` (fn-941) — one row per currently-blocked plan task the
+  // daemon producer has armed. The wire pk is `task_id`; the snapshot reads from
+  // `byId` (the pk is single-column, so no collapse). An empty steady state still
+  // produces a `result` with `rows: []` so the first-paint gate clears.
+  const blockEscalations = makeState(
+    "block_escalations",
+    blockEscalationsSubId,
+    "task_id",
+    {
+      type: "query",
+      collection: "block_escalations",
+      id: blockEscalationsSubId,
+      limit: BLOCK_ESCALATIONS_PAGE_LIMIT,
+    },
+  );
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1515,6 +1545,7 @@ export function subscribeReadiness(
     autopilotState,
     armedEpics,
     scheduledTasks,
+    blockEscalations,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1533,7 +1564,10 @@ export function subscribeReadiness(
       !armedEpics.gotResult ||
       // `scheduled_tasks` (fn-813) — the jobs-TUI cron detail feed. Empty
       // produces a `result` with `rows: []`, so it still clears the gate.
-      !scheduledTasks.gotResult
+      !scheduledTasks.gotResult ||
+      // `block_escalations` (fn-941) — the escalation latch feed. Empty produces
+      // a `result` with `rows: []`, so it still clears the gate.
+      !blockEscalations.gotResult
     ) {
       return;
     }
@@ -1580,6 +1614,16 @@ export function subscribeReadiness(
         | undefined
     )?.mode;
     const mode: "yolo" | "armed" = modeRaw === "armed" ? "armed" : "yolo";
+    // fn-941: the autopilot `paused` flag off the same singleton row. Stored as a
+    // 0/1 INTEGER; a missing/malformed value defaults to PAUSED (mirrors
+    // `cli/autopilot.ts`'s coercion — boot-paused is the safe default).
+    const pausedRaw = (
+      autopilotState.byId.get(autopilotState.order[0] ?? "") as
+        | { paused?: unknown }
+        | undefined
+    )?.paused;
+    const autopilotPaused =
+      typeof pausedRaw === "number" ? pausedRaw !== 0 : true;
     // In `armed` mode, compute the eligible set (armed ∪ transitive upstream
     // closure) via the SAME `computeEligibleEpics` the reconciler runs. In
     // `yolo` mode leave it `undefined` so `computeReadiness` takes the legacy
@@ -1618,6 +1662,11 @@ export function subscribeReadiness(
     // `(job_id, cron_id)` identity rides a single-column `job_id` wire pk, so
     // `byId` would collapse a multi-cron session to one row.
     const scheduledTasksTyped = projectRows<ScheduledTask>(scheduledTasks);
+    // fn-941: the escalation latch rows. `task_id` is the single-column wire pk,
+    // so `byId` carries every row without collapse — read from `state.rows` for
+    // symmetry with the other projections.
+    const blockEscalationsTyped =
+      projectRows<BlockEscalation>(blockEscalations);
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1628,6 +1677,8 @@ export function subscribeReadiness(
       deadLetters: deadLettersTyped,
       pendingDispatches: pendingDispatchesTyped,
       scheduledTasks: scheduledTasksTyped,
+      blockEscalations: blockEscalationsTyped,
+      autopilotPaused,
       readiness,
     });
   }

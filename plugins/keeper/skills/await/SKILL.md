@@ -55,7 +55,7 @@ the literal `and` token.
 |---|---|---|
 | `complete <id>` | Default for a keeper plan id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
 | `started <id>` | A keeper plan id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
-| `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
+| `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). A `runtime-blocked` task the daemon has escalated to the planner reports `waiting` (escalation in flight), not `stuck`, while the autopilot is paused — see the escalated-but-paused note under *Defaults and overrides*. | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
 | `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot — i.e. the moment the READ socket opens, which (since fn-897) is right after `migrate()` while the reducer may still be CATCHING UP. So `server-up` means "the control plane is reachable", NOT "the board has fully caught up"; an early board read may be provisional (its frames carry a `catching_up` boot-status header until the drain reaches head + the git surface is seeded). Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
@@ -179,6 +179,14 @@ Defaults and overrides:
 - **Stuck verdicts** (job-rejected, dep-on-epic-dangling) keep waiting
   by default. Add `--fail-on-stuck` only if the user explicitly wants
   the wait to surrender on those.
+- **Escalated-but-paused holds, never surrenders.** A `runtime-blocked`
+  task the daemon has escalated to its epic's planner (a
+  `block_escalations` latch is armed) reports `waiting` — *escalation in
+  flight* — rather than `stuck` **while the autopilot is paused**, since
+  the cold re-dispatch that resumes it can't fire until play resumes. So
+  even a `--fail-on-stuck` wait visibly HOLDS for the planner instead of
+  exiting 5 on a stall that will clear. Once the autopilot is un-paused (or
+  the latch clears on unblock) the normal verdict resumes.
 
 ## Step 3 — Listen for the terminal line
 

@@ -238,6 +238,36 @@ function isStuck(v: Verdict): boolean {
   return v.tag === "blocked" && STUCK_REASON_KINDS.has(v.reason.kind);
 }
 
+/**
+ * fn-941: the escalated-but-paused softening. A `runtime-blocked` task whose
+ * `block_escalations` latch is present (a planner has been / is being notified)
+ * is NOT a terminal stall while the autopilot is PAUSED — the planner is in the
+ * loop and the cold re-dispatch that resumes the task simply can't fire until
+ * play resumes. Reporting it as `waiting` (escalation in flight) keeps an armed
+ * `--fail-on-stuck` await visibly HOLDING instead of surrendering exit-5 on a
+ * stall that will clear once the autopilot un-pauses.
+ *
+ * Gate is narrow and conjunctive: ONLY a `runtime-blocked` verdict (the stamped
+ * block kind the daemon escalates), ONLY when the task id carries a latch row,
+ * ONLY when the autopilot is paused. An UNPAUSED escalated block is left to its
+ * normal verdict — the cold re-dispatch can fire, so it self-resolves and does
+ * not need the softening. A non-escalated `runtime-blocked` stays `stuck`.
+ */
+function escalationSoftensStuck(
+  v: Verdict,
+  taskId: string,
+  escalatedTaskIds: ReadonlySet<string> | undefined,
+  autopilotPaused: boolean | undefined,
+): boolean {
+  return (
+    autopilotPaused === true &&
+    v.tag === "blocked" &&
+    v.reason.kind === "runtime-blocked" &&
+    escalatedTaskIds !== undefined &&
+    escalatedTaskIds.has(taskId)
+  );
+}
+
 // ---------------------------------------------------------------------------
 // AwaitState
 // ---------------------------------------------------------------------------
@@ -353,14 +383,31 @@ function epicHasWorkableRow(epic: Epic, snapshot: ReadinessSnapshot): boolean {
  * `unblocked` await to `stuck` when no row is workable AND at least one
  * row is human-only-blocked — without this the command would sit in
  * `waiting` forever on an epic whose every task is rejected.
+ *
+ * fn-941: a task row whose stuck-ness is softened by an escalated-but-paused
+ * `runtime-blocked` latch ({@link escalationSoftensStuck}) is SKIPPED — it is
+ * escalation-in-flight, not a terminal stall, so it must not elevate the epic
+ * to `stuck`. The close row carries no task id, so the softening never applies
+ * to it.
  */
 function epicAnyStuckRow(
   epic: Epic,
   snapshot: ReadinessSnapshot,
+  escalatedTaskIds: ReadonlySet<string> | undefined,
+  autopilotPaused: boolean | undefined,
 ): Verdict | null {
   for (const task of epic.tasks) {
     const v = snapshot.perTask.get(task.task_id);
-    if (v !== undefined && isStuck(v)) {
+    if (
+      v !== undefined &&
+      isStuck(v) &&
+      !escalationSoftensStuck(
+        v,
+        task.task_id,
+        escalatedTaskIds,
+        autopilotPaused,
+      )
+    ) {
       return v;
     }
   }
@@ -449,12 +496,30 @@ function epicStarted(epic: Epic): boolean {
  *                        epics: a re-query hit means the epic id is
  *                        present in the daemon's `epics` projection
  *                        regardless of approval. Defaults to `false`.
+ *   - `escalatedTaskIds` — the set of task ids carrying a `block_escalations`
+ *                        latch row (the daemon block-escalation producer's
+ *                        escalate-once gate, fn-941). A coarse "escalation in
+ *                        flight" signal — membership means a planner has been
+ *                        (or is being) notified for that blocked task. Read as
+ *                        a yes/no, NOT the latch's internal pending/requested/
+ *                        attempted state machine. Defaults EMPTY (no escalation
+ *                        plumbed → behave exactly as before).
+ *   - `autopilotPaused`  — true iff the autopilot reconciler is paused, so the
+ *                        cold re-dispatch that resumes an unblocked task CANNOT
+ *                        fire. Together with `escalatedTaskIds` this softens an
+ *                        escalated `runtime-blocked` task from `stuck` (terminal
+ *                        under `--fail-on-stuck`) to `waiting` (escalation in
+ *                        flight) — so an armed await visibly HOLDS instead of
+ *                        silently surrendering on a stall the planner will clear.
+ *                        Defaults `false`.
  */
 export interface AwaitInputs {
   epics: readonly Epic[];
   snapshot: ReadinessSnapshot;
   priorPresence: boolean;
   reQueryHit?: boolean;
+  escalatedTaskIds?: ReadonlySet<string>;
+  autopilotPaused?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +614,22 @@ function evaluateTaskAwait(
   if (workable(v)) {
     return { kind: "met", detail: verdictPhrase(v) };
   }
+  // fn-941: an escalated-but-paused `runtime-blocked` task is escalation-in-flight,
+  // NOT a terminal stall — soften it to `waiting` BEFORE the stuck read so an armed
+  // `--fail-on-stuck` await holds for the planner instead of surrendering exit-5.
+  if (
+    escalationSoftensStuck(
+      v,
+      target.id,
+      inputs.escalatedTaskIds,
+      inputs.autopilotPaused,
+    )
+  ) {
+    return {
+      kind: "waiting",
+      detail: "escalation in flight (blocked:escalated, autopilot paused)",
+    };
+  }
   if (isStuck(v)) {
     return { kind: "stuck", detail: verdictPhrase(v) };
   }
@@ -586,7 +667,15 @@ function evaluateEpicAwait(
   if (epicHasWorkableRow(epic, inputs.snapshot)) {
     return { kind: "met", detail: "epic has at least one workable row" };
   }
-  const stuckRow = epicAnyStuckRow(epic, inputs.snapshot);
+  // fn-941: an escalated-but-paused `runtime-blocked` row is skipped by
+  // `epicAnyStuckRow`, so an epic whose only stuck row is escalation-in-flight
+  // reports `waiting` (holds for the planner) instead of `stuck`.
+  const stuckRow = epicAnyStuckRow(
+    epic,
+    inputs.snapshot,
+    inputs.escalatedTaskIds,
+    inputs.autopilotPaused,
+  );
   if (stuckRow !== null) {
     return { kind: "stuck", detail: verdictPhrase(stuckRow) };
   }

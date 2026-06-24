@@ -153,6 +153,11 @@ function buildSnap(
     // fn-813: the scheduled-tasks (cron) collection. Empty default; this
     // CLI-path fixture doesn't exercise the jobs-TUI cron detail section.
     scheduledTasks: [],
+    // fn-941: the block-escalation latch collection + autopilot paused flag.
+    // Empty / unpaused defaults; this CLI-path fixture doesn't exercise the
+    // escalated-but-paused await softening.
+    blockEscalations: [],
+    autopilotPaused: false,
     readiness,
   };
 }

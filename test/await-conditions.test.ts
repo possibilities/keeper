@@ -633,6 +633,117 @@ test("task-unblocked: running task → waiting (already in motion)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// fn-941: escalated-but-paused softening. A `runtime-blocked` task whose
+// `block_escalations` latch is present reports `waiting` (escalation in flight)
+// — NOT `stuck` — while the autopilot is paused, so an armed `--fail-on-stuck`
+// await holds for the planner instead of surrendering. Unpaused (cold
+// re-dispatch can fire) OR non-escalated stays `stuck`.
+// ---------------------------------------------------------------------------
+
+function runtimeBlockedSnap(taskId = "fn-1-foo.1") {
+  const task = makeTask({ task_id: taskId, runtime_status: "blocked" });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  // Sanity: the verdict is the stamped runtime-blocked kind (stuck by default).
+  expect(snap.perTask.get(taskId)).toEqual({
+    tag: "blocked",
+    reason: { kind: "runtime-blocked" },
+  });
+  return { task, epic, snap };
+}
+
+test("task-unblocked: runtime-blocked + escalated + paused → waiting (escalation in flight)", () => {
+  const { task, epic, snap } = runtimeBlockedSnap();
+  const state = evaluateAwaitCondition(
+    {
+      epics: [epic],
+      snapshot: snap,
+      priorPresence: true,
+      escalatedTaskIds: new Set([task.task_id]),
+      autopilotPaused: true,
+    },
+    { id: task.task_id, kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("task-unblocked: runtime-blocked + escalated + UNPAUSED → stuck (cold re-dispatch can fire)", () => {
+  const { task, epic, snap } = runtimeBlockedSnap();
+  const state = evaluateAwaitCondition(
+    {
+      epics: [epic],
+      snapshot: snap,
+      priorPresence: true,
+      escalatedTaskIds: new Set([task.task_id]),
+      autopilotPaused: false,
+    },
+    { id: task.task_id, kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("stuck");
+});
+
+test("task-unblocked: runtime-blocked + NOT escalated + paused → stuck (no latch to soften)", () => {
+  const { task, epic, snap } = runtimeBlockedSnap();
+  const state = evaluateAwaitCondition(
+    {
+      epics: [epic],
+      snapshot: snap,
+      priorPresence: true,
+      escalatedTaskIds: new Set<string>(),
+      autopilotPaused: true,
+    },
+    { id: task.task_id, kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("stuck");
+});
+
+test("task-unblocked: runtime-blocked with no escalation inputs → stuck (backward-compat default)", () => {
+  const { task, epic, snap } = runtimeBlockedSnap();
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("stuck");
+});
+
+test("epic-unblocked: sole stuck row is escalated-but-paused → waiting (softened, not stuck)", () => {
+  // An epic whose only task is a runtime-blocked + escalated row, autopilot
+  // paused. The row's stuck-ness is softened, so the epic holds `waiting`
+  // instead of surfacing `stuck`.
+  const task = makeTask({ task_id: "fn-1-foo.1", runtime_status: "blocked" });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  const state = evaluateAwaitCondition(
+    {
+      epics: [epic],
+      snapshot: snap,
+      priorPresence: true,
+      escalatedTaskIds: new Set([task.task_id]),
+      autopilotPaused: true,
+    },
+    { id: epic.epic_id, kind: "epic", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("epic-unblocked: sole stuck row escalated but UNPAUSED → stuck (not softened)", () => {
+  const task = makeTask({ task_id: "fn-1-foo.1", runtime_status: "blocked" });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  const state = evaluateAwaitCondition(
+    {
+      epics: [epic],
+      snapshot: snap,
+      priorPresence: true,
+      escalatedTaskIds: new Set([task.task_id]),
+      autopilotPaused: false,
+    },
+    { id: epic.epic_id, kind: "epic", condition: "unblocked" },
+  );
+  expect(state.kind).toBe("stuck");
+});
+
+// ---------------------------------------------------------------------------
 // Epic-unblocked: read off perTask + perCloseRow, NOT perEpic. The
 // load-bearing fixture is the mutex-demoted-but-workable case.
 // ---------------------------------------------------------------------------

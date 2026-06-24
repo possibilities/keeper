@@ -868,6 +868,12 @@ event-log/reducer/hook touch. Run any of them with
   from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
   line so the human reads the cause without scanning the upstream rows.
+  A `runtime-blocked` task the daemon block-escalation producer has
+  notified the planner about (a `block_escalations` latch row is armed)
+  renders `[blocked:escalated]` instead of `[blocked:runtime-blocked]`
+  (fn-941) — "escalation pending / planner notified", read coarsely off
+  the latch row's PRESENCE, not its internal pending/requested/attempted
+  state; the `blocked:` prefix keeps it in the amber warn family.
   The `BlockReason` vocabulary splits epic-dep failures into two cousins:
   `dep-on-epic <id>` (amber / warn — the upstream IS in the snapshot
   but its close verdict isn't `completed`; for an in-snapshot upstream

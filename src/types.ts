@@ -838,6 +838,24 @@ export interface Task {
 }
 
 /**
+ * A `block_escalations` projection row (fn-941) — the daemon block-escalation
+ * producer's escalate-once latch, one row per currently-blocked plan task keyed
+ * by `(epic_id, task_id)`. Subscribed by the board / `keeper await` as a coarse
+ * "escalation in flight" signal (a row's PRESENCE for a task, not its internal
+ * `status` state machine). The `status` advances `pending → requested →
+ * attempted`; `outcome` records the helper's result on the `attempted` row.
+ * `blocked_since` / `last_event_id` are event ids, never wall-clock.
+ */
+export interface BlockEscalation {
+  epic_id: string;
+  task_id: string;
+  blocked_since: number;
+  status: string;
+  outcome: string | null;
+  last_event_id: number;
+}
+
+/**
  * Pre-flattened `BlockEscalationRequested` synthetic event payload — the daemon
  * block-escalation producer (task 3) mints it for a `pending` `block_escalations`
  * latch row right before it spawns the one-way bus-send helper, advancing the

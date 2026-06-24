@@ -134,6 +134,18 @@ function sanitizeValue(v: string): string {
   return v.replace(/[\r\n]/g, " ");
 }
 
+/**
+ * fn-941: project the readiness snapshot's `block_escalations` latch rows into
+ * the coarse "escalation in flight" set of task ids `evaluateAwaitCondition`
+ * consumes — a row's PRESENCE for a task means a planner has been / is being
+ * notified, read as a yes/no rather than the latch's internal state machine.
+ */
+function escalatedTaskIdsOf(
+  snap: ReadinessClientSnapshot,
+): ReadonlySet<string> {
+  return new Set(snap.blockEscalations.map((e) => e.task_id));
+}
+
 // ---------------------------------------------------------------------------
 // Event line emit (stdout) and progress line (stderr)
 // ---------------------------------------------------------------------------
@@ -1186,6 +1198,10 @@ export async function runAwait(
       epics: snap.epics as readonly Epic[],
       snapshot: snap.readiness,
       priorPresence: slot.everSeen,
+      // fn-941: the escalated-but-paused softening — an escalated `runtime-blocked`
+      // task held only by a paused autopilot reports `waiting`, not `stuck`.
+      escalatedTaskIds: escalatedTaskIdsOf(snap),
+      autopilotPaused: snap.autopilotPaused,
     };
     const evalState = evaluateAwaitCondition(inputs, slot.target);
 
@@ -1448,6 +1464,8 @@ export async function runAwait(
             snapshot: snap.readiness,
             priorPresence: slot.everSeen,
             reQueryHit: outcome === "hit",
+            escalatedTaskIds: escalatedTaskIdsOf(snap),
+            autopilotPaused: snap.autopilotPaused,
           },
           slot.target,
         );

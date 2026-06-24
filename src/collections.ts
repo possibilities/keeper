@@ -632,6 +632,38 @@ export const BUILDS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `block_escalations` descriptor (fn-941) — the daemon block-escalation
+ * producer's escalate-once LATCH, one row per blocked plan task keyed by
+ * `(epic_id, task_id)`. A reducer projection (re-fold rebuilds it
+ * byte-identically). `task_id` carries the wire identity; `epic_id` rides in
+ * `columns` / `filters`. Registering it here is what makes the latch
+ * subscribable over the UDS socket so the board renders an escalated-blocked
+ * task distinctly and `keeper await` reads the escalation-in-flight signal.
+ */
+export const BLOCK_ESCALATIONS_DESCRIPTOR: CollectionDescriptor = {
+  name: "block_escalations",
+  table: "block_escalations",
+  columns: [
+    "task_id",
+    "epic_id",
+    "blocked_since",
+    "status",
+    "outcome",
+    "last_event_id",
+  ],
+  pk: "task_id",
+  version: "last_event_id",
+  sortable: new Set(["task_id", "epic_id", "blocked_since", "last_event_id"]),
+  defaultSort: { column: "blocked_since", dir: "desc" },
+  filters: {
+    task_id: "task_id",
+    epic_id: "epic_id",
+    status: "status",
+  },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -647,6 +679,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
   [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
+  [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

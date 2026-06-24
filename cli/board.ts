@@ -267,6 +267,35 @@ function taskNumFromId(id: string): number | null {
  * to its own continuation line so a long interactive stop reads without
  * wrapping. Iteration order is the projection's own `(kind, job_id)` ASC sort.
  */
+/**
+ * fn-941: render the iconized verdict pill for a TASK, distinguishing an
+ * escalated `runtime-blocked` task from a plain blocked one. When the daemon
+ * block-escalation producer has armed a `block_escalations` latch for the task
+ * (membership in `escalatedTaskIds`) AND the verdict is `runtime-blocked`, the
+ * pill renders `[blocked:escalated]` — "escalation pending / planner notified" —
+ * instead of `[blocked:runtime-blocked]`. The `blocked:` prefix keeps it in the
+ * amber warn family and inherits the ban glyph (same theming as every other
+ * `blocked:*` pill). The escalated flag is read as a coarse yes/no, NOT the
+ * latch's internal pending/requested/attempted state. Every other verdict
+ * renders the standard {@link formatPill} text. Module-level + exported so a
+ * synthetic-state unit test can assert the escalated-vs-plain distinction
+ * without standing up the subscribe loop.
+ */
+export function taskVerdictPill(
+  verdict: Verdict,
+  taskId: string,
+  escalatedTaskIds: ReadonlySet<string>,
+): string {
+  if (
+    verdict.tag === "blocked" &&
+    verdict.reason.kind === "runtime-blocked" &&
+    escalatedTaskIds.has(taskId)
+  ) {
+    return iconizePills("[blocked:escalated]");
+  }
+  return iconizePills(formatPill(verdict));
+}
+
 export function renderJobLinkLines(jobLinks: unknown): string[] {
   if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
     return [];
@@ -485,6 +514,12 @@ export async function main(argv: string[]): Promise<void> {
         ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
         : [`${epicHeader} ${iconizePills(formatPill(epicVerdict))}`];
     lines.push(...epicHeaderLines, ...renderJobLinkLines(row.job_links));
+    // fn-941: the coarse "escalation in flight" set for this snapshot — task ids
+    // carrying a `block_escalations` latch row. An escalated `runtime-blocked`
+    // task renders `[blocked·escalated]` (planner notified) vs plain `[blocked:…]`.
+    const escalatedTaskIds = new Set(
+      snap.blockEscalations.map((e) => e.task_id),
+    );
     const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
       const t = task as Record<string, unknown>;
@@ -500,7 +535,7 @@ export async function main(argv: string[]): Promise<void> {
       // reference; ready/completed/running stay inline. The
       // `[task-repo:<basename>]` divergence pill follows the verdict wherever
       // it lands (see `taskRepoPillSeg`).
-      const taskPillSeg = `${iconizePills(formatPill(taskVerdict))}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
+      const taskPillSeg = `${taskVerdictPill(taskVerdict, taskId, escalatedTaskIds)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
       const taskIdLines =
         taskVerdict.tag === "blocked"
           ? [`    [${taskId}]`, `    ${taskPillSeg}`]
