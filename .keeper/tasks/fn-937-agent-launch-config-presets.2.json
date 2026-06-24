@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "autopilot worker preset",
-  "updated_at": "2026-06-24T17:16:28.049000Z"
+  "updated_at": "2026-06-24T20:03:36.149000Z",
+  "worker_done_at": "2026-06-24T20:03:36.149000Z"
 }

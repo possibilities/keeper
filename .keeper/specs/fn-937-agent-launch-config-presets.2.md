@@ -53,5 +53,5 @@ fallback, so behavior is byte-identical when no registry/preset exists.
 - [ ] README autopilot-launch prose names the `worker`-preset path.
 
 ## Done summary
-
+Autopilot resolves a 'worker' preset for --model/--effort, coalescing per-field onto WORKER_MODEL/WORKER_EFFORT (sonnet/max) with a fail-safe swallow of ConfigError so a bad presets.yaml never crashes dispatch. Both worker-command builders read the same resolved values via the snapshot, preserving drift-guard parity.
 ## Evidence
