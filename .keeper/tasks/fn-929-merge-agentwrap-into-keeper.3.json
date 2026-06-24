@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "repoint keeper launch call sites onto keeper agent",
-  "updated_at": "2026-06-24T03:08:41.325000Z"
+  "updated_at": "2026-06-24T03:55:07.835000Z",
+  "worker_done_at": "2026-06-24T03:55:07.835000Z"
 }

@@ -60,5 +60,5 @@ seams to keep unit tests synthetic.
 - [ ] `resolveAgentwrapPath` call sites routed onto `resolveKeeperAgentPath`
 
 ## Done summary
-
+Repointed every launch consumer (exec-backend seam, autopilot worker, manual dispatch, pair launch/wait/show, daemon boot probe) off the external agentwrap binary onto the folded keeper agent launcher via a [bun, cli/keeper.ts, agent] argv prefix; daemon boot check is now an autopilot-gated self-check. mapAgentwrapExit's exit->breaker contract byte-preserved; byte-pins updated deliberately.
 ## Evidence
