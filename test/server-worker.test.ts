@@ -29,6 +29,8 @@ import {
   getCollection,
   JOBS_DESCRIPTOR,
   type Row,
+  SUBAGENT_INVOCATIONS_DESCRIPTOR,
+  SUBAGENT_INVOCATIONS_RECENCY_SEC,
 } from "../src/collections";
 import { openDb } from "../src/db";
 import {
@@ -109,6 +111,37 @@ function seedJob(
     opts.state ?? "stopped",
     opts.last_event_id ?? 0,
     opts.updated_at ?? 1,
+  );
+}
+
+/**
+ * Seed one `subagent_invocations` row. `ts` is Unix epoch SECONDS (the fold
+ * writes `event.ts`, which is seconds); the recency bound floors on it.
+ * `turn_seq` distinguishes re-entrant rows under one `(job_id, agent_id)`.
+ */
+function seedSubagent(
+  db: Database,
+  opts: {
+    job_id: string;
+    agent_id?: string;
+    turn_seq?: number;
+    ts: number;
+    status?: string;
+    last_event_id?: number;
+  },
+): void {
+  db.query(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, status, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    opts.job_id,
+    opts.agent_id ?? "a0",
+    opts.turn_seq ?? 0,
+    opts.ts,
+    opts.status ?? "running",
+    opts.last_event_id ?? 1,
+    opts.ts,
   );
 }
 
@@ -3288,6 +3321,160 @@ test("countAndToken: token is order-stable regardless of insertion order", () =>
   const t2 = countAndToken(db2, JOBS_DESCRIPTOR, "", []).token;
   db2.close();
   expect(t1).toBe(t2);
+});
+
+// ---------------------------------------------------------------------------
+// recencyBound — subagent_invocations token/page/COUNT(*) recency floor (fn-921)
+// ---------------------------------------------------------------------------
+
+// A fixed wall-clock anchor (Unix epoch sec) so the recency cutoff is pinned.
+const NOW_SEC = 1_750_000_000;
+
+test("resolveFilter: recencyBound ANDs a `<col> >= ?` floor on the unfiltered query", () => {
+  const where = resolveFilter(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    undefined,
+    NOW_SEC,
+  );
+  expect(where.clause).toBe("WHERE ts >= ?");
+  expect(where.params).toEqual([
+    Math.floor(NOW_SEC) - SUBAGENT_INVOCATIONS_RECENCY_SEC,
+  ]);
+});
+
+test("resolveFilter: recencyBound ANDs on TOP of an explicit wire filter (not dropped like a default)", () => {
+  const where = resolveFilter(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    { job_id: "j1" },
+    NOW_SEC,
+  );
+  // A pk lookup is EXEMPT — a per-job detail timeline resolves any age. So the
+  // floor is NOT applied here; only the job_id equality remains.
+  expect(where.clause).toBe("WHERE job_id = ?");
+  expect(where.params).toEqual(["j1"]);
+});
+
+test("resolveFilter: recencyBound floor uses `floor(nowSec)` so a fractional clock is integer-bound", () => {
+  const where = resolveFilter(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    undefined,
+    NOW_SEC + 0.97,
+  );
+  expect(where.params).toEqual([NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC]);
+});
+
+test("countAndToken + page agree: the recency floor bounds total, token, AND page consistently", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // Two recent rows (inside the window) and two ancient rows (outside).
+  seedSubagent(db, { job_id: "recent1", ts: NOW_SEC - 10 });
+  seedSubagent(db, { job_id: "recent2", ts: NOW_SEC - 1000 });
+  seedSubagent(db, {
+    job_id: "old1",
+    ts: NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC - 1,
+  });
+  seedSubagent(db, {
+    job_id: "old2",
+    ts: NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC - 100,
+  });
+
+  const where = resolveFilter(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    undefined,
+    NOW_SEC,
+  );
+  const ct = countAndToken(
+    db,
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    where.clause,
+    where.params,
+  );
+  // COUNT reflects only the in-window rows (the pk is job_id; the token is the
+  // ordered set of in-window job_ids).
+  expect(ct.total).toBe(2);
+  expect(ct.token).toBe("recent1,recent2");
+
+  // The page (runQuery, default limit 0 = unbounded) carries the SAME bounded
+  // set — count, token, and page agree by construction (one ResolvedFilter).
+  const res = asResult(
+    runQuery(
+      db,
+      0,
+      { type: "query", collection: "subagent_invocations", limit: 0 },
+      undefined,
+      NOW_SEC,
+    ),
+  );
+  expect(res.total).toBe(2);
+  expect(res.rows.map((r) => String(r.job_id)).sort()).toEqual([
+    "recent1",
+    "recent2",
+  ]);
+  db.close();
+});
+
+test("recencyBound: token recompute is INSENSITIVE to the unbounded historical backlog", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const where = resolveFilter(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    undefined,
+    NOW_SEC,
+  );
+  seedSubagent(db, { job_id: "live", ts: NOW_SEC - 5 });
+  const before = countAndToken(
+    db,
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    where.clause,
+    where.params,
+  );
+  // Pile on ancient backlog rows — the unbounded-history CPU source. The token
+  // must NOT move: they are below the floor, so the recompute stays bounded.
+  for (let i = 0; i < 50; i++) {
+    seedSubagent(db, {
+      job_id: `ancient${i}`,
+      ts: NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC - i - 1,
+    });
+  }
+  const after = countAndToken(
+    db,
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    where.clause,
+    where.params,
+  );
+  expect(after.total).toBe(before.total);
+  expect(after.token).toBe(before.token);
+  db.close();
+});
+
+test("recencyBound: a pk (job_id) detail subscribe resolves an OUT-OF-WINDOW row", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // An ancient row for one job — a detail timeline read must still resolve it.
+  seedSubagent(db, {
+    job_id: "jold",
+    ts: NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC - 5000,
+  });
+  const res = asResult(
+    runQuery(
+      db,
+      0,
+      {
+        type: "query",
+        collection: "subagent_invocations",
+        filter: { job_id: "jold" },
+        limit: 0,
+      },
+      undefined,
+      NOW_SEC,
+    ),
+  );
+  expect(res.total).toBe(1);
+  expect(res.rows.map((r) => String(r.job_id))).toEqual(["jold"]);
+  db.close();
+});
+
+test("recencyBound: a non-recency descriptor (jobs) is unaffected — no floor applied", () => {
+  const where = resolveFilter(JOBS_DESCRIPTOR, { state: "working" }, NOW_SEC);
+  expect(where.clause).toBe("WHERE state = ?");
+  expect(where.params).toEqual(["working"]);
 });
 
 // ---------------------------------------------------------------------------

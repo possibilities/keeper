@@ -638,7 +638,13 @@ function serveFromMemo(
   // Resolve the filter the same way runQuery does (cheap map lookup, no SELECT)
   // to build the signature key. On a miss runQuery re-resolves the identical
   // filter into `seed.where`, which is what the SubState baseline records.
-  const where = resolveFilter(descriptor, frame.filter);
+  // Pin `nowSec` ONCE and thread it to BOTH the sigKey resolve here and the
+  // `runQuery` miss below: a recency-bounded descriptor binds the cutoff from
+  // the clock, so two resolves straddling a second boundary would otherwise key
+  // the entry under one cutoff and seed it from another. One `nowSec` keeps the
+  // sigKey, the cached `where`, and the page on the SAME window.
+  const nowSec = Date.now() / 1000;
+  const where = resolveFilter(descriptor, frame.filter, nowSec);
   const sigKey = querySignature(descriptor, frame, where);
 
   let entry = memo.entries.get(sigKey);
@@ -656,7 +662,7 @@ function serveFromMemo(
     }
     // MISS: one runQuery + one JSON.stringify, cached under the read worldRev.
     const seed = {} as { where: ResolvedFilter; total: number; token: string };
-    const out = runQuery(db, worldRev, frame, seed);
+    const out = runQuery(db, worldRev, frame, seed, nowSec);
     if (out.type !== "result") {
       // A known descriptor returning a non-result is unexpected (runQuery only
       // errors on unknown_collection, handled above); don't cache — fall
@@ -1058,10 +1064,17 @@ export interface ResolvedFilter {
  * The descriptor is the SOLE identifier-injection gate: only declared columns
  * are interpolated; wire keys are never interpolated, operators are fixed
  * literals, values always bound.
+ *
+ * `nowSec` (default `Date.now()/1000`) is the wall-clock the optional
+ * `descriptor.recencyBound` floor binds against. It is threaded as a param ONLY
+ * so tests pin the cutoff deterministically; the live serve path always uses the
+ * default. `resolveFilter` is never invoked from a fold, so reading the clock
+ * here does not touch re-fold determinism.
  */
 export function resolveFilter(
   descriptor: CollectionDescriptor,
   filter: Record<string, FilterValue> | undefined,
+  nowSec: number = Date.now() / 1000,
 ): ResolvedFilter {
   const where: string[] = [];
   const params: (string | number)[] = [];
@@ -1116,6 +1129,18 @@ export function resolveFilter(
   if (wireIsEmpty && !isPkLookup && descriptor.defaultClause) {
     where.push(descriptor.defaultClause.sql);
     params.push(...descriptor.defaultClause.params);
+  }
+  // Recency floor — UNLIKE the default scope, it ANDs on top of any wire filter
+  // (it bounds history, it is not a default the wire overrides); only a pk
+  // lookup is exempt (a per-identity detail read resolves any age). The cutoff
+  // is bound (`?`); the column is a descriptor constant, safe to interpolate.
+  // Scoping it here threads it into BOTH the page SELECT and the membership
+  // `countAndToken` (they share this `ResolvedFilter`), so token/page/COUNT(*)
+  // agree on the same window.
+  if (descriptor.recencyBound && !isPkLookup) {
+    const cutoff = Math.floor(nowSec) - descriptor.recencyBound.windowSec;
+    where.push(`${descriptor.recencyBound.column} >= ?`);
+    params.push(cutoff);
   }
   return {
     clause: where.length > 0 ? `WHERE ${where.join(" AND ")}` : "",
@@ -1176,6 +1201,7 @@ export function runQuery(
   worldRev: number,
   frame: QueryFrame,
   out?: { where: ResolvedFilter; total: number; token: string },
+  nowSec: number = Date.now() / 1000,
 ): ResultFrame | ErrorFrame {
   const descriptor = getCollection(frame.collection);
   if (!descriptor) {
@@ -1208,7 +1234,9 @@ export function runQuery(
 
   // Resolve the filter ONCE (descriptor map lookup, bound values) and thread it
   // to BOTH the page SELECT and the membership count below — they can't drift.
-  const where = resolveFilter(descriptor, frame.filter);
+  // `nowSec` pins the optional recency cutoff so a memo seed (`serveFromMemo`)
+  // and this call share the SAME window — see the threading there.
+  const where = resolveFilter(descriptor, frame.filter, nowSec);
 
   // Staged timing instrumentation — gated by the same module-level `TRACE`
   // const so a `KEEPER_TRACE_SERVER=0` daemon does zero stage work. Ternary

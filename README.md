@@ -247,6 +247,22 @@ changes — a row enters or leaves the filter — so a paginated client can rend
 "showing X of N" and a non-disruptive "set changed, refresh" nudge without the
 list reflowing under the cursor.
 
+The membership `total`/token is `COUNT(*)` + `group_concat(pk)` over the
+filtered set — so an UNBOUNDED, never-compacted table re-pages its whole history
+to every subscriber on each membership change (the 2026-06-23 server-worker CPU
+peg, fn-921: `subagent_invocations` grew to ~5k rows / ~1MB and each new subagent
+flipped the token → every board/dash client refetched the full collection). A
+descriptor may declare a `recencyBound` (`<column> >= ?`) that floors EVERY
+non-pk query of that collection to a recent window (`subagent_invocations`: 1
+day on `ts`). The floor threads through ONE `ResolvedFilter`, so the token, the
+page, and `COUNT(*)` all scope to the same window and stay in agreement — it is a
+WHERE floor, NOT a `LIMIT` (which would trim the page but not the count and break
+render's count/stuck). The cutoff is wall-clock at query-resolve time (the live
+serve path only — never a fold, so the re-fold charter is untouched), pinned once
+per memo seed so concurrent identical queries share it. A pk detail subscribe is
+exempt (a per-identity timeline read resolves any age). A `meta` membership change
+thus re-pages only the bounded recent set, not the full backlog.
+
 The QUERY surface is read-only: the server is just another reader on its own
 read-only connection, polling `data_version` like the reducer-wake worker.
 **Mutation is a separate, scoped path:** the same socket carries `rpc` request

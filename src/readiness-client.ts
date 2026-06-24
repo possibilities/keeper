@@ -938,7 +938,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       }
       scheduleRefetchFor(state);
     } else if (frame.type === "meta") {
-      // A membership-change nudge — UNMERGEABLE from one row, so always refetch.
+      // A membership-change nudge — UNMERGEABLE from one row, so refetch. The
+      // refetch re-sends `state.query`; for a recency-bounded collection
+      // (`subagent_invocations`) the server scopes that re-page to its window,
+      // so a membership change re-pages only the bounded recent set, NOT the
+      // full unbounded history that pegged the server-worker (fn-921). The
+      // `queryInFlight` coalescer collapses a fold burst into one round.
       const state =
         (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
         byCollection.get(frame.collection);

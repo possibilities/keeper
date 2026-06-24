@@ -159,7 +159,16 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   swapped the full session-sweep for a per-session `mergeJobLinkSlice` whose cost is
   independent of how many sessions touched the epic; fn-892 swapped the pass-1
   full-history scans for an `id > maxId` append memo on the live-only git surface),
-  never O(history)/O(board)-per-event.
+  never O(history)/O(board)-per-event. The same time-bomb shape exists on the
+  SUBSCRIBE serve path: the per-tick membership token is `group_concat(pk)` +
+  `COUNT(*)` over the whole filtered set, so registering an UNBOUNDED,
+  never-compacted collection re-pages its full history to every subscriber on each
+  membership change (the fn-921 `subagent_invocations` CPU peg). Bound such a
+  collection with the descriptor's `recencyBound` (`<col> >= now - window`, a WHERE
+  floor that threads through ONE `ResolvedFilter` so token/page/`COUNT(*)` agree —
+  NOT a `LIMIT`, which breaks render's count/stuck); it is a live serve-path read
+  (wall-clock at query-resolve, never a fold), exempt only for a pk detail
+  subscribe.
 
 ## Hook rules
 

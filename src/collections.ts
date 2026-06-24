@@ -42,6 +42,18 @@ export type { Row };
  *   be per-key ANDs (e.g. epics' `default_visible = 1`). The `sql` is
  *   interpolated verbatim (the author owns its safety); `params` are bound. ANY
  *   explicit wire filter drops the whole clause. Coexists with `defaultFilter`.
+ * - `recencyBound` — an optional `<column> >= ?` floor applied to EVERY non-pk
+ *   query of this collection (`resolveFilter` binds the cutoff
+ *   `floor(now_sec) - window_sec`). Unlike `defaultClause`/`defaultFilter` an
+ *   EXPLICIT wire filter does NOT drop it (it ANDs on top), and only a pk lookup
+ *   is exempt (a detail read of one identity must resolve any age). It exists to
+ *   bound an unbounded, never-compacted history table (`subagent_invocations`)
+ *   so the membership token (`group_concat(pk)`), the page, and `COUNT(*)` all
+ *   scope to the same recent window — they read through one `ResolvedFilter`, so
+ *   they can never drift. The cutoff is wall-clock at query-resolve time: this is
+ *   the LIVE serve path only (`resolveFilter` is never called from a fold), so it
+ *   does not touch the re-fold determinism charter. `column` MUST be a descriptor
+ *   constant (interpolated, never wire text).
  * - `jsonColumns` — columns stored as JSON TEXT that {@link decodeRow} parses
  *   into real values at the read boundary (so `result` and `patch` frames serve
  *   an array/object, not a JSON string). A parse failure / NULL falls back to
@@ -58,6 +70,7 @@ export interface CollectionDescriptor {
   filters: Readonly<Record<string, string>>;
   defaultFilter?: Readonly<Record<string, FilterValue>>;
   defaultClause?: { sql: string; params: readonly (string | number)[] };
+  recencyBound?: { column: string; windowSec: number };
   jsonColumns: ReadonlySet<string>;
 }
 
@@ -344,11 +357,35 @@ export const PROFILES_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * Recency window (seconds) bounding the `subagent_invocations` membership token,
+ * page, and `COUNT(*)` to invocations whose `ts` (start time, Unix epoch sec)
+ * falls within the last day. The table is never compacted, so its history grows
+ * unbounded (4997 rows over 35 days as of 2026-06-23) — without this floor the
+ * `group_concat(job_id)` token recompute and the unbounded full-set page re-page
+ * the entire ~1MB collection to all board/dash subscribers on ~every event (the
+ * server-worker CPU peg, fn-921). One day keeps every live/recent invocation
+ * (the only rows render annotates and readiness predicate-6 reads — a `running`
+ * sub goes stale at `SUBAGENT_STALENESS_SEC` = 120s, far inside the window) and
+ * drops only weeks-old terminal rows belonging to long-ended jobs absent from
+ * any live task's `task.jobs`.
+ */
+export const SUBAGENT_INVOCATIONS_RECENCY_SEC = 86_400;
+
+/**
  * The `subagent_invocations` descriptor — per-job timeline of `Agent` (Task)
  * tool invocations and their `SubagentStart` / `SubagentStop` lifecycle.
  * Composite pk `(job_id, agent_id, turn_seq)` in the table, but `pk` expects a
  * single column, so `job_id` carries the wire identity (every subscribe filters
  * by it) and the other two ride in `columns` for display.
+ *
+ * `recencyBound` scopes every non-pk query to `ts >= now - 1d`. The membership
+ * token, the page SELECT, and `COUNT(*)` all read through ONE `ResolvedFilter`,
+ * so the bound applies to all three consistently — render's count/stuck and the
+ * byId diff stay in agreement (the constraint the column-narrowing comment below
+ * preserves, now also across the recency floor). It is NOT a `LIMIT` page (which
+ * would trim the page but not the count and break that agreement); it is a WHERE
+ * floor, so count/token/page agree by construction. A pk (`job_id`) detail
+ * subscribe is exempt — a per-job timeline read resolves invocations of any age.
  */
 export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   name: "subagent_invocations",
@@ -372,6 +409,7 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   sortable: new Set(["ts", "turn_seq", "duration_ms"]),
   defaultSort: { column: "ts", dir: "asc" },
   filters: { job_id: "job_id" },
+  recencyBound: { column: "ts", windowSec: SUBAGENT_INVOCATIONS_RECENCY_SEC },
   jsonColumns: new Set(),
 };
 
