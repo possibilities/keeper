@@ -47,5 +47,5 @@ rotation over several cycles; confirm `keeper usage` renders live data.
 - [ ] soak clean over multiple cycles before declaring done
 
 ## Done summary
-
+Tests green (bun run test:full 4325 pass/0 fail + opentui 76 pass; test:hygiene ok) — the worker unit suite + daemon-boot integration assertion landed in .4. Docs updated forward-facing (commit 81934e79): README Architecture gains the usage-scraper PRODUCER worker paragraph + reframes the usage CONSUMER paragraph; README Install gains usage_scraper_uv_path / usage_scraper_project_dir + a uv/pexpect/pyte Python-runtime prereq; CLAUDE.md gains a producer-vs-consumer worker-roster note; rollback documented (unset the config key -> worker un-arms -> restart external daemon). DEFERRED to human observation outside the sandbox: the live cutover (stop arthack.agentusage.daemon LaunchAgent, set the config keys, restart keeperd) + the multi-cycle soak — the scrape needs a real PTY the agent Bash sandbox blocks and /usage is upstream rate-limited.
 ## Evidence

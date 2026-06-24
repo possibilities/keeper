@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "tests, soak/cutover, docs",
-  "updated_at": "2026-06-24T14:14:51.342000Z"
+  "updated_at": "2026-06-24T16:02:54.360000Z",
+  "worker_done_at": "2026-06-24T16:02:54.360000Z"
 }
