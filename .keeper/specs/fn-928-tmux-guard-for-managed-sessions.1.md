@@ -65,5 +65,5 @@ Author `tmux/keeper-guard.conf` at the repo root (peer of `plist/`) with, in ord
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Shipped tmux/keeper-guard.conf: indexed session-created[42] hook stamps @keeper_managed_session on the 4 managed sessions, -b load-time sweep, and 5 confirm-before-guarded create-keys (c/|/_ + root M-\/M--) with byte-identical else-branch. Content-guard unit test + real-tmux slow test (quarantined from fast tier, run by test:full).
 ## Evidence
