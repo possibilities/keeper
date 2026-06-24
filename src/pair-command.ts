@@ -19,7 +19,9 @@
  *   1. `agentwrap <cli> --agentwrap-tmux --agentwrap-tmux-detached
  *      --agentwrap-no-confirm <native flags> <prompt>` → one launch-JSON line
  *      carrying the `id` handle.
- *   2. `agentwrap wait-for-stop <id>` → blocks until the partner's next stop.
+ *   2. `agentwrap wait-for-stop <id> --stop-timeout-ms <ms>` → blocks until the
+ *      partner's next stop; the ms budget forwards keeper's `--timeout` so
+ *      agentwrap's stop-wait honors it instead of its own 600s default.
  *   3. `agentwrap show-last-message <id>` → the partner's final assistant
  *      message on stdout + a JSON metadata line.
  */

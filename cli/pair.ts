@@ -15,7 +15,9 @@
  * Compose flow (the agentwrap subcommand contract from task .1):
  *   1. `agentwrap <cli> --agentwrap-tmux --agentwrap-tmux-detached
  *      --agentwrap-no-confirm <native flags> <prompt>` → launch JSON `id`.
- *   2. `agentwrap wait-for-stop <id>` → block until the partner stops.
+ *   2. `agentwrap wait-for-stop <id> --stop-timeout-ms <ms>` → block until the
+ *      partner stops; keeper's `--timeout` drives the ms budget (overriding
+ *      agentwrap's 600s default) and the widened subprocess-kill margin.
  *   3. `agentwrap show-last-message <id>` → the partner's final message.
  * The partner's final answer is written to `--output` (YAML) via
  * write-temp-then-rename, and `completed` is emitted only AFTER the rename so
