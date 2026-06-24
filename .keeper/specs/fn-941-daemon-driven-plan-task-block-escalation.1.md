@@ -37,5 +37,5 @@ Add coverage in `plugins/plan/test/` following the block/reset seed-then-assert 
 - [ ] Test added; `bun test` (plan plugin) green.
 
 ## Done summary
-
+Added keeper plan unblock verb (mirror of block): flips a blocked task back to todo preserving claim history, typed error on non-blocked, zero commit. Registered in COMMANDS + dispatch switch, tested, doc noted in restamp non-members.
 ## Evidence
