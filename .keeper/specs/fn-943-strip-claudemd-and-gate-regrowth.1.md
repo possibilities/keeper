@@ -78,5 +78,5 @@ staged/not-staged gating via a direct `runScopedLint` call.
 - [ ] `package.json` carries a `lint:claude-md` alias; `bun run test:full` (and the new tests) green
 
 ## Done summary
-
+Added scripts/lint-claude-md.ts (pure scanText gating CLAUDE.md size <=120 lines/<=16KB plus re-narration fingerprints: fn-ids, lowercase versions, ISO dates, past-tense provenance; SCHEMA_VERSION and 'would otherwise' stay clean) and wired it as a claude-md arm in runScopedLint, gated on CLAUDE.md being staged AND the script existing at cwd so it is a no-op elsewhere. Added the lint:claude-md alias and full fixture coverage.
 ## Evidence
