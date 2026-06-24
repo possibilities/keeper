@@ -68,5 +68,5 @@ ghost results.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Marked a pure-send register (keeper bus chat send/broadcast) as send_only: it binds the from identity without joining the registry, taking over the agent's live watch channel, or persisting a bus.db cache row. Fixes the unreachable-live-agent bug where a transient send evicted the agent's watch and left a sock=null ghost. fn-918 wake-on-send preserved.
 ## Evidence
