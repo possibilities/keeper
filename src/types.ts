@@ -836,3 +836,35 @@ export interface Task {
    */
   jobs: EmbeddedJob[];
 }
+
+/**
+ * Pre-flattened `BlockEscalationRequested` synthetic event payload — the daemon
+ * block-escalation producer (task 3) mints it for a `pending` `block_escalations`
+ * latch row right before it spawns the one-way bus-send helper, advancing the
+ * latch `pending → requested`. Keyed strictly `(epic_id, task_id)` — the latch
+ * pk. The reducer fold reads this event (it stays in the KEEP-SET inline forever,
+ * the complement of the retention shed allow-list).
+ */
+export interface BlockEscalationRequestedPayload {
+  /** Parent epic id — part of the `block_escalations` pk. */
+  epic_id: string;
+  /** Blocked task id — part of the `block_escalations` pk. */
+  task_id: string;
+}
+
+/**
+ * Pre-flattened `BlockEscalationAttempted` synthetic event payload — the producer
+ * mints it after the one-way bus-send helper resolves, advancing the latch
+ * `requested → attempted` and recording the helper's `outcome` (e.g. `"sent"` /
+ * `"skipped"` / `"failed"`). Keyed `(epic_id, task_id)`. The reducer fold reads
+ * this event (KEEP-SET inline forever — never added to the retention shed
+ * predicate).
+ */
+export interface BlockEscalationAttemptedPayload {
+  /** Parent epic id — part of the `block_escalations` pk. */
+  epic_id: string;
+  /** Blocked task id — part of the `block_escalations` pk. */
+  task_id: string;
+  /** Producer-recorded helper outcome, recorded onto the latch `outcome` column. */
+  outcome: string;
+}

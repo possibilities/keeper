@@ -52,6 +52,8 @@ import {
 } from "./subagent-invocations";
 import type {
   ApiErrorKind,
+  BlockEscalationAttemptedPayload,
+  BlockEscalationRequestedPayload,
   Epic,
   Event,
   InputRequestKind,
@@ -721,6 +723,40 @@ function projectPlanRow(db: Database, event: Event): void {
         `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
            VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
         [epicId, event.id, ts, tasksJson],
+      );
+    }
+
+    // `block_escalations` latch — the escalate-once gate for the daemon
+    // block-escalation producer (task 3). The transition is read off the
+    // EMBEDDED array's prev value (`oldElement`, the latch's prev-value source —
+    // a first-sight task has none, so its prior status is not-blocked) versus the
+    // freshly-folded `element.runtime_status`. Pure function of the payload + the
+    // persisted row (event.id only — no wall-clock/fs/liveness), so the fold
+    // stays re-fold-deterministic. Category is NOT read here: the
+    // `TOOLING_FAILURE`-skip gate lives in the producer.
+    const prevRuntimeStatus = oldElement?.runtime_status ?? null;
+    const nextRuntimeStatus = element.runtime_status;
+    if (prevRuntimeStatus !== "blocked" && nextRuntimeStatus === "blocked") {
+      // Entered blocked: ARM the latch. `ON CONFLICT DO NOTHING` preserves the
+      // first-observed arm's `blocked_since`/`status` so a redundant re-snapshot
+      // of an already-blocked task (same blocked instance) never resets the
+      // latch — only the leave-blocked DELETE below clears it, so an
+      // unblock→re-block re-arms exactly once (the `dispatch_never_bound`
+      // bind/clear reset analog).
+      db.run(
+        `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id)
+           VALUES (?, ?, ?, 'pending', NULL, ?)
+         ON CONFLICT(epic_id, task_id) DO NOTHING`,
+        [epicId, entityId, event.id, event.id],
+      );
+    } else if (
+      prevRuntimeStatus === "blocked" &&
+      nextRuntimeStatus !== "blocked"
+    ) {
+      // Left blocked: CLEAR the latch so the next block instance re-arms fresh.
+      db.run(
+        "DELETE FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+        [epicId, entityId],
       );
     }
   }
@@ -3876,6 +3912,116 @@ function foldDispatchExpired(db: Database, event: Event): void {
       payload.id,
     ]);
   }
+}
+
+/**
+ * Parse a `BlockEscalationRequested` event payload. Returns null on any
+ * structural miss ({@link foldBlockEscalationRequested} folds null to a safe
+ * no-op); NEVER throws. Strict: `epic_id` / `task_id` non-empty strings (the
+ * `block_escalations` pk).
+ */
+function extractBlockEscalationRequestedPayload(
+  event: Event,
+): BlockEscalationRequestedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<BlockEscalationRequestedPayload>;
+    if (typeof parsed.epic_id !== "string" || parsed.epic_id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.task_id !== "string" || parsed.task_id.length === 0) {
+      return null;
+    }
+    return { epic_id: parsed.epic_id, task_id: parsed.task_id };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse BlockEscalationRequested payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `BlockEscalationRequested` event. Advances the
+ * `block_escalations` latch `pending → requested` for the matching
+ * `(epic_id, task_id)`. Idempotent: a missing latch row (the leave-blocked
+ * DELETE already cleared it, or a malformed payload) folds to a safe no-op — the
+ * UPDATE matches zero rows. Pure function of the payload + the persisted row
+ * (`event.id` only, no wall-clock/fs/liveness), so re-fold is byte-deterministic.
+ */
+function foldBlockEscalationRequested(db: Database, event: Event): void {
+  const payload = extractBlockEscalationRequestedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `UPDATE block_escalations
+        SET status = 'requested', last_event_id = ?
+      WHERE epic_id = ? AND task_id = ?`,
+    [event.id, payload.epic_id, payload.task_id],
+  );
+}
+
+/**
+ * Parse a `BlockEscalationAttempted` event payload. Returns null on any
+ * structural miss ({@link foldBlockEscalationAttempted} folds null to a safe
+ * no-op); NEVER throws. Strict: `epic_id` / `task_id` / `outcome` non-empty
+ * strings.
+ */
+function extractBlockEscalationAttemptedPayload(
+  event: Event,
+): BlockEscalationAttemptedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<BlockEscalationAttemptedPayload>;
+    if (typeof parsed.epic_id !== "string" || parsed.epic_id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.task_id !== "string" || parsed.task_id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return {
+      epic_id: parsed.epic_id,
+      task_id: parsed.task_id,
+      outcome: parsed.outcome,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse BlockEscalationAttempted payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `BlockEscalationAttempted` event. Advances the
+ * `block_escalations` latch `requested → attempted` and records the producer's
+ * `outcome` for the matching `(epic_id, task_id)`. Idempotent on a missing latch
+ * row (the UPDATE matches zero rows). Pure function of the payload + the
+ * persisted row (`event.id` only), so re-fold is byte-deterministic.
+ */
+function foldBlockEscalationAttempted(db: Database, event: Event): void {
+  const payload = extractBlockEscalationAttemptedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `UPDATE block_escalations
+        SET status = 'attempted', outcome = ?, last_event_id = ?
+      WHERE epic_id = ? AND task_id = ?`,
+    [payload.outcome, event.id, payload.epic_id, payload.task_id],
+  );
 }
 
 /**
@@ -7575,6 +7721,10 @@ export function applyEvent(
       foldDispatched(db, event);
     } else if (event.hook_event === "DispatchExpired") {
       foldDispatchExpired(db, event);
+    } else if (event.hook_event === "BlockEscalationRequested") {
+      foldBlockEscalationRequested(db, event);
+    } else if (event.hook_event === "BlockEscalationAttempted") {
+      foldBlockEscalationAttempted(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {

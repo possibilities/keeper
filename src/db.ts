@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 85;
+export const SCHEMA_VERSION = 86;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1132,6 +1132,37 @@ CREATE TABLE IF NOT EXISTS dispatch_never_bound (
 `;
 
 /**
+ * `block_escalations` projection table — the escalate-once LATCH for the daemon
+ * block-escalation producer. A row exists for as long as a plan task is in
+ * `runtime_status='blocked'`: the `TaskSnapshot` fold INSERTs the latch
+ * (`status='pending'`, `blocked_since=event.id`) on the transition INTO blocked
+ * and DELETEs it on the transition OUT, so an unblock→re-block re-arms the latch
+ * exactly once — the `dispatch_never_bound` bind/clear reset analog. The producer
+ * (task 3) walks the `pending` rows, mints `BlockEscalationRequested` (→
+ * `status='requested'`) then `BlockEscalationAttempted` (→ `status='attempted'`,
+ * `outcome` recorded), so the latch advances pending→requested→attempted and the
+ * escalation fires exactly once per block instance.
+ *
+ * Category-AGNOSTIC: the fold tracks only the blocked transition + the escalation
+ * events; the `TOOLING_FAILURE`-skip category gate lives in the PRODUCER, never
+ * here. A reducer projection (DETERMINISTIC-replayed — in every rewind-and-redrain
+ * DELETE list; NOT live-only, so a plain `DELETE`, never `rewindLiveProjection`).
+ * `blocked_since` / `last_event_id` are event ids, never wall-clock, so the fold
+ * is re-fold-deterministic.
+ */
+const CREATE_BLOCK_ESCALATIONS = `
+CREATE TABLE IF NOT EXISTS block_escalations (
+    epic_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    blocked_since INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    outcome TEXT,
+    last_event_id INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, task_id)
+)
+`;
+
+/**
  * `epic_tombstones` projection table — a permanent "this epic was deleted"
  * record minted by `EpicDeleted` and cleared by a re-creating `EpicSnapshot`.
  * Every epic-shell-INSERT site consults it and skips the resurrection when a
@@ -2173,6 +2204,7 @@ function migrate(db: Database): void {
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_DISPATCH_NEVER_BOUND);
+      db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
       // `event_blobs` is HISTORICAL (fn-836.4 shed): NOT created in the
       // steady-state schema-setup block, so a post-shed boot never resurrects
@@ -3540,6 +3572,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4432,6 +4465,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4682,6 +4716,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -4747,6 +4782,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -5063,9 +5099,26 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
+
+      // v85→v86 (fn-941 task .2): the daemon block-escalation latch —
+      // comment-only no-op. The `block_escalations` reducer projection (the
+      // escalate-once latch the `TaskSnapshot` fold sets on the transition into
+      // `runtime_status='blocked'` and deletes on the transition out, advanced
+      // pending→requested→attempted by the producer's `BlockEscalationRequested`
+      // / `BlockEscalationAttempted` events) is created above and populates from
+      // the fold arms; the version stamp needs a slot. A reducer projection (in
+      // the rewind-and-redrain DELETE list). NO cursor rewind: a from-scratch
+      // re-fold replays the same `TaskSnapshot` / `BlockEscalation*` stream and
+      // re-derives byte-identical latch rows (empty on a pre-feature log; a task
+      // blocked across the upgrade re-arms on its next blocked transition, the
+      // `dispatch_never_bound` pre-feature-empty tolerance). Whitelist-only Python
+      // read (keeper-py never reads this table) — this bump MUST add 86 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or every
+      // keeper-py read fails host-wide; test/schema-version.test.ts enforces this.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

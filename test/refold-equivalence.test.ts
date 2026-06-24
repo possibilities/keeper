@@ -136,6 +136,8 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "DispatchCleared",
   "Dispatched",
   "DispatchExpired",
+  "BlockEscalationRequested",
+  "BlockEscalationAttempted",
   "AutopilotPaused",
   "AutopilotCapSet",
   "AutopilotMode",
@@ -918,6 +920,201 @@ test("resurrection regression: a full re-fold over historical Dispatched events 
     .query("SELECT reason FROM dispatch_failures WHERE verb = ? AND id = ?")
     .get("work", "fn-870-loop.3") as { reason: string } | null;
   expect(loopFailure?.reason).toBe("never-bound");
+});
+
+// ---------------------------------------------------------------------------
+// `block_escalations` latch (fn-941) — the escalate-once gate for the daemon
+// block-escalation producer. A DETERMINISTIC-replayed projection cloned from
+// `dispatch_never_bound`: it MUST re-fold byte-identically from a from-scratch
+// replay, or the escalate-once guarantee is unsound.
+// ---------------------------------------------------------------------------
+
+/** Insert a `TaskSnapshot` event (task pk = session_id; epic_id + runtime_status in data). */
+function taskSnapshotEvent(
+  taskId: string,
+  epicId: string,
+  runtimeStatus: string,
+): number {
+  return insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: taskId,
+    data: JSON.stringify({
+      epic_id: epicId,
+      task_number: 1,
+      title: "t",
+      runtime_status: runtimeStatus,
+    }),
+  });
+}
+
+/** Stable JSON snapshot of `block_escalations`, sorted by pk — the byte-compare unit. */
+function snapshotBlockEscalations(): string {
+  const rows = db
+    .query(
+      `SELECT epic_id, task_id, blocked_since, status, outcome, last_event_id
+         FROM block_escalations
+        ORDER BY epic_id, task_id`,
+    )
+    .all();
+  return JSON.stringify(rows);
+}
+
+test("block_escalations: latch arms on entering blocked, advances on escalation events, clears on leaving blocked", () => {
+  const EPIC = "fn-x";
+  const TASK = "fn-x.1";
+
+  // 1. Enter blocked → latch ARMED at status=pending, blocked_since=event.id.
+  const blockId = taskSnapshotEvent(TASK, EPIC, "blocked");
+  drainAll();
+  let row = db
+    .query(
+      "SELECT blocked_since, status, outcome, last_event_id FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as {
+    blocked_since: number;
+    status: string;
+    outcome: string | null;
+    last_event_id: number;
+  } | null;
+  expect(row).not.toBeNull();
+  expect(row?.status).toBe("pending");
+  expect(row?.blocked_since).toBe(blockId);
+  expect(row?.outcome).toBeNull();
+
+  // A redundant re-snapshot of the STILL-blocked task does NOT reset the latch
+  // (ON CONFLICT DO NOTHING preserves the first arm's blocked_since/status).
+  taskSnapshotEvent(TASK, EPIC, "blocked");
+  drainAll();
+  row = db
+    .query(
+      "SELECT blocked_since, status, outcome, last_event_id FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as typeof row;
+  expect(row?.status).toBe("pending");
+  expect(row?.blocked_since).toBe(blockId);
+
+  // 2. Producer mints BlockEscalationRequested → pending → requested.
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK }),
+  });
+  drainAll();
+  expect(
+    (
+      db
+        .query(
+          "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+        )
+        .get(EPIC, TASK) as { status: string }
+    ).status,
+  ).toBe("requested");
+
+  // 3. Producer mints BlockEscalationAttempted → requested → attempted + outcome.
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK, outcome: "sent" }),
+  });
+  drainAll();
+  row = db
+    .query(
+      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as typeof row;
+  expect(row?.status).toBe("attempted");
+  expect(row?.outcome).toBe("sent");
+
+  // 4. Leave blocked (unblock → todo) → latch CLEARED.
+  taskSnapshotEvent(TASK, EPIC, "todo");
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT 1 FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      )
+      .get(EPIC, TASK),
+  ).toBeNull();
+
+  // 5. Re-block → latch RE-ARMS fresh at pending (the escalate-once-per-instance
+  // re-arm — exactly one escalation per block instance).
+  const reblockId = taskSnapshotEvent(TASK, EPIC, "blocked");
+  drainAll();
+  row = db
+    .query(
+      "SELECT blocked_since, status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as typeof row;
+  expect(row?.status).toBe("pending");
+  expect(row?.blocked_since).toBe(reblockId);
+  expect(row?.outcome).toBeNull();
+});
+
+test("block_escalations: a TOOLING_FAILURE-style block is folded latch-AGNOSTIC (the category gate is NOT in the fold)", () => {
+  // The fold tracks ONLY the blocked transition — it knows nothing about the
+  // block category (TOOLING_FAILURE vs SPEC_UNCLEAR live in the reason text, not
+  // runtime_status). Every blocked task gets a latch; the producer (task 3) is
+  // the sole place the TOOLING_FAILURE skip is decided. This pins that the fold
+  // never reads a category, so re-fold can never diverge on one.
+  const EPIC = "fn-y";
+  const TASK = "fn-y.1";
+  taskSnapshotEvent(TASK, EPIC, "blocked");
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      )
+      .get(EPIC, TASK),
+  ).toEqual({ status: "pending" });
+});
+
+test("block_escalations re-folds byte-identically from a from-scratch replay (escalate-once latch determinism)", () => {
+  // Seed the full lifecycle stream for two tasks across two epics: arm,
+  // escalate, attempt, unblock, re-block — the exact shape the escalate-once
+  // guarantee depends on.
+  const A_EPIC = "fn-a";
+  const A_TASK = "fn-a.1";
+  const B_EPIC = "fn-b";
+  const B_TASK = "fn-b.2";
+
+  taskSnapshotEvent(A_TASK, A_EPIC, "blocked");
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: A_EPIC, task_id: A_TASK }),
+  });
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      epic_id: A_EPIC,
+      task_id: A_TASK,
+      outcome: "sent",
+    }),
+  });
+  // A unblock→re-block round-trip on the SAME task — re-arms the latch exactly
+  // once; the re-fold must reproduce the SECOND arm's blocked_since, not the first.
+  taskSnapshotEvent(A_TASK, A_EPIC, "todo");
+  taskSnapshotEvent(A_TASK, A_EPIC, "blocked");
+  // A second task that lands in blocked and stays pending (never escalated).
+  taskSnapshotEvent(B_TASK, B_EPIC, "blocked");
+  drainAll();
+
+  const live = snapshotBlockEscalations();
+  // Two latch rows: A re-armed at pending (post round-trip), B pending.
+  expect(JSON.parse(live).length).toBe(2);
+
+  // Full from-scratch re-fold: rewind the cursor + wipe every projection
+  // (the production rewinding-migration shape — block_escalations rides the
+  // canonical DELETE list), then re-drain from id 0.
+  rewindAndWipeProjections();
+  db.run("DELETE FROM block_escalations");
+  drainAll();
+
+  const refolded = snapshotBlockEscalations();
+  // Byte-identical — the escalate-once latch is re-fold-deterministic.
+  expect(refolded).toBe(live);
 });
 
 // ---------------------------------------------------------------------------

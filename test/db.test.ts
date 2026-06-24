@@ -2128,8 +2128,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // worker's root across the bind → first-activity handoff, fn-924); the
   // v62→v63 epics-shape migration this test exercises is unchanged. v85 strips
   // the static priority/ordering machinery — DROPs `epics.sort_path` /
-  // `queue_jump` / `created_by_closer_of` + `events.plan_queue_jump`, fn-936.
-  expect(SCHEMA_VERSION).toBe(85);
+  // `queue_jump` / `created_by_closer_of` + `events.plan_queue_jump`, fn-936;
+  // v86 adds the `block_escalations` escalate-once latch projection table, fn-941
+  // (comment-only no-op — created via CREATE_BLOCK_ESCALATIONS, populated from
+  // the fold arms). The v62→v63 epics-shape migration this test exercises is
+  // unchanged.
+  expect(SCHEMA_VERSION).toBe(86);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

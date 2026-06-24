@@ -2769,11 +2769,14 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // handoff). And to 85 via fn-936 task .1 (stripping the static priority/
   // ordering machinery — DROP `epics.sort_path` / `queue_jump` /
   // `created_by_closer_of` + `events.plan_queue_jump` via a table rebuild +
-  // full rewind-and-redrain). This pin tracks the LIVE schema version: the guard
-  // it provides is "an accidental reducer/schema change must surface as a failing
-  // whitelist + this pin", which still holds — bump both together when the schema
-  // genuinely moves.
-  expect(SCHEMA_VERSION).toBe(85);
+  // full rewind-and-redrain). And to 86 via fn-941 task .2 (adding the
+  // `block_escalations` escalate-once latch projection table — comment-only
+  // no-op, NO cursor rewind: the latch re-folds byte-identical from the
+  // `TaskSnapshot` / `BlockEscalation*` stream). This pin tracks the LIVE schema
+  // version: the guard it provides is "an accidental reducer/schema change must
+  // surface as a failing whitelist + this pin", which still holds — bump both
+  // together when the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(86);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
