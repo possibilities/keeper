@@ -55,5 +55,5 @@ Rewrite the panel's hardcoded two-command fan-out into a data-driven loop over a
 - [ ] references/panel.md + panel-judge.md attribute by preset name.
 
 ## Done summary
-
+Rewrote the panel docs to resolve panels.<name> via 'keeper agent presets resolve' and fan out one 'keeper pair send --preset <member>' per member, with the legacy claude+codex two-command form as the zero-config fallback. references/panel.md and panel-judge.md now attribute by preset name so two same-harness-different-model panelists stay distinguishable.
 ## Evidence
