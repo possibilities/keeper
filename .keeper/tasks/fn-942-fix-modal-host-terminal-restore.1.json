@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "reset child input modes on teardown",
-  "updated_at": "2026-06-24T18:32:46.262000Z"
+  "updated_at": "2026-06-24T21:50:11.300000Z",
+  "worker_done_at": "2026-06-24T21:50:11.300000Z"
 }

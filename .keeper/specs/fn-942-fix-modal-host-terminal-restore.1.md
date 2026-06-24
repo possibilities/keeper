@@ -41,5 +41,5 @@ cycle and re-emit if not). Leave the no-flag / stub path byte-identical.
 - [ ] A regression test asserts the reset bytes are written on each exit path; the no-flag / stub path is unchanged
 
 ## Done summary
-
+Modal host now emits TERMINAL_INPUT_RESET (mouse/SGR/focus/bracketed-paste OFF, cursor ON) in restore() before un-raw on every exit path, fail-open, so the shell prompt no longer floods with the child's input-reporting escapes after exit; the overlay re-enables focus reporting on close symmetric to the open-side disable. Regression tests assert the reset fires on normal/child-exit-while-open/crash/signal paths exactly once, plus the focus open->close survival.
 ## Evidence
