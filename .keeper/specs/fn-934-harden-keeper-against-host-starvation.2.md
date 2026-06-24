@@ -68,5 +68,5 @@ Any real-`ps`/real-process integration goes in `*.slow.test.ts` + scripts/test-r
 - [ ] README reaper taxonomy + CLAUDE.md "reapers" block updated (→ the orphan arm); `bun run test:full` green.
 
 ## Done summary
-
+Added a third reaper arm (selectOrphanedProcessCandidates) that reaps agent-orphaned host runaways via a closed-conjunction gate (uid==self, proc-info-ok, ppid==1, exe-path allow-list, age>min, pid not in keeper's live set), a net-new raw-pid actuator with (pid,start_time) TOCTOU re-fingerprint and two-phase SIGTERM->SIGKILL, plus the disableOrphanReap config opt-out.
 ## Evidence
