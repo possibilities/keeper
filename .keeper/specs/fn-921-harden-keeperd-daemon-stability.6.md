@@ -57,5 +57,5 @@ dispatch — but it makes every reboot slow.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Fast cold-boot git seed: discoverSeedRoots prunes missing/stale roots before the 2s toplevel resolve, warmGitAttribMemo hoists the cold O(history) attribution scan out of the per-root fold loop (pure optimization, byte-identical re-fold), and the whole-scan budget widens 30s->60s. Eliminates the 0/10 boot-seed exhaustion and the 3.9s cold folds.
 ## Evidence

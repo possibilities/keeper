@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Cold-boot git-fold perf + boot-seed resilience",
-  "updated_at": "2026-06-23T23:58:20.973000Z"
+  "updated_at": "2026-06-24T02:13:05.976000Z",
+  "worker_done_at": "2026-06-24T02:13:05.976000Z"
 }
