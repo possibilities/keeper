@@ -39,5 +39,5 @@ Unit-test the await condition's escalated-but-paused branch with synthetic proje
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Surface escalated-but-paused blocked tasks: keeper:await softens an escalated runtime-blocked task from stuck to waiting while the autopilot is paused (so an armed --fail-on-stuck wait holds for the planner), and the board renders [blocked:escalated] distinctly from [blocked:runtime-blocked]. Subscribed block_escalations + autopilot paused onto the readiness snapshot.
 ## Evidence
