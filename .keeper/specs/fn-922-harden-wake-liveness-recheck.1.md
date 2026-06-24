@@ -25,5 +25,5 @@ not the `stopped`+live-pane case.
 - [ ] `test/bus-wake.test.ts` adds a `stopped`+live-pane case (synthetic inputs, no real tmux).
 
 ## Done summary
-
+Widened the bus-wake liveness recheck to treat a stopped creator with a live tmux pane as live (new isStoppedPaneLive mirroring the autopilot's isStoppedJobLive), injected as a pure WakeDeps.livePaneIds seam and wired to a real list-panes sweep in cli/bus.ts, closing the redundant-resume hazard. Added stopped+live-pane unit coverage.
 ## Evidence
