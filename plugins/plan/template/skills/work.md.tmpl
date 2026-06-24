@@ -7,7 +7,7 @@ description: >-
   says "work", "/work", or invokes the plan work workflow on an existing
   `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(keeper plan:*), Bash(keeper bus chat send:*), Read, Glob, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Read, Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -123,7 +123,7 @@ keeper plan reconcile <task_id>
 - **`in_progress_committed`** → the worker's source commit landed but `keeper plan done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `keeper plan done <task_id> --summary "..."` now."*
 - **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests within your two-full-pass budget, `keeper commit-work`, `keeper plan done`."*
 - **`state_uncommitted`** → the worker stamped `done` but the `.keeper/` state commit never landed. Resume with the nudge *"Re-run `keeper plan done <task_id> --summary "..."` to land the state commit."*
-- **`blocked`** → the worker escalated a semantic block → **Phase 2c** (escalate to the planner once, then fall back). Carry the `blocked_reason` plus any `BLOCKED: <category>` breadcrumb from the worker return into Phase 2c.
+- **`blocked`** → the worker escalated a semantic block; the task already carries the block on the board → **Phase 2c** (stamp-if-needed, then surface-and-stop). Carry the `blocked_reason` plus any `BLOCKED: <category>` breadcrumb from the worker return into Phase 2c.
 - **`not_started`** → unexpected post-worker (the task is still `todo`); surface the verdict verbatim and stop.
 - **`tooling_error`** → a git subprocess failed and the verdict is unreliable; surface the envelope verbatim and stop. **Do NOT act on a `tooling_error`** — fail closed, never resume against an unreliable verdict.
 
@@ -166,35 +166,21 @@ keeper plan reconcile <task_id>
    - `blocked` → BLOCKED short-circuit.
    - a non-`done` `in_progress_*` / `state_uncommitted` arm (the cold spawn dropped) → this cold-resume invocation has spent its single attempt. The cold path holds no cross-invocation counter, so do NOT block — surface the verdict verbatim and stop. A fresh `/plan:work` re-run takes another attempt under the best-effort budget; a task that genuinely can't progress surfaces repeatedly and the human blocks it by hand.
 
-**`BLOCKED:` short-circuit:** if the worker returns a `BLOCKED: <category>` message at any point, route to **Phase 2c** (escalate to the planner once, then fall back) carrying the breadcrumb verbatim. Semantic failures bypass the `in_progress_*` recovery flow entirely — Phase 2c is a single bus escalation, not that retry loop.
+**`BLOCKED:` short-circuit:** if the worker returns a `BLOCKED: <category>` message at any point, stamp the block and stop — route to **Phase 2c**. Semantic failures bypass the `in_progress_*` recovery flow entirely.
 
-### 2c. Escalate to the planner once, then fall back
+### 2c. Stamp the block and stop
 
-Both semantic-block exits — the `blocked` reconcile verdict and the `BLOCKED: <category>` short-circuit — funnel here. The planner is a live sibling session of the same human (the one who planned this epic); when reachable, it can do the unblock work itself or direct a concrete resume. The wielder NEVER edits code — it only escalates and then resumes the worker per the planner's reply.
+Both semantic-block exits — the `blocked` reconcile verdict and the `BLOCKED: <category>` short-circuit — funnel here. The wielder's only job on a semantic block is to record it on the board and surface it; the daemon owns escalation from there. The wielder NEVER edits code, sends on the bus, or resumes the worker.
 
-**Bound: ONE escalation per block.** Hold an invocation-local "escalated this block" flag keyed on `(task_id, BLOCKED category)`, mirroring the Phase 2b invocation-local attempt counter. If you have already escalated this exact `(task_id, category)` block this invocation, do NOT re-escalate — surface the breadcrumb verbatim and stop. Phase 2c is separate from the 5-attempt `in_progress_*` budget; semantic blocks were never in it.
+**Step 1 — stamp the block (if not already blocked).** If the task is not already `blocked` (the `BLOCKED:` short-circuit path — reconcile read a non-`blocked` verdict, or the worker returned a `BLOCKED:` breadcrumb mid-flight), stamp it:
 
-**Step 1 — escalate (send blindly).** Address the planner by role: `keeper bus chat send "planner@<epic_id>" -` with the body on stdin. The synchronous send IS the reachability check — do NOT pre-check `keeper bus list`. The body is LOAD-BEARING: `planner@<epic_id>` is only a resolution convenience — the receiver has no "planner mode" and acts via the ordinary authoritative-bus contract — so ALL framing must travel in the message. Use the bus hand-off vocab (`LEAD:` / `HANDOFF:`) and carry, verbatim:
+```bash
+keeper plan block <task_id> --reason "<CATEGORY>: <one-line text>"
+```
 
-- `epic_id`, `task_id`, the `BLOCKED: <category>` breadcrumb, the `blocked_reason`;
-- `target_repo` and `primary_repo` (from the Phase 1 claim envelope);
-- the full framing, biased toward **(a)** "do the unblock yourself, commit, then tell me to resume", with **(b)** "this is part of the plan — resume your worker with `<directive>`" as the alternative.
+Format the reason with the worker's `BLOCKED: <category>` category as the prefix (`SPEC_UNCLEAR: …`, `DEPENDENCY_BLOCKED: …`, etc.) — the daemon's escalation producer parses this category prefix and skips `TOOLING_FAILURE`. If the task is ALREADY `blocked` (the `blocked` reconcile verdict — the board already carries the reason), do not re-stamp.
 
-**Step 2 — branch on the send outcome.** The CLI prints the outcome token and sets the exit code. Two outcomes are exit-0 successes — `delivered` (the planner is live) and `queued_for_wake` (the planner is the known-but-offline creator; the escalation was DURABLY persisted for replay on its return); every other result (`not_connected`, `unknown_target`, `ambiguous_target`, `delivery_failed`) exits 1.
-
-- **`delivered`** → announce *"waiting for planner on `<task_id>`"* and **YIELD** — end the turn. "Wait means yield, not spin." NEVER run `keeper bus watch`. The planner's authoritative reply arrives via the already-armed inbox Monitor as a notification that re-invokes you; a long body spills to a file you read via `Read`.
-- **`queued_for_wake`** → the planner is offline but the escalation is persisted. **AUTO-WAKE then YIELD:** announce *"queued escalation for offline planner on `<task_id>`; waking it"*, run `keeper bus wake "planner@<epic_id>"` once (it resumes the offline creator into the `agentbus` session — single-flighted, liveness- and cooldown-gated, fail-open), then **YIELD** — end the turn exactly as the `delivered` path does. Do NOT inspect or retry the wake outcome (`launched` / `already_live` / `in_flight` / `cooldown` / `launch_failed` are all fine): the woken planner re-arms its inbox Monitor, the persisted escalation is redelivered on resubscribe, and its authoritative reply re-invokes you via the same notification path. NEVER run `keeper bus watch`. This is yield-and-wake, NOT the surface-BLOCKED-and-stop fallback.
-- **Any other non-success** (`not_connected` / `unknown_target` / `ambiguous_target` / `delivery_failed`) → **FALL BACK**: surface the original `BLOCKED:` breadcrumb (plus `blocked_reason`) verbatim and STOP. This is today's surface-BLOCKED-and-stop — the autopilot-headless / planner-absent / self-send degrade. A missed directed send falls back to surface-and-stop.
-
-**Self-send-to-creator degrade.** If you ARE the epic's creator, the bus excludes self from fanout → the send is `not_connected` (never `queued_for_wake` — a self-send does not queue) → the fallback fires. That is correct: you are already the planner, so handle the block directly (surface and stop) rather than wait for a reply that can never come.
-
-**Step 3 — on the planner's reply, resume the worker (never edit code yourself).** When the reply arrives:
-
-1. Re-run `keeper plan reconcile <task_id>`. `reconcile` is authoritative for `done` — a planner "I did it" claim that does NOT reconcile to `done` resumes the worker; it does not re-escalate and is not trusted on its word.
-2. If the verdict is `done` → continue to Phase 3.
-3. Otherwise route the reply's directive into the worker via the EXISTING Phase 2b resume machinery — warm `SendMessage(to=worker_agent_id)` if it was captured this invocation, else cold `keeper plan worker resume`. Both planner paths (a) and (b) end in resume-the-worker.
-
-**No re-escalation (ping-pong / maker-checker guard).** If the post-resume `reconcile` is still `blocked` with the SAME blocker, the `(task_id, category)` flag is already set → surface the breadcrumb and stop. Never re-escalate the same block — this layers on the bus loop-stop reflex.
+**Step 2 — surface and stop.** Surface the `BLOCKED: <category>` breadcrumb plus the `blocked_reason` verbatim, then STOP. The daemon detects the blocked task on the board, escalates to the epic's `planner@<epic>` over the Agent Bus exactly once per block, and the worker cold-re-dispatches via the autopilot once the planner unblocks the task. No bus send, no wake, no yield, no resume machinery in this skill.
 
 ---
 
@@ -218,7 +204,7 @@ Include the per-task commit sha from the worker return and `epic_progress.done` 
 - **Post-worker assessment is a single `keeper plan reconcile` call + a total switch on its seven verdicts** (Phase 2b) — no `keeper plan show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. The orchestrator speaks only in typed verdicts.
 - **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `keeper plan done`, and self-checks its own delivery cleanliness before returning. A `done` verdict implies both commits landed and no session file of the worker's is left dirty.
 - **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the failure surfaces verbatim and the resume path picks it up.
-- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — it ESCALATES once to the planner (Phase 2c: one bus send + a single planner-directed resume), then falls back to surface-and-stop on any non-`delivered` send or an unresolved re-`reconcile`. This is an escalation, NOT the `in_progress_*` retry loop, and never edits code. The `in_progress_committed` / `in_progress_uncommitted` / `state_uncommitted` verdicts *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b resume machinery). A `tooling_error` verdict surfaces-and-stops (fail closed — never resume against an unreliable verdict).
+- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — it STAMPS the block on the board (`keeper plan block --reason "<CATEGORY>: …"` if not already blocked) and surfaces-and-stops (Phase 2c). The daemon owns escalation to the planner and the worker cold-re-dispatches via the autopilot once the task is unblocked — this skill never sends on the bus, waits, or resumes a semantic block. The `in_progress_committed` / `in_progress_uncommitted` / `state_uncommitted` verdicts *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b resume machinery). A `tooling_error` verdict surfaces-and-stops (fail closed — never resume against an unreliable verdict).
 - **Delivery cleanliness belongs to the worker, not the orchestrator** — the worker commits its own session files before returning; the orchestrator never inspects, classifies, or commits dirty files, never runs `keeper plan done`, and never commits source on the worker's behalf.
 - **Tier routing is owned by the planner + `claim`, not this skill** — spawn the envelope's `worker_agent` (`plan:worker-<tier>`) verbatim, no `model=`, no tier-read. A `null` `worker_agent` is a typed stop, never a spawn.
 - **Never reads or writes** outside plan state + project code. Never use `TodoWrite` — the plan tooling tracks all tasks.
