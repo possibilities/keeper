@@ -441,6 +441,24 @@ Keeper has no `install` verb. Wire it up manually:
      Default EMPTY (every managed session autocloses past the idle grace); a
      non-string/empty entry is dropped. Does NOT touch the `autopilot` session
      (its reap is verdict-gated, not idle-gated).
+   - `usage_scraper_uv_path` / `usage_scraper_project_dir` — the runtime for the
+     usage-scraper PRODUCER worker (the in-keeper agentusage producer). The first
+     is an absolute path to the `uv` binary (e.g. `/opt/homebrew/bin/uv`); the
+     second is an absolute path to the agentusage project directory (the repo
+     holding `pyproject.toml` + `agentusage/scrape_cli.py`). The worker shells out
+     `<uv> run --directory <project_dir> python -m agentusage.scrape_cli …` to the
+     stateless Python scrape util. Both keys have NO default and are independent
+     best-effort: absent/empty/garbage on either leaves the runtime unresolved, so
+     the worker is NOT spawned (keeperd boots normally — this is the rollback
+     switch: unset a key and restart and the worker un-arms). Both MUST be
+     absolute — keeperd's LaunchAgent PATH is stripped, so a bare `uv` would not
+     resolve. **Python prereq:** the agentusage project must be an `uv`-managed
+     project whose env carries `pexpect` + `pyte` (the scrape engine), resolvable
+     by that absolute `uv` path; run `<uv> run --directory <project_dir> python -m
+     agentusage.scrape_cli --target claude --profile default` once by hand to
+     confirm it prints the discriminated JSON contract before gating the worker on.
+     Like `keeper_agent_path`, the absolute path survives the stripped LaunchAgent
+     PATH.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -452,6 +470,8 @@ Keeper has no `install` verb. Wire it up manually:
    # keeper_agent_path: ~/code/keeper/cli/keeper.ts   # launcher re-exec entry
    max_concurrent_jobs: 3
    # disable_autoclose: [pair]   # leave these managed sessions' windows open
+   # usage_scraper_uv_path: /opt/homebrew/bin/uv      # absolute uv binary
+   # usage_scraper_project_dir: ~/code/agentusage     # the scrape util's project
    YAML
    ```
 
@@ -2689,11 +2709,12 @@ The replace swaps only the `subscription` variable; the line stream's byte
 offsets are untouched, so the post-re-arm rescan re-anchors nothing and emits
 no phantom titles.
 
-A **fifth** Worker thread is the usage producer: it watches the agentusage
-daemon's flat leaf state directory (`~/.local/state/agentusage/`, one
-`<id>.json` per profile) with `@parcel/watcher`, safe-parses each changed
-file, and posts a `usage-snapshot` message to main (and a `usage-deleted`
-tombstone when a file vanishes). Main — again the sole writer — turns each
+A **fifth** Worker thread is the usage CONSUMER: it watches the flat leaf
+usage state directory (`~/.local/state/agentusage/`, one `<id>.json` per
+account) with `@parcel/watcher`, safe-parses each changed file, and posts a
+`usage-snapshot` message to main (and a `usage-deleted` tombstone when a file
+vanishes). The envelopes it folds are written by the in-keeper usage-scraper
+PRODUCER worker (below). Main — again the sole writer — turns each
 into a synthetic `UsageSnapshot` (or `UsageDeleted`) events row and pumps a
 wake; the reducer folds it as an idempotent upsert into the flat `usage`
 projection (one row per profile; deletes via tombstone). As of schema v23
@@ -2708,6 +2729,32 @@ log only via main, and the watcher subscription is released in the
 worker's own shutdown handler. The producer also self-recovers from a
 *dropped-events* FSEvents overrun via a debounced single-flight re-scan
 of the existing change-gated boot-scan path.
+
+Feeding that consumer is the usage-scraper PRODUCER worker (`src/usage-scraper-worker.ts`):
+keeperd both produces AND consumes the per-account Claude/Codex usage data. It is
+wired like the builds poller (a non-watcher, config-gated poll producer, NOT a
+`@parcel/watcher` member) and is gated on a resolvable runtime — an absolute `uv`
+binary path (`usage_scraper_uv_path`) plus the agentusage project dir
+(`usage_scraper_project_dir`); an unresolved runtime leaves the worker un-spawned
+(a warning, never a `fatalExit`). When spawned it runs N concurrent per-account
+async loops sharing a global profile-gate (launches ≥60s apart) and a per-target
+mutex, on a 60–180s jitter cadence. Each cycle runs the idle/cooldown gates,
+resolves the account's tier→multiplier, then shells out via the scrape runner —
+`<uv> run --directory <agentusage> python -m agentusage.scrape_cli …` — to the
+stateless Python scrape util, which `pexpect`-spawns the real `claude`/`codex` TUI
+(direct, with `CLAUDE_CONFIG_DIR` set — no `keeper agent`, no hook, no job),
+`pyte`-renders the `/usage`|`/status` panel, parses it, and prints one
+discriminated `{ok|error}` JSON object. The worker assembles the envelope
+(producer-side wall-clock owns `multiplier`, `next_fetch_at`, `last_*_fetch_at`,
+and the fresh-derived `lift_at`) and atomically writes the `<id>.json` envelope (+
+`<id>.error.json` sidecar + `events.jsonl` audit line) the consumer above folds.
+The whole cycle is no-throw: a scrape/IO failure writes a `stale` envelope and an
+`.error.json`, never crash-loops. It writes ONLY this on-disk surface (its
+read-only keeper.db handle is the worker-contract convention; main stays the sole
+event writer). A singleton `scraper.lock` FileLock on the state dir means two
+producers never race the same files, so the worker simply un-arms if a lock is
+held. `KEEPER_AGENTUSAGE_ROOT` moves the producer + consumer + the vendored
+picker's ledger off the real state dir together (the test-isolation seam).
 
 A **sixth** Worker thread is the exit-watcher: it owns a kqueue (macOS) or
 pidfd+epoll (Linux) fd via `bun:ffi`, polls `data_version` to keep its watch

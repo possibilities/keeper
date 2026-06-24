@@ -356,6 +356,21 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   worker's own shutdown handler releases them (close the bus.db connection, close
   the listener, drop the lock). The keeper.db connection it ALSO opens stays
   read-only — a worker writing keeper.db is still forbidden.
+- **Usage is a PRODUCER + a CONSUMER, two distinct workers.** The
+  `usage`-watcher CONSUMER (`@parcel/watcher`, a `WATCHER_WORKERS` member) folds
+  the `~/.local/state/agentusage/<id>.json` envelopes into the `usage` projection
+  via main; the usage-scraper PRODUCER (`src/usage-scraper-worker.ts`) WRITES those
+  envelopes. The producer is a non-watcher, config-gated poll producer modeled on
+  `builds-worker` (N per-account loops, global profile-gate + per-target mutex,
+  60–180s jitter, no-throw cycle), gated on a resolvable runtime
+  (`usage_scraper_uv_path` + `usage_scraper_project_dir` — both absolute, NO
+  default, un-spawn + warn when unresolved, NEVER `fatalExit`). Each cycle shells
+  out `<uv> run --directory <agentusage> python -m agentusage.scrape_cli …` to the
+  stateless Python scrape util (it owns the `pexpect`+`pyte`+panel parsers; keeper
+  owns the orchestration + the vendored picker). It writes ONLY its on-disk
+  surface (envelope + `.error.json` + `events.jsonl`); main stays the sole event
+  writer. `KEEPER_AGENTUSAGE_ROOT` sandboxes the state dir + picker ledger for
+  tests.
 
 ## Test isolation
 
