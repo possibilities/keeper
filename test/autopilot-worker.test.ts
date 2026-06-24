@@ -29,7 +29,7 @@
 
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
@@ -60,6 +60,7 @@ import {
   type ReconcileState,
   reconcile,
   refreshSuppressionForOpenPending,
+  resolveWorkerLaunchConfig,
   runReconcileCycle,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
@@ -181,6 +182,12 @@ function makeSnapshot(
     // so every pre-fn-905 test sees the normal dispatch behavior; the
     // unseeded-gate tests override it with the roots to gate.
     unseededRoots: new Set<string>(),
+    // fn-937: the worker `--model`/`--effort` resolved producer-side from the
+    // `worker` preset, COALESCING onto the WORKER_* constants. Default to the
+    // constants so every pre-fn-937 test sees byte-for-byte identical dispatch;
+    // the preset-override tests set these explicitly.
+    workerModel: WORKER_MODEL,
+    workerEffort: WORKER_EFFORT,
     ...overrides,
   };
 }
@@ -636,6 +643,26 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
   expect(plan?.workerCommand).toBe(
     "cd /repo && claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
+});
+
+test("fn-937: a snapshot's resolved worker preset flows into the launch's command AND the launch model/effort", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    workerModel: "opus",
+    workerEffort: "high",
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const plan = decision.launches[0];
+  expect(plan?.workerCommand).toBe(
+    "cd /repo && claude --model opus --effort high --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+  );
+  // The same resolved values ride on the launch so the cycle glue feeds
+  // buildPlannedLaunchSpec identically (drift-guard parity).
+  expect(plan?.model).toBe("opus");
+  expect(plan?.effort).toBe("high");
 });
 
 test("fn-905: reconcile dispatches NOTHING into an unseeded root", () => {
@@ -2670,6 +2697,105 @@ test("buildWorkerCommand: work / close flag shapes (fn-756: approve verb gone)",
   expect(buildWorkerCommand("work", "fn-1-foo.1", "")).toBe(
     "claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-937 — `worker` preset resolution (defaults to sonnet/max, fail-safe)
+// ---------------------------------------------------------------------------
+
+test("buildWorkerCommand / buildPlannedLaunchSpec: a resolved preset overrides BOTH builders in lockstep", () => {
+  const cmd = buildWorkerCommand("work", "fn-1-foo.1", "/repo", "opus", "high");
+  expect(cmd).toBe(
+    "cd /repo && claude --model opus --effort high --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+  );
+  const spec = buildPlannedLaunchSpec("work", "fn-1-foo.1", "opus", "high");
+  expect(spec).toEqual({
+    prompt: "/plan:work fn-1-foo.1",
+    claudeName: "work::fn-1-foo.1",
+    model: "opus",
+    effort: "high",
+  });
+});
+
+test("buildWorkerCommand / buildPlannedLaunchSpec: omitted model/effort default to WORKER_* (byte-identical to no-preset)", () => {
+  expect(buildWorkerCommand("work", "fn-1-foo.1", "/repo")).toContain(
+    `--model ${WORKER_MODEL} --effort ${WORKER_EFFORT}`,
+  );
+  expect(buildPlannedLaunchSpec("work", "fn-1-foo.1")).toEqual({
+    prompt: "/plan:work fn-1-foo.1",
+    claudeName: "work::fn-1-foo.1",
+    model: WORKER_MODEL,
+    effort: WORKER_EFFORT,
+  });
+});
+
+test("resolveWorkerLaunchConfig: no registry file → WORKER_* constants", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  try {
+    const cfg = resolveWorkerLaunchConfig(join(dir, "presets.yaml"));
+    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkerLaunchConfig: a `worker` preset overrides model/effort", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  try {
+    const path = join(dir, "presets.yaml");
+    writeFileSync(
+      path,
+      "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: high\n",
+    );
+    const cfg = resolveWorkerLaunchConfig(path);
+    expect(cfg).toEqual({ model: "opus", effort: "high" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkerLaunchConfig: a partial `worker` preset layers per-field over the constants", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  try {
+    const path = join(dir, "presets.yaml");
+    // model-only preset → effort falls back to WORKER_EFFORT.
+    writeFileSync(
+      path,
+      "presets:\n  worker:\n    harness: claude\n    model: opus\n",
+    );
+    const cfg = resolveWorkerLaunchConfig(path);
+    expect(cfg).toEqual({ model: "opus", effort: WORKER_EFFORT });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkerLaunchConfig: no `worker` preset in a present registry → constants", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  try {
+    const path = join(dir, "presets.yaml");
+    writeFileSync(
+      path,
+      "presets:\n  other:\n    harness: claude\n    model: opus\n",
+    );
+    const cfg = resolveWorkerLaunchConfig(path);
+    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkerLaunchConfig: a malformed registry FALLS BACK to constants without throwing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  try {
+    const path = join(dir, "presets.yaml");
+    // `presets` as a list (not a mapping) → ConfigError, must be swallowed.
+    writeFileSync(path, "presets:\n  - not-a-mapping\n");
+    const cfg = resolveWorkerLaunchConfig(path);
+    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("buildLaunchArgv wraps the worker command in [shell, -l, -i, -c, body]", () => {

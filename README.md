@@ -1355,7 +1355,12 @@ event-log/reducer/hook touch. Run any of them with
   unknown preset name. Presets are producer-side launch config, never a fold
   input — no RPC writes a preset and the registry is re-parsed per dispatch (no
   watcher), so an edit lands without a daemon bounce. The autopilot worker launch
-  resolves a `worker` preset (defaulting to today's `sonnet`/`max`).
+  resolves its `--model`/`--effort` from a `worker` preset, COALESCING per-field
+  onto the `WORKER_MODEL`/`WORKER_EFFORT` constants (today's `sonnet`/`max`) when
+  the preset (or the whole registry) is absent — so with no `worker` preset the
+  dispatched command is byte-identical to the old hardcoded launch. Re-resolved
+  per dispatch and fail-SAFE: a malformed `presets.yaml` is swallowed-to-constants
+  in the dispatch path so the daemon never crashes on a bad registry.
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,

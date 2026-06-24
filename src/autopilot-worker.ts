@@ -39,6 +39,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { ConfigError, loadPresetRegistry, type Preset } from "./agent/config";
 import { computeEligibleEpics } from "./armed-closure";
 import {
   BackstopCounters,
@@ -265,11 +266,14 @@ export function buildWorkerCommand(
   verb: Verb,
   id: string,
   projectDir: string,
+  model: string = WORKER_MODEL,
+  effort: string = WORKER_EFFORT,
 ): string {
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   const flags: string[] = [];
-  // Both verbs launch at max effort.
-  flags.push("--model", WORKER_MODEL, "--effort", WORKER_EFFORT);
+  // Model/effort default to the `WORKER_*` constants; the `worker` preset (when
+  // present in `presets.yaml`) overrides them, resolved producer-side per cycle.
+  flags.push("--model", model, "--effort", effort);
   flags.push("--agentwrap-no-confirm");
   // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
@@ -284,6 +288,45 @@ export const WORKER_MODEL = "sonnet" as const;
 export const WORKER_EFFORT = "max" as const;
 
 /**
+ * Resolve the autopilot worker's `{model, effort}` from the `worker` preset in
+ * `presets.yaml`, COALESCING onto the {@link WORKER_MODEL}/{@link WORKER_EFFORT}
+ * constants per-field so behavior is byte-identical when no registry/preset
+ * exists. Read PRODUCER-SIDE (per dispatch, not a fold input) — the resolved
+ * model never enters `events` as a fold key, so re-fold stays byte-identical.
+ *
+ * Fail-SAFE: a missing registry yields an empty registry (constants), and a
+ * malformed registry's `ConfigError` is SWALLOWED-to-constants here — the daemon
+ * must never crash on a bad `presets.yaml`. Re-resolved per cycle (cheap
+ * single-file parse) so a preset edit lands without a daemon bounce; never
+ * file-watched.
+ */
+export function resolveWorkerLaunchConfig(configPath?: string): {
+  model: string;
+  effort: string;
+} {
+  let preset: Preset | undefined;
+  try {
+    const registry = loadPresetRegistry(
+      ...(configPath === undefined ? [] : ([configPath] as const)),
+    );
+    preset = registry.presets.worker;
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      console.error(
+        "[autopilot-worker] malformed presets.yaml — falling back to worker defaults:",
+        err.message,
+      );
+    } else {
+      throw err;
+    }
+  }
+  return {
+    model: preset?.model ?? WORKER_MODEL,
+    effort: preset?.effort ?? WORKER_EFFORT,
+  };
+}
+
+/**
  * Build the structured {@link LaunchSpec} for a planned launch — the unwrapped
  * inputs {@link agentwrapLaunch} builds its invocation from. Mirrors
  * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/
@@ -291,12 +334,17 @@ export const WORKER_EFFORT = "max" as const;
  * `buildLaunchArgv` shape even though agentwrap reads only this spec. Pure —
  * exported for tests.
  */
-export function buildPlannedLaunchSpec(verb: Verb, id: string): LaunchSpec {
+export function buildPlannedLaunchSpec(
+  verb: Verb,
+  id: string,
+  model: string = WORKER_MODEL,
+  effort: string = WORKER_EFFORT,
+): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
     claudeName: dispatchKey(verb, id),
-    model: WORKER_MODEL,
-    effort: WORKER_EFFORT,
+    model,
+    effort,
   };
 }
 
@@ -412,6 +460,17 @@ export interface ReconcileSnapshot {
    * later DELETEd from re-wedging.
    */
   unseededRoots: Set<string>;
+  /**
+   * The autopilot worker `--model` / `--effort`, resolved producer-side per
+   * cycle from the `worker` preset in `presets.yaml` (COALESCING onto
+   * {@link WORKER_MODEL}/{@link WORKER_EFFORT} when absent/malformed). Assembled
+   * read-time in {@link loadReconcileSnapshot} so the pure `reconcile` stays
+   * fs-free; threaded onto each {@link PlannedLaunch} so both worker-command
+   * builders read the SAME resolved values. NEVER a fold input — re-fold stays
+   * byte-identical regardless of which model runs.
+   */
+  workerModel: string;
+  workerEffort: string;
 }
 
 /**
@@ -471,6 +530,15 @@ export interface PlannedLaunch {
   cwd: string;
   /** `claude --model ... --name <key> '/plan:<verb> <id>'`. */
   workerCommand: string;
+  /**
+   * The resolved worker `--model` / `--effort` for this launch (the `worker`
+   * preset or the {@link WORKER_MODEL}/{@link WORKER_EFFORT} fallback). Carried
+   * onto the launch so the cycle glue feeds {@link buildPlannedLaunchSpec} the
+   * SAME values {@link buildWorkerCommand} baked into `workerCommand` — the
+   * drift-guard parity across the shell + structured shapes.
+   */
+  model: string;
+  effort: string;
   /** Task `tier`, only set for `work` rows. */
   tier: string | null;
   /**
@@ -1037,7 +1105,15 @@ export function reconcile(
         id: taskId,
         key,
         cwd,
-        workerCommand: buildWorkerCommand(verb, taskId, cwd),
+        workerCommand: buildWorkerCommand(
+          verb,
+          taskId,
+          cwd,
+          snapshot.workerModel,
+          snapshot.workerEffort,
+        ),
+        model: snapshot.workerModel,
+        effort: snapshot.workerEffort,
         tier: verb === "work" ? task.tier : null,
       });
       budget--;
@@ -1097,7 +1173,15 @@ export function reconcile(
           id: epicId,
           key: closeKey,
           cwd: projectDir,
-          workerCommand: buildWorkerCommand(closeVerb, epicId, projectDir),
+          workerCommand: buildWorkerCommand(
+            closeVerb,
+            epicId,
+            projectDir,
+            snapshot.workerModel,
+            snapshot.workerEffort,
+          ),
+          model: snapshot.workerModel,
+          effort: snapshot.workerEffort,
           tier: null,
           // fn-742 — every close-row launch is an epic finalizer (`close`);
           // the cycle glue stamps the per-epic guard for these.
@@ -1314,7 +1398,12 @@ export async function runReconcileCycle(
       state.finalizerGuard.set(plan.id, deps.now());
     }
     const argv = buildLaunchArgv(shell, plan.workerCommand);
-    const spec = buildPlannedLaunchSpec(plan.verb, plan.id);
+    const spec = buildPlannedLaunchSpec(
+      plan.verb,
+      plan.id,
+      plan.model,
+      plan.effort,
+    );
     try {
       const outcome = await confirmRunning(
         plan.verb,
@@ -1643,6 +1732,11 @@ export async function loadReconcileSnapshot(
       unseededGatedRoots(db, readGitProjectionFloor(db), memoizedGitToplevel())
     : new Set<string>();
 
+  // Resolve the `worker` preset per cycle (cheap single-file parse, fail-safe to
+  // the WORKER_* constants) — producer-side launch config, never a fold input.
+  const { model: workerModel, effort: workerEffort } =
+    resolveWorkerLaunchConfig();
+
   return {
     epics,
     jobs,
@@ -1655,6 +1749,8 @@ export async function loadReconcileSnapshot(
     mode,
     armedIds,
     unseededRoots,
+    workerModel,
+    workerEffort,
   };
 }
 
