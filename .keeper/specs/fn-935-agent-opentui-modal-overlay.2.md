@@ -56,5 +56,5 @@ no faithful agent render behind it.
 - [ ] The OpenTUI test is added to the `test:opentui` serial chain and passes
 
 ## Done summary
-
+OpenTUI modal overlay floats on the --agentwrap-modal hotkey: a suspended renderer resumes to show a placeholder Box modal over a dim alpha-blended FrameBuffer scrim, dismissed by Esc or a scrim click with an atomic stdin-mutex handoff and a SIGWINCH agent redraw. The host destroys the renderer before propagating the child's disposition on every exit path; covered by a serial test:opentui suite + a real-PTY slow smoke.
 ## Evidence
