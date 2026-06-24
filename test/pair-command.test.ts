@@ -108,7 +108,7 @@ test("assemblePrompt: omits the System block when systemPrompt is empty", () => 
 // native flag sets — claude
 // ---------------------------------------------------------------------------
 
-test("nativeClaudeArgs: write posture accepts edits + skips permissions", () => {
+test("nativeClaudeArgs: interactive TUI shape — no --print, write posture accepts edits", () => {
   const args = nativeClaudeArgs({
     agentwrapPath: AW,
     cli: "claude",
@@ -116,12 +116,13 @@ test("nativeClaudeArgs: write posture accepts edits + skips permissions", () => 
     readOnly: false,
   });
   expect(args).toEqual([
-    "--print",
-    "-p",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
   ]);
+  // The interactive tracked-job shape drops the headless flags.
+  expect(args).not.toContain("--print");
+  expect(args).not.toContain("-p");
 });
 
 test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () => {
@@ -132,14 +133,13 @@ test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () 
     readOnly: true,
   });
   expect(args).toEqual([
-    "--print",
-    "-p",
     "--disallowed-tools",
     "Edit,Write,NotebookEdit",
     "--dangerously-skip-permissions",
   ]);
-  // No acceptEdits in read-only.
+  // No acceptEdits in read-only; no headless --print.
   expect(args).not.toContain("acceptEdits");
+  expect(args).not.toContain("--print");
   // Regression guard: the variadic `--disallowed-tools` must never be the last
   // flag (it would swallow the prompt `buildPairLaunchArgv` appends). The
   // trailing flag must be the boolean `--dangerously-skip-permissions`.
@@ -209,8 +209,45 @@ test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt la
     "--agentwrap-tmux-detached",
     "--agentwrap-no-confirm",
   ]);
+  // Interactive tracked-job shape — never the headless --print -p.
+  expect(argv).not.toContain("--print");
+  // No session supplied → no binding carrier (nothing to name).
+  expect(argv).not.toContain("--agentwrap-tmux-env");
   // The prompt is ALWAYS the final positional element.
   expect(argv.at(-1)).toBe("THE PROMPT");
+});
+
+test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION binding carrier", () => {
+  const argv = buildPairLaunchArgv({
+    agentwrapPath: AW,
+    cli: "claude",
+    prompt: "P",
+    readOnly: false,
+    session: "panels",
+  });
+  // The carrier is what binds the partner into `jobs` as a tracked job, mirroring
+  // buildAgentwrapLaunchArgv. Its value names the same session as the window.
+  const envIdx = argv.indexOf("--agentwrap-tmux-env");
+  expect(envIdx).toBeGreaterThanOrEqual(0);
+  expect(argv[envIdx + 1]).toBe("KEEPER_TMUX_SESSION=panels");
+  // And the window session flag is still present + names the same session.
+  const sessIdx = argv.indexOf("--agentwrap-tmux-session");
+  expect(sessIdx).toBeGreaterThanOrEqual(0);
+  expect(argv[sessIdx + 1]).toBe("panels");
+});
+
+test("buildPairLaunchArgv: codex never gets the binding carrier (stays headless)", () => {
+  const argv = buildPairLaunchArgv({
+    agentwrapPath: AW,
+    cli: "codex",
+    prompt: "P",
+    readOnly: false,
+    session: "pair",
+  });
+  // codex fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION
+  // carrier, even with a session named for the window.
+  expect(argv).not.toContain("--agentwrap-tmux-env");
+  expect(argv).toContain("--agentwrap-tmux-session");
 });
 
 test("buildPairLaunchArgv: codex — agent token is codex, exec native flags present", () => {

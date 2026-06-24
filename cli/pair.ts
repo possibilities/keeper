@@ -331,7 +331,19 @@ export async function main(argv: string[]): Promise<void> {
   });
   startedEmitted = true;
 
-  const env = stripClaudeEnv(process.env as Record<string, string | undefined>);
+  // Partner env. The CLAUDE path launches as an INTERACTIVE TUI bound into the
+  // `jobs` projection (the `KEEPER_TMUX_SESSION` carrier in the launch argv): it
+  // KEEPS the inherited env so agentwrap's own `--session-id` pin — not an env
+  // scrub — is what keeps the partner transcript distinct from the driver's; the
+  // self-collision guard below still backstops the resolver. codex fires no
+  // keeper hooks and stays headless, so it keeps the CLAUDE* env strip that
+  // prevents the orchestrator's identity from leaking into the partner pane.
+  const env =
+    pairCli === "claude"
+      ? (Object.fromEntries(
+          Object.entries(process.env).filter(([, val]) => val !== undefined),
+        ) as Record<string, string>)
+      : stripClaudeEnv(process.env as Record<string, string | undefined>);
 
   // Read-only backstop: snapshot the tree in the partner's cwd BEFORE the
   // partner can run (i.e. before the launch), so a write the partner makes
@@ -421,8 +433,9 @@ export async function main(argv: string[]): Promise<void> {
   // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
   // if the resolver fell back to newest-by-mtime and won the DRIVER's own
   // concurrently-written transcript, never surface that as a `completed` carrying
-  // a bogus answer — fail loud. Read the driver's session id from the orchestrator
-  // env (before stripClaudeEnv scrubbed it for the partner).
+  // a bogus answer — fail loud. The driver's session id is read straight off the
+  // orchestrator's OWN process env (always present here, independent of whatever
+  // env the partner pane inherited).
   if (
     isSelfTranscriptCollision(
       showParse.result.transcriptPath,

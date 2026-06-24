@@ -170,13 +170,24 @@ export interface PairLaunchOpts {
  *
  *   `<abs-agentwrap> <cli> --agentwrap-tmux --agentwrap-tmux-detached
  *     --agentwrap-no-confirm [--agentwrap-tmux-session <s>]
+ *     [--agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>]
  *     -- <native cli flags> <prompt>`
  *
  * The native flags differ per CLI (see {@link nativeClaudeArgs} /
  * {@link nativeCodexArgs}). The `--agentwrap-no-confirm` flag suppresses the
  * cwd-confirm prompt; `--agentwrap-tmux-detached` creates the window without
- * stealing focus, so the orchestrating session keeps control. Pure — exported
- * for byte-pin tests.
+ * stealing focus, so the orchestrating session keeps control.
+ *
+ * `--agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
+ * CLAUDE path only (mirroring `buildAgentwrapLaunchArgv` in
+ * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
+ * the `jobs` projection as a tracked job — agentwrap injects it into the pane
+ * env via tmux `-e`, so the SessionStart hook stamps the session name as the
+ * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). codex
+ * fires no keeper hooks, so it never becomes a tracked job and omits the carrier
+ * (it stays a headless one-shot reaped CLI-side). The carrier needs a session to
+ * name, so it is added only when `session` is present. Pure — exported for
+ * byte-pin tests.
  */
 export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
   const wrapperFlags: string[] = [
@@ -186,6 +197,12 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
   ];
   if (opts.session !== undefined && opts.session !== "") {
     wrapperFlags.push("--agentwrap-tmux-session", opts.session);
+    if (opts.cli === "claude") {
+      wrapperFlags.push(
+        "--agentwrap-tmux-env",
+        `KEEPER_TMUX_SESSION=${opts.session}`,
+      );
+    }
   }
   const native =
     opts.cli === "claude" ? nativeClaudeArgs(opts) : nativeCodexArgs(opts);
@@ -199,20 +216,23 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
 }
 
 /**
- * Native claude flags for a headless one-shot pairing turn. `--print -p` runs
- * headless; the read-only posture strips the edit tools via `--disallowed-tools`
- * (the directive is the primary guard, the strip reinforces it). The write
- * posture accepts edits + skips permission prompts so the partner can edit.
- * Pure — exported for tests.
+ * Native claude flags for a one-turn pairing partner launched as an INTERACTIVE
+ * TUI (not headless `--print`). The interactive shape is what registers the
+ * partner as a tracked `jobs` row — agentwrap binds the pane via the
+ * `KEEPER_TMUX_SESSION` env carrier {@link buildPairLaunchArgv} injects, and the
+ * SessionStart hook stamps the birth session onto the row. The read-only posture
+ * strips the edit tools via `--disallowed-tools` (the directive is the primary
+ * guard, the strip reinforces it); the write posture accepts edits. Both keep
+ * `--dangerously-skip-permissions` so the single-turn partner never stalls on a
+ * permission prompt. Pure — exported for tests.
  */
 export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
-  const args = ["--print", "-p"];
+  const args: string[] = [];
   if (opts.readOnly) {
     // `--disallowed-tools` is variadic — it consumes every following token up to
     // the next flag. It must NOT be the last flag before the trailing prompt
     // positional (`buildPairLaunchArgv` appends the prompt last), or the prompt
-    // is swallowed as bogus tool-deny rules and the partner aborts with "Input
-    // must be provided … when using --print". Keep the boolean
+    // is swallowed as bogus tool-deny rules. Keep the boolean
     // `--dangerously-skip-permissions` last so the prompt survives as a clean
     // positional.
     args.push(
