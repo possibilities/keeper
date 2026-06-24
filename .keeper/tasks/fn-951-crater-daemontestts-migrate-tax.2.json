@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T23:12:24.789000Z",
+  "depends_on": [
+    "fn-951-crater-daemontestts-migrate-tax.1"
+  ],
+  "epic": "fn-951-crater-daemontestts-migrate-tax",
+  "id": "fn-951-crater-daemontestts-migrate-tax.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Decide spawn-test fate and fix docs",
+  "updated_at": "2026-06-24T23:12:24.789000Z"
+}
