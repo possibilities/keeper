@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-24T05:37:44.300000Z",
   "created_at": "2026-06-24T03:08:41.325000Z",
   "depends_on_epics": [],
   "id": "fn-929-merge-agentwrap-into-keeper",
@@ -8,11 +9,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "merge agentwrap into keeper",
   "touched_repos": [
     "/Users/mike/code/agentwrap",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T03:08:41.325000Z"
+  "updated_at": "2026-06-24T05:37:44.300000Z"
 }
