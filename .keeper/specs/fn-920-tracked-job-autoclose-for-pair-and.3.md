@@ -38,5 +38,5 @@ Update resolver tests to the `disable-autoclose` semantics (default empty). Asse
 - [ ] Monitor two-line `completed` contract unchanged for both clis.
 
 ## Done summary
-
+Split pair window reap by CLI: claude is a tracked job (daemon reaper owns autoclose, no synchronous kill), codex/pi keep the CLI-side synchronous reap. Replaced DEFAULT_PAIR_PERSIST_SESSIONS/resolvePairPersistSessions with the unified resolveDisableAutoclose resolver (default empty), sourced from resolveConfig().disableAutoclose so CLI + daemon share one knob.
 ## Evidence
