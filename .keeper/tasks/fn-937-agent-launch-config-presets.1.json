@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T17:16:28.049000Z",
+  "depends_on": [],
+  "epic": "fn-937-agent-launch-config-presets",
+  "id": "fn-937-agent-launch-config-presets.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "preset registry and launcher resolution",
+  "updated_at": "2026-06-24T17:16:28.049000Z"
+}
