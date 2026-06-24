@@ -1331,6 +1331,33 @@ export function __resetGitAttribMemoForTest(db: Database): void {
 }
 
 /**
+ * Pre-warm the per-`Database` {@link GitAttribMemo} to the current
+ * `max(events.id)` ONCE, OUTSIDE any fold's lock-held critical section (fn-921).
+ *
+ * On a fresh connection the memo is cold (`maxId = 0`), so the FIRST
+ * {@link buildExplicitAttribHoist} call inside a fold pays the single `id > 0`
+ * full-history scan of the sparse bash-mutation subset. At boot the boot-seed
+ * runs that first git fold per root while holding the reducer write lock and
+ * racing the per-root time budget; paying the cold scan there is what made one
+ * slow root starve the rest of the seed loop. Warming the memo here moves that
+ * one-time scan ahead of the per-root fold loop so each root's fold sees a warm
+ * memo (an `id > maxId` empty/near-empty delta).
+ *
+ * This is a PURE optimization: the memo is never a fold INPUT — every projection
+ * write re-derives attribution newest-wins per file, and the memo only caches
+ * the snapshot-invariant scan rows. So warming early changes no projection byte
+ * and leaves re-fold determinism untouched (identical to a fold that warmed the
+ * memo lazily on its first call). Producer-only — call it from the boot-seed
+ * before the per-root loop, NEVER from inside a fold.
+ */
+export function warmGitAttribMemo(db: Database): void {
+  // `buildExplicitAttribHoist` does the incremental `id > maxId` scan and bumps
+  // the memo watermark as a side effect; we discard the returned hoist (the
+  // per-fold loop builds its own cheaply off the now-warm memo).
+  buildExplicitAttribHoist(db);
+}
+
+/**
  * Build the per-snapshot {@link ExplicitAttribHoist} once before the pass-1
  * loop. The two scans here ran once per dirty file (fn-787 hoisted them to once
  * per snapshot); fn-892 makes each INCREMENTAL via the per-`Database`

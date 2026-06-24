@@ -1945,6 +1945,10 @@ re-derives the surface for the GATED roots (open-epic `project_dir` + task
 `target_repo`, via `gatedGitRoots` — not the full historical `jobs.cwd` sweep)
 before the daemon serves; live events above the floor keep it current and clear
 `seed_required` once every gated root is seeded (the per-root self-heal, fn-905).
+To keep a reboot fast (fn-921) the boot-seed prunes a candidate whose path no
+longer exists BEFORE the 2s toplevel resolve (a dead `/Volumes/Scratch/*` repo
+never burns the timeout) and pre-warms the attribution memo ONCE outside the
+per-root fold loop so the cold `id > 0` scan doesn't run under the seed budget.
 The carve-out exists because the
 `projectGitStatus` git fold historically re-scanned the WHOLE event log per
 `GitSnapshot` (the pass-1 bash + git-rm/git-mv scans, now memoized incrementally

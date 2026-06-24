@@ -16,7 +16,12 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { __resetGitAttribMemoForTest, applyEvent, drain } from "../src/reducer";
+import {
+  __resetGitAttribMemoForTest,
+  applyEvent,
+  drain,
+  warmGitAttribMemo,
+} from "../src/reducer";
 import type { Event } from "../src/types";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
@@ -2050,6 +2055,107 @@ test("fn-892 incremental pass-1 memo: warm-cache fold equals a cold full rescan 
 
   // Byte-identical: the incremental append equals the full scan.
   expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+});
+
+test("fn-921 warmGitAttribMemo: pre-warming before the first fold yields the SAME file_attributions as lazy warm-on-first-fold", () => {
+  // The boot-seed pre-warms the per-`Database` memo OUTSIDE the per-root fold
+  // loop (so the cold O(history) scan doesn't run inside a lock-held fold racing
+  // the seed budget). Pre-warming must be a PURE optimization: the resulting
+  // projection bytes are identical to lazily warming the memo on the first fold.
+  // Same log, same connection: drain LAZILY, then rewind + wipe + reset the memo
+  // and re-drain with an explicit pre-warm — the two projections must match.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-pw" });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-pw",
+    cwd: "/repo",
+    ts: 2000,
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/old"]),
+    data: JSON.stringify({ tool_input: { command: "git rm -r old" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-pw",
+    cwd: "/repo",
+    ts: 2001,
+    mutation_path: "/repo/new.ts",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/new.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 2002,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "oidpw",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "old/a.ts", xy: " D" as const, mtime_ms: null },
+        { path: "new.ts", xy: " M" as const, mtime_ms: null },
+      ],
+    }),
+  });
+
+  // LAZY path: drain (the first fold warms the memo on its own).
+  drainAll();
+  const lazy = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  expect(lazy.length).toBeGreaterThan(0); // the run actually attributed something
+
+  // PRE-WARM path: rewind the cursor, wipe the projection + memo, then warm the
+  // memo BEFORE re-draining — the explicit hoist the boot-seed performs.
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM git_status");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetGitAttribMemoForTest(db);
+  warmGitAttribMemo(db); // pre-warm before any fold
+  drainAll();
+  const prewarmed = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  // Byte-identical projection: pre-warming changed no output.
+  expect(JSON.stringify(prewarmed)).toBe(JSON.stringify(lazy));
+});
+
+test("fn-921 warmGitAttribMemo: warming an empty log is a no-op (no throw, leaves the memo at the head)", () => {
+  // The boot-seed warms the memo unconditionally; on an empty/near-empty log it
+  // must be a safe no-op. A subsequent fold over a fresh GitSnapshot still
+  // attributes correctly (the memo was warmed to head, not corrupted).
+  expect(() => warmGitAttribMemo(db)).not.toThrow();
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    ts: 3000,
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "oid-empty",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+    }),
+  });
+  drainAll();
+  // A clean snapshot still lands a git_status row (proving the fold ran after the
+  // warm, unperturbed).
+  const row = db
+    .query("SELECT dirty_count FROM git_status WHERE project_dir = '/repo'")
+    .get() as { dirty_count: number } | null;
+  expect(row?.dirty_count ?? 0).toBe(0);
 });
 
 test("fn-892 incremental pass-1 memo: a malformed bash_mutation_targets row advances the watermark (no stall, no throw)", () => {

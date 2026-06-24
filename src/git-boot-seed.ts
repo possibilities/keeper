@@ -55,6 +55,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import type { Stmts } from "./db";
 import { raiseGitProjectionFloor, setGitProjectionSeedRequired } from "./db";
 import { allGatedRootsSeeded, gatedGitRoots } from "./gated-roots";
@@ -66,14 +67,24 @@ import {
   readStatus,
   resolveGitToplevel,
 } from "./git-worker";
+import { warmGitAttribMemo } from "./reducer";
 
 /**
  * Default wall-clock budget for the WHOLE boot-seed git scan. Generous enough to
  * cover a handful of repos with dirty-heavy trees on a slow disk, but bounded so
  * a wedged git can never brick boot. On exhaustion the seed stops issuing new
  * per-root scans, `seed_required` stays set, and the daemon serves.
+ *
+ * Raised 30s→60s (fn-921): the original 30s exhausted at 0/10 roots because the
+ * cold attribution memo paid an O(history) scan inside the first root's fold AND
+ * stale `/Volumes/Scratch/*` roots each burned the 2s toplevel-resolve timeout.
+ * With the cold scan pre-warmed once (`warmGitAttribMemo`) and missing roots
+ * pruned before resolve (`discoverSeedRoots`'s `pathExists`), the per-root cost
+ * is bounded; the wider budget is headroom for a genuinely dirty-heavy real repo
+ * set, and the per-root bulkhead (fn-905) already protects correctness when it
+ * is exceeded (one unseeded root darks only itself, the rest serve).
  */
-export const DEFAULT_GIT_SEED_BUDGET_MS = 30_000;
+export const DEFAULT_GIT_SEED_BUDGET_MS = 60_000;
 
 export interface SeedGitProjectionOptions {
   /**
@@ -91,6 +102,16 @@ export interface SeedGitProjectionOptions {
    * Tests pass explicit roots; production omits it.
    */
   roots?: string[];
+  /**
+   * Probe whether a candidate root path exists on disk. Defaults to
+   * `fs.existsSync`. Used by {@link discoverSeedRoots} to PRUNE missing/stale
+   * roots (e.g. an unmounted `/Volumes/Scratch/*`) BEFORE the per-candidate
+   * `resolveGitToplevel` git spawn — a missing root would otherwise burn the full
+   * 2s toplevel-resolve timeout for nothing, and 10 such roots drag the whole
+   * boot-seed. A producer-side fs read (never inside a fold). Injectable so a
+   * unit test drives the prune decision without touching the real filesystem.
+   */
+  pathExists?: (path: string) => boolean;
   /**
    * The per-root snapshot builder — the ONLY git-touching step. Defaults to the
    * real producer path (`readStatus` → `buildGitSnapshot`, both shelling out to
@@ -155,8 +176,21 @@ function readMaxEventId(db: Database): number {
  * fails to resolve here is still covered by the producer-only self-heal: main's
  * above-floor fold clears `seed_required` once it acquires a row, and until then
  * the per-root gate forces only THAT root `unknown`.
+ *
+ * STALE-ROOT PRUNE (fn-921): a candidate whose path no longer EXISTS on disk
+ * (e.g. an unmounted `/Volumes/Scratch/*` repo from a long-dead session) is
+ * dropped BEFORE `resolveGitToplevel` — `git -C <missing> rev-parse` would
+ * otherwise burn the full 2s toplevel-resolve timeout per such root, and a
+ * handful of them is exactly what dragged the boot-seed to 0/10. The prune is a
+ * cheap `existsSync` (`pathExists`), producer-side, never inside a fold. A
+ * GATED-but-missing root self-heals the same way: it never seeds here, so main's
+ * above-floor fold (or a later boot when the volume is back) clears it.
  */
-function discoverSeedRoots(db: Database, nowMs: number): string[] {
+export function discoverSeedRoots(
+  db: Database,
+  nowMs: number,
+  pathExists: (path: string) => boolean = existsSync,
+): string[] {
   const candidates = buildDiscoveryCandidates(db, {
     nowMs,
     runFullSweep: false,
@@ -168,6 +202,19 @@ function discoverSeedRoots(db: Database, nowMs: number): string[] {
 
   const roots = new Set<string>();
   for (const candidate of candidates) {
+    if (candidate.length === 0) continue;
+    // Prune a missing/stale root BEFORE the 2s git toplevel-resolve. A path that
+    // is gone (unmounted volume, deleted scratch repo) can never seed and only
+    // burns the resolve timeout.
+    let present: boolean;
+    try {
+      present = pathExists(candidate);
+    } catch {
+      // A probe failure (permissions, broken symlink) is treated as "missing" —
+      // no worse than the resolve returning null, and never throws here.
+      present = false;
+    }
+    if (!present) continue;
     let root: string | null = null;
     try {
       root = resolveGitToplevel(candidate);
@@ -296,7 +343,17 @@ export function seedGitProjection(
   //    next boot re-seeds.
   setGitProjectionSeedRequired(db, true);
 
-  const roots = options.roots ?? discoverSeedRoots(db, Date.now());
+  // 2b. Pre-warm the per-`Database` git-attribution memo ONCE, before the
+  //     per-root fold loop. On a fresh boot connection the memo is cold, so the
+  //     FIRST root's fold would otherwise pay the single `id > 0` full-history
+  //     scan WHILE holding the reducer lock and racing the per-root time budget
+  //     — the cold-fold cost that let one slow root starve the seed (0/10). This
+  //     hoists that one-time scan out of the loop; it is a pure optimization (the
+  //     memo is never a fold input), so re-fold determinism is untouched.
+  warmGitAttribMemo(db);
+
+  const roots =
+    options.roots ?? discoverSeedRoots(db, Date.now(), options.pathExists);
 
   const seededRoots: string[] = [];
   let complete = true;

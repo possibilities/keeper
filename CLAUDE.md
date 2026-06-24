@@ -123,7 +123,17 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   full historical `jobs.cwd` sweep, so a stale `/Volumes/Scratch` root never gates),
   populate the surface, then persist the floor + clear `seed_required` once every
   gated root is seeded (best-effort for a root the seed missed); a crash mid-seed
-  leaves `seed_required` set so the next boot re-seeds. **Self-clearing in steady
+  leaves `seed_required` set so the next boot re-seeds. **Cold-boot perf (fn-921):**
+  two costs made the seed exhaust at 0/10. (1) `discoverSeedRoots` PRUNES a
+  candidate whose path no longer EXISTS (`pathExists`/`existsSync`) BEFORE the 2s
+  `resolveGitToplevel` spawn — an unmounted `/Volumes/Scratch/*` repo would
+  otherwise burn the resolve timeout for nothing; the probe is producer-side, never
+  inside a fold. (2) `seedGitProjection` PRE-WARMS the per-`Database`
+  `GitAttribMemo` (`warmGitAttribMemo`) ONCE before the per-root loop so the cold
+  `id > 0` attribution scan runs OUTSIDE a lock-held fold racing the budget; the
+  memo is a pure optimization (NEVER a fold input), so warming early leaves the
+  byte-identical re-fold untouched. The whole-scan budget was widened 30s→60s given
+  the per-root bulkhead already protects correctness. **Self-clearing in steady
   state:** for a root the boot-seed missed/failed, MAIN's above-floor `GitSnapshot`
   fold (`projectGitStatus`) clears `seed_required` once `allGatedRootsSeeded` holds —
   the live producer's emit folded by main, never a git-worker write. The

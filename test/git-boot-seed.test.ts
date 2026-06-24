@@ -34,6 +34,7 @@ import {
 } from "../src/gated-roots";
 import {
   DEFAULT_GIT_SEED_BUDGET_MS,
+  discoverSeedRoots,
   seedGitProjection,
 } from "../src/git-boot-seed";
 import type { GitSnapshotPayload } from "../src/git-worker";
@@ -628,6 +629,132 @@ test("multi-root: each explicit root is seeded independently from its own snapsh
 
 test("default budget constant is a sane positive value", () => {
   expect(DEFAULT_GIT_SEED_BUDGET_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-921: stale-root prune — a missing root is dropped BEFORE the toplevel
+// resolve, so an unmounted /Volumes/Scratch/* repo can't burn the resolve
+// timeout and drag the seed.
+// ---------------------------------------------------------------------------
+
+test("fn-921: discoverSeedRoots prunes a missing root BEFORE resolveGitToplevel (no git spawn for the absent root)", () => {
+  // An open epic whose project_dir + task target_repo are STALE scratch paths
+  // (the repo is gone). `pathExists` reports them missing, so they are pruned
+  // before the 2s toplevel resolve — `resolveGitToplevel` is never reached for
+  // them (proven by an empty result: every candidate is missing, so no real git
+  // is spawned at all and the function returns []).
+  const scratchProj = fakeRoot("Volumes/Scratch/gone-proj");
+  const scratchTask = fakeRoot("Volumes/Scratch/gone-task");
+  seedOpenEpic("fn-1-scratch", scratchProj, [scratchTask]);
+  // A stale working-job cwd that is also gone.
+  kdb.db.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at, state, cwd) VALUES ('j-gone', 1, 1, 'working', ?)",
+    [fakeRoot("Volumes/Scratch/gone-cwd")],
+  );
+
+  const probed: string[] = [];
+  const roots = discoverSeedRoots(kdb.db, Date.now(), (p) => {
+    probed.push(p);
+    return false; // every candidate is missing → all pruned
+  });
+
+  // Every candidate was probed for existence…
+  expect(probed).toContain(scratchProj);
+  expect(probed).toContain(scratchTask);
+  expect(probed).toContain(fakeRoot("Volumes/Scratch/gone-cwd"));
+  // …and every one pruned, so the resolved set is empty (no git spawned).
+  expect(roots).toEqual([]);
+});
+
+test("fn-921: a probe that throws treats the root as missing (never throws into discovery)", () => {
+  const repo = fakeRoot("Volumes/Scratch/broken-symlink");
+  seedOpenEpic("fn-1-broken", repo, [repo]);
+  // A probe that throws (a broken symlink / permission error) must NOT propagate
+  // — the candidate is treated as missing and pruned.
+  expect(() =>
+    discoverSeedRoots(kdb.db, Date.now(), () => {
+      throw new Error("EACCES");
+    }),
+  ).not.toThrow();
+  const roots = discoverSeedRoots(kdb.db, Date.now(), () => {
+    throw new Error("EACCES");
+  });
+  expect(roots).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-921: warm-memo — pre-warming the attribution memo before the per-root loop
+// produces a byte-identical surface to the cold-fold path. The memo is a pure
+// optimization, never a fold input, so re-fold determinism is untouched.
+// ---------------------------------------------------------------------------
+
+test("fn-921: pre-warmed memo yields the same git surface as the cold fold (memo is not a fold input)", () => {
+  // Two independent connections seed the SAME log: one where the memo is warmed
+  // ahead of the per-root loop (production path), one explicit-roots run that is
+  // cold by construction (fresh DB). The observable git surface must match.
+  const repo = fakeRoot("warm-equiv");
+  const sess = "22222222-2222-2222-2222-222222222222";
+  const dirtyPath = `${repo}/dirty.ts`;
+
+  // A live mutation event so attribution is non-trivial (a real bash-mutation
+  // row the memo's incremental scan must pick up).
+  const seedLog = (db: Database): void => {
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, updated_at, state) VALUES (?, 1000, 1000, 'working')",
+      [sess],
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, tool_name, cwd, data, mutation_path)
+         VALUES (1001, ?, NULL, 'PostToolUse', 'post_tool_use', 'Write', ?, ?, ?)`,
+      [sess, repo, JSON.stringify({ file_path: dirtyPath }), dirtyPath],
+    );
+  };
+
+  const captureSurface = (db: Database) =>
+    JSON.stringify({
+      gitStatus: db
+        .query(
+          "SELECT branch, dirty_count FROM git_status WHERE project_dir = ?",
+        )
+        .get(repo),
+      attributions: db
+        .query(
+          "SELECT session_id, file_path, source, op FROM file_attributions WHERE project_dir = ? ORDER BY file_path, session_id",
+        )
+        .all(repo),
+    });
+
+  // Path A — the production seed (warmGitAttribMemo runs before the per-root
+  // loop inside seedGitProjection).
+  seedLog(kdb.db);
+  const warmResult = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [repo],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root, "dirty.ts"),
+  });
+  expect(warmResult.complete).toBe(true);
+  const warmSurface = captureSurface(kdb.db);
+
+  // Path B — a SECOND fresh connection (cold memo), same log, same seed. With no
+  // pre-warm difference visible in the output, the two surfaces are identical.
+  const cold = freshMemDb();
+  try {
+    seedLog(cold.db);
+    const coldResult = seedGitProjection(cold.db, cold.stmts, {
+      drainToCompletion: () => {
+        let n: number;
+        do {
+          n = drain(cold.db);
+        } while (n > 0);
+      },
+      roots: [repo],
+      buildSnapshotForRoot: (root) => dirtySnapshot(root, "dirty.ts"),
+    });
+    expect(coldResult.complete).toBe(true);
+    expect(warmSurface).toBe(captureSurface(cold.db));
+  } finally {
+    cold.db.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
