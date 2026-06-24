@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T03:08:41.325000Z",
+  "depends_on": [],
+  "epic": "fn-929-merge-agentwrap-into-keeper",
+  "id": "fn-929-merge-agentwrap-into-keeper.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "vendor agentwrap and wire keeper agent",
+  "updated_at": "2026-06-24T03:08:41.325000Z"
+}
