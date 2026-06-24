@@ -83,7 +83,7 @@ Monitor(
   registers as a tracked job; its stopped window is autoclosed by keeperd's daemon reaper past an idle
   grace, so attach promptly (`tmux attach -t panels`) to inspect a panelist's full session. To keep the
   windows open for inspection, add `panels` to the `disable_autoclose` config key (default empty).
-  Concurrent legs share the session safely — agentwrap recovers from the create race.
+  Concurrent legs share the session safely — `keeper agent` recovers from the create race.
 - `keeper pair` emits a strict two-line contract on stdout: one `[keeper-pair] started …` line, then one
   terminal line. When `started` arrives, do nothing until the terminal line for that run. On
   `[keeper-pair] completed …`, note the exact `--output` path you passed — **do not read its content into

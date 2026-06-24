@@ -20,7 +20,8 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   events-writer HOOK plugin + the `keeper:await` / `keeper:dispatch` /
   `keeper:autopilot` / `keeper:pair` skills) and `plugins/plan/` (the
   plan plugin behind `keeper plan`, carrying the `plan:*` skills).
-  agentwrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
+  The in-binary `keeper agent` launcher loads both from one `plugin_scan_dirs`
+  entry pointing at `plugins/`.
   Each plugin has exactly ONE manifest at its own `<plugin>/.claude-plugin/plugin.json`
   and the keeper plugin exactly ONE `plugins/keeper/hooks/hooks.json` — never
   duplicate either, never add a `~/.claude/plugins/keeper` symlink (it

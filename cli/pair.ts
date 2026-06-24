@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
  * `keeper pair send` — fan a task out to another model CLI (claude / codex) via
- * agentwrap, driven from the orchestrating session's Monitor tool. Owns the
- * pairing ergonomics, delegating the tmux transport + model/effort selection to
- * agentwrap.
+ * the in-binary `keeper agent` launcher, driven from the orchestrating session's
+ * Monitor tool. Owns the pairing ergonomics, delegating the tmux transport +
+ * model/effort selection to `keeper agent`.
  *
  * STDOUT IS THE MONITOR EVENT CHANNEL. Every run emits exactly one
  * `[keeper-pair] started ...` line followed by exactly one terminal line —
@@ -12,13 +12,13 @@
  * ONLY the event stream. The two-line contract holds on EVERY path, including
  * SIGTERM/timeout (a Monitor kill) and early validation errors.
  *
- * Compose flow (the agentwrap subcommand contract from task .1):
- *   1. `agentwrap <cli> --agentwrap-tmux --agentwrap-tmux-detached
+ * Compose flow (the `keeper agent` subcommand contract):
+ *   1. `keeper agent <cli> --agentwrap-tmux --agentwrap-tmux-detached
  *      --agentwrap-no-confirm <native flags> <prompt>` → launch JSON `id`.
- *   2. `agentwrap wait-for-stop <id> --stop-timeout-ms <ms>` → block until the
+ *   2. `keeper agent wait-for-stop <id> --stop-timeout-ms <ms>` → block until the
  *      partner stops; keeper's `--timeout` drives the ms budget (overriding
- *      agentwrap's 600s default) and the widened subprocess-kill margin.
- *   3. `agentwrap show-last-message <id>` → the partner's final message.
+ *      the subcommand's 600s default) and the widened subprocess-kill margin.
+ *   3. `keeper agent show-last-message <id>` → the partner's final message.
  * The partner's final answer is written to `--output` (YAML) via
  * write-temp-then-rename, and `completed` is emitted only AFTER the rename so
  * the Monitor event never points at a half-written file.
@@ -66,7 +66,7 @@ import {
   stripClaudeEnv,
 } from "../src/pair-command";
 
-const HELP = `keeper pair — fan a task out to another model CLI via agentwrap
+const HELP = `keeper pair — fan a task out to another model CLI via keeper agent
 
 Usage:
   keeper pair send <prompt-file> --cli <claude|codex> --output <path> [options]

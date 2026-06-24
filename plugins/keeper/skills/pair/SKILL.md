@@ -18,7 +18,7 @@ argument-hint: <what to ask> [--cli claude|codex] [--role …] [--read-only]
 # pair
 
 `keeper pair send` fans ONE task out to another model CLI — `claude` or
-`codex` — launched as a detached partner via agentwrap, waits for it to stop,
+`codex` — launched as a detached partner via `keeper agent`, waits for it to stop,
 and writes the partner's final answer to a `--output` file. It is keeper's
 pairing surface: a second opinion, a cross-vendor cross-check, a code review or
 co-plan from a different model, or a read-only audit.
@@ -95,7 +95,7 @@ atomically, only once complete) rather than holding one blocking call open.
   drill-down for the FULL conversation when `message` alone isn't enough. Read
   it only if you need to see the partner's reasoning/steps, not just its
   conclusion.
-- `handle` — the agentwrap launch handle (correlation id).
+- `handle` — the `keeper agent` launch handle (correlation id).
 - `elapsed_seconds` — wall time of the partner's turn.
 - `read_only` / `changed_files` / `read_only_violation` — present only on a
   read-only run; see below.
@@ -119,7 +119,7 @@ expected path.
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 | `--session <s>` | Target tmux session for the partner window. Defaults to `pair` (panel legs use `panels`). For a **claude** partner the window-kill is fire-and-forget: the CLI captures the answer synchronously then leaves the window for keeperd's daemon reaper, which autocloses the stopped tracked window past an idle grace. A **codex/pi** partner (never a tracked job) keeps the CLI-side synchronous reap. A session listed in the `disable_autoclose` config key (default empty) is left **open + interactive** for inspection (`tmux attach -t pair`) instead of autoclosing. Usually omit. |
-| `--timeout <s>` | Wait timeout in seconds (default 1800). It is authoritative for the partner stop wait: keeper forwards it to agentwrap as `wait-for-stop … --stop-timeout-ms <ms>` (overriding agentwrap's 600s subcommand default) and widens the subprocess-kill margin to sit strictly above agentwrap's worst-case clean return, so a 10–30 min turn no longer dies at 10 min. On timeout the run emits `failed`; a codex/pi window is reaped synchronously, a claude window is left for the daemon reaper. |
+| `--timeout <s>` | Wait timeout in seconds (default 1800). It is authoritative for the partner stop wait: keeper forwards it to `keeper agent wait-for-stop … --stop-timeout-ms <ms>` (overriding the subcommand's 600s default) and widens the subprocess-kill margin to sit strictly above the launcher's worst-case clean return, so a 10–30 min turn no longer dies at 10 min. On timeout the run emits `failed`; a codex/pi window is reaped synchronously, a claude window is left for the daemon reaper. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a
 sensible default (a cross-vendor partner, `default` role) and say what you

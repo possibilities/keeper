@@ -70,7 +70,7 @@ synchronous `process.env` reads (no fork, no fs, no PPID-walk). The backend is
 tmux, read via `TMUX` (`KEEPER_TMUX_SESSION` for the session name, which a
 keeper-managed launch injects via `-e`, and `TMUX_PANE` for the pane). The pane id
 is a two-step read: native `TMUX_PANE` first, else the keeper-owned carrier
-`KEEPER_TMUX_PANE` (agentwrap strips `TMUX`/`TMUX_PANE` so Claude emits truecolor,
+`KEEPER_TMUX_PANE` (the launcher strips `TMUX`/`TMUX_PANE` so Claude emits truecolor,
 copying the pane id into the carrier first). `backend_exec_type` +
 `backend_exec_pane_id` fold onto the `jobs` row latest-non-NULL-wins via
 `COALESCE`. As of schema v83 (fn-907) the FROZEN launch session does NOT track
@@ -403,14 +403,20 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `agentwrap_path` — absolute path to the agentwrap binary, keeper's sole
-     launch transport: keeperd's server-side autopilot reconciler and the manual
-     `keeper dispatch` both invoke agentwrap (which owns the tmux window) to spawn
-     a worker into a managed window. The `KEEPER_AGENTWRAP_PATH` env var wins, else
-     this config key, else `~/.bun/bin/agentwrap`. A leading `~` is expanded at
-     resolve time (`execvp` does not expand `~`). agentwrap is a HARD runtime
-     dependency: keeperd validates its presence at boot (logging the resolved
-     absolute path; a prominent warning if missing). The managed-session name is
+   - `keeper_agent_path` — absolute path to the keeper CLI entry (`cli/keeper.ts`)
+     that the launcher re-execs as `keeper agent …`: keeperd's server-side
+     autopilot reconciler and the manual `keeper dispatch` both launch a worker
+     into a managed window through the in-binary `keeper agent <claude|codex|pi>`
+     subcommand (which owns the tmux window). The `KEEPER_AGENT_PATH` env var wins,
+     else this config key, else the derived default (this binary's own
+     `cli/keeper.ts`, symlink-resolved). A leading `~` is expanded at resolve time
+     (`execvp` does not expand `~`); the resolved path is absolute and symlink-
+     resolved so the detached pane's re-exec survives keeperd's stripped LaunchAgent
+     PATH. The launcher is an in-binary subcommand, not an external dependency:
+     keeperd probes its launchability at boot (logging the resolved launcher argv;
+     a prominent warning if `bun` + `cli/keeper.ts` are not launchable). The
+     `agentwrap_path` config key and `KEEPER_AGENTWRAP_PATH` env are still read as a
+     deprecated alias. The managed-session name is
      hardcoded (`autopilot`), NOT configurable; each dispatch opens a new window
      inside that shared background session. The window-reaper worker closes an
      `autopilot` managed window ONLY once its work is verifiably complete (stopped
@@ -443,7 +449,7 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   # agentwrap_path: ~/.bun/bin/agentwrap   # keeper's launch transport
+   # keeper_agent_path: ~/code/keeper/cli/keeper.ts   # launcher re-exec entry
    max_concurrent_jobs: 3
    # disable_autoclose: [pair]   # leave these managed sessions' windows open
    YAML
@@ -455,8 +461,8 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `agentwrap_path: ~/.bun/bin/agentwrap`). Unknown config keys are silently
-   ignored.
+   `keeper_agent_path:` the derived `cli/keeper.ts`). Unknown config keys are
+   silently ignored.
 
 4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
@@ -472,10 +478,10 @@ Keeper has no `install` verb. Wire it up manually:
    manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
-   behind `keeper plan` + the `plan:*` skills, a native plugin loaded by agentwrap). agentwrap's
-   `plugin_scan_dirs` points at `~/code/keeper/plugins`, scans the parent, and
-   appends one `--plugin-dir` per manifest-bearing child — so a fresh session
-   auto-loads BOTH plugins from this repo. No symlink step. A
+   behind `keeper plan` + the `plan:*` skills, a native plugin loaded by the
+   launcher). The launcher's `plugin_scan_dirs` points at `~/code/keeper/plugins`,
+   scans the parent, and appends one `--plugin-dir` per manifest-bearing child —
+   so a fresh session auto-loads BOTH plugins from this repo. No symlink step. A
    `~/.claude/plugins/keeper` symlink double-registers the hook (every
    invocation writes two `events` rows, with no runtime dedup guard) — there
    must be none.
@@ -1071,7 +1077,7 @@ event-log/reducer/hook touch. Run any of them with
   tmux window by hand, the client-side complement to the server-side
   reconciler above: where `autopilot` is the daemon's level-triggered
   dispatcher, `keeper dispatch` is a one-shot human-driven launch that goes
-  through a direct `agentwrapLaunch(...)` with NO daemon RPC, NO
+  through a direct in-binary `keeper agent` launch with NO daemon RPC, NO
   synthetic event, and NO reducer/migration touch — so re-fold determinism and
   the five-surface RPC-write invariant hold by construction. Two
   mutually-exclusive modes: a **plan form** (`work::<id>` / `close::<id>`) that
@@ -2113,7 +2119,7 @@ tmux session gets it filled later by the restore-worker pane poller, epic
 fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
 PPID-walk; absent env ⇒ NULL coords, never a bogus `type`). The pane id is a
 two-step read: native `TMUX_PANE` first, else the keeper-owned carrier
-`KEEPER_TMUX_PANE` (agentwrap strips `TMUX`/`TMUX_PANE` to let Claude emit
+`KEEPER_TMUX_PANE` (the launcher strips `TMUX`/`TMUX_PANE` to let Claude emit
 truecolor, copying the pane id into the carrier first so window renaming
 survives the strip; the carrier-fed fallback stamps coord-identical tmux rows).
 And the reducer's
@@ -2853,11 +2859,11 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live in
-`src/exec-backend.ts`. keeper launches via agentwrap directly: both the
-autopilot reconciler dispatch and the manual `keeper dispatch` call
-`agentwrapLaunch(...)`, which invokes the agentwrap CLI (which owns the tmux
-window) — agentwrap is the sole, hard-required launch transport (validated at
-boot). tmux is used DIRECTLY for everything else: the pane ops
+`src/exec-backend.ts`. keeper launches in-binary: both the autopilot reconciler
+dispatch and the manual `keeper dispatch` re-exec the `keeper agent
+<claude|codex|pi>` subcommand (which owns the tmux window) — the in-binary
+launcher is the sole launch path (keeperd probes its launchability at boot). tmux
+is used DIRECTLY for everything else: the pane ops
 (`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer,
 and `killWindow`, the reaper's only kill op; there is no general sweep-close
 path) and the crash-recovery restore replay (`restore-agents.ts`, which spawns a
@@ -2960,7 +2966,7 @@ keeps the three resume-command producers byte-identical, pacing window creation
 0.5s apart. The restore replay is a direct tmux launch: it execs the recorded
 spec-less `claude --resume` argv into a get-or-created session via its own
 per-call mint (the crash-recovery path stays on tmux directly, distinct from the
-agentwrap dispatch launch).
+`keeper agent` dispatch launch).
 `--last-generation` swaps the candidate source to `deriveLastGenerationSet`
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.
