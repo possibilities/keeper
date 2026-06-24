@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T23:22:22.683000Z",
+  "depends_on": [
+    "fn-952-tmux-control-mode-focus-capture.2"
+  ],
+  "epic": "fn-952-tmux-control-mode-focus-capture",
+  "id": "fn-952-tmux-control-mode-focus-capture.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Separately-named live-only delete predicate for cold focus events",
+  "updated_at": "2026-06-24T23:22:22.683000Z"
+}
