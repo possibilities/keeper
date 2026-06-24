@@ -1,0 +1,16 @@
+{
+  "branch_name": "runtime-settable-autopilot-config",
+  "bundles": [],
+  "created_at": "2026-06-24T23:43:32.356000Z",
+  "depends_on_epics": [],
+  "id": "fn-953-runtime-settable-autopilot-config",
+  "last_validated_at": "2026-06-24T23:43:32.375000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Runtime-settable autopilot config",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-24T23:43:32.356000Z"
+}
