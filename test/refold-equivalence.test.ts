@@ -1050,6 +1050,116 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   expect(row?.outcome).toBeNull();
 });
 
+test("block_escalations: a send_failed Attempted leaves the latch re-swept (pending), a successful outcome does not (fn-948)", () => {
+  // fn-948: a `send_failed` outcome is NON-TERMINAL. The producer mints
+  // `Attempted{send_failed}` exactly as for any outcome, but the fold RESETS the
+  // latch to `pending` so `selectPendingBlockEscalations` re-sweeps it next tick
+  // (a transient bus failure retries instead of permanently dropping the
+  // escalation). A `sent` / `queued_for_wake` outcome stays terminal at
+  // `attempted`. This pins both arms end to end through the real fold.
+  const EPIC = "fn-z";
+  const TASK = "fn-z.1";
+
+  // Arm the latch, then mint Requested → requested.
+  taskSnapshotEvent(TASK, EPIC, "blocked");
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK }),
+  });
+  drainAll();
+  expect(
+    (
+      db
+        .query(
+          "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+        )
+        .get(EPIC, TASK) as { status: string }
+    ).status,
+  ).toBe("requested");
+
+  // A send_failed Attempted RESETS the latch to pending (re-swept next tick), but
+  // still records the outcome so the failure is observable.
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      epic_id: EPIC,
+      task_id: TASK,
+      outcome: "send_failed",
+    }),
+  });
+  drainAll();
+  let row = db
+    .query(
+      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as { status: string; outcome: string | null };
+  expect(row.status).toBe("pending");
+  expect(row.outcome).toBe("send_failed");
+
+  // The next sweep re-mints Requested → requested, THEN a successful Attempted
+  // advances it terminally to attempted (the retry succeeds and stops re-sweeping).
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK }),
+  });
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK, outcome: "sent" }),
+  });
+  drainAll();
+  row = db
+    .query(
+      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(EPIC, TASK) as { status: string; outcome: string | null };
+  expect(row.status).toBe("attempted");
+  expect(row.outcome).toBe("sent");
+});
+
+test("block_escalations: a send_failed lifecycle re-folds byte-identically (fn-948 non-terminal latch determinism)", () => {
+  // The send_failed reset reads ONLY the payload outcome, so a stream carrying a
+  // failed-then-retried escalation must re-fold byte-identically — pin it.
+  const EPIC = "fn-c";
+  const TASK = "fn-c.1";
+  taskSnapshotEvent(TASK, EPIC, "blocked");
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK }),
+  });
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      epic_id: EPIC,
+      task_id: TASK,
+      outcome: "send_failed",
+    }),
+  });
+  // Retry tick: re-mint Requested, then a successful Attempted.
+  insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK }),
+  });
+  insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: "reconciler",
+    data: JSON.stringify({ epic_id: EPIC, task_id: TASK, outcome: "sent" }),
+  });
+  drainAll();
+
+  const live = snapshotBlockEscalations();
+  rewindAndWipeProjections();
+  db.run("DELETE FROM block_escalations");
+  drainAll();
+  expect(snapshotBlockEscalations()).toBe(live);
+});
+
 test("block_escalations: a TOOLING_FAILURE-style block is folded latch-AGNOSTIC (the category gate is NOT in the fold)", () => {
   // The fold tracks ONLY the blocked transition — it knows nothing about the
   // block category (TOOLING_FAILURE vs SPEC_UNCLEAR live in the reason text, not

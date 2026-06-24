@@ -4005,22 +4005,29 @@ function extractBlockEscalationAttemptedPayload(
 }
 
 /**
- * Fold one synthetic `BlockEscalationAttempted` event. Advances the
- * `block_escalations` latch `requested → attempted` and records the producer's
- * `outcome` for the matching `(epic_id, task_id)`. Idempotent on a missing latch
- * row (the UPDATE matches zero rows). Pure function of the payload + the
- * persisted row (`event.id` only), so re-fold is byte-deterministic.
+ * Fold one synthetic `BlockEscalationAttempted` event. For a TERMINAL outcome
+ * (every outcome except `send_failed`) it advances the `block_escalations` latch
+ * `requested → attempted` and records the `outcome`. For the non-terminal
+ * `send_failed` outcome (fn-948) it instead RESETS the latch to `pending` so
+ * `selectPendingBlockEscalations` re-sweeps it on the next heartbeat tick — a
+ * transient bus failure retries instead of dropping the escalation forever (the
+ * latch otherwise only re-arms on an unblock→re-block `TaskSnapshot` transition).
+ * The `outcome` is still recorded on the row so the failure is observable. The
+ * branch reads ONLY the payload `outcome` + the persisted row (`event.id`, no
+ * wall-clock/fs/liveness), so re-fold stays byte-deterministic. Idempotent on a
+ * missing latch row (the UPDATE matches zero rows).
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
     return;
   }
+  const status = payload.outcome === "send_failed" ? "pending" : "attempted";
   db.run(
     `UPDATE block_escalations
-        SET status = 'attempted', outcome = ?, last_event_id = ?
+        SET status = ?, outcome = ?, last_event_id = ?
       WHERE epic_id = ? AND task_id = ?`,
-    [payload.outcome, event.id, payload.epic_id, payload.task_id],
+    [status, payload.outcome, event.id, payload.epic_id, payload.task_id],
   );
 }
 
