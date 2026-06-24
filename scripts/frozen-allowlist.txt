@@ -62,7 +62,11 @@ anchor|cli/commit-work.ts|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[
 # spelling-tolerant read of those keys; those literals are themselves frozen
 # schema-history (a fresh-DB walk + a v66 upgrade replay them to rewrite / read
 # the historical corpus), so they count toward the pin.
-count|src/db.ts|184
+#
+# fn-936 (v85) dropped `events.plan_queue_jump` and removed the now-dead
+# `planctl_queue_jump` line from the CREATE_EVENTS literal (the v30/v78
+# schema-history `planctl_queue_jump` references stay), so the pin drops by one.
+count|src/db.ts|183
 
 # =========================================================================
 # CLASS 3 — Commit-event data keys + wire kind: RETIRED by fn-889 task .3

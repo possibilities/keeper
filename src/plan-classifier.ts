@@ -15,9 +15,8 @@
  * epic-shaped `parsePlanRef(target).kind === 'epic'`; otherwise `refiner` if
  * the op names an epic (`epic_id` resolves). `scaffold` is keeper's canonical
  * epic-create path (zero `epic-create` events have ever fired on this
- * codebase); `/plan:defer` rides the scaffold→creator path, and
- * `/plan:next` / queue-jump / direct-CLI edits land as refiners. No other
- * kinds.
+ * codebase); `/plan:defer` rides the scaffold→creator path, and direct-CLI
+ * edits land as refiners. No other kinds.
  *
  * **Autopilot-op exclusions.** Two epic-mutating ops are EXCLUDED — they emit
  * no edge of either kind: the worker's `done` (`keeper plan done`, every
@@ -25,7 +24,7 @@
  * close`, `/plan:close`). They are redundant with the task rows and
  * self-evident from the job title's `work::` / `close::` spawn-name prefix, so
  * `refiner` means only genuine plan-shaping edits (`refine-apply`,
- * `/plan:next` queue jumps, `epic set-*`, deps, direct CLI). No other op
+ * `epic set-*`, deps, direct CLI). No other op
  * normalizes to `done`/`close`, so the exclusion is collateral-free. The skips
  * are pure constant-time branches, so re-fold determinism holds by
  * construction (fn-881; the v79→v80 rewind purges the stale persisted edges).

@@ -53,7 +53,11 @@ import {
 } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
-import { formatPill, type Verdict } from "../src/readiness";
+import {
+  formatPill,
+  orderEpicsForScheduling,
+  type Verdict,
+} from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
   subscribeCollection,
@@ -470,19 +474,12 @@ export async function main(argv: string[]): Promise<void> {
     const epicId = seg(row.epic_id);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
-    // `[slotted-after-closer]` pill — appears only when the epic was minted by
-    // another epic's closer session (`created_by_closer_of` non-null).
-    // Self-delimited (empty when absent, leading space when present).
-    const slottedSeg =
-      row.created_by_closer_of == null
-        ? ""
-        : ` ${pill("slotted-after-closer")}`;
     // The `{epic_number} {title}` label falls back to `epic_id` when both are
     // null (a pre-`EpicSnapshot` stub row), so the header is never blank.
     // `validatedPill` and `armedPill` both omit their default and self-delimit,
     // emitting their pill only at the non-resting value.
     const armedSeg = armedPill(armedSet.has(epicId));
-    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}${armedSeg}`;
+    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${armedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
@@ -544,7 +541,9 @@ export async function main(argv: string[]): Promise<void> {
       return "";
     }
     const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
-    const epicsList = snap.epics as Epic[];
+    // Route the creation-order seed through the single scheduling-order seam (an
+    // identity passthrough today; the future home for any runtime priority).
+    const epicsList = orderEpicsForScheduling(snap.epics as Epic[]);
     return epicsList
       .map((e) =>
         renderEpicBlock(

@@ -97,12 +97,6 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a plan
-    // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other plan event (stamped 0). The test helper defaults to NULL so
-    // every non-plan event lands NULL — matches the live hook's stamping
-    // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
-    plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here
     // so a non-Bash event lands NULL. Tests covering bash attribution pass
@@ -131,11 +125,11 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        plan_op, plan_target, plan_epic_id, plan_task_id,
-       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -162,7 +156,6 @@ function insertEvent(
       row.plan_subject_present,
       row.tool_use_id,
       row.config_dir,
-      row.plan_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
       row.plan_files,
@@ -1534,9 +1527,6 @@ function getEpic(epicId: string) {
     jobs: string;
     job_links: string;
     last_validated_at: string | null;
-    created_by_closer_of: string | null;
-    sort_path: string;
-    queue_jump: number;
     // Schema v34 (fn-637): NULL = not-yet-computed; '[]' = computed, no deps.
     resolved_epic_deps: string | null;
     // Schema v32 (fn-634): VIRTUAL generated column SQLite computes from
@@ -1631,15 +1621,6 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // No `last_validated_at` in the blob → folds to NULL (the schema column is
     // a plain nullable TEXT, no DEFAULT).
     last_validated_at: null,
-    // Schema v29: created_by_closer_of stays NULL (no plan links yet);
-    // sort_path is derived immediately when epic_number is known (the
-    // EpicSnapshot fold now computes it on first sight so parent chains
-    // resolve without requiring a plan event on the parent epic).
-    created_by_closer_of: null,
-    sort_path: "000001",
-    // Schema v30: queue_jump defaults to 0 — no planctl_invocation envelope
-    // with `queue_jump: true` has been observed for this epic.
-    queue_jump: 0,
     // Schema v34 (fn-637): the task-.3 forward stamp populates this
     // column from the shared `resolveEpicDep` helper inside the same
     // BEGIN IMMEDIATE transaction as the EpicSnapshot fold. A first-

@@ -372,9 +372,6 @@ test("subscribeReadiness: boot-status header fires onBootStatus and forces readi
     ],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
   };
@@ -2126,7 +2123,6 @@ test("subscribeCollection: onRows hands back a fresh array copy per render", () 
 function readyEpicRow(
   epicId: string,
   epicNumber: number,
-  sortPath: string,
   projectDir: string,
 ): Record<string, unknown> {
   return {
@@ -2154,9 +2150,6 @@ function readyEpicRow(
     ],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: sortPath,
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
   };
@@ -2166,8 +2159,8 @@ function readyEpicRow(
 // single-pass per-root slot), fn-2 sorts second.
 function sharedRootEpicRows(): Record<string, unknown>[] {
   return [
-    readyEpicRow("fn-1-foo", 1, "000001", "/repo"),
-    readyEpicRow("fn-2-bar", 2, "000002", "/repo"),
+    readyEpicRow("fn-1-foo", 1, "/repo"),
+    readyEpicRow("fn-2-bar", 2, "/repo"),
   ];
 }
 

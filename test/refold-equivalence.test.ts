@@ -2011,17 +2011,17 @@ test("merge byte-identity: tombstoned epic WITHOUT live descendants is not resur
   assertPlanRefoldByteIdentical();
 });
 
-test("merge byte-identity: tombstoned epic WITH a live descendant keeps the sort_path cascade", () => {
-  // A closer session for the parent creates a CHILD epic whose
-  // created_by_closer_of points back at the parent. We then tombstone the parent
-  // but the child stays live: the per-epic loop pre-filters the tombstoned parent
-  // out of the job_links write yet STILL runs the cascade, so the child's
-  // sort_path is re-stamped off the (now-absent) parent path. The byte-identity
-  // re-fold proves the cascade-for-tombstoned-with-live-descendant path holds.
+test("orderless re-fold ignores legacy queue_jump/sort_path envelope signals (byte-identical)", () => {
+  // fn-936 stripped all static priority/ordering machinery (`sort_path`,
+  // `queue_jump`, `created_by_closer_of`). The deriver no longer reads the
+  // envelope's `queue_jump` and the fold no longer derives any ordering column.
+  // This is the orderless-fold determinism guard: a corpus that INCLUDES legacy
+  // `queue_jump: true` envelopes (and a closer relationship that used to drive
+  // the `created_by_closer_of` / `sort_path` cascade) must re-fold byte-
+  // identically — proving the new fold silently ignores the retired signals.
   const PARENT = "fn-6-parent";
   const CHILD = "fn-6-child";
-  // Parent epic, real EpicSnapshot so it has an epic_number → a non-placeholder
-  // sort_path.
+  // Parent epic, created via the column-driven plan-event path the fold reads.
   planSessionStart(PLAN_SESS_A);
   insertPlanEvent({
     sessionId: PLAN_SESS_A,
@@ -2029,6 +2029,30 @@ test("merge byte-identity: tombstoned epic WITH a live descendant keeps the sort
     target: PARENT,
     epicId: PARENT,
     subjectPresent: true,
+  });
+  // A RAW PostToolUse:Bash whose envelope carries the legacy `queue_jump: true`
+  // signal the deriver used to lift into `plan_queue_jump`. That column is gone
+  // and the deriver no longer reads the key, so this row contributes no ordering
+  // state — the re-fold below must reproduce the projection regardless.
+  insertEvent({
+    hook_event: "PostToolUse",
+    session_id: PLAN_SESS_A,
+    tool_name: "Bash",
+    plan_op: "epic-set-title",
+    plan_target: PARENT,
+    data: JSON.stringify({
+      tool_response: {
+        stdout: JSON.stringify({
+          plan_invocation: {
+            op: "epic-set-title",
+            target: PARENT,
+            subject: "retitle",
+            // The retired priority signal — the deriver no longer reads it.
+            queue_jump: true,
+          },
+        }),
+      },
+    }),
   });
   insertEvent({
     hook_event: "EpicSnapshot",
@@ -2040,9 +2064,9 @@ test("merge byte-identity: tombstoned epic WITH a live descendant keeps the sort
       status: "open",
     }),
   });
-  // A closer session (plan_verb='close', plan_ref=PARENT) creates the child, so
-  // the child's created_by_closer_of resolves to PARENT. The closer identity is
-  // carried by the SessionStart `spawn_name` column the fold parses.
+  // A closer session (plan_verb='close', plan_ref=PARENT) creates the child —
+  // the relationship that used to populate `created_by_closer_of` + drive the
+  // `sort_path` cascade. With those columns gone the fold just links the child.
   insertEvent({
     hook_event: "SessionStart",
     session_id: PLAN_SESS_B,
@@ -2066,29 +2090,9 @@ test("merge byte-identity: tombstoned epic WITH a live descendant keeps the sort
     }),
   });
   drainAll();
-  // Sanity (non-vacuous): the child resolved its closer parent, so it IS a live
-  // descendant of the parent and the cascade below has a real child to re-stamp.
-  const childPre = db
-    .query("SELECT created_by_closer_of FROM epics WHERE epic_id = ?")
-    .get(CHILD) as { created_by_closer_of: string | null };
-  expect(childPre.created_by_closer_of).toBe(PARENT);
-  // Tombstone the parent; the child stays live.
-  insertEvent({
-    hook_event: "EpicDeleted",
-    session_id: PARENT,
-    data: JSON.stringify({ epic_id: PARENT }),
-  });
-  // Another plan event re-triggers syncPlanLinks over the tombstoned parent's
-  // surviving link target (the child epic still references it as closer), forcing
-  // the tombstone-with-live-descendant cascade branch.
-  insertPlanEvent({
-    sessionId: PLAN_SESS_B,
-    op: "epic-set-title",
-    target: CHILD,
-    epicId: CHILD,
-    subjectPresent: true,
-  });
-  drainAll();
+  // Non-vacuous: both epics materialized.
+  expect(epicRowExists(PARENT)).toBe(true);
+  expect(epicRowExists(CHILD)).toBe(true);
   assertPlanRefoldByteIdentical();
 });
 
@@ -2456,13 +2460,16 @@ test("0 → head from-scratch migrate succeeds; event_blobs is gone at head (cre
 // 77), then reopening to drive the v78 step forward.
 // ---------------------------------------------------------------------------
 
+// `plan_queue_jump` / `planctl_queue_jump` is intentionally ABSENT: fn-936 (v85)
+// dropped the column, so a fresh v85 DB has nothing to reverse-rename to the v77
+// shape. The v77→v78 rename + byte-identity proof still holds over the surviving
+// columns.
 const V78_EVENT_COLS = [
   ["plan_op", "planctl_op"],
   ["plan_target", "planctl_target"],
   ["plan_epic_id", "planctl_epic_id"],
   ["plan_task_id", "planctl_task_id"],
   ["plan_subject_present", "planctl_subject_present"],
-  ["plan_queue_jump", "planctl_queue_jump"],
   ["plan_files", "planctl_files"],
 ] as const;
 

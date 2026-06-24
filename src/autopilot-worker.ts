@@ -63,6 +63,7 @@ import { memoizedGitToplevel } from "./git-toplevel";
 import {
   computeReadiness,
   isRootOccupant,
+  orderEpicsForScheduling,
   type PendingDispatch,
   type Verdict,
 } from "./readiness";
@@ -1536,21 +1537,24 @@ export async function loadReconcileSnapshot(
       ? (doneRes.rows as unknown as Epic[])
       : ([] as Epic[]);
   const seenEpicIds = new Set<string>();
-  const epics: Epic[] = [];
+  const dedupedEpics: Epic[] = [];
   for (const epic of openEpics) {
     if (seenEpicIds.has(epic.epic_id)) {
       continue;
     }
     seenEpicIds.add(epic.epic_id);
-    epics.push(epic);
+    dedupedEpics.push(epic);
   }
   for (const epic of doneEpics) {
     if (seenEpicIds.has(epic.epic_id)) {
       continue;
     }
     seenEpicIds.add(epic.epic_id);
-    epics.push(epic);
+    dedupedEpics.push(epic);
   }
+  // Route the creation-order seed through the single scheduling-order seam (an
+  // identity passthrough today; the future home for any runtime priority).
+  const epics = orderEpicsForScheduling(dedupedEpics);
 
   const jobs = new Map<string, Job>();
   for (const row of read("jobs") as unknown as Job[]) {

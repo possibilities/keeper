@@ -85,9 +85,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     tasks: [],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
@@ -936,7 +933,6 @@ test("renderDependencyGraph — skips epics with no tasks, omits the dep clause 
   const epic = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     tasks: [
       makeTask({
         task_id: "fn-2-bar.1",

@@ -83,6 +83,24 @@ export function resolveEpicDep(
   );
 }
 
+/**
+ * The single ordering seam every scheduling consumer (the board, the autopilot
+ * reconciler, the `keeper autopilot` viewer) routes its epic list through.
+ *
+ * The backend serves epics in a NEUTRAL `epic_number ASC` creation order (the
+ * `EPICS_DESCRIPTOR` default sort); no priority/ordering signal lives in
+ * epic/board STATE. This is an IDENTITY passthrough today — it preserves the
+ * creation-order seed verbatim — and is the SINGLE future home for any runtime
+ * priority (which will live on the autopilot surface, never plan metadata). A
+ * consumer that wants a priority-aware order changes ONLY this function.
+ *
+ * Pure: no I/O, no clock, never throws. Returns a fresh array (never mutates the
+ * input) so callers can rely on the seed staying intact.
+ */
+export function orderEpicsForScheduling(epics: readonly Epic[]): Epic[] {
+  return epics.slice();
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------

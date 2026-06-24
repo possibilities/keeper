@@ -120,9 +120,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     tasks: [],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
@@ -660,14 +657,12 @@ test("fn-905: an unseeded root blocks only its own rows; a seeded sibling dispat
   const epicA = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo-a",
     tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
   });
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo-b",
     tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
   });
@@ -1214,7 +1209,6 @@ function readyCloseEpic(epicId: string, projectDir: string): Epic {
     epic_id: epicId,
     epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
     project_dir: projectDir,
-    sort_path: epicId,
     tasks: [
       makeTask({
         task_id: `${epicId}.1`,
@@ -1631,7 +1625,6 @@ test("fn-924 reconcile: a bound-but-not-yet-active worker (stopped+plan_verb, ac
     epic_id: "fn-1-foo",
     epic_number: 1,
     project_dir: "/repo",
-    sort_path: "fn-1-foo",
     tasks: [
       makeTask({
         task_id: "fn-1-foo.1",
@@ -1651,7 +1644,6 @@ test("fn-924 reconcile: a bound-but-not-yet-active worker (stopped+plan_verb, ac
     epic_id: "fn-2-bar",
     epic_number: 2,
     project_dir: "/repo",
-    sort_path: "fn-2-bar",
     tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
   });
   const snap = makeSnapshot({ epics: [epicA, epicB], pendingDispatches: [] });
@@ -1671,7 +1663,6 @@ test("fn-924 control: a stopped-AFTER-working worker (active_since set) does NOT
     epic_id: "fn-1-foo",
     epic_number: 1,
     project_dir: "/repo",
-    sort_path: "fn-1-foo",
     tasks: [
       makeTask({
         task_id: "fn-1-foo.1",
@@ -1691,7 +1682,6 @@ test("fn-924 control: a stopped-AFTER-working worker (active_since set) does NOT
     epic_id: "fn-2-bar",
     epic_number: 2,
     project_dir: "/repo",
-    sort_path: "fn-2-bar",
     tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
   });
   const snap = makeSnapshot({ epics: [epicA, epicB], pendingDispatches: [] });
@@ -1710,7 +1700,6 @@ test("fn-924 cap: a bound-pending worker counts as ONE occupant (cap not double-
     epic_id: "fn-1-a",
     epic_number: 1,
     project_dir: "/repo-a",
-    sort_path: "fn-1-a",
     tasks: [
       makeTask({
         task_id: "fn-1-a.1",
@@ -1753,7 +1742,6 @@ function occupantEpic(epicId: string, projectDir: string): Epic {
     epic_id: epicId,
     epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
     project_dir: projectDir,
-    sort_path: epicId,
     tasks: [
       makeTask({
         task_id: taskId,
@@ -1780,7 +1768,6 @@ function readyEpic(epicId: string, projectDir: string): Epic {
     epic_id: epicId,
     epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
     project_dir: projectDir,
-    sort_path: epicId,
     tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
   });
 }
@@ -1819,7 +1806,6 @@ test("fn-867 cap: a validated epic with a working planner link competes for budg
     epic_id: "fn-1-plan",
     epic_number: 1,
     project_dir: "/repo-plan",
-    sort_path: "fn-1-plan",
     // A working job_link no longer holds the epic's tasks off `ready`.
     job_links: [
       {
@@ -1867,7 +1853,6 @@ test("fn-725 cap: the budget is shared across task + close-row push sites (a clo
     epic_id: "fn-2-b",
     epic_number: 2,
     project_dir: "/repo-b",
-    sort_path: "fn-2-b",
     tasks: [completedTask],
   });
   const snap = makeSnapshot({ epics: [occ, closeEpic] });
@@ -1901,7 +1886,6 @@ test("fn-756 budget: a work and a close row both respect budget<=0 (no exemption
     epic_id: "fn-3-c",
     epic_number: 3,
     project_dir: "/repo-c",
-    sort_path: "fn-3-c",
     tasks: [completedTask],
   });
   const snap = makeSnapshot({ epics: [occ, ready, closeEpic] });
@@ -1923,7 +1907,6 @@ test("fn-756 budget: with one free slot, the close row launches and consumes it 
     epic_id: "fn-2-b",
     epic_number: 2,
     project_dir: "/repo-b",
-    sort_path: "fn-2-b",
     tasks: [completedTask],
   });
   const ready = readyEpic("fn-3-c", "/repo-c");
@@ -2530,7 +2513,6 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
     epic_id: "fn-1-foo",
     project_dir: "/repo-a",
     tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
-    sort_path: "000001",
   });
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
@@ -2543,7 +2525,6 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
         task_number: 1,
       }),
     ],
-    sort_path: "000002",
   });
   const snap = makeSnapshot({ epics: [epicA, epicB] });
   const state = makeState();
@@ -2596,7 +2577,6 @@ test("fn-887 runReconcileCycle: a missing launch cwd is blocked-with-reason (cwd
     epic_id: "fn-1-foo",
     project_dir: missing,
     tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
-    sort_path: "000001",
   });
   const epicPresent = makeEpic({
     epic_id: "fn-2-bar",
@@ -2605,7 +2585,6 @@ test("fn-887 runReconcileCycle: a missing launch cwd is blocked-with-reason (cwd
     tasks: [
       makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar", task_number: 1 }),
     ],
-    sort_path: "000002",
   });
   const snap = makeSnapshot({ epics: [epicMissing, epicPresent] });
   const state = makeState();
@@ -2651,7 +2630,6 @@ test("runReconcileCycle: a tiered `work` task launches directly — no work-plug
     epic_id: "fn-1-foo",
     project_dir: "/repo",
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "high" })],
-    sort_path: "000001",
   });
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState();
@@ -2759,8 +2737,8 @@ test("reconcile: a non-completed task id is NOT in completedRowIds", () => {
 
 /**
  * Seed one `epics` row directly (mirrors test/collections.test.ts `seedEpic`):
- * only the schema-required columns are populated; `sort_path` defaults to the
- * zero-padded epic_number so the default `sort_path ASC` order is stable.
+ * only the schema-required columns are populated. The default board order is
+ * `epic_number ASC`, so the seeded `epic_number` makes that order stable.
  */
 function seedEpicRow(
   db: Database,
@@ -2775,8 +2753,8 @@ function seedEpicRow(
   },
 ): void {
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, sort_path, created_by_closer_of, last_validated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, last_validated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number,
@@ -2789,8 +2767,6 @@ function seedEpicRow(
     "[]",
     JSON.stringify(opts.jobs ?? []),
     "[]",
-    String(opts.epic_number).padStart(6, "0"),
-    null,
     opts.last_validated_at ?? "2026-05-24T00:00:00Z",
   );
 }
@@ -3359,7 +3335,7 @@ test("fn-773 isEpicInFlight: each in-flight signal flips it true; a cold epic is
 
 test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed sibling and dispatches", () => {
   // THE DEADLOCK FIX. Two open epics share `/repo`; the earlier-sorted (lower
-  // sort_path) `fn-1-unarmed` is NOT armed, `fn-2-armed` is. Pre-fn-770 the
+  // epic_number) `fn-1-unarmed` is NOT armed, `fn-2-armed` is. Pre-fn-770 the
   // armed-blind per-root mutex awarded `/repo` to fn-1 (first ready in sort
   // order), the armed gate then suppressed fn-1's launch (ineligible) AND fn-2
   // was already mutex-demoted → net deadlock, fn-2 never dispatched. With the
@@ -3368,7 +3344,6 @@ test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed siblin
   const unarmed = makeEpic({
     epic_id: "fn-1-unarmed",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     resolved_epic_deps: [],
     tasks: [makeTask({ task_id: "fn-1-unarmed.1", epic_id: "fn-1-unarmed" })],
@@ -3376,7 +3351,6 @@ test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed siblin
   const armed = makeEpic({
     epic_id: "fn-2-armed",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     resolved_epic_deps: [],
     tasks: [makeTask({ task_id: "fn-2-armed.1", epic_id: "fn-2-armed" })],
@@ -3402,7 +3376,6 @@ test("fn-770: yolo on a shared root is unchanged — earlier-sorted wins the sin
   const first = makeEpic({
     epic_id: "fn-1-unarmed",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     resolved_epic_deps: [],
     tasks: [makeTask({ task_id: "fn-1-unarmed.1", epic_id: "fn-1-unarmed" })],
@@ -3410,7 +3383,6 @@ test("fn-770: yolo on a shared root is unchanged — earlier-sorted wins the sin
   const second = makeEpic({
     epic_id: "fn-2-armed",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     resolved_epic_deps: [],
     tasks: [makeTask({ task_id: "fn-2-armed.1", epic_id: "fn-2-armed" })],

@@ -103,12 +103,6 @@ function insertEvent(
     plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
-    // Schema v30: queue-jump sparse column; NULL unless this is a plan
-    // event whose envelope carried `queue_jump: true` (stamped 1) or any
-    // other plan event (stamped 0). The test helper defaults to NULL so
-    // every non-plan event lands NULL — matches the live hook's stamping
-    // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
-    plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here
     // so a non-Bash event lands NULL. Tests covering bash attribution pass
@@ -150,11 +144,11 @@ function insertEvent(
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
        plan_op, plan_target, plan_epic_id, plan_task_id,
-       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id, mutation_path
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -181,7 +175,6 @@ function insertEvent(
       row.plan_subject_present,
       row.tool_use_id,
       row.config_dir,
-      row.plan_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
       row.plan_files,
@@ -318,10 +311,6 @@ function planEvent(args: {
   epicId: string | null;
   taskId?: string | null;
   subjectPresent: boolean;
-  // Schema v30: optional queue-jump flag. Defaults `false` so existing tests
-  // (every one written before v30) keep their old shape; new tests opt in by
-  // passing `queueJump: true` to drive the `/plan:queue` projection path.
-  queueJump?: boolean;
   // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
   // `events.plan_files` AND inline into the envelope's `state_repo`
   // payload (so the reducer's mint can read `state_repo` from event.data).
@@ -362,7 +351,6 @@ function planEvent(args: {
     plan_epic_id: args.epicId,
     plan_task_id: args.taskId ?? null,
     plan_subject_present: args.subjectPresent ? 1 : 0,
-    plan_queue_jump: args.queueJump ? 1 : 0,
     plan_files: args.files != null ? JSON.stringify(args.files) : null,
     data,
   });
@@ -2652,7 +2640,6 @@ test("plan mint: empty plan_files array mints no rows (defensive)", () => {
     plan_target: "fn-1-foo",
     plan_epic_id: "fn-1-foo",
     plan_subject_present: 1,
-    plan_queue_jump: 0,
     plan_files: "[]",
     data: JSON.stringify({
       tool_response: {
@@ -2688,7 +2675,6 @@ test("plan mint: missing state_repo (corrupt envelope) mints no rows", () => {
     plan_target: "fn-1-foo",
     plan_epic_id: "fn-1-foo",
     plan_subject_present: 1,
-    plan_queue_jump: 0,
     plan_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     // data missing the state_repo field
     data: JSON.stringify({
@@ -2724,7 +2710,6 @@ test("plan mint: malformed event.data folds to no-op (safe value invariant)", ()
     plan_target: "fn-1-foo",
     plan_epic_id: "fn-1-foo",
     plan_subject_present: 1,
-    plan_queue_jump: 0,
     plan_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     data: "{this is not valid json",
   });
@@ -2747,7 +2732,6 @@ test("plan mint: malformed plan_files JSON folds to no-op", () => {
     plan_target: "fn-1-foo",
     plan_epic_id: "fn-1-foo",
     plan_subject_present: 1,
-    plan_queue_jump: 0,
     plan_files: "not valid json",
     data: JSON.stringify({
       tool_response: {

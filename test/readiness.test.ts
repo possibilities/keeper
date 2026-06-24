@@ -77,9 +77,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     tasks: [],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
@@ -572,7 +569,6 @@ test("fn-719: live worker monitor in epic A occupies the root, demotes a same-ro
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     // Same project_dir as epic A → same root.
     project_dir: "/repo",
     tasks: [b1],
@@ -676,7 +672,6 @@ test("fn-924 handoff window: a bound-but-stopped, plan_verb-bearing job occupies
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     // Same project_dir → same root.
     project_dir: "/repo",
     tasks: [b1],
@@ -710,7 +705,6 @@ test("fn-924: bound-pending holds the root in ARMED two-pass too (eligible same-
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [b1],
   });
@@ -883,7 +877,6 @@ test("fn-779 close-row: status:done + working close job occupies the per-root mu
   const e2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
   });
@@ -909,7 +902,6 @@ test("fn-779 predicate 9: satisfied dep on an in-snapshot, live-closing upstream
   const upstream = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     status: "done",
     tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
     jobs: [
@@ -946,7 +938,6 @@ test("fn-779 predicate 9: satisfied dep on an in-snapshot, IDLE upstream → rea
   const upstream = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     status: "done",
     tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
     jobs: [
@@ -983,7 +974,6 @@ test("fn-779 predicate 9: satisfied dep, live work on the upstream's TASK-level 
   const upstream = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     status: "done",
     tasks: [
       makeTask({
@@ -1019,14 +1009,12 @@ test("fn-779 predicate 9: multiple satisfied deps, a LATER one is live → block
   const idle = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     status: "done",
     tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
   });
   const live = makeEpic({
     epic_id: "fn-3-baz",
     epic_number: 3,
-    sort_path: "000003",
     status: "done",
     tasks: [makeTask({ task_id: "fn-3-baz.1", worker_phase: "done" })],
     jobs: [
@@ -1074,7 +1062,6 @@ test("fn-779 predicate 9: forward-reference order (consumer BEFORE live upstream
   const upstream = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     status: "done",
     tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
     jobs: [
@@ -1143,7 +1130,6 @@ test("fn-835 (a): runtime_status='blocked' does NOT hold the per-root mutex (occ
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     tasks: [blockedTask],
   });
@@ -1151,7 +1137,6 @@ test("fn-835 (a): runtime_status='blocked' does NOT hold the per-root mutex (occ
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [readyTask],
   });
@@ -1208,14 +1193,12 @@ test("fn-835 (a): runtime_status='in_progress'/'todo' are dispatchable (only lit
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo-a",
     tasks: [todoTask],
   });
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo-b",
     tasks: [inProgressTask],
   });
@@ -1267,7 +1250,6 @@ function sharedRootPair() {
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     tasks: [t1],
   });
@@ -1275,7 +1257,6 @@ function sharedRootPair() {
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [t2],
   });
@@ -1283,7 +1264,7 @@ function sharedRootPair() {
 }
 
 test("fn-770 (a): eligible ready beats an earlier-sorted ineligible ready on a shared root", () => {
-  // THE DEADLOCK REPRO. fn-1 (lower sort_path, ready, INELIGIBLE) would win the
+  // THE DEADLOCK REPRO. fn-1 (lower epic_number, ready, INELIGIBLE) would win the
   // single per-root slot under the legacy single-pass; the armed gate would
   // then suppress fn-2's `work` launch → net deadlock. With fn-2 eligible, the
   // two-pass pass-2a awards `/repo` to fn-2 FIRST; fn-1 is demoted.
@@ -1317,7 +1298,6 @@ test('fn-770 (c): `""` rootless bucket — ineligible never wins over an eligibl
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: null,
     tasks: [t1],
   });
@@ -1325,7 +1305,6 @@ test('fn-770 (c): `""` rootless bucket — ineligible never wins over an eligibl
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: null,
     tasks: [t2],
   });
@@ -1395,7 +1374,6 @@ test("fn-770 (f): pass-1 live occupant demotes an eligible ready row (no preempt
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     tasks: [t1],
   });
@@ -1403,7 +1381,6 @@ test("fn-770 (f): pass-1 live occupant demotes an eligible ready row (no preempt
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [t2],
   });
@@ -1462,7 +1439,6 @@ test("fn-835 (c): armed mode — an INELIGIBLE ready close row does NOT claim th
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     status: "open",
     tasks: [closeTask],
@@ -1471,7 +1447,6 @@ test("fn-835 (c): armed mode — an INELIGIBLE ready close row does NOT claim th
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [t2],
   });
@@ -1515,7 +1490,6 @@ test("fn-835 (c): armed mode — an ELIGIBLE epic's ready close row STILL claims
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     status: "open",
     tasks: [closeTask],
@@ -1524,7 +1498,6 @@ test("fn-835 (c): armed mode — an ELIGIBLE epic's ready close row STILL claims
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [t2],
   });
@@ -1564,7 +1537,6 @@ test("fn-835 (c): YOLO — a ready close row STILL claims the root (mode-exempt,
   const epic1 = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo",
     status: "open",
     tasks: [closeTask],
@@ -1573,7 +1545,6 @@ test("fn-835 (c): YOLO — a ready close row STILL claims the root (mode-exempt,
   const epic2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo",
     tasks: [t2],
   });
@@ -4051,14 +4022,12 @@ test("fn-905: an unseeded root blocks ONLY its own rows; a seeded sibling stays 
   const epicA = makeEpic({
     epic_id: "fn-1-foo",
     epic_number: 1,
-    sort_path: "000001",
     project_dir: "/repo-a",
     tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
   });
   const epicB = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
-    sort_path: "000002",
     project_dir: "/repo-b",
     tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
   });

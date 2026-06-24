@@ -829,7 +829,7 @@ event-log/reducer/hook touch. Run any of them with
   `--help` (`keeper board --help` / `keeper jobs --help`). Each
   epic renders as a header line —
   `({dir}) {epic_number} {title} [#dep,#dep] [validated]?
-  [slotted-after-closer]? [ready|completed|blocked:<reason>]` (the
+  [ready|completed|blocked:<reason>]` (the
   `[validated]` pill appears ONLY when the epic is validated; its absence
   encodes `unvalidated`) — followed by indented task lines
   (the `{epic_number} {title}` label falls back to `{epic_id}` when BOTH
@@ -839,11 +839,9 @@ event-log/reducer/hook touch. Run any of them with
   blank `({dir})` line — under fn-708's omit-default an unvalidated stub
   no longer even carries a trailing `[unvalidated]` pill; the row is
   never hidden, fn-700)
-  (the optional `[slotted-after-closer]` pill — schema v29, active/cyan
-  bucket — appears only when the epic was minted by another epic's
-  closer session, i.e. `epics.created_by_closer_of != null`; its
-  presence is also what slots the row directly below its parent under
-  the default `sort_path ASC` ordering)
+  (epics render in `epic_number ASC` creation order — a neutral seed
+  consumers reorder through readiness's `orderEpicsForScheduling` seam;
+  no priority/ordering signal lives in epic/board state)
   (with omit-default `[<runtime>]? [worker-done]?
   [ready|completed|blocked:<reason>]` pills — the two native fields
   consolidated per fn-708: the plan runtime enum elides its `todo`
@@ -1348,11 +1346,7 @@ event-log/reducer/hook touch. Run any of them with
   Monitor-shaped event
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
-  `[keeper-await] failed …` line — and exits when its condition holds. A
-  single `complete <epic>` met additionally carries `followup=<id>`
-  (comma-joined; a `--json` array) when the closer that finished the epic
-  minted follow-up epic(s) for it (read off the `created_by_closer_of`
-  projection), omitted entirely when there is none.
+  `[keeper-await] failed …` line — and exits when its condition holds.
   Seven conditions: `complete <id>` (epic/task pops off the board),
   `started <id>` (work has begun at least once — a monotonic milestone
   keyed on job-presence OR `runtime_status` in {in_progress, done} OR
@@ -1829,24 +1823,17 @@ SessionStart environment, projecting the arthack-claude profile a session
 ran under (latest-non-NULL-wins via `COALESCE(excluded.config_dir,
 jobs.config_dir)` on the SessionStart ON CONFLICT branch, so a resume
 SessionStart that captures NULL preserves the prior attribution).
-As of schema v29, the `epics` projection gains `created_by_closer_of` (TEXT,
-nullable — the closer→child link's `plan_ref`, i.e. the closed-epic id whose
-`/plan:plan` closer session minted this child epic via `epic-create`) and
-`sort_path` (TEXT NOT NULL DEFAULT '' — a zero-padded-6 dotted materialized-
-path key like `"000003.000007"`). As of schema v30 (fn-595), `epics` adds
-`queue_jump` (INTEGER NOT NULL DEFAULT 0) projected from the
-`plan_queue_jump` envelope column on `/plan:queue` scaffold events;
-when set on a root epic, `cascadeSortPath` stamps a `!`-prefixed
-`sort_path` so queue-jumped epics sort above all other root epics in the
-default `sort_path ASC` page. Both are reducer-derived inside
-`syncPlanLinks` from the existing `job_links` + `jobs.plan_verb` /
-`plan_ref` substrate; an `EpicSnapshot` carve-out preserves them across a
-file-content re-observation (alongside `tasks` / `jobs` / `job_links`). The
-`EPICS_DESCRIPTOR.defaultSort` flips from `epic_number asc` to
-`sort_path asc`, so a closer-created child epic slots directly below its
-parent in the default page; `sort_path` overflows to `''` at the documented
-ceiling `epic_number >= 1_000_000` (safe-fold; the reducer never throws
-inside `BEGIN IMMEDIATE`). As of schema v31, the `git` collection is
+As of schema v85 (fn-936), the `epics` projection carries NO static
+priority/ordering machinery: `EPICS_DESCRIPTOR.defaultSort` is
+`epic_number asc` (tie-break `epic_id`) — plain creation order, a neutral
+seed. Clients (board, autopilot, the `keeper autopilot` viewer) consume that
+order through readiness's `orderEpicsForScheduling` seam — an identity
+passthrough today, the single future home for any runtime priority (which
+will live on the autopilot surface, never plan metadata/state). v85 dropped
+the `sort_path` / `queue_jump` / `created_by_closer_of` `epics` columns, the
+`events.plan_queue_jump` column, the `[slotted-after-closer]` board pill, and
+the `/queue` surface (`/plan:next` + `keeper plan epic queue-jump`). As of
+schema v31, the `git` collection is
 rebuilt around per-(session, file) attribution: `events` gains
 `bash_mutation_kind` + `bash_mutation_targets` (hook-side derived columns
 that name the mutation shape and the affected paths on every
@@ -2079,10 +2066,11 @@ schema v32 (fn-634, narrowed at v63/fn-756), `epics` adds
 `CASE WHEN status='open' THEN 1 ELSE 0 END`,
 materializing the descriptor's default scope as a single
 0/1 derived value; a partial composite index
-`idx_epics_default_visible ON epics(default_visible, sort_path, epic_id)
+`idx_epics_default_visible ON epics(default_visible, epic_number, epic_id)
 WHERE default_visible = 1` serves the default no-wire-filter query as
 a covering SEARCH (no SCAN, no temp B-tree for the
-`sort_path ASC, epic_id ASC` ORDER BY) — collapsing the Tier 4
+`epic_number ASC, epic_id ASC` ORDER BY — fn-936 reshaped it off the
+dropped `sort_path`) — collapsing the Tier 4
 diffTick/metaCount p95 tail. As of schema v33 (fn-639), a new
 `profiles` projection table (one row per Claude profile directory keyed
 by `config_dir TEXT NOT NULL PRIMARY KEY`; the `''` sentinel collapses
@@ -2129,9 +2117,8 @@ no longer calls `resolveEpicDep`, and the `BlockReason` surface
 autopilot consumes — `dep-on-epic` with `cross_project`,
 `dep-on-epic-dangling` — is byte-for-byte preserved off the projection
 shape). The `EpicSnapshot` ON CONFLICT carve-out widens to include
-`resolved_epic_deps` alongside `tasks` / `jobs` / `job_links` /
-`created_by_closer_of` / `sort_path` / `queue_jump` so a file-content
-re-observation can't wipe the projection-derived dep resolution.
+`resolved_epic_deps` alongside `tasks` / `jobs` / `job_links` so a
+file-content re-observation can't wipe the projection-derived dep resolution.
 As of schema v35 (fn-642, corrected at v42/fn-662), the `usage`
 projection colocates the Claude rate-limit annotation:
 `last_rate_limit_at` + `last_rate_limit_session_id` are populated
@@ -2581,7 +2568,7 @@ As of schema v77 (fn-856), the plan-link classifier is ungated from the
 `/plan:plan` time-window model: a session that never invokes `/plan:plan` used
 to have zero windows, so every plan op it made was silently dropped — leaking
 three populations (closers that scaffold their follow-up epic via
-`close-finalize`, pre-first-opener scaffolds, and `/plan:defer` / `/plan:next` /
+`close-finalize`, pre-first-opener scaffolds, and `/plan:defer` /
 direct-CLI edits). The measured cost on the live DB: `epics.job_links` empty for
 ~1013/1020 epics and `created_by_closer_of` set for 0/1020 (the
 `[slotted-after-closer]` pill had never once fired). The classifier now links
@@ -2602,7 +2589,7 @@ autopiloted `/plan:work` worker (`keeper plan done`) and the `/plan:close` close
 job title's `work::` / `close::` spawn-name prefix. `classifyEntry` now returns
 null for `op === "done"` / `op === "close"` (after the read-only gate, before the
 creator/refiner branches), so `refiner` means only genuine plan-shaping edits
-(`refine-apply`, `/plan:next` queue jumps, `epic set-*`, deps, direct CLI). Because
+(`refine-apply`, `epic set-*`, deps, direct CLI). Because
 the fold output changed, the migration MIRRORS the v77 rewind/wipe block but RAISES
 the git skip-floor instead of resetting it to 0 (preserving the v79 git carve-out so
 the cursor-0 re-fold drain no-ops historical git folds), so the deterministic link
@@ -3438,27 +3425,27 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 
 # Epics by inbound-link density — every job whose `keeper plan` footprint (stdout scrape ∪ durable commit-trailer facts, epic fn-695) created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, sort_path ASC LIMIT 10"
+  "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, epic_number ASC LIMIT 10"
 # Unnest job_links to see each link's embedded display payload (schema v25: kind, job_id, title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind, json_extract(l.value, '\$.last_input_request_at') AS last_input_request_at, json_extract(l.value, '\$.last_input_request_kind') AS last_input_request_kind FROM epics e, json_each(e.job_links) l ORDER BY e.sort_path ASC, kind ASC, job_id ASC LIMIT 20"
+  "SELECT e.epic_id, json_extract(l.value, '\$.kind') AS kind, json_extract(l.value, '\$.job_id') AS job_id, json_extract(l.value, '\$.title') AS title, json_extract(l.value, '\$.state') AS state, json_extract(l.value, '\$.last_api_error_at') AS last_api_error_at, json_extract(l.value, '\$.last_api_error_kind') AS last_api_error_kind, json_extract(l.value, '\$.last_input_request_at') AS last_input_request_at, json_extract(l.value, '\$.last_input_request_kind') AS last_input_request_kind FROM epics e, json_each(e.job_links) l ORDER BY e.epic_number ASC, kind ASC, job_id ASC LIMIT 20"
 
 # Killed sessions specifically (proven-dead from outside the hook stream — SIGKILL, terminal-pane closure, reboot):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.keeper` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — an unfiltered query uses idx_epics_sort_path; the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
+# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.keeper` roots. The natural sort is `epic_number ASC` (matches the `EPICS_DESCRIPTOR` default — plain creation order, a neutral seed; fn-936 v85 dropped the old `sort_path` ordering); the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, sort_path, created_by_closer_of, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
-# Default-scope epics — what the board sees by default: every open epic. Schema v32 (fn-634, narrowed at v63/fn-756) materializes the predicate `status='open'` as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
+  'SELECT epic_id, epic_number, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY epic_number ASC, epic_id ASC LIMIT 10'
+# Default-scope epics — what the board sees by default: every open epic. Schema v32 (fn-634, narrowed at v63/fn-756) materializes the predicate `status='open'` as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, epic_number, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, sort_path, title, status FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
-# Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the plan-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.keeper/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY uses the idx_epics_sort_path index:
+  'SELECT epic_id, epic_number, title, status FROM epics WHERE default_visible = 1 ORDER BY epic_number ASC, epic_id ASC LIMIT 10'
+# Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the plan-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.keeper/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY follows the default `epic_number` order:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.sort_path ASC, task_number ASC LIMIT 10"
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.epic_number ASC, task_number ASC LIMIT 10"
 # Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
+  "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.epic_number ASC, task_id ASC LIMIT 10"
 
 # Git projection — one row per watched worktree (membership gate `.keeper present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|plan (the plan badge is minted by the reducer's plan_op fold from the envelope's files[] array so .keeper/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \

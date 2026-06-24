@@ -27,7 +27,7 @@ import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 import type { ClientFrame } from "../src/protocol";
-import type { Verdict } from "../src/readiness";
+import { orderEpicsForScheduling, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
   subscribeCollection,
@@ -124,17 +124,18 @@ function shortTaskId(taskId: string, epicId: string): string {
 
 /**
  * Render the open-task dependency graph as an ASCII DAG. One block per epic
- * in board (`sort_path`) order; within a block, one line per task carrying a
- * status glyph, the short `.M` id, and a `← <deps>` clause naming the
- * `depends_on` upstreams it waits for. An epic that itself waits on other
- * epics annotates its header with `← epic:<id>` per `depends_on_epics`.
+ * in board (creation, `epic_number ASC`) order via `orderEpicsForScheduling`;
+ * within a block, one line per task carrying a status glyph, the short `.M` id,
+ * and a `← <deps>` clause naming the `depends_on` upstreams it waits for. An
+ * epic that itself waits on other epics annotates its header with `← epic:<id>`
+ * per `depends_on_epics`.
  *
  * Pure transform — returns the section body lines (the `--- dependencies ---`
  * header is added by `renderBody`). Empty array when there is nothing open.
  */
 export function renderDependencyGraph(snap: ReadinessClientSnapshot): string[] {
   const out: string[] = [];
-  for (const epic of snap.epics) {
+  for (const epic of orderEpicsForScheduling(snap.epics)) {
     const epicId = seg(epic.epic_id);
     const tasks = asArray<Task>(epic.tasks);
     if (tasks.length === 0) {

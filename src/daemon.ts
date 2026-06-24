@@ -740,7 +740,6 @@ export const INGEST_EVENTS_COLUMNS = [
   "plan_subject_present",
   "tool_use_id",
   "config_dir",
-  "plan_queue_jump",
   "bash_mutation_kind",
   "bash_mutation_targets",
   "plan_files",
@@ -1596,9 +1595,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
          subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
          plan_op, plan_target, plan_epic_id, plan_task_id,
-         plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+         plan_subject_present, tool_use_id, config_dir,
          bash_mutation_kind, bash_mutation_targets, plan_files
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           Date.now() / 1000, // unix seconds as REAL
           "autopilot", // stable synthetic session_id
@@ -1625,7 +1624,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           null, // plan_subject_present
           null, // tool_use_id
           null, // config_dir
-          null, // plan_queue_jump
           null, // bash_mutation_kind
           null, // bash_mutation_targets
           null, // plan_files
@@ -1645,9 +1643,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
          subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
          plan_op, plan_target, plan_epic_id, plan_task_id,
-         plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+         plan_subject_present, tool_use_id, config_dir,
          bash_mutation_kind, bash_mutation_targets, plan_files
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           Date.now() / 1000, // unix seconds as REAL
           "autopilot", // stable synthetic session_id
@@ -1677,7 +1675,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           null, // plan_subject_present
           null, // tool_use_id
           null, // config_dir
-          null, // plan_queue_jump
           null, // bash_mutation_kind
           null, // bash_mutation_targets
           null, // plan_files
@@ -2035,7 +2032,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               $plan_task_id: null,
               $plan_subject_present: null,
               $config_dir: null,
-              $plan_queue_jump: null,
               $bash_mutation_kind: null,
               $bash_mutation_targets: null,
               $plan_files: null,
@@ -2104,7 +2100,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $plan_task_id: null,
             $plan_subject_present: null,
             $config_dir: null,
-            $plan_queue_jump: null,
             $bash_mutation_kind: null,
             $bash_mutation_targets: null,
             $plan_files: null,
@@ -2181,7 +2176,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $plan_task_id: null,
             $plan_subject_present: null,
             $config_dir: null,
-            $plan_queue_jump: null,
             $bash_mutation_kind: null,
             $bash_mutation_targets: null,
             $plan_files: null,
@@ -2243,7 +2237,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $plan_task_id: null,
             $plan_subject_present: null,
             $config_dir: null,
-            $plan_queue_jump: null,
             $bash_mutation_kind: null,
             $bash_mutation_targets: null,
             $plan_files: null,
@@ -2376,7 +2369,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $plan_task_id: null,
           $plan_subject_present: null,
           $config_dir: null,
-          $plan_queue_jump: null,
           $bash_mutation_kind: null,
           $bash_mutation_targets: null,
           $plan_files: null,
@@ -2421,7 +2413,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $plan_task_id: null,
           $plan_subject_present: null,
           $config_dir: null,
-          $plan_queue_jump: null,
           $bash_mutation_kind: null,
           $bash_mutation_targets: null,
           $plan_files: null,
@@ -2465,7 +2456,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $plan_task_id: null,
           $plan_subject_present: null,
           $config_dir: null,
-          $plan_queue_jump: null,
           $bash_mutation_kind: null,
           $bash_mutation_targets: null,
           $plan_files: null,
@@ -2512,7 +2502,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $plan_task_id: null,
           $plan_subject_present: null,
           $config_dir: null,
-          $plan_queue_jump: null,
           $bash_mutation_kind: null,
           $bash_mutation_targets: null,
           $plan_files: null,
@@ -2656,7 +2645,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -2793,7 +2781,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -2925,7 +2912,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -3034,7 +3020,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -3133,7 +3118,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -3440,7 +3424,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -3505,7 +3488,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -3588,7 +3570,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
@@ -4104,7 +4085,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $plan_task_id: null,
         $plan_subject_present: null,
         $config_dir: null,
-        $plan_queue_jump: null,
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,

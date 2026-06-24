@@ -476,9 +476,6 @@ function extractPlanSnapshot(event: Event): PlanSnapshot | null {
   return null;
 }
 
-/** Zero-pad an integer to width 6 for `sort_path` keys. */
-const zeroPad6 = (n: number): string => String(n).padStart(6, "0");
-
 /**
  * Predicate: is `epicId` an actively-tombstoned epic? `true` when an
  * `EpicDeleted` has been folded for this id WITHOUT a subsequent `EpicSnapshot`
@@ -534,15 +531,14 @@ function projectPlanRow(db: Database, event: Event): void {
     db.run("DELETE FROM epic_tombstones WHERE epic_id = ?", [entityId]);
 
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
-    // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
-    // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries none of
-    // that data, and a shell row inserted by a task/job/plan-event before
-    // the epic already holds those columns. Without the carve-out, an
-    // EpicSnapshot re-fold would wipe the provenance, closer-link, sort-path,
-    // queue-jump, and resolved-deps projections.
+    // `jobs` / `job_links` / `resolved_epic_deps`: an epic snapshot carries
+    // none of that data, and a shell row inserted by a task/job/plan-event
+    // before the epic already holds those columns. Without the carve-out, an
+    // EpicSnapshot re-fold would wipe the provenance, job-link, and
+    // resolved-deps projections.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -566,55 +562,6 @@ function projectPlanRow(db: Database, event: Event): void {
         ts,
       ],
     );
-    // If `sort_path` is still '' but `epic_number` is now known, derive it so
-    // child epics can inherit a non-empty parent path (an EpicSnapshot for a
-    // root epic unblocks the chain without a plan event). Prepend `!` for
-    // ROOT epics whose `queue_jump = 1`: `!` (ASCII 33) sorts strictly below
-    // the digits under SQLite BINARY collation, lifting a queue-jumped root
-    // above non-queued roots. A non-root queue-jumped epic inherits its
-    // parent's path, so the root's `!`-prefix propagates for free.
-    const spRow = db
-      .query(
-        "SELECT epic_number, created_by_closer_of, sort_path, queue_jump FROM epics WHERE epic_id = ?",
-      )
-      .get(entityId) as {
-      epic_number: number | null;
-      created_by_closer_of: string | null;
-      sort_path: string;
-      queue_jump: number;
-    } | null;
-    if (spRow != null && spRow.sort_path === "" && spRow.epic_number != null) {
-      const ownNumber = spRow.epic_number;
-      let derivedPath: string;
-      if (ownNumber >= 1_000_000) {
-        derivedPath = "";
-      } else if (spRow.created_by_closer_of == null) {
-        // Root: stamp `!`-prefix when queue_jump=1; plain zero-padded
-        // epic_number otherwise.
-        derivedPath =
-          spRow.queue_jump === 1
-            ? `!${zeroPad6(ownNumber)}`
-            : zeroPad6(ownNumber);
-      } else {
-        const parentRow = db
-          .query("SELECT sort_path FROM epics WHERE epic_id = ?")
-          .get(spRow.created_by_closer_of) as {
-          sort_path: string | null;
-        } | null;
-        const parentPath = parentRow?.sort_path ?? "";
-        derivedPath =
-          parentPath === ""
-            ? zeroPad6(ownNumber)
-            : `${parentPath}.${zeroPad6(ownNumber)}`;
-      }
-      if (derivedPath !== "") {
-        db.run(
-          "UPDATE epics SET sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
-          [derivedPath, event.id, ts, entityId],
-        );
-        cascadeSortPath(db, entityId, event.id, ts);
-      }
-    }
 
     // Forward stamp + reverse fan-out for `resolved_epic_deps` +
     // `epic_dep_edges`. The all-epics index is built ONCE and shared across
@@ -5351,8 +5298,8 @@ function sortJobLinks(
  *
  * What stays per-caller (NOT merged here): the classifier `kind` ownership
  * (`syncPlanLinks` derives a fresh `kind`; the sibling re-stamps the OLD entry's
- * `kind`), the closer/`sort_path`/`queue_jump`/cascade derivation, and the
- * shell-insert shape. Those differ per caller and live at the call sites.
+ * `kind`) and the shell-insert shape. Those differ per caller and live at the
+ * call sites.
  */
 function mergeJobLinkSlice(
   existing: readonly JobLinkEntry[],
@@ -5498,16 +5445,13 @@ function syncJobLinksOnJobWrite(
       );
     } else {
       // No epic row yet — shell-insert. The EpicSnapshot ON CONFLICT carve-out
-      // preserves `job_links` / `created_by_closer_of` / `sort_path` /
-      // `queue_jump`, so a later snapshot can't wipe the enriched payload; the
-      // next `syncPlanLinks` computes the closer columns. `queue_jump` is
-      // omitted so SQLite fills its `NOT NULL DEFAULT 0`.
+      // preserves `job_links`, so a later snapshot can't wipe the enriched
+      // payload.
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
-           last_event_id, updated_at, tasks, jobs, job_links,
-           created_by_closer_of, sort_path
-         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, NULL, '')`,
+           last_event_id, updated_at, tasks, jobs, job_links
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
         [epicId, eventId, ts, jobLinksJson],
       );
     }
@@ -6040,20 +5984,14 @@ function syncPlanLinks(
     : new Map([[sessionId, invocations]]);
 
   // Step 2: re-derive job_links for each touched epic and UPDATE the epic row
-  // (shell-insert a missing one). Per-epic, also derive `created_by_closer_of`
-  // (the closer→child link) and `sort_path` (the materialized-path sort key),
-  // then transitively re-stamp every descendant's `sort_path` whose
-  // closer-chain leads back to this epic — inside the same transaction for
-  // byte-identical re-fold.
+  // (shell-insert a missing one), inside the same transaction for byte-identical
+  // re-fold.
   for (const epicId of touchedEpics) {
     // Pre-filter tombstoned epics before the derive loop: a deleted epic gets no
-    // job_links UPDATE / shell-insert (it would resurrect a ghost row), but its
-    // sort_path cascade STILL runs so a live descendant re-stamps off the
-    // (already-deleted) parent's path. Matches the old code's net effect: the
-    // shell-insert was tombstone-suppressed and an UPDATE on a missing/deleted
-    // row was a no-op, while the cascade always fired.
+    // job_links UPDATE / shell-insert (it would resurrect a ghost row). An
+    // UPDATE on a missing/deleted row would be a no-op, so the skip is the same
+    // net effect.
     if (isEpicTombstoned(db, epicId)) {
-      cascadeSortPath(db, epicId, eventId, ts);
       continue;
     }
 
@@ -6086,232 +6024,28 @@ function syncPlanLinks(
     }
     const jobLinksJson = JSON.stringify(enriched);
 
-    // Derive `created_by_closer_of` from the creator entries whose backing
-    // `jobs` row is `plan_verb='close' AND plan_ref IS NOT NULL`; tie-break on
-    // lowest `job_id` ASC. None → NULL.
-    let createdByCloserOf: string | null = null;
-    const creatorJobIds = enriched
-      .filter((e) => e.kind === "creator")
-      .map((e) => e.job_id);
-    if (creatorJobIds.length > 0) {
-      const placeholders = creatorJobIds.map(() => "?").join(",");
-      const closerRows = db
-        .query(
-          `SELECT job_id, plan_ref
-             FROM jobs
-            WHERE job_id IN (${placeholders})
-              AND plan_verb = 'close'
-              AND plan_ref IS NOT NULL
-            ORDER BY job_id ASC`,
-        )
-        .all(...creatorJobIds) as {
-        job_id: string;
-        plan_ref: string;
-      }[];
-      if (closerRows.length > 0) {
-        createdByCloserOf = closerRows[0].plan_ref;
-      }
-    }
-
-    // Derive `sort_path` from `created_by_closer_of` and this epic's
-    // `epic_number`: root → `zeroPad6(epic_number)`; non-root → inherit parent's
-    // path; missing/placeholder parent → fall back to root-level (the cascade
-    // re-stamps when the parent resolves); `epic_number >= 1_000_000` → `''` +
-    // note (never throws). `epic_number` is read off the touched row, so a shell
-    // row (plan event before the EpicSnapshot) has NULL → folds to
-    // `"000000"`; the next EpicSnapshot recomputes against the known number.
-    const ownRow = db
-      .query("SELECT epic_number FROM epics WHERE epic_id = ?")
-      .get(epicId) as { epic_number: number | null } | null;
-    const ownNumber = ownRow?.epic_number ?? 0;
-
-    // Derive `queue_jump`: scan this epic's events for any plan envelope that
-    // carried `queue_jump: true`. Sticky-true — any single flip locks the epic
-    // queued for the projection's lifetime (no `/plan:unqueue`); a re-fold
-    // replays the same envelopes, so EXISTS is byte-deterministic. Keyed off
-    // `plan_epic_id`, served by the dedicated partial composite index.
-    const queueJumpRow = db
-      .query(
-        `SELECT EXISTS(
-           SELECT 1 FROM events
-            WHERE plan_op IS NOT NULL
-              AND plan_epic_id = ?
-              AND plan_queue_jump = 1
-         ) AS hit`,
-      )
-      .get(epicId) as { hit: number };
-    const queueJump = queueJumpRow.hit === 1 ? 1 : 0;
-
-    let sortPath: string;
-    if (ownNumber >= 1_000_000) {
-      // Overflow guard — width=6 can't represent this monotonic id; the
-      // documented ceiling is 999,999. Fold to `''` and note; never throw.
-      console.error(
-        `keeper reducer: epic ${epicId} has epic_number=${ownNumber} ` +
-          `>= 1_000_000; sort_path overflow ceiling — folding to ''`,
-      );
-      sortPath = "";
-    } else if (createdByCloserOf == null) {
-      // Root: prepend `!` when queue_jump=1 so this epic sorts strictly above
-      // non-queued roots under SQLite BINARY collation (`!` = ASCII 33 <
-      // digits). Multiple queue-jumped roots sort FIFO under the shared prefix.
-      sortPath =
-        queueJump === 1 ? `!${zeroPad6(ownNumber)}` : zeroPad6(ownNumber);
-    } else {
-      const parentRow = db
-        .query("SELECT sort_path FROM epics WHERE epic_id = ?")
-        .get(createdByCloserOf) as { sort_path: string | null } | null;
-      const parentPath = parentRow?.sort_path ?? "";
-      if (parentPath === "") {
-        // Parent missing / placeholder — fall back to root-level; the cascade
-        // re-stamps (with any inherited `!`-prefix) when the parent resolves.
-        sortPath = zeroPad6(ownNumber);
-      } else {
-        // Non-root: inherit the parent's path verbatim — a parent `!`-prefix
-        // propagates through the concat for free.
-        sortPath = `${parentPath}.${zeroPad6(ownNumber)}`;
-      }
-    }
-
     const epicExists = db
       .query("SELECT epic_id FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_id: string } | null;
     if (epicExists != null) {
       db.run(
-        "UPDATE epics SET job_links = ?, created_by_closer_of = ?, sort_path = ?, queue_jump = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
-        [
-          jobLinksJson,
-          createdByCloserOf,
-          sortPath,
-          queueJump,
-          eventId,
-          ts,
-          epicId,
-        ],
+        "UPDATE epics SET job_links = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
+        [jobLinksJson, eventId, ts, epicId],
       );
     } else {
-      // Shell-insert: no epic row yet. The just-derived closer/sort/queue
-      // columns are stamped (sort_path typically the `"000000"` placeholder
-      // until an EpicSnapshot supplies `epic_number`); the ON CONFLICT carve-out
-      // preserves them. Routed through the tombstone-checking helper — a
-      // plan-event-before-epic shell for a deleted epic is suppressed.
+      // Shell-insert: no epic row yet. Routed through the tombstone-checking
+      // helper — a plan-event-before-epic shell for a deleted epic is
+      // suppressed.
       insertEpicShellIfNotTombstoned(
         db,
         epicId,
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
-           last_event_id, updated_at, tasks, jobs, job_links,
-           created_by_closer_of, sort_path, queue_jump
-         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?, ?, ?, ?)`,
-        [
-          epicId,
-          eventId,
-          ts,
-          jobLinksJson,
-          createdByCloserOf,
-          sortPath,
-          queueJump,
-        ],
+           last_event_id, updated_at, tasks, jobs, job_links
+         ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
+        [epicId, eventId, ts, jobLinksJson],
       );
     }
-
-    // Transitive cascade: re-stamp `sort_path` on every descendant whose
-    // `created_by_closer_of` is this epic. Cycles can't form
-    // (`created_by_closer_of` is immutable once set); the cycle guard is
-    // defense-in-depth.
-    cascadeSortPath(db, epicId, eventId, ts);
-  }
-}
-
-/**
- * Re-stamp `sort_path` on every transitive descendant of `rootEpicId`. BFS over
- * an in-memory queue with a `visited` cycle guard + depth cap of 50 — cycles
- * can't form (`created_by_closer_of` is immutable once set), so the guard is
- * defense-in-depth; both bails note and return, never throws. Each descendant's
- * path is `<parent.sort_path>.<zeroPad6(epic_number)>` (or just
- * `zeroPad6(epic_number)` when the parent's path is the `''` placeholder); same
- * `epic_number >= 1_000_000 → ''` overflow guard as {@link syncPlanLinks}.
- *
- * Schema v30: the `!`-prefix queue-jump signal propagates through the
- * `parentPath` string concat for free. If the root epic carries
- * `sort_path = "!000003"`, the BFS reads that string off the `epics` row
- * and composes `"!000003.000007"` for each child — the cascade has NO
- * separate queue_jump awareness because the prefix is already baked into
- * the parent path string. `queue_jump` itself (the projection column) is
- * NOT re-stamped here: children carry their OWN queue-jump state set by
- * `syncPlanLinks` on their own session's events, independent of the
- * root's state. Cascading only touches `sort_path`, never `queue_jump`.
- */
-function cascadeSortPath(
-  db: Database,
-  rootEpicId: string,
-  eventId: number,
-  ts: number,
-): void {
-  const MAX_DEPTH = 50;
-  const visited = new Set<string>();
-  visited.add(rootEpicId);
-  // BFS frontier: each entry is `(parentId, depth)`. We re-stamp every
-  // child of `parentId` and enqueue the children for their own children.
-  let frontier: { id: string; depth: number }[] = [
-    { id: rootEpicId, depth: 0 },
-  ];
-  while (frontier.length > 0) {
-    const next: { id: string; depth: number }[] = [];
-    for (const { id: parentId, depth } of frontier) {
-      if (depth >= MAX_DEPTH) {
-        console.error(
-          `keeper reducer: sort_path cascade depth >= ${MAX_DEPTH} ` +
-            `at parent=${parentId}; bailing (cycle guard / defense-in-depth)`,
-        );
-        return;
-      }
-      const parentRow = db
-        .query("SELECT sort_path FROM epics WHERE epic_id = ?")
-        .get(parentId) as { sort_path: string | null } | null;
-      const parentPath = parentRow?.sort_path ?? "";
-      const children = db
-        .query(
-          `SELECT epic_id, epic_number
-             FROM epics
-            WHERE created_by_closer_of = ?
-            ORDER BY epic_id ASC`,
-        )
-        .all(parentId) as {
-        epic_id: string;
-        epic_number: number | null;
-      }[];
-      for (const child of children) {
-        if (visited.has(child.epic_id)) {
-          console.error(
-            `keeper reducer: sort_path cascade cycle detected ` +
-              `at epic=${child.epic_id}; bailing (defense-in-depth)`,
-          );
-          return;
-        }
-        visited.add(child.epic_id);
-        const childNumber = child.epic_number ?? 0;
-        let childPath: string;
-        if (childNumber >= 1_000_000) {
-          console.error(
-            `keeper reducer: epic ${child.epic_id} has epic_number=` +
-              `${childNumber} >= 1_000_000; sort_path overflow ceiling ` +
-              `— folding to '' (cascade)`,
-          );
-          childPath = "";
-        } else if (parentPath === "") {
-          childPath = zeroPad6(childNumber);
-        } else {
-          childPath = `${parentPath}.${zeroPad6(childNumber)}`;
-        }
-        db.run(
-          "UPDATE epics SET sort_path = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
-          [childPath, eventId, ts, child.epic_id],
-        );
-        next.push({ id: child.epic_id, depth: depth + 1 });
-      }
-    }
-    frontier = next;
   }
 }
 
@@ -6347,9 +6081,6 @@ function epicLiteToEpic(row: EpicLite): Epic {
     jobs: [],
     job_links: [],
     last_validated_at: null,
-    created_by_closer_of: null,
-    sort_path: "",
-    queue_jump: 0,
     resolved_epic_deps: null,
   };
 }
@@ -6478,8 +6209,8 @@ function preserveSourceOrder(_arr: ResolvedEpicDep[]): void {
 /**
  * The forward fold: rebuild `epic_dep_edges` for consumer `epicId` from scratch,
  * then stamp the enriched `resolved_epic_deps` array on the consumer's row.
- * Called from the EpicSnapshot arm AFTER the consumer's row + sort_path settle
- * but BEFORE the reverse fan-out.
+ * Called from the EpicSnapshot arm AFTER the consumer's row settles but BEFORE
+ * the reverse fan-out.
  *
  * Full-recompute, never delta-merge (a delta-merge would double-add on re-fold):
  * DELETE every existing edge for this consumer, INSERT one per `dep_token`. Each

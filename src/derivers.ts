@@ -385,11 +385,6 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
  *
  * `subject_present` mirrors the envelope's `subject != null` (the verb carries
  * human subject text); drives creator/refiner classification downstream.
- *
- * `queue_jump` mirrors the envelope's field. The `=== true` defensive check is
- * load-bearing for re-fold determinism: any legacy event lacking the key folds
- * to `false`. Drives the `!`-prefix `sort_path` so queued work sorts atop the
- * board.
  */
 export interface PlanInvocation {
   op: string;
@@ -397,7 +392,6 @@ export interface PlanInvocation {
   epic_id: string | null;
   task_id: string | null;
   subject_present: boolean;
-  queue_jump: boolean;
   /**
    * Repo-relative paths plan wrote during this op. NULL (NOT an empty array)
    * when absent, non-array, filtered to zero strings, or over PLAN_FILES_CAP
@@ -497,10 +491,6 @@ export function extractPlanInvocation(
     typeof rawTarget === "string" ? rawTarget : null;
   const rawSubject = envObj.subject;
   const subject_present = rawSubject != null;
-  // Defensive `=== true` (NOT truthiness) is load-bearing for re-fold
-  // determinism: any legacy event lacking the key folds to `false`, so the only
-  // way to land `true` is the CLI emitting the literal boolean.
-  const queue_jump = envObj.queue_jump === true;
   const refParsed = target !== null ? parsePlanRef(target) : null;
   const epic_id = refParsed?.epic_id ?? null;
   const task_id = refParsed?.kind === "task" ? refParsed.task_id : null;
@@ -521,7 +511,7 @@ export function extractPlanInvocation(
       files = filtered;
     }
   }
-  return { op, target, epic_id, task_id, subject_present, queue_jump, files };
+  return { op, target, epic_id, task_id, subject_present, files };
 }
 
 /**

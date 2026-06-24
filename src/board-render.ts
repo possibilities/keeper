@@ -414,15 +414,10 @@ const PILL_COLORS: Record<string, PillBucket> = {
   // emits the bare `working` state pill), so the shared hue introduces
   // no in-view ambiguity.
   working: "blue",
-  // Schema v29: the `[slotted-after-closer]` epic-header pill (rendered
-  // when `epics.created_by_closer_of != null`). Active/cyan bucket — this
-  // is "live, structural relationship visible to the human" rather than
-  // a success/error/warn state. See `renderEpicBlock` for the placement.
-  "slotted-after-closer": "active",
   // fn-751 (schema v62): the `[armed]` epic-header pill (rendered when the
   // epic is present in the `armed_epics` presence table). Active/cyan bucket
-  // — like `slotted-after-closer`, this is a "live, human-chosen structural
-  // signal" rather than a success/error/warn state.
+  // — a "live, human-chosen structural signal" rather than a
+  // success/error/warn state.
   armed: "active",
   ok: "success",
   approved: "success",

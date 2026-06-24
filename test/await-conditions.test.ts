@@ -30,7 +30,6 @@ import {
   type AwaitState,
   agentsIdleState,
   classifyTargetId,
-  closerChildrenOf,
   evaluateAwaitCondition,
   gitCleanState,
   monitorRunningState,
@@ -82,9 +81,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     tasks: [],
     jobs: [],
     job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
@@ -567,13 +563,11 @@ test("task-unblocked: mutex-demoted single-task-per-root → met (carve-out)", (
     epic_id: "fn-1-foo",
     epic_number: 1,
     tasks: [t1],
-    sort_path: "000001",
   });
   const e2 = makeEpic({
     epic_id: "fn-2-bar",
     epic_number: 2,
     tasks: [t2],
-    sort_path: "000002",
   });
   const snap = run([e1, e2]);
   expect(snap.perTask.get(t2.task_id)).toEqual({
@@ -679,7 +673,6 @@ test("epic-unblocked: SOLE ready task got mutex-demoted → still met (perTask c
     epic_id: "fn-9-busy",
     epic_number: 9,
     tasks: [sibling],
-    sort_path: "000009",
   });
   const target = makeTask({
     task_id: "fn-10-target.1",
@@ -690,7 +683,6 @@ test("epic-unblocked: SOLE ready task got mutex-demoted → still met (perTask c
     epic_id: "fn-10-target",
     epic_number: 10,
     tasks: [target],
-    sort_path: "000010",
   });
   const snap = run([siblingEpic, targetEpic]);
   // Sanity-check the demotion landed and the perEpic rollup is blocked.
@@ -1267,81 +1259,4 @@ test("monitor-running: ownSessionId null → met (no own row, vacuously done)", 
   expect(monitorRunningState(null, { command: "watch.sh" }, jobs).kind).toBe(
     "met",
   );
-});
-
-// ---------------------------------------------------------------------------
-// closerChildrenOf — closer-minted follow-up epics for a closed epic
-// ---------------------------------------------------------------------------
-
-test("closerChildrenOf: returns matching children sorted by sort_path", () => {
-  const epics = [
-    makeEpic({
-      epic_id: "fn-9-child-b",
-      epic_number: 9,
-      created_by_closer_of: "fn-1-parent",
-      sort_path: "000001.000009",
-    }),
-    makeEpic({
-      epic_id: "fn-7-child-a",
-      epic_number: 7,
-      created_by_closer_of: "fn-1-parent",
-      sort_path: "000001.000007",
-    }),
-  ];
-  // sort_path order (000001.000007 < 000001.000009), not iteration order.
-  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([
-    "fn-7-child-a",
-    "fn-9-child-b",
-  ]);
-});
-
-test("closerChildrenOf: ignores non-matching and null created_by_closer_of", () => {
-  const epics = [
-    makeEpic({ epic_id: "fn-1-plain", created_by_closer_of: null }),
-    makeEpic({
-      epic_id: "fn-2-other-parent",
-      epic_number: 2,
-      created_by_closer_of: "fn-99-someone-else",
-      sort_path: "000099.000002",
-    }),
-    makeEpic({
-      epic_id: "fn-3-match",
-      epic_number: 3,
-      created_by_closer_of: "fn-1-parent",
-      sort_path: "000001.000003",
-    }),
-  ];
-  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual(["fn-3-match"]);
-});
-
-test("closerChildrenOf: empty input → []", () => {
-  expect(closerChildrenOf([], "fn-1-parent")).toEqual([]);
-});
-
-test("closerChildrenOf: no match → []", () => {
-  const epics = [makeEpic({ epic_id: "fn-1-plain" })];
-  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([]);
-});
-
-test("closerChildrenOf: sort_path-placeholder children sort stably on epic_id", () => {
-  // Two children whose parent hasn't re-stamped the cascade yet both carry
-  // the empty-string placeholder sort_path — the epic_id tie-break orders them.
-  const epics = [
-    makeEpic({
-      epic_id: "fn-12-late",
-      epic_number: 12,
-      created_by_closer_of: "fn-1-parent",
-      sort_path: "",
-    }),
-    makeEpic({
-      epic_id: "fn-11-early",
-      epic_number: 11,
-      created_by_closer_of: "fn-1-parent",
-      sort_path: "",
-    }),
-  ];
-  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([
-    "fn-11-early",
-    "fn-12-late",
-  ]);
 });

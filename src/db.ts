@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 84;
+export const SCHEMA_VERSION = 85;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -652,7 +652,6 @@ CREATE TABLE IF NOT EXISTS events (
     planctl_subject_present INTEGER,
     tool_use_id TEXT,
     config_dir TEXT,
-    planctl_queue_jump INTEGER,
     bash_mutation_kind TEXT,
     bash_mutation_targets TEXT,
     planctl_files TEXT,
@@ -818,14 +817,13 @@ const CREATE_SCHEDULED_TASKS_INDEXES = [
 ];
 
 /**
- * Always-run indexes on `epics`. `idx_epics_sort_path` serves
- * explicit-status/filter queries; `idx_epics_default_visible` (partial on the
+ * Always-run indexes on `epics`. `idx_epics_default_visible` (partial on the
  * v32 `default_visible` VIRTUAL generated column) serves the default
- * no-wire-filter query without a SCAN or temp B-tree for the ORDER BY.
+ * no-wire-filter query — `epic_number ASC, epic_id` creation order — without a
+ * SCAN or temp B-tree for the ORDER BY.
  */
 const CREATE_EPICS_INDEXES = [
-  "CREATE INDEX IF NOT EXISTS idx_epics_sort_path ON epics(sort_path, epic_id)",
-  "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+  "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, epic_number, epic_id) WHERE default_visible = 1",
 ];
 
 /**
@@ -902,9 +900,6 @@ CREATE TABLE IF NOT EXISTS epics (
     jobs TEXT NOT NULL DEFAULT '[]',
     job_links TEXT NOT NULL DEFAULT '[]',
     last_validated_at TEXT,
-    created_by_closer_of TEXT,
-    sort_path TEXT NOT NULL DEFAULT '',
-    queue_jump INTEGER NOT NULL DEFAULT 0,
     resolved_epic_deps TEXT,
     default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL
 )
@@ -1943,9 +1938,6 @@ function backfillResolvedEpicDeps(db: Database): void {
       jobs: [],
       job_links: [],
       last_validated_at: null,
-      created_by_closer_of: null,
-      sort_path: "",
-      queue_jump: 0,
       resolved_epic_deps: null,
     };
     epicById.set(row.epic_id, epic);
@@ -1991,9 +1983,6 @@ function backfillResolvedEpicDeps(db: Database): void {
           jobs: [],
           job_links: [],
           last_validated_at: null,
-          created_by_closer_of: null,
-          sort_path: "",
-          queue_jump: 0,
           resolved_epic_deps: null,
         };
         let depTokens: string[] = [];
@@ -3099,8 +3088,17 @@ function migrate(db: Database): void {
       // zero-padded-6 dotted key like `"000003.000007"` — the dot (ASCII 46) is
       // strictly below the digits (48-57), so the prefix-sort invariant
       // `"000003" < "000003.000007" < "000004"` holds under BINARY collation.
-      addColumnIfMissing(db, "epics", "created_by_closer_of", "TEXT");
-      addColumnIfMissing(db, "epics", "sort_path", "TEXT NOT NULL DEFAULT ''");
+      // VERSION-GUARDED (fn-936 v85 DROPS both columns; an unconditional re-add
+      // would resurrect them on every post-v85 reboot — the v85 drop runs once).
+      if (preMigrateStoredVersion < 29) {
+        addColumnIfMissing(db, "epics", "created_by_closer_of", "TEXT");
+        addColumnIfMissing(
+          db,
+          "epics",
+          "sort_path",
+          "TEXT NOT NULL DEFAULT ''",
+        );
+      }
 
       // Version-guarded rewind-and-redrain (both columns derive from the log via
       // `syncPlanLinks`).
@@ -3122,18 +3120,19 @@ function migrate(db: Database): void {
       // `epics.queue_jump`. `queue_jump` drives the `!`-prefix `sort_path` branch
       // for root epics — `"!"` (ASCII 33) sorts strictly below the digits (48-57)
       // under BINARY collation, lifting queued roots above non-queued ones. The
-      // `planctl_queue_jump` add is VERSION-GUARDED (v78 renames it → `plan_queue_jump`,
-      // so an unconditional re-add would resurrect a zombie post-v78); the
-      // non-renamed `epics.queue_jump` add stays unconditional.
+      // Both adds are VERSION-GUARDED: `planctl_queue_jump` because v78 renames
+      // it → `plan_queue_jump` (an unconditional re-add resurrects a zombie
+      // post-v78), and `epics.queue_jump` because fn-936 (v85) DROPS it (an
+      // unconditional re-add resurrects it on every post-v85 reboot).
       if (preMigrateStoredVersion < 30) {
         addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
+        addColumnIfMissing(
+          db,
+          "epics",
+          "queue_jump",
+          "INTEGER NOT NULL DEFAULT 0",
+        );
       }
-      addColumnIfMissing(
-        db,
-        "epics",
-        "queue_jump",
-        "INTEGER NOT NULL DEFAULT 0",
-      );
 
       // Version-guarded rewind-and-redrain (both columns derive from the log).
       const storedVersionV30 = Number(
@@ -3833,7 +3832,10 @@ function migrate(db: Database): void {
           "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL",
         );
         db.run(
-          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+          // fn-936 (v85) dropped `sort_path`; this historical index recreation
+          // uses the post-v85 `epic_number` shape so it never references the
+          // dropped column (the v85 block DROPs + recreates it regardless).
+          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, epic_number, epic_id) WHERE default_visible = 1",
         );
         const integrity = db.prepare("PRAGMA quick_check").get() as {
           quick_check: string;
@@ -3895,13 +3897,19 @@ function migrate(db: Database): void {
             "CREATE TABLE events_v58_new",
           ),
         );
+        // The v30 queue-jump column is intentionally OMITTED from this copy:
+        // fn-936 (v85) dropped it AND removed it from `CREATE_EVENTS`, so the
+        // `events_v58_new` table built from that literal has no such column. The
+        // source column carries no fold-read value (the boot drain folds only at
+        // head=v85, where the column is gone), so not copying it is harmless —
+        // v78/v85 would rename-then-drop it anyway.
         db.run(
           `INSERT INTO events_v58_new (
            id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
            cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
            subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
            planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-           planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+           planctl_subject_present, tool_use_id, config_dir,
            bash_mutation_kind, bash_mutation_targets, planctl_files,
            backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
            background_task_id
@@ -3911,7 +3919,7 @@ function migrate(db: Database): void {
            cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
            subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
            planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-           planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+           planctl_subject_present, tool_use_id, config_dir,
            bash_mutation_kind, bash_mutation_targets, planctl_files,
            backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
            background_task_id
@@ -3995,7 +4003,10 @@ function migrate(db: Database): void {
           "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL",
         );
         db.run(
-          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+          // fn-936 (v85) dropped `sort_path`; this historical index recreation
+          // uses the post-v85 `epic_number` shape so it never references the
+          // dropped column (the v85 block DROPs + recreates it regardless).
+          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, epic_number, epic_id) WHERE default_visible = 1",
         );
         dropColumnIfPresent(db, "epics", "approval");
         const integrity = db.prepare("PRAGMA quick_check").get() as {
@@ -4943,6 +4954,119 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces this.
 
+      // v84→v85 (fn-936 task .1): strip all static priority/ordering machinery
+      // from the plan fold + state. DROP the `epics.sort_path` / `queue_jump` /
+      // `created_by_closer_of` columns + the `events.plan_queue_jump` column;
+      // the backend now returns epics in plain `epic_number ASC` creation order
+      // (a neutral seed clients order through `orderEpicsForScheduling`). The
+      // orderless `epics` fold re-folds byte-identically minus the dropped
+      // columns, so this does the FULL v81-style cursor-0 rewind-and-redrain to
+      // CONVERGE every historical `epics` row under the new code (and to
+      // self-validate the orderless fold's determinism).
+      //
+      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
+      // socket, not these projection internals) — this bump MUST add 85 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      if (preMigrateStoredVersion < 85) {
+        // 1. `epics` column drop via the v82-style table rebuild (the only way to
+        // drop the 3 cols AND re-declare the `default_visible` VIRTUAL generated
+        // column with its new `(default_visible, epic_number, epic_id)` index
+        // shape). DROP both epics indexes first (SQLite drops them with the base
+        // table anyway, but the explicit DROP keeps the rebuild self-contained
+        // and clears the now-stale `idx_epics_sort_path`).
+        db.run("DROP INDEX IF EXISTS idx_epics_sort_path");
+        db.run("DROP INDEX IF EXISTS idx_epics_default_visible");
+        db.run("DROP TABLE IF EXISTS epics_v85_tmp");
+        db.run(`
+        CREATE TABLE epics_v85_tmp (
+            epic_id TEXT PRIMARY KEY,
+            epic_number INTEGER,
+            title TEXT,
+            project_dir TEXT,
+            status TEXT,
+            last_event_id INTEGER,
+            updated_at REAL NOT NULL DEFAULT 0,
+            tasks TEXT NOT NULL DEFAULT '[]',
+            depends_on_epics TEXT NOT NULL DEFAULT '[]',
+            jobs TEXT NOT NULL DEFAULT '[]',
+            job_links TEXT NOT NULL DEFAULT '[]',
+            last_validated_at TEXT,
+            resolved_epic_deps TEXT,
+            default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL
+        )
+      `);
+        // Copy the KEPT columns ORDER BY rowid for stable physical order. The
+        // VIRTUAL `default_visible` is omitted (it can't be inserted into; it
+        // recomputes from `status`). The cursor-0 re-fold below rebuilds every
+        // row regardless, but the faithful copy keeps the table non-empty across
+        // the rebuild for any concurrent boot read.
+        db.run(`
+        INSERT INTO epics_v85_tmp
+            (epic_id, epic_number, title, project_dir, status, last_event_id,
+             updated_at, tasks, depends_on_epics, jobs, job_links,
+             last_validated_at, resolved_epic_deps)
+          SELECT epic_id, epic_number, title, project_dir, status, last_event_id,
+                 updated_at, tasks, depends_on_epics, jobs, job_links,
+                 last_validated_at, resolved_epic_deps
+            FROM epics
+        ORDER BY rowid
+      `);
+        db.run("DROP TABLE epics");
+        db.run("ALTER TABLE epics_v85_tmp RENAME TO epics");
+        // Recreate the kept epics index(es) with the new `sort_path`-free shape
+        // (SQLite drops indexes with their base table).
+        for (const sql of CREATE_EPICS_INDEXES) {
+          db.run(sql);
+        }
+
+        // 2. Drop `events.plan_queue_jump`. No index references it (it was a
+        // plain INTEGER column), so a direct DROP COLUMN suffices — heavier than
+        // the epics drop (the events table is large) but in-place. Idempotent: a
+        // fresh DB never created the column, so `dropColumnIfPresent` no-ops.
+        dropColumnIfPresent(db, "events", "plan_queue_jump");
+
+        // 3. FULL v81-style rewind-and-redrain. Rewind the cursor to 0 and wipe
+        // every DETERMINISTIC-replayed projection so the boot drain re-folds them
+        // from id 0 under the orderless `epics` fold. `commit_trailer_facts` is
+        // DELIBERATELY NOT wiped (a derive input, keyed by `event_id` PK with an
+        // `INSERT OR IGNORE` fold — it re-folds byte-identically from id 0
+        // without a wipe). The LIVE-ONLY git surface is wiped + its floor RAISED
+        // to `max(events.id)` (NOT reset to 0 — that re-arms the
+        // `computeRepoBashWindows` O(history) re-fold time-bomb v79 fixed),
+        // `seed_required = 1` so the boot-seed re-derives it above the floor. The
+        // ephemeral / autopilot tables are wiped so the cursor-0 re-fold can't
+        // resurrect a phantom `pending_dispatches` dispatch jam. Modeled EXACTLY
+        // on the v80/v81 steps above. The re-fold runs via the normal
+        // post-migrate boot drain, NOT inline here (avoids holding the writer
+        // lock across a full-log replay).
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        for (const table of LIVE_ONLY_PROJECTIONS) {
+          db.run(`DELETE FROM ${table}`);
+        }
+        db.run(
+          `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+        );
+        db.run(
+          `UPDATE git_projection_state
+              SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                  seed_required = 1,
+                  updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        db.run("DELETE FROM dispatch_failures");
+        db.run("DELETE FROM autopilot_state");
+        db.run("DELETE FROM pending_dispatches");
+        db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
+      }
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -4980,7 +5104,7 @@ export function prepareStmts(db: Database): Stmts {
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         plan_op, plan_target, plan_epic_id, plan_task_id,
-        plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+        plan_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id, mutation_path
@@ -4989,7 +5113,7 @@ export function prepareStmts(db: Database): Stmts {
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
         $plan_op, $plan_target, $plan_epic_id, $plan_task_id,
-        $plan_subject_present, $tool_use_id, $config_dir, $plan_queue_jump,
+        $plan_subject_present, $tool_use_id, $config_dir,
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
         $background_task_id, $mutation_path

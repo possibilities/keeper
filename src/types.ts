@@ -185,13 +185,6 @@ export interface Event {
    */
   plan_subject_present: number | null;
   /**
-   * Queue-jump signal lifted from the envelope's `queue_jump` boolean (INTEGER
-   * 0/1). `1` ONLY when the envelope carried literal `true`; NULL when
-   * `plan_op` is NULL. Projected to `epics.queue_jump` by `syncPlanLinks`;
-   * root epics with `queue_jump = 1` get a `!`-prefix on `sort_path`.
-   */
-  plan_queue_jump: number | null;
-  /**
    * Anthropic tool_use correlator (`toolu_...`) parsed from any event payload
    * by {@link import("./derivers").extractToolUseId}. Backed by a partial
    * index `WHERE tool_use_id IS NOT NULL`. Bridges the Pre/PostToolUse →
@@ -726,47 +719,6 @@ export interface Epic {
    * Drives the board's `[validated]`/`[unvalidated]` pill.
    */
   last_validated_at: string | null;
-  /**
-   * The closer→child link — the closed-epic id of the closer session whose
-   * `/plan:plan` window minted THIS epic via `epic-create`. `null` for plain
-   * epics. Reducer-derived in `syncPlanLinks` (filtered to
-   * `plan_verb='close'`, tie-broken on lowest `job_id`). Immutable once set
-   * (one closer-creator per epic), which makes the transitive `sort_path`
-   * cascade converge without a cycle. Preserved across an `EpicSnapshot`
-   * round-trip by the `projectPlanRow` ON CONFLICT carve-out.
-   */
-  created_by_closer_of: string | null;
-  /**
-   * Materialized-path sort key — a zero-padded-6 dotted string like
-   * `"000003.000007"` driving `EPICS_DESCRIPTOR.defaultSort`. The dot (ASCII
-   * 46) sorts below the digits, so `"000003" < "000003.000007" < "000004"`
-   * holds under BINARY collation — a closer-created child slots directly after
-   * its parent.
-   *
-   * Reducer-derived in `syncPlanLinks`:
-   * - {@link created_by_closer_of} `== null` → `zeroPad6(epic_number)`.
-   * - Else → `<parent.sort_path>.<zeroPad6(epic_number)>` (parent-missing
-   *   folds to the placeholder `zeroPad6(epic_number)`; a later parent
-   *   snapshot's transitive cascade re-stamps the chain).
-   * - Overflow guard: `epic_number >= 1_000_000` → `''` (safe-fold so the
-   *   reducer never throws inside the open transaction).
-   *
-   * Empty string is also the zero-event default and the shell-INSERT
-   * placeholder. Preserved across an `EpicSnapshot` round-trip by the
-   * `projectPlanRow` ON CONFLICT carve-out.
-   */
-  sort_path: string;
-  /**
-   * Priority-jump flag projected from {@link Event.plan_queue_jump} (INTEGER
-   * 0/1). `1` ONLY when the epic's session emitted a `queue_jump: true`
-   * envelope; `0` otherwise. A root epic with `queue_jump = 1` projects
-   * `sort_path = "!" + zeroPad6(epic_number)` — the `!` (ASCII 33) sorts below
-   * the digits and lifts the epic above every non-queued root; the prefix
-   * propagates through `parentPath` concat to all closer-of descendants.
-   * Preserved across an `EpicSnapshot` round-trip by the `projectPlanRow` ON
-   * CONFLICT carve-out.
-   */
-  queue_jump: number;
   /**
    * The resolved + enriched state of this epic's `depends_on_epics`, computed
    * at fold time via `resolveEpicDep`. Drives readiness's `dep-on-epic` /

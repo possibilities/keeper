@@ -3001,10 +3001,9 @@ test("diffTick property: K changes ⇒ K patches; only changed rows are fetched/
       db.query(\`
         INSERT INTO epics (
           epic_id, epic_number, title, project_dir, status, last_event_id,
-          updated_at, tasks, depends_on_epics, jobs, job_links, sort_path,
-          created_by_closer_of
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, NULL)
-      \`).run(\`fn-\${i}\`, i, \`title-\${i}\`, "/repo", "open", i * 10, 1, tasks, String(i).padStart(6, "0"));
+          updated_at, tasks, depends_on_epics, jobs, job_links
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]')
+      \`).run(\`fn-\${i}\`, i, \`title-\${i}\`, "/repo", "open", i * 10, 1, tasks);
     }
     db.query("UPDATE reducer_state SET last_event_id = 999 WHERE id = 1").run();
 
@@ -4120,15 +4119,13 @@ function seedEpic(
     tasks: unknown[];
     job_links: unknown[];
     status: string;
-    sort_path: string;
   }> = {},
 ): void {
   db.query(
     `INSERT INTO epics (
        epic_id, epic_number, title, project_dir, status, last_event_id,
-       updated_at, tasks, depends_on_epics, jobs, job_links, sort_path,
-       created_by_closer_of
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?, NULL)`,
+       updated_at, tasks, depends_on_epics, jobs, job_links
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? 1,
@@ -4139,7 +4136,6 @@ function seedEpic(
     1,
     JSON.stringify(opts.tasks ?? []),
     JSON.stringify(opts.job_links ?? []),
-    opts.sort_path ?? "000001",
   );
 }
 
@@ -4240,7 +4236,6 @@ test("fn-698 single-flight: N identical-signature queries → ONE runQuery + ONE
     seedEpic(db, `fn-${i}`, {
       epic_number: i,
       last_event_id: i,
-      sort_path: String(i).padStart(6, "0"),
       tasks: [{ id: `fn-${i}.1`, title: `t${i}` }],
     });
   }
@@ -4302,12 +4297,10 @@ test("fn-698 distinct signatures cache separately; the rows blob is shared per e
   seedEpic(db, "fn-0", {
     epic_number: 0,
     last_event_id: 0,
-    sort_path: "000000",
   });
   seedEpic(db, "fn-1", {
     epic_number: 1,
     last_event_id: 1,
-    sort_path: "000001",
   });
   setWorldRev(db, 3);
 

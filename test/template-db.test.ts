@@ -46,7 +46,6 @@ function eventBindings(ts: number): Record<string, string | number | null> {
     $plan_subject_present: null,
     $tool_use_id: null,
     $config_dir: null,
-    $plan_queue_jump: null,
     $bash_mutation_kind: null,
     $bash_mutation_targets: null,
     $plan_files: null,

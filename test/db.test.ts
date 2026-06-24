@@ -87,7 +87,6 @@ test("all expected indexes are present", () => {
     "idx_events_ts",
     "idx_events_pid_hook_tool",
     "idx_events_subagent_agent_id",
-    "idx_epics_sort_path",
     "idx_jobs_created_state",
     "idx_events_plan_epic",
     "idx_events_plan_target",
@@ -298,7 +297,6 @@ test("migrate: false skips schema convergence but still applies PRAGMAs + prepar
     $plan_subject_present: null,
     $tool_use_id: null,
     $config_dir: null,
-    $plan_queue_jump: null,
     $bash_mutation_kind: null,
     $bash_mutation_targets: null,
     $plan_files: null,
@@ -346,10 +344,10 @@ test("migrate: false against a stale schema fails on a column-binding error (hoo
   // bump can't silently make the hook self-migrate or mask the failure.
   const staleDbPath = join(tmpDir, "stale-schema.db");
   // Hand-roll an older events table that omits at least one column
-  // insertEvent's INSERT statement names — here, planctl_queue_jump,
-  // tool_use_id, config_dir, plus the planctl_* envelope columns. This is
-  // the shape a keeper DB last migrated several schema versions ago would
-  // present to a freshly-built hook binary.
+  // insertEvent's INSERT statement names — here, tool_use_id, config_dir,
+  // plus the plan_* envelope columns. This is the shape a keeper DB last
+  // migrated several schema versions ago would present to a freshly-built
+  // hook binary.
   const seed = new Database(staleDbPath, { create: true });
   seed.run(`
     CREATE TABLE events (
@@ -1062,12 +1060,15 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
       // v73 `mutation_path` column the faithful v57 fixture must NOT have, so a
       // `*` copy would mismatch `events_dn`'s arity. The seeded rows leave
       // `mutation_path` NULL anyway — it's a no-op for the rebuild fidelity proof.
+      // `planctl_queue_jump` stays in the faithful v57 `events_dn` CREATE above
+      // but is left unpopulated (NULL): the live `events` no longer carries the
+      // column (v85 dropped `plan_queue_jump`), so the copy can't source it.
       built.db.run(`INSERT INTO events_dn (
         id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+        planctl_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, planctl_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id
@@ -1076,7 +1077,7 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
         plan_op, plan_target, plan_epic_id, plan_task_id,
-        plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+        plan_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id
@@ -1393,12 +1394,6 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     "jobs",
     "job_links",
     "last_validated_at",
-    // Schema v29: the closer-creator link + materialized-path sort key.
-    "created_by_closer_of",
-    "sort_path",
-    // Schema v30: priority-jump flag (INTEGER NOT NULL DEFAULT 0)
-    // projected from the planctl_invocation envelope's `queue_jump`.
-    "queue_jump",
     // Schema v34 (fn-637): nullable JSON array carrying the resolved +
     // enriched state of `depends_on_epics`. NULL is load-bearing
     // ("not-yet-computed", distinct from `'[]'` = "computed empty"); the
@@ -1749,13 +1744,14 @@ test("v10 idx_jobs_plan_ref serves a WHERE plan_verb='close' query (EXPLAIN QUER
   db.close();
 });
 
-test("Tier 2 (fn-628) idx_epics_sort_path + idx_jobs_created_state are present on fresh openDb", () => {
+test("fn-936: idx_epics_sort_path is gone; idx_jobs_created_state present on fresh openDb", () => {
   const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
   const names = new Set(indexes.map((i) => i.name));
-  expect(names.has("idx_epics_sort_path")).toBe(true);
+  // fn-936 dropped the `sort_path` index alongside the column.
+  expect(names.has("idx_epics_sort_path")).toBe(false);
   expect(names.has("idx_jobs_created_state")).toBe(true);
   db.close();
 });
@@ -1780,11 +1776,11 @@ test("Tier 4.1 (fn-634) idx_epics_default_visible is present on fresh openDb", (
 });
 
 test("Tier 4.1 (fn-634) idx_epics_default_visible serves the default epics query (EXPLAIN QUERY PLAN)", () => {
-  // Seed ~50 rows + ANALYZE so the planner picks the index. The schema v32
-  // default epics query (EPICS_DESCRIPTOR.defaultClause = `default_visible
-  // = 1`, defaultSort = sort_path asc) is served by the partial composite
-  // index `idx_epics_default_visible ON epics(default_visible, sort_path,
-  // epic_id) WHERE default_visible = 1`. EQP should show
+  // Seed ~50 rows + ANALYZE so the planner picks the index. The default epics
+  // query (EPICS_DESCRIPTOR.defaultClause = `default_visible = 1`, defaultSort
+  // = epic_number asc) is served by the partial composite index
+  // `idx_epics_default_visible ON epics(default_visible, epic_number, epic_id)
+  // WHERE default_visible = 1`. EQP should show
   // `SEARCH epics USING (COVERING )?INDEX idx_epics_default_visible`
   // — SEARCH (not SCAN), no temp B-tree for the ORDER BY. The literal-1
   // clause is load-bearing: a parameterized `default_visible = ?` with
@@ -1792,52 +1788,22 @@ test("Tier 4.1 (fn-634) idx_epics_default_visible serves the default epics query
   // across SQLite versions.
   const { db } = openDb(":memory:");
   const insert = db.prepare(
-    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at, sort_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
   );
   for (let i = 0; i < 50; i++) {
     const status = i % 3 === 0 ? "closed" : "open";
-    const padded = String(i).padStart(6, "0");
-    insert.run(`fn-${i}-foo`, i, `Epic ${i}`, status, i, 1, padded);
+    insert.run(`fn-${i}-foo`, i, `Epic ${i}`, status, i, 1);
   }
   db.run("ANALYZE");
 
   const plan = db
     .prepare(
-      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC",
+      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY epic_number ASC, epic_id ASC",
     )
     .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toMatch(
     /SEARCH epics USING (COVERING )?INDEX idx_epics_default_visible/,
-  );
-  expect(detail).not.toMatch(/USE TEMP B-TREE/);
-  db.close();
-});
-
-test("Tier 2 (fn-628) idx_epics_sort_path still serves the explicit-status epics query (EXPLAIN QUERY PLAN)", () => {
-  // The Tier 2 index continues to serve explicit-filter queries whose WHERE
-  // drops the descriptor's defaultClause. Pins that the Tier 4.1 work
-  // doesn't regress the prior coverage — both indexes coexist and the
-  // planner picks the right one for each query shape.
-  const { db } = openDb(":memory:");
-  const insert = db.prepare(
-    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at, sort_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  );
-  for (let i = 0; i < 50; i++) {
-    const status = i % 3 === 0 ? "done" : "open";
-    const padded = String(i).padStart(6, "0");
-    insert.run(`fn-${i}-foo`, i, `Epic ${i}`, status, i, 1, padded);
-  }
-  db.run("ANALYZE");
-
-  const plan = db
-    .prepare(
-      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE status = 'done' ORDER BY sort_path ASC, epic_id ASC",
-    )
-    .all() as { detail: string }[];
-  const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toMatch(
-    /SCAN epics USING (COVERING )?INDEX idx_epics_sort_path/,
   );
   expect(detail).not.toMatch(/USE TEMP B-TREE/);
   db.close();
@@ -2009,7 +1975,7 @@ test("fn-712 idx_epics_default_visible still serves the default epics query with
 
   const plan = db
     .prepare(
-      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC",
+      "EXPLAIN QUERY PLAN SELECT epic_id FROM epics WHERE default_visible = 1 ORDER BY epic_number ASC, epic_id ASC",
     )
     .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
@@ -2160,8 +2126,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // embedded `epics.jobs` element — a JSON-cell-only add, fix-forward (no column,
   // no rewind, absent ≡ null), so readiness can hold a freshly-bound `stopped`
   // worker's root across the bind → first-activity handoff, fn-924); the
-  // v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(84);
+  // v62→v63 epics-shape migration this test exercises is unchanged. v85 strips
+  // the static priority/ordering machinery — DROPs `epics.sort_path` /
+  // `queue_jump` / `created_by_closer_of` + `events.plan_queue_jump`, fn-936.
+  expect(SCHEMA_VERSION).toBe(85);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -2424,31 +2392,6 @@ test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH plan partial indexes
   expect(detail).toMatch(/COMPOUND QUERY/);
   expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_epic/);
   expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_target/);
-  db.close();
-});
-
-test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_plan_epic (EXPLAIN QUERY PLAN)", () => {
-  // The per-epic queue_jump EXISTS scan at src/reducer.ts:~2543 keys off
-  // `plan_epic_id = ?` — must hit the new index (the schema-v14
-  // session-leading index cannot serve a plan_epic_id equality).
-  const { db } = openDb(":memory:");
-  seedPlanctlEventMix(db);
-
-  const plan = db
-    .prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT EXISTS(
-         SELECT 1 FROM events
-          WHERE plan_op IS NOT NULL
-            AND plan_epic_id = ?
-            AND plan_queue_jump = 1
-       ) AS hit`,
-    )
-    .all("fn-100-foo") as { detail: string }[];
-  const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toMatch(
-    /SEARCH events USING INDEX idx_events_plan_epic \(plan_epic_id=\?\)/,
-  );
   db.close();
 });
 
@@ -5851,37 +5794,23 @@ test("fresh v25 DB: CREATE_JOBS literal carries last_input_request_at + last_inp
 });
 
 // ---------------------------------------------------------------------------
-// Schema v29 — `created_by_closer_of` + `sort_path` on epics
+// fn-936 (v85) — the static priority/ordering columns are gone from epics
 // ---------------------------------------------------------------------------
 
-test("fresh v29 DB: epics has created_by_closer_of + sort_path with correct shapes", () => {
+test("fresh DB: epics carries none of the dropped priority columns", () => {
   const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(epics)").all() as {
     name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
   }[];
-  const createdBy = cols.find((c) => c.name === "created_by_closer_of");
-  const sortPath = cols.find((c) => c.name === "sort_path");
-  expect(createdBy).toBeDefined();
-  expect(createdBy?.type).toBe("TEXT");
-  // Nullable, no default.
-  expect(createdBy?.notnull).toBe(0);
-  expect(createdBy?.dflt_value).toBeNull();
-  expect(sortPath).toBeDefined();
-  expect(sortPath?.type).toBe("TEXT");
-  // NOT NULL with empty-string default (matches the schema zero-event
-  // reading and the shell-INSERT placeholder).
-  expect(sortPath?.notnull).toBe(1);
-  expect(sortPath?.dflt_value).toBe("''");
+  const names = new Set(cols.map((c) => c.name));
+  // fn-936 deleted the static priority/ordering machinery.
+  expect(names.has("created_by_closer_of")).toBe(false);
+  expect(names.has("sort_path")).toBe(false);
+  expect(names.has("queue_jump")).toBe(false);
   db.close();
 });
 
-test("addColumnIfMissing is idempotent for the v29 columns", () => {
-  // First open: migrate() adds both columns. Second open: addColumnIfMissing
-  // sees them already present and no-ops. The schema_version stays at the
-  // current SCHEMA_VERSION (v31 as of fn-633.2).
+test("fn-936: the dropped epics columns stay gone across a re-open (drop is idempotent)", () => {
   const { db: db1 } = openDb(dbPath);
   db1.close();
   const { db: db2 } = openDb(dbPath);
@@ -5889,9 +5818,9 @@ test("addColumnIfMissing is idempotent for the v29 columns", () => {
     name: string;
   }[];
   const names = cols.map((c) => c.name);
-  // Each column appears exactly once.
-  expect(names.filter((n) => n === "created_by_closer_of").length).toBe(1);
-  expect(names.filter((n) => n === "sort_path").length).toBe(1);
+  expect(names.filter((n) => n === "created_by_closer_of").length).toBe(0);
+  expect(names.filter((n) => n === "sort_path").length).toBe(0);
+  expect(names.filter((n) => n === "queue_jump").length).toBe(0);
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
@@ -5966,11 +5895,11 @@ test("fresh v29 DB schema (CREATE_EPICS) matches v28→v29 migrated schema", () 
   expect(migratedCols).toEqual(freshCols);
 });
 
-test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added, idempotent re-open", () => {
+test("v29 DB migrates to head: the v30 queue_jump columns are added then dropped by v85", () => {
   // Build a v29-shaped DB by hand: epics + events tables WITHOUT the new
   // `queue_jump` / `planctl_queue_jump` columns; schema_version '29'. The
-  // migrate() path's `addColumnIfMissing` ALTERs must add both columns
-  // and stamp `'30'` on the meta row.
+  // migrate() ladder adds them at v30 then DROPS them at v85 (fn-936), so the
+  // head schema carries neither — proving the full ladder converges.
   const otherTmp = mkdtempSync(join(tmpdir(), "keeper-db-v29-shape-"));
   const otherPath = join(otherTmp, "k.db");
   const migrated = new Database(otherPath, { create: true });
@@ -6014,28 +5943,14 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
 
-  // epics.queue_jump column present + the existing row reads it as 0
-  // (the INTEGER NOT NULL DEFAULT 0 fills the pre-existing row safely;
-  // SQLite's ALTER ADD COLUMN treats the default as the value for every
-  // pre-existing row).
+  // fn-936 (v85): `epics.queue_jump` was DROPPED at the tail of the ladder,
+  // so the head schema must NOT carry it.
   const epicCols = (
     reopened.prepare("PRAGMA table_info(epics)").all() as { name: string }[]
   ).map((c) => c.name);
-  expect(epicCols).toContain("queue_jump");
-  // The v29 rewind-and-redrain (or our v30 rewind) wipes the manually-
-  // inserted row, so we don't expect to read it back — but if we DID,
-  // queue_jump would default to 0. Verify the schema default holds by
-  // inserting a fresh row that omits the column.
-  reopened.run(
-    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES ('fn-2-post30', 2, 'Post-v30', 'open', 200, 2)",
-  );
-  const post = reopened
-    .prepare("SELECT queue_jump FROM epics WHERE epic_id = 'fn-2-post30'")
-    .get() as { queue_jump: number };
-  expect(post.queue_jump).toBe(0);
+  expect(epicCols).not.toContain("queue_jump");
 
-  // events.planctl_queue_jump column present (INTEGER, nullable, no DEFAULT
-  // since the sparse-column convention matches `planctl_subject_present`).
+  // fn-936 (v85): `events.plan_queue_jump` was likewise DROPPED.
   const evCols = (
     reopened.prepare("PRAGMA table_info(events)").all() as {
       name: string;
@@ -6044,7 +5959,7 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
       dflt_value: string | null;
     }[]
   ).map((c) => c.name);
-  expect(evCols).toContain("plan_queue_jump");
+  expect(evCols).not.toContain("plan_queue_jump");
 
   reopened.close();
 
@@ -6059,10 +5974,10 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
   rmSync(otherTmp, { recursive: true, force: true });
 });
 
-test("addColumnIfMissing is idempotent for the v30 columns", () => {
-  // First open: migrate() adds both v30 columns. Second open:
-  // addColumnIfMissing sees them already present and no-ops. The
-  // schema_version stays at the current SCHEMA_VERSION.
+test("fn-936: the v30 queue_jump columns are absent from the head schema (drop is idempotent across re-open)", () => {
+  // The v30 columns are added then dropped by v85; re-opening must keep the
+  // head schema free of them (the v85 drop no-ops on the already-dropped
+  // shape) and leave NO stray `planctl_queue_jump` zombie from the v78 rename.
   const { db: db1 } = openDb(dbPath);
   db1.close();
   const { db: db2 } = openDb(dbPath);
@@ -6070,13 +5985,12 @@ test("addColumnIfMissing is idempotent for the v30 columns", () => {
     name: string;
   }[];
   const epicNames = epicCols.map((c) => c.name);
-  expect(epicNames.filter((n) => n === "queue_jump").length).toBe(1);
+  expect(epicNames.filter((n) => n === "queue_jump").length).toBe(0);
   const evCols = db2.prepare("PRAGMA table_info(events)").all() as {
     name: string;
   }[];
   const evNames = evCols.map((c) => c.name);
-  expect(evNames.filter((n) => n === "plan_queue_jump").length).toBe(1);
-  // Zombie guard: the v78 rename must leave NO stray `planctl_queue_jump`.
+  expect(evNames.filter((n) => n === "plan_queue_jump").length).toBe(0);
   expect(evNames.filter((n) => n === "planctl_queue_jump").length).toBe(0);
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")

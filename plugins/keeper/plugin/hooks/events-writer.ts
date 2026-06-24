@@ -559,7 +559,6 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "plan_subject_present",
   "tool_use_id",
   "config_dir",
-  "plan_queue_jump",
   "bash_mutation_kind",
   "bash_mutation_targets",
   "plan_files",
@@ -662,10 +661,6 @@ async function main(): Promise<void> {
   // the event is not a plan invocation at all.
   const planSubjectPresent =
     planInvocation === null ? null : planInvocation.subject_present ? 1 : 0;
-  // `queue_jump` mirrors the `subject_present` 0/1/null convention — INTEGER
-  // on disk, NULL when the event isn't a plan invocation at all.
-  const planQueueJump =
-    planInvocation === null ? null : planInvocation.queue_jump ? 1 : 0;
   // The envelope's repo-relative `files[]` array, JSON-encoded for the SQLite
   // TEXT column. NULL when the deriver couldn't lift a non-empty string array
   // (non-plan events, read-only ops, or runaway-size payloads). Sparse
@@ -771,7 +766,6 @@ async function main(): Promise<void> {
     $plan_subject_present: planSubjectPresent,
     $tool_use_id: toolUseId,
     $config_dir: configDir,
-    $plan_queue_jump: planQueueJump,
     $bash_mutation_kind: bashMutationKind,
     $bash_mutation_targets: bashMutationTargets,
     $plan_files: planFiles,

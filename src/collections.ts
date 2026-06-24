@@ -156,12 +156,12 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * The `epics` descriptor — each epic embeds its tasks + plan/close jobs as
  * JSON-array columns (decoded at the read boundary).
  *
- * Default sort is `sort_path asc` — the materialized-path key the reducer
- * derives (zero-padded-6 dotted lexicographic, e.g. `"000003.000007"`). The dot
- * (ASCII 46) sits below the digits, so under BINARY collation the prefix-sort
- * invariant `"000003" < "000003.000007" < "000004"` slots a closer-created
- * child directly after its parent. Closer-completion thus DOES reorder the page,
- * by design; ordinary task edits do not (they don't touch `sort_path`).
+ * Default sort is `epic_number asc` (tie-break `epic_id`) — plain creation
+ * order, a neutral seed. This backend carries NO priority/ordering signal;
+ * clients (board, autopilot) consume the seed through readiness's
+ * `orderEpicsForScheduling` seam, the single future home for any runtime
+ * priority. A NULL `epic_number` shell row (a plan event before its
+ * `EpicSnapshot`) sorts first, matching the prior empty-`sort_path` first-sort.
  */
 export const EPICS_DESCRIPTOR: CollectionDescriptor = {
   name: "epics",
@@ -181,15 +181,6 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // `last_validated_at`: nullable scalar TEXT. Display-only; out of
     // `jsonColumns` (decoding a scalar would corrupt it to `[]`).
     "last_validated_at",
-    // `created_by_closer_of` (closer-creator link) + `sort_path`
-    // (materialized-path sort key), both reducer-derived in `syncPlanLinks`.
-    // `sort_path` lands in `sortable` below; `created_by_closer_of` stays out
-    // (downstream branches on its null-ness, not its value).
-    "created_by_closer_of",
-    "sort_path",
-    // `queue_jump`: priority-jump flag (INTEGER 0/1). OUT of `sortable` (the
-    // `!`-prefix on `sort_path` carries the ordering signal) and `filters`.
-    "queue_jump",
     // `resolved_epic_deps`: nullable JSON-TEXT array. NULL is load-bearing —
     // "not-yet-computed", DISTINCT from `'[]'` ("computed, no deps"). Decoded as
     // a jsonColumn; out of `sortable`/`filters` (clients branch on element
@@ -207,13 +198,12 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "updated_at",
     "last_event_id",
     "epic_id",
+    // The creation-order key — in the trust-boundary allowlist so the generic
+    // ORDER BY interpolation accepts it as the default sort column.
     "epic_number",
     "status",
-    // The materialized-path sort key — in the trust-boundary allowlist so the
-    // generic ORDER BY interpolation accepts it as the default sort column.
-    "sort_path",
   ]),
-  defaultSort: { column: "sort_path", dir: "asc" },
+  defaultSort: { column: "epic_number", dir: "asc" },
   filters: {
     epic_id: "epic_id",
     status: "status",

@@ -161,7 +161,6 @@ export const FA_CLASSIC: IconTheme = {
     ambient: FA.plug,
 
     // --- markers ---
-    "slotted-after-closer": FA.levelDown,
     armed: FA.bolt,
   },
   prefix: {

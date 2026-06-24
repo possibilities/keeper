@@ -256,17 +256,6 @@ shell command, run it via Bash.
 On any `failed`, surface the terminal line to the user verbatim and ask
 how they want to proceed — do NOT silently run the follow-up.
 
-**If a `complete <epic>` met carries `followup=<id>`,** the closer that
-finished this epic minted a fresh epic for it. Surface the id to the user and
-pick by context:
-
-- They just wanted the result of THIS epic → **inspect** the follow-up via the
-  CLI: `keeper plan board` nests it under a `[slotted-after-closer]` pill, or
-  `keeper plan show <id>` for its spec. Report what it is; don't auto-start it.
-- The flow was wait-then-continue / circle-back → **daisy-chain**: arm a fresh
-  `Monitor({ command: "keeper await complete <followup-id>", … })` so the next
-  hand-off fires the same way.
-
 ## Examples
 
 ### Wait then review (plan)
