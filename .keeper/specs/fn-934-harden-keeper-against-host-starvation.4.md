@@ -50,5 +50,5 @@ No `Date.now()`/wall-clock/env/fs in the fold. `bun run test:full`.
 - [ ] `computeMonitors` added to the CLAUDE.md O(history) invariant index; `bun run test:full` green.
 
 ## Done summary
-
+Bounded computeMonitors' O(history) Stop-fold provenance lookup with a per-Database incremental id-watermark WeakMap memo (mirrors fn-892), scanning only id > maxId and accumulating first-observed provenance per (session, task_id). jobs.monitors is byte-identical to the prior unbounded scan with no lookback window, proven over a long multi-monitor corpus + from-scratch re-fold.
 ## Evidence
