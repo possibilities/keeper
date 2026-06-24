@@ -72,5 +72,5 @@ Lands after fn-934's schema bump (epic dep). On boot to v85 the daemon re-folds 
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Stripped all static priority/ordering machinery: v85 migration drops epics.sort_path/queue_jump/created_by_closer_of + events.plan_queue_jump via table rebuild + full rewind-and-redrain; orderless syncPlanLinks fold; EPICS_DESCRIPTOR defaultSort epic_number asc consumed through new readiness orderEpicsForScheduling seam (board/autopilot); removed [slotted-after-closer] pill, closerChildrenOf, await followup, /plan:next coupling.
 ## Evidence
