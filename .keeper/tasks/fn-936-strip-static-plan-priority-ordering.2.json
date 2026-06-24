@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Remove /queue from the plan plugin",
-  "updated_at": "2026-06-24T16:41:13.141000Z"
+  "updated_at": "2026-06-24T19:22:25.081000Z",
+  "worker_done_at": "2026-06-24T19:22:25.081000Z"
 }

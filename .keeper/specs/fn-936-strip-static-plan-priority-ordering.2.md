@@ -41,5 +41,5 @@ Grep `plugins/plan/src` + `plugins/plan/test` for `queue_jump`/`queue-jump`/`pla
 - [ ] Plan plugin tests green under `bun run test:full`.
 
 ## Done summary
-
+Removed the /queue surface from the plan plugin: deleted the /plan:next skill + keeper plan epic queue-jump verb and all EpicDef.queue_jump/emit/invocation/scaffold plumbing, pruned doc cross-refs, and rewrote autopilot SKILL.md priority negations forward-facing. Plan plugin suite green.
 ## Evidence
