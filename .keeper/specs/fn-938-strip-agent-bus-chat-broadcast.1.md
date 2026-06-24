@@ -113,5 +113,5 @@ wake path depends on both. `EventEnvelope.event` is hardcoded `"message"`
 - [ ] Landed as one `keeper commit-work` commit.
 
 ## Done summary
-
+Stripped keeper bus chat broadcast (CLI verb, server publish fanout branch, null-target fanout primitive) and all broadcast advice; narrowed the publish event union to 'send', made the directed-send path unconditional, preserved the selectQueuedForWake event='send' wake filter and the schema. Both root (test:full) and plan-plugin suites green.
 ## Evidence
