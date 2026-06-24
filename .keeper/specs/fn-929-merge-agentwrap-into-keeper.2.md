@@ -54,5 +54,5 @@ CLI-context callers (synthetic `argv[1]` both ways) → identical prefix.
 - [ ] `KEEPER_AGENTWRAP_PATH` / `agentwrap_path` still read as deprecated aliases
 
 ## Done summary
-
+Built the detached-pane self-invocation seam: an explicit launcherArgvPrefix ([bun, abs cli/keeper.ts, agent]) replaces the process.argv[1]-derived re-exec, plus a config-aware resolveKeeperAgentPath (db.ts) and a dep-free src/keeper-agent-path.ts cold-start/pair variant (KEEPER_AGENT_PATH/keeper_agent_path override; KEEPER_AGENTWRAP_PATH/agentwrap_path deprecated aliases). A real-tmux slow test asserts the actual pane command re-execs cli/keeper.ts agent, argv[1]-independent.
 ## Evidence
