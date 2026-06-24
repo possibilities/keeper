@@ -61,5 +61,5 @@ allowlist. Run `bun run test:full` (worker + db + bus paths).
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+enrichPeerFromJobs now keys on (pid, start_time): probes the live pid's start_time once per matched row and binds the keeper.db jobs identity only on a verbatim match, else fails closed so the ancestry walk climbs to the true parent. Stops an OS-recycled pid with a lingering dead jobs row from misattributing a directed send. Injectable probe threaded through for pure tests; README + CLAUDE.md updated.
 ## Evidence

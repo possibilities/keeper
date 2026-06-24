@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "guard enrichPeerFromJobs with start_time",
-  "updated_at": "2026-06-24T15:45:32.789000Z"
+  "updated_at": "2026-06-24T16:11:56.378000Z",
+  "worker_done_at": "2026-06-24T16:11:56.378000Z"
 }
