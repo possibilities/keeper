@@ -50,5 +50,5 @@ agentwrap unlinked.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Retired the external agentwrap: bun unlink removed the global link, swept README/CLAUDE.md/pair+dispatch+panel SKILL.md/cli/pair.ts --help onto the in-binary keeper agent surface (forward-facing), and recorded the absorbed agentwrap SHA f9e5113 in the source commit. test:full + test:hygiene green; keeper agent claude --version works with the external binary gone.
 ## Evidence
