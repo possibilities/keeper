@@ -81,9 +81,11 @@ Monitor(
 - Neither panelist gets an assigned role or persona — both answer the human's task straight. The
   cross-family difference (Opus 4.8 vs GPT-5.5) is the diversity the panel harvests.
 - `--read-only` on both: claude strips its edit tools; codex carries read-only via its prompt directive.
-- `--session panels` on both: panelists land in a dedicated `panels` tmux session that stays open +
-  interactive after the run (exempt from autoclose), so you can `tmux attach -t panels` to inspect a
-  panelist's full session. Concurrent legs share it safely — agentwrap recovers from the create race.
+- `--session panels` on both: panelists land in a dedicated `panels` tmux session. A claude panelist
+  registers as a tracked job; its stopped window is autoclosed by keeperd's daemon reaper past an idle
+  grace, so attach promptly (`tmux attach -t panels`) to inspect a panelist's full session. To keep the
+  windows open for inspection, add `panels` to the `disable_autoclose` config key (default empty).
+  Concurrent legs share the session safely — agentwrap recovers from the create race.
 - `keeper pair` emits a strict two-line contract on stdout: one `[keeper-pair] started …` line, then one
   terminal line. When `started` arrives, do nothing until the terminal line for that run. On
   `[keeper-pair] completed …`, note the exact `--output` path you passed — **do not read its content into
