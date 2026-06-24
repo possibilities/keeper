@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Emit --stop-timeout-ms and widen keeper's kill margin",
-  "updated_at": "2026-06-23T19:07:52.331000Z"
+  "updated_at": "2026-06-24T00:59:16.891000Z",
+  "worker_done_at": "2026-06-24T00:59:16.891000Z"
 }

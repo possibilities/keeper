@@ -64,5 +64,5 @@ Commit via `keeper commit-work`.
 - [ ] depends on the agentwrap flag being live (task `.1`) before this runs
 
 ## Done summary
-
+keeper pair now forwards its --timeout to agentwrap as wait-for-stop --stop-timeout-ms via a single tested stopTimeoutMsFromSeconds seam, and widens the subprocess-kill margin to stopTimeoutMs + 30s + 5s so a slow agentwrap path-discovery start returns a clean retryable exit-4 instead of a raw SIGKILL.
 ## Evidence
