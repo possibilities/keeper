@@ -21,19 +21,32 @@ Panelists must never see each other's work. Don't show one panelist another's an
 orchestrator pre-digest or summarize the task before handing it over. The judge is the only place the
 answers meet. Cross-pollination before the judge defeats the entire mechanism.
 
-## The panel: opus4.8-gpt5.5
+## Defining the panel
 
-Two panelists answer **in parallel**, then the `plan:panel-judge` subagent fuses them:
+The panel's members come from a named `panels.<name>` array in the launch-config registry
+(`~/.config/agentwrap/presets.yaml`), each member a named preset — a `{harness, model, effort}` triple.
+`keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
+**preset name** (not its harness), so two panelists on the same harness but different models stay
+distinguishable. Every member answers **in parallel** via `keeper pair send --preset <member> --read-only`,
+then the `plan:panel-judge` subagent fuses them:
 
-- **Opus 4.8** via `keeper pair send --cli claude --read-only`. `--read-only` strips its edit tools
-  and prepends an explore-only directive — it reads, greps, and runs bash to research, then reports.
-- **GPT-5.5** via `keeper pair send --cli codex --read-only`. The non-Claude panelist is the
-  cross-family diversity the panel is built to harvest. Codex's read-only posture is carried by the prompt
-  directive plus a changed-files backstop. The codex panelist runs as an interactive TUI with its cwd
-  directory-trust pre-seeded (fail-open), so its window never hangs on codex's trust prompt.
+- **A claude member** (`harness: claude`) runs `keeper pair send --preset <member> --read-only`.
+  `--read-only` strips its edit tools and prepends an explore-only directive — it reads, greps, and runs
+  bash to research, then reports.
+- **A codex member** (`harness: codex`) is the cross-family diversity the panel is built to harvest.
+  Codex's read-only posture is carried by the prompt directive plus a changed-files backstop. A codex
+  member runs as an interactive TUI with its cwd directory-trust pre-seeded (fail-open), so its window
+  never hangs on codex's trust prompt.
 
-Neither panelist gets an assigned role or persona — both answer the human's task straight, and the
-diversity comes from running two different frontier models cold (see "No lenses, no personas" above).
+No member gets an assigned role or persona — every member answers the human's task straight, and the
+diversity comes from running the panel's preset spread cold (see "No lenses, no personas" above).
+
+**Zero-config fallback.** With no registry or no defined panel, `presets resolve` exits non-zero and the
+panel falls back to the legacy two-model form — **Opus 4.8 (`--cli claude`)** + **GPT-5.5
+(`--cli codex`)** — so the panel works with zero config and presets are a pure opt-in upgrade. An example
+registry: `presets: { claude-opus-xhigh: {harness: claude, model: opus, effort: xhigh}, codex-gpt55-high:
+{harness: codex, model: gpt-5.5, effort: high} }` with `panels: { default: [claude-opus-xhigh,
+codex-gpt55-high] }`.
 
 The judge is kept separate from the panelists — it runs in the `plan:panel-judge` subagent, reading
 both answer files fresh in its own context rather than defending an answer it wrote itself.

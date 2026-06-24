@@ -17,7 +17,7 @@ You run in a subagent so the fan-out transcripts stay off the caller's context. 
 
 You receive, in your prompt:
 - The **original question** verbatim (the same text every panelist got).
-- **Answer-file paths** — one path per panelist, each labeled with its panelist source (e.g. `opus run A → /tmp/panel-xxx/opus.yaml`, `gpt-5.5 → /tmp/panel-xxx/codex.yaml`). Each is a YAML whose `message` field is that panelist's final answer. Optionally a scratch dir for Track A.
+- **Answer-file paths** — one path per panelist, each labeled with its **preset-name** source (e.g. `claude-opus-xhigh → /tmp/panel-xxx/claude-opus-xhigh.yaml`, `codex-gpt55-high → /tmp/panel-xxx/codex-gpt55-high.yaml`; on the legacy two-model fallback the labels are model-family names like `opus → …` / `gpt-5.5 → …`). Each is a YAML whose `message` field is that panelist's final answer. Optionally a scratch dir for Track A.
 
 Read every answer file in full, in your own context, before judging. If reading any panelist file trips `stop_reason: model_context_window_exceeded`, say so explicitly in your output, read what you can in chunks, and mark any section you could not fully ground as **partial / unverified** rather than guessing.
 
@@ -30,7 +30,7 @@ Before synthesizing, decide what the question actually asks for:
 
 Mixed task ("design and implement X"): the implementation is the deliverable — use Track A for the code and fold the reasoning in as brief rationale.
 
-Attribute by panelist throughout (e.g. "opus run A", "GPT-5.5") so the human can trace any decision back to its source.
+Attribute by panelist throughout, using each panelist's **preset name** (e.g. "claude-opus-xhigh", "codex-gpt55-high") so the human can trace any decision back to its source and two same-harness members stay distinct.
 
 ---
 

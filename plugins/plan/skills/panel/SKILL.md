@@ -11,10 +11,10 @@ argument-hint: "[hard question]"
 
 # Panel
 
-Panel turns one question into a panel. The question goes to two models **at the same time**, each
-answering independently — with web search and bash, and with no knowledge of the other. Then the
-`plan:panel-judge` subagent reads both answers, extracts the structure of the panel's reasoning (what
-they agree on, where they conflict, what only one saw, what they both missed), and writes a final answer
+Panel turns one question into a panel. The question goes to the panel's members **at the same time**, each
+answering independently — with web search and bash, and with no knowledge of the others. Then the
+`plan:panel-judge` subagent reads every answer, extracts the structure of the panel's reasoning (what
+they agree on, where they conflict, what only one saw, what they all missed), and writes a final answer
 grounded in that analysis.
 
 The whole mechanism is **independence, then synthesis**. The diversity that makes a panel beat a single
@@ -29,10 +29,37 @@ answer content into your context**: you collect only the answer-file PATHS from 
 pass those paths to the judge. That keeps you lean — the full transcripts live in files the judge reads in
 its own context.
 
-## Step 0 — Confirm the panel
+## Step 0 — Resolve the panel
 
-The panel is **opus4.8-gpt5.5**: Opus 4.8 (`--cli claude`) + GPT-5.5 (`--cli codex`). Both run
-read-only, both in parallel.
+The panel's members come from a named `panels.<name>` array in the launch-config registry
+(`~/.config/agentwrap/presets.yaml`), resolved through the launcher's `presets resolve` verb. Default to
+the `default` panel unless the human named another. Resolve it once:
+
+```bash
+PANEL=default   # or the panel name the human named
+keeper agent presets resolve "$PANEL"
+```
+
+On a hit this prints one JSON line — `{"kind":"panel","name":"<panel>","members":[{"name":"<preset>","harness":"claude|codex"},...]}` —
+listing the panelists in declaration order, each named by its **preset** (not its harness), so two
+panelists on the same harness but different models stay distinguishable. Capture that JSON for Step 2.
+
+**Backward-compat fallback.** When no registry exists, or the named panel is undefined, `presets resolve`
+exits non-zero. Treat that as a clean signal to fall back to the legacy two-model form — **Opus 4.8
+(`--cli claude`) + GPT-5.5 (`--cli codex`)** — so the panel works with zero config and presets are a pure
+opt-in upgrade. (An empty `members` array, by contrast, is a misconfigured panel — surface that error, do
+not fan out.) Both members run read-only and in parallel either way.
+
+An example registry an operator would define:
+
+```yaml
+# ~/.config/agentwrap/presets.yaml
+presets:
+  claude-opus-xhigh: { harness: claude, model: opus, effort: xhigh }
+  codex-gpt55-high:  { harness: codex,  model: gpt-5.5, effort: high }
+panels:
+  default: [claude-opus-xhigh, codex-gpt55-high]
+```
 
 ## Step 1 — Build the panelist prompt
 
@@ -57,9 +84,35 @@ independence the panel runs on.
 
 ## Step 2 — Fan out, in parallel and blind
 
-Launch **both panelists in a single turn** (two Monitor calls in one message) so they run concurrently.
-Each writes to its own `--output` file. keeper-pair partners have full filesystem access — the prompt
-gives directions and the verbatim task, never pre-read content.
+Launch **every panelist in a single turn** (one Monitor call per member, all in one message) so they run
+concurrently. Each writes to its own `--output` file, named by its **preset** so two same-harness members
+stay distinguishable. keeper-pair partners have full filesystem access — the prompt gives directions and
+the verbatim task, never pre-read content.
+
+**Preset form (registry hit).** Parse the Step-0 JSON with `jq` and emit one Monitor call per member,
+binding that member's preset:
+
+```bash
+echo "$PANEL_JSON" | jq -r '.members[].name'   # one preset name per line
+```
+
+For each preset name `<member>` returned, issue:
+
+```
+Monitor(
+    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --preset <member> --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/<member>.yaml',
+    description="panel <member>",
+    timeout_ms=3600000,
+    persistent=false,
+)
+```
+
+All member Monitor calls go out in ONE message — same parallel fan-out, same two-line per-run contract as
+before. The `--output` file is labeled by preset name; keep that `<member> → <path>` mapping for the judge
+in Step 3.
+
+**Legacy form (no registry / undefined panel).** When Step 0 fell back, emit the two-model form instead —
+one Monitor call each, in the same single turn:
 
 ```
 Monitor(
@@ -76,12 +129,13 @@ Monitor(
 )
 ```
 
-- Neither panelist gets an assigned role or persona — both answer the human's task straight. The
-  cross-family difference (Opus 4.8 vs GPT-5.5) is the diversity the panel harvests.
-- `--read-only` on both: claude strips its edit tools; codex carries read-only via its prompt directive.
-  Both panelists run as an interactive TUI; the codex panelist's cwd directory-trust is pre-seeded
+- Neither panelist gets an assigned role or persona — every member answers the human's task straight. The
+  diversity the panel harvests is the spread of models the panel array (or the legacy claude+codex pair)
+  spans.
+- `--read-only` on every member: claude strips its edit tools; codex carries read-only via its prompt
+  directive. Each panelist runs as an interactive TUI; a codex panelist's cwd directory-trust is pre-seeded
   (fail-open) so its window never hangs on the trust prompt.
-- `--session panels` on both: panelists land in a dedicated `panels` tmux session. A claude panelist
+- `--session panels` on every member: panelists land in a dedicated `panels` tmux session. A claude panelist
   registers as a tracked job; its stopped window is autoclosed by keeperd's daemon reaper past an idle
   grace, so attach promptly (`tmux attach -t panels`) to inspect a panelist's full session. To keep the
   windows open for inspection, add `panels` to the `disable_autoclose` config key (default empty).
@@ -98,12 +152,14 @@ path you hand to the judge — the judge reads it in its own context, not you.
 
 ## Step 3 — Spawn the judge subagent
 
-Once both runs have completed, spawn `plan:panel-judge` via the Agent tool with the original question
+Once all runs have completed, spawn `plan:panel-judge` via the Agent tool with the original question
 verbatim and the answer-file PATHS — never the content. Give the judge:
 
 - The **original question**, verbatim (the same text the panelists got).
-- **Answer-file paths**, one per panelist, each labeled by source — e.g.
-  `opus → /tmp/panel-<sid>/opus.yaml`, `gpt-5.5 → /tmp/panel-<sid>/codex.yaml`.
+- **Answer-file paths**, one per panelist, each labeled by its **preset name** so two same-harness members
+  stay distinguishable — e.g. `claude-opus-xhigh → /tmp/panel-<sid>/claude-opus-xhigh.yaml`,
+  `codex-gpt55-high → /tmp/panel-<sid>/codex-gpt55-high.yaml`. (On the legacy fallback the labels are the
+  two-model names — `opus → …/opus.yaml`, `gpt-5.5 → …/codex.yaml`.)
 
 The judge reads every answer file in full in its own context, classifies
 the deliverable (artifact → merge & verify; research → five-section synthesis), and returns the final
