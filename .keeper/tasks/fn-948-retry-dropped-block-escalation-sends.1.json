@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Make failed escalation send retry",
-  "updated_at": "2026-06-24T21:49:29.082000Z"
+  "updated_at": "2026-06-24T22:19:24.718000Z",
+  "worker_done_at": "2026-06-24T22:19:24.718000Z"
 }

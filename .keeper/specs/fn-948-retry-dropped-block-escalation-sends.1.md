@@ -33,5 +33,5 @@ read `outcome` so a terminally-failed row drops out of the escalated set.
 - [ ] Re-fold stays byte-identical (the `refold-equivalence.test.ts` guard holds) and the spawn stays producer-only.
 
 ## Done summary
-
+Made the block-escalation send_failed outcome non-terminal: foldBlockEscalationAttempted now resets the latch to pending on send_failed (recording the outcome) instead of advancing to attempted, so selectPendingBlockEscalations re-sweeps it next tick and a transient bus failure retries instead of dropping the escalation. Board pill and await softening self-resolve since a failed send stays genuinely in flight.
 ## Evidence
