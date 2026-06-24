@@ -213,7 +213,13 @@ No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopil
 - **Planning-dependent daisy-chain** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → plan A, arm `keeper:await complete fn-A`, and on `met` plan B against what landed. One session drives several plan rounds without the human re-priming context. Each round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
 - **Take-over window** (drive execution by hand for a stretch) → `keeper:autopilot` captures the current `{paused, mode, armed}` state, changes it for the window, and restores it when the human says done; `keeper:dispatch` fires one worker by hand inside that window.
 
-Pick the shape confidently and inform; only ask when genuinely torn between two topologies and the choice changes the outcome.
+**These three are not human questions — derive them, don't ask.** "What order should the epics roll out?", "what deps should I set?", and "should I wait for this epic to finish before planning the next?" each have a determinate answer you already hold; surfacing them to the human is the failure mode, not the safe default.
+
+- **Order is not a preference.** Keeper has no human-chosen rollout sequence — autopilot is level-triggered and dispatches whatever is ready. Execution order falls out of the dep edges plus the reconciler, so there is nothing to ask: wire the deps and order takes care of itself.
+- **Deps are derived, not chosen.** A cross-epic edge comes from a real code/process dependency — does B's execution consume A's landed APIs, files, or structures? You just planned both, so you know. epic-scout and Phase 6 auto-wire inter-epic edges against the open board; you set `depends_on_epics` for the genuine execution dep and leave independent epics dep-free. A dep you can't name a concrete code reason for is not a dep.
+- **Await-before-plan is the rare exception, gated by one test:** *can I author every epic's task specs right now, against today's codebase plus the other epics' plans?* **Yes — the common case → plan all the epics in this session now**, wire deps, and let autopilot sequence; do NOT await between plans. **No, and only when B's SPECS literally need A's landed reality** (new APIs, file shapes, schema the specs must reference) → daisy-chain: plan A, arm `keeper:await complete fn-A`, plan B on `met`. An *execution* dependency (B's code needs A's code) is NOT a planning dependency — that is `depends_on_epics` plus autopilot, never a reason to stall planning.
+
+Apply the test and commit to a topology. Ask only when the planability test is genuinely indeterminate AND a wrong call is expensive to unwind — not because more than one shape is conceivable.
 
 ### Always check the session is done — speak only to close it
 
