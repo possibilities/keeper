@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "hold root across dispatch-bind-running handoff",
-  "updated_at": "2026-06-24T01:18:40.873000Z"
+  "updated_at": "2026-06-24T02:33:18.959000Z",
+  "worker_done_at": "2026-06-24T02:33:18.959000Z"
 }

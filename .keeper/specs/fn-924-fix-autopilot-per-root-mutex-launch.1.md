@@ -79,5 +79,5 @@ doesn't now over-count a transient bound-stopped job and starve dispatch.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Close the per-root mutex launch-window leak: a new read-time bound-pending verdict holds a freshly-bound worker's root (stopped + plan_verb jobs row, active_since IS NULL) across the bind -> first-activity handoff, with the active_since gate preventing a stopped-after-working/dead worker from over-holding. Carried jobs.active_since free on the embedded epics.jobs element (JSON-cell-only, fix-forward); SCHEMA_VERSION 83->84.
 ## Evidence
