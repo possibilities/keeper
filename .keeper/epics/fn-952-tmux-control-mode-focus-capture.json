@@ -2,9 +2,12 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-06-24T23:22:22.683000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-946-add-keeper-handoff-fire-and-forget",
+    "fn-950-time-bound-autopilot-done-epics-reap"
+  ],
   "id": "fn-952-tmux-control-mode-focus-capture",
-  "last_validated_at": "2026-06-24T23:22:22.798000Z",
+  "last_validated_at": "2026-06-24T23:22:43.690000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T23:22:22.683000Z"
+  "updated_at": "2026-06-24T23:22:43.603000Z"
 }
