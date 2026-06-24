@@ -2701,7 +2701,7 @@ function stepGitHeartbeat(
       record: buildMissedWakeRecord({
         backstop: "git-heartbeat",
         worker: "git-worker",
-        fastPath: "fsevents",
+        fastPath: "metadata-poll",
         rescued: true,
         now,
         lastFastPathAt,
@@ -2713,7 +2713,7 @@ function stepGitHeartbeat(
 
 test("fn-720 git-heartbeat: a mute-watcher rescue (a root re-emitted) posts a missed-wake record with correct staleness", () => {
   const counters = new BackstopCounters();
-  // The FSEvents/db-poll fast path last fired (scheduler emit) at t=1000.
+  // The metadata-poll fast path last fired (scheduler emit) at t=1000.
   const lastFastPathAt = 1000;
   // Heartbeat at t=62240: one subscribed root re-emitted a snapshot the live
   // path missed (watcher went mute), so rescued=true.
@@ -2726,7 +2726,7 @@ test("fn-720 git-heartbeat: a mute-watcher rescue (a root re-emitted) posts a mi
     class: "missed-wake",
     backstop: "git-heartbeat",
     worker: "git-worker",
-    fast_path: "fsevents",
+    fast_path: "metadata-poll",
     rescued: true,
     staleness_ms: 61240, // 62240 - 1000
     last_fast_path_at: 1000,

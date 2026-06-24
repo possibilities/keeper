@@ -2670,7 +2670,10 @@ function startWorker(): void {
         record: buildMissedWakeRecord({
           backstop: "git-heartbeat",
           worker: "git-worker",
-          fastPath: "fsevents",
+          // fn-925: the git surface is POLL-ONLY since fn-921 — the fast path
+          // this rescue is measured against is the two-tier .git metadata stat
+          // poll, not the retired @parcel/watcher/FSEvents subscription.
+          fastPath: "metadata-poll",
           rescued: true,
           now,
           lastFastPathAt,
