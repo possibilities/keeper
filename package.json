@@ -12,6 +12,7 @@
     "lint": "biome check --no-errors-on-unmatched cli src test",
     "assert-comment-only": "bun scripts/assert-comment-only.ts",
     "lint:retired-name": "bash scripts/lint-retired-name.sh",
+    "lint:claude-md": "bun scripts/lint-claude-md.ts",
     "test:hygiene": "bun scripts/lint-no-real-git.ts",
     "typecheck": "tsc --noEmit",
     "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts test/dash-app.test.ts test/dash-shell.test.ts test/agent-modal-overlay.test.ts",

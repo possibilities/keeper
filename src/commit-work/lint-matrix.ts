@@ -386,6 +386,26 @@ export async function runScopedLint(
     });
   }
 
+  // 10 --- claude-md (CLAUDE.md size + re-narration guard; keeper-only). Gated
+  //        on CLAUDE.md being staged AND the script existing at cwd, so it is a
+  //        strict no-op in any other repo (commit-work is a general tool). ---
+  const claudeMdScript = join(cwd, "scripts", "lint-claude-md.ts");
+  if (stagedFiles.includes("CLAUDE.md") && existsSync(claudeMdScript)) {
+    tasks.push({
+      order: 10,
+      run: async () => {
+        const r = await runTool(["bun", claudeMdScript], cwd);
+        return r.code !== 0
+          ? {
+              linter: "claude-md",
+              files: ["CLAUDE.md"],
+              stderr: failureStderr("claude-md", r),
+            }
+          : null;
+      },
+    });
+  }
+
   // Fire every checker concurrently, then sort results by their dispatch order
   // so aggregation is byte-deterministic regardless of subprocess finish order.
   const settled = await Promise.all(
