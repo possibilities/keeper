@@ -42,6 +42,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import {
+  ConfigError,
+  loadPresetRegistry,
+  type Preset,
+  resolvePreset,
+} from "../src/agent/config";
 import { ensureCodexDirTrust } from "../src/codex-trust";
 import { resolveConfig } from "../src/db";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
@@ -70,6 +76,7 @@ import {
 const HELP = `keeper pair — fan a task out to another model CLI via keeper agent
 
 Usage:
+  keeper pair send <prompt-file> --preset <name> --output <path> [options]
   keeper pair send <prompt-file> --cli <claude|codex> --output <path> [options]
   keeper pair --help
 
@@ -80,7 +87,10 @@ from your session's Monitor tool: launch it, then do nothing until the terminal
 notification, then read --output.
 
 Options:
-  --cli <claude|codex>   Partner CLI (required)
+  --preset <name>        Named launch-config preset (~/.config/agentwrap/presets.yaml);
+                         drives harness + model/effort. The recommended interface.
+  --cli <claude|codex>   Partner CLI (required unless --preset given; a
+                         compatibility alias whose harness must agree with --preset)
   --model <m>            Native model (claude --model / codex -m)
   --effort <e>           Reasoning effort (codex only)
   --role <r>             Role prompt: default|planner|codereviewer|coplanner
@@ -191,6 +201,7 @@ export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv.slice(1),
     options: {
+      preset: { type: "string" },
       cli: { type: "string" },
       model: { type: "string" },
       effort: { type: "string" },
@@ -211,10 +222,49 @@ export async function main(argv: string[]): Promise<void> {
 
   const v = parsed.values;
   const promptFile = parsed.positionals[0];
-  const cli = v.cli;
+  const presetName = v.preset;
   const output = v.output;
-  const role = v.role ?? "default";
   const readOnly = v["read-only"] ?? false;
+
+  // ---- resolve the named preset (dep-free registry; no src/db.ts) ----
+  // A preset drives the harness (claude-vs-codex orchestration: env strip, reap
+  // policy, codex trust-seed) and an optional role; model/effort are NOT read here
+  // — they ride to the launcher via `--agentwrap-preset` so the launcher owns
+  // resolution. A preset-not-found / malformed registry is CLI misuse → exit 2.
+  let preset: Preset | undefined;
+  if (presetName !== undefined && presetName !== "") {
+    try {
+      preset = resolvePreset(loadPresetRegistry(), presetName);
+    } catch (err) {
+      const msg = err instanceof ConfigError ? err.message : String(err);
+      process.stderr.write(`pair: ${msg}\n`);
+      process.exit(2);
+    }
+    // PairCli excludes pi: a preset pinning pi handed to pair fails loud.
+    if (!PAIR_CLIS.has(preset.harness)) {
+      process.stderr.write(
+        `pair: preset '${presetName}' pins harness ${preset.harness}, ` +
+          "which pairing does not support (claude|codex only)\n",
+      );
+      process.exit(2);
+    }
+    // `--cli` is a compatibility alias; a disagreeing harness fails loud.
+    if (v.cli !== undefined && v.cli !== preset.harness) {
+      process.stderr.write(
+        `pair: --cli ${v.cli} disagrees with preset '${presetName}' harness ` +
+          `${preset.harness}\n`,
+      );
+      process.exit(2);
+    }
+  }
+
+  // Effective harness: the preset's when given, else the legacy `--cli` flag.
+  const cli = preset?.harness ?? v.cli;
+  // Effective role: explicit `--role` wins; otherwise the preset's role (if any);
+  // otherwise the parseArgs "default". An explicit `--role` is detected by it
+  // differing from the default sentinel OR the preset carrying no role.
+  const explicitRole = v.role !== undefined && v.role !== "default";
+  const role = explicitRole ? v.role : (preset?.role ?? v.role ?? "default");
 
   // Track whether `started` has been emitted so every failure path still pairs
   // a start with its terminal line (the two-line contract never breaks).
@@ -225,6 +275,7 @@ export async function main(argv: string[]): Promise<void> {
         cli: cli ?? "unknown",
         role,
         output: output ?? "",
+        preset: presetName,
       });
       startedEmitted = true;
     }
@@ -244,7 +295,8 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (cli === undefined || !PAIR_CLIS.has(cli)) {
     process.stderr.write(
-      `pair: --cli must be claude|codex (got ${cli ?? "none"})\n`,
+      `pair: --cli must be claude|codex (got ${cli ?? "none"}) — ` +
+        "pass --cli or --preset\n",
     );
     process.exit(2);
   }
@@ -310,7 +362,7 @@ export async function main(argv: string[]): Promise<void> {
   process.on("SIGTERM", () => {
     reap();
     if (!startedEmitted) {
-      emitEvent("started", { cli, role, output });
+      emitEvent("started", { cli, role, output, preset: presetName });
     }
     emitEvent("failed", { cli, output, error: "killed by monitor timeout" });
     process.exit(1);
@@ -342,6 +394,7 @@ export async function main(argv: string[]): Promise<void> {
   // this line the moment keeper pair starts running.
   emitEvent("started", {
     cli,
+    preset: presetName,
     role,
     output,
     "read-only": readOnly || undefined,
@@ -386,6 +439,9 @@ export async function main(argv: string[]): Promise<void> {
     cli: pairCli,
     prompt,
     readOnly,
+    ...(presetName !== undefined && presetName !== ""
+      ? { preset: presetName }
+      : {}),
     ...(v.model !== undefined ? { model: v.model } : {}),
     ...(v.effort !== undefined ? { effort: v.effort } : {}),
     // Partners land in a stable named session (`pair` by default, `panels` for
@@ -521,6 +577,7 @@ export async function main(argv: string[]): Promise<void> {
   // in place the moment it acts on the event.
   emitEvent("completed", {
     cli,
+    preset: presetName,
     output,
     "read-only": readOnly || undefined,
     changed: changedFiles.length > 0 ? changedFiles.length : undefined,

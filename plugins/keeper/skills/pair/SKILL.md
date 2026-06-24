@@ -12,7 +12,7 @@ description: >-
   RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
   (that is `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash, Monitor
-argument-hint: <what to ask> [--cli claude|codex] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <name> | --cli claude|codex] [--role …] [--read-only]
 ---
 
 # pair
@@ -115,8 +115,9 @@ expected path.
 
 | Flag | Meaning |
 |---|---|
-| `--cli claude\|codex` | The partner CLI. **Required.** Both launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open) so it never stalls on the trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
-| `--model <m>` | Native model id, passed through (`claude --model` / `codex -m`). Omit for the CLI's default. |
+| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude-vs-codex orchestration from the preset's `harness` and its optional `role`. A preset pinning `pi`, or a `--cli` whose harness disagrees, fails loud. A claude preset's `effort` is dropped (the headless claude pair path has no effort flag); a codex preset's effort is honored. |
+| `--cli claude\|codex` | The partner CLI. **Required unless `--preset` is given** (then a compatibility alias whose harness must agree with the preset). Both launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open) so it never stalls on the trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--model <m>` | Native model id, passed through (`claude --model` / `codex -m`). Omit for the CLI's default. With `--preset` the launcher owns model resolution. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |

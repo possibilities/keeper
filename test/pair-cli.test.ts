@@ -56,6 +56,9 @@ const TOUCHED_ENV_KEYS = [
   "KEEPER_BUS_DB",
   "KEEPER_BUS_SOCK",
   "KEEPER_CONFIG",
+  // The preset registry path is sandboxed via KEEPER_PRESETS_CONFIG (os.homedir()
+  // ignores $HOME on macOS, so the default `~/.config/...` can't be redirected).
+  "KEEPER_PRESETS_CONFIG",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -77,6 +80,9 @@ beforeEach(() => {
       // resolves to its EMPTY default (the user's real config never bleeds in):
       // the codex reap path is then exercised against an autoclosing session.
       KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
+      // Sandbox the preset registry under the tmpdir so the user's real presets
+      // never bleed in (default points absent → empty registry).
+      KEEPER_PRESETS_CONFIG: join(dir, "presets.yaml"),
     },
   });
   for (const k of TOUCHED_ENV_KEYS) {
@@ -178,4 +184,112 @@ test("started precedes failed on the failure path", async () => {
   const failedIdx = r.stdout.indexOf("[keeper-pair] failed");
   expect(startedIdx).toBeGreaterThanOrEqual(0);
   expect(failedIdx).toBeGreaterThan(startedIdx);
+});
+
+/** Write the sandboxed `presets.yaml` (KEEPER_PRESETS_CONFIG points at it). */
+function writePresets(body: string): void {
+  writeFileSync(join(dir, "presets.yaml"), body);
+}
+
+test("--preset alone is valid: harness comes from the preset, started carries preset=", async () => {
+  writePresets("presets:\n  reviewer:\n    harness: claude\n    model: opus\n");
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "review this");
+
+  // --preset (no --cli) reaches the LAUNCH (fails there on the bad launcher path),
+  // proving the cli===undefined hard-fail was relaxed for the preset case.
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--preset",
+    "reviewer",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(1);
+  // started carries the preset name AND the harness resolved from the preset.
+  expect(r.stdout).toContain("[keeper-pair] started cli=claude");
+  expect(r.stdout).toContain("preset=reviewer");
+  // It reached the launch, not an arg-fault exit-2.
+  expect(r.stdout).toContain("error=agentwrap launch exited");
+});
+
+test("--preset + agreeing --cli is accepted", async () => {
+  writePresets("presets:\n  reviewer:\n    harness: claude\n    model: opus\n");
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "review this");
+
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--preset",
+    "reviewer",
+    "--cli",
+    "claude",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(r.stdout).toContain("error=agentwrap launch exited");
+});
+
+test("--preset disagreeing with --cli fails loud (exit 2, no started line)", async () => {
+  writePresets("presets:\n  reviewer:\n    harness: claude\n    model: opus\n");
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "review this");
+
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--preset",
+    "reviewer",
+    "--cli",
+    "codex",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("disagrees with preset");
+  // Arg fault precedes any Monitor event.
+  expect(countEvent(r.stdout, "started")).toBe(0);
+});
+
+test("a pi preset handed to pair fails loud (exit 2)", async () => {
+  writePresets("presets:\n  thinker:\n    harness: pi\n    model: pi-1\n");
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "think");
+
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--preset",
+    "thinker",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("pairing does not support");
+  expect(countEvent(r.stdout, "started")).toBe(0);
+});
+
+test("a missing preset name fails loud naming the available presets (exit 2)", async () => {
+  writePresets("presets:\n  reviewer:\n    harness: claude\n    model: opus\n");
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "x");
+
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--preset",
+    "nope",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("not found");
+  expect(r.stderr).toContain("reviewer");
+  expect(countEvent(r.stdout, "started")).toBe(0);
 });

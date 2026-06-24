@@ -42,6 +42,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
+  ConfigError,
+  loadPresetRegistry,
+  type Preset,
+  resolvePreset,
+} from "../src/agent/config";
+import { resolveWorkerLaunchConfig } from "../src/autopilot-worker";
+import {
   resolveConfig,
   resolveKeeperAgentPath,
   resolveSockPath,
@@ -126,8 +133,11 @@ Options:
   --name <n>           claude --name (OPTIONAL pass-through in free form)
   --session <s>        Target tmux session (overrides every fallback)
   --cwd <dir>          Working dir (free form; defaults to process.cwd())
-  --model <m>          Pass --model to claude
-  --effort <e>         Pass --effort to claude
+  --preset <name>      Named launch-config preset (~/.config/agentwrap/presets.yaml,
+                       claude-only); supplies --model/--effort. Plan form defaults
+                       to the same 'worker' preset the autopilot uses.
+  --model <m>          Pass --model to claude (overrides the preset)
+  --effort <e>         Pass --effort to claude (overrides the preset)
   --force              Plan form: skip the race guard
   --no-prefix          Free form: bypass the configured dispatch_prompt_prefix
   --dry-run            Print the resolved launch plan; launch nothing
@@ -342,6 +352,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       name: { type: "string" },
       session: { type: "string" },
       cwd: { type: "string" },
+      preset: { type: "string" },
       model: { type: "string" },
       effort: { type: "string" },
       force: { type: "boolean", default: false },
@@ -388,6 +399,40 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       `plan form takes exactly one <verb>::<id> positional (got ${parsed.positionals.length})`,
     );
   }
+
+  // ---- resolve model/effort (claude-only) ----
+  // Precedence per field: explicit --model/--effort > --preset > worker preset
+  // (plan form only) > none. Dispatch widens to claude alone for now — LaunchSpec
+  // carries only claude model/effort (codex/pi dispatch is a follow-up). The
+  // plan-form default is the SAME `worker` preset the autopilot resolves, so a
+  // hand-fired plan worker is byte-identical to an automated one.
+  let baseModel: string | undefined;
+  let baseEffort: string | undefined;
+  if (hasPlanKey) {
+    const worker = resolveWorkerLaunchConfig();
+    baseModel = worker.model;
+    baseEffort = worker.effort;
+  }
+  if (v.preset !== undefined && v.preset !== "") {
+    let preset: Preset;
+    try {
+      preset = resolvePreset(loadPresetRegistry(), v.preset);
+    } catch (err) {
+      argFault(err instanceof ConfigError ? err.message : String(err));
+    }
+    if (preset.harness !== "claude") {
+      argFault(
+        `--preset ${v.preset} pins harness ${preset.harness}; dispatch is ` +
+          "claude-only (codex/pi dispatch is a follow-up)",
+      );
+    }
+    // A partial preset layers over the worker/plan base per field.
+    if (preset.model !== null) baseModel = preset.model;
+    if (preset.effort !== null) baseEffort = preset.effort;
+  }
+  // Explicit flags win over any preset/worker default.
+  const model = v.model ?? baseModel;
+  const effort = v.effort ?? baseEffort;
 
   // Launch directly through `keeper agent` (keeper's sole launch transport) into
   // the resolved session — the same transport as the autopilot path. The
@@ -497,8 +542,8 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     cwd,
     claudeName,
     prompt,
-    ...(v.model !== undefined ? { model: v.model } : {}),
-    ...(v.effort !== undefined ? { effort: v.effort } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort } : {}),
     noConfirm: true,
   });
 
@@ -521,8 +566,8 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   const spec: LaunchSpec = {
     prompt,
     ...(claudeName !== undefined ? { claudeName } : {}),
-    ...(v.model !== undefined ? { model: v.model } : {}),
-    ...(v.effort !== undefined ? { effort: v.effort } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort } : {}),
   };
 
   // UNNAMED window (empty `name`): the renamer worker labels plan-form windows

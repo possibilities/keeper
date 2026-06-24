@@ -289,6 +289,38 @@ test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session suppli
   expect(argv[idx + 1]).toBe("pair-sess");
 });
 
+test("buildPairLaunchArgv: --preset forwards --agentwrap-preset so the launcher owns model/effort", () => {
+  const argv = buildPairLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "P",
+    readOnly: false,
+    preset: "claude-opus-xhigh",
+  });
+  const idx = argv.indexOf("--agentwrap-preset");
+  expect(idx).toBeGreaterThanOrEqual(0);
+  expect(argv[idx + 1]).toBe("claude-opus-xhigh");
+  // The base wrapper-flag triad stays the first three flags after the cli token —
+  // preset rides AFTER them, never reordering the load-bearing prefix.
+  expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-no-confirm",
+  ]);
+  // The prompt is still the final positional.
+  expect(argv.at(-1)).toBe("P");
+});
+
+test("buildPairLaunchArgv: no preset → no --agentwrap-preset flag (zero behavior change)", () => {
+  const argv = buildPairLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "P",
+    readOnly: false,
+  });
+  expect(argv).not.toContain("--agentwrap-preset");
+});
+
 test("buildWaitForStopArgv / buildShowLastMessageArgv: handle composition", () => {
   expect(buildWaitForStopArgv(LAP, "tmux-abc", 1_800_000)).toEqual([
     ...LAP,

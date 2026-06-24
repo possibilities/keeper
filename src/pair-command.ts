@@ -167,6 +167,10 @@ export interface PairLaunchOpts {
   readOnly: boolean;
   /** Target tmux session agentwrap mints/targets. Omitted = agentwrap default. */
   session?: string;
+  /** A named launch-config preset forwarded as `--agentwrap-preset <name>` so the
+   *  launcher owns model/effort resolution — pair never re-derives them. Omitted
+   *  = no preset flag (model/effort fall to the explicit `--model`/`--effort`). */
+  preset?: string;
 }
 
 /**
@@ -174,6 +178,7 @@ export interface PairLaunchOpts {
  *
  *   `<bun> <abs cli/keeper.ts> agent <cli> --agentwrap-tmux
  *     --agentwrap-tmux-detached --agentwrap-no-confirm
+ *     [--agentwrap-preset <name>]
  *     [--agentwrap-tmux-session <s>] [--agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>]
  *     <native cli flags> <prompt>`
  *
@@ -203,6 +208,12 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
     "--agentwrap-tmux-detached",
     "--agentwrap-no-confirm",
   ];
+  // The named preset rides as a launcher flag so `keeper agent` owns model/effort
+  // resolution (explicit > env > preset > yaml > native). pair never re-derives
+  // model/effort from the preset — it only reads the preset's harness/role itself.
+  if (opts.preset !== undefined && opts.preset !== "") {
+    wrapperFlags.push("--agentwrap-preset", opts.preset);
+  }
   if (opts.session !== undefined && opts.session !== "") {
     wrapperFlags.push("--agentwrap-tmux-session", opts.session);
     if (opts.cli === "claude") {

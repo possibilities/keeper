@@ -69,6 +69,13 @@ export function pluginConfigPath(): string {
 }
 
 export function presetsConfigPath(): string {
+  // `KEEPER_PRESETS_CONFIG` overrides the default location — the test-isolation
+  // seam (os.homedir() ignores $HOME on macOS) and a production override. Read
+  // producer-side at resolve time, never a fold input.
+  const override = process.env.KEEPER_PRESETS_CONFIG;
+  if (override !== undefined && override !== "") {
+    return override;
+  }
   return join(homedir(), ".config", "agentwrap", "presets.yaml");
 }
 
