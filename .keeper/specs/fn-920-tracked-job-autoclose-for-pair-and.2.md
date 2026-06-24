@@ -54,5 +54,5 @@ Pure predicate unit tests mirroring the clause-by-clause style: a managed-sessio
 - [ ] the reaper writes nothing to the DB; idle grace + disable-list thread via `workerData`.
 
 ## Done summary
-
+Added the reaper's second managed-session autoclose arm: a verdict-free predicate autocloses stopped tracked NON-plan jobs in pair/panels/agentbus past an idle grace, keyed on the frozen birth-session allow-list (excludes the autopilot session, so the two arms never overlap) and gated by the default-empty disable_autoclose config opt-out threaded via workerData.
 ## Evidence

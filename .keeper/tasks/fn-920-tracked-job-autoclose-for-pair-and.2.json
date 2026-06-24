@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reaper second arm: managed-session idle autoclose",
-  "updated_at": "2026-06-23T19:39:41.009000Z"
+  "updated_at": "2026-06-24T01:14:50.925000Z",
+  "worker_done_at": "2026-06-24T01:14:50.925000Z"
 }
