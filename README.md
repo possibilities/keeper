@@ -3182,8 +3182,11 @@ liveness timer; boot rehydration still drops dead pids. `keeper bus list` is
 informational only, never a send precondition (there is no `resolve` subcommand —
 agents send blindly by current-or-former name). The server
 resolves the connecting peer's pid via `LOCAL_PEERPID` and OVERWRITES any
-client-claimed `from` with that peer-resolved identity (anti-spoof); the socket
-is mode 0600. The wire envelope carries a `namespace` axis (`chat` is the first
+client-claimed `from` with that peer-resolved identity (anti-spoof), enriching it
+from keeper.db `jobs` only when the live process's start_time matches the row's —
+a `(pid, start_time)` guard so an OS-recycled pid carrying a dead agent's
+lingering row is never bound (a mismatch/unreadable probe fails closed and the
+ancestry walk climbs to the true parent); the socket is mode 0600. The wire envelope carries a `namespace` axis (`chat` is the first
 tenant; the core routes tenant-agnostically). Per-client send queues are bounded
 so a slow/dead subscriber is evicted rather than blocking the relay, and a
 malformed/oversized frame is dropped without affecting other subscribers. It

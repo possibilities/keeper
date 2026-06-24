@@ -55,7 +55,12 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   `runWatch`'s reconnect loop re-subscribes after a bounce) owns a durable,
   subscribable, list-visible channel. fn-918 wake-on-send is unaffected — it is
   recipient-side (`queued_for_wake` for an offline creator), never the sender's
-  registration.
+  registration. The `(pid, start_time)` identity guards BOTH the deregister path
+  (`deleteChannel`) AND the enrich path: `enrichPeerFromJobs` probes the live pid's
+  start_time ONCE per matched row and binds the keeper.db `jobs` identity ONLY on a
+  verbatim match (fn-933) — a mismatch/unreadable probe fails closed (returns null,
+  the ancestry walk climbs to the true parent), so an OS-recycled pid carrying a
+  dead agent's lingering row never misattributes the sender.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.

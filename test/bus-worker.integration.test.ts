@@ -28,6 +28,7 @@ import { main as busMain } from "../cli/bus";
 import { openBusDb } from "../src/bus-db";
 import type { BusWorkerData } from "../src/bus-worker";
 import { openDb } from "../src/db";
+import { readOsStartTime } from "../src/seed-sweep";
 import { retryUntil } from "./helpers/retry-until";
 import { freshDbFile } from "./helpers/template-db";
 
@@ -84,6 +85,14 @@ beforeEach(() => {
 function seedHarnessJob(): void {
   // Reopen the on-disk db (migrate:false — already migrated by the beforeEach
   // template write) and add the row alongside the shared seed.
+  // The peer pid here is THIS live test process, so the recycled-pid enrich
+  // guard (`enrichPeerFromJobs` matches `(pid, start_time)`) requires the seeded
+  // start_time to equal the live process's real start_time — seed it from the
+  // SAME `readOsStartTime` the worker probes (a slow/integration-tier real-`ps`
+  // read, exercising the genuine real-process boundary). A null probe (rare ps
+  // failure) falls back to a stable sentinel that simply won't match → the test
+  // surfaces the miss honestly rather than silently passing.
+  const liveStartTime = readOsStartTime(process.pid) ?? "t-harness-job";
   const kdb = openDb(dbPath, { migrate: false });
   kdb.db
     .query(
@@ -95,7 +104,7 @@ function seedHarnessJob(): void {
       1,
       20,
       process.pid,
-      "t-harness-job",
+      liveStartTime,
       "harness-live",
       JSON.stringify(["harness-old", "harness-live"]),
     );

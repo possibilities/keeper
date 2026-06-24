@@ -8,7 +8,8 @@
  * `closeOwnsBinding` (the takeover generation token), `toLiveChannel` (the
  * presence axis), `takeoverVictim` (duplicate-watcher/takeover on the stable
  * `(pid, start_time)` key), `liveChannelsAtBoot` (dead-pid drop), and
- * `enrichPeerFromJobs` (read-only keeper.db identity enrichment).
+ * `enrichPeerFromJobs` (read-only keeper.db identity enrichment, including the
+ * `(pid, start_time)` recycled-pid guard that fails closed to the ancestry walk).
  *
  * NO Worker spawn — the `isMainThread` guard keeps the plain import inert (the
  * same shape every other worker fast-test uses; worker lifecycle is covered by
@@ -310,7 +311,8 @@ test("enrichPeerFromJobs maps a peer pid to its newest job identity", () => {
     name_history: ["beta", "gamma"],
     updated_at: 10,
   });
-  const id = enrichPeerFromJobs(db, 7777);
+  // Live probe matches the row's start_time → the same process that registered.
+  const id = enrichPeerFromJobs(db, 7777, () => "t1");
   expect(id).not.toBeNull();
   expect(id?.job_id).toBe("sess-1");
   expect(id?.title).toBe("gamma");
@@ -320,9 +322,21 @@ test("enrichPeerFromJobs maps a peer pid to its newest job identity", () => {
 
 test("enrichPeerFromJobs prefers the NEWEST job for a reused pid", () => {
   const { db } = freshMemDb();
-  seedJob(db, { job_id: "old", pid: 8888, title: "stale", updated_at: 5 });
-  seedJob(db, { job_id: "new", pid: 8888, title: "fresh", updated_at: 50 });
-  const id = enrichPeerFromJobs(db, 8888);
+  seedJob(db, {
+    job_id: "old",
+    pid: 8888,
+    start_time: "t1",
+    title: "stale",
+    updated_at: 5,
+  });
+  seedJob(db, {
+    job_id: "new",
+    pid: 8888,
+    start_time: "t2",
+    title: "fresh",
+    updated_at: 50,
+  });
+  const id = enrichPeerFromJobs(db, 8888, () => "t2");
   expect(id?.job_id).toBe("new");
   expect(id?.title).toBe("fresh");
   db.close();
@@ -330,7 +344,55 @@ test("enrichPeerFromJobs prefers the NEWEST job for a reused pid", () => {
 
 test("enrichPeerFromJobs returns null on a keeper miss (resume-gap fallback path)", () => {
   const { db } = freshMemDb();
-  expect(enrichPeerFromJobs(db, 9999)).toBeNull();
+  expect(enrichPeerFromJobs(db, 9999, () => "t1")).toBeNull();
+  db.close();
+});
+
+test("enrichPeerFromJobs returns null for a recycled pid whose live start_time differs from the stale dead row (anti-misattribution)", () => {
+  const { db } = freshMemDb();
+  // A lingering dead `jobs` row from a former agent that held this pid; the OS
+  // has since recycled the number to a new, unrelated process.
+  seedJob(db, {
+    job_id: "dead-agent",
+    pid: 89510,
+    start_time: "darwin:Sat Jun  7 12:00:00 2026",
+    title: "fix-duplicate-approve-bug",
+    updated_at: 10,
+  });
+  // Live probe returns the CURRENT process's start_time — a different boot.
+  const id = enrichPeerFromJobs(
+    db,
+    89510,
+    () => "darwin:Mon Jun 23 09:00:00 2026",
+  );
+  expect(id).toBeNull();
+  db.close();
+});
+
+test("enrichPeerFromJobs fails closed when the start_time probe is null/unreadable", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-1",
+    pid: 7777,
+    start_time: "t1",
+    title: "gamma",
+    updated_at: 10,
+  });
+  // Probe failure (ps timeout, gone pid) → cannot verify → drop the enrichment.
+  expect(enrichPeerFromJobs(db, 7777, () => null)).toBeNull();
+  db.close();
+});
+
+test("enrichPeerFromJobs fails closed when the row itself has no start_time", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-1",
+    pid: 7777,
+    start_time: null,
+    title: "gamma",
+    updated_at: 10,
+  });
+  expect(enrichPeerFromJobs(db, 7777, () => "t1")).toBeNull();
   db.close();
 });
 
@@ -432,6 +494,58 @@ test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loo
     () => null,
   );
   expect(res).toBeNull();
+});
+
+test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk climbs to the TRUE parent agent", () => {
+  // The 4th send subprocess inherited pid 89510 — a number a dead agent's
+  // lingering jobs row still holds. The TRUE sender is the parent harness (pid
+  // 100, sitter-system-overview). The single opRegister path governs BOTH a send
+  // (send_only:true) and a watch (send_only:false), so one guard fixes both:
+  // assert the resolved chain for each registration form.
+  const { db } = freshMemDb();
+  // Dead agent's lingering row on the recycled pid (different boot start_time).
+  seedJob(db, {
+    job_id: "dead-agent",
+    pid: 89510,
+    start_time: "darwin:Sat Jun  7 12:00:00 2026",
+    title: "fix-duplicate-approve-bug",
+    updated_at: 10,
+  });
+  // The TRUE parent agent (the harness that actually issued the send).
+  seedJob(db, {
+    job_id: "sitter-sess",
+    pid: 100,
+    start_time: "darwin:Mon Jun 23 09:00:00 2026",
+    title: "sitter-system-overview",
+    updated_at: 50,
+  });
+  // peer (send/watch subprocess, pid 89510) → zsh (200) → harness (100).
+  const parents: Record<number, number> = { 89510: 200, 200: 100, 100: 1 };
+  // The live probe returns the CURRENT process start_time for whichever pid is
+  // probed: pid 89510 is now a recycled, unrelated process (mismatch → skip);
+  // pid 100 is the live sitter harness (match → enrich).
+  const liveStartTime: Record<number, string> = {
+    89510: "darwin:Mon Jun 23 11:00:00 2026", // recycled — NOT the dead boot
+    100: "darwin:Mon Jun 23 09:00:00 2026", // the real sitter harness
+  };
+  const probe = (pid: number): string | null => liveStartTime[pid] ?? null;
+
+  // The same enrichment lambda opRegister passes to resolveHarnessIdentity, for
+  // both send_only:true and send_only:false (the flag never touches enrichment).
+  for (const _form of ["send_only:true", "send_only:false"]) {
+    const res = resolveHarnessIdentity(
+      89510,
+      (p) => parents[p] ?? null,
+      (p) => enrichPeerFromJobs(db, p, probe),
+    );
+    expect(res).not.toBeNull();
+    expect(res?.pid).toBe(100);
+    expect(res?.identity.job_id).toBe("sitter-sess");
+    expect(res?.identity.title).toBe("sitter-system-overview");
+    // Crucially NOT the dead agent the bare-pid match would have bound.
+    expect(res?.identity.title).not.toBe("fix-duplicate-approve-bug");
+  }
+  db.close();
 });
 
 // ---------------------------------------------------------------------------

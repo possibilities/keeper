@@ -62,6 +62,7 @@ import {
 } from "./bus-identity";
 import { openDb, resolveBusDbPath, resolveBusSockPath } from "./db";
 import { LineBuffer } from "./protocol";
+import { readOsStartTime } from "./seed-sweep";
 import {
   acquireLock,
   isPidAlive,
@@ -468,10 +469,23 @@ export interface JobIdentity {
  * name_history. A keeper MISS (a just-started session keeper has not folded yet)
  * returns null and the caller falls back to the client-provided floor name.
  * Bound params only.
+ *
+ * RECYCLED-PID GUARD: a bare-pid match proves only that SOME process holds that
+ * number, not that it is the one that registered. An OS-recycled pid carrying a
+ * lingering dead `jobs` row would otherwise bind the dead agent's identity. So
+ * on a row hit we probe the LIVE process's start_time ONCE (`readStartTime`) and
+ * compare it verbatim to the row's `start_time` — the same `(pid, start_time)`
+ * identity `src/bus-identity.ts` and `src/exit-watcher.ts` already key on. The
+ * persisted format is byte-identical to the probe (both share
+ * `splitArgsLstart`/`parseLinuxStarttime`), so the compare is a plain string
+ * match. On a mismatch OR a null/failed probe we return null (fail closed) — the
+ * ancestry walk then climbs to the true parent rather than bind an unverified
+ * pid-only identity. Probed at most once per matched row, never per ancestry hop.
  */
 export function enrichPeerFromJobs(
   keeperDb: Database,
   pid: number,
+  readStartTime: (pid: number) => string | null = readOsStartTime,
 ): JobIdentity | null {
   const row = keeperDb
     .prepare(
@@ -482,6 +496,11 @@ export function enrichPeerFromJobs(
     )
     .get(pid) as Record<string, unknown> | null;
   if (!row) return null;
+  const rowStartTime = row.start_time == null ? null : String(row.start_time);
+  // Recycled-pid guard: verify the live pid is the SAME process the row tracks.
+  // Fail closed (return null → keep climbing) on a stale/dead row or an
+  // unreadable probe — never bind a pid-only identity.
+  if (rowStartTime === null || readStartTime(pid) !== rowStartTime) return null;
   let history: string[] = [];
   const cell = row.name_history;
   if (typeof cell === "string" && cell.length > 0) {
@@ -619,6 +638,7 @@ export function startBusServer(
   keeperDb: Database,
   sockPath: string,
   lockPath: string,
+  readStartTime: (pid: number) => string | null = readOsStartTime,
 ): BusServer {
   acquireLock(lockPath, sockPath);
 
@@ -803,7 +823,7 @@ export function startBusServer(
     const harness =
       peerPid > 0
         ? resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
-            enrichPeerFromJobs(keeperDb, p),
+            enrichPeerFromJobs(keeperDb, p, readStartTime),
           )
         : null;
     const enriched = harness?.identity ?? null;
