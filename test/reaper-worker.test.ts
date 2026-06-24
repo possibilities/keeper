@@ -35,12 +35,21 @@ import {
 } from "../src/exec-backend";
 import type { ReadinessSnapshot, Verdict } from "../src/readiness";
 import {
+  actuateOrphanKill,
+  buildKeeperLivePids,
+  ORPHAN_MIN_AGE_SEC,
+  ORPHAN_TERM_GRACE_SEC,
+  type OrphanTermState,
+  orphanReapCycle,
+  type ProcCensusEntry,
+  parsePsCensusLine,
   REAP_KILL_COOLDOWN_SEC,
   REAP_MANAGED_SESSION_IDLE_SEC,
   REAP_STOPPED_AGE_SEC,
   type ReapCandidate,
   reaperCycle,
   selectManagedSessionReapCandidates,
+  selectOrphanedProcessCandidates,
   selectReapCandidates,
 } from "../src/reaper-worker";
 import type { Job } from "../src/types";
@@ -527,4 +536,395 @@ test("reaperCycle fires for a managed-session candidate (arm-agnostic orchestrat
   );
   expect(backend.kills).toEqual(["%9"]);
   expect(cooldown.get("j-9")).toBe(NOW);
+});
+
+// ---------------------------------------------------------------------------
+// selectOrphanedProcessCandidates — the orphan-process arm (epic fn-934)
+// ---------------------------------------------------------------------------
+
+const SELF_UID = 501;
+const SELF_PID = 99_999;
+
+/** The canonical orphaned-runaway census shape: this user's process, reparented
+ *  to init (ppid==1), exe matches the allow-list, aged past the min, with a
+ *  resolvable start_time. Every exclusion test flips exactly one field. */
+function makeProc(overrides: Partial<ProcCensusEntry> = {}): ProcCensusEntry {
+  return {
+    pid: 12_345,
+    startTime: "darwin:Wed Jun 24 10:00:00 2026",
+    ppid: 1,
+    uid: SELF_UID,
+    exe: "/usr/local/bin/bun test --test-worker test/foo.test.ts",
+    ageSec: ORPHAN_MIN_AGE_SEC + 1,
+    ...overrides,
+  };
+}
+
+function selectOrphans(
+  census: ProcCensusEntry[],
+  opts: Partial<{
+    now: number;
+    selfUid: number;
+    keeperLivePids: ReadonlySet<number>;
+    exempt: ReadonlySet<string>;
+    termState: Map<number, OrphanTermState>;
+  }> = {},
+) {
+  return selectOrphanedProcessCandidates(census, {
+    now: opts.now ?? NOW,
+    selfUid: opts.selfUid ?? SELF_UID,
+    keeperLivePids: opts.keeperLivePids ?? new Set<number>([SELF_PID]),
+    exempt: opts.exempt ?? new Set<string>(),
+    termState: opts.termState ?? new Map<number, OrphanTermState>(),
+  });
+}
+
+test("an orphaned runaway (ppid==1, allow-listed exe, aged, self-uid) is a TERM candidate", () => {
+  const out = selectOrphans([makeProc()]);
+  expect(out).toEqual([
+    {
+      pid: 12_345,
+      startTime: "darwin:Wed Jun 24 10:00:00 2026",
+      exe: "/usr/local/bin/bun test --test-worker test/foo.test.ts",
+      phase: "term",
+    },
+  ]);
+});
+
+test("each allow-listed runaway class is selected", () => {
+  const cases: string[] = [
+    "/usr/local/bin/bun test test/foo.test.ts",
+    "/bin/sh -c while :; do :; done",
+    "/bin/bash -c while true; do :; done",
+    "/usr/local/bin/bun run test/helpers/flock_peer.ts",
+  ];
+  for (const exe of cases) {
+    expect(selectOrphans([makeProc({ exe })])).toHaveLength(1);
+  }
+});
+
+test("a live-parented test run (ppid != 1) is NOT selected", () => {
+  expect(selectOrphans([makeProc({ ppid: 4242 })])).toEqual([]);
+});
+
+test("keeperd's own pid is NOT selected (in keeper's live set)", () => {
+  // keeperd's pid is seeded into the live set by buildKeeperLivePids.
+  expect(
+    selectOrphans([makeProc({ pid: SELF_PID })], {
+      keeperLivePids: new Set<number>([SELF_PID]),
+    }),
+  ).toEqual([]);
+});
+
+test("a live plan-worker pid is NOT selected (in keeper's live set)", () => {
+  expect(
+    selectOrphans([makeProc({ pid: 55_555 })], {
+      keeperLivePids: new Set<number>([SELF_PID, 55_555]),
+    }),
+  ).toEqual([]);
+});
+
+test("the human's shell (exe not in allow-list) is NOT selected", () => {
+  expect(selectOrphans([makeProc({ exe: "-zsh" })])).toEqual([]);
+  expect(
+    selectOrphans([makeProc({ exe: "/Applications/MyEditor.app/editor" })]),
+  ).toEqual([]);
+});
+
+test("an other-uid process is NOT selected", () => {
+  expect(selectOrphans([makeProc({ uid: 0 })])).toEqual([]);
+  expect(selectOrphans([makeProc({ uid: SELF_UID + 1 })])).toEqual([]);
+});
+
+test("a too-young process (age <= minAge) is NOT selected", () => {
+  expect(selectOrphans([makeProc({ ageSec: ORPHAN_MIN_AGE_SEC })])).toEqual([]);
+  expect(selectOrphans([makeProc({ ageSec: ORPHAN_MIN_AGE_SEC - 1 })])).toEqual(
+    [],
+  );
+  expect(
+    selectOrphans([makeProc({ ageSec: ORPHAN_MIN_AGE_SEC + 1 })]),
+  ).toHaveLength(1);
+});
+
+test("a probe-failed process (null exe or null start_time) is NOT selected", () => {
+  // A partial/failed proc_pidinfo read folds to NULL exe / NULL start_time —
+  // can't-confirm-don't-kill.
+  expect(selectOrphans([makeProc({ exe: null })])).toEqual([]);
+  expect(selectOrphans([makeProc({ startTime: null })])).toEqual([]);
+});
+
+test("a disableOrphanReap exemption vetoes a matching candidate", () => {
+  // An operator exemption substring that matches the candidate's exe vetoes it,
+  // even though it also matches the closed allow-list.
+  expect(
+    selectOrphans(
+      [makeProc({ exe: "/usr/local/bin/bun test --test-worker x" })],
+      {
+        exempt: new Set<string>(["--test-worker"]),
+      },
+    ),
+  ).toEqual([]);
+  // A non-matching exemption does not veto.
+  expect(
+    selectOrphans([makeProc()], { exempt: new Set<string>(["unrelated"]) }),
+  ).toHaveLength(1);
+});
+
+test("orphan candidates are returned in ascending pid order", () => {
+  const out = selectOrphans([
+    makeProc({ pid: 300 }),
+    makeProc({ pid: 100 }),
+    makeProc({ pid: 200 }),
+  ]);
+  expect(out.map((c) => c.pid)).toEqual([100, 200, 300]);
+});
+
+// --- two-phase escalation -------------------------------------------------
+
+test("a previously-TERM'd pid (same start_time) escalates to KILL past the grace", () => {
+  const termState = new Map<number, OrphanTermState>([
+    [
+      12_345,
+      {
+        startTime: "darwin:Wed Jun 24 10:00:00 2026",
+        termAt: NOW - ORPHAN_TERM_GRACE_SEC,
+      },
+    ],
+  ]);
+  const out = selectOrphans([makeProc()], { termState, now: NOW });
+  expect(out).toHaveLength(1);
+  expect(out[0].phase).toBe("kill");
+});
+
+test("a previously-TERM'd pid INSIDE the grace is suppressed (no re-TERM)", () => {
+  const termState = new Map<number, OrphanTermState>([
+    [
+      12_345,
+      {
+        startTime: "darwin:Wed Jun 24 10:00:00 2026",
+        termAt: NOW - ORPHAN_TERM_GRACE_SEC + 1,
+      },
+    ],
+  ]);
+  expect(selectOrphans([makeProc()], { termState, now: NOW })).toEqual([]);
+});
+
+test("a recycled pid (start_time differs from the TERM'd one) restarts as TERM", () => {
+  // The stored term state is for a DIFFERENT process (start_time mismatch) — the
+  // recycled pid restarts the ladder at TERM, never an immediate KILL.
+  const termState = new Map<number, OrphanTermState>([
+    [12_345, { startTime: "darwin:OLD", termAt: NOW - 10_000 }],
+  ]);
+  const out = selectOrphans([makeProc()], { termState, now: NOW });
+  expect(out).toHaveLength(1);
+  expect(out[0].phase).toBe("term");
+});
+
+// ---------------------------------------------------------------------------
+// actuateOrphanKill — the raw-pid actuator + TOCTOU re-fingerprint
+// ---------------------------------------------------------------------------
+
+function orphanCandidate(
+  overrides: Partial<{
+    pid: number;
+    startTime: string | null;
+    exe: string | null;
+    phase: "term" | "kill";
+  }> = {},
+) {
+  return {
+    pid: 12_345,
+    startTime: "darwin:Wed Jun 24 10:00:00 2026",
+    exe: "bun test --test-worker",
+    phase: "term" as const,
+    ...overrides,
+  };
+}
+
+test("actuateOrphanKill sends SIGTERM for a term-phase candidate whose fingerprint matches", () => {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const outcome = actuateOrphanKill(orphanCandidate(), {
+    isAlive: () => true,
+    readStartTime: () => "darwin:Wed Jun 24 10:00:00 2026",
+    kill: (pid, signal) => sent.push([pid, signal]),
+  });
+  expect(outcome).toBe("termed");
+  expect(sent).toEqual([[12_345, "SIGTERM"]]);
+});
+
+test("actuateOrphanKill sends SIGKILL for a kill-phase candidate", () => {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const outcome = actuateOrphanKill(orphanCandidate({ phase: "kill" }), {
+    isAlive: () => true,
+    readStartTime: () => "darwin:Wed Jun 24 10:00:00 2026",
+    kill: (pid, signal) => sent.push([pid, signal]),
+  });
+  expect(outcome).toBe("killed");
+  expect(sent).toEqual([[12_345, "SIGKILL"]]);
+});
+
+test("actuateOrphanKill ABORTS (no signal) when the re-fingerprint shows a recycled pid", () => {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const outcome = actuateOrphanKill(orphanCandidate(), {
+    isAlive: () => true,
+    // The live pid's start_time differs — the pid was recycled into a DIFFERENT
+    // process between census and kill. Must NOT signal.
+    readStartTime: () => "darwin:DIFFERENT START",
+    kill: (pid, signal) => sent.push([pid, signal]),
+  });
+  expect(outcome).toBe("skip:recycled");
+  expect(sent).toEqual([]);
+});
+
+test("actuateOrphanKill skips a vanished pid (isAlive false) without signalling", () => {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const outcome = actuateOrphanKill(orphanCandidate(), {
+    isAlive: () => false,
+    readStartTime: () => "darwin:Wed Jun 24 10:00:00 2026",
+    kill: (pid, signal) => sent.push([pid, signal]),
+  });
+  expect(outcome).toBe("skip:gone");
+  expect(sent).toEqual([]);
+});
+
+test("actuateOrphanKill skips when the re-probe start_time read fails", () => {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const outcome = actuateOrphanKill(orphanCandidate(), {
+    isAlive: () => true,
+    readStartTime: () => null,
+    kill: (pid, signal) => sent.push([pid, signal]),
+  });
+  expect(outcome).toBe("skip:probe-failed");
+  expect(sent).toEqual([]);
+});
+
+test("actuateOrphanKill never throws on an ESRCH/EPERM kill error", () => {
+  const outcome = actuateOrphanKill(orphanCandidate(), {
+    isAlive: () => true,
+    readStartTime: () => "darwin:Wed Jun 24 10:00:00 2026",
+    kill: () => {
+      const err = new Error("no such process") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    },
+  });
+  expect(outcome).toBe("skip:ESRCH");
+});
+
+// ---------------------------------------------------------------------------
+// buildKeeperLivePids — keeper's own-tree exclusion set
+// ---------------------------------------------------------------------------
+
+test("buildKeeperLivePids includes self pid + every non-terminal pid; excludes terminal", () => {
+  const jobs: Job[] = [
+    makeJob({ pid: 100, state: "working" }),
+    makeJob({ pid: 200, state: "stopped" }),
+    makeJob({ pid: 300, state: "killed" }),
+    makeJob({ pid: 400, state: "ended" }),
+    makeJob({ pid: null }),
+  ];
+  const live = buildKeeperLivePids(jobs, SELF_PID);
+  expect(live.has(SELF_PID)).toBe(true);
+  expect(live.has(100)).toBe(true);
+  expect(live.has(200)).toBe(true);
+  // Terminal rows excluded so a stale recycled pid never shields a true orphan.
+  expect(live.has(300)).toBe(false);
+  expect(live.has(400)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// parsePsCensusLine — the ps stride parser
+// ---------------------------------------------------------------------------
+
+test("parsePsCensusLine parses a well-formed ps line", () => {
+  // `ps -axww -o pid=,ppid=,uid=,lstart=,args=` → fixed-width 24-char lstart.
+  const line =
+    "12345     1   501 Wed Jun 24 10:00:00 2026 /usr/local/bin/bun test --test-worker x";
+  const parsed = parsePsCensusLine(line);
+  expect(parsed).not.toBeNull();
+  expect(parsed?.pid).toBe(12_345);
+  expect(parsed?.ppid).toBe(1);
+  expect(parsed?.uid).toBe(501);
+  expect(parsed?.startTime).toBe("darwin:Wed Jun 24 10:00:00 2026");
+  expect(parsed?.exe).toBe("/usr/local/bin/bun test --test-worker x");
+});
+
+test("parsePsCensusLine returns null on a malformed line", () => {
+  expect(parsePsCensusLine("")).toBeNull();
+  expect(parsePsCensusLine("garbage")).toBeNull();
+  expect(parsePsCensusLine("PID PPID UID")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// orphanReapCycle — census → select → actuate, with stamp/clear of term state
+// ---------------------------------------------------------------------------
+
+function orphanCycleSeams(
+  overrides: Partial<{
+    now: number;
+    census: ProcCensusEntry[];
+    termState: Map<number, OrphanTermState>;
+    isAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+  }> = {},
+) {
+  const sent: Array<[number, NodeJS.Signals]> = [];
+  const census = overrides.census ?? [makeProc()];
+  const termState = overrides.termState ?? new Map<number, OrphanTermState>();
+  return {
+    sent,
+    termState,
+    seams: {
+      now: overrides.now ?? NOW,
+      selfUid: SELF_UID,
+      selfPid: SELF_PID,
+      exempt: new Set<string>(),
+      termState,
+      enumerate: () => census,
+      isAlive: overrides.isAlive ?? (() => true),
+      readStartTime:
+        overrides.readStartTime ?? (() => "darwin:Wed Jun 24 10:00:00 2026"),
+      kill: (pid: number, signal: NodeJS.Signals) => sent.push([pid, signal]),
+    },
+  };
+}
+
+test("orphanReapCycle TERMs an orphan and stamps the term state", () => {
+  const ctx = orphanCycleSeams();
+  orphanReapCycle([], ctx.seams);
+  expect(ctx.sent).toEqual([[12_345, "SIGTERM"]]);
+  expect(ctx.termState.get(12_345)).toEqual({
+    startTime: "darwin:Wed Jun 24 10:00:00 2026",
+    termAt: NOW,
+  });
+});
+
+test("orphanReapCycle KILLs a still-alive previously-TERM'd orphan and clears the term state", () => {
+  const termState = new Map<number, OrphanTermState>([
+    [
+      12_345,
+      {
+        startTime: "darwin:Wed Jun 24 10:00:00 2026",
+        termAt: NOW - ORPHAN_TERM_GRACE_SEC,
+      },
+    ],
+  ]);
+  const ctx = orphanCycleSeams({ termState });
+  orphanReapCycle([], ctx.seams);
+  expect(ctx.sent).toEqual([[12_345, "SIGKILL"]]);
+  // Cleared so a recycled pid restarts the ladder rather than re-killing.
+  expect(ctx.termState.has(12_345)).toBe(false);
+});
+
+test("orphanReapCycle never kills a pid in keeper's live jobs set", () => {
+  // A jobs row carrying the orphan's pid as a LIVE worker shields it entirely.
+  const ctx = orphanCycleSeams();
+  orphanReapCycle([makeJob({ pid: 12_345, state: "working" })], ctx.seams);
+  expect(ctx.sent).toEqual([]);
+});
+
+test("orphanReapCycle does NOT throw on an empty census", () => {
+  const ctx = orphanCycleSeams({ census: [] });
+  expect(() => orphanReapCycle([], ctx.seams)).not.toThrow();
+  expect(ctx.sent).toEqual([]);
 });

@@ -53,7 +53,8 @@ import {
   type TmuxPaneOps,
 } from "./exec-backend";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
-import type { runQuery } from "./server-worker";
+import { readOsStartTime } from "./seed-sweep";
+import { isPidAlive, type runQuery } from "./server-worker";
 import type { Job } from "./types";
 import { watchLoop } from "./wake-worker";
 
@@ -84,6 +85,14 @@ export interface ReaperWorkerData {
    * autopilot session rides the verdict-gated arm.
    */
   disableAutoclose?: string[];
+  /**
+   * Operator opt-out for the ORPHAN-process arm (epic fn-934): a list of
+   * exe-signature SUBSTRINGS to exempt from reaping. An entry that matches a
+   * candidate's resolved exe-path vetoes its candidacy. Threaded from
+   * `resolveConfig().disableOrphanReap`. Default empty (every allow-listed
+   * runaway class is reapable). Mirrors {@link disableAutoclose}'s shape.
+   */
+  disableOrphanReap?: string[];
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -309,6 +318,443 @@ export function selectManagedSessionReapCandidates(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Orphan-process reap arm (epic fn-934) — the THIRD, raw-process arm
+// ---------------------------------------------------------------------------
+//
+// Unlike the two tmux-window arms above (which read `jobs` rows and kill via
+// `killWindow`), this arm reaps RAW OS PROCESSES that agent test activity left
+// running on the shared host: orphaned `bun test` worker trees, infinite-loop
+// shell harnesses, leaked `flock_peer` fixtures. The incident: ~28 orphaned
+// `while :; do :; done` harnesses + 2 leaked fixtures pegged the host to load
+// ~188 on 10 cores and starved keeperd to 0.9% CPU.
+//
+// Killing the WRONG process is catastrophic, so the kill GATE is a CLOSED
+// CONJUNCTION (every clause load-bearing, none optional):
+//   uid == self                     — never another user's process
+//   AND proc-info read succeeded     — a partial/failed read is can't-confirm
+//   AND ppid == 1                    — a reparented orphan (its parent is gone)
+//   AND exe_path matches the CLOSED  — match the EXE PATH, never the spoofable,
+//       allow-list (minus exemptions)  16-char-truncated process NAME
+//   AND age > minAge                 — launch-race guard (several minutes)
+//   AND pid ∉ keeper's live set      — never keeperd or a live plan worker
+//
+// It NEVER throws — every probe/kill failure is a logged non-fatal skip (a
+// throw would crash the worker via onerror→fatalExit). Escalation is two-phase
+// WITHOUT a blocking in-cycle sleep: a first match sends SIGTERM and stamps an
+// in-memory `(pid,start_time)` cooldown; the NEXT tick that still sees the SAME
+// `(pid,start_time)` alive escalates to SIGKILL.
+
+/**
+ * Minimum age (unix SECONDS) before an orphan is reapable. A launch-race guard:
+ * a just-spawned test worker can momentarily read `ppid == 1` during the parent
+ * handoff, and a legitimate short-lived process must be allowed to finish on its
+ * own. Several minutes — orphaned runaways live indefinitely, so the bar costs
+ * nothing against a true runaway while excluding every transient.
+ */
+export const ORPHAN_MIN_AGE_SEC = 5 * 60;
+
+/**
+ * Two-phase escalation grace (unix SECONDS): after a SIGTERM the SAME
+ * `(pid,start_time)` must still be alive on a LATER tick before SIGKILL. The
+ * tick re-derives the census every cycle, so this is simply "seen alive on a
+ * subsequent tick" — no in-cycle blocking sleep. Tighter than the kill cooldown
+ * because a runaway ignoring SIGTERM should escalate within a couple of ticks.
+ */
+export const ORPHAN_TERM_GRACE_SEC = 5;
+
+/**
+ * The CLOSED allow-list of exe-path signatures a process must match to be an
+ * orphan-reap candidate. Matched as a SUBSTRING of the resolved exe path (and
+ * its argv when the runtime is a generic interpreter), never the truncated
+ * process name. Deliberately narrow — only the known agent-test runaway classes
+ * the fn-934 incident identified. A signature is an EXE-PATH fragment, so a
+ * human's editor/shell/long build never matches.
+ *
+ *  - `bun test`-spawned worker trees orphaned when their parent `bun test` died
+ *    (`--test-worker` / the bun test runner exe).
+ *  - the leak-prone `flock_peer.ts` test fixture (fn-934 T3 self-terminates it,
+ *    but a pre-fix leaked instance still needs reaping).
+ *  - infinite-loop shell harnesses (`while :; do :; done`) — matched on the
+ *    busy-loop argv signature, the de-flake-work runaway class.
+ */
+export const ORPHAN_EXE_SIGNATURES: readonly string[] = [
+  "bun test",
+  "--test-worker",
+  "flock_peer",
+  "while :; do :; done",
+  "while true; do :; done",
+];
+
+/**
+ * One process row of a synthetic-or-real census. The selector reads ONLY these
+ * fields; tests build them directly (no real `ps`). `exe` is the resolved
+ * executable path PLUS argv (joined) so an argv-only runaway signature (the
+ * busy-loop shell) is matchable — we match a SUBSTRING, never the name.
+ */
+export interface ProcCensusEntry {
+  pid: number;
+  /** Opaque platform-tagged start instant, same shape as `jobs.start_time`. */
+  startTime: string | null;
+  ppid: number;
+  uid: number;
+  /** Resolved exe path + argv, joined. Matched as a substring of the allow-list. */
+  exe: string | null;
+  /** Process age in seconds at census time. */
+  ageSec: number;
+}
+
+/**
+ * One orphan reap the selector emits. Carries the re-fingerprint identity
+ * (`pid` + `startTime`) and the escalation `phase` the actuator acts on. `exe`
+ * rides along for the audit line.
+ */
+export interface OrphanCandidate {
+  pid: number;
+  startTime: string | null;
+  exe: string | null;
+  /** `term` → SIGTERM (first sighting); `kill` → SIGKILL (still alive next tick). */
+  phase: "term" | "kill";
+}
+
+/**
+ * Per-pid escalation state: the `(pid,start_time)` we sent SIGTERM to and when.
+ * In-memory only — a daemon restart re-derives and re-sends SIGTERM once
+ * (idempotent: ESRCH on an already-gone pid is a non-fatal skip).
+ */
+export interface OrphanTermState {
+  startTime: string | null;
+  termAt: number;
+}
+
+/**
+ * Does `entry.exe` match the closed allow-list (minus operator exemptions)?
+ * Substring match on the resolved exe-path-plus-argv — NEVER the spoofable,
+ * 16-char-truncated process name. An exemption in `exempt` (a
+ * `disableOrphanReap` signature) that the entry matches vetoes the candidacy.
+ */
+function matchesOrphanSignature(
+  exe: string | null,
+  exempt: ReadonlySet<string>,
+): boolean {
+  if (exe == null || exe === "") {
+    return false;
+  }
+  for (const sig of exempt) {
+    if (sig !== "" && exe.includes(sig)) {
+      return false;
+    }
+  }
+  return ORPHAN_EXE_SIGNATURES.some((sig) => exe.includes(sig));
+}
+
+/**
+ * The PURE orphan-reap predicate over a process census at a fixed `now` (unix
+ * seconds). Drivable in tests with a synthetic census + injected seams — no real
+ * `ps`, no DB. Returns candidates in ascending pid order for a deterministic
+ * fire order and stable assertions.
+ *
+ * A census entry is a candidate iff ALL hold (the closed conjunction):
+ *  - `uid === selfUid` — only this user's processes (a recycled pid owned by
+ *    another user is never killed — an LPE vector).
+ *  - the proc-info read SUCCEEDED — a NULL `exe`/`startTime` signals a partial or
+ *    failed `proc_pidinfo` (another user's process, or the pid vanished), which
+ *    is can't-confirm → don't-kill.
+ *  - `ppid === 1` — a reparented orphan (its real parent is gone). A live-parented
+ *    test run keeps its parent and is excluded.
+ *  - `exe` matches {@link ORPHAN_EXE_SIGNATURES} minus `exempt` (an exe-PATH
+ *    substring, never the truncated NAME).
+ *  - `ageSec > minAge` — the launch-race guard.
+ *  - `pid ∉ keeperLivePids` — never keeperd's own pid nor a live plan worker
+ *    (the read-only `jobs` live-pid set, plus keeperd's own pid).
+ *
+ * Phase: a pid NOT in `termState` (or whose stored `(pid,start_time)` differs —
+ * a recycled pid) gets `phase: "term"`. A pid already SIGTERM'd as the SAME
+ * `(pid,start_time)`, with `now - termAt >= ORPHAN_TERM_GRACE_SEC`, escalates to
+ * `phase: "kill"`; still inside the grace, it is suppressed (no re-TERM churn).
+ */
+export function selectOrphanedProcessCandidates(
+  census: Iterable<ProcCensusEntry>,
+  opts: {
+    now: number;
+    selfUid: number;
+    keeperLivePids: ReadonlySet<number>;
+    exempt: ReadonlySet<string>;
+    termState: Map<number, OrphanTermState>;
+    minAge?: number;
+    termGrace?: number;
+  },
+): OrphanCandidate[] {
+  const minAge = opts.minAge ?? ORPHAN_MIN_AGE_SEC;
+  const termGrace = opts.termGrace ?? ORPHAN_TERM_GRACE_SEC;
+  const out: OrphanCandidate[] = [];
+  for (const entry of census) {
+    if (entry.uid !== opts.selfUid) {
+      continue;
+    }
+    // A partial/failed proc-info read folds to NULL exe + NULL start_time. We
+    // CANNOT confirm identity, so we never kill — `proc_pidinfo` 0/partial for
+    // another user is can't-confirm-don't-kill (best-practice).
+    if (entry.exe == null || entry.startTime == null) {
+      continue;
+    }
+    if (entry.ppid !== 1) {
+      continue;
+    }
+    if (!matchesOrphanSignature(entry.exe, opts.exempt)) {
+      continue;
+    }
+    if (entry.ageSec <= minAge) {
+      continue;
+    }
+    if (opts.keeperLivePids.has(entry.pid)) {
+      continue;
+    }
+    // Two-phase escalation. A first sighting (or a recycled pid whose stored
+    // start_time no longer matches) is a SIGTERM; the same `(pid,start_time)`
+    // still alive a grace later escalates to SIGKILL.
+    const prior = opts.termState.get(entry.pid);
+    if (prior === undefined || prior.startTime !== entry.startTime) {
+      out.push({
+        pid: entry.pid,
+        startTime: entry.startTime,
+        exe: entry.exe,
+        phase: "term",
+      });
+      continue;
+    }
+    if (opts.now - prior.termAt < termGrace) {
+      // Inside the grace — suppress so we don't re-TERM every tick.
+      continue;
+    }
+    out.push({
+      pid: entry.pid,
+      startTime: entry.startTime,
+      exe: entry.exe,
+      phase: "kill",
+    });
+  }
+  out.sort((a, b) => a.pid - b.pid);
+  return out;
+}
+
+/**
+ * Enumerate the host's process census via one bounded `ps` spawn. macOS + Linux:
+ * `ps -ax -o pid=,ppid=,uid=,lstart=,comm=,args=` — the same `ps` precedent the
+ * bus-worker (`ps -o ppid=`) and seed-sweep (`ps -p … -o lstart=`) already use.
+ * Returns `[]` on any failure (ps unavailable, timeout, parse miss) — an empty
+ * census reaps nothing, the conservative default. NEVER throws.
+ *
+ * `startTime` is re-read per-candidate by {@link readOsStartTime} at the
+ * actuator's TOCTOU re-check (the verbatim `darwin:`/`linux:` format the recycle
+ * compare needs); the census `startTime` here is the same format via the shared
+ * `lstart` column on darwin, and a coarse age proxy on linux — but the actuator's
+ * re-fingerprint is the authoritative pid-reuse guard, not this census field.
+ */
+export function enumerateProcessCensus(): ProcCensusEntry[] {
+  try {
+    // lstart is fixed-width 24 chars; comm trails before args so the columns are
+    // parseable. We request args last (un-truncated by the implicit -ww on the
+    // long format) so the busy-loop argv signature is matchable.
+    const res = Bun.spawnSync(
+      ["ps", "-axww", "-o", "pid=,ppid=,uid=,lstart=,args="],
+      { stdout: "pipe", stderr: "ignore", timeout: 4000 },
+    );
+    if (!res.success) {
+      return [];
+    }
+    const text = res.stdout.toString();
+    const out: ProcCensusEntry[] = [];
+    for (const line of text.split("\n")) {
+      const parsed = parsePsCensusLine(line);
+      if (parsed === null) {
+        continue;
+      }
+      // Age proxy from the parsed lstart epoch; null start → unknown age (0, so
+      // the min-age gate excludes it as can't-confirm). The authoritative
+      // re-fingerprint at the actuator uses readOsStartTime, not this.
+      out.push(parsed);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parse one `ps -axww -o pid=,ppid=,uid=,lstart=,args=` line into a census entry.
+ * `lstart` is a fixed-width 24-char date (`Wed Jun 24 10:11:12 2026`); the args
+ * remainder is the full argv. Returns null on any malformed line so a parse miss
+ * is a skipped row, never a throw. Exported for unit reach.
+ */
+export function parsePsCensusLine(line: string): ProcCensusEntry | null {
+  const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.{24})\s(.*)$/);
+  if (m === null) {
+    return null;
+  }
+  const pid = Number.parseInt(m[1], 10);
+  const ppid = Number.parseInt(m[2], 10);
+  const uid = Number.parseInt(m[3], 10);
+  const lstart = m[4].trim();
+  const args = m[5];
+  if (
+    !Number.isInteger(pid) ||
+    !Number.isInteger(ppid) ||
+    !Number.isInteger(uid)
+  ) {
+    return null;
+  }
+  const startMs = Date.parse(lstart);
+  const ageSec = Number.isNaN(startMs)
+    ? 0
+    : Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  return {
+    pid,
+    ppid,
+    uid,
+    startTime: Number.isNaN(startMs) ? null : `darwin:${lstart}`,
+    exe: args,
+    ageSec,
+  };
+}
+
+/**
+ * The NET-NEW raw-pid actuator — `process.kill`, distinct from the tmux
+ * `killWindow` actuator the two job-arms use. Re-fingerprints `(pid,start_time)`
+ * immediately BEFORE the signal (the CWE-367 TOCTOU pid-reuse guard): if the
+ * live pid's OS start_time no longer matches the candidate's, the pid was
+ * recycled into a DIFFERENT process between census and kill — abort. NEVER
+ * throws: ESRCH (already gone) / EPERM (raced into another owner) are non-fatal
+ * logged skips. Returns the outcome string for the audit line.
+ *
+ * Injected `isAlive` / `readStartTime` / `kill` seams mirror `reprobeLoop`'s
+ * shape so the actuator is unit-testable without real signals.
+ */
+export function actuateOrphanKill(
+  candidate: OrphanCandidate,
+  seams: {
+    isAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+    kill: (pid: number, signal: NodeJS.Signals) => void;
+  },
+): string {
+  try {
+    if (!seams.isAlive(candidate.pid)) {
+      return "skip:gone";
+    }
+    // Re-fingerprint at the TOCTOU pre-kill re-check: a recycled pid carrying a
+    // different process must NOT be signalled.
+    const liveStart = seams.readStartTime(candidate.pid);
+    if (liveStart == null) {
+      return "skip:probe-failed";
+    }
+    if (liveStart !== candidate.startTime) {
+      return "skip:recycled";
+    }
+    const signal: NodeJS.Signals =
+      candidate.phase === "kill" ? "SIGKILL" : "SIGTERM";
+    seams.kill(candidate.pid, signal);
+    return candidate.phase === "kill" ? "killed" : "termed";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ESRCH (gone) / EPERM (raced into another owner) are expected — non-fatal.
+    return `skip:${code ?? "error"}`;
+  }
+}
+
+/**
+ * Build keeper's LIVE pid set from a jobs snapshot — every non-null `pid` on a
+ * non-terminal row, PLUS keeperd's own pid. The orphan arm subtracts this set so
+ * it can never kill keeper's own tree (the daemon or a live plan worker). A
+ * terminal row (killed/ended) is excluded so a stale row's recycled pid never
+ * shields a true orphan.
+ */
+export function buildKeeperLivePids(
+  jobs: Iterable<Job>,
+  selfPid: number,
+): Set<number> {
+  const live = new Set<number>([selfPid]);
+  for (const job of jobs) {
+    if (job.pid == null) {
+      continue;
+    }
+    if (job.state === "killed" || job.state === "ended") {
+      continue;
+    }
+    live.add(job.pid);
+  }
+  return live;
+}
+
+/**
+ * Run the orphan-reap arm for one cycle: enumerate the census, select candidates
+ * against keeper's live-pid set + the closed conjunction, and actuate each via
+ * the raw-pid two-phase actuator. Stamps the per-pid SIGTERM state on a `term`
+ * attempt; clears it on a `kill` so a re-appeared (recycled) pid restarts the
+ * two-phase ladder. NEVER throws — a census or actuator failure is a logged skip.
+ *
+ * Separated from {@link reaperCycle} (the tmux-window arms): this arm kills raw
+ * pids, not tmux windows, and carries its own re-fingerprint TOCTOU + escalation
+ * state. Both are driven from the same worker cycle.
+ */
+export function orphanReapCycle(
+  jobs: Iterable<Job>,
+  seams: {
+    now: number;
+    selfUid: number;
+    selfPid: number;
+    exempt: ReadonlySet<string>;
+    termState: Map<number, OrphanTermState>;
+    enumerate: (now: number) => ProcCensusEntry[];
+    isAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+    kill: (pid: number, signal: NodeJS.Signals) => void;
+  },
+): void {
+  let census: ProcCensusEntry[];
+  try {
+    census = seams.enumerate(seams.now);
+  } catch (err) {
+    console.error(
+      `[reaper-worker] orphan census failed (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  const keeperLivePids = buildKeeperLivePids(jobs, seams.selfPid);
+  const candidates = selectOrphanedProcessCandidates(census, {
+    now: seams.now,
+    selfUid: seams.selfUid,
+    keeperLivePids,
+    exempt: seams.exempt,
+    termState: seams.termState,
+  });
+  for (const c of candidates) {
+    const outcome = actuateOrphanKill(c, {
+      isAlive: seams.isAlive,
+      readStartTime: seams.readStartTime,
+      kill: seams.kill,
+    });
+    // Stamp / clear the escalation state. A successful SIGTERM stamps the
+    // `(pid,start_time)` so the next tick can escalate; a SIGKILL clears it so a
+    // recycled pid (different start_time) restarts the ladder rather than
+    // immediately re-killing.
+    if (c.phase === "term" && outcome === "termed") {
+      seams.termState.set(c.pid, {
+        startTime: c.startTime,
+        termAt: seams.now,
+      });
+    } else if (c.phase === "kill") {
+      seams.termState.delete(c.pid);
+    }
+    // The one trace the orphan arm leaves: a single audit line per attempt.
+    console.error(
+      `[reaper-worker] reap arm=orphan pid=${c.pid} exe=${c.exe} phase=${c.phase} outcome=${outcome}`,
+    );
+  }
+}
+
 /**
  * Load a fresh snapshot, run readiness at `now` (unix seconds), and select the
  * reap candidates from BOTH arms (autopilot verdict + managed-session idle). The
@@ -462,6 +908,33 @@ function main(): void {
   // connection. The cycle's pre-kill re-check re-runs it against a fresh read.
   const select: ReapSelector = (n, cd) =>
     selectFromDb(db, n, cd, disableAutoclose);
+
+  // Orphan-arm state (epic fn-934). The exempt set is the operator opt-out
+  // (frozen for the worker's lifetime, same as disableAutoclose). The termState
+  // map holds the per-pid two-phase escalation (in-memory only). selfUid/selfPid
+  // anchor the uid-self gate + keeper's own-pid exclusion.
+  const orphanExempt: ReadonlySet<string> = new Set(
+    data.disableOrphanReap ?? [],
+  );
+  const orphanTermState = new Map<number, OrphanTermState>();
+  const selfUid = process.getuid?.() ?? -1;
+  const selfPid = process.pid;
+  // A cheap read-only jobs read for the orphan arm's keeper-live-pid exclusion —
+  // just pid + state, not the full reconcile snapshot. A slightly-stale read is
+  // safe: the live-pid set only grows the exclusion (more safety), and the
+  // actuator's `(pid,start_time)` re-fingerprint is the authoritative guard.
+  const liveJobsQuery = db.query(
+    `SELECT pid, state FROM jobs WHERE pid IS NOT NULL`,
+  );
+  const loadLiveJobs = (): Job[] => {
+    try {
+      return liveJobsQuery.all() as Job[];
+    } catch (err) {
+      console.error("[reaper-worker] orphan live-jobs read failed:", err);
+      return [];
+    }
+  };
+
   let shutdown = false;
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
@@ -499,6 +972,22 @@ function main(): void {
           return;
         }
         await reaperCycle(select, backend, cooldown, now);
+        // The orphan-process arm (epic fn-934): raw-pid reaper, distinct from
+        // the tmux-window arms above. It enumerates the host census, excludes
+        // keeper's own live tree, and two-phase-escalates SIGTERM→SIGKILL. It
+        // never throws — its own internal try/catch isolates census/actuator
+        // failures as logged skips.
+        orphanReapCycle(loadLiveJobs(), {
+          now: now(),
+          selfUid,
+          selfPid,
+          exempt: orphanExempt,
+          termState: orphanTermState,
+          enumerate: () => enumerateProcessCensus(),
+          isAlive: isPidAlive,
+          readStartTime: readOsStartTime,
+          kill: (pid, signal) => process.kill(pid, signal),
+        });
       } while (wakePending && !shutdown);
     } catch (err) {
       console.error(

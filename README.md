@@ -441,6 +441,12 @@ Keeper has no `install` verb. Wire it up manually:
      Default EMPTY (every managed session autocloses past the idle grace); a
      non-string/empty entry is dropped. Does NOT touch the `autopilot` session
      (its reap is verdict-gated, not idle-gated).
+   - `disable_orphan_reap` — a list of exe-signature SUBSTRINGS the reaper's
+     ORPHAN-process arm (epic fn-934) leaves ALIVE instead of reaping — the
+     operator opt-out for the raw-process arm. An entry that matches a
+     candidate's resolved exe-path vetoes its reaping. Default EMPTY (every
+     allow-listed runaway class is reapable); a non-string/empty entry is
+     dropped.
    - `usage_scraper_uv_path` / `usage_scraper_project_dir` — the runtime for the
      usage-scraper PRODUCER worker (the in-keeper agentusage producer). The first
      is an absolute path to the `uv` binary (e.g. `/opt/homebrew/bin/uv`); the
@@ -470,6 +476,7 @@ Keeper has no `install` verb. Wire it up manually:
    # keeper_agent_path: ~/code/keeper/cli/keeper.ts   # launcher re-exec entry
    max_concurrent_jobs: 3
    # disable_autoclose: [pair]   # leave these managed sessions' windows open
+   # disable_orphan_reap: [flock_peer]   # exempt these exe-signatures from the orphan reaper
    # usage_scraper_uv_path: /opt/homebrew/bin/uv      # absolute uv binary
    # usage_scraper_project_dir: ~/code/agentusage     # the scrape util's project
    YAML
@@ -3159,6 +3166,26 @@ re-spawn tmux every cycle. It writes NOTHING to the DB and posts NOTHING to main
 never assumed to have sufficed. The cooldown is in-memory only, so a restart
 re-derives and re-kills once (an idempotent no-op against a closed window). One
 stderr audit line per attempt is the only trace it leaves.
+
+The same worker carries a THIRD arm (epic fn-934) that reaps RAW OS PROCESSES —
+not tmux windows — that agent test activity orphaned on the shared host
+(orphaned `bun test` worker trees, infinite-loop shell harnesses, leaked
+`flock_peer` fixtures; the incident pegged a 10-core host to load ~188 and
+starved keeperd to 0.9% CPU). Because killing the wrong process is catastrophic,
+the kill GATE is a CLOSED CONJUNCTION (every clause load-bearing): `uid == self`
+AND the proc-info read SUCCEEDED (a partial/failed read is can't-confirm) AND
+`ppid == 1` (a reparented orphan) AND the resolved EXE PATH (never the spoofable,
+16-char-truncated process NAME) matches a CLOSED allow-list minus the
+`disable_orphan_reap` exemptions AND age > several-minutes (the launch-race
+guard) AND the pid is NOT in keeper's own live set (keeperd's pid + every
+non-terminal `jobs` pid). It kills via a NET-NEW raw-pid actuator
+(`process.kill`, distinct from `killWindow`), re-fingerprinting `(pid,start_time)`
+immediately before the signal (the CWE-367 pid-reuse guard — a recycled pid
+aborts). Escalation is two-phase WITHOUT a blocking in-cycle sleep: a first match
+SIGTERMs and stamps an in-memory `(pid,start_time)` cooldown; the NEXT tick that
+still sees the SAME `(pid,start_time)` alive SIGKILLs. The arm NEVER throws (every
+probe/kill failure is a logged non-fatal skip — a throw would crash the worker)
+and emits an `arm=orphan` audit line per attempt.
 
 A **thirteenth** Worker thread is the Agent Bus relay (epic fn-875): a local
 inter-agent message bus that is PHYSICALLY OUT of keeper.db's blast radius. It

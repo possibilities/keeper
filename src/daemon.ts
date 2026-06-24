@@ -4123,11 +4123,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // (epic fn-920) reads its `disable_autoclose` opt-out from the resolved config
   // and threads it through workerData (frozen for the worker's lifetime; a
   // config change takes effect on the next bounce, same as the other tunables).
+  // The orphan-process arm (epic fn-934) reads its `disable_orphan_reap` opt-out
+  // the same way.
+  const reaperConfig = resolveConfig();
   const reaperWorker = want("reaper")
     ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
         workerData: {
           dbPath,
-          disableAutoclose: resolveConfig().disableAutoclose,
+          disableAutoclose: reaperConfig.disableAutoclose,
+          disableOrphanReap: reaperConfig.disableOrphanReap,
         } satisfies ReaperWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;

@@ -163,6 +163,11 @@ export interface KeeperConfig {
   // Folded from the `disable_autoclose` YAML list; non-string/empty entries are
   // dropped. NOT the autopilot session (that arm is verdict-gated, never here).
   disableAutoclose: string[];
+  // Exe-signature SUBSTRINGS the reaper's ORPHAN-process arm (epic fn-934) leaves
+  // ALIVE instead of reaping — the operator opt-out for the raw-process arm.
+  // Folded from the `disable_orphan_reap` YAML list; non-string/empty entries are
+  // dropped. Default EMPTY (every allow-listed runaway class is reapable).
+  disableOrphanReap: string[];
   // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
@@ -211,6 +216,7 @@ export function resolveConfig(): KeeperConfig {
   let keeperAgentPath: string | undefined;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let disableAutoclose: string[] = [];
+  let disableOrphanReap: string[] = [];
   let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
@@ -220,6 +226,7 @@ export function resolveConfig(): KeeperConfig {
         agentusageRoot,
         maxConcurrentJobs,
         disableAutoclose,
+        disableOrphanReap,
         accountAliases,
       };
     }
@@ -302,6 +309,17 @@ export function resolveConfig(): KeeperConfig {
           .map((s) => s.trim())
           .filter((s) => s !== "");
       }
+      // Best-effort string list — keep only non-empty trimmed strings; a
+      // non-array/absent value leaves the default (empty → reap every
+      // allow-listed orphan-runaway class).
+      const dor = (raw as { disable_orphan_reap?: unknown })
+        .disable_orphan_reap;
+      if (Array.isArray(dor)) {
+        disableOrphanReap = dor
+          .filter((s): s is string => typeof s === "string")
+          .map((s) => s.trim())
+          .filter((s) => s !== "");
+      }
       // Keep only string→non-empty-string entries; drop the rest.
       const aliases = (raw as { account_aliases?: unknown }).account_aliases;
       if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
@@ -325,6 +343,7 @@ export function resolveConfig(): KeeperConfig {
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
       disableAutoclose: [],
+      disableOrphanReap: [],
       accountAliases: {},
     };
   }
@@ -340,6 +359,7 @@ export function resolveConfig(): KeeperConfig {
     keeperAgentPath,
     maxConcurrentJobs,
     disableAutoclose,
+    disableOrphanReap,
     accountAliases,
   };
 }
