@@ -60,6 +60,7 @@ import {
 import { runTaskSetTargetRepo } from "./verbs/task_set_target_repo.ts";
 import { runTaskSetTier } from "./verbs/task_set_tier.ts";
 import { runTasks } from "./verbs/tasks.ts";
+import { runUnblock } from "./verbs/unblock.ts";
 import { runValidate } from "./verbs/validate.ts";
 import { runVerdictSubmit } from "./verbs/verdict_submit.ts";
 import { runWorkerResume } from "./verbs/worker_resume.ts";
@@ -214,6 +215,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "tasks",
     shortHelp: "List tasks with optional filtering.",
+    implemented: true,
+  },
+  {
+    name: "unblock",
+    shortHelp: "Flip a blocked task back to todo.",
     implemented: true,
   },
   {
@@ -842,6 +848,12 @@ function dispatch(parsed: ParsedArgs): number {
         taskId: readPositional(rest),
         reason: readOption(rest, "--reason"),
         reasonFile: readOption(rest, "--reason-file"),
+        format,
+      });
+      break;
+    case "unblock":
+      runUnblock({
+        taskId: readPositional(rest),
         format,
       });
       break;
