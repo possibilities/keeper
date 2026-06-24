@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T17:20:57.335000Z",
+  "depends_on": [],
+  "epic": "fn-938-strip-agent-bus-chat-broadcast",
+  "id": "fn-938-strip-agent-bus-chat-broadcast.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Strip broadcast from bus and advice",
+  "updated_at": "2026-06-24T17:20:57.335000Z"
+}
