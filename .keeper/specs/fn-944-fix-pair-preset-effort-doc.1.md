@@ -23,5 +23,5 @@ effort field rides through the launcher.
 - [ ] The corrected text matches the actual launcher behavior at src/agent/main.ts:1314-1330
 
 ## Done summary
-
+Corrected SKILL.md:118 to state a claude preset's effort is honored (pushed by the launcher), not dropped; left the explicit --effort + --cli claude arg-fault claims at lines 121 and 157 unchanged.
 ## Evidence
