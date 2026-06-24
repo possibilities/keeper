@@ -527,6 +527,25 @@ Keeper has no `install` verb. Wire it up manually:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
    ```
 
+   **Scheduling priority.** The plist runs keeperd at `ProcessType=Standard`
+   with `Nice=-5`, NOT the throttled `Background` class. keeperd is the most
+   latency-sensitive process on the host — it folds every hook event in real
+   time — so it must keep scheduling priority under host CPU contention rather
+   than starving first. (`Interactive` is deliberately avoided: it removes all
+   throttling and can starve the human's foreground work.) `ProcessType` is read
+   at SPAWN, and `Nice` is read from the plist REGISTRATION, so after editing
+   re-register the service with a bootout + bootstrap cycle (a
+   `launchctl kickstart -k` alone re-spawns the process but keeps the cached
+   registration, so a newly-added `Nice` does not take):
+
+   ```sh
+   launchctl bootout gui/$(id -u)/arthack.keeperd
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
+   ```
+
+   Then confirm with `ps -o pid,nice,comm -p <keeperd-pid>` that keeperd is
+   running at nice `-5`.
+
    **The daemon does the schema work, but the hook no longer needs it to be
    booted to capture events.** Since fn-736 the hook does NOT open SQLite at
    all — it appends a per-pid NDJSON line under the events-log dir

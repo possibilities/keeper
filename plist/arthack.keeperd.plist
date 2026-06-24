@@ -69,8 +69,21 @@
 		<key>ThrottleInterval</key>
 		<integer>10</integer>
 	</dict>
+	<!--
+	  keeperd is the most latency-sensitive process on the host — it must fold
+	  every hook event in real time — so it MUST NOT run in the throttled
+	  Background QoS class, which starves it FIRST under host CPU contention.
+	  Standard + Nice=-5 gives it scheduling priority without the all-throttling-
+	  removed Interactive class (which can starve the human's foreground work).
+	  launchd honors a negative Nice for its agents. ProcessType is read at SPAWN,
+	  so after editing this re-read it via:
+	    launchctl kickstart -k gui/$UID/arthack.keeperd
+	  and confirm `ps -o pid,nice,comm -p <keeperd-pid>` shows nice -5.
+	-->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
+	<key>Nice</key>
+	<integer>-5</integer>
 	<key>WorkingDirectory</key>
 	<string>/Users/mike/code/keeper</string>
 	<key>StandardOutPath</key>
