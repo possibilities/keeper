@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-24T02:17:47.812000Z",
+  "created_by_close_of": "fn-921-harden-keeperd-daemon-stability",
+  "depends_on_epics": [
+    "fn-921-harden-keeperd-daemon-stability"
+  ],
+  "id": "fn-925-fix-stale-git-worker-fast-path-label",
+  "last_validated_at": "2026-06-24T02:17:47.928000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Fix stale git-worker fast-path label",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-24T02:17:47.812000Z"
+}

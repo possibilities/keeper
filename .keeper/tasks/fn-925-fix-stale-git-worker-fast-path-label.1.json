@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T02:17:47.812000Z",
+  "depends_on": [],
+  "epic": "fn-925-fix-stale-git-worker-fast-path-label",
+  "id": "fn-925-fix-stale-git-worker-fast-path-label.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Correct missed-wake fast-path label",
+  "updated_at": "2026-06-24T02:17:47.812000Z"
+}
