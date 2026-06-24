@@ -62,5 +62,5 @@ the no-throw failure path. A daemon-boot test asserts the new worker is in
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Ported agentusage's retired daemon.py producer into src/usage-scraper-worker.ts: N concurrent per-account scrape loops (jitter, idle/cooldown gates, profile-gate, per-target mutex) writing <id>.json/.error.json/events.jsonl envelopes via .3's ScrapeRunner, with tier/multiplier + account discovery + lift_at moved TS-side (keep-prior-multiplier, restart-cheap next_fetch_at, no-throw failure cycle). Wired a config-gated usageScraper worker into daemon.ts (in ALL_WORKERS + spawnedWorkers, NOT WATCHER_WORKERS).
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "usage-scraper-worker + daemon wiring",
-  "updated_at": "2026-06-24T14:14:51.342000Z"
+  "updated_at": "2026-06-24T15:55:35.387000Z",
+  "worker_done_at": "2026-06-24T15:55:35.387000Z"
 }
