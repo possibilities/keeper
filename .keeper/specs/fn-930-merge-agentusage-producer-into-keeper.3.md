@@ -56,5 +56,5 @@ test:full` + `bun run test:hygiene`.
 - [ ] a `*.slow.test.ts` proves the keeper→`uv`→util→JSON round-trip with non-empty stdout (Bun#24690 verified on 1.3.14); allowlisted + fast-tier-ignored; `test:hygiene` green
 
 ## Done summary
-
+Built the keeper→uv→agentusage scrape seam: ScrapeRunner with concurrent stdout drain + SIGKILL timeout + discriminated JSON validation, db config keys + no-default gate resolver for the absolute uv path/project dir, KEEPER_AGENTUSAGE_ROOT test-isolation override, and a slow test proving the real uv round-trip (incl. the in-Worker Bun#24690 hazard does NOT reproduce on Bun 1.3.14).
 ## Evidence

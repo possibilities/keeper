@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "scrape runtime resolver + test-isolation seam (proof)",
-  "updated_at": "2026-06-24T14:14:51.342000Z"
+  "updated_at": "2026-06-24T15:44:27.835000Z",
+  "worker_done_at": "2026-06-24T15:44:27.835000Z"
 }
