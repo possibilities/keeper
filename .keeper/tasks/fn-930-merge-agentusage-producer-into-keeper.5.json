@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T14:14:51.342000Z",
+  "depends_on": [
+    "fn-930-merge-agentusage-producer-into-keeper.4"
+  ],
+  "epic": "fn-930-merge-agentusage-producer-into-keeper",
+  "id": "fn-930-merge-agentusage-producer-into-keeper.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "tests, soak/cutover, docs",
+  "updated_at": "2026-06-24T14:14:51.342000Z"
+}
