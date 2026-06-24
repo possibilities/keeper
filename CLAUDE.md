@@ -88,6 +88,26 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   reads stays inline in `events.data` forever (the keep-set IS the complement of
   the shed allow-list — `keeper plan` Bash, legacy Agent, PreToolUse:Agent, snapshot /
   session / prompt folds, …), so the projection re-fold stays byte-identical.
+  fn-934 (.5) added a SECOND, MUCH NARROWER reclaim — PHYSICAL ROW DELETE
+  (`deleteNoopSnapshotRows`, `NOOP_SNAPSHOT_DELETE_PREDICATE`): the body-NULL pass
+  reclaims body bytes but never the per-row overhead, so the cold tail of the THREE
+  retired-to-explicit-no-op snapshot arms — `BackendExecSnapshot`/`TmuxPaneSnapshot`/
+  `WindowIndexSnapshot` (`src/reducer.ts`) — is physically DELETEd. Deleting a ROW
+  (vs NULLing a body) skips its fold arm AND drops it from every producer/memo scan
+  on a re-fold, so it is safe ONLY when the arm is a no-op AND the row carries no
+  producer-scanned cheap column (`mutation_path`/`bash_mutation_*` git surface,
+  `background_task_id` computeMonitors, `plan_op` plan-link). These three qualify;
+  the rest of the body-NULL shed class does NOT (its arms — SubagentStart/Stop/Turn,
+  modern PostToolUse:Agent, Pre/PostToolUse, Notification — mutate
+  `jobs`/`subagent_invocations` ORDER-DEPENDENTLY, so a broad delete diverges the
+  re-fold, empirically proven). The delete predicate is a SINGLE named constant
+  PINNED by a guarding test (the SAFE + NECESSARY pair in
+  `test/refold-equivalence.test.ts`) so it can never silently widen; same batched +
+  `id < cursor` + cold-watermark + `incremental_vacuum` shape as the NULL pass, in
+  keeper's OWN writer process. The charter becomes: physical row deletion is
+  restricted to the no-op-arm snapshot classes, and re-fold determinism holds over
+  the SURVIVING rows. NO `is_shed_deleted` marker / SCHEMA_VERSION bump (a
+  proven-safe dead-weight delete needs no staging).
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
   defaults match the zero-event projection, so an empty re-fold reproduces the rows.

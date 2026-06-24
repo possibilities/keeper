@@ -29,6 +29,7 @@ import { join } from "node:path";
 import {
   computeColdWatermark,
   countAbsentBlobs,
+  deleteNoopSnapshotRows,
   drainColdPayloads,
   readFoldCursor,
   retainColdPayloads,
@@ -676,4 +677,241 @@ test("drainColdPayloads over a clean DB is a no-op (no passes shed)", () => {
   expect(result.shed).toBe(0);
   expect(result.passes).toBe(1);
   expect(result.hitPassCap).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// deleteNoopSnapshotRows (fn-934.5) — the ROW-DELETE mechanics: batched, gated
+// `id < cursor AND id <= coldWatermark`, paced/bounded, idempotent, reclaiming via
+// per-batch incremental_vacuum. (The re-fold-SAFETY proof lives in
+// refold-equivalence.test.ts; here we pin the delete plumbing.)
+// ---------------------------------------------------------------------------
+
+/** Insert a no-op-arm snapshot row (BackendExecSnapshot by default). */
+function insertNoopSnapshot(
+  opts: { hook_event?: string; session_id?: string; ts?: number } = {},
+): number {
+  return insertEvent({
+    hook_event: opts.hook_event ?? "BackendExecSnapshot",
+    session_id: opts.session_id ?? "noop-sess",
+    ts: opts.ts,
+    data: JSON.stringify({ note: "no-op snapshot" }),
+  });
+}
+
+test("deleteNoopSnapshotRows physically removes cold no-op-snapshot rows; keep-set + recent rows survive", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const promptId = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: TEST_UUID,
+    data: JSON.stringify({ prompt: "keep me" }),
+  });
+  // A cold mutation row (shed-class but NOT no-op-snapshot — must survive the
+  // DELETE; only its body is NULL-eligible elsewhere).
+  const mutationId = insertMutation("/repo/keep.ts");
+  // Each of the three no-op-snapshot classes.
+  const besId = insertNoopSnapshot({ hook_event: "BackendExecSnapshot" });
+  const tpsId = insertNoopSnapshot({ hook_event: "TmuxPaneSnapshot" });
+  const wisId = insertNoopSnapshot({ hook_event: "WindowIndexSnapshot" });
+  for (let i = 0; i < 5; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  drainAll();
+
+  const beforeRowCount = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+
+  const result = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 2,
+    batchSize: 10,
+    maxBatches: 5,
+    incrementalVacuumPages: 0,
+  });
+  expect(result.deleted).toBe(3);
+  expect(result.batches).toBeGreaterThan(0);
+
+  // The three no-op-snapshot rows are GONE.
+  for (const id of [besId, tpsId, wisId]) {
+    expect(db.query("SELECT id FROM events WHERE id = ?").get(id)).toBeNull();
+  }
+  // Keep-set + the non-no-op shed-class mutation row survive.
+  expect(
+    db.query("SELECT id FROM events WHERE id = ?").get(promptId),
+  ).not.toBeNull();
+  expect(
+    db.query("SELECT id FROM events WHERE id = ?").get(mutationId),
+  ).not.toBeNull();
+  // Exactly three rows removed.
+  const afterRowCount = (
+    db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
+  ).n;
+  expect(afterRowCount).toBe(beforeRowCount - 3);
+});
+
+test("deleteNoopSnapshotRows never deletes a row at or above the fold cursor", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 10; i++) {
+    insertNoopSnapshot();
+  }
+  // Undrained: cursor is 0, so NOTHING is past it — nothing eligible.
+  expect(readFoldCursor(db)).toBe(0);
+  const undrained = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(undrained.deleted).toBe(0);
+
+  // Drain, then rewind the cursor to mid-stream: only ids strictly below the
+  // cursor are eligible.
+  drainAll();
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  const partialCursor = maxId - 4;
+  db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [
+    partialCursor,
+  ]);
+
+  deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+
+  // Every surviving no-op-snapshot row must have id >= cursor.
+  const minSurviving = (
+    db
+      .query(
+        "SELECT MIN(id) AS m FROM events WHERE hook_event = 'BackendExecSnapshot'",
+      )
+      .get() as { m: number | null }
+  ).m;
+  if (minSurviving !== null) {
+    expect(minSurviving).toBeGreaterThanOrEqual(partialCursor);
+  }
+});
+
+test("deleteNoopSnapshotRows is paced (never exceeds maxBatches*batchSize) and idempotent across passes", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 50; i++) {
+    insertNoopSnapshot();
+  }
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  // batchSize 5 * maxBatches 3 = 15 max per pass even though >15 are cold.
+  const first = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 3,
+    incrementalVacuumPages: 0,
+  });
+  expect(first.deleted).toBe(15);
+  expect(first.batches).toBe(3);
+  expect(first.moreLikely).toBe(true);
+
+  // A second pass picks up where the first left off (the deleted rows are gone,
+  // so they cannot re-match) and removes the next 15.
+  const second = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 3,
+    incrementalVacuumPages: 0,
+  });
+  expect(second.deleted).toBe(15);
+});
+
+test("deleteNoopSnapshotRows reclaims freed pages via per-batch incremental_vacuum on an INCREMENTAL DB", () => {
+  const path = join(tmpDir, "noop-incr.db");
+  const idb = new Database(path, { create: true });
+  idb.run("PRAGMA auto_vacuum=INCREMENTAL");
+  idb.run("PRAGMA journal_mode=WAL");
+  idb.run(
+    `CREATE TABLE events (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       ts REAL, session_id TEXT, hook_event TEXT, event_type TEXT,
+       tool_name TEXT, cwd TEXT, data TEXT, mutation_path TEXT,
+       plan_op TEXT, subagent_agent_id TEXT
+     )`,
+  );
+  idb.run(
+    "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
+  );
+  idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
+
+  // 40 no-op-snapshot rows with bodies large enough to spill onto overflow pages.
+  const bigBody = JSON.stringify({ note: "x".repeat(8000) });
+  for (let i = 0; i < 40; i++) {
+    idb.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'BackendExecSnapshot', 'BackendExecSnapshot', ?)`,
+      [1000 + i, "noop-sess", bigBody],
+    );
+  }
+  idb.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
+
+  const result = deleteNoopSnapshotRows(idb, {
+    recentRetentionMargin: 0,
+    batchSize: 100,
+    maxBatches: 10,
+    incrementalVacuumPages: 200,
+  });
+  expect(result.deleted).toBe(40);
+  // Every no-op-snapshot row physically removed.
+  expect(
+    (idb.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n,
+  ).toBe(0);
+  // incremental_vacuum returned freed pages to the file tail; freelist drained.
+  expect(result.reclaimedPages).toBeGreaterThan(0);
+  expect(
+    (idb.query("PRAGMA freelist_count").get() as { freelist_count: number })
+      .freelist_count,
+  ).toBe(0);
+  idb.close();
+});
+
+test("deleteNoopSnapshotRows over a clean / no-eligible-rows DB is a no-op", () => {
+  const empty = deleteNoopSnapshotRows(db);
+  expect(empty.deleted).toBe(0);
+  expect(empty.batches).toBe(0);
+  expect(empty.coldWatermark).toBe(0);
+
+  // Only keep-set rows present → still a clean no-op (no no-op-snapshot rows).
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 5; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  drainAll();
+  const keepOnly = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(keepOnly.deleted).toBe(0);
+});
+
+test("countAbsentBlobs re-spec: an absent (deleted) no-op-snapshot row is NOT a data-loss alarm; a missing keep-set body still is", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const promptId = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: TEST_UUID,
+    data: JSON.stringify({ prompt: "keep me" }),
+  });
+  for (let i = 0; i < 5; i++) insertNoopSnapshot();
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // Physically delete the no-op-snapshot rows — an INTENTIONAL absence that must
+  // NOT be flagged (a gone row carries no record, so it can never surface as a
+  // NULL body either).
+  deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // Inject the BUG state: NULL a KEEP-SET body — real data loss neither retention
+  // path can create. The sentinel must still flag it.
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [promptId]);
+  expect(countAbsentBlobs(db)).toBe(1);
 });

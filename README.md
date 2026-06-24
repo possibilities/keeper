@@ -3352,10 +3352,32 @@ gates past the recent window AND strictly below the fold cursor. After each batc
 `PRAGMA incremental_vacuum` returns the freed overflow pages to the file tail (a
 no-op unless the file was born `auto_vacuum=INCREMENTAL`, baked by `reclaimDb`
 above). Because no fold reads a shed-class body (and the mutation tools' file_path
-is already promoted), retention-then-refold stays byte-identical. The data-loss
-sentinel (`countAbsentBlobs`) reuses the SAME cheap-column class predicate inside
-its `NOT()` — flagging only a NULL body OUTSIDE the shed class (a missing keep-set
-body), never the intentional shed NULLs, and never re-parsing an already-NULL body.
+is already promoted), retention-then-refold stays byte-identical.
+
+ROW growth is bounded by a SECOND, much narrower pass (`deleteNoopSnapshotRows`,
+fn-934.5): the body-NULL pass reclaims body bytes but never the per-row overhead,
+so the cold tail of THREE classes is PHYSICALLY DELETEd — `BackendExecSnapshot` /
+`TmuxPaneSnapshot` / `WindowIndexSnapshot`, the retired-to-explicit-no-op fold arms
+(`src/reducer.ts`). A row is safe to DELETE (not just NULL) only when its absence
+cannot change any projection: deleting a row skips its fold arm AND drops it from
+every producer/memo scan on a re-fold, so it is deletable ONLY when the arm is a
+no-op AND it carries no producer-scanned cheap column (`mutation_path` /
+`bash_mutation_*` for the git surface, `background_task_id` for `computeMonitors`,
+`plan_op` for the plan-link folds). These three qualify; the rest of the shed class
+does NOT — its bodies are fold-unread but its ARMS (SubagentStart/Stop/Turn, modern
+PostToolUse:Agent, Pre/PostToolUse, Notification mutate `jobs`/`subagent_invocations`
+order-dependently) and cheap columns are load-bearing (empirically a broad delete
+diverges the re-fold). The delete predicate is a SINGLE named constant
+(`NOOP_SNAPSHOT_DELETE_PREDICATE`) PINNED by a guarding test so it can never silently
+widen; the same batched + `id < cursor` + cold-watermark + `incremental_vacuum`
+discipline as the NULL pass, in keeper's OWN writer process. The charter is now:
+physical row deletion is restricted to the no-op-arm snapshot classes, and re-fold
+determinism holds over the SURVIVING rows. The data-loss sentinel
+(`countAbsentBlobs`) reuses the SAME cheap-column class predicate inside its `NOT()`
+— flagging only a NULL body OUTSIDE the shed class (a missing keep-set body), never
+the intentional shed NULLs, and never an absent no-op-snapshot ROW (a gone row
+carries no record, so it never surfaces as a NULL body), and never re-parsing an
+already-NULL body.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

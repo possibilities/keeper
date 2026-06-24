@@ -194,6 +194,43 @@ export const RETENTION_SHED_PREDICATE = `${RETENTION_SHED_CLASS_PREDICATE}
              END IS NOT NULL
        )`;
 
+/**
+ * The PHYSICAL-DELETE set — a hard-pinned allow-list of THREE event classes
+ * whose ROW (not just body) can be deleted with re-fold determinism preserved.
+ * MUCH narrower than {@link RETENTION_SHED_CLASS_PREDICATE} (the body-NULL set),
+ * and deliberately so: NULLing a fold-unread BODY is always safe, but deleting a
+ * ROW skips its fold arm AND removes it from every producer/memo scan on a
+ * from-scratch re-fold, so a row is deletable ONLY when its absence cannot
+ * change any projection.
+ *
+ * These three are the retired-to-explicit-no-op fold arms (`src/reducer.ts`
+ * BackendExecSnapshot / TmuxPaneSnapshot / WindowIndexSnapshot): each arm touches
+ * NO projection, and the rows carry none of the producer-scanned cheap columns
+ * (`mutation_path` / `bash_mutation_*` for the git surface, `background_task_id`
+ * for `computeMonitors`, `plan_op` for the plan-link folds). So deleting one is
+ * indistinguishable from it never having existed — a re-fold over the surviving
+ * rows reproduces byte-identical projections.
+ *
+ * Why NOT the broad shed class: it includes load-bearing ROWS whose BODY is
+ * unread but whose ARM / cheap columns are not. SubagentStart/Stop/Turn and
+ * modern PostToolUse:Agent mutate `subagent_invocations`; Pre/PostToolUse and
+ * Notification mutate `jobs` (clearing api-error / input-request /
+ * permission-prompt stamps, flipping `state` stopped→working, stamping
+ * `active_since`) in an ORDER-DEPENDENT way; non-plan Bash carries
+ * `bash_mutation_*` + `background_task_id`. Deleting any of those diverges a
+ * re-fold (empirically: jobs.state working→stopped, last_api_error_at
+ * resurrected, last_permission_prompt stamp + active_since lost, a whole
+ * subagent_invocations turn vanished). The
+ * `physical row deletion is restricted to the no-op-arm snapshot classes` test in
+ * test/refold-equivalence.test.ts pins this set so it can never silently widen.
+ *
+ * Expressed over the cheap `hook_event` column only (no json parse), the same
+ * contract as {@link RETENTION_SHED_CLASS_PREDICATE}.
+ */
+export const NOOP_SNAPSHOT_DELETE_PREDICATE = `hook_event IN (
+        'BackendExecSnapshot','TmuxPaneSnapshot','WindowIndexSnapshot'
+      )`;
+
 export interface RetentionOptions {
   /** Rows per transaction. Defaults to {@link DEFAULT_RETENTION_BATCH_SIZE}. */
   batchSize?: number;
@@ -487,6 +524,136 @@ export function drainColdPayloads(
   return { shed, batches, passes, reclaimedPages, hitPassCap };
 }
 
+export interface DeleteResult {
+  /** Number of rows physically DELETEd this pass (sum across batches). */
+  deleted: number;
+  /** Number of transactions (batches) executed this pass. */
+  batches: number;
+  /** The cold watermark used this pass (rows at or below were eligible). */
+  coldWatermark: number;
+  /** The fold cursor at pass start (only rows strictly below it are eligible). */
+  cursor: number;
+  /** Pages returned to the file tail by per-batch `incremental_vacuum`. */
+  reclaimedPages: number;
+  /**
+   * `true` when a full `maxBatches` ran AND the last batch was full — i.e. more
+   * cold no-op-snapshot rows likely remain and the caller may schedule a
+   * follow-up pass sooner than the next slack tick.
+   */
+  moreLikely: boolean;
+}
+
+/**
+ * PHYSICALLY DELETE cold rows of the no-op-arm snapshot classes
+ * ({@link NOOP_SNAPSHOT_DELETE_PREDICATE}), paced — the ROW-growth bound
+ * complementing {@link retainColdPayloads}'s body-NULL pass. Runs on MAIN's
+ * writable connection; NEVER call inside a fold transaction.
+ *
+ * Each batch is one transaction: DELETE the next `batchSize` cold no-op-snapshot
+ * ids (`id <= coldWatermark AND id < cursor AND <NOOP_SNAPSHOT_DELETE_PREDICATE>`).
+ * After each batch, `PRAGMA incremental_vacuum(pages)` returns the freed pages to
+ * the file tail. The same `id < cursor` + cold-watermark gate as the NULL pass —
+ * a row is removed only AFTER the fold has advanced past it, so a forward fold
+ * never iterates a row this pass deletes, and a from-scratch re-fold over the
+ * surviving rows is byte-identical (the three classes' fold arms are no-ops and
+ * carry no producer-scanned column — proven in test/refold-equivalence.test.ts).
+ *
+ * UNLIKE the NULL pass, this is NOT keyed on `data IS NOT NULL`: a snapshot row
+ * whose body the NULL pass already shed is still DELETE-able (its row overhead is
+ * the bytes this pass reclaims). Idempotent across passes — once a row is gone it
+ * cannot re-match.
+ *
+ * The per-batch `incremental_vacuum` only reclaims if the DB was born with
+ * `auto_vacuum=INCREMENTAL`; on a non-INCREMENTAL DB the pragma is a no-op and the
+ * freed pages sit on the freelist for a later full reclaim (the DELETE removes the
+ * row either way — re-fold safety does not depend on the reclaim).
+ */
+export function deleteNoopSnapshotRows(
+  db: Database,
+  options: RetentionOptions = {},
+): DeleteResult {
+  const batchSize = options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE;
+  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
+  const recentRetentionMargin =
+    options.recentRetentionMargin ?? RECENT_RETENTION_MARGIN;
+  const incrementalVacuumPages =
+    options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES;
+
+  const coldWatermark = computeColdWatermark(db, recentRetentionMargin);
+  const cursor = readFoldCursor(db);
+  // Same eligibility ceiling as the NULL pass: `min(coldWatermark, cursor - 1)`
+  // — at or below the cold window AND strictly below the fold cursor.
+  const idCeiling = Math.min(coldWatermark, cursor - 1);
+  if (idCeiling <= 0) {
+    return {
+      deleted: 0,
+      batches: 0,
+      coldWatermark,
+      cursor,
+      reclaimedPages: 0,
+      moreLikely: false,
+    };
+  }
+
+  // One prepared statement set, reused across batches. The SELECT picks the next
+  // cold no-op-snapshot batch by id; the DELETE removes the SAME ids. Both share
+  // the `id <= ceiling AND <NOOP_SNAPSHOT_DELETE_PREDICATE>` predicate so a row
+  // the SELECT picked is exactly the row the DELETE removes.
+  const selectBatch = db.prepare(
+    `SELECT id FROM events
+      WHERE id <= ?
+        AND ${NOOP_SNAPSHOT_DELETE_PREDICATE}
+      ORDER BY id ASC
+      LIMIT ?`,
+  );
+  const deleteRows = db.prepare(
+    `DELETE FROM events
+      WHERE id IN (SELECT value FROM json_each(?))`,
+  );
+
+  let deleted = 0;
+  let batches = 0;
+  let reclaimedPages = 0;
+  let lastBatchFull = false;
+
+  for (let i = 0; i < maxBatches; i++) {
+    const idRows = selectBatch.all(idCeiling, batchSize) as { id: number }[];
+    if (idRows.length === 0) break;
+    const ids = idRows.map((r) => r.id);
+    const idsJson = JSON.stringify(ids);
+
+    // ONE atomic transaction per batch. `.immediate()` grabs the writer lock at
+    // BEGIN so the DELETE can't lose the upgrade-to-writer race to a concurrent
+    // hook write (same fix as `retainColdPayloads`/`migrate()`).
+    db.transaction(() => {
+      deleteRows.run(idsJson);
+    }).immediate();
+
+    deleted += ids.length;
+    batches += 1;
+    lastBatchFull = ids.length === batchSize;
+
+    // Return freed pages to the file tail in a bounded chunk — OUTSIDE the batch
+    // transaction (incremental_vacuum cannot run inside one), never one unbounded
+    // call. A no-op on a DB not born with auto_vacuum=INCREMENTAL.
+    if (incrementalVacuumPages > 0) {
+      const before = freelistPageCount(db);
+      db.run(`PRAGMA incremental_vacuum(${incrementalVacuumPages})`);
+      const after = freelistPageCount(db);
+      reclaimedPages += Math.max(0, before - after);
+    }
+  }
+
+  return {
+    deleted,
+    batches,
+    coldWatermark,
+    cursor,
+    reclaimedPages,
+    moreLikely: batches === maxBatches && lastBatchFull,
+  };
+}
+
 /** Current freelist page count — the pool `incremental_vacuum` drains. */
 function freelistPageCount(db: Database): number {
   const row = db.query("PRAGMA freelist_count").get() as {
@@ -502,10 +669,24 @@ function freelistPageCount(db: Database): number {
  * is now an INTENTIONAL outcome for shed-class rows, so the old "absent ⇒ data
  * loss" alarm must NOT fire on a legitimately-shed body.
  *
- * The re-spec'd sentinel flags only a NULL body that is NOT shed-class — i.e. a
- * keep-set event whose body a fold reads but which is missing. Retention can
- * never create that state (its predicate matches ONLY the shed-class allow-list),
- * so a positive count always indicates a bug elsewhere (a stray NULLing write, a
+ * Two intentional outcomes the sentinel must tolerate, both confined to the
+ * shed/no-op sets:
+ *  - a NULLed BODY of a shed-class row ({@link RETENTION_SHED_CLASS_PREDICATE}) —
+ *    excluded via the `NOT(...)` below;
+ *  - a physically ABSENT ROW of a no-op-snapshot class
+ *    ({@link NOOP_SNAPSHOT_DELETE_PREDICATE}) — {@link deleteNoopSnapshotRows}
+ *    removes these. An absent row carries NO record at all, so it can never
+ *    surface as a `data IS NULL` hit — the absent-row case is inherently
+ *    invisible to this `COUNT(*)`. (The no-op-snapshot classes are a SUBSET of
+ *    the shed class, so a NULLed-but-not-yet-deleted snapshot row is excluded by
+ *    the `NOT(...)` anyway.) Either way an absent/NULL no-op-snapshot row is
+ *    never flagged.
+ *
+ * The sentinel flags only a NULL body that is NOT shed-class — i.e. a keep-set
+ * event whose body a fold reads but which is missing. Neither retention pass can
+ * create that state (the NULL pass matches only the shed-class allow-list; the
+ * DELETE pass removes only no-op-snapshot rows, never a keep-set ROW), so a
+ * positive count always indicates a bug elsewhere (a stray NULLing write, a
  * corrupt restore). The daemon logs it distinctly from the (large, legitimate)
  * shed count.
  *

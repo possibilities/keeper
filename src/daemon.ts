@@ -41,7 +41,11 @@ import {
 import { type BackupResult, liveBackupPage } from "./backup";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
-import { countAbsentBlobs, retainColdPayloads } from "./compaction";
+import {
+  countAbsentBlobs,
+  deleteNoopSnapshotRows,
+  retainColdPayloads,
+} from "./compaction";
 import {
   openDb,
   readGitProjectionSeedRequired,
@@ -3687,22 +3691,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, EVENTS_INGEST_FALLBACK_INTERVAL_MS);
 
-  // Producer-side retention pass (fn-836.5). NULLs the cold tail of redundant
-  // shed-class `events.data` bodies in place — PostToolUse mutation-tool rows
-  // whose `tool_input.file_path` is already promoted to `mutation_path`, the
-  // complement of the keep-set ALLOW-list — paced so the writer lock never
-  // starves a concurrent hook INSERT, and returns the freed overflow pages to the
-  // file tail via per-batch `incremental_vacuum`. Runs ON THE MAIN THREAD against
-  // the writable connection, STRICTLY outside the fold. `events.data` is the
-  // canonical event log, NOT a reducer projection: NULLing a redundant shed-class
-  // body (whose file_path the fold reads from the column, never the body) touches
-  // no projection, so a from-scratch re-fold stays byte-identical. The shed
-  // predicate (`src/compaction.ts`) never strips a body the fold still needs (it
-  // excludes any row still owing a `mutation_path` backfill and gates on the
-  // cursor).
+  // Producer-side retention pass. TWO complementary reclaims, both paced so the
+  // writer lock never starves a concurrent hook INSERT and both gated strictly
+  // below the fold cursor + cold watermark:
+  //  - BODY-NULL (fn-836.5): NULLs the cold tail of redundant shed-class
+  //    `events.data` bodies in place — the complement of the keep-set ALLOW-list,
+  //    whose file_path the fold reads from `mutation_path` not the body. Reclaims
+  //    body bytes, never rows.
+  //  - ROW-DELETE (fn-934.5): physically DELETEs the cold tail of the no-op-arm
+  //    snapshot classes (`BackendExecSnapshot`/`TmuxPaneSnapshot`/
+  //    `WindowIndexSnapshot`), reclaiming the per-row overhead the NULL pass
+  //    leaves behind. PROVEN re-fold-safe for those three ONLY (no-op fold arms,
+  //    no producer-scanned column), pinned by a guarding test.
+  // Both run ON THE MAIN THREAD against the writable connection (keeper's OWN
+  // writer process — a separate process + long reader would pin the WAL), STRICTLY
+  // outside the fold, returning freed pages via per-batch `incremental_vacuum`.
+  // `events.data` is the canonical event log, NOT a reducer projection: NULLing a
+  // redundant shed-class body and deleting a no-op-snapshot row both touch no
+  // projection, so a from-scratch re-fold over the surviving rows stays
+  // byte-identical. The shed predicate (`src/compaction.ts`) never strips a body
+  // the fold still needs (it excludes any row still owing a `mutation_path`
+  // backfill).
   function runRetentionPass(): void {
     if (shuttingDown) return;
     let shed = 0;
+    let deleted = 0;
     try {
       const result = retainColdPayloads(db);
       shed = result.shed;
@@ -3711,13 +3724,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           `[keeperd] retention: shed ${shed} cold body/bodies in ${result.batches} batch(es), reclaimed ${result.reclaimedPages} page(s) (watermark id<=${result.coldWatermark}, cursor<${result.cursor}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
+      // Row-growth bound (fn-934.5): physically DELETE cold rows of the no-op-arm
+      // snapshot classes — the body-NULL pass above reclaims body bytes but never
+      // the per-row overhead. PROVEN re-fold-safe for these three classes ONLY
+      // (their fold arms are no-ops and they carry no producer-scanned column);
+      // the predicate is pinned to that set by a guarding test so it can't widen.
+      // Same writable-connection / paced / cursor-gated discipline as the NULL
+      // pass — and it runs in keeper's OWN writer process (a separate process + a
+      // long reader would pin the WAL during the delete).
+      const del = deleteNoopSnapshotRows(db);
+      deleted = del.deleted;
+      if (deleted > 0) {
+        console.error(
+          `[keeperd] retention: deleted ${deleted} cold no-op-snapshot row(s) in ${del.batches} batch(es), reclaimed ${del.reclaimedPages} page(s) (watermark id<=${del.coldWatermark}, cursor<${del.cursor}${del.moreLikely ? ", more remain" : ""})`,
+        );
+      }
       // The re-spec'd data-loss sentinel: a NULL body that is NOT shed-class is a
-      // missing keep-set body — genuine data loss the retention path cannot
-      // create (its predicate matches ONLY shed-class mutation tools). Logged
-      // loudly but NOT fatal. Gate on `shed > 0`: a pass that NULLed nothing
-      // cannot have introduced a missing keep-set body, so the scan is wasted
-      // work on an idle slack tick.
-      if (shed > 0) {
+      // missing keep-set body — genuine data loss neither retention path can
+      // create (the NULL pass matches ONLY shed-class rows; the DELETE pass
+      // removes ONLY no-op-snapshot rows, an absent row never surfacing as a NULL
+      // body). Logged loudly but NOT fatal. Gate on a pass having moved bytes: a
+      // pass that touched nothing cannot have introduced a missing keep-set body,
+      // so the scan is wasted work on an idle slack tick.
+      if (shed > 0 || deleted > 0) {
         const absent = countAbsentBlobs(db);
         if (absent > 0) {
           console.error(
@@ -3727,8 +3756,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
     } catch (err) {
       // A retention failure is pure space-reclamation loss, never a correctness
-      // issue (the body stays inline on a rolled-back batch). Log non-fatally; the
-      // next slack tick retries.
+      // issue (the body stays inline / the row stays present on a rolled-back
+      // batch). Log non-fatally; the next slack tick retries.
       console.error(
         `[keeperd] retention pass threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -3737,10 +3766,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       return;
     }
     // Checkpoint WAL space OUTSIDE the per-batch transactions and only when a pass
-    // shed bytes. PASSIVE never waits on writers (TRUNCATE would, starving a
-    // contending hook); it checkpoints what it can without blocking. Per-batch
-    // `incremental_vacuum` already returned freed pages to the file tail.
-    if (shed > 0) {
+    // moved bytes (shed a body OR deleted a row). PASSIVE never waits on writers
+    // (TRUNCATE would, starving a contending hook); it checkpoints what it can
+    // without blocking. Per-batch `incremental_vacuum` already returned freed
+    // pages to the file tail.
+    if (shed > 0 || deleted > 0) {
       try {
         db.run("PRAGMA wal_checkpoint(PASSIVE)");
       } catch (err) {

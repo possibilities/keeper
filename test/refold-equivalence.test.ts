@@ -54,6 +54,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   countAbsentBlobs,
+  deleteNoopSnapshotRows,
+  NOOP_SNAPSHOT_DELETE_PREDICATE,
   RETENTION_SHED_CLASS_PREDICATE,
   RETENTION_SHED_PREDICATE,
   retainColdPayloads,
@@ -1509,6 +1511,214 @@ function rewindAndWipeWidened(): void {
   rewindAndWipeProjections();
   db.run("DELETE FROM scheduled_tasks");
 }
+
+// ---------------------------------------------------------------------------
+// fn-934 (task .5) — PHYSICAL ROW-DELETE of the no-op-arm snapshot classes.
+//
+// The body-NULL retention pass reclaims fold-unread BODY bytes but never the
+// per-row overhead. `deleteNoopSnapshotRows` bounds ROW growth by physically
+// DELETING old rows of the THREE retired-to-explicit-no-op snapshot classes
+// (`BackendExecSnapshot`/`TmuxPaneSnapshot`/`WindowIndexSnapshot`) — and ONLY
+// those. This section is the PERMANENT regression gate proving the narrowing is
+// both SAFE (the three classes delete byte-identically) and NECESSARY (the broad
+// shed class does NOT). It runs the ACTUAL `DELETE` then a from-scratch re-fold —
+// never a re-NULL.
+// ---------------------------------------------------------------------------
+
+/** Insert a no-op-arm snapshot row of the given hook_event in a dedicated
+ * session (these folds key on the payload, never `event.session_id`). */
+function insertNoopSnapshot(hookEvent: string): number {
+  return insertEvent({
+    hook_event: hookEvent,
+    session_id: `noop-${hookEvent}`,
+    data: JSON.stringify({
+      note: "no-op snapshot — fold touches no projection",
+    }),
+  });
+}
+
+/** DELETE every load-bearing shed-class row below the cursor — the BROAD set the
+ * narrowing rejects. Used by the negative-control test to PROVE deleting these
+ * diverges a re-fold (so the narrowness is self-justifying, not arbitrary). */
+function deleteBroadShedClassRows(): number {
+  const cursor = (
+    db
+      .query("SELECT last_event_id AS c FROM reducer_state WHERE id = 1")
+      .get() as {
+      c: number;
+    }
+  ).c;
+  return db.run(
+    `DELETE FROM events WHERE id < ? AND ${RETENTION_SHED_CLASS_PREDICATE}`,
+    [cursor],
+  ).changes;
+}
+
+test("no-op-snapshot delete predicate is pinned to exactly the three retired no-op-arm classes (cannot silently widen)", () => {
+  // The single named constant is the ONLY place the delete set is expressed. Pin
+  // it to the literal three classes AND assert it is NOT the broad shed class — a
+  // future edit that widens it to a load-bearing class fails here (and the
+  // byte-identity tests below), making the narrowness un-bypassable.
+  const probe = new Database(":memory:");
+  probe.run(
+    `CREATE TABLE events (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, hook_event TEXT, tool_name TEXT,
+       plan_op TEXT, subagent_agent_id TEXT, mutation_path TEXT, data TEXT
+     )`,
+  );
+  const matches = (
+    hookEvent: string,
+    toolName: string | null = null,
+  ): boolean => {
+    probe.run("DELETE FROM events");
+    probe.run("INSERT INTO events (hook_event, tool_name) VALUES (?, ?)", [
+      hookEvent,
+      toolName,
+    ]);
+    return (
+      (
+        probe
+          .query(
+            `SELECT COUNT(*) AS n FROM events WHERE ${NOOP_SNAPSHOT_DELETE_PREDICATE}`,
+          )
+          .get() as { n: number }
+      ).n === 1
+    );
+  };
+
+  // The three no-op-arm classes match.
+  for (const he of [
+    "BackendExecSnapshot",
+    "TmuxPaneSnapshot",
+    "WindowIndexSnapshot",
+  ]) {
+    expect({ he, match: matches(he) }).toEqual({ he, match: true });
+  }
+  // Every OTHER shed-class member (load-bearing arm and/or producer-scanned
+  // column) does NOT match — a delete must never touch these.
+  for (const [he, tool] of [
+    ["PostToolUse", "Write"],
+    ["PostToolUse", "Bash"],
+    ["PostToolUse", "Agent"],
+    ["PostToolUse", "Read"],
+    ["PreToolUse", "Bash"],
+    ["PostToolUseFailure", "Read"],
+    ["SubagentStart", null],
+    ["SubagentStop", null],
+    ["Notification", null],
+  ] as Array<[string, string | null]>) {
+    expect({ he, tool, match: matches(he, tool) }).toEqual({
+      he,
+      tool,
+      match: false,
+    });
+  }
+  // The predicate carries NO json parse (cheap `hook_event` column only) and is
+  // strictly NARROWER than the body-NULL shed class.
+  expect(NOOP_SNAPSHOT_DELETE_PREDICATE).not.toContain("json_extract");
+  expect(NOOP_SNAPSHOT_DELETE_PREDICATE).not.toContain("json_valid");
+  expect(NOOP_SNAPSHOT_DELETE_PREDICATE).not.toBe(
+    RETENTION_SHED_CLASS_PREDICATE,
+  );
+  probe.close();
+});
+
+test("SAFE: DELETE only the no-op-snapshot classes over a corpus with EVERY shed-class type → two from-scratch re-folds byte-identical (jobs + subagent_invocations + git surface)", () => {
+  // Seed the widened corpus (every shed-class type — plan/non-plan Bash, modern +
+  // legacy Agent, Pre/Post:Agent, SubagentStart/Stop, Notification, the pure
+  // cheap-column tools, Cron, a malformed body) and INTERLEAVE no-op-snapshot rows
+  // among them so their removal is proven not to perturb the order-dependent
+  // jobs/subagent folds around them.
+  seedWidenedShedCorpus();
+  insertNoopSnapshot("BackendExecSnapshot");
+  insertNoopSnapshot("TmuxPaneSnapshot");
+  insertNoopSnapshot("WindowIndexSnapshot");
+  insertNoopSnapshot("BackendExecSnapshot");
+  // Trailing keep-set filler so every seeded no-op-snapshot row sits STRICTLY
+  // below the fold cursor (`id < cursor`) after a full drain, making it eligible.
+  const NOOP_FILLER = "eeeeeeee-1111-2222-3333-444444444444";
+  insertEvent({ hook_event: "SessionStart", session_id: NOOP_FILLER });
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "Stop", session_id: NOOP_FILLER });
+  }
+
+  // P0 — the live projection (every row present).
+  drainAll();
+  const p0 = snapshotWidenedProjections();
+
+  // Sanity: the corpus genuinely carries the order-dependent surfaces a broad
+  // delete would wreck, so the byte-identity below is non-vacuous.
+  expect((p0.subagent_invocations as unknown[]).length).toBeGreaterThan(0);
+
+  // The eligible no-op-snapshot rows (every one below the cursor — the whole set
+  // after the trailing filler). `seedWidenedShedCorpus` itself seeds one
+  // BackendExecSnapshot, plus the four inserted above.
+  const eligibleNoop = (
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events WHERE ${NOOP_SNAPSHOT_DELETE_PREDICATE}`,
+      )
+      .get() as { n: number }
+  ).n;
+  expect(eligibleNoop).toBeGreaterThanOrEqual(5);
+
+  // Run the PRODUCTION delete path over the no-op-snapshot tail (real predicate +
+  // watermark + cursor gate). `recentRetentionMargin` 0 makes the whole
+  // cold-and-past-cursor tail eligible; `incrementalVacuumPages` 0 (mem DB is not
+  // auto_vacuum=INCREMENTAL).
+  const del = deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(del.deleted).toBe(eligibleNoop); // every no-op-snapshot row removed
+  // The rows are GONE — not merely NULLed.
+  expect(
+    (
+      db
+        .query(
+          `SELECT COUNT(*) AS n FROM events WHERE ${NOOP_SNAPSHOT_DELETE_PREDICATE}`,
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  // An absent no-op-snapshot row is NOT a data-loss alarm.
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // P1 — a from-scratch re-fold over the POST-DELETE row set.
+  rewindAndWipeWidened();
+  drainAll();
+  const p1 = snapshotWidenedProjections();
+  expect(p1).toEqual(p0);
+
+  // P2 — a SECOND from-scratch re-fold reproduces byte-identical rows (re-fold
+  // determinism over the surviving rows is sacred).
+  rewindAndWipeWidened();
+  drainAll();
+  const p2 = snapshotWidenedProjections();
+  expect(p2).toEqual(p1);
+});
+
+test("NECESSARY (negative control): deleting the BROAD shed class instead diverges the re-fold — proving the narrowing is required, not arbitrary", () => {
+  // The mirror of the SAFE test: seed the SAME corpus, but DELETE the broad
+  // `RETENTION_SHED_CLASS_PREDICATE` set. The shed BODIES are fold-unread, but the
+  // ROWS' arms (subagent_invocations turns, jobs stamp clears) and cheap columns
+  // are load-bearing — so a from-scratch re-fold over the broad-deleted set MUST
+  // diverge. This is what makes `deleteNoopSnapshotRows`'s narrowness
+  // self-justifying: widening it to this set is a re-fold break the suite catches.
+  seedWidenedShedCorpus();
+  drainAll();
+  const p0 = snapshotWidenedProjections();
+
+  const broadDeleted = deleteBroadShedClassRows();
+  expect(broadDeleted).toBeGreaterThan(0);
+
+  rewindAndWipeWidened();
+  drainAll();
+  const diverged = snapshotWidenedProjections();
+
+  // The broad delete is NOT re-fold-safe — at least one projection differs.
+  expect(diverged).not.toEqual(p0);
+});
 
 // ---------------------------------------------------------------------------
 // fn-888 — `syncPlanLinks` per-session replace-by-key merge byte-identity.
