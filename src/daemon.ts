@@ -404,6 +404,340 @@ export function buildPendingDispatchSweepRecords(
 }
 
 /**
+ * Heartbeat cadence (ms) for the daemon block-escalation producer sweep. Rides a
+ * heartbeat, NOT the level-triggered `data_version` wake: the `TaskSnapshot` fold
+ * that ARMS a `block_escalations` latch does bump `data_version`, but the
+ * cancellation guard + per-recipient coalescing want a steady-state re-check even
+ * on a quiescent board (a planner-side unblock between sweeps must be observed
+ * before the spawn). One-minute cadence matches the pending-dispatch sweep — a
+ * blocked task is not latency-sensitive on the order of seconds.
+ */
+export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * The ONE blocked category that does NOT escalate to the planner: a
+ * `TOOLING_FAILURE` is surface-and-stop (a broken runner / env, not a question a
+ * planner can answer on the board). DENYLIST shape — every other worker category
+ * (`SPEC_UNCLEAR` / `DEPENDENCY_BLOCKED` / `DESIGN_CONFLICT` / `SCOPE_EXCEEDED` /
+ * `EXTERNAL_BLOCKED`) plus `RESUME_EXHAUSTED` escalates — so a future category
+ * rides through as escalatable with no code change.
+ */
+export const BLOCK_ESCALATION_SKIP_CATEGORY = "TOOLING_FAILURE";
+
+/**
+ * A pending `block_escalations` latch row joined to its epic's `project_dir` and
+ * the embedded task's live `runtime_status` / `target_repo`. The producer sweep's
+ * current-state working set — bounded by the number of concurrently-blocked
+ * tasks, never a history scan.
+ */
+export interface PendingBlockEscalation {
+  epic_id: string;
+  task_id: string;
+  /** Owning epic's `project_dir` — the plan state-file root for the reason read. */
+  project_dir: string | null;
+  /** The embedded task's live `runtime_status` — the cancellation-guard signal. */
+  runtime_status: string | null;
+  /** The embedded task's `target_repo` — the effective-repo override. */
+  target_repo: string | null;
+}
+
+/**
+ * Select every `block_escalations` row in `status='pending'`, joined to its epic
+ * row for `project_dir` and to the embedded task element (decoded from the epic's
+ * `tasks` JSON) for the live `runtime_status` + `target_repo`. The cancellation
+ * guard re-checks `runtime_status` at sweep time against the live projection — a
+ * task unblocked between arm and sweep reads non-`blocked` here and is skipped
+ * (the `TaskSnapshot` leave-blocked fold DELETEs its latch on its own). A pending
+ * latch with no surviving epic / task element returns null fields; the producer
+ * treats that as "no longer escalatable" and skips. Reads the projection on the
+ * passed connection — production passes main's writable connection so the read is
+ * sequenced inside the same writer that mints.
+ */
+export function selectPendingBlockEscalations(
+  db: Database,
+): PendingBlockEscalation[] {
+  const latches = db
+    .query(
+      `SELECT epic_id, task_id FROM block_escalations WHERE status = 'pending'`,
+    )
+    .all() as { epic_id: string; task_id: string }[];
+  if (latches.length === 0) return [];
+  const out: PendingBlockEscalation[] = [];
+  for (const latch of latches) {
+    const epicRow = db
+      .query(`SELECT project_dir, tasks FROM epics WHERE epic_id = ?`)
+      .get(latch.epic_id) as
+      | { project_dir: string | null; tasks: string }
+      | null
+      | undefined;
+    let runtimeStatus: string | null = null;
+    let targetRepo: string | null = null;
+    if (epicRow != null) {
+      // The embedded `tasks` JSON is a foreign-process array; a parse failure
+      // folds to "task element not found" (null fields) — never throws into the
+      // sweep.
+      try {
+        const tasks = JSON.parse(epicRow.tasks) as {
+          task_id?: unknown;
+          runtime_status?: unknown;
+          target_repo?: unknown;
+        }[];
+        const el = tasks.find((t) => t.task_id === latch.task_id);
+        if (el != null) {
+          runtimeStatus =
+            typeof el.runtime_status === "string" ? el.runtime_status : null;
+          targetRepo =
+            typeof el.target_repo === "string" ? el.target_repo : null;
+        }
+      } catch {
+        // Leave null fields — the producer skips a latch it can't resolve.
+      }
+    }
+    out.push({
+      epic_id: latch.epic_id,
+      task_id: latch.task_id,
+      project_dir: epicRow?.project_dir ?? null,
+      runtime_status: runtimeStatus,
+      target_repo: targetRepo,
+    });
+  }
+  return out;
+}
+
+/**
+ * Parse the leading `<CATEGORY>:` prefix off a worker's `blocked_reason` (e.g.
+ * `"SPEC_UNCLEAR: the spec ..."` → `"SPEC_UNCLEAR"`). Returns null on an absent /
+ * empty / prefix-less reason (no leading `WORD:` token) — the producer treats a
+ * null category the same as `TOOLING_FAILURE`: skip. Pure; never throws. The
+ * token is `[A-Z_]+` so a free-text reason that happens to contain a `:` later
+ * (e.g. `"see foo: bar"`) does NOT false-match.
+ */
+export function parseBlockedCategory(reason: string | null): string | null {
+  if (reason == null) return null;
+  const m = reason.match(/^\s*([A-Z_]+):/);
+  return m != null ? m[1] : null;
+}
+
+/**
+ * The escalation gate (DENYLIST): escalate unless the parsed category is
+ * `TOOLING_FAILURE` or absent/unparseable. A `null` category (no `<CATEGORY>:`
+ * prefix) is NOT escalatable — an unparseable reason is treated as surface-and-stop,
+ * never blindly fanned out to the planner. Pure.
+ */
+export function shouldEscalateBlockedCategory(
+  category: string | null,
+): boolean {
+  return category != null && category !== BLOCK_ESCALATION_SKIP_CATEGORY;
+}
+
+/**
+ * Build the one-way notification body the producer sends to `planner@<epic>`. The
+ * free-text `blocked_reason` rides as a body line — NEVER interpolated into a
+ * shell arg (the helper passes the whole body via stdin / array form). Pure. The
+ * directive is intentionally one-way: the planner unblocks/refines on the board
+ * and the autopilot cold-re-dispatches; the daemon sender has no subscribable
+ * channel to receive a reply.
+ */
+export function buildBlockEscalationBody(args: {
+  epicId: string;
+  taskId: string;
+  category: string;
+  blockedReason: string;
+  repo: string;
+}): string {
+  return [
+    `Plan task ${args.taskId} (epic ${args.epicId}) is BLOCKED and needs you.`,
+    ``,
+    `Category: ${args.category}`,
+    `Repo: ${args.repo}`,
+    ``,
+    `Blocked reason:`,
+    args.blockedReason.trim(),
+    ``,
+    `Resolve it on the board: \`keeper plan unblock ${args.taskId}\` (after`,
+    `addressing the blocker — refine the spec, clear the dep, etc.). The`,
+    `autopilot then cold-re-dispatches a fresh worker — NO reply needed, do not`,
+    `reply to this message. If the autopilot isn't armed, run`,
+    `\`keeper dispatch work::${args.taskId}\` yourself.`,
+  ].join("\n");
+}
+
+/**
+ * Compute the effective repo for the notification body: the task's `target_repo`
+ * override when present, else the epic's `project_dir`, else `""`. Mirrors the
+ * autopilot/readiness `effectiveRoot` derivation (the dispatch cwd). Pure.
+ */
+export function effectiveBlockEscalationRepo(
+  targetRepo: string | null,
+  projectDir: string | null,
+): string {
+  if (targetRepo != null && targetRepo !== "") return targetRepo;
+  if (projectDir != null && projectDir !== "") return projectDir;
+  return "";
+}
+
+/** The terminal outcome the producer records on the `block_escalations` latch
+ *  (the `BlockEscalationAttempted.outcome` column). */
+export type BlockEscalationOutcome =
+  | "sent"
+  | "queued_for_wake"
+  | "skipped_category"
+  | "skipped_unblocked"
+  | "skipped_coalesced"
+  | "send_failed";
+
+/** The result of the helper that notifies one planner over the bus. `wake` is
+ *  attempted ONLY when `outcome === "queued_for_wake"` (the offline-creator path);
+ *  fail-open — every error degrades to `send_failed`, never throws. */
+export interface BlockEscalationSendResult {
+  outcome: "sent" | "queued_for_wake" | "send_failed";
+  detail: string;
+}
+
+/** Injectable dependency surface for {@link runBlockEscalationSweep}. Mirrors
+ *  `runWake`'s fail-open injectable-deps discipline so the producer is testable
+ *  with synthetic rows + an injected helper, and never throws into the daemon
+ *  loop. */
+export interface BlockEscalationSweepDeps {
+  /** The current-state pending working set (DELEGATES to
+   *  {@link selectPendingBlockEscalations} in production). */
+  readonly selectPending: () => PendingBlockEscalation[];
+  /** Read the task's `blocked_reason` from its plan state file, or null on any
+   *  miss (absent file / unreadable / no field). Producer-side fs read — legal
+   *  outside any fold. */
+  readonly readBlockedReason: (
+    projectDir: string | null,
+    taskId: string,
+  ) => string | null;
+  /** Mint a `BlockEscalationRequested` synthetic event (advances the latch
+   *  `pending → requested`). */
+  readonly mintRequested: (epicId: string, taskId: string) => void;
+  /** Mint a `BlockEscalationAttempted{outcome}` synthetic event (advances the
+   *  latch `requested → attempted`, records `outcome`). */
+  readonly mintAttempted: (
+    epicId: string,
+    taskId: string,
+    outcome: BlockEscalationOutcome,
+  ) => void;
+  /** Notify one planner over the bus (and wake on `queued_for_wake`). Async +
+   *  fail-open. */
+  readonly notifyPlanner: (args: {
+    epicId: string;
+    taskId: string;
+    category: string;
+    blockedReason: string;
+    repo: string;
+  }) => Promise<BlockEscalationSendResult>;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one daemon block-escalation sweep. The producer half of the escalate-once
+ * loop: walk the pending `block_escalations` latch rows, gate each by the
+ * cancellation guard + category denylist, COALESCE the survivors per
+ * `planner@<epic>` (at most one send per recipient per cycle), then for each
+ * group mint `BlockEscalationRequested` → notify the planner over the bus → mint
+ * `BlockEscalationAttempted{outcome}`. The latch advances pending→requested→
+ * attempted exactly once per block instance.
+ *
+ * Each row resolves to exactly one terminal outcome so it never re-evaluates next
+ * sweep (a skipped/sent latch is no longer `pending`):
+ *  - `skipped_unblocked` — the cancellation guard fired (task left `blocked`).
+ *  - `skipped_category` — `TOOLING_FAILURE` / absent-or-unparseable reason.
+ *  - `skipped_coalesced` — a sibling row already claimed this planner this cycle.
+ *  - `sent` / `queued_for_wake` / `send_failed` — the helper result.
+ *
+ * For a skipped row we STILL mint Requested→Attempted so the latch leaves
+ * `pending` and the producer never re-sweeps it. NEVER throws — every helper edge
+ * degrades to an outcome (mirrors `runWake`). The spawn lives ONLY here in the
+ * producer, never reachable from `applyEvent`, so a re-fold never re-fires a send.
+ */
+export async function runBlockEscalationSweep(
+  deps: BlockEscalationSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let pending: PendingBlockEscalation[];
+  try {
+    pending = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: block-escalation sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (pending.length === 0) return;
+
+  // First pass: classify each pending row WITHOUT side effects, so the
+  // coalescing decision sees every escalatable row this cycle before any send.
+  // The recipient claim is per-epic (`planner@<epic>`), so two blocked tasks in
+  // the same epic coalesce to a single send; tasks in different epics each send.
+  const claimedPlanner = new Set<string>();
+  for (const row of pending) {
+    // Cancellation guard: the task left `blocked` between arm and sweep. The
+    // leave-blocked `TaskSnapshot` fold DELETEs the latch on its own, so mint
+    // Requested→Attempted{skipped_unblocked} is a belt-and-braces terminal — if
+    // the DELETE already ran, both folds no-op on the missing row.
+    if (row.runtime_status !== "blocked") {
+      deps.mintRequested(row.epic_id, row.task_id);
+      deps.mintAttempted(row.epic_id, row.task_id, "skipped_unblocked");
+      continue;
+    }
+
+    const reason = deps.readBlockedReason(row.project_dir, row.task_id);
+    const category = parseBlockedCategory(reason);
+    if (!shouldEscalateBlockedCategory(category)) {
+      // TOOLING_FAILURE / absent / unparseable: surface-and-stop. Record a
+      // terminal outcome so it never re-evaluates.
+      deps.mintRequested(row.epic_id, row.task_id);
+      deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
+      continue;
+    }
+
+    // Coalesce fan-in: at most one send per `planner@<epic>` per cycle. A sibling
+    // row in the same epic gets a terminal `skipped_coalesced` — its latch leaves
+    // pending, so the next sweep won't re-fan it; the single send already covers
+    // the epic's planner.
+    if (claimedPlanner.has(row.epic_id)) {
+      deps.mintRequested(row.epic_id, row.task_id);
+      deps.mintAttempted(row.epic_id, row.task_id, "skipped_coalesced");
+      continue;
+    }
+    claimedPlanner.add(row.epic_id);
+
+    // The escalatable, coalescing-winner row. Mint Requested, THEN notify, THEN
+    // mint Attempted with the helper outcome. `category`/`reason` are non-null
+    // here (the gate above proved category non-null; a non-null category implies
+    // a non-null reason).
+    deps.mintRequested(row.epic_id, row.task_id);
+    const repo = effectiveBlockEscalationRepo(row.target_repo, row.project_dir);
+    let result: BlockEscalationSendResult;
+    try {
+      result = await deps.notifyPlanner({
+        epicId: row.epic_id,
+        taskId: row.task_id,
+        category: category as string,
+        blockedReason: reason as string,
+        repo,
+      });
+    } catch (err) {
+      // The helper is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a terminal outcome and never aborts the
+      // sweep.
+      note(
+        `# warn: block-escalation notify threw for ${row.task_id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      result = { outcome: "send_failed", detail: "notify threw" };
+    }
+    deps.mintAttempted(row.epic_id, row.task_id, result.outcome);
+  }
+}
+
+/**
  * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush the
  * WAL once and restore the steady-state threshold.
  *
@@ -3588,6 +3922,198 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  /**
+   * Mint one synthetic `BlockEscalation{Requested,Attempted}` event onto the
+   * writable connection — the producer's only write path into the
+   * `block_escalations` latch (it never UPDATEs the projection directly; the
+   * reducer fold owns that). `(epic_id, task_id)` rides the entity-key overload on
+   * `session_id` so a re-fold correlates the row WITHOUT re-parsing `data`; the
+   * full payload also rides `data` for the strict fold parser. NON-FATAL on insert
+   * failure — the next heartbeat sweep re-attempts (the latch stays `pending`).
+   */
+  function mintBlockEscalationEvent(
+    hookEvent: "BlockEscalationRequested" | "BlockEscalationAttempted",
+    epicId: string,
+    taskId: string,
+    outcome: string | null,
+  ): void {
+    const data =
+      hookEvent === "BlockEscalationAttempted"
+        ? JSON.stringify({ epic_id: epicId, task_id: taskId, outcome })
+        : JSON.stringify({ epic_id: epicId, task_id: taskId });
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${epicId}::${taskId}`,
+        $pid: null,
+        $hook_event: hookEvent,
+        $event_type: "block_escalations",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] ${hookEvent} mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Read the task's `blocked_reason` from its plan state file
+   * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`). Producer-side fs
+   * read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
+   * absent / unreadable file, malformed JSON, no `blocked_reason` field) so the
+   * category gate folds an unresolved reason to "skip". NEVER throws.
+   */
+  function readTaskBlockedReason(
+    projectDir: string | null,
+    taskId: string,
+  ): string | null {
+    if (projectDir == null || projectDir === "") return null;
+    const statePath = join(
+      projectDir,
+      ".keeper",
+      "state",
+      "tasks",
+      `${taskId}.state.json`,
+    );
+    try {
+      if (!existsSync(statePath)) return null;
+      const parsed = JSON.parse(readFileSync(statePath, "utf8")) as {
+        blocked_reason?: unknown;
+      };
+      return typeof parsed.blocked_reason === "string"
+        ? parsed.blocked_reason
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Notify one `planner@<epic>` over the bus that a plan task is blocked, then
+   * wake the planner ONLY when the send returns `queued_for_wake` (the
+   * known-but-offline creator path). Both legs spawn the `keeper` CLI ASYNC
+   * (`Bun.spawn`, NEVER `Bun.spawnSync` — a sync spawn would block the daemon main
+   * loop). The body goes in via STDIN (`keeper bus chat send <target> -`) so the
+   * free-text `blocked_reason` is NEVER interpolated into a shell arg. Mirrors
+   * `runWake`'s fail-open discipline — every error degrades to `send_failed`,
+   * never throws into the sweep.
+   */
+  async function notifyPlannerOfBlock(args: {
+    epicId: string;
+    taskId: string;
+    category: string;
+    blockedReason: string;
+    repo: string;
+  }): Promise<BlockEscalationSendResult> {
+    const target = `planner@${args.epicId}`;
+    const body = buildBlockEscalationBody({
+      epicId: args.epicId,
+      taskId: args.taskId,
+      category: args.category,
+      blockedReason: args.blockedReason,
+      repo: args.repo,
+    });
+    // `[bun, cli/keeper.ts]` — the same resolved transport the autopilot launcher
+    // uses, minus the `agent` suffix, so the bus subcommand rides directly.
+    const cliPrefix = [process.execPath, resolveKeeperAgentPath()];
+    let sendResult: { result: string; failed: boolean };
+    try {
+      const proc = Bun.spawn(
+        [...cliPrefix, "bus", "chat", "send", target, "-"],
+        {
+          stdin: new TextEncoder().encode(body),
+          stdout: "pipe",
+          stderr: "pipe",
+          // PATH is load-bearing — a bare env drops it and a re-exec false-ENOENTs.
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const [stdoutText, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        proc.exited,
+      ]);
+      // The CLI prints `queued_for_wake for <target>` on the offline-creator path
+      // and exits 0 on both `delivered` and `queued_for_wake`. A non-zero exit is
+      // a loud miss (not_connected / unknown_target / …).
+      const queued = stdoutText.includes("queued_for_wake");
+      sendResult = {
+        result: queued ? "queued_for_wake" : "delivered",
+        failed: exitCode !== 0,
+      };
+    } catch (err) {
+      console.error(
+        `[keeperd] block-escalation bus send spawn threw for ${target} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return { outcome: "send_failed", detail: "send spawn threw" };
+    }
+
+    if (sendResult.failed) {
+      return {
+        outcome: "send_failed",
+        detail: `bus send to ${target} did not deliver`,
+      };
+    }
+
+    if (sendResult.result !== "queued_for_wake") {
+      // Delivered live — no wake needed.
+      return { outcome: "sent", detail: `delivered to ${target}` };
+    }
+
+    // Offline creator — wake it. A wake failure does NOT downgrade the outcome:
+    // the message is durably queued and redelivered when the planner returns, so
+    // the escalation succeeded regardless of the wake leg.
+    try {
+      const wakeProc = Bun.spawn([...cliPrefix, "bus", "wake", target], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: process.env as Record<string, string | undefined>,
+      });
+      await wakeProc.exited;
+    } catch (err) {
+      console.error(
+        `[keeperd] block-escalation bus wake spawn threw for ${target} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return {
+      outcome: "queued_for_wake",
+      detail: `queued_for_wake for ${target}`,
+    };
+  }
+
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -3650,6 +4176,53 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   const pendingDispatchSweepTimer = setInterval(() => {
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
+
+  // Producer-side block-escalation sweep (fn-941). Each heartbeat tick walks the
+  // current-state pending `block_escalations` latch rows, gates each by the
+  // cancellation guard + the TOOLING_FAILURE denylist, coalesces survivors per
+  // `planner@<epic>`, and for each escalatable winner mints
+  // `BlockEscalationRequested` → notifies the planner over the bus → mints
+  // `BlockEscalationAttempted{outcome}`. The latch advances pending→requested→
+  // attempted exactly once per block instance, so a daemon escalates a given
+  // block ONCE. All wall-clock + fs + spawn lives HERE in the producer, never in a
+  // fold; the spawn lives only here, so a re-fold never re-fires a notify.
+  //
+  // `void`: `runBlockEscalationSweep` is async (the notify spawns the bus CLI),
+  // but the sweep MUST NOT block the heartbeat — the mints land synchronously and
+  // the spawn resolves on a later tick. `.catch` is belt-and-braces; the sweep is
+  // fail-open by contract.
+  async function runBlockEscalationSweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    await runBlockEscalationSweep({
+      selectPending: () => selectPendingBlockEscalations(db),
+      readBlockedReason: readTaskBlockedReason,
+      mintRequested: (epicId, taskId) =>
+        mintBlockEscalationEvent(
+          "BlockEscalationRequested",
+          epicId,
+          taskId,
+          null,
+        ),
+      mintAttempted: (epicId, taskId, outcome) =>
+        mintBlockEscalationEvent(
+          "BlockEscalationAttempted",
+          epicId,
+          taskId,
+          outcome,
+        ),
+      notifyPlanner: notifyPlannerOfBlock,
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const blockEscalationSweepTimer = setInterval(() => {
+    void runBlockEscalationSweepTick().catch((err) => {
+      console.error(
+        `[keeperd] block-escalation sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS);
 
   // Poll-is-truth fallback for the events-log live ingest. The watcher hint is
   // the fast path, but a dropped/coalesced event (or a worker that never
@@ -4307,6 +4880,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // integrity-probe + backup + catch-up timers live on the maintenance worker,
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
+    clearInterval(blockEscalationSweepTimer);
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(retentionTimer);
     clearInterval(mutationPathBackfillTimer);

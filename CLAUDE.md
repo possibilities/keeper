@@ -546,6 +546,32 @@ already-failed key is a slot release, not a target failure). `DispatchCleared` a
 DELETEs the `pending_dispatches` row so an operator clear immediately frees the
 slot.
 
+**The daemon block-escalation producer (fn-941)** notifies a plan task's
+`planner@<epic>` over the Agent Bus when the task is stamped
+`runtime_status='blocked'`, so the wielder stamps `keeper plan block` and STOPS —
+the planner unblocks on the board (`keeper plan unblock`) and the autopilot
+cold-re-dispatches a fresh worker (no warm resume, no orchestrator in the loop).
+The `block_escalations` latch (deterministic-replayed, v86) is the escalate-once
+gate: the `TaskSnapshot` fold INSERTs it `pending` on entering blocked and DELETEs
+it on leaving, so an unblock→re-block re-arms exactly once. A heartbeat sweep
+(`runBlockEscalationSweep`, `BLOCK_ESCALATION_SWEEP_INTERVAL_MS`, armed AFTER the
+fn-897 actuator gate, `clearInterval` on shutdown) walks the `pending` rows
+(`selectPendingBlockEscalations` — a CURRENT-STATE working set, never a history
+scan), re-checks each is still `blocked` in the live projection (the cancellation
+guard), reads `blocked_reason` from the task state file (a producer-side fs read —
+NEVER in a fold), and gates by a DENYLIST: every category escalates EXCEPT
+`TOOLING_FAILURE` and an absent/unparseable reason (surface-and-stop). Survivors
+COALESCE per `planner@<epic>` (one send per recipient per cycle). For each it mints
+`BlockEscalationRequested` (latch `pending→requested`), then spawns a short-lived
+one-way CLI helper ASYNC (`keeper bus chat send` with the body via STDIN so the
+free-text reason is never shell-interpolated, + `keeper bus wake` only on
+`queued_for_wake`), then mints `BlockEscalationAttempted{outcome}` (latch
+`requested→attempted`). The producer NEVER writes the latch directly — it mints
+synthetic events the fold folds; the spawn lives ONLY in the producer (never
+reachable from `applyEvent`), so a re-fold never re-fires a notify, and it is
+fail-open per `runWake`'s injectable-deps discipline (every error degrades to a
+recorded outcome, never throws into the daemon loop).
+
 ## Out of scope
 
 prise/env-var integration, multi-session lineage, harness_meta.

@@ -2967,7 +2967,26 @@ TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
 `dispatch-pending` occupancy self-clear without any live multiplexer probe (the
 `verb::id` window name is a cosmetic label only). SAFETY SEAM: the fn-721
 occupant closes the cross-cycle double-dispatch window; `confirmRunning`'s
-serial wait still covers the intra-cycle race and stays in place. The reconciler boots PAUSED (the in-memory
+serial wait still covers the intra-cycle race and stays in place. A SECOND
+main-thread heartbeat producer rides the same gate-armed `setInterval` shape: the
+**block-escalation producer** (`runBlockEscalationSweep`,
+`BLOCK_ESCALATION_SWEEP_INTERVAL_MS`, 60s, fn-941). When a plan task is stamped
+`runtime_status='blocked'` the `TaskSnapshot` fold arms the deterministic-replayed
+`block_escalations` escalate-once latch (v86); each sweep walks the `pending` rows
+(`selectPendingBlockEscalations`, a current-state working set), re-checks the task
+is still blocked (cancellation guard), reads `blocked_reason` from the plan state
+file (producer-side fs read, never a fold), and escalates to the task's
+`planner@<epic>` over the Agent Bus — gated by a DENYLIST (every category escalates
+except `TOOLING_FAILURE` and an absent/unparseable reason) and COALESCED per
+recipient (one send per planner per cycle). It mints `BlockEscalationRequested`
+(latch `pending→requested`), spawns a short-lived one-way CLI helper ASYNC (`keeper
+bus chat send` with the body via stdin so the free-text reason is never
+shell-interpolated, + `keeper bus wake` on `queued_for_wake`), then mints
+`BlockEscalationAttempted{outcome}` (latch `requested→attempted`) — escalate-once
+per block instance, fail-open per `runWake`'s injectable-deps discipline. The
+planner unblocks on the board (`keeper plan unblock`) and the autopilot
+cold-re-dispatches a fresh worker; the wielder that stamped the block has already
+stopped (no warm resume, no orchestrator in the loop). The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection
