@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T18:03:37.987000Z",
+  "depends_on": [],
+  "epic": "fn-939-cover-modal-host-resilience-invariants",
+  "id": "fn-939-cover-modal-host-resilience-invariants.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Cover modal-host fallback and suppression",
+  "updated_at": "2026-06-24T18:03:37.987000Z"
+}
