@@ -42,8 +42,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
-  resolveAgentwrapPath,
   resolveConfig,
+  resolveKeeperAgentPath,
   resolveSockPath,
 } from "../src/db";
 import {
@@ -55,6 +55,7 @@ import {
 } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { agentwrapLaunch } from "../src/exec-backend";
+import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
 
@@ -388,16 +389,19 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     );
   }
 
-  // Launch directly through agentwrap (keeper's sole launch transport) into the
-  // resolved session — the same transport as the autopilot path. The pre-wrapped
-  // `argv` is ignored; agentwrap builds its invocation from `spec`.
-  const agentwrapPath = resolveAgentwrapPath();
+  // Launch directly through `keeper agent` (keeper's sole launch transport) into
+  // the resolved session — the same transport as the autopilot path. The
+  // pre-wrapped `argv` is ignored; the launcher builds its invocation from `spec`.
+  const launcherArgvPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolveKeeperAgentPath(),
+  );
   const launch: LaunchFn =
     deps.launch ??
     ((session, _argv, cwd, name, spec) =>
       agentwrapLaunch({
         noteLine: (line: string) => process.stderr.write(`${line}\n`),
-        agentwrapPath,
+        launcherArgvPrefix,
         session,
         cwd,
         label: name !== "" ? name : `session=${session}`,

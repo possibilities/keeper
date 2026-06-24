@@ -45,7 +45,6 @@ import { countAbsentBlobs, retainColdPayloads } from "./compaction";
 import {
   openDb,
   readGitProjectionSeedRequired,
-  resolveAgentwrapPath,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
   resolveClaudeProjectsRoot,
@@ -53,6 +52,7 @@ import {
   resolveDbPath,
   resolveDeadLetterDir,
   resolveEventsLogDir,
+  resolveKeeperAgentPath,
   resolvePlanRoots,
   resolveSockPath,
   resolveUsageRoot,
@@ -77,6 +77,7 @@ import type {
   GitWorkerMessage,
 } from "./git-worker";
 import { livePage } from "./integrity-probe";
+import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import type {
   BackupResultMessage,
   MaintenanceLogMessage,
@@ -1391,35 +1392,38 @@ export interface DaemonHandle {
   sockPath: string;
 }
 
-/** Minimal `Bun.spawnSync`-shaped result the agentwrap boot probe reads. */
+/** Minimal `Bun.spawnSync`-shaped result the keeper-agent boot self-check reads. */
 export interface AgentwrapProbeResult {
   readonly success: boolean;
   readonly exitCode: number;
 }
 
-/** Injectable `Bun.spawnSync`-shaped probe for {@link checkAgentwrapPresence};
- *  a throw models an unlaunchable binary (ENOENT / non-executable). */
-export type AgentwrapProbeFn = (path: string) => AgentwrapProbeResult;
+/** Injectable `Bun.spawnSync`-shaped probe for {@link checkKeeperAgentPresence};
+ *  takes the full launcher argv (`[<bun>, <keeper.ts>, "agent", "--version"]`); a
+ *  throw models an unlaunchable launcher (ENOENT bun / missing keeper.ts). */
+export type AgentwrapProbeFn = (argv: string[]) => AgentwrapProbeResult;
 
 /**
- * Fail-fast agentwrap presence check, run at boot ONLY where launch is reachable
- * (the `want("autopilot")` gate). agentwrap is keeper's sole, direct launch
- * transport — no tmux-launch fallback — so a missing/non-executable binary would
- * otherwise surface only as a per-launch ENOENT, spiralling into the never-bound
- * breaker. This pre-empts that with one loud boot warning naming the resolved
- * ABSOLUTE path + an install hint.
+ * Fail-fast keeper-agent launcher SELF-check, run at boot ONLY where launch is
+ * reachable (the `want("autopilot")` gate). The folded `keeper agent` launcher is
+ * keeper's sole, direct launch transport — no tmux-launch fallback — so an
+ * unresolvable launcher (a missing bun / a `cli/keeper.ts` the resolver could not
+ * locate) would otherwise surface only as a per-launch ENOENT, spiralling into
+ * the never-bound breaker. This pre-empts that with one loud boot warning naming
+ * the resolved launcher argv + a hint.
  *
  * Never throws and never exits: the daemon still serves reads + pane-ops without
- * agentwrap, so a miss is a WARNING, not a hard exit. Returns `true` when present
- * (probe succeeded with exit 0), `false` when missing/unlaunchable.
+ * a launchable launcher, so a miss is a WARNING, not a hard exit. Returns `true`
+ * when present (the self-invocation succeeded with exit 0), `false` otherwise.
  *
- * The probe runs `agentwrap --version`. `PATH` MUST ride in the env — a bare
- * custom env drops it and a binary that re-execs a PATH lookup would false-ENOENT.
- * Injectable `spawn`/`log` for unit tests so the present/missing branches exercise
- * with no real fork.
+ * The probe self-invokes `<bun> <cli/keeper.ts> agent --version` — proving the
+ * SAME launcher argv the dispatch path embeds actually answers. `PATH` MUST ride
+ * in the env — a bare custom env drops it and a re-exec PATH lookup would
+ * false-ENOENT. Injectable `spawn`/`log` for unit tests so the present/missing
+ * branches exercise with no real fork.
  */
-export function checkAgentwrapPresence(
-  agentwrapPath: string,
+export function checkKeeperAgentPresence(
+  launcherArgvPrefix: string[],
   deps: {
     spawn?: AgentwrapProbeFn;
     log?: (msg: string) => void;
@@ -1428,8 +1432,8 @@ export function checkAgentwrapPresence(
   const log = deps.log ?? ((msg: string) => console.error(msg));
   const probe: AgentwrapProbeFn =
     deps.spawn ??
-    ((path: string) => {
-      const res = Bun.spawnSync([path, "--version"], {
+    ((argv: string[]) => {
+      const res = Bun.spawnSync(argv, {
         timeout: 5_000,
         // PATH is load-bearing — a bare custom env drops it and a binary that
         // re-execs a PATH lookup false-ENOENTs.
@@ -1437,20 +1441,22 @@ export function checkAgentwrapPresence(
       });
       return { success: res.success, exitCode: res.exitCode };
     });
+  const probeArgv = [...launcherArgvPrefix, "--version"];
+  const launcherLabel = launcherArgvPrefix.join(" ");
   let ok = false;
   try {
-    const res = probe(agentwrapPath);
+    const res = probe(probeArgv);
     ok = res.success && res.exitCode === 0;
   } catch {
     ok = false;
   }
   if (ok) {
-    log(`[keeper] agentwrap launch transport: ${agentwrapPath}`);
+    log(`[keeper] keeper agent launch transport: ${launcherLabel}`);
   } else {
     log(
-      `[keeper] WARNING: agentwrap not found or not executable at ${agentwrapPath} — ` +
-        `worker launch (autopilot + manual dispatch) will FAIL until installed ` +
-        `(install agentwrap or set KEEPER_AGENTWRAP_PATH / config agentwrap_path).`,
+      `[keeper] WARNING: keeper agent launcher not launchable (${launcherLabel}) — ` +
+        `worker launch (autopilot + manual dispatch) will FAIL until repaired ` +
+        `(ensure bun + cli/keeper.ts are present, or set KEEPER_AGENT_PATH / config keeper_agent_path).`,
     );
   }
   return ok;
@@ -3269,16 +3275,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // relay. Config is read here on main and threaded into workerData so the worker
   // never opens config itself.
   const apConfig = resolveConfig();
-  // Absolute agentwrap binary — keeper's sole launch transport. Resolved once on
-  // main (env override + config + `~`-expansion), boot-checked for presence, then
-  // frozen into workerData; restart-to-apply (a config flip lags until restart).
-  const agentwrapPath = resolveAgentwrapPath();
-  // Fail-fast presence check ONLY where launch is reachable (the autopilot gate):
-  // a loud boot warning naming the resolved path pre-empts the per-launch
+  // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the reconciler
+  // spawns to reach the folded `keeper agent` launcher — keeper's sole launch
+  // transport. Resolved once on main (`process.execPath` + env override + config +
+  // `~`-expansion), boot-checked for presence, then frozen into workerData;
+  // restart-to-apply (a config flip lags until restart).
+  const launcherArgvPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolveKeeperAgentPath(),
+  );
+  // Fail-fast self-check ONLY where launch is reachable (the autopilot gate): a
+  // loud boot warning naming the resolved launcher pre-empts the per-launch
   // ENOENT → never-bound-breaker spiral. Never hard-exits — reads + pane-ops still
-  // serve without agentwrap.
+  // serve without a launchable launcher.
   if (want("autopilot")) {
-    checkAgentwrapPresence(agentwrapPath);
+    checkKeeperAgentPresence(launcherArgvPrefix);
   }
   // Gated on the selector — `null` when unselected. The server-worker bridge's
   // `set_autopilot_paused` relay null-guards via `autopilotWorker === null`, so a
@@ -3288,7 +3299,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          agentwrapPath,
+          launcherArgvPrefix,
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
           role: "autopilot",
         } satisfies AutopilotWorkerData,

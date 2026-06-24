@@ -149,8 +149,11 @@ export function assemblePrompt(args: {
 
 /** Inputs to {@link buildPairLaunchArgv}. */
 export interface PairLaunchOpts {
-  /** Absolute agentwrap binary path (resolved + `~`-expanded by the caller). */
-  agentwrapPath: string;
+  /** The launcher argv PREFIX (`[<bun>, <abs cli/keeper.ts>, "agent"]`) the spawn
+   *  execs to reach the folded `keeper agent` launcher (built by the caller from
+   *  `process.execPath` + `resolvePairKeeperAgentPath`). The `cli` token + flags
+   *  are appended, yielding `<bun> <keeper.ts> agent <cli> …`. */
+  launcherArgvPrefix: readonly string[];
   /** Partner CLI. */
   cli: PairCli;
   /** The assembled prompt — the FINAL positional argv element. */
@@ -167,22 +170,25 @@ export interface PairLaunchOpts {
 }
 
 /**
- * Build the detached agentwrap launch argv for a pairing partner. Shape:
+ * Build the detached `keeper agent` launch argv for a pairing partner. Shape:
  *
- *   `<abs-agentwrap> <cli> --agentwrap-tmux --agentwrap-tmux-detached
- *     --agentwrap-no-confirm [--agentwrap-tmux-session <s>]
- *     [--agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>]
- *     -- <native cli flags> <prompt>`
+ *   `<bun> <abs cli/keeper.ts> agent <cli> --agentwrap-tmux
+ *     --agentwrap-tmux-detached --agentwrap-no-confirm
+ *     [--agentwrap-tmux-session <s>] [--agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>]
+ *     <native cli flags> <prompt>`
  *
- * The native flags differ per CLI (see {@link nativeClaudeArgs} /
- * {@link nativeCodexArgs}). The `--agentwrap-no-confirm` flag suppresses the
+ * The `[<bun>, <keeper.ts>, "agent"]` prefix is `launcherArgvPrefix` (resolved by
+ * the caller from `process.execPath` + `resolvePairKeeperAgentPath`), since under
+ * keeper `process.argv[1]` is `cli/keeper.ts` / `src/daemon.ts` — neither carries
+ * the `agent` token. The native flags differ per CLI (see {@link nativeClaudeArgs}
+ * / {@link nativeCodexArgs}). The `--agentwrap-no-confirm` flag suppresses the
  * cwd-confirm prompt; `--agentwrap-tmux-detached` creates the window without
  * stealing focus, so the orchestrating session keeps control.
  *
  * `--agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
  * CLAUDE path only (mirroring `buildAgentwrapLaunchArgv` in
  * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
- * the `jobs` projection as a tracked job — agentwrap injects it into the pane
+ * the `jobs` projection as a tracked job — the launcher injects it into the pane
  * env via tmux `-e`, so the SessionStart hook stamps the session name as the
  * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). codex
  * fires no keeper hooks, so it never becomes a tracked job and omits the carrier
@@ -208,7 +214,7 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
   const native =
     opts.cli === "claude" ? nativeClaudeArgs(opts) : nativeCodexArgs(opts);
   return [
-    opts.agentwrapPath,
+    ...opts.launcherArgvPrefix,
     opts.cli,
     ...wrapperFlags,
     ...native,
@@ -289,17 +295,18 @@ export function stopTimeoutMsFromSeconds(timeoutSeconds: number): number {
   return Math.ceil(timeoutSeconds * 1000);
 }
 
-/** Build the `agentwrap wait-for-stop <handle> --stop-timeout-ms <ms>` argv. The
- *  `stopTimeoutMs` forwards keeper's resolved `--timeout` budget so agentwrap's
- *  stop-wait honors it instead of its own 600s default — keeper is authoritative.
- *  Pure — exported for tests. */
+/** Build the `keeper agent wait-for-stop <handle> --stop-timeout-ms <ms>` argv.
+ *  `launcherArgvPrefix` is `[<bun>, <keeper.ts>, "agent"]`. The `stopTimeoutMs`
+ *  forwards keeper's resolved `--timeout` budget so the launcher's stop-wait
+ *  honors it instead of its own 600s default — keeper is authoritative. Pure —
+ *  exported for tests. */
 export function buildWaitForStopArgv(
-  agentwrapPath: string,
+  launcherArgvPrefix: readonly string[],
   handle: string,
   stopTimeoutMs: number,
 ): string[] {
   return [
-    agentwrapPath,
+    ...launcherArgvPrefix,
     "wait-for-stop",
     handle,
     "--stop-timeout-ms",
@@ -307,13 +314,14 @@ export function buildWaitForStopArgv(
   ];
 }
 
-/** Build the `agentwrap show-last-message <handle>` argv. Pure — exported for
+/** Build the `keeper agent show-last-message <handle>` argv.
+ *  `launcherArgvPrefix` is `[<bun>, <keeper.ts>, "agent"]`. Pure — exported for
  *  tests. */
 export function buildShowLastMessageArgv(
-  agentwrapPath: string,
+  launcherArgvPrefix: readonly string[],
   handle: string,
 ): string[] {
-  return [agentwrapPath, "show-last-message", handle];
+  return [...launcherArgvPrefix, "show-last-message", handle];
 }
 
 // ---------------------------------------------------------------------------
@@ -617,42 +625,16 @@ export function isSelfTranscriptCollision(
 }
 
 // ---------------------------------------------------------------------------
-// agentwrap path resolution (tilde-expanded; mirrors src/db.ts)
+// keeper-agent launcher path resolution (tilde-expanded; mirrors src/db.ts)
 // ---------------------------------------------------------------------------
-
-/** Default agentwrap binary path when no override is configured. */
-export const DEFAULT_PAIR_AGENTWRAP_PATH = "~/.bun/bin/agentwrap";
-
-/**
- * Resolve the absolute agentwrap binary path for `keeper pair`, tilde-expanding
- * AT RESOLVE TIME (`execvp` does not expand `~`). `KEEPER_AGENTWRAP_PATH` wins;
- * else the default. Kept dep-free of `src/db.ts` (whose `resolveAgentwrapPath`
- * also folds the config key) so this leaf never drags the DB graph — the env
- * override + default cover the pair surface. `env`/`home` injectable for tests.
- */
-export function resolvePairAgentwrapPath(
-  env: Record<string, string | undefined> = process.env,
-  home: string = homedir(),
-): string {
-  const override = env.KEEPER_AGENTWRAP_PATH;
-  const entry =
-    override && override.length > 0 ? override : DEFAULT_PAIR_AGENTWRAP_PATH;
-  if (entry === "~") {
-    return home;
-  }
-  if (entry.startsWith("~/")) {
-    return join(home, entry.slice(2));
-  }
-  return entry;
-}
 
 /**
  * Resolve the absolute keeper CLI entry the pair path launches partners through
- * (`<bun> <this path> agent <cli> …`), superseding {@link resolvePairAgentwrapPath}
- * now that the launcher folded into `keeper agent`. db.ts-free (delegates to the
- * shared {@link resolveKeeperAgentPathDepFree} leaf so this surface never drags
- * the DB graph): `KEEPER_AGENT_PATH` > `KEEPER_AGENTWRAP_PATH` (deprecated alias)
- * > the derived `cli/keeper.ts` default. `env`/`home` injectable for tests.
+ * (`<bun> <this path> agent <cli> …`) — the folded `keeper agent` launcher.
+ * db.ts-free (delegates to the shared {@link resolveKeeperAgentPathDepFree} leaf
+ * so this surface never drags the DB graph): `KEEPER_AGENT_PATH` >
+ * `KEEPER_AGENTWRAP_PATH` (deprecated alias) > the derived `cli/keeper.ts`
+ * default. `env`/`home` injectable for tests.
  */
 export function resolvePairKeeperAgentPath(
   env: Record<string, string | undefined> = process.env,

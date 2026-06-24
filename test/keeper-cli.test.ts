@@ -12,7 +12,6 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -854,19 +853,21 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
   });
 });
 
-// cli/dispatch launch transport — the manual CLI launches DIRECTLY through
-// agentwrap (keeper's sole launch transport). With NO injected launch seam,
-// `main()` resolves the real path from `resolveAgentwrapPath()` and invokes it.
-// A stub agentwrap binary (a recording shell script) proves the agentwrap launch
-// fires and carries the round-1 contract flags. A stale `exec_backend:` key in
-// config is silently ignored (the toggle is gone — agentwrap launches either
-// way). KEEPER_CONFIG + KEEPER_AGENTWRAP_PATH sandbox the resolve.
+// cli/dispatch launch transport — the manual CLI launches DIRECTLY through the
+// folded `keeper agent` launcher (keeper's sole launch transport). With NO
+// injected launch seam, `main()` resolves the real launcher path from
+// `resolveKeeperAgentPath()`, builds the `[bun, keeper.ts, "agent"]` prefix, and
+// spawns `bun <keeper.ts> agent claude …`. A stub keeper-agent entry (a recording
+// .ts script bun runs) proves the launch fires and carries the round-1 contract
+// flags. A stale `exec_backend:` key in config is silently ignored (the toggle is
+// gone). KEEPER_CONFIG + KEEPER_AGENT_PATH sandbox the resolve.
 // ---------------------------------------------------------------------------
-describe("cli/dispatch launches via the agentwrap transport", () => {
-  /** Build a tmp dir holding a recording agentwrap stub that appends its argv to
-   *  `argv.log` and emits the schema_version:1 launch JSON, plus a config.yaml
-   *  (optionally carrying a stale `exec_backend:` to prove it is ignored).
-   *  Returns the paths plus a reader for the recorded argv lines. */
+describe("cli/dispatch launches via the keeper agent transport", () => {
+  /** Build a tmp dir holding a recording keeper-agent stub (a .ts entry `bun`
+   *  runs) that appends its argv to `argv.log` and emits the schema_version:1
+   *  launch JSON, plus a config.yaml (optionally carrying a stale `exec_backend:`
+   *  to prove it is ignored). Returns the paths plus a reader for the recorded
+   *  argv lines. */
   function setupBackendSandbox(staleExecBackend?: string): {
     configPath: string;
     stubPath: string;
@@ -875,15 +876,17 @@ describe("cli/dispatch launches via the agentwrap transport", () => {
   } {
     const dir = mkdtempSync(join(tmpdir(), "dispatch-backend-"));
     const argvLog = join(dir, "argv.log");
-    const stubPath = join(dir, "agentwrap-stub.sh");
-    // Record argv, emit one line of schema_version:1 JSON, exit 0 (launched).
+    // The stub stands in for `cli/keeper.ts`; the dispatch path spawns it as
+    // `bun <stub> agent claude …`, so it records `process.argv.slice(2)` (the
+    // `agent claude …` tail) and emits one line of schema_version:1 JSON, exit 0.
+    const stubPath = join(dir, "keeper-agent-stub.ts");
     writeFileSync(
       stubPath,
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${argvLog}'\n` +
-        `echo '{"schema_version":1,"session":"scratch","windowId":"@9","paneId":"%9"}'\n` +
-        `exit 0\n`,
+      `import { appendFileSync } from "node:fs";\n` +
+        `appendFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join(" ") + "\\n");\n` +
+        `process.stdout.write('{"schema_version":1,"session":"scratch","windowId":"@9","paneId":"%9"}\\n');\n` +
+        `process.exit(0);\n`,
     );
-    chmodSync(stubPath, 0o755);
     const configPath = join(dir, "config.yaml");
     writeFileSync(
       configPath,
@@ -906,21 +909,21 @@ describe("cli/dispatch launches via the agentwrap transport", () => {
     s: { configPath: string; stubPath: string },
   ): Promise<MainRun> {
     const prevConfig = process.env.KEEPER_CONFIG;
-    const prevPath = process.env.KEEPER_AGENTWRAP_PATH;
+    const prevPath = process.env.KEEPER_AGENT_PATH;
     process.env.KEEPER_CONFIG = s.configPath;
-    process.env.KEEPER_AGENTWRAP_PATH = s.stubPath;
+    process.env.KEEPER_AGENT_PATH = s.stubPath;
     try {
-      // No `launch` dep → main resolves the real agentwrap path + launches.
+      // No `launch` dep → main resolves the real launcher path + launches.
       return await runMain(argv, {});
     } finally {
       if (prevConfig === undefined) delete process.env.KEEPER_CONFIG;
       else process.env.KEEPER_CONFIG = prevConfig;
-      if (prevPath === undefined) delete process.env.KEEPER_AGENTWRAP_PATH;
-      else process.env.KEEPER_AGENTWRAP_PATH = prevPath;
+      if (prevPath === undefined) delete process.env.KEEPER_AGENT_PATH;
+      else process.env.KEEPER_AGENT_PATH = prevPath;
     }
   }
 
-  test("manual dispatch launches via the agentwrap binary with the contract flags", async () => {
+  test("manual dispatch launches via `keeper agent` with the contract flags", async () => {
     const s = setupBackendSandbox();
     try {
       const r = await runWithBackendEnv(
@@ -930,8 +933,9 @@ describe("cli/dispatch launches via the agentwrap transport", () => {
       // The stub exited 0 → launched; dispatch reports success.
       expect(r.code).toBeUndefined();
       const recorded = s.readArgvLog();
-      // The agentwrap launch argv reached the binary (round-1 contract flags).
-      expect(recorded).toContain("claude --agentwrap-tmux");
+      // The launch argv reached the launcher — the `agent` token prefixes it,
+      // then the round-1 contract flags.
+      expect(recorded).toContain("agent claude --agentwrap-tmux");
       expect(recorded).toContain("--agentwrap-tmux-session scratch");
       expect(recorded).toContain(
         "--agentwrap-tmux-env KEEPER_TMUX_SESSION=scratch",
@@ -943,7 +947,7 @@ describe("cli/dispatch launches via the agentwrap transport", () => {
     }
   });
 
-  test("a stale exec_backend: key in config is ignored — agentwrap still launches", async () => {
+  test("a stale exec_backend: key in config is ignored — `keeper agent` still launches", async () => {
     // The exec_backend toggle is gone; a leftover key must not change behavior.
     const s = setupBackendSandbox("tmux");
     try {
@@ -952,8 +956,8 @@ describe("cli/dispatch launches via the agentwrap transport", () => {
         s,
       );
       expect(r.code).toBeUndefined();
-      // agentwrap still fired despite `exec_backend: tmux` in config.
-      expect(s.readArgvLog()).toContain("claude --agentwrap-tmux");
+      // `keeper agent` still fired despite `exec_backend: tmux` in config.
+      expect(s.readArgvLog()).toContain("agent claude --agentwrap-tmux");
     } finally {
       s.cleanup();
     }

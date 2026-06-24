@@ -43,6 +43,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveConfig } from "../src/db";
+import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import {
   assemblePrompt,
   buildPairLaunchArgv,
@@ -60,7 +61,7 @@ import {
   parsePairLaunchJson,
   parseShowLastMessageJson,
   resolveDisableAutoclose,
-  resolvePairAgentwrapPath,
+  resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
   stripClaudeEnv,
 } from "../src/pair-command";
@@ -269,7 +270,12 @@ export async function main(argv: string[]): Promise<void> {
 
   const pairCli = cli as PairCli;
   const cwd = process.cwd();
-  const agentwrapPath = resolvePairAgentwrapPath();
+  // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the partner is
+  // launched + waited-on + read through — the folded `keeper agent` launcher.
+  const launcherArgvPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolvePairKeeperAgentPath(),
+  );
 
   // Partner tmux session + autoclose policy. The window-kill is split by CLI:
   //   - claude launches as a tracked interactive TUI job (the `KEEPER_TMUX_SESSION`
@@ -365,7 +371,7 @@ export async function main(argv: string[]): Promise<void> {
 
   // ---- 1. launch the partner detached ----
   const launchArgv = buildPairLaunchArgv({
-    agentwrapPath,
+    launcherArgvPrefix,
     cli: pairCli,
     prompt,
     readOnly,
@@ -381,7 +387,7 @@ export async function main(argv: string[]): Promise<void> {
   const launchRes = runAgentwrap(launchArgv, env, cwd);
   if (launchRes === null) {
     return fail(
-      `agentwrap launch produced no result (bad path '${agentwrapPath}'?)`,
+      `agentwrap launch produced no result (bad launcher '${launcherArgvPrefix.join(" ")}'?)`,
     );
   }
   if (launchRes.exitCode !== 0) {
@@ -402,7 +408,7 @@ export async function main(argv: string[]): Promise<void> {
   // strictly above agentwrap's worst-case clean return (stop budget + ≤30s path
   // discovery + slop) so a slow agentwrap start never gets SIGKILLed mid-wait.
   const waitRes = runAgentwrap(
-    buildWaitForStopArgv(agentwrapPath, handle, stopTimeoutMs),
+    buildWaitForStopArgv(launcherArgvPrefix, handle, stopTimeoutMs),
     env,
     cwd,
     stopTimeoutMs + PATH_CEILING_MS + SLOP_MS,
@@ -418,7 +424,7 @@ export async function main(argv: string[]): Promise<void> {
 
   // ---- 3. read the partner's final message ----
   const showRes = runAgentwrap(
-    buildShowLastMessageArgv(agentwrapPath, handle),
+    buildShowLastMessageArgv(launcherArgvPrefix, handle),
     env,
     cwd,
   );

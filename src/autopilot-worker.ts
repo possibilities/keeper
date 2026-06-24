@@ -1387,13 +1387,15 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Absolute agentwrap binary path — keeper's sole launch transport. Resolved
-   * once on main (`resolveAgentwrapPath()`: env override + config +
-   * `~`-expansion) and frozen in here (restart-to-apply: a config flip lags
-   * until the next restart). The in-worker reconciler dispatches DIRECTLY through
-   * agentwrap into the hardcoded `MANAGED_EXEC_SESSION` (not configurable).
+   * The launcher argv PREFIX (`[<abs bun>, <abs cli/keeper.ts>, "agent"]`) the
+   * reconciler spawns to reach the folded `keeper agent` launcher — keeper's sole
+   * launch transport. Resolved once on main (`process.execPath` +
+   * `resolveKeeperAgentPath()`: env override + config + `~`-expansion) and frozen
+   * in here (restart-to-apply: a config flip lags until the next restart). The
+   * in-worker reconciler dispatches DIRECTLY through `keeper agent` into the
+   * hardcoded `MANAGED_EXEC_SESSION` (not configurable).
    */
-  agentwrapPath?: string;
+  launcherArgvPrefix?: string[];
   /**
    * Global root-occupant cap across ALL epics/roots. `null`/absent = unlimited.
    * Threaded in from `resolveConfig()`.
@@ -1789,11 +1791,11 @@ function main(): void {
   const noteLine = (line: string): void => {
     console.error(line);
   };
-  // Launch is DIRECT via agentwrap (keeper's sole launch transport) into the
-  // hardcoded `MANAGED_EXEC_SESSION`. `data.agentwrapPath` (resolved on main) is
-  // the absolute agentwrap binary; `data.agentwrapPath` absent → an empty path
-  // that fails LOUDLY per launch (the daemon boot check is the primary guard).
-  const agentwrapPath = data.agentwrapPath ?? "";
+  // Launch is DIRECT via `keeper agent` (keeper's sole launch transport) into the
+  // hardcoded `MANAGED_EXEC_SESSION`. `data.launcherArgvPrefix` (resolved on main)
+  // is `[bun, cli/keeper.ts, "agent"]`; absent → an empty prefix that fails
+  // LOUDLY per launch (the daemon boot self-check is the primary guard).
+  const launcherArgvPrefix = data.launcherArgvPrefix ?? [];
   // The read-time liveness probe (`listPanes`) is a direct tmux pane-ops seam —
   // it targets server-global tmux ids the hook stamps, independent of the launch
   // transport.
@@ -1841,13 +1843,13 @@ function main(): void {
   // a DispatchFailed is described to main via `postMessage` (main is the
   // sole writer of the synthetic event, mirroring the git-worker mint).
   const deps: ConfirmRunningDeps = {
-    // Direct agentwrap launch into the managed session. The pre-wrapped `argv`
-    // is ignored — agentwrap builds its invocation from the structured `spec`
-    // and owns the tmux window; `name` is the warn/log label + dedup key.
+    // Direct `keeper agent` launch into the managed session. The pre-wrapped
+    // `argv` is ignored — the launcher builds its invocation from the structured
+    // `spec` and owns the tmux window; `name` is the warn/log label + dedup key.
     launch: (_argv, name, cwd, spec) =>
       agentwrapLaunch({
         noteLine,
-        agentwrapPath,
+        launcherArgvPrefix,
         session: MANAGED_EXEC_SESSION,
         cwd,
         label: name,

@@ -27,12 +27,14 @@ import {
   parseShowLastMessageJson,
   READ_ONLY_DIRECTIVE,
   resolveDisableAutoclose,
-  resolvePairAgentwrapPath,
+  resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
   stripClaudeEnv,
 } from "../src/pair-command";
 
-const AW = "/abs/agentwrap";
+// The folded-launcher argv prefix the pair path spawns: `[bun, cli/keeper.ts,
+// "agent"]`. Supersedes the standalone `agentwrap` binary path.
+const LAP = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
 
 // Subprocess-kill margin over the stop budget, mirrored from cli/pair.ts
 // (PATH_CEILING_MS 30s + SLOP_MS 5s). Asserted here so the kill-margin invariant
@@ -109,7 +111,7 @@ test("assemblePrompt: omits the System block when systemPrompt is empty", () => 
 
 test("nativeClaudeArgs: interactive TUI shape — no --print, write posture accepts edits", () => {
   const args = nativeClaudeArgs({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "p",
     readOnly: false,
@@ -126,7 +128,7 @@ test("nativeClaudeArgs: interactive TUI shape — no --print, write posture acce
 
 test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () => {
   const args = nativeClaudeArgs({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "p",
     readOnly: true,
@@ -147,7 +149,7 @@ test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () 
 
 test("nativeClaudeArgs: --model appended when supplied", () => {
   const args = nativeClaudeArgs({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "p",
     readOnly: false,
@@ -163,7 +165,7 @@ test("nativeClaudeArgs: --model appended when supplied", () => {
 test("nativeCodexArgs: keeps web search in BOTH write and read-only", () => {
   for (const readOnly of [false, true]) {
     const args = nativeCodexArgs({
-      agentwrapPath: AW,
+      launcherArgvPrefix: LAP,
       cli: "codex",
       prompt: "p",
       readOnly,
@@ -179,7 +181,7 @@ test("nativeCodexArgs: keeps web search in BOTH write and read-only", () => {
 
 test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () => {
   const args = nativeCodexArgs({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "p",
     readOnly: false,
@@ -196,14 +198,16 @@ test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () 
 
 test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt last", () => {
   const argv = buildPairLaunchArgv({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "THE PROMPT",
     readOnly: false,
   });
-  expect(argv[0]).toBe(AW);
-  expect(argv[1]).toBe("claude");
-  expect(argv.slice(2, 5)).toEqual([
+  // The launch spawns the folded `keeper agent` launcher prefix, then the cli
+  // token, then the wrapper flags.
+  expect(argv.slice(0, LAP.length)).toEqual([...LAP]);
+  expect(argv[LAP.length]).toBe("claude");
+  expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
     "--agentwrap-tmux",
     "--agentwrap-tmux-detached",
     "--agentwrap-no-confirm",
@@ -218,7 +222,7 @@ test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt la
 
 test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION binding carrier", () => {
   const argv = buildPairLaunchArgv({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
     readOnly: false,
@@ -237,7 +241,7 @@ test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION b
 
 test("buildPairLaunchArgv: codex never gets the binding carrier (stays headless)", () => {
   const argv = buildPairLaunchArgv({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "P",
     readOnly: false,
@@ -251,13 +255,13 @@ test("buildPairLaunchArgv: codex never gets the binding carrier (stays headless)
 
 test("buildPairLaunchArgv: codex — agent token is codex, exec native flags present", () => {
   const argv = buildPairLaunchArgv({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "P",
     readOnly: true,
     effort: "medium",
   });
-  expect(argv[1]).toBe("codex");
+  expect(argv[LAP.length]).toBe("codex");
   expect(argv).toContain("exec");
   expect(argv).toContain("web_search_request");
   expect(argv.at(-1)).toBe("P");
@@ -265,7 +269,7 @@ test("buildPairLaunchArgv: codex — agent token is codex, exec native flags pre
 
 test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session supplied", () => {
   const argv = buildPairLaunchArgv({
-    agentwrapPath: AW,
+    launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
     readOnly: false,
@@ -277,15 +281,15 @@ test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session suppli
 });
 
 test("buildWaitForStopArgv / buildShowLastMessageArgv: handle composition", () => {
-  expect(buildWaitForStopArgv(AW, "tmux-abc", 1_800_000)).toEqual([
-    AW,
+  expect(buildWaitForStopArgv(LAP, "tmux-abc", 1_800_000)).toEqual([
+    ...LAP,
     "wait-for-stop",
     "tmux-abc",
     "--stop-timeout-ms",
     "1800000",
   ]);
-  expect(buildShowLastMessageArgv(AW, "tmux-abc")).toEqual([
-    AW,
+  expect(buildShowLastMessageArgv(LAP, "tmux-abc")).toEqual([
+    ...LAP,
     "show-last-message",
     "tmux-abc",
   ]);
@@ -305,7 +309,7 @@ test("stopTimeoutMsFromSeconds: fractional seconds round UP to ms", () => {
 test("buildWaitForStopArgv emits --stop-timeout-ms <Math.ceil(secs*1000)>", () => {
   // A fractional --timeout still emits an integer-ms flag (the same one tested
   // seam the kill margin uses) — never a fractional ms.
-  const argv = buildWaitForStopArgv(AW, "h", stopTimeoutMsFromSeconds(1.0009));
+  const argv = buildWaitForStopArgv(LAP, "h", stopTimeoutMsFromSeconds(1.0009));
   const idx = argv.indexOf("--stop-timeout-ms");
   expect(idx).toBeGreaterThanOrEqual(0);
   expect(argv[idx + 1]).toBe("1001");
@@ -550,23 +554,28 @@ test("isSelfTranscriptCollision: null/empty inputs never collide", () => {
 });
 
 // ---------------------------------------------------------------------------
-// agentwrap path resolution
+// keeper-agent launcher path resolution
 // ---------------------------------------------------------------------------
 
-test("resolvePairAgentwrapPath: KEEPER_AGENTWRAP_PATH wins; tilde expands", () => {
+test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; deprecated alias next; tilde expands", () => {
+  // The new env override wins.
   expect(
-    resolvePairAgentwrapPath(
-      { KEEPER_AGENTWRAP_PATH: "/custom/aw" },
+    resolvePairKeeperAgentPath(
+      { KEEPER_AGENT_PATH: "/custom/keeper.ts" },
       "/home/u",
     ),
-  ).toBe("/custom/aw");
+  ).toBe("/custom/keeper.ts");
+  // The deprecated agentwrap alias still resolves (migration readability).
   expect(
-    resolvePairAgentwrapPath({ KEEPER_AGENTWRAP_PATH: "~/bin/aw" }, "/home/u"),
-  ).toBe("/home/u/bin/aw");
-  // Default when no override.
-  expect(resolvePairAgentwrapPath({}, "/home/u")).toBe(
-    "/home/u/.bun/bin/agentwrap",
-  );
+    resolvePairKeeperAgentPath(
+      { KEEPER_AGENTWRAP_PATH: "~/bin/keeper.ts" },
+      "/home/u",
+    ),
+  ).toBe("/home/u/bin/keeper.ts");
+  // No override → derived `cli/keeper.ts` default (absolute, ends in keeper.ts).
+  const derived = resolvePairKeeperAgentPath({}, "/home/u");
+  expect(derived.startsWith("/")).toBe(true);
+  expect(derived.endsWith("/cli/keeper.ts")).toBe(true);
 });
 
 test("schema version constant is pinned at 1 (cross-repo contract)", () => {

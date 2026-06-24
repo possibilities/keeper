@@ -916,8 +916,13 @@ export const AGENTWRAP_TMUX_EXIT = {
 /** Inputs to {@link buildAgentwrapLaunchArgv}. Structured (DB-free) so the argv
  *  is byte-pin testable. */
 export interface AgentwrapLaunchOpts {
-  /** Absolute agentwrap binary (resolved + `~`-expanded by `resolveAgentwrapPath`). */
-  readonly agentwrapPath: string;
+  /** The launcher argv PREFIX the spawn execs to reach the folded launcher:
+   *  `[<abs bun>, <abs cli/keeper.ts>, "agent"]` (built by
+   *  `buildLauncherArgvPrefix` over `process.execPath` + `resolveKeeperAgentPath`).
+   *  The agent token + flags are appended, yielding
+   *  `<bun> <keeper.ts> agent claude …`. Supersedes the standalone agentwrap
+   *  binary path — the launcher folded into `keeper agent`. */
+  readonly launcherArgvPrefix: readonly string[];
   /** Managed tmux session agentwrap mints/targets via `--agentwrap-tmux-session`. */
   readonly session: string;
   /** The initial interactive prompt — the FINAL positional argv element. */
@@ -933,20 +938,25 @@ export interface AgentwrapLaunchOpts {
 }
 
 /**
- * Build the agentwrap launch argv — the unwrapped agentwrap invocation, NOT the
- * `[shell,-l,-i,-c,…]` wrapper the tmux backend execs. agentwrap owns the tmux
- * window, so keeper delegates session-create + handoff to it:
+ * Build the in-binary launch argv — the unwrapped `keeper agent claude …`
+ * invocation, NOT the `[shell,-l,-i,-c,…]` wrapper the tmux backend execs. The
+ * folded launcher owns the tmux window, so keeper delegates session-create +
+ * handoff to it:
  *
- *   `<abs-agentwrap> claude --agentwrap-tmux --agentwrap-tmux-detached
- *     --agentwrap-tmux-session <session>
+ *   `<bun> <abs cli/keeper.ts> agent claude --agentwrap-tmux
+ *     --agentwrap-tmux-detached --agentwrap-tmux-session <session>
  *     --agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>
  *     [--model <m>] [--effort <e>] [--agentwrap-no-confirm]
  *     [--name <claudeName>] <prompt>`
  *
+ * The `[<bun>, <keeper.ts>, "agent"]` prefix is `launcherArgvPrefix` (resolved by
+ * the caller from `process.execPath` + `resolveKeeperAgentPath`), since under
+ * keeper `process.argv[1]` is `cli/keeper.ts` (CLI) / `src/daemon.ts` (keeperd) —
+ * neither carries the `agent` token, and `daemon.ts` is the wrong binary. The
  * `--agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>` is the load-bearing
- * binding carrier: agentwrap injects it into the pane env via tmux `-e`, so the
- * SessionStart hook stamps the session name on the bound `jobs` row exactly as
- * the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
+ * binding carrier: the launcher injects it into the pane env via tmux `-e`, so
+ * the SessionStart hook stamps the session name on the bound `jobs` row exactly
+ * as the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
  * reap/classify parsing. Pure — exported for byte-pin tests.
  */
 export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
@@ -964,7 +974,7 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     flags.push("--name", opts.claudeName);
   }
   return [
-    opts.agentwrapPath,
+    ...opts.launcherArgvPrefix,
     "claude",
     "--agentwrap-tmux",
     "--agentwrap-tmux-detached",
@@ -1112,7 +1122,11 @@ export const AGENTWRAP_CAPTURE_TIMEOUT_MS = 30_000;
  *  tests. */
 export interface AgentwrapLaunchDeps {
   readonly noteLine: (line: string) => void;
-  readonly agentwrapPath: string;
+  /** The launcher argv PREFIX (`[<bun>, <abs cli/keeper.ts>, "agent"]`) the spawn
+   *  execs to reach the folded `keeper agent` launcher. Resolved by the caller
+   *  (`buildLauncherArgvPrefix` over `process.execPath` + `resolveKeeperAgentPath`),
+   *  frozen in here. Supersedes the standalone agentwrap binary path. */
+  readonly launcherArgvPrefix: readonly string[];
   readonly session: string;
   readonly cwd: string;
   readonly label: string;
@@ -1147,7 +1161,7 @@ export async function agentwrapLaunch(
     kind: "agentwrap",
   });
   const launchArgv = buildAgentwrapLaunchArgv({
-    agentwrapPath: deps.agentwrapPath,
+    launcherArgvPrefix: deps.launcherArgvPrefix,
     session: deps.session,
     prompt: deps.spec.prompt,
     ...(deps.spec.claudeName !== undefined
@@ -1164,12 +1178,12 @@ export async function agentwrapLaunch(
     deps.cwd !== "" ? { cwd: deps.cwd } : undefined,
   );
   if (res == null) {
-    // ENOENT (bad/missing agentwrap path) OR a timeout-kill. A missing path
+    // ENOENT (bad/missing bun or keeper path) OR a timeout-kill. A missing path
     // must fail LOUDLY (not silently): note it. Classify as TRANSIENT so a
     // wedged-but-recoverable launch (the timeout-kill case) re-dispatches; a
     // genuinely-missing binary keeps failing each cycle and surfaces in the
     // warn log, tripping the K=3 never-bound breaker after bounded retries.
-    const error = `agentwrap launch for ${deps.label} produced no result (bad path '${deps.agentwrapPath}'? or timeout-kill)`;
+    const error = `agentwrap launch for ${deps.label} produced no result (bad prefix '${deps.launcherArgvPrefix.join(" ")}'? or timeout-kill)`;
     deps.noteLine(`# warn: ${error}`);
     return { ok: false, error, retryable: true };
   }

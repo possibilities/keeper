@@ -869,13 +869,13 @@ const AGENTWRAP_OK_LINE = `${JSON.stringify({
 })}\n`;
 
 /**
- * agentwrap-launch spawn stub: keys the launch result off the agentwrap binary
- * path (cmd[0]) and captures every spawn's argv + options (cwd) so the test can
- * assert the invocation shape and the worker-cwd-on-spawn behavior. tmux ops
- * fall through to a zero-exit default.
+ * `keeper agent` launch spawn stub: keys the launch result off the launcher
+ * prefix (cmd[0..2] === `[bun, keeper.ts, "agent"]`) and captures every spawn's
+ * argv + options (cwd) so the test can assert the invocation shape and the
+ * worker-cwd-on-spawn behavior. tmux ops fall through to a zero-exit default.
  */
 function makeAgentwrapSpawnStub(
-  agentwrapPath: string,
+  launcherArgvPrefix: readonly string[],
   launch: { stdout?: string; stderr?: string; exitCode?: number },
   records: Array<{ cmd: string[]; cwd?: string }>,
 ): SpawnFn {
@@ -886,8 +886,8 @@ function makeAgentwrapSpawnStub(
         ? { cwd: (options as { cwd?: string }).cwd }
         : {}),
     });
-    const isAgentwrap = cmd[0] === agentwrapPath;
-    const canned = isAgentwrap
+    const isLauncher = launcherArgvPrefix.every((tok, i) => cmd[i] === tok);
+    const canned = isLauncher
       ? launch
       : { stdout: "", stderr: "", exitCode: 0 };
     return {
@@ -899,12 +899,15 @@ function makeAgentwrapSpawnStub(
   };
 }
 
-const AWP = "/abs/bin/agentwrap";
+// The folded-launcher argv prefix the dispatch path spawns: `[bun, cli/keeper.ts,
+// "agent"]`. Supersedes the standalone `agentwrap` binary path — the launcher
+// folded into `keeper agent`.
+const LAP = ["/abs/bin/bun", "/abs/cli/keeper.ts", "agent"] as const;
 
 test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)", () => {
   expect(
     buildAgentwrapLaunchArgv({
-      agentwrapPath: AWP,
+      launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "/plan:work fn-1-x.1",
       claudeName: "work::fn-1-x.1",
@@ -913,7 +916,7 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
       noConfirm: true,
     }),
   ).toEqual([
-    AWP,
+    ...LAP,
     "claude",
     "--agentwrap-tmux",
     "--agentwrap-tmux-detached",
@@ -935,13 +938,13 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
 test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confirm flag", () => {
   expect(
     buildAgentwrapLaunchArgv({
-      agentwrapPath: AWP,
+      launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "do a thing",
       noConfirm: false,
     }),
   ).toEqual([
-    AWP,
+    ...LAP,
     "claude",
     "--agentwrap-tmux",
     "--agentwrap-tmux-detached",
@@ -1036,13 +1039,13 @@ test("fixture: the real line carries schema_version === AGENTWRAP_SCHEMA_VERSION
 test("fixture-fed agentwrapLaunch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
-    AWP,
+    LAP,
     { stdout: AGENTWRAP_FIXTURE_STDOUT, exitCode: 0 },
     records,
   );
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1113,13 +1116,13 @@ test("mapAgentwrapExit: exit-code → outcome class table (1/2/3 permanent, 4 tr
 test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv with worker cwd on the spawn", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
-    AWP,
+    LAP,
     { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
     records,
   );
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1132,9 +1135,10 @@ test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv wit
     spawn,
   });
   expect(res).toEqual({ ok: true });
-  // The launch spawned the agentwrap binary by absolute path, into the managed
-  // session, with the worker cwd set on the spawn (agentwrap has no cwd flag).
-  expect(records[0]?.cmd[0]).toBe(AWP);
+  // The launch spawned the folded `keeper agent` launcher (bun + keeper.ts +
+  // "agent" prefix), into the managed session, with the worker cwd set on the
+  // spawn (the launcher has no cwd flag).
+  expect(records[0]?.cmd.slice(0, LAP.length)).toEqual([...LAP]);
   expect(records[0]?.cmd).toContain("--agentwrap-tmux");
   expect(records[0]?.cmd).toContain("autopilot"); // the managed session
   expect(records[0]?.cwd).toBe("/repo");
@@ -1142,10 +1146,10 @@ test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv wit
 
 test("agentwrapLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 4 }, records);
+  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 4 }, records);
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1157,10 +1161,10 @@ test("agentwrapLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:tru
 
 test("agentwrapLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 3 }, records);
+  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 3 }, records);
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1175,10 +1179,10 @@ test("agentwrapLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
 
 test("agentwrapLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 2 }, records);
+  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 2 }, records);
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1194,13 +1198,13 @@ test("agentwrapLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)",
 test("agentwrapLaunch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
-    AWP,
+    LAP,
     { stdout: `${JSON.stringify({ schema_version: 2 })}\n`, exitCode: 0 },
     records,
   );
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1216,13 +1220,13 @@ test("agentwrapLaunch: exit 0 but schema_version:2 stdout → permanent (unconfi
 test("agentwrapLaunch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
-    AWP,
+    LAP,
     { stdout: "", exitCode: 0 },
     records,
   );
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1246,7 +1250,7 @@ test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () =
   });
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1257,15 +1261,15 @@ test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () =
   expect(res).toMatchObject({ ok: false, retryable: true });
 });
 
-test("agentwrapLaunch: ENOENT (bad path) → transient, loud (noteLine warned)", async () => {
+test("agentwrapLaunch: ENOENT (bad launcher) → transient, loud (noteLine warned)", async () => {
   const warnings: string[] = [];
-  // A spawn that throws models ENOENT (missing binary).
+  // A spawn that throws models ENOENT (missing bun / keeper.ts).
   const spawn: SpawnFn = () => {
     throw new Error("ENOENT");
   };
   const res = await agentwrapLaunch({
     noteLine: (l) => warnings.push(l),
-    agentwrapPath: "/nope/agentwrap",
+    launcherArgvPrefix: ["/nope/bun", "/nope/keeper.ts", "agent"],
     session: MANAGED_EXEC_SESSION,
     cwd: "/repo",
     label: "work::fn-1-x.1",
@@ -1273,8 +1277,8 @@ test("agentwrapLaunch: ENOENT (bad path) → transient, loud (noteLine warned)",
     spawn,
   });
   expect(res).toMatchObject({ ok: false, retryable: true });
-  // Loud, not silent — the bad path is named in a warn line.
-  expect(warnings.some((w) => w.includes("/nope/agentwrap"))).toBe(true);
+  // Loud, not silent — the bad launcher is named in a warn line.
+  expect(warnings.some((w) => w.includes("/nope/keeper.ts"))).toBe(true);
 });
 
 test("agentwrapLaunch: a per-call session targets that session, not the managed default", async () => {
@@ -1282,13 +1286,13 @@ test("agentwrapLaunch: a per-call session targets that session, not the managed 
   // current session) rather than the hardcoded managed one.
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
-    AWP,
+    LAP,
     { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
     records,
   );
   const res = await agentwrapLaunch({
     noteLine: () => {},
-    agentwrapPath: AWP,
+    launcherArgvPrefix: LAP,
     session: "work",
     cwd: "/proj",
     label: "session=work",
@@ -1296,7 +1300,7 @@ test("agentwrapLaunch: a per-call session targets that session, not the managed 
     spawn,
   });
   expect(res).toEqual({ ok: true });
-  expect(records[0]?.cmd[0]).toBe(AWP);
+  expect(records[0]?.cmd.slice(0, LAP.length)).toEqual([...LAP]);
   // Per-call session targeted, not the managed default.
   expect(records[0]?.cmd).toContain("work");
   expect(records[0]?.cmd).toContain("KEEPER_TMUX_SESSION=work");

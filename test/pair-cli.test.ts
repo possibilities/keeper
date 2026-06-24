@@ -65,8 +65,9 @@ beforeEach(() => {
   for (const k of TOUCHED_ENV_KEYS) savedEnv[k] = process.env[k];
 
   // Sandbox every keeper state path under the per-test tmpdir (the isolation
-  // rule) and point the agentwrap resolver at a nonexistent binary so the launch
-  // spawn deterministically fails.
+  // rule) and point the keeper-agent launcher path at a nonexistent module so the
+  // launch spawn (`bun <bad-path> agent claude …`) deterministically fails — bun
+  // runs but cannot load the bad module and exits non-zero.
   const env = sandboxEnv({
     tmpDir: dir,
     dbPath: join(dir, "keeper.db"),
@@ -153,9 +154,10 @@ test("launch-failure path emits exactly one started + one failed line (two-line 
   // …and no completed line leaked onto the failure path.
   expect(countEvent(r.stdout, "completed")).toBe(0);
 
-  // The terminal line carries the launch-failure cause (the bad agentwrap path).
+  // The terminal line carries the launch-failure cause: bun runs the bad launcher
+  // module and exits non-zero, surfaced as an "agentwrap launch exited" error.
   expect(r.stdout).toContain("[keeper-pair] failed");
-  expect(r.stdout).toContain("error=agentwrap launch produced no result");
+  expect(r.stdout).toContain("error=agentwrap launch exited");
 });
 
 test("started precedes failed on the failure path", async () => {

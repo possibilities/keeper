@@ -29,7 +29,7 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildPendingDispatchSweepRecords,
-  checkAgentwrapPresence,
+  checkKeeperAgentPresence,
   type DaemonHandle,
   decideGitSeedWatchdog,
   drainToCompletion,
@@ -3511,45 +3511,58 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
 });
 
 // ---------------------------------------------------------------------------
-// fn-896: agentwrap is keeper's sole launch transport (no tmux-launch fallback),
-// so boot fail-fasts with a loud warning when the resolved binary is absent
-// rather than spiralling into the per-launch ENOENT → never-bound breaker.
+// fn-929: the folded `keeper agent` launcher is keeper's sole launch transport
+// (no tmux-launch fallback), so boot fail-fasts with a loud warning when the
+// launcher SELF-check fails rather than spiralling into the per-launch ENOENT →
+// never-bound breaker. The self-check self-invokes `<bun> <keeper.ts> agent
+// --version` — the SAME launcher argv the dispatch path embeds.
 // ---------------------------------------------------------------------------
 
-test("checkAgentwrapPresence: present (exit 0) returns true and logs the resolved path", () => {
+const PROBE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
+
+test("checkKeeperAgentPresence: present (exit 0) returns true, self-invokes `--version`, logs the launcher", () => {
   const logs: string[] = [];
-  const ok = checkAgentwrapPresence("/opt/bin/agentwrap", {
-    spawn: () => ({ success: true, exitCode: 0 }),
+  const probed: string[][] = [];
+  const ok = checkKeeperAgentPresence(PROBE_PREFIX, {
+    spawn: (argv) => {
+      probed.push(argv);
+      return { success: true, exitCode: 0 };
+    },
     log: (m) => logs.push(m),
   });
   expect(ok).toBe(true);
+  // Self-check ran the SAME launcher argv the dispatch path embeds, + --version.
+  expect(probed).toEqual([[...PROBE_PREFIX, "--version"]]);
   expect(logs).toHaveLength(1);
-  expect(logs[0]).toContain("/opt/bin/agentwrap");
+  expect(logs[0]).toContain("/abs/cli/keeper.ts");
 });
 
-test("checkAgentwrapPresence: non-zero exit returns false and warns with the path + install hint", () => {
+test("checkKeeperAgentPresence: non-zero exit returns false and warns with the launcher + repair hint", () => {
   const logs: string[] = [];
-  const ok = checkAgentwrapPresence("/opt/bin/agentwrap", {
+  const ok = checkKeeperAgentPresence(PROBE_PREFIX, {
     spawn: () => ({ success: false, exitCode: 127 }),
     log: (m) => logs.push(m),
   });
   expect(ok).toBe(false);
   expect(logs).toHaveLength(1);
   expect(logs[0]).toContain("WARNING");
-  expect(logs[0]).toContain("/opt/bin/agentwrap");
-  expect(logs[0]).toContain("KEEPER_AGENTWRAP_PATH");
+  expect(logs[0]).toContain("/abs/cli/keeper.ts");
+  expect(logs[0]).toContain("KEEPER_AGENT_PATH");
 });
 
-test("checkAgentwrapPresence: a throwing spawn (unlaunchable binary) returns false and warns", () => {
+test("checkKeeperAgentPresence: a throwing spawn (unlaunchable launcher) returns false and warns", () => {
   const logs: string[] = [];
-  const ok = checkAgentwrapPresence("/no/such/agentwrap", {
-    spawn: () => {
-      throw new Error("ENOENT");
+  const ok = checkKeeperAgentPresence(
+    ["/no/such/bun", "/no/keeper.ts", "agent"],
+    {
+      spawn: () => {
+        throw new Error("ENOENT");
+      },
+      log: (m) => logs.push(m),
     },
-    log: (m) => logs.push(m),
-  });
+  );
   expect(ok).toBe(false);
   expect(logs).toHaveLength(1);
   expect(logs[0]).toContain("WARNING");
-  expect(logs[0]).toContain("/no/such/agentwrap");
+  expect(logs[0]).toContain("/no/keeper.ts");
 });
