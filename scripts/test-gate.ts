@@ -170,6 +170,10 @@ async function runBunTest(args: string[]): Promise<number> {
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
+    // The gate's own process already holds the host-wide lock; mark the child so
+    // the `bunfig.toml` test preload skips re-acquiring it (re-locking the same
+    // host-wide lock the parent holds would block the child forever).
+    env: { ...process.env, KEEPER_TEST_GATED: "1" },
   });
   await child.exited;
   return child.exitCode ?? 1;

@@ -429,14 +429,20 @@ single source of truth for the slow/integration tier that legitimately keeps rea
 git (the three `*.slow.test.ts` files above plus the commit/plan integration
 suites). Add a file there ONLY when its contract genuinely IS git's own execution.
 
-**Run the suite through the gate, not raw.** `bun test` / `bun run test:full`
-route through `scripts/test-gate.ts`, which caps per-run parallelism
-(`KEEPER_TEST_PARALLEL`, default 4) and takes a host-wide `flock` so concurrent
-agents serialize instead of thrashing the CPU. Invoke the package.json scripts
-(`bun run test` / `bun run test:full`) — a raw `bun test` bypasses the gate and
-oversubscribes the host. `KEEPER_TEST_NO_GATE` skips only the lock (the cap +
-ignore-list still apply); the gate fails open on lock timeout so it can never
-wedge an agent.
+**The host-wide test lock is un-bypassable; the cap rides the gate script.**
+`bun run test` / `bun run test:full` route through `scripts/test-gate.ts`, which
+caps per-run parallelism (`KEEPER_TEST_PARALLEL`, default 4) AND takes a host-wide
+`flock` at `~/.local/state/keeper/test.lock` so concurrent agents serialize instead
+of thrashing the CPU. A RAW `bun test` (any entry point) still takes that same
+host-wide lock: a `bunfig.toml` `[test] preload` (`scripts/test-preload.ts`, and
+the plan plugin's `plugins/plan/test/preload.ts` for its own suite) re-applies the
+flock in-process, so an ad-hoc/agent run can never oversubscribe the host. Prefer
+`bun run test` / `test:full` for the parallel cap; the lock itself is not
+bypassable by going raw. The gate spawns its child with `KEEPER_TEST_GATED=1` so
+the child's preload skips re-locking the lock the parent already holds (no
+self-deadlock). `KEEPER_TEST_NO_GATE` skips the lock for both the gate and the
+preload (the cap + ignore-list still apply); every lock path fails open on error or
+timeout so a wedged holder can never block an agent.
 
 **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
 `retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` — a fixed

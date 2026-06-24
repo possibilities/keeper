@@ -1,0 +1,6 @@
+# The plan plugin's own `bun test` is path-ignored by the keeper gate, so it
+# would run un-serialized. This preload re-applies the same host-wide flock the
+# keeper gate uses, so the plan suite serializes against every other suite on the
+# host and cannot oversubscribe it (fn-934). `KEEPER_TEST_GATED=1` skips re-locking.
+[test]
+preload = ["./test/preload.ts"]
