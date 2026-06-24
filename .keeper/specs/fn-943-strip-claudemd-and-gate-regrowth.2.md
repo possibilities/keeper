@@ -71,5 +71,5 @@ and the README back-references resolving.
 - [ ] the `AGENTS.md` symlink is untouched (edited in place, never recreated)
 
 ## Done summary
-
+Stripped root CLAUDE.md from 577 to 119 imperative-only guardrails (lint-green, docs-prune as rule #0), relocated codex-trust prose to README ## Architecture, and repointed the dangling README back-references.
 ## Evidence
