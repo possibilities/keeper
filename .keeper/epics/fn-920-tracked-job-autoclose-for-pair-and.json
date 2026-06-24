@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-24T01:34:59.170000Z",
   "created_at": "2026-06-23T19:39:41.009000Z",
   "depends_on_epics": [
     "fn-918-wake-offline-planner-durable-bus",
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Tracked-job autoclose for pair and panel windows",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-23T19:39:49.005000Z"
+  "updated_at": "2026-06-24T01:34:59.170000Z"
 }
