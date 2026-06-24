@@ -15,11 +15,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, join } from "node:path";
-import { DEFAULT_PROFILE, listProfiles, pickProfile } from "agentusage";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
+import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeAgentwrapProfileArg, parseArgsForAgent } from "./args";
 import {
   type CodexSessionNameIndexerOptions,
