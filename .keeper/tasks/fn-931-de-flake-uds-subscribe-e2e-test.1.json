@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "stabilize uds subscribe fold-patch race",
-  "updated_at": "2026-06-24T14:23:13.083000Z"
+  "updated_at": "2026-06-24T14:34:55.927000Z",
+  "worker_done_at": "2026-06-24T14:34:55.927000Z"
 }

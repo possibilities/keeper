@@ -37,5 +37,5 @@ in the test. Do not add a blanket retry/skip on the test.
 - [ ] `bun run test:full` passes
 
 ## Done summary
-
+Root cause: a deadline race, not a server delivery-ordering race. The server's diffTick convergence invariant (re-detect + re-emit on the next tick, backpressure re-reflects) guarantees eventual delivery, so no frame is dropped or misordered; the flapping assertion is the propagation-dependent retryUntil await whose 2s default occasionally loses to fold->serve->subscribe->deliver latency under test:full core thrashing. Fix at the test layer: widened retryUntil's default timeout 2s->10s (cadence unchanged, still poll-based, no fixed sleep, no skip/blanket-retry). Idle box returns on the first poll; only a starved box uses the headroom. Verified 25/25 consecutive green locally.
 ## Evidence
