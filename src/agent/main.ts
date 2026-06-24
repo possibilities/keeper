@@ -33,9 +33,13 @@ import {
   loadLauncherDefaults,
   loadPiLauncherDefaults,
   loadPluginSources,
+  loadPresetRegistry,
   type PiLauncherDefaults,
   type PluginSources,
+  type Preset,
+  type PresetRegistry,
   pluginConfigPath,
+  resolvePreset,
 } from "./config";
 import { checkCwdInProjectRoot } from "./cwd-confirm";
 import { nextCwdOrdinal } from "./cwd-ordinal";
@@ -135,6 +139,12 @@ export interface MainDeps {
   loadPiLauncherDefaultsFn: () => PiLauncherDefaults;
   loadClaudeStowDirFn: () => string | null;
   loadPluginSourcesFn: () => PluginSources;
+  /**
+   * Read the named-preset registry from `presets.yaml`. Producer-side launch
+   * config only — never a fold input; re-parsed per dispatch (no watcher) so an
+   * edit lands without a daemon bounce.
+   */
+  loadPresetRegistryFn: () => PresetRegistry;
   ensureClaudeStateSharingFn: (
     listProfilesFn: () => string[],
     actionLog: string[],
@@ -197,6 +207,7 @@ export function realDeps(): MainDeps {
     loadPiLauncherDefaultsFn: loadPiLauncherDefaults,
     loadClaudeStowDirFn: loadClaudeStowDir,
     loadPluginSourcesFn: loadPluginSources,
+    loadPresetRegistryFn: loadPresetRegistry,
     ensureClaudeStateSharingFn: (listProfilesFn, actionLog, claudeStowDir) =>
       ensureClaudeStateSharing(
         listProfilesFn,
@@ -644,6 +655,70 @@ async function runTranscriptSubcommand(
   return deps.exit(0);
 }
 
+/**
+ * `presets resolve <name>`: emit the resolved launch-config JSON to stdout. A
+ * name matching a single preset emits `{kind:"preset", name, harness, model,
+ * effort, thinking, role}` (absent fields null); a name matching a panel emits
+ * `{kind:"panel", name, members:[{name, harness}, ...]}` in declaration order,
+ * validating each member is pair-launchable (claude|codex) and failing loud if a
+ * member pins pi. A `kind` discriminator pins the contract task 4's panel SKILL
+ * parses with jq. A name matching neither is fail-loud (exit 2).
+ */
+function runPresetsResolve(deps: MainDeps, name: string): never {
+  let registry: PresetRegistry;
+  try {
+    registry = deps.loadPresetRegistryFn();
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+
+  const panelMembers = registry.panels[name];
+  if (panelMembers !== undefined) {
+    const members: { name: string; harness: string }[] = [];
+    for (const memberName of panelMembers) {
+      // Load-time validation already guarantees the member resolves.
+      const preset = registry.presets[memberName] as Preset;
+      if (preset.harness === "pi") {
+        deps.writeErr(
+          `Error: panel '${name}' member '${memberName}' pins harness pi, ` +
+            "which is not pair-launchable (claude|codex only).\n",
+        );
+        return deps.exit(2);
+      }
+      members.push({ name: memberName, harness: preset.harness });
+    }
+    deps.write(`${JSON.stringify({ kind: "panel", name, members })}\n`);
+    return deps.exit(0);
+  }
+
+  let preset: Preset;
+  try {
+    preset = resolvePreset(registry, name);
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+  deps.write(
+    `${JSON.stringify({
+      kind: "preset",
+      name,
+      harness: preset.harness,
+      model: preset.model,
+      effort: preset.effort,
+      thinking: preset.thinking,
+      role: preset.role,
+    })}\n`,
+  );
+  return deps.exit(0);
+}
+
 export async function main(deps: MainDeps): Promise<never> {
   const actionLog: string[] = [];
 
@@ -675,7 +750,36 @@ export async function main(deps: MainDeps): Promise<never> {
   if (dispatch.kind === "subcommand") {
     return runTranscriptSubcommand(deps, dispatch.verb, dispatch.rest);
   }
-  const agent = dispatch.agent;
+  if (dispatch.kind === "presets-resolve") {
+    return runPresetsResolve(deps, dispatch.presetName);
+  }
+
+  // Resolve the leading-token harness. `run` carries it directly; the
+  // harnessless `run-preset` form drives it from the named preset's harness.
+  // The preset name (CLI flag or harnessless head) is resolved per field below
+  // the explicit-flag / env slots; a head agent disagreeing with the preset's
+  // harness is rejected.
+  let agent: AgentKind;
+  let argv: string[];
+  let dispatchPresetName: string | null = null;
+  if (dispatch.kind === "run-preset") {
+    dispatchPresetName = dispatch.presetName;
+    let preset: Preset;
+    try {
+      preset = resolvePreset(deps.loadPresetRegistryFn(), dispatch.presetName);
+    } catch (exc) {
+      if (exc instanceof ConfigError) {
+        deps.writeErr(`Error: ${exc.message}\n`);
+        return deps.exit(2);
+      }
+      throw exc;
+    }
+    agent = preset.harness;
+    argv = dispatch.rest;
+  } else {
+    agent = dispatch.agent;
+    argv = dispatch.rest;
+  }
   const bin =
     agent === "claude"
       ? deps.claudeBin
@@ -683,7 +787,6 @@ export async function main(deps: MainDeps): Promise<never> {
         ? deps.codexBin
         : deps.piBin;
   const agentLabel = displayAgent(agent);
-  const argv = dispatch.rest;
 
   // Wrapper-owned help short-circuits before the tmux pre-pass, passthrough
   // detection, and launch — `agentwrap <agent> --agentwrap-help` prints the
@@ -761,6 +864,35 @@ export async function main(deps: MainDeps): Promise<never> {
   const { agentwrapVerbose, agentwrapVeryVerbose, agentwrapNoConfirm } = parsed;
   const { agentwrapCodexSessionName, agentwrapModal } = parsed;
   let { agentwrapProfile, explicitAgentwrapProfile } = parsed;
+
+  // Named preset resolution: the `--agentwrap-preset` flag (or the harnessless
+  // head, already mirrored onto parsed.agentwrapPreset). Resolve it once here so
+  // its model/effort/thinking can layer into the resolver default slots BELOW
+  // the explicit-flag / effort-env precedence. A head agent disagreeing with the
+  // preset's harness is fail-loud — never silently re-route the launch.
+  const presetName = parsed.agentwrapPreset ?? dispatchPresetName;
+  let resolvedPreset: Preset | null = null;
+  if (presetName !== null) {
+    try {
+      resolvedPreset = resolvePreset(deps.loadPresetRegistryFn(), presetName);
+    } catch (exc) {
+      if (exc instanceof ConfigError) {
+        deps.writeErr(`Error: ${exc.message}\n`);
+        return deps.exit(2);
+      }
+      throw exc;
+    }
+    if (dispatch.kind === "run" && resolvedPreset.harness !== agent) {
+      deps.writeErr(
+        `Error: --agentwrap-preset ${presetName} pins harness ` +
+          `${resolvedPreset.harness}, but the ${agent} subcommand was given.\n`,
+      );
+      return deps.exit(2);
+    }
+    actionLog.push(
+      `Resolved preset '${presetName}' (${resolvedPreset.harness})`,
+    );
+  }
 
   // Experimental --agentwrap-modal precondition gate (claude-only, interactive
   // TTY-only). Reject early — before any state-sharing / profile setup — so the
@@ -1012,8 +1144,12 @@ export async function main(deps: MainDeps): Promise<never> {
       );
     }
 
-    const { model: defaultModel, effort: defaultEffort } =
+    const { model: yamlModel, effort: yamlEffort } =
       deps.loadCodexLauncherDefaultsFn();
+    // Per-field: preset layers OVER yaml (a model-only preset leaves effort
+    // falling through to yaml). The resolver still gives explicit/env priority.
+    const defaultModel = resolvedPreset?.model ?? yamlModel;
+    const defaultEffort = resolvedPreset?.effort ?? yamlEffort;
     const startupModel = resolveCodexStartupModelOverride(
       remainingArgs,
       defaultModel,
@@ -1170,8 +1306,13 @@ export async function main(deps: MainDeps): Promise<never> {
   actionLog.push(`Built base ${agentLabel} command`);
 
   if (agent === "claude") {
-    const { model: defaultModel, effort: defaultEffort } =
+    const { model: yamlModel, effort: yamlEffort } =
       deps.loadLauncherDefaultsFn();
+    // Per-field: preset layers OVER yaml. resolveStartup*Override still encode
+    // explicit > env > default, so the net order is explicit > env > preset >
+    // yaml > native, per field with no new precedence machinery.
+    const defaultModel = resolvedPreset?.model ?? yamlModel;
+    const defaultEffort = resolvedPreset?.effort ?? yamlEffort;
     const startupModel = resolveStartupModelOverride(
       remainingArgs,
       defaultModel,
@@ -1198,8 +1339,11 @@ export async function main(deps: MainDeps): Promise<never> {
     runCmd.push("--teammate-mode", "in-process");
     actionLog.push("Added --strict-mcp-config --teammate-mode in-process");
   } else {
-    const { model: defaultModel, thinking: defaultThinking } =
+    const { model: yamlModel, thinking: yamlThinking } =
       deps.loadPiLauncherDefaultsFn();
+    // Per-field: preset layers OVER yaml (preset.thinking is pi-only).
+    const defaultModel = resolvedPreset?.model ?? yamlModel;
+    const defaultThinking = resolvedPreset?.thinking ?? yamlThinking;
     const startupThinking = resolveStartupThinkingOverride(
       remainingArgs,
       defaultThinking,

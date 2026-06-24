@@ -10,6 +10,7 @@
  */
 
 import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
+import type { PresetRegistry } from "../../src/agent/config";
 import type { MainDeps } from "../../src/agent/main";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
@@ -79,6 +80,8 @@ export interface HarnessOptions {
   codexLauncherEffort?: string | null;
   piLauncherModel?: string | null;
   piLauncherThinking?: string | null;
+  /** Preset registry loadPresetRegistryFn returns (default empty). */
+  presetRegistry?: PresetRegistry;
   claudeStowDir?: string | null;
   spawn?: SpawnFn;
   /** Override the --agentwrap-modal interactive-TTY precondition (default true). */
@@ -161,6 +164,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
     }),
     loadClaudeStowDirFn: () => opts.claudeStowDir ?? null,
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
+    loadPresetRegistryFn: () =>
+      opts.presetRegistry ?? { presets: {}, panels: {} },
     ensureClaudeStateSharingFn: () => {},
     ensureAgentwrapProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);

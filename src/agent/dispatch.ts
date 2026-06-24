@@ -21,6 +21,8 @@ export type SubcommandKind = "wait-for-stop" | "show-last-message";
 /** Result of the leading-token classification. Discriminated on `kind`. */
 export type Dispatch =
   | { kind: "run"; agent: AgentKind; rest: string[] }
+  | { kind: "run-preset"; presetName: string; rest: string[] }
+  | { kind: "presets-resolve"; presetName: string }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
@@ -42,6 +44,9 @@ Usage:
   agentwrap claude [args...]        Launch Claude Code.
   agentwrap codex [args...]         Launch Codex CLI.
   agentwrap pi [args...]            Launch pi.
+  agentwrap --agentwrap-preset <name> [args...]
+                                    Launch the preset's harness (harnessless).
+  agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   agentwrap show-last-message <h>   Print a detached run's final message.
@@ -82,6 +87,19 @@ Wrapper flags:
   --agentwrap-no-confirm            Skip the cwd-confirmation prompt.
   --agentwrap-profile <name>        Select a profile ('default' = native
                                     account; 'auto' picks via the ledger).
+  --agentwrap-preset <name>         Apply a named launch-config preset from
+                                    ~/.config/agentwrap/presets.yaml
+                                    (harness/model/effort defaults BELOW any
+                                    explicit --model/--effort or effort env).
+                                    With no agent token the harness comes from
+                                    the preset; with one, a disagreeing harness
+                                    is rejected.
+
+Preset resolution:
+  agentwrap presets resolve <name>  Emit the resolved JSON for a single preset
+                                    ({name,harness,model,effort|thinking,role})
+                                    or a panel (an ordered array of
+                                    {name,harness} members).
 
 Experimental flags (opt-in):
   --agentwrap-modal                 (claude only) Host claude in a Bun PTY under
@@ -129,7 +147,11 @@ Top-level flags:
 /**
  * Classify the leading argv token. `claude`/`codex`/`pi` → run with the remaining
  * args (even when empty, so a bare `agentwrap claude`, `agentwrap codex`, or `agentwrap pi`
- * still launches interactively); `wait-for-stop`/`show-last-message` → the
+ * still launches interactively); a leading `--agentwrap-preset <name>` (no head
+ * agent token) → the harnessless run-preset form whose harness comes from the
+ * preset (the whole argv stays in `rest` so parseArgs strips the flag);
+ * `presets resolve <name>` → emit the resolved preset/panel JSON;
+ * `wait-for-stop`/`show-last-message` → the
  * post-launch transcript verbs with the remaining args (the handle); `--agentwrap-help`
  * → wrapper help; `-h`/`--help` → short usage; `-v`/`--version` → version; an empty
  * argv or any other leading token → usage (carrying the unknown subcommand name when
@@ -144,6 +166,28 @@ export function splitSubcommand(argv: string[]): Dispatch {
   }
   if (head === "claude" || head === "codex" || head === "pi") {
     return { kind: "run", agent: head, rest: argv.slice(1) };
+  }
+  if (head === "presets") {
+    if (argv[1] === "resolve") {
+      const presetName = argv[2];
+      if (presetName === undefined || presetName.trim() === "") {
+        return { kind: "usage", unknown: "presets resolve" };
+      }
+      return { kind: "presets-resolve", presetName: presetName.trim() };
+    }
+    return { kind: "usage", unknown: `presets ${argv[1] ?? ""}`.trim() };
+  }
+  if (head === "--agentwrap-preset" || head.startsWith("--agentwrap-preset=")) {
+    // Harnessless launch: harness comes from the named preset. Keep the WHOLE
+    // argv in `rest` so parseArgs strips the flag and main() resolves it.
+    const presetName =
+      head === "--agentwrap-preset"
+        ? (argv[1] ?? "").trim()
+        : head.slice("--agentwrap-preset=".length).trim();
+    if (presetName === "") {
+      return { kind: "usage", unknown: "--agentwrap-preset" };
+    }
+    return { kind: "run-preset", presetName, rest: argv };
   }
   if (head === "wait-for-stop" || head === "show-last-message") {
     return { kind: "subcommand", verb: head, rest: argv.slice(1) };

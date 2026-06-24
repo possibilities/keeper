@@ -104,6 +104,53 @@ describe("splitSubcommand", () => {
     });
   });
 
+  test("leading --agentwrap-preset is the harnessless run-preset form", () => {
+    expect(
+      splitSubcommand(["--agentwrap-preset", "claude-opus-xhigh", "/p"]),
+    ).toEqual({
+      kind: "run-preset",
+      presetName: "claude-opus-xhigh",
+      // The whole argv stays in rest so parseArgs strips the flag.
+      rest: ["--agentwrap-preset", "claude-opus-xhigh", "/p"],
+    });
+  });
+
+  test("leading --agentwrap-preset=joined form classifies as run-preset", () => {
+    expect(splitSubcommand(["--agentwrap-preset=codex-gpt55-high"])).toEqual({
+      kind: "run-preset",
+      presetName: "codex-gpt55-high",
+      rest: ["--agentwrap-preset=codex-gpt55-high"],
+    });
+  });
+
+  test("--agentwrap-preset with no name is usage", () => {
+    expect(splitSubcommand(["--agentwrap-preset"])).toEqual({
+      kind: "usage",
+      unknown: "--agentwrap-preset",
+    });
+  });
+
+  test("presets resolve <name> classifies", () => {
+    expect(splitSubcommand(["presets", "resolve", "default"])).toEqual({
+      kind: "presets-resolve",
+      presetName: "default",
+    });
+  });
+
+  test("presets resolve with no name is usage", () => {
+    expect(splitSubcommand(["presets", "resolve"])).toEqual({
+      kind: "usage",
+      unknown: "presets resolve",
+    });
+  });
+
+  test("presets with an unknown verb is usage", () => {
+    expect(splitSubcommand(["presets", "list"])).toEqual({
+      kind: "usage",
+      unknown: "presets list",
+    });
+  });
+
   test("empty argv is bare usage (no unknown)", () => {
     expect(splitSubcommand([])).toEqual({ kind: "usage" });
   });

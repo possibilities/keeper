@@ -6,8 +6,9 @@
  *
  * Three consumed flags carry no value (`--agentwrap-verbose`,
  * `--agentwrap-very-verbose`, `--agentwrap-no-confirm`) and wrapper value flags
- * take either split (`--agentwrap-profile x`) or joined
- * (`--agentwrap-profile=x`) form. Every other token passes through verbatim into
+ * (`--agentwrap-profile`, `--agentwrap-preset`,
+ * `--agentwrap-codex-session-name`) take either split (`--agentwrap-profile x`)
+ * or joined (`--agentwrap-profile=x`) form. Every other token passes through verbatim into
  * `remainingArgs`, preserving order — the agent sees exactly what the human
  * typed minus the launcher flags. A stray non-launcher flag (including the
  * retired `--arthack-*` spelling) is forwarded to the agent, which rejects it
@@ -51,6 +52,13 @@ export interface ParsedArgs {
   /** Synthetic Codex session name to index once the live session id is known. */
   agentwrapCodexSessionName: string | null;
   /**
+   * `--agentwrap-preset <name>` — a named launch-config preset resolved from
+   * `presets.yaml` that supplies harness/model/effort defaults BELOW any
+   * explicit flag or effort env. `null` when unset (no "auto"); the preset
+   * never overrides an explicit `--model`/`--effort`.
+   */
+  agentwrapPreset: string | null;
+  /**
    * `--agentwrap-modal` seen — experimental: host claude in a Bun PTY under an
    * OpenTUI modal-overlay shell. Opt-in, claude-only, interactive-TTY-only;
    * stripped from `remainingArgs` so the child never sees it.
@@ -88,9 +96,11 @@ export function parseArgsForAgent(
   let agentwrapModal = false;
   let agentwrapProfile = "auto";
   let agentwrapCodexSessionName: string | null = null;
+  let agentwrapPreset: string | null = null;
   let explicitAgentwrapProfile = false;
   let parsingAgentwrapProfile = false;
   let parsingAgentwrapCodexSessionName = false;
+  let parsingAgentwrapPreset = false;
 
   for (const arg of args) {
     if (parsingAgentwrapProfile) {
@@ -102,6 +112,11 @@ export function parseArgsForAgent(
     if (parsingAgentwrapCodexSessionName) {
       agentwrapCodexSessionName = arg.trim() || null;
       parsingAgentwrapCodexSessionName = false;
+      continue;
+    }
+    if (parsingAgentwrapPreset) {
+      agentwrapPreset = arg.trim() || null;
+      parsingAgentwrapPreset = false;
       continue;
     }
     if (arg === "--agentwrap-verbose") {
@@ -123,6 +138,10 @@ export function parseArgsForAgent(
     } else if (arg.startsWith("--agentwrap-codex-session-name=")) {
       agentwrapCodexSessionName =
         arg.slice("--agentwrap-codex-session-name=".length).trim() || null;
+    } else if (arg === "--agentwrap-preset") {
+      parsingAgentwrapPreset = true;
+    } else if (arg.startsWith("--agentwrap-preset=")) {
+      agentwrapPreset = arg.slice("--agentwrap-preset=".length).trim() || null;
     } else {
       remainingArgs.push(arg);
       if (agent !== "codex" && isContinueOrResumeArg(arg, agent)) {
@@ -158,6 +177,7 @@ export function parseArgsForAgent(
     agentwrapProfile,
     explicitAgentwrapProfile,
     agentwrapCodexSessionName,
+    agentwrapPreset,
   };
 }
 

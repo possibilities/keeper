@@ -68,6 +68,10 @@ export function pluginConfigPath(): string {
   return join(homedir(), ".config", "agentwrap", "plugins.yaml");
 }
 
+export function presetsConfigPath(): string {
+  return join(homedir(), ".config", "agentwrap", "presets.yaml");
+}
+
 export interface LauncherDefaults {
   model: string | null;
   effort: string | null;
@@ -216,6 +220,214 @@ export function loadPluginSources(
     pluginDirs: paths("plugin_dirs"),
     pluginScanDirs: paths("plugin_scan_dirs"),
   };
+}
+
+/** A harness the launcher can drive. */
+export type PresetHarness = "claude" | "codex" | "pi";
+
+/**
+ * A named launch-config triple. `model`/`effort`/`thinking` are partial: a
+ * preset that omits a field layers OVER the per-harness yaml rather than
+ * replacing it. `effort` is claude/codex-only, `thinking` is pi-only (never
+ * both). `role` is an optional pair-only label carried verbatim.
+ */
+export interface Preset {
+  harness: PresetHarness;
+  model: string | null;
+  effort: string | null;
+  thinking: string | null;
+  role: string | null;
+}
+
+/**
+ * The single launch-config registry parsed from `presets.yaml`: named presets
+ * plus named panels (each an ordered list of preset names). Read ONLY by this
+ * dep-free config island — the launcher import graph never reaches `src/db.ts`.
+ */
+export interface PresetRegistry {
+  presets: Record<string, Preset>;
+  panels: Record<string, string[]>;
+}
+
+const PRESET_HARNESSES: ReadonlySet<string> = new Set([
+  "claude",
+  "codex",
+  "pi",
+]);
+
+/**
+ * Names a preset / panel may NOT take — they would collide with a launcher
+ * subcommand or with a downstream YAML-1.1 boolean re-parse. `Bun.YAML.parse`
+ * is YAML 1.2 (boolean-free), but a name consumed by a 1.1 re-parser (jq,
+ * another yaml lib) could silently coerce, so reserve them here.
+ */
+const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
+  "claude",
+  "codex",
+  "pi",
+  "wait-for-stop",
+  "show-last-message",
+  "default",
+  "help",
+  // YAML 1.1 booleans / null.
+  "yes",
+  "no",
+  "on",
+  "off",
+  "true",
+  "false",
+  "null",
+  "~",
+]);
+
+const PRESET_NAME_PATTERN = /^[a-z0-9_-]+$/;
+
+function presetStringField(
+  raw: Record<string, unknown>,
+  key: string,
+  name: string,
+  configPath: string,
+): string | null {
+  const v = raw[key];
+  if (v === null || v === undefined) {
+    return null;
+  }
+  if (typeof v !== "string" || !v.trim()) {
+    throw new ConfigError(
+      `Preset '${name}' field ${key} must be a non-empty string in ${configPath}`,
+    );
+  }
+  return v.trim();
+}
+
+function validatePresetName(name: string, configPath: string): void {
+  if (!PRESET_NAME_PATTERN.test(name)) {
+    throw new ConfigError(
+      `Preset name '${name}' must match [a-z0-9_-]+ in ${configPath}`,
+    );
+  }
+  if (RESERVED_PRESET_NAMES.has(name)) {
+    throw new ConfigError(
+      `Preset name '${name}' is reserved and cannot be used in ${configPath}`,
+    );
+  }
+}
+
+function parsePreset(name: string, value: unknown, configPath: string): Preset {
+  if (!isRecord(value)) {
+    throw new ConfigError(
+      `Preset '${name}' must be a mapping in ${configPath}`,
+    );
+  }
+  const harness = value.harness;
+  if (typeof harness !== "string" || !PRESET_HARNESSES.has(harness)) {
+    throw new ConfigError(
+      `Preset '${name}' harness must be one of claude|codex|pi in ${configPath}`,
+    );
+  }
+  const effort = presetStringField(value, "effort", name, configPath);
+  const thinking = presetStringField(value, "thinking", name, configPath);
+  if (effort !== null && thinking !== null) {
+    throw new ConfigError(
+      `Preset '${name}' cannot set both effort and thinking in ${configPath}`,
+    );
+  }
+  if (thinking !== null && harness !== "pi") {
+    throw new ConfigError(
+      `Preset '${name}' thinking is pi-only, not ${harness} in ${configPath}`,
+    );
+  }
+  if (effort !== null && harness === "pi") {
+    throw new ConfigError(
+      `Preset '${name}' effort is claude/codex-only, not pi in ${configPath}`,
+    );
+  }
+  return {
+    harness: harness as PresetHarness,
+    model: presetStringField(value, "model", name, configPath),
+    effort,
+    thinking,
+    role: presetStringField(value, "role", name, configPath),
+  };
+}
+
+/**
+ * Read the named-preset registry from `presets.yaml`. Fail-OPEN on a missing
+ * file (an empty registry — presets are recommended, never mandatory), and
+ * fail-LOUD (ConfigError) on malformed YAML or any invalid entry: a bad
+ * harness, cross-harness effort+thinking, a reserved / non-matching name, or a
+ * panel member that references no defined preset.
+ */
+export function loadPresetRegistry(
+  configPath: string = presetsConfigPath(),
+): PresetRegistry {
+  if (!isFile(configPath)) {
+    return { presets: {}, panels: {} };
+  }
+  const raw = readMapping(configPath);
+
+  const presets: Record<string, Preset> = {};
+  const presetsRaw = raw.presets ?? {};
+  if (!isRecord(presetsRaw)) {
+    throw new ConfigError(`Expected presets to be a mapping in ${configPath}`);
+  }
+  for (const [name, value] of Object.entries(presetsRaw)) {
+    validatePresetName(name, configPath);
+    presets[name] = parsePreset(name, value, configPath);
+  }
+
+  const panels: Record<string, string[]> = {};
+  const panelsRaw = raw.panels ?? {};
+  if (!isRecord(panelsRaw)) {
+    throw new ConfigError(`Expected panels to be a mapping in ${configPath}`);
+  }
+  for (const [name, members] of Object.entries(panelsRaw)) {
+    validatePresetName(name, configPath);
+    if (!Array.isArray(members) || members.length === 0) {
+      throw new ConfigError(
+        `Panel '${name}' must be a non-empty list in ${configPath}`,
+      );
+    }
+    const out: string[] = [];
+    for (const member of members) {
+      if (typeof member !== "string" || !member.trim()) {
+        throw new ConfigError(
+          `Panel '${name}' members must be non-empty strings in ${configPath}`,
+        );
+      }
+      const memberName = member.trim();
+      if (!(memberName in presets)) {
+        throw new ConfigError(
+          `Panel '${name}' references undefined preset '${memberName}' in ${configPath}`,
+        );
+      }
+      out.push(memberName);
+    }
+    panels[name] = out;
+  }
+
+  return { presets, panels };
+}
+
+/**
+ * Resolve a single preset by name. Fail-loud with a specific message naming the
+ * file, the requested name, and the available names — never a silent fallback to
+ * a default (a typo must be visible).
+ */
+export function resolvePreset(
+  registry: PresetRegistry,
+  name: string,
+  configPath: string = presetsConfigPath(),
+): Preset {
+  const preset = registry.presets[name];
+  if (preset === undefined) {
+    const available = Object.keys(registry.presets);
+    const list = available.length > 0 ? available.join(", ") : "(none)";
+    throw new ConfigError(
+      `Preset '${name}' not found in ${configPath}. Available: ${list}`,
+    );
+  }
+  return preset;
 }
 
 function isFile(p: string): boolean {

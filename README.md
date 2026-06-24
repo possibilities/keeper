@@ -1339,6 +1339,24 @@ event-log/reducer/hook touch. Run any of them with
   deferred follow-on. The flag is claude-only and rejected for codex/pi, `-p`/
   `--print`, and any non-TTY invocation.
 
+  Named launch-config presets (fn-937) live in a single registry,
+  `~/.config/agentwrap/presets.yaml`, read ONLY by the dep-free `src/agent/config.ts`
+  island (the launcher import graph never reaches `src/db.ts`). A preset is a
+  named `{harness, model?, effort?, thinking?, role?}` triple
+  (`presets.<name>`); a panel is an ordered list of preset names
+  (`panels.<name>`). `keeper agent --agentwrap-preset <name> [args...]` applies
+  one — harnessless, the harness comes from the preset — and `keeper agent
+  presets resolve <name>` emits the resolved preset/panel JSON. Resolution is
+  per-field `explicit flag > effort env > preset > per-harness yaml > native
+  default`, so a preset never overrides an explicit `--model`/`--effort` and a
+  partial preset layers over the yaml rather than replacing it; with no
+  `--agentwrap-preset` the launch is byte-identical to today. The registry is
+  fail-open on a missing file and fail-loud on a malformed/invalid entry or an
+  unknown preset name. Presets are producer-side launch config, never a fold
+  input — no RPC writes a preset and the registry is re-parsed per dispatch (no
+  watcher), so an edit lands without a daemon bounce. The autopilot worker launch
+  resolves a `worker` preset (defaulting to today's `sonnet`/`max`).
+
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,
   `server-up` + `reason=unreachable` added in fn-750.2, give-up made

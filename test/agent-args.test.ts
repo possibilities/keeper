@@ -117,6 +117,22 @@ describe("parseArgs", () => {
     expect(parseArgs(["hi"]).agentwrapModal).toBe(false);
   });
 
+  test("--agentwrap-preset split form is consumed and stripped", () => {
+    const p = parseArgs(["--agentwrap-preset", "claude-opus-xhigh", "hi"]);
+    expect(p.agentwrapPreset).toBe("claude-opus-xhigh");
+    expect(p.remainingArgs).toEqual(["hi"]);
+  });
+
+  test("--agentwrap-preset=joined form is consumed and stripped", () => {
+    const p = parseArgs(["--agentwrap-preset=codex-gpt55-high", "hi"]);
+    expect(p.agentwrapPreset).toBe("codex-gpt55-high");
+    expect(p.remainingArgs).toEqual(["hi"]);
+  });
+
+  test("--agentwrap-preset defaults to null (no auto)", () => {
+    expect(parseArgs(["hi"]).agentwrapPreset).toBeNull();
+  });
+
   test("--agentwrap-help is dispatch-owned, not a parser-consumed flag", () => {
     // main() short-circuits --agentwrap-help before parseArgs ever runs; the
     // parser sets no launch-mode signal for it and treats it like any unknown
