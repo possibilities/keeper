@@ -25,7 +25,10 @@ import {
   runModalHost,
   TERMINAL_INPUT_RESET,
 } from "../src/agent/modal-host";
-import type { OverlayHandle } from "../src/agent/modal-overlay";
+import type {
+  OverlayHandle,
+  OverlayHostSeam,
+} from "../src/agent/modal-overlay";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 // ── main() branch wiring ──────────────────────────────────────────────────
@@ -461,6 +464,38 @@ describe("runModalHost overlay resilience", () => {
     handle.close();
     h.pty.emitData([0x68, 0x69]); // "hi" — streamed
     expect(h.stdout).toEqual([0x68, 0x69]);
+    h.pty.finishExit(0);
+    await run;
+  });
+
+  test("raw passthrough is re-asserted after build and on modal close (no cooked-mode leak)", async () => {
+    const h = makeHostHarness();
+    let seam: OverlayHostSeam | null = null;
+    const handle: OverlayHandle = {
+      open() {},
+      close() {},
+      get isOpen() {
+        return false;
+      },
+      destroy() {},
+    };
+    h.deps.buildOverlay = (s) => {
+      seam = s;
+      return Promise.resolve(handle);
+    };
+    const run = runHost(h.deps);
+    await Promise.resolve();
+    await Promise.resolve();
+    // In production the overlay build suspends the renderer, which drops the
+    // parent to cooked mode + pauses stdin. The host re-asserts raw afterward,
+    // so the last recorded setRawMode is true — not the false a suspend leaves.
+    expect(h.rawModes.at(-1)).toBe(true);
+    // A modal open→close round-trip re-enters passthrough via the seam's attach,
+    // which must also re-assert raw (suspend dropped it again on close).
+    seam!.stdinHandoff.detach();
+    const before = h.rawModes.length;
+    seam!.stdinHandoff.attach();
+    expect(h.rawModes.slice(before)).toContain(true);
     h.pty.finishExit(0);
     await run;
   });

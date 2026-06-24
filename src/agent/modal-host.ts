@@ -315,7 +315,19 @@ export async function runModalHost(
     const seam: OverlayHostSeam = {
       stdinHandoff: {
         detach: () => stdin.off("data", onStdin),
-        attach: () => stdin.on("data", onStdin),
+        // Re-assert raw passthrough on the way back to the modal-closed state:
+        // OpenTUI's suspend() drops the parent to cooked mode + pauses stdin,
+        // which would otherwise echo + line-buffer input (e.g. the child's mouse
+        // reports) once the modal closes.
+        attach: () => {
+          try {
+            stdin.setRawMode?.(true);
+          } catch {
+            // TTY rejected raw mode — degrade to cooked input.
+          }
+          stdin.resume();
+          stdin.on("data", onStdin);
+        },
       },
       requestAgentRedraw: () => onResize(),
       termWrite: (data) => void stdout.write(data),
@@ -330,6 +342,16 @@ export async function runModalHost(
       );
       overlay = null;
     }
+    // buildOverlay leaves the renderer suspended, and OpenTUI's suspend() drops
+    // the parent terminal to cooked mode + pauses stdin. Re-assert raw passthrough
+    // so the modal-closed resting period does not echo + line-buffer input — the
+    // gap that made the child's mouse reports spill into the terminal as text.
+    try {
+      stdin.setRawMode?.(true);
+    } catch {
+      // TTY rejected raw mode — degrade to cooked input.
+    }
+    stdin.resume();
   }
 
   // Read the child's REAL exit disposition out-of-band (Subprocess.exited),
