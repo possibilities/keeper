@@ -6,12 +6,12 @@
   "id": "fn-933-fix-bus-sender-misattribution-recycled",
   "last_validated_at": "2026-06-24T15:45:32.807000Z",
   "primary_repo": "/Users/mike/code/keeper",
-  "queue_jump": false,
+  "queue_jump": true,
   "snippets": [],
   "status": "open",
   "title": "fix bus sender misattribution recycled pid",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T15:45:32.789000Z"
+  "updated_at": "2026-06-24T15:46:15.479000Z"
 }
