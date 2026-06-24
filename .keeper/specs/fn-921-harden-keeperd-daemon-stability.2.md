@@ -67,5 +67,5 @@ rows since 2026-05-19, never compacted) makes each refetch ~1MB.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Bound the subagent_invocations subscription by recency (ts >= now - 1d) via a descriptor recencyBound threaded through one ResolvedFilter, so the membership token, page, and COUNT(*) scope to one recent window — killing the server-worker CPU peg from re-paging the ~5k-row/~1MB never-compacted history to every subscriber on each membership change. A meta change now re-pages only the bounded set; pk detail subscribes stay exempt.
 ## Evidence

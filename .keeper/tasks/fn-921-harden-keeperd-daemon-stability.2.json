@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Bound subagent_invocations subscription fanout",
-  "updated_at": "2026-06-23T21:12:29.247000Z"
+  "updated_at": "2026-06-24T01:47:12.181000Z",
+  "worker_done_at": "2026-06-24T01:47:12.181000Z"
 }
