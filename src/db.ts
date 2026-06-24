@@ -118,6 +118,18 @@ export interface KeeperConfig {
   roots: string[];
   claudeProjectsRoot?: string;
   agentusageRoot?: string;
+  // Absolute path to the `uv` binary the usage-scraper-worker shells the
+  // stateless agentusage scrape util through. Independent best-effort key with
+  // NO default — absent/empty/garbage → undefined → the scraper worker is not
+  // spawned. MUST be absolute (keeperd's LaunchAgent PATH is stripped, so a bare
+  // `uv` would not resolve). Resolved by {@link resolveUsageScraperRuntime}.
+  usageScraperUvPath?: string;
+  // Absolute path to the agentusage project directory (the repo holding
+  // `pyproject.toml` + `agentusage/scrape_cli.py`). Independent best-effort key
+  // with NO default — absent/empty/garbage → undefined → the scraper worker is
+  // not spawned. The worker runs `<uv> run --directory <this> python -m
+  // agentusage.scrape_cli …`. Resolved by {@link resolveUsageScraperRuntime}.
+  usageScraperProjectDir?: string;
   // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
@@ -184,6 +196,10 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
+  // No default — absent leaves these undefined so the usage-scraper worker
+  // never spawns. Both must be absolute (stripped LaunchAgent PATH).
+  let usageScraperUvPath: string | undefined;
+  let usageScraperProjectDir: string | undefined;
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
@@ -231,6 +247,20 @@ export function resolveConfig(): KeeperConfig {
       const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
       if (typeof bbu === "string" && bbu.length > 0) {
         buildbotUrl = bbu;
+      }
+      // Independent best-effort keys — non-empty string only; garbage/absent
+      // leaves them undefined and the usage-scraper worker un-spawned. NOT
+      // tilde-expanded here — resolution happens in
+      // `resolveUsageScraperRuntime()`.
+      const usuv = (raw as { usage_scraper_uv_path?: unknown })
+        .usage_scraper_uv_path;
+      if (typeof usuv === "string" && usuv.length > 0) {
+        usageScraperUvPath = usuv;
+      }
+      const uspd = (raw as { usage_scraper_project_dir?: unknown })
+        .usage_scraper_project_dir;
+      if (typeof uspd === "string" && uspd.length > 0) {
+        usageScraperProjectDir = uspd;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `dispatchPromptPrefix` undefined and no free-form prompt prefix
@@ -303,6 +333,8 @@ export function resolveConfig(): KeeperConfig {
     claudeProjectsRoot,
     agentusageRoot,
     buildbotUrl,
+    usageScraperUvPath,
+    usageScraperProjectDir,
     dispatchPromptPrefix,
     agentwrapPath,
     keeperAgentPath,
@@ -396,6 +428,55 @@ export function resolveBuildbotUrl(): string | null {
   return resolveConfig().buildbotUrl ?? null;
 }
 
+/** Expand a leading `~`/`~/` via `homedir()`; pass an absolute path through. */
+function expandTilde(entry: string): string {
+  const home = homedir();
+  if (entry === "~") {
+    return home;
+  }
+  if (entry.startsWith("~/")) {
+    return join(home, entry.slice(2));
+  }
+  return entry;
+}
+
+/** Resolved usage-scraper runtime: an absolute `uv` path + agentusage project dir. */
+export interface UsageScraperRuntime {
+  uvPath: string;
+  projectDir: string;
+}
+
+/**
+ * Resolve the usage-scraper worker's runtime (absolute `uv` binary + agentusage
+ * project dir), or null when EITHER is unconfigured. Independent best-effort
+ * keys with NO default — the worker spawn is GATED on a non-null return here
+ * (resolves → spawn; unresolved → un-spawn + warn, never `fatalExit`). Mirrors
+ * {@link resolveBuildbotUrl}'s no-default gate template.
+ *
+ * Precedence per slot: `KEEPER_USAGE_SCRAPER_UV_PATH` /
+ * `KEEPER_USAGE_SCRAPER_PROJECT_DIR` env > the matching config key. A leading
+ * `~` is expanded AT RESOLVE TIME (`execvp` does not expand `~`). No existence
+ * check — a bad path fails the scrape loudly at spawn, never silently here.
+ */
+export function resolveUsageScraperRuntime(): UsageScraperRuntime | null {
+  const cfg = resolveConfig();
+  const uvEntry = firstNonEmpty(
+    process.env.KEEPER_USAGE_SCRAPER_UV_PATH,
+    cfg.usageScraperUvPath,
+  );
+  const dirEntry = firstNonEmpty(
+    process.env.KEEPER_USAGE_SCRAPER_PROJECT_DIR,
+    cfg.usageScraperProjectDir,
+  );
+  if (uvEntry === undefined || dirEntry === undefined) {
+    return null;
+  }
+  return {
+    uvPath: expandTilde(uvEntry),
+    projectDir: expandTilde(dirEntry),
+  };
+}
+
 /**
  * Resolve configured plan roots to absolute paths: tilde-expand, then
  * skip-and-log any non-existent/non-directory root so one bad root never
@@ -444,19 +525,22 @@ export function resolveClaudeProjectsRoot(): string {
 }
 
 /**
- * Resolve the agentusage watch root to an absolute path. Tilde-expand only, NO
- * existence-filter (the usage-worker tolerates absence).
+ * Resolve the agentusage state root to an absolute path. `KEEPER_AGENTUSAGE_ROOT`
+ * env wins (the test-isolation seam — sandboxes the state dir + picker ledger so
+ * a scrape/spawn test never touches the real `~/.local/state/agentusage/`); else
+ * the `agentusage_root` config key; else the default. Tilde-expand only, NO
+ * existence-filter (the usage-worker + scraper tolerate absence). Both the
+ * consumer (usage-worker watch root) and the producer (scraper write dir + the
+ * vendored picker's `setStateDir`) resolve through here so one override moves the
+ * whole tree.
  */
 export function resolveUsageRoot(): string {
-  const home = homedir();
-  const entry = resolveConfig().agentusageRoot ?? DEFAULT_AGENTUSAGE_ROOT;
-  if (entry === "~") {
-    return home;
-  }
-  if (entry.startsWith("~/")) {
-    return join(home, entry.slice(2));
-  }
-  return entry;
+  const override = process.env.KEEPER_AGENTUSAGE_ROOT;
+  const entry =
+    override && override.length > 0
+      ? override
+      : (resolveConfig().agentusageRoot ?? DEFAULT_AGENTUSAGE_ROOT);
+  return expandTilde(entry);
 }
 
 /**
