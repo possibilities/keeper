@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T18:32:46.262000Z",
+  "depends_on": [],
+  "epic": "fn-942-fix-modal-host-terminal-restore",
+  "id": "fn-942-fix-modal-host-terminal-restore.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "reset child input modes on teardown",
+  "updated_at": "2026-06-24T18:32:46.262000Z"
+}
