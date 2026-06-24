@@ -2,9 +2,11 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-06-24T21:56:21.087000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-946-add-keeper-handoff-fire-and-forget"
+  ],
   "id": "fn-949-prefer-started-epics-in-scheduling",
-  "last_validated_at": "2026-06-24T21:56:21.125000Z",
+  "last_validated_at": "2026-06-24T21:56:29.016000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T21:56:21.087000Z"
+  "updated_at": "2026-06-24T21:56:28.959000Z"
 }
