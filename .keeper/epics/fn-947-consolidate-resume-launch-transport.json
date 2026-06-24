@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-24T21:25:56.099000Z",
+  "depends_on_epics": [],
+  "id": "fn-947-consolidate-resume-launch-transport",
+  "last_validated_at": "2026-06-24T21:25:56.122000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Consolidate resume launch transport",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-24T21:25:56.099000Z"
+}
