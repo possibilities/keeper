@@ -26,5 +26,5 @@ subsequent edge). Forward-facing invariant wording only — no behavior change.
 - [ ] No production logic or test assertion changes — comments only.
 
 ## Done summary
-
+Corrected the active_since doc comments in types.ts, reducer.ts, and readiness.ts: the field is re-stamped on every un-stop edge (not frozen), and the schema boundary is pre-v84 (not the non-existent v90). Comments only — no behavior change.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix active_since comment accuracy",
-  "updated_at": "2026-06-24T02:36:49.707000Z"
+  "updated_at": "2026-06-24T02:48:08.741000Z",
+  "worker_done_at": "2026-06-24T02:48:08.741000Z"
 }
