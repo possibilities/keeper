@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T23:47:12.247000Z",
+  "depends_on": [
+    "fn-955-topology-anchored-crash-restore.2"
+  ],
+  "epic": "fn-955-topology-anchored-crash-restore",
+  "id": "fn-955-topology-anchored-crash-restore.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "fail-closed apply autopilot gate",
+  "updated_at": "2026-06-24T23:47:12.247000Z"
+}
