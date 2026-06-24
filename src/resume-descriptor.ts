@@ -6,12 +6,13 @@
  *    `claude --resume "<target>"` shell string `scripts/resume.ts` prints.
  *    Byte-unchanged, alias-shaped (a bare `claude` token a human pastes).
  *  - LAUNCH ({@link buildResumeLaunchForm}): the alias-independent,
- *    quoting-safe argv the TWO launch producers spawn — `keeper bus wake`
- *    ({@link import("./bus-wake").buildWakeResumeArgv}) and the crash-restore
- *    util ({@link import("../scripts/restore-agents").buildResumeLaunchArgv}).
+ *    quoting-safe argv the crash-restore util
+ *    ({@link import("../scripts/restore-agents").buildResumeLaunchArgv}) spawns.
  *    It rides an ABSOLUTE `keeper agent` launcher prefix (injected by the
  *    caller) + the resume tokens as positional `"$@"` args, so no `claude`
  *    alias is needed and no shell metacharacter in the session name can fire.
+ *    (`keeper bus wake` now resumes via the unified `agentwrapLaunch` transport,
+ *    not this form.)
  *
  * Everything in this module is PURE — no socket, no fs, no `Date.now()`, no
  * env reads. `scripts/resume.ts` still owns the lazy per-epic UDS fetch loop

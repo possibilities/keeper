@@ -5,7 +5,7 @@
  *
  *  - the hotkey (overlay.open()) floats the test modal over the dim scrim — the
  *    scrim + box renderables mount and the placeholder copy paints;
- *  - Esc dismisses, and a click on the scrim (NOT the modal) dismisses;
+ *  - Esc dismisses; clicks are inert (mouse is disabled, so v0 is Esc-only);
  *  - while open the stdin mutex is honored (detach BEFORE resume, attach AFTER
  *    suspend) and a dismiss forces the agent redraw;
  *  - destroy() while open auto-dismisses (child-exit-while-open) and tears the
@@ -43,7 +43,7 @@ const RUNTIME = {
   TextRenderable,
 } as unknown as OverlayBundle["runtime"];
 
-const MODAL_BODY = "Test modal. Press Esc or click the scrim to dismiss.";
+const MODAL_BODY = "Test modal. Press Esc to dismiss.";
 
 beforeAll(() => {
   process.env.OTUI_USE_CONSOLE = "false";
@@ -161,18 +161,20 @@ test("Esc dismisses: layers gone, agent redraw forced, handoff balanced", async 
   expect(log.attach).toBe(1);
 });
 
-test("clicking the scrim dismisses; clicking the modal does not", async () => {
+test("v0 has no mouse dismiss: clicks are inert, only Esc dismisses", async () => {
   const { setup, overlay } = await bootOverlay({ width: 80, height: 24 });
   overlay.open();
   await setup.renderOnce();
 
-  // Click on the modal box center (does NOT dismiss).
+  // Mouse is disabled (useMouse:false) so the overlay never enables mouse
+  // reporting — keeping the passthrough terminal clean. A click on the modal
+  // or the scrim therefore does nothing; dismissal is Esc-only.
   await setup.mockMouse.click(40, 12);
+  await setup.mockMouse.click(0, 0);
   await setup.renderOnce();
   expect(overlay.isOpen).toBe(true);
 
-  // Click on the scrim (top-left corner, far from the centered modal) dismisses.
-  await setup.mockMouse.click(0, 0);
+  setup.mockInput.pressEscape();
   await waitUntil(setup, () => !overlay.isOpen);
   expect(overlay.isOpen).toBe(false);
 });

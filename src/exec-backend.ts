@@ -75,8 +75,15 @@ export type LaunchResult =
  * threading the spec costs nothing at the seam.
  */
 export interface LaunchSpec {
-  /** The initial interactive prompt — the FINAL positional of the worker argv. */
+  /** The initial interactive prompt — the FINAL positional of the worker argv.
+   *  In resume mode ({@link resumeTarget} set) it is unused: the argv carries
+   *  `--resume <target>` and NO trailing prompt positional. */
   readonly prompt: string;
+  /** Resume mode: when set (non-empty), the launch emits `--resume <target>` and
+   *  DROPS the trailing prompt positional — a `claude --resume` re-attach rather
+   *  than a fresh prompted session. Omitted for the prompt-mode worker/dispatch
+   *  launch (the byte-unchanged default). */
+  readonly resumeTarget?: string;
   /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
@@ -925,8 +932,12 @@ export interface AgentwrapLaunchOpts {
   readonly launcherArgvPrefix: readonly string[];
   /** Managed tmux session agentwrap mints/targets via `--agentwrap-tmux-session`. */
   readonly session: string;
-  /** The initial interactive prompt — the FINAL positional argv element. */
+  /** The initial interactive prompt — the FINAL positional argv element. Dropped
+   *  in resume mode ({@link resumeTarget} set). */
   readonly prompt: string;
+  /** Resume mode: when set (non-empty), emit `--resume <target>` and NO trailing
+   *  prompt positional. Omitted for the prompt-mode worker/dispatch launch. */
+  readonly resumeTarget?: string;
   /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
@@ -947,7 +958,13 @@ export interface AgentwrapLaunchOpts {
  *     --agentwrap-tmux-detached --agentwrap-tmux-session <session>
  *     --agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>
  *     [--model <m>] [--effort <e>] [--agentwrap-no-confirm]
- *     [--name <claudeName>] <prompt>`
+ *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
+ *
+ * The tail is the ONLY conditional: prompt mode (the default) ends with the
+ * `prompt` positional; resume mode ({@link AgentwrapLaunchOpts.resumeTarget} set)
+ * ends with `--resume <target>` and NO prompt — the `keeper bus wake` / crash-
+ * restore re-attach. The prompt-mode argv is byte-identical to before the resume
+ * branch was added.
  *
  * The `[<bun>, <keeper.ts>, "agent"]` prefix is `launcherArgvPrefix` (resolved by
  * the caller from `process.execPath` + `resolveKeeperAgentPath`), since under
@@ -973,6 +990,13 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
   if (opts.claudeName !== undefined) {
     flags.push("--name", opts.claudeName);
   }
+  // Resume mode is `--resume <target>` with NO trailing prompt positional — a
+  // re-attach to an existing session. Prompt mode keeps the prompt as the
+  // UNCONDITIONAL final positional, so the worker/dispatch argv is byte-unchanged.
+  const tail =
+    opts.resumeTarget !== undefined && opts.resumeTarget !== ""
+      ? ["--resume", opts.resumeTarget]
+      : [opts.prompt];
   return [
     ...opts.launcherArgvPrefix,
     "claude",
@@ -983,7 +1007,7 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     "--agentwrap-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
     ...flags,
-    opts.prompt,
+    ...tail,
   ];
 }
 
@@ -1164,6 +1188,9 @@ export async function agentwrapLaunch(
     launcherArgvPrefix: deps.launcherArgvPrefix,
     session: deps.session,
     prompt: deps.spec.prompt,
+    ...(deps.spec.resumeTarget !== undefined
+      ? { resumeTarget: deps.spec.resumeTarget }
+      : {}),
     ...(deps.spec.claudeName !== undefined
       ? { claudeName: deps.spec.claudeName }
       : {}),

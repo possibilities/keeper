@@ -49,7 +49,7 @@ const SCRIM_ALPHA = 0.55;
 
 /** Placeholder modal copy — this is the MECHANICS proof, not the final UI. */
 const MODAL_TITLE = " agentwrap modal ";
-const MODAL_BODY = "Test modal. Press Esc or click the scrim to dismiss.";
+const MODAL_BODY = "Test modal. Press Esc to dismiss.";
 
 /** Minimal RGBA surface (the subset we construct). Mirrors `@opentui/core`'s. */
 export interface RGBAType {
@@ -241,9 +241,9 @@ export function attachModalOverlay(deps: OverlayDeps): OverlayHandle {
   };
 
   // Build the scrim (bottom z) + the modal box (top z via add-order + zIndex).
-  // The scrim's onMouseDown is the click-to-dismiss hit-test: a click anywhere on
-  // the scrim (i.e. NOT on the modal box, which sits on top and captures its own
-  // clicks) dismisses.
+  // The scrim is a visual dim-backdrop only; dismissal is Esc. Mouse is disabled
+  // (see `useMouse: false` in the renderer build) to keep the passthrough terminal
+  // clean, so there is no click-to-dismiss.
   const buildLayers = (w: number, h: number): void => {
     // Absolute positioning so the scrim and the modal OVERLAP (z-ordered) rather
     // than stacking in the flex flow — a full-screen flex child would otherwise
@@ -258,7 +258,6 @@ export function attachModalOverlay(deps: OverlayDeps): OverlayHandle {
       respectAlpha: true,
       zIndex: 0,
     });
-    scrim.onMouseDown = (): void => close();
     paintScrim(scrim, w, h);
 
     const modalW = Math.min(Math.max(w - 8, 20), 60);
@@ -276,8 +275,6 @@ export function attachModalOverlay(deps: OverlayDeps): OverlayHandle {
       border: true,
       title: MODAL_TITLE,
     });
-    // A click on the modal itself must NOT dismiss — only the scrim dismisses.
-    modal.onMouseDown = (): void => {};
     modalText = new runtime.TextRenderable(renderer, {
       id: "agentwrap-modal-text",
       content: MODAL_BODY,
@@ -429,6 +426,13 @@ export async function defaultBuildOverlayBundle(): Promise<OverlayBundle> {
     exitSignals: [],
     autoFocus: false,
     screenMode: "alternate-screen",
+    // Zero mouse footprint. With mouse tracking on, OpenTUI briefly enables it
+    // at startup (?1000h..?1003h) before suspend disables it; under a mouse-on
+    // multiplexer that brief enable flips the pane into mouse-forwarding, so the
+    // user's scroll/motion is then routed to the passthrough child — which is not
+    // in mouse mode — and spills into it as literal escape-sequence text. The
+    // modal dismisses on Esc, so it needs no mouse at all.
+    useMouse: false,
   })) as unknown as OverlayRenderer;
   return {
     renderer,

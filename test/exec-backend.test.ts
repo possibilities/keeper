@@ -956,6 +956,54 @@ test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confir
   ]);
 });
 
+test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trailing prompt (byte-pinned)", () => {
+  expect(
+    buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: LAP,
+      session: "agentbus",
+      prompt: "", // unused in resume mode
+      resumeTarget: "planner-session",
+      noConfirm: true,
+    }),
+  ).toEqual([
+    ...LAP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "agentbus",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=agentbus",
+    "--agentwrap-no-confirm",
+    "--resume",
+    "planner-session",
+  ]);
+});
+
+test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode", () => {
+  // A degenerate empty target must NOT emit `--resume ""` (a quoting/UX hazard);
+  // it falls through to the trailing prompt positional.
+  expect(
+    buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: LAP,
+      session: "agentbus",
+      prompt: "fallback prompt",
+      resumeTarget: "",
+      noConfirm: false,
+    }),
+  ).toEqual([
+    ...LAP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "agentbus",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=agentbus",
+    "fallback prompt",
+  ]);
+});
+
 // --- parseAgentwrapStdout ---
 
 test("parseAgentwrapStdout: a schema_version:1 line → ok", () => {

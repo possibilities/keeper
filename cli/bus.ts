@@ -62,7 +62,7 @@ import {
   resolveBusSockPath,
   resolveDbPath,
 } from "../src/db";
-import { createTmuxPaneOps, type SpawnFn } from "../src/exec-backend";
+import { createTmuxPaneOps } from "../src/exec-backend";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
@@ -615,7 +615,6 @@ async function runWakeVerb(target: string): Promise<{
     readCooldown: readWakeCooldown,
     writeCooldown: writeWakeCooldown,
     tryLock: tryWakeLock,
-    spawn: (cmd, options) => Bun.spawn(cmd, options) as ReturnType<SpawnFn>,
     now: () => Date.now(),
     noteLine: (l) => process.stderr.write(`${l}\n`),
   });
