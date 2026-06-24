@@ -58,7 +58,9 @@ import {
   MAX_CONNECTIONS,
   META_MIN_INTERVAL_MS,
   newResultMemo,
+  PER_PID_MAX_CONNECTIONS,
   type PreSerialized,
+  pidConnCount,
   pollLoop,
   type ReplayBridge,
   type ResultMemo,
@@ -72,6 +74,7 @@ import {
   STUCK_PENDING_TTL_MS,
   type SubState,
   startServer,
+  UNENGAGED_CONN_TTL_MS,
   unregisterRpc,
   type Writable,
   writeFrames,
@@ -143,6 +146,8 @@ function dispatchInit(): ConnState {
     pendingSince: null,
     lastActivityAt: Date.now(),
     peerPid: null,
+    connectedAt: Date.now(),
+    everEngaged: false,
   };
 }
 
@@ -2159,11 +2164,12 @@ test("fn-778 dead-peer sweep is inert for a null peerPid (probe unavailable → 
   db.close();
 });
 
-test("fn-778 dead-peer sweep does NOT touch a zero-sub conn (idle sweep owns that)", async () => {
-  // A zero-sub conn with a dead peer but a FRESH clock: the dead-peer arm is
-  // subscribed-only, and the idle sweep is fresh-clock-exempt — so neither fires
-  // and the conn survives this pass (the idle sweep ages it out later). This
-  // pins the scope boundary so the arms don't double-own the zero-sub case.
+test("fn-921.5 dead-peer sweep evicts a ZERO-SUB conn at once (the connection-cap-wedge fix)", async () => {
+  // A zero-sub conn with a dead peer and a FRESH clock — the exact shape that
+  // wedged the cap: a one-shot / reconnect-probe client SIGKILLed before the
+  // 5-minute idle TTL. The dead-peer arm now keys on LIVENESS not subs, so it
+  // reaps this AT ONCE rather than letting it occupy a slot for 5 minutes (and
+  // pile to the cap under a storm). Reaping garbage on liveness is the fix.
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -2171,13 +2177,125 @@ test("fn-778 dead-peer sweep does NOT touch a zero-sub conn (idle sweep owns tha
 
   expect(sock.data.subs.size).toBe(0);
   sock.data.peerPid = await deadPid();
-  sock.data.lastActivityAt = Date.now();
+  sock.data.lastActivityAt = Date.now(); // fresh — only the liveness key can evict
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-921.5 — read-socket connection protection: subscribe-by-deadline sweep +
+// per-pid admission cap. A hammering client (a reconnect-loop `keeper board`)
+// must never exhaust the connection table and wedge the daemon's read socket.
+// ---------------------------------------------------------------------------
+
+test("fn-921.5 unengaged sweep evicts a zero-sub conn that never spoke, past the deadline", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  // Connected, zero subs, never dispatched a frame (everEngaged false), aged
+  // past the subscribe-by-deadline — connect-and-silent dead weight from a
+  // reconnect storm whose peer is still alive (so the dead-peer arm can't help).
+  expect(sock.data.subs.size).toBe(0);
+  expect(sock.data.everEngaged).toBe(false);
+  sock.data.peerPid = process.pid; // alive — dead-peer arm is inert
+  sock.data.connectedAt = Date.now() - (UNENGAGED_CONN_TTL_MS + 1);
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+test("fn-921.5 unengaged sweep SPARES an engaged zero-sub conn (a slow cold-boot query in flight)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  // The cold-boot one-shot query: it dispatched its query FRAME (everEngaged
+  // true) and is now awaiting a multi-second reply while main warms the fold
+  // memo — zero subs, connected long ago. Engagement exempts it: the deadline
+  // must NEVER reap a conn with real work in flight.
+  expect(sock.data.subs.size).toBe(0);
+  sock.data.everEngaged = true;
+  sock.data.peerPid = process.pid;
+  sock.data.connectedAt = Date.now() - UNENGAGED_CONN_TTL_MS * 10;
 
   reapConns([...conns]);
 
   expect(sock.ended).toBe(false);
   expect(conns.has(sock)).toBe(true);
   db.close();
+});
+
+test("fn-921.5 unengaged sweep SPARES a fresh zero-sub conn still inside the deadline", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  // Just connected, no frame yet — a client mid-handshake about to query. Inside
+  // the deadline it is never swept (mirrors the idle-sweep fresh-conn exemption).
+  expect(sock.data.everEngaged).toBe(false);
+  sock.data.peerPid = process.pid;
+  expect(Date.now() - sock.data.connectedAt).toBeLessThan(
+    UNENGAGED_CONN_TTL_MS,
+  );
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("fn-921.5 unengaged sweep NEVER touches a subscribed conn (a quiet board)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // A board holds a sub but (legacy clients) may never re-dispatch a frame, so
+  // everEngaged could be false; the subs-count exemption must keep it alive
+  // regardless of the deadline — a subscription IS engagement.
+  sock.data.everEngaged = false;
+  sock.data.peerPid = process.pid;
+  sock.data.connectedAt = Date.now() - UNENGAGED_CONN_TTL_MS * 100;
+  expect(sock.data.subs.size).toBe(1);
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("fn-921.5 pidConnCount counts only conns sharing a peer pid", () => {
+  const conns = new Set<Writable>();
+  const a1 = fakeSock(conns);
+  a1.data.peerPid = 1111;
+  const a2 = fakeSock(conns);
+  a2.data.peerPid = 1111;
+  const b1 = fakeSock(conns);
+  b1.data.peerPid = 2222;
+  const nul = fakeSock(conns);
+  nul.data.peerPid = null;
+  for (const s of [a1, a2, b1, nul]) conns.add(s);
+
+  expect(pidConnCount(conns, 1111)).toBe(2);
+  expect(pidConnCount(conns, 2222)).toBe(1);
+  expect(pidConnCount(conns, 9999)).toBe(0);
+  // A sane per-client wall: well below the global cap so one client can't fill it.
+  expect(PER_PID_MAX_CONNECTIONS).toBeLessThan(MAX_CONNECTIONS);
 });
 
 test("fn-778 a dead-peer end() throw is swallowed (no-self-heal) and siblings still reap", async () => {
@@ -2400,7 +2518,9 @@ test("overlapping one-shot query churn returns conns to baseline (never approach
   const { db } = openDb(dbPath, { readonly: true });
   const server = startServer(db, sockPath, lockPath);
 
-  const N = 30; // well under the 64 cap; overlapping, not staggered
+  // One test process = one peer pid, so the reachable wall is the per-pid cap,
+  // not the global one. Stay safely under it: all N must be admitted.
+  const N = PER_PID_MAX_CONNECTIONS - 4; // overlapping, not staggered
   let peak = 0;
   const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
   for (let i = 0; i < N; i++) {
@@ -2412,10 +2532,11 @@ test("overlapping one-shot query churn returns conns to baseline (never approach
     );
     peak = Math.max(peak, server.conns.size);
   }
-  // All N admitted concurrently — never rejected, never near the cap.
+  // All N admitted concurrently — never rejected, never near either cap.
   await retryUntil(() => (server.conns.size === N ? true : null));
   expect(server.conns.size).toBe(N);
-  expect(peak).toBeLessThan(MAX_CONNECTIONS);
+  expect(peak).toBe(N);
+  expect(peak).toBeLessThan(PER_PID_MAX_CONNECTIONS);
 
   // Every client exits cleanly (FIN): the close handler must drain conns to 0.
   for (const c of clients) {
@@ -2469,13 +2590,15 @@ test("a reap-tick throw is swallowed (no-self-heal) by handleKick", () => {
   db.close();
 });
 
-test("max-conn cap rejects a new connection with an error frame + close; the oldest survives", async () => {
+test("per-pid cap rejects a single client's overflow conn with too_many_connections; the oldest survives", async () => {
   const { db } = openDb(dbPath, { readonly: true });
   const server = startServer(db, sockPath, lockPath);
 
-  // Open exactly MAX_CONNECTIONS clients — all should be admitted.
+  // One test process = one peer pid, so the per-pid cap is the wall a single
+  // client hits — exactly the incident shape (a runaway `keeper board` reconnect
+  // loop is ONE client). Open exactly PER_PID_MAX_CONNECTIONS — all admitted.
   const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
-  for (let i = 0; i < MAX_CONNECTIONS; i++) {
+  for (let i = 0; i < PER_PID_MAX_CONNECTIONS; i++) {
     clients.push(
       await Bun.connect({
         unix: sockPath,
@@ -2483,10 +2606,12 @@ test("max-conn cap rejects a new connection with an error frame + close; the old
       }),
     );
   }
-  await retryUntil(() => (server.conns.size === MAX_CONNECTIONS ? true : null));
+  await retryUntil(() =>
+    server.conns.size === PER_PID_MAX_CONNECTIONS ? true : null,
+  );
 
-  // The (cap+1)th connection is rejected: it receives a `max_connections`
-  // error frame then the server closes it. Capture the frame on the client.
+  // The (cap+1)th connection from the same pid is rejected: it receives a
+  // `too_many_connections` error frame then the server closes it.
   const rejectFrames: Array<{ type?: string; code?: string }> = [];
   const overflow = await Bun.connect({
     unix: sockPath,
@@ -2505,15 +2630,15 @@ test("max-conn cap rejects a new connection with an error frame + close; the old
   });
 
   const frame = await retryUntil(() =>
-    rejectFrames.find((f) => f.code === "max_connections"),
+    rejectFrames.find((f) => f.code === "too_many_connections"),
   );
   expect(frame).toBeDefined();
   expect(frame?.type).toBe("error");
-  expect(frame?.code).toBe("max_connections");
+  expect(frame?.code).toBe("too_many_connections");
 
-  // Reject-new, NOT LRU-evict: the conn count never exceeded the cap, and the
-  // first (oldest, live) client was never closed to make room.
-  expect(server.conns.size).toBe(MAX_CONNECTIONS);
+  // Reject-new, NOT LRU-evict: the count never exceeded the per-pid cap, and the
+  // first (oldest, live) conn from this client was never closed to make room.
+  expect(server.conns.size).toBe(PER_PID_MAX_CONNECTIONS);
 
   overflow.end();
   for (const c of clients) {
@@ -2524,16 +2649,17 @@ test("max-conn cap rejects a new connection with an error frame + close; the old
 });
 
 test("cap-hit synchronously sweeps reapable idle conns, then accepts the new conn", async () => {
-  // The headline fn-807 change: at the cap, the open() handler sweeps reapable
-  // conns BEFORE rejecting. Fill to MAX_CONNECTIONS with real zero-sub clients,
-  // age every server-side conn's clock past the idle ceiling (idle-sweep
+  // At the cap, the open() handler sweeps reapable conns BEFORE rejecting. Fill
+  // to PER_PID_MAX_CONNECTIONS with real zero-sub clients (one process = one
+  // pid, so the per-pid wall is what this single-process test reaches), age
+  // every server-side conn's clock past the idle ceiling (idle-sweep
   // candidates), then open one more. The sweep frees the aged conns
-  // synchronously and the (cap+1)th is ACCEPTED, never sent max_connections.
+  // synchronously and the (cap+1)th is ACCEPTED, never rejected.
   const { db } = openDb(dbPath, { readonly: true });
   const server = startServer(db, sockPath, lockPath);
 
   const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
-  for (let i = 0; i < MAX_CONNECTIONS; i++) {
+  for (let i = 0; i < PER_PID_MAX_CONNECTIONS; i++) {
     clients.push(
       await Bun.connect({
         unix: sockPath,
@@ -2541,7 +2667,9 @@ test("cap-hit synchronously sweeps reapable idle conns, then accepts the new con
       }),
     );
   }
-  await retryUntil(() => (server.conns.size === MAX_CONNECTIONS ? true : null));
+  await retryUntil(() =>
+    server.conns.size === PER_PID_MAX_CONNECTIONS ? true : null,
+  );
 
   // Age every server-side conn past the idle ceiling: all zero-sub, so the idle
   // sweep is eligible to reap them. (They are otherwise alive — this is a
@@ -2551,7 +2679,7 @@ test("cap-hit synchronously sweeps reapable idle conns, then accepts the new con
   }
 
   // The (cap+1)th client must be accepted: the cap-hit sweep frees a slot
-  // synchronously and no max_connections frame is ever written to it.
+  // synchronously and no rejection frame is ever written to it.
   const overflowFrames: Array<{ type?: string; code?: string }> = [];
   const overflow = await Bun.connect({
     unix: sockPath,
@@ -2583,9 +2711,11 @@ test("cap-hit synchronously sweeps reapable idle conns, then accepts the new con
   // one accepted.
   const fresh = await retryUntil(() => (server.conns.size === 1 ? true : null));
   expect(fresh).toBe(true);
-  // No rejection frame was delivered to the accepted conn.
+  // No rejection frame (per-pid or global) was delivered to the accepted conn.
   expect(
-    overflowFrames.find((f) => f.code === "max_connections"),
+    overflowFrames.find(
+      (f) => f.code === "max_connections" || f.code === "too_many_connections",
+    ),
   ).toBeUndefined();
 
   overflow.end();
@@ -2599,8 +2729,8 @@ test("cap-hit synchronously sweeps reapable idle conns, then accepts the new con
 test("cap-hit with all-healthy conns rejects; a live board subscriber is never evicted", async () => {
   // The protection invariant: when NO conn is reapable (all fresh-clock, peer
   // alive — and one is a SUBSCRIBED live board), the cap-hit sweep recovers
-  // nothing and the (cap+1)th is rejected with the existing envelope. The live
-  // subscriber survives the sweep untouched.
+  // nothing and the overflow is rejected. The live subscriber survives the
+  // sweep untouched. One process = one pid, so the per-pid cap is the wall.
   const { db } = openDb(dbPath, { readonly: true });
   const server = startServer(db, sockPath, lockPath);
 
@@ -2616,9 +2746,9 @@ test("cap-hit with all-healthy conns rejects; a live board subscriber is never e
       error() {},
     },
   });
-  // Fill the rest to exactly the cap with plain healthy conns.
+  // Fill the rest to exactly the per-pid cap with plain healthy conns.
   const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
-  for (let i = 0; i < MAX_CONNECTIONS - 1; i++) {
+  for (let i = 0; i < PER_PID_MAX_CONNECTIONS - 1; i++) {
     clients.push(
       await Bun.connect({
         unix: sockPath,
@@ -2629,7 +2759,7 @@ test("cap-hit with all-healthy conns rejects; a live board subscriber is never e
 
   // Wait until full AND the board's subscription has landed (subs.size > 0).
   const boardConn = await retryUntil(() => {
-    if (server.conns.size !== MAX_CONNECTIONS) return null;
+    if (server.conns.size !== PER_PID_MAX_CONNECTIONS) return null;
     for (const c of server.conns) {
       if (c.data.subs.size > 0) return c;
     }
@@ -2637,8 +2767,9 @@ test("cap-hit with all-healthy conns rejects; a live board subscriber is never e
   });
   expect(boardConn).not.toBeNull();
 
-  // Every conn is healthy (fresh clock, peer = this live process), so the sweep
-  // reaps nothing: the (cap+1)th is rejected with max_connections.
+  // Every conn is healthy (fresh clock, peer = this live process, none aged past
+  // the unengaged deadline), so the sweep reaps nothing: the overflow conn from
+  // this same pid is rejected with too_many_connections.
   const rejectFrames: Array<{ type?: string; code?: string }> = [];
   const overflow = await Bun.connect({
     unix: sockPath,
@@ -2657,14 +2788,14 @@ test("cap-hit with all-healthy conns rejects; a live board subscriber is never e
   });
 
   const frame = await retryUntil(() =>
-    rejectFrames.find((f) => f.code === "max_connections"),
+    rejectFrames.find((f) => f.code === "too_many_connections"),
   );
   expect(frame?.type).toBe("error");
-  expect(frame?.code).toBe("max_connections");
+  expect(frame?.code).toBe("too_many_connections");
   // The live board subscriber survived the sweep, still subscribed.
   expect(server.conns.has(boardConn as unknown as Writable)).toBe(true);
   expect((boardConn as Writable).data.subs.size).toBeGreaterThan(0);
-  expect(server.conns.size).toBe(MAX_CONNECTIONS);
+  expect(server.conns.size).toBe(PER_PID_MAX_CONNECTIONS);
 
   overflow.end();
   board.end();

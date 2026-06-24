@@ -299,14 +299,30 @@ export const DEFAULT_LIMIT = 100;
 export const MAX_LIMIT = 500;
 
 /**
- * Hard upper bound on concurrent subscriber connections. The single-threaded
- * worker diffs every projection change against ALL live conns serially, so a
- * leak of orphan viewers saturates the fan-out. At the cap a NEW connection is
- * REJECTED with a `max_connections` frame then closed — reject-new, NOT
- * LRU-evict: the oldest conn is the legit long-lived board. Hitting the cap is
- * logged loudly (un-gated) — it means the reaper regressed.
+ * Hard upper bound on concurrent connections — the global backstop. Diff fan-out
+ * scales with SUBSCRIBED conns only (a zero-sub conn carries no subs and never
+ * enters a diff), so the real cost driver is `sub_live`, which the reapers keep
+ * low; this ceiling guards against a connection STORM (a reconnect-loop client)
+ * filling the table. At the cap a NEW connection is REJECTED with a
+ * `max_connections` frame then closed — reject-new, NOT LRU-evict: the oldest
+ * conn is the legit long-lived board. The {@link PER_PID_MAX_CONNECTIONS}
+ * per-client cap is the first wall (one client can't monopolize the table);
+ * this global cap is the second. Hitting it AFTER a sweep is logged loudly
+ * (un-gated) — it means every conn is genuinely live and busy.
  */
-export const MAX_CONNECTIONS = 64;
+export const MAX_CONNECTIONS = 256;
+
+/**
+ * Per-peer-pid connection cap — admission control so a SINGLE misbehaving client
+ * (a `keeper board` reconnect loop, a hung CLI re-dialing) cannot exhaust the
+ * global {@link MAX_CONNECTIONS} table on its own. At accept, if the peer pid
+ * already holds this many conns, a hygiene sweep runs and the new conn is
+ * rejected if the count still holds. Generous enough for legit bursty usage (a
+ * board sub + a few in-flight one-shot queries from one session) yet a hard wall
+ * against a loop that opens hundreds. `null` peer pid (non-darwin / probe
+ * failure) is exempt — it degrades to the global cap + the reapers.
+ */
+export const PER_PID_MAX_CONNECTIONS = 16;
 
 /**
  * Ceiling (ms) a connection's outbound write may stay BACKPRESSURED before the
@@ -332,6 +348,23 @@ export const STUCK_PENDING_TTL_MS = 30_000;
  * chunk, so a client mid-handshake or querying is never swept.
  */
 export const IDLE_CONN_TTL_MS = 5 * 60_000;
+
+/**
+ * Subscribe-by-deadline ceiling (ms): a connection that has neither established
+ * a subscription NOR engaged at all (sent zero complete frames — never queried,
+ * never subscribed) within this window of `connectedAt` is force-closed. This is
+ * the fast arm against a reconnect storm — a client that dials, parks a zero-sub
+ * connection, and never speaks would otherwise wait out the 5-minute
+ * {@link IDLE_CONN_TTL_MS}, and a burst refills the table far faster than that.
+ *
+ * Keyed on `connectedAt` (immutable) NOT `lastActivityAt`, so noise chunks can't
+ * defer it; gated on `everEngaged`, so a slow cold-boot query is SAFE — engagement
+ * flips true the instant the query FRAME arrives (well before the multi-second
+ * response main computes), so the deadline never reaps a conn with work in flight.
+ * It only targets connect-and-silent dead weight. Much shorter than the idle TTL
+ * because an unengaged conn has, by definition, done nothing worth waiting for.
+ */
+export const UNENGAGED_CONN_TTL_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // DEBUG: timing instrumentation
@@ -763,18 +796,37 @@ export interface ConnState {
    * idle + stuck-pending arms).
    */
   peerPid: number | null;
+  /**
+   * Epoch-ms when this connection was accepted (`open`). IMMUTABLE — unlike
+   * `lastActivityAt` it never refreshes, so the subscribe-by-deadline sweep
+   * ({@link reapUnengaged} vs {@link UNENGAGED_CONN_TTL_MS}) measures true age
+   * from connect and a noise-chunk stream can't defer it.
+   */
+  connectedAt: number;
+  /**
+   * True once this connection has dispatched at least one complete inbound frame
+   * (a query / subscribe / unsubscribe). Distinguishes a conn doing real work —
+   * including one with a slow cold-boot query in flight — from connect-and-silent
+   * dead weight: the subscribe-by-deadline sweep ({@link reapUnengaged}) reaps
+   * ONLY a still-`false` zero-sub conn, so a legit query is never force-closed
+   * mid-answer (engagement flips the instant the frame arrives, before the reply).
+   */
+  everEngaged: boolean;
   /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
   id?: number;
 }
 
 function newConnState(): ConnState {
+  const now = Date.now();
   return {
     buffer: new LineBuffer(),
     subs: new Map(),
     pending: null,
     pendingSince: null,
-    lastActivityAt: Date.now(),
+    lastActivityAt: now,
     peerPid: null,
+    connectedAt: now,
+    everEngaged: false,
   };
 }
 
@@ -2166,25 +2218,24 @@ function reapIdleConns(list: Writable[], conns?: Set<Writable>): void {
 }
 
 /**
- * Evict a SUBSCRIBED connection whose peer process is gone — the hole fn-767's
- * idle sweep left exempt (a subscribed conn is never idle-reaped, but a dead
- * peer must still evict). Probes `isPidAlive(peerPid)` keyed on PROCESS
- * LIVENESS, never on inactivity, so a quiet-but-alive viewer is never touched.
- * Distinguishes dead-peer from quiet-viewer — exactly what the fn-723 ping/pong
- * descope said ping could not.
+ * Evict ANY connection whose peer process is gone — subscribed OR zero-sub.
+ * Probes `isPidAlive(peerPid)` keyed on PROCESS LIVENESS, never on inactivity,
+ * so a quiet-but-alive viewer is never touched. Distinguishes dead-peer from
+ * quiet-viewer — exactly what the fn-723 ping/pong descope said ping could not.
  *
- * Scoped to SUBSCRIBED conns (`subs.size > 0`): a zero-sub conn is already
- * covered by the idle sweep, and skipping it keeps the probe O(subscribers).
+ * The ZERO-SUB case is the load-bearing arm: a one-shot query / reconnect-probe
+ * client that is SIGKILLed (or half-opens — macOS UDS reports no FIN) leaves a
+ * zero-sub conn whose `lastActivityAt` is frozen but NOT yet past the 5-minute
+ * {@link IDLE_CONN_TTL_MS}. Under a reconnect storm such dead conns refill the
+ * table far faster than the idle TTL clears them, wedging the cap with garbage
+ * the sweep "can't" reap. Liveness, not inactivity, makes them reapable AT ONCE.
+ *
  * A `null` peerPid (probe unavailable — non-darwin, or a getsockopt failure) is
- * NEVER reaped here: the idle + stuck-pending arms remain the backstop. Per-conn
- * try/catch as in the sibling reapers.
+ * NEVER reaped here: the idle + unengaged + stuck-pending arms remain the
+ * backstop. Per-conn try/catch as in the sibling reapers.
  */
 function reapDeadPeers(list: Writable[], conns?: Set<Writable>): void {
   for (const sock of list) {
-    // Subscribed-only — the zero-sub case is the idle sweep's job.
-    if (sock.data.subs.size === 0) {
-      continue;
-    }
     const pid = sock.data.peerPid;
     // Unknown pid (null/undefined) → never reap on liveness (degrade to the
     // other arms). `== null` catches a ConnState built without the field too.
@@ -2195,11 +2246,55 @@ function reapDeadPeers(list: Writable[], conns?: Set<Writable>): void {
       continue;
     }
     console.error(
-      `[server-worker] reaping subscribed dead-peer conn ${sock.data.id ?? -1} ` +
+      `[server-worker] reaping dead-peer conn ${sock.data.id ?? -1} ` +
         `(peer pid ${pid} gone; ${sock.data.subs.size} sub(s))`,
     );
     evictConn(sock, conns);
   }
+}
+
+/**
+ * Evict a zero-sub connection that has done NOTHING — never subscribed, never
+ * dispatched a single frame — past {@link UNENGAGED_CONN_TTL_MS} of its
+ * `connectedAt`. The fast arm against a reconnect storm of LIVE-peer conns the
+ * dead-peer sweep can't touch (the client is alive, just re-dialing without
+ * speaking) and that the 5-minute idle TTL clears far too slowly.
+ *
+ * SAFE for a slow cold-boot query: `everEngaged` flips true the instant the
+ * query FRAME lands (in `handleData`, before main computes the multi-second
+ * reply), so a conn with work in flight is exempt. Subscribed conns (`subs.size
+ * > 0`) are exempt by construction — a quiet board is legitimately silent.
+ * Keyed on the IMMUTABLE `connectedAt`, so a noise-chunk stream can't defer it.
+ */
+function reapUnengaged(list: Writable[], conns?: Set<Writable>): void {
+  const now = Date.now();
+  for (const sock of list) {
+    if (sock.data.subs.size > 0 || sock.data.everEngaged) {
+      continue;
+    }
+    if (now - sock.data.connectedAt < UNENGAGED_CONN_TTL_MS) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping unengaged conn ${sock.data.id ?? -1} ` +
+        `(connected ${now - sock.data.connectedAt}ms ago, no subscribe/query)`,
+    );
+    evictConn(sock, conns);
+  }
+}
+
+/**
+ * Count live connections sharing a peer pid — the admission-control predicate
+ * behind {@link PER_PID_MAX_CONNECTIONS}. Pure read over the conn set.
+ */
+export function pidConnCount(conns: Iterable<Writable>, pid: number): number {
+  let n = 0;
+  for (const sock of conns) {
+    if (sock.data.peerPid === pid) {
+      n++;
+    }
+  }
+  return n;
 }
 
 /**
@@ -2212,8 +2307,11 @@ function reapDeadPeers(list: Writable[], conns?: Set<Writable>): void {
  * `sub_unknown` (subscribed, peerPid null — never liveness-reaped). Pure read.
  */
 function logCapCensus(conns: Set<Writable>): void {
+  const now = Date.now();
   let pending = 0;
   let zeroSub = 0;
+  let zeroSubDead = 0;
+  let zeroSubUnengaged = 0;
   let subLive = 0;
   let subDead = 0;
   let subUnknown = 0;
@@ -2221,23 +2319,33 @@ function logCapCensus(conns: Set<Writable>): void {
     if (sock.data.pending !== null) {
       pending++;
     }
+    const pid = sock.data.peerPid;
+    const dead = pid != null && !isPidAlive(pid);
     if (sock.data.subs.size === 0) {
       zeroSub++;
+      if (dead) {
+        zeroSubDead++;
+      } else if (
+        !sock.data.everEngaged &&
+        now - sock.data.connectedAt >= UNENGAGED_CONN_TTL_MS
+      ) {
+        zeroSubUnengaged++;
+      }
       continue;
     }
-    const pid = sock.data.peerPid;
     if (pid == null) {
       subUnknown++;
-    } else if (isPidAlive(pid)) {
-      subLive++;
-    } else {
+    } else if (dead) {
       subDead++;
+    } else {
+      subLive++;
     }
   }
   console.error(
     `[server-worker] conn-cap census (${conns.size}/${MAX_CONNECTIONS}): ` +
-      `pending=${pending} zero_sub=${zeroSub} sub_live=${subLive} ` +
-      `sub_dead=${subDead} sub_unknown=${subUnknown}`,
+      `pending=${pending} zero_sub=${zeroSub} (dead=${zeroSubDead} ` +
+      `unengaged=${zeroSubUnengaged}) sub_live=${subLive} sub_dead=${subDead} ` +
+      `sub_unknown=${subUnknown}`,
   );
 }
 
@@ -2255,8 +2363,11 @@ function logCapCensus(conns: Set<Writable>): void {
  */
 export function reapConns(list: Writable[], conns?: Set<Writable>): void {
   reapStuckPending(list, conns);
-  reapIdleConns(list, conns);
+  // Dead-peer + unengaged are the fast storm-clearers (they free a flood of
+  // garbage conns at once); the 5-minute idle sweep is the slow backstop.
   reapDeadPeers(list, conns);
+  reapUnengaged(list, conns);
+  reapIdleConns(list, conns);
 }
 
 /**
@@ -2683,24 +2794,61 @@ export function startServer(
         try {
           socket.data = newConnState();
           socket.data.id = ++__nextConnId;
-          // At the cap, FIRST synchronously sweep reapable conns (stuck-pending /
-          // idle zero-sub / subscribed dead-peer) and accept if that frees a slot.
-          // NOT LRU-evict: the sweep reuses the existing reaper classifications
-          // unchanged, so a live board subscriber can never be evicted (idle sweep
-          // exempts subscribed conns; dead-peer only evicts dead-pid subscribers).
-          // The reapers free SYNCHRONOUSLY (the `conns` arg), so the recheck below
-          // sees a true `conns.size`. Only a cap STILL held after the sweep is the
-          // genuine anomaly — that is where the "reaper regressed" alarm now lives.
+          // Capture the peer pid up front — both admission gates (the per-pid cap
+          // and the dead-peer sweep) key on it. macOS LOCAL_PEERPID; `null` on any
+          // other platform / probe failure, which degrades to the idle + unengaged
+          // + stuck-pending arms. Best-effort — a probe failure never blocks accept.
+          socket.data.peerPid = peerPidForFd(
+            (socket as unknown as { fd?: number }).fd ?? -1,
+          );
+          const w = socket as unknown as Writable;
+
+          // FIRST wall — per-client admission control: one peer pid cannot hold
+          // more than PER_PID_MAX_CONNECTIONS slots, so a single reconnect-loop
+          // client (a runaway `keeper board`) can never monopolize the table and
+          // wedge every other client out of the global cap. Sweep first (the
+          // loop's own dead / unengaged conns free here), then reject if it holds.
+          const pid = socket.data.peerPid;
+          if (
+            pid != null &&
+            pidConnCount(conns, pid) >= PER_PID_MAX_CONNECTIONS
+          ) {
+            reapConns([...conns], conns);
+            if (pidConnCount(conns, pid) >= PER_PID_MAX_CONNECTIONS) {
+              console.error(
+                `[server-worker] per-pid cap (${PER_PID_MAX_CONNECTIONS}) held ` +
+                  `for peer pid ${pid} — rejecting conn ${socket.data.id} ` +
+                  `(one client cannot monopolize the connection table)`,
+              );
+              writeFrames(w, [
+                errorFrame(
+                  db,
+                  "too_many_connections",
+                  `peer at per-client connection cap (${PER_PID_MAX_CONNECTIONS}); rejecting new connection`,
+                ),
+              ]);
+              socket.end();
+              return; // never added to `conns`
+            }
+          }
+
+          // SECOND wall — the global cap. Synchronously sweep reapable conns and
+          // accept if that frees a slot. NOT LRU-evict: the sweep reuses the
+          // reaper classifications, so a live board subscriber is never evicted
+          // (idle sweep exempts subscribed conns; dead-peer evicts only dead-pid
+          // conns; unengaged evicts only connect-and-silent ones). The reapers
+          // free SYNCHRONOUSLY (the `conns` arg), so the recheck sees a true
+          // `conns.size`. A cap STILL held after the sweep means every conn is
+          // genuinely live + busy — logged loudly with the attributing census.
           if (conns.size >= MAX_CONNECTIONS) {
             logCapCensus(conns);
             reapConns([...conns], conns);
             if (conns.size >= MAX_CONNECTIONS) {
               console.error(
                 `[server-worker] max_connections cap (${MAX_CONNECTIONS}) held ` +
-                  `AFTER sweep — rejecting conn ${socket.data.id}; the reaper has ` +
-                  `regressed (no reapable conns among ${conns.size})`,
+                  `AFTER sweep — rejecting conn ${socket.data.id} ` +
+                  `(${conns.size} live conns, all busy)`,
               );
-              const w = socket as unknown as Writable;
               writeFrames(w, [
                 errorFrame(
                   db,
@@ -2716,13 +2864,6 @@ export function startServer(
                 `sweep recovered a slot (now ${conns.size}); accepting conn ${socket.data.id}`,
             );
           }
-          // Capture the peer pid for the subscribed-ghost dead-peer sweep
-          // (macOS LOCAL_PEERPID; `null` on any other platform / probe failure,
-          // which degrades to the idle + stuck-pending arms). Best-effort —
-          // a probe failure must never block accepting the connection.
-          socket.data.peerPid = peerPidForFd(
-            (socket as unknown as { fd?: number }).fd ?? -1,
-          );
           conns.add(socket as unknown as Writable);
           if (TRACE) srvTs(`conn ${socket.data.id} open`);
         } catch (err) {
@@ -2849,6 +2990,10 @@ function handleData(
     : undefined;
 
   for (const line of lines) {
+    // A complete inbound frame: this conn is doing real work, so it is exempt
+    // from the subscribe-by-deadline sweep (a slow cold-boot query in flight is
+    // engaged the instant its frame lands, before the multi-second reply).
+    socket.data.everEngaged = true;
     let frames: (ServerFrame | PreSerialized)[];
     // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
     const _dispatchStart = Date.now();
