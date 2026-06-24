@@ -46,5 +46,5 @@ flock contention) + `flock.test.ts` (advisory-lock correctness) verbatim into ke
 - [ ] ported picker + flock tests pass under `bun run test:full`
 
 ## Done summary
-
+Vendored agentusage's picker (api.ts) + flock (flock.ts) into keeper as a db-free leaf pair (src/usage-picker.ts imports FileLock from src/usage-flock.ts); repointed src/agent/main.ts and dropped the file:../agentusage dep. Bundled leaf has zero bun:sqlite/src/db references; ported picker + flock tests pass under test:full.
 ## Evidence
