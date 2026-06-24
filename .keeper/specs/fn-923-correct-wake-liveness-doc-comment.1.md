@@ -19,5 +19,5 @@ conservative on-doubt-SKIP fallback. No code change.
 - [ ] The `creatorIsLive` doc-comment no longer claims `null` is "NOT consulted" / "empty set only on genuine empty sweep"; it states the `null`->treat-as-live conservative fallback, consistent with the two adjacent doc-comments. No runtime behavior changes.
 
 ## Done summary
-
+Corrected the creatorIsLive doc-comment in src/bus-wake.ts so it states a null livePaneIds reads as live (the on-doubt-SKIP fallback), agreeing with isStoppedPaneLive and WakeDeps.livePaneIds. Comment-only, no runtime change.
 ## Evidence
