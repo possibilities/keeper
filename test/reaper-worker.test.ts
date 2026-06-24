@@ -15,20 +15,32 @@
  *    verdict, wrong-map (close verdict only in perCloseRow) lookup.
  *  - the happy work + close candidate (perTask / perCloseRow keying).
  *  - cooldown suppression and post-expiry re-admittance.
+ *  - the managed-session arm (epic fn-920): a stopped+aged pair/panels/agentbus
+ *    job IS reaped; a human-session job (birth-session ∉ allow-list) is NOT; a
+ *    `disable_autoclose` session is NOT; an autopilot/plan-verb job is untouched
+ *    by the new arm; live-session COALESCE onto birth-session; clause-by-clause
+ *    exclusions mirroring the autopilot arm.
  *  - reaperCycle: fires killWindow on a passing candidate; aborts on a flipped
  *    verdict at the pre-kill re-check; stamps the cooldown on every attempt; a
- *    killWindow failure is a non-fatal skip.
+ *    killWindow failure is a non-fatal skip; a managed-session candidate fires.
  */
 
 import { expect, test } from "bun:test";
 import type { LaunchResult, TmuxPaneOps } from "../src/exec-backend";
-import { MANAGED_EXEC_SESSION } from "../src/exec-backend";
+import {
+  AGENTBUS_EXEC_SESSION,
+  MANAGED_EXEC_SESSION,
+  PAIR_EXEC_SESSION,
+  PANELS_EXEC_SESSION,
+} from "../src/exec-backend";
 import type { ReadinessSnapshot, Verdict } from "../src/readiness";
 import {
   REAP_KILL_COOLDOWN_SEC,
+  REAP_MANAGED_SESSION_IDLE_SEC,
   REAP_STOPPED_AGE_SEC,
   type ReapCandidate,
   reaperCycle,
+  selectManagedSessionReapCandidates,
   selectReapCandidates,
 } from "../src/reaper-worker";
 import type { Job } from "../src/types";
@@ -246,6 +258,179 @@ test("a job inside its cooldown window is suppressed; past it, re-admitted", () 
 });
 
 // ---------------------------------------------------------------------------
+// selectManagedSessionReapCandidates — the SECOND, verdict-free arm (fn-920)
+// ---------------------------------------------------------------------------
+
+/** A managed-session NON-plan partner: stopped+aged past the idle grace, live
+ *  session resolved to `pair`. Every exclusion test flips one field off this. */
+function makeManagedJob(overrides: Partial<Job> = {}): Job {
+  return makeJob({
+    plan_verb: null,
+    plan_ref: null,
+    backend_exec_session_id: PAIR_EXEC_SESSION,
+    backend_exec_birth_session_id: PAIR_EXEC_SESSION,
+    updated_at: NOW - REAP_MANAGED_SESSION_IDLE_SEC - 1,
+    ...overrides,
+  });
+}
+
+const NO_DISABLE: ReadonlySet<string> = new Set();
+
+function selectManaged(
+  jobs: Job[],
+  cooldown: Map<string, number> = new Map(),
+  disableAutoclose: ReadonlySet<string> = NO_DISABLE,
+  now: number = NOW,
+): ReapCandidate[] {
+  return selectManagedSessionReapCandidates(
+    jobs,
+    now,
+    cooldown,
+    disableAutoclose,
+  );
+}
+
+test("a stopped+aged managed-session partner is a candidate (session, no verb/ref)", () => {
+  expect(selectManaged([makeManagedJob()])).toEqual([
+    {
+      job_id: "j-1",
+      pane_id: "%7",
+      verb: null,
+      plan_ref: null,
+      session: PAIR_EXEC_SESSION,
+    },
+  ]);
+});
+
+test("every managed session (pair/panels/agentbus) is in the allow-list", () => {
+  for (const s of [
+    PAIR_EXEC_SESSION,
+    PANELS_EXEC_SESSION,
+    AGENTBUS_EXEC_SESSION,
+  ]) {
+    const out = selectManaged([
+      makeManagedJob({
+        backend_exec_session_id: s,
+        backend_exec_birth_session_id: s,
+      }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.session).toBe(s);
+  }
+});
+
+test("CATASTROPHE GUARD: a human-session partner (birth-session ∉ allow-list) is NEVER reaped", () => {
+  // A human's hand-started claude folds to plan_verb NULL too — the allow-list
+  // keyed on the frozen birth-session is the ONLY thing that keeps the arm off
+  // it. Both the live AND birth session are a human name.
+  const job = makeManagedJob({
+    backend_exec_session_id: "mike-hacking",
+    backend_exec_birth_session_id: "mike-hacking",
+  });
+  expect(selectManaged([job])).toEqual([]);
+});
+
+test("the autopilot session is excluded from the managed-session arm (no overlap)", () => {
+  // MANAGED_EXEC_SESSION is deliberately absent from the allow-list so the two
+  // arms never double-handle a job.
+  const job = makeManagedJob({
+    backend_exec_session_id: MANAGED_EXEC_SESSION,
+    backend_exec_birth_session_id: MANAGED_EXEC_SESSION,
+  });
+  expect(selectManaged([job])).toEqual([]);
+});
+
+test("a plan-verb job is excluded from the managed-session arm (autopilot arm's domain)", () => {
+  // Even if launched into a managed session, a plan-verb job belongs to the
+  // verdict-gated autopilot arm, never this one.
+  for (const verb of ["work", "close", "approve", "plan"]) {
+    expect(selectManaged([makeManagedJob({ plan_verb: verb })])).toEqual([]);
+  }
+});
+
+test("the live session COALESCEs onto the frozen birth-session when NULL", () => {
+  // A fresh pair job reads a NULL live session until TmuxTopologySnapshot
+  // resolves the pane — the birth-session must still admit it.
+  const job = makeManagedJob({
+    backend_exec_session_id: null,
+    backend_exec_birth_session_id: PAIR_EXEC_SESSION,
+  });
+  const out = selectManaged([job]);
+  expect(out).toHaveLength(1);
+  expect(out[0]?.session).toBe(PAIR_EXEC_SESSION);
+});
+
+test("a job with both live and birth session NULL is excluded", () => {
+  const job = makeManagedJob({
+    backend_exec_session_id: null,
+    backend_exec_birth_session_id: null,
+  });
+  expect(selectManaged([job])).toEqual([]);
+});
+
+test("a session in disable_autoclose is not reaped (the debug opt-out)", () => {
+  const job = makeManagedJob();
+  expect(selectManaged([job], new Map(), new Set([PAIR_EXEC_SESSION]))).toEqual(
+    [],
+  );
+  // A different session in the disable list does NOT exempt this one.
+  expect(
+    selectManaged([job], new Map(), new Set([PANELS_EXEC_SESSION])),
+  ).toHaveLength(1);
+});
+
+test("a working (not stopped) managed-session job is excluded", () => {
+  expect(selectManaged([makeManagedJob({ state: "working" })])).toEqual([]);
+});
+
+test("a managed-session job under the idle grace is excluded; exactly-grace excluded; over included", () => {
+  expect(
+    selectManaged([
+      makeManagedJob({ updated_at: NOW - REAP_MANAGED_SESSION_IDLE_SEC + 1 }),
+    ]),
+  ).toEqual([]);
+  expect(
+    selectManaged([
+      makeManagedJob({ updated_at: NOW - REAP_MANAGED_SESSION_IDLE_SEC }),
+    ]),
+  ).toEqual([]);
+  expect(
+    selectManaged([
+      makeManagedJob({ updated_at: NOW - REAP_MANAGED_SESSION_IDLE_SEC - 1 }),
+    ]),
+  ).toHaveLength(1);
+});
+
+test("a null pane id is excluded from the managed-session arm", () => {
+  expect(
+    selectManaged([makeManagedJob({ backend_exec_pane_id: null })]),
+  ).toEqual([]);
+});
+
+test("a null pid is excluded from the managed-session arm", () => {
+  expect(selectManaged([makeManagedJob({ pid: null })])).toEqual([]);
+});
+
+test("the managed-session arm honors the shared cooldown map", () => {
+  const cooldown = new Map<string, number>([
+    ["j-1", NOW - REAP_KILL_COOLDOWN_SEC + 1],
+  ]);
+  expect(selectManaged([makeManagedJob()], cooldown)).toEqual([]);
+  const expired = new Map<string, number>([
+    ["j-1", NOW - REAP_KILL_COOLDOWN_SEC],
+  ]);
+  expect(selectManaged([makeManagedJob()], expired)).toHaveLength(1);
+});
+
+test("managed-session candidates are returned in ascending job_id order", () => {
+  const out = selectManaged([
+    makeManagedJob({ job_id: "j-2", backend_exec_pane_id: "%2" }),
+    makeManagedJob({ job_id: "j-1", backend_exec_pane_id: "%1" }),
+  ]);
+  expect(out.map((c) => c.job_id)).toEqual(["j-1", "j-2"]);
+});
+
+// ---------------------------------------------------------------------------
 // reaperCycle — orchestration with an injected selector + fake backend
 // ---------------------------------------------------------------------------
 
@@ -319,4 +504,27 @@ test("reaperCycle stamps the cooldown even when killWindow fails (non-fatal skip
   // throw — the cycle resolves cleanly.
   expect(backend.kills).toEqual(["%7"]);
   expect(cooldown.get("j-1")).toBe(NOW);
+});
+
+test("reaperCycle fires for a managed-session candidate (arm-agnostic orchestration)", async () => {
+  // The cycle treats both arms identically — it keys on (job_id, pane_id), not
+  // the discriminators. A managed-session candidate (verb/ref NULL, session set)
+  // drives the same TOCTOU re-check + cooldown + kill.
+  const managedCandidate: ReapCandidate = {
+    job_id: "j-9",
+    pane_id: "%9",
+    verb: null,
+    plan_ref: null,
+    session: PAIR_EXEC_SESSION,
+  };
+  const backend = fakeBackend();
+  const cooldown = new Map<string, number>();
+  await reaperCycle(
+    async () => [managedCandidate],
+    backend,
+    cooldown,
+    () => NOW,
+  );
+  expect(backend.kills).toEqual(["%9"]);
+  expect(cooldown.get("j-9")).toBe(NOW);
 });

@@ -135,6 +135,12 @@ export interface KeeperConfig {
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
   // Enforced as a reconcile-level budget, not a readiness verdict.
   maxConcurrentJobs?: number | null;
+  // Keeper-managed sessions (`pair`/`panels`/`agentbus`) whose stopped tracked
+  // windows the reaper's managed-session arm leaves OPEN instead of autoclosing
+  // — the debug opt-out. Default EMPTY (every managed session autocloses).
+  // Folded from the `disable_autoclose` YAML list; non-string/empty entries are
+  // dropped. NOT the autopilot session (that arm is verdict-gated, never here).
+  disableAutoclose: string[];
   // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
@@ -175,6 +181,7 @@ export function resolveConfig(): KeeperConfig {
   // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
   let agentwrapPath: string | undefined;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
+  let disableAutoclose: string[] = [];
   let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
@@ -183,6 +190,7 @@ export function resolveConfig(): KeeperConfig {
         claudeProjectsRoot,
         agentusageRoot,
         maxConcurrentJobs,
+        disableAutoclose,
         accountAliases,
       };
     }
@@ -233,6 +241,16 @@ export function resolveConfig(): KeeperConfig {
       if (typeof mcj === "number" && Number.isInteger(mcj) && mcj > 0) {
         maxConcurrentJobs = mcj;
       }
+      // Best-effort string list — keep only non-empty trimmed strings; a
+      // non-array/absent value leaves the default (empty → autoclose every
+      // managed session).
+      const dac = (raw as { disable_autoclose?: unknown }).disable_autoclose;
+      if (Array.isArray(dac)) {
+        disableAutoclose = dac
+          .filter((s): s is string => typeof s === "string")
+          .map((s) => s.trim())
+          .filter((s) => s !== "");
+      }
       // Keep only string→non-empty-string entries; drop the rest.
       const aliases = (raw as { account_aliases?: unknown }).account_aliases;
       if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
@@ -255,6 +273,7 @@ export function resolveConfig(): KeeperConfig {
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
+      disableAutoclose: [],
       accountAliases: {},
     };
   }
@@ -266,6 +285,7 @@ export function resolveConfig(): KeeperConfig {
     dispatchPromptPrefix,
     agentwrapPath,
     maxConcurrentJobs,
+    disableAutoclose,
     accountAliases,
   };
 }

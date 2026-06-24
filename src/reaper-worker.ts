@@ -48,6 +48,7 @@ import { loadReconcileSnapshot } from "./autopilot-worker";
 import { openDb } from "./db";
 import {
   createTmuxPaneOps,
+  MANAGED_AUTOCLOSE_SESSIONS,
   MANAGED_EXEC_SESSION,
   type TmuxPaneOps,
 } from "./exec-backend";
@@ -75,6 +76,14 @@ export interface ReaperWorkerData {
    * elapsing writes nothing, so a pulse never fires on aging alone).
    */
   tickMs?: number;
+  /**
+   * Operator opt-out: keeper-managed session names whose stopped tracked windows
+   * the managed-session arm leaves OPEN. Threaded from `resolveConfig().
+   * disableAutoclose` at the single populate site. Default empty (every managed
+   * session autocloses). NEVER includes {@link MANAGED_EXEC_SESSION} — the
+   * autopilot session rides the verdict-gated arm.
+   */
+  disableAutoclose?: string[];
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -90,6 +99,17 @@ export interface ShutdownMessage {
  * `data_version` pulse so a window never dies the same instant its row lands.
  */
 export const REAP_STOPPED_AGE_SEC = 1;
+
+/**
+ * Idle grace (unix SECONDS) for the managed-session arm. Longer than
+ * {@link REAP_STOPPED_AGE_SEC} because that arm carries NO readiness verdict —
+ * the allow-list + this grace are its whole safety margin. The CLI captures the
+ * partner's answer SYNCHRONOUSLY (`wait-for-stop`/`show-last-message`) the
+ * instant the Stop lands, so the window is dead weight once stopped; this grace
+ * only keeps a just-stopped window alive long enough that a human glancing at it
+ * (or a slow capture read) isn't racing the reaper.
+ */
+export const REAP_MANAGED_SESSION_IDLE_SEC = 30;
 
 /**
  * In-memory kill cooldown (unix SECONDS). After an attempt, the same job is
@@ -108,13 +128,25 @@ export const DEFAULT_REAP_TICK_MS = 1000;
 /**
  * One reap the decision emits: the job whose window to kill and the pane id
  * that targets it (the stable `%N` handle, rename-proof — a concurrent
- * renamer can't redirect it). `verb`/`plan_ref` ride along for the audit line.
+ * renamer can't redirect it). The remaining fields ride along for the audit
+ * line. The autopilot verdict arm sets `verb`/`plan_ref` (its discriminators);
+ * the managed-session arm sets `session` instead (its jobs carry NULL
+ * `plan_verb`/`plan_ref`). The two arms are disjoint, so exactly one shape fires
+ * per job.
  */
 export interface ReapCandidate {
   job_id: string;
   pane_id: string;
-  verb: string;
-  plan_ref: string;
+  /** Autopilot arm: the `plan_verb`. NULL for a managed-session candidate. */
+  verb: string | null;
+  /** Autopilot arm: the `plan_ref`. NULL for a managed-session candidate. */
+  plan_ref: string | null;
+  /**
+   * Managed-session arm: the resolved birth/live session name driving the kill.
+   * NULL for an autopilot candidate (its session is always
+   * {@link MANAGED_EXEC_SESSION}).
+   */
+  session?: string | null;
 }
 
 /**
@@ -197,16 +229,101 @@ export function selectReapCandidates(
 }
 
 /**
+ * The managed-session reap arm (epic fn-920) — the SECOND, verdict-free arm.
+ * Autocloses any stopped tracked NON-plan job launched into a keeper-managed
+ * session (`pair`/`panels`/`agentbus`) past the idle grace. It reads ONLY the
+ * `jobs` projection + an idle clock — NO readiness verdict (these jobs carry no
+ * `plan_ref`, so there is no verdict to look up; the Stop hook landing `state =
+ * 'stopped'` is the authoritative done signal). Pure: tests drive it with no DB.
+ *
+ * A row is a candidate iff ALL hold:
+ *  - `plan_verb IS NULL` — a tracked NON-plan job (a pair/panel/agentbus
+ *    partner). A plan-verb job is the autopilot arm's domain.
+ *  - `(backend_exec_session_id ?? backend_exec_birth_session_id)` ∈
+ *    {@link MANAGED_AUTOCLOSE_SESSIONS} — the COALESCE onto the FROZEN
+ *    birth-session matters: a fresh pair job reads a NULL live session until the
+ *    first `TmuxTopologySnapshot` resolves it, and the birth-session
+ *    (`KEEPER_TMUX_SESSION` at spawn) is stamped ONLY on keeper's own launches.
+ *    This allow-list — NOT `plan_verb IS NULL` alone — is what keeps the arm off
+ *    a human's hand-started claude window (which also folds to NULL `plan_verb`).
+ *  - that resolved session is NOT in `disableAutoclose` — the operator opt-out.
+ *  - `state === 'stopped'` AND `now - updated_at > REAP_MANAGED_SESSION_IDLE_SEC`.
+ *  - non-null `backend_exec_pane_id` AND non-null `pid` (same degeneracy guard as
+ *    the autopilot arm).
+ *  - not inside the shared in-memory kill cooldown.
+ *
+ * The autopilot session ({@link MANAGED_EXEC_SESSION}) is DELIBERATELY absent
+ * from {@link MANAGED_AUTOCLOSE_SESSIONS}, so the two arms never overlap and no
+ * job is double-handled. Returns candidates in ascending `job_id` order.
+ */
+export function selectManagedSessionReapCandidates(
+  jobs: Iterable<Job>,
+  now: number,
+  cooldown: Map<string, number>,
+  disableAutoclose: ReadonlySet<string>,
+  idleSec: number = REAP_MANAGED_SESSION_IDLE_SEC,
+): ReapCandidate[] {
+  const out: ReapCandidate[] = [];
+  for (const job of jobs) {
+    // NON-plan jobs only — a plan-verb job belongs to the autopilot arm.
+    if (job.plan_verb != null && job.plan_verb !== "") {
+      continue;
+    }
+    // COALESCE the LIVE session onto the FROZEN birth-session: a fresh pair job
+    // reads a NULL live session until TmuxTopologySnapshot resolves the pane.
+    const session =
+      job.backend_exec_session_id ?? job.backend_exec_birth_session_id;
+    if (session == null || !MANAGED_AUTOCLOSE_SESSIONS.has(session)) {
+      continue;
+    }
+    // The operator opt-out: a managed session a human is debugging stays open.
+    if (disableAutoclose.has(session)) {
+      continue;
+    }
+    if (job.state !== "stopped") {
+      continue;
+    }
+    if (now - job.updated_at <= idleSec) {
+      continue;
+    }
+    const paneId = job.backend_exec_pane_id;
+    if (paneId == null || paneId === "") {
+      continue;
+    }
+    if (job.pid == null) {
+      continue;
+    }
+    const last = cooldown.get(job.job_id);
+    if (last !== undefined && now - last < REAP_KILL_COOLDOWN_SEC) {
+      continue;
+    }
+    out.push({
+      job_id: job.job_id,
+      pane_id: paneId,
+      verb: null,
+      plan_ref: null,
+      session,
+    });
+  }
+  out.sort((a, b) => (a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0));
+  return out;
+}
+
+/**
  * Load a fresh snapshot, run readiness at `now` (unix seconds), and select the
- * reap candidates. The single composed read the cycle and the immediate
- * pre-kill re-check both call, so the re-check sees the SAME pipeline (and thus
- * a flipped verdict provably aborts the kill). `now` is injected so the
- * pre-kill re-check uses the current instant.
+ * reap candidates from BOTH arms (autopilot verdict + managed-session idle). The
+ * single composed read the cycle and the immediate pre-kill re-check both call,
+ * so the re-check sees the SAME pipeline (and thus a flipped verdict / resumed
+ * partner provably aborts the kill). `now` is injected so the pre-kill re-check
+ * uses the current instant. Config (`disableAutoclose`, idle grace) is bound at
+ * the call site; the readiness pass is computed ONCE and reused for the
+ * autopilot arm only (the managed-session arm reads no verdict).
  */
 async function selectFromDb(
   db: Parameters<typeof runQuery>[0],
   now: number,
   cooldown: Map<string, number>,
+  disableAutoclose: ReadonlySet<string>,
 ): Promise<ReapCandidate[]> {
   const snapshot = await loadReconcileSnapshot(db);
   const readiness = computeReadiness(
@@ -217,7 +334,19 @@ async function selectFromDb(
     now,
     snapshot.pendingDispatches,
   );
-  return selectReapCandidates(snapshot.jobs.values(), readiness, now, cooldown);
+  // Two disjoint arms over the SAME jobs snapshot — autopilot verdict-gated
+  // (plan-verb jobs in the autopilot session) + managed-session idle-gated
+  // (NON-plan jobs in pair/panels/agentbus). The allow-list excludes the
+  // autopilot session, so no job appears in both lists.
+  return [
+    ...selectReapCandidates(snapshot.jobs.values(), readiness, now, cooldown),
+    ...selectManagedSessionReapCandidates(
+      snapshot.jobs.values(),
+      now,
+      cooldown,
+      disableAutoclose,
+    ),
+  ];
 }
 
 /**
@@ -260,9 +389,12 @@ export async function reaperCycle(
     const stillReapable = fresh.some(
       (c) => c.job_id === candidate.job_id && c.pane_id === candidate.pane_id,
     );
+    // The arm-specific discriminators for the audit line: the autopilot arm
+    // carries verb/ref, the managed-session arm carries session.
+    const desc = describeCandidate(candidate);
     if (!stillReapable) {
       console.error(
-        `[reaper-worker] reap aborted job=${candidate.job_id} verb=${candidate.verb} ref=${candidate.plan_ref} outcome=recheck-miss`,
+        `[reaper-worker] reap aborted job=${candidate.job_id} ${desc} outcome=recheck-miss`,
       );
       continue;
     }
@@ -274,9 +406,17 @@ export async function reaperCycle(
     // The one trace the reaper leaves: a single audit line per attempt. The
     // exit-watcher's Killed mint — not this line — is the truth of the death.
     console.error(
-      `[reaper-worker] reap job=${candidate.job_id} verb=${candidate.verb} ref=${candidate.plan_ref} pane=${candidate.pane_id} outcome=${outcome}`,
+      `[reaper-worker] reap job=${candidate.job_id} ${desc} pane=${candidate.pane_id} outcome=${outcome}`,
     );
   }
+}
+
+/** The arm-specific audit fragment: `verb=…/ref=…` for an autopilot candidate,
+ *  `session=…` for a managed-session candidate. */
+function describeCandidate(c: ReapCandidate): string {
+  return c.session != null
+    ? `arm=managed-session session=${c.session}`
+    : `arm=autopilot verb=${c.verb} ref=${c.plan_ref}`;
 }
 
 /**
@@ -312,9 +452,16 @@ function main(): void {
   // job_id → last kill-attempt unix-seconds. In-memory only.
   const cooldown = new Map<string, number>();
   const now = (): number => Math.floor(Date.now() / 1000);
+  // The operator opt-out set, threaded from `resolveConfig().disableAutoclose`
+  // at the daemon populate site. Frozen for the worker's lifetime — a config
+  // change takes effect on the next daemon bounce, same as the other tunables.
+  const disableAutoclose: ReadonlySet<string> = new Set(
+    data.disableAutoclose ?? [],
+  );
   // The production selector: the full pipeline bound to this read-only
   // connection. The cycle's pre-kill re-check re-runs it against a fresh read.
-  const select: ReapSelector = (n, cd) => selectFromDb(db, n, cd);
+  const select: ReapSelector = (n, cd) =>
+    selectFromDb(db, n, cd, disableAutoclose);
   let shutdown = false;
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {

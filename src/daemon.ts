@@ -4062,10 +4062,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Gated on the selector — `null` when unselected.
+  // Gated on the selector — `null` when unselected. The managed-session reap arm
+  // (epic fn-920) reads its `disable_autoclose` opt-out from the resolved config
+  // and threads it through workerData (frozen for the worker's lifetime; a
+  // config change takes effect on the next bounce, same as the other tunables).
   const reaperWorker = want("reaper")
     ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
-        workerData: { dbPath } satisfies ReaperWorkerData,
+        workerData: {
+          dbPath,
+          disableAutoclose: resolveConfig().disableAutoclose,
+        } satisfies ReaperWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;
 

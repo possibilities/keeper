@@ -260,3 +260,47 @@ test("dispatch_prompt_prefix resolves independently of a malformed sibling key",
   expect(cfg.dispatchPromptPrefix).toBe("/hack");
   expect(cfg.roots.length).toBeGreaterThan(0);
 });
+
+// ---------------------------------------------------------------------------
+// disable_autoclose (fn-920) — the reaper managed-session opt-out; default
+// empty (every managed session autocloses), best-effort string list.
+// ---------------------------------------------------------------------------
+
+test("disableAutoclose defaults to [] when the file is absent", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  expect(resolveConfig().disableAutoclose).toEqual([]);
+});
+
+test("disableAutoclose defaults to [] when the key is absent", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().disableAutoclose).toEqual([]);
+});
+
+test("disable_autoclose parses a session-name list", () => {
+  writeConfig("disable_autoclose:\n  - pair\n  - panels\n");
+  expect(resolveConfig().disableAutoclose).toEqual(["pair", "panels"]);
+});
+
+test("disable_autoclose trims and drops empty / non-string entries", () => {
+  writeConfig(
+    "disable_autoclose:\n" +
+      '  - "  pair  "\n' +
+      '  - ""\n' +
+      "  - 7\n" +
+      "  - null\n" +
+      "  - panels\n",
+  );
+  expect(resolveConfig().disableAutoclose).toEqual(["pair", "panels"]);
+});
+
+test("a non-array disable_autoclose falls back to [] (a list is required)", () => {
+  writeConfig("disable_autoclose: pair\n");
+  expect(resolveConfig().disableAutoclose).toEqual([]);
+});
+
+test("disable_autoclose resolves independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\ndisable_autoclose:\n  - pair\n");
+  const cfg = resolveConfig();
+  expect(cfg.disableAutoclose).toEqual(["pair"]);
+  expect(cfg.roots.length).toBeGreaterThan(0);
+});
