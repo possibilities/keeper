@@ -115,7 +115,7 @@ expected path.
 
 | Flag | Meaning |
 |---|---|
-| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude-vs-codex orchestration from the preset's `harness` and its optional `role`. A preset pinning `pi`, or a `--cli` whose harness disagrees, fails loud. A claude preset's `effort` is dropped (the headless claude pair path has no effort flag); a codex preset's effort is honored. |
+| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude-vs-codex orchestration from the preset's `harness` and its optional `role`. A preset pinning `pi`, or a `--cli` whose harness disagrees, fails loud. A claude preset's `effort` is honored — the launcher pushes `--effort` from the preset on the interactive claude pair path; a codex preset's effort is honored too. |
 | `--cli claude\|codex` | The partner CLI. **Required unless `--preset` is given** (then a compatibility alias whose harness must agree with the preset). Both launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open) so it never stalls on the trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
 | `--model <m>` | Native model id, passed through (`claude --model` / `codex -m`). Omit for the CLI's default. With `--preset` the launcher owns model resolution. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
