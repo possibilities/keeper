@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Remove /plan:work Phase 2c; wielder stamps block then stops",
-  "updated_at": "2026-06-24T18:27:21.978000Z"
+  "updated_at": "2026-06-24T21:27:14.068000Z",
+  "worker_done_at": "2026-06-24T21:27:14.068000Z"
 }

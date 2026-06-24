@@ -44,5 +44,5 @@ No code test surface (skill prose). Verify by rendering: after `render-plugin-te
 - [ ] SKILL.md regenerated from the template and committed in sync; forward-facing prose only.
 
 ## Done summary
-
+Stripped Phase 2c bus escalation from the /work skill template: the wielder now stamps keeper plan block --reason "<CATEGORY>: ..." and surfaces-and-stops (daemon owns escalation, autopilot cold-re-dispatches on unblock). Dropped keeper bus chat send from allowed-tools; regenerated SKILL.md in sync; worker template unchanged.
 ## Evidence
