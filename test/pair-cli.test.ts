@@ -55,7 +55,7 @@ const TOUCHED_ENV_KEYS = [
   "KEEPER_BACKSTOP_LOG",
   "KEEPER_BUS_DB",
   "KEEPER_BUS_SOCK",
-  "KEEPER_PAIR_PERSIST_SESSIONS",
+  "KEEPER_CONFIG",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -72,9 +72,10 @@ beforeEach(() => {
     dbPath: join(dir, "keeper.db"),
     extra: {
       KEEPER_AGENTWRAP_PATH: join(dir, "no-such-agentwrap-binary"),
-      // Autoclose every session so the SIGTERM/failure reap path is exercised
-      // without leaving the `pair`/`panels` default-exempt sessions in play.
-      KEEPER_PAIR_PERSIST_SESSIONS: "",
+      // Point the config resolver at a nonexistent file so `disable-autoclose`
+      // resolves to its EMPTY default (the user's real config never bleeds in):
+      // the codex reap path is then exercised against an autoclosing session.
+      KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
     },
   });
   for (const k of TOUCHED_ENV_KEYS) {

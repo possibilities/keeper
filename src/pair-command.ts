@@ -655,35 +655,17 @@ export function resolvePairAgentwrapPath(
 export const DEFAULT_PAIR_SESSION = "pair";
 
 /**
- * tmux session names EXEMPT from autoclose. A partner whose session is exempt is
- * left open + interactive after its turn (attach with `tmux attach -t <name>`)
- * instead of having its window reaped; every other session autocloses. `panels`
- * holds `/plan:panel` legs, `pair` holds default `keeper pair` partners — both
- * kept open for inspection by default.
+ * Normalize a `disable-autoclose` session list into the exempt set the reap gate
+ * checks against. This is the ONE knob shared CLI-side (the codex synchronous
+ * reap below) and daemon-side (the reaper's managed-session arm, task .2): the
+ * config-sourced list comes from `resolveConfig().disableAutoclose` (the
+ * `disable_autoclose` YAML key, default EMPTY → every managed session
+ * autocloses). Kept pure + dep-free of `src/db.ts` so this leaf never drags the
+ * DB graph — the CLI passes `resolveConfig().disableAutoclose` in. Non-empty
+ * trimmed entries only; an empty/absent list autocloses everything.
  */
-export const DEFAULT_PAIR_PERSIST_SESSIONS: readonly string[] = [
-  "panels",
-  DEFAULT_PAIR_SESSION,
-];
-
-/**
- * Resolve the set of tmux session names exempt from autoclose. Default is
- * {@link DEFAULT_PAIR_PERSIST_SESSIONS}; `KEEPER_PAIR_PERSIST_SESSIONS` overrides
- * with a comma-separated list (an empty value → autoclose everything). Mirrors
- * {@link resolvePairAgentwrapPath}'s env-override pattern so this leaf stays
- * dep-free of `src/db.ts`. `env` injectable for tests.
- */
-export function resolvePairPersistSessions(
-  env: Record<string, string | undefined> = process.env,
+export function resolveDisableAutoclose(
+  disableAutoclose: readonly string[] = [],
 ): Set<string> {
-  const override = env.KEEPER_PAIR_PERSIST_SESSIONS;
-  if (override === undefined) {
-    return new Set(DEFAULT_PAIR_PERSIST_SESSIONS);
-  }
-  return new Set(
-    override
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s !== ""),
-  );
+  return new Set(disableAutoclose.map((s) => s.trim()).filter((s) => s !== ""));
 }

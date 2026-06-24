@@ -42,6 +42,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { resolveConfig } from "../src/db";
 import {
   assemblePrompt,
   buildPairLaunchArgv,
@@ -58,8 +59,8 @@ import {
   parseGitPorcelain,
   parsePairLaunchJson,
   parseShowLastMessageJson,
+  resolveDisableAutoclose,
   resolvePairAgentwrapPath,
-  resolvePairPersistSessions,
   stopTimeoutMsFromSeconds,
   stripClaudeEnv,
 } from "../src/pair-command";
@@ -270,19 +271,29 @@ export async function main(argv: string[]): Promise<void> {
   const cwd = process.cwd();
   const agentwrapPath = resolvePairAgentwrapPath();
 
-  // Partner tmux session + autoclose policy. A partner whose session opts out of
-  // autoclose (default-exempt: `panels` / `pair`) is left open + interactive for
-  // inspection — attach with `tmux attach -t <session>`; every other session is
-  // autoclosed, its window reaped once we have the answer (and on any failure /
-  // timeout path). agentwrap's race-safe launch lets concurrent partners share a
-  // named session without a create race, so a stable name is safe.
+  // Partner tmux session + autoclose policy. The window-kill is split by CLI:
+  //   - claude launches as a tracked interactive TUI job (the `KEEPER_TMUX_SESSION`
+  //     carrier), so the DAEMON reaper's managed-session arm (task .2) owns its
+  //     autoclose past the idle grace. The CLI NEVER synchronously reaps a claude
+  //     window — doing so would race the answer-capture against the kill.
+  //   - codex/pi fire no keeper hooks → they never become tracked jobs → the
+  //     daemon cannot reap them, so the CLI keeps the synchronous reap here.
+  // Either way a session listed in `disable-autoclose` (the ONE knob, shared with
+  // the daemon arm via `resolveConfig().disableAutoclose`; default EMPTY) is left
+  // open + interactive for inspection — attach with `tmux attach -t <session>`.
+  // agentwrap's race-safe launch lets concurrent partners share a named session
+  // without a create race, so a stable name is safe.
   const sessionName = v.session ?? DEFAULT_PAIR_SESSION;
-  const shouldReap = !resolvePairPersistSessions().has(sessionName);
+  const disableAutoclose = resolveDisableAutoclose(
+    resolveConfig().disableAutoclose,
+  );
+  const shouldReap = pairCli !== "claude" && !disableAutoclose.has(sessionName);
 
   // SIGTERM handler: a Monitor kills the process when its timeout_ms expires. We
   // MUST still emit a terminal line (so the orchestrating agent never hangs) AND
-  // reap the partner's tmux window unless its session opts out of autoclose. The
-  // pane id is captured into `reapPaneId` the moment the launch JSON is parsed.
+  // reap the partner's tmux window when `shouldReap` holds (codex/pi only — a
+  // claude window is the daemon reaper's to autoclose). The pane id is captured
+  // into `reapPaneId` the moment the launch JSON is parsed.
   let reapPaneId: string | null = null;
   const reap = (): void => {
     if (shouldReap) {
@@ -426,8 +437,9 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   // The partner has stopped and we have the message; autoclose its window now
-  // (unless its session opted out, in which case `reap` is a no-op and the
-  // window stays open + interactive for inspection).
+  // for the codex/pi path (for a claude partner `reap` is a no-op — the daemon
+  // reaper owns its autoclose — and a `disable-autoclose` session likewise stays
+  // open + interactive for inspection).
   reap();
 
   // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
