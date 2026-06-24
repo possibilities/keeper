@@ -3,12 +3,12 @@
  * flock-guarded JSON counter under `~/.local/state/agentwrap/cwd-ordinals.json`,
  * keyed by cwd basename; each launch increments and returns the new value.
  *
- * Unlike the agentusage picker (which locks a SIDECAR and atomically renames),
+ * Unlike the vendored picker (which locks a SIDECAR and atomically renames),
  * Python here flocks the DATA FILE directly and rewrites it in place — open
  * append-read, flock, read, truncate, rewrite, release. We replicate exactly
- * using agentusage's raw flock exports on a NON-truncating open (agentusage's
- * `FileLock.acquire` opens `"w"`, which would truncate the counter). Fail-open:
- * any IO/parse error returns ordinal 1.
+ * using the raw flock exports on a NON-truncating open (`FileLock.acquire`
+ * opens `"w"`, which would truncate the counter). Fail-open: any IO/parse
+ * error returns ordinal 1.
  */
 
 import {
@@ -26,7 +26,7 @@ import {
   flockFd,
   loadLibc,
   setCloexec,
-} from "agentusage/flock";
+} from "../usage-flock";
 
 function stateDir(): string {
   return join(homedir(), ".local", "state", "agentwrap");
