@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Schema migration, handoffs table, config key",
-  "updated_at": "2026-06-24T21:24:54.815000Z"
+  "updated_at": "2026-06-24T23:36:41.572000Z",
+  "worker_done_at": "2026-06-24T23:36:41.572000Z"
 }

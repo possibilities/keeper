@@ -59,5 +59,5 @@ kind union.
 - [ ] test:full green incl. schema-version.test.ts and a handoffs migration test
 
 ## Done summary
-
+Bumped SCHEMA_VERSION to 87 with a CREATE_HANDOFFS deterministic-replayed reducer projection wired into all five rewind-and-redrain wipe blocks (absent from EPHEMERAL/LIVE_ONLY); added handoffPromptPrefix config + HandoffLinkEntry type, with db/config/schema tests and version-pin updates. test:full green.
 ## Evidence
