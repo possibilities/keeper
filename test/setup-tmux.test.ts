@@ -14,6 +14,10 @@ import {
   buildWorkNewSessionArgs,
   dashPaneArgv,
   dashTmux,
+  type GuardFs,
+  guardConfLink,
+  guardConfSource,
+  HELP,
   isBusyCommand,
   main,
   parseBusyPanes,
@@ -971,5 +975,182 @@ describe("main() provision / sweep / teardown roles", () => {
     expect(exited).toBe(false);
     // work still provisioned despite the dash failure.
     expect(mintedWorkSession(calls, "work")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tmux guard drop-in symlink install (fn-928.2). All idempotence branches are
+// driven through an injected GuardFs seam — NO real fs / ~/.config touch.
+// ---------------------------------------------------------------------------
+
+interface GuardFsCalls {
+  mkdirp: string[];
+  symlink: Array<{ target: string; path: string }>;
+}
+
+/**
+ * Fake GuardFs: records `mkdirp`/`symlink` calls; `lstatIsSymlink`/`readlink`
+ * answer from canned state. `throwOn` makes the named method throw to exercise
+ * the fs-error fail-open path.
+ */
+function makeGuardFs(
+  opts: {
+    isLink?: boolean | null;
+    readlinkTarget?: string;
+    throwOn?: "mkdirp" | "symlink" | "lstat";
+  },
+  calls: GuardFsCalls,
+): GuardFs {
+  return {
+    lstatIsSymlink: () => {
+      if (opts.throwOn === "lstat") {
+        throw new Error("lstat boom");
+      }
+      return opts.isLink ?? null;
+    },
+    readlink: () => opts.readlinkTarget ?? "",
+    symlink: (target, path) => {
+      if (opts.throwOn === "symlink") {
+        throw new Error("symlink boom");
+      }
+      calls.symlink.push({ target, path });
+    },
+    mkdirp: (path) => {
+      if (opts.throwOn === "mkdirp") {
+        throw new Error("mkdirp boom");
+      }
+      calls.mkdirp.push(path);
+    },
+  };
+}
+
+const HOME_FOR_TEST = process.env.HOME ?? "";
+const GUARD_LINK = `${HOME_FOR_TEST}/.config/tmux/conf.d/zz-keeper-guard.conf`;
+const GUARD_SOURCE = `${HOME_FOR_TEST}/code/keeper/tmux/keeper-guard.conf`;
+
+/** Run main() (no args) with stdio pinned non-TTY + empty candidate counts so
+ *  only the guard-symlink + provisioning paths run, injecting `guardFs`. */
+async function runWithGuardFs(
+  guardFs: GuardFs,
+  spawnCalls: string[][],
+): Promise<void> {
+  const spawn = makeOfferStub({ work: 0 }, spawnCalls);
+  const savedStdinTTY = process.stdin.isTTY;
+  const savedStdoutTTY = process.stdout.isTTY;
+  const savedOut = process.stdout.write;
+  const savedErr = process.stderr.write;
+  Object.defineProperty(process.stdin, "isTTY", {
+    value: false,
+    configurable: true,
+  });
+  Object.defineProperty(process.stdout, "isTTY", {
+    value: false,
+    configurable: true,
+  });
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    await main([], spawn, () => ({}), guardFs);
+  } finally {
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: savedStdinTTY,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      value: savedStdoutTTY,
+      configurable: true,
+    });
+    process.stdout.write = savedOut;
+    process.stderr.write = savedErr;
+  }
+}
+
+describe("guard symlink path builders", () => {
+  test("source is <repo>/tmux/keeper-guard.conf", () => {
+    expect(guardConfSource()).toBe(GUARD_SOURCE);
+  });
+
+  test("link is ~/.config/tmux/conf.d/zz-keeper-guard.conf", () => {
+    expect(guardConfLink(HOME_FOR_TEST)).toBe(GUARD_LINK);
+  });
+
+  test("empty HOME yields empty link (caller no-ops)", () => {
+    expect(guardConfLink("")).toBe("");
+  });
+});
+
+describe("ensureGuardSymlink idempotence branches (via main, injected fs)", () => {
+  test("correct existing symlink ⇒ no relink (no symlink call)", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const guardFs = makeGuardFs(
+      { isLink: true, readlinkTarget: GUARD_SOURCE },
+      calls,
+    );
+    await runWithGuardFs(guardFs, []);
+    // mkdir -p the parent always runs; the link already points at source.
+    expect(calls.mkdirp).toHaveLength(1);
+    expect(calls.symlink).toHaveLength(0);
+  });
+
+  test("symlink to a WRONG target ⇒ relink to the source", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const guardFs = makeGuardFs(
+      { isLink: true, readlinkTarget: "/somewhere/stale.conf" },
+      calls,
+    );
+    await runWithGuardFs(guardFs, []);
+    expect(calls.symlink).toEqual([{ target: GUARD_SOURCE, path: GUARD_LINK }]);
+  });
+
+  test("absent link ⇒ create the symlink", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    // lstat null (ENOENT) ⇒ parent mkdir then symlink.
+    const guardFs = makeGuardFs({ isLink: null }, calls);
+    await runWithGuardFs(guardFs, []);
+    expect(calls.mkdirp).toHaveLength(1);
+    expect(calls.symlink).toEqual([{ target: GUARD_SOURCE, path: GUARD_LINK }]);
+  });
+
+  test("REAL file at the link path ⇒ refuse (no symlink call)", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    // lstat false ⇒ a real file, never clobbered.
+    const guardFs = makeGuardFs({ isLink: false }, calls);
+    await runWithGuardFs(guardFs, []);
+    expect(calls.symlink).toHaveLength(0);
+  });
+
+  test("parent missing ⇒ mkdir -p then link", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const guardFs = makeGuardFs({ isLink: null }, calls);
+    await runWithGuardFs(guardFs, []);
+    // mkdir -p runs on the conf.d parent before the symlink.
+    expect(calls.mkdirp[0]).toBe(`${HOME_FOR_TEST}/.config/tmux/conf.d`);
+    expect(calls.symlink).toHaveLength(1);
+  });
+
+  test("fs error (mkdirp throws) ⇒ warn + main still completes provisioning", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const spawnCalls: string[][] = [];
+    const guardFs = makeGuardFs({ throwOn: "mkdirp" }, calls);
+    await runWithGuardFs(guardFs, spawnCalls);
+    // No symlink attempted, but the dash rebuild + work ensure still fired:
+    // a dash kill-server proves main proceeded past the guard step.
+    expect(calls.symlink).toHaveLength(0);
+    expect(spawnedDashKillServer(spawnCalls)).toBe(true);
+  });
+
+  test("symlink throw on relink ⇒ fail-open, main still provisions", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const spawnCalls: string[][] = [];
+    const guardFs = makeGuardFs({ isLink: null, throwOn: "symlink" }, calls);
+    await runWithGuardFs(guardFs, spawnCalls);
+    expect(spawnedDashKillServer(spawnCalls)).toBe(true);
+  });
+});
+
+describe("HELP mentions the tmux guard symlink install", () => {
+  test("names the drop-in install and the conf.d-sourcing precondition", () => {
+    expect(HELP).toContain("zz-keeper-guard.conf");
+    expect(HELP).toContain("conf.d");
   });
 });

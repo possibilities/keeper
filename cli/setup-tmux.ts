@@ -30,6 +30,7 @@
  *   keeper setup-tmux --help
  */
 
+import * as fs from "node:fs";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
@@ -50,6 +51,12 @@ daemon-minted on demand, so it is not created here — but it is still swept and
 torn down by --kill-sessions. An existing 'work' session is left untouched.
 NEVER attaches or switch-clients — safe to run inside or outside tmux. Attach
 the dashboard with: tmux -L dash attach.
+
+Also symlinks the tmux guard drop-in (tmux/keeper-guard.conf →
+~/.config/tmux/conf.d/zz-keeper-guard.conf), idempotently and fail-open, so a
+keeper-managed session (autopilot/pair/panels/agentbus) prompts before a
+keyboard-triggered window/split creation. Only activates if your tmux.conf
+sources conf.d/*.conf. Refuses to clobber a real (non-symlink) file there.
 
 When the work session ('work') is ABSENT (the first run
 after a crash) and the last tmux-server generation left crashed agents for it,
@@ -127,6 +134,47 @@ const defaultSpawn: SyncSpawnFn = (cmd, options) =>
     stderr: "pipe",
     ...(options?.env != null ? { env: options.env } : {}),
   }) as unknown as SyncSpawnResult;
+
+/**
+ * Injectable filesystem seam — the minimal `node:fs` subset
+ * {@link ensureGuardSymlink} needs. Injected (never inlined) so `main` stays
+ * test-drivable without touching real `~/.config`. `lstat` reports whether the
+ * link path is a symlink (vs a real file); `readlink` resolves an existing
+ * symlink's target; `symlink`/`mkdir` create. A method throwing surfaces as the
+ * fail-open warn-and-continue path.
+ */
+export interface GuardFs {
+  lstatIsSymlink(path: string): boolean | null;
+  readlink(path: string): string;
+  symlink(target: string, path: string): void;
+  mkdirp(path: string): void;
+}
+
+const defaultGuardFs: GuardFs = {
+  lstatIsSymlink: (path) => {
+    try {
+      return fs.lstatSync(path).isSymbolicLink();
+    } catch {
+      // ENOENT (link absent) ⇒ null so the caller creates it.
+      return null;
+    }
+  },
+  readlink: (path) => fs.readlinkSync(path),
+  symlink: (target, path) => {
+    // Replace any existing (stale) symlink — `symlinkSync` fails EEXIST
+    // otherwise. The caller only reaches here for an absent or wrong-target
+    // SYMLINK path (a real file is refused upstream), so the unlink is safe.
+    try {
+      fs.unlinkSync(path);
+    } catch {
+      // Absent path ⇒ nothing to unlink; proceed to create.
+    }
+    fs.symlinkSync(target, path);
+  },
+  mkdirp: (path) => {
+    fs.mkdirSync(path, { recursive: true });
+  },
+};
 
 // ===========================================================================
 // Pure argv builders — `zsh -ic` triples, never shell strings.
@@ -482,6 +530,68 @@ function rebuildDash(spawn: SyncSpawnFn): void {
   }
 }
 
+/** The guard drop-in's source (in this repo) and the conf.d link path. */
+export function guardConfSource(): string {
+  return `${KEEPER_DIR}/tmux/keeper-guard.conf`;
+}
+
+/** `~/.config/tmux/conf.d/zz-keeper-guard.conf` — the `zz-` prefix sources it
+ *  last so it overrides the human's own create-key binds. `home` empty ⇒ "" so
+ *  the caller no-ops rather than writing a root-relative path. */
+export function guardConfLink(home: string): string {
+  if (home === "") {
+    return "";
+  }
+  return `${home}/.config/tmux/conf.d/zz-keeper-guard.conf`;
+}
+
+/**
+ * Idempotently install the tmux guard drop-in symlink
+ * (`<repo>/tmux/keeper-guard.conf` → `~/.config/tmux/conf.d/zz-keeper-guard.conf`).
+ * `mkdir -p` the conf.d parent, then: link already points at the source ⇒ quiet
+ * no-op; a symlink to a wrong/missing target ⇒ relink; a REAL file (not a
+ * symlink) ⇒ refuse + warn (never clobber); any fs error ⇒ warn + continue. The
+ * caller wraps this in its own try/catch so a failure can't abort `main`.
+ */
+function ensureGuardSymlink(gfs: GuardFs): void {
+  const home = process.env.HOME ?? "";
+  const link = guardConfLink(home);
+  if (link === "") {
+    process.stderr.write(
+      "keeper setup-tmux: empty HOME, skipping tmux guard symlink\n",
+    );
+    return;
+  }
+  const source = guardConfSource();
+  const parent = link.slice(0, link.lastIndexOf("/"));
+  gfs.mkdirp(parent);
+
+  const isLink = gfs.lstatIsSymlink(link);
+  if (isLink === false) {
+    // A REAL file at the link path — never clobber the human's own config.
+    process.stderr.write(
+      `keeper setup-tmux: ${link} is a real file (not a symlink), refusing to clobber — tmux guard not installed\n`,
+    );
+    return;
+  }
+  if (isLink === true) {
+    // Existing symlink: a no-op if it already points at the source, else relink.
+    let current = "";
+    try {
+      current = gfs.readlink(link);
+    } catch {
+      current = "";
+    }
+    if (current === source) {
+      return;
+    }
+    gfs.symlink(source, link);
+    return;
+  }
+  // Absent (lstat null) — create the link.
+  gfs.symlink(source, link);
+}
+
 /** Ensure each provisioned session exists (mint when absent, never touch when
  *  present). `has-session` non-zero (no session OR no server) ⇒ absent. */
 function ensureWorkSessions(spawn: SyncSpawnFn): void {
@@ -594,6 +704,7 @@ export async function main(
   argv: string[],
   spawn: SyncSpawnFn = defaultSpawn,
   candidateCount: CandidateCountFn = defaultCandidateCount,
+  guardFs: GuardFs = defaultGuardFs,
 ): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -610,6 +721,17 @@ export async function main(
   }
 
   try {
+    // Fail-open: install the tmux guard drop-in symlink in its OWN inner
+    // try/catch so a failure (fs error, permissions) warns + continues and
+    // never skips dash rebuild / work-session ensure.
+    try {
+      ensureGuardSymlink(guardFs);
+    } catch (e) {
+      process.stderr.write(
+        `keeper setup-tmux: tmux guard symlink install failed, continuing — ${String(e)}\n`,
+      );
+    }
+
     if (parsed.values["kill-sessions"]) {
       // Gate on server liveness first: no server ⇒ nothing to kill, nothing
       // busy, proceed straight to setup.

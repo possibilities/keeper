@@ -692,7 +692,13 @@ Keeper has no `install` verb. Wire it up manually:
     never attaches or `switch-client`s (safe inside or outside tmux), and leaves
     an existing `work` session untouched. `--kill-sessions` tears the
     `work`/`autopilot` default-server sessions down first, prompting only when
-    they hold busy panes. Attach the dashboard with `tmux -L dash attach`:
+    they hold busy panes. The same run also symlinks the tmux guard drop-in
+    (`tmux/keeper-guard.conf` → `~/.config/tmux/conf.d/zz-keeper-guard.conf`),
+    idempotently and fail-open, so a keeper-managed session
+    (`autopilot`/`pair`/`panels`/`agentbus`) prompts before a keyboard-triggered
+    window/split creation — it only activates if your `tmux.conf` sources
+    `conf.d/*.conf`, and it refuses to clobber a real (non-symlink) file there.
+    Attach the dashboard with `tmux -L dash attach`:
 
     ```sh
     keeper setup-tmux                 # rebuild dash server, ensure work session
@@ -1443,7 +1449,14 @@ log.
   relaunch is a spawned subprocess (`restore-agents`), so `setup-tmux` owns no
   launch transport. The dash panes connect to the daemon over its UDS
   (`KEEPER_SOCK`), independent of the tmux socket, so the `-L dash` move needs no
-  pane-command change.
+  pane-command change. The same run also idempotently symlinks the tmux guard
+  drop-in (`tmux/keeper-guard.conf` → `~/.config/tmux/conf.d/zz-keeper-guard.conf`)
+  in its own fail-open inner try/catch — `mkdir -p`s the `conf.d` parent, leaves
+  a correct existing symlink untouched, relinks a wrong/missing target, and
+  refuses to clobber a real (non-symlink) file. It only activates if your
+  `tmux.conf` sources `conf.d/*.conf`; the drop-in `confirm-before`-wraps
+  keyboard-triggered window/split creation in a keeper-managed session
+  (`autopilot`/`pair`/`panels`/`agentbus`) — a deterrent, not a hard lock.
 
   ```sh
   keeper setup-tmux                 # rebuild dash server, ensure work session
@@ -1460,6 +1473,9 @@ rm ~/Library/LaunchAgents/arthack.keeperd.plist
 # If installed: the rotation sidecar.
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+# Remove the tmux guard drop-in symlink (tmux has no live config-unload, so it
+# stays effective in running tmux servers until they restart or re-source).
+rm ~/.config/tmux/conf.d/zz-keeper-guard.conf
 # The sitter scanners now live in ~/code/sitter; uninstall them per that repo's README.
 # Stop loading the plugins: remove the `plugin_scan_dirs` entry pointing at
 # `~/code/keeper/plugins` from whatever entrypoint launches `claude` (e.g. the
