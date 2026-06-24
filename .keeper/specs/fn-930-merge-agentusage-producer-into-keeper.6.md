@@ -37,5 +37,5 @@ is no longer required for the repo. Sanity: nothing in keeper resolves `agentusa
 - [ ] nothing in keeper resolves `agentusage` (verified post-`.2`)
 
 ## Done summary
-
+Removed agentusage's orphaned TS surface (src/{api,flock,index}.ts, TS tests, package.json/bun.lock/tsconfig/biome) making the repo Python-only; revised README + CLAUDE.md forward-facing to the one-shot util framing; migrated keeper's cwd-ordinal import from agentusage/flock to the vendored src/usage-flock so nothing in keeper resolves agentusage.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/agentusage",
   "tier": "medium",
   "title": "retire agentusage orphaned TS to Python-only",
-  "updated_at": "2026-06-24T14:14:51.342000Z"
+  "updated_at": "2026-06-24T16:07:26.883000Z",
+  "worker_done_at": "2026-06-24T16:07:26.883000Z"
 }
