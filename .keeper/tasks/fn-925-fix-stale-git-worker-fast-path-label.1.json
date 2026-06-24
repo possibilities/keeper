@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Correct missed-wake fast-path label",
-  "updated_at": "2026-06-24T02:17:47.812000Z"
+  "updated_at": "2026-06-24T02:41:00.362000Z",
+  "worker_done_at": "2026-06-24T02:41:00.362000Z"
 }

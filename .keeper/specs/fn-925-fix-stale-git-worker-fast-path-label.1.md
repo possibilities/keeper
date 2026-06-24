@@ -21,5 +21,5 @@ shape are unchanged — this is a label-correctness fix only.
 - [ ] Rescue accounting / missed-wake counters are byte-for-byte unchanged.
 
 ## Done summary
-
+Relabeled the git-heartbeat missed-wake record's fastPath from 'fsevents' to 'metadata-poll' to name the fn-921 poll-only producer, and updated the faithful test mirror. Rescue accounting and counters unchanged.
 ## Evidence
