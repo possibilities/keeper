@@ -107,6 +107,16 @@ describe("parseArgs", () => {
     expect(p.remainingArgs).toEqual([]);
   });
 
+  test("--agentwrap-modal is a bare bool, stripped from the residual argv", () => {
+    const p = parseArgs(["--agentwrap-modal", "hello"]);
+    expect(p.agentwrapModal).toBe(true);
+    expect(p.remainingArgs).toEqual(["hello"]);
+  });
+
+  test("--agentwrap-modal defaults to false", () => {
+    expect(parseArgs(["hi"]).agentwrapModal).toBe(false);
+  });
+
   test("--agentwrap-help is dispatch-owned, not a parser-consumed flag", () => {
     // main() short-circuits --agentwrap-help before parseArgs ever runs; the
     // parser sets no launch-mode signal for it and treats it like any unknown

@@ -50,6 +50,12 @@ export interface ParsedArgs {
   explicitAgentwrapProfile: boolean;
   /** Synthetic Codex session name to index once the live session id is known. */
   agentwrapCodexSessionName: string | null;
+  /**
+   * `--agentwrap-modal` seen — experimental: host claude in a Bun PTY under an
+   * OpenTUI modal-overlay shell. Opt-in, claude-only, interactive-TTY-only;
+   * stripped from `remainingArgs` so the child never sees it.
+   */
+  agentwrapModal: boolean;
 }
 
 /**
@@ -79,6 +85,7 @@ export function parseArgsForAgent(
   let agentwrapVerbose = false;
   let agentwrapVeryVerbose = false;
   let agentwrapNoConfirm = false;
+  let agentwrapModal = false;
   let agentwrapProfile = "auto";
   let agentwrapCodexSessionName: string | null = null;
   let explicitAgentwrapProfile = false;
@@ -103,6 +110,8 @@ export function parseArgsForAgent(
       agentwrapVeryVerbose = true;
     } else if (arg === "--agentwrap-no-confirm") {
       agentwrapNoConfirm = true;
+    } else if (arg === "--agentwrap-modal") {
+      agentwrapModal = true;
     } else if (arg === "--agentwrap-profile") {
       parsingAgentwrapProfile = true;
       explicitAgentwrapProfile = true;
@@ -145,6 +154,7 @@ export function parseArgsForAgent(
     agentwrapVerbose,
     agentwrapVeryVerbose,
     agentwrapNoConfirm,
+    agentwrapModal,
     agentwrapProfile,
     explicitAgentwrapProfile,
     agentwrapCodexSessionName,

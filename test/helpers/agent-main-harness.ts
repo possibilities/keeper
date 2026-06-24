@@ -38,6 +38,8 @@ export interface Harness {
   deps: MainDeps;
   /** Every command handed to the spawn seam, in order. */
   spawned: string[][];
+  /** Every command handed to the modal-host seam (--agentwrap-modal), in order. */
+  modalHosted: string[][];
   /** stdout sink. */
   out: string[];
   /** stderr sink. */
@@ -79,6 +81,8 @@ export interface HarnessOptions {
   piLauncherThinking?: string | null;
   claudeStowDir?: string | null;
   spawn?: SpawnFn;
+  /** Override the --agentwrap-modal interactive-TTY precondition (default true). */
+  isInteractive?: () => boolean;
   nextCwdOrdinal?: (dirName: string) => number;
   randomUuid?: () => string;
   tmuxBin?: string;
@@ -95,6 +99,7 @@ export interface HarnessOptions {
  */
 export function makeHarness(opts: HarnessOptions): Harness {
   const spawned: string[][] = [];
+  const modalHosted: string[][] = [];
   const out: string[] = [];
   const err: string[] = [];
   const bootstrappedProfiles: string[] = [];
@@ -121,6 +126,11 @@ export function makeHarness(opts: HarnessOptions): Harness {
     env: opts.env ?? {},
     cwd: opts.cwd ?? "/fake-home/code/proj",
     spawn,
+    runModalHostFn: (cmd: string[]) => {
+      modalHosted.push(cmd);
+      return throwingExit(0);
+    },
+    isInteractive: opts.isInteractive ?? (() => true),
     readChar: () => "n",
     listProfilesFn: opts.listProfiles ?? (() => []),
     pickProfileFn: () => {
@@ -185,6 +195,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   return {
     deps,
     spawned,
+    modalHosted,
     out,
     err,
     bootstrappedProfiles,

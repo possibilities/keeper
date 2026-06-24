@@ -83,6 +83,13 @@ Wrapper flags:
   --agentwrap-profile <name>        Select a profile ('default' = native
                                     account; 'auto' picks via the ledger).
 
+Experimental flags (opt-in):
+  --agentwrap-modal                 (claude only) Host claude in a Bun PTY under
+                                    an OpenTUI modal-overlay shell. With the modal
+                                    closed it is a raw passthrough; a reserved
+                                    hotkey floats a test modal. Requires an
+                                    interactive TTY; rejected with -p/--print.
+
 tmux transport flags (any one implies tmux mode):
   --agentwrap-tmux                  Open the invocation in a new tmux window.
   --agentwrap-tmux-detached         Create the window without moving focus.
