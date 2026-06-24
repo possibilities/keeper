@@ -65,14 +65,12 @@ gives directions and the verbatim task, never pre-read content.
 Monitor(
     command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
     description="panel opus",
-    until="[keeper-pair] (completed|failed)",
     timeout_ms=3600000,
     persistent=false,
 )
 Monitor(
     command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
     description="panel codex",
-    until="[keeper-pair] (completed|failed)",
     timeout_ms=1860000,
     persistent=false,
 )

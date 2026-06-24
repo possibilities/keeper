@@ -46,7 +46,9 @@ This is the whole flow. Do it from the orchestrating (main) session:
    ```
    Monitor(
      command="keeper pair send /tmp/ask.md --cli codex --output /tmp/ans.yaml",
-     until="[keeper-pair] (completed|failed)",
+     description="pair codex",
+     timeout_ms=3600000,
+     persistent=false,
    )
    ```
 
