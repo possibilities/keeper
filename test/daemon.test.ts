@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { projectAutopilotPaused } from "../cli/autopilot";
 import {
   appendBackstopRecord,
   BackstopCounters,
@@ -161,6 +162,74 @@ test("boot drain is idempotent — a second pass folds nothing", () => {
 
   expect(secondCursor).toBe(firstCursor);
   db.close();
+});
+
+/**
+ * Seed one synthetic `autopilot_state` event (`AutopilotPaused` /
+ * `AutopilotCapSet`) carrying a JSON `data` payload — the shape the daemon's
+ * boot drain folds into the singleton.
+ */
+function seedAutopilotEvent(
+  db: ReturnType<typeof openDb>["db"],
+  hookEvent: "AutopilotPaused" | "AutopilotCapSet",
+  ts: number,
+  data: Record<string, unknown>,
+): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (?, 'autopilot', NULL, ?, 'autopilot_state', ?)`,
+    [ts, hookEvent, JSON.stringify(data)],
+  );
+}
+
+test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; a fresh board boots PAUSED (the daemon's seed-from-column step)", () => {
+  // Leg A — durable `play`: a real `AutopilotPaused{paused:false}` in history,
+  // then the daemon's `AutopilotCapSet` boot re-arm (NO forced boot-pause). The
+  // CapSet ON CONFLICT branch preserves the durable paused=0. After the drain
+  // the daemon reads the singleton via `projectAutopilotPaused` and seeds its
+  // in-memory `autopilotPaused` — a non-null `false` means BOOTS PLAYING.
+  const playingDb = openDb(dbPath).db;
+  seedAutopilotEvent(playingDb, "AutopilotPaused", 1, { paused: false });
+  seedAutopilotEvent(playingDb, "AutopilotCapSet", 2, {
+    max_concurrent_jobs: null,
+  });
+  drainToCompletion(playingDb);
+  const playingRows = playingDb
+    .query("SELECT paused FROM autopilot_state WHERE id = 1")
+    .all() as Record<string, unknown>[];
+  // The daemon's exact seed step: `const p = projectAutopilotPaused(rows); if
+  // (p !== null) autopilotPaused = p;`. Provenance: a real durable play event.
+  const seededPlaying = projectAutopilotPaused(playingRows);
+  expect(seededPlaying).toBe(false); // boots PLAYING
+  playingDb.close();
+
+  // Leg B — fresh board: a brand-new DB with NO `AutopilotPaused` history, only
+  // the daemon's `AutopilotCapSet` boot re-arm. Its INSERT path (`VALUES (1, 1,
+  // …)`) is the SOLE carrier of the fresh-DB `paused=1` default now that the
+  // forced boot-pause is gone — so the seed resolves to PAUSED.
+  const freshPath = join(tmpDir, "fresh.db");
+  const freshDb = openDb(freshPath).db;
+  seedAutopilotEvent(freshDb, "AutopilotCapSet", 1, {
+    max_concurrent_jobs: null,
+  });
+  drainToCompletion(freshDb);
+  const freshRows = freshDb
+    .query("SELECT paused FROM autopilot_state WHERE id = 1")
+    .all() as Record<string, unknown>[];
+  const seededFresh = projectAutopilotPaused(freshRows);
+  expect(seededFresh).toBe(true); // boots PAUSED
+  freshDb.close();
+
+  // Leg C — empty singleton: no autopilot events at all. The seed step leaves
+  // the in-memory boots-paused default untouched (`null` means "keep default").
+  const emptyPath = join(tmpDir, "empty.db");
+  const emptyDb = openDb(emptyPath).db;
+  drainToCompletion(emptyDb);
+  const emptyRows = emptyDb
+    .query("SELECT paused FROM autopilot_state WHERE id = 1")
+    .all() as Record<string, unknown>[];
+  expect(projectAutopilotPaused(emptyRows)).toBeNull();
+  emptyDb.close();
 });
 
 test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and restores it after", () => {

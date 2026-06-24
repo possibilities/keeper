@@ -19,6 +19,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
+import { projectAutopilotPaused } from "../cli/autopilot";
 import type {
   AutopilotWorkerData,
   DispatchExpiredMessage,
@@ -1917,60 +1918,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     withBootDrainCheckpointTuning(db, () => {
       drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
       seedKilledSweep(db);
-      // Unconditional boot-append of an `AutopilotPaused{paused:true}` re-arm. The
-      // worker boots PAUSED in memory (safety default); this synthetic event
-      // preserves that in the durable `autopilot_state` projection so the viewer's
-      // banner reads `[paused]` honestly from boot. The trailing `drainToCompletion`
-      // folds it BEFORE `serverWorker` spawns. Raw `db.run` INSERT — the column list
-      // MUST stay in sync with the prepared form in `prepareStmts`.
-      db.run(
-        `INSERT INTO events (
-         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
-         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-         plan_op, plan_target, plan_epic_id, plan_task_id,
-         plan_subject_present, tool_use_id, config_dir,
-         bash_mutation_kind, bash_mutation_targets, plan_files
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          Date.now() / 1000, // unix seconds as REAL
-          "autopilot", // stable synthetic session_id
-          null, // pid
-          "AutopilotPaused",
-          "autopilot_state", // synthetic event_type tag
-          null, // tool_name
-          null, // matcher
-          null, // cwd
-          null, // permission_mode
-          null, // agent_id
-          null, // agent_type
-          null, // stop_hook_active
-          JSON.stringify({ paused: true }), // boot re-arm
-          null, // subagent_agent_id
-          null, // spawn_name
-          null, // start_time
-          null, // slash_command
-          null, // skill_name
-          null, // plan_op
-          null, // plan_target
-          null, // plan_epic_id
-          null, // plan_task_id
-          null, // plan_subject_present
-          null, // tool_use_id
-          null, // config_dir
-          null, // bash_mutation_kind
-          null, // bash_mutation_targets
-          null, // plan_files
-        ],
-      );
       // Unconditional boot-append of an `AutopilotCapSet` re-arm carrying the
-      // global concurrency cap, minted AFTER the `AutopilotPaused` re-arm (so the
-      // cap fold hits the shared-singleton CONFLICT branch and preserves the
-      // just-folded `paused` flag) and BEFORE the trailing `drainToCompletion`. The
-      // cap value is read from config HERE, on main, and FROZEN into the payload —
-      // `resolveConfig()` is NEVER called inside the fold (re-fold determinism). The
-      // column LAGS config until the next restart re-mints. Raw `db.run` INSERT —
-      // column list MUST stay in sync with `prepareStmts`.
+      // global concurrency cap, minted BEFORE the trailing `drainToCompletion`. The
+      // daemon does NOT re-pause at boot — it resumes the last durable `paused`
+      // flag (seeded into the in-memory `autopilotPaused` after the drain, below).
+      // On a FRESH board with no `AutopilotPaused` history this CapSet fold is the
+      // SOLE carrier of the `paused=1` default: its INSERT path mints
+      // `VALUES (1, 1, …)` (paused), and its ON CONFLICT branch leaves an existing
+      // durable `paused` untouched. The cap value is read from config HERE, on main,
+      // and FROZEN into the payload — `resolveConfig()` is NEVER called inside the
+      // fold (re-fold determinism). The column LAGS config until the next restart
+      // re-mints. Raw `db.run` INSERT — column list MUST stay in sync with
+      // `prepareStmts`.
       db.run(
         `INSERT INTO events (
          ts, session_id, pid, hook_event, event_type, tool_name, matcher,
@@ -2098,10 +2057,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let gitSeedReseedAttempts = 0;
   let gitSeedWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Autopilot in-memory paused flag. Boots PAUSED (safety default). Lives ONLY
-  // in main's memory — never persisted, never RPC-writable except via the
-  // `set_autopilot_paused` RPC. The worker is told via the main→worker
-  // `{ type: "set-paused", paused }` channel.
+  // Autopilot in-memory paused flag. Initialized PAUSED (safety default), then
+  // re-seeded from the durable `autopilot_state.paused` column after the boot
+  // drain reaches head (below) — so the daemon resumes its last durable state
+  // (an intentional `play` survives a restart) and a fresh board still boots
+  // PAUSED. Steady-state it is RPC-writable only via `set_autopilot_paused`. The
+  // worker is told via the main→worker `{ type: "set-paused", paused }` channel.
   let autopilotPaused = true;
   // Forward references filled in when the workers spawn below; the bridge
   // handlers capture these via closure. Until a worker is constructed, a bridge
@@ -2630,6 +2591,35 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   serverWorker?.postMessage({
     type: "boot-complete",
   } satisfies BootCompleteMessage);
+
+  // Resume the last durable paused state. `serveBootDrain()` above drained to
+  // head, so the `autopilot_state` singleton now carries the durable `paused`
+  // flag — read it and seed the in-memory `autopilotPaused` (initialized `true`)
+  // from it. An intentional `play` therefore survives a restart (durable
+  // `paused=0` → boots PLAYING); a fresh board with no `AutopilotPaused` history
+  // boots PAUSED via the `AutopilotCapSet` INSERT default. REUSE
+  // `projectAutopilotPaused` and honor its null-means-empty contract: an empty
+  // singleton returns `null`, which leaves the boots-paused default intact (a
+  // bare assignment would coerce that to a truthy/falsy wrong value). Run
+  // unconditionally (cheap, one singleton SELECT) even when `want("autopilot")`
+  // is false — it keeps the flag honest for the `set_autopilot_paused` RPC's
+  // null-guard relay path on a server-only boot.
+  {
+    const autopilotRows = db
+      .query("SELECT paused FROM autopilot_state WHERE id = 1")
+      .all() as Record<string, unknown>[];
+    const seededPaused = projectAutopilotPaused(autopilotRows);
+    if (seededPaused !== null) {
+      autopilotPaused = seededPaused;
+    }
+    // Playing-after-reboot is the new, surprising-by-default behavior — log it
+    // once so an operator can tell a resumed-play from a play-RPC after boot.
+    if (!autopilotPaused) {
+      console.error(
+        "[keeperd] autopilot resuming PLAYING from persisted state (durable paused=0)",
+      );
+    }
+  }
 
   // Spawn the transcript worker in the SAME post-migration window. It watches
   // the external transcript tree and posts a `transcript-title` message whenever
@@ -3638,7 +3628,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // server-side: data_version wake → desired-vs-observed verdict → launch via
   // agentwrap → confirm → mint on ceiling (bridged through main). The pure
   // decision logic lives in `src/autopilot-worker.ts`; this spawn is the glue.
-  // Boots PAUSED (safety default) from the `paused: true` workerData; the flag
+  // Boots from the `paused: autopilotPaused` workerData — `autopilotPaused` was
+  // seeded from the durable `autopilot_state.paused` column after the boot drain,
+  // so the worker resumes the last durable state (PLAYING if a `play` was the
+  // last durable intent) and a fresh board boots PAUSED. Steady-state the flag
   // flips ONLY via the `set_autopilot_paused` RPC → bridge → `{type:"set-paused"}`
   // relay. Config is read here on main and threaded into workerData so the worker
   // never opens config itself.

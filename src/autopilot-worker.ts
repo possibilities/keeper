@@ -30,9 +30,12 @@
  * lifecycle (the shutdown handler aborts in-flight confirms and the poll loop
  * exits); no in-process self-heal.
  *
- * Boots PAUSED. Main flips it via `set-paused` once the human plays. The flag is
- * in-memory only and NEVER persisted — boots-paused is the safety default;
- * persisting it would survive a restart in a way that contradicts the invariant.
+ * Boots from `workerData.paused`, which main seeds from the durable
+ * `autopilot_state.paused` column — so the reconciler resumes the last durable
+ * state across a daemon restart (an intentional `play` survives), and a fresh
+ * board boots PAUSED. The worker's own copy of the flag is in-memory only;
+ * main is the durable owner and flips the worker via `set-paused` on a steady-
+ * state pause/play.
  */
 
 import { existsSync } from "node:fs";
@@ -495,7 +498,8 @@ export interface ReconcileState {
    * not have folded yet; the cooldown bridges that gap for
    * `REDISPATCH_COOLDOWN_S` seconds. Held here so `reconcile()` can READ it and
    * stay pure — MUTATED only in the cycle glue. IN-MEMORY ONLY; boots EMPTY on
-   * restart (safe — autopilot boots paused).
+   * restart (safe — the first cycle rebuilds suppression from the live `jobs` /
+   * `pending_dispatches` projection, even when the daemon resumes PLAYING).
    */
   redispatchCooldown: Map<DispatchKey, number>;
   /**
@@ -1469,9 +1473,12 @@ export async function runReconcileCycle(
 export interface AutopilotWorkerData {
   dbPath: string;
   /**
-   * Initial paused flag. Boots-paused is the safety default; the supervisor
-   * passes `true` always and flips it later via `set-paused`. Exposed so tests
-   * can override.
+   * Initial paused flag. The supervisor seeds this from the durable
+   * `autopilot_state.paused` column it read after the boot drain — so the worker
+   * resumes the last durable state (PLAYING if a `play` was the last durable
+   * intent) and a fresh board boots PAUSED. Absent → `?? true` in `main()`
+   * (boots-paused safety default for a degraded boot). Steady-state pause/play
+   * arrives via `set-paused`. Exposed so tests can override.
    */
   paused?: boolean;
   /** Poll cadence for the data_version wake loop (ms). */
@@ -1791,10 +1798,12 @@ function main(): void {
     bootRetry: true,
   });
   const state: ReconcileState = {
+    // Seeded from `workerData.paused` (main resumes the durable
+    // `autopilot_state.paused`); `?? true` defends a degraded boot with no flag.
     paused: data.paused ?? true,
     inFlight: new Set(),
-    // Boot EMPTY (safe: autopilot boots paused; the first cycle rebuilds
-    // suppression from the live projection). In-memory only.
+    // Boot EMPTY (safe: the first cycle rebuilds suppression from the live
+    // projection regardless of paused/playing). In-memory only.
     redispatchCooldown: new Map(),
     finalizerGuard: new Map(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,

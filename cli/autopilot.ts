@@ -12,8 +12,9 @@
  * Data plumbing: the readiness collections ride one `subscribeReadiness`
  * connection; `dispatch_failures`, the `autopilot_state` singleton (the
  * banner-truth substrate), and `armed_epics` each ride their own
- * `subscribeCollection`. The daemon boot-appends `AutopilotPaused{paused:true}`
- * before the server worker spawns, so the viewer reads a real row immediately.
+ * `subscribeCollection`. The daemon boot-appends `AutopilotCapSet` before the
+ * server worker spawns (and resumes the durable `paused` flag rather than
+ * re-pausing), so the viewer reads a real singleton row immediately.
  *
  * Usage:
  *   keeper autopilot [--sock <path>]            # viewer

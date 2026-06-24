@@ -1212,9 +1212,13 @@ CREATE TABLE IF NOT EXISTS event_blobs (
  * sourced from `event.ts` for re-fold determinism. `max_concurrent_jobs` is
  * frozen from config at boot-append mint time (read on main, never in the fold);
  * `foldAutopilotPaused` / `foldAutopilotCapSet` each preserve the other's column
- * on conflict so a toggle never clobbers the cap. No migration seed row: the
- * unconditional boot-append `AutopilotPaused{paused:true}` folds the row before
- * any viewer reads it, keeping `created_at` purely event-log-derived.
+ * on conflict so a toggle never clobbers the cap. No migration seed row: on a
+ * fresh board the unconditional `AutopilotCapSet` boot-append's INSERT path
+ * (`VALUES (1, 1, …)`) materializes the singleton with the `paused=1` default
+ * before any viewer reads it, keeping `created_at` purely event-log-derived. The
+ * daemon does NOT re-pause at boot — it resumes the durable `paused` flag — so an
+ * existing row's `paused` survives a restart untouched (the CapSet re-arm's ON
+ * CONFLICT branch preserves it).
  */
 const CREATE_AUTOPILOT_STATE = `
 CREATE TABLE IF NOT EXISTS autopilot_state (

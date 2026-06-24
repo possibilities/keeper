@@ -1060,13 +1060,14 @@ event-log/reducer/hook touch. Run any of them with
     connection FIRST (the reducer folds it into the singleton
     `autopilot_state` projection — the banner-truth substrate added in
     schema v47 / fn-667), THEN flips the in-memory worker gate + relays to
-    the autopilot worker. Boots paused: the daemon's boot drain
-    unconditionally appends `AutopilotPaused{paused:true}` BEFORE
-    `serverWorker` spawns, so a restart returns to safe-by-default paused
-    via the boot-append re-arm (not via a "never persisted" volatility
-    guarantee — the flag IS persisted as of v47; the safe-by-default is
-    maintained by the boot re-arm event the reducer folds before any
-    viewer can subscribe).
+    the autopilot worker. The daemon RESUMES its last durable paused state
+    across a restart: after the boot drain reaches head, main reads the
+    durable `autopilot_state.paused` column and seeds the in-memory
+    `autopilotPaused` flag (and the worker's boot flag) from it — so an
+    intentional `play` survives a restart (boots PLAYING). A fresh board
+    with no `AutopilotPaused` history boots PAUSED via the
+    `AutopilotCapSet` boot-append's INSERT default (`paused=1`); the daemon
+    no longer force-pauses at boot.
   - `keeper autopilot retry <verb::id>` — clear a sticky `dispatch_failures`
     row via `retry_dispatch`. The RPC bridges through main, which appends a
     `DispatchCleared` synthetic event; the reducer DELETEs the failure +
@@ -2248,27 +2249,33 @@ As of schema v47 (fn-667), the autopilot pause/playing flag is event-sourced
 into a new singleton `autopilot_state` projection table (`id INTEGER PRIMARY
 KEY CHECK (id = 1)`, `paused INTEGER NOT NULL`, plus `last_event_id` /
 `created_at` / `updated_at` per the standard projection discipline). Main
-mints `AutopilotPaused{paused:boolean}` synthetic events (steady-state via
-the `set_autopilot_paused` RPC bridge, which appends the event FIRST then
+mints `AutopilotPaused{paused:boolean}` synthetic events via the
+`set_autopilot_paused` RPC bridge, which appends the event FIRST then
 flips the in-memory worker gate only on a successful insert — so the gate
-and the projection cannot diverge on partial failure; boot via the daemon's
-boot drain, which unconditionally appends `AutopilotPaused{paused:true}`
-BEFORE `serverWorker` spawns, so a viewer subscribing the instant the
-socket opens reads a real `paused=1` row, never an empty surface). The
-reducer's `foldAutopilotPaused` arm UPSERTs on the singleton id and
-preserves `created_at` through subsequent flips (mirrors
-`foldDispatchFailed`'s "first observation" semantic). A from-scratch
-re-fold reproduces the row byte-identically (no `Date.now`, no env reads,
-no `jobs` SELECT — `created_at` and `updated_at` both derive from
-`event.ts`). The `keeper autopilot` viewer subscribes the singleton via
+and the projection cannot diverge on partial failure. The daemon does NOT
+re-pause at boot: after the boot drain reaches head it READS the durable
+`autopilot_state.paused` column and seeds the in-memory `autopilotPaused`
+flag (and the autopilot worker's boot flag) from it, so the daemon resumes
+its last durable state — an intentional `play` survives a restart (boots
+PLAYING). On a fresh board with no `AutopilotPaused` history the singleton
+materializes from the `AutopilotCapSet` boot-append's INSERT path
+(`VALUES (1, 1, …)` → `paused=1`), so the daemon defaults to PAUSED and a
+viewer subscribing the instant the socket opens still reads a real row,
+never an empty surface. The reducer's `foldAutopilotPaused` arm UPSERTs on
+the singleton id and preserves `created_at` through subsequent flips
+(mirrors `foldDispatchFailed`'s "first observation" semantic). A
+from-scratch re-fold reproduces the row byte-identically (no `Date.now`,
+no env reads, no `jobs` SELECT — `created_at` and `updated_at` both derive
+from `event.ts`); removing the boot-time `AutopilotPaused` re-arm keeps
+that byte-identity intact because real `paused` history folds the durable
+value and the `AutopilotCapSet` INSERT carries the no-history default. The
+`keeper autopilot` viewer subscribes the singleton via
 `subscribeCollection({collection: "autopilot_state"})` and drives its
 `[paused]` / `[playing]` banner from the folded `paused` column —
 replacing the pre-fn-667 hardcoded `state.paused = true` which made the
 banner ALWAYS read `[paused]` even while the worker was actively
-dispatching (the divergence bug this epic fixes). Trade-off: ~1 extra
-event per daemon restart (the boot-append re-arm), accepted in exchange
-for re-fold determinism (no migration seed → `created_at` derived purely
-from the event log). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+dispatching (the divergence bug this epic fixes). keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `47` (whitelist-only; keeper-py reads neither `autopilot_state`
 nor `AutopilotPaused`).
 As of schema v62 (fn-751), the autopilot gains an explicit mode enum plus a
@@ -2279,8 +2286,8 @@ remain; `armed` works ONLY explicitly-armed epics PLUS their transitive
 upstream dependency closure (arming an epic pulls in the prerequisites it
 can't complete without, instead of deadlocking on them). The `DEFAULT 'yolo'`
 makes the zero-event / pre-existing-row projection identical to today's
-behavior and satisfies the NOT NULL constraint for the daemon's boot re-arm
-INSERTs (the paused / cap arms bind no `mode`). Main mints
+behavior and satisfies the NOT NULL constraint for the daemon's
+`AutopilotCapSet` boot re-arm INSERT (the cap arm binds no `mode`). Main mints
 `AutopilotMode{mode:'yolo'|'armed'}` synthetic events; the reducer's
 `foldAutopilotMode` arm UPSERTs on the singleton id setting ONLY `mode` and
 PRESERVING `paused` + `max_concurrent_jobs` on conflict (the three arms share

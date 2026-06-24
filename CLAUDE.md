@@ -113,7 +113,7 @@ imperative guardrails only.
 
 ## Autopilot
 
-- **The reconciler boots PAUSED** and is level-triggered on `PRAGMA data_version`. An unpaused
+- **The reconciler resumes its last durable paused state** (defaults to PAUSED on a fresh board) and is level-triggered on `PRAGMA data_version`. An unpaused
   autopilot that "does nothing" is almost always a readiness gate firing correctly — the gates live
   in `src/readiness.ts` (`computeReadiness`); the `[paused]` banner is authoritative. For modes,
   caps, cooldown, completion-reap, and the four reapers, read `src/autopilot-worker.ts` + README.

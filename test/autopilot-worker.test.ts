@@ -605,14 +605,12 @@ test("reconcile: paused state suppresses every launch (boots-paused safety)", ()
 });
 
 test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
-  // The fn-778 boot-pause leg found NO bug: boot-pause is already deterministic.
-  // `main()` sets `state.paused = data.paused ?? true`, and daemon.ts hardcodes
-  // `autopilotPaused = true` + an unconditional `AutopilotPaused{paused:true}` boot
-  // re-arm — so EVERY boot comes up paused. (The 2026-06-10 "came up unpaused"
-  // observation was a human play RPC fired ~2s after the boot re-arm, not a boot
-  // default; see Evidence.) This pins the worker-side half: the `?? true` default
+  // The worker boots from `workerData.paused`, which the daemon seeds from the
+  // durable `autopilot_state.paused` column — so a normal boot resumes the last
+  // durable state. This test pins the worker-side DEGRADED-boot half: when
+  // `workerData.paused` is absent, `main()`'s `state.paused = data.paused ?? true`
   // must resolve `undefined`/absent to a PAUSED state that launches nothing, so a
-  // future refactor can't silently flip the boot default to unpaused.
+  // future refactor can't silently flip the no-flag boot default to unpaused.
   // Model `main()`'s `state.paused = data.paused ?? true` against an absent field.
   const data: { paused?: boolean } = {};
   const paused = data.paused ?? true;

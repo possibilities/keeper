@@ -767,6 +767,14 @@ function snapshotProjections() {
     commit_trailer_facts: db
       .query("SELECT * FROM commit_trailer_facts ORDER BY event_id")
       .all(),
+    // The `autopilot_state` singleton — a deterministic-replayed projection.
+    // The daemon no longer force-pauses at boot (it resumes the durable flag),
+    // so removing that boot-append must keep this re-fold byte-identical: real
+    // `AutopilotPaused` history folds the durable value and the `AutopilotCapSet`
+    // INSERT carries the no-history `paused=1` default.
+    autopilot_state: db
+      .query("SELECT * FROM autopilot_state ORDER BY id")
+      .all(),
   };
 }
 
@@ -799,6 +807,7 @@ function rewindAndWipeProjections(): void {
   db.run("DELETE FROM subagent_invocations");
   db.run("DELETE FROM usage");
   db.run("DELETE FROM commit_trailer_facts");
+  db.run("DELETE FROM autopilot_state");
   // Reset the LIVE-ONLY git skip-floor to 0 alongside the cursor rewind. In
   // PRODUCTION the git surface (`git_status`/`file_attributions`/the 3 jobs
   // git-counters) is live-only and a rewind leaves it to the boot-seed — but
@@ -920,6 +929,77 @@ test("resurrection regression: a full re-fold over historical Dispatched events 
     .query("SELECT reason FROM dispatch_failures WHERE verb = ? AND id = ?")
     .get("work", "fn-870-loop.3") as { reason: string } | null;
   expect(loopFailure?.reason).toBe("never-bound");
+});
+
+// ---------------------------------------------------------------------------
+// `autopilot_state` re-fold determinism (fn-945) — the daemon no longer
+// force-pauses at boot; it resumes the durable `paused` flag. The boot-time
+// `AutopilotPaused{paused:true}` re-arm is GONE, so the live event stream no
+// longer carries it. The singleton MUST still re-fold byte-identically: real
+// `AutopilotPaused` history folds the durable value and the `AutopilotCapSet`
+// boot re-arm's INSERT path (`VALUES (1, 1, …)`) carries the no-history default.
+// ---------------------------------------------------------------------------
+
+test("autopilot_state: a durable AutopilotPaused{paused:false} survives, and the singleton re-folds byte-identically without a boot re-arm", () => {
+  // A real pause/play history (the durable `play`), then the daemon's
+  // `AutopilotCapSet` boot re-arm — NO `AutopilotPaused{paused:true}` boot-append
+  // (it is removed). The CapSet ON CONFLICT branch must PRESERVE the just-folded
+  // `paused=0`, proving an intentional `play` is durable across the boot drain.
+  insertEvent({
+    hook_event: "AutopilotPaused",
+    session_id: "autopilot",
+    event_type: "autopilot_state",
+    data: JSON.stringify({ paused: false }),
+  });
+  insertEvent({
+    hook_event: "AutopilotCapSet",
+    session_id: "autopilot",
+    event_type: "autopilot_state",
+    data: JSON.stringify({ max_concurrent_jobs: null }),
+  });
+  drainAll();
+
+  // The durable `play` survived the CapSet re-arm: the singleton reads paused=0.
+  const live = db
+    .query("SELECT paused FROM autopilot_state WHERE id = 1")
+    .get() as { paused: number };
+  expect(live.paused).toBe(0);
+
+  // RE-FOLD DETERMINISM: two from-scratch re-folds reproduce byte-identical rows.
+  const snap1 = snapshotProjections().autopilot_state;
+  rewindAndWipeProjections();
+  drainAll();
+  const snap2 = snapshotProjections().autopilot_state;
+  expect(snap2).toEqual(snap1);
+  // And the re-folded singleton still carries the durable paused=0.
+  expect(
+    (
+      db.query("SELECT paused FROM autopilot_state WHERE id = 1").get() as {
+        paused: number;
+      }
+    ).paused,
+  ).toBe(0);
+});
+
+test("autopilot_state: a fresh board with no AutopilotPaused history boots PAUSED via the AutopilotCapSet INSERT default", () => {
+  // No `AutopilotPaused` event at all — only the daemon's `AutopilotCapSet` boot
+  // re-arm. Its INSERT path (`VALUES (1, 1, …)`) is the SOLE carrier of the
+  // fresh-DB `paused=1` default now that the forced boot-pause is gone.
+  insertEvent({
+    hook_event: "AutopilotCapSet",
+    session_id: "autopilot",
+    event_type: "autopilot_state",
+    data: JSON.stringify({ max_concurrent_jobs: 4 }),
+  });
+  drainAll();
+
+  const row = db
+    .query(
+      "SELECT paused, max_concurrent_jobs FROM autopilot_state WHERE id = 1",
+    )
+    .get() as { paused: number; max_concurrent_jobs: number };
+  expect(row.paused).toBe(1);
+  expect(row.max_concurrent_jobs).toBe(4);
 });
 
 // ---------------------------------------------------------------------------
