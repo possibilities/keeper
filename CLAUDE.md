@@ -180,7 +180,12 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   scan + a git-rm/git-mv deletion scan, the dominant steady-state reducer cost until
   fn-892 made them incremental via a per-`Database` `WeakMap` memo that scans only
   `id > maxId` and appends; `computeRepoBashWindows` pass-2 is already bounded by
-  `MAX_BASH_WINDOW_SEC`) OR with the board / projection size (the old `syncPlanLinks`
+  `MAX_BASH_WINDOW_SEC`; fn-934 likewise made `computeMonitors`' Stop-fold
+  provenance lookup — a full-session `background_task_id` rescan on EVERY Stop —
+  an `id > maxId` per-`Database` `WeakMap` memo accumulating first-observed
+  provenance per `(session, task_id)`, byte-identical to the unbounded scan
+  WITHOUT a lookback window that would silently drop a long-lived monitor)
+  OR with the board / projection size (the old `syncPlanLinks`
   re-derived a touched epic over EVERY session that ever touched it —
   O(touched_epics × swept_sessions) per plan event, the fn-888 ~15-min socket-down
   catch-up) is a replay time-bomb: model it **live-only, constant-bounded, an

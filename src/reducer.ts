@@ -7576,6 +7576,131 @@ function appendNameHistory(persisted: string, title: string): string {
 }
 
 /**
+ * fn-934 (task .4): per-`Database` INCREMENTAL id-watermark memo for the
+ * `computeMonitors` provenance scan. The old scan re-read a session's WHOLE
+ * `background_task_id`-bearing history on EVERY Stop (O(history) per-event —
+ * the next O(history) time-bomb after fn-892's git pass-1). This memo mirrors
+ * fn-892's {@link GitAttribMemo}: per fold it scans only `id > maxId` and
+ * ACCUMULATES the first-observed provenance per `(session, task_id)`, so
+ * steady-state cost is O(rows since the last fold), not session history.
+ *
+ * Correctness — the accumulated set is byte-identical to the unbounded scan:
+ *  - the event log below head is APPEND-ONLY (`background_task_id` is never
+ *    rewritten; retention only NULLs fold-unread BODIES, never this column),
+ *    so an incremental `id > maxId` append faithfully reproduces a full rescan;
+ *  - the unbounded scan deduped FIRST-observed by the index's natural order
+ *    `(session_id, background_task_id, id)` — i.e. the LOWEST id per
+ *    `(session, task_id)` wins. The watermark axis IS ascending `id`, so the
+ *    accumulator's "keep the first provenance written per key" reproduces that
+ *    lowest-id winner exactly (a later higher-id row for the same key never
+ *    overwrites);
+ *  - the Stop fold runs in strict `id ASC` order (drain `ORDER BY id ASC`), so
+ *    by the time `computeMonitors` runs at `currentEventId` the memo holds every
+ *    `id < currentEventId` row already. The incremental scan is bounded
+ *    `id < currentEventId` (NOT unbounded `> maxId`) so a higher-id row already
+ *    physically present in the batch but NOT YET folded can never leak into this
+ *    fold's result — preserving the unbounded scan's `id < currentEventId` gate.
+ *
+ * PURE optimization — the memo is NEVER a fold INPUT that changes output: it
+ * only caches the snapshot-invariant provenance the scan would re-derive, and
+ * `jobs.monitors` is recomputed from `extractBackgroundTasks` + this lookup each
+ * Stop. Uses only the event's `id` (the watermark axis); NO `Date.now()` /
+ * wall-clock / env / fs / liveness probe (re-fold determinism is sacred — the
+ * serve-path `recencyBound`/`ResolvedFilter` is forbidden in a fold). Keyed by
+ * `Database` via a `WeakMap` so a dropped connection's memo is collected; a
+ * fresh-DB-per-test starts cold (`maxId = 0`, first scan = `id > 0` = the whole
+ * history once — preserving full fidelity on a cold connection).
+ */
+interface MonitorProvenanceMemo {
+  maxId: number;
+  // session_id -> (task_id -> first-observed provenance). First-write-wins per
+  // key reproduces the unbounded scan's lowest-id winner.
+  bySession: Map<string, Map<string, "monitor" | "bash-bg">>;
+}
+
+const monitorProvenanceMemos = new WeakMap<Database, MonitorProvenanceMemo>();
+
+/**
+ * Test-only: drop the per-`Database` monitor-provenance memo so the NEXT
+ * `computeMonitors` on this connection starts cold (a full `id > 0` rescan).
+ * Production never calls this — the WeakMap collects a dropped connection's memo
+ * on its own, and a fresh-DB-per-test is cold by construction. Exposed so a
+ * warm-vs-cold equivalence test can force a cold rescan on a warmed connection.
+ */
+export function __resetMonitorProvenanceMemoForTest(db: Database): void {
+  monitorProvenanceMemos.delete(db);
+}
+
+/**
+ * Advance the {@link MonitorProvenanceMemo} for `db` to cover every
+ * `background_task_id`-bearing event with `id < currentEventId`, then return the
+ * provenance map for `sessionId`. Scans only `id > memo.maxId` (and bounded
+ * `< currentEventId`) per call, accumulating first-observed-wins per
+ * `(session, task_id)`. NEVER throws — a strict SELECT against known columns.
+ */
+function monitorProvenanceForSession(
+  db: Database,
+  sessionId: string,
+  currentEventId: number,
+): Map<string, "monitor" | "bash-bg"> {
+  let memo = monitorProvenanceMemos.get(db);
+  if (memo == null) {
+    memo = { maxId: 0, bySession: new Map() };
+    monitorProvenanceMemos.set(db, memo);
+  }
+  const fromId = memo.maxId;
+  // Bound the incremental slice `(fromId, currentEventId)`: strictly above the
+  // watermark and strictly below the current Stop. The drain folds in `id ASC`,
+  // so this exactly reproduces the unbounded scan's `id < currentEventId` gate
+  // while paying only the delta. `idx_events_background_task_id
+  // (session_id, background_task_id, id, tool_name) WHERE background_task_id IS
+  // NOT NULL` covers the read (trailing `tool_name` keeps it covering); the
+  // `id` range bound rides the index's natural order.
+  if (currentEventId > fromId) {
+    const rows = db
+      .query(
+        `SELECT id, session_id, background_task_id AS task_id, tool_name
+           FROM events
+          WHERE background_task_id IS NOT NULL
+            AND id > ?
+            AND id < ?`,
+      )
+      .all(fromId, currentEventId) as {
+      id: number;
+      session_id: string;
+      task_id: string;
+      tool_name: string | null;
+    }[];
+    for (const row of rows) {
+      let bucket = memo.bySession.get(row.session_id);
+      if (bucket == null) {
+        bucket = new Map();
+        memo.bySession.set(row.session_id, bucket);
+      }
+      // First-observed-wins per key: the unbounded scan deduped on the LOWEST
+      // id per `(session, task_id)`; ascending-id accumulation reproduces it.
+      if (bucket.has(row.task_id)) continue;
+      if (row.tool_name === "Monitor") {
+        bucket.set(row.task_id, "monitor");
+      } else if (row.tool_name === "Bash") {
+        bucket.set(row.task_id, "bash-bg");
+      }
+      // tool_name not in {Monitor, Bash}: leave the key unset — the entry folds
+      // to `ambient` in `computeMonitors`. (A future third launch kind learns a
+      // name in the deriver + here together.)
+    }
+    // Commit the watermark to `currentEventId - 1`, the highest id this slice
+    // could cover (the scan is bounded `id < currentEventId`). Every
+    // `id < currentEventId` row is already folded and thus present in the table,
+    // so the slice was complete to that ceiling — clamping to it (rather than the
+    // highest OBSERVED background-task id) means the next Stop's `id > maxId` slice
+    // never re-scans the gap of non-monitor rows below this Stop.
+    memo.maxId = currentEventId - 1;
+  }
+  return memo.bySession.get(sessionId) ?? new Map();
+}
+
+/**
  * Schema v51 (fn-682): compute the next `jobs.monitors` JSON-array
  * value from the Stop event's `data.background_tasks` snapshot, the
  * persisted live entries, and an in-fold scan of `events` for
@@ -7594,23 +7719,28 @@ function appendNameHistory(persisted: string, title: string): string {
  *   matches (plugin/harness-armed before the session existed, or
  *   launched by a SubagentStart that we never saw a PostToolUse for).
  *
- * The provenance scan is gated on `id < currentEventId` so it reads
+ * The provenance lookup is gated on `id < currentEventId` so it reads
  * only the immutable log up to but not including the current Stop —
  * a future event minted later cannot influence this fold's result, so
- * a cursor=0 re-fold reproduces byte-identical output. Index-backed
- * via `idx_events_background_task_id`'s partial composite predicate;
- * the trailing `tool_name` makes the index covering for the projected
- * read. Pure function of `(persistedJson, eventDataPayload, sessionId,
- * currentEventId, dbScan)` — `dbScan` reads only the event log.
+ * a cursor=0 re-fold reproduces byte-identical output. fn-934 (task .4):
+ * the lookup is served by the INCREMENTAL {@link MonitorProvenanceMemo}
+ * (via {@link monitorProvenanceForSession}) instead of an O(history)
+ * full-session rescan on every Stop — steady-state cost is now the
+ * `id > maxId` delta, not session length, and the accumulated provenance
+ * set is byte-identical to the old unbounded scan (a long-lived monitor
+ * older than any window is NEVER dropped — the memo never forgets a key).
+ * The memo is a PURE optimization, never a fold INPUT, and reads only the
+ * event `id` (no wall-clock / serve-path recencyBound — forbidden in a fold).
+ * Pure function of `(persistedJson, eventDataPayload, sessionId,
+ * currentEventId, memo-of-the-event-log)`.
  *
  * fn-718 (task 1): each entry also carries `command` / `description`,
  * which ride straight from the Stop payload via `extractBackgroundTasks`
- * (NOT from the events scan) so the render layer can show the script the
- * monitor is running. The provenance SELECT is UNCHANGED — only `kind`
- * comes from the scan — so the covering index is unaffected.
+ * (NOT from the provenance lookup) so the render layer can show the script
+ * the monitor is running. Only `kind` comes from the provenance memo.
  *
  * NEVER throws — `extractBackgroundTasks` already swallows malformed
- * `background_tasks` shapes (returns `[]`), and the in-fold scan is
+ * `background_tasks` shapes (returns `[]`), and the provenance lookup is
  * a strict SELECT against a known column shape.
  */
 function computeMonitors(
@@ -7623,47 +7753,15 @@ function computeMonitors(
   if (tasks.length === 0) {
     return "[]";
   }
-  // Index-backed provenance scan: the partial composite
-  // `idx_events_background_task_id (session_id, background_task_id,
-  // id, tool_name) WHERE background_task_id IS NOT NULL` makes this a
-  // direct seek + range lookup, never a full-table scan. The trailing
-  // `tool_name` makes the index covering — no heap row lookup.
-  const rows = db
-    .query(
-      `SELECT background_task_id AS task_id, tool_name
-         FROM events
-        WHERE session_id = ?
-          AND background_task_id IS NOT NULL
-          AND id < ?`,
-    )
-    .all(sessionId, currentEventId) as {
-    task_id: string;
-    tool_name: string | null;
-  }[];
-  // Map<id, provenance>: a re-launch with the same id (extremely
-  // unlikely but defensive) keeps the FIRST observed mint, since
-  // background-task ids are session-scoped and the launch event is
-  // by definition the one that minted the id we see in the snapshot.
-  // The forEach order is the same on every re-fold (the SELECT is
-  // ordered by the index's natural order — `(session_id,
-  // background_task_id, id)` — so the dedupe is deterministic).
-  const provenance = new Map<string, "monitor" | "bash-bg">();
-  for (const row of rows) {
-    if (provenance.has(row.task_id)) continue;
-    if (row.tool_name === "Monitor") {
-      provenance.set(row.task_id, "monitor");
-    } else if (row.tool_name === "Bash") {
-      provenance.set(row.task_id, "bash-bg");
-    }
-    // tool_name not in {Monitor, Bash}: skip — the deriver should
-    // never have stamped background_task_id, but if a future event
-    // shape adds a third kind we leave it as `ambient` until the
-    // deriver+projection learn how to name it.
-  }
+  // fn-934 (task .4): the per-`Database` incremental id-watermark memo serves the
+  // first-observed provenance per `(session, task_id)` over every
+  // `id < currentEventId` row — byte-identical to the old unbounded full-session
+  // scan, but at O(delta) steady-state cost. A re-launch with the same id keeps
+  // the FIRST observed mint (lowest-id winner) exactly as the index-ordered scan
+  // did. `idx_events_background_task_id` covers the bounded slice inside the memo.
+  const provenance = monitorProvenanceForSession(db, sessionId, currentEventId);
   // fn-718 (task 1): command/description ride from the Stop payload via
-  // `extractBackgroundTasks`; only `kind` is merged from the provenance
-  // scan above. The provenance SELECT is UNCHANGED — it still reads only
-  // `(background_task_id, tool_name)`, so the covering index is unaffected.
+  // `extractBackgroundTasks`; only `kind` is merged from the provenance memo.
   const entries: MonitorEntry[] = tasks.map((t) => ({
     id: t.id,
     kind: provenance.get(t.id) ?? "ambient",

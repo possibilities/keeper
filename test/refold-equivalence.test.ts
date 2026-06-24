@@ -60,7 +60,7 @@ import {
 } from "../src/compaction";
 import { EPHEMERAL_PROJECTIONS, openDb, SCHEMA_VERSION } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
-import { drain } from "../src/reducer";
+import { __resetMonitorProvenanceMemoForTest, drain } from "../src/reducer";
 import { resolveBridgeAgentId } from "../src/subagent-invocations";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -1985,6 +1985,186 @@ test("enrichment-freshness invariant: every enriched-column jobs-write is paired
   // `syncIfPlanRef` must in fact call the reverse fan-out — the pairing above is
   // only meaningful if this edge holds.
   expect(src).toContain("syncJobLinksOnJobWrite(db, jobId, eventId, ts)");
+});
+
+// ---------------------------------------------------------------------------
+// fn-934 (task .4) — `computeMonitors` incremental id-watermark memo.
+//
+// The Stop fold's provenance lookup used to re-scan a session's WHOLE
+// `background_task_id`-bearing history on EVERY Stop (O(history) per-event). The
+// memo collapses that to the `id > maxId` delta. These fixtures pin the two
+// properties the bound must preserve: (1) `jobs.monitors` is byte-identical to
+// the prior unbounded scan over a multi-monitor, LONG-session corpus — a
+// monitor launched FAR in the past (older than any window) is NEVER dropped; and
+// (2) a from-scratch re-fold (cursor=0, COLD memo) reproduces byte-identical
+// `jobs.monitors`. The byte-identity gate is what `.5` (retention DELETE)
+// depends on — proving the fold can be bounded WITHOUT changing the projection.
+// ---------------------------------------------------------------------------
+
+const MON_SESS_A = "aabbccdd-0000-0000-0000-monitorsessa";
+const MON_SESS_B = "aabbccdd-0000-0000-0000-monitorsessb";
+
+/** Insert a PostToolUse:Monitor launch in `sessionId`, stamping the
+ * `background_task_id` column the provenance scan reads (the live hook stamps
+ * this at INSERT via `extractBackgroundTaskId`). */
+function insertMonitorLaunchRaw(taskId: string, sessionId: string): number {
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, tool_name, cwd, data, background_task_id)
+     VALUES (?, ?, 4242, 'PostToolUse', 'post_tool_use', 'Monitor', '/tmp/work', ?, ?)`,
+    [
+      tsCounter++,
+      sessionId,
+      JSON.stringify({ tool_response: { taskId } }),
+      taskId,
+    ],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+
+/** Insert a PostToolUse:Bash `run_in_background` launch in `sessionId`. */
+function insertBashBgLaunchRaw(taskId: string, sessionId: string): number {
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, tool_name, cwd, data, background_task_id)
+     VALUES (?, ?, 4242, 'PostToolUse', 'post_tool_use', 'Bash', '/tmp/work', ?, ?)`,
+    [
+      tsCounter++,
+      sessionId,
+      JSON.stringify({ tool_response: { backgroundTaskId: taskId } }),
+      taskId,
+    ],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+
+/** Insert a Stop whose `data.background_tasks` carries the given shell ids. */
+function insertStopWithTasksRaw(ids: string[], sessionId: string): number {
+  return insertEvent({
+    hook_event: "Stop",
+    session_id: sessionId,
+    data: JSON.stringify({
+      background_tasks: ids.map((id) => ({ id, type: "shell" })),
+    }),
+  });
+}
+
+/** Parse a session's persisted `jobs.monitors` array. */
+function monitorsFor(sessionId: string): unknown[] {
+  const row = db
+    .query("SELECT monitors FROM jobs WHERE job_id = ?")
+    .get(sessionId) as { monitors: string | null } | null;
+  if (row?.monitors == null) return [];
+  return JSON.parse(row.monitors) as unknown[];
+}
+
+/**
+ * Seed a multi-monitor, LONG-session corpus:
+ *  - session A launches a monitor (mon-old) FAR in the past, then 40 filler Stops
+ *    (no live shells) — the old monitor sits well below any plausible window —
+ *    then re-launches it AND a bash-bg shell, and a FINAL Stop that lists both
+ *    plus an ambient (never-launched) shell;
+ *  - session B launches its own monitor and ends with a Stop listing it.
+ * The final per-session Stop is the one whose `jobs.monitors` survives.
+ */
+function seedMonitorCorpus(): void {
+  insertEvent({ hook_event: "SessionStart", session_id: MON_SESS_A });
+  insertEvent({ hook_event: "SessionStart", session_id: MON_SESS_B });
+
+  // A: an OLD monitor launch, then a long run of empty Stops (the monitor's
+  // launch id sits far below the recent tail — a window would forget it).
+  insertMonitorLaunchRaw("mon-old", MON_SESS_A);
+  for (let i = 0; i < 40; i++) {
+    insertStopWithTasksRaw([], MON_SESS_A);
+  }
+  // A bash-bg launch much later in A's stream.
+  insertBashBgLaunchRaw("bash-late", MON_SESS_A);
+
+  // B: its own monitor launch.
+  insertMonitorLaunchRaw("mon-b", MON_SESS_B);
+
+  // FINAL Stops (these survive in the projection). A lists the OLD monitor, the
+  // late bash-bg, and an ambient never-launched shell; B lists its monitor.
+  insertStopWithTasksRaw(["mon-old", "bash-late", "amb-x"], MON_SESS_A);
+  insertStopWithTasksRaw(["mon-b"], MON_SESS_B);
+}
+
+test("monitor memo: jobs.monitors byte-identical to the unbounded scan over a long multi-monitor corpus (old monitor never dropped)", () => {
+  seedMonitorCorpus();
+  drainAll();
+
+  // A's final monitors resolve every provenance correctly DESPITE the old
+  // monitor's launch sitting far below the recent tail — the memo never forgets
+  // a key, so a window-style drop is structurally impossible here.
+  expect(monitorsFor(MON_SESS_A)).toEqual([
+    { id: "amb-x", kind: "ambient", command: "", description: "" },
+    { id: "bash-late", kind: "bash-bg", command: "", description: "" },
+    { id: "mon-old", kind: "monitor", command: "", description: "" },
+  ]);
+  expect(monitorsFor(MON_SESS_B)).toEqual([
+    { id: "mon-b", kind: "monitor", command: "", description: "" },
+  ]);
+
+  // Airtight byte-identity: derive each projected entry's `kind` directly from
+  // the OLD unbounded provenance scan (the exact SQL `computeMonitors` ran
+  // pre-memo, first-observed-wins over the index's natural order) and assert the
+  // memo-served projection reproduces it for every monitor entry. This proves the
+  // memo equals the unbounded scan, not merely a hand-written expectation.
+  const unboundedKind = (sessionId: string, taskId: string): string => {
+    const rows = db
+      .query(
+        `SELECT tool_name FROM events
+          WHERE session_id = ? AND background_task_id = ?
+          ORDER BY id ASC`,
+      )
+      .all(sessionId, taskId) as { tool_name: string | null }[];
+    for (const r of rows) {
+      if (r.tool_name === "Monitor") return "monitor";
+      if (r.tool_name === "Bash") return "bash-bg";
+    }
+    return "ambient";
+  };
+  for (const sessionId of [MON_SESS_A, MON_SESS_B]) {
+    for (const entry of monitorsFor(sessionId) as Array<{
+      id: string;
+      kind: string;
+    }>) {
+      expect({ id: entry.id, kind: entry.kind }).toEqual({
+        id: entry.id,
+        kind: unboundedKind(sessionId, entry.id),
+      });
+    }
+  }
+});
+
+test("monitor memo: byte-identical from-scratch re-fold (cold memo) reproduces jobs.monitors", () => {
+  seedMonitorCorpus();
+  drainAll();
+  const warm = {
+    a: monitorsFor(MON_SESS_A),
+    b: monitorsFor(MON_SESS_B),
+  };
+
+  // Cursor=0 re-fold on a COLD memo: drop the per-`Database` provenance memo so
+  // the re-fold pays the incremental `id > 0` accumulation from scratch (the
+  // genuinely-cold-connection path), wipe the deterministic jobs projection, and
+  // re-drain. The result MUST be byte-identical to the warm-memo first pass.
+  __resetMonitorProvenanceMemoForTest(db);
+  rewindAndWipeProjections();
+  drainAll();
+  expect({ a: monitorsFor(MON_SESS_A), b: monitorsFor(MON_SESS_B) }).toEqual(
+    warm,
+  );
+
+  // A SECOND re-fold reusing the now-WARM memo (no reset) reproduces the same
+  // bytes — the over-broad warm cache cannot perturb the final per-session Stop
+  // (every relevant launch is `id < currentEventId` for the last Stop), so the
+  // projection is identical whether the memo entered cold or warm.
+  rewindAndWipeProjections();
+  drainAll();
+  expect({ a: monitorsFor(MON_SESS_A), b: monitorsFor(MON_SESS_B) }).toEqual(
+    warm,
+  );
 });
 
 // ---------------------------------------------------------------------------
