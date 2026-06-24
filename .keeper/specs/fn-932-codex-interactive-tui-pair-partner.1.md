@@ -56,5 +56,5 @@ Two coupled code changes that MUST land together — the argv flip alone regress
 - [ ] docs no longer describe codex as headless (pair/SKILL.md, panel SKILL.md + panel.md) and CLAUDE.md carries the one-line fail-open trust-seed invariant.
 
 ## Done summary
-
+Flipped nativeCodexArgs to launch the codex pair/panel partner as an interactive TUI (dropped exec/--skip-git-repo-check/deprecated web_search flag) and added the dep-free fail-open src/codex-trust.ts seeder that pre-seeds codex per-directory trust (idempotent, O_EXCL-locked), wired codex-path-only in cli/pair.ts before launch; docs + CLAUDE.md updated.
 ## Evidence
