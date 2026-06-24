@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "forbid broadcast as offline send fallback",
-  "updated_at": "2026-06-24T15:45:32.789000Z"
+  "updated_at": "2026-06-24T16:18:50.591000Z",
+  "worker_done_at": "2026-06-24T16:18:50.591000Z"
 }

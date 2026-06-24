@@ -36,5 +36,5 @@ only (no change history); match the existing bold-imperative DON'T style.
 - [ ] All edits are forward-facing prose (no change-history narration).
 
 ## Done summary
-
+Forbade broadcast as a fallback for a missed/offline directed send in bus SKILL.md and the work.md.tmpl not_connected arm, and revised the anti-spoof wording to describe (pid, start_time)-keyed sender identity.
 ## Evidence
