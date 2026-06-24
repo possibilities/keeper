@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "pty-host claude passthrough keystone",
-  "updated_at": "2026-06-24T16:12:30.323000Z"
+  "updated_at": "2026-06-24T17:41:22.147000Z",
+  "worker_done_at": "2026-06-24T17:41:22.147000Z"
 }

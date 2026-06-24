@@ -63,5 +63,5 @@ child's disposition.
 - [ ] The reserved hotkey is detected in the passthrough byte stream and fires a stub callback (modal wired in .2)
 
 ## Done summary
-
+Added the experiment-flagged --agentwrap-modal PTY-host launch path: parses/strips the flag (claude-only, interactive-TTY-only, rejects codex/pi and -p/non-TTY), hosts claude via Bun.spawn({terminal}) with raw passthrough, SIGWINCH resize forwarding, out-of-band exit-code propagation, reserved-hotkey stub, and terminal restore on every exit path. Forks only the claude tail; no-flag and codex paths stay byte-identical. Real-PTY smoke validates the keystone empirically.
 ## Evidence
