@@ -82,8 +82,7 @@ export interface HarnessOptions {
   nextCwdOrdinal?: (dirName: string) => number;
   randomUuid?: () => string;
   tmuxBin?: string;
-  bunBin?: string;
-  agentwrapBin?: string;
+  launcherArgvPrefix?: string[];
   agentwrapStateDir?: string;
   transcriptHomeDir?: string;
   tmuxCommand?: (cmd: string[]) => TmuxCommandResult;
@@ -167,9 +166,11 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return () => {};
     },
     tmuxBin: opts.tmuxBin ?? "tmux",
-    bunBin: opts.bunBin ?? "/fake-home/.bun/bin/bun",
-    agentwrapBin:
-      opts.agentwrapBin ?? "/fake-home/code/agentwrap/bin/agentwrap.ts",
+    launcherArgvPrefix: opts.launcherArgvPrefix ?? [
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+    ],
     agentwrapStateDir: opts.agentwrapStateDir ?? "/tmp/agentwrap-test-state",
     transcriptHomeDir: opts.transcriptHomeDir ?? "/fake-home",
     runTmuxCommandFn: (cmd: string[]): TmuxCommandResult => {

@@ -31,6 +31,7 @@ import {
   slashCommandFromPrompt,
 } from "./derivers";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
+import { defaultKeeperAgentPath } from "./keeper-agent-path";
 import {
   type ClassifierInvocation,
   deriveEpicLinks,
@@ -131,7 +132,16 @@ export interface KeeperConfig {
   // Independent best-effort key with NO default at the parse layer (absent →
   // undefined here); `resolveAgentwrapPath()` supplies the `~/.bun/bin/agentwrap`
   // default + the `KEEPER_AGENTWRAP_PATH` env override + tilde-expansion.
+  // DEPRECATED alias of `keeperAgentPath` since the agentwrap launcher folded
+  // into `keeper agent` — still read so an existing config keeps working.
   agentwrapPath?: string;
+  // Absolute path to the keeper CLI entry the detached tmux pane re-execs to
+  // reach the folded launcher (`<bun> <keeperAgentPath> agent <agent> …`).
+  // Independent best-effort key with NO default at the parse layer (absent →
+  // undefined here); `resolveKeeperAgentPath()` supplies the derived default +
+  // the `KEEPER_AGENT_PATH` env override + tilde-expansion. Supersedes
+  // `agentwrapPath` (read as a deprecated alias).
+  keeperAgentPath?: string;
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
   // Enforced as a reconcile-level budget, not a readiness verdict.
   maxConcurrentJobs?: number | null;
@@ -180,6 +190,9 @@ export function resolveConfig(): KeeperConfig {
   // No default at the parse layer — absent leaves `agentwrapPath` undefined so
   // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
   let agentwrapPath: string | undefined;
+  // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
+  // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
+  let keeperAgentPath: string | undefined;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let disableAutoclose: string[] = [];
   let accountAliases: Record<string, string> = {};
@@ -235,6 +248,14 @@ export function resolveConfig(): KeeperConfig {
       if (typeof awp === "string" && awp.length > 0) {
         agentwrapPath = awp;
       }
+      // Independent best-effort key — non-empty string only; garbage/absent
+      // leaves `keeperAgentPath` undefined and `resolveKeeperAgentPath()` falls
+      // back to `agentwrap_path` (deprecated alias) then the derived default.
+      // NOT tilde-expanded here — resolution happens in `resolveKeeperAgentPath()`.
+      const kap = (raw as { keeper_agent_path?: unknown }).keeper_agent_path;
+      if (typeof kap === "string" && kap.length > 0) {
+        keeperAgentPath = kap;
+      }
       // Only a POSITIVE INTEGER overrides the unlimited (`null`) default.
       const mcj = (raw as { max_concurrent_jobs?: unknown })
         .max_concurrent_jobs;
@@ -284,6 +305,7 @@ export function resolveConfig(): KeeperConfig {
     buildbotUrl,
     dispatchPromptPrefix,
     agentwrapPath,
+    keeperAgentPath,
     maxConcurrentJobs,
     disableAutoclose,
     accountAliases,
@@ -313,6 +335,54 @@ export function resolveAgentwrapPath(): string {
     return join(home, entry.slice(2));
   }
   return entry;
+}
+
+/**
+ * Resolve the absolute keeper CLI entry the detached tmux pane re-execs to reach
+ * the folded launcher (`<bun> <this path> agent <agent> …`). Config-aware sibling
+ * of {@link resolveKeeperAgentPathDepFree} (the cold-start/pair variant in
+ * `src/keeper-agent-path.ts`): it folds the `keeper_agent_path` config key on top
+ * of the same env-override + derived default.
+ *
+ * Precedence: `KEEPER_AGENT_PATH` env > `keeper_agent_path` config >
+ * `KEEPER_AGENTWRAP_PATH` env (deprecated alias) > `agentwrap_path` config
+ * (deprecated alias) > the derived `cli/keeper.ts` default. A leading `~` on a
+ * config/env value is expanded via `homedir()` AT RESOLVE TIME (`execvp`/the
+ * shell re-exec do not expand `~`). The DERIVED default is already absolute +
+ * `realpath`'d. No existence check — a bad path fails the launch loudly at spawn.
+ */
+export function resolveKeeperAgentPath(): string {
+  const cfg = resolveConfig();
+  const entry =
+    firstNonEmpty(
+      process.env.KEEPER_AGENT_PATH,
+      cfg.keeperAgentPath,
+      process.env.KEEPER_AGENTWRAP_PATH,
+      cfg.agentwrapPath,
+    ) ?? null;
+  if (entry === null) {
+    return defaultKeeperAgentPath();
+  }
+  const home = homedir();
+  if (entry === "~") {
+    return home;
+  }
+  if (entry.startsWith("~/")) {
+    return join(home, entry.slice(2));
+  }
+  return entry;
+}
+
+/** First non-empty string among the candidates, or undefined. */
+function firstNonEmpty(
+  ...candidates: (string | undefined)[]
+): string | undefined {
+  for (const c of candidates) {
+    if (c !== undefined && c.length > 0) {
+      return c;
+    }
+  }
+  return undefined;
 }
 
 /**

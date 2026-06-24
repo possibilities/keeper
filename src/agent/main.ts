@@ -16,6 +16,10 @@ import {
 import { homedir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "agentusage";
+import {
+  buildLauncherArgvPrefix,
+  resolveKeeperAgentPathDepFree,
+} from "../keeper-agent-path";
 import { normalizeAgentwrapProfileArg, parseArgsForAgent } from "./args";
 import {
   type CodexSessionNameIndexerOptions,
@@ -81,7 +85,6 @@ import {
   defaultTmuxCommandRunner,
   launchAgentwrapInTmux,
   parseAgentwrapTmuxArgs,
-  resolveAgentwrapBin,
   resolveTmuxBin,
   TMUX_EXIT,
   type TmuxCommandRunner,
@@ -138,8 +141,13 @@ export interface MainDeps {
     opts: CodexSessionNameIndexerOptions,
   ) => () => void;
   tmuxBin: string;
-  bunBin: string;
-  agentwrapBin: string;
+  /**
+   * The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>,
+   * "agent"]`), ahead of the agent token + inner args. Resolved in `realDeps()`
+   * from `resolveKeeperAgentPathDepFree` (db.ts-free — the launcher carries no
+   * daemon dependency), NOT from `process.argv[1]`.
+   */
+  launcherArgvPrefix: string[];
   agentwrapStateDir: string;
   transcriptHomeDir: string;
   runTmuxCommandFn: TmuxCommandRunner;
@@ -183,10 +191,9 @@ export function realDeps(): MainDeps {
       ensureAgentwrapPiProfileDir(profileName, actionLog, homedir()),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     tmuxBin: resolveTmuxBin(process.env),
-    bunBin: process.execPath,
-    agentwrapBin: resolveAgentwrapBin(
-      process.argv[1] ?? "agentwrap",
-      process.cwd(),
+    launcherArgvPrefix: buildLauncherArgvPrefix(
+      process.execPath,
+      resolveKeeperAgentPathDepFree(),
     ),
     agentwrapStateDir: defaultAgentwrapStateDir(process.env),
     transcriptHomeDir: homedir(),
@@ -691,8 +698,7 @@ export async function main(deps: MainDeps): Promise<never> {
         startedAtMs,
         stateDir: deps.agentwrapStateDir,
         tmuxBin: deps.tmuxBin,
-        bunBin: deps.bunBin,
-        agentwrapBin: deps.agentwrapBin,
+        launcherArgvPrefix: deps.launcherArgvPrefix,
         randomUuid: deps.randomUuid,
         runTmuxCommand: deps.runTmuxCommandFn,
       });

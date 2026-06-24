@@ -31,6 +31,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
+import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
 
 // ---------------------------------------------------------------------------
 // CLIs, roles, read-only directive
@@ -643,6 +644,21 @@ export function resolvePairAgentwrapPath(
     return join(home, entry.slice(2));
   }
   return entry;
+}
+
+/**
+ * Resolve the absolute keeper CLI entry the pair path launches partners through
+ * (`<bun> <this path> agent <cli> …`), superseding {@link resolvePairAgentwrapPath}
+ * now that the launcher folded into `keeper agent`. db.ts-free (delegates to the
+ * shared {@link resolveKeeperAgentPathDepFree} leaf so this surface never drags
+ * the DB graph): `KEEPER_AGENT_PATH` > `KEEPER_AGENTWRAP_PATH` (deprecated alias)
+ * > the derived `cli/keeper.ts` default. `env`/`home` injectable for tests.
+ */
+export function resolvePairKeeperAgentPath(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  return resolveKeeperAgentPathDepFree(env, home);
 }
 
 // ---------------------------------------------------------------------------

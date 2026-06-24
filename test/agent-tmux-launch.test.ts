@@ -178,7 +178,7 @@ describe("--agentwrap-tmux", () => {
       'AGENTWRAP_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/agentwrap/bin/agentwrap.ts' 'codex' '--agentwrap-profile' 'work' 'hello'`,
+      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--agentwrap-profile' 'work' 'hello'`,
     );
     expect(script).not.toContain("--agentwrap-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
@@ -376,7 +376,7 @@ describe("--agentwrap-tmux", () => {
     );
     const script = readFileSync(launchScript, "utf8");
     expect(script).toContain(
-      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/agentwrap/bin/agentwrap.ts' 'pi' 'hello'`,
+      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
     );
     expect(script).not.toContain("--agentwrap-tmux-L");
   });

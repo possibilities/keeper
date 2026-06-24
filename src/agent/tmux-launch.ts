@@ -142,8 +142,15 @@ export interface TmuxLaunchRequest {
   stateDir: string;
   /** Absolute `tmux` binary; resolved by the caller so a stripped PATH can't ENOENT it. */
   tmuxBin: string;
-  bunBin: string;
-  agentwrapBin: string;
+  /**
+   * The argv PREFIX the detached pane re-execs, ahead of the agent token + inner
+   * args: `[<abs bun>, <abs cli/keeper.ts>, "agent"]`. Computed by the caller
+   * from `resolveKeeperAgentPath` — NEVER from `process.argv[1]` (which is
+   * `daemon.ts` under keeperd, `cli/keeper.ts` under the CLI, neither carrying
+   * the `agent` token). Both entries are absolute so the launch script's `cd` +
+   * keeperd's stripped LaunchAgent PATH cannot mis-resolve them.
+   */
+  launcherArgvPrefix: string[];
   randomUuid: () => string;
   runTmuxCommand: TmuxCommandRunner;
 }
@@ -701,9 +708,11 @@ export function resolveTmuxBin(env: NodeJS.ProcessEnv): string {
 }
 
 /**
- * Resolve `agentwrapBin` to an absolute path. `process.argv[1]` may be relative
- * to the invocation cwd; the launch script `cd`s before re-exec'ing the
- * wrapper, so a relative path would not resolve from the new cwd.
+ * Resolve a bin path to absolute against an invocation cwd. Retained as a pure
+ * path helper; the detached pane's self-re-exec no longer derives its target
+ * from here — it embeds an explicit `launcherArgvPrefix` resolved by the caller
+ * (`resolveKeeperAgentPath`), since `process.argv[1]` under keeper is
+ * `daemon.ts`/`cli/keeper.ts`, neither carrying the `agent` token.
  */
 export function resolveAgentwrapBin(
   bin: string,
@@ -813,8 +822,7 @@ function buildLaunchScript(req: TmuxLaunchRequest): string {
   lines.push(
     'AGENTWRAP_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     `exec "$AGENTWRAP_SHELL" -l -i -c '${tmuxShellBody()}' "$AGENTWRAP_SHELL" ${[
-      req.bunBin,
-      req.agentwrapBin,
+      ...req.launcherArgvPrefix,
       ...argv,
     ]
       .map(shellQuote)
