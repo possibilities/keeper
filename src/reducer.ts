@@ -4847,12 +4847,13 @@ interface EmbeddedJobElement {
   git_orphan_count: number;
   /**
    * Mirror of `jobs.active_since` (`null` until the first `stopped → working`
-   * transition, then frozen). A pure jobs-row fact — lifted fresh by
-   * {@link buildEmbeddedJob} each re-sync, NO clobber-guard carry needed.
-   * Readiness reads it to keep a freshly-bound `stopped` worker holding its
-   * root across the bind → first-activity handoff without over-holding a
-   * stopped-after-working one. Optional + absent ≡ `null` for a pre-v90 stored
-   * element.
+   * un-stop edge, then non-null and re-stamped to the latest `ts` on each
+   * subsequent un-stop edge — the most-recent-edge timestamp, NOT frozen). A
+   * pure jobs-row fact — lifted fresh by {@link buildEmbeddedJob} each re-sync,
+   * NO clobber-guard carry needed. Readiness reads it to keep a freshly-bound
+   * `stopped` worker holding its root across the bind → first-activity handoff
+   * without over-holding a stopped-after-working one. Optional + absent ≡ `null`
+   * for a pre-v84 stored element.
    */
   active_since?: number | null;
   /**
@@ -4913,8 +4914,9 @@ interface JobsRowForSync {
   git_unattributed_to_live_count: number;
   // Schema v31: new strict-mystery column.
   git_orphan_count: number;
-  // `null` until the first `stopped → working` transition (stamped once, then
-  // frozen). Lifted onto the embedded element so readiness can tell a
+  // `null` until the first `stopped → working` un-stop edge, then non-null and
+  // re-stamped to the latest edge's `ts` on each subsequent edge (the
+  // most-recent-edge timestamp, NOT frozen). Lifted onto the embedded element so readiness can tell a
   // freshly-bound `stopped` worker (never active) from a stopped-after-working
   // one. Pure function of event order — re-fold byte-stable.
   active_since: number | null;

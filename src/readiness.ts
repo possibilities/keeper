@@ -1497,7 +1497,8 @@ function anyEmbeddedJobWorking(
  * an embedded job is `state='stopped'`, carries a real `plan_verb` (the
  * spawn-name dispatch correlator the `(plan|work|close)` whitelist sets), AND
  * has never been active (`active_since` is null/absent — the reducer stamps it
- * once on the first `stopped → working` edge and freezes it).
+ * on the first `stopped → working` un-stop edge, then re-stamps it on each
+ * subsequent edge; null/absent therefore means no un-stop edge has fired yet).
  *
  * This is the post-bind half of the unbroken occupancy hold: the SessionStart
  * fold that mints this row DELETEs the worker's `pending_dispatches` row in the

@@ -583,11 +583,13 @@ export interface EmbeddedJob {
   git_unattributed_to_live_count: number;
   git_orphan_count: number;
   /**
-   * Mirror of `jobs.active_since` — `null` until the session's FIRST transition
-   * into `working` (the reducer stamps it on the first `state != 'working'`
-   * arm), then frozen at that `ts`. Lifted by `buildEmbeddedJob` straight off
-   * the row, so it round-trips byte-deterministically; optional + absent ≡
-   * `null` for a pre-v90 stored element. Readiness reads it to disambiguate a
+   * Mirror of `jobs.active_since` — `null` until the session's FIRST un-stop
+   * edge (the reducer stamps it on the first `state != 'working'` arm), then
+   * non-null and re-stamped to the latest `ts` on every subsequent un-stop edge
+   * (it is the most-recent-edge timestamp, NOT frozen at the first). Lifted by
+   * `buildEmbeddedJob` straight off the row, so it round-trips
+   * byte-deterministically; optional + absent ≡ `null` for a pre-v84 stored
+   * element. Readiness reads it to disambiguate a
    * FRESHLY-BOUND `stopped` worker (bound by SessionStart, never yet active:
    * `active_since === null`) from a genuinely STOPPED-AFTER-WORKING / dead one
    * (`active_since` non-null) — the former occupies its root through the bind →
