@@ -3,7 +3,9 @@
  *
  * Drive the pure pieces of `scripts/restore-agents.ts` against in-memory
  * candidate fixtures and a seeded read-only `keeper.db`:
- *  - `buildResumeLaunchArgv` — latest-name resume key, login-shell wrap, no --plugin-dir.
+ *  - `buildResumeLaunchArgv` — latest-name resume key, alias-independent
+ *    positional LAUNCH form (absolute launcher prefix + `claude --resume` as
+ *    `"$@"`), no --plugin-dir.
  *  - `planRestore` — `--session` filter over the candidate's backend session.
  *  - `applyRestore` — apply-vs-dry-run via a capturing fake ensureLaunched, the
  *    0.5s inter-window pacing, continue-past-failure.
@@ -138,6 +140,11 @@ function fakeCandidate(opts: {
   };
 }
 
+/** The absolute `keeper agent` launcher prefix injected into the LAUNCH form
+ *  (the live util resolves it from `process.execPath` +
+ *  `resolveKeeperAgentPathDepFree`; tests inject a fixed one). */
+const RESTORE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
+
 // ---------------------------------------------------------------------------
 // renderSnapshotScript — the --snapshot-current revive script
 // ---------------------------------------------------------------------------
@@ -165,6 +172,7 @@ test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-
     candidates,
     null,
     "/bin/zsh",
+    RESTORE_PREFIX,
     "/tmp/keeper.db",
   );
   expect(script.startsWith("#!/usr/bin/env bash\n")).toBe(true);
@@ -172,9 +180,10 @@ test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-
   // Get-or-create the session before its windows (every argv token single-quoted).
   expect(script).toContain("'tmux' 'has-session' '-t' '=work'");
   expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'work'");
-  // Resume by the LATEST name, never the job_id UUID.
-  expect(script).toContain('claude --resume "first-name"');
-  expect(script).toContain('claude --resume "second-name"');
+  // Resume by the LATEST name, never the job_id UUID. The name rides as a
+  // single-quoted POSITIONAL `--resume` value (alias-independent launch form).
+  expect(script).toContain("'claude' '--resume' 'first-name'");
+  expect(script).toContain("'claude' '--resume' 'second-name'");
   expect(script).not.toContain("j1");
   expect(script).not.toContain("j2");
   // Exactly one inter-window pause (between the two windows; none leading/trailing).
@@ -201,20 +210,22 @@ test("renderSnapshotScript --session filter narrows to one bucket", () => {
     candidates,
     "other",
     "/bin/zsh",
+    RESTORE_PREFIX,
     "/tmp/keeper.db",
   );
-  expect(script).toContain('claude --resume "b-name"');
-  expect(script).not.toContain('claude --resume "a-name"');
+  expect(script).toContain("'claude' '--resume' 'b-name'");
+  expect(script).not.toContain("'claude' '--resume' 'a-name'");
   expect(script).toContain("# summary: snapshot-current sessions=1 windows=1");
 });
 
 // ---------------------------------------------------------------------------
-// buildResumeLaunchArgv — latest-name resume key, shell wrap, no --plugin-dir
+// buildResumeLaunchArgv — alias-independent, quoting-safe positional LAUNCH form
 // ---------------------------------------------------------------------------
 
-test("buildResumeLaunchArgv wraps the resume command in a login shell prologue", () => {
+test("buildResumeLaunchArgv: shell -l -i -c fixed body + absolute launcher prefix as positionals", () => {
   const argv = buildResumeLaunchArgv(
     "/bin/zsh",
+    RESTORE_PREFIX,
     fakeCandidate({
       job_id: "sess-xyz",
       resume_target: "sess-xyz",
@@ -222,29 +233,56 @@ test("buildResumeLaunchArgv wraps the resume command in a login shell prologue",
     }),
   );
   expect(argv.slice(0, 4)).toEqual(["/bin/zsh", "-l", "-i", "-c"]);
-  // The fifth element is the body — cd, claude --resume <uuid>, exec back into
-  // the shell so the tab survives `claude` exiting.
-  expect(argv[4]).toContain("cd /repo");
-  expect(argv[4]).toContain(`claude --resume "sess-xyz"`);
-  expect(argv[4]).toContain("exec /bin/zsh -l -i");
+  // Fixed-literal body — no caller data interpolated, claude part NOT exec'd
+  // (the trailing `exec "$0"` is the hold-open login shell).
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  // `$0` slot is the shell repeated; the resume tokens ride as positionals via
+  // the absolute launcher prefix — no `claude` alias, no `cd`.
+  expect(argv[5]).toBe("/bin/zsh");
+  expect(argv.slice(6)).toEqual([
+    "/abs/bun",
+    "/abs/cli/keeper.ts",
+    "agent",
+    "claude",
+    "--resume",
+    "sess-xyz",
+    "--agentwrap-no-confirm",
+  ]);
+  expect(argv.join(" ")).not.toContain("cd ");
+  expect(argv).not.toContain("--agentwrap-tmux");
 });
 
-test("buildResumeLaunchArgv drops cd prefix when cwd is null", () => {
+test("buildResumeLaunchArgv: a resume target with shell metacharacters rides byte-faithful as a positional", () => {
+  const nasty = [
+    "single ' quote",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal `${...}` is the adversarial byte content under test
+    "$VAR and ${BRACED}",
+    "back`tick`s",
+    "$(rm -rf /)",
+    "line one\nline two",
+    "semis ; and && pipes |",
+    "-leading-dash",
+  ].join(" :: ");
   const argv = buildResumeLaunchArgv(
     "/bin/zsh",
-    fakeCandidate({ job_id: "x", resume_target: "x", cwd: null }),
+    RESTORE_PREFIX,
+    fakeCandidate({ job_id: "x", resume_target: nasty, cwd: "/repo" }),
   );
-  expect(argv[4]).not.toContain("cd ");
-  expect(argv[4].startsWith(`claude --resume "x"`)).toBe(true);
+  const resumeIdx = argv.indexOf("--resume");
+  expect(argv[resumeIdx + 1]).toBe(nasty);
+  // The `-c` body never references the target text — no class can fire.
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  expect(argv[4]).not.toContain(nasty);
 });
 
 test("buildResumeLaunchArgv never includes --plugin-dir (fn-10 inverted tier routing)", () => {
   const argv = buildResumeLaunchArgv(
     "/bin/zsh",
+    RESTORE_PREFIX,
     fakeCandidate({ job_id: "x", resume_target: "x", cwd: "/repo" }),
   );
-  expect(argv[4]).not.toContain("--plugin-dir");
-  expect(argv[4]).not.toContain("work-plugins");
+  expect(argv).not.toContain("--plugin-dir");
+  expect(argv.join(" ")).not.toContain("work-plugins");
 });
 
 // ---------------------------------------------------------------------------
@@ -310,12 +348,17 @@ test("applyRestore launches each would-restore via ensureLaunched", async () => 
       return { ok: true };
     },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async () => {},
   );
   expect(out.map((o) => o.kind)).toEqual(["restored", "restored"]);
   expect(calls).toHaveLength(2);
   expect(calls[0].session).toBe("work");
-  expect(calls[0].argv[4]).toContain(`claude --resume "a"`);
+  // The resume target rides as the `--resume` positional value (fixed-literal
+  // body, alias-independent launcher prefix).
+  const argv = calls[0].argv;
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  expect(argv[argv.indexOf("--resume") + 1]).toBe("a");
 });
 
 test("applyRestore continues past a single agent's launch failure", async () => {
@@ -326,10 +369,11 @@ test("applyRestore continues past a single agent's launch failure", async () => 
   const out = await applyRestore(
     plan,
     async (_session, argv) =>
-      argv[4].includes(`"fail"`)
+      argv.includes("fail")
         ? { ok: false, error: "tmux ENOENT" }
         : { ok: true },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async () => {},
   );
   expect(out).toHaveLength(2);
@@ -346,6 +390,7 @@ test("applyRestore traps a thrown ensureLaunched and marks the entry failed", as
       throw new Error("spawn failed");
     },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async () => {},
   );
   expect(out).toHaveLength(1);
@@ -371,6 +416,7 @@ test("applyRestore pauses 0.5s between consecutive launches only", async () => {
       return { ok: true };
     },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async (ms) => {
       sleeps.push(ms);
     },
@@ -387,6 +433,7 @@ test("applyRestore emits no pause for a single launch", async () => {
     plan,
     async () => ({ ok: true }),
     "/bin/zsh",
+    RESTORE_PREFIX,
     async (ms) => {
       sleeps.push(ms);
     },
@@ -406,8 +453,9 @@ test("applyRestore still pauses after a launch FAILURE (pacing outside try/catch
   const out = await applyRestore(
     plan,
     async (_s, argv) =>
-      argv[4].includes(`"fail"`) ? { ok: false, error: "boom" } : { ok: true },
+      argv.includes("fail") ? { ok: false, error: "boom" } : { ok: true },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async (ms) => {
       sleeps.push(ms);
     },
@@ -443,8 +491,9 @@ test("renderOutcomes apply summary names restored / failed", async () => {
   const out = await applyRestore(
     plan,
     async (_s, argv) =>
-      argv[4].includes(`"z"`) ? { ok: false, error: "nope" } : { ok: true },
+      argv.includes("z") ? { ok: false, error: "nope" } : { ok: true },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async () => {},
   );
   const rendered = renderOutcomes(out, true, 0);
@@ -583,13 +632,17 @@ test("loadRestoreSet end-to-end: the apply path relaunches each derived candidat
       return { ok: true };
     },
     "/bin/zsh",
+    RESTORE_PREFIX,
     async () => {},
   );
   expect(out.map((o) => o.kind)).toEqual(["restored", "restored"]);
   expect(calls.map((c) => c.session)).toEqual(["work", "work"]);
-  expect(calls[0].argv[4]).toContain(`claude --resume "uuid-a"`);
+  // The resume target rides as the `--resume` positional value (alias-free).
+  const argvA = calls[0].argv;
+  expect(argvA[argvA.indexOf("--resume") + 1]).toBe("uuid-a");
   expect(calls[0].cwd).toBe("/repo/a");
-  expect(calls[1].argv[4]).toContain(`claude --resume "uuid-b"`);
+  const argvB = calls[1].argv;
+  expect(argvB[argvB.indexOf("--resume") + 1]).toBe("uuid-b");
   expect(calls[1].cwd).toBe("/repo/b");
 });
 

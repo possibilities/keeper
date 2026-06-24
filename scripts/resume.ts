@@ -11,9 +11,11 @@
  *
  * The descriptor-building primitives — `resumeTarget` / `buildResumeCommand` /
  * `tierForJobFromEpics` — live in the shared `src/resume-descriptor.ts`
- * module so this script, the restore worker (epic fn-677, T3), and the
- * `scripts/restore-agents.ts` util (T4) build byte-identical commands from
- * one formula. This script keeps the lazy per-epic UDS fetch loop (one
+ * module. That module exposes ONE DISPLAY form (`buildResumeCommand`, the bare
+ * `claude --resume` string THIS script prints) plus ONE LAUNCH form
+ * (`buildResumeLaunchForm`, the alias-independent positional argv the two
+ * launch producers — `keeper bus wake` + `scripts/restore-agents.ts` — spawn).
+ * This script is the DISPLAY producer. It keeps the lazy per-epic UDS fetch loop (one
  * round-trip per distinct work-job epic, memoized) because it's read-on-
  * demand against the daemon; the restore worker subscribes the full epics
  * projection once and feeds the pure helper its in-memory map instead.

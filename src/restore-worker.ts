@@ -319,12 +319,13 @@ export const RESTORE_SCHEMA_VERSION = 3;
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
  * job that carries a non-NULL `backend_exec_session_id`. The fields are the
  * exact substrate the `scripts/restore-agents.ts` util needs to rebuild the
- * `claude --resume` command via `buildResumeCommand`:
+ * resume LAUNCH form via `buildResumeLaunchForm`:
  *
  *  - `job_id` — the Claude session id, also the dedup key against live jobs at
  *    restore time.
- *  - `cwd` — directory to `cd` into before `claude --resume`; `null` when the
- *    SessionStart event never carried one.
+ *  - `cwd` — the directory the resumed window opens in (applied by the tmux
+ *    transport via `new-window -c`, not interpolated into the launch body);
+ *    `null` when the SessionStart event never carried one.
  *  - `resume_target` — pre-resolved via {@link resumeTarget} (the latest session
  *    name, `job_id` fallback — resume by the name keeper currently knows).
  *    Pre-resolved at producer time so the restore-agents util doesn't re-derive it.

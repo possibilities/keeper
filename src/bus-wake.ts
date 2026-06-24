@@ -29,13 +29,15 @@ import {
   restoreReplayLaunch,
   type SpawnFn,
 } from "./exec-backend";
-import { buildResumeCommand, resumeTarget } from "./resume-descriptor";
+import { buildResumeLaunchForm, resumeTarget } from "./resume-descriptor";
 
 /**
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
  * import("./types").Job} so the resolve/liveness/launch pipeline unit-tests with a
  * tiny synthetic row. `title`/`job_id` feed {@link resumeTarget}; `cwd` is the
- * resume `cd`; `state` is the running-liveness signal; `backend_exec_pane_id` is
+ * directory the resumed window opens in (passed to the tmux transport's
+ * `new-window -c`, not interpolated into the launch body); `state` is the
+ * running-liveness signal; `backend_exec_pane_id` is
  * the live-pane liveness signal (a `stopped` row whose pane is still listed is
  * live); `updated_at` is the newest-creator tiebreaker. Field names + types match
  * `Job` so a real `jobs` row is assignable directly.
@@ -183,17 +185,26 @@ export function inCooldown(
 }
 
 /**
- * Build the `claude --resume` launch argv for a creator session, wrapped for a
- * login shell so the spawned `agentbus` window survives the resumed claude exiting
- * (the trailing `exec bash -l -i` holds the pane, mirroring the crash-restore
- * replay shape in `scripts/restore-agents.ts`). `buildResumeCommand` returns a
- * SHELL STRING; this bridges it to the `argv:string[]` `restoreReplayLaunch`
- * takes. Pure over `(cwd, target)`.
+ * Build the resume LAUNCH argv for a creator session into the `agentbus`
+ * window. Delegates to {@link buildResumeLaunchForm}: the alias-independent,
+ * quoting-safe positional form (absolute launcher `prefix` + `claude --resume
+ * <target> --agentwrap-no-confirm` riding as `"$@"`, no `claude` alias needed)
+ * wrapped in a login+interactive `bash` whose trailing `exec "$0" -l -i` holds
+ * the pane open after the resumed claude exits.
+ *
+ * Bash is the wake shell (the `agentbus` transport spawns under bash); the
+ * `<shell> -c 'body' a0 a1` positional mapping (`$0=a0, $1=a1`) is identical to
+ * the restore producer's zsh. The absolute `prefix` is INJECTED by `runWake`
+ * (resolved from `process.execPath` + `resolveKeeperAgentPathDepFree` at the
+ * `cli/bus.ts` wiring) so this stays pure. `cwd` is no longer interpolated —
+ * the tmux transport applies it via `new-window -c`. Pure over `(prefix,
+ * target)`.
  */
-export function buildWakeResumeArgv(cwd: string, target: string): string[] {
-  const resumeCmd = buildResumeCommand(cwd, target, null);
-  const body = `${resumeCmd} ; exec bash -l -i`;
-  return ["bash", "-l", "-i", "-c", body];
+export function buildWakeResumeArgv(
+  prefix: string[],
+  target: string,
+): string[] {
+  return buildResumeLaunchForm("bash", prefix, target);
 }
 
 /**
@@ -219,6 +230,13 @@ export function pickCreatorJob(jobRows: WakeCreator[]): WakeCreator | null {
 /** Injectable seams for {@link runWake} — every impure edge arrives as a dep so
  *  the orchestration unit-tests with no real tmux/daemon/process/fs. */
 export interface WakeDeps {
+  /** The absolute `keeper agent` launcher prefix
+   *  (`[<bun>, <abs cli/keeper.ts>, "agent"]` from `buildLauncherArgvPrefix`),
+   *  resolved by the caller (impure: reads `process.execPath` +
+   *  `resolveKeeperAgentPathDepFree`) and INJECTED so the resume-argv builder
+   *  stays pure. Rides as positional `"$@"` tokens — see
+   *  {@link buildWakeResumeArgv}. */
+  readonly launcherPrefix: string[];
   /** Resolve the creator `jobs` rows for `(role=creator, epic)`. Returns the rows
    *  (already decoded), or `[]` on a miss. */
   readonly resolveCreatorJobs: (epic: string) => WakeCreator[];
@@ -266,7 +284,7 @@ export interface WakeDeps {
  *     alone is racy).
  *  4. Cooldown ({@link inCooldown}): a recent failed wake still inside the window →
  *     `cooldown`, SKIP.
- *  5. Launch the `bash -l -c`-wrapped `claude --resume` into `agentbus`
+ *  5. Launch the alias-independent resume LAUNCH form into `agentbus`
  *     ({@link buildWakeResumeArgv}); fail-open on `{ ok: false }` → `launch_failed`,
  *     bump the cooldown record. On success, clear the cooldown record and stamp the
  *     managed-window marker (best-effort; a marker failure does NOT fail the wake).
@@ -320,7 +338,7 @@ export async function runWake(
     }
 
     const cwd = job.cwd ?? "";
-    const argv = buildWakeResumeArgv(cwd, resumeTarget(job));
+    const argv = buildWakeResumeArgv(deps.launcherPrefix, resumeTarget(job));
     const result = await launch(AGENTBUS_EXEC_SESSION, argv, cwd);
     if (!result.ok) {
       const failures = (cd?.failures ?? 0) + 1;

@@ -36,9 +36,13 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **The bus relay NEVER spawns — wake is the client-side `keeper bus wake` CLI
   verb** (`cli/bus.ts` → `src/bus-wake.ts`, fn-918). A `planner@<epic>` send to a
   known-but-offline creator persists `queued_for_wake` on `messages` (no bus.db
-  schema bump); `keeper bus wake` resumes that creator via `claude --resume` into
-  the dedicated `agentbus` tmux session — single-flighted per session, liveness-
-  and cooldown-gated, fail-open. It runs in the CLI process, NEVER the bus socket /
+  schema bump); `keeper bus wake` resumes that creator into the dedicated
+  `agentbus` tmux session via the alias-independent resume LAUNCH form
+  (`buildResumeLaunchForm`, fn-940 — an absolute `keeper agent` launcher prefix
+  + `claude --resume <target>` riding as positional `"$@"` args, so no `claude`
+  alias is needed and a session name with shell metacharacters is safe; one
+  DISPLAY form + two LAUNCH producers — wake + crash-restore) — single-flighted
+  per session, liveness- and cooldown-gated, fail-open. It runs in the CLI process, NEVER the bus socket /
   a daemon RPC / `src/wake-worker.ts` (the unrelated `data_version` pump — a
   name-collision hazard). `agentbus` is a managed session keeper SPAWNS into; its
   stopped tracked windows are autoclosed by the reaper's managed-session arm

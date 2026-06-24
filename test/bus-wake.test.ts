@@ -5,7 +5,8 @@
  * tmux/daemon/process/fs):
  *  - `creatorIsLive` / `isRunningState` — the spawn-time liveness recheck.
  *  - `inCooldown` — the failed-wake circuit-breaker window.
- *  - `buildWakeResumeArgv` — the `bash -l -c`-wrapped `claude --resume` argv.
+ *  - `buildWakeResumeArgv` — the alias-independent, quoting-safe positional
+ *    resume LAUNCH argv (absolute launcher prefix + `claude --resume` as `"$@"`).
  *  - `pickCreatorJob` — the newest-creator pick over >1 edges.
  *  - `runWake` — resolve → liveness-skip → single-flight-skip → cooldown-skip →
  *    launch (+ the managed-window marker argv) → launch_failed bumps cooldown.
@@ -74,6 +75,11 @@ function makeDeps(
   const locked = overrides.locked ?? new Set<string>();
   const spawnCalls = overrides.spawnCalls ?? [];
   return {
+    launcherPrefix: overrides.launcherPrefix ?? [
+      "/abs/bun",
+      "/abs/cli/keeper.ts",
+      "agent",
+    ],
     resolveCreatorJobs:
       overrides.resolveCreatorJobs ?? (() => overrides.jobs ?? [creator()]),
     liveSessionIds:
@@ -173,23 +179,54 @@ test("inCooldown: a recent failure gates; old/absent/zero-failure does not", () 
 });
 
 // ---------------------------------------------------------------------------
-// buildWakeResumeArgv — bash -l -c wrapping
+// buildWakeResumeArgv — alias-independent, quoting-safe positional LAUNCH form
 // ---------------------------------------------------------------------------
 
-test("buildWakeResumeArgv: bash -l -c wraps claude --resume + a trailing login shell", () => {
-  const argv = buildWakeResumeArgv("/abs/repo", "planner-title");
-  expect(argv.slice(0, 3)).toEqual(["bash", "-l", "-i"]);
-  expect(argv[3]).toBe("-c");
-  const body = argv[4];
-  expect(body).toContain('cd /abs/repo && claude --resume "planner-title"');
-  expect(body).toContain("--agentwrap-no-confirm");
-  // The trailing login shell keeps the pane alive after the resumed claude exits.
-  expect(body).toContain("; exec bash -l -i");
+const WAKE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
+
+test("buildWakeResumeArgv: bash -l -i -c fixed body + absolute launcher prefix as positionals", () => {
+  const argv = buildWakeResumeArgv([...WAKE_PREFIX], "planner-title");
+  // Login+interactive bash wrapper.
+  expect(argv.slice(0, 4)).toEqual(["bash", "-l", "-i", "-c"]);
+  // The `-c` body is the FIXED literal — no caller data interpolated, and the
+  // claude part is NOT exec'd (the trailing `exec "$0"` is the hold-open shell).
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  // `$0` slot is bash (repeated) so the first prefix token is $1, not eaten.
+  expect(argv[5]).toBe("bash");
+  // The resume tokens ride as positionals: absolute prefix, then the alias-free
+  // `claude --resume <target> --agentwrap-no-confirm`. No `claude` alias, no cd.
+  expect(argv.slice(6)).toEqual([
+    "/abs/bun",
+    "/abs/cli/keeper.ts",
+    "agent",
+    "claude",
+    "--resume",
+    "planner-title",
+    "--agentwrap-no-confirm",
+  ]);
+  // No --agentwrap-tmux (the launch already runs inside a tmux window), no cd.
+  expect(argv).not.toContain("--agentwrap-tmux");
+  expect(argv.join(" ")).not.toContain("cd ");
 });
 
-test("buildWakeResumeArgv: empty cwd drops the cd prefix", () => {
-  const body = buildWakeResumeArgv("", "sess-x")[4];
-  expect(body.startsWith('claude --resume "sess-x"')).toBe(true);
+test("buildWakeResumeArgv: a session name with shell metacharacters rides byte-faithful as a positional", () => {
+  const nasty = [
+    "single ' quote",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal `${...}` is the adversarial byte content under test
+    "$VAR and ${BRACED}",
+    "back`tick`s",
+    "$(rm -rf /)",
+    "line one\nline two",
+    "semis ; and && pipes |",
+    "-leading-dash",
+  ].join(" :: ");
+  const argv = buildWakeResumeArgv([...WAKE_PREFIX], nasty);
+  // The target rides as the `--resume` value positional — byte-identical, no
+  // quoting/escaping/interpolation — and the `-c` body never references it.
+  const resumeIdx = argv.indexOf("--resume");
+  expect(argv[resumeIdx + 1]).toBe(nasty);
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  expect(argv[4]).not.toContain(nasty);
 });
 
 // ---------------------------------------------------------------------------
@@ -341,11 +378,20 @@ test("runWake: launched resumes into agentbus, clears cooldown, stamps the marke
   );
   expect(res.outcome).toBe("launched");
   expect(res.sessionId).toBe("s1");
-  // Launched into the dedicated agentbus session with the wrapped resume argv.
+  // Launched into the dedicated agentbus session with the wrapped resume argv,
+  // threading the injected launcher prefix as positionals (alias-independent).
   expect(launchArgs).toHaveLength(1);
   expect(launchArgs[0].session).toBe("agentbus");
   expect(launchArgs[0].cwd).toBe("/abs/repo");
   expect(launchArgs[0].argv[0]).toBe("bash");
+  expect(launchArgs[0].argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  expect(launchArgs[0].argv).toContain("/abs/cli/keeper.ts");
+  expect(launchArgs[0].argv.slice(-4)).toEqual([
+    "claude",
+    "--resume",
+    "planner",
+    "--agentwrap-no-confirm",
+  ]);
   // Cooldown cleared on success.
   expect(cooldowns.has("s1")).toBe(false);
   // The managed-window marker is stamped on the agentbus window.

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { resolveRestorePath } from "../src/db";
 import {
   buildResumeCommand,
+  buildResumeLaunchForm,
   resumeTarget,
   tierForJobFromEpics,
 } from "../src/resume-descriptor";
@@ -86,6 +87,82 @@ test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
   expect(cmd).toBe(
     'cd /repo && claude --resume "fn-1.1" --agentwrap-no-confirm',
   );
+});
+
+// ---------------------------------------------------------------------------
+// buildResumeLaunchForm — the alias-independent, quoting-safe LAUNCH form
+// ---------------------------------------------------------------------------
+
+const LAUNCH_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
+
+test("buildResumeLaunchForm: shell -l -i -c + fixed body + absolute launcher prefix as positionals", () => {
+  const argv = buildResumeLaunchForm("/bin/zsh", LAUNCH_PREFIX, "fn-677.1");
+  // Login+interactive wrapper.
+  expect(argv.slice(0, 4)).toEqual(["/bin/zsh", "-l", "-i", "-c"]);
+  // The `-c` body is the FIXED literal — no caller data interpolated, and the
+  // command part is NOT exec'd (the trailing `exec "$0"` is the hold-open shell
+  // that must survive claude exiting; contrast buildDispatchLaunchArgv).
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  // `$0` slot is the shell repeated so the first prefix token is $1, not eaten.
+  expect(argv[5]).toBe("/bin/zsh");
+  // Resume tokens ride as positionals: absolute prefix, then the alias-free
+  // `claude --resume <target> --agentwrap-no-confirm`.
+  expect(argv.slice(6)).toEqual([
+    "/abs/bun",
+    "/abs/cli/keeper.ts",
+    "agent",
+    "claude",
+    "--resume",
+    "fn-677.1",
+    "--agentwrap-no-confirm",
+  ]);
+  // No cd, no --agentwrap-tmux (the launch already runs inside a tmux window).
+  expect(argv.join(" ")).not.toContain("cd ");
+  expect(argv).not.toContain("--agentwrap-tmux");
+});
+
+test("buildResumeLaunchForm: a target with shell metacharacters rides byte-faithful as a positional", () => {
+  const nasty = [
+    "single ' quote",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal `${...}` is the adversarial byte content under test
+    "$VAR and ${BRACED}",
+    "back`tick`s",
+    "$(rm -rf /)",
+    "line one\nline two",
+    "semis ; and && pipes |",
+    "-leading-dash",
+  ].join(" :: ");
+  const argv = buildResumeLaunchForm("/bin/bash", LAUNCH_PREFIX, nasty);
+  // The target is the `--resume` value positional — byte-identical, no quoting,
+  // no escaping, no interpolation. The `-c` body never references the target.
+  const resumeIdx = argv.indexOf("--resume");
+  expect(argv[resumeIdx + 1]).toBe(nasty);
+  expect(argv[4]).toBe(`"$@" ; exec "$0" -l -i`);
+  expect(argv[4]).not.toContain(nasty);
+});
+
+test("buildResumeLaunchForm: bash and zsh emit identical positional mapping", () => {
+  // `<shell> -c 'body' a0 a1` assigns $0=a0, $1=a1 in both — the only shell
+  // difference is the binary token, so the wake (bash) and restore (zsh)
+  // producers share one positional contract.
+  const bash = buildResumeLaunchForm("bash", LAUNCH_PREFIX, "t");
+  const zsh = buildResumeLaunchForm("zsh", LAUNCH_PREFIX, "t");
+  expect(bash.slice(1)).toEqual([
+    "-l",
+    "-i",
+    "-c",
+    `"$@" ; exec "$0" -l -i`,
+    "bash",
+    ...LAUNCH_PREFIX,
+    "claude",
+    "--resume",
+    "t",
+    "--agentwrap-no-confirm",
+  ]);
+  // Same shape, only the two shell-token slots differ.
+  expect(zsh[0]).toBe("zsh");
+  expect(zsh[5]).toBe("zsh");
+  expect(bash.slice(6)).toEqual(zsh.slice(6));
 });
 
 test("tierForJobFromEpics resolves the tier for a work job whose epic is in the map", () => {

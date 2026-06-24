@@ -10,10 +10,10 @@
  * (a read-only `keeper.db` connection, no socket round-trip).
  *
  * Each surviving candidate is replayed back into its original backend session
- * via `ExecBackend.ensureLaunched` (T2) using the resume command
- * `scripts/resume.ts` and the restore worker already agree on
- * (`buildResumeCommand` / `resumeTarget` — the shared `src/resume-descriptor`
- * substrate that makes the three resume-command producers byte-identical). The
+ * via `ExecBackend.ensureLaunched` (T2) using the shared resume LAUNCH form
+ * (`buildResumeLaunchForm` / `resumeTarget` from `src/resume-descriptor` — the
+ * alias-independent positional argv this and `keeper bus wake` are the TWO
+ * producers of; `scripts/resume.ts` keeps the human-facing DISPLAY form). The
  * resume key is the job's LATEST name (`title`, `job_id` fallback) — read live
  * from the jobs projection at restore time, never a frozen one — so a renamed
  * session restores to the name keeper currently knows.
@@ -67,12 +67,19 @@ import {
   restoreReplayLaunch,
 } from "../src/exec-backend";
 import {
+  buildLauncherArgvPrefix,
+  resolveKeeperAgentPathDepFree,
+} from "../src/keeper-agent-path";
+import {
   deriveCurrentSet,
   deriveLastGenerationSet,
   deriveRestoreSet,
   type RestoreCandidate,
 } from "../src/restore-set";
-import { buildResumeCommand } from "../src/resume-descriptor";
+import {
+  buildResumeCommand,
+  buildResumeLaunchForm,
+} from "../src/resume-descriptor";
 
 const HELP = `restore-agents — replay crash-killed Claude Code agents derived from keeper.db
 
@@ -91,8 +98,9 @@ Usage:
 Derives the crash-restore candidate set RETROSPECTIVELY from keeper.db: a
 killed job whose producer-stamped close_kind reads crash-like, that was live
 recently and doesn't already re-occupy a backend. Resumes by the latest session
-name (read live from keeper.db, never a frozen one) wrapped in the same shell
-prologue scripts/resume.ts emits, into the original tmux session. Works with
+name (read live from keeper.db, never a frozen one) via the absolute 'keeper
+agent' launcher (alias-independent; the session name rides as a positional, so
+shell metacharacters are safe), into the original tmux session. Works with
 keeperd DOWN — the read is a read-only keeper.db connection with no socket
 round-trip.
 
@@ -140,9 +148,10 @@ interface ParsedArgs {
  * dry-run path) the per-agent label lines. PURE shape — no I/O leaks out. The
  * candidate carries everything the launch needs: `resume_target` (the latest-name
  * resume key), `backend_exec_session_id` (the tmux session to relaunch
- * into), and `cwd` (to `cd` into before `claude --resume`). `tier` is irrelevant
- * — fn-10 inverted tier routing dropped the `--plugin-dir` flag, so a resume
- * command never carries a tier.
+ * into), and `cwd` (the directory the resumed window opens in, applied by the
+ * tmux transport via `new-window -c`). `tier` is irrelevant — fn-10 inverted
+ * tier routing dropped the `--plugin-dir` flag, so a resume command never
+ * carries a tier.
  */
 export type AgentOutcome =
   | { kind: "would-restore"; candidate: RestoreCandidate }
@@ -181,25 +190,28 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
 }
 
 /**
- * Pure: assemble the agent's resume shell command. Wraps it in the same
- * `$SHELL -l -i -c "<cmd> ; exec $SHELL -l -i"` prologue the autopilot
- * worker's `buildLaunchArgv` uses, so a freshly minted tab survives the
- * `claude` process exiting (you keep a login shell). The resume key is the
- * candidate's `resume_target` (the latest name). The shell is injected for
- * testability — the live util passes `process.env.SHELL ?? DEFAULT_SHELL`.
+ * Pure: assemble the agent's resume LAUNCH argv. Delegates to the shared
+ * {@link buildResumeLaunchForm}: the alias-independent, quoting-safe positional
+ * form (absolute launcher `prefix` + `claude --resume <target>
+ * --agentwrap-no-confirm` riding as `"$@"`, no `claude` alias needed) wrapped
+ * in a login+interactive shell whose trailing `exec "$0" -l -i` holds the pane
+ * open after the resumed claude exits.
+ *
+ * The resume key is the candidate's `resume_target` (the latest name). `shell`
+ * is injected for testability (the live util passes
+ * `process.env.SHELL ?? DEFAULT_SHELL`); the absolute `prefix` is likewise
+ * injected (resolved once in `main` from `process.execPath` +
+ * `resolveKeeperAgentPathDepFree`) so this stays pure. cwd is no longer
+ * interpolated — the tmux transport applies it via `new-window -c`.
  *
  * Exported for tests.
  */
 export function buildResumeLaunchArgv(
   shell: string,
+  prefix: string[],
   candidate: RestoreCandidate,
 ): string[] {
-  const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
-  // fn-10: the resume command no longer carries a tier-plugin flag, so tier is
-  // always null on the restore path.
-  const workerCommand = buildResumeCommand(cwd, candidate.resume_target, null);
-  const body = `${workerCommand} ; exec ${shell} -l -i`;
-  return [shell, "-l", "-i", "-c", body];
+  return buildResumeLaunchForm(shell, prefix, candidate.resume_target);
 }
 
 /**
@@ -269,6 +281,7 @@ export async function applyRestore(
   plan: AgentOutcome[],
   ensureLaunched: EnsureLaunchedFn,
   shell: string,
+  prefix: string[],
   sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
   const out: AgentOutcome[] = [];
@@ -283,7 +296,7 @@ export async function applyRestore(
       await sleep(INTER_WINDOW_PAUSE_MS);
     }
     launched++;
-    const argv = buildResumeLaunchArgv(shell, entry.candidate);
+    const argv = buildResumeLaunchArgv(shell, prefix, entry.candidate);
     const cwd = entry.candidate.cwd == null ? "" : seg(entry.candidate.cwd);
     const session = entry.candidate.backend_exec_session_id;
     try {
@@ -389,6 +402,7 @@ export function renderSnapshotScript(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
   shell: string,
+  prefix: string[],
   sourcePath: string,
 ): string {
   const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
@@ -437,7 +451,7 @@ export function renderSnapshotScript(
     );
     for (const candidate of bucket) {
       const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
-      const innerArgv = buildResumeLaunchArgv(shell, candidate);
+      const innerArgv = buildResumeLaunchArgv(shell, prefix, candidate);
       // No window name — mirrors --apply (ensureLaunched passes none), so the
       // revived window stays unnamed and the renamer worker labels it later.
       if (windowsEmitted > 0) {
@@ -546,6 +560,13 @@ async function main(): Promise<void> {
 
   const dbPath = args.db ?? resolveDbPath();
   const shell = process.env.SHELL ?? DEFAULT_SHELL;
+  // The absolute `keeper agent` launcher prefix — PATH-independent, so a
+  // restored tab never depends on the `claude` alias (the resume launch form
+  // rides it as positional `"$@"` tokens; see buildResumeLaunchArgv).
+  const launcherPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolveKeeperAgentPathDepFree(),
+  );
 
   // --snapshot-current: emit a runnable revive script for the CURRENT live set
   // (every working/stopped session), independent of the crash-derivation path —
@@ -559,7 +580,13 @@ async function main(): Promise<void> {
       die(`failed to open keeper.db at ${dbPath}: ${(err as Error).message}`);
     }
     process.stdout.write(
-      renderSnapshotScript(current, args.session, shell, dbPath),
+      renderSnapshotScript(
+        current,
+        args.session,
+        shell,
+        launcherPrefix,
+        dbPath,
+      ),
     );
     process.exit(0);
   }
@@ -605,6 +632,7 @@ async function main(): Promise<void> {
     plan,
     ensureLaunched,
     shell,
+    launcherPrefix,
     defaultSleep,
   );
   process.stdout.write(renderOutcomes(outcomes, true, excludedIdleCount));

@@ -2984,8 +2984,8 @@ launcher is the sole launch path (keeperd probes its launchability at boot). tmu
 is used DIRECTLY for everything else: the pane ops
 (`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer,
 and `killWindow`, the reaper's only kill op; there is no general sweep-close
-path) and the crash-recovery restore replay (`restore-agents.ts`, which spawns a
-spec-less `claude --resume` argv into a get-or-created session via its own
+path) and the crash-recovery restore replay (`restore-agents.ts`, which spawns the
+alias-independent resume LAUNCH argv into a get-or-created session via its own
 per-call mint). Each reconciler dispatch opens as a new window in the
 hardcoded managed session (`autopilot`); the launch and pane ops each run a cheap
 per-call `has-session` probe and mint via `new-session -d` only when the
@@ -3077,14 +3077,22 @@ in original order. Each candidate's `resume_target` is the `job_id` UUID, never 
 mutable session name — a RENAMED session restores correctly.
 
 `scripts/restore-agents.ts` is a thin presenter over that ordered set: its dry-run
-prints the plan, `--apply` relaunches each survivor into its original session via
+prints the plan (using the human-facing `buildResumeCommand` DISPLAY form),
+`--apply` relaunches each survivor into its original session via
 `restoreReplayLaunch` (`src/exec-backend.ts`) using the shared
-`buildResumeCommand` / `resumeTarget` substrate (`src/resume-descriptor`) that
-keeps the three resume-command producers byte-identical, pacing window creation
-0.5s apart. The restore replay is a direct tmux launch: it execs the recorded
-spec-less `claude --resume` argv into a get-or-created session via its own
-per-call mint (the crash-recovery path stays on tmux directly, distinct from the
-`keeper agent` dispatch launch).
+`buildResumeLaunchForm` / `resumeTarget` substrate (`src/resume-descriptor`),
+pacing window creation 0.5s apart. The substrate is ONE DISPLAY form
+(`buildResumeCommand`, the bare `claude --resume` string `scripts/resume.ts`
+prints) plus ONE LAUNCH form (`buildResumeLaunchForm`, fn-940) shared by the TWO
+launch producers — this crash-restore util and `keeper bus wake`. The LAUNCH form
+is alias-independent and quoting-safe: an absolute `keeper agent` launcher prefix
++ `claude --resume <target> --agentwrap-no-confirm` riding as positional `"$@"`
+args, so it needs no `claude` alias and a session name with shell metacharacters
+is handled safely. The restore replay is a direct tmux launch: it execs that argv
+into a get-or-created session via its own per-call mint (the crash-recovery path
+stays on tmux directly, distinct from the `keeper agent` dispatch launch). cwd is
+applied by the tmux transport via `new-window -c`, not interpolated into the
+launch body.
 `--last-generation` swaps the candidate source to `deriveLastGenerationSet`
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.
@@ -3246,9 +3254,13 @@ outcome. The CLI exits 0 on the two successes (`delivered`, `queued_for_wake`)
 and fails loud (exit 1, stderr) on every other result — a non-delivery is never a
 silent exit-0. A `queued_for_wake` send can be RESUMED now by the CLIENT-SIDE
 `keeper bus wake "planner@<epic_id>"` verb (fn-918): it resolves the epic's
-creator from the trusted `job_links` edge and `claude --resume`s it into a
-dedicated `agentbus` tmux session (single-flighted per session, liveness- and
-cooldown-gated, fail-open). The relay itself NEVER spawns — wake is entirely the
+creator from the trusted `job_links` edge and resumes it into a dedicated
+`agentbus` tmux session via the alias-independent resume LAUNCH form
+(`buildResumeLaunchForm`, fn-940 — an absolute `keeper agent` launcher prefix +
+`claude --resume <target>` as positional `"$@"` args, so no `claude` alias is
+needed and a session name with shell metacharacters is safe; one DISPLAY form +
+two LAUNCH producers, shared with crash-restore), single-flighted per session,
+liveness- and cooldown-gated, fail-open. The relay itself NEVER spawns — wake is entirely the
 CLI verb — and a stopped tracked `agentbus` window is autoclosed by the
 window-reaper's managed-session arm (epic fn-920) past the idle grace, alongside
 `pair`/`panels`. Liveness is socket-close, NOT a heartbeat: a peer's

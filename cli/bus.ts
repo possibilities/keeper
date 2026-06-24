@@ -63,6 +63,10 @@ import {
   resolveDbPath,
 } from "../src/db";
 import { createTmuxPaneOps, type SpawnFn } from "../src/exec-backend";
+import {
+  buildLauncherArgvPrefix,
+  resolveKeeperAgentPathDepFree,
+} from "../src/keeper-agent-path";
 
 /** Reserved tenant namespace handled by the `chat` sub-verb. */
 export const CHAT_NAMESPACE = "chat";
@@ -127,10 +131,13 @@ Send blindly:
   informational only.
 
 Wake an offline planner:
-  'keeper bus wake <planner@epic>' resumes the epic's offline creator session via
-  'claude --resume' into a dedicated 'agentbus' tmux session, so a queued
-  escalation (queued_for_wake) is redelivered when the planner returns. The wake
-  runs CLIENT-SIDE in this verb — the bus relay never spawns. It is single-flighted
+  'keeper bus wake <planner@epic>' resumes the epic's offline creator session
+  into a dedicated 'agentbus' tmux session, so a queued escalation
+  (queued_for_wake) is redelivered when the planner returns. The resume launches
+  via the absolute 'keeper agent' launcher (alias-independent — no 'claude'
+  alias needed), with the session name riding as a positional so shell
+  metacharacters are handled safely. The wake runs CLIENT-SIDE in this verb —
+  the bus relay never spawns. It is single-flighted
   per session (no double-resume), skipped when the creator is already live, and
   cooldown-gated after repeated failures. Outcomes (all exit 0 except a hard miss):
     launched         → a resume was spawned into 'agentbus'
@@ -594,7 +601,14 @@ async function runWakeVerb(target: string): Promise<{
   // is a sync getter the recheck calls). A `stopped`+live-pane creator reads as
   // live off this set; a `null` probe falls back to "on doubt, SKIP".
   const livePaneIds = await readLivePaneIds();
+  // The absolute `keeper agent` launcher prefix — PATH-independent, so the
+  // resumed planner never depends on the `claude` alias (the original wake bug).
+  const launcherPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolveKeeperAgentPathDepFree(),
+  );
   const result = await runWake(role.epic, {
+    launcherPrefix,
     resolveCreatorJobs,
     liveSessionIds: readLiveSessionIds,
     livePaneIds: () => livePaneIds,
