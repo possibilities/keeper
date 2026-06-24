@@ -75,5 +75,5 @@ sweep and a test.
 - [ ] The boots-paused invariant is corrected (deliverable, not hygiene) in CLAUDE.md, README.md (`## Architecture`), src/db.ts:1184-1186, the src/autopilot-worker.ts JSDoc/comments, the src/daemon.ts comments, and the fn-778 test comment — forward-facing.
 
 ## Done summary
-
+Removed the forced AutopilotPaused{paused:true} boot re-arm in serveBootDrain and seed the in-memory autopilotPaused from the durable autopilot_state.paused column after the boot drain (via projectAutopilotPaused, null-on-empty), so an intentional play survives a daemon restart while a fresh board still boots PAUSED via the AutopilotCapSet INSERT default. Corrected the stale boots-paused invariant across CLAUDE.md, README.md, src/db.ts, src/autopilot-worker.ts, cli/autopilot.ts, and the fn-778 test comment; added re-fold byte-identity + boot-seed provenance tests.
 ## Evidence
