@@ -41,5 +41,5 @@ No unit test (a plist + docs change). Verify by reload + `ps -o pid,nice,comm` s
 - [ ] Plist comment + README install note explain the priority choice (forward-facing).
 
 ## Done summary
-
+Took keeperd off the throttled Background QoS: ProcessType=Standard + Nice=-5 in the plist, applied via bootout+bootstrap (kickstart -k was insufficient), and verified keeperd running at nice -5. Documented the priority rationale (inline plist comment) and the re-register procedure (README).
 ## Evidence
