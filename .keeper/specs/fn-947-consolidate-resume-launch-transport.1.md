@@ -86,5 +86,5 @@ crash-restore still consumes it (deleted in `.2`).
 - [ ] `bun run test:full` + `bun run test:hygiene` pass.
 
 ## Done summary
-
+Added resumeTarget to buildAgentwrapLaunchArgv/LaunchSpec (emits --resume <target>, no prompt) and migrated keeper bus wake onto the unified agentwrapLaunch resume transport; deleted buildWakeResumeArgv and the dead @keeper_managed window marker.
 ## Evidence
