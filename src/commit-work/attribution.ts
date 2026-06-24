@@ -267,3 +267,186 @@ export function discoverSessionFiles(
 }
 
 export { PLAN_EXCLUDE_PREFIXES };
+
+// ---------------------------------------------------------------------------
+// Read-side wait: close the poll-lag window the `.1` poll-only git producer
+// leaves (fn-921.4).
+// ---------------------------------------------------------------------------
+
+/**
+ * `file_attributions` is charged ONLY in pass 1 of the GitSnapshot fold — by
+ * intersecting promoted `mutation_path` events with a GitSnapshot's live-dirty
+ * set. Since `.1` made the git producer POLL-ONLY (scanning every ~300ms), a
+ * file edited immediately before `commit-work` runs is live-dirty but NOT yet
+ * charged (no GitSnapshot has folded since the edit), so the on-hook ∩ live read
+ * would miss staging it. This module lets `commit-work` WAIT — bounded and
+ * fail-open — for the producer to catch up before it reads.
+ *
+ * The "is my session caught up?" predicate keys off the LIVE-DIRTY set, NOT the
+ * raw mutation stream, so it can never false-wait forever: a mutation to a file
+ * that is no longer dirty (edited then reverted) or to an excluded/`.keeper`
+ * path simply isn't in the live-dirty set, so it never demands a charged row.
+ * The session is caught up iff every file that is BOTH (a) the target of one of
+ * the session's `mutation_path` events AND (b) currently live-dirty in the cwd
+ * repo AND (c) not a board-excluded path has a charged `file_attributions` row.
+ */
+
+/** Default bounded-wait ceiling — rides `.1`'s ~300ms scan cadence with margin. */
+export const DEFAULT_ATTRIBUTION_WAIT_MS = 1500;
+/** Default poll interval while waiting (a fraction of the scan cadence). */
+export const DEFAULT_ATTRIBUTION_POLL_MS = 75;
+
+/** Tuning + injectable clock/sleep for {@link waitForAttributionCaughtUp} (tests). */
+export interface AttributionWaitOpts {
+  /** Hard ceiling on the wait; on expiry we fail open to the current read. */
+  ceilingMs?: number;
+  /** Poll interval between caught-up checks. */
+  pollMs?: number;
+  /** Monotonic clock (ms); defaults to {@link Date.now}. */
+  now?: () => number;
+  /** Async sleep; defaults to a real `setTimeout` promise. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * The session's repo-relative live-dirty mutation targets in `cwdRepo` that lack
+ * a charged (undischarged) `file_attributions` row — the "not yet folded" set.
+ * Empty ⇒ the session's attribution is caught up with its latest edits.
+ *
+ * Reads keeper.db read-only (the session's `mutation_path` events + its
+ * undischarged attribution rows for `cwdRepo`) and takes ONE live `git status`
+ * read (the same source {@link getSessionDirtyFiles} already trusts). The DB
+ * handle is closed before the git read so the connection window stays narrow.
+ *
+ * Path canonicalization mirrors the fold: `mutation_path` is the absolute
+ * `tool_input.file_path`, so it is mapped to repo-relative by stripping the
+ * `cwdRepo + "/"` prefix (lexical only — no symlink walk), exactly inverting the
+ * fold's `projectDir + "/" + file.path` join. A mutation outside `cwdRepo` (no
+ * prefix match) is dropped — it cannot be a cwd-repo dirty file.
+ */
+export function pendingAttributionFiles(
+  sessionId: string,
+  cwdRepo: string,
+  deps: AttributionDeps = {},
+): string[] {
+  const liveDirtyPaths = deps.liveDirtyPaths ?? defaultLiveDirtyPaths;
+  const dbPath = deps.dbPath ?? resolveDbPath();
+
+  const { db } = openDb(dbPath, { readonly: true });
+  let mutationPaths: string[];
+  let charged: Set<string>;
+  try {
+    mutationPaths = (
+      db
+        .query(
+          "SELECT DISTINCT mutation_path FROM events " +
+            "WHERE session_id = ? AND mutation_path IS NOT NULL",
+        )
+        .all(sessionId) as Array<{ mutation_path: string }>
+    ).map((r) => r.mutation_path);
+    charged = new Set(
+      (
+        db
+          .query(
+            "SELECT file_path FROM file_attributions " +
+              "WHERE session_id = ? AND project_dir = ? " +
+              "AND (last_commit_at IS NULL OR last_commit_at < last_mutation_at)",
+          )
+          .all(sessionId, cwdRepo) as Array<{ file_path: string }>
+      ).map((r) => r.file_path),
+    );
+  } finally {
+    db.close();
+  }
+
+  // No session edits → nothing can be lagging.
+  if (mutationPaths.length === 0) return [];
+
+  // Map the absolute mutation targets to cwd-repo-relative, keeping only those
+  // under `cwdRepo` and not board-excluded.
+  const root = cwdRepo.endsWith("/") ? cwdRepo.slice(0, -1) : cwdRepo;
+  const prefix = `${root}/`;
+  const sessionRel = new Set<string>();
+  for (const abs of mutationPaths) {
+    if (!abs.startsWith(prefix)) continue;
+    const rel = abs.slice(prefix.length);
+    if (rel.length === 0) continue;
+    if (PLAN_EXCLUDE_PREFIXES.some((pfx) => rel.startsWith(pfx))) continue;
+    sessionRel.add(rel);
+  }
+  if (sessionRel.size === 0) return [];
+
+  // Intersect with the LIVE dirty set. A `null` (git unreadable) means we can't
+  // tell what is dirty — fail open: report nothing pending so the caller does
+  // not block on an unreadable repo.
+  const dirty = liveDirtyPaths(cwdRepo);
+  if (dirty === null) return [];
+
+  const pending: string[] = [];
+  for (const rel of sessionRel) {
+    if (dirty.has(rel) && !charged.has(rel)) pending.push(rel);
+  }
+  return pending.sort();
+}
+
+/**
+ * Resolve `cwd` to its git toplevel for the read-side wait — the cwd-repo key
+ * the wait + predicate compare against. Honors an injected `gitRoot` (tests);
+ * defaults to the live `git rev-parse --show-toplevel`. `null` ⇒ not a repo, so
+ * there is nothing to wait on.
+ */
+export function resolveCwdRepo(
+  cwd: string,
+  deps: AttributionDeps = {},
+): string | null {
+  return (deps.gitRoot ?? defaultGitRoot)(cwd);
+}
+
+/** Is the session's attribution caught up with its latest cwd-repo edits? */
+export function isSessionAttributionCaughtUp(
+  sessionId: string,
+  cwdRepo: string,
+  deps: AttributionDeps = {},
+): boolean {
+  return pendingAttributionFiles(sessionId, cwdRepo, deps).length === 0;
+}
+
+/**
+ * Block until the session's attribution is caught up with its latest cwd-repo
+ * edits, or the bounded ceiling elapses — whichever comes first. BOUNDED and
+ * FAIL-OPEN by construction: a wedged/slow git producer can never hang
+ * commit-work; on ceiling expiry this simply returns and the caller falls back
+ * to its existing on-hook ∩ live read (the pre-`.1` behavior). Returns `true`
+ * if the session converged within the ceiling, `false` on a fail-open timeout.
+ *
+ * The first check happens immediately (no initial sleep), so the steady-state
+ * common case — already caught up — pays zero wait. Only a genuinely-lagging
+ * session polls keeper.db read-only every `pollMs` until the `.1` poll producer
+ * scans + folds a GitSnapshot covering the edit.
+ */
+export async function waitForAttributionCaughtUp(
+  sessionId: string,
+  cwdRepo: string,
+  deps: AttributionDeps = {},
+  opts: AttributionWaitOpts = {},
+): Promise<boolean> {
+  const ceilingMs = opts.ceilingMs ?? DEFAULT_ATTRIBUTION_WAIT_MS;
+  const pollMs = opts.pollMs ?? DEFAULT_ATTRIBUTION_POLL_MS;
+  const now = opts.now ?? Date.now;
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  const deadline = now() + ceilingMs;
+  for (;;) {
+    if (isSessionAttributionCaughtUp(sessionId, cwdRepo, deps)) return true;
+    if (now() >= deadline) return false;
+    // Don't sleep past the deadline.
+    const remaining = deadline - now();
+    await sleep(Math.min(pollMs, Math.max(0, remaining)));
+    if (now() >= deadline) {
+      // One final check after the last sleep so a fold that landed during the
+      // sleep is observed rather than reported as a timeout.
+      return isSessionAttributionCaughtUp(sessionId, cwdRepo, deps);
+    }
+  }
+}

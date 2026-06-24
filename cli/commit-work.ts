@@ -33,7 +33,11 @@
  */
 
 import { existsSync } from "node:fs";
-import { discoverSessionFiles } from "../src/commit-work/attribution";
+import {
+  discoverSessionFiles,
+  resolveCwdRepo,
+  waitForAttributionCaughtUp,
+} from "../src/commit-work/attribution";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
@@ -347,6 +351,22 @@ async function gitCommitStaged(
   return { sha: sha.stdout.trim() };
 }
 
+/**
+ * Default read-side wait: resolve the cwd's git toplevel, then block (bounded +
+ * fail-open) until the session's attribution is caught up with its latest edits
+ * in that repo. A non-repo cwd has nothing to wait on, so this is a no-op there.
+ * Never throws — the bounded wait fails open on a slow/wedged producer, and a
+ * resolution miss simply skips the wait, preserving the pre-`.1` read behavior.
+ */
+async function defaultWaitCaughtUp(
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  const cwdRepo = resolveCwdRepo(cwd);
+  if (!cwdRepo) return;
+  await waitForAttributionCaughtUp(sessionId, cwdRepo);
+}
+
 // ---------------------------------------------------------------------------
 // orchestration
 // ---------------------------------------------------------------------------
@@ -384,6 +404,12 @@ export interface CommitWorkDeps {
   gitRunner?: GitRunner;
   /** Session-attributed dirty file discovery (default: real attribution read). */
   discoverFiles?: (sessionId: string, cwd: string) => string[];
+  /**
+   * Read-side wait that lets the `.1` poll-only git producer catch up so a file
+   * edited immediately before commit-work is attributed before the read. Bounded
+   * + fail-open by contract (default: real {@link waitForAttributionCaughtUp}).
+   */
+  waitCaughtUp?: (sessionId: string, cwd: string) => Promise<void>;
   /** Lint matrix; throws {@link LintFailure} on a violation (default: real). */
   runLint?: (stagedFiles: string[], cwd: string) => Promise<void>;
   /** Commit-work flock acquire (default: real {@link CommitWorkLock.acquire}). */
@@ -419,6 +445,7 @@ async function runInner(
   const cwd = process.cwd();
   const git = deps.gitRunner ?? gitExec;
   const discoverFiles = deps.discoverFiles ?? discoverSessionFiles;
+  const waitCaughtUp = deps.waitCaughtUp ?? defaultWaitCaughtUp;
   const runLint = deps.runLint ?? runScopedLint;
   const acquireLock = deps.acquireLock ?? CommitWorkLock.acquire;
 
@@ -434,6 +461,12 @@ async function runInner(
         "git commit and git push.",
     });
   }
+
+  // Read-side wait (fn-921.4): let the `.1` poll-only git producer fold a
+  // GitSnapshot covering any just-landed edit so its attribution is charged
+  // before we read. Bounded + fail-open — a wedged/slow producer never blocks
+  // the commit; on timeout we fall back to the on-hook ∩ live read below.
+  await waitCaughtUp(sessionId, cwd);
 
   // Discover + gitignore-filter OUTSIDE the lock (pure reads, no mutation).
   let files = discoverFiles(sessionId, cwd);

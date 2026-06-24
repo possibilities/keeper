@@ -143,6 +143,10 @@ function deps(opts: {
   const d: CommitWorkDeps = {
     gitRunner: run,
     discoverFiles: () => opts.files,
+    // No-op the read-side attribution wait: this suite injects the file set
+    // directly, so there is nothing to wait for, and the default wait would
+    // spawn real git + read the production DB — both banned here.
+    waitCaughtUp: async () => {},
     runLint: opts.runLint ?? (async () => {}),
     acquireLock: () => ({ release: () => {} }),
   };
