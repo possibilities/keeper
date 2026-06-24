@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T18:27:21.978000Z",
+  "depends_on": [
+    "fn-941-daemon-driven-plan-task-block-escalation.2"
+  ],
+  "epic": "fn-941-daemon-driven-plan-task-block-escalation",
+  "id": "fn-941-daemon-driven-plan-task-block-escalation.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Surface escalated-blocked state; await + board",
+  "updated_at": "2026-06-24T18:27:21.978000Z"
+}
