@@ -55,5 +55,5 @@ whole resolution path out of `src/db.ts` (cold-start invariant).
 - [ ] With no `--agentwrap-preset` passed, launcher behavior is byte-identical to today.
 
 ## Done summary
-
+Added the named-preset registry (loadPresetRegistry/resolvePreset) to the dep-free src/agent/config.ts island and wired --agentwrap-preset, the harnessless run-preset form, and the 'presets resolve' JSON verb through the launcher at explicit > env > preset > yaml > native precedence per field. A cold-start guard test proves the launcher import graph never reaches src/db.ts.
 ## Evidence
