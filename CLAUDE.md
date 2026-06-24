@@ -39,8 +39,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   the dedicated `agentbus` tmux session — single-flighted per session, liveness-
   and cooldown-gated, fail-open. It runs in the CLI process, NEVER the bus socket /
   a daemon RPC / `src/wake-worker.ts` (the unrelated `data_version` pump — a
-  name-collision hazard). `agentbus` is a managed session keeper only SPAWNS into;
-  its reaping/autoclose is owned by a separate cleanup system, never this repo.
+  name-collision hazard). `agentbus` is a managed session keeper SPAWNS into; its
+  stopped tracked windows are autoclosed by the reaper's managed-session arm
+  (`src/reaper-worker.ts`) past an idle grace, alongside `pair`/`panels`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.
@@ -389,11 +390,16 @@ paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot 
 Close-row completion is liveness-gated in `src/readiness.ts` (done AND closer idle),
 not reap-side; the completion reap inherits done-AND-idle from that verdict.
 For modes, caps, the cooldown, and completion-reap, read `src/autopilot-worker.ts`,
-`src/readiness.ts`, and README. Two distinct reapers, do not conflate: the
-autopilot completion-reap closes done plan rows, while the exit-watcher's
+`src/readiness.ts`, and README. Three distinct reapers, do not conflate: the
+autopilot completion-reap closes done plan rows; the exit-watcher's
 dead-pid re-probe (`reprobeLoop` in `src/exit-watcher.ts`, ~60s, age-gated on
 `created_at >= 5 min`) mints a synthetic `Killed` for a job whose worker pid is
-verifiably gone — the kernel-arm-miss backstop, not a tmux/window reaper.
+verifiably gone — the kernel-arm-miss backstop, not a tmux/window reaper; and the
+reaper's managed-session idle-grace arm (`src/reaper-worker.ts`) autocloses a
+stopped tracked NON-plan job in a keeper-managed session (`pair`/`panels`/`agentbus`)
+past `REAP_MANAGED_SESSION_IDLE_SEC`, allow-list gated so a human's hand-started
+claude window is never reaped and opt-out via the `disable_autoclose` config list
+(default empty).
 The never-bound circuit breaker (`dispatch_never_bound`, v76) folds a per-`(verb,
 id)` consecutive-`DispatchExpired`-without-bind counter in `foldDispatchExpired`;
 at K=3 it mints a sticky `dispatch_failures(reason='never-bound')` the existing
