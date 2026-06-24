@@ -61,5 +61,5 @@ to the Uninstall block (`~1447-1463`) with the no-live-unload note.
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Wired the tmux guard drop-in install into keeper setup-tmux via an injectable fs seam: idempotent symlink (correct/wrong/real-file/absent/error branches), fail-open in its own try/catch, plus HELP + README docs. Unit-tested through the seam, no real fs.
 ## Evidence
