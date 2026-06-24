@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-24T00:51:13.993000Z",
+  "created_by_close_of": "fn-922-harden-wake-liveness-recheck",
+  "depends_on_epics": [
+    "fn-922-harden-wake-liveness-recheck"
+  ],
+  "id": "fn-923-correct-wake-liveness-doc-comment",
+  "last_validated_at": "2026-06-24T00:51:14.153000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "correct wake liveness doc-comment",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-24T00:51:13.993000Z"
+}
