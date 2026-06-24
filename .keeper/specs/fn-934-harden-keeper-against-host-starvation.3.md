@@ -45,5 +45,5 @@ flock tests + `bun run test:full`.
 - [ ] Existing flock/contention tests still pass; CLAUDE.md test-gate note reflects the current enforcement (forward-facing).
 
 ## Done summary
-
+Closed the raw-bun-test gate bypass via bunfig.toml host-wide-flock preloads (keeper + plan suites, KEEPER_TEST_GATED avoids self-deadlock) and fixed the flock_peer hold-mode busy-spin to poll with Bun.sleepSync plus max-hold + parent-death self-exit.
 ## Evidence
