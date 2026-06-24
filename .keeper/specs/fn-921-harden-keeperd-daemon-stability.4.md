@@ -72,5 +72,5 @@ a guarded RPC verb without an explicit planning decision.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+commit-work now read-side-waits (bounded, fail-open) for the .1 poll-only git producer to charge file_attributions before reading the on-hook set, closing the poll-lag staging-miss window. Predicate keys off the live-dirty set so it never false-waits on reverted/excluded/cross-repo mutations; no new guarded RPC surface.
 ## Evidence
