@@ -48,5 +48,5 @@ Add a refold-equivalence test mirroring the `dispatch_never_bound` one: fold a s
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Add the deterministic-replayed block_escalations escalate-once latch projection (v86): TaskSnapshot fold arms on entering runtime_status=blocked and clears on leaving; BlockEscalation{Requested,Attempted} folds advance pending->requested->attempted. Category-agnostic, re-fold byte-identical (guarded test), keeper/api.py bumped to 86.
 ## Evidence

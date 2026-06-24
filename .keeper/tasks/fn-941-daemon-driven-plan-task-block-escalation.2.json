@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add block_escalations projection and fold",
-  "updated_at": "2026-06-24T18:27:21.978000Z"
+  "updated_at": "2026-06-24T21:09:47.989000Z",
+  "worker_done_at": "2026-06-24T21:09:47.989000Z"
 }
