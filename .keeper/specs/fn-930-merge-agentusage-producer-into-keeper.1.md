@@ -57,5 +57,5 @@ marker). Do NOT spawn a real TUI in the default pytest run.
 - [ ] the JSON contract carries an integer `schema_version` and a documented arm taxonomy
 
 ## Done summary
-
+Added agentusage.scrape_cli one-shot util printing a discriminated {ok subscribed | ok no_subscription | error} JSON contract (integer schema_version, stderr diagnostics, correct exit codes, no state writes). Hardened scrape.py with setsid+killpg teardown and pinned TERM/LINES/COLUMNS+dims/command overrides; retired daemon.py/scrape_one.py and their orchestration tests, keeping scrape+parsers; documented the arm taxonomy in README.
 ## Evidence
