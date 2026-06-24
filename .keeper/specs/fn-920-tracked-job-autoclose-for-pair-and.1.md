@@ -48,5 +48,5 @@ Update the `buildPairLaunchArgv` byte-pin in test/pair-command.test.ts to the in
 - [ ] codex path unchanged (headless).
 
 ## Done summary
-
+Switched the claude pair/panel partner from headless --print -p to an interactive TUI launch with the KEEPER_TMUX_SESSION binding carrier so it registers as a tracked job (plan_verb NULL); codex stays headless with the CLAUDE* env strip, and the read-only posture + self-collision guard are unchanged.
 ## Evidence
