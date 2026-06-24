@@ -114,9 +114,9 @@ export interface WakeResult {
  * state signals miss. This mirrors the autopilot's `isStoppedJobLive`
  * (`src/autopilot-worker.ts`). On doubt, treat as live and SKIP — a double
  * `claude --resume` of a live id is the hazard the recheck guards against: a
- * `null` `livePaneIds` (probe unavailable) is therefore NOT consulted here (the
- * caller passes the empty set only when the probe genuinely returned an empty
- * sweep). Pure over `(job, liveSessionIds, livePaneIds)`.
+ * `null` `livePaneIds` (probe unavailable) is therefore treated as live via
+ * signal (3), the conservative on-doubt-SKIP fallback (see `isStoppedPaneLive`
+ * and `WakeDeps.livePaneIds`). Pure over `(job, liveSessionIds, livePaneIds)`.
  */
 export function creatorIsLive(
   job: WakeCreator,
