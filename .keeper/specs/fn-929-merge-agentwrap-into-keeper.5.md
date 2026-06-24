@@ -38,5 +38,5 @@ archive notice renders.
 - [ ] repo archived / read-only, NOT deleted
 
 ## Done summary
-
+Added archive-notice header to agentwrap CLAUDE.md (edited in place, AGENTS.md symlink preserved) pointing at 'keeper agent …'; noted plugin-loading surface moved to keeper. Pushed tag archived-folded-into-keeper at 732812f and GitHub-archived the repo (read-only, not deleted).
 ## Evidence
