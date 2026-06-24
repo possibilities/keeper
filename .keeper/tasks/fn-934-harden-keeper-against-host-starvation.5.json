@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "retention DELETE to bound db growth",
-  "updated_at": "2026-06-24T17:28:36.462000Z"
+  "updated_at": "2026-06-24T17:40:26.624000Z",
+  "worker_done_at": "2026-06-24T17:40:26.624000Z"
 }

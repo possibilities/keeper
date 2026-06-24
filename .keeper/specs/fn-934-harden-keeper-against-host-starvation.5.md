@@ -70,5 +70,5 @@ delete/checkpoint/vacuum mechanics + the countAbsentBlobs re-spec. `bun run test
 - [ ] No SCHEMA_VERSION bump (no new column). README compaction + CLAUDE.md retention invariant updated (forward-facing). `bun run test:full` green.
 
 ## Done summary
-
+Bound keeper.db ROW growth by physically deleting the cold tail of the three no-op-arm snapshot classes (BackendExecSnapshot/TmuxPaneSnapshot/WindowIndexSnapshot) — proven re-fold-safe (their arms touch no projection, no producer-scanned column) while the broad shed class stays body-NULL-only. Predicate pinned by a guarding test; permanent SAFE+NECESSARY refold-equivalence regression added. No SCHEMA_VERSION bump.
 ## Evidence
