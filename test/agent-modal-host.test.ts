@@ -24,6 +24,7 @@ import {
   type PtySpawnOptions,
   runModalHost,
 } from "../src/agent/modal-host";
+import type { OverlayHandle } from "../src/agent/modal-overlay";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 // ── main() branch wiring ──────────────────────────────────────────────────
@@ -401,6 +402,60 @@ describe("runModalHost disposition", () => {
     // The re-raise (proc.kill) fires; no plain exit code is taken.
     expect(h.reraised).toEqual(["SIGTERM"]);
     expect(h.exits).toEqual([]);
+  });
+});
+
+describe("runModalHost overlay resilience", () => {
+  test("a rejecting buildOverlay falls back to the stub hotkey; child exits cleanly", async () => {
+    const h = makeHostHarness();
+    h.deps.buildOverlay = () => Promise.reject(new Error("renderer fault"));
+    const run = runHost(h.deps);
+    // Let the awaited buildOverlay reject + fall back to overlay=null before we
+    // drive the passthrough.
+    await Promise.resolve();
+    await Promise.resolve();
+    // The hotkey fires the stub (overlay is null) and is still swallowed; the
+    // surrounding bytes forward — the passthrough is not wedged by the fault.
+    h.emitStdin([0x61, MODAL_HOTKEY_BYTE, 0x62]);
+    h.pty.finishExit(0);
+    await run;
+    expect(h.hotkeyFires()).toBe(1);
+    expect(h.pty.written).toEqual([0x61, 0x62]);
+    expect(h.exits).toEqual([0]);
+    expect(h.pty.closed()).toBe(true);
+  });
+
+  test("child output is dropped while the overlay is open, resumes when closed", async () => {
+    const h = makeHostHarness();
+    let open = false;
+    const handle: OverlayHandle = {
+      open() {
+        open = true;
+      },
+      close() {
+        open = false;
+      },
+      get isOpen() {
+        return open;
+      },
+      destroy() {},
+    };
+    h.deps.buildOverlay = () => Promise.resolve(handle);
+    const run = runHost(h.deps);
+    // Wait for the awaited buildOverlay to resolve so `overlay` is wired.
+    await Promise.resolve();
+    await Promise.resolve();
+    // Open the modal via the hotkey, then emit child bytes: they are suppressed.
+    h.emitStdin([MODAL_HOTKEY_BYTE]);
+    expect(open).toBe(true);
+    h.pty.emitData([0x6f, 0x6b]); // "ok" — dropped while open
+    expect(h.stdout).toEqual([]);
+    // Close the modal; verbatim streaming resumes.
+    handle.close();
+    h.pty.emitData([0x68, 0x69]); // "hi" — streamed
+    expect(h.stdout).toEqual([0x68, 0x69]);
+    h.pty.finishExit(0);
+    await run;
   });
 });
 
