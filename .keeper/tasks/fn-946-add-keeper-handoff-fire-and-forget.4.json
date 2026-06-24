@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T21:24:54.815000Z",
+  "depends_on": [
+    "fn-946-add-keeper-handoff-fire-and-forget.3"
+  ],
+  "epic": "fn-946-add-keeper-handoff-fire-and-forget",
+  "id": "fn-946-add-keeper-handoff-fire-and-forget.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Render handoff relationship on board and dash",
+  "updated_at": "2026-06-24T21:24:54.815000Z"
+}

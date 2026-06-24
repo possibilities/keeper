@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-24T21:24:54.815000Z",
+  "depends_on_epics": [],
+  "id": "fn-946-add-keeper-handoff-fire-and-forget",
+  "last_validated_at": "2026-06-24T21:24:54.832000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Add keeper handoff fire-and-forget dispatch",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-24T21:24:54.815000Z"
+}

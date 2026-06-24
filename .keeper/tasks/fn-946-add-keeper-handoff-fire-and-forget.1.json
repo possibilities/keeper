@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-24T21:24:54.815000Z",
+  "depends_on": [],
+  "epic": "fn-946-add-keeper-handoff-fire-and-forget",
+  "id": "fn-946-add-keeper-handoff-fire-and-forget.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Schema migration, handoffs table, config key",
+  "updated_at": "2026-06-24T21:24:54.815000Z"
+}
