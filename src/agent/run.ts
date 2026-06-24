@@ -1,0 +1,149 @@
+/**
+ * Process layer — the job-control keystone. Spawns claude with all three stdio
+ * streams inherited (pipes would remove the child from the foreground-pgroup
+ * TTY semantics and break ctrl-z), wires parent signal handling, and propagates
+ * the child's exit/signal disposition verbatim.
+ *
+ * Resolved design (fixed — implement as specified, keep it free of cleverness):
+ *  - `Bun.spawn(runCmd, {stdio: ["inherit","inherit","inherit"]})`.
+ *  - SIGINT no-op handler in the parent — the child owns ctrl-c; the parent
+ *    keeps awaiting (the `installSigintNoop` idiom).
+ *  - Forward SIGTERM/SIGHUP to the child.
+ *  - NO SIGTSTP handler — the kernel stops the whole foreground pgroup on
+ *    ctrl-z and a stopped child simply doesn't resolve `.exited`; on `fg` the
+ *    kernel resumes both and the await continues. This replaces the
+ *    `waitpid(WUNTRACED)` loop outright.
+ *  - On `await proc.exited`: `exitCode !== null` → `process.exit(exitCode)`;
+ *    else `signalCode` is set → remove our own handler for that signal and
+ *    re-raise it on ourselves (`process.kill(process.pid, signalCode)`), so a
+ *    supervisor observes the real signal, never `128 + n`.
+ */
+
+export interface SpawnedChild {
+  /** Resolves when the child exits (or is signalled). */
+  readonly exited: Promise<number>;
+  /** Exit code, or null when the child died from a signal. */
+  readonly exitCode: number | null;
+  /** Signal name the child died from, or null on a normal exit. */
+  readonly signalCode: NodeJS.Signals | null;
+  /** Send a signal to the child. */
+  kill(signal: NodeJS.Signals): void;
+}
+
+/** Injectable spawn seam — the DI point the test-port task records against. */
+export type SpawnFn = (cmd: string[]) => SpawnedChild;
+
+/** Production spawn: Bun.spawn with all three stdio streams inherited. */
+export const defaultSpawn: SpawnFn = (cmd: string[]): SpawnedChild => {
+  // Pass env as an explicit spread of the (already-mutated) process.env, NOT
+  // inherit-mode. Bun's inherit spawn hands the child the original OS environ
+  // and ignores `delete process.env.X` performed earlier in this process — so
+  // the tmux strip in main.ts (delete TMUX/TMUX_PANE so Claude renders 24-bit
+  // truecolor) only reaches the child if we materialize the current view here.
+  // The spread also carries KEEPER_TMUX_PANE and preserves PATH/HOME/etc.
+  // Never switch this back to inherit-mode or the strip silently no-ops.
+  const proc = Bun.spawn(cmd, {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: { ...process.env },
+  });
+  return {
+    exited: proc.exited,
+    get exitCode() {
+      return proc.exitCode;
+    },
+    get signalCode() {
+      return proc.signalCode as NodeJS.Signals | null;
+    },
+    kill(signal: NodeJS.Signals) {
+      proc.kill(signal);
+    },
+  };
+};
+
+/**
+ * Spawn claude, wire signals, and await its disposition — then exit the parent
+ * to mirror the child. Never returns (it always calls `exit`). `spawn` and
+ * `exit` are injectable so the wiring is testable without a real subprocess.
+ */
+export async function runWithJobControl(
+  runCmd: string[],
+  spawn: SpawnFn = defaultSpawn,
+  exit: (code: number) => never = (code) => process.exit(code),
+): Promise<never> {
+  const child = spawn(runCmd);
+
+  // SIGINT no-op: the child (in the same foreground pgroup) receives ctrl-c
+  // directly from the TTY; the parent must NOT die or it would orphan the
+  // child mid-render. Keep awaiting.
+  const sigintNoop = (): void => {};
+  process.on("SIGINT", sigintNoop);
+
+  // Forward terminating signals the parent receives (not via the pgroup) to
+  // the child so `kill <wrapper>` propagates.
+  const forward = (signal: NodeJS.Signals) => () => {
+    try {
+      child.kill(signal);
+    } catch {
+      // child already gone
+    }
+  };
+  const onTerm = forward("SIGTERM");
+  const onHup = forward("SIGHUP");
+  process.on("SIGTERM", onTerm);
+  process.on("SIGHUP", onHup);
+
+  try {
+    await child.exited;
+  } finally {
+    process.removeListener("SIGINT", sigintNoop);
+    process.removeListener("SIGTERM", onTerm);
+    process.removeListener("SIGHUP", onHup);
+  }
+
+  const exitCode = child.exitCode;
+  if (exitCode !== null) {
+    return exit(exitCode);
+  }
+
+  // Signal death: re-raise the real signal on ourselves so a supervisor sees
+  // it. Remove our own handler for that signal first (default disposition) so
+  // the re-raise actually terminates us instead of looping into our handler.
+  const signalCode = child.signalCode;
+  if (signalCode) {
+    process.removeAllListeners(signalCode);
+    process.kill(process.pid, signalCode);
+  }
+  // Fallback: neither exit code nor signal (should not happen). Exit 1.
+  return exit(1);
+}
+
+/**
+ * Passthrough exec — the `execvp` replacement for informational flags and
+ * built-in subcommands. Same spawn-inherit helper; await and propagate the exit
+ * code verbatim. The parent lingers briefly (accepted). Signal death re-raises
+ * like the main path.
+ */
+export async function runPassthrough(
+  runCmd: string[],
+  spawn: SpawnFn = defaultSpawn,
+  exit: (code: number) => never = (code) => process.exit(code),
+): Promise<never> {
+  const child = spawn(runCmd);
+  const sigintNoop = (): void => {};
+  process.on("SIGINT", sigintNoop);
+  try {
+    await child.exited;
+  } finally {
+    process.removeListener("SIGINT", sigintNoop);
+  }
+  const exitCode = child.exitCode;
+  if (exitCode !== null) {
+    return exit(exitCode);
+  }
+  const signalCode = child.signalCode;
+  if (signalCode) {
+    process.removeAllListeners(signalCode);
+    process.kill(process.pid, signalCode);
+  }
+  return exit(1);
+}

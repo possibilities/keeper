@@ -40,6 +40,7 @@ export const SUBCOMMANDS = [
   "prompt",
   "dispatch",
   "pair",
+  "agent",
   "reclaim",
   "bus",
 ] as const;
@@ -71,6 +72,7 @@ Subcommands:
   prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
   dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
   pair                Fan a task to another model CLI (claude/codex) via agentwrap (\`keeper pair send\`)
+  agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded agentwrap launcher)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
   bus                 Agent Bus: \`keeper bus <list|resolve|chat send|chat broadcast|watch>\`
 
@@ -180,6 +182,7 @@ export async function main(): Promise<void> {
     prompt: async (argv) => (await import("./prompt")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
     pair: async (argv) => (await import("./pair")).main(argv),
+    agent: async (argv) => (await import("./agent")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
     bus: async (argv) => (await import("./bus")).main(argv),
   };
