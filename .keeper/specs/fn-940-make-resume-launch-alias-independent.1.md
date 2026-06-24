@@ -118,5 +118,5 @@ assigns `$0=a0, $1=a1` in both.
 - [ ] `bun run test:full` + `bun run test:hygiene` pass.
 
 ## Done summary
-
+Split the resume descriptor into a DISPLAY form (buildResumeCommand, unchanged) and a new pure LAUNCH form (buildResumeLaunchForm): absolute keeper-agent launcher prefix + claude --resume <target> --agentwrap-no-confirm as positional $@ args. Rewired bus-wake + crash-restore onto it (alias-independent, quoting-safe); verified a real keeper agent claude --resume forwards the flag and strips --agentwrap-no-confirm (no more 'error: unknown option'). Docs reworded to one DISPLAY + two LAUNCH producers.
 ## Evidence
