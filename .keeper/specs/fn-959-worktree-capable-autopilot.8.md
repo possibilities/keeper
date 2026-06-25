@@ -39,5 +39,5 @@ rides fn-953's `set_autopilot_config`, adding no new RPC.
 - [ ] No new RPC added to the scoped-write list; lint-claude-md green.
 
 ## Done summary
-
+Documented autopilot worktree mode forward-facing across README ## Architecture (lane lifecycle, commit-work push-skip, branch-guard producer carve-out), CLAUDE.md (producer-only worktree rule, branch-guard subagent-only scope), and the autopilot SKILL.md (worktree subcommand + worktree_mode in the take-over capture set). lint-claude-md green; no new RPC added.
 ## Evidence
