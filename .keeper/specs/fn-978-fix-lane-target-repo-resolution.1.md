@@ -101,5 +101,5 @@ then make the pure lane geometry compare and place by resolved toplevel. Six mov
 - [ ] README §3196-3198 + §169-171 and the `WorktreeReject` JSDoc updated to describe toplevel normalization + both reject kinds (forward-facing, present tense).
 
 ## Done summary
-
+Resolve each epic's target_repo/project_dir to one git toplevel in the producer snapshot-build (classifyWorktreeRepos + nullable per-cycle memo), then place worktree lanes by resolved toplevel via one shared prepareWorktreeGeometry (gate + dispatch). Adds the distinct worktree-repo-unresolved reject. Source landed on the epic branch (commit 397f5708). Deploy note: a previously-FALSE worktree-multi-repo epic keeps its sticky DispatchFailed until a manual retry_dispatch sweep (likely zero rows; worktree mode default-OFF).
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Resolve worktree lane geometry repos to git toplevels",
-  "updated_at": "2026-06-25T22:58:04.409000Z"
+  "updated_at": "2026-06-25T23:49:19.198000Z",
+  "worker_done_at": "2026-06-25T23:49:19.198000Z"
 }
