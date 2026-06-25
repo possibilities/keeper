@@ -41,16 +41,15 @@ imperative guardrails only.
 ## Hook rules
 
 - **Four hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash invocation,
-  NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a subagent from git branch
-  create/switch/worktree-add), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state,
-  NEVER the `.md` body), docs-pusher (`Stop`, pushes `~/docs` once per turn).
-- **Always exit 0** — a non-zero exit can fail-closed the human's session. The branch-guard denies
-  via the `PreToolUse` JSON envelope (`hookSpecificOutput.permissionDecision:"deny"`), not a
-  non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping, so the docs-pusher swallows + logs failures.
+  NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT — `agent_id` present — from git
+  branch create/switch/worktree-add; the in-daemon worktree producer shells git with no `agent_id`, so it
+  is NOT gated), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md`
+  body), docs-pusher (`Stop`, pushes `~/docs` once per turn).
+- **Always exit 0** — a non-zero exit can fail-closed the human's session. The branch-guard denies via the
+  `PreToolUse` JSON envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows + logs).
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook.** Keep imports to `node:*` + the
   dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit}.ts` helpers; never the plan plugin.
-- **A `~/docs` hook may spawn a bounded git subprocess** against the `~/docs` repo only — never a
-  keeper-DB write. The docs-pusher never runs `git fetch` per turn, never rebases or force-pushes.
+- **A `~/docs` hook may spawn a bounded git subprocess** against the `~/docs` repo only — never a keeper-DB write, never `git fetch`/rebase/force-push.
 
 ## Migrations
 
@@ -113,7 +112,8 @@ imperative guardrails only.
 
 ## Autopilot
 
-- **The reconciler resumes its last durable paused state** (defaults to PAUSED on a fresh board) and is level-triggered on `PRAGMA data_version`. An unpaused
-  autopilot that "does nothing" is almost always a readiness gate firing correctly — the gates live
-  in `src/readiness.ts` (`computeReadiness`); the `[paused]` banner is authoritative. For modes,
-  caps, cooldown, completion-reap, and the four reapers, read `src/autopilot-worker.ts` + README.
+- **The reconciler resumes its last durable paused state** (PAUSED on a fresh board), level-triggered on
+  `PRAGMA data_version`. An unpaused autopilot that "does nothing" is almost always a readiness gate
+  firing correctly (`src/readiness.ts` `computeReadiness`); the `[paused]` banner is authoritative. For
+  modes, caps, cooldown, reaps, and the four reapers, read `src/autopilot-worker.ts` + README.
+- **Worktree mode** (durable `autopilot_state` column, default OFF, set via `set_autopilot_config` — no new RPC) **is PRODUCER-ONLY**: lanes re-derived each cycle from the DAG + live git, never a fold (see README).

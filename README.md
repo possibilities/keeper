@@ -1635,7 +1635,12 @@ the current branch. It denies via the `PreToolUse` JSON envelope
 (`hookSpecificOutput.permissionDecision:"deny"`) and STILL exits 0 — exit 0 is
 required for the deny to be honored. It makes no subprocess/fs/git/DB calls, fails
 open, and never touches non-subagent sessions (the human's interactive claude and the
-`/plan:work` orchestrator both run with no `agent_id`).
+`/plan:work` orchestrator both run with no `agent_id`). The autopilot worktree
+producer — which shells `git worktree add` / branch / merge directly inside
+keeperd — is NOT a subagent and carries no `agent_id`, so the branch-guard never
+fires for it; it STILL hard-blocks a `/plan:work` worker subagent from creating
+or switching branches, so workers stay on the lane worktree the producer placed
+them in.
 
 A **third**, daemon-independent `PostToolUse(Write|Edit|MultiEdit|Bash)` hook, the
 **sidecar-writer** (`plugins/keeper/plugin/hooks/sidecar-writer.ts`), owns the
@@ -3133,6 +3138,40 @@ the matching `dispatch_failures` row on the next drain. The only durable
 autopilot-owned state is the event-sourced `dispatch_failures` and
 `pending_dispatches` projections; a from-scratch re-fold reproduces both
 byte-identically.
+
+The reconciler also carries a durable **worktree mode** (the `worktree_mode`
+column on the `autopilot_state` singleton, default OFF — byte-identical to today
+when off, set at runtime via fn-953's generic `set_autopilot_config` patch with
+NO new RPC, and read fresh each cycle). It is entirely mechanical and lives
+ONLY in the producer path (`runReconcileCycle`), never in a fold — a fold may
+not read git/fs, so worktree→lane assignment is re-derived each cycle from the
+epic task DAG + live git rather than persisted in a projection. When OFF, the
+producer asserts the target repo is on its resolved default branch before
+dispatch. When ON, it shapes each epic's tasks into git worktrees off a pure,
+deterministic topology module (a total function of `depends_on`): a maximal
+linear chain shares ONE worktree (no merge), the first child of a fork inherits
+the parent's worktree while every other child FORKS a sub-worktree off the
+parent's committed tip, a fan-in task sequentially pairwise-merges its incoming
+lane branches (never octopus) before it dispatches, and a synthetic `__close__`
+sink pinned to the epic base makes the closer run where every lane has merged
+in; the base then merges into the default branch after the closer reaches done.
+Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>/<task>`
+ribs). Before `confirmRunning` mints the durable `Dispatched`, the producer
+lazily ensures the lane worktree exists, runs any pre-merges, asserts HEAD
+(ON → worktree HEAD equals the derived branch and the worktree is registered;
+OFF → repo on its default branch), and sets the launch cwd to the worktree path.
+Both HEAD assertions fail as sticky `DispatchFailed` (cleared by `retry_dispatch`),
+never `fatalExit`. Every merge/prune takes the shared
+`$GIT_COMMON_DIR/keeper-commit-work.lock` flock; a conflict aborts
+(`git merge --abort`) + fails loud + stops (no merge-to-default, no teardown).
+Crash/restart recovery is producer-only: detect `MERGE_HEAD` → abort →
+`git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
+`keeper/epic/*` scan decoupled from the recent-done window. Multi-repo epics
+(per-task `target_repo`) and enabling the toggle mid-epic are both rejected loud
+in worktree mode for v1 (`keeper autopilot worktree on` has a `--force` escape
+hatch for the mid-epic guard). `commit-work` skips its push leg whenever it runs
+inside a linked git worktree (submodule false-positive guarded), so per-lane
+branches never reach origin — autopilot pushes once at merge-to-default.
 
 The crash-restore set is derived RETROSPECTIVELY from `keeper.db` at READ TIME
 (`src/restore-set.ts`, epic fn-817) — there is no frozen snapshot to read and no

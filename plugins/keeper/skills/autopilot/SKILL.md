@@ -4,7 +4,7 @@ description: >-
   Drive the server-side autopilot reconciler by hand — pause / play, switch
   mode (yolo vs armed), arm / disarm an epic, retry a stuck dispatch, or read
   what it is doing. Also the temporary take-over window: capture the current
-  {paused, mode, armed} state, change it for a bit, then restore it when the
+  {paused, mode, armed, worktree_mode} state, change it for a bit, then restore it when the
   human says done. Use when the user asks to pause or steer the autopilot —
   pause/play, mode, arm, retry, or inspect it ("pause it", "let it rip",
   "only work fn-X", "approve fn-Y", "what's autopilot doing") — even when they
@@ -13,7 +13,7 @@ description: >-
   triggers this skill (plan state carries no board-priority knob — only an
   explicit autopilot/armed reference does); NOT for planning (`/plan:plan`).
 allowed-tools: Bash Monitor
-argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | retry <verb::id> | show
+argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | worktree <on|off> | retry <verb::id> | show
 ---
 
 # autopilot
@@ -66,6 +66,7 @@ flags." Every control op below is a bare one-shot Bash call:
 | Armed mode | "armed mode", "only work armed epics", "narrow it to what I arm" | `keeper autopilot mode armed` |
 | Arm an epic | "arm fn-X", "only work fn-X and its deps" — an epic id `fn-N-slug` | `keeper autopilot arm fn-N-slug` |
 | Disarm an epic | "disarm fn-X", "stop arming fn-X" | `keeper autopilot disarm fn-N-slug` |
+| Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
 | Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper autopilot --snapshot \| tail -1` (read) |
@@ -92,11 +93,11 @@ JSON object). Its `state` field is a PATH to a per-frame sidecar JSON carrying
 the captured singleton plus the body sections:
 
 ```json
-{ "paused": false, "mode": "yolo", "armed": [], "current": [], "dependencies": [], "failed": [] }
+{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "current": [], "dependencies": [], "failed": [] }
 ```
 
-The `{paused, mode, armed}` triple IS the autopilot's global singleton — read
-those three to answer "what's it doing" and to capture before a take-over. For a
+The `{paused, mode, armed, worktree_mode}` set IS the autopilot's global singleton — read
+those to answer "what's it doing" and to capture before a take-over. For a
 human-readable frame instead of the trailer, drop `| tail -1` and read the whole
 snapshot block (banner pill `[playing] · yolo · max ∞`, plus the current /
 stopped / failed / armed / dependencies sections). `status: "ok"` with `frame:
@@ -129,8 +130,9 @@ fields in your working context for the whole window:
 keeper autopilot --snapshot | tail -1   # read the `state` sidecar → {paused, mode, armed}
 ```
 
-Capture `{paused, mode, armed_epics}` — capturing fewer than all three produces
-a wrong GLOBAL state on restore. Pin them; do not re-derive from memory later.
+Capture `{paused, mode, armed_epics, worktree_mode}` — capturing fewer than all
+four produces a wrong GLOBAL state on restore. Pin them; do not re-derive from
+memory later.
 
 **2 — Drive.** Run the control ops the take-over needs (pause, mode, arm, …).
 Wire the restore plan PER MUTATING PHASE as you go — track exactly which fields
@@ -219,7 +221,7 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 > User: "Pause it and switch to armed while I poke at fn-871, then restore it."
 
 1. **Capture:** `keeper autopilot --snapshot | tail -1` → pin `{paused:false,
-   mode:"yolo", armed:[]}`.
+   mode:"yolo", armed:[], worktree_mode:false}`.
 2. **Drive:** `keeper autopilot pause`; `keeper autopilot mode armed`. Track:
    changed `paused` and `mode` (not `armed`).
 3. Window stays open across turns until the human says "restore it / done."
@@ -243,8 +245,8 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 - Do not restore without RE-READING current state first — the level-triggered
   reconciler may have drifted, and restoring a stale capture sets a wrong global
   state.
-- Do not capture fewer than {paused, mode, armed_epics} — a partial capture
-  restores a wrong global state.
+- Do not capture fewer than {paused, mode, armed_epics, worktree_mode} — a
+  partial capture restores a wrong global state.
 - Do not swallow a restore failure — surface "autopilot state unknown — verify
   with `keeper autopilot --snapshot`" distinctly, and name the partial-mutation
   field that's still off.
