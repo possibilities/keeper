@@ -87,5 +87,5 @@ must confirm.
 - [ ] Verified by a real run from inside a subagent caller (caller → runner → judge).
 
 ## Done summary
-
+Added plan:panel-runner static agent: a context-isolated subagent that resolves the panel (preset-driven with legacy --cli claude/codex fallback), fans panelists out as detached read-only keeper pair legs, waits token-free via chunked blocking Bash with an N-of-N hard-fail PANEL_RUN_FAILED marker, then spawns plan:panel-judge and returns the fused answer.
 ## Evidence
