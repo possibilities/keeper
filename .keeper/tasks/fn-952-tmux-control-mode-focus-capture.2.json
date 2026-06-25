@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "TmuxClientFocusSnapshot event, singleton projection, fold and migration",
-  "updated_at": "2026-06-24T23:22:22.683000Z"
+  "updated_at": "2026-06-25T02:38:38.571000Z",
+  "worker_done_at": "2026-06-25T02:38:38.571000Z"
 }

@@ -51,5 +51,5 @@ last-write-wins, malformed-payload no-op + cursor advance. Keep `test/schema-ver
 - [ ] Fold unit test covers default / UPSERT / malformed-no-op.
 
 ## Done summary
-
+Added the tmux_client_focus LIVE-ONLY singleton (CHECK id=1, no floor/seed, registered in LIVE_ONLY_PROJECTIONS) + foldTmuxClientFocusSnapshot last-write-wins UPSERT routed in applyEvent; bumped SCHEMA_VERSION 88->89 with the api.py whitelist in the same commit, plus a fold unit test (default/UPSERT-LWW/malformed-no-op).
 ## Evidence
