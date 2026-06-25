@@ -50,5 +50,5 @@ reaper's boot-frozen compile in the next task would crash the worker).
 - [ ] new `test/glob.test.ts` passes; `config` + `pair-cli` tests updated and green
 
 ## Done summary
-
+Extracted the dep-free fnmatch helper into src/glob.ts (node:* only, hook-reachable via reducer) and made resolveDisableAutoclose return a glob-aware (session)=>boolean predicate; bare names match exactly (backward compatible), panels:* matches via fnmatch, fail-open never throws.
 ## Evidence
