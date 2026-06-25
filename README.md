@@ -683,7 +683,7 @@ Keeper has no `install` verb. Wire it up manually:
    suite carries TWO complementary test helpers (fn-769): `sandboxEnv` isolates
    the state paths for any test that launches a real subprocess (hook / daemon /
    CLI), while the template-DB helper in `test/helpers/template-db.ts`
-   (`freshDb()` / `freshDbFile()`) serves pure in-process unit tests that only
+   (`freshMemDb()` / `freshDbFile()`) serves pure in-process unit tests that only
    need a migrated schema — it migrates one `:memory:` DB per file-process,
    `serialize()`s it once, and deserializes a per-test clone (~0.2ms) instead of
    re-running the 63-version `migrate()` ladder on every `openDb(":memory:")`,

@@ -74,6 +74,7 @@ import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
 import { withInProcessDaemon } from "./helpers/in-process-daemon";
 import { retryUntil } from "./helpers/retry-until";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -102,7 +103,7 @@ function seedEvent(
 }
 
 test("boot drain folds a pre-seeded events table to completion", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // Pre-seed a full session lifecycle as if events accumulated during downtime.
   seedEvent(db, "sess-a", "SessionStart", 1);
@@ -140,7 +141,7 @@ test("boot drain folds a pre-seeded events table to completion", () => {
 });
 
 test("boot drain is idempotent — a second pass folds nothing", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedEvent(db, "sess-a", "SessionStart", 1);
   seedEvent(db, "sess-a", "Stop", 2);
 
@@ -188,7 +189,7 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
   // CapSet ON CONFLICT branch preserves the durable paused=0. After the drain
   // the daemon reads the singleton via `projectAutopilotPaused` and seeds its
   // in-memory `autopilotPaused` — a non-null `false` means BOOTS PLAYING.
-  const playingDb = openDb(dbPath).db;
+  const playingDb = freshMemDb().db;
   seedAutopilotEvent(playingDb, "AutopilotPaused", 1, { paused: false });
   seedAutopilotEvent(playingDb, "AutopilotCapSet", 2, {
     max_concurrent_jobs: null,
@@ -207,8 +208,7 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
   // the daemon's `AutopilotCapSet` boot re-arm. Its INSERT path (`VALUES (1, 1,
   // …)`) is the SOLE carrier of the fresh-DB `paused=1` default now that the
   // forced boot-pause is gone — so the seed resolves to PAUSED.
-  const freshPath = join(tmpDir, "fresh.db");
-  const freshDb = openDb(freshPath).db;
+  const freshDb = freshMemDb().db;
   seedAutopilotEvent(freshDb, "AutopilotCapSet", 1, {
     max_concurrent_jobs: null,
   });
@@ -222,8 +222,7 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
 
   // Leg C — empty singleton: no autopilot events at all. The seed step leaves
   // the in-memory boots-paused default untouched (`null` means "keep default").
-  const emptyPath = join(tmpDir, "empty.db");
-  const emptyDb = openDb(emptyPath).db;
+  const emptyDb = freshMemDb().db;
   drainToCompletion(emptyDb);
   const emptyRows = emptyDb
     .query("SELECT paused FROM autopilot_state WHERE id = 1")
@@ -233,7 +232,7 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
 });
 
 test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and restores it after", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // Steady-state default before the wrapper runs.
   const initial = (
@@ -267,7 +266,7 @@ test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and 
 });
 
 test("withBootDrainCheckpointTuning restores autocheckpoint even if the body throws", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   expect(() =>
     withBootDrainCheckpointTuning(db, () => {
@@ -288,6 +287,10 @@ test("withBootDrainCheckpointTuning restores autocheckpoint even if the body thr
 });
 
 test("withBootDrainCheckpointTuning still folds the boot backlog to completion", () => {
+  // keep-migrate: a real on-disk WAL is required. The trailing
+  // `wal_checkpoint(PASSIVE)` assertion (`checkpointed == log`) is only
+  // meaningful against actual WAL frames; a `:memory:` clone has no WAL file
+  // (WAL is a no-op on memory DBs) and the checkpoint would pass vacuously 0==0.
   const { db } = openDb(dbPath);
 
   seedEvent(db, "sess-a", "SessionStart", 1);
@@ -343,6 +346,9 @@ test("boot drain checkpoints the WAL periodically so peak stays bounded, and the
     path: string,
     total: number,
   ): { folded: number; peakWalBytes: number; postTruncateWalBytes: number } => {
+    // keep-migrate: this test measures the on-disk `-wal` high-water via
+    // `statSync(${path}-wal)`. A `:memory:` clone has no WAL file at all, so the
+    // size gates would be meaningless — a real on-disk migrate is the contract.
     const { db } = openDb(path);
     db.run("BEGIN");
     for (let i = 1; i <= total; i += 1) {
@@ -399,7 +405,7 @@ test("boot drain checkpoints the WAL periodically so peak stays bounded, and the
 }, 30_000);
 
 test("boot drain spanning multiple batches catches up every event", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // More events than a single small batch, to exercise the drain loop.
   const total = 25;
@@ -456,7 +462,7 @@ test("boot drain spanning multiple batches catches up every event", () => {
 //     block on; every worker's first open then sees no WAL/-shm recovery path)
 
 test("drain post-COMMIT pacing invokes the injected sleep exactly once per folded event", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   const total = 10;
   for (let i = 1; i <= total; i += 1) {
@@ -485,7 +491,7 @@ test("drain post-COMMIT pacing invokes the injected sleep exactly once per folde
 });
 
 test("drain post-COMMIT pacing is OFF by default — no sleep call when paceMs is unset", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   const total = 5;
   for (let i = 1; i <= total; i += 1) {
@@ -509,7 +515,7 @@ test("drain post-COMMIT pacing is OFF by default — no sleep call when paceMs i
 });
 
 test("drain paceEvents budget caps how many folds in a single batch get paced", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   const total = 10;
   for (let i = 1; i <= total; i += 1) {
@@ -537,7 +543,7 @@ test("drain paceEvents budget caps how many folds in a single batch get paced", 
 });
 
 test("drainToCompletion pace budget carries across batches and exhausts cleanly", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // 30 events × batchSize 10 = three drain batches.
   const total = 30;
@@ -576,7 +582,7 @@ test("drainToCompletion pace budget carries across batches and exhausts cleanly"
 });
 
 test("drainToCompletion: large backlog with bounded paceEvents catches up to head in bounded time", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // Simulate a from-scratch re-fold scale: enough events that an unbounded
   // pace (paceEvents=0) at the production paceMs would clearly wedge boot.
@@ -657,8 +663,7 @@ test("pacing preserves re-fold byte-identical determinism (projection unchanged)
   }
 
   // First fold: NO pacing (the historical shape).
-  const dbPathA = join(tmpDir, "keeper-a.db");
-  const a = openDb(dbPathA);
+  const a = freshMemDb();
   for (let i = 1; i <= 25; i += 1) {
     seedEvent(a.db, `sess-${i}`, "SessionStart", i);
     seedEvent(
@@ -676,8 +681,7 @@ test("pacing preserves re-fold byte-identical determinism (projection unchanged)
 
   // Second fold: pacing ON via a mock sleep (no real time spent). Identical
   // event seed.
-  const dbPathB = join(tmpDir, "keeper-b.db");
-  const b = openDb(dbPathB);
+  const b = freshMemDb();
   for (let i = 1; i <= 25; i += 1) {
     seedEvent(b.db, `sess-${i}`, "SessionStart", i);
     seedEvent(
@@ -1136,6 +1140,11 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
   // busy_timeout and asserts the thrown error is one `isTransientBusyError`
   // classifies transient — proving the live bun error carries the `code` the
   // drop-don't-crash path keys on, not just a hand-built object.
+  //
+  // keep-migrate: a real on-disk file is required (a subprocess lock-holder
+  // reopens this path) AND the `busyTimeoutMs` pragma drives the timing; a
+  // `:memory:` clone has no shared file for the holder and would not reproduce
+  // the cross-connection lock contention.
   const { db, stmts } = openDb(dbPath, { busyTimeoutMs: 100 });
 
   const readyMarkerPath = join(tmpDir, "lockholder-ready");
@@ -1221,6 +1230,10 @@ test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (em
   // This test pins the SPECIFIC checkpoint mode by asserting `log == 0` after —
   // the regression signal if a future tweak switches the trailing checkpoint
   // back to PASSIVE.
+  //
+  // keep-migrate: this pins the TRUNCATE-vs-PASSIVE checkpoint mode via the
+  // on-disk WAL's post-state (`log == 0` after TRUNCATE reclaims the file). A
+  // `:memory:` clone has no WAL file, so the probe would pass vacuously.
   const { db } = openDb(dbPath);
 
   // Seed enough events that PASSIVE would leave a measurable WAL frame count —
@@ -1286,7 +1299,7 @@ function insertPlanSnapshot(
 }
 
 test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded)", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = freshMemDb();
 
   insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
     epic_number: 7,
@@ -1373,7 +1386,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
 });
 
 test("EpicSnapshot folds depends_on_epics; TaskSnapshot folds depends_on into the embedded element", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = freshMemDb();
 
   insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
     epic_number: 7,
@@ -1408,7 +1421,7 @@ test("EpicSnapshot folds depends_on_epics; TaskSnapshot folds depends_on into th
 });
 
 test("a re-arrived EpicSnapshot upserts last-write-wins with monotonic last_event_id", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = freshMemDb();
 
   insertPlanSnapshot(stmts, "EpicSnapshot", "fn-7-add-oauth", 1, {
     epic_number: 7,
@@ -1595,7 +1608,7 @@ test("seed sweep folds dead/recycled rows to killed; leaves alive+matching and l
 });
 
 test("seed sweep is idempotent — a second sweep emits no duplicate Killed events", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   const deadPid = pickDeadPid();
   seedJobsRow(db, "sess-zombie", deadPid, null);
@@ -1638,7 +1651,7 @@ test("seed sweep is idempotent — a second sweep emits no duplicate Killed even
 });
 
 test("seed sweep ignores terminal rows (ended, killed) — incl. NULL-pid ones", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   const deadPid = pickDeadPid();
   // Terminal states are out of scope per the candidate query — even with a
@@ -1681,7 +1694,7 @@ test("fn-743 seed sweep: a NON-terminal NULL-pid (stopped) row IS reaped to kill
   // unwatchable (exit-watcher's old `pid IS NOT NULL` filter never armed it)
   // and unprobeable, so it lived forever. The sweep now reaps it via a pidless
   // Killed. Default state for `seedJobsRow` is `stopped`.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedJobsRow(db, "sess-no-pid", null, null);
 
   seedKilledSweep(db);
@@ -1746,7 +1759,7 @@ function seedDeadLetter(
 }
 
 test("recoverOneDeadLetter appends a real events row + flips dead_letters to recovered, in one transaction", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Seed one SessionStart dead-letter — the dropped-incident scenario.
   seedDeadLetter(db, {
     dl_id: "dl-aaa",
@@ -1824,7 +1837,7 @@ test("recoverOneDeadLetter appends a real events row + flips dead_letters to rec
 });
 
 test("recoverOneDeadLetter folded by the reducer → jobs row appears for the recovered session", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedDeadLetter(db, {
     dl_id: "dl-bbb",
     session_id: "sess-folded",
@@ -1870,7 +1883,7 @@ test("recoverOneDeadLetter folded by the reducer → jobs row appears for the re
 });
 
 test("recoverOneDeadLetter picks the OLDEST waiting row, ordered by (dl_written_at ASC, dl_id ASC)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Three rows; the middle write_at is the oldest by dl_written_at, and the
   // dl_id tiebreaker resolves the dl_written_at tie deterministically.
   seedDeadLetter(db, {
@@ -1929,7 +1942,7 @@ test("recoverOneDeadLetter picks the OLDEST waiting row, ordered by (dl_written_
 });
 
 test("recoverOneDeadLetter on empty backlog returns null and writes nothing", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const eventsBefore = (
     db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
   ).n;
@@ -1942,7 +1955,7 @@ test("recoverOneDeadLetter on empty backlog returns null and writes nothing", ()
 });
 
 test("recoverOneDeadLetter rolls back the events INSERT on malformed bindings; row stays waiting", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Hand-write a row with garbage `bindings` JSON (bypassing
   // parseDeadLetterLine which would have rejected it on the import path).
   db.prepare(
@@ -1969,7 +1982,7 @@ test("recoverOneDeadLetter rolls back the events INSERT on malformed bindings; r
 });
 
 test("recoverOneDeadLetter forward-compat: unknown columns in bindings are dropped, known ones bind", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedDeadLetter(db, {
     dl_id: "dl-fwd",
     session_id: "sess-fwd",
@@ -1998,7 +2011,7 @@ test("recoverOneDeadLetter forward-compat: unknown columns in bindings are dropp
 });
 
 test("recoverOneDeadLetter skips rows already in `recovered` status (idempotency under re-invocation)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedDeadLetter(db, {
     dl_id: "dl-once",
     session_id: "sess-once",
@@ -2025,7 +2038,7 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
   // operational sidecar, NEVER a fold target). Recover, then simulate a
   // from-scratch re-fold: zero the cursor + delete projections + re-drain.
   // dead_letters row must survive byte-identically.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedDeadLetter(db, {
     dl_id: "dl-refold",
     session_id: "sess-refold",
@@ -2100,8 +2113,7 @@ test("scan→replay re-fold parity: a record imported from an NDJSON file folds 
   // (A) Directly-landed reference: INSERT the same bindings straight into
   // `events` and fold — this is what the hook's original INSERT would have
   // produced.
-  const refPath = join(tmpDir, "ref.db");
-  const { db: refDb } = openDb(refPath);
+  const { db: refDb } = freshMemDb();
   const refCols = Object.keys(bindings);
   refDb.run(
     `INSERT INTO events (${refCols.join(", ")}) VALUES (${refCols.map(() => "?").join(", ")})`,
@@ -2117,7 +2129,7 @@ test("scan→replay re-fold parity: a record imported from an NDJSON file folds 
 
   // (B) Replayed path: write the record to an on-disk per-pid NDJSON file,
   // import via `scanDeadLetterDir`, replay via `recoverOneDeadLetter`, fold.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const dlDir = join(tmpDir, "dead-letters");
   mkdirSync(dlDir, { recursive: true });
   writeFileSync(
@@ -2146,7 +2158,7 @@ test("scan→replay re-fold parity: a record imported from an NDJSON file folds 
 });
 
 test("scan→replay idempotency: importing + replaying twice yields exactly one events row (no dup on re-run)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const dlDir = join(tmpDir, "dead-letters");
   mkdirSync(dlDir, { recursive: true });
   const line = serializeDeadLetterRecord({
@@ -2187,7 +2199,7 @@ test("scan→replay idempotency: importing + replaying twice yields exactly one 
 });
 
 test("scanDeadLetterDir skips a torn final line — the partial record is never imported or replayed", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const dlDir = join(tmpDir, "dead-letters");
   mkdirSync(dlDir, { recursive: true });
 
@@ -2481,7 +2493,7 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
 });
 
 test("fn-651: serialized snapshot folds end-to-end — status / subscription_active / error_* are non-NULL after drain", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Seed the events row exactly the way main's `usage-snapshot` handler
   // would: session_id = profile pk, data = serialized payload.
   db.run(
@@ -2540,7 +2552,7 @@ test("fn-651: a no-subscription envelope folds subscription_active = 0 so the re
   // The `mc1` case from the epic spec: subscription_active=false on the
   // wire becomes 0 in the column, which is what `cli/usage.ts`'s
   // `subscription_active !== 0` filter checks to redact the row.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
        VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
@@ -2584,7 +2596,7 @@ test("fn-651: an old event missing the fn-645 fields folds them to NULL without 
   // subscription_active / error_*. The reducer must keep folding them
   // safely; only NEW events carry the fields. This pins the
   // backwards-compat contract spelled in the task spec.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
        VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
@@ -2876,7 +2888,7 @@ test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbea
 });
 
 test("selectExpiredPendingDispatches returns aged rows past the TTL", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const now = 1_700_000_000_000; // arbitrary fixed epoch (ms)
   const nowSec = now / 1000;
   // Aged: dispatched 121s ago (past the 120s TTL).
@@ -2893,7 +2905,7 @@ test("selectExpiredPendingDispatches returns aged rows past the TTL", () => {
 });
 
 test("selectExpiredPendingDispatches expires an aged row EVEN with an open dispatch_failures row (fn-870 BUG2 self-heal)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const now = 1_700_000_000_000;
   const nowSec = now / 1000;
   // Aged row WITH a sticky dispatch_failures row for the same (verb, id). The
@@ -2913,7 +2925,7 @@ test("selectExpiredPendingDispatches expires an aged row EVEN with an open dispa
 });
 
 test("selectExpiredPendingDispatches measures TTL against frozen dispatched_at (a daemon restart never resets the clock)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // The frozen `dispatched_at` lifts off the synthetic event's payload,
   // not `Date.now()` inside the fold (CLAUDE.md re-fold determinism).
   // This test confirms the SWEEP side honors the same contract: the
@@ -2935,7 +2947,7 @@ test("selectExpiredPendingDispatches measures TTL against frozen dispatched_at (
 });
 
 test("selectExpiredPendingDispatches on an empty pending_dispatches table returns []", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   expect(selectExpiredPendingDispatches(db, 1_700_000_000_000)).toEqual([]);
   db.close();
 });
@@ -3128,7 +3140,7 @@ function seedBlockLatch(
 }
 
 test("selectPendingBlockEscalations: joins pending latch to epic project_dir + embedded task runtime_status/target_repo", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   seedEpicWithTasks(db, "fn-1-foo", "/proj/foo", [
     {
       task_id: "fn-1-foo.1",
@@ -3154,7 +3166,7 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
 });
 
 test("selectPendingBlockEscalations: a pending latch with no surviving epic/task element returns null fields", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Latch with NO matching epic row.
   seedBlockLatch(db, "fn-2-ghost", "fn-2-ghost.1");
   // Latch whose epic exists but the embedded task element is absent.
@@ -3184,7 +3196,7 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
 });
 
 test("selectPendingBlockEscalations: empty table returns []", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   expect(selectPendingBlockEscalations(db)).toEqual([]);
   db.close();
 });

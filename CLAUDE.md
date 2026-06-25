@@ -99,13 +99,13 @@ imperative guardrails only.
   hook/daemon/CLI: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`,
   `KEEPER_BACKSTOP_LOG`, and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never
   `{ ...process.env, KEEPER_DB }`; build via `sandboxEnv(...)`. Pure in-process unit tests use
-  `freshDb()` / `freshDbFile()` instead of a full `migrate()`.
+  `freshMemDb()` / `freshDbFile()` instead of a full `migrate()`.
 - **Two tiers.** Default `bun test` runs the FAST tier only. **`bun run test:full` is mandatory
   before landing any change touching daemon / worker / db / hook / git process paths or a slow file.**
-- **No real git in the default tiers.** Test git-boundary DECISIONS with synthetic inputs or golden
-  strings via a pure seam; a test whose contract genuinely IS git's own execution is named
-  `*.slow.test.ts`, path-ignored from the fast tier, and allowlisted in
-  `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene` guards this).
+- **Two independent test axes.** (1) Slow-tier: a too-slow test is named `*.slow.test.ts`, path-ignored
+  from the fast tier into `test:full`. (2) No real git in default tiers — test git-boundary DECISIONS
+  via a pure seam (synthetic inputs / golden strings); a test whose contract genuinely IS git's
+  execution must ALSO be allowlisted in `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene`).
 - **The host-wide test lock is un-bypassable** — `scripts/test-gate.ts` (parallelism cap + `flock`)
   and the `bunfig.toml` preload both apply it; every lock path fails open.
 - **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses `retryUntil`
