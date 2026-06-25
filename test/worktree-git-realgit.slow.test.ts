@@ -22,6 +22,8 @@
 
 import { afterAll, expect, test } from "bun:test";
 import {
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -35,6 +37,7 @@ import {
   abortInterruptedMerge,
   commitWorkLockPath,
   ensureWorktree,
+  epicBaseHasDoneState,
   hasMergeInProgress,
   isAncestorOf,
   isLinkedWorktree,
@@ -373,4 +376,46 @@ test("listEpicBaseBranches: enumerates keeper/epic/<id> bases, excludes ribs", a
   expect(bases).toEqual([
     { branch: "keeper/epic/fn-1-foo", epicId: "fn-1-foo" },
   ]);
+});
+
+test("epicBaseHasDoneState: reads the LANE base tip's epic spec — done on the lane → true, open → false, never-forked → false", async () => {
+  const s = makeScratch();
+  const tip = git(s.repo, "rev-parse", "HEAD");
+  // Commit the epic spec ON each lane branch (via a worktree), so the done-state
+  // lives only on `keeper/epic/<id>` — INVISIBLE to main's working tree, the
+  // chicken-and-egg this probe sidesteps by reading the lane ref directly.
+  const layLane = async (epicId: string, status: string): Promise<void> => {
+    const wt = s.wt(epicId);
+    await ensureWorktree(
+      s.repo,
+      wt,
+      `keeper/epic/${epicId}`,
+      tip,
+      spawnGitExec,
+    );
+    mkdirSync(join(wt, ".keeper/epics"), { recursive: true });
+    writeFileSync(
+      join(wt, `.keeper/epics/${epicId}.json`),
+      JSON.stringify({ id: epicId, status }),
+    );
+    git(wt, "add", "-A");
+    git(wt, "commit", "-qm", `${status} ${epicId}`);
+  };
+  await layLane("fn-9-done", "done");
+  await layLane("fn-7-open", "open");
+
+  // Read from the MAIN repo dir — `git show <lane-branch>:<spec>` resolves the
+  // lane tip without checking it out.
+  expect(await epicBaseHasDoneState(s.repo, "fn-9-done", spawnGitExec)).toBe(
+    true,
+  );
+  expect(await epicBaseHasDoneState(s.repo, "fn-7-open", spawnGitExec)).toBe(
+    false,
+  );
+  // A never-forked epic (no base branch) → false, never throws.
+  expect(await epicBaseHasDoneState(s.repo, "fn-0-nope", spawnGitExec)).toBe(
+    false,
+  );
+  // The done-state really is lane-only: main's working tree has no such file.
+  expect(existsSync(join(s.repo, ".keeper/epics/fn-9-done.json"))).toBe(false);
 });

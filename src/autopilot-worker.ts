@@ -90,6 +90,7 @@ import {
   branchExists as gitBranchExists,
   currentBranch as gitCurrentBranch,
   ensureWorktree as gitEnsureWorktree,
+  epicBaseHasDoneState as gitEpicBaseHasDoneState,
   isAncestorOf as gitIsAncestorOf,
   listEpicBaseBranches as gitListEpicBaseBranches,
   listWorktrees as gitListWorktrees,
@@ -97,6 +98,7 @@ import {
   pruneWorktrees as gitPruneWorktrees,
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
+  isKeeperLaneEntry,
   type LockAcquirer,
   type MergeResult,
   type WorktreeEntry,
@@ -1188,6 +1190,41 @@ export function isEpicInFlight(
 }
 
 /**
+ * Has an epic's CLOSER worker RUN AND FINISHED — a `close::<epic_id>` job row
+ * exists in the projection but no longer OCCUPIES its slot (not `working`, not a
+ * live-`stopped` session)? The producer-observable half of the worktree finalize
+ * trigger that DECOUPLES finalize from the main-worktree `epics` projection:
+ * after task .2 the closer's `status:done` commit lands on the LANE, so the main
+ * projection never folds the close-row to `completed` and the projection-gated
+ * finalize would deadlock. This signal fires off the durable `jobs` projection
+ * instead, and finalize then confirms the lane truly carries done via
+ * `epicBaseHasDoneState` before merging.
+ *
+ * Producer-only + re-fold-safe (jobs is a deterministic-replayed projection,
+ * read here in the producer, never in a fold). Crash/restart-safe: the close job
+ * row survives a daemon bounce, and after restart no panes are live so the
+ * finished closer reads as non-occupying — the trigger re-fires. A crashed or
+ * still-running closer is handled safely: a still-running one occupies (so this
+ * is `false`); a crashed one that never committed done trips this but the git
+ * confirm in `finalizeEpic` no-ops the merge until the lane carries done. Pure —
+ * reads the snapshot fields only.
+ */
+export function closerJobFinished(
+  jobs: Map<string, Job>,
+  epicId: string,
+  livePaneIds: ReadonlySet<string> | null,
+): boolean {
+  let sawCloseJob = false;
+  for (const job of jobs.values()) {
+    if (job.plan_verb === "close" && job.plan_ref === epicId) {
+      sawCloseJob = true;
+      break;
+    }
+  }
+  return sawCloseJob && !isOccupyingJob(jobs, "close", epicId, livePaneIds);
+}
+
+/**
  * The pure reconcile decision. Walks every epic / task / close-row, computes the
  * verb each verdict wants, and emits a `PlannedLaunch` IFF no suppression rule
  * fires: `state.paused`, `state.inFlight.has(key)` (one-at-a-time stagger),
@@ -1466,10 +1503,26 @@ export function reconcile(
   // paused autopilot must not do. Launches are already suppressed while paused, so
   // the geometry attach has nothing to decorate either.
   if (snapshot.worktreeMode && !state.paused) {
+    // fn-972 BUG 3 — the producer-observable finalize trigger. The close-row's
+    // `completed` verdict is gated on `epic.status==="done"` in the MAIN-worktree
+    // projection, which never folds the lane's close commit — so it deadlocks.
+    // Collect the epics whose CLOSER JOB finished (the durable jobs projection,
+    // re-fold-safe + restart-safe); `finalizeEpic` then confirms the lane base
+    // carries done via git before merging. Union'd with `completedRowIds` so the
+    // pre-worktree done-on-main path is unchanged.
+    const closerFinishedIds = new Set<string>();
+    for (const epic of snapshot.epics) {
+      if (
+        closerJobFinished(snapshot.jobs, epic.epic_id, snapshot.livePaneIds)
+      ) {
+        closerFinishedIds.add(epic.epic_id);
+      }
+    }
     attachWorktreeGeometry(
       snapshot.epics,
       launches,
       completedRowIds,
+      closerFinishedIds,
       worktreeFinalize,
     );
   }
@@ -1490,19 +1543,24 @@ export function reconcile(
  *    order, the primary-parent branch). The close-row launch maps to the synthetic
  *    {@link CLOSE_SINK_ID} sink (pinned to base).
  *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every epic
- *    whose close-row id is in `completedRowIds` (the closer reached done) — the
- *    producer merges that base into the default branch + tears down.
+ *    that needs finalizing — its close-row id is in `completedRowIds` (the MAIN
+ *    projection folded `status:done`) OR `closerFinishedIds` (fn-972 BUG 3: the
+ *    closer JOB finished on the lane, the producer-observable signal that fires
+ *    BEFORE the projection can ever see done, since the close commit is on the
+ *    lane). The producer merges that base into the default branch + tears down,
+ *    confirming the lane carries done via git first (`finalizeEpic`).
  *
- * Pure: a total function of the epics + launches (the topology module touches no
- * fs/git). A `WorktreeCycleError` from a bad DAG is left to surface — a cyclic
- * `depends_on` is a data bug the topology module fails loud on, and that throw is
- * caught by `driveCycle`'s cycle-level backstop (no launch is fired for a cyclic
- * epic, which is the safe outcome).
+ * Pure: a total function of the epics + launches + the two id sets (the topology
+ * module touches no fs/git). A `WorktreeCycleError` from a bad DAG is left to
+ * surface — a cyclic `depends_on` is a data bug the topology module fails loud
+ * on, and that throw is caught by `driveCycle`'s cycle-level backstop (no launch
+ * is fired for a cyclic epic, which is the safe outcome).
  */
 function attachWorktreeGeometry(
   epics: Epic[],
   launches: PlannedLaunch[],
   completedRowIds: Set<string>,
+  closerFinishedIds: Set<string>,
   worktreeFinalize: WorktreeLaunchInfo[],
 ): void {
   // Index launches by epic so each epic's plan is derived ONCE. A task launch
@@ -1520,7 +1578,8 @@ function attachWorktreeGeometry(
     const epicId = epic.epic_id;
     const repoDir = epic.project_dir ?? "";
     const epicLaunches = launches.filter((l) => epicOf(l) === epicId);
-    const needsFinalize = completedRowIds.has(epicId);
+    const needsFinalize =
+      completedRowIds.has(epicId) || closerFinishedIds.has(epicId);
     if (epicLaunches.length === 0 && !needsFinalize) {
       continue;
     }
@@ -2156,6 +2215,19 @@ export function createWorktreeDriver(
         if (!(await gitBranchExists(repoDir, baseBranch, run))) {
           return { ok: true };
         }
+        // fn-972 BUG 3 — the git half of the producer-observable finalize trigger:
+        // only merge a lane that actually CARRIES the epic-done state. The
+        // closer-job-finished signal that flags this epic for finalize also trips
+        // for a CRASHED closer that never committed `status:done`; merging that
+        // lane would push incomplete work to the default branch. Confirm the lane
+        // base's `.keeper/epics/<id>.json` reads done first — decoupled from the
+        // main projection (it reads the LANE), crash-safe, idempotent. Not done →
+        // no-op cleanly; the readiness gate re-dispatches the closer and a later
+        // cycle retries once the done commit lands.
+        const epicId = closeKeyEpicId(info);
+        if (!(await gitEpicBaseHasDoneState(repoDir, epicId, run))) {
+          return { ok: true };
+        }
         const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
         // Merge the epic base into the default branch IN THE MAIN worktree (the
         // repo dir is the main worktree, checked out on the default branch). This
@@ -2297,6 +2369,15 @@ export async function recoverWorktrees(
     for (const entry of entries) {
       if (entry.bare || entry.branch === null) {
         continue; // a bare/detached entry carries no lane merge to recover
+      }
+      // fn-972 BUG 4 — only KEEPER-managed lanes (`keeper/epic/*`). A foreign
+      // linked worktree (e.g. a `.claude/worktrees/<name>` lane another tool
+      // registered) is never keeper's to abort-merge or prune, and if its dir was
+      // removed out from under git the abort-merge `git` spawn ENOENTs against the
+      // vanished cwd — minting a spurious recovery failure. Classify on the branch
+      // (a keeper lane IS its `keeper/epic/*` branch), not the path.
+      if (!isKeeperLaneEntry(entry)) {
+        continue;
       }
       try {
         const aborted = await gitAbortInterruptedMerge(entry.path, run);

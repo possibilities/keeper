@@ -367,6 +367,36 @@ export async function isAncestorOf(
 }
 
 /**
+ * The branch-ref prefix every keeper worktree lane checks out: the base
+ * `keeper/epic/<epic_id>` and the ribs `keeper/epic/<epic_id>/<task_id>`. The
+ * single classifier of a keeper-managed lane — a worktree on a branch under this
+ * prefix is keeper's to recover/finalize; anything else (a foreign
+ * `.claude/worktrees/<name>` lane from another tool) is NOT.
+ */
+export const KEEPER_EPIC_BRANCH_PREFIX = "keeper/epic/";
+
+/**
+ * Whether a `git worktree list` entry is a KEEPER-managed lane — checked out on a
+ * `keeper/epic/<...>` branch (the base or a rib). The recovery sweep's pass-1
+ * abort-merge MUST gate on this: enumerating ALL registered linked worktrees and
+ * abort-merging each touches FOREIGN lanes (e.g. a `.claude/worktrees/<name>`
+ * worktree another tool registered) — and if such a lane's dir was removed out
+ * from under git, the `git` spawn against its vanished cwd ENOENTs. A keeper lane
+ * is DEFINED by its branch, so classify on the branch ref, not the path. The
+ * entry `branch` is a full `refs/heads/...` ref (or `null` when detached → never
+ * a lane). Pure — fast-tier covered.
+ */
+export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
+  if (entry.branch === null) {
+    return false;
+  }
+  const short = entry.branch.startsWith("refs/heads/")
+    ? entry.branch.slice("refs/heads/".length)
+    : entry.branch;
+  return short.startsWith(KEEPER_EPIC_BRANCH_PREFIX);
+}
+
+/**
  * Enumerate the epic BASE branches (`keeper/epic/<epic_id>`) that still exist as
  * local refs — the done-but-unmerged backstop's candidate set, sourced from LIVE
  * git (never a window-bounded projection read), so a daemon restart between an
@@ -388,14 +418,13 @@ export async function listEpicBaseBranches(
   if (r.code !== 0) {
     return [];
   }
-  const prefix = "keeper/epic/";
   const out: { branch: string; epicId: string }[] = [];
   for (const raw of r.stdout.split("\n")) {
     const branch = raw.trim();
-    if (!branch.startsWith(prefix)) {
+    if (!branch.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) {
       continue;
     }
-    const rest = branch.slice(prefix.length);
+    const rest = branch.slice(KEEPER_EPIC_BRANCH_PREFIX.length);
     // A rib branch carries a `/` (`<epic_id>/<task_id>`); the base does not.
     if (rest.length === 0 || rest.includes("/")) {
       continue;
@@ -403,6 +432,42 @@ export async function listEpicBaseBranches(
     out.push({ branch, epicId: rest });
   }
   return out;
+}
+
+/**
+ * Whether the epic BASE branch (`keeper/epic/<epic_id>`) carries the epic's
+ * DONE-state — its tip's `.keeper/epics/<epic_id>.json` parses to
+ * `status === "done"`. The git-observable half of the worktree finalize trigger:
+ * the closer commits `status:done` to the lane base, so this flips true the
+ * instant that commit lands — DECOUPLED from the main-worktree `epics` projection
+ * (which folds the MAIN worktree's `.keeper/` files and so never sees the lane
+ * commit until finalize merges it; gating finalize on the projection deadlocks).
+ * Reads LIVE git only (`git show <branch>:<path>`), so it survives a daemon
+ * restart for free and is idempotent. A missing branch/file, a non-zero `show`,
+ * or torn JSON folds to `false` (not done) — never throws. Pairs with the
+ * producer's closer-job-finished signal so finalize fires off the lane, but only
+ * merges a lane that genuinely carries the done-state (a crashed closer that
+ * never committed done leaves this `false`, so finalize no-ops and retries).
+ */
+export async function epicBaseHasDoneState(
+  cwd: string,
+  epicId: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const branch = `${KEEPER_EPIC_BRANCH_PREFIX}${epicId}`;
+  // The data dir is `.keeper/` (DATA_DIR_NAMES[0] in plan-worker.ts); a lane is a
+  // worktree of the SAME repo, so the epic spec lives at the same path on it.
+  const specPath = `.keeper/epics/${epicId}.json`;
+  const r = await run(["show", `${branch}:${specPath}`], { cwd });
+  if (r.code !== 0) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(r.stdout) as { status?: unknown };
+    return parsed.status === "done";
+  } catch {
+    return false;
+  }
 }
 
 /**

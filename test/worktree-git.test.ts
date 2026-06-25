@@ -15,6 +15,8 @@ import {
   commitWorkLockPath,
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
+  epicBaseHasDoneState,
+  isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
   mergeBranchInto,
@@ -23,6 +25,7 @@ import {
   removeWorktree,
   resolveDefaultBranch,
   resolveDefaultBranchPure,
+  type WorktreeEntry,
 } from "../src/worktree-git";
 import {
   argvStartsWith,
@@ -170,6 +173,94 @@ test("parseWorktreeList: a detached entry has null branch; bare flag parses", ()
 
 test("parseWorktreeList: empty output → no entries", () => {
   expect(parseWorktreeList("")).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-972 BUG 4 — isKeeperLaneEntry (pure keeper-lane classifier for the
+// recovery sweep's pass-1 filter)
+// ---------------------------------------------------------------------------
+
+const entry = (over: Partial<WorktreeEntry>): WorktreeEntry => ({
+  path: "/wt",
+  branch: null,
+  head: "abc",
+  bare: false,
+  ...over,
+});
+
+test("isKeeperLaneEntry: a keeper base/rib branch → true; a foreign or detached entry → false", () => {
+  // The base and the ribs both live under `keeper/epic/`.
+  expect(
+    isKeeperLaneEntry(entry({ branch: "refs/heads/keeper/epic/fn-1-foo" })),
+  ).toBe(true);
+  expect(
+    isKeeperLaneEntry(
+      entry({ branch: "refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2" }),
+    ),
+  ).toBe(true);
+  // A foreign linked worktree (e.g. another tool's `.claude/worktrees` lane) on a
+  // non-keeper branch → never keeper's to recover.
+  expect(isKeeperLaneEntry(entry({ branch: "refs/heads/some-feature" }))).toBe(
+    false,
+  );
+  // A branch that merely CONTAINS the token elsewhere is not a lane.
+  expect(
+    isKeeperLaneEntry(entry({ branch: "refs/heads/feature/keeper/epic/x" })),
+  ).toBe(false);
+  // A detached entry (null branch) is never a lane.
+  expect(isKeeperLaneEntry(entry({ branch: null }))).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-972 BUG 3 — epicBaseHasDoneState (the lane-base done-state git confirm
+// that decouples finalize from the main-worktree projection)
+// ---------------------------------------------------------------------------
+
+test("epicBaseHasDoneState: reads `git show <base>:<spec>` and returns status===done", async () => {
+  const done = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "show"),
+      result: {
+        exitCode: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+      },
+    },
+  ]);
+  expect(await epicBaseHasDoneState("/repo", "fn-1-foo", done.run)).toBe(true);
+  // It reads the epic spec at the LANE base tip — `keeper/epic/<id>` + the
+  // `.keeper/epics/<id>.json` path, NOT the main worktree's working copy.
+  expect(done.calls[0].args).toEqual([
+    "show",
+    "keeper/epic/fn-1-foo:.keeper/epics/fn-1-foo.json",
+  ]);
+  expect(done.calls[0].cwd).toBe("/repo");
+});
+
+test("epicBaseHasDoneState: a still-open spec, a non-zero show, or torn JSON → false", async () => {
+  const open = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "show"),
+      result: { exitCode: 0, stdout: JSON.stringify({ status: "open" }) },
+    },
+  ]);
+  expect(await epicBaseHasDoneState("/repo", "fn-1-foo", open.run)).toBe(false);
+
+  // Missing branch/file → `git show` exits non-zero.
+  const missing = fakeAsyncGit([
+    { when: (a) => argvStartsWith(a, "show"), result: { exitCode: 128 } },
+  ]);
+  expect(await epicBaseHasDoneState("/repo", "fn-1-foo", missing.run)).toBe(
+    false,
+  );
+
+  // A torn / mid-write blob folds to false — never throws.
+  const torn = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "show"),
+      result: { exitCode: 0, stdout: "{not json" },
+    },
+  ]);
+  expect(await epicBaseHasDoneState("/repo", "fn-1-foo", torn.run)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

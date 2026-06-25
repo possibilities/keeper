@@ -3168,7 +3168,16 @@ the parent's worktree while every other child FORKS a sub-worktree off the
 parent's committed tip, a fan-in task sequentially pairwise-merges its incoming
 lane branches (never octopus) before it dispatches, and a synthetic `__close__`
 sink pinned to the epic base makes the closer run where every lane has merged
-in; the base then merges into the default branch after the closer reaches done.
+in; the base then merges into the default branch once the producer observes the
+closer JOB finished AND the lane base carries the epic-done commit. That
+finalize trigger is decoupled from the main-worktree `epics` projection: the
+closer commits `status:done` on the LANE, which the projection (folded from the
+MAIN worktree's `.keeper/` files) never sees until this very merge brings it
+over — so finalize keys off the durable `jobs` projection (`closerJobFinished`,
+re-fold-safe + restart-safe) plus a `git show` of the lane base's spec
+(`epicBaseHasDoneState`), never the projection's done-status. A crashed closer
+that never committed done leaves the lane base not-done, so finalize no-ops and
+retries rather than pushing incomplete work to default.
 Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>/<task>`
 ribs). Before `confirmRunning` mints the durable `Dispatched`, the producer
 lazily ensures the lane worktree exists, runs any pre-merges, asserts HEAD
@@ -3178,7 +3187,10 @@ Both HEAD assertions fail as sticky `DispatchFailed` (cleared by `retry_dispatch
 never `fatalExit`. Every merge/prune takes the shared
 `$GIT_COMMON_DIR/keeper-commit-work.lock` flock; a conflict aborts
 (`git merge --abort`) + fails loud + stops (no merge-to-default, no teardown).
-Crash/restart recovery is producer-only: detect `MERGE_HEAD` → abort →
+Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
+(pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
+as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
+pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
 `keeper/epic/*` scan decoupled from the recent-done window. Multi-repo epics
 (per-task `target_repo`) and toggling the mode while a STARTED open epic is in

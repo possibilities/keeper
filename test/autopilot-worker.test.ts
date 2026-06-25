@@ -38,6 +38,7 @@ import {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   type ConfirmRunningDeps,
+  closerJobFinished,
   confirmRunning,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
@@ -4108,6 +4109,199 @@ test("worktree finalize is gated on not-paused — a paused board collects no fi
   expect(reconcile(snap, makeState(), 0).worktreeFinalize.length).toBe(1);
 });
 
+// ---------------------------------------------------------------------------
+// fn-972 BUG 3 — finalize triggers off the closer-FINISHED signal (the
+// producer-observable, projection-decoupled chicken-and-egg fix) + the git
+// confirm that the lane base carries the epic-done state before merging.
+// ---------------------------------------------------------------------------
+
+/** A close-sink {@link WorktreeLaunchInfo} for finalize tests (laneOrder empty:
+ *  teardown is the base lane only). */
+function makeFinalizeInfo(epicId = "fn-1-foo"): WorktreeLaunchInfo {
+  const branch = `keeper/epic/${epicId}`;
+  const baseWorktreePath = `/repo.worktrees/keeper-epic-${epicId}`;
+  return {
+    assignment: {
+      nodeId: "__close__",
+      isCloseSink: true,
+      branch,
+      worktreePath: baseWorktreePath,
+      inherited: true,
+      preMerges: [],
+      assertBranch: branch,
+    },
+    baseBranch: branch,
+    baseWorktreePath,
+    repoDir: "/repo",
+    laneOrder: [],
+    parentBranch: branch,
+  };
+}
+
+test("fn-972 BUG 3 closerJobFinished: finished close job (dead pane) → true; running / live-stopped / wrong-verb / absent → false", () => {
+  const epicId = "fn-1-foo";
+  const close = (extra: Partial<Job>): Map<string, Job> =>
+    new Map([
+      [
+        "j-c",
+        makeJob({
+          job_id: "j-c",
+          plan_verb: "close",
+          plan_ref: epicId,
+          ...extra,
+        }),
+      ],
+    ]);
+  // A finished closer: a `close::<epic>` job, stopped, no live pane.
+  expect(
+    closerJobFinished(close({ state: "stopped" }), epicId, new Set()),
+  ).toBe(true);
+  // Still working → occupies → not finished.
+  expect(
+    closerJobFinished(close({ state: "working" }), epicId, new Set()),
+  ).toBe(false);
+  // Stopped but its pane is LIVE (parked-alive) → still occupies → not finished.
+  expect(
+    closerJobFinished(
+      close({ state: "stopped", backend_exec_pane_id: "%7" }),
+      epicId,
+      new Set(["%7"]),
+    ),
+  ).toBe(false);
+  // A `work` job sharing the epic id is NOT a closer.
+  const workJob = new Map<string, Job>([
+    [
+      "j-w",
+      makeJob({
+        job_id: "j-w",
+        plan_verb: "work",
+        plan_ref: epicId,
+        state: "stopped",
+      }),
+    ],
+  ]);
+  expect(closerJobFinished(workJob, epicId, new Set())).toBe(false);
+  // No close job at all → false.
+  expect(closerJobFinished(new Map(), epicId, new Set())).toBe(false);
+});
+
+test("fn-972 BUG 3 reconcile: a finished closer JOB collects the finalize WITHOUT the main projection seeing done", () => {
+  // The closer committed `status:done` on the LANE, so the main-worktree `epics`
+  // projection still reads the epic as open — yet the closer JOB finished. The
+  // producer-observable signal must collect the finalize anyway (the chicken-and-
+  // egg fix); finalizeEpic confirms the lane carries done via git before merging.
+  const epicId = "fn-1-foo";
+  const epic = makeEpic({
+    epic_id: epicId,
+    project_dir: "/repo",
+    status: "open", // NOT done in the main projection
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const closeJob = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    jobs: new Map([[closeJob.job_id, closeJob]]),
+    // Probe available, no live panes → the stopped closer reads as finished.
+    livePaneIds: new Set(),
+  });
+  // The finalizer guard (stamped when the closer was dispatched) suppresses a
+  // close RE-dispatch this cycle, so the only producer action is the finalize.
+  const state = makeState({ finalizerGuard: new Map([[epicId, 0]]) });
+  const decision = reconcile(snap, state, 0);
+  expect(epic.status).not.toBe("done");
+  expect(decision.launches.some((l) => l.verb === "close")).toBe(false);
+  expect(decision.worktreeFinalize.length).toBe(1);
+  expect(decision.worktreeFinalize[0]?.baseBranch).toBe("keeper/epic/fn-1-foo");
+
+  // Control: WITHOUT the finished close job, an open epic collects NO finalize —
+  // proving the trigger is the closer-finished signal, not merely worktree mode.
+  const noJob = makeSnapshot({ epics: [epic], worktreeMode: true });
+  expect(reconcile(noJob, makeState(), 0).worktreeFinalize).toEqual([]);
+});
+
+test("fn-972 BUG 3 finalizeEpic: lane base WITHOUT done-state → no-op, never merges (a crashed closer's incomplete lane is not pushed to default)", async () => {
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base branch EXISTS
+    }
+    if (args[0] === "show") {
+      // The lane base tip's epic spec is still open (closer never committed done).
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "open" }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+  );
+  expect(res).toEqual({ ok: true });
+  // It checked the branch + the lane done-state via git, then stopped — no merge.
+  expect(cmds.some((c) => c.startsWith("show keeper/epic/fn-1-foo:"))).toBe(
+    true,
+  );
+  expect(cmds.some((c) => c.startsWith("merge"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-972 BUG 3 finalizeEpic: lane base CARRYING done-state → passes the guard, pushes the merge-to-default (off the lane, not the projection)", async () => {
+  // The done-state git confirm lets finalize PROCEED past the branch-exists guard:
+  // it resolves the default branch and pushes the merge-to-default. (The full
+  // real-merge + teardown — which takes the commit-work flock — is the slow
+  // real-git test; here the base is already an ancestor of default so the merge
+  // is the idempotent no-lock skip, isolating the trigger/guard contrast.)
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" }; // main worktree on default
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // already an ancestor → no-lock skip
+    }
+    // worktree list (empty → teardown no-op) + push fall through to code 0.
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+  );
+  expect(res).toEqual({ ok: true });
+  // Passed the done-state guard → resolved the default branch and pushed.
+  expect(cmds.some((c) => c.startsWith("symbolic-ref"))).toBe(true);
+  expect(cmds.some((c) => c === "push")).toBe(true);
+});
+
 test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
   // The raw dir embeds `/`, which the retry_dispatch validator rejects (stranding
   // the row); the slug strips separators and any leading dash.
@@ -4508,6 +4702,33 @@ test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async ()
   expect(failures).toEqual([]);
   expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
   expect(calls.some((c) => c.args.startsWith("worktree prune"))).toBe(false);
+});
+
+test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktrees` lane, still recovers the keeper lane", async () => {
+  // Pass-1 enumerates ALL registered linked worktrees; a FOREIGN lane (another
+  // tool's `.claude/worktrees/<name>` on a non-`keeper/epic/*` branch) is never
+  // keeper's to abort-merge, and if its dir vanished the `git` spawn against that
+  // cwd would ENOENT. Filter to keeper lanes: touch the keeper lane, never the
+  // foreign one.
+  const keeperLane = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const foreignLane = "/home/me/proj/.claude/worktrees/some-feature";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${keeperLane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n` +
+      `worktree ${foreignLane}\nHEAD z\nbranch refs/heads/some-feature\n\n`,
+    mergeHeadAt: new Set([keeperLane, foreignLane]), // both carry a stale MERGE_HEAD
+    epicBases: [], // no pass-2 work
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  // The keeper lane's interrupted merge WAS aborted (keeper lanes still recover).
+  expect(
+    calls.some((c) => c.cwd === keeperLane && c.args === "merge --abort"),
+  ).toBe(true);
+  // The foreign lane was NEVER touched — zero git spawns against its cwd, so a
+  // vanished foreign dir can't ENOENT the recovery sweep.
+  expect(calls.some((c) => c.cwd === foreignLane)).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {
