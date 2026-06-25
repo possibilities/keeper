@@ -69,5 +69,5 @@ re-fold). Register `handoffs` as a queryable collection so `keeper handoff show`
 - [ ] test:full green
 
 ## Done summary
-
+Built the keeper handoff enqueue half: cli/handoff.ts (--prompt/--prompt-file/--title/--session/--no-prefix, 64KB doc cap, handoff_prompt_prefix) + handoff show read verb; request_handoff as the SIXTH mutating RPC (validate+bridge handler, daemon mint of HandoffRequested with best-effort initiator_job_id by pane); foldHandoffRequested UPSERTs the handoffs row (status=requested) + writes the handoff-from link onto the new jobs.handoff_links column (v88 ALTER); handoffs registered as a queryable collection. test:full green on all touched files.
 ## Evidence
