@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T18:52:30.251000Z",
+  "depends_on": [],
+  "epic": "fn-975-thin-test-suite-to-pure-unit-core",
+  "id": "fn-975-thin-test-suite-to-pure-unit-core.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Keep hook decision logic as pure smoke",
+  "updated_at": "2026-06-25T18:52:30.251000Z"
+}

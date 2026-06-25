@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T18:52:30.251000Z",
+  "depends_on": [
+    "fn-975-thin-test-suite-to-pure-unit-core.1",
+    "fn-975-thin-test-suite-to-pure-unit-core.2",
+    "fn-975-thin-test-suite-to-pure-unit-core.3",
+    "fn-975-thin-test-suite-to-pure-unit-core.4"
+  ],
+  "epic": "fn-975-thin-test-suite-to-pure-unit-core",
+  "id": "fn-975-thin-test-suite-to-pure-unit-core.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Collapse to one tier, prune helpers + docs, verify",
+  "updated_at": "2026-06-25T18:52:30.251000Z"
+}
