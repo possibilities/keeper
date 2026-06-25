@@ -4309,14 +4309,15 @@ function foldAutopilotCapSet(db: Database, event: Event): void {
  */
 const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_jobs: "max_concurrent_jobs",
+  max_concurrent_per_root: "max_concurrent_per_root",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
 
 /**
  * `AutopilotConfigSet` synthetic-event payload — a PARTIAL patch of the scalar
- * autopilot config columns (currently just `max_concurrent_jobs`, extensible via
- * {@link AUTOPILOT_CONFIG_COLUMNS}). Round-trips through the generic
+ * autopilot config columns (`max_concurrent_jobs` + `max_concurrent_per_root`,
+ * extensible via {@link AUTOPILOT_CONFIG_COLUMNS}). Round-trips through the generic
  * `set_autopilot_config` RPC → main append → this fold, which UPSERTs the
  * `autopilot_state` singleton setting ONLY the patched columns and PRESERVING
  * every other column (mirror of the `AutopilotCapSet`/`Mode`/`Paused` discipline).
@@ -4326,6 +4327,11 @@ interface AutopilotConfigSetPayload {
   /** A positive-integer concurrency cap, or `null` for unlimited. Present iff
    *  the patch touches the cap. */
   max_concurrent_jobs?: number | null;
+  /** A positive-integer per-root dispatch concurrency count, or `null` to reset
+   *  to the in-memory `DEFAULT_MAX_CONCURRENT_PER_ROOT` (= 1). Present iff the
+   *  patch touches it. UNLIKE the cap, `null` is "reset to default", NOT
+   *  "unlimited" — there is no unlimited sentinel for the per-root count. */
+  max_concurrent_per_root?: number | null;
 }
 
 /**
@@ -4333,10 +4339,11 @@ interface AutopilotConfigSetPayload {
  * Returns null on a structurally-invalid blob OR an EMPTY patch (no recognized
  * field) — {@link foldAutopilotConfigSet} folds null to a safe no-op so the
  * cursor still advances. NEVER throws (a throw inside the fold wedges the
- * reducer). Per-field tolerance MIRRORS the cap parser: `max_concurrent_jobs`
- * coerces a non-positive / non-integer / non-number to `null` (= unlimited),
- * matching the config parser's contract; an explicit `null` is a first-class
- * value (= unlimited). An ABSENT field is dropped from the patch (preserve the
+ * reducer). Per-field tolerance MIRRORS the cap parser: each field coerces a
+ * non-positive / non-integer / non-number to `null` (`max_concurrent_jobs`
+ * `null` = unlimited; `max_concurrent_per_root` `null` = reset to the in-memory
+ * default = 1), matching the config parser's contract; an explicit `null` is a
+ * first-class value. An ABSENT field is dropped from the patch (preserve the
  * column), distinct from a present `null` (set the column to NULL).
  */
 function extractAutopilotConfigSetPayload(
@@ -4355,6 +4362,17 @@ function extractAutopilotConfigSetPayload(
       const raw = parsed.max_concurrent_jobs;
       // null/non-positive/non-integer → unlimited (NULL); a positive int wins.
       patch.max_concurrent_jobs =
+        typeof raw === "number" && Number.isInteger(raw) && raw > 0
+          ? raw
+          : null;
+    }
+    if ("max_concurrent_per_root" in parsed) {
+      const raw = parsed.max_concurrent_per_root;
+      // null/non-positive/non-integer → NULL (= reset to the in-memory
+      // DEFAULT_MAX_CONCURRENT_PER_ROOT = 1, the byte-identical N=1 mutex); a
+      // positive int sets the per-root count. NO unlimited sentinel — the column
+      // is always resolved `?? DEFAULT` to a positive integer at read time.
+      patch.max_concurrent_per_root =
         typeof raw === "number" && Number.isInteger(raw) && raw > 0
           ? raw
           : null;

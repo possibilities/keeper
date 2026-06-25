@@ -2879,8 +2879,11 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // 89 via fn-952 task .2 (adding the `tmux_client_focus` LIVE-ONLY client-focus
   // singleton — comment-only no-op, NO cursor rewind: no seed/floor, registered
   // in LIVE_ONLY_PROJECTIONS, so an empty log leaves the table empty and the
-  // surface is excluded from the byte-identical re-fold charter).
-  expect(SCHEMA_VERSION).toBe(89);
+  // surface is excluded from the byte-identical re-fold charter). And to 90 via
+  // fn-954 task .1 (appending the `autopilot_state.max_concurrent_per_root`
+  // config column — an additive ALTER, NO cursor rewind: NULL = the in-memory
+  // default, the fold never reads it, so a pre-feature log re-folds byte-identical).
+  expect(SCHEMA_VERSION).toBe(90);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

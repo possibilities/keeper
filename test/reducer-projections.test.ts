@@ -2136,7 +2136,10 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with mixe
 // ---------------------------------------------------------------------------
 
 function autopilotConfigSetEvent(
-  patch: { max_concurrent_jobs?: number | null },
+  patch: {
+    max_concurrent_jobs?: number | null;
+    max_concurrent_per_root?: number | null;
+  },
   sessionId = "autopilot",
 ): number {
   return insertEvent({
@@ -2155,6 +2158,7 @@ function getAutopilotStateConfig() {
     updated_at: number;
     max_concurrent_jobs: number | null;
     mode: string;
+    max_concurrent_per_root: number | null;
   } | null;
 }
 
@@ -2270,6 +2274,120 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with mixe
     .all();
   expect(getAutopilotStateConfig()?.paused).toBe(1);
   expect(getAutopilotStateConfig()?.mode).toBe("armed");
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v90 (fn-954) — `max_concurrent_per_root` is the SECOND scalar config
+// column riding the generic `AutopilotConfigSet` fold. Default NULL (= the
+// in-memory DEFAULT = 1); set via a `{max_concurrent_per_root:N}` patch; the
+// fold preserves it across sibling folds and preserves the OTHER columns when a
+// patch touches only it. NO unlimited sentinel — a present-but-bad value coerces
+// to NULL (= reset to default), never a dropped event.
+// ---------------------------------------------------------------------------
+
+test("fresh DB has no autopilot_state row → max_concurrent_per_root resolves to the default (fn-954)", () => {
+  // No event touching the row: the column is absent (no row), which the
+  // reconciler/board resolve `?? DEFAULT` = 1.
+  expect(getAutopilotStateConfig()).toBeNull();
+});
+
+test("AutopilotConfigSet sets max_concurrent_per_root and advances the cursor (fn-954)", () => {
+  const eventId = autopilotConfigSetEvent({ max_concurrent_per_root: 3 });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.max_concurrent_per_root).toBe(3);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+  // INSERT path still materializes the boots-paused / yolo defaults.
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet explicit null clears max_concurrent_per_root to SQL NULL (= reset to default) (fn-954)", () => {
+  autopilotConfigSetEvent({ max_concurrent_per_root: 4 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(4);
+  autopilotConfigSetEvent({ max_concurrent_per_root: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBeNull();
+});
+
+test("AutopilotConfigSet {max_concurrent_per_root} PRESERVES paused, mode, and the cap (sibling columns) (fn-954)", () => {
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({ max_concurrent_jobs: 4 });
+  drainAll();
+  autopilotConfigSetEvent({ max_concurrent_per_root: 3 });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.max_concurrent_per_root).toBe(3); // landed
+  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
+  expect(row?.paused).toBe(0); // play PRESERVED
+  expect(row?.mode).toBe("armed"); // mode PRESERVED
+});
+
+test("a per-root patch and the cap patch in one combined frame both land (fn-954)", () => {
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 8,
+    max_concurrent_per_root: 2,
+  });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.max_concurrent_jobs).toBe(8);
+  expect(row?.max_concurrent_per_root).toBe(2);
+});
+
+test("a cap-only patch, a pause toggle, and a mode flip all PRESERVE max_concurrent_per_root (fn-954)", () => {
+  autopilotConfigSetEvent({ max_concurrent_per_root: 5 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(5);
+  autopilotConfigSetEvent({ max_concurrent_jobs: 2 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(5); // preserved
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(5); // preserved
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(5); // preserved
+});
+
+test("AutopilotConfigSet present-but-bad max_concurrent_per_root coerces to NULL (= default) (fn-954)", () => {
+  autopilotConfigSetEvent({ max_concurrent_per_root: 6 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(6);
+  for (const bad of [0, -3, 2.5, "9"]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({ max_concurrent_per_root: bad }),
+    });
+    drainAll();
+    expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBeNull();
+    autopilotConfigSetEvent({ max_concurrent_per_root: 6 });
+    drainAll();
+  }
+});
+
+test("from-scratch re-fold reproduces autopilot_state byte-identically with a per-root config column (fn-954)", () => {
+  autopilotConfigSetEvent({ max_concurrent_per_root: 3 });
+  autopilotPausedEvent(false);
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 9,
+    max_concurrent_per_root: 7,
+  });
+  autopilotModeEvent("armed");
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(7);
   expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM autopilot_state");

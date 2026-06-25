@@ -193,6 +193,10 @@ function makeSnapshot(
     // behavior as the pre-fn-953 unlimited default; the cap tests drive it via
     // `makeState({ maxConcurrentJobs })` (the cap rides `state` in `reconcile`).
     maxConcurrentJobs: null,
+    // fn-954: the per-root dispatch concurrency count, resolved snapshot-time
+    // `column ?? DEFAULT` (= 1 = the one-task-per-root mutex). RESERVED for task
+    // .2's allocator; carried but unconsumed here.
+    maxConcurrentPerRoot: 1,
     ...overrides,
   };
 }
@@ -208,6 +212,8 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
     // Default unlimited — every pre-fn-725 test that omits this must see
     // identical dispatch behavior.
     maxConcurrentJobs: null,
+    // fn-954: per-root count N. Default 1 = the one-task-per-root mutex.
+    maxConcurrentPerRoot: 1,
     ...overrides,
   };
 }

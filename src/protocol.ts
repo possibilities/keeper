@@ -109,6 +109,14 @@ export interface BootStatus {
   catching_up: boolean;
   git_seed_required: boolean;
   git_unseeded_roots?: string[];
+  /**
+   * fn-954 — the per-root dispatch concurrency count N the board must apply so it
+   * computes the SAME per-root demotions as the reconciler. Stamped from the
+   * folded `autopilot_state.max_concurrent_per_root` column (`?? DEFAULT` = 1).
+   * Optional/additive — an older client ignoring it (or a frame omitting it)
+   * falls back to N=1, today's one-task-per-root mutex.
+   */
+  max_concurrent_per_root?: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -51,6 +51,7 @@ import {
 } from "./backstop-telemetry";
 import {
   DEFAULT_MAX_CONCURRENT_JOBS,
+  DEFAULT_MAX_CONCURRENT_PER_ROOT,
   openDb,
   readGitProjectionFloor,
   readGitProjectionSeedRequired,
@@ -469,6 +470,18 @@ export interface ReconcileSnapshot {
    * in the cycle glue before `reconcile` reads it.
    */
   maxConcurrentJobs: number | null;
+  /**
+   * The PER-ROOT dispatch concurrency count N, read FRESH from the
+   * `autopilot_state` singleton's `max_concurrent_per_root` column each cycle
+   * (resolved `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT` = 1 — an absent/never-set
+   * row, NULL, or a non-positive value = the in-memory default, byte-identical to
+   * today's one-task-per-root mutex). Projection-pull only (no `workerData`, no
+   * config) so a runtime `set_autopilot_config` lands the next cycle and N survives
+   * a restart. Refreshed onto {@link ReconcileState.maxConcurrentPerRoot} in the
+   * cycle glue. RESERVED for task .2's round-robin allocator; until .2 lands it is
+   * carried but unconsumed (the hardcoded N=1 mutex still runs).
+   */
+  maxConcurrentPerRoot: number;
 }
 
 /**
@@ -515,6 +528,16 @@ export interface ReconcileState {
    * existing `state`-sourced cap signature.
    */
   maxConcurrentJobs: number | null;
+  /**
+   * Per-root dispatch concurrency count N this reconciler grants per root.
+   * REFRESHED each cycle from {@link ReconcileSnapshot.maxConcurrentPerRoot}
+   * (`autopilot_state.max_concurrent_per_root ?? DEFAULT` = 1) in the cycle glue
+   * BEFORE `reconcile()` reads it — so a runtime `set_autopilot_config` lands on
+   * the next cycle. Held on `state` (not read straight off the snapshot) for the
+   * same reason as `maxConcurrentJobs`. RESERVED for task .2's round-robin
+   * allocator; until .2 lands the hardcoded N=1 mutex still runs.
+   */
+  maxConcurrentPerRoot: number;
 }
 
 /**
@@ -1698,6 +1721,21 @@ export async function loadReconcileSnapshot(
       ? capRaw
       : DEFAULT_MAX_CONCURRENT_JOBS;
 
+  // fn-954: the per-root dispatch concurrency count N rides the SAME singleton
+  // row — resolve `max_concurrent_per_root ?? DEFAULT` (= 1, the one-task-per-root
+  // mutex). An absent/never-set row, NULL, or a non-positive / non-integer value
+  // → DEFAULT. Projection-pull only so a runtime `set_autopilot_config` lands the
+  // very next cycle. RESERVED for task .2's allocator (carried but unconsumed now).
+  const perRootRaw = (
+    autopilotRows[0] as { max_concurrent_per_root?: unknown } | undefined
+  )?.max_concurrent_per_root;
+  const maxConcurrentPerRoot: number =
+    typeof perRootRaw === "number" &&
+    Number.isInteger(perRootRaw) &&
+    perRootRaw > 0
+      ? perRootRaw
+      : DEFAULT_MAX_CONCURRENT_PER_ROOT;
+
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -1760,6 +1798,7 @@ export async function loadReconcileSnapshot(
     workerModel,
     workerEffort,
     maxConcurrentJobs,
+    maxConcurrentPerRoot,
   };
 }
 
@@ -1812,6 +1851,9 @@ function main(): void {
     // `autopilot_state` projection (`?? DEFAULT`) before `reconcile` reads it, so
     // a runtime-set cap takes effect immediately and survives a restart.
     maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
+    // fn-954: seed the in-memory per-root DEFAULT (= 1); the FIRST `driveCycle`
+    // refreshes it from the projection before `reconcile` reads it.
+    maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
   };
   // In-flight surfaces this reconciler owns confirm/reap work for. Boots EMPTY:
   // a cold restart re-derives "already running" from the durable `jobs`
@@ -2110,6 +2152,10 @@ function main(): void {
         // `autopilot_state.max_concurrent_jobs`) takes effect this very cycle.
         // Snapshot already resolved `column ?? DEFAULT`.
         state.maxConcurrentJobs = snapshot.maxConcurrentJobs;
+        // fn-954: refresh N the same way so a runtime `set_autopilot_config`
+        // {max_concurrent_per_root} takes effect this cycle. Snapshot already
+        // resolved `column ?? DEFAULT` (= 1).
+        state.maxConcurrentPerRoot = snapshot.maxConcurrentPerRoot;
         const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(
           decision,

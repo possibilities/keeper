@@ -53,7 +53,12 @@ import {
   selectByIdsChunked,
   selectVersionsByIdsChunked,
 } from "./collections";
-import { openDb, readGitProjectionFloor, resolveSockPath } from "./db";
+import {
+  DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  openDb,
+  readGitProjectionFloor,
+  resolveSockPath,
+} from "./db";
 import type { RetryDispatchVerb } from "./dispatch-command";
 import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
@@ -245,7 +250,10 @@ export interface SetAutopilotModeResultMessage {
 export interface SetAutopilotConfigRequestMessage {
   kind: "set-autopilot-config-request";
   id: string;
-  patch: { max_concurrent_jobs?: number | null };
+  patch: {
+    max_concurrent_jobs?: number | null;
+    max_concurrent_per_root?: number | null;
+  };
 }
 
 /** Main→worker reply paired with {@link SetAutopilotConfigRequestMessage}. */
@@ -1449,7 +1457,10 @@ export interface ReplayBridge {
    * columns) and pump a wake. APPEND-ONLY (no relay) — the reconciler re-reads
    * the config columns from the projection each cycle.
    */
-  setAutopilotConfig(patch: { max_concurrent_jobs?: number | null }): Promise<{
+  setAutopilotConfig(patch: {
+    max_concurrent_jobs?: number | null;
+    max_concurrent_per_root?: number | null;
+  }): Promise<{
     ok: boolean;
     error?: string;
   }>;
@@ -2014,6 +2025,26 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
   // `seed_required`-set window). Defensive: a probe failure degrades to an empty
   // set, which only over-dispatches in the brief unseeded window — never throws
   // into the read path (the caller is no-self-heal).
+  // fn-954: stamp the per-root dispatch concurrency count N so the board
+  // computes the SAME per-root demotions as the reconciler. Resolve the folded
+  // `autopilot_state.max_concurrent_per_root` column `?? DEFAULT` (= 1): an
+  // absent/never-set row, NULL, or a non-positive / non-integer value all fall
+  // back to the in-memory default. Defensive — a probe failure degrades to the
+  // default; never throws into the read path.
+  let maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
+  try {
+    const a = db
+      .prepare(
+        "SELECT max_concurrent_per_root FROM autopilot_state WHERE id = 1",
+      )
+      .get() as { max_concurrent_per_root: number | null } | null;
+    const raw = a?.max_concurrent_per_root;
+    if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+      maxConcurrentPerRoot = raw;
+    }
+  } catch {
+    maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
+  }
   let unseededRoots: string[] = [];
   if (seedRequired) {
     try {
@@ -2044,6 +2075,9 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // Per-root refinement so the board renders the SAME per-root `unknown` the
     // autopilot dispatches against.
     git_unseeded_roots: unseededRoots,
+    // fn-954: the per-root dispatch concurrency count so the board demotes the
+    // SAME way the reconciler does.
+    max_concurrent_per_root: maxConcurrentPerRoot,
   };
 }
 
@@ -3376,6 +3410,7 @@ function main(): void {
     },
     setAutopilotConfig(patch: {
       max_concurrent_jobs?: number | null;
+      max_concurrent_per_root?: number | null;
     }): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();

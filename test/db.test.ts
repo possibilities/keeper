@@ -812,6 +812,31 @@ test("autopilot_state has a NOT NULL mode column defaulting 'yolo'; armed_epics 
   db.close();
 });
 
+test("autopilot_state has a nullable max_concurrent_per_root column (NULL = the in-memory default) (fn-954 v90)", () => {
+  const { db } = openDb(":memory:");
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const col = stateCols.find((c) => c.name === "max_concurrent_per_root");
+  expect(col).toBeDefined();
+  // Nullable, no SQL default — NULL is the "never set" state the reconciler /
+  // board resolve `?? DEFAULT_MAX_CONCURRENT_PER_ROOT` (= 1).
+  expect(col?.notnull).toBe(0);
+  expect(col?.dflt_value).toBeNull();
+
+  // An INSERT that omits the column lands NULL (the lazy-materialize default).
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT max_concurrent_per_root FROM autopilot_state WHERE id = 1")
+    .get() as { max_concurrent_per_root: number | null };
+  expect(r.max_concurrent_per_root).toBeNull();
+  db.close();
+});
+
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
   const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
@@ -2238,9 +2263,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v89 adds the `tmux_client_focus` LIVE-ONLY client-focus singleton, fn-952
   // task .2 (comment-only no-op — created via CREATE_TMUX_CLIENT_FOCUS,
   // populated from the fold arm; no seed/floor, registered in
-  // LIVE_ONLY_PROJECTIONS). The v62→v63 epics-shape migration this test
-  // exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(89);
+  // LIVE_ONLY_PROJECTIONS). v90 appends the nullable
+  // `autopilot_state.max_concurrent_per_root` config column (an additive ALTER,
+  // not an epics-shape change), fn-954 task .1. The v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(90);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

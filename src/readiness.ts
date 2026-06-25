@@ -477,6 +477,15 @@ export function computeReadiness(
   // simulator callers (and the byte-identical re-fold simulator) behave exactly
   // as before. Producers pass an empty set whenever `seed_required` is CLEAR.
   unseededRoots: ReadonlySet<string> = new Set<string>(),
+  // fn-954: the per-root dispatch concurrency count N — how many tasks may
+  // dispatch concurrently into a single root, distributed fairly across the
+  // root's epics. Default 1 = today's hardcoded one-task-per-root mutex
+  // (byte-identical). RESERVED for task .2's round-robin allocator, which
+  // replaces the per-epic + per-root mutexes; until .2 lands this is threaded
+  // through (so both consumers carry the SAME N) but the N=1 mutex still runs.
+  // Appended LAST so default-reliant call sites stay valid.
+  // biome-ignore lint/correctness/noUnusedFunctionParameters: threaded now for client/reconciler parity; task .2's round-robin allocator consumes it.
+  maxConcurrentPerRoot: number = 1,
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the

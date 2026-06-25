@@ -604,6 +604,10 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // Autopilot mode enum (`'yolo'` | `'armed'`), defaulting `'yolo'` on a
     // zero-event / pre-existing row.
     "mode",
+    // Per-root dispatch concurrency count, served so the board resolves the SAME
+    // per-root slot count the reconciler dispatches against. NULL = the in-memory
+    // DEFAULT_MAX_CONCURRENT_PER_ROOT (= 1).
+    "max_concurrent_per_root",
   ],
   pk: "id",
   version: "last_event_id",

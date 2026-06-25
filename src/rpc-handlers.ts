@@ -336,10 +336,13 @@ export async function setEpicArmedHandler(
  * `set_autopilot_config` wire params — a PARTIAL patch of the scalar autopilot
  * config columns. Every field is OPTIONAL; an absent field leaves its column
  * untouched (the fold preserves it). `max_concurrent_jobs`: a positive-integer
- * concurrency cap, or `null` for unlimited.
+ * concurrency cap, or `null` for unlimited. `max_concurrent_per_root`: a
+ * positive-integer per-root dispatch count, or `null` to reset to the in-memory
+ * default (= 1) — NO unlimited sentinel.
  */
 export interface SetAutopilotConfigParams {
   max_concurrent_jobs?: number | null;
+  max_concurrent_per_root?: number | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch. */
@@ -360,7 +363,7 @@ function validateSetAutopilotConfigParams(
   // Reject any field that isn't a known config column — an unknown key is a
   // typo or a param-injection probe; surface it as a typed bad_params rather
   // than silently dropping it (the reducer would fold it to a no-op).
-  const known = new Set(["max_concurrent_jobs"]);
+  const known = new Set(["max_concurrent_jobs", "max_concurrent_per_root"]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
     throw new BadParamsError(
@@ -378,6 +381,20 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`max_concurrent_jobs\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("max_concurrent_per_root" in obj) {
+    const raw = obj.max_concurrent_per_root;
+    // null = reset to the in-memory default (= 1); otherwise a POSITIVE INTEGER
+    // only. NO unlimited sentinel — the per-root count is always a positive int.
+    if (raw === null) {
+      patch.max_concurrent_per_root = null;
+    } else if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+      patch.max_concurrent_per_root = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`max_concurrent_per_root\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
       );
     }
   }

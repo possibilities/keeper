@@ -196,7 +196,10 @@ function autopilotStubBridge(opts: {
     setPausedCalls: boolean[];
     retryCalls: Array<{ verb: string; id: string }>;
     setModeCalls: string[];
-    setConfigCalls: Array<{ max_concurrent_jobs?: number | null }>;
+    setConfigCalls: Array<{
+      max_concurrent_jobs?: number | null;
+      max_concurrent_per_root?: number | null;
+    }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
       handoff_id: string;
@@ -212,7 +215,10 @@ function autopilotStubBridge(opts: {
     setPausedCalls: [] as boolean[],
     retryCalls: [] as Array<{ verb: string; id: string }>,
     setModeCalls: [] as string[],
-    setConfigCalls: [] as Array<{ max_concurrent_jobs?: number | null }>,
+    setConfigCalls: [] as Array<{
+      max_concurrent_jobs?: number | null;
+      max_concurrent_per_root?: number | null;
+    }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
       handoff_id: string;
@@ -393,6 +399,62 @@ test("set_autopilot_config rejects a non-positive / non-integer max_concurrent_j
     { max_concurrent_jobs: -2 },
     { max_concurrent_jobs: 2.5 },
     { max_concurrent_jobs: "3" },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a max_concurrent_per_root patch (fn-954)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_per_root: 3 },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { max_concurrent_per_root: 3 },
+  });
+  expect(state.setConfigCalls).toEqual([{ max_concurrent_per_root: 3 }]);
+});
+
+test("set_autopilot_config accepts an explicit null max_concurrent_per_root (= reset to default) (fn-954)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_per_root: null },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { max_concurrent_per_root: null },
+  });
+  expect(state.setConfigCalls).toEqual([{ max_concurrent_per_root: null }]);
+});
+
+test("set_autopilot_config forwards a combined cap + per-root patch (fn-954)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_jobs: 8, max_concurrent_per_root: 2 },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { max_concurrent_jobs: 8, max_concurrent_per_root: 2 },
+  });
+  expect(state.setConfigCalls).toEqual([
+    { max_concurrent_jobs: 8, max_concurrent_per_root: 2 },
+  ]);
+});
+
+test("set_autopilot_config rejects a non-positive / non-integer max_concurrent_per_root (fn-954)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { max_concurrent_per_root: 0 },
+    { max_concurrent_per_root: -2 },
+    { max_concurrent_per_root: 2.5 },
+    { max_concurrent_per_root: "3" },
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,

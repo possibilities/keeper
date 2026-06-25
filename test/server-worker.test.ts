@@ -1627,6 +1627,9 @@ test("fn-905: the boot-status header ships git_unseeded_roots for an unseeded ga
   expect(result).not.toBeNull();
   expect(result?.boot?.git_seed_required).toBe(true);
   expect(result?.boot?.git_unseeded_roots).toEqual(["/repo-x"]);
+  // fn-954: no autopilot_state row → the per-root count N stamps the in-memory
+  // default (= 1, today's one-task-per-root mutex).
+  expect(result?.boot?.max_concurrent_per_root).toBe(1);
 
   client.end();
   server.stop();

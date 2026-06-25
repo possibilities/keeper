@@ -651,6 +651,28 @@ test("buildSetConfigFrame — an explicit null cap (unlimited) rides verbatim (f
   });
 });
 
+test("buildSetConfigFrame — a per-root patch emits set_autopilot_config {max_concurrent_per_root} (fn-954)", () => {
+  expect(
+    buildSetConfigFrame("rpc-uuid-11", { max_concurrent_per_root: 3 }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-11",
+    method: "set_autopilot_config",
+    params: { max_concurrent_per_root: 3 },
+  });
+});
+
+test("buildSetConfigFrame — an explicit null per-root (reset to default) rides verbatim (fn-954)", () => {
+  expect(
+    buildSetConfigFrame("rpc-uuid-12", { max_concurrent_per_root: null }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-12",
+    method: "set_autopilot_config",
+    params: { max_concurrent_per_root: null },
+  });
+});
+
 // ---------------------------------------------------------------------------
 // projectAutopilotMode / projectArmedEpics — fn-751 socket-sourced projections.
 // ---------------------------------------------------------------------------

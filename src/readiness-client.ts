@@ -59,6 +59,7 @@
 
 import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
+import { DEFAULT_MAX_CONCURRENT_PER_ROOT } from "./db";
 import {
   type BootStatus,
   encodeFrame,
@@ -1407,6 +1408,11 @@ export function subscribeReadiness(
   // Defaults EMPTY (steady state / a server that stamps no header / an older
   // server omitting the field → assume every root seeded, no per-root gating).
   let unseededRoots: Set<string> = new Set<string>();
+  // fn-954: latch the per-root dispatch concurrency count N off the boot-status
+  // header so the board computes the SAME per-root demotions as the reconciler.
+  // Defaults to 1 (today's one-task-per-root mutex) — a server that stamps no
+  // header, an older server omitting the field, or an absent value all keep N=1.
+  let maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
   const onFatal = opts.onFatal ?? defaultOnFatal;
   const connect = opts.connect ?? defaultConnect;
 
@@ -1691,6 +1697,10 @@ export function subscribeReadiness(
       // fn-905: the per-root unseeded set → only rows whose `effectiveRoot` is
       // unseeded are forced UNKNOWN (a seeded sibling root still renders ready).
       unseededRoots,
+      // fn-954: the per-root dispatch concurrency count N (latched off the
+      // boot-status header) so the board demotes the SAME way the reconciler
+      // does. Default 1 = today's one-task-per-root mutex.
+      maxConcurrentPerRoot,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
     // Read from `state.rows` (not `byId.values()`) — the composite
@@ -1745,6 +1755,14 @@ export function subscribeReadiness(
     // only in the brief unseeded window, never to a clean-read-as-dirty hazard.
     onBootStatus: (boot: BootStatus): void => {
       unseededRoots = new Set(boot.git_unseeded_roots ?? []);
+      // fn-954: latch N for the readiness pass. An absent/non-positive value (an
+      // older server, or a frame omitting it) defaults to 1 = the one-task-per-root
+      // mutex — never a wrong N. The pass reads this on its NEXT emit.
+      const n = boot.max_concurrent_per_root;
+      maxConcurrentPerRoot =
+        typeof n === "number" && Number.isInteger(n) && n > 0
+          ? n
+          : DEFAULT_MAX_CONCURRENT_PER_ROOT;
       opts.onBootStatus?.(boot);
     },
   });

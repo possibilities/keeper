@@ -367,6 +367,10 @@ from pathlib import Path
 # current tmux client's focused session/window/pane, fed by keeperd's persistent
 # ``tmux -C`` control worker. keeper-py never reads this table, so only the
 # version whitelist gains 89.
+#
+# v90 (fn-954 task .1) adds the ``autopilot_state.max_concurrent_per_root``
+# config column — the runtime-settable per-root dispatch concurrency count.
+# keeper-py never reads this column, so only the version whitelist gains 90.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -428,6 +432,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         87,
         88,
         89,
+        90,
     }
 )
 

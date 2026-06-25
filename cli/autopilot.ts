@@ -68,9 +68,11 @@ Subcommands:
            every ready epic; armed works ONLY explicitly-armed epics plus
            their transitive upstream dep-closure.
   config   Send set_autopilot_config {<key>:<value>} and exit. Runtime-sets a
-           scalar autopilot config value. Key: max_concurrent_jobs (a positive
-           integer cap, or 'unlimited' to clear it). e.g.
-           keeper autopilot config max_concurrent_jobs 8
+           scalar autopilot config value. Keys: max_concurrent_jobs (a positive
+           integer cap, or 'unlimited' to clear it); max_concurrent_per_root (a
+           positive integer count of concurrent tasks per root, or 'default'/1).
+           e.g. keeper autopilot config max_concurrent_jobs 8
+                keeper autopilot config max_concurrent_per_root 3
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
@@ -497,7 +499,10 @@ export function buildSetArmedFrame(
  */
 export function buildSetConfigFrame(
   id: string,
-  patch: { max_concurrent_jobs?: number | null },
+  patch: {
+    max_concurrent_jobs?: number | null;
+    max_concurrent_per_root?: number | null;
+  },
 ): ClientFrame {
   return {
     type: "rpc",
@@ -879,40 +884,62 @@ export async function main(argv: string[]): Promise<void> {
   if (subcommand === "config") {
     // `config <key> <value>` — the generic runtime config setter. Validate the
     // key + value CLI-side so a typo dies with a clear message before the
-    // round-trip (the server re-validates). Currently the only key is
-    // `max_concurrent_jobs`; a positive integer sets a cap, `unlimited`/`null`
-    // clears it (→ unlimited).
+    // round-trip (the server re-validates). Keys: `max_concurrent_jobs` (a
+    // positive integer cap, `unlimited`/`null` → unlimited) and
+    // `max_concurrent_per_root` (a positive integer count, `default`/`null` → the
+    // in-memory default = 1; NO 'unlimited').
     if (rest.length !== 2) {
       die(
         `'config' takes exactly two positionals <key> <value> (got ${rest.length}); pass --help for usage.`,
       );
     }
     const [key, value] = rest;
-    if (key !== "max_concurrent_jobs") {
-      die(
-        `'config' key must be one of max_concurrent_jobs (got ${JSON.stringify(key)})`,
-      );
-    }
-    let cap: number | null;
-    if (value === "unlimited" || value === "null") {
-      cap = null;
-    } else {
-      const n = Number(value);
-      if (!Number.isInteger(n) || n <= 0) {
-        die(
-          `'config max_concurrent_jobs' value must be a positive integer or 'unlimited' (got ${JSON.stringify(value)})`,
-        );
-      }
-      cap = n;
-    }
     const id = crypto.randomUUID();
-    await sendControlRpc(
-      sockPath,
-      buildSetConfigFrame(id, { max_concurrent_jobs: cap }),
-      id,
-      die,
+    if (key === "max_concurrent_jobs") {
+      let cap: number | null;
+      if (value === "unlimited" || value === "null") {
+        cap = null;
+      } else {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n <= 0) {
+          die(
+            `'config max_concurrent_jobs' value must be a positive integer or 'unlimited' (got ${JSON.stringify(value)})`,
+          );
+        }
+        cap = n;
+      }
+      await sendControlRpc(
+        sockPath,
+        buildSetConfigFrame(id, { max_concurrent_jobs: cap }),
+        id,
+        die,
+      );
+      return;
+    }
+    if (key === "max_concurrent_per_root") {
+      let n: number | null;
+      if (value === "default" || value === "null") {
+        n = null;
+      } else {
+        const parsed = Number(value);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          die(
+            `'config max_concurrent_per_root' value must be a positive integer or 'default' (got ${JSON.stringify(value)})`,
+          );
+        }
+        n = parsed;
+      }
+      await sendControlRpc(
+        sockPath,
+        buildSetConfigFrame(id, { max_concurrent_per_root: n }),
+        id,
+        die,
+      );
+      return;
+    }
+    die(
+      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root (got ${JSON.stringify(key)})`,
     );
-    return;
   }
 
   die(

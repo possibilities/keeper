@@ -444,6 +444,70 @@ test("subscribeReadiness: boot-status header fires onBootStatus and forces readi
 });
 
 // ---------------------------------------------------------------------------
+// fn-954 — the boot-status header carries `max_concurrent_per_root` (N), which
+//          the client latches for the readiness pass (consumed by task .2's
+//          allocator). A frame stamping N forwards it via `onBootStatus`; a
+//          frame omitting it falls back to N=1 (today's one-task-per-root mutex).
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: boot-status header forwards max_concurrent_per_root via onBootStatus", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const boots: { max_concurrent_per_root?: number }[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-n",
+    onSnapshot: () => {},
+    onBootStatus: (b) => boots.push(b),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) throw new Error("mock socket never installed");
+  sock.takeOutbound();
+
+  // A frame stamping N=3.
+  sock.deliver([
+    {
+      type: "result",
+      id: "test-n-epics",
+      collection: "epics",
+      rev: 1,
+      total: 0,
+      rows: [],
+      boot: {
+        rev: 1,
+        head_event_id: 1,
+        catching_up: true,
+        git_seed_required: false,
+        max_concurrent_per_root: 3,
+      },
+    },
+  ]);
+  expect(boots.at(-1)?.max_concurrent_per_root).toBe(3);
+
+  // A later frame omitting the field — `onBootStatus` sees no N (the client
+  // latch defaults to 1 internally; the wire field is simply absent).
+  sock.deliver([
+    {
+      type: "result",
+      id: "test-n-jobs",
+      collection: "jobs",
+      rev: 1,
+      total: 0,
+      rows: [],
+      boot: {
+        rev: 1,
+        head_event_id: 1,
+        catching_up: true,
+        git_seed_required: false,
+      },
+    },
+  ]);
+  expect(boots.at(-1)?.max_concurrent_per_root).toBeUndefined();
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // (a.2) fn-813 — the `scheduled_tasks` collection rides the snapshot, and a
 //       multi-cron session is NOT collapsed (the composite `(job_id, cron_id)`
 //       identity reads off `state.rows`, not the `job_id` wire pk's `byId`).

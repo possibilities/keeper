@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 89;
+export const SCHEMA_VERSION = 90;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -186,6 +186,19 @@ export interface KeeperConfig {
  * `column ?? DEFAULT_MAX_CONCURRENT_JOBS`.
  */
 export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
+
+/**
+ * The IN-MEMORY default for the runtime-settable PER-ROOT dispatch concurrency
+ * count — used until a `set_autopilot_config` sets
+ * `autopilot_state.max_concurrent_per_root`. `1` = today's hardcoded
+ * one-task-per-root mutex (N=1 is byte-identical to the pre-feature board);
+ * a positive integer N grants up to N concurrent tasks per root, distributed
+ * fairly across the root's epics (the allocator lands in task .2). Unlike the
+ * global cap, this has NO unlimited sentinel — it is always a positive integer,
+ * resolved `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT` by the reconciler + the
+ * board. The reconciler/board resolve `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT`.
+ */
+export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
 
 /** `KEEPER_CONFIG` env wins; else `~/.config/keeper/config.yaml`. Pure. */
 export function resolveConfigPath(): string {
@@ -1279,7 +1292,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     max_concurrent_jobs INTEGER,
-    mode TEXT NOT NULL DEFAULT 'yolo'
+    mode TEXT NOT NULL DEFAULT 'yolo',
+    max_concurrent_per_root INTEGER
 )
 `;
 
@@ -5272,6 +5286,28 @@ function migrate(db: Database): void {
       // table) — this bump MUST add 89 to `SUPPORTED_SCHEMA_VERSIONS` in
       // `keeper/api.py` in the SAME commit, or every keeper-py read fails
       // host-wide; test/schema-version.test.ts enforces this.
+
+      // v89→v90 (fn-954 task .1): add the nullable
+      // `autopilot_state.max_concurrent_per_root` config column (DEFAULT NULL =
+      // the in-memory `DEFAULT_MAX_CONCURRENT_PER_ROOT` = 1, byte-identical to
+      // today's hardcoded one-task-per-root mutex). Runtime-settable via the
+      // generic `set_autopilot_config` RPC → `AutopilotConfigSet` fold (NOT
+      // config-file-frozen); each singleton fold preserves the columns it does
+      // not own on conflict, so a pause/mode/cap patch never clobbers it.
+      // FIX-FORWARD (no rewind): the fold never READS this column (it is resolved
+      // at read time by the reconciler/board), so an addColumnIfMissing append is
+      // re-fold-safe — a from-scratch re-fold re-derives byte-identical rows and
+      // leaves the new column NULL (= DEFAULT). APPEND-via-ALTER keeps the
+      // `PRAGMA table_info` column-shape parity tests stable. Whitelist-only
+      // Python read (keeper-py never reads this column) — this bump MUST add 90
+      // to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      addColumnIfMissing(
+        db,
+        "autopilot_state",
+        "max_concurrent_per_root",
+        "INTEGER",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
