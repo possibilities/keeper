@@ -46,5 +46,5 @@ Pure-seam DI tests (injected git driver + topology): ensure-worktree-before-Disp
 - [ ] OFF mode is byte-identical to today except the added on-default-branch assertion.
 
 ## Done summary
-
+Wired the pure DAG->worktree topology + producer git driver into the autopilot reconcile cycle: reconcile stamps worktree geometry (or multi-repo reject) per launch when worktree_mode is ON; runReconcileCycle provisions the lane + pre-merges + asserts HEAD before Dispatched (re-pointing launch cwd to the worktree), OFF asserts on-default-branch, and a closer-done epic merges its base into the default branch + pushes once + tears lanes down. Both HEAD assertions and multi-repo rejection are sticky DispatchFailed cleared by retry_dispatch.
 ## Evidence
