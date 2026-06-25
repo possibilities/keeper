@@ -26,5 +26,5 @@ The plan auto-commit (`realGitVcs.commit`, plugins/plan/src/vcs.ts:210-221) shel
 - [ ] bun run test:full green
 
 ## Done summary
-
+Strip the four worktree-routing GIT_* vars (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_COMMON_DIR) from every plan git spawn in vcs.ts so the explicit cwd alone fixes the repo+branch; an inherited GIT_DIR no longer routes a lane-worktree done/close commit onto main. Added an in-process lane-cwd assertion and a real-git slow test proving env-strip isolation.
 ## Evidence
