@@ -44,5 +44,5 @@ Real-git contract test in `*.slow.test.ts` (allowlisted): add/list/merge-clean/m
 - [ ] Real-git contract test is `*.slow.test.ts` and listed in the allowlist; fast-tier covers the pure helpers.
 
 ## Done summary
-
+Added src/worktree-git.ts: the producer git driver (idempotent worktree add/list/remove/prune --expire now, sequential pairwise merge with is-ancestor skip + MERGE_HEAD-guarded abort, default-branch + submodule-guarded linked-worktree detection, flock-serialized merges). Pure helpers fast-tier covered; real-git lifecycle in an allowlisted *.slow.test.ts.
 ## Evidence
