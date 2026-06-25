@@ -574,6 +574,23 @@ When the plan spans more than one epic, how those epics EXECUTE is a cross-skill
 
 The planning flow's default wrap-up stays quiet (Phase 8) — these shapes engage only on the human's request.
 
+### Reacting to a blocked-worker bus directive
+
+A blocked `/plan:work` worker stamps the block and the daemon escalates ONCE to you over the Agent Bus — an authoritative `Plan task <task> (epic <epic>) is BLOCKED and needs you.` directive carrying the category, repo, and `blocked_reason`. When it wakes you, react in this order — **bus-resume is PRIMARY; cold-re-dispatch is the fallback, not the default**:
+
+1. **Resolve the blocker per its category** — do the human-gated action, clear the dep, refine the spec (`/plan:plan <epic> refine`), or whatever the `Category:` line calls for. The directive carries the verbatim `blocked_reason`.
+2. **Unblock the board** — `keeper plan unblock <task>` (flips the task `blocked → todo`, preserving claim history).
+3. **PRIMARY — resume the still-live worker in place over the bus:**
+
+   ```bash
+   keeper bus chat send work::<task> "RESOLVED: <what changed> — resume now"
+   ```
+
+   `work::<task>` is the still-live `/plan:work` orchestrator session's deterministic name. A `delivered` result (exit 0) means that session picks the task back up in-context with everything it already figured out — done. Say more than "resume now" if the resolution changed the work.
+4. **FALLBACK — only on a miss:** a `not_connected`/`unknown_target` send result (exit 1, per `keeper:bus`'s result tokens) means that worker session has died. The `keeper plan unblock` you already did lets the autopilot cold-re-dispatch a fresh worker; if the autopilot is paused, run `keeper dispatch work::<task>` yourself.
+
+Precedence is strict: try the bus-resume FIRST and fall through to cold-re-dispatch ONLY on the exit-1 miss. Do not pre-check `keeper bus list` — send blindly and branch on the send's own result. Resuming a live worker reuses its accumulated context; cold-re-dispatch discards it, so it is the genuinely-dead-worker path only.
+
 ---
 
 ## Phase 7 — Validate (refine path only)

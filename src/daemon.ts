@@ -550,12 +550,13 @@ export function shouldEscalateBlockedCategory(
 }
 
 /**
- * Build the one-way notification body the producer sends to `planner@<epic>`. The
+ * Build the notification body the producer sends to `planner@<epic>`. The
  * free-text `blocked_reason` rides as a body line — NEVER interpolated into a
  * shell arg (the helper passes the whole body via stdin / array form). Pure. The
- * directive is intentionally one-way: the planner unblocks/refines on the board
- * and the autopilot cold-re-dispatches; the daemon sender has no subscribable
- * channel to receive a reply.
+ * directive asks the planner to resolve the blocker, unblock the board, and then
+ * RESUME the still-live worker in-context over the bus (`work::<task>`); cold
+ * re-dispatch is named only as the dead-worker fallback. The daemon sender still
+ * has no subscribable channel — the resume hop runs from the planner session.
  */
 export function buildBlockEscalationBody(args: {
   epicId: string;
@@ -573,10 +574,18 @@ export function buildBlockEscalationBody(args: {
     `Blocked reason:`,
     args.blockedReason.trim(),
     ``,
-    `Resolve it on the board: \`keeper plan unblock ${args.taskId}\` (after`,
-    `addressing the blocker — refine the spec, clear the dep, etc.). The`,
-    `autopilot then cold-re-dispatches a fresh worker — NO reply needed, do not`,
-    `reply to this message. If the autopilot isn't armed, run`,
+    `Resolve the blocker (refine the spec, clear the dep, do the human-gated`,
+    `action — whatever the category calls for), then unblock the board:`,
+    `\`keeper plan unblock ${args.taskId}\`.`,
+    ``,
+    `PRIMARY — resume the still-live worker in place over the bus:`,
+    `\`keeper bus chat send work::${args.taskId} "RESOLVED: <what changed> — resume now"\``,
+    `(say more if the resolution changes the work). An exit-0 \`delivered\``,
+    `means the live worker session picks the task back up with full context.`,
+    ``,
+    `FALLBACK — a \`not_connected\`/\`unknown_target\` miss (exit 1) means that`,
+    `worker session is gone; the board-unblock you already did lets the autopilot`,
+    `cold-re-dispatch a fresh worker. If the autopilot is paused, run`,
     `\`keeper dispatch work::${args.taskId}\` yourself.`,
   ].join("\n");
 }

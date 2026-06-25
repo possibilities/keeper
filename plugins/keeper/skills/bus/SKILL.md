@@ -34,6 +34,14 @@ socket — a send reports `not_connected` and delivers to no one), or
 an agent's process dies, its socket closes and it leaves the bus; there is
 no heartbeat and no periodic liveness timer.
 
+A dispatched plan worker's live session carries a deterministic name —
+`work::<taskId>` for a `/plan:work` run, `close::<epic>` for a `/plan:close`
+run — so a planner can reach a still-live blocked worker by that name to
+resume it in place. These are PLAIN session names, not a special role like
+`planner@<epic>`: a miss (`not_connected`/`unknown_target`, exit 1) means the
+session is GONE and nothing is queued — unlike a `planner@<epic>` send, which
+can `queued_for_wake`.
+
 ## Your inbox is already open — never start a listener
 
 Your Agent Bus inbox is already open. The keeper plugin arms `keeper bus

@@ -3057,9 +3057,16 @@ bus chat send` with the body via stdin so the free-text reason is never
 shell-interpolated, + `keeper bus wake` on `queued_for_wake`), then mints
 `BlockEscalationAttempted{outcome}` (latch `requested→attempted`) — escalate-once
 per block instance, fail-open per `runWake`'s injectable-deps discipline. The
-planner unblocks on the board (`keeper plan unblock`) and the autopilot
-cold-re-dispatches a fresh worker; the wielder that stamped the block has already
-stopped (no warm resume, no orchestrator in the loop). The reconciler boots PAUSED (the in-memory
+planner then resolves the blocker, unblocks on the board (`keeper plan unblock`),
+and resumes the work via two ordered paths. PRIMARY: the `/plan:work` orchestrator
+session that stamped the block ends its turn but stays reachable (its `keeper bus
+watch` inbox armed); the planner bus-sends `work::<task>` a resume directive, and
+that live session re-enters its Phase 2b warm-resume to continue the original
+worker subagent in-context. FALLBACK: a miss on that send (`not_connected`/
+`unknown_target`) means the orchestrator session is gone, so the board-unblock lets
+the autopilot cold-re-dispatch a fresh worker — gated against double-dispatch by
+the live-pane occupancy gate (`isOccupyingJob`), which suppresses re-dispatch while
+the worker pane lives. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection

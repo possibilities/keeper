@@ -3098,7 +3098,7 @@ test("effectiveBlockEscalationRepo: target_repo override, else project_dir, else
   expect(effectiveBlockEscalationRepo("", "")).toBe("");
 });
 
-test("buildBlockEscalationBody: carries epic/task/category/repo/reason + the one-way directive", () => {
+test("buildBlockEscalationBody: carries epic/task/category/repo/reason + the resume directive", () => {
   const body = buildBlockEscalationBody({
     epicId: "fn-9-foo",
     taskId: "fn-9-foo.2",
@@ -3111,10 +3111,10 @@ test("buildBlockEscalationBody: carries epic/task/category/repo/reason + the one
   expect(body).toContain("SPEC_UNCLEAR");
   expect(body).toContain("/Users/me/code/foo");
   expect(body).toContain("the acceptance is ambiguous");
-  // The one-way directive — unblock on the board, autopilot re-dispatches, no
-  // reply, and the manual-dispatch fallback.
+  // Unblock the board, then PRIMARY bus-resume the still-live worker, with the
+  // cold-re-dispatch / manual-dispatch fallback for a dead worker session.
   expect(body).toContain("keeper plan unblock fn-9-foo.2");
-  expect(body).toContain("NO reply needed");
+  expect(body).toContain("keeper bus chat send work::fn-9-foo.2");
   expect(body).toContain("keeper dispatch work::fn-9-foo.2");
 });
 
