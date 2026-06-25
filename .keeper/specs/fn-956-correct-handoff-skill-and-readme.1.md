@@ -30,5 +30,5 @@ audience):
 - [ ] README.md:3348 no longer uses "oldest" for handoff dispatch order.
 
 ## Done summary
-
+Aligned handoff skill + README with actual CLI behavior: SKILL.md no longer claims the CLI prints the resolved target session (it emits only {ok, handoff_id}), and the README describes dispatch order as handoff_id-lexicographic over a random UUID rather than 'oldest'.
 ## Evidence
