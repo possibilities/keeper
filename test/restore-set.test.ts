@@ -23,6 +23,7 @@ import {
   BURST_MIN_SIZE,
   burstEventIds,
   DEFAULT_IDLE_CUTOFF_SECS,
+  DYING_GENERATION_SCAN_LIMIT,
   deriveCurrentSet,
   deriveLastGenerationSet,
   deriveLastGenerationSetFromTopology,
@@ -1010,7 +1011,7 @@ test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback whe
 });
 
 test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded — a recycled pane_id from another generation never resolves the wrong job", () => {
-  // F5 regression pin: the join keys on (generation_id, pane_id) precisely so a
+  // Recycle-guard pin: the join keys on (generation_id, pane_id) precisely so a
   // tmux pane id reused across server generations cannot cross-resolve. Two jobs
   // share pane %3 under two distinct generations. The wrong-generation row is
   // seeded FIRST (lower rowid) so an unqualified pane_id-only scan would return
@@ -1042,6 +1043,49 @@ test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded
   expect(res.candidates.map((c) => c.job_id)).toEqual(["right-gen"]);
   expect(res.candidates[0]?.resume_target).toBe("dying-occupant");
   expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: DYING_GENERATION_SCAN_LIMIT + 1 G_now snapshots ahead of the dying generation ⇒ labeled fallback", () => {
+  // The dying-generation scan is a DESC-head LIMIT heuristic, not a proven
+  // invariant: stack more than DYING_GENERATION_SCAN_LIMIT G_now snapshots
+  // ahead of the dying generation and the window fills before reaching it, so
+  // selectDyingGenerationSnapshot returns null. The deriver must then demote to
+  // the labeled fallbackNote (degraded but visible), never return a wrong/empty
+  // candidate set silently.
+  seedJob(kdb.db, {
+    job_id: "buried-dying",
+    state: "killed",
+    title: "buried",
+    window_index: 0,
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_generation_id: "gen-dead",
+  });
+  // The dying-generation snapshot sits at the LOWEST rowid; DYING_GENERATION_SCAN_LIMIT + 1
+  // newer G_now snapshots bury it past the DESC-head window.
+  seedTmuxTopologySnapshot(kdb.db, 1, "gen-dead", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 0,
+      job_id: "buried-dying",
+    },
+  ]);
+  for (let i = 0; i <= DYING_GENERATION_SCAN_LIMIT; i++) {
+    seedTmuxTopologySnapshot(kdb.db, 1000 + i, "gen-now", [
+      {
+        pane_id: "%2",
+        session_name: "work",
+        window_index: 0,
+        job_id: "live-now",
+      },
+    ]);
+  }
+  const res = deriveTopo("gen-now");
+  // The dying generation never enters the scan window, so the deriver demotes to
+  // the retrospective fallback and labels it.
+  expect(res.fallbackNote).toBeDefined();
+  expect(res.candidates.map((c) => c.job_id)).not.toContain("buried-dying");
 });
 
 test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot overall is the dying generation", () => {

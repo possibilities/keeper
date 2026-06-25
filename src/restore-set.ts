@@ -171,10 +171,13 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * ever reads past `G_now`'s own leading snapshots (plus any malformed rows ahead
  * of the dying generation). Retention keeps every snapshot row unconditionally
  * (`RETENTION_KEEP_CLASS_PREDICATE`), so without a bound the scan would load the
- * whole snapshot history. This LIMIT is sized far above any plausible count of
- * `G_now`-or-malformed rows stacked ahead of the dying generation, so a deep
- * dying generation is never truncated below its correct snapshot. */
-const DYING_GENERATION_SCAN_LIMIT = 256;
+ * whole snapshot history. This LIMIT is a heuristic sized above the plausible
+ * count of `G_now`-or-malformed rows stacked ahead of the dying generation; it
+ * is not a proven invariant. Should that many rows ever stack ahead, the scan
+ * window fills before reaching the dying generation, `selectDyingGenerationSnapshot`
+ * returns `null`, and the caller demotes to the labeled `fallbackNote` restore
+ * (degraded but visible) — never a silent wrong answer. */
+export const DYING_GENERATION_SCAN_LIMIT = 256;
 
 /**
  * Total-order comparator placing candidates in original visual (left-to-right)
