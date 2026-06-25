@@ -41,5 +41,5 @@ task .2. Until .2 lands, N is read but unused (the hardcoded N=1 mutex still run
 - [ ] `bun run test:full` green (mutex behavior unchanged — still N=1).
 
 ## Done summary
-
+Added max_concurrent_per_root as a runtime-settable autopilot config column (v90, in-memory default 1) riding fn-953's set_autopilot_config: served on the subscribe socket, threaded onto BootStatus and latched client-side (defaults to 1 when absent), and into ReconcileSnapshot/ReconcileState. N is available everywhere but unconsumed (the N=1 mutex still runs); task .2's allocator consumes it.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Wire max_concurrent_per_root config + client",
-  "updated_at": "2026-06-24T23:44:31.392000Z"
+  "updated_at": "2026-06-25T04:31:08.258000Z",
+  "worker_done_at": "2026-06-25T04:31:08.258000Z"
 }
