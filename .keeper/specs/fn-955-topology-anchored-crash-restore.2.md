@@ -40,5 +40,5 @@ Add a topology-anchored sibling to the real-incident regression: seed a dying-ge
 - [ ] Real-incident regression: respawned server + day-old killed rows offers only the live windows
 
 ## Done summary
-
+Added deriveLastGenerationSetFromTopology as the primary --last-generation deriver (dying-gen TmuxTopologySnapshot anchored, selected by probing G_now), demoted the killed-cohort model to a labeled fallback, and wired restore-agents + setup-tmux to the primary.
 ## Evidence
