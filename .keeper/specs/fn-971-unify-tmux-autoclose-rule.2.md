@@ -80,5 +80,5 @@ Then rewrite the README autoclose sections and the two skill docs to the one rul
 - [ ] README autoclose sections + pair/panel skill docs rewritten to the one rule (no fn-ids, no stale 60s/~20s timings, no `disable_orphan_reap`, no "two arms"); `bun run test:full` green
 
 ## Done summary
-
+Collapsed the window-reaper's two tmux arms + orphan raw-process arm into one rule: a keeper-created (birth-session non-null) tmux window reaps when stopped cleanly (stopped/ended, never killed) and idle past a config grace (autoclose_grace_seconds, default 3s), gated by the glob-aware disable_autoclose (live+birth, autopilot included). Removed disable_orphan_reap entirely; docs + tests rewritten.
 ## Evidence
