@@ -12,7 +12,7 @@ description: >-
   RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
   (that is `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash, Monitor
-argument-hint: <what to ask> [--preset <name> | --cli claude|codex] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <name> | --cli claude|codex] [--role …] [--read-only] | panel start|wait
 ---
 
 # pair
@@ -144,6 +144,46 @@ output YAML and a WARNING prints. Treat a `read_only_violation` as a real
 signal that the partner bypassed the posture, not noise. Use `--read-only` for
 any "just look / just review / don't change anything" ask, but know the
 guarantee is best-effort.
+
+## Panel fan-out (`panel start|wait`)
+
+`keeper pair panel` is the cross-OS sub-verb the `plan:panel-runner` agent drives to fan ONE question
+out to a whole panel of models at once. It is the multi-leg sibling of `send`: `send` pairs with one
+partner; `panel` resolves a set of members and launches each as its own detached read-only `send` leg,
+then waits for them all token-free. It runs identically on macOS and Linux — all detachment and polling
+live in the binary, with no `setsid`/`timeout`/`gtimeout` on the path. Two operations:
+
+```
+keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+keeper pair panel wait  --dir <d> [--chunk <s>]
+```
+
+- **`start`** resolves the panel members (a registry panel, a single preset, or the legacy `opus`+`codex`
+  fallback when the name is unknown), mints a scratch dir, copies the prompt in, launches every member as
+  a detached `keeper pair send --read-only` leg in the `panels` session, writes `<dir>/manifest.json`,
+  prints it, and **exits 0 immediately** — it never blocks. Stdout is one line of manifest JSON:
+  `{"dir":"…","members":[{"name","harness","yaml","log","pidfile"},…]}`. Capture `.dir` for the wait.
+- **`wait`** re-reads the manifest and blocks ONE `--chunk` window (default 540s, max 570 — one Bash call
+  is capped at 600s) polling each leg's terminality, then prints the verdict JSON:
+  `{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
+
+Exit semantics drive the agent's re-issue loop:
+
+| Exit | `start` | `wait` |
+|---|---|---|
+| 0 | legs launched; manifest printed | every leg terminal; verdict printed |
+| 124 | — | the chunk elapsed before all legs finished — **re-issue `wait`** |
+| 2 | bad flags / unreadable prompt / a panel that resolves to zero members / an undefined preset / a non-pairable harness | a missing or corrupt manifest, or bad flags |
+
+`wait` **exit 0 means all-terminal, NOT all-success** — key off the verdict's `ok` flag, which is true
+iff every member produced its output `.yaml`. The verdict is content-blind: `wait` reads each `.yaml`
+only for existence and each `.log` only for the wrapper's own `[keeper-pair]` event / `pair:` arg-fault
+lines, never a panelist's answer. The per-member `reason` on a `fail` is that wrapper-sourced diagnostic.
+
+The human-facing `PANEL_RUN_FAILED` marker is owned by the **`plan:panel-runner` agent**, not this
+subcommand: the agent emits it (with the failing legs' reasons and the scratch dir) whenever `start`
+exits non-zero or the verdict's `ok` is false, and otherwise spawns `plan:panel-judge` with the per-member
+`.yaml` paths. Run `keeper pair panel --help` for the full option list.
 
 ## What NOT to do
 
