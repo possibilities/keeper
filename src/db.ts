@@ -175,17 +175,18 @@ export interface KeeperConfig {
   // the `KEEPER_AGENT_PATH` env override + tilde-expansion. Supersedes
   // `agentwrapPath` (read as a deprecated alias).
   keeperAgentPath?: string;
-  // Keeper-managed sessions (`pair`/`panels`/`agentbus`) whose stopped tracked
-  // windows the reaper's managed-session arm leaves OPEN instead of autoclosing
-  // — the debug opt-out. Default EMPTY (every managed session autocloses).
-  // Folded from the `disable_autoclose` YAML list; non-string/empty entries are
-  // dropped. NOT the autopilot session (that arm is verdict-gated, never here).
+  // Keeper-created session tokens (exact names or globs like `panels:*`) whose
+  // stopped tracked windows the reaper leaves OPEN instead of autoclosing — the
+  // debug opt-out. Tested against BOTH the live and birth session; gates EVERY
+  // keeper session, `autopilot` included. Default EMPTY (every keeper session
+  // autocloses). Folded from the `disable_autoclose` YAML list; non-string/empty
+  // entries are dropped.
   disableAutoclose: string[];
-  // Exe-signature SUBSTRINGS the reaper's ORPHAN-process arm (epic fn-934) leaves
-  // ALIVE instead of reaping — the operator opt-out for the raw-process arm.
-  // Folded from the `disable_orphan_reap` YAML list; non-string/empty entries are
-  // dropped. Default EMPTY (every allow-listed runaway class is reapable).
-  disableOrphanReap: string[];
+  // Idle grace (SECONDS) a cleanly-stopped keeper window must sit past before it
+  // autocloses. Folded from the `autoclose_grace_seconds` YAML key; a
+  // non-number / negative / garbage value falls back to
+  // {@link DEFAULT_AUTOCLOSE_GRACE_SECONDS}.
+  autocloseGraceSeconds: number;
   // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
@@ -214,6 +215,15 @@ export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
  * board. The reconciler/board resolve `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT`.
  */
 export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
+
+/**
+ * Default idle grace (SECONDS) the reaper waits after a keeper window stops
+ * cleanly before autoclosing it. Tight — the clean-stop signal plus the
+ * immediate pre-kill re-check carry the safety; this grace only keeps a
+ * just-stopped window alive long enough that a human glancing at it isn't racing
+ * the reaper. Overridable via the `autoclose_grace_seconds` config key.
+ */
+export const DEFAULT_AUTOCLOSE_GRACE_SECONDS = 3;
 
 /** `KEEPER_CONFIG` env wins; else `~/.config/keeper/config.yaml`. Pure. */
 export function resolveConfigPath(): string {
@@ -253,7 +263,7 @@ export function resolveConfig(): KeeperConfig {
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
   let disableAutoclose: string[] = [];
-  let disableOrphanReap: string[] = [];
+  let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
   let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
@@ -262,7 +272,7 @@ export function resolveConfig(): KeeperConfig {
         claudeProjectsRoot,
         agentusageRoot,
         disableAutoclose,
-        disableOrphanReap,
+        autocloseGraceSeconds,
         accountAliases,
       };
     }
@@ -347,16 +357,12 @@ export function resolveConfig(): KeeperConfig {
           .map((s) => s.trim())
           .filter((s) => s !== "");
       }
-      // Best-effort string list — keep only non-empty trimmed strings; a
-      // non-array/absent value leaves the default (empty → reap every
-      // allow-listed orphan-runaway class).
-      const dor = (raw as { disable_orphan_reap?: unknown })
-        .disable_orphan_reap;
-      if (Array.isArray(dor)) {
-        disableOrphanReap = dor
-          .filter((s): s is string => typeof s === "string")
-          .map((s) => s.trim())
-          .filter((s) => s !== "");
+      // Best-effort number — a finite non-negative value wins; a non-number /
+      // negative / NaN leaves the default grace.
+      const ags = (raw as { autoclose_grace_seconds?: unknown })
+        .autoclose_grace_seconds;
+      if (typeof ags === "number" && Number.isFinite(ags) && ags >= 0) {
+        autocloseGraceSeconds = ags;
       }
       // Keep only string→non-empty-string entries; drop the rest.
       const aliases = (raw as { account_aliases?: unknown }).account_aliases;
@@ -380,7 +386,7 @@ export function resolveConfig(): KeeperConfig {
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       disableAutoclose: [],
-      disableOrphanReap: [],
+      autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
       accountAliases: {},
     };
   }
@@ -396,7 +402,7 @@ export function resolveConfig(): KeeperConfig {
     agentwrapPath,
     keeperAgentPath,
     disableAutoclose,
-    disableOrphanReap,
+    autocloseGraceSeconds,
     accountAliases,
   };
 }

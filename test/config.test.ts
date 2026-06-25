@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DEFAULT_AUTOCLOSE_GRACE_SECONDS,
   DEFAULT_MAX_CONCURRENT_JOBS,
   resolveAgentwrapPath,
   resolveConfig,
@@ -264,8 +265,8 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
 });
 
 // ---------------------------------------------------------------------------
-// disable_autoclose (fn-920) — the reaper managed-session opt-out; default
-// empty (every managed session autocloses), best-effort string list.
+// disable_autoclose — the reaper opt-out; default empty (every keeper session
+// autocloses, autopilot included), best-effort string list, glob-aware.
 // ---------------------------------------------------------------------------
 
 test("disableAutoclose defaults to [] when the file is absent", () => {
@@ -314,4 +315,49 @@ test("a disable_autoclose glob pattern parses and resolves through the matcher",
   expect(isDisabled("panels:fn-1")).toBe(true);
   expect(isDisabled("pair")).toBe(true);
   expect(isDisabled("autopilot")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// autoclose_grace_seconds — the single reaper idle grace; default 3, best-effort
+// number (garbage / negative falls back to the default).
+// ---------------------------------------------------------------------------
+
+test("autocloseGraceSeconds defaults when the file is absent", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  expect(resolveConfig().autocloseGraceSeconds).toBe(
+    DEFAULT_AUTOCLOSE_GRACE_SECONDS,
+  );
+});
+
+test("autocloseGraceSeconds defaults when the key is absent", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().autocloseGraceSeconds).toBe(
+    DEFAULT_AUTOCLOSE_GRACE_SECONDS,
+  );
+});
+
+test("autoclose_grace_seconds parses a positive number override", () => {
+  writeConfig("autoclose_grace_seconds: 15\n");
+  expect(resolveConfig().autocloseGraceSeconds).toBe(15);
+});
+
+test("autoclose_grace_seconds accepts 0", () => {
+  writeConfig("autoclose_grace_seconds: 0\n");
+  expect(resolveConfig().autocloseGraceSeconds).toBe(0);
+});
+
+test("a garbage / negative autoclose_grace_seconds falls back to the default", () => {
+  for (const bad of ["not-a-number", "-5", "[]"]) {
+    writeConfig(`autoclose_grace_seconds: ${bad}\n`);
+    expect(resolveConfig().autocloseGraceSeconds).toBe(
+      DEFAULT_AUTOCLOSE_GRACE_SECONDS,
+    );
+  }
+});
+
+test("autoclose_grace_seconds resolves independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\nautoclose_grace_seconds: 9\n");
+  const cfg = resolveConfig();
+  expect(cfg.autocloseGraceSeconds).toBe(9);
+  expect(cfg.roots.length).toBeGreaterThan(0);
 });

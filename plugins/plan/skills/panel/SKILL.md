@@ -67,8 +67,11 @@ default. For a directly invoked `/plan:panel`, answer the question in its natura
 
 **Reveal on demand.** If the human asks how you reached the answer / what contributed / to see the panel,
 *then* surface the composition and point them at the panelist runs — each lands in the `panels` tmux
-session, one `tmux attach -t panels` / `claudectl show-session` away. A substance follow-up ("are you
-sure?", "why?") is not that trigger — answer it substantively in your own voice, not with a panel reveal.
+session, one `tmux attach -t panels` / `claudectl show-session` away. A panel window autocloses once it
+stops cleanly and sits idle past the grace; to keep panel windows open for inspection, set
+`disable_autoclose: ['panels:*']` in `~/.config/keeper/config.yaml` (the opt-out accepts globs). A
+substance follow-up ("are you sure?", "why?") is not that trigger — answer it substantively in your own
+voice, not with a panel reveal.
 
 **Hedge as yourself.** When the fused answer's contradictions or blind spots tell you the answer is
 genuinely uncertain, express that low confidence in your own voice — you are unsure, not "the panel

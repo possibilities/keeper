@@ -435,12 +435,10 @@ Keeper has no `install` verb. Wire it up manually:
      `agentwrap_path` config key and `KEEPER_AGENTWRAP_PATH` env are still read as a
      deprecated alias. The managed-session name is
      hardcoded (`autopilot`), NOT configurable; each dispatch opens a new window
-     inside that shared background session. The window-reaper worker closes an
-     `autopilot` managed window ONLY once its work is verifiably complete (stopped
-     past a short debounce with a completed readiness verdict — gone within ~1-2s);
-     its second arm autocloses a stopped tracked NON-plan job in a keeper-managed
-     session (`pair`/`panels`/`agentbus`) past an idle grace; every other window
-     stays open for inspection.
+     inside that shared background session. The window-reaper worker closes a
+     keeper-created window by ONE rule: it has stopped cleanly and sat idle past
+     the grace (see the autoclose deep-dive). A human-created window is never
+     touched.
    - `dispatch_prompt_prefix` — a global prompt prefix for `keeper dispatch`
      FREE-FORM dispatches (`--prompt`/`--prompt-file`). When set (e.g. `/hack`),
      a free-form prompt launches as `<prefix> <prompt>` (single space) — handy
@@ -457,18 +455,15 @@ Keeper has no `install` verb. Wire it up manually:
      is applied at this ONE site, the launch prompt — never to the doc body.
      A non-empty string only; absent/empty leaves it unset (the launch prompt is
      the bare pointer, no skill boot).
-   - `disable_autoclose` — a list of keeper-managed session names
-     (`pair`/`panels`/`agentbus`) whose stopped tracked windows the reaper's
-     managed-session arm leaves OPEN instead of autoclosing — the debug opt-out.
-     Default EMPTY (every managed session autocloses past the idle grace); a
-     non-string/empty entry is dropped. Does NOT touch the `autopilot` session
-     (its reap is verdict-gated, not idle-gated).
-   - `disable_orphan_reap` — a list of exe-signature SUBSTRINGS the reaper's
-     ORPHAN-process arm (epic fn-934) leaves ALIVE instead of reaping — the
-     operator opt-out for the raw-process arm. An entry that matches a
-     candidate's resolved exe-path vetoes its reaping. Default EMPTY (every
-     allow-listed runaway class is reapable); a non-string/empty entry is
-     dropped.
+   - `disable_autoclose` — a list of keeper-created session tokens (exact names
+     like `pair`, or globs like `panels:*`) whose stopped tracked windows the
+     reaper leaves OPEN instead of autoclosing — the debug opt-out. Tested against
+     BOTH the live and birth session, and it gates EVERY keeper session,
+     `autopilot` included. Default EMPTY (every keeper session autocloses past the
+     grace); a non-string/empty entry is dropped.
+   - `autoclose_grace_seconds` — the idle grace (SECONDS) a keeper window must sit
+     stopped before the reaper closes it. Default `3`; a non-number / negative /
+     garbage value falls back to the default.
    - `usage_scraper_uv_path` / `usage_scraper_project_dir` — the runtime for the
      usage-scraper PRODUCER worker (the in-keeper agentusage producer). The first
      is an absolute path to the `uv` binary (e.g. `/opt/homebrew/bin/uv`); the
@@ -496,8 +491,8 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/src
    claude_projects_root: ~/.claude/projects
    # keeper_agent_path: ~/code/keeper/cli/keeper.ts   # launcher re-exec entry
-   # disable_autoclose: [pair]   # leave these managed sessions' windows open
-   # disable_orphan_reap: [flock_peer]   # exempt these exe-signatures from the orphan reaper
+   # disable_autoclose: [pair, 'panels:*']   # leave these keeper sessions' windows open
+   # autoclose_grace_seconds: 3   # idle grace before a stopped keeper window closes
    # usage_scraper_uv_path: /opt/homebrew/bin/uv      # absolute uv binary
    # usage_scraper_project_dir: ~/code/agentusage     # the scrape util's project
    YAML
@@ -2611,8 +2606,8 @@ a test) emits `DispatchExpired` only if the bind truly never lands. On
 launch-window surfaces by intersecting `list-panes -a -j` with OPEN
 `pending_dispatches` rows — a discharged row = live worker, never reaped — and
 the reap never threw (no-self-heal). That broad pause/boot reap is gone; the
-window-reaper is its narrow, completion-gated successor (a single `killWindow`,
-never a sweep).
+window-reaper is its narrow, clean-stop-and-idle-gated successor (a single
+`killWindow`, never a sweep).
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -3120,22 +3115,25 @@ directory-trust prompt. It is exact-header idempotent (trust is NOT inherited), 
 an O_EXCL lock + post-acquire re-check for concurrent launches, and FAIL-OPEN (never
 throws, never blocks the launch; `KEEPER_CODEX_TRUST_LOG` overrides the log path).
 
-keeper closes a managed window ONLY through the window-reaper worker (epic
-fn-802), via one of its two disjoint arms. The autopilot arm closes a window
-only when the work is VERIFIABLY complete: an autopilot-dispatched
-`work`/`close` job stopped for over 60s with a `{tag:"completed"}` readiness
-verdict. The managed-session arm (epic fn-920) autocloses a stopped tracked
-NON-plan job (`plan_verb` NULL) in a keeper-managed session
-(`pair`/`panels`/`agentbus`) past `REAP_MANAGED_SESSION_IDLE_SEC`, keyed on the
-frozen birth-session allow-list so a human's hand-started claude window is never
-reaped, and skipped for any session in the `disable_autoclose` config list
-(default empty). The two arms are disjoint (the managed-session arm excludes the
-`autopilot` session), so no job is double-handled. Every other window — pending,
-live, working, or worker-ended-incomplete — stays open for inspection until the
-human closes it. There is no broad launch-window pause-ghost reap and no
-`autoclose_windows` config key; the window-reaper is the only close path —
-narrow and evidence-gated (`killWindow` on a single managed pane, never a
-`list-panes` sweep-and-close). The
+keeper closes a managed window ONLY through the window-reaper worker, via ONE
+rule (no arms, no readiness verdict): a job's window closes iff keeper created
+its session (birth-session non-null — the identity test; a human window carries a
+live session name but a NULL birth, so keying on birth keeps the reaper off it),
+the backend is tmux, the row stopped CLEANLY (`stopped`/`ended`, never `killed` —
+a crashed window stays open for forensics), an idle grace
+(`autoclose_grace_seconds`, default 3s) has elapsed, the pane id is present, and
+the `disable_autoclose` opt-out (glob-aware, tested against BOTH the live and
+birth session, default empty) matches neither. The `autopilot` session is reaped
+by this same rule and gated by `disable_autoclose` like any other. Dropping the
+old readiness-verdict gate means a cleanly-stopped-but-incomplete plan worker is
+now reaped, its slot frees, and autopilot re-dispatches (bounded by
+`REDISPATCH_COOLDOWN_S`). A human-created window (NULL birth) is never touched,
+and a `killed` window stays open. There is no broad launch-window pause-ghost
+reap and no `autoclose_windows` config key; the window-reaper is the only close
+path — narrow and evidence-gated (`killWindow` on a single managed pane, never a
+`list-panes` sweep-and-close), and keeper does NOT reap runaway raw OS processes
+(a leaked `bun test` tree or busy-loop shell is fixed at its source, not
+SIGKILLed by the daemon). The
 pending-dispatch row still discharges on `SessionStart` or the 120s TTL sweep
 (above), independent of the reaper. The close-row
 readiness verdict still rides the fn-764 wind-down read: the default epics read
@@ -3361,60 +3359,37 @@ unhandled throw out of the watch loop escalates via `onerror`/`close` →
 fatalExit. Human windows get useful tab names for free; autopilot's managed
 windows (deliberately launched unnamed) finally get labels.
 
-A **twelfth** Worker thread is the tmux window-reaper (epic fn-802): a pure
-EXTERNAL ACTUATOR that opens its own read-only connection and drives a
-single-flight cycle from BOTH `PRAGMA data_version` pulses (via the shared
-`watchLoop`) AND a coarse ~20s periodic tick — the tick is LOAD-BEARING, not
-telemetry, because the 60s completion threshold elapsing writes NOTHING to the
-DB, so no pulse fires on aging alone and time itself must wake the cycle. Each
-cycle loads the SAME `loadReconcileSnapshot` the autopilot reconciler uses
-(including the merged recently-done epics read — the `epics_recent_done`
-collection, time-bounded to `updated_at >= now - 1800s` — that keeps a done
-epic's close-row `completed` verdict observable through its done→idle wind-down),
-runs `computeReadiness` at unix-seconds now, and selects
-reap candidates from TWO disjoint arms. The autopilot arm selects the rows
-passing the FULL predicate: managed session (`autopilot`) AND a `work`/`close`
-verb with a `plan_ref` AND `state='stopped'` for over 60s AND a non-null pane id
-AND a non-null pid AND a `{tag:"completed"}` verdict looked up BY VERB (work →
-`perTask`, close → `perCloseRow` — never both maps, so an approve row's `perTask`
-verdict can't leak through). The managed-session arm (epic fn-920) selects a
-stopped tracked NON-plan job (`plan_verb` NULL) whose birth session is in the
-`pair`/`panels`/`agentbus` allow-list, idle past `REAP_MANAGED_SESSION_IDLE_SEC`,
-and NOT in the `disable_autoclose` config opt-out (default empty) — no readiness
-verdict, just the idle clock, so a human's hand-started claude window (NULL
-birth-session) is never reaped. The arms are disjoint on session, so no job is
-double-handled. Immediately before each
-kill it re-runs the full predicate against a FRESH snapshot and requires the
-SAME job to still pass (the CWE-367 TOCTOU mitigation: a resume that flipped the
-verdict aborts the kill), then fires `killWindow` on the stable `%N` pane handle
-(rename-proof against the concurrent renamer) and stamps an in-memory ~10min
-per-job cooldown so a SIGHUP-absorbing process or an already-gone window doesn't
-re-spawn tmux every cycle. It writes NOTHING to the DB and posts NOTHING to main
-— row terminalization flows through the existing exit-watcher → synthetic
-`Killed` mint (pid + start_time match), the SOLE truth of the death; the kill is
-never assumed to have sufficed. The cooldown is in-memory only, so a restart
-re-derives and re-kills once (an idempotent no-op against a closed window). One
-stderr audit line per attempt is the only trace it leaves.
-
-The same worker carries a THIRD arm (epic fn-934) that reaps RAW OS PROCESSES —
-not tmux windows — that agent test activity orphaned on the shared host
-(orphaned `bun test` worker trees, infinite-loop shell harnesses, leaked
-`flock_peer` fixtures; the incident pegged a 10-core host to load ~188 and
-starved keeperd to 0.9% CPU). Because killing the wrong process is catastrophic,
-the kill GATE is a CLOSED CONJUNCTION (every clause load-bearing): `uid == self`
-AND the proc-info read SUCCEEDED (a partial/failed read is can't-confirm) AND
-`ppid == 1` (a reparented orphan) AND the resolved EXE PATH (never the spoofable,
-16-char-truncated process NAME) matches a CLOSED allow-list minus the
-`disable_orphan_reap` exemptions AND age > several-minutes (the launch-race
-guard) AND the pid is NOT in keeper's own live set (keeperd's pid + every
-non-terminal `jobs` pid). It kills via a NET-NEW raw-pid actuator
-(`process.kill`, distinct from `killWindow`), re-fingerprinting `(pid,start_time)`
-immediately before the signal (the CWE-367 pid-reuse guard — a recycled pid
-aborts). Escalation is two-phase WITHOUT a blocking in-cycle sleep: a first match
-SIGTERMs and stamps an in-memory `(pid,start_time)` cooldown; the NEXT tick that
-still sees the SAME `(pid,start_time)` alive SIGKILLs. The arm NEVER throws (every
-probe/kill failure is a logged non-fatal skip — a throw would crash the worker)
-and emits an `arm=orphan` audit line per attempt.
+A **twelfth** Worker thread is the tmux window-reaper: a pure EXTERNAL ACTUATOR
+that opens its own read-only connection and drives a single-flight cycle from
+BOTH `PRAGMA data_version` pulses (via the shared `watchLoop`) AND a coarse ~1s
+periodic tick — the tick is LOAD-BEARING, not telemetry, because the idle grace
+elapsing writes NOTHING to the DB, so no pulse fires on aging alone and time
+itself must wake the cycle. Each cycle does a light read of the `jobs` projection
+(no reconcile snapshot, no readiness verdict) and applies ONE unified predicate:
+a window reaps iff keeper created its session (`backend_exec_birth_session_id`
+non-null — the identity test; a human window carries a live session name but a
+NULL birth, so keying on birth keeps the reaper off it) AND the backend is tmux
+AND the row stopped CLEANLY (`state ∈ {stopped, ended}`, never `killed`) AND it
+sat idle past `autoclose_grace_seconds` (default 3) AND the pane id is present AND
+the `disable_autoclose` opt-out (glob-aware, tested against BOTH the live and
+birth session, default empty) matches neither. The `autopilot` session is reaped
+by this same rule and gated by `disable_autoclose` like any other — there is no
+readiness verdict and no `plan_verb` filter, so a cleanly-stopped-but-incomplete
+plan worker is reaped, its slot frees, and autopilot re-dispatches (bounded by
+`REDISPATCH_COOLDOWN_S`). Immediately before each kill it re-reads fresh and
+requires the SAME job to still pass (the CWE-367 TOCTOU mitigation: a resume that
+flipped `stopped → working` aborts the kill), then fires `killWindow` on the
+stable `%N` pane handle (rename-proof against the concurrent renamer) and stamps
+an in-memory ~10min per-job cooldown so a SIGHUP-absorbing process or an
+already-gone window doesn't re-spawn tmux every cycle. It writes NOTHING to the DB
+and posts NOTHING to main — row terminalization flows through the existing
+exit-watcher → synthetic `Killed` mint (pid + start_time match), the SOLE truth
+of the death; the kill is never assumed to have sufficed. The cooldown is
+in-memory only, so a restart re-derives and re-kills once (an idempotent no-op
+against a closed window). One stderr audit line per attempt is the only trace it
+leaves. keeper does NOT reap runaway raw OS processes — a leaked `bun test` tree,
+busy-loop shell harness, or stuck fixture is a test/fixture bug fixed at its
+source, not something the control daemon SIGKILLs on the shared host.
 
 A **thirteenth** Worker thread is the Agent Bus relay (epic fn-875): a local
 inter-agent message bus that is PHYSICALLY OUT of keeper.db's blast radius. It
@@ -3455,8 +3430,8 @@ mints/owns the window, and holds the pane open after claude exits — so there i
 ONE launch transport, not a separate shell-wrapper. Single-flighted per session,
 liveness- and cooldown-gated, fail-open. The relay itself NEVER spawns — wake is entirely the
 CLI verb — and a stopped tracked `agentbus` window is autoclosed by the
-window-reaper's managed-session arm (epic fn-920) past the idle grace, alongside
-`pair`/`panels`. Liveness is socket-close, NOT a heartbeat: a peer's
+window-reaper's single unified rule past the idle grace, alongside
+`pair`/`panels` and `autopilot`. Liveness is socket-close, NOT a heartbeat: a peer's
 death closes its fd → kernel FIN → the relay drops the channel, with no periodic
 liveness timer; boot rehydration still drops dead pids. `keeper bus list` is
 informational only, never a send precondition (there is no `resolve` subcommand —

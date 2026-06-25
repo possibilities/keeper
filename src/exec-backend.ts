@@ -125,8 +125,8 @@ export const MANAGED_EXEC_SESSION = "autopilot" as const;
 /** The dedicated managed-session name `keeper bus wake` resumes an offline
  *  planner@<epic> creator into. Hardcoded, distinct from {@link
  *  MANAGED_EXEC_SESSION} so woken planners never share a window list with
- *  autopilot dispatch. Window reaping for this session is owned by the reaper's
- *  managed-session arm (epic fn-920); this constant only names the spawn target. */
+ *  autopilot dispatch. The reaper autocloses its stopped windows via the single
+ *  unified rule; this constant only names the spawn target. */
 export const AGENTBUS_EXEC_SESSION = "agentbus" as const;
 
 /** Default tmux session name `keeper pair` partners land in (mirrors
@@ -136,22 +136,6 @@ export const PAIR_EXEC_SESSION = "pair" as const;
 
 /** tmux session name `/plan:panel` legs land in. */
 export const PANELS_EXEC_SESSION = "panels" as const;
-
-/**
- * The keeper-managed sessions the reaper's managed-session arm (epic fn-920)
- * autocloses: stopped tracked NON-plan jobs whose frozen birth-session is one of
- * these are reaped past the idle grace, unless the session is in the operator's
- * `disable_autoclose` opt-out. A human's hand-started claude folds to a NULL
- * `plan_verb` too, so this allow-list — keyed on the frozen `KEEPER_TMUX_SESSION`
- * keeper stamps ONLY on its own launches — is the ONLY thing that keeps the arm
- * off a human window. DELIBERATELY excludes {@link MANAGED_EXEC_SESSION}: the
- * autopilot session is handled by the verdict-gated arm, so the arms never overlap.
- */
-export const MANAGED_AUTOCLOSE_SESSIONS: ReadonlySet<string> = new Set([
-  PAIR_EXEC_SESSION,
-  PANELS_EXEC_SESSION,
-  AGENTBUS_EXEC_SESSION,
-]);
 
 /** Read a `ReadableStream` into a string. Returns `""` on null/empty. */
 async function streamToText(s: ReadableStream | null): Promise<string> {
