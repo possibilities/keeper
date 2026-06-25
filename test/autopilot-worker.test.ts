@@ -47,6 +47,7 @@ import {
   type DispatchKey,
   FINALIZER_GUARD_S,
   type FoundJob,
+  isEpicDoneById,
   isEpicInFlight,
   isFinalizerGuarded,
   isFinalizerVerb,
@@ -59,7 +60,9 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
+  recoverWorktrees,
   refreshSuppressionForOpenPending,
+  reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
   sweepFinalizerGuard,
@@ -69,6 +72,7 @@ import {
   WORKER_MODEL,
   type WorktreeDriver,
   type WorktreeLaunchInfo,
+  type WorktreeRecoveryFailure,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -3669,17 +3673,20 @@ interface FakeWorktreeLog {
   provisions: WorktreeLaunchInfo[];
   finalizes: WorktreeLaunchInfo[];
   assertCwds: string[];
+  recoverRepos: string[][];
 }
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
+  recoverFailures?: WorktreeRecoveryFailure[];
 }): { driver: WorktreeDriver; log: FakeWorktreeLog } {
   const log: FakeWorktreeLog = {
     calls: [],
     provisions: [],
     finalizes: [],
     assertCwds: [],
+    recoverRepos: [],
   };
   const driver: WorktreeDriver = {
     async provision(info) {
@@ -3708,6 +3715,11 @@ function makeFakeWorktreeDriver(opts?: {
         return { ok: false, reason };
       }
       return { ok: true };
+    },
+    async recover(repos) {
+      log.calls.push(`recover:${[...repos].join(",")}`);
+      log.recoverRepos.push([...repos]);
+      return opts?.recoverFailures ?? [];
     },
   };
   return { driver, log };
@@ -4153,4 +4165,337 @@ test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the defa
     expect(res.reason).toContain("not-on-default-branch");
     expect(res.reason).toContain("expected main");
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-959.7 — producer-only worktree crash/restart recovery (recoverWorktrees,
+// reposForRecovery, isEpicDoneById). Fast tier drives the two passes with a
+// hand-built fake GitRunner; the real-git lifecycle lives in the slow test.
+// ---------------------------------------------------------------------------
+
+test("fn-959.7 reposForRecovery: deduped, non-empty project_dirs", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-a", project_dir: "/repo-a" }),
+    makeEpic({ epic_id: "fn-2-b", project_dir: "/repo-a" }), // shares /repo-a
+    makeEpic({ epic_id: "fn-3-c", project_dir: "/repo-c" }),
+    makeEpic({ epic_id: "fn-4-d", project_dir: null }), // absent → skipped
+    makeEpic({ epic_id: "fn-5-e", project_dir: "" }), // empty → skipped
+  ];
+  expect(reposForRecovery(epics)).toEqual(["/repo-a", "/repo-c"]);
+});
+
+/**
+ * A stateful fake GitRunner for the recovery passes. Models a per-cwd MERGE_HEAD
+ * flag, a registered worktree list, the `keeper/epic/*` base set, the default
+ * branch, each base's already-merged (ancestor) status, the main worktree's HEAD,
+ * and whether a `merge`/`push` succeeds — enough to drive both recovery passes
+ * without real git. Records the issued argv per cwd so a test asserts the
+ * abort/prune/merge/push sequence.
+ */
+function makeRecoveryGit(state: {
+  worktreeList?: string; // git worktree list --porcelain stdout
+  mergeHeadAt?: Set<string>; // cwds with a stale MERGE_HEAD
+  epicBases?: string[]; // keeper/epic/<id> short refs (for-each-ref output)
+  defaultBranch?: string; // resolved via symbolic-ref
+  ancestors?: Set<string>; // branches already an ancestor of default
+  repoHead?: string; // main worktree current branch
+  mergeConflict?: boolean; // a real merge hits a conflict
+  pushFails?: boolean;
+}): {
+  run: Parameters<typeof recoverWorktrees>[2];
+  calls: { cwd: string; args: string }[];
+  lock: NonNullable<Parameters<typeof recoverWorktrees>[3]>;
+} {
+  const calls: { cwd: string; args: string }[] = [];
+  // A no-op lock acquirer so the merge path never touches the real FFI flock
+  // (the slow real-git test covers the actual flock-around-merge contract).
+  const lock: NonNullable<Parameters<typeof recoverWorktrees>[3]> = () => ({
+    release() {},
+  });
+  const run: Parameters<typeof recoverWorktrees>[2] = async (args, o) => {
+    const cwd = o?.cwd ?? "";
+    const joined = args.join(" ");
+    calls.push({ cwd, args: joined });
+    if (joined.startsWith("worktree list")) {
+      return { code: 0, stdout: state.worktreeList ?? "", stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+      const present = state.mergeHeadAt?.has(cwd) ?? false;
+      return {
+        code: present ? 0 : 1,
+        stdout: present ? "head\n" : "",
+        stderr: "",
+      };
+    }
+    if (joined === "merge --abort") {
+      state.mergeHeadAt?.delete(cwd);
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree prune")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
+      return {
+        code: 0,
+        stdout: (state.epicBases ?? []).join("\n"),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return {
+        code: 0,
+        stdout: `origin/${state.defaultBranch ?? "main"}\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("for-each-ref")) {
+      // local-branch enumeration for resolveDefaultBranch fallback
+      return {
+        code: 0,
+        stdout: `${state.defaultBranch ?? "main"}\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      const branch = args[2];
+      return {
+        code: state.ancestors?.has(branch) ? 0 : 1,
+        stdout: "",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return {
+        code: 0,
+        stdout: `${state.repoHead ?? state.defaultBranch ?? "main"}\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("rev-parse --git-common-dir")) {
+      return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return state.mergeConflict
+        ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "push") {
+      return state.pushFails
+        ? { code: 1, stdout: "", stderr: "remote rejected\n" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls, lock };
+}
+
+test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane → abort + prune", async () => {
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set([lane]),
+    epicBases: [], // no done-but-unmerged work in this scenario
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  // The lane's stale merge was aborted, and the repo's worktrees pruned once.
+  expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
+    true,
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args.startsWith("worktree prune")),
+  ).toBe(true);
+});
+
+test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async () => {
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set(), // clean
+    epicBases: [],
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(calls.some((c) => c.args.startsWith("worktree prune"))).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(), // base is NOT yet merged
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-1-foo", // epic is done
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.some(
+      (c) =>
+        c.cwd === "/repo" && c.args === "merge --no-edit keeper/epic/fn-1-foo",
+    ),
+  ).toBe(true);
+  expect(calls.some((c) => c.cwd === "/repo" && c.args === "push")).toBe(true);
+});
+
+test("fn-959.7 recoverWorktrees: already-merged base → idempotent skip (no merge, no push)", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(["keeper/epic/fn-1-foo"]), // already an ancestor of default
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  expect(calls.some((c) => c.args === "push")).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: open (not-done) epic base → skipped, never merged", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false, // epic still open
+    run,
+  );
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: backstop merge conflict → keyed failure on the epic, no push", async () => {
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    mergeConflict: true,
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-conflict");
+  expect(failures[0]?.dir).toBe("/repo");
+  // No push on a conflict.
+  expect(calls.some((c) => c.args === "push")).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: main worktree off the default branch → loud failure, no merge", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/feature-x\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "feature-x", // NOT on default
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-not-on-default");
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: push failure on a recovered merge → keyed failure", async () => {
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    pushFails: true,
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-push-failed");
+});
+
+test("fn-959.7 recoverWorktrees: rib branches are excluded from the base backstop", async () => {
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    // A rib (extra `/` segment) plus the base; only the base may merge to default.
+    epicBases: ["keeper/epic/fn-1-foo", "keeper/epic/fn-1-foo/fn-1-foo.2"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  // Only the base merged — never the rib.
+  expect(
+    calls
+      .filter((c) => c.args.startsWith("merge --no-edit"))
+      .map((c) => c.args),
+  ).toEqual(["merge --no-edit keeper/epic/fn-1-foo"]);
+});
+
+test("fn-959.7 recoverWorktrees: repos are deduped — one sweep per distinct repo", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: [],
+  });
+  await recoverWorktrees(["/repo", "/repo", "/repo"], async () => false, run);
+  // The worktree-list probe (pass 1 entry) ran exactly once despite three repo entries.
+  expect(calls.filter((c) => c.args.startsWith("worktree list"))).toHaveLength(
+    1,
+  );
+});
+
+test("fn-959.7 isEpicDoneById: pk-lookup resolves a DONE epic unbounded by the recent-done window", async () => {
+  await withSeededDb(async (db) => {
+    // A done epic whose `updated_at` is FAR past the 1800s recent-done window —
+    // `epics_recent_done` would NOT return it, but the pk-lookup (no recency
+    // bound, OPEN-scope bypassed) must, which is the whole point of the decoupled
+    // backstop. Plus an open epic and an absent id.
+    const nowSec = Math.floor(Date.now() / 1000);
+    seedEpicRow(db, "fn-1-done", {
+      epic_number: 1,
+      status: "done",
+      updated_at: nowSec - DONE_EPICS_REAP_WINDOW_SEC - 10_000, // way past the window
+    });
+    seedEpicRow(db, "fn-2-open", { epic_number: 2, status: "open" });
+    expect(await isEpicDoneById(db, "fn-1-done")).toBe(true);
+    expect(await isEpicDoneById(db, "fn-2-open")).toBe(false);
+    expect(await isEpicDoneById(db, "fn-3-absent")).toBe(false);
+
+    // Sanity: the SAME stale done epic is INVISIBLE to the window-bounded snapshot
+    // read, proving the pk-lookup is genuinely decoupled from the 1800s window.
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.epics.map((e) => e.epic_id)).not.toContain("fn-1-done");
+  });
 });

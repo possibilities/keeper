@@ -300,6 +300,99 @@ export async function pruneWorktrees(
 }
 
 /**
+ * True IFF a merge is mid-flight at `cwd` (`MERGE_HEAD` present). A crash between
+ * `git merge` starting and committing leaves `MERGE_HEAD`; the recovery path
+ * detects it here, aborts, and prunes so the next reconcile cycle re-runs the
+ * merge from a clean state (level-triggered retry, no in-process self-heal).
+ */
+export async function hasMergeInProgress(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const r = await run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], {
+    cwd,
+  });
+  return r.code === 0;
+}
+
+/**
+ * Abort an interrupted merge at `cwd` IFF a `MERGE_HEAD` is present (guarded so a
+ * tree with no merge in flight is never spuriously `merge --abort`ed). Returns
+ * `true` when it aborted, `false` when there was nothing to abort. Producer-only
+ * recovery: the caller follows with a `pruneWorktrees` and lets the next cycle
+ * re-attempt the merge.
+ */
+export async function abortInterruptedMerge(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  if (!(await hasMergeInProgress(cwd, run))) {
+    return false;
+  }
+  await run(["merge", "--abort"], { cwd });
+  return true;
+}
+
+/**
+ * True IFF `maybeAncestor` is an ancestor of `ref` (`git merge-base --is-ancestor`
+ * exit 0). The idempotency guard for the done-but-unmerged backstop: an epic base
+ * already merged into the default branch is its ancestor, so the backstop SKIPS it
+ * (never a double-merge). A non-existent ref / non-repo cwd → `false` (treat an
+ * unresolvable pair as "not merged", the conservative branch — the merge attempt
+ * that follows fails loud rather than silently skipping a real orphan).
+ */
+export async function isAncestorOf(
+  cwd: string,
+  maybeAncestor: string,
+  ref: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const r = await run(["merge-base", "--is-ancestor", maybeAncestor, ref], {
+    cwd,
+  });
+  return r.code === 0;
+}
+
+/**
+ * Enumerate the epic BASE branches (`keeper/epic/<epic_id>`) that still exist as
+ * local refs — the done-but-unmerged backstop's candidate set, sourced from LIVE
+ * git (never a window-bounded projection read), so a daemon restart between an
+ * epic-done and its merge-to-default can never orphan the merge. RIB branches
+ * (`keeper/epic/<epic_id>/<task_id>`, which carry an extra `/` segment) are
+ * EXCLUDED: only the base merges into the default branch. Returns each match as
+ * `{ branch, epicId }` with the `keeper/epic/` prefix stripped to recover the
+ * epic id. Order is git's ref order (stable enough; the caller cross-references
+ * each id independently so order is not load-bearing).
+ */
+export async function listEpicBaseBranches(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<{ branch: string; epicId: string }[]> {
+  const r = await run(
+    ["for-each-ref", "--format=%(refname:short)", "refs/heads/keeper/epic"],
+    { cwd },
+  );
+  if (r.code !== 0) {
+    return [];
+  }
+  const prefix = "keeper/epic/";
+  const out: { branch: string; epicId: string }[] = [];
+  for (const raw of r.stdout.split("\n")) {
+    const branch = raw.trim();
+    if (!branch.startsWith(prefix)) {
+      continue;
+    }
+    const rest = branch.slice(prefix.length);
+    // A rib branch carries a `/` (`<epic_id>/<task_id>`); the base does not.
+    if (rest.length === 0 || rest.includes("/")) {
+      continue;
+    }
+    out.push({ branch, epicId: rest });
+  }
+  return out;
+}
+
+/**
  * Ensure a worktree exists at `path` on `branch`, forked off `commitish` (the
  * parent lane's committed tip, or the base branch for a root). Idempotent + crash-
  * recoverable:

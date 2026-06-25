@@ -86,13 +86,19 @@ import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
+  abortInterruptedMerge as gitAbortInterruptedMerge,
   currentBranch as gitCurrentBranch,
   ensureWorktree as gitEnsureWorktree,
+  isAncestorOf as gitIsAncestorOf,
+  listEpicBaseBranches as gitListEpicBaseBranches,
   listWorktrees as gitListWorktrees,
   mergeBranchInto as gitMergeBranchInto,
+  pruneWorktrees as gitPruneWorktrees,
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
+  type LockAcquirer,
   type MergeResult,
+  type WorktreeEntry,
 } from "./worktree-git";
 import {
   CLOSE_SINK_ID,
@@ -858,6 +864,43 @@ export interface WorktreeDriver {
   assertOnDefaultBranch(
     cwd: string,
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * fn-959.7 — producer-only crash/restart recovery, run BEFORE each reconcile
+   * cycle (so it also covers the boot drain — the first cycle is the post-restart
+   * sweep). Two idempotent passes over LIVE git, never a window-bounded projection
+   * read, so a restart between an epic-done and its merge-to-default cannot orphan
+   * the work:
+   *  1. INTERRUPTED MERGE: for every registered linked worktree across `repos`,
+   *     detect a stale `MERGE_HEAD` (a crash mid-merge) → `git merge --abort` →
+   *     `git worktree prune --expire now`. The next cycle re-runs the merge from a
+   *     clean state (level-triggered retry, no in-process self-heal).
+   *  2. DONE-BUT-UNMERGED BACKSTOP: enumerate `keeper/epic/<id>` base branches
+   *     from git; for each whose epic `isEpicDone` reports done but whose base is
+   *     NOT yet an ancestor of the resolved default branch, merge it to default +
+   *     push (idempotent: an already-merged base is skipped). DECOUPLED from
+   *     `DONE_EPICS_REAP_WINDOW_SEC`.
+   *
+   * Returns the failures (if any) for the caller to mint as sticky DispatchFailed;
+   * a recovery failure NEVER throws past the driver (a producer git error must not
+   * wedge the cycle).
+   */
+  recover(
+    repos: readonly string[],
+    isEpicDone: (epicId: string) => Promise<boolean>,
+  ): Promise<WorktreeRecoveryFailure[]>;
+}
+
+/**
+ * fn-959.7 — one recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
+ * `epicId` is set for a done-but-unmerged backstop failure (keyed onto the
+ * `close::<epicId>` sticky DispatchFailed); `null` for a merge-abort/prune failure
+ * tied to a worktree path rather than an epic. `dir` is the repo the failure
+ * occurred in.
+ */
+export interface WorktreeRecoveryFailure {
+  epicId: string | null;
+  reason: string;
+  dir: string;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -2159,7 +2202,221 @@ export function createWorktreeDriver(
         };
       }
     },
+    recover(repos, isEpicDone) {
+      return recoverWorktrees(repos, isEpicDone, run);
+    },
   };
+}
+
+/**
+ * fn-959.7 — the producer-only crash/restart recovery sweep wrapped by
+ * {@link WorktreeDriver.recover}. Exported so the fast tier drives both passes
+ * with a fake {@link WorktreeGitRunner}; the real-git lifecycle lives in the slow
+ * test. Pure of keeper.db / folds / the wall clock — it reads ONLY live git plus
+ * the injected `isEpicDone` done-ness probe.
+ *
+ * Pass 1 (interrupted-merge abort): every linked worktree under each repo (the
+ * registered base + ribs) is checked for a stale `MERGE_HEAD`; when present, abort
+ * the merge then prune the repo's worktree admin entries. The next reconcile cycle
+ * re-runs the merge from a clean tree (level-triggered retry).
+ *
+ * Pass 2 (done-but-unmerged backstop): every `keeper/epic/<id>` base branch in
+ * each repo whose epic `isEpicDone` reports done but whose base is NOT yet an
+ * ancestor of the resolved default branch is merged into default (in the MAIN
+ * worktree, on the default branch) + pushed once. Idempotent: an already-merged
+ * base is skipped via `merge-base --is-ancestor`. DECOUPLED from the 1800s
+ * recent-done window — git is the authority for which bases still need merging.
+ *
+ * Every git error is caught and returned as a {@link WorktreeRecoveryFailure}; a
+ * recovery error NEVER throws past here so a producer git failure can't wedge the
+ * cycle.
+ */
+export async function recoverWorktrees(
+  repos: readonly string[],
+  isEpicDone: (epicId: string) => Promise<boolean>,
+  run: WorktreeGitRunner = gitExec,
+  acquireLock?: LockAcquirer,
+): Promise<WorktreeRecoveryFailure[]> {
+  const failures: WorktreeRecoveryFailure[] = [];
+  // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
+  // once. A repo whose main worktree is the same path is collapsed by the set.
+  const seen = new Set<string>();
+  const uniqueRepos: string[] = [];
+  for (const r of repos) {
+    const key = stripTrailingSlashPath(r.trim());
+    if (key.length === 0 || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    uniqueRepos.push(r);
+  }
+
+  for (const repo of uniqueRepos) {
+    // --- Pass 1: abort any interrupted merge in a live linked worktree. ---
+    let entries: WorktreeEntry[];
+    try {
+      entries = await gitListWorktrees(repo, run);
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-list-failed: ${errMsg(err)}`,
+        dir: repo,
+      });
+      continue;
+    }
+    let prunedThisRepo = false;
+    for (const entry of entries) {
+      if (entry.bare || entry.branch === null) {
+        continue; // a bare/detached entry carries no lane merge to recover
+      }
+      try {
+        const aborted = await gitAbortInterruptedMerge(entry.path, run);
+        if (aborted) {
+          // Prune ONCE per repo after the first abort — a `merge --abort` can
+          // leave the admin entry healthy, but pruning clears any stale orphan a
+          // crash left so the next `ensureWorktree` re-adds cleanly.
+          if (!prunedThisRepo) {
+            await gitPruneWorktrees(repo, run);
+            prunedThisRepo = true;
+          }
+        }
+      } catch (err) {
+        failures.push({
+          epicId: null,
+          reason: `worktree-recover-abort-failed: ${entry.path} — ${errMsg(err)}`,
+          dir: repo,
+        });
+      }
+    }
+
+    // --- Pass 2: merge any done-but-unmerged epic base into the default branch. ---
+    let bases: { branch: string; epicId: string }[];
+    try {
+      bases = await gitListEpicBaseBranches(repo, run);
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-base-list-failed: ${errMsg(err)}`,
+        dir: repo,
+      });
+      continue;
+    }
+    if (bases.length === 0) {
+      continue;
+    }
+    let defaultBranch: string;
+    try {
+      defaultBranch = await gitResolveDefaultBranch(repo, run);
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-default-branch-failed: ${errMsg(err)}`,
+        dir: repo,
+      });
+      continue;
+    }
+    for (const base of bases) {
+      try {
+        if (!(await isEpicDone(base.epicId))) {
+          continue; // epic still open — its base is merged by `finalizeEpic`, not here
+        }
+        // Idempotency guard: an already-merged base is an ancestor of default.
+        if (await gitIsAncestorOf(repo, base.branch, defaultBranch, run)) {
+          continue;
+        }
+        // The merge runs in the MAIN worktree (the repo dir), which must be on the
+        // default branch for the base to land there. A non-default HEAD means a
+        // human (or another lane) is mid-checkout — fail loud, retry next cycle.
+        const head = await gitCurrentBranch(repo, run);
+        if (head !== defaultBranch) {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-not-on-default: ${repo} HEAD is ${head}, expected ${defaultBranch} to merge ${base.branch}`,
+            dir: repo,
+          });
+          continue;
+        }
+        const merge: MergeResult = acquireLock
+          ? await gitMergeBranchInto(repo, base.branch, run, acquireLock)
+          : await gitMergeBranchInto(repo, base.branch, run);
+        if (merge.kind === "conflict") {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+            dir: repo,
+          });
+          continue;
+        }
+        // Push the recovered merge once (the per-lane pushes were skipped).
+        const push = await run(["push"], { cwd: repo });
+        if (push.code !== 0) {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-push-failed: ${(push.stdout + push.stderr).trim()}`,
+            dir: repo,
+          });
+        }
+      } catch (err) {
+        failures.push({
+          epicId: base.epicId,
+          reason: `worktree-recover-failed: ${base.branch} — ${errMsg(err)}`,
+          dir: repo,
+        });
+      }
+    }
+  }
+  return failures;
+}
+
+/** Compact an unknown thrown value to its message string. */
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * fn-959.7 — the deduped, non-empty repo dirs to sweep in the worktree recovery
+ * pass: every snapshot epic's `project_dir` (the main worktree each epic's lanes
+ * fork off). The recovery scan itself enumerates `keeper/epic/*` bases per repo
+ * from live git, so this only narrows the sweep to repos autopilot actually
+ * tracks (an empty/absent `project_dir` contributes nothing).
+ */
+export function reposForRecovery(epics: readonly Epic[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const epic of epics) {
+    const dir = epic.project_dir;
+    if (dir == null || dir === "" || seen.has(dir)) {
+      continue;
+    }
+    seen.add(dir);
+    out.push(dir);
+  }
+  return out;
+}
+
+/**
+ * fn-959.7 — the done-ness probe the recovery backstop threads into the driver.
+ * A pk-lookup read of the `epics` projection by `epic_id` (which bypasses the
+ * default OPEN scope AND any recency floor in `resolveFilter`), so a DONE epic is
+ * resolved UNBOUNDED by `DONE_EPICS_REAP_WINDOW_SEC` — the whole point of the
+ * decoupled backstop. Returns `true` IFF the epic exists and `status === "done"`.
+ * A read-time producer probe (never a fold).
+ */
+export function isEpicDoneById(
+  db: Parameters<typeof runQuery>[0],
+  epicId: string,
+): Promise<boolean> {
+  const frame = {
+    type: "query" as const,
+    collection: "epics",
+    id: `autopilot-recover-epic-${epicId}`,
+    filter: { epic_id: epicId },
+    limit: 1,
+  };
+  const res = runQuery(db, 0, frame);
+  const rows = res.type === "result" ? res.rows : [];
+  const status = (rows[0] as { status?: unknown } | undefined)?.status;
+  return Promise.resolve(status === "done");
 }
 
 /** Trailing-slash-tolerant path compare helper for worktree-path equality. */
@@ -2854,6 +3111,34 @@ function main(): void {
         // {max_concurrent_per_root} takes effect this cycle. Snapshot already
         // resolved `column ?? DEFAULT` (= 1).
         state.maxConcurrentPerRoot = snapshot.maxConcurrentPerRoot;
+        // fn-959.7 — producer-only worktree crash/restart recovery, BEFORE the
+        // dispatch decision (so the first boot cycle is the post-restart sweep).
+        // Gated on worktree mode ON AND not-paused (recovery does git merges +
+        // pushes, the same side-effect class the dispatch loop suppresses while
+        // paused). Reads ONLY live git + the durable done-ness probe; never a fold.
+        // Wrapped so a producer git failure can't wedge the wake loop.
+        if (snapshot.worktreeMode && !state.paused && deps.worktree) {
+          try {
+            const repos = reposForRecovery(snapshot.epics);
+            const failures = await deps.worktree.recover(repos, (epicId) =>
+              isEpicDoneById(db, epicId),
+            );
+            for (const f of failures) {
+              deps.emitDispatchFailed({
+                verb: "close",
+                id: f.epicId ?? `worktree-recover:${f.dir}`,
+                reason: f.reason,
+                dir: f.dir,
+                ts: deps.now(),
+              });
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] worktree recovery threw (non-fatal):",
+              err,
+            );
+          }
+        }
         const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(
           decision,

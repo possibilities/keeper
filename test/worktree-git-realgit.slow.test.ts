@@ -32,9 +32,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnGitExec } from "../src/commit-work/git-exec";
 import {
+  abortInterruptedMerge,
   commitWorkLockPath,
   ensureWorktree,
+  hasMergeInProgress,
+  isAncestorOf,
   isLinkedWorktree,
+  listEpicBaseBranches,
   listWorktrees,
   mergeBranchInto,
   pruneWorktrees,
@@ -300,4 +304,73 @@ test("pruneWorktrees: --expire now clears a stale admin entry whose dir is gone"
   expect(
     (await listWorktrees(s.repo, spawnGitExec)).some((e) => e.path === wt),
   ).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-959.7 recovery primitives — interrupted-merge detect/abort, ancestor
+// guard, epic-base enumeration.
+// ---------------------------------------------------------------------------
+
+test("hasMergeInProgress / abortInterruptedMerge: a real conflicting merge leaves MERGE_HEAD, the abort clears it", async () => {
+  const s = makeScratch();
+  const tip = git(s.repo, "rev-parse", "HEAD");
+  const baseWt = s.wt("base");
+  await ensureWorktree(s.repo, baseWt, "epic-base", tip, spawnGitExec);
+  gitCommit(baseWt, "clash.txt", "base side\n", "base clash");
+  const ribWt = s.wt("rib");
+  await ensureWorktree(s.repo, ribWt, "epic-rib-b", tip, spawnGitExec);
+  gitCommit(ribWt, "clash.txt", "rib side\n", "rib clash");
+
+  // A clean tree has no merge in flight.
+  expect(await hasMergeInProgress(baseWt, spawnGitExec)).toBe(false);
+  // Start a merge WITHOUT the driver's auto-abort, to leave a real MERGE_HEAD
+  // behind (the crash-mid-merge state the recovery path must clean up).
+  const raw = await spawnGitExec(["merge", "--no-edit", "epic-rib-b"], {
+    cwd: baseWt,
+  });
+  expect(raw.code).not.toBe(0); // conflicted
+  expect(await hasMergeInProgress(baseWt, spawnGitExec)).toBe(true);
+
+  // The recovery abort clears MERGE_HEAD and returns true.
+  expect(await abortInterruptedMerge(baseWt, spawnGitExec)).toBe(true);
+  expect(await hasMergeInProgress(baseWt, spawnGitExec)).toBe(false);
+  expect(git(baseWt, "status", "--porcelain")).toBe("");
+  // Idempotent: a clean tree aborts nothing.
+  expect(await abortInterruptedMerge(baseWt, spawnGitExec)).toBe(false);
+});
+
+test("isAncestorOf: a merged branch is an ancestor of the target; an un-merged one is not", async () => {
+  const s = makeScratch();
+  const tip = git(s.repo, "rev-parse", "HEAD");
+  const baseWt = s.wt("base");
+  await ensureWorktree(s.repo, baseWt, "epic-base", tip, spawnGitExec);
+  const ribWt = s.wt("rib");
+  await ensureWorktree(s.repo, ribWt, "epic-rib-b", tip, spawnGitExec);
+  gitCommit(ribWt, "rib.txt", "rib\n", "rib work");
+
+  // Before merge: the rib is NOT an ancestor of the base.
+  expect(
+    await isAncestorOf(baseWt, "epic-rib-b", "epic-base", spawnGitExec),
+  ).toBe(false);
+  await mergeBranchInto(baseWt, "epic-rib-b", spawnGitExec);
+  // After merge: the rib IS now an ancestor (the idempotency guard skips it).
+  expect(
+    await isAncestorOf(baseWt, "epic-rib-b", "epic-base", spawnGitExec),
+  ).toBe(true);
+});
+
+test("listEpicBaseBranches: enumerates keeper/epic/<id> bases, excludes ribs", async () => {
+  const s = makeScratch();
+  const tip = git(s.repo, "rev-parse", "HEAD");
+  // Create a base branch and a rib nested under a DIFFERENT epic id (a base ref
+  // and a rib ref under the SAME id are a D/F conflict git rejects).
+  git(s.repo, "branch", "keeper/epic/fn-1-foo", tip);
+  git(s.repo, "branch", "keeper/epic/fn-2-bar/fn-2-bar.3", tip);
+  // A non-keeper branch is ignored entirely.
+  git(s.repo, "branch", "feature/x", tip);
+
+  const bases = await listEpicBaseBranches(s.repo, spawnGitExec);
+  expect(bases).toEqual([
+    { branch: "keeper/epic/fn-1-foo", epicId: "fn-1-foo" },
+  ]);
 });
