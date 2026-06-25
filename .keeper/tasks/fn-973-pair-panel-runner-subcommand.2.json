@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Rewrite panel-runner agent onto the subcommand",
-  "updated_at": "2026-06-25T18:00:27.977000Z"
+  "updated_at": "2026-06-25T23:56:47.627000Z",
+  "worker_done_at": "2026-06-25T23:56:47.627000Z"
 }

@@ -61,5 +61,5 @@ task `.1`'s real contract; the epic's real `/plan:panel` smoke run is the proof 
 - [ ] Prose is forward-facing (no fn-ids / provenance / past-tense narration)
 
 ## Done summary
-
+Collapsed panel-runner agent Steps 0-4 onto keeper pair panel start|wait (no setsid/timeout/gtimeout/MAX_CHUNKS shell); documented the sub-verb, manifest/verdict contracts, and 0/124/2 exit semantics in pair/SKILL.md in its own section with an extended argument-hint. PANEL_RUN_FAILED stays agent-owned; judge spawn intact.
 ## Evidence
