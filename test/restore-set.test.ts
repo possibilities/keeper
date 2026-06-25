@@ -18,6 +18,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { extractTmuxTopologySnapshot } from "../src/reducer";
 import {
   BURST_MIN_SIZE,
   burstEventIds,
@@ -27,6 +28,7 @@ import {
   deriveRestoreSet,
   isCrashLike,
 } from "../src/restore-set";
+import type { Event } from "../src/types";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -126,6 +128,45 @@ function seedBackendExecStart(
   );
 }
 
+interface SeedTopologyPane {
+  pane_id: string;
+  session_name: string;
+  window_index?: number | null;
+  job_id?: string;
+}
+
+/**
+ * Insert a synthetic `TmuxTopologySnapshot` event at an EXPLICIT rowid carrying
+ * `{generation_id, panes}` — mirrors {@link seedBackendExecStart}'s explicit-id
+ * shape and the daemon producer's column mapping. Each pane carries the OPTIONAL
+ * producer-stamped `job_id`; omit it to model a pane keeper never launched (or
+ * whose job row was not yet written at post time).
+ */
+function seedTmuxTopologySnapshot(
+  db: Database,
+  id: number,
+  generationId: string,
+  panes: SeedTopologyPane[],
+): void {
+  db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
+    [
+      id,
+      NOW - 100,
+      JSON.stringify({
+        generation_id: generationId,
+        panes: panes.map((p) => ({
+          pane_id: p.pane_id,
+          session_name: p.session_name,
+          window_index: p.window_index ?? null,
+          ...(p.job_id !== undefined ? { job_id: p.job_id } : {}),
+        })),
+      }),
+    ],
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -171,6 +212,91 @@ test("isCrashLike: unknown/NULL qualify ONLY inside a burst", () => {
   expect(isCrashLike("unknown", true)).toBe(true);
   expect(isCrashLike(null, false)).toBe(false);
   expect(isCrashLike(null, true)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// TmuxTopologySnapshot job_id payload (T1) — the additive per-pane job identity
+// the topology-anchored deriver reads from the EVENT PAYLOAD. The decoder must
+// round-trip job_id, tolerate its absence, and the field must NOT perturb the
+// fold (a no-op here: the decoder is the fold's only payload reader).
+// ---------------------------------------------------------------------------
+
+function readEvent(db: Database, id: number): Event {
+  return db.query("SELECT * FROM events WHERE id = ?").get(id) as Event;
+}
+
+test("extractTmuxTopologySnapshot: round-trips a present job_id", () => {
+  seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
+    { pane_id: "%5", session_name: "fg", window_index: 3, job_id: "job-a" },
+  ]);
+  const snap = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
+  expect(snap).toEqual({
+    generation_id: "gen-100",
+    panes: [
+      { pane_id: "%5", session_name: "fg", window_index: 3, job_id: "job-a" },
+    ],
+  });
+});
+
+test("extractTmuxTopologySnapshot: a pane WITHOUT job_id decodes cleanly (field absent)", () => {
+  seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
+    { pane_id: "%5", session_name: "fg", window_index: 3 },
+  ]);
+  const snap = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
+  expect(snap).toEqual({
+    generation_id: "gen-100",
+    panes: [{ pane_id: "%5", session_name: "fg", window_index: 3 }],
+  });
+  // The absent field decodes to `undefined`, never an empty string or null.
+  expect(snap?.panes[0]).not.toHaveProperty("job_id");
+});
+
+test("extractTmuxTopologySnapshot: an empty / non-string job_id is dropped, never coerced", () => {
+  // Hand-craft a payload with a non-string + empty-string job_id (the seed
+  // helper only emits strings) to exercise the type-narrow.
+  kdb.db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
+    [
+      100,
+      NOW - 100,
+      JSON.stringify({
+        generation_id: "gen-100",
+        panes: [
+          { pane_id: "%1", session_name: "a", window_index: 0, job_id: 7 },
+          { pane_id: "%2", session_name: "b", window_index: 1, job_id: "" },
+        ],
+      }),
+    ],
+  );
+  const snap = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
+  expect(snap?.panes).toEqual([
+    { pane_id: "%1", session_name: "a", window_index: 0 },
+    { pane_id: "%2", session_name: "b", window_index: 1 },
+  ]);
+});
+
+test("extractTmuxTopologySnapshot: job_id presence does NOT change the rest of the decode (fold invariance)", () => {
+  // Same generation + panes, one with job_id and one without — the
+  // generation/pane_id/session_name/window_index the FOLD keys on must be
+  // byte-identical across the two, proving job_id is inert to fold inputs.
+  seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
+    { pane_id: "%5", session_name: "fg", window_index: 3, job_id: "job-a" },
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 200, "gen-100", [
+    { pane_id: "%5", session_name: "fg", window_index: 3 },
+  ]);
+  const withJob = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
+  const without = extractTmuxTopologySnapshot(readEvent(kdb.db, 200));
+  const foldInputs = (s: typeof withJob) => ({
+    generation_id: s?.generation_id,
+    panes: s?.panes.map((p) => ({
+      pane_id: p.pane_id,
+      session_name: p.session_name,
+      window_index: p.window_index,
+    })),
+  });
+  expect(foldInputs(withJob)).toEqual(foldInputs(without));
 });
 
 // ---------------------------------------------------------------------------

@@ -201,11 +201,22 @@ export interface BackendExecStartMessage {
  * left-to-right POSITION). Keyed by `pane_id` within a single server generation
  * — `%N` is reused after a kill, so the generation handle (the server pid) is
  * carried alongside the panes, NOT inside each pane.
+ *
+ * `job_id` is the keeper job that owns the pane at post time, resolved by the
+ * producer's `(pane_id → jobs.backend_exec_pane_id)` join. It is OPTIONAL: a
+ * pane keeper never launched, or one whose job row is not yet written, carries
+ * no `job_id`. The topology-anchored crash-restore deriver reads it from the
+ * EVENT PAYLOAD to identify the dying generation's live jobs without the
+ * fold-lagged projection; an absent `job_id` falls back to the
+ * `(generation_id, pane_id)` projection join. EXCLUDED from `hashTopology` — it
+ * is stable per pane and never gates a re-post. The fold ignores it entirely
+ * (re-fold determinism), so the field is purely additive.
  */
 export interface TmuxTopologyPane {
   pane_id: string;
   session_name: string;
   window_index: number | null;
+  job_id?: string;
 }
 
 /**
@@ -914,7 +925,9 @@ function hashWindowIndexCache(cache: Map<string, number>): string {
  * (session or window-index change) or a server-generation flip MUST re-fire the
  * post so the live-location fold tracks reality. Sorts panes by `pane_id` so the
  * probe's row order doesn't churn the hash. An empty pane set still hashes the
- * generation (a generation change with no panes is still a change). Pure.
+ * generation (a generation change with no panes is still a change). EXCLUDES the
+ * per-pane `job_id` — it is stable per pane and stamping it must never re-fire
+ * the post. Pure.
  */
 function hashTopology(generationId: string, panes: TmuxTopologyPane[]): string {
   const sorted = [...panes].sort((a, b) =>
@@ -1057,9 +1070,39 @@ function topologySnapshotPulse(
   post({
     kind: "tmux-topology-snapshot",
     generation_id: generationId,
-    panes: probe.panes,
+    panes: stampPaneJobIds(jobs, probe.panes),
   });
   state.lastTopologyHash = hash;
+}
+
+/**
+ * Join each probed pane to the keeper job that owns it, stamping an OPTIONAL
+ * `job_id` onto the pane so the dying-generation snapshot carries job identity
+ * in the event payload (the topology-anchored crash-restore deriver reads it
+ * there, not from the fold-lagged projection). Mirrors {@link fillablePairs}'
+ * `pane_id → job` match, but over ALL live tmux jobs (not just NULL-session
+ * fillable ones) — a pane MOVE happens to an already-resolved job, so the join
+ * must cover resolved jobs too. A pane with no owning job is returned unchanged
+ * (no `job_id`); the deriver tolerates the absence. EXCLUDED from `hashTopology`
+ * — stamping job ids never gates a re-post. Pure: reads only the args.
+ */
+function stampPaneJobIds(
+  jobs: Job[],
+  panes: TmuxTopologyPane[],
+): TmuxTopologyPane[] {
+  const jobByPaneId = new Map<string, string>();
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (job.backend_exec_type === "tmux" && job.backend_exec_pane_id != null) {
+      jobByPaneId.set(job.backend_exec_pane_id, job.job_id);
+    }
+  }
+  return panes.map((pane) => {
+    const jobId = jobByPaneId.get(pane.pane_id);
+    return jobId == null ? pane : { ...pane, job_id: jobId };
+  });
 }
 
 /**

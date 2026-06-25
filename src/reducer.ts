@@ -3161,10 +3161,16 @@ function retractUsageRow(db: Database, event: Event): void {
  * generation — `%N` is reused after a kill, so the generation handle rides
  * alongside the panes (see {@link TmuxTopologySnapshot}), not inside each pane.
  */
-interface TmuxTopologyPaneEntry {
+export interface TmuxTopologyPaneEntry {
   pane_id: string;
   session_name: string;
   window_index: number | null;
+  // OPTIONAL keeper job that owned the pane at post time (producer-stamped via
+  // the `pane_id → jobs.backend_exec_pane_id` join). Decoded for the
+  // topology-anchored crash-restore deriver, which reads job identity from the
+  // event payload; the FOLD ignores it (re-fold determinism). Absent when no
+  // keeper job owned the pane, or when the field is missing / non-string.
+  job_id?: string;
 }
 
 /**
@@ -3175,7 +3181,7 @@ interface TmuxTopologyPaneEntry {
  * generation, but without one the recycle guard cannot run, so the fold must not
  * touch live location).
  */
-interface TmuxTopologySnapshot {
+export interface TmuxTopologySnapshot {
   generation_id: string;
   panes: TmuxTopologyPaneEntry[];
 }
@@ -3198,7 +3204,7 @@ interface TmuxTopologySnapshot {
  * {@link extractWindowIndexSnapshot}; the one structural difference is the
  * generation_id sidecar (validated once, snapshot-wide) the recycle guard needs.
  */
-function extractTmuxTopologySnapshot(
+export function extractTmuxTopologySnapshot(
   event: Event,
 ): TmuxTopologySnapshot | null {
   if (event.data == null || event.data.length === 0) {
@@ -3239,10 +3245,17 @@ function extractTmuxTopologySnapshot(
         typeof rawIndex === "number" && Number.isInteger(rawIndex)
           ? rawIndex
           : null;
+      // OPTIONAL: a non-empty string decodes; anything else (absent / non-string
+      // / empty) leaves `job_id` undefined. The deriver tolerates the absence;
+      // the fold never reads it.
+      const rawJobId = rec.job_id;
+      const jobId =
+        typeof rawJobId === "string" && rawJobId !== "" ? rawJobId : undefined;
       panes.push({
         pane_id: paneId,
         session_name: sessionName,
         window_index: windowIndex,
+        ...(jobId !== undefined ? { job_id: jobId } : {}),
       });
     }
   }

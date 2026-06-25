@@ -1434,22 +1434,37 @@ test("restorePulse posts ONE TmuxTopologySnapshot on a change, deduped on no cha
       postTopology: (m) => topo.push(m),
     });
   };
-  // First observation → ONE post carrying generation_id + the pane map.
+  // First observation → ONE post carrying generation_id + the pane map. The
+  // producer joins pane `%1` to its owning live tmux job and stamps `job_id`.
   pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1000);
   expect(topo).toHaveLength(1);
   expect(topo[0]).toEqual({
     kind: "tmux-topology-snapshot",
     generation_id: "900",
-    panes: [{ pane_id: "%1", session_name: "autopilot", window_index: 2 }],
+    panes: [
+      {
+        pane_id: "%1",
+        session_name: "autopilot",
+        window_index: 2,
+        job_id: "j1",
+      },
+    ],
   });
-  // Unchanged topology → deduped.
+  // Unchanged topology → deduped (job_id is excluded from the hash, so it never
+  // gates a re-post on its own).
   pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1500);
   expect(topo).toHaveLength(1);
-  // The pane MOVED to a new session + window — a real change re-fires.
+  // The pane MOVED to a new session + window — a real change re-fires, still
+  // carrying the owning job_id.
   pulse({ kind: "panes", lines: ["%1\t0\tforeground"] }, 2000);
   expect(topo).toHaveLength(2);
   expect(topo[1].panes).toEqual([
-    { pane_id: "%1", session_name: "foreground", window_index: 0 },
+    {
+      pane_id: "%1",
+      session_name: "foreground",
+      window_index: 0,
+      job_id: "j1",
+    },
   ]);
 });
 
