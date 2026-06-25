@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Persistent tmux-control-worker with daemon wiring and supervision",
-  "updated_at": "2026-06-24T23:22:22.683000Z"
+  "updated_at": "2026-06-25T03:04:00.497000Z",
+  "worker_done_at": "2026-06-25T03:04:00.497000Z"
 }

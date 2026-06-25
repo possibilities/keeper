@@ -73,5 +73,5 @@ Poll daemon/worker state with `retryUntil`, never `Bun.sleep`. `bun run test:ful
 - [ ] Fast-tier tests use an injected seam (no real tmux); the live attach test is `*.slow.test.ts`, allowlisted.
 
 ## Done summary
-
+Added the persistent tmux -C control-focus worker (src/tmux-control-worker.ts): debounced single-in-flight framed re-read of list-clients/list-panes, dedup excluding client_activity, bounded-backoff reconnect, and a liveness-pulse watchdog. Wired into ALL_WORKERS gated behind !disableNativeWatcher; main mints the TmuxClientFocusSnapshot event.
 ## Evidence
