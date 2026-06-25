@@ -67,6 +67,7 @@ import { appendDiagnostic } from "../src/readiness-diagnostics";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import type {
   Epic,
+  HandoffLinkEntry,
   JobLinkEntry,
   ResolvedEpicDep,
   SubagentInvocation,
@@ -332,6 +333,57 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
   return out;
 }
 
+/**
+ * Per-job handoff edge lines — the sibling of {@link renderJobLinkLines} for
+ * the job→job handoff relationship. Unlike `creator`/`refiner` (epic-anchored),
+ * a handoff has no epic header to sit under, so these render on the job/session
+ * surface off the job's own `handoff_links` array. Each {@link HandoffLinkEntry}
+ * is denormalized off the peer `jobs` row at the reducer's write boundary, so
+ * the render reads every field straight off the projection — no live-jobs join.
+ * The line shape mirrors the job-link line:
+ *
+ *     {title ?? peer_job_id} [{kind}] [{state}]{apiErrorPillSeg}
+ *       [awaiting:<kind>]   ← only when present, own continuation line
+ *
+ * `kind` is `handoff-from` (the initiator's row, pointing at the handoff-ee) or
+ * `handoff-to` (the handoff-ee's row, pointing back at the initiator); the
+ * icon-theme stamps the directional glyph, falling back to a missing-glyph pill
+ * for the from-side-unknown case. Title falls back to `peer_job_id` when the
+ * embedded `title` is null (e.g. an unfolded / orphan peer). Iteration order is
+ * the projection's own stored sort — render must NOT re-sort.
+ */
+export function renderHandoffLinkLines(handoffLinks: unknown): string[] {
+  if (!Array.isArray(handoffLinks) || handoffLinks.length === 0) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const link of handoffLinks as HandoffLinkEntry[]) {
+    const label = link.title ?? link.peer_job_id;
+    // Same omit-default convention as the job-link line: the resting `stopped`
+    // state renders NO pill; only live states stamp one. `pillOrEmpty`
+    // self-delimits.
+    const stateSeg = pillOrEmpty(link.state, "stopped");
+    const awaiting = inputRequestPillSeg(
+      link.last_input_request_at,
+      link.last_input_request_kind,
+    );
+    const awaitingPP = permissionPromptPillSeg(
+      link.last_permission_prompt_at,
+      link.last_permission_prompt_kind,
+    );
+    out.push(
+      `  ${label} ${pill(String(link.kind))}${stateSeg}${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
+    );
+    if (awaiting !== "") {
+      out.push(`    ${awaiting.trimStart()}`);
+    }
+    if (awaitingPP !== "") {
+      out.push(`    ${awaitingPP.trimStart()}`);
+    }
+  }
+  return out;
+}
+
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -435,6 +487,12 @@ export async function main(argv: string[]): Promise<void> {
       }
       if (awaitingPP !== "") {
         out.push(`      ${awaitingPP.trimStart()}`);
+      }
+      // Handoff edges this job participates in (job→job, NOT epic-anchored).
+      // Read defensively off the row — absent ≡ no edges. Indented one level
+      // deeper to read as a sub-detail of the job row.
+      for (const hline of renderHandoffLinkLines(job.handoff_links)) {
+        out.push(`  ${hline}`);
       }
       out.push(
         ...subagentLinesFor(subagentIndex, String(job.job_id), "      "),

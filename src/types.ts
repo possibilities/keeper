@@ -464,6 +464,17 @@ export interface Job {
    */
   monitors: string | null;
   /**
+   * The job→job handoff edges this row participates in — a `handoff-from` entry
+   * (written by the `HandoffRequested` fold onto the initiator job) and/or a
+   * `handoff-to` entry (written by the callee's `SessionStart` bind fold). NOT
+   * epic-anchored, unlike {@link epic_links}. JSON-TEXT at the projection
+   * boundary, decoded at the read boundary (a `jsonColumn`); optional + absent ≡
+   * `[]` for a pre-v88 stored row, so renderers treat absent as no edges. Render
+   * reads it via {@link import("../cli/board").renderHandoffLinkLines} on the
+   * board and a relation badge on the dash card; the reducer is the sole writer.
+   */
+  handoff_links?: HandoffLinkEntry[];
+  /**
    * Live tmux `#{window_index}` — the window's left-to-right VISUAL position —
    * folded onto the row from each `WindowIndexSnapshot` the restore-worker
    * posts on a `data_version` pulse. The `keeper dash` view-model orders cards

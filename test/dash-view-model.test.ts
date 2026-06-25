@@ -181,6 +181,86 @@ test("ladder: robotGlyph resolver matches the materialized codepoints", () => {
   expect(robotGlyph("killed")).toBe(ROBOT.killed);
 });
 
+// ---------------------------------------------------------------------------
+// handoff relation badge — the dash's only relationship surface (greenfield)
+// ---------------------------------------------------------------------------
+
+test("handoffBadge: no handoff_links → empty badge", () => {
+  expect(onlyCard(build([makeJob({ job_id: "j" })])).handoffBadge).toBe("");
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", handoff_links: [] })])).handoffBadge,
+  ).toBe("");
+});
+
+test("handoffBadge: handoff-to surfaces the inbound badge with the peer (initiator) label", () => {
+  const job = makeJob({
+    job_id: "j",
+    handoff_links: [
+      {
+        kind: "handoff-to",
+        handoff_id: "h-1",
+        peer_job_id: "initiator-3",
+        status: "dispatched",
+        title: "the initiator",
+        state: "stopped",
+        last_api_error_at: null,
+        last_api_error_kind: null,
+        last_input_request_at: null,
+        last_input_request_kind: null,
+        last_permission_prompt_at: null,
+        last_permission_prompt_kind: null,
+      },
+    ],
+  });
+  expect(onlyCard(build([job])).handoffBadge).toBe("↰ from the initiator");
+});
+
+test("handoffBadge: handoff-to with null peer title falls back to the bare inbound arm", () => {
+  const job = makeJob({
+    job_id: "j",
+    handoff_links: [
+      {
+        kind: "handoff-to",
+        handoff_id: "h-1",
+        peer_job_id: "",
+        status: "dispatched",
+        title: null,
+        state: "stopped",
+        last_api_error_at: null,
+        last_api_error_kind: null,
+        last_input_request_at: null,
+        last_input_request_kind: null,
+        last_permission_prompt_at: null,
+        last_permission_prompt_kind: null,
+      },
+    ],
+  });
+  expect(onlyCard(build([job])).handoffBadge).toBe("↰ from");
+});
+
+test("handoffBadge: handoff-from surfaces the outbound (handed off) badge", () => {
+  const job = makeJob({
+    job_id: "j",
+    handoff_links: [
+      {
+        kind: "handoff-from",
+        handoff_id: "h-1",
+        peer_job_id: "callee-7",
+        status: "dispatched",
+        title: "explore X",
+        state: "working",
+        last_api_error_at: null,
+        last_api_error_kind: null,
+        last_input_request_at: null,
+        last_input_request_kind: null,
+        last_permission_prompt_at: null,
+        last_permission_prompt_kind: null,
+      },
+    ],
+  });
+  expect(onlyCard(build([job])).handoffBadge).toBe("↳ handed off");
+});
+
 test("ladder: api-error outranks live base states (priority 1, red rail)", () => {
   // Live (non-terminal) states only — terminal ended/killed now win over a
   // stale annotation stamp (see the terminal-state-wins ladder below).

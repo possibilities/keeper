@@ -28,7 +28,7 @@
  * fast tier.
  */
 
-import type { Job } from "../types";
+import type { HandoffLinkEntry, Job } from "../types";
 import type { IconRole } from "./theme";
 
 // ---------------------------------------------------------------------------
@@ -213,6 +213,14 @@ export interface CardVM {
   readonly robotGlyph: string;
   readonly iconRole: IconRole;
   readonly isTerminal: boolean;
+  /**
+   * Minimal handoff relation badge, or `""` when the job is in no handoff edge.
+   * `↳ handed off` flags the INITIATOR side (`handoff-from`, work flowed OUT);
+   * `↰ from <peer>` flags the HANDOFF-EE side (`handoff-to`, work flowed IN,
+   * peer = the initiator's label). The dash renders no other relationships, so
+   * this stays a single pre-rendered string — not a relationship subsystem.
+   */
+  readonly handoffBadge: string;
 }
 
 /** One session band: a keyed (tmux session name, or {@link DETACHED_KEY}),
@@ -271,6 +279,27 @@ function jobLabel(job: Job): string {
   return job.job_id;
 }
 
+/**
+ * Minimal handoff relation badge off the job's `handoff_links` (absent ≡ no
+ * edges). The first edge wins (a job is normally only one end of one handoff):
+ * `handoff-to` → `↰ from <peer>` (this job was handed work; peer = initiator),
+ * `handoff-from` → `↳ handed off` (this job handed work out). The peer label
+ * coalesces `title → peer_job_id`; a `handoff-to` whose peer is unknown still
+ * renders the bare `↰ from` arm. Returns `""` for no edge. Pure, never throws.
+ */
+function handoffBadge(job: Job): string {
+  const links = job.handoff_links;
+  if (!Array.isArray(links) || links.length === 0) {
+    return "";
+  }
+  const link = links[0] as HandoffLinkEntry;
+  if (link.kind === "handoff-to") {
+    const peer = sanitize(str(link.title) || str(link.peer_job_id));
+    return peer === "" ? "↰ from" : `↰ from ${peer}`;
+  }
+  return "↳ handed off";
+}
+
 // ---------------------------------------------------------------------------
 // Line build
 // ---------------------------------------------------------------------------
@@ -284,6 +313,7 @@ function buildCard(job: Job, rung: RobotRung): CardVM {
     robotGlyph: robotGlyph(rung),
     iconRole: RUNG_ICON[rung],
     isTerminal: isTerminalRung(rung),
+    handoffBadge: handoffBadge(job),
   };
 }
 

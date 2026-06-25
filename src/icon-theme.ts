@@ -81,6 +81,9 @@ const FA = {
   random: "f074",
   filesO: "f0c5",
   bolt: "f0e7",
+  signOut: "f08b",
+  signIn: "f090",
+  exchange: "f0ec",
 } as const;
 
 /**
@@ -115,6 +118,13 @@ export const FA_CLASSIC: IconTheme = {
     closer: FA.flagCheckered,
     creator: FA.plusCircle,
     refiner: FA.magic,
+    // --- handoff edge (job→job relationship pills) ---
+    // `handoff-from` rides the initiator's row (work flows OUT → sign-out);
+    // `handoff-to` rides the handoff-ee's row (work flowed IN → sign-in). The
+    // `handoff:` prefix below is the missing-glyph fallback for the
+    // from-side-unknown / null-initiator case (no exact token match).
+    "handoff-from": FA.signOut,
+    "handoff-to": FA.signIn,
 
     // --- RuntimeStatus (keeper plan manual) ---
     todo: FA.circleO,
@@ -165,6 +175,11 @@ export const FA_CLASSIC: IconTheme = {
   },
   prefix: {
     "blocked:": FA.ban, // ONE glyph for every block reason (reason via text)
+    // Missing-glyph fallback for the handoff edge: an exact `handoff-from` /
+    // `handoff-to` token wins above; this catches a from-side-unknown
+    // (null-initiator) `handoff:<...>` token with the bidirectional exchange
+    // glyph so the pill never renders icon-less.
+    handoff: FA.exchange,
     "task-repo:": FA.random,
     "dead-letter:": FA.envelope,
     // catch-alls when a future kind isn't enumerated in `exact`:

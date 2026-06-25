@@ -34,6 +34,7 @@ import {
   epicNumFromIdOrBare,
   renderDeadLetterPill,
   renderEpicDepPills,
+  renderHandoffLinkLines,
   renderJobLinkLines,
   taskVerdictPill,
 } from "../cli/board";
@@ -58,6 +59,7 @@ import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
 import type {
   EmbeddedJob,
   Epic,
+  HandoffLinkEntry,
   Job,
   JobLinkEntry,
   SubagentInvocation,
@@ -934,6 +936,129 @@ test("renderJobLinkLines: many creator + refiner edges per epic each render thei
     `  Refiner one ${pill("refiner")} ${pill("stopped")}`,
     `  Refiner two ${pill("refiner")} ${pill("working")}`,
     `  Refiner three ${pill("refiner")} ${pill("stopped")}`,
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// renderHandoffLinkLines — the job→job handoff edge, sibling of the job-link
+// renderer but NOT epic-anchored (renders off the job's own handoff_links).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a `HandoffLinkEntry` with the same missing-row defaults `enrichHandoff`
+ * uses (`title: null, state: "stopped", all pair fields null`). Callers
+ * override per-test.
+ */
+function makeHandoffLink(
+  overrides: Partial<HandoffLinkEntry>,
+): HandoffLinkEntry {
+  return {
+    kind: "handoff-from",
+    handoff_id: "h-1",
+    peer_job_id: "peer-1",
+    status: "dispatched",
+    title: null,
+    state: "stopped",
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
+    ...overrides,
+  };
+}
+
+test("renderHandoffLinkLines: empty / non-array input → []", () => {
+  expect(renderHandoffLinkLines([])).toEqual([]);
+  expect(renderHandoffLinkLines(undefined)).toEqual([]);
+  expect(renderHandoffLinkLines(null)).toEqual([]);
+  expect(renderHandoffLinkLines("not an array")).toEqual([]);
+});
+
+test("renderHandoffLinkLines: handoff-from entry → peer label + [handoff-from] + state pill", () => {
+  const out = renderHandoffLinkLines([
+    makeHandoffLink({
+      kind: "handoff-from",
+      peer_job_id: "callee-7",
+      title: "explore X",
+      state: "working",
+    }),
+  ]);
+  expect(out).toEqual([
+    `  explore X ${pill("handoff-from")} ${pill("working")}`,
+  ]);
+});
+
+test("renderHandoffLinkLines: handoff-to entry → peer label + [handoff-to] + state pill", () => {
+  const out = renderHandoffLinkLines([
+    makeHandoffLink({
+      kind: "handoff-to",
+      peer_job_id: "initiator-3",
+      title: "the initiator",
+      state: "stopped",
+    }),
+  ]);
+  expect(out).toEqual([
+    `  the initiator ${pill("handoff-to")} ${pill("stopped")}`,
+  ]);
+});
+
+test("renderHandoffLinkLines: null title falls back to peer_job_id (the from-side-unknown / null-initiator case)", () => {
+  // A `handoff-to` whose initiator job is unfolded/orphan enriches to
+  // `{title: null, state: "stopped"}` — the renderer subs in `peer_job_id`
+  // so the line stays readable and the `[handoff-to]` pill still carries its
+  // themed glyph (no icon-less / `[null]` render).
+  const out = renderHandoffLinkLines([
+    makeHandoffLink({
+      kind: "handoff-to",
+      peer_job_id: "unknown-initiator",
+      title: null,
+      state: "stopped",
+    }),
+  ]);
+  expect(out).toEqual([
+    `  unknown-initiator ${pill("handoff-to")} ${pill("stopped")}`,
+  ]);
+});
+
+test("renderHandoffLinkLines: api-error stamps inline, awaiting drops to its own continuation line", () => {
+  const out = renderHandoffLinkLines([
+    makeHandoffLink({
+      kind: "handoff-from",
+      peer_job_id: "callee-9",
+      title: "do the thing",
+      state: "stopped",
+      last_api_error_at: 1700000000,
+      last_api_error_kind: "rate_limit",
+      last_input_request_at: 1700000001,
+      last_input_request_kind: "ask_user_question",
+    }),
+  ]);
+  expect(out).toEqual([
+    `  do the thing ${pill("handoff-from")} ${pill("stopped")} ${pill("failed:rate_limit")}`,
+    `    ${pill("awaiting:ask_user_question")}`,
+  ]);
+});
+
+test("renderHandoffLinkLines: multiple entries iterate in provided (stored) order — render must not re-sort", () => {
+  const out = renderHandoffLinkLines([
+    makeHandoffLink({
+      kind: "handoff-to",
+      peer_job_id: "init",
+      title: "From initiator",
+      state: "stopped",
+    }),
+    makeHandoffLink({
+      kind: "handoff-from",
+      peer_job_id: "callee",
+      title: "To callee",
+      state: "working",
+    }),
+  ]);
+  expect(out).toEqual([
+    `  From initiator ${pill("handoff-to")} ${pill("stopped")}`,
+    `  To callee ${pill("handoff-from")} ${pill("working")}`,
   ]);
 });
 
