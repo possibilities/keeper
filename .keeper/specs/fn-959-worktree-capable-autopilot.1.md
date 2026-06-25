@@ -54,5 +54,5 @@ worktree segment for BOTH on and off. schema-version test stays green.
 - [ ] SCHEMA_VERSION bumped + SUPPORTED_SCHEMA_VERSIONS updated in the same commit; schema-version test green.
 
 ## Done summary
-
+Added the durable worktree_mode toggle (autopilot_state v91 column, default OFF) riding fn-953's generic set_autopilot_config patch — no new RPC, fold preserves siblings, reconciler reads it fresh each cycle. Added keeper autopilot worktree <on|off> [--force] with a mid-epic guard and a worktree:on/off banner segment; SCHEMA_VERSION 90->91 with the matching api.py whitelist entry.
 ## Evidence
