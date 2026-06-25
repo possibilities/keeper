@@ -21,6 +21,10 @@
  *  - reaperCycle: fires killWindow on a passing candidate; aborts on a flipped
  *    state at the pre-kill re-check; stamps the cooldown on every fired attempt; a
  *    killWindow failure is a non-fatal skip.
+ *  - the recycle guard (`livePaneOwned` + reaperCycle): a kill fires only when the
+ *    LIVE topology confirms the pane still belongs to THIS job at its recorded
+ *    generation; a recycled %N (generation mismatch), a reassigned pane, an absent
+ *    pane, or an unavailable snapshot all degrade to SKIP (never kill).
  */
 
 import { expect, test } from "bun:test";
@@ -29,6 +33,9 @@ import { MANAGED_EXEC_SESSION, PAIR_EXEC_SESSION } from "../src/exec-backend";
 import { resolveDisableAutoclose } from "../src/pair-command";
 import {
   DEFAULT_AUTOCLOSE_GRACE_SEC,
+  type LiveTopology,
+  type LiveTopologyReader,
+  livePaneOwned,
   REAP_KILL_COOLDOWN_SEC,
   type ReapCandidate,
   reaperCycle,
@@ -38,6 +45,8 @@ import type { Job } from "../src/types";
 
 const NOW = 1_000_000;
 const GRACE = DEFAULT_AUTOCLOSE_GRACE_SEC;
+/** The tmux server generation the canonical reapable job was resolved under. */
+const GEN = "g-srv-1";
 
 /** A keeper-created, cleanly-stopped-past-grace, tmux window — the canonical
  *  reapable shape. Every exclusion test flips exactly one field off this. */
@@ -68,6 +77,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     backend_exec_session_id: MANAGED_EXEC_SESSION,
     backend_exec_birth_session_id: MANAGED_EXEC_SESSION,
     backend_exec_pane_id: "%7",
+    backend_exec_generation_id: GEN,
     backend_exec_type: "tmux",
     ...overrides,
   } as Job;
@@ -100,7 +110,12 @@ function select(
 
 test("a cleanly-stopped keeper window is a candidate (job_id, pane, birth session)", () => {
   expect(select([makeJob()])).toEqual([
-    { job_id: "j-1", pane_id: "%7", session: MANAGED_EXEC_SESSION },
+    {
+      job_id: "j-1",
+      pane_id: "%7",
+      session: MANAGED_EXEC_SESSION,
+      generation_id: GEN,
+    },
   ]);
 });
 
@@ -129,7 +144,12 @@ test("a non-plan keeper partner (pair) reaps via the same rule", () => {
     backend_exec_birth_session_id: PAIR_EXEC_SESSION,
   });
   expect(select([job])).toEqual([
-    { job_id: "j-1", pane_id: "%7", session: PAIR_EXEC_SESSION },
+    {
+      job_id: "j-1",
+      pane_id: "%7",
+      session: PAIR_EXEC_SESSION,
+      generation_id: GEN,
+    },
   ]);
 });
 
@@ -265,15 +285,39 @@ const candidate: ReapCandidate = {
   job_id: "j-1",
   pane_id: "%7",
   session: MANAGED_EXEC_SESSION,
+  generation_id: GEN,
 };
+
+/** Build a live topology snapshot keyed `pane_id → owning job_id?`. */
+function makeTopo(
+  generation_id: string,
+  panes: Array<{ pane_id: string; job_id?: string }>,
+): LiveTopology {
+  const paneOwners = new Map<string, string | undefined>();
+  for (const p of panes) {
+    paneOwners.set(p.pane_id, p.job_id);
+  }
+  return { generation_id, paneOwners };
+}
+
+/** A reader returning a fixed topology (or `null` — the degrade case). */
+function topoReader(topo: LiveTopology | null): LiveTopologyReader {
+  return () => topo;
+}
+
+/** The canonical pass-the-guard topology: `%7` live at `GEN`, owned by `j-1`. */
+const OWNED_TOPO: LiveTopologyReader = topoReader(
+  makeTopo(GEN, [{ pane_id: "%7", job_id: "j-1" }]),
+);
 
 test("reaperCycle fires killWindow and stamps the cooldown for a passing candidate", async () => {
   const backend = fakeBackend();
   const cooldown = new Map<string, number>();
   // Selector returns the same candidate on both the initial select and the
-  // pre-kill re-check.
+  // pre-kill re-check; the live topology confirms %7 still belongs to j-1.
   await reaperCycle(
     () => [candidate],
+    OWNED_TOPO,
     backend,
     cooldown,
     () => NOW,
@@ -292,7 +336,7 @@ test("reaperCycle aborts the kill when the pre-kill re-check no longer lists the
     call += 1;
     return call === 1 ? [candidate] : [];
   };
-  await reaperCycle(select, backend, cooldown, () => NOW);
+  await reaperCycle(select, OWNED_TOPO, backend, cooldown, () => NOW);
   expect(backend.kills).toEqual([]);
   // No kill attempted → no cooldown stamp (cooldown is stamped only on a fired
   // attempt, after the re-check passes).
@@ -304,6 +348,7 @@ test("reaperCycle stamps the cooldown even when killWindow fails (non-fatal skip
   const cooldown = new Map<string, number>();
   await reaperCycle(
     () => [candidate],
+    OWNED_TOPO,
     backend,
     cooldown,
     () => NOW,
@@ -312,4 +357,126 @@ test("reaperCycle stamps the cooldown even when killWindow fails (non-fatal skip
   // throw — the cycle resolves cleanly.
   expect(backend.kills).toEqual(["%7"]);
   expect(cooldown.get("j-1")).toBe(NOW);
+});
+
+// ---------------------------------------------------------------------------
+// livePaneOwned — the recycle guard verdict (pure)
+// ---------------------------------------------------------------------------
+
+test("livePaneOwned: a matching (generation, pane) owned by the job reaps", () => {
+  expect(
+    livePaneOwned(candidate, makeTopo(GEN, [{ pane_id: "%7", job_id: "j-1" }])),
+  ).toBe(true);
+});
+
+test("livePaneOwned: a matching generation with NO recorded owner reaps (an ended job's lingering window)", () => {
+  // An `ended` reap candidate is excluded from the producer's owner join, so its
+  // still-live pane carries no job_id — but the generation matches, so it is ours.
+  expect(livePaneOwned(candidate, makeTopo(GEN, [{ pane_id: "%7" }]))).toBe(
+    true,
+  );
+});
+
+test("livePaneOwned: a generation mismatch (a recycled %N in a new server) is SKIPPED", () => {
+  expect(
+    livePaneOwned(
+      candidate,
+      makeTopo("g-srv-2", [{ pane_id: "%7", job_id: "intruder" }]),
+    ),
+  ).toBe(false);
+});
+
+test("livePaneOwned: an absent live pane is SKIPPED", () => {
+  expect(
+    livePaneOwned(
+      candidate,
+      makeTopo(GEN, [{ pane_id: "%99", job_id: "j-1" }]),
+    ),
+  ).toBe(false);
+});
+
+test("livePaneOwned: a pane owned by a DIFFERENT live job is SKIPPED", () => {
+  expect(
+    livePaneOwned(
+      candidate,
+      makeTopo(GEN, [{ pane_id: "%7", job_id: "intruder" }]),
+    ),
+  ).toBe(false);
+});
+
+test("livePaneOwned: an unavailable topology (null) is SKIPPED (degrade, never kill)", () => {
+  expect(livePaneOwned(candidate, null)).toBe(false);
+});
+
+test("livePaneOwned: a NULL recorded generation never matches a live snapshot", () => {
+  const unresolved: ReapCandidate = { ...candidate, generation_id: null };
+  expect(
+    livePaneOwned(
+      unresolved,
+      makeTopo(GEN, [{ pane_id: "%7", job_id: "j-1" }]),
+    ),
+  ).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// reaperCycle — the recycle guard in the pre-kill cross-check
+// ---------------------------------------------------------------------------
+
+test("reaperCycle reaps a matching (generation, pane) for a cleanly-stopped keeper job", async () => {
+  const backend = fakeBackend();
+  const cooldown = new Map<string, number>();
+  await reaperCycle(
+    () => [candidate],
+    topoReader(makeTopo(GEN, [{ pane_id: "%7", job_id: "j-1" }])),
+    backend,
+    cooldown,
+    () => NOW,
+  );
+  expect(backend.kills).toEqual(["%7"]);
+  expect(cooldown.get("j-1")).toBe(NOW);
+});
+
+test("reaperCycle SKIPS the kill when the live pane was recycled into a new generation", async () => {
+  const backend = fakeBackend();
+  const cooldown = new Map<string, number>();
+  // The job still passes the predicate, but the live snapshot shows %7 now lives
+  // under a NEW server generation owned by another window — collateral-kill averted.
+  await reaperCycle(
+    () => [candidate],
+    topoReader(makeTopo("g-srv-2", [{ pane_id: "%7", job_id: "intruder" }])),
+    backend,
+    cooldown,
+    () => NOW,
+  );
+  expect(backend.kills).toEqual([]);
+  // No fired attempt → no cooldown stamp.
+  expect(cooldown.has("j-1")).toBe(false);
+});
+
+test("reaperCycle SKIPS the kill when the pane is absent from the live snapshot", async () => {
+  const backend = fakeBackend();
+  const cooldown = new Map<string, number>();
+  await reaperCycle(
+    () => [candidate],
+    topoReader(makeTopo(GEN, [{ pane_id: "%4", job_id: "other" }])),
+    backend,
+    cooldown,
+    () => NOW,
+  );
+  expect(backend.kills).toEqual([]);
+  expect(cooldown.has("j-1")).toBe(false);
+});
+
+test("reaperCycle SKIPS the kill when the live topology is unavailable (degrade, never kill)", async () => {
+  const backend = fakeBackend();
+  const cooldown = new Map<string, number>();
+  await reaperCycle(
+    () => [candidate],
+    topoReader(null),
+    backend,
+    cooldown,
+    () => NOW,
+  );
+  expect(backend.kills).toEqual([]);
+  expect(cooldown.has("j-1")).toBe(false);
 });

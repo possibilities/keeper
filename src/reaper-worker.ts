@@ -64,7 +64,8 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import { createTmuxPaneOps, type TmuxPaneOps } from "./exec-backend";
 import { resolveDisableAutoclose } from "./pair-command";
-import type { Job } from "./types";
+import { extractTmuxTopologySnapshot } from "./reducer";
+import type { Event, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 
 /**
@@ -140,6 +141,13 @@ export interface ReapCandidate {
   pane_id: string;
   /** The keeper birth-session whose window is being reaped (audit fragment). */
   session: string;
+  /**
+   * The tmux server generation (`backend_exec_generation_id`) this job's pane was
+   * last resolved under, or `null` when unresolved. The pre-kill recycle guard
+   * cross-checks it against the LIVE topology generation — a mismatch means `%N`
+   * was recycled into a new server generation and the kill is skipped.
+   */
+  generation_id: string | null;
 }
 
 /**
@@ -213,7 +221,12 @@ export function selectReapCandidates(
     if (last !== undefined && now - last < REAP_KILL_COOLDOWN_SEC) {
       continue;
     }
-    out.push({ job_id: job.job_id, pane_id: paneId, session: birth });
+    out.push({
+      job_id: job.job_id,
+      pane_id: paneId,
+      session: birth,
+      generation_id: job.backend_exec_generation_id ?? null,
+    });
   }
   out.sort((a, b) => (a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0));
   return out;
@@ -231,19 +244,90 @@ export type ReapSelector = (
 ) => ReapCandidate[];
 
 /**
+ * The live tmux pane→owner mapping the recycle guard cross-checks against,
+ * derived from the LATEST `TmuxTopologySnapshot` event. `generation_id` is the
+ * server generation (the tmux server pid) the snapshot was read under;
+ * `paneOwners` maps each live `%N` to the keeper job that owned it at post time
+ * — `has(pane_id)` is the pane's LIVENESS in this generation, and the value is
+ * the owning `job_id` (or `undefined` when no working/stopped keeper job claimed
+ * the pane, e.g. an `ended` job's lingering window, which the producer's owner
+ * join excludes).
+ */
+export interface LiveTopology {
+  generation_id: string;
+  paneOwners: Map<string, string | undefined>;
+}
+
+/**
+ * Reads the latest live topology, or `null` when it is unavailable (no snapshot
+ * yet / a read or decode failure). The production binding reads the most recent
+ * `TmuxTopologySnapshot` over the worker's read-only connection; tests inject a
+ * fixed snapshot. A `null` return degrades the recycle guard to SKIP (never
+ * kill) — the read NEVER throws into the cycle.
+ */
+export type LiveTopologyReader = () => LiveTopology | null;
+
+/**
+ * The recycle guard's verdict: may the reaper kill `candidate.pane_id`? TRUE only
+ * when the live topology POSITIVELY confirms the pane still belongs to THIS job
+ * at THIS job's recorded generation. Any uncertainty degrades to FALSE (skip,
+ * never kill) — the failure mode this guards is collateral-killing a LIVE window
+ * whose `%N` a long-dead job still claims after tmux recycled the id across a
+ * server generation.
+ *
+ * FALSE (skip) when ANY holds:
+ *  - the live topology is unavailable (`null` — no snapshot / read failed),
+ *  - the pane is ABSENT from the live snapshot (no live pane to kill),
+ *  - the live snapshot's generation != the job's recorded generation (a `%N`
+ *    recycled into a NEW server generation; also covers a NULL recorded
+ *    generation, which can never positively match), OR
+ *  - the pane is present but OWNED by a DIFFERENT keeper job (reassigned).
+ *
+ * A present pane at the matching generation with NO recorded owner is OUR
+ * lingering window — an `ended` reap candidate is excluded from the producer's
+ * owner join, so its still-live pane carries no `job_id` — and DOES reap.
+ *
+ * Pure: reads only its two args. Exported for unit reach.
+ */
+export function livePaneOwned(
+  candidate: ReapCandidate,
+  topo: LiveTopology | null,
+): boolean {
+  if (topo === null) {
+    return false;
+  }
+  if (!topo.paneOwners.has(candidate.pane_id)) {
+    return false;
+  }
+  if (topo.generation_id !== candidate.generation_id) {
+    return false;
+  }
+  const owner = topo.paneOwners.get(candidate.pane_id);
+  if (owner != null && owner !== candidate.job_id) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Drive one reaper cycle. Calls `select` for the candidate set, and for EACH
  * candidate re-runs `select` against a FRESH read immediately before the kill —
  * requiring the SAME job to still pass the full predicate. A resume that flipped
  * `stopped → working` (or any other clause miss) between selection and now
- * aborts that kill (the CWE-367 TOCTOU mitigation). Stamps the cooldown on every
- * attempt and emits one stderr audit line per attempt. NEVER throws for an
- * expected degradation: a `killWindow` failure is a logged non-fatal skip.
+ * aborts that kill (the CWE-367 TOCTOU mitigation). It then cross-checks the
+ * LIVE topology via {@link livePaneOwned}: tmux recycles `%N` across server
+ * generations, so a job that still passes the predicate may now point at a pane
+ * a DIFFERENT live window owns — that kill is skipped (the recycle guard). Stamps
+ * the cooldown on every fired attempt and emits one stderr audit line per
+ * attempt. NEVER throws for an expected degradation: a missing topology or a
+ * `killWindow` failure is a logged non-fatal skip.
  *
  * Exported for unit reach: tests drive this directly with an injected selector +
- * fake backend and a controllable `now`.
+ * topology reader + fake backend and a controllable `now`.
  */
 export async function reaperCycle(
   select: ReapSelector,
+  liveTopology: LiveTopologyReader,
   backend: Pick<TmuxPaneOps, "killWindow">,
   cooldown: Map<string, number>,
   now: () => number,
@@ -252,27 +336,39 @@ export async function reaperCycle(
   for (const candidate of candidates) {
     // Re-run the full predicate against a FRESH read immediately before the kill
     // and require the SAME job to still pass. A resume that flipped the state
-    // between selection and now aborts the kill.
+    // between selection and now aborts the kill. The fresh row carries the
+    // current generation for the recycle cross-check below.
     const recheckNow = now();
     const fresh = select(recheckNow, cooldown);
-    const stillReapable = fresh.some(
+    const freshCandidate = fresh.find(
       (c) => c.job_id === candidate.job_id && c.pane_id === candidate.pane_id,
     );
-    if (!stillReapable) {
+    if (freshCandidate === undefined) {
       console.error(
         `[reaper-worker] reap aborted job=${candidate.job_id} session=${candidate.session} outcome=recheck-miss`,
       );
       continue;
     }
+    // Recycle guard: the job still passes the predicate, but tmux recycles `%N`
+    // across server generations, so re-confirm the LIVE pane still belongs to
+    // THIS job at its recorded generation. A mismatch (different generation, a
+    // different owner, an absent pane, or an unavailable snapshot) degrades to
+    // SKIP — never kill the collateral-kill this guards against.
+    if (!livePaneOwned(freshCandidate, liveTopology())) {
+      console.error(
+        `[reaper-worker] reap aborted job=${freshCandidate.job_id} session=${freshCandidate.session} pane=${freshCandidate.pane_id} outcome=pane-recycled`,
+      );
+      continue;
+    }
     // Stamp the cooldown on EVERY attempt (before the fire) so a SIGHUP-absorbed
     // kill that left the row stopped doesn't re-spawn tmux next cycle.
-    cooldown.set(candidate.job_id, recheckNow);
-    const res = await backend.killWindow(candidate.pane_id);
+    cooldown.set(freshCandidate.job_id, recheckNow);
+    const res = await backend.killWindow(freshCandidate.pane_id);
     const outcome = res.ok ? "killed" : `skip:${res.error}`;
     // The one trace the reaper leaves: a single audit line per attempt. The
     // exit-watcher's Killed mint — not this line — is the truth of the death.
     console.error(
-      `[reaper-worker] reap job=${candidate.job_id} session=${candidate.session} pane=${candidate.pane_id} outcome=${outcome}`,
+      `[reaper-worker] reap job=${freshCandidate.job_id} session=${freshCandidate.session} pane=${freshCandidate.pane_id} outcome=${outcome}`,
     );
   }
 }
@@ -328,7 +424,7 @@ function main(): void {
   const jobsQuery = db.query(
     `SELECT job_id, state, updated_at, backend_exec_type,
             backend_exec_session_id, backend_exec_birth_session_id,
-            backend_exec_pane_id
+            backend_exec_pane_id, backend_exec_generation_id
        FROM jobs
       WHERE backend_exec_birth_session_id IS NOT NULL
         AND backend_exec_type = 'tmux'
@@ -344,6 +440,44 @@ function main(): void {
       return [];
     }
     return selectReapCandidates(jobs, n, cd, disableAutoclose, graceSec);
+  };
+
+  // The LIVE topology read for the recycle guard — the single most recent
+  // `TmuxTopologySnapshot` over this read-only connection, decoded by the
+  // reducer's null-safe `extractTmuxTopologySnapshot` (reads ONLY `event.data`).
+  // Prepared once; `.get()` re-executes against the latest committed snapshot on
+  // every pre-kill cross-check. NEVER throws into the cycle: an absent snapshot,
+  // a read error, or a malformed payload degrades to `null` (the guard then SKIPS
+  // — never kills).
+  const topologyQuery = db.query(
+    `SELECT data FROM events
+      WHERE hook_event = 'TmuxTopologySnapshot'
+      ORDER BY id DESC LIMIT 1`,
+  );
+  const readLiveTopology: LiveTopologyReader = () => {
+    let row: { data: string | null } | null;
+    try {
+      row = topologyQuery.get() as { data: string | null } | null;
+    } catch (err) {
+      console.error("[reaper-worker] topology read failed (non-fatal):", err);
+      return null;
+    }
+    if (row == null || row.data == null) {
+      return null;
+    }
+    // extractTmuxTopologySnapshot reads ONLY `event.data`; the minimal row stands
+    // in for the full Event (cast through `unknown` since the shape is partial).
+    const snap = extractTmuxTopologySnapshot({
+      data: row.data,
+    } as unknown as Event);
+    if (snap === null) {
+      return null;
+    }
+    const paneOwners = new Map<string, string | undefined>();
+    for (const pane of snap.panes) {
+      paneOwners.set(pane.pane_id, pane.job_id);
+    }
+    return { generation_id: snap.generation_id, paneOwners };
   };
 
   let shutdown = false;
@@ -381,7 +515,7 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        await reaperCycle(select, backend, cooldown, now);
+        await reaperCycle(select, readLiveTopology, backend, cooldown, now);
       } while (wakePending && !shutdown);
     } catch (err) {
       console.error(
