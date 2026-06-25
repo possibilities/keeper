@@ -19,15 +19,19 @@ import { describe, expect, test } from "bun:test";
 import { decideTmuxControlWatchdog } from "../src/daemon";
 import {
   buildAttachArgs,
+  type ControlChild,
   decideReconnect,
   deriveFocus,
   focusDedupKey,
   hasLiveTmuxJob,
   isStructuralNotification,
   pickAnchorSession,
+  runConnection,
+  type TmuxClientFocusSnapshotMessage,
 } from "../src/tmux-control-worker";
 import type { FocusDerivation } from "../src/tmux-focus-derive";
 import type { Job } from "../src/types";
+import { retryUntil } from "./helpers/retry-until";
 
 function fakeJob(opts: {
   job_id?: string;
@@ -419,5 +423,254 @@ describe("decideTmuxControlWatchdog", () => {
         livenessThresholdMs: threshold,
       }),
     ).toBe("escalate");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runConnection — synthetic-child handshake drop + redirty re-read (fast tier)
+//
+// Drives the intricate dirty/redirty/handshake-drop state machine through the
+// `ControlChild` injection seam with a SCRIPTED transcript and NO real `tmux -C`
+// fork: a fake stdout `ReadableStream` we push chunks into, plus a stdin stub
+// that records the worker's commands and triggers the matching reply chunks.
+// This is the fast-tier coverage the seam was built to enable — it pins the
+// fn-962 fix: the bootstrap is released only after the unsolicited attach
+// handshake block has FULLY settled, even when its `%end` splits into a later
+// read, so no reply is mis-correlated to the wrong command's resolver.
+// ---------------------------------------------------------------------------
+
+/** A scripted `ControlChild` over a manually-fed stdout stream. `pushStdout`
+ *  enqueues a raw chunk (split a `%end` into a later push to simulate a read
+ *  boundary); `onWrite` observes each stdin command the worker issues; `eof`
+ *  ends the stream so `runConnection` returns. No real process. */
+function makeScriptedChild(onWrite: (cmd: string) => void): {
+  child: ControlChild;
+  pushStdout: (chunk: string) => void;
+  eof: () => void;
+} {
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const pending: Uint8Array[] = [];
+  const enc = new TextEncoder();
+  const stdout = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+      // Flush anything pushed before the reader subscribed.
+      for (const chunk of pending) c.enqueue(chunk);
+      pending.length = 0;
+    },
+  });
+  let exitResolve: (code: number) => void = () => {};
+  const exited = new Promise<number>((r) => {
+    exitResolve = r;
+  });
+  const pushStdout = (chunk: string): void => {
+    const bytes = enc.encode(chunk);
+    if (controller) controller.enqueue(bytes);
+    else pending.push(bytes);
+  };
+  const eof = (): void => {
+    try {
+      controller?.close();
+    } catch {
+      // already closed
+    }
+    exitResolve(0);
+  };
+  const child: ControlChild = {
+    stdout,
+    stdin: {
+      write(chunk: string) {
+        // The worker writes `${text}\n`; hand the trimmed command to the script.
+        onWrite(chunk.replace(/\n$/, ""));
+      },
+    },
+    exited,
+    kill() {
+      eof();
+    },
+  };
+  return { child, pushStdout, eof };
+}
+
+/** Frame a scripted reply block for command number `n` with the given body. */
+function replyBlock(n: number, body: string[]): string {
+  return [`%begin 0 ${n} 1`, ...body, `%end 0 ${n} 1`, ""].join("\n");
+}
+
+describe("runConnection — synthetic-child handshake drop + redirty re-read", () => {
+  test("a handshake whose %end splits into a later read does not release the bootstrap early and never mis-correlates the first command reply", async () => {
+    const posted: TmuxClientFocusSnapshotMessage[] = [];
+    const commands: string[] = [];
+    let stopping = false;
+
+    // The real client on `main` window 3 pane %42; keeper's own control client
+    // (controlMode=1) is dropped by the derivation. A non-trivial pane table so a
+    // mis-correlated reply (handshake body leaking into a list-* slot) would visibly
+    // derive the WRONG focus instead of this one.
+    const clientsBody = [
+      "/dev/ttys001\t0\t120\t10\tmain",
+      "/dev/ttys999\t1\t130\t11\tmain",
+    ];
+    const panesBody = [
+      "1\t1\t3\t%42\tmain",
+      "1\t0\t3\t%41\tmain",
+      "0\t1\t1\t%10\tmain",
+    ];
+
+    let cmdNum = 100;
+    const child = (() => {
+      const h = makeScriptedChild((cmd) => {
+        commands.push(cmd);
+        // Reply to each bootstrap/re-read command in FIFO order. The reply's
+        // command number is internally consistent (begin/end match); FIFO order —
+        // not the number — is what correlates it to the awaiting resolver.
+        cmdNum += 1;
+        if (cmd.startsWith("refresh-client")) {
+          h.pushStdout(replyBlock(cmdNum, []));
+        } else if (cmd.startsWith("copy-mode")) {
+          h.pushStdout(replyBlock(cmdNum, []));
+        } else if (cmd.startsWith("display-message")) {
+          h.pushStdout(replyBlock(cmdNum, ["48271"])); // the server pid
+        } else if (cmd.startsWith("list-clients")) {
+          h.pushStdout(replyBlock(cmdNum, clientsBody));
+        } else if (cmd.startsWith("list-panes")) {
+          h.pushStdout(replyBlock(cmdNum, panesBody));
+        }
+      });
+      return h;
+    })();
+
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: (m) => posted.push(m),
+      postLiveness: () => {},
+    });
+
+    // Emit the unsolicited attach handshake block with its `%end` SPLIT across two
+    // reads: the `%begin` + body land first; NO command must be sent yet (the
+    // bootstrap must still be blocked on the unsettled handshake).
+    child.pushStdout(`%begin 0 0 1\n`);
+    child.pushStdout(`%session-changed $1 main\n`); // body inside the open block
+    // The handshake is still open — assert the bootstrap has NOT been released.
+    await Bun.sleep(20);
+    expect(commands.length).toBe(0);
+
+    // The handshake's `%end` arrives in a LATER read — only now does the
+    // connection-scoped parser complete the handshake reply, drop it (empty queue),
+    // and release the bootstrap to send its first command.
+    child.pushStdout(`%end 0 0 1\n`);
+
+    // The framed focus read must derive the CORRECT focus — a mis-correlation
+    // (the handshake body matching the refresh-client resolver) would shift every
+    // later reply by one and derive a wrong/none focus.
+    const got = await retryUntil(
+      () => (posted.length > 0 ? posted[posted.length - 1] : null),
+      5000,
+    );
+    expect(got).toEqual({
+      kind: "tmux-client-focus-snapshot",
+      status: "connected",
+      generation_id: "48271",
+      session_name: "main",
+      window_index: 3,
+      pane_id: "%42",
+    });
+
+    // The bootstrap + first re-read issued exactly these commands in order — the
+    // handshake never consumed a resolver slot.
+    expect(commands).toEqual([
+      "refresh-client -f no-output",
+      "copy-mode -q",
+      "display-message -p '#{pid}'",
+      "list-clients -F '#{client_name}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{client_session}'",
+      "list-panes -a -F '#{window_active}\t#{pane_active}\t#{window_index}\t#{pane_id}\t#{session_name}'",
+    ]);
+
+    stopping = true;
+    child.eof();
+    expect(await conn).toBe(true);
+  });
+
+  test("a structural notification arriving mid-re-read re-arms exactly one more re-read", async () => {
+    const posted: TmuxClientFocusSnapshotMessage[] = [];
+    const commands: string[] = [];
+    let stopping = false;
+
+    // Two distinct focus states so the redirty re-read produces a SECOND, different
+    // post (window 3 → window 5). The first re-read reads state A; a structural
+    // notification lands while it is in flight; the re-arm reads state B.
+    const clientsBody = ["/dev/ttys001\t0\t120\t10\tmain"];
+    const panesA = ["1\t1\t3\t%42\tmain"];
+    const panesB = ["1\t1\t5\t%99\tmain"];
+
+    let readCount = 0;
+    let cmdNum = 200;
+    const child = (() => {
+      const h = makeScriptedChild((cmd) => {
+        commands.push(cmd);
+        cmdNum += 1;
+        if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
+          h.pushStdout(replyBlock(cmdNum, []));
+        } else if (cmd.startsWith("display-message")) {
+          h.pushStdout(replyBlock(cmdNum, ["77"]));
+        } else if (cmd.startsWith("list-clients")) {
+          h.pushStdout(replyBlock(cmdNum, clientsBody));
+        } else if (cmd.startsWith("list-panes")) {
+          readCount += 1;
+          if (readCount === 1) {
+            // While the FIRST re-read's panes reply is being consumed, inject a
+            // structural notification — it must re-arm exactly one more re-read.
+            h.pushStdout(replyBlock(cmdNum, panesA));
+            h.pushStdout(`%window-pane-changed @4 %99\n`);
+          } else {
+            h.pushStdout(replyBlock(cmdNum, panesB));
+          }
+        }
+      });
+      return h;
+    })();
+
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: (m) => posted.push(m),
+      postLiveness: () => {},
+    });
+
+    // Settle the handshake (begin+end in one read this time) → bootstrap releases.
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    // Expect exactly TWO posts: state A then the re-armed state B.
+    const second = await retryUntil(
+      () => (posted.length >= 2 ? posted[1] : null),
+      5000,
+    );
+    expect(second).toEqual({
+      kind: "tmux-client-focus-snapshot",
+      status: "connected",
+      generation_id: "77",
+      session_name: "main",
+      window_index: 5,
+      pane_id: "%99",
+    });
+    expect(posted[0]).toEqual({
+      kind: "tmux-client-focus-snapshot",
+      status: "connected",
+      generation_id: "77",
+      session_name: "main",
+      window_index: 3,
+      pane_id: "%42",
+    });
+
+    // Exactly two framed reads ran (the redirty re-armed ONCE, not a loop): the
+    // generation is read once, then list-clients/list-panes per re-read.
+    const paneReads = commands.filter((c) => c.startsWith("list-panes")).length;
+    expect(paneReads).toBe(2);
+    // No third re-read piles up after the re-arm drains.
+    await Bun.sleep(150);
+    expect(commands.filter((c) => c.startsWith("list-panes")).length).toBe(2);
+
+    stopping = true;
+    child.eof();
+    expect(await conn).toBe(true);
   });
 });

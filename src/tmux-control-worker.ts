@@ -45,7 +45,7 @@ import { openDb } from "./db";
 import { localeDefaultedEnv } from "./exec-backend";
 import { LineBuffer, OversizedLineError } from "./protocol";
 import { runQuery } from "./server-worker";
-import { parseControlStream } from "./tmux-control-parser";
+import { createControlStreamParser } from "./tmux-control-parser";
 import {
   type FocusDerivation,
   parseClientLines,
@@ -321,8 +321,10 @@ const SHUTDOWN_DEADLINE_MS = 2_000;
 // ---------------------------------------------------------------------------
 
 /** Minimal shape of the `Bun.spawn` child the runtime drives — the injection
- *  seam (a test substitutes a synthetic-transcript child with no real fork). */
-interface ControlChild {
+ *  seam (a test substitutes a synthetic-transcript child with no real fork).
+ *  Exported so the fast-tier synthetic-child test can feed a scripted transcript
+ *  through {@link runConnection} with no real `tmux -C` fork. */
+export interface ControlChild {
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stdin: { write(chunk: string): void; flush?(): void };
   readonly exited: Promise<number>;
@@ -599,7 +601,7 @@ function pickAnchorForConnect(jobs: readonly Job[]): string | null {
  * `copy-mode -q`, read the server pid (generation) FIRST, then the initial framed
  * focus read. A notification landing mid-re-read re-arms dirty and re-reads once.
  */
-async function runConnection(
+export async function runConnection(
   child: ControlChild,
   ctx: {
     isStopping: () => boolean;
@@ -617,17 +619,40 @@ async function runConnection(
   // makes the leading UNSOLICITED reply block deterministic to drop: on attach
   // tmux emits its own `%begin`/`%end` handshake block (plus a `%session-changed`)
   // BEFORE any command of ours. Because the first command is sent only AFTER the
-  // reader has drained that initial output (see `firstChunk` below), the handshake
-  // block arrives with an EMPTY queue and is dropped — so a reply is never
-  // mis-matched to the wrong command's resolver. The reader NEVER awaits a DB
-  // write; it only buffers lines + resolves queue heads.
+  // reader has drained one COMPLETE reply event against the empty queue (that
+  // handshake block — see `handshakeSettled` below), the handshake block is dropped
+  // with an empty queue and a reply is never mis-matched to the wrong command's
+  // resolver. The handshake's `%end` may split into a later read; a connection-
+  // scoped stateful parser reassembles it, so the drop is deterministic regardless
+  // of read boundaries. The reader NEVER awaits a DB write; it only buffers lines +
+  // resolves queue heads.
   type ReplyResolver = (lines: readonly string[]) => void;
   const replyQueue: ReplyResolver[] = [];
+
+  // Resolves once the reader has drained ONE complete reply event against an
+  // EMPTY queue — i.e. tmux's unsolicited attach handshake `%begin`/`%end` block
+  // has fully settled (its `%end` may arrive in a later read; the connection-
+  // scoped parser reassembles it). The bootstrap awaits this before sending its
+  // first command so that handshake reply can never FIFO-match one of our
+  // resolvers. Gating on a settled reply — not on "processed a chunk with a
+  // line" — makes the drop deterministic regardless of read boundaries.
+  let resolveHandshake: () => void = () => {};
+  const handshakeSettled = new Promise<void>((r) => {
+    resolveHandshake = r;
+  });
+
   /** Resolve the queue head (FIFO). A reply with an empty queue (the unsolicited
-   *  attach handshake block) is dropped. */
+   *  attach handshake block) is dropped — and that empty-queue drop is exactly
+   *  the signal that releases the bootstrap (`resolveHandshake`). */
   const settleHead = (lines: readonly string[]): void => {
     const waiter = replyQueue.shift();
-    if (waiter) waiter(lines);
+    if (waiter) {
+      waiter(lines);
+      return;
+    }
+    // Empty queue: an unsolicited reply (the attach handshake block). Dropping it
+    // here is the deterministic bootstrap-release signal.
+    resolveHandshake();
   };
   /** Drain every still-pending waiter (child gone / teardown) so an in-flight
    *  `runReread` unblocks instead of hanging. */
@@ -642,15 +667,6 @@ async function runConnection(
   let madeProgress = false;
   let exited = false;
   let exitReason: string | null = null;
-
-  // Resolves once the reader has processed its FIRST non-empty chunk — i.e. the
-  // unsolicited attach handshake block + `%session-changed` have been read (and
-  // dropped). The bootstrap awaits this before sending its first command so that
-  // handshake block never matches one of our resolvers.
-  let resolveFirstChunk: () => void = () => {};
-  const firstChunk = new Promise<void>((r) => {
-    resolveFirstChunk = r;
-  });
 
   // Dirty/re-read coordination — a single-in-flight, debounced re-read. A
   // notification sets `dirty`; if a re-read is in flight, `redirty` re-arms so the
@@ -683,6 +699,10 @@ async function runConnection(
   // structural notification; the re-read + post happen on the awaiting side.
   const readerDone = (async (): Promise<void> => {
     const reader = child.stdout.getReader();
+    // Connection-scoped, stateful parser: `%begin`/`%end` framing state survives
+    // across reads, so a reply block (notably the unsolicited attach handshake)
+    // whose `%end` lands in a LATER read reassembles into ONE reply event.
+    const parser = createControlStreamParser();
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -700,14 +720,14 @@ async function runConnection(
           throw err;
         }
         if (lines.length === 0) continue;
-        // Parse the accumulated complete lines as a transcript chunk. The parser
-        // is whole-transcript pure; feeding it complete lines per chunk keeps each
-        // `%begin`/`%end` block intact (we only ever pass whole lines).
-        const events = parseControlStream(`${lines.join("\n")}\n`);
+        // Feed the accumulated complete lines into the stateful parser. An open
+        // `%begin` block is carried forward; its `%end` in a later feed completes
+        // the reply — so a split handshake never leaks an early bootstrap release.
+        const events = parser.feed(`${lines.join("\n")}\n`);
         for (const ev of events) {
           if (ev.kind === "reply") {
             // Resolve the FIFO head; a reply with an empty queue (the unsolicited
-            // attach handshake block) is dropped.
+            // attach handshake block) is dropped AND releases the bootstrap.
             settleHead(ev.lines);
           } else if (ev.kind === "exit") {
             exited = true;
@@ -719,16 +739,13 @@ async function runConnection(
             }
           }
         }
-        // The first non-empty chunk has been processed (handshake + initial
-        // notifications drained) — release the bootstrap to send its commands.
-        resolveFirstChunk();
         if (exited) break;
       }
     } finally {
       reader.releaseLock();
-      // Release a bootstrap still blocked on the first chunk (a child that died
-      // before emitting any output) so teardown does not hang.
-      resolveFirstChunk();
+      // Release a bootstrap still blocked on the handshake (a child that died
+      // before emitting a complete reply block) so teardown does not hang.
+      resolveHandshake();
       // The child's stream ended (EOF or `%exit`). Unblock every command awaiting
       // a reply that will now never arrive, so a `runReread` in flight settles
       // instead of hanging the connection teardown.
@@ -816,15 +833,18 @@ async function runConnection(
     }
   }
 
-  // Bootstrap the connection. WAIT for the reader's first chunk first — that
-  // chunk carries tmux's unsolicited attach handshake `%begin`/`%end` block, which
-  // must be read (and dropped, the reply queue being empty) BEFORE we enqueue any
-  // command, or that block would FIFO-match our first command's resolver. Then
-  // re-assert no-output (NEVER toggle) and send the defensive copy-mode, AWAITED in
-  // order so their reply blocks drain before the first focus read. A child-gone
-  // mid-bootstrap settles via the reader's EOF/exit path.
+  // Bootstrap the connection. WAIT for the unsolicited attach handshake to fully
+  // settle first — tmux emits its own `%begin`/`%end` handshake block on attach,
+  // which must be drained (and dropped, the reply queue being empty) BEFORE we
+  // enqueue any command, or that block would FIFO-match our first command's
+  // resolver. Gating on the handshake reply having SETTLED (not on "a chunk with a
+  // line arrived") keeps the drop deterministic even when the handshake's `%end`
+  // splits into a later read. Then re-assert no-output (NEVER toggle) and send the
+  // defensive copy-mode, AWAITED in order so their reply blocks drain before the
+  // first focus read. A child-gone mid-bootstrap settles via the reader's EOF/exit
+  // path.
   void (async (): Promise<void> => {
-    await firstChunk;
+    await handshakeSettled;
     try {
       await sendCommand("refresh-client -f no-output");
       await sendCommand("copy-mode -q");

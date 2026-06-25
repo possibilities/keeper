@@ -100,103 +100,125 @@ function frameCmdNum(tokens: readonly string[]): number | null {
 }
 
 /**
- * Parse a complete control-mode transcript (a string of `\n`-joined lines) into
- * an ordered list of {@link ControlEvent}s. Pure: same input always yields the
- * same output, no I/O, no throw.
- *
- * A trailing partial line (no terminating newline) is treated as a whole line —
- * the daemon's reader frames on newlines before calling this, so a caller is
- * expected to pass only complete lines; an incomplete tail simply parses as its
- * own line and, if it is an unmatched `%begin`, leaves the machine InBlock with
- * no emitted reply (the next chunk's `%end` closes it only if the caller
- * preserves state — for whole-transcript golden tests this is a non-issue).
+ * A stateful, incremental control-stream parser. `feed` is called with a chunk
+ * of WHOLE lines (a string of `\n`-joined lines, the caller having already
+ * framed on newlines) and returns the events that completed within this chunk;
+ * a `%begin` block whose matching `%end`/`%error` has not yet arrived is carried
+ * forward and emitted only once the trailer lands in a LATER `feed` — so a
+ * handshake (or any reply) split across reads reassembles into exactly ONE
+ * `reply` event regardless of read boundaries. Stateful, NOT pure; never throws.
  */
-export function parseControlStream(text: string): ControlEvent[] {
-  const events: ControlEvent[] = [];
-  const lines = text.split("\n");
-  // Drop a trailing empty element produced by a terminating newline so it is
-  // not mistaken for a blank protocol line.
-  if (lines.length > 0 && lines[lines.length - 1] === "") {
-    lines.pop();
-  }
+export interface ControlStreamParser {
+  feed(text: string): ControlEvent[];
+  /** True while an unterminated `%begin` block is being carried across feeds. */
+  inBlock(): boolean;
+}
 
+/** Create a fresh incremental {@link ControlStreamParser}. The InBlock framing
+ *  state (open command number + accumulated body lines) survives across `feed`
+ *  calls, so a `%begin`/`%end` split across reads frames into one reply. */
+export function createControlStreamParser(): ControlStreamParser {
   let inBlock = false;
   let blockCmdNum = 0;
   let blockLines: string[] = [];
 
-  const limit = Math.min(lines.length, MAX_LINES);
-  for (let i = 0; i < limit; i++) {
-    const line = lines[i] as string;
+  const feed = (text: string): ControlEvent[] => {
+    const events: ControlEvent[] = [];
+    const lines = text.split("\n");
+    // Drop a trailing empty element produced by a terminating newline so it is
+    // not mistaken for a blank protocol line.
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
 
-    if (inBlock) {
-      // Inside a block EVERY line is body until the matching trailer — match by
-      // command number only.
-      if (line.startsWith("%end ") || line.startsWith("%error ")) {
-        const tokens = line.split(" ");
-        const cmdNum = frameCmdNum(tokens);
-        if (cmdNum === blockCmdNum) {
-          events.push({
-            kind: "reply",
-            cmdNum: blockCmdNum,
-            lines: blockLines,
-            isError: line.startsWith("%error "),
-          });
-          inBlock = false;
-          blockLines = [];
-          continue;
+    const limit = Math.min(lines.length, MAX_LINES);
+    for (let i = 0; i < limit; i++) {
+      const line = lines[i] as string;
+
+      if (inBlock) {
+        // Inside a block EVERY line is body until the matching trailer — match by
+        // command number only.
+        if (line.startsWith("%end ") || line.startsWith("%error ")) {
+          const tokens = line.split(" ");
+          const cmdNum = frameCmdNum(tokens);
+          if (cmdNum === blockCmdNum) {
+            events.push({
+              kind: "reply",
+              cmdNum: blockCmdNum,
+              lines: blockLines,
+              isError: line.startsWith("%error "),
+            });
+            inBlock = false;
+            blockLines = [];
+            continue;
+          }
+          // Trailer for a DIFFERENT command number: still body (misframing guard).
         }
-        // Trailer for a DIFFERENT command number: still body (misframing guard).
-      }
-      blockLines.push(line);
-      continue;
-    }
-
-    // Idle state.
-    if (!line.startsWith("%")) {
-      // Non-notification protocol noise in Idle — ignore.
-      continue;
-    }
-
-    if (line.startsWith("%begin ")) {
-      const tokens = line.split(" ");
-      const cmdNum = frameCmdNum(tokens);
-      if (cmdNum === null) {
-        // Malformed header — drop it, stay Idle (never throw).
+        blockLines.push(line);
         continue;
       }
-      inBlock = true;
-      blockCmdNum = cmdNum;
-      blockLines = [];
-      continue;
+
+      // Idle state.
+      if (!line.startsWith("%")) {
+        // Non-notification protocol noise in Idle — ignore.
+        continue;
+      }
+
+      if (line.startsWith("%begin ")) {
+        const tokens = line.split(" ");
+        const cmdNum = frameCmdNum(tokens);
+        if (cmdNum === null) {
+          // Malformed header — drop it, stay Idle (never throw).
+          continue;
+        }
+        inBlock = true;
+        blockCmdNum = cmdNum;
+        blockLines = [];
+        continue;
+      }
+
+      if (line === "%exit" || line.startsWith("%exit ")) {
+        const reason = line.length > "%exit".length ? line.slice(6) : undefined;
+        events.push(
+          reason !== undefined && reason !== ""
+            ? { kind: "exit", reason }
+            : { kind: "exit" },
+        );
+        continue;
+      }
+
+      // A plain notification: `%verb arg arg …`.
+      const sp = line.indexOf(" ");
+      const verb = sp < 0 ? line.slice(1) : line.slice(1, sp);
+      if (verb === "") {
+        // A bare `%` — ignore.
+        continue;
+      }
+      if (!KNOWN_NOTIFICATION_VERBS.has(verb)) {
+        // Unknown verb: parse-and-ignore (never throw).
+        continue;
+      }
+      const rest = sp < 0 ? "" : line.slice(sp + 1);
+      const args = rest === "" ? [] : rest.split(" ");
+      events.push({ kind: "notification", verb, args });
     }
 
-    if (line === "%exit" || line.startsWith("%exit ")) {
-      const reason = line.length > "%exit".length ? line.slice(6) : undefined;
-      events.push(
-        reason !== undefined && reason !== ""
-          ? { kind: "exit", reason }
-          : { kind: "exit" },
-      );
-      continue;
-    }
+    return events;
+  };
 
-    // A plain notification: `%verb arg arg …`.
-    const sp = line.indexOf(" ");
-    const verb = sp < 0 ? line.slice(1) : line.slice(1, sp);
-    if (verb === "") {
-      // A bare `%` — ignore.
-      continue;
-    }
-    if (!KNOWN_NOTIFICATION_VERBS.has(verb)) {
-      // Unknown verb: parse-and-ignore (never throw).
-      continue;
-    }
-    const rest = sp < 0 ? "" : line.slice(sp + 1);
-    const args = rest === "" ? [] : rest.split(" ");
-    events.push({ kind: "notification", verb, args });
-  }
+  return { feed, inBlock: () => inBlock };
+}
 
-  return events;
+/**
+ * Parse a complete control-mode transcript (a string of `\n`-joined lines) into
+ * an ordered list of {@link ControlEvent}s. Pure: same input always yields the
+ * same output, no I/O, no throw. A whole-transcript convenience over
+ * {@link createControlStreamParser} (a single `feed`) — for golden tests and any
+ * caller holding the entire transcript at once. A trailing unmatched `%begin`
+ * leaves the parser InBlock with no emitted reply (discarded with the parser).
+ */
+export function parseControlStream(text: string): ControlEvent[] {
+  return createControlStreamParser().feed(text);
 }
 
 /**
