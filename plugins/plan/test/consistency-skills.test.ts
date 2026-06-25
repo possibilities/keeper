@@ -285,6 +285,64 @@ describe("close skill coordinator invariants", () => {
 });
 
 // ---------------------------------------------------------------------------
+// panel skill — thin shim spawns plan:panel-runner; the runner agent's
+// frontmatter; the stale "never in a subagent" claim gone from both surfaces
+// ---------------------------------------------------------------------------
+
+const PANEL_RUNNER = join(REPO, "agents", "panel-runner.md");
+const PANEL_SKILL = join(REPO, "skills", "panel", "SKILL.md");
+const PANEL_REFERENCE = join(REPO, "skills", "panel", "references", "panel.md");
+
+describe("panel-runner agent frontmatter", () => {
+  test("exists as a tracked agent named panel-runner", () => {
+    expect(existsSync(PANEL_RUNNER)).toBe(true);
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_RUNNER));
+    expect(fm.name).toBe("panel-runner");
+  });
+
+  test("pins model: opus", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_RUNNER));
+    expect(fm.model).toBe("opus");
+  });
+
+  test("disallows Monitor (waits with blocking Bash) but keeps Task (spawns the judge)", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_RUNNER));
+    expect(fm.disallowedTools).toContain("Monitor");
+    expect(fm.disallowedTools).not.toContain("Task");
+  });
+});
+
+describe("panel skill shim", () => {
+  test("spawns plan:panel-runner with no model= kwarg", () => {
+    const text = readFileSync(PANEL_SKILL, "utf-8");
+    const runnerBlocks = extractTaskCallBlocks(text).filter((b) =>
+      b.includes("plan:panel-runner"),
+    );
+    expect(runnerBlocks.length).toBeGreaterThanOrEqual(1);
+    expect(text).toContain('subagent_type="plan:panel-runner"');
+    for (const block of runnerBlocks) {
+      expect(block).not.toContain("model=");
+    }
+  });
+
+  test("keys on the runner's PANEL_RUN_FAILED failure marker", () => {
+    expect(readFileSync(PANEL_SKILL, "utf-8")).toContain("PANEL_RUN_FAILED");
+  });
+});
+
+describe("panel prose drops the stale subagent claim", () => {
+  const surfaces: [string, string][] = [
+    ["panel/SKILL.md", PANEL_SKILL],
+    ["panel/references/panel.md", PANEL_REFERENCE],
+  ];
+  for (const [label, path] of surfaces) {
+    test(`${label} carries no "never in a subagent" claim`, () => {
+      expect(readFileSync(path, "utf-8")).not.toContain("never in a subagent");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // work.md.tmpl — verb guard, agentId regex, tier-routed agents, spawn shape
 // ---------------------------------------------------------------------------
 

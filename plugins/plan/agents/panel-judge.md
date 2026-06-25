@@ -1,6 +1,6 @@
 ---
 name: panel-judge
-description: Internal panel synthesizer — spawned by `/plan:panel` with panelist answer-file paths, reads them in its own context, and returns the final answer plus a five-section audit. Holds the judge inference off the caller's context. Do not invoke directly — use `/plan:panel`.
+description: Internal panel synthesizer — spawned by `plan:panel-runner` with panelist answer-file paths, reads them in its own context, and returns the final answer plus a five-section audit. Holds the judge inference off the caller's context. Do not invoke directly — use `/plan:panel`.
 model: opus
 disallowedTools: Task, Monitor, Edit, Write
 effort: "xhigh"
