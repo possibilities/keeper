@@ -32,5 +32,5 @@ dying-generation scan bound) and land as one commit.
 - [ ] A test seeds DYING_GENERATION_SCAN_LIMIT + 1 G_now snapshots and asserts the fallbackNote fires; placed in a *.slow sibling if the seed is heavy.
 
 ## Done summary
-
+Reframed the DYING_GENERATION_SCAN_LIMIT comment as a heuristic that demotes to the labeled fallback (no 'never truncated' claim), scrubbed the fn-id provenance tag from the recycle-guard test comment, and added a boundary test pinning that LIMIT+1 G_now snapshots ahead of the dying generation fire the fallbackNote.
 ## Evidence
