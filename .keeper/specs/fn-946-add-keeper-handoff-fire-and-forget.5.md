@@ -58,5 +58,5 @@ Forward-facing advice only (no change history in comments/docs).
 - [ ] test:full green; keeper commit-work succeeds
 
 ## Done summary
-
+Added keeper:handoff skill (modeled on dispatch) plus set handoff_prompt_prefix in machine-local config; brought README + CLAUDE.md current (six-surface RPC + request_handoff, worker roster, config catalogue, v87/v88 schema history, board narrative, handoff:: spawn class).
 ## Evidence
