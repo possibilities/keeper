@@ -4655,7 +4655,7 @@ function makeRecoveryGit(state: {
         stderr: "",
       };
     }
-    if (joined.startsWith("rev-parse --git-common-dir")) {
+    if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
       return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
     }
     if (joined.startsWith("merge --no-edit")) {

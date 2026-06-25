@@ -5,6 +5,12 @@
  * Monitor tool. Owns the pairing ergonomics, delegating the tmux transport +
  * model/effort selection to `keeper agent`.
  *
+ * `keeper pair panel start|wait` — the cross-OS panel fan-out the
+ * `plan:panel-runner` agent drives (members → detached `keeper pair send` legs →
+ * chunked terminality poll → N-of-N verdict). All OS-specific machinery
+ * (detachment, polling, deadline-bounding) lives in `src/pair/panel.ts` — zero
+ * `setsid`/`timeout`/`gtimeout`. See that module for the start/wait contract.
+ *
  * STDOUT IS THE MONITOR EVENT CHANNEL. Every run emits exactly one
  * `[keeper-pair] started ...` line followed by exactly one terminal line —
  * either `[keeper-pair] completed ...` (exit 0) or `[keeper-pair] failed ...`
@@ -51,6 +57,7 @@ import {
 import { ensureCodexDirTrust } from "../src/codex-trust";
 import { resolveConfig } from "../src/db";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
+import { runPanel } from "../src/pair/panel";
 import {
   assemblePrompt,
   buildPairLaunchArgv,
@@ -78,7 +85,14 @@ const HELP = `keeper pair — fan a task out to another model CLI via keeper age
 Usage:
   keeper pair send <prompt-file> --preset <name> --output <path> [options]
   keeper pair send <prompt-file> --cli <claude|codex> --output <path> [options]
+  keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper pair panel wait --dir <d> [--chunk <s>]
   keeper pair --help
+
+The 'panel' sub-verb fans a question out to a panel of models as detached
+read-only legs, then waits for them token-free (start launches + prints a
+manifest; wait blocks one chunk + prints the N-of-N verdict). Run
+'keeper pair panel --help' for its options.
 
 stdout is the Monitor event channel: exactly one [keeper-pair] started line then
 one terminal line (completed/failed). The partner's final answer is written to
@@ -187,14 +201,21 @@ function killWindow(paneId: string | null): void {
 }
 
 export async function main(argv: string[]): Promise<void> {
-  // Sub-verb routing: only `send` is supported today.
+  // Sub-verb routing: `send` (fan one task to a partner) and `panel` (fan a
+  // question to a panel of detached legs + chunked-wait verdict).
   const sub = argv[0];
   if (sub === "--help" || sub === "-h" || sub === undefined) {
     process.stdout.write(HELP);
     process.exit(sub === undefined ? 2 : 0);
   }
+  if (sub === "panel") {
+    await runPanel(argv.slice(1));
+    return;
+  }
   if (sub !== "send") {
-    process.stderr.write(`pair: unknown sub-verb '${sub}' (expected 'send')\n`);
+    process.stderr.write(
+      `pair: unknown sub-verb '${sub}' (expected 'send' or 'panel')\n`,
+    );
     process.exit(2);
   }
 

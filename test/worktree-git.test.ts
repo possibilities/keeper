@@ -267,10 +267,11 @@ test("epicBaseHasDoneState: a still-open spec, a non-zero show, or torn JSON →
 // commitWorkLockPath
 // ---------------------------------------------------------------------------
 
-test("commitWorkLockPath: appends the lock name to the common dir", async () => {
+test("commitWorkLockPath: appends the lock name to the per-worktree git dir", async () => {
   const { run } = fakeAsyncGit([
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
       result: { stdout: "/repo/.git\n" },
     },
   ]);
@@ -279,16 +280,52 @@ test("commitWorkLockPath: appends the lock name to the common dir", async () => 
   );
 });
 
-test("commitWorkLockPath: falls back to .git on a non-repo cwd", async () => {
+test("commitWorkLockPath: falls back to the worktree-anchored .git on a non-repo cwd", async () => {
   const { run } = fakeAsyncGit([
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
       result: { exitCode: 128, stderr: "not a git repo" },
     },
   ]);
+  // Never a bare relative `.git` (would resolve against the daemon's cwd) and
+  // never `/keeper-commit-work.lock` (root, from empty stdout).
   expect(await commitWorkLockPath("/nowhere", run)).toBe(
-    ".git/keeper-commit-work.lock",
+    "/nowhere/.git/keeper-commit-work.lock",
   );
+});
+
+test("commitWorkLockPath: two linked worktrees get DISTINCT locks; a base-merge and base commit-work share ONE (identical argv)", async () => {
+  const lockFor = (gitDir: string) =>
+    commitWorkLockPath(
+      "/repo",
+      fakeAsyncGit([
+        {
+          when: (a) =>
+            argvStartsWith(
+              a,
+              "rev-parse",
+              "--path-format=absolute",
+              "--git-dir",
+            ),
+          result: { stdout: `${gitDir}\n` },
+        },
+      ]).run,
+    );
+
+  // Disjoint linked worktrees never share a lock — the cross-lane serialization
+  // this change drops.
+  const laneA = await lockFor("/repo/.git/worktrees/A");
+  const laneB = await lockFor("/repo/.git/worktrees/B");
+  expect(laneA).toBe("/repo/.git/worktrees/A/keeper-commit-work.lock");
+  expect(laneB).toBe("/repo/.git/worktrees/B/keeper-commit-work.lock");
+  expect(laneA).not.toBe(laneB);
+
+  // A base-merge and a base commit-work emit the SAME argv against the base's
+  // own git dir → ONE lock — the serialization this change PRESERVES.
+  const base = await lockFor("/repo/.git");
+  expect(base).toBe("/repo/.git/keeper-commit-work.lock");
+  expect(await lockFor("/repo/.git")).toBe(base);
 });
 
 // ---------------------------------------------------------------------------
@@ -556,7 +593,8 @@ test("mergeBranchInto: clean merge → merged, lock acquired+released around mer
       result: { exitCode: 1 }, // not an ancestor → must merge
     },
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
       result: { stdout: "/wt/.git\n" },
     },
     {
@@ -583,7 +621,8 @@ test("mergeBranchInto: conflict with MERGE_HEAD → abort, conflict, lock releas
       result: { exitCode: 1 },
     },
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
       result: { stdout: "/wt/.git\n" },
     },
     {
@@ -617,7 +656,8 @@ test("mergeBranchInto: merge fails with NO MERGE_HEAD → no spurious abort", as
       result: { exitCode: 1 },
     },
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
       result: { stdout: "/wt/.git\n" },
     },
     {

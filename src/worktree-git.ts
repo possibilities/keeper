@@ -24,9 +24,10 @@
  *    DAYS — without the flag stale entries linger and block gc).
  *
  * Merges are SEQUENTIAL PAIRWISE (`git merge` one source at a time, never an
- * octopus merge) and each acquires the shared
- * `$GIT_COMMON_DIR/keeper-commit-work.lock` flock so a merge serializes against
- * concurrent agent `keeper commit-work` commits in the same repo.
+ * octopus merge) and each acquires the per-worktree
+ * `<--git-dir>/keeper-commit-work.lock` flock so a merge serializes against a
+ * concurrent `keeper commit-work` commit in the SAME worktree (they share the
+ * one per-worktree index); disjoint linked worktrees take distinct locks.
  *
  * Default-branch resolution (`git symbolic-ref --short refs/remotes/origin/HEAD`
  * with a `main|master|trunk|develop` fallback) and linked-worktree detection
@@ -207,14 +208,27 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
 // Git-shelling wrappers — slow real-git covered.
 // ---------------------------------------------------------------------------
 
-/** The shared commit-work lock path: `$(git rev-parse --git-common-dir)/keeper-commit-work.lock`. */
+/**
+ * The per-worktree commit-work lock path:
+ * `$(git rev-parse --path-format=absolute --git-dir)/keeper-commit-work.lock`.
+ * Keyed on the worktree's OWN git dir (IDENTICAL argv to the lock build in
+ * `cli/commit-work.ts`), so a base-merge serializes only against a commit-work
+ * in the SAME worktree; disjoint linked worktrees take distinct locks. In the
+ * main worktree `--git-dir` == `--git-common-dir`, so the path is unchanged. On
+ * a git error / empty stdout, falls back to the worktree-anchored absolute
+ * `<cwd>/.git/keeper-commit-work.lock` — never a bare relative `.git`.
+ */
 export async function commitWorkLockPath(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<string> {
-  const res = await run(["rev-parse", "--git-common-dir"], { cwd });
-  const common = res.code === 0 ? res.stdout.trim() : ".git";
-  return joinPath(common, "keeper-commit-work.lock");
+  const res = await run(["rev-parse", "--path-format=absolute", "--git-dir"], {
+    cwd,
+  });
+  const gitDir = res.stdout.trim();
+  const dir =
+    res.code === 0 && gitDir.length > 0 ? gitDir : joinPath(cwd, ".git");
+  return joinPath(dir, "keeper-commit-work.lock");
 }
 
 /** Resolve the repo's default branch (origin/HEAD, else fallback chain). */
@@ -545,8 +559,9 @@ export async function ensureWorktree(
  *    The abort is guarded so a merge that failed for a non-conflict reason (and
  *    left no MERGE_HEAD) is not "aborted" spuriously.
  *
- * The flock path comes from the worktree's own common dir (shared across all
- * linked worktrees of the repo), so every lane coordinates through one lock.
+ * The flock path comes from the worktree's own git dir, so a merge serializes
+ * only against a commit-work in the SAME worktree; disjoint lanes take distinct
+ * locks and never block each other.
  */
 export async function mergeBranchInto(
   worktreePath: string,

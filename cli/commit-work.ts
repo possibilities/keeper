@@ -12,7 +12,7 @@
  *     → `--preview-files` branch (pretty envelope, NO lock, NO commit)
  *     → require message · sanitize (`_FORBIDDEN_TRAILER_RE`, multi-line only)
  *     → no-files branch (pretty `committed:false`)
- *     → acquire flock ($GIT_COMMON_DIR/keeper-commit-work.lock)
+ *     → acquire flock (<per-worktree --git-dir>/keeper-commit-work.lock)
  *       → `git add -A -- <pathspecs>` (pathspec-scoped; deletions stage as removals)
  *       → unstage stale (`all_staged − caller_files`) BEFORE lint
  *       → lint matrix (src/commit-work/lint-matrix) — fail → release + emit
@@ -242,12 +242,6 @@ async function filterGitignored(
   if (raw.length === 0) return [...files];
   const ignored = new Set(raw.split("\0").filter((c) => c.length > 0));
   return files.filter((p) => !ignored.has(p));
-}
-
-/** Git common dir (shared across worktrees), or `.git` on failure. */
-async function gitCommonDir(cwd: string, run: GitRunner): Promise<string> {
-  const res = await run(["rev-parse", "--git-common-dir"], { cwd });
-  return res.code === 0 ? res.stdout.trim() : ".git";
 }
 
 /**
@@ -539,12 +533,25 @@ async function runInner(
     return 0;
   }
 
-  // Acquire the per-repo commit lock for the full stage → lint → commit → push
-  // window. The lock path is under the git common dir so every worktree of the
-  // repo coordinates through the same lock.
-  let common = await gitCommonDir(worktree, git);
-  if (!common.startsWith("/")) common = `${worktree}/${common}`;
-  const lockPath = `${common}/keeper-commit-work.lock`;
+  // Acquire the per-worktree commit lock for the full stage → lint → commit →
+  // push window, keyed on the worktree's OWN git dir. The git index, index.lock,
+  // and HEAD are per-worktree, so a commit-work serializes only against another
+  // commit-work (or an autopilot base-merge) in the SAME worktree; disjoint
+  // linked worktrees share no staging state and take distinct locks. In the
+  // main worktree `--git-dir` == `--git-common-dir`, so the path is unchanged.
+  // Identical argv to `commitWorkLockPath` in src/worktree-git.ts, so a lane's
+  // commit-work and the autopilot merge for that same worktree still collide.
+  const gitDirRes = await git(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd: worktree },
+  );
+  const gitDir = gitDirRes.stdout.trim();
+  // Fallback (git error / empty stdout): the worktree-anchored absolute `.git` —
+  // never a bare relative `.git` (it would resolve against the daemon's ambient
+  // cwd, not the pinned worktree) and never `/keeper-commit-work.lock` (root).
+  const lockDir =
+    gitDirRes.code === 0 && gitDir.length > 0 ? gitDir : `${worktree}/.git`;
+  const lockPath = `${lockDir}/keeper-commit-work.lock`;
 
   const lock = acquireLock(lockPath);
   let exitCode = 0;

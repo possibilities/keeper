@@ -1465,8 +1465,9 @@ commits only that session's attributed files. The other three are read-only.
   Discovers session-attributed files via the `file_attributions` reader,
   gitignore-filters them (`git check-ignore`), stages pathspec-scoped
   (`git add -A -- <files>`, never tree-wide — deletions stage as removals),
-  serializes concurrent invocations on
-  `$GIT_COMMON_DIR/keeper-commit-work.lock` via an `FD_CLOEXEC` `flock(2)`,
+  serializes concurrent invocations in the same worktree on
+  `<git rev-parse --path-format=absolute --git-dir>/keeper-commit-work.lock`
+  via an `FD_CLOEXEC` `flock(2)`,
   then runs the lint matrix (ruff/ty/cli-boundaries/shellcheck/zig/lua/
   hadolint/npm-lint + a `tsc --noEmit` arm) where exit-code is the sole
   pass/fail signal. Emits a compact two-line NDJSON envelope (commit line +
@@ -3182,9 +3183,11 @@ lazily ensures the lane worktree exists, runs any pre-merges, asserts HEAD
 (ON → worktree HEAD equals the derived branch and the worktree is registered;
 OFF → repo on its default branch), and sets the launch cwd to the worktree path.
 Both HEAD assertions fail as sticky `DispatchFailed` (cleared by `retry_dispatch`),
-never `fatalExit`. Every merge/prune takes the shared
-`$GIT_COMMON_DIR/keeper-commit-work.lock` flock; a conflict aborts
-(`git merge --abort`) + fails loud + stops (no merge-to-default, no teardown).
+never `fatalExit`. Every merge takes the base worktree's own per-worktree
+`<--git-dir>/keeper-commit-work.lock` flock, serializing it against a
+`commit-work` in that SAME worktree (disjoint lanes take distinct locks); a
+conflict aborts (`git merge --abort`) + fails loud + stops (no merge-to-default,
+no teardown).
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 (pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or

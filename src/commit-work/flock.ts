@@ -1,13 +1,15 @@
 /**
  * `flock(2)` advisory lock primitive for serializing concurrent
- * `keeper commit-work` invocations on one repo.
+ * `keeper commit-work` invocations on one worktree.
  *
  * Concurrent committers in the same worktree would race `git add` / `git
  * commit` against `.git/index.lock` and against each other's staged set. A
- * single advisory `flock(LOCK_EX)` on a per-common-dir lock file serializes
- * them: the lock path is `$(git rev-parse --git-common-dir)/keeper-commit-
- * work.lock`, so every worktree of one repo (the common dir is shared across
- * linked worktrees) coordinates through the same lock.
+ * single advisory `flock(LOCK_EX)` on a per-worktree lock file serializes them:
+ * the lock path is `$(git rev-parse --path-format=absolute --git-dir)/keeper-
+ * commit-work.lock`, so a commit-work coordinates with another commit-work (or
+ * an autopilot base-merge) in the SAME worktree. The git index, `index.lock`,
+ * and HEAD are per-worktree, so disjoint linked worktrees share no staging
+ * state and take distinct locks.
  *
  * Two macOS-aarch64 correctness hazards the epic's risks call out, both
  * asserted in tests because they fail SILENTLY:

@@ -49,7 +49,9 @@ afterEach(() => {
 
 /**
  * The standard git rule set for a clean repo with `n` staged files. Models every
- * git call the success pipeline makes: common-dir, add, staged-name read,
+ * git call the success pipeline makes: git-dir (per-worktree lock + the push
+ * skip-gate's git-dir/common-dir pair, equal here → main worktree), add,
+ * staged-name read,
  * interpret-trailers (echoes stdin, optionally with a Job-Id trailer appended),
  * commit, short-sha, the @{u} probe + push. `stagedNames` is what `diff
  * --cached --name-only -z` reports back (the intersection that forms the commit
@@ -68,8 +70,19 @@ function successRules(opts: {
       result: { exitCode: 1, stdout: "" }, // none ignored
     },
     {
-      when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
-      result: { exitCode: 0, stdout: ".git\n" },
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+      result: { exitCode: 0, stdout: "/repo/.git\n" },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(
+          a,
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ),
+      result: { exitCode: 0, stdout: "/repo/.git\n" },
     },
     {
       when: (a) => argvStartsWith(a, "add", "-A", "--"),

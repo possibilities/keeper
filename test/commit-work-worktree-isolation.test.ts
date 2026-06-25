@@ -109,10 +109,6 @@ describe("commit-work: worktree-pinned cwd threading", () => {
         result: { exitCode: 0, stdout: `${worktree}\n` },
       },
       {
-        when: (a) => argvStartsWith(a, "rev-parse", "--git-common-dir"),
-        result: { exitCode: 0, stdout: "/repo/.git\n" },
-      },
-      {
         when: (a) => argvStartsWith(a, "add", "-A", "--"),
         result: { exitCode: 0 },
       },

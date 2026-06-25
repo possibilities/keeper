@@ -221,10 +221,10 @@ test("mergeBranchInto: conflict aborts (MERGE_HEAD cleared) and reports conflict
 });
 
 // ---------------------------------------------------------------------------
-// Merges take the shared commit-work flock.
+// Merges take the base worktree's per-worktree commit-work flock.
 // ---------------------------------------------------------------------------
 
-test("mergeBranchInto: a clean merge runs while holding the shared commit-work flock", async () => {
+test("mergeBranchInto: a clean merge runs while holding the base worktree's per-worktree commit-work flock", async () => {
   const s = makeScratch();
   const tip = git(s.repo, "rev-parse", "HEAD");
   const baseWt = s.wt("base");
@@ -235,8 +235,12 @@ test("mergeBranchInto: a clean merge runs while holding the shared commit-work f
   gitCommit(ribWt, "rib.txt", "rib\n", "rib");
 
   const lockPath = await commitWorkLockPath(baseWt, spawnGitExec);
-  // The lock path resolves to the shared common dir, identical from either lane.
-  expect(lockPath).toBe(await commitWorkLockPath(ribWt, spawnGitExec));
+  // Each linked worktree resolves to its OWN per-worktree git dir, so the two
+  // lanes get DISTINCT locks (the cross-lane serialization this change drops).
+  expect(lockPath).not.toBe(await commitWorkLockPath(ribWt, spawnGitExec));
+  // The base-merge below acquires the base worktree's own lock — the SAME path
+  // a base commit-work resolves to (the serialization this change preserves).
+  expect(lockPath).toContain("/worktrees/");
 
   let acquired = "";
   let released = false;
