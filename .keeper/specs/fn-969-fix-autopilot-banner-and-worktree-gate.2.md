@@ -82,5 +82,5 @@ positive int → that value. Update all `autopilotBannerLabel` golden strings to
 - [ ] README banner-segment enumeration updated (per-root + worktree-mode mention); `bun run test:full` green
 
 ## Done summary
-
+Re-scoped the worktree-toggle guard to gate on started open epics (isEpicStarted) via an injectable query, so drained/unstarted/zero-epic boards toggle freely while a transport error still fails closed; added an always-rendered 'per-root N' banner segment between 'max N' and the worktree segment via projectMaxConcurrentPerRoot (NULL/invalid defaults to 1). Updated all banner golden tests, added gate + per-root unit tests, and revised README/HELP prose.
 ## Evidence

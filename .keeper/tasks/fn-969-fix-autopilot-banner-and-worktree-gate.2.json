@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Re-scope worktree force gate and surface per-root on the banner",
-  "updated_at": "2026-06-25T12:09:56.644000Z"
+  "updated_at": "2026-06-25T12:41:08.191000Z",
+  "worker_done_at": "2026-06-25T12:41:08.191000Z"
 }
