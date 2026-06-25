@@ -4516,10 +4516,40 @@ test("isEpicStarted: resting worker_phase 'open' alone does NOT mark started", (
   expect(isEpicStarted(epic)).toBe(false);
 });
 
-test("isEpicStarted: any epic-form job marks started", () => {
+test("isEpicStarted: a plan-only epic-form job (no other activity) is NOT started", () => {
+  // fn-957: every planned epic carries a stopped `plan::<ref>` planner job in
+  // `epics.jobs[]` (a bare epic ref folds as kind=epic). Counting it collapsed
+  // the started tier to a no-op, so a `plan`-verb-only epic must read unstarted.
   const epic = makeEpic({
-    jobs: [makeEmbeddedJob({ plan_verb: "close" })],
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    jobs: [makeEmbeddedJob({ plan_verb: "plan" })],
+    job_links: [],
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", runtime_status: "todo" }),
+      makeTask({ task_id: "fn-1-foo.2", runtime_status: "todo" }),
+    ],
+  });
+  expect(isEpicStarted(epic)).toBe(false);
+});
+
+test("isEpicStarted: any non-plan epic-form job (close/approve) marks started", () => {
+  for (const verb of ["close", "approve"]) {
+    const epic = makeEpic({
+      jobs: [makeEmbeddedJob({ plan_verb: verb })],
+      tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    });
+    expect(isEpicStarted(epic)).toBe(true);
+  }
+});
+
+test("isEpicStarted: a plan job alongside genuine activity still marks started", () => {
+  // A planned-then-worked epic carries the planner job AND a real signal; the
+  // plan-verb skip must not mask the close/task-job/runtime_status signals.
+  const epic = makeEpic({
+    jobs: [
+      makeEmbeddedJob({ plan_verb: "plan" }),
+      makeEmbeddedJob({ plan_verb: "close" }),
+    ],
+    tasks: [makeTask({ task_id: "fn-1-foo.1", runtime_status: "todo" })],
   });
   expect(isEpicStarted(epic)).toBe(true);
 });
@@ -4619,6 +4649,20 @@ test("orderEpicsForScheduling: started epics sort ahead of unstarted ones", () =
   const e1 = unstartedEpic({ epic_id: "fn-1-foo", epic_number: 1 });
   const e2 = startedEpic({ epic_id: "fn-2-bar", epic_number: 2 });
   const ordered = orderEpicsForScheduling([e1, e2]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-2-bar", "fn-1-foo"]);
+});
+
+test("orderEpicsForScheduling: a plan-only epic tiers BEHIND a genuinely started one", () => {
+  // fn-957: the lower-numbered epic carries only a stopped `plan` planner job
+  // (unstarted); the higher-numbered one is genuinely in-progress. Started-first
+  // must reorder the in-progress epic ahead despite its later creation number.
+  const planOnly = unstartedEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    jobs: [makeEmbeddedJob({ plan_verb: "plan" })],
+  });
+  const inProgress = startedEpic({ epic_id: "fn-2-bar", epic_number: 2 });
+  const ordered = orderEpicsForScheduling([planOnly, inProgress]);
   expect(ordered.map((e) => e.epic_id)).toEqual(["fn-2-bar", "fn-1-foo"]);
 });
 

@@ -88,23 +88,37 @@ export function resolveEpicDep(
  * Whether an epic has been STARTED — i.e. real worker activity has touched it.
  * The pure read-time signal behind Rule #1 ("prefer the started epic"); never
  * persisted in epic/board state. An epic counts as started when ANY of:
- *   - it carries an epic-form job (`jobs`) — a `plan`/`close`/`approve` verb ran,
+ *   - it carries an epic-form job (`jobs`) whose verb is NOT `plan` — i.e. a
+ *     `close`/`approve` (or any non-planner) verb ran,
  *   - it carries a provenance `job_links` entry — a session created/refined it,
  *   - any task carries a task-form job (`task.jobs`) — a `work`/`approve` ran,
  *   - any task's `runtime_status` has advanced off `"todo"`.
  *
+ * Deliberately does NOT count a planning-time `plan`-verb epic-form job: every
+ * planned epic is created via a `plan` session whose `plan::<ref>` job folds
+ * into `epics.jobs[]` (a bare epic ref classifies as `kind=epic`) and persists
+ * `state='stopped'` after planning. Counting it would mark essentially every
+ * planned-but-unworked epic started and collapse the tiering to a no-op — so a
+ * planner job is NOT real worker activity. A genuine `plan`-then-worked epic is
+ * already caught by the close/task-job/runtime_status signals above.
+ *
  * Deliberately does NOT key on `task.worker_phase`: its resting value on a
  * never-worked task shell is `"open"` (not null), so counting it would mark
- * every epic started and collapse the tiering to a no-op. A fresh epic — no
- * jobs, all tasks `runtime_status === "todo"` — is NOT started.
+ * every epic started and collapse the tiering. A fresh epic — only a `plan`
+ * planner job, all tasks `runtime_status === "todo"` — is NOT started.
  *
  * Null-safe on every field (missing arrays read as empty, missing
- * `runtime_status` reads as the `"todo"` default): the board calls the seam via
- * an untyped `snap.epics as Epic[]` cast, so a throw here would crash the render
- * path. Pure.
+ * `runtime_status` reads as the `"todo"` default, missing `plan_verb` reads as
+ * non-`plan` so it still marks started): the board calls the seam via an untyped
+ * `snap.epics as Epic[]` cast, so a throw here would crash the render path. Pure.
  */
 export function isEpicStarted(epic: Epic): boolean {
-  if ((epic.jobs?.length ?? 0) > 0 || (epic.job_links?.length ?? 0) > 0) {
+  for (const job of epic.jobs ?? []) {
+    if (job?.plan_verb !== "plan") {
+      return true;
+    }
+  }
+  if ((epic.job_links?.length ?? 0) > 0) {
     return true;
   }
   for (const task of epic.tasks ?? []) {
