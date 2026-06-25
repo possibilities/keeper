@@ -61,5 +61,5 @@ test/exec-backend.test.ts argv fixture for the new flag.
 - [ ] test/exec-backend.test.ts fixture + drift guard updated; pure-seam tests pass; no real-git test added.
 
 ## Done summary
-
+Producer now injects a realpath-normalized KEEPER_PLAN_WORKTREE lane env (a 2nd --agentwrap-tmux-env entry) for worktree-mode launches, threaded through LaunchSpec -> AgentwrapLaunchOpts -> buildAgentwrapLaunchArgv; non-worktree/pair launches stay byte-identical and the flag rides resume mode too. Pure-seam tests only.
 ## Evidence
