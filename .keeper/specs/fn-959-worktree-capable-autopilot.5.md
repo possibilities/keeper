@@ -38,5 +38,5 @@ Readiness unit tests: worktree-OFF byte-identical to today; worktree-ON each lan
 - [ ] Both the readiness key and the dispatch-side resolver are re-keyed symmetrically; composes as a parameter to fn-954's allocator.
 
 ## Done summary
-
+Re-keyed the per-root allocator on derived lane worktree paths in worktree mode (cap-1 per lane, parallel siblings concurrent) as a parameter to fn-954's round-robin allocator; OFF mode byte-identical, gate and dispatch-side resolver both derive lanes off the same deriveWorktreePlan.
 ## Evidence

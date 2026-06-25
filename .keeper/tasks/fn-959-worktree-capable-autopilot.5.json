@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Lane-aware per-root mutex on fn-954 allocator",
-  "updated_at": "2026-06-25T02:49:06.461000Z"
+  "updated_at": "2026-06-25T06:40:02.245000Z",
+  "worker_done_at": "2026-06-25T06:40:02.245000Z"
 }
