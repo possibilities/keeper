@@ -175,6 +175,72 @@ export function pickCurrentClient(
   };
 }
 
+/**
+ * One pane of a whole-server topology snapshot: the durable `%N` `pane_id`, its
+ * current `#{session_name}`, and its current `#{window_index}` (the window's
+ * left-to-right POSITION). Keyed by `pane_id` within a single server generation —
+ * `%N` is reused after a kill, so the generation handle (the server pid) is
+ * carried alongside the panes, NOT inside each pane.
+ *
+ * `job_id` is the keeper job that owns the pane at post time, resolved by the
+ * producer's `(pane_id → jobs.backend_exec_pane_id)` join. OPTIONAL: a pane
+ * keeper never launched (or one whose job row is not yet written) carries no
+ * `job_id`. EXCLUDED from {@link hashTopology} — stable per pane, never gates a
+ * re-post; the fold ignores it (re-fold determinism), so it is purely additive.
+ *
+ * Lives here (the pure, dependency-free focus-derive seam) so BOTH the
+ * restore-worker poll and the control-worker feed map their rows through the SAME
+ * shape + the SAME {@link hashTopology}, guaranteeing dedup-equivalence across the
+ * two producers. Re-exported from `restore-worker.ts` for its existing importers.
+ */
+export interface TmuxTopologyPane {
+  pane_id: string;
+  session_name: string;
+  window_index: number | null;
+  job_id?: string;
+}
+
+/**
+ * Stable hash of a whole-server topology for the `TmuxTopologySnapshot` post-dedup
+ * gate. INCLUDES the `generation_id`, every pane's `session_name`, AND its
+ * `window_index` — a pane MOVE (session or window-index change) or a server-
+ * generation flip MUST re-fire the post so the live-location fold tracks reality.
+ * Sorts panes by `pane_id` so the probe's row order doesn't churn the hash. An
+ * empty pane set still hashes the generation (a generation change with no panes is
+ * still a change). EXCLUDES the per-pane `job_id` — stable per pane; stamping it
+ * must never re-fire the post. Pure.
+ */
+export function hashTopology(
+  generationId: string,
+  panes: TmuxTopologyPane[],
+): string {
+  const sorted = [...panes].sort((a, b) =>
+    a.pane_id < b.pane_id ? -1 : a.pane_id > b.pane_id ? 1 : 0,
+  );
+  const body = sorted
+    .map((p) => `${p.pane_id}\t${p.session_name}\t${p.window_index ?? ""}`)
+    .join("\n");
+  return String(Bun.hash(`${generationId}\n${body}`));
+}
+
+/**
+ * Additive widening of the focus derivation: parse the two framed reads ONCE and
+ * return BOTH the focus pick AND the full parsed `list-panes -a` row set. The
+ * focus half is byte-identical to {@link pickCurrentClient} over the same input —
+ * the focus contract is unbroken; the `panes` half is the SAME `TmuxPaneRow[]`
+ * the focus pick consumes, exposed so the control-worker can additionally map it
+ * into a whole-server topology snapshot without a second `list-panes` read. Pure;
+ * never throws.
+ */
+export function deriveFocusAndPanes(
+  clientsBody: string,
+  panesBody: string,
+): { readonly focus: FocusDerivation; readonly panes: TmuxPaneRow[] } {
+  const panes = parsePaneLines(panesBody);
+  const focus = pickCurrentClient(parseClientLines(clientsBody), panes);
+  return { focus, panes };
+}
+
 /** Split a tab-delimited line into exactly `count` fields, reading the LAST
  *  field to end-of-line (so a trailing variable-length value keeps any embedded
  *  tabs). Returns `null` when there are fewer than `count - 1` tabs. */

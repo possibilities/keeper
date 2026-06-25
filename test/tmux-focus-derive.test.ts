@@ -9,11 +9,14 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  deriveFocusAndPanes,
+  hashTopology,
   parseClientLines,
   parsePaneLines,
   pickCurrentClient,
   type TmuxClientRow,
   type TmuxPaneRow,
+  type TmuxTopologyPane,
 } from "../src/tmux-focus-derive";
 
 // `#{client_name}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{client_session}`
@@ -264,5 +267,98 @@ describe("pickCurrentClient", () => {
       window_index: null,
       pane_id: "%2",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveFocusAndPanes — additive widening: focus pick is byte-identical to the
+// focus-only derivation AND the full parsed pane set rides alongside.
+// ---------------------------------------------------------------------------
+
+describe("deriveFocusAndPanes", () => {
+  const clientsBody = clientLine("/dev/ttys001", 0, 120, 10, "main");
+  const panesBody = [
+    paneLine(1, 1, 3, "%42", "main"),
+    paneLine(1, 0, 3, "%41", "main"),
+    paneLine(0, 1, 1, "%10", "main"),
+  ].join("\n");
+
+  test("the focus half is byte-identical to the focus-only pick (contract unbroken)", () => {
+    const { focus } = deriveFocusAndPanes(clientsBody, panesBody);
+    const focusOnly = pickCurrentClient(
+      parseClientLines(clientsBody),
+      parsePaneLines(panesBody),
+    );
+    expect(focus).toEqual(focusOnly);
+    expect(focus).toEqual({
+      status: "focused",
+      session_name: "main",
+      window_index: 3,
+      pane_id: "%42",
+    });
+  });
+
+  test("the panes half is the SAME row set parsePaneLines produces", () => {
+    const { panes } = deriveFocusAndPanes(clientsBody, panesBody);
+    expect(panes).toEqual(parsePaneLines(panesBody));
+    expect(panes).toHaveLength(3);
+  });
+
+  test("a none focus still carries the full pane set", () => {
+    // Only keeper's own control client (controlMode=1) → focus is `none`, but the
+    // panes are still parsed and returned (the topology emit does not gate on focus).
+    const onlyControl = clientLine("/dev/ttys999", 1, 130, 11, "main");
+    const { focus, panes } = deriveFocusAndPanes(onlyControl, panesBody);
+    expect(focus).toEqual({ status: "none" });
+    expect(panes).toHaveLength(3);
+  });
+
+  test("empty bodies → none focus, empty pane set", () => {
+    const { focus, panes } = deriveFocusAndPanes("", "");
+    expect(focus).toEqual({ status: "none" });
+    expect(panes).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hashTopology — the shared dedup hash (excludes job_id, sorts by pane_id).
+// ---------------------------------------------------------------------------
+
+describe("hashTopology", () => {
+  const panes: TmuxTopologyPane[] = [
+    { pane_id: "%42", session_name: "main", window_index: 3 },
+    { pane_id: "%10", session_name: "work", window_index: 1 },
+  ];
+
+  test("is stable across row order (sorts by pane_id)", () => {
+    expect(hashTopology("g1", panes)).toBe(
+      hashTopology("g1", [...panes].reverse()),
+    );
+  });
+
+  test("EXCLUDES job_id — stamping a job id never re-fires the post", () => {
+    const stamped: TmuxTopologyPane[] = [
+      { ...panes[0], job_id: "sess-a" } as TmuxTopologyPane,
+      { ...panes[1], job_id: "sess-b" } as TmuxTopologyPane,
+    ];
+    expect(hashTopology("g1", stamped)).toBe(hashTopology("g1", panes));
+  });
+
+  test("a session_name change re-fires", () => {
+    const moved = [{ ...panes[0], session_name: "other" }, panes[1]];
+    expect(hashTopology("g1", moved)).not.toBe(hashTopology("g1", panes));
+  });
+
+  test("a window_index change re-fires", () => {
+    const moved = [{ ...panes[0], window_index: 9 }, panes[1]];
+    expect(hashTopology("g1", moved)).not.toBe(hashTopology("g1", panes));
+  });
+
+  test("a generation flip re-fires even at the same topology", () => {
+    expect(hashTopology("g2", panes)).not.toBe(hashTopology("g1", panes));
+  });
+
+  test("an empty pane set still hashes the generation", () => {
+    expect(hashTopology("g1", [])).not.toBe(hashTopology("g2", []));
   });
 });

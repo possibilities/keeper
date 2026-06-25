@@ -95,6 +95,7 @@ import {
 } from "./exec-backend";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
+import { hashTopology, type TmuxTopologyPane } from "./tmux-focus-derive";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 
@@ -196,28 +197,13 @@ export interface BackendExecStartMessage {
 }
 
 /**
- * One pane of a whole-server topology snapshot: the durable `%N` `pane_id`, its
- * current `#{session_name}`, and its current `#{window_index}` (the window's
- * left-to-right POSITION). Keyed by `pane_id` within a single server generation
- * — `%N` is reused after a kill, so the generation handle (the server pid) is
- * carried alongside the panes, NOT inside each pane.
- *
- * `job_id` is the keeper job that owns the pane at post time, resolved by the
- * producer's `(pane_id → jobs.backend_exec_pane_id)` join. It is OPTIONAL: a
- * pane keeper never launched, or one whose job row is not yet written, carries
- * no `job_id`. The topology-anchored crash-restore deriver reads it from the
- * EVENT PAYLOAD to identify the dying generation's live jobs without the
- * fold-lagged projection; an absent `job_id` falls back to the
- * `(generation_id, pane_id)` projection join. EXCLUDED from `hashTopology` — it
- * is stable per pane and never gates a re-post. The fold ignores it entirely
- * (re-fold determinism), so the field is purely additive.
+ * One pane of a whole-server topology snapshot — the `(pane_id, session_name,
+ * window_index, job_id?)` shape. Defined in the pure focus-derive seam so BOTH
+ * this poll AND the control-worker feed map their rows through the SAME shape +
+ * the SAME `hashTopology`, guaranteeing dedup-equivalence. Re-exported here for
+ * existing importers (the daemon's restore-arm + the boot-seed test).
  */
-export interface TmuxTopologyPane {
-  pane_id: string;
-  session_name: string;
-  window_index: number | null;
-  job_id?: string;
-}
+export type { TmuxTopologyPane };
 
 /**
  * Worker→main message: the LIVE whole-server tmux topology, posted on a ~1s
@@ -916,27 +902,6 @@ function hashWindowIndexCache(cache: Map<string, number>): string {
   return String(
     Bun.hash(entries.map(([id, idx]) => `${id}\t${idx}`).join("\n")),
   );
-}
-
-/**
- * Stable hash of a whole-server topology for the `TmuxTopologySnapshot` post
- * dedup gate (epic fn-907). INCLUDES the `generation_id`, every pane's
- * `session_name`, AND its `window_index` — the whole point is that a pane MOVE
- * (session or window-index change) or a server-generation flip MUST re-fire the
- * post so the live-location fold tracks reality. Sorts panes by `pane_id` so the
- * probe's row order doesn't churn the hash. An empty pane set still hashes the
- * generation (a generation change with no panes is still a change). EXCLUDES the
- * per-pane `job_id` — it is stable per pane and stamping it must never re-fire
- * the post. Pure.
- */
-function hashTopology(generationId: string, panes: TmuxTopologyPane[]): string {
-  const sorted = [...panes].sort((a, b) =>
-    a.pane_id < b.pane_id ? -1 : a.pane_id > b.pane_id ? 1 : 0,
-  );
-  const body = sorted
-    .map((p) => `${p.pane_id}\t${p.session_name}\t${p.window_index ?? ""}`)
-    .join("\n");
-  return String(Bun.hash(`${generationId}\n${body}`));
 }
 
 /**

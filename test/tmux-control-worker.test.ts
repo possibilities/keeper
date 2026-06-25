@@ -17,6 +17,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { decideTmuxControlWatchdog } from "../src/daemon";
+import { probeTmuxTopology, type SpawnSyncFn } from "../src/restore-worker";
 import {
   buildAttachArgs,
   type ControlChild,
@@ -25,11 +26,17 @@ import {
   focusDedupKey,
   hasLiveTmuxJob,
   isStructuralNotification,
+  mapPaneRowsToTopology,
   pickAnchorSession,
   runConnection,
   type TmuxClientFocusSnapshotMessage,
+  type TmuxTopologySnapshotMessage,
 } from "../src/tmux-control-worker";
-import type { FocusDerivation } from "../src/tmux-focus-derive";
+import {
+  type FocusDerivation,
+  hashTopology,
+  parsePaneLines,
+} from "../src/tmux-focus-derive";
 import type { Job } from "../src/types";
 import { retryUntil } from "./helpers/retry-until";
 
@@ -38,6 +45,7 @@ function fakeJob(opts: {
   state?: string;
   backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
+  backend_exec_pane_id?: string | null;
 }): Job {
   return {
     job_id: opts.job_id ?? "j1",
@@ -45,7 +53,7 @@ function fakeJob(opts: {
     state: opts.state ?? "working",
     backend_exec_type: opts.backend_exec_type ?? null,
     backend_exec_session_id: opts.backend_exec_session_id ?? null,
-    backend_exec_pane_id: null,
+    backend_exec_pane_id: opts.backend_exec_pane_id ?? null,
   } as unknown as Job;
 }
 
@@ -543,7 +551,9 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: (m) => posted.push(m),
+      postTopology: () => {},
       postLiveness: () => {},
+      readJobs: () => [],
     });
 
     // Emit the unsolicited attach handshake block with its `%end` SPLIT across two
@@ -633,7 +643,9 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: (m) => posted.push(m),
+      postTopology: () => {},
       postLiveness: () => {},
+      readJobs: () => [],
     });
 
     // Settle the handshake (begin+end in one read this time) → bootstrap releases.
@@ -672,5 +684,365 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     stopping = true;
     child.eof();
     expect(await conn).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mapPaneRowsToTopology — maps the 5-col focus rows → topology pane shape and
+// stamps job_id over all live tmux jobs (resolved AND null-session).
+// ---------------------------------------------------------------------------
+
+// 5-col focus `list-panes -a` row: window_active, pane_active, window_index,
+// pane_id, session_name.
+function focusPane(
+  windowIndex: number | string,
+  paneId: string,
+  session: string,
+): string {
+  return ["1", "1", String(windowIndex), paneId, session].join("\t");
+}
+
+describe("mapPaneRowsToTopology", () => {
+  const rows = parsePaneLines(
+    [
+      focusPane(3, "%42", "main"),
+      focusPane(1, "%10", "work"),
+      focusPane(2, "%99", "orphan"),
+    ].join("\n"),
+  );
+
+  test("maps paneId→pane_id, session→session_name, windowIndex→window_index", () => {
+    const panes = mapPaneRowsToTopology(rows, []);
+    expect(panes).toEqual([
+      { pane_id: "%42", session_name: "main", window_index: 3 },
+      { pane_id: "%10", session_name: "work", window_index: 1 },
+      { pane_id: "%99", session_name: "orphan", window_index: 2 },
+    ]);
+  });
+
+  test("stamps job_id for owning tmux jobs (resolved AND null-session), leaves orphans bare", () => {
+    const jobs = [
+      fakeJob({
+        job_id: "sess-a",
+        backend_exec_type: "tmux",
+        backend_exec_session_id: "main",
+        backend_exec_pane_id: "%42",
+      }),
+      // A null-session (not-yet-resolved) tmux job still owns its pane → stamped.
+      fakeJob({
+        job_id: "sess-b",
+        backend_exec_type: "tmux",
+        backend_exec_session_id: null,
+        backend_exec_pane_id: "%10",
+      }),
+    ];
+    const panes = mapPaneRowsToTopology(rows, jobs);
+    expect(panes).toEqual([
+      {
+        pane_id: "%42",
+        session_name: "main",
+        window_index: 3,
+        job_id: "sess-a",
+      },
+      {
+        pane_id: "%10",
+        session_name: "work",
+        window_index: 1,
+        job_id: "sess-b",
+      },
+      { pane_id: "%99", session_name: "orphan", window_index: 2 }, // no owning job
+    ]);
+  });
+
+  test("a dead (not working/stopped) tmux job does NOT stamp its pane", () => {
+    const jobs = [
+      fakeJob({
+        job_id: "sess-dead",
+        state: "done",
+        backend_exec_type: "tmux",
+        backend_exec_pane_id: "%42",
+      }),
+    ];
+    const panes = mapPaneRowsToTopology(rows, jobs);
+    expect(panes[0].job_id).toBeUndefined();
+  });
+
+  test("a null window_index row carries window_index null", () => {
+    const nullIdx = parsePaneLines(focusPane("NaN", "%5", "s"));
+    expect(mapPaneRowsToTopology(nullIdx, [])).toEqual([
+      { pane_id: "%5", session_name: "s", window_index: null },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dual-source equivalence — the control-worker's mapped snapshot matches what the
+// restore-worker `list-panes -a` poll produced for the SAME tmux state. The hash
+// (the dedup contract) is byte-identical, so a steady topology never churns a
+// spurious event when the producer relocates.
+// ---------------------------------------------------------------------------
+
+describe("dual-source equivalence vs the restore-worker poll", () => {
+  // ONE logical tmux state, rendered into BOTH `-F` formats:
+  //  - the restore poll's 3-col `#{pane_id}\t#{window_index}\t#{session_name}`;
+  //  - the control-worker's 5-col `…\t#{window_index}\t#{pane_id}\t#{session_name}`.
+  const state = [
+    { pane_id: "%42", window_index: 3, session_name: "main" },
+    { pane_id: "%10", window_index: 1, session_name: "work" },
+    { pane_id: "%99", window_index: 2, session_name: "orphan" },
+  ];
+  const generationId = "48271";
+
+  const restoreBody = state
+    .map((p) => `${p.pane_id}\t${p.window_index}\t${p.session_name}`)
+    .join("\n");
+  const controlBody = state
+    .map((p) => focusPane(p.window_index, p.pane_id, p.session_name))
+    .join("\n");
+
+  const restoreSpawn: SpawnSyncFn = () => ({
+    success: true,
+    exitCode: 0,
+    stdout: Buffer.from(`${restoreBody}\n`),
+    stderr: Buffer.from(""),
+  });
+
+  test("the restore probe panes and the control-worker mapped panes hash IDENTICALLY", () => {
+    const restoreProbe = probeTmuxTopology(restoreSpawn);
+    expect(restoreProbe.kind).toBe("panes");
+    if (restoreProbe.kind !== "panes") return;
+
+    const controlPanes = mapPaneRowsToTopology(parsePaneLines(controlBody), []);
+
+    // The dedup contract — byte-identical hashes for the same logical state.
+    expect(hashTopology(generationId, controlPanes)).toBe(
+      hashTopology(generationId, restoreProbe.panes),
+    );
+  });
+
+  test("the mapped pane triples equal the restore probe's, field-for-field", () => {
+    const restoreProbe = probeTmuxTopology(restoreSpawn);
+    if (restoreProbe.kind !== "panes") throw new Error("expected panes");
+    const controlPanes = mapPaneRowsToTopology(parsePaneLines(controlBody), []);
+    // Same order (the probe preserves row order; both render `state` in order)
+    // and same `{pane_id, session_name, window_index}` per pane.
+    expect(controlPanes).toEqual(restoreProbe.panes);
+  });
+
+  test("job_id stamping is hash-irrelevant — the stamped control payload still matches the unstamped restore hash", () => {
+    const restoreProbe = probeTmuxTopology(restoreSpawn);
+    if (restoreProbe.kind !== "panes") throw new Error("expected panes");
+    const jobs = [
+      fakeJob({
+        job_id: "sess-a",
+        backend_exec_type: "tmux",
+        backend_exec_session_id: "main",
+        backend_exec_pane_id: "%42",
+      }),
+    ];
+    const controlPanes = mapPaneRowsToTopology(
+      parsePaneLines(controlBody),
+      jobs,
+    );
+    expect(controlPanes[0].job_id).toBe("sess-a");
+    expect(hashTopology(generationId, controlPanes)).toBe(
+      hashTopology(generationId, restoreProbe.panes),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runConnection — topology emit over the framed re-read + every skip-gate.
+// Drives the synthetic-child seam; topology rides the SAME re-read as focus.
+// ---------------------------------------------------------------------------
+
+/** Build a scripted child that replies to the bootstrap + framed re-read with a
+ *  fixed pid / clients / panes transcript. `panesBody` lines are the 5-col focus
+ *  `list-panes -a` rows. Returns the harness so the caller drives the handshake. */
+function scriptedReread(opts: {
+  pid: string;
+  clients: string[];
+  panes: string[];
+}): ReturnType<typeof makeScriptedChild> {
+  let cmdNum = 300;
+  const h = makeScriptedChild((cmd) => {
+    cmdNum += 1;
+    if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
+      h.pushStdout(replyBlock(cmdNum, []));
+    } else if (cmd.startsWith("display-message")) {
+      h.pushStdout(replyBlock(cmdNum, [opts.pid]));
+    } else if (cmd.startsWith("list-clients")) {
+      h.pushStdout(replyBlock(cmdNum, opts.clients));
+    } else if (cmd.startsWith("list-panes")) {
+      h.pushStdout(replyBlock(cmdNum, opts.panes));
+    }
+  });
+  return h;
+}
+
+describe("runConnection — topology emit + skip-gates", () => {
+  // A real client focused on main/3/%42; the topology covers two panes.
+  const clients = ["/dev/ttys001\t0\t120\t10\tmain"];
+  const panes = ["1\t1\t3\t%42\tmain", "0\t1\t1\t%10\twork"];
+  const liveTmuxJobs: Job[] = [
+    fakeJob({
+      job_id: "sess-a",
+      backend_exec_type: "tmux",
+      backend_exec_session_id: "main",
+      backend_exec_pane_id: "%42",
+    }),
+  ];
+
+  test("posts a topology snapshot with a live tmux job, byte-identical to the mapped shape", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    let stopping = false;
+    const child = scriptedReread({ pid: "48271", clients, panes });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: () => {},
+      postTopology: (m) => topos.push(m),
+      postLiveness: () => {},
+      readJobs: () => liveTmuxJobs,
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    const got = await retryUntil(
+      () => (topos.length > 0 ? topos[0] : null),
+      5000,
+    );
+    expect(got).toEqual({
+      kind: "tmux-topology-snapshot",
+      generation_id: "48271",
+      panes: [
+        {
+          pane_id: "%42",
+          session_name: "main",
+          window_index: 3,
+          job_id: "sess-a",
+        },
+        { pane_id: "%10", session_name: "work", window_index: 1 },
+      ],
+    });
+
+    stopping = true;
+    child.eof();
+    await conn;
+  });
+
+  test("emit-gate: NO topology post when no live tmux job exists", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    const focus: TmuxClientFocusSnapshotMessage[] = [];
+    let stopping = false;
+    const child = scriptedReread({ pid: "48271", clients, panes });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: (m) => focus.push(m),
+      postTopology: (m) => topos.push(m),
+      postLiveness: () => {},
+      readJobs: () => [], // no live tmux job → topology gated off
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    // Focus still posts (its own contract); topology stays silent.
+    await retryUntil(() => (focus.length > 0 ? focus[0] : null), 5000);
+    await Bun.sleep(120);
+    expect(topos).toHaveLength(0);
+
+    stopping = true;
+    child.eof();
+    await conn;
+  });
+
+  test("skip-gate: empty pane set → NO topology post (never a wiping snapshot)", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    const focus: TmuxClientFocusSnapshotMessage[] = [];
+    let stopping = false;
+    // Panes empty (server up, no panes) — focus derives `none`, topology skips.
+    const child = scriptedReread({ pid: "48271", clients: [], panes: [] });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: (m) => focus.push(m),
+      postTopology: (m) => topos.push(m),
+      postLiveness: () => {},
+      readJobs: () => liveTmuxJobs,
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    await retryUntil(() => (focus.length > 0 ? focus[0] : null), 5000);
+    await Bun.sleep(120);
+    expect(topos).toHaveLength(0);
+
+    stopping = true;
+    child.eof();
+    await conn;
+  });
+
+  test("skip-gate: null generation (empty pid reply) → NO topology post", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    const focus: TmuxClientFocusSnapshotMessage[] = [];
+    let stopping = false;
+    // pid reply empty → generationId stays null → topology gated off (focus too).
+    const child = scriptedReread({ pid: "", clients, panes });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: (m) => focus.push(m),
+      postTopology: (m) => topos.push(m),
+      postLiveness: () => {},
+      readJobs: () => liveTmuxJobs,
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    // Give the re-read time to run; a null generation suppresses BOTH posts'
+    // generation context — topology must stay empty.
+    await Bun.sleep(200);
+    expect(topos).toHaveLength(0);
+
+    stopping = true;
+    child.eof();
+    await conn;
+  });
+
+  test("dedup: a steady topology posts exactly once across two re-reads", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    let stopping = false;
+    let paneReads = 0;
+    let cmdNum = 400;
+    let child!: ReturnType<typeof makeScriptedChild>;
+    child = makeScriptedChild((cmd) => {
+      cmdNum += 1;
+      if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
+        child.pushStdout(replyBlock(cmdNum, []));
+      } else if (cmd.startsWith("display-message")) {
+        child.pushStdout(replyBlock(cmdNum, ["48271"]));
+      } else if (cmd.startsWith("list-clients")) {
+        child.pushStdout(replyBlock(cmdNum, clients));
+      } else if (cmd.startsWith("list-panes")) {
+        paneReads += 1;
+        // Same panes on the first read; a structural notification re-arms a
+        // second re-read whose panes are IDENTICAL → topology dedups (no 2nd post).
+        child.pushStdout(replyBlock(cmdNum, panes));
+        if (paneReads === 1) {
+          child.pushStdout(`%window-pane-changed @1 %42\n`);
+        }
+      }
+    });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: () => {},
+      postTopology: (m) => topos.push(m),
+      postLiveness: () => {},
+      readJobs: () => liveTmuxJobs,
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    // Wait for both re-reads to run.
+    await retryUntil(() => (paneReads >= 2 ? true : null), 5000);
+    await Bun.sleep(120);
+    // Two re-reads, ONE topology post (the second read's identical topology dedups).
+    expect(topos).toHaveLength(1);
+
+    stopping = true;
+    child.eof();
+    await conn;
   });
 });

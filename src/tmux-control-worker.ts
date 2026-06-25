@@ -47,10 +47,14 @@ import { LineBuffer, OversizedLineError } from "./protocol";
 import { runQuery } from "./server-worker";
 import { createControlStreamParser } from "./tmux-control-parser";
 import {
+  deriveFocusAndPanes,
   type FocusDerivation,
+  hashTopology,
   parseClientLines,
   parsePaneLines,
   pickCurrentClient,
+  type TmuxPaneRow,
+  type TmuxTopologyPane,
 } from "./tmux-focus-derive";
 import type { Job } from "./types";
 
@@ -101,9 +105,31 @@ export interface TmuxControlLivenessMessage {
   at_ms: number;
 }
 
+/**
+ * Worker→main whole-server tmux topology observation (epic fn-968). Carries the
+ * server `generation_id` (the pid the topology was read under) and the live pane
+ * map `{pane_id, session_name, window_index}`, MAPPED from the SAME framed
+ * `list-panes -a` re-read that drives focus — no new tmux command, no subprocess.
+ * Main mints ONE `TmuxTopologySnapshot` event carrying `{generation_id, panes}`,
+ * byte-identical to the restore-worker poll's payload, which the live-location
+ * fold OVERWRITES each matching tmux job's `backend_exec_session_id` +
+ * `window_index` from.
+ *
+ * NEVER posted on a wiping/degraded observation — the worker self-gates on a
+ * resolvable generation, a non-empty pane set, and a successful (non-faulting)
+ * read; only a successful non-empty read posts, so a blip never clobbers a live
+ * location.
+ */
+export interface TmuxTopologySnapshotMessage {
+  kind: "tmux-topology-snapshot";
+  generation_id: string;
+  panes: TmuxTopologyPane[];
+}
+
 export type TmuxControlWorkerMessage =
   | TmuxClientFocusSnapshotMessage
-  | TmuxControlLivenessMessage;
+  | TmuxControlLivenessMessage
+  | TmuxTopologySnapshotMessage;
 
 // ---------------------------------------------------------------------------
 // Pure seams (fast-tier testable — no I/O, no real tmux)
@@ -295,6 +321,39 @@ export function deriveFocus(
   );
 }
 
+/**
+ * Map the focus re-read's 5-col `TmuxPaneRow[]` into the whole-server topology
+ * pane shape (`paneId→pane_id`, `session→session_name`, `windowIndex→
+ * window_index`), stamping an OPTIONAL `job_id` for the keeper job that owns each
+ * pane (`pane_id → job.backend_exec_pane_id` over all live tmux jobs — a pane MOVE
+ * happens to an already-resolved job, so resolved jobs are joined too). Mirrors
+ * the restore-worker's `stampPaneJobIds` join so the two producers emit a
+ * byte-identical payload for the same tmux state. The focus parser's
+ * `windowActive`/`paneActive` flags are dropped — topology is whole-server, not
+ * the focused pane. Pure; reads only its args.
+ */
+export function mapPaneRowsToTopology(
+  rows: readonly TmuxPaneRow[],
+  jobs: readonly Job[],
+): TmuxTopologyPane[] {
+  const jobByPaneId = new Map<string, string>();
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") continue;
+    if (job.backend_exec_type === "tmux" && job.backend_exec_pane_id != null) {
+      jobByPaneId.set(job.backend_exec_pane_id, job.job_id);
+    }
+  }
+  return rows.map((r) => {
+    const pane: TmuxTopologyPane = {
+      pane_id: r.paneId,
+      session_name: r.session,
+      window_index: r.windowIndex,
+    };
+    const jobId = jobByPaneId.get(r.paneId);
+    return jobId == null ? pane : { ...pane, job_id: jobId };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Worker runtime constants
 // ---------------------------------------------------------------------------
@@ -416,6 +475,9 @@ function main(): void {
   const postFocus = (msg: TmuxClientFocusSnapshotMessage): void => {
     if (!stopping) port.postMessage(msg);
   };
+  const postTopology = (msg: TmuxTopologySnapshotMessage): void => {
+    if (!stopping) port.postMessage(msg);
+  };
   const postLiveness = (): void => {
     if (!stopping) {
       port.postMessage({
@@ -454,7 +516,9 @@ function main(): void {
     gatePollMs,
     isStopping: () => stopping,
     postFocus,
+    postTopology,
     postLiveness,
+    readJobs: () => readJobs(db),
     spawn: spawnControlChild,
   })
     .then(() => {
@@ -510,7 +574,9 @@ async function supervise(ctx: {
   gatePollMs: number;
   isStopping: () => boolean;
   postFocus: (msg: TmuxClientFocusSnapshotMessage) => void;
+  postTopology: (msg: TmuxTopologySnapshotMessage) => void;
   postLiveness: () => void;
+  readJobs: () => Job[];
   spawn: (anchor: string) => ControlChild;
 }): Promise<void> {
   let attempts = 0;
@@ -606,7 +672,9 @@ export async function runConnection(
   ctx: {
     isStopping: () => boolean;
     postFocus: (msg: TmuxClientFocusSnapshotMessage) => void;
+    postTopology: (msg: TmuxTopologySnapshotMessage) => void;
     postLiveness: () => void;
+    readJobs: () => Job[];
   },
 ): Promise<boolean> {
   const decoder = new TextDecoder();
@@ -664,6 +732,10 @@ export async function runConnection(
   };
   let generationId: string | null = null;
   let lastPostedKey: string | null = null;
+  // Per-connection topology dedup, scoped EXACTLY like `lastPostedKey`: a steady
+  // topology never re-posts within a connection; a reconnect (a fresh scope) re-
+  // reads + re-posts from scratch (ids are reused across server restarts).
+  let lastPostedTopologyKey: string | null = null;
   let madeProgress = false;
   let exited = false;
   let exitReason: string | null = null;
@@ -766,8 +838,8 @@ export async function runConnection(
   }
 
   /** The single-in-flight framed re-read: read the generation (pid) if unknown,
-   *  then `list-clients` + `list-panes -a`, derive focus, dedup, post on change.
-   *  Re-arms once if a notification landed mid-read. */
+   *  then `list-clients` + `list-panes -a`, derive focus AND topology (one parse),
+   *  dedup each, post on change. Re-arms once if a notification landed mid-read. */
   async function runReread(): Promise<void> {
     if (rereadInFlight) {
       redirty = true;
@@ -791,7 +863,13 @@ export async function runConnection(
       const panesBody = (
         await sendCommand(`list-panes -a -F '${LIST_PANES_FORMAT}'`)
       ).join("\n");
-      const derivation = deriveFocus(clientsBody, panesBody);
+      // ONE parse of the two framed reads → BOTH the focus pick AND the full pane
+      // set the topology emit maps. The focus half is byte-identical to the prior
+      // `deriveFocus`.
+      const { focus: derivation, panes: paneRows } = deriveFocusAndPanes(
+        clientsBody,
+        panesBody,
+      );
       // A completed read (even a `none`) is forward progress — it resets the
       // supervisor's reconnect-backoff counter.
       madeProgress = true;
@@ -817,6 +895,33 @@ export async function runConnection(
                 pane_id: null,
               },
         );
+      }
+      // Topology emit — relocated from the restore-worker poll, riding the SAME
+      // framed re-read. Skip-gates (all NO-posts, never a wiping snapshot that
+      // would clobber a live job location):
+      //  1. null generation — no recycle key to stamp;
+      //  2. emit-gate `hasLiveTmuxJob` — pointless with no jobs to locate;
+      //  3. empty pane set — a wiping empty topology would clobber every location;
+      //  4. read-fault — handled by the outer `catch` (no post).
+      // Deduped via the SHARED `hashTopology` over the SAME `{pane_id,
+      // session_name, window_index}` triples (job_id excluded), so a steady
+      // topology never churns and the hash matches the old poll's byte-for-byte.
+      if (generationId !== null) {
+        const jobs = ctx.readJobs();
+        if (hasLiveTmuxJob(jobs)) {
+          const panes = mapPaneRowsToTopology(paneRows, jobs);
+          if (panes.length > 0) {
+            const topoKey = hashTopology(generationId, panes);
+            if (topoKey !== lastPostedTopologyKey) {
+              lastPostedTopologyKey = topoKey;
+              ctx.postTopology({
+                kind: "tmux-topology-snapshot",
+                generation_id: generationId,
+                panes,
+              });
+            }
+          }
+        }
       }
     } catch {
       // A re-read fault (child went away mid-command) — let the reader's EOF/exit

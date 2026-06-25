@@ -5316,6 +5316,55 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         });
         wakePending = true;
         pumpWakes();
+        return;
+      }
+      if (msg.kind === "tmux-topology-snapshot") {
+        // epic fn-968 — the LIVE-LOCATION channel, relocated onto the control
+        // worker's existing framed re-read (no new tmux command, no subprocess).
+        // Mints ONE `TmuxTopologySnapshot` carrying `{generation_id, panes}` —
+        // BYTE-IDENTICAL to the restore-worker poll's payload, so the live-only
+        // fold (gated above `tmux_projection_state.floor`, recycle-guarded on
+        // `(generation_id, pane_id)`) OVERWRITES each tmux job's live session +
+        // `window_index` exactly as before. Stable synthetic `session_id` per
+        // kind (events.session_id is NOT NULL; the fold keys on the payload).
+        const topo = msg as TmuxTopologySnapshotMessage;
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: "tmux-topology-snapshot",
+          $pid: null,
+          $hook_event: "TmuxTopologySnapshot",
+          $event_type: "tmux_topology_snapshot",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({
+            generation_id: topo.generation_id,
+            panes: topo.panes,
+          }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+        });
+        wakePending = true;
+        pumpWakes();
       }
     };
 
