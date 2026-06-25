@@ -53,5 +53,5 @@ exercised in task `.3`'s `*.slow.test.ts`.
 - [ ] Fast-tier tests cover the mapping, dedup-equivalence vs the old source, and every skip-gate.
 
 ## Done summary
-
+Control-worker now emits TmuxTopologySnapshot from its existing framed list-panes re-read (no new tmux command), emit-gated on hasLiveTmuxJob, deduped via the shared hashTopology, with null-generation/empty-panes/read-fault as no-posts. Main mints the relocated event; the fold and restore-poll are untouched (the two producers coexist behind the same byte-identical contract).
 ## Evidence

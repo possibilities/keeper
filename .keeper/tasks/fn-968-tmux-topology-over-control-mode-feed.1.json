@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Control-worker emits TmuxTopologySnapshot over the feed",
-  "updated_at": "2026-06-25T11:44:44.112000Z"
+  "updated_at": "2026-06-25T12:08:15.795000Z",
+  "worker_done_at": "2026-06-25T12:08:15.795000Z"
 }
