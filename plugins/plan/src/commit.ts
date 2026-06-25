@@ -11,11 +11,13 @@
 // domains (index.lock for staging, ref-lock for the commit) by re-running
 // add+commit from the current HEAD each attempt.
 //
-// Git spawns inherit the ambient environment untouched — GIT_CONFIG_GLOBAL /
-// GIT_CONFIG_SYSTEM (committer identity, gpgsign, hooks) and PLANCTL_* /
-// CLAUDE_CODE_SESSION_ID all ride through. Never set GIT_DIR/GIT_WORK_TREE and
-// never substitute a sanitized env: the conformance harness rides these vars and
-// stripping them makes every commit fail or diverge.
+// Git spawns ride the ambient environment with ONE exception (applied in
+// vcs.ts's runGit): the four worktree-routing vars — GIT_DIR / GIT_WORK_TREE /
+// GIT_INDEX_FILE / GIT_COMMON_DIR — are stripped so the explicit per-spawn cwd
+// alone fixes the repo + branch (an inherited GIT_DIR otherwise routes a lane-
+// worktree commit onto the main branch). Everything else rides through:
+// GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM (committer identity, gpgsign, hooks) and
+// PLANCTL_* / CLAUDE_CODE_SESSION_ID the conformance harness depends on.
 //
 // Every git operation routes through the PlanVcs facade (vcs.ts): production gets
 // realGitVcs (the verbatim spawns), the bun:test harness installs a fake that

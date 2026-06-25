@@ -17,7 +17,9 @@ import { join } from "node:path";
 import {
   type CliResult,
   firstJsonPayload,
+  gitHeadMessage,
   gitInit,
+  gitLogCount,
   parseCliOutput,
   runCli,
   scaffoldPlanYaml,
@@ -251,6 +253,55 @@ describe("cross-repo id-addressed verb resolution (fn-882)", () => {
     const doneR = invoke(mr, a as string, ["done", taskId, "--summary", "ok"]);
     expect(doneR.code).toBe(0);
     expect(taskJson(a as string, taskId).worker_done_at).toBeTruthy();
+  });
+
+  test("done inside a worktree lane commits to the lane cwd, not the epic's primary_repo (fn-972.2)", () => {
+    // Worktree-mode shape: the worker runs IN a lane checkout that owns the
+    // epic+task, while the epic's primary_repo points at the MAIN toplevel. The
+    // plan-state commit must land on the lane (its cwd-resolved owner) — the
+    // committing cwd is the lane, never primary_repo — so done's done-stamp stays
+    // on the lane branch instead of escaping onto main.
+    const mr = multiRepo(getRoot, getHome, ["lane", "main"]);
+    const { lane, main } = mr.projects;
+    const { epicId, taskId } = seedEpicIn(mr, lane as string, "Lane work");
+
+    // Point the epic's primary_repo at MAIN, as worktree mode does (epic state is
+    // owned by the main toplevel; the lane is a linked-worktree checkout of it).
+    const epicPath = join(lane as string, ".keeper", "epics", `${epicId}.json`);
+    const epicDef = JSON.parse(readFileSync(epicPath, "utf-8"));
+    epicDef.primary_repo = main as string;
+    writeFileSync(epicPath, `${JSON.stringify(epicDef, null, 2)}\n`);
+
+    expect(invoke(mr, lane as string, ["claim", taskId]).code).toBe(0);
+
+    const laneCommitsBefore = gitLogCount(lane as string);
+    const mainCommitsBefore = gitLogCount(main as string);
+
+    const doneR = invoke(mr, lane as string, [
+      "done",
+      taskId,
+      "--summary",
+      "lane-shipped",
+    ]);
+    expect(doneR.code).toBe(0);
+
+    // The commit cwd (plan_invocation.state_repo / repo_root) is the LANE, not
+    // primary_repo — this is the lane-cwd-commit contract.
+    const inv = parseCliOutput(doneR.output).plan_invocation as Record<
+      string,
+      unknown
+    >;
+    expect(inv.state_repo).toBe(lane as string);
+    expect(inv.repo_root).toBe(lane as string);
+
+    // Auto-commit-its-own-scope: exactly ONE done commit lands, on the lane.
+    expect(gitLogCount(lane as string)).toBe(laneCommitsBefore + 1);
+    expect(gitHeadMessage(lane as string).split("\n")[0]).toBe(
+      `chore(plan): done ${taskId}`,
+    );
+    // Nothing leaked onto the main toplevel.
+    expect(gitLogCount(main as string)).toBe(mainCommitsBefore);
+    expect(taskJson(lane as string, taskId).worker_done_at).toBeTruthy();
   });
 
   test("list stays project-scoped (the cwd board, not a global view)", () => {

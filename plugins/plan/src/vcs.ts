@@ -133,15 +133,43 @@ export interface PlanVcs {
 // Real implementation — the verbatim git plumbing. Production default.
 // ---------------------------------------------------------------------------
 
-/** Run git with the live process env and an explicit cwd. The env is passed
+// The four git env vars that route the repo/index/work-tree BEFORE cwd is
+// consulted. When any is set — inherited from a parent process that ran inside a
+// DIFFERENT worktree (e.g. autopilot's worktree-mode producer, or a git hook) —
+// git resolves the repo from them and IGNORES the explicit cwd, so a plan-state
+// commit made from inside a lane worktree lands on the main repo's branch. They
+// are stripped from every plan git spawn so the explicit cwd alone fixes the
+// repo + branch. Everything else rides through untouched: GIT_CONFIG_GLOBAL /
+// GIT_CONFIG_SYSTEM (committer identity, gpgsign, hooks) and PLANCTL_* /
+// CLAUDE_CODE_SESSION_ID the conformance harness depends on.
+const WORKTREE_ROUTING_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+] as const;
+
+/** A snapshot of the live process env with the worktree-routing vars stripped.
+ * Read at call time, so an in-process caller that reassigned process.env — the
+ * bun:test harness installing the fixture's GIT_CONFIG_GLOBAL / committer
+ * identity — is still reflected; only the cwd-overriding GIT_* vars are removed. */
+function gitEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of WORKTREE_ROUTING_ENV) {
+    delete env[key];
+  }
+  return env;
+}
+
+/** Run git with the sanitized process env (worktree-routing GIT_* stripped) and
+ * an explicit cwd, so the cwd alone fixes the repo/branch. The env is passed
  * explicitly (not the default-snapshot inheritance) so an in-process caller that
- * reassigned process.env — the bun:test harness installing the fixture's
- * GIT_CONFIG_GLOBAL / committer identity — reaches git's config resolution.
- * `input`, when given, is fed to stdin (used for `commit -F -`). */
+ * reassigned process.env reaches git's config resolution. `input`, when given,
+ * is fed to stdin (used for `commit -F -`). */
 function runGit(args: string[], cwd: string, input?: string): GitResult {
   const proc = Bun.spawnSync(["git", ...args], {
     cwd,
-    env: process.env,
+    env: gitEnv(),
     ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
   });
   return {
@@ -324,7 +352,7 @@ export const realGitVcs: PlanVcs = {
       ["diff", "HEAD", "--stat"],
     ]) {
       try {
-        const proc = Bun.spawnSync(["git", ...argv], { cwd });
+        const proc = Bun.spawnSync(["git", ...argv], { cwd, env: gitEnv() });
         const out = proc.stdout.toString().trim();
         if (out) {
           parts.push(out);
@@ -347,7 +375,7 @@ export const realGitVcs: PlanVcs = {
           `--grep=Task: ${taskId}`,
           "--fixed-strings",
         ],
-        { cwd },
+        { cwd, env: gitEnv() },
       );
       if (proc.exitCode !== 0) {
         return null;
@@ -366,12 +394,14 @@ const FIELD_SEP = "\x1f";
 
 /** Run a read-only git probe in `repo`, never throwing on a non-zero exit; a
  * missing git binary surfaces as a non-zero exit (Bun's spawn throws on ENOENT —
- * caught here). No explicit env: the in-verb reads always ran under the default
- * snapshot env, preserved here. */
+ * caught here). The sanitized env (worktree-routing GIT_* stripped) keeps `repo`
+ * authoritative — an inherited GIT_DIR must not redirect a trailer / HEAD scan to
+ * another worktree's branch. */
 function runReadGit(args: string[], repo: string, input?: string): GitResult {
   try {
     const proc = Bun.spawnSync(["git", ...args], {
       cwd: repo,
+      env: gitEnv(),
       ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
     });
     return {

@@ -72,6 +72,16 @@ function makeDirty(rel: string, content = "dirty\n"): string {
   return rel;
 }
 
+/** Set `process.env[key]` to `value`, or delete it when `value` is undefined —
+ * the save/restore primitive for the GIT_* env-pollution test. */
+function setOrDeleteEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
 // Real-git repo setup runs ONLY in the slow tier — src-commit drives the REAL
 // commit path (realGitVcs) directly (the real index.lock contention-retry +
 // prev-sha resolution have no fake-VCS analogue), so it is a genuine real-git
@@ -503,6 +513,90 @@ describe.skipIf(!SLOW_ENABLED)(
       }
       expect(caught).toBeInstanceOf(CommitFailed);
       expect((caught as CommitFailed).error).toBe("commit_contended");
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// worktree-lane isolation — the inherited-GIT_* reroute bug + its fix.
+// ---------------------------------------------------------------------------
+//
+// In worktree-mode autopilot the worker/closer runs IN a lane linked worktree.
+// If the environment carries the four worktree-routing GIT_* vars pointed at the
+// MAIN repo (inherited from the producer / a git hook), git resolves the repo
+// from them and IGNORES the cwd, so a plan-state commit made from inside the lane
+// lands on the MAIN branch. vcs.ts strips those vars so the explicit cwd alone
+// fixes the branch; this asserts the commit stays on the lane.
+
+describe.skipIf(!SLOW_ENABLED)(
+  "autoCommitFromInvocation worktree-lane isolation",
+  () => {
+    test("inherited main-pointed GIT_* does not pull a lane commit onto the main branch", () => {
+      // `repo` (the beforeEach seed) is the MAIN worktree on its default branch.
+      const defaultBranch = git(
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        repo,
+      ).trim();
+      const seedSha = headSha(repo);
+
+      // A linked worktree on a lane branch forked off the seed. `worktree add`
+      // wants a path that does not already exist, so reserve a unique name then
+      // remove the dir before adding.
+      const lane = mkdtempSync(join(tmpdir(), "planctl-lane-"));
+      rmSync(lane, { recursive: true, force: true });
+      const laneBranch = "keeper/epic/fn-972-lane";
+      git(["worktree", "add", "-b", laneBranch, lane, "HEAD"], repo);
+      try {
+        const rel = ".keeper/epics/lane_marker.txt";
+        mkdirSync(join(lane, ".keeper", "epics"), { recursive: true });
+        writeFileSync(join(lane, rel), "lane\n");
+
+        // Pollute the env with all four worktree-routing vars pointed at MAIN,
+        // exactly as an inherited main-worktree context would.
+        const prior = {
+          GIT_DIR: process.env.GIT_DIR,
+          GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+          GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
+          GIT_COMMON_DIR: process.env.GIT_COMMON_DIR,
+        };
+        process.env.GIT_DIR = join(repo, ".git");
+        process.env.GIT_WORK_TREE = repo;
+        process.env.GIT_INDEX_FILE = join(repo, ".git", "index");
+        process.env.GIT_COMMON_DIR = join(repo, ".git");
+
+        let sha: string | null;
+        try {
+          sha = autoCommitFromInvocation({
+            files: [rel],
+            op: "done",
+            target: "fn-972-lane.1",
+            subject: "chore(plan): done fn-972-lane.1",
+            state_repo: lane,
+            repo_root: lane,
+          });
+        } finally {
+          // Restore BEFORE any assertion git() call — the helper inherits env.
+          for (const [k, v] of Object.entries(prior)) {
+            setOrDeleteEnv(k, v);
+          }
+        }
+
+        expect(sha).not.toBeNull();
+        // The commit advanced the LANE branch...
+        expect(
+          git(["rev-parse", `refs/heads/${laneBranch}`], repo).trim(),
+        ).toBe(sha);
+        expect(headSha(lane)).toBe(sha as string);
+        expect(commitCount(lane)).toBe(2); // seed + done
+        // ...and left the default branch (main) untouched.
+        expect(
+          git(["rev-parse", `refs/heads/${defaultBranch}`], repo).trim(),
+        ).toBe(seedSha);
+        expect(commitCount(repo)).toBe(1); // seed only
+      } finally {
+        git(["worktree", "remove", "--force", lane], repo);
+        rmSync(lane, { recursive: true, force: true });
+      }
     });
   },
 );
