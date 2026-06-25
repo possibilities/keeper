@@ -8,7 +8,7 @@
     "fn-952-tmux-control-mode-focus-capture"
   ],
   "id": "fn-959-worktree-capable-autopilot",
-  "last_validated_at": "2026-06-25T02:49:14.963000Z",
+  "last_validated_at": "2026-06-25T02:51:38.228000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T02:49:14.946000Z"
+  "updated_at": "2026-06-25T02:51:38.204000Z"
 }
