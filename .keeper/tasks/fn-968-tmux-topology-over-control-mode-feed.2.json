@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Retire restore-worker tmux polling; re-source restore.json window_index",
-  "updated_at": "2026-06-25T11:44:44.112000Z"
+  "updated_at": "2026-06-25T12:22:51.222000Z",
+  "worker_done_at": "2026-06-25T12:22:51.222000Z"
 }

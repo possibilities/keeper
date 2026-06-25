@@ -48,5 +48,5 @@ spawn/post seams; no real tmux in the fast tier. `bun run test:full`.
 - [ ] Tests prove topology is silenced on the restore-worker, the generation probe still fires, and restore.json carries correct window indices.
 
 ## Done summary
-
+Retired the restore-worker's tmux list-panes -a topology poll (topology/window-index/pane-fill arms + idle-wake driver removed); buildRestoreTier now reads window_index straight off the jobs projection (kept fresh by the control-worker's TmuxTopologySnapshot fold). The ungated display-message generation probe and its ~1s wake stay; reducer no-op arms, fold, floor, and boot-seed untouched.
 ## Evidence
