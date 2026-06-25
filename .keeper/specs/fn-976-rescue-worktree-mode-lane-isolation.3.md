@@ -60,5 +60,5 @@ the task re-dispatches.
 - [ ] Existing unblock / `retry_dispatch` recovery flow still re-dispatches a resolved task; pure-seam tests cover suppress + clear.
 
 ## Done summary
-
+Durable TOOLING_FAILURE re-dispatch guard: the daemon block-escalation sweep mints a once-only sticky DispatchFailed on work::<task> for surface-and-stop blocks, so the existing failedKeys reconcile arm suppresses re-dispatch independent of the transient runtime_status=blocked latch; cleared by retry_dispatch. No new projection column.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Durable re-dispatch guard on TOOLING_FAILURE block",
-  "updated_at": "2026-06-25T21:26:50.522000Z"
+  "updated_at": "2026-06-25T22:27:15.047000Z",
+  "worker_done_at": "2026-06-25T22:27:15.047000Z"
 }
