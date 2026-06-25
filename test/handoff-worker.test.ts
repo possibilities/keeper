@@ -1,0 +1,297 @@
+/**
+ * Unit tests for the `keeper handoff` dispatch worker (`src/handoff-worker.ts`).
+ *
+ * The headline coverage is the BOOT-RECOVERY decision table — the durable
+ * `handoffs` projection survives a restart, so a phantom `dispatching` row must
+ * NOT double-launch (the lease + bind check) yet a genuinely-lost one MUST
+ * re-dispatch. Driven against the pure `decideHandoffAction` with synthetic rows
+ * + an injected clock, NO real spawn. Plus the `dispatchOneHandoff` confirm path
+ * (mint-before-launch, ack abort, permanent vs transient launch failure) with
+ * injected deps, and `buildHandoffPrompt`.
+ *
+ * The `isMainThread` guard in the worker makes a plain `import` inert (no Worker,
+ * no DB), so these symbols are reachable without booting the loop.
+ */
+
+import { expect, test } from "bun:test";
+import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
+import {
+  buildHandoffPrompt,
+  decideHandoffAction,
+  dispatchOneHandoff,
+  HANDOFF_LEASE_TTL_MS,
+  type HandoffDispatchDeps,
+  type HandoffDispatchingAck,
+  type HandoffDispatchRow,
+  type HandoffLaunchFailedPayload,
+  NEVER_BOUND_HANDOFF_THRESHOLD,
+} from "../src/handoff-worker";
+
+const NOW = 1_700_000_000_000; // unix ms
+
+function row(over: Partial<HandoffDispatchRow>): HandoffDispatchRow {
+  return {
+    handoff_id: "h-1",
+    status: "requested",
+    doc: "brief",
+    target_session: "work",
+    claimed_at: null,
+    never_bound_count: 0,
+    ...over,
+  };
+}
+
+// ── decision table ──────────────────────────────────────────────────────────
+
+test("a requested row dispatches", () => {
+  const a = decideHandoffAction(row({ status: "requested" }), false, NOW);
+  expect(a.kind).toBe("dispatch");
+});
+
+test("a bound handoff (bind exists) is skipped regardless of status", () => {
+  // Even a stale `dispatching` row that has since bound must NOT re-dispatch —
+  // the bind check is the authoritative 'already up' gate and fires first.
+  const a = decideHandoffAction(
+    row({ status: "dispatching", claimed_at: 1 }), // ancient lease
+    true,
+    NOW,
+  );
+  expect(a).toMatchObject({ kind: "skip", reason: "bound" });
+});
+
+test("a terminal failed row is skipped (sticky)", () => {
+  const a = decideHandoffAction(row({ status: "failed" }), false, NOW);
+  expect(a).toMatchObject({ kind: "skip", reason: "failed" });
+});
+
+test("a FRESH dispatching row (lease not expired) is left alone — no double-dispatch", () => {
+  // claimed just now → lease has not expired → still booting.
+  const claimedAtSec = NOW / 1000;
+  const a = decideHandoffAction(
+    row({ status: "dispatching", claimed_at: claimedAtSec }),
+    false,
+    NOW,
+  );
+  expect(a).toMatchObject({ kind: "skip", reason: "dispatching-fresh" });
+});
+
+test("a STALE dispatching row (lease expired, no bind) re-dispatches", () => {
+  // claimed_at older than the lease TTL and never bound → presumed lost.
+  const claimedAtSec = (NOW - HANDOFF_LEASE_TTL_MS - 1000) / 1000;
+  const a = decideHandoffAction(
+    row({ status: "dispatching", claimed_at: claimedAtSec }),
+    false,
+    NOW,
+  );
+  expect(a.kind).toBe("redispatch");
+});
+
+test("the lease boundary is inclusive — exactly TTL old re-dispatches", () => {
+  const claimedAtSec = (NOW - HANDOFF_LEASE_TTL_MS) / 1000;
+  const a = decideHandoffAction(
+    row({ status: "dispatching", claimed_at: claimedAtSec }),
+    false,
+    NOW,
+  );
+  expect(a.kind).toBe("redispatch");
+});
+
+test("a dispatching row with a NULL claimed_at is treated as expired (can't wedge)", () => {
+  const a = decideHandoffAction(
+    row({ status: "dispatching", claimed_at: null }),
+    false,
+    NOW,
+  );
+  expect(a.kind).toBe("redispatch");
+});
+
+test("an unknown status is inert", () => {
+  const a = decideHandoffAction(row({ status: "weird" }), false, NOW);
+  expect(a.kind).toBe("skip");
+});
+
+// ── prompt composition ────────────────────────────────────────────────────
+
+test("buildHandoffPrompt prepends the configured prefix + the brief pointer", () => {
+  const p = buildHandoffPrompt("abc-123", "/hack");
+  expect(p.startsWith("/hack ")).toBe(true);
+  expect(p).toContain("keeper handoff show abc-123");
+});
+
+test("buildHandoffPrompt with no prefix is just the pointer", () => {
+  const p = buildHandoffPrompt("abc-123", undefined);
+  expect(p.startsWith("/")).toBe(false);
+  expect(p).toContain("keeper handoff show abc-123");
+  // An empty-string prefix is treated as absent.
+  expect(buildHandoffPrompt("abc-123", "")).toBe(p);
+});
+
+// ── dispatchOneHandoff confirm path ─────────────────────────────────────────
+
+interface Recorder {
+  dispatching: number;
+  launches: Array<{ session: string; spec: LaunchSpec }>;
+  failed: HandoffLaunchFailedPayload[];
+}
+
+function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
+  deps: HandoffDispatchDeps;
+  rec: Recorder;
+} {
+  const rec: Recorder = over.rec ?? {
+    dispatching: 0,
+    launches: [],
+    failed: [],
+  };
+  const deps: HandoffDispatchDeps = {
+    emitDispatching: async (): Promise<HandoffDispatchingAck> => {
+      rec.dispatching++;
+      return { ok: true };
+    },
+    launch: async (session, _cwd, spec): Promise<LaunchResult> => {
+      rec.launches.push({ session, spec });
+      return { ok: true };
+    },
+    emitLaunchFailed: (p): void => {
+      rec.failed.push(p);
+    },
+    buildPrompt: (id) => `/hack show ${id}`,
+    ...over,
+  };
+  return { deps, rec };
+}
+
+const noAbort = new AbortController().signal;
+
+test("dispatchOneHandoff mints HandoffDispatching BEFORE launch with --name handoff::<id>", async () => {
+  const order: string[] = [];
+  const { deps } = makeDeps({
+    emitDispatching: async () => {
+      order.push("mint");
+      return { ok: true };
+    },
+    launch: async (_s, _c, spec) => {
+      order.push(`launch:${spec.claudeName}`);
+      return { ok: true };
+    },
+  });
+  const out = await dispatchOneHandoff(
+    row({ handoff_id: "h-9", target_session: "work" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(out).toBe("launched");
+  // Mint strictly precedes launch (the outbox ordering), and the launch carries
+  // the binding `--name handoff::<id>`.
+  expect(order).toEqual(["mint", "launch:handoff::h-9"]);
+});
+
+test("dispatchOneHandoff launches into the row's target_session", async () => {
+  const { deps, rec } = makeDeps({});
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-10", target_session: "my-session" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.session).toBe("my-session");
+});
+
+test("an ack {ok:false} aborts WITHOUT launching (no double-dispatch window)", async () => {
+  const { deps, rec } = makeDeps({
+    emitDispatching: async () => ({ ok: false }),
+  });
+  const out = await dispatchOneHandoff(row({}), "/repo", noAbort, deps);
+  expect(out).toBe("aborted-prelaunch");
+  expect(rec.launches.length).toBe(0);
+});
+
+test("an ack REJECT (timeout/shutdown) aborts WITHOUT launching", async () => {
+  const { deps, rec } = makeDeps({
+    emitDispatching: async () => {
+      throw new Error("ack timeout");
+    },
+  });
+  const out = await dispatchOneHandoff(row({}), "/repo", noAbort, deps);
+  expect(out).toBe("aborted-prelaunch");
+  expect(rec.launches.length).toBe(0);
+});
+
+test("a PERMANENT launch failure mints HandoffLaunchFailed", async () => {
+  const { deps, rec } = makeDeps({
+    launch: async (): Promise<LaunchResult> => ({
+      ok: false,
+      error: "agentwrap exit 3",
+    }),
+  });
+  const out = await dispatchOneHandoff(
+    row({ handoff_id: "h-11" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(out).toBe("failed");
+  expect(rec.failed).toEqual([
+    { handoff_id: "h-11", reason: "agentwrap exit 3" },
+  ]);
+});
+
+test("a TRANSIENT launch failure does NOT mint a terminal failure (lease re-dispatches)", async () => {
+  const { deps, rec } = makeDeps({
+    launch: async (): Promise<LaunchResult> => ({
+      ok: false,
+      error: "timeout-kill",
+      retryable: true,
+    }),
+  });
+  const out = await dispatchOneHandoff(row({}), "/repo", noAbort, deps);
+  expect(out).toBe("failed");
+  // The `dispatching` row stays put; the never-bound breaker bounds the retries.
+  expect(rec.failed.length).toBe(0);
+});
+
+test("a thrown launch is treated as a PERMANENT failure", async () => {
+  const { deps, rec } = makeDeps({
+    launch: async (): Promise<LaunchResult> => {
+      throw new Error("spawn blew up");
+    },
+  });
+  const out = await dispatchOneHandoff(
+    row({ handoff_id: "h-12" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(out).toBe("failed");
+  expect(rec.failed[0]?.handoff_id).toBe("h-12");
+  expect(rec.failed[0]?.reason).toContain("launch threw");
+});
+
+test("a row with no target_session is a permanent failure, never launched", async () => {
+  const { deps, rec } = makeDeps({});
+  const out = await dispatchOneHandoff(
+    row({ handoff_id: "h-13", target_session: null }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(out).toBe("invalid-target");
+  expect(rec.launches.length).toBe(0);
+  expect(rec.failed[0]?.handoff_id).toBe("h-13");
+});
+
+test("a pre-aborted signal skips the dispatch entirely", async () => {
+  const ac = new AbortController();
+  ac.abort();
+  const { deps, rec } = makeDeps({});
+  const out = await dispatchOneHandoff(row({}), "/repo", ac.signal, deps);
+  expect(out).toBe("aborted-shutdown");
+  expect(rec.dispatching).toBe(0);
+  expect(rec.launches.length).toBe(0);
+});
+
+test("NEVER_BOUND_HANDOFF_THRESHOLD is K=3 (the breaker contract)", () => {
+  // Pinned so the worker's decision-table comment + the fold agree on K.
+  expect(NEVER_BOUND_HANDOFF_THRESHOLD).toBe(3);
+});

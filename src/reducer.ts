@@ -19,6 +19,7 @@ import type { Database, SQLQueryBindings, Statement } from "bun:sqlite";
 import {
   extractBackgroundTasks,
   extractCommit,
+  handoffIdFromSpawnName,
   hasLiveWorkerMonitor,
   isKilledTaskNotification,
   type MonitorEntry,
@@ -4441,6 +4442,156 @@ function foldHandoffRequested(db: Database, event: Event): void {
 }
 
 /**
+ * Never-bound circuit-breaker threshold for handoffs: K CONSECUTIVE
+ * `HandoffDispatching` events for one handoff WITHOUT an intervening bind flip
+ * the row to sticky `failed`. Mirrors {@link NEVER_BOUND_EXPIRE_THRESHOLD} (the
+ * autopilot dispatch breaker). A successful bind ({@link projectJobsRow}'s
+ * `handoff::` SessionStart arm) resets `never_bound_count` to 0, so a handoff
+ * that binds even once never trips it. Defined fold-side (NOT imported from the
+ * producer worker) so the reducer's import graph stays free of the launch
+ * transport — the worker carries its own copy under the same name.
+ */
+const NEVER_BOUND_HANDOFF_THRESHOLD = 3;
+
+/**
+ * `HandoffDispatching` synthetic-event payload — the durable transactional-outbox
+ * marker the dispatcher mints BEFORE it launches the handoff-ee. `handoff_id` is
+ * the only field; `claimed_at` is stamped fold-side from `event.ts` (NEVER from
+ * the producer) so a re-fold reproduces byte-identical rows.
+ */
+interface HandoffDispatchingPayload {
+  handoff_id: string;
+}
+
+/** Parse a `HandoffDispatching` payload; null on any miss (fold no-ops). */
+function extractHandoffDispatchingPayload(
+  event: Event,
+): HandoffDispatchingPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<HandoffDispatchingPayload>;
+    if (
+      typeof parsed.handoff_id !== "string" ||
+      parsed.handoff_id.length === 0
+    ) {
+      return null;
+    }
+    return { handoff_id: parsed.handoff_id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold one `HandoffDispatching` event — the dispatcher's mint-before-launch
+ * marker. Advances the matching `handoffs` row to `status='dispatching'`,
+ * stamps `claimed_at` from `event.ts` (the lease anchor the worker reads back),
+ * and BUMPS `never_bound_count`. When the bumped count reaches
+ * {@link NEVER_BOUND_HANDOFF_THRESHOLD} the row goes sticky `failed` — K
+ * consecutive dispatches with no intervening bind (a bind resets the counter in
+ * {@link projectJobsRow}). A `bound`/`failed` row is left ALONE (a late marker
+ * for an already-settled handoff must never re-open it); the breaker also leaves
+ * an already-`failed` row untouched. NO-OP when the row is absent (the marker
+ * raced ahead of the `HandoffRequested` fold — can't happen given outbox
+ * ordering, but defense-in-depth). Pure (all time is `event.ts`); NEVER throws.
+ */
+function foldHandoffDispatching(db: Database, event: Event): void {
+  const payload = extractHandoffDispatchingPayload(event);
+  if (payload == null) {
+    return;
+  }
+  const row = db
+    .query(
+      "SELECT status, never_bound_count FROM handoffs WHERE handoff_id = ?",
+    )
+    .get(payload.handoff_id) as
+    | { status: string; never_bound_count: number }
+    | undefined;
+  if (row == null) {
+    // Marker with no requested row — outbox ordering prevents this; ignore.
+    return;
+  }
+  if (row.status === "bound" || row.status === "failed") {
+    // Terminal/settled — a late marker must not re-open it.
+    return;
+  }
+  const nextCount = row.never_bound_count + 1;
+  const tripped = nextCount >= NEVER_BOUND_HANDOFF_THRESHOLD;
+  db.run(
+    `UPDATE handoffs
+        SET status = ?, claimed_at = ?, never_bound_count = ?, last_event_id = ?
+      WHERE handoff_id = ?`,
+    [
+      tripped ? "failed" : "dispatching",
+      event.ts,
+      nextCount,
+      event.id,
+      payload.handoff_id,
+    ],
+  );
+}
+
+/**
+ * `HandoffLaunchFailed` synthetic-event payload — a PERMANENT launch failure
+ * (agentwrap exit 1/2/3, a thrown launch) the dispatcher surfaces. Distinct from
+ * the never-bound breaker (which trips off `never_bound_count`). `reason` is the
+ * surfaced launch error (carried for the operator view; the fold only needs the
+ * id to flip status).
+ */
+interface HandoffLaunchFailedPayload {
+  handoff_id: string;
+  reason: string;
+}
+
+/** Parse a `HandoffLaunchFailed` payload; null on any miss (fold no-ops). */
+function extractHandoffLaunchFailedPayload(
+  event: Event,
+): HandoffLaunchFailedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<HandoffLaunchFailedPayload>;
+    if (
+      typeof parsed.handoff_id !== "string" ||
+      parsed.handoff_id.length === 0
+    ) {
+      return null;
+    }
+    return {
+      handoff_id: parsed.handoff_id,
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold one `HandoffLaunchFailed` event — flip the matching `handoffs` row to
+ * terminal `status='failed'`. A `bound` row is left ALONE (a launch-failure
+ * mint racing a successful bind must never knock a live handoff-ee terminal);
+ * an already-`failed` row is idempotently re-stamped (cheap). NO-OP on a missing
+ * row. Pure; NEVER throws.
+ */
+function foldHandoffLaunchFailed(db: Database, event: Event): void {
+  const payload = extractHandoffLaunchFailedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `UPDATE handoffs
+        SET status = 'failed', last_event_id = ?
+      WHERE handoff_id = ? AND status != 'bound'`,
+    [event.id, payload.handoff_id],
+  );
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -5814,6 +5965,82 @@ function writeHandoffLinkOnJob(
 }
 
 /**
+ * Bind a handoff-ee on its `SessionStart`: the back half of the job→job handoff
+ * edge. Called from {@link projectJobsRow}'s SessionStart arm ONLY when the
+ * spawn name parsed to a `handoff::<id>` — the AUTHORITATIVE bind signal (the
+ * bind EVENT, not the tmux window, which can outlive its process). The callee's
+ * `jobs` row was just UPSERTed by the SessionStart arm, so `calleeJobId` is a
+ * live row here.
+ *
+ * Three writes, all pure functions of the event + persisted state:
+ *  1. Stamp `handoffs.callee_job_id = calleeJobId`, `status = 'bound'`, and RESET
+ *     `never_bound_count = 0` (a worker that binds even once must never trip the
+ *     never-bound breaker — mirrors the autopilot discharge-on-bind). The bind
+ *     wins over a `dispatching` OR a prior `failed` row: a live process is
+ *     attached, so liveness supersedes a never-bound write-off. NO-OP on a
+ *     missing handoffs row (a `handoff::` spawn with no matching enqueue — a
+ *     stale window; nothing to bind).
+ *  2. Write the `handoff-to` {@link HandoffLinkEntry} onto the CALLEE's job row
+ *     (peer = the initiator).
+ *  3. Re-stamp the `handoff-from` entry on the INITIATOR's job row so its
+ *     `peer_job_id` (empty at request time) now points at the bound callee, and
+ *     both endpoints carry `status='bound'`.
+ *
+ * Idempotent: a duplicate SessionStart (a resume) re-stamps the same bytes
+ * (status already `bound`, count already 0, links replace-merged by key). Pure —
+ * `event.id`/`event.ts` are the only "time"; re-fold byte-identical. NEVER throws.
+ */
+function bindHandoffOnSessionStart(
+  db: Database,
+  handoffId: string,
+  calleeJobId: string,
+  eventId: number,
+  ts: number,
+): void {
+  const row = db
+    .query("SELECT initiator_job_id FROM handoffs WHERE handoff_id = ?")
+    .get(handoffId) as { initiator_job_id: string | null } | undefined;
+  if (row == null) {
+    // A `handoff::<id>` spawn with no matching enqueue — a stale window or a
+    // hand-typed name. Nothing to bind; leave the projection untouched.
+    return;
+  }
+  db.run(
+    `UPDATE handoffs
+        SET callee_job_id = ?, status = 'bound', never_bound_count = 0, last_event_id = ?
+      WHERE handoff_id = ?`,
+    [calleeJobId, eventId, handoffId],
+  );
+  const initiatorJobId = row.initiator_job_id;
+  // 2. handoff-to on the callee — peer is the initiator (may be "" / orphan).
+  writeHandoffLinkOnJob(
+    db,
+    calleeJobId,
+    "handoff-to",
+    handoffId,
+    initiatorJobId ?? "",
+    "bound",
+    eventId,
+    ts,
+  );
+  // 3. Re-stamp handoff-from on the initiator so its peer now points at the
+  // bound callee (it was "" at request time). NO-OP when the initiator job is an
+  // orphan / unfolded — the edge is half-anchored by the row's raw coords.
+  if (initiatorJobId != null && initiatorJobId.length > 0) {
+    writeHandoffLinkOnJob(
+      db,
+      initiatorJobId,
+      "handoff-from",
+      handoffId,
+      calleeJobId,
+      "bound",
+      eventId,
+      ts,
+    );
+  }
+}
+
+/**
  * Reverse fan-out from a jobs-write that may have changed display / annotation
  * fields on a session whose plan footprint already produced epic-link edges.
  * For each epic referencing this `jobId` via the symmetric `jobs.epic_links`
@@ -7024,6 +7251,16 @@ function projectJobsRow(db: Database, event: Event): void {
             plan_ref,
           ]);
         }
+        // Handoff bind: a `handoff::<id>` spawn name is a SEPARATE spawn-name
+        // class from the `{plan,work,close}::` plan verbs (it carries no plan
+        // ref — `planVerbRefFromSpawnName` returned NULL above, so the discharge
+        // block did not fire). Bind the handoff-ee to its `handoffs` row here,
+        // AFTER the callee's jobs row was UPSERTed (so the back-link can enrich
+        // off it). Pure parse + projection reads — re-fold byte-identical.
+        const handoffId = handoffIdFromSpawnName(event.spawn_name);
+        if (handoffId != null) {
+          bindHandoffOnSessionStart(db, handoffId, jobId, event.id, ts);
+        }
       }
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
@@ -8035,6 +8272,10 @@ export function applyEvent(
       foldEpicArmed(db, event);
     } else if (event.hook_event === "HandoffRequested") {
       foldHandoffRequested(db, event);
+    } else if (event.hook_event === "HandoffDispatching") {
+      foldHandoffDispatching(db, event);
+    } else if (event.hook_event === "HandoffLaunchFailed") {
+      foldHandoffLaunchFailed(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {
       // retired fn-684 — fold to no-op so historical events advance the
       // cursor without touching the jobs projection. MUST stay an explicit

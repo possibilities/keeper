@@ -34,6 +34,19 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 const SPAWN_VERB_REF_RE = /^(plan|work|close)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
 
 /**
+ * Anchored `handoff::<handoff_id>` spawn-name match — the SEPARATE spawn-name
+ * class for `keeper handoff` dispatch. DELIBERATELY its own regex, never folded
+ * into {@link SPAWN_VERB_REF_RE}: a `handoff::` name must NOT populate
+ * `plan_verb`/`plan_ref` (it carries no plan ref and would pollute readiness +
+ * the autopilot dispatch correlator), so the plan-verb parser returns
+ * `(null, null)` for it. The id is a `crypto.randomUUID()` (lowercase hex +
+ * hyphens) the CLI mints, so the body class is kebab/hex (`[a-z0-9-]`); the `$`
+ * anchor rejects any trailing `::` segment so a typo rejects rather than
+ * binding wrong. Sibling of `SPAWN_VERB_REF_RE` — kept narrow on purpose.
+ */
+const HANDOFF_SPAWN_RE = /^handoff::([a-z0-9-]+)$/;
+
+/**
  * Extract the leading slash command from a `UserPromptSubmit`'s `data.prompt`.
  * Returns `null` for anything not an anchored `/lowercase…` token. The parser
  * stays shape-agnostic (string in, `null`-or-string out) so the migration
@@ -105,6 +118,25 @@ export function planVerbRefFromSpawnName(
   }
   // biome-ignore lint/style/noNonNullAssertion: regex match guarantees both capture groups
   return { plan_verb: m[1]!, plan_ref: m[2]! };
+}
+
+/**
+ * Extract the `handoff_id` from a `handoff::<id>` spawn name (the handoff-ee
+ * worker's `--name`, scraped on `SessionStart`). Returns the id on a clean
+ * match, else `null` (a NULL name, a non-handoff verb, or a malformed body).
+ * Distinct from {@link planVerbRefFromSpawnName} so a `handoff::` name lands
+ * the handoff bind WITHOUT ever populating `plan_verb`/`plan_ref` — the two
+ * spawn-name classes never cross. Pure; re-fold-deterministic. NEVER throws.
+ */
+export function handoffIdFromSpawnName(
+  spawnName: string | null,
+): string | null {
+  if (spawnName == null || spawnName.length === 0) {
+    return null;
+  }
+  const m = spawnName.match(HANDOFF_SPAWN_RE);
+  // biome-ignore lint/style/noNonNullAssertion: regex match guarantees the capture group
+  return m == null ? null : m[1]!;
 }
 
 /**

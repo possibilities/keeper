@@ -5521,3 +5521,291 @@ test("from-scratch re-fold reproduces handoffs + jobs.handoff_links byte-identic
   expect(handoffsAfter).toEqual(handoffsBefore);
   expect(jobsAfter).toEqual(jobsBefore);
 });
+
+// ---------------------------------------------------------------------------
+// `HandoffDispatching` / `HandoffLaunchFailed` (fn-946 task .3): the dispatcher's
+// transactional-outbox lifecycle, folded onto the same `handoffs` row. Plus the
+// `handoff::<id>` SessionStart bind arm (callee_job_id + status=bound + to-link).
+// All time is event-ts-derived (claimed_at); folds never throw; re-fold identical.
+// ---------------------------------------------------------------------------
+
+function handoffDispatchingEvent(handoffId: string, ts?: number): number {
+  return insertEvent({
+    hook_event: "HandoffDispatching",
+    event_type: "handoffs",
+    session_id: handoffId,
+    ...(ts !== undefined ? { ts } : {}),
+    data: JSON.stringify({ handoff_id: handoffId }),
+  });
+}
+
+function handoffLaunchFailedEvent(handoffId: string, reason: string): number {
+  return insertEvent({
+    hook_event: "HandoffLaunchFailed",
+    event_type: "handoffs",
+    session_id: handoffId,
+    data: JSON.stringify({ handoff_id: handoffId, reason }),
+  });
+}
+
+/** Seed a SessionStart bound to a handoff (the handoff-ee's `handoff::<id>` name). */
+function bindHandoffSession(handoffId: string, calleeJobId: string): number {
+  return insertEvent({
+    hook_event: "SessionStart",
+    session_id: calleeJobId,
+    spawn_name: `handoff::${handoffId}`,
+  });
+}
+
+test("HandoffDispatching advances the row to dispatching + stamps claimed_at from event ts (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "d-1",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  const id = handoffDispatchingEvent("d-1", 1_700_000_111);
+  drainAll();
+  const row = getHandoffs().find((r) => r.handoff_id === "d-1");
+  expect(row).toMatchObject({
+    handoff_id: "d-1",
+    status: "dispatching",
+    claimed_at: 1_700_000_111,
+    never_bound_count: 1,
+    last_event_id: id,
+  });
+});
+
+test("a handoff:: SessionStart binds callee_job_id + status=bound + resets never_bound_count (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "b-1",
+    doc: "x",
+    target_session: "work",
+  });
+  handoffDispatchingEvent("b-1");
+  drainAll();
+  bindHandoffSession("b-1", "callee-job-1");
+  drainAll();
+  const row = getHandoffs().find((r) => r.handoff_id === "b-1");
+  expect(row).toMatchObject({
+    handoff_id: "b-1",
+    status: "bound",
+    callee_job_id: "callee-job-1",
+    never_bound_count: 0,
+  });
+});
+
+test("a handoff:: SessionStart writes the handoff-to link on the callee job (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "b-2",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  bindHandoffSession("b-2", "callee-job-2");
+  drainAll();
+  const job = db
+    .query("SELECT handoff_links FROM jobs WHERE job_id = ?")
+    .get("callee-job-2") as { handoff_links: string };
+  const links = JSON.parse(job.handoff_links) as Array<{
+    kind: string;
+    handoff_id: string;
+    status: string;
+  }>;
+  expect(links.length).toBe(1);
+  expect(links[0]).toMatchObject({
+    kind: "handoff-to",
+    handoff_id: "b-2",
+    status: "bound",
+  });
+});
+
+test("the bind re-stamps the initiator's handoff-from peer to the bound callee (fn-946)", () => {
+  seedJobSession("initiator-job");
+  handoffRequestedEvent({
+    handoff_id: "b-3",
+    doc: "x",
+    target_session: "work",
+    initiator_job_id: "initiator-job",
+  });
+  drainAll();
+  bindHandoffSession("b-3", "callee-job-3");
+  drainAll();
+  const job = db
+    .query("SELECT handoff_links FROM jobs WHERE job_id = ?")
+    .get("initiator-job") as { handoff_links: string };
+  const links = JSON.parse(job.handoff_links) as Array<{
+    kind: string;
+    handoff_id: string;
+    peer_job_id: string;
+    status: string;
+  }>;
+  const fromLink = links.find((l) => l.kind === "handoff-from");
+  expect(fromLink).toMatchObject({
+    handoff_id: "b-3",
+    peer_job_id: "callee-job-3", // was "" at request time, now the bound callee
+    status: "bound",
+  });
+});
+
+test("a plan:: SessionStart does NOT touch any handoffs row (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "b-4",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  // A non-handoff spawn name must never bind — the handoff:: parser rejects it.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "plan-job",
+    spawn_name: "work::fn-1-foo.2",
+  });
+  drainAll();
+  const row = getHandoffs().find((r) => r.handoff_id === "b-4");
+  expect(row?.status).toBe("requested");
+  expect(row?.callee_job_id).toBeNull();
+});
+
+test("never-bound breaker: K=3 consecutive HandoffDispatching with no bind → sticky failed (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "k-1",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  handoffDispatchingEvent("k-1");
+  handoffDispatchingEvent("k-1");
+  drainAll();
+  // Two dispatches, still trying.
+  expect(getHandoffs().find((r) => r.handoff_id === "k-1")?.status).toBe(
+    "dispatching",
+  );
+  handoffDispatchingEvent("k-1"); // the 3rd
+  drainAll();
+  const row = getHandoffs().find((r) => r.handoff_id === "k-1");
+  expect(row?.status).toBe("failed");
+  expect(row?.never_bound_count).toBe(3);
+});
+
+test("a bind between dispatches resets the counter so the breaker never trips (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "k-2",
+    doc: "x",
+    target_session: "work",
+  });
+  handoffDispatchingEvent("k-2");
+  handoffDispatchingEvent("k-2");
+  drainAll();
+  bindHandoffSession("k-2", "callee-k2"); // resets count to 0, status=bound
+  drainAll();
+  // A later stray dispatch on a bound row is ignored (terminal/settled).
+  handoffDispatchingEvent("k-2");
+  drainAll();
+  const row = getHandoffs().find((r) => r.handoff_id === "k-2");
+  expect(row?.status).toBe("bound");
+  expect(row?.never_bound_count).toBe(0);
+});
+
+test("HandoffLaunchFailed flips the row to terminal failed (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "f-1",
+    doc: "x",
+    target_session: "work",
+  });
+  handoffDispatchingEvent("f-1");
+  drainAll();
+  handoffLaunchFailedEvent("f-1", "agentwrap exit 3");
+  drainAll();
+  expect(getHandoffs().find((r) => r.handoff_id === "f-1")?.status).toBe(
+    "failed",
+  );
+});
+
+test("HandoffLaunchFailed does NOT knock a bound handoff terminal (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "f-2",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  bindHandoffSession("f-2", "callee-f2");
+  drainAll();
+  // A launch-failure mint racing a successful bind must leave the live one bound.
+  handoffLaunchFailedEvent("f-2", "stale launch error");
+  drainAll();
+  expect(getHandoffs().find((r) => r.handoff_id === "f-2")?.status).toBe(
+    "bound",
+  );
+});
+
+test("malformed HandoffDispatching/HandoffLaunchFailed fold to safe no-ops (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "m-1",
+    doc: "x",
+    target_session: "work",
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "HandoffDispatching",
+    event_type: "handoffs",
+    session_id: "m-1",
+    data: "{not json",
+  });
+  const lastId = insertEvent({
+    hook_event: "HandoffLaunchFailed",
+    event_type: "handoffs",
+    session_id: "m-1",
+    data: JSON.stringify({ reason: "no id" }),
+  });
+  expect(drainAll()).toBeGreaterThanOrEqual(1);
+  // Row untouched (still requested); cursor advanced past the malformed events.
+  expect(getHandoffs().find((r) => r.handoff_id === "m-1")?.status).toBe(
+    "requested",
+  );
+  expect(getCursor()).toBe(lastId);
+});
+
+test("from-scratch re-fold reproduces the full handoff lifecycle byte-identically (fn-946)", () => {
+  seedJobSession("rf-init");
+  handoffRequestedEvent({
+    handoff_id: "rf-1",
+    doc: "brief",
+    target_session: "work",
+    initiator_job_id: "rf-init",
+  });
+  handoffDispatchingEvent("rf-1", 1_700_000_500);
+  bindHandoffSession("rf-1", "rf-callee");
+  // A second handoff that goes to the never-bound breaker.
+  handoffRequestedEvent({ handoff_id: "rf-2", doc: "b2", target_session: "x" });
+  handoffDispatchingEvent("rf-2", 1_700_000_600);
+  handoffDispatchingEvent("rf-2", 1_700_000_700);
+  handoffDispatchingEvent("rf-2", 1_700_000_800);
+  drainAll();
+  const handoffsBefore = getHandoffs();
+  const jobsBefore = db
+    .query(
+      "SELECT job_id, handoff_links FROM jobs WHERE handoff_links != '[]' ORDER BY job_id ASC",
+    )
+    .all();
+  // Sanity: rf-1 bound, rf-2 tripped the breaker.
+  expect(handoffsBefore.find((r) => r.handoff_id === "rf-1")?.status).toBe(
+    "bound",
+  );
+  expect(handoffsBefore.find((r) => r.handoff_id === "rf-2")?.status).toBe(
+    "failed",
+  );
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM handoffs");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  expect(getHandoffs()).toEqual(handoffsBefore);
+  expect(
+    db
+      .query(
+        "SELECT job_id, handoff_links FROM jobs WHERE handoff_links != '[]' ORDER BY job_id ASC",
+      )
+      .all(),
+  ).toEqual(jobsBefore);
+});

@@ -82,6 +82,13 @@ import type {
   GitWorkerData,
   GitWorkerMessage,
 } from "./git-worker";
+import type {
+  HandoffDispatchingAckMessage,
+  HandoffDispatchingMessage,
+  HandoffLaunchFailedMessage,
+  HandoffOutboundMessage,
+  HandoffWorkerData,
+} from "./handoff-worker";
 import { livePage } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import type {
@@ -1656,6 +1663,7 @@ export type WorkerName =
   | "deadLetter"
   | "eventsIngest"
   | "autopilot"
+  | "handoff"
   | "maintenance"
   | "restore"
   | "renamer"
@@ -1680,6 +1688,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "deadLetter",
   "eventsIngest",
   "autopilot",
+  "handoff",
   "maintenance",
   "restore",
   "renamer",
@@ -3800,6 +3809,223 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     };
   } // end `if (autopilotWorkerInstance)` onmessage guard
 
+  // The `keeper handoff` dispatch worker — the process-manager reactor that
+  // launches a fire-and-forget handoff-ee into the INITIATOR's tmux session. It
+  // shares the autopilot's launcher prefix (`keeper agent`, the sole launch
+  // transport) and mint-before-launch protocol, but its decider is the durable
+  // boot-recovery decision table over the `handoffs` projection (the projection
+  // SURVIVES boot, unlike `pending_dispatches`, so the lease + bind check is the
+  // double-dispatch guard). Gated on the selector — `null` when unselected. The
+  // worker reads keeper.db read-only; every mutation round-trips through main as
+  // a synthetic `HandoffDispatching` / `HandoffLaunchFailed` event. `cwd` is
+  // keeperd's own cwd (a handoff-ee carries no plan ref; agentwrap reads its own
+  // process.cwd for the launch-script `cd`).
+  const handoffWorkerInstance = want("handoff")
+    ? new Worker(new URL("./handoff-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          launcherArgvPrefix,
+          handoffPromptPrefix: apConfig.handoffPromptPrefix,
+          cwd: process.cwd(),
+        } satisfies HandoffWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (handoffWorkerInstance) {
+    const hw = handoffWorkerInstance;
+    // Worker → main: the durable `HandoffDispatching` mint (ack round-trip) and
+    // the terminal `HandoffLaunchFailed` mint (+ dead-letter). Workers never
+    // write the DB; the producer-side intent rides the synthetic event and the
+    // fold owns the projection. NON-FATAL on insert failure — the next cycle
+    // re-attempts (the lease + bind check make re-dispatch idempotent).
+    hw.onmessage = (
+      ev: MessageEvent<HandoffOutboundMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "handoff-dispatching-request") {
+        handleHandoffDispatchingMint(msg);
+      } else if (msg.kind === "handoff-launch-failed") {
+        handleHandoffLaunchFailedMint(msg.payload);
+      }
+    };
+
+    hw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] handoff worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    hw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // end `if (handoffWorkerInstance)`
+
+  /**
+   * Mint a synthetic `HandoffDispatching` event AND reply a durable
+   * `handoff-dispatching-ack{id, ok}`. The reducer's fold advances the matching
+   * `handoffs` row to `dispatching`, stamps `claimed_at` from the event ts (the
+   * lease anchor), and bumps `never_bound_count` (the breaker trips at K=3). The
+   * handoff_id rides the entity-key overload on `session_id` so a re-fold
+   * correlates it WITHOUT re-parsing `data`.
+   *
+   * DURABLE before launch: the worker AWAITS this ack BEFORE it launches, so the
+   * reply MUST fire on every path (`ok:true` once the insert lands, `ok:false`
+   * when it throws). The worker launches only on `ok:true`. NON-FATAL on insert
+   * failure. Mirrors {@link handleDispatchedMint}.
+   */
+  function handleHandoffDispatchingMint(msg: HandoffDispatchingMessage): void {
+    const { id, payload } = msg;
+    const data = JSON.stringify(payload);
+    let ok = false;
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: payload.handoff_id,
+        $pid: null,
+        $hook_event: "HandoffDispatching",
+        $event_type: "handoffs",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      ok = true;
+    } catch (err) {
+      console.error(
+        `[keeperd] HandoffDispatching mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    // Reply on EVERY path — the worker is blocked awaiting this ack before it
+    // launches; a `false` reply tells it to abort. Reply IMMEDIATELY after the
+    // INSERT, BEFORE the (potentially slow) reducer pump. The `?.` keeps it
+    // null-safe on an unselected-handoff boot.
+    handoffWorkerInstance?.postMessage({
+      type: "handoff-dispatching-ack",
+      id,
+      ok,
+    } satisfies HandoffDispatchingAckMessage);
+    if (ok) {
+      try {
+        wakePending = true;
+        pumpWakes();
+      } catch (err) {
+        console.error(
+          `[keeperd] HandoffDispatching pump threw (non-fatal, ack already sent): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Mint a synthetic `HandoffLaunchFailed` event (flips the `handoffs` row to
+   * terminal `failed`) AND write a `dead_letters` row — a PERMANENT launch
+   * failure (agentwrap exit 1/2/3 / a thrown launch). The dead-letter is a
+   * DIRECT operational-table write (NOT an event fold), mirroring
+   * {@link scanDeadLetterDir}'s INSERT shape, keyed on a fresh `dl_id`. NON-FATAL
+   * on either write — the row stays `dispatching` and the never-bound breaker
+   * eventually goes sticky.
+   */
+  function handleHandoffLaunchFailedMint(
+    payload: HandoffLaunchFailedMessage["payload"],
+  ): void {
+    const data = JSON.stringify(payload);
+    const nowSec = Date.now() / 1000;
+    try {
+      stmts.insertEvent.run({
+        $ts: nowSec,
+        $session_id: payload.handoff_id,
+        $pid: null,
+        $hook_event: "HandoffLaunchFailed",
+        $event_type: "handoffs",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] HandoffLaunchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    // Dead-letter the permanent failure so the operator surface lists it. DIRECT
+    // INSERT into `dead_letters` (the same shape `scanDeadLetterDir` uses), keyed
+    // on a fresh `dl_id`. NON-FATAL — best-effort operational record.
+    try {
+      db.run(
+        `INSERT OR IGNORE INTO dead_letters
+           (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+            status, recovered_at, replayed_event_id, source_file)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, ?)`,
+        [
+          crypto.randomUUID(),
+          payload.handoff_id,
+          "HandoffLaunchFailed",
+          nowSec,
+          nowSec,
+          null,
+          data,
+          "handoff-launch-failed",
+        ],
+      );
+    } catch (err) {
+      console.error(
+        `[keeperd] HandoffLaunchFailed dead-letter write threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /**
    * Mint a synthetic `DispatchFailed` event. The dispatch key (`${verb}::${id}`)
    * rides as the entity-key overload on `session_id` so a re-fold correlates it
@@ -4980,6 +5206,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       deadLetterWorker,
       eventsIngestWorker,
       autopilotWorkerInstance,
+      handoffWorkerInstance,
       maintenanceWorker,
       restoreWorker,
       renamerWorker,

@@ -3925,6 +3925,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
   "autopilot-worker.ts": "autopilot",
+  "handoff-worker.ts": "handoff",
   "maintenance-worker.ts": "maintenance",
   "restore-worker.ts": "restore",
   "renamer-worker.ts": "renamer",
@@ -4019,7 +4020,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL seventeen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -4031,10 +4032,12 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL seventeen w
   // owns its own bus.db + bus.sock, reads keeper.db read-only); fn-930 added
   // `usageScraper` (the in-process agentusage producer, gated on a resolvable `uv`
   // runtime — `spawnedWorkerNames` pins the config keys; no watcher, no message
-  // minter — writes only on-disk envelopes the `usage` consumer folds).
+  // minter — writes only on-disk envelopes the `usage` consumer folds); fn-946
+  // added `handoff` (the `keeper handoff` dispatch worker; no watcher, mints
+  // HandoffDispatching/HandoffLaunchFailed, reads keeper.db read-only).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(17);
+  expect(spawned).toHaveLength(18);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -4050,6 +4053,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL seventeen w
     "deadLetter",
     "eventsIngest",
     "autopilot",
+    "handoff",
     "maintenance",
     "restore",
     "renamer",
