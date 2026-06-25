@@ -21,4 +21,5 @@ NULL `backend_exec_pane_id` (and `backend_exec_generation_id`) when a job folds 
 - [ ] SCHEMA_VERSION bumped + added to SUPPORTED_SCHEMA_VERSIONS; schema-version test passes
 - [ ] bun run test:full green
 ## Done summary
+Terminal (ended/killed) jobs now NULL backend_exec_pane_id + generation in the fold (COALESCE arm guarded against terminal rows), plus a v91->v92 version-guarded migration clears the coords on existing terminal jobs; SCHEMA_VERSION bumped to 92 + whitelisted in keeper/api.py.
 ## Evidence
