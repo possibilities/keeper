@@ -57,5 +57,5 @@ Convert in batches; after each batch run `KEEPER_TEST_NO_GATE=1 bun test test/da
 - [ ] The ~9 spawn/Worker tests left untouched for task `.2`
 
 ## Done summary
-
+Converted ~37 single-connection openDb(dbPath) sites in daemon.test.ts to freshMemDb() template clones. Classification: 37 mem-clone (converted), 0 file-clone (none needed — all multi-connection sites are in the untouched spawn set), 7 keep-migrate/carve-out (4 WAL/checkpoint + busyTimeout sites with why-comments: 290/352/1148/1237; plus spawn/Worker/in-process-daemon tests left for .2). In-process suite time ~124.7s to 11.5s (~10.8x). test:full green 4513 pass/0 fail; 97 tests (spec said 96 — stale, 0 delta from this change). Also fixed stale freshDb()->freshMemDb() in CLAUDE.md+README and orthogonalized slow-tier vs real-git-allowlist guidance.
 ## Evidence

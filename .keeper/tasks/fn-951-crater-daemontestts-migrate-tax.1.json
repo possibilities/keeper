@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Convert in-process openDb sites to template clones",
-  "updated_at": "2026-06-24T23:12:24.789000Z"
+  "updated_at": "2026-06-25T01:40:50.110000Z",
+  "worker_done_at": "2026-06-25T01:40:50.110000Z"
 }
