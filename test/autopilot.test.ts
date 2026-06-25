@@ -40,6 +40,7 @@ import {
   projectAutopilotPaused,
   projectFailedRows,
   projectMaxConcurrentJobs,
+  projectWorktreeMode,
   renderBody,
   renderDependencyGraph,
 } from "../cli/autopilot";
@@ -673,6 +674,42 @@ test("buildSetConfigFrame — an explicit null per-root (reset to default) rides
   });
 });
 
+test("buildSetConfigFrame — a worktree_mode boolean patch emits set_autopilot_config {worktree_mode} (fn-959)", () => {
+  expect(buildSetConfigFrame("rpc-uuid-13", { worktree_mode: true })).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-13",
+    method: "set_autopilot_config",
+    params: { worktree_mode: true },
+  });
+  expect(buildSetConfigFrame("rpc-uuid-14", { worktree_mode: false })).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-14",
+    method: "set_autopilot_config",
+    params: { worktree_mode: false },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// projectWorktreeMode — fn-959 socket-sourced worktree-toggle projection.
+// ---------------------------------------------------------------------------
+
+test("projectWorktreeMode — empty row set → null (singleton not folded yet) (fn-959)", () => {
+  expect(projectWorktreeMode([])).toBeNull();
+});
+
+test("projectWorktreeMode — worktree_mode=1 row → true (ON) (fn-959)", () => {
+  expect(projectWorktreeMode([{ id: 1, worktree_mode: 1 }])).toBe(true);
+});
+
+test("projectWorktreeMode — worktree_mode=0 / NULL / missing → false (OFF, the default) (fn-959)", () => {
+  // Only a stored `1` is ON; every other value (0, NULL, absent column, non-1)
+  // is the byte-identical OFF default.
+  expect(projectWorktreeMode([{ id: 1, worktree_mode: 0 }])).toBe(false);
+  expect(projectWorktreeMode([{ id: 1, worktree_mode: null }])).toBe(false);
+  expect(projectWorktreeMode([{ id: 1 }])).toBe(false);
+  expect(projectWorktreeMode([{ id: 1, worktree_mode: 2 }])).toBe(false);
+});
+
 // ---------------------------------------------------------------------------
 // projectAutopilotMode / projectArmedEpics — fn-751 socket-sourced projections.
 // ---------------------------------------------------------------------------
@@ -846,8 +883,9 @@ test("autopilotBannerLabel — yolo mode + finite cap renders `[playing] · yolo
       maxConcurrentJobs: 3,
       mode: "yolo",
       armedCount: 0,
+      worktreeMode: false,
     }),
-  ).toBe("[playing] · yolo · max 3");
+  ).toBe("[playing] · yolo · max 3 · worktree:off");
 });
 
 test("autopilotBannerLabel — yolo mode never shows an armed count even with a nonzero count (fn-751)", () => {
@@ -859,8 +897,9 @@ test("autopilotBannerLabel — yolo mode never shows an armed count even with a 
       maxConcurrentJobs: null,
       mode: "yolo",
       armedCount: 4,
+      worktreeMode: false,
     }),
-  ).toBe("[paused] · yolo · max ∞");
+  ).toBe("[paused] · yolo · max ∞ · worktree:off");
 });
 
 test("autopilotBannerLabel — armed mode shows the armed count (fn-751)", () => {
@@ -870,8 +909,9 @@ test("autopilotBannerLabel — armed mode shows the armed count (fn-751)", () =>
       maxConcurrentJobs: 2,
       mode: "armed",
       armedCount: 2,
+      worktreeMode: false,
     }),
-  ).toBe("[playing] · armed · 2 armed · max 2");
+  ).toBe("[playing] · armed · 2 armed · max 2 · worktree:off");
 });
 
 test("autopilotBannerLabel — armed mode with NOTHING armed renders distinctly (idle-by-design, not broken) (fn-751)", () => {
@@ -882,8 +922,9 @@ test("autopilotBannerLabel — armed mode with NOTHING armed renders distinctly 
       maxConcurrentJobs: null,
       mode: "armed",
       armedCount: 0,
+      worktreeMode: false,
     }),
-  ).toBe("[playing] · armed · nothing armed · max ∞");
+  ).toBe("[playing] · armed · nothing armed · max ∞ · worktree:off");
 });
 
 test("autopilotBannerLabel — paused flag drives the pill independent of mode/cap (fn-725/fn-751)", () => {
@@ -893,16 +934,41 @@ test("autopilotBannerLabel — paused flag drives the pill independent of mode/c
       maxConcurrentJobs: 5,
       mode: "armed",
       armedCount: 1,
+      worktreeMode: false,
     }),
-  ).toBe("[paused] · armed · 1 armed · max 5");
+  ).toBe("[paused] · armed · 1 armed · max 5 · worktree:off");
   expect(
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
       mode: "yolo",
       armedCount: 0,
+      worktreeMode: false,
     }),
-  ).toBe("[playing] · yolo · max ∞");
+  ).toBe("[playing] · yolo · max ∞ · worktree:off");
+});
+
+test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` segment for BOTH yolo and armed (fn-959)", () => {
+  // The worktree segment renders for BOTH on and off so the live durable toggle
+  // is always scannable; ON is `worktree:on`.
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: 3,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: true,
+    }),
+  ).toBe("[playing] · yolo · max 3 · worktree:on");
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      mode: "armed",
+      armedCount: 2,
+      worktreeMode: true,
+    }),
+  ).toBe("[playing] · armed · 2 armed · max ∞ · worktree:on");
 });
 
 // ---------------------------------------------------------------------------

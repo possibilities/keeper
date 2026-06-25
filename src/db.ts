@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 90;
+export const SCHEMA_VERSION = 91;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1293,7 +1293,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     updated_at REAL NOT NULL,
     max_concurrent_jobs INTEGER,
     mode TEXT NOT NULL DEFAULT 'yolo',
-    max_concurrent_per_root INTEGER
+    max_concurrent_per_root INTEGER,
+    worktree_mode INTEGER
 )
 `;
 
@@ -5308,6 +5309,22 @@ function migrate(db: Database): void {
         "max_concurrent_per_root",
         "INTEGER",
       );
+
+      // v90→v91 (fn-959 task .1): add the nullable `autopilot_state.worktree_mode`
+      // config column (INTEGER: NULL/0 = OFF, 1 = ON; DEFAULT NULL = OFF, the
+      // byte-identical no-worktree behavior). Runtime-settable via the generic
+      // `set_autopilot_config` RPC → `AutopilotConfigSet` fold (NOT
+      // config-file-frozen); each singleton fold preserves the columns it does not
+      // own on conflict, so a pause/mode/cap/per-root patch never clobbers it.
+      // FIX-FORWARD (no rewind): the fold never READS this column (the reconciler
+      // resolves it `?? OFF` at read time), so an addColumnIfMissing append is
+      // re-fold-safe — a from-scratch re-fold re-derives byte-identical rows and
+      // leaves the new column NULL (= OFF). APPEND-via-ALTER keeps the
+      // `PRAGMA table_info` column-shape parity tests stable. Whitelist-only Python
+      // read (keeper-py never reads this column) — this bump MUST add 91 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      addColumnIfMissing(db, "autopilot_state", "worktree_mode", "INTEGER");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

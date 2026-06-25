@@ -2883,7 +2883,10 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // fn-954 task .1 (appending the `autopilot_state.max_concurrent_per_root`
   // config column — an additive ALTER, NO cursor rewind: NULL = the in-memory
   // default, the fold never reads it, so a pre-feature log re-folds byte-identical).
-  expect(SCHEMA_VERSION).toBe(90);
+  // And to 91 via fn-959 task .1 (appending the `autopilot_state.worktree_mode`
+  // config column — an additive ALTER, NO cursor rewind: NULL = OFF, the fold
+  // never reads it, so a pre-feature log re-folds byte-identical).
+  expect(SCHEMA_VERSION).toBe(91);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

@@ -482,6 +482,16 @@ export interface ReconcileSnapshot {
    * carried but unconsumed (the hardcoded N=1 mutex still runs).
    */
   maxConcurrentPerRoot: number;
+  /**
+   * The durable worktree-mode toggle, read FRESH from the `autopilot_state`
+   * singleton's `worktree_mode` column each cycle (resolved `column truthy?` — an
+   * absent/never-set row, NULL, or 0 = OFF, the byte-identical no-worktree
+   * dispatch; only a stored `1` = ON). Projection-pull only (no `workerData`, no
+   * config) so a runtime `set_autopilot_config` lands the very next cycle and the
+   * toggle survives a restart for free. RESERVED for the downstream worktree tasks
+   * (.2+); until they land it is carried but unconsumed (dispatch is unchanged).
+   */
+  worktreeMode: boolean;
 }
 
 /**
@@ -1742,6 +1752,16 @@ export async function loadReconcileSnapshot(
       ? perRootRaw
       : DEFAULT_MAX_CONCURRENT_PER_ROOT;
 
+  // fn-959: the durable worktree-mode toggle rides the SAME singleton row —
+  // resolve `worktree_mode truthy` (an absent/never-set row, NULL, or 0 = OFF,
+  // the byte-identical no-worktree dispatch; only a stored 1 = ON). Projection-pull
+  // only so a runtime `set_autopilot_config` lands the very next cycle. RESERVED
+  // for the downstream worktree tasks (carried but unconsumed now).
+  const worktreeRaw = (
+    autopilotRows[0] as { worktree_mode?: unknown } | undefined
+  )?.worktree_mode;
+  const worktreeMode: boolean = worktreeRaw === 1;
+
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -1805,6 +1825,7 @@ export async function loadReconcileSnapshot(
     workerEffort,
     maxConcurrentJobs,
     maxConcurrentPerRoot,
+    worktreeMode,
   };
 }
 

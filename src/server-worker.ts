@@ -253,6 +253,7 @@ export interface SetAutopilotConfigRequestMessage {
   patch: {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
+    worktree_mode?: boolean;
   };
 }
 
@@ -1460,6 +1461,7 @@ export interface ReplayBridge {
   setAutopilotConfig(patch: {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
+    worktree_mode?: boolean;
   }): Promise<{
     ok: boolean;
     error?: string;
@@ -3411,6 +3413,7 @@ function main(): void {
     setAutopilotConfig(patch: {
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
+      worktree_mode?: boolean;
     }): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();

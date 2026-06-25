@@ -199,6 +199,7 @@ function autopilotStubBridge(opts: {
     setConfigCalls: Array<{
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
+      worktree_mode?: boolean;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -218,6 +219,7 @@ function autopilotStubBridge(opts: {
     setConfigCalls: [] as Array<{
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
+      worktree_mode?: boolean;
     }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
@@ -455,6 +457,33 @@ test("set_autopilot_config rejects a non-positive / non-integer max_concurrent_p
     { max_concurrent_per_root: -2 },
     { max_concurrent_per_root: 2.5 },
     { max_concurrent_per_root: "3" },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a worktree_mode boolean patch (fn-959)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const on = await setAutopilotConfigHandler({ worktree_mode: true }, bridge);
+  expect(on).toEqual({ ok: true, patch: { worktree_mode: true } });
+  const off = await setAutopilotConfigHandler({ worktree_mode: false }, bridge);
+  expect(off).toEqual({ ok: true, patch: { worktree_mode: false } });
+  expect(state.setConfigCalls).toEqual([
+    { worktree_mode: true },
+    { worktree_mode: false },
+  ]);
+});
+
+test("set_autopilot_config rejects a non-boolean worktree_mode (fn-959)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { worktree_mode: 1 },
+    { worktree_mode: 0 },
+    { worktree_mode: "true" },
+    { worktree_mode: null },
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,

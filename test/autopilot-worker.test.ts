@@ -197,6 +197,10 @@ function makeSnapshot(
     // `column ?? DEFAULT` (= 1 = the one-task-per-root mutex). RESERVED for task
     // .2's allocator; carried but unconsumed here.
     maxConcurrentPerRoot: 1,
+    // fn-959: the durable worktree-mode toggle, resolved snapshot-time
+    // `worktree_mode truthy`. Default OFF (`false`) so every pre-fn-959 test sees
+    // byte-for-byte identical dispatch; RESERVED for the downstream worktree tasks.
+    worktreeMode: false,
     ...overrides,
   };
 }

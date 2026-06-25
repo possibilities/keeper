@@ -343,6 +343,9 @@ export async function setEpicArmedHandler(
 export interface SetAutopilotConfigParams {
   max_concurrent_jobs?: number | null;
   max_concurrent_per_root?: number | null;
+  /** The durable worktree-mode toggle — a boolean. `true` enables worktree-shaped
+   *  autopilot dispatch, `false` disables it (the byte-identical default). */
+  worktree_mode?: boolean;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch. */
@@ -363,7 +366,11 @@ function validateSetAutopilotConfigParams(
   // Reject any field that isn't a known config column — an unknown key is a
   // typo or a param-injection probe; surface it as a typed bad_params rather
   // than silently dropping it (the reducer would fold it to a no-op).
-  const known = new Set(["max_concurrent_jobs", "max_concurrent_per_root"]);
+  const known = new Set([
+    "max_concurrent_jobs",
+    "max_concurrent_per_root",
+    "worktree_mode",
+  ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
     throw new BadParamsError(
@@ -395,6 +402,19 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`max_concurrent_per_root\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("worktree_mode" in obj) {
+    const raw = obj.worktree_mode;
+    // A strict boolean only — `true` enables, `false` disables. Reject anything
+    // else (number/string/null) so a caller gets a clear signal rather than a
+    // silently-coerced toggle.
+    if (typeof raw === "boolean") {
+      patch.worktree_mode = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`worktree_mode\` must be a boolean (got ${JSON.stringify(raw)})`,
       );
     }
   }

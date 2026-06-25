@@ -43,7 +43,7 @@ import {
 } from "../src/snapshot";
 import type { Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
-import { sendControlRpc } from "./control-rpc";
+import { queryCollection, sendControlRpc } from "./control-rpc";
 
 const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
@@ -55,6 +55,7 @@ Usage:
   keeper autopilot config <key> <value> [--sock <path>]
   keeper autopilot arm <epic-id> [--sock <path>]
   keeper autopilot disarm <epic-id> [--sock <path>]
+  keeper autopilot worktree <on|off> [--force] [--sock <path>]
   keeper autopilot retry <verb::id> [--sock <path>]
   keeper autopilot --help
 
@@ -75,6 +76,10 @@ Subcommands:
                 keeper autopilot config max_concurrent_per_root 3
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
+  worktree Send set_autopilot_config {worktree_mode:<on|off>} and exit. Durable
+           toggle for worktree-shaped autopilot dispatch (OFF by default).
+           REJECTED mid-epic (any live job or pending dispatch in flight) so a
+           flip never half-migrates an epic; pass --force to override.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3). verb is
            one of work|close|approve; approve clears a resurrected/phantom
@@ -86,6 +91,7 @@ Options:
                  a machine-parseable keeper-meta: line, then exit) even on a TTY
   --watch        (viewer only) Force the live subscribe stream even when piped
   --timeout <s>  (viewer only) Snapshot wait before the timeout escape (~2s)
+  --force        (worktree only) Bypass the mid-epic toggle guard
   --help         Show this help
 
 By default the viewer's stdout that is NOT a TTY (piped into an agent)
@@ -329,6 +335,22 @@ export function projectAutopilotMode(
 }
 
 /**
+ * Coerce a singleton `autopilot_state` wire row's `worktree_mode` column
+ * (NULLABLE INTEGER: `1` ON, NULL/0 OFF) to the banner boolean. An empty row set
+ * (singleton not yet folded) returns `null` so the caller leaves the seed
+ * untouched; only a stored `1` is ON, every other value (NULL, 0, absent column,
+ * non-1) is OFF — the byte-identical default. Pure — exported for tests.
+ */
+export function projectWorktreeMode(
+  rows: Record<string, unknown>[],
+): boolean | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  return rows[0]?.worktree_mode === 1;
+}
+
+/**
  * Project the `armed_epics` wire rows to a sorted list of the explicitly-armed
  * epic ids. Re-sorted by `epic_id` ASC for a stable, deterministic armed-
  * section render. Pure — exported for tests.
@@ -502,6 +524,7 @@ export function buildSetConfigFrame(
   patch: {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
+    worktree_mode?: boolean;
   },
 ): ClientFrame {
   return {
@@ -531,6 +554,9 @@ interface ViewerState {
   // The explicit autopilot mode, sourced from the `autopilot_state` singleton's
   // `mode` column.
   mode: "yolo" | "armed";
+  // The durable worktree-mode toggle, sourced from the `autopilot_state`
+  // singleton's `worktree_mode` column. `false` (OFF) is the default.
+  worktreeMode: boolean;
   // The explicitly-armed epic ids, sourced from the `armed_epics` presence
   // table.
   armedEpics: string[];
@@ -538,11 +564,13 @@ interface ViewerState {
 
 /**
  * Render the persistent banner pill: the play/pause pill, the mode suffix, the
- * concurrency-cap suffix, and (in `armed` mode) the armed-epic count.
- * `[playing] · yolo · max 3` in yolo mode; `[playing] · armed · 2 armed · max
- * ∞` with two armed epics. The empty-armed-set-in-armed-mode case renders
- * DISTINCTLY as `[playing] · armed · nothing armed` so idle-by-design is never
- * mistaken for a broken autopilot.
+ * concurrency-cap suffix, (in `armed` mode) the armed-epic count, and the
+ * worktree-mode suffix. `[playing] · yolo · max 3 · worktree:off` in yolo mode;
+ * `[playing] · armed · 2 armed · max ∞ · worktree:on` with two armed epics and
+ * worktree mode on. The empty-armed-set-in-armed-mode case renders DISTINCTLY as
+ * `[playing] · armed · nothing armed` so idle-by-design is never mistaken for a
+ * broken autopilot. The worktree segment renders for BOTH on and off so the live
+ * toggle is always scannable.
  *
  * Pure — exported for tests. All values are socket-sourced; the viewer never
  * reads config.
@@ -552,6 +580,7 @@ export function autopilotBannerLabel(state: {
   maxConcurrentJobs: number | null;
   mode: "yolo" | "armed";
   armedCount: number;
+  worktreeMode: boolean;
 }): string {
   const pill = state.paused ? "[paused]" : "[playing]";
   const cap =
@@ -564,7 +593,10 @@ export function autopilotBannerLabel(state: {
         ? " · nothing armed"
         : ` · ${state.armedCount} armed`
       : "";
-  return `${pill} · ${state.mode}${armedSeg} · max ${cap}`;
+  // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
+  // so the live durable toggle is always visible at a glance.
+  const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
+  return `${pill} · ${state.mode}${armedSeg} · max ${cap}${worktreeSeg}`;
 }
 
 async function runViewer(
@@ -582,6 +614,8 @@ async function runViewer(
     maxConcurrentJobs: null,
     // Seed `'yolo'` (the work-everything default) until the edge lands the mode.
     mode: "yolo",
+    // Seed `false` (OFF, the default) until the `autopilot_state` edge lands it.
+    worktreeMode: false,
     // Seed empty until the `armed_epics` subscribe edge lands.
     armedEpics: [],
   };
@@ -603,6 +637,7 @@ async function runViewer(
         maxConcurrentJobs: state.maxConcurrentJobs,
         mode: state.mode,
         armedCount: state.armedEpics.length,
+        worktreeMode: state.worktreeMode,
       }),
     renderBody: (snap) => {
       // The view-shell's TSnap is our own `ViewerState` (`snap === state`).
@@ -620,6 +655,7 @@ async function runViewer(
         stateJson: {
           paused: snap.paused,
           mode: snap.mode,
+          worktree_mode: snap.worktreeMode,
           armed: snap.armedEpics,
           current,
           dependencies,
@@ -634,11 +670,13 @@ async function runViewer(
     maxConcurrentJobs: number | null;
     mode: "yolo" | "armed";
     armedCount: number;
+    worktreeMode: boolean;
   } => ({
     paused: state.paused,
     maxConcurrentJobs: state.maxConcurrentJobs,
     mode: state.mode,
     armedCount: state.armedEpics.length,
+    worktreeMode: state.worktreeMode,
   });
 
   // Seed the banner immediately so the human sees `[paused] · yolo · max ∞`
@@ -703,11 +741,12 @@ async function runViewer(
         return;
       }
       state.paused = paused;
-      // The cap + mode ride the SAME singleton wire row as `paused` — fold them
-      // on every edge so a config-change-then-restart and a live toggle both
-      // land on the banner.
+      // The cap + mode + worktree toggle ride the SAME singleton wire row as
+      // `paused` — fold them on every edge so a config-change-then-restart and a
+      // live toggle both land on the banner.
       state.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
       state.mode = projectAutopilotMode(rows) ?? "yolo";
+      state.worktreeMode = projectWorktreeMode(rows) ?? false;
       view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
       view.emit(state);
     },
@@ -750,6 +789,50 @@ async function runViewer(
   }
 }
 
+/**
+ * Mid-epic guard for the `worktree <on|off>` toggle — query the daemon for any
+ * in-flight dispatch and DIE LOUD if one exists, so a worktree-mode flip never
+ * lands mid-epic (where some lanes ran under the old mode and some would run
+ * under the new one — a half-migrated, unrecoverable epic). "Mid-flight" means a
+ * live (non-terminal) `jobs` row OR an open `pending_dispatches` row (the
+ * launch→SessionStart blind window). `--force` bypasses (the documented
+ * escape hatch that teaches manual draining).
+ *
+ * A query transport failure DIES too — refusing to toggle blind is the safe side
+ * (the operator can `--force` if they have out-of-band confidence the board is
+ * idle). Exported for tests.
+ */
+export async function assertNoMidEpicDispatch(
+  sockPath: string,
+  force: boolean,
+  die: (message: string) => never,
+): Promise<void> {
+  if (force) {
+    return;
+  }
+  let liveJobs: Record<string, unknown>[];
+  let pending: Record<string, unknown>[];
+  try {
+    // No explicit filter → the `jobs` descriptor's default `state not_in
+    // (ended, killed)` scopes to LIVE rows; `pending_dispatches` carries one row
+    // per in-flight dispatch in the launch→SessionStart blind window.
+    [liveJobs, pending] = await Promise.all([
+      queryCollection(sockPath, "jobs"),
+      queryCollection(sockPath, "pending_dispatches"),
+    ]);
+  } catch (err) {
+    die(
+      `cannot verify the board is idle before toggling worktree mode (${(err as Error).message}); pass --force to override if you know it is drained`,
+    );
+  }
+  const inFlight = liveJobs.length + pending.length;
+  if (inFlight > 0) {
+    die(
+      `refusing to toggle worktree mode mid-epic: ${liveJobs.length} live job(s) + ${pending.length} pending dispatch(es) in flight. Drain the board (or wait for the current epics to finish) and retry, or pass --force to override.`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher entry — routes the (none) / pause / play / retry subcommands.
 // ---------------------------------------------------------------------------
@@ -765,6 +848,8 @@ export async function main(argv: string[]): Promise<void> {
       // manually below (exit 2 on a non-positive / non-numeric value).
       timeout: { type: "string" },
       help: { type: "boolean", default: false },
+      // `worktree <on|off> --force` — bypass the mid-epic toggle guard.
+      force: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
@@ -942,8 +1027,32 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
+  if (subcommand === "worktree") {
+    // `worktree <on|off> [--force]` — the durable worktree-mode toggle. Validate
+    // the enum CLI-side, run the mid-epic guard (bypassed by --force), then write
+    // the boolean via the generic `set_autopilot_config` patch.
+    if (rest.length !== 1) {
+      die(
+        `'worktree' takes exactly one positional <on|off> (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const onoff = rest[0];
+    if (onoff !== "on" && onoff !== "off") {
+      die(`'worktree' must be one of on | off (got ${JSON.stringify(onoff)})`);
+    }
+    await assertNoMidEpicDispatch(sockPath, parsed.values.force ?? false, die);
+    const id = crypto.randomUUID();
+    await sendControlRpc(
+      sockPath,
+      buildSetConfigFrame(id, { worktree_mode: onoff === "on" }),
+      id,
+      die,
+    );
+    return;
+  }
+
   die(
-    `unknown subcommand '${subcommand}' (expected pause | play | mode | config | arm | disarm | retry); pass --help for usage.`,
+    `unknown subcommand '${subcommand}' (expected pause | play | mode | config | arm | disarm | retry | worktree); pass --help for usage.`,
   );
 }
 

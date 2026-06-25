@@ -2139,6 +2139,7 @@ function autopilotConfigSetEvent(
   patch: {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
+    worktree_mode?: boolean;
   },
   sessionId = "autopilot",
 ): number {
@@ -2159,6 +2160,7 @@ function getAutopilotStateConfig() {
     max_concurrent_jobs: number | null;
     mode: string;
     max_concurrent_per_root: number | null;
+    worktree_mode: number | null;
   } | null;
 }
 
@@ -2389,6 +2391,117 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with a pe
     .all();
   expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(7);
   expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v91 (fn-959) — `worktree_mode` is the THIRD scalar config column riding
+// the generic `AutopilotConfigSet` fold. A BOOLEAN wire field stored as INTEGER
+// 0/1 (DEFAULT NULL/absent = OFF); set via a `{worktree_mode:true|false}` patch;
+// the fold preserves it across sibling folds and preserves the OTHER columns when
+// a patch touches only it. A present field always lands a concrete 0/1 (no unset
+// sentinel — the parser coerces `true`→1, anything-else→0).
+// ---------------------------------------------------------------------------
+
+test("fresh DB has no autopilot_state row → worktree_mode resolves to OFF (fn-959)", () => {
+  // No event touching the row: the column is absent (no row), which the
+  // reconciler/board resolve `?? OFF` = false.
+  expect(getAutopilotStateConfig()).toBeNull();
+});
+
+test("AutopilotConfigSet {worktree_mode:true} sets the column to 1 and advances the cursor (fn-959)", () => {
+  const eventId = autopilotConfigSetEvent({ worktree_mode: true });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.worktree_mode).toBe(1);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+  // INSERT path still materializes the boots-paused / yolo defaults.
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet {worktree_mode:false} sets the column to 0 (explicit OFF) (fn-959)", () => {
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
+  autopilotConfigSetEvent({ worktree_mode: false });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(0);
+});
+
+test("AutopilotConfigSet {worktree_mode} PRESERVES paused, mode, and both concurrency columns (fn-959)", () => {
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 4,
+    max_concurrent_per_root: 3,
+  });
+  drainAll();
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.worktree_mode).toBe(1); // landed
+  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
+  expect(row?.max_concurrent_per_root).toBe(3); // per-root PRESERVED
+  expect(row?.paused).toBe(0); // play PRESERVED
+  expect(row?.mode).toBe("armed"); // mode PRESERVED
+});
+
+test("a cap/per-root patch, a pause toggle, and a mode flip all PRESERVE worktree_mode (fn-959)", () => {
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
+  autopilotConfigSetEvent({ max_concurrent_jobs: 2 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1); // preserved
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1); // preserved
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1); // preserved
+});
+
+test("AutopilotConfigSet present-but-non-boolean worktree_mode coerces to 0 (OFF) (fn-959)", () => {
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
+  // A non-boolean present value (number/string/null) coerces to 0 (OFF) — the
+  // parser only treats a literal `true` as ON.
+  for (const bad of [1, 0, "true", null]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({ worktree_mode: bad }),
+    });
+    drainAll();
+    expect(getAutopilotStateConfig()?.worktree_mode).toBe(0);
+    autopilotConfigSetEvent({ worktree_mode: true });
+    drainAll();
+  }
+});
+
+test("from-scratch re-fold reproduces autopilot_state byte-identically with a worktree_mode column (fn-959)", () => {
+  autopilotConfigSetEvent({ worktree_mode: true });
+  autopilotPausedEvent(false);
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 9,
+    worktree_mode: false,
+  });
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  expect(getAutopilotStateConfig()?.mode).toBe("armed");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM autopilot_state");
   drainAll();

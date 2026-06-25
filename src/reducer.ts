@@ -4323,6 +4323,7 @@ function foldAutopilotCapSet(db: Database, event: Event): void {
 const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_jobs: "max_concurrent_jobs",
   max_concurrent_per_root: "max_concurrent_per_root",
+  worktree_mode: "worktree_mode",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -4345,6 +4346,13 @@ interface AutopilotConfigSetPayload {
    *  patch touches it. UNLIKE the cap, `null` is "reset to default", NOT
    *  "unlimited" — there is no unlimited sentinel for the per-root count. */
   max_concurrent_per_root?: number | null;
+  /** The durable worktree-mode toggle, stored as INTEGER 0/1 (`1` = ON, `0` =
+   *  OFF) so the generic fold loop binds it like the other config columns.
+   *  Present iff the patch touches it. The wire field is a BOOLEAN; the parser
+   *  coerces `true`→1 / anything-else→0 (`null`/absent/non-boolean → OFF). No
+   *  `null` here — there is no unlimited/unset sentinel; a present field always
+   *  resolves to a concrete 0/1. */
+  worktree_mode?: number;
 }
 
 /**
@@ -4389,6 +4397,14 @@ function extractAutopilotConfigSetPayload(
         typeof raw === "number" && Number.isInteger(raw) && raw > 0
           ? raw
           : null;
+    }
+    if ("worktree_mode" in parsed) {
+      const raw = parsed.worktree_mode;
+      // BOOLEAN wire field stored as INTEGER 0/1: `true` → 1 (ON), anything else
+      // (false / null / non-boolean) → 0 (OFF). A present field always resolves
+      // to a concrete 0/1 — there is no unset sentinel, so the column never goes
+      // NULL via a patch (the reconciler still resolves an absent column `?? OFF`).
+      patch.worktree_mode = raw === true ? 1 : 0;
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;

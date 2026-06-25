@@ -837,6 +837,31 @@ test("autopilot_state has a nullable max_concurrent_per_root column (NULL = the 
   db.close();
 });
 
+test("autopilot_state has a nullable worktree_mode column (NULL = OFF, the default) (fn-959 v91)", () => {
+  const { db } = openDb(":memory:");
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const col = stateCols.find((c) => c.name === "worktree_mode");
+  expect(col).toBeDefined();
+  // Nullable, no SQL default — NULL/absent is OFF, the byte-identical
+  // no-worktree behavior the reconciler resolves `?? OFF` at read time.
+  expect(col?.notnull).toBe(0);
+  expect(col?.dflt_value).toBeNull();
+
+  // An INSERT that omits the column lands NULL (the lazy-materialize OFF default).
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT worktree_mode FROM autopilot_state WHERE id = 1")
+    .get() as { worktree_mode: number | null };
+  expect(r.worktree_mode).toBeNull();
+  db.close();
+});
+
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
   const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
@@ -2265,9 +2290,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // populated from the fold arm; no seed/floor, registered in
   // LIVE_ONLY_PROJECTIONS). v90 appends the nullable
   // `autopilot_state.max_concurrent_per_root` config column (an additive ALTER,
-  // not an epics-shape change), fn-954 task .1. The v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(90);
+  // not an epics-shape change), fn-954 task .1. v91 appends the nullable
+  // `autopilot_state.worktree_mode` config column (an additive ALTER, not an
+  // epics-shape change), fn-959 task .1. The v62→v63 epics-shape migration this
+  // test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(91);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
