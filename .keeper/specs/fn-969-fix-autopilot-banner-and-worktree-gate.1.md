@@ -45,5 +45,5 @@ assert per-root too if convenient. Fast tier; this file is not in the slow tier.
 - [ ] `keeper autopilot worktree on` then `keeper autopilot --snapshot` shows `worktree:on`
 
 ## Done summary
-
+Added worktree_mode to AUTOPILOT_STATE_DESCRIPTOR.columns so runQuery serves it on the wire (kept out of jsonColumns as a scalar INTEGER), with a served-columns regression test.
 ## Evidence
