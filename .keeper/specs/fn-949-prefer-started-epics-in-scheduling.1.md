@@ -65,5 +65,5 @@ pill enumeration, forward-facing only.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added pure isEpicStarted predicate + started-first stable total-order sort in orderEpicsForScheduling (epic_number ASC null-last, epic_id tiebreak), inherited by all three consumers; added an omit-default [started] board pill + glyph. Composed reorder->mutex, predicate truth-table, and cycle-invariance tests added; full suite green.
 ## Evidence
