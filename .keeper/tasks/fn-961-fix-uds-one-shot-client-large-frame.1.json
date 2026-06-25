@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T03:36:49.855000Z",
+  "depends_on": [],
+  "epic": "fn-961-fix-uds-one-shot-client-large-frame",
+  "id": "fn-961-fix-uds-one-shot-client-large-frame.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Backpressure-aware write in one-shot UDS client + regression test",
+  "updated_at": "2026-06-25T03:36:49.855000Z"
+}
