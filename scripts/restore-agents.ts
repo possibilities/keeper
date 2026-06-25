@@ -46,11 +46,16 @@
  *                      set (every working/stopped session) into tmux windows — a
  *                      manual safety net independent of the crash-derivation path.
  *                      Pipe to a file and run later. Read-only, no daemon.
+ *   --force            Override the `--apply` autopilot fail-closed gate (still
+ *                      emits a stderr double-dispatch warning).
  *   --db <path>        keeper.db path override (else $KEEPER_DB, else the
  *                      ~/.local/state/keeper/keeper.db default).
  *   --help             Show this help.
  *
- * `--apply` and `--snapshot-current` are mutually exclusive.
+ * `--apply` and `--snapshot-current` are mutually exclusive. `--apply` fails
+ * closed (non-zero, launches nothing) while autopilot is unpaused unless
+ * `--force` is passed — restored tabs aren't `verb::id`-named, so a live
+ * autopilot may double-dispatch.
  *
  * Exit codes:
  *   0 — printed the plan (dry-run), completed the restore (--apply), or emitted
@@ -92,6 +97,7 @@ Usage:
   --last-generation   Bound the crash set to the LAST tmux-server generation
                       window ("the session you just lost"); composes with --apply/--session
   --snapshot-current  Emit a runnable revive script for the CURRENT live set (read-only)
+  --force             Override the --apply autopilot fail-closed gate (still warns)
   --db <path>         keeper.db path override ($KEEPER_DB / default otherwise)
   --help              Show this help
 
@@ -124,9 +130,12 @@ launches.
 --apply and --snapshot-current are mutually exclusive. Zero candidates prints a
 clear message and exits 0 (nothing to restore).
 
-When --apply runs while autopilot is unpaused, restored tabs are not
+--apply FAILS CLOSED while autopilot is unpaused: restored tabs are not
 'verb::id'-named, so autopilot's fn-674 dedup probe cannot see them and may
-double-dispatch — pause autopilot before --apply.
+double-dispatch. It exits non-zero having launched nothing — pause autopilot, or
+pass --force to override (which still launches, with a stderr double-dispatch
+warning). The paused read is daemon-down (the last durable state, no socket); an
+unknown/absent state reads as paused (permissive).
 `;
 
 interface ParsedArgs {
@@ -134,6 +143,7 @@ interface ParsedArgs {
   apply: boolean;
   snapshotCurrent: boolean;
   lastGeneration: boolean;
+  force: boolean;
   db: string | null;
   help: boolean;
 }
@@ -168,6 +178,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
       apply: { type: "boolean", default: false },
       "snapshot-current": { type: "boolean", default: false },
       "last-generation": { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
       db: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -178,6 +189,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
     apply: parsed.values.apply === true,
     snapshotCurrent: parsed.values["snapshot-current"] === true,
     lastGeneration: parsed.values["last-generation"] === true,
+    force: parsed.values.force === true,
     db: parsed.values.db ?? null,
     help: parsed.values.help === true,
   };
@@ -563,6 +575,68 @@ export function loadCurrentSet(dbPath: string): RestoreCandidate[] {
   }
 }
 
+/**
+ * Read the LAST-DURABLE `autopilot_state.paused` off a read-only `keeper.db` in
+ * one open span — the `--apply` fail-closed gate's source. Daemon-down by design
+ * (NO socket round-trip): a recovery tool runs precisely when the daemon is
+ * dead, so it reads the durable projection, not live state.
+ *
+ * Coerces with the `paused ?? true` unknown-is-paused convention (mirrors
+ * {@link projectAutopilotPaused} in cli/autopilot.ts): an absent singleton (fresh
+ * board), a non-`1`/`0` value, or any read/open error all resolve to PAUSED — the
+ * permissive side, so a recovery tool still works on a quiet board. Only a folded
+ * `paused = 0` reads as UNPAUSED (the gate-tripping state). Exported for tests.
+ */
+export function readAutopilotPaused(dbPath: string): boolean {
+  try {
+    const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+    try {
+      const row = db
+        .query("SELECT paused FROM autopilot_state WHERE id = 1")
+        .get() as { paused: number | null } | null;
+      if (row == null || typeof row.paused !== "number") {
+        return true;
+      }
+      return row.paused !== 0;
+    } finally {
+      try {
+        db.close();
+      } catch {
+        // best-effort; the script is one-shot and exits next.
+      }
+    }
+  } catch {
+    // Open/read failure → treat as PAUSED (permissive): a recovery tool must not
+    // wedge because the board can't be read.
+    return true;
+  }
+}
+
+/** The paused-read seam — `main()` passes the real read-only open; tests inject
+ *  a fixed verdict so the gate is asserted without a seeded autopilot row. */
+export type ReadPausedFn = (dbPath: string) => boolean;
+
+/**
+ * Pure: decide the `--apply` autopilot fail-closed gate from the last-durable
+ * paused state and the `--force` flag. Three outcomes:
+ *  - `"proceed"` — paused (the safe state): launch normally, no warning.
+ *  - `"blocked"` — unpaused without `--force`: FAIL CLOSED — caller exits
+ *    non-zero having launched nothing (the un-`verb::id`-named double-dispatch
+ *    hazard against a live autopilot).
+ *  - `"forced"` — unpaused WITH `--force`: launch anyway, but the caller emits a
+ *    stderr double-dispatch warning.
+ * Exported for tests so the decision is locked down without driving `main()`.
+ */
+export function autopilotGateDecision(
+  paused: boolean,
+  force: boolean,
+): "proceed" | "blocked" | "forced" {
+  if (paused) {
+    return "proceed";
+  }
+  return force ? "forced" : "blocked";
+}
+
 async function main(): Promise<void> {
   const args = parseArgsTyped(Bun.argv.slice(2));
 
@@ -640,6 +714,26 @@ async function main(): Promise<void> {
     }
     process.stdout.write(renderOutcomes(plan, false, excludedIdleCount));
     process.exit(0);
+  }
+
+  // --apply autopilot fail-closed gate. Restored tabs are NOT `verb::id`-named,
+  // so a LIVE autopilot's dedup probe can't see them and may double-dispatch the
+  // same work. Read the last-durable paused state daemon-down (no socket) and
+  // fail closed when autopilot is unpaused unless `--force` is passed. Sits AFTER
+  // set derivation, BEFORE the first launch.
+  const gate = autopilotGateDecision(readAutopilotPaused(dbPath), args.force);
+  if (gate === "blocked") {
+    die(
+      "autopilot is UNPAUSED — refusing to --apply (restored tabs aren't " +
+        "'verb::id'-named, so autopilot may double-dispatch). Pause autopilot, " +
+        "or pass --force to override.",
+    );
+  }
+  if (gate === "forced") {
+    process.stderr.write(
+      "restore-agents: WARNING --force with autopilot UNPAUSED — restored tabs " +
+        "aren't 'verb::id'-named; autopilot may double-dispatch this work.\n",
+    );
   }
 
   // --apply path. Route every candidate through keeper's sole launch transport —

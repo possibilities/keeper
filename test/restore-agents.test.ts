@@ -27,9 +27,11 @@ import { join } from "node:path";
 import {
   type AgentOutcome,
   applyRestore,
+  autopilotGateDecision,
   loadLastGenerationSet,
   loadRestoreSet,
   planRestore,
+  readAutopilotPaused,
   renderOutcomes,
   renderSnapshotScript,
 } from "../scripts/restore-agents";
@@ -149,6 +151,17 @@ function seedTmuxTopologySnapshot(
         })),
       }),
     ],
+  );
+}
+
+/** Upsert the singleton `autopilot_state` row at `paused` (1 paused, 0 playing)
+ *  — the daemon-down fail-closed gate's read source. */
+function seedAutopilotPaused(db: Database, paused: number): void {
+  db.run(
+    `INSERT OR REPLACE INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at)
+       VALUES (1, ?, 0, ?, ?)`,
+    [paused, RECENT, RECENT],
   );
 }
 
@@ -800,4 +813,87 @@ test("loadLastGenerationSet: no snapshot ⇒ labeled fallback, killed cohort off
   const set = loadLastGenerationSet(dbPath, () => "gen-now");
   expect(set.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
   expect(set.fallbackNote).toBeDefined();
+});
+
+// ---------------------------------------------------------------------------
+// autopilotGateDecision / readAutopilotPaused — the --apply fail-closed gate
+// (epic fn-955 T3)
+// ---------------------------------------------------------------------------
+
+test("autopilotGateDecision: paused ⇒ proceed regardless of --force", () => {
+  expect(autopilotGateDecision(true, false)).toBe("proceed");
+  expect(autopilotGateDecision(true, true)).toBe("proceed");
+});
+
+test("autopilotGateDecision: unpaused without --force ⇒ blocked (fail closed)", () => {
+  expect(autopilotGateDecision(false, false)).toBe("blocked");
+});
+
+test("autopilotGateDecision: unpaused with --force ⇒ forced (launch + warn)", () => {
+  expect(autopilotGateDecision(false, true)).toBe("forced");
+});
+
+test("readAutopilotPaused: folded paused=0 reads UNPAUSED (the gate-tripping state)", () => {
+  seedAutopilotPaused(kdb.db, 0);
+  kdb.db.close();
+  expect(readAutopilotPaused(dbPath)).toBe(false);
+});
+
+test("readAutopilotPaused: folded paused=1 reads PAUSED", () => {
+  seedAutopilotPaused(kdb.db, 1);
+  kdb.db.close();
+  expect(readAutopilotPaused(dbPath)).toBe(true);
+});
+
+test("readAutopilotPaused: absent singleton (fresh board) reads PAUSED (permissive)", () => {
+  // No autopilot_state row seeded — a quiet/fresh board.
+  kdb.db.close();
+  expect(readAutopilotPaused(dbPath)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// The --apply gate in the action loop: unpaused + no --force launches NOTHING.
+// applyRestore is the launch seam; the gate sits BEFORE it. Assert via the
+// capturing-fake launcher that a "blocked" decision spawns zero windows while a
+// "proceed"/"forced" decision spawns all of them.
+// ---------------------------------------------------------------------------
+
+test("--apply gate: blocked decision launches zero windows (capturing fake)", async () => {
+  const plan = planRestore(
+    [fakeCandidate({ job_id: "a" }), fakeCandidate({ job_id: "b" })],
+    null,
+  );
+  let launches = 0;
+  const launcher = async () => {
+    launches++;
+    return { ok: true as const };
+  };
+  // The gate trips before applyRestore is ever reached — mirror main()'s order.
+  const decision = autopilotGateDecision(/* paused */ false, /* force */ false);
+  if (decision !== "blocked") {
+    await applyRestore(plan, launcher, async () => {});
+  }
+  expect(decision).toBe("blocked");
+  expect(launches).toBe(0);
+});
+
+test("--apply gate: forced/proceed decision launches every window (capturing fake)", async () => {
+  const plan = planRestore(
+    [fakeCandidate({ job_id: "a" }), fakeCandidate({ job_id: "b" })],
+    null,
+  );
+  for (const decision of [
+    autopilotGateDecision(true, false), // proceed (paused)
+    autopilotGateDecision(false, true), // forced (unpaused + --force)
+  ]) {
+    let launches = 0;
+    const launcher = async () => {
+      launches++;
+      return { ok: true as const };
+    };
+    if (decision !== "blocked") {
+      await applyRestore(plan, launcher, async () => {});
+    }
+    expect(launches).toBe(2);
+  }
 });

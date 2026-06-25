@@ -25,8 +25,7 @@ imperative guardrails only.
 
 ## Event-sourcing invariants
 
-- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold writes the
-  projection AND bumps `reducer_state.last_event_id` together.
+- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold writes the projection AND bumps `reducer_state.last_event_id` together.
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the cursor still
   advances. Schema defaults must match the zero-event projection.
 - **Re-fold determinism is sacred** for the deterministic-replayed projection class
@@ -82,6 +81,7 @@ imperative guardrails only.
   LaunchAgent restarts the single recovery path. Never respawn a worker in-process (carve-outs:
   closing a stale/EPIPE UDS client, and the git seed-liveness watchdog's capped MAIN boot-seed
   re-runs before it escalates to `fatalExit`).
+- **`restore-agents --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract
 
