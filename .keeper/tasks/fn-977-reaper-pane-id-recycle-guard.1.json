@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T22:37:35.410000Z",
+  "depends_on": [],
+  "epic": "fn-977-reaper-pane-id-recycle-guard",
+  "id": "fn-977-reaper-pane-id-recycle-guard.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "reaper generation-guard on kill",
+  "updated_at": "2026-06-25T22:37:35.410000Z"
+}
