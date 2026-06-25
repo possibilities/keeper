@@ -52,5 +52,5 @@ the walk; no anti-starvation guard.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Replaced the per-epic + per-root mutexes with one applyPerRootRoundRobinAllocator reading N (max_concurrent_per_root): N=1 delegates verbatim to the legacy passes (byte-identical), N>1 seeds per-root + per-(root,epic) occupancy and fills remaining slots round-robin in seam order. Wired state.maxConcurrentPerRoot through the reconciler; board already had it off BootStatus.
 ## Evidence

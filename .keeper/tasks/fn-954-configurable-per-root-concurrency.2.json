@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Per-root round-robin allocator",
-  "updated_at": "2026-06-24T23:44:31.392000Z"
+  "updated_at": "2026-06-25T04:43:53.934000Z",
+  "worker_done_at": "2026-06-25T04:43:53.934000Z"
 }
