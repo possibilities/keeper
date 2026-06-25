@@ -18,5 +18,5 @@ defense so a regression that dropped generation_id from the join key would fail.
 - [ ] The test fails if the join key is reduced to pane_id alone.
 
 ## Done summary
-
+Added a test pinning the %N-recycle guard: seeds one pane_id under two generations and proves resolvePaneJobId's (generation_id, pane_id) join resolves only the dying generation's job. Verified it fails when the join key is reduced to pane_id alone.
 ## Evidence
