@@ -34,5 +34,5 @@ started — that line is the bug, stated as intent).
       fields); existing null-safety tests preserved.
 
 ## Done summary
-
+Fixed isEpicStarted to skip the planning-time plan-verb epic-form job so a planned-but-unworked epic reads unstarted, restoring the started-first scheduling tier. Added tests pinning plan-only-not-started, non-plan-job-started, and a plan-only-tiers-behind-in-progress reorder.
 ## Evidence

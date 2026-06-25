@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Exclude plan job from started signal",
-  "updated_at": "2026-06-25T01:33:05.626000Z"
+  "updated_at": "2026-06-25T05:19:19.858000Z",
+  "worker_done_at": "2026-06-25T05:19:19.858000Z"
 }
