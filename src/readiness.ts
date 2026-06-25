@@ -30,15 +30,16 @@
  *  10.6. runtime-blocked          — task: keeper plan `runtime_status==="blocked"`
  *                                   (last per-row predicate; converts only the
  *                                   erroneous `ready`, never holds a mutex)
- *  11.   single-task-per-epic     — post-pass: one non-completed slot per epic
- *  12.   single-task-per-root     — post-pass: one non-completed slot per root
+ *  11.   single-task-per-epic     — post-pass: lost its epic's fair share
+ *  12.   single-task-per-root     — post-pass: root saturated before its turn
  *
- * The per-epic (11) and per-root (12) post-passes both key on the same
- * occupancy predicate (`isRootOccupant` collapses to `isLiveWorkOccupant`).
- * They run per-epic FIRST (tighter scope wins the reason); each walks board
- * traversal order, the FIRST occupant claims the slot, every LATER `ready` row
- * in that slot is demoted. Only `ready` rows are mutated; iteration order is
- * the determinism gate.
+ * Predicates 11+12 are emitted by ONE post-pass, `applyPerRootRoundRobinAllocator`
+ * — it distributes up to N (`max_concurrent_per_root`) concurrent slots per root
+ * fairly across the root's epics via round-robin, keying on the same occupancy
+ * predicate (`isRootOccupant` collapses to `isLiveWorkOccupant`). N=1 is
+ * byte-identical to the legacy per-epic-FIRST-then-per-root mutexes (it delegates
+ * verbatim). Only `ready` rows are mutated; the seam order + `epic_id` tiebreak
+ * are the determinism gate.
  *
  * Epic header rollup (after per-row + both post-passes):
  *   - `[completed]`      if the close row is `completed`.
@@ -134,9 +135,10 @@ export function isEpicStarted(epic: Epic): boolean {
  * sorts last) → epic_id`. The unique `epic_id` final tiebreak makes the result
  * cycle-invariant — the same set in any input order yields the same output, so
  * the reconciler's per-tick `dedupedEpics` ordering can't oscillate the board.
- * Hard-categorical: no aging/floor/threshold — the per-root single-task mutex
- * serializes same-root epics, self-bounding "prefer started" to "finish A, then
- * B, then C" in creation order.
+ * Hard-categorical: no aging/floor/threshold — the per-root round-robin
+ * allocator bounds same-root concurrency to N (default 1), self-bounding "prefer
+ * started" to "finish A, then B, then C" in creation order at N=1, and at N>1
+ * walking this same seam order to spread a root's N slots across its epics.
  *
  * Pure: no I/O, no clock, never throws. The tier is snapshotted per epic before
  * sorting (so the comparator stays a cheap field read), and the comparator is
@@ -479,12 +481,14 @@ export function computeReadiness(
   unseededRoots: ReadonlySet<string> = new Set<string>(),
   // fn-954: the per-root dispatch concurrency count N — how many tasks may
   // dispatch concurrently into a single root, distributed fairly across the
-  // root's epics. Default 1 = today's hardcoded one-task-per-root mutex
-  // (byte-identical). RESERVED for task .2's round-robin allocator, which
-  // replaces the per-epic + per-root mutexes; until .2 lands this is threaded
-  // through (so both consumers carry the SAME N) but the N=1 mutex still runs.
-  // Appended LAST so default-reliant call sites stay valid.
-  _maxConcurrentPerRoot: number = 1,
+  // root's epics by `applyPerRootRoundRobinAllocator` (which REPLACES the
+  // per-epic + per-root mutexes). Default 1 = today's hardcoded one-task-per-root
+  // behavior (byte-identical — the allocator delegates verbatim to the two legacy
+  // passes at N=1). Both readiness consumers (board + reconciler) carry the SAME
+  // N off `BootStatus` so they compute identical demotions. A LITERAL default
+  // (not the imported `DEFAULT_MAX_CONCURRENT_PER_ROOT`) keeps readiness an import
+  // LEAF. Appended LAST so default-reliant call sites stay valid.
+  maxConcurrentPerRoot: number = 1,
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
@@ -608,17 +612,20 @@ export function computeReadiness(
     }
   }
 
-  // Post-pass mutexes — mutate `perTask` / `perCloseRow` in board traversal
-  // order. Per-epic FIRST so its tighter scope reports the reason when both
-  // would apply; per-root SECOND over the same maps (seeded with the
-  // root-fallback occupants above).
-  applySingleTaskPerEpicMutex(epicsArr, perTask);
-  applySingleTaskPerRootMutex(
+  // Post-pass allocator (fn-954) — mutates `perTask` / `perCloseRow` in board
+  // traversal order. ONE pass supersedes the two legacy mutexes: it distributes
+  // up to `maxConcurrentPerRoot` (N) concurrent slots per root fairly across the
+  // root's epics via round-robin. N=1 is byte-identical (it delegates verbatim to
+  // the per-epic-FIRST then per-root passes); N>1 fills round-robin. Seeded with
+  // the root-fallback occupants resolved above; armed eligibility + the close-row
+  // gate carry through both paths.
+  applyPerRootRoundRobinAllocator(
     epicsArr,
     perTask,
     perCloseRow,
     subRunningByJobId,
     fallbackRoots,
+    maxConcurrentPerRoot,
     eligibleEpicIds,
   );
 
@@ -960,8 +967,9 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "runtime-blocked" } };
   }
 
-  // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
-  // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
+  // 11+12. single-task-per-epic / single-task-per-root — deferred to the
+  // post-pass `applyPerRootRoundRobinAllocator` (N-slot round-robin; N=1 is the
+  // legacy per-epic-then-per-root mutex byte-identical).
 
   return { tag: "ready" };
 }
@@ -1158,8 +1166,9 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "bound-pending" } };
   }
 
-  // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
-  // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
+  // 11+12. single-task-per-epic / single-task-per-root — deferred to the
+  // post-pass `applyPerRootRoundRobinAllocator` (N-slot round-robin; N=1 is the
+  // legacy per-epic-then-per-root mutex byte-identical).
 
   return { tag: "ready" };
 }
@@ -1480,6 +1489,297 @@ export function applySingleTaskPerRootMutex(
     const projectDir = stringOrNull(epic.project_dir);
     for (const task of epic.tasks) {
       settleTask(task, projectDir);
+    }
+  }
+}
+
+/**
+ * Per-root N-slot round-robin allocator (predicates 11+12, fn-954). The SINGLE
+ * post-pass `computeReadiness` runs — it SUPERSEDES the two independent mutexes
+ * (`applySingleTaskPerEpicMutex` + `applySingleTaskPerRootMutex`, kept exported
+ * for their direct unit tests). `maxConcurrentPerRoot` (N, threaded from
+ * `autopilot_state.max_concurrent_per_root ?? 1`) is how many tasks may dispatch
+ * concurrently into ONE root, distributed fairly across the root's epics:
+ *
+ *   - **N === 1 is byte-identical to today** — it delegates verbatim to the two
+ *     legacy passes (per-epic FIRST so its tighter scope owns the reason, then
+ *     per-root over the same maps). The N=1-equivalence contract is satisfied by
+ *     construction: the exact same code runs.
+ *   - **N > 1 fills via round-robin.** Per root: seed a per-root occupancy
+ *     counter AND a per-(root,epic) counter from in-flight work (`isRootOccupant`
+ *     tasks + the scoped close-row claim + `fallbackRoots`), then fill the
+ *     remaining `N − occupied` slots round-robin over the root's epics in
+ *     `orderEpicsForScheduling` seam order. An epic stacks a 2nd ready task ONLY
+ *     after every sibling epic on the root with ready work has its first (the
+ *     fill always grants to the epic currently holding the FEWEST tasks on the
+ *     root; ties break by seam order). A lone epic takes every free slot.
+ *
+ * Demotion reason by CAUSE (kinds kept): an epic that received a grant or was
+ * already occupied loses its extras to `single-task-per-epic` (its fair share);
+ * an epic that got ZERO slots because the root saturated first loses to
+ * `single-task-per-root`. At N=1 this reduces to today's per-epic-first
+ * attribution.
+ *
+ * The armed two-pass + close-row eligibility gate (fn-770/fn-835) carry through
+ * BOTH paths: pass-1 physical occupancy is eligibility-blind; in armed mode an
+ * eligible epic's ready rows claim free slots before any ineligible sibling, and
+ * an ineligible `ready` close row neither claims nor demotes (mirroring the
+ * launcher's close gate). Pure + deterministic: no cross-tick cursor, `epic_id`
+ * final tiebreak via the seam order. Caps compose under the global
+ * `maxConcurrentJobs` budget as an absolute ceiling (demoted rows never reach
+ * it). Exported so the test suite can drive N>1 directly.
+ */
+export function applyPerRootRoundRobinAllocator(
+  epicsArr: Epic[],
+  perTask: Map<string, Verdict>,
+  perCloseRow: Map<string, Verdict>,
+  subRunningByJobId: Map<string, SubagentInvocation[]> = new Map(),
+  fallbackRoots: Set<string> = new Set(),
+  maxConcurrentPerRoot = 1,
+  eligibleEpicIds?: Set<string>,
+): void {
+  // N=1 (or any degenerate ≤1 from a misconfig — the config validation guards
+  // ≥1, but stay total) is the legacy two-pass verbatim: byte-identical demotions
+  // + reason attribution + armed two-pass + close-row gate. This IS the
+  // equivalence guarantee — the same code path the prior mutex tests pin.
+  if (maxConcurrentPerRoot <= 1) {
+    applySingleTaskPerEpicMutex(epicsArr, perTask);
+    applySingleTaskPerRootMutex(
+      epicsArr,
+      perTask,
+      perCloseRow,
+      subRunningByJobId,
+      fallbackRoots,
+      eligibleEpicIds,
+    );
+    return;
+  }
+
+  // ---- N > 1: per-root round-robin fill ----
+
+  // Pass 1 — seed occupancy. `rootOccupied` counts every in-flight slot already
+  // consumed on a root; `epicHeld` counts how many a given (root, epic) holds, so
+  // the fair-share fill grants to the epic holding the FEWEST. A pending dispatch
+  // with no matching row (`fallbackRoots`) consumes a root slot but no epic's.
+  const rootOccupied = new Map<string, number>();
+  const epicHeld = new Map<string, number>(); // key: `${root} ${epicId}`
+  const bumpRoot = (root: string): void => {
+    rootOccupied.set(root, (rootOccupied.get(root) ?? 0) + 1);
+  };
+  const epicKey = (root: string, epicId: string): string => `${root} ${epicId}`;
+  const bumpEpic = (root: string, epicId: string): void => {
+    const k = epicKey(root, epicId);
+    epicHeld.set(k, (epicHeld.get(k) ?? 0) + 1);
+  };
+  for (const root of fallbackRoots) {
+    bumpRoot(root);
+  }
+  for (const epic of epicsArr) {
+    const projectDir = stringOrNull(epic.project_dir);
+    for (const task of epic.tasks) {
+      const verdict = perTask.get(task.task_id);
+      if (verdict === undefined || !isRootOccupant(verdict)) {
+        continue;
+      }
+      const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
+      bumpRoot(root);
+      bumpEpic(root, epic.epic_id);
+    }
+    // Close-row occupancy claim — IDENTICAL gate to the legacy per-root mutex's
+    // pass-1 (epic-level non-planner source live, OR a launched-but-unbound
+    // closer), scoped to the epic's own `effectiveRoot(null, projectDir)`. A
+    // running closer is a root-level consumption only (no per-row epic bucket —
+    // the per-epic fair share is task-derived).
+    const closeVerdict = perCloseRow.get(epic.epic_id);
+    if (closeVerdict !== undefined && isRootOccupant(closeVerdict)) {
+      const epicLevelRunning =
+        anyEmbeddedJobWorking(epic.jobs) ||
+        anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId);
+      const closeRowDispatchPending =
+        closeVerdict.tag === "blocked" &&
+        closeVerdict.reason.kind === "dispatch-pending";
+      if (epicLevelRunning || closeRowDispatchPending) {
+        bumpRoot(effectiveRoot(null, projectDir));
+      }
+    }
+  }
+
+  // Pass 2 — fill the remaining slots. The slot ledger decrements as grants land.
+  const remaining = new Map<string, number>();
+  const slotsLeft = (root: string): number => {
+    let r = remaining.get(root);
+    if (r === undefined) {
+      r = Math.max(0, maxConcurrentPerRoot - (rootOccupied.get(root) ?? 0));
+      remaining.set(root, r);
+    }
+    return r;
+  };
+  const consumeSlot = (root: string): void => {
+    remaining.set(root, slotsLeft(root) - 1);
+  };
+
+  // Per-(root) ready-task queues, each keyed by epic so the round-robin can grant
+  // to the least-loaded epic. A `granted` tally per (root, epic) drives the
+  // per-task keep/demote split after the fill. Built in seam order so the
+  // round-robin walk and the tiebreak are deterministic.
+  const ordered = orderEpicsForScheduling(epicsArr);
+  type EpicQueue = {
+    epic: Epic;
+    root: string;
+    ready: Task[]; // ready tasks on THIS root, traversal order
+    granted: number;
+  };
+  // root → ordered list of per-epic queues (seam order). An epic spanning two
+  // roots contributes one queue per root.
+  const queuesByRoot = new Map<string, EpicQueue[]>();
+  const queueOf = new Map<string, EpicQueue>(); // `${root} ${epicId}`
+  for (const epic of ordered) {
+    const projectDir = stringOrNull(epic.project_dir);
+    for (const task of epic.tasks) {
+      const verdict = perTask.get(task.task_id);
+      if (verdict === undefined || verdict.tag !== "ready") {
+        continue;
+      }
+      const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
+      const k = epicKey(root, epic.epic_id);
+      let q = queueOf.get(k);
+      if (q === undefined) {
+        q = { epic, root, ready: [], granted: 0 };
+        queueOf.set(k, q);
+        const list = queuesByRoot.get(root);
+        if (list === undefined) {
+          queuesByRoot.set(root, [q]);
+        } else {
+          list.push(q);
+        }
+      }
+      q.ready.push(task);
+    }
+  }
+
+  // Demote helpers (kinds kept).
+  const demotePerEpic = (taskId: string): void => {
+    perTask.set(taskId, {
+      tag: "blocked",
+      reason: { kind: "single-task-per-epic" },
+    });
+  };
+  const demotePerRoot = (taskId: string): void => {
+    perTask.set(taskId, {
+      tag: "blocked",
+      reason: { kind: "single-task-per-root" },
+    });
+  };
+
+  // Round-robin the queues on ONE root: repeatedly grant to the epic holding the
+  // FEWEST tasks (seeded + granted) with an ungranted ready task, tie → seam
+  // order (queues are pre-sorted), until the root's slots run dry or no queue has
+  // ungranted work. `eligibleFilter` restricts which queues may be granted this
+  // sweep (armed pass-2a = eligible only; pass-2b / yolo = all).
+  const fillRoot = (
+    root: string,
+    queues: EpicQueue[],
+    eligibleFilter: ((epicId: string) => boolean) | null,
+  ): void => {
+    for (;;) {
+      if (slotsLeft(root) <= 0) {
+        return;
+      }
+      let best: EpicQueue | undefined;
+      let bestHeld = Number.POSITIVE_INFINITY;
+      for (const q of queues) {
+        if (q.granted >= q.ready.length) {
+          continue; // every ready task already granted
+        }
+        if (eligibleFilter !== null && !eligibleFilter(q.epic.epic_id)) {
+          continue;
+        }
+        const held =
+          (epicHeld.get(epicKey(root, q.epic.epic_id)) ?? 0) + q.granted;
+        // Strict `<` keeps the seam order as the tiebreak (queues are ordered, so
+        // the first-seen minimum wins).
+        if (held < bestHeld) {
+          bestHeld = held;
+          best = q;
+        }
+      }
+      if (best === undefined) {
+        return; // no grantable queue under this filter
+      }
+      best.granted += 1;
+      consumeSlot(root);
+    }
+  };
+
+  // Settle one epic's ready CLOSE row against the root slot ledger — same
+  // eligibility gate as the legacy `settleCloseRow`: in armed mode an ineligible
+  // ready close neither claims nor demotes; otherwise it consumes a slot when one
+  // is free, else demotes to `single-task-per-root`. Consumes BEFORE the task
+  // fill for its root so an eligible epic's own closer still beats its same-root
+  // task (the legacy "close sorts with its epic" ordering).
+  const settleCloseRow = (epic: Epic): void => {
+    const closeVerdict = perCloseRow.get(epic.epic_id);
+    if (closeVerdict === undefined || closeVerdict.tag !== "ready") {
+      return;
+    }
+    if (eligibleEpicIds !== undefined && !eligibleEpicIds.has(epic.epic_id)) {
+      return;
+    }
+    const root = effectiveRoot(null, stringOrNull(epic.project_dir));
+    if (slotsLeft(root) > 0) {
+      consumeSlot(root);
+    } else {
+      perCloseRow.set(epic.epic_id, {
+        tag: "blocked",
+        reason: { kind: "single-task-per-root" },
+      });
+    }
+  };
+
+  // Close rows first (in seam order) — a ready closer is a finalizer that should
+  // claim its slot ahead of the discretionary task fill, mirroring the legacy
+  // interleave where a close row settles right after its epic's tasks but BEFORE
+  // later roots. Settling all closers up front is equivalent for slot accounting
+  // and keeps the eligibility gate identical.
+  for (const epic of ordered) {
+    settleCloseRow(epic);
+  }
+
+  // Task fill. Armed mode (`eligibleEpicIds !== undefined`): pass-2a fills
+  // eligible epics on every root FIRST, then pass-2b fills the residual with
+  // ineligible epics — so an eligible epic claims a free slot before any
+  // ineligible sibling. Yolo (`undefined`): one unfiltered sweep per root.
+  if (eligibleEpicIds !== undefined) {
+    const isEligible = (epicId: string): boolean => eligibleEpicIds.has(epicId);
+    for (const [root, queues] of queuesByRoot) {
+      fillRoot(root, queues, isEligible);
+    }
+    for (const [root, queues] of queuesByRoot) {
+      fillRoot(root, queues, null);
+    }
+  } else {
+    for (const [root, queues] of queuesByRoot) {
+      fillRoot(root, queues, null);
+    }
+  }
+
+  // Apply: per epic-queue, the first `granted` ready tasks stay `ready`; the rest
+  // demote. Reason by cause — an epic that received a grant OR was already
+  // occupied (`epicHeld > 0`) loses its extras to `single-task-per-epic` (its
+  // fair share); an epic that got NOTHING because the root saturated first loses
+  // to `single-task-per-root`.
+  for (const queues of queuesByRoot.values()) {
+    for (const q of queues) {
+      const seeded = epicHeld.get(epicKey(q.root, q.epic.epic_id)) ?? 0;
+      const hadRepresentation = q.granted > 0 || seeded > 0;
+      // The first `granted` ready tasks keep their slot; demote the rest.
+      for (const task of q.ready.slice(q.granted)) {
+        if (hadRepresentation) {
+          demotePerEpic(task.task_id);
+        } else {
+          demotePerRoot(task.task_id);
+        }
+      }
     }
   }
 }

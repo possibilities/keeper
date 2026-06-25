@@ -1028,6 +1028,12 @@ export function reconcile(
     // `effectiveRoot` is unseeded (dispatch nothing into an unseeded root, while a
     // seeded sibling root still dispatches). Empty whenever `seed_required` is clear.
     snapshot.unseededRoots,
+    // fn-954: the per-root dispatch concurrency count N (refreshed each cycle from
+    // `autopilot_state.max_concurrent_per_root`) — drives the round-robin
+    // allocator so up to N tasks dispatch concurrently into one root, spread
+    // across its epics. The board latches the SAME N off `BootStatus`, so both
+    // consumers compute identical demotions. Default 1 = one-task-per-root.
+    state.maxConcurrentPerRoot,
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second

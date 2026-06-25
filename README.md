@@ -1422,8 +1422,8 @@ event-log/reducer/hook touch. Run any of them with
   literal `and` token block until ALL hold simultaneously (level-
   triggered, glitch-free); only the subscriptions a condition needs are
   opened. "unblocked" deliberately excludes autopilot's
-  `single-task-per-epic` / `single-task-per-root` concurrency mutexes
-  (every other blocker still blocks). By default every condition reconnects
+  `single-task-per-epic` / `single-task-per-root` round-robin-allocator
+  block reasons (every other blocker still blocks). By default every condition reconnects
   FOREVER — a plain `keeper await <cond>` survives an arbitrarily long
   keeperd bounce and never emits `reason=unreachable` (fn-757; the shared
   driver's give-up policy is opt-in, and `server-up` always relied on the
@@ -2338,22 +2338,23 @@ re-fold leaves zero rows for any epic that ever completed. The reconcile worker 
 both `mode` and the armed set from the projection snapshot every cycle (no
 relay, no in-memory cache) so the state survives restart for free. The mode
 suppression lives in two places: a per-row `work`-gate in `reconcile()`, AND
-(fn-770) the per-root mutex inside `computeReadiness`. The reconcile worker
-computes the eligible-epic closure (`computeEligibleEpics`) ONCE per cycle —
-only when `mode === 'armed'` (yolo pays no BFS) — and passes the SAME Set to
-both `computeReadiness` (a new trailing-optional `eligibleEpicIds?:
-Set<string>`, threaded into `applySingleTaskPerRootMutex`) and the `work`-gate.
-The mutex's discretionary pass-2 ready-tiebreak became eligibility-aware: an
-ELIGIBLE epic's ready task claims a free root BEFORE an earlier-sorted INELIGIBLE
-sibling can, fixing the armed-mode deadlock where an unarmed epic captured the
-single per-root slot in sort order and the `work`-gate then suppressed the armed
-epic that lost the mutex (net: the armed epic never dispatched). The param is
-ABSENT (`undefined`) in yolo — byte-identical legacy single-pass — and PROVIDED
-(even empty: armed-but-nothing-armed) in armed mode; the discriminator is
-`!== undefined`, never `.size === 0`. Pass-1 physical occupancy (live workers +
-launch-window fallback roots) stays eligibility-blind so an eligible task never
-preempts a live worker, and close rows stay always-eligible IN THE MUTEX
-(mode-exempt) so a finalizer is never starved by the per-root tiebreak. The
+(fn-770) the per-root round-robin allocator inside `computeReadiness`. The
+reconcile worker computes the eligible-epic closure (`computeEligibleEpics`)
+ONCE per cycle — only when `mode === 'armed'` (yolo pays no BFS) — and passes
+the SAME Set to both `computeReadiness` (a trailing-optional `eligibleEpicIds?:
+Set<string>`, threaded into `applyPerRootRoundRobinAllocator`) and the
+`work`-gate. The allocator's discretionary fill is eligibility-aware: an
+ELIGIBLE epic's ready task claims a free root slot BEFORE an earlier-sorted
+INELIGIBLE sibling can (pass-2a fills eligible epics on every root first, pass-2b
+the residual), fixing the armed-mode deadlock where an unarmed epic captured the
+sole per-root slot in sort order and the `work`-gate then suppressed the armed
+epic that lost (net: the armed epic never dispatched). The param is ABSENT
+(`undefined`) in yolo — single unfiltered fill — and PROVIDED (even empty:
+armed-but-nothing-armed) in armed mode; the discriminator is `!== undefined`,
+never `.size === 0`. Pass-1 physical occupancy (live workers + launch-window
+fallback roots) stays eligibility-blind so an eligible task never preempts a live
+worker, and close rows settle with the same eligibility gate (an ineligible
+`ready` close neither claims nor demotes) so a finalizer is never starved. The
 `work`-gate is RETAINED — a pass-2b ineligible task can still win a root with no
 eligible contender and surface `ready`, and the gate is the only thing that
 stops that ineligible winner from launching. fn-773 ADDS a narrowed
@@ -2535,8 +2536,8 @@ the next Stop event re-stamps the real value, so an existing row needs no
 backfill. Every input is event-derived (no fold-time wall clock / env / fs /
 liveness probe), so a from-scratch cursor=0 re-fold reproduces byte-identical
 `epics` rows. A later readiness change (epic fn-719 task 2) reads the
-embedded fact to hold
-the per-epic / per-root mutex while a stopped session's backgrounded suite
+embedded fact to occupy
+a per-epic / per-root allocator slot while a stopped session's backgrounded suite
 is still running, with the embedded job's `updated_at` (bumped by the
 monitors-only Stop write) as the staleness lease anchor.
 keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `59`
@@ -2978,10 +2979,11 @@ disambiguator against over-holding a stopped-after-working / dead worker is
 `jobs.active_since` (carried free on the embedded element, JSON-cell-only): it is
 NULL only until the first `stopped → working` edge, so `bound-pending` fires
 exclusively for a never-yet-active bound worker. Both `dispatch-pending` and
-`bound-pending` hold the per-epic AND per-root mutex (`isLiveWorkOccupant` →
-auto-covers `isRootOccupant`), demoting a same-epic OR same-root ready sibling. A
-pending row matching no snapshot row occupies its root via its own `dir` column
-(root-fallback). The pre-existing same-`(verb, id)` `liveTabKeys.has(key)`
+`bound-pending` pre-consume a per-epic AND per-root slot in the round-robin
+allocator (`isLiveWorkOccupant` → auto-covers `isRootOccupant`), so the
+allocator grants only the REMAINING `N − occupied` slots — demoting a same-epic
+OR same-root ready sibling once the slots fill. A pending row matching no
+snapshot row occupies its root via its own `dir` column (root-fallback). The pre-existing same-`(verb, id)` `liveTabKeys.has(key)`
 suppression arm (sitting alongside the `isOccupyingJob` arm) is PRESERVED for
 same-key re-dispatch — orthogonal to the cross-sibling demotion the occupant
 does. `reconcile()` stays pure — it reads the synchronous pending-rows

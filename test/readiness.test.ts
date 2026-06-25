@@ -19,6 +19,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  applyPerRootRoundRobinAllocator,
   applySingleTaskPerEpicMutex,
   applySingleTaskPerRootMutex,
   type BlockReason,
@@ -1564,6 +1565,388 @@ test("fn-835 (c): YOLO — a ready close row STILL claims the root (mode-exempt,
   expect(perTask.get(t2.task_id)).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-954: per-root N-slot round-robin allocator (predicates 11+12)
+// ---------------------------------------------------------------------------
+//
+// `applyPerRootRoundRobinAllocator` REPLACES the two legacy mutexes. N=1 is
+// byte-identical (it delegates verbatim to per-epic-then-per-root); N>1 fills
+// up to N concurrent slots per root, spread fairly across the root's epics via
+// round-robin (a 2nd task per epic only after every sibling epic with ready
+// work has its first; a lone epic takes multiple). Occupancy (running/pending)
+// is pre-consumed so an in-flight epic isn't over-allocated. The armed two-pass
+// + close-row eligibility gate carry through both paths.
+
+// Thread N through `computeReadiness`'s trailing param (eligible defaults to
+// `undefined` = yolo). All prior default-reliant callers stay valid.
+function runWithN(
+  epics: Epic[],
+  n: number,
+  eligible: Set<string> | undefined = undefined,
+) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    eligible,
+    new Set<string>(),
+    n,
+  );
+}
+
+// N ready tasks in one epic on a shared root, traversal order t.1..t.N.
+function makeStackEpic(
+  epicId: string,
+  epicNumber: number,
+  root: string,
+  readyCount: number,
+  extra: Partial<Epic> = {},
+): { epic: Epic; tasks: Task[] } {
+  const tasks: Task[] = [];
+  for (let i = 1; i <= readyCount; i++) {
+    tasks.push(
+      makeTask({
+        task_id: `${epicId}.${i}`,
+        epic_id: epicId,
+        task_number: i,
+        target_repo: root,
+      }),
+    );
+  }
+  const epic = makeEpic({
+    epic_id: epicId,
+    epic_number: epicNumber,
+    project_dir: root,
+    tasks,
+    ...extra,
+  });
+  return { epic, tasks };
+}
+
+test("fn-954 N=1 equivalence: cross-epic same-root → byte-identical to the legacy mutex (first wins, rest per-root)", () => {
+  // THE EQUIVALENCE GATE. Same fixture as the legacy per-root suite. N=1 MUST
+  // produce identical demotions: fn-1 (seam-first) keeps its slot, fn-2 demotes
+  // to `single-task-per-root` — exactly today's two-pass result.
+  const a = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [a],
+  });
+  const b = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [b],
+  });
+  const snap = runWithN([e1, e2], 1);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-954 N=1 equivalence: intra-epic same-root → second demotes single-task-per-epic (per-epic-first attribution)", () => {
+  // Per-epic-first reason attribution must survive: a same-epic same-root
+  // collision reports `single-task-per-epic`, NOT per-root.
+  const { epic } = makeStackEpic("fn-1-foo", 1, "/r", 2);
+  const snap = runWithN([epic], 1);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 N=3 round-robin spread: 4 epics, 1 ready each on a shared root → first 3 (seam order) win, 4th demotes per-root", () => {
+  const e1 = makeStackEpic("fn-1-a", 1, "/r", 1).epic;
+  const e2 = makeStackEpic("fn-2-b", 2, "/r", 1).epic;
+  const e3 = makeStackEpic("fn-3-c", 3, "/r", 1).epic;
+  const e4 = makeStackEpic("fn-4-d", 4, "/r", 1).epic;
+  const snap = runWithN([e1, e2, e3, e4], 3);
+  // Seam order (all unstarted → epic_number asc): fn-1, fn-2, fn-3 each take a
+  // slot; fn-4 got ZERO slots because the root saturated → single-task-per-root.
+  expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-3-c.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-4-d.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-954 N=3 intra-epic stacking: lone epic with 3 ready tasks → all 3 dispatch", () => {
+  const { epic } = makeStackEpic("fn-1-foo", 1, "/r", 3);
+  const snap = runWithN([epic], 3);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.3")).toEqual({ tag: "ready" });
+});
+
+test("fn-954 N=3 fairness: a 2nd task per epic only after every sibling epic with ready work has its first", () => {
+  // Two epics on /r, each with 2 ready tasks, N=3. Round 1: fn-1.1, fn-2.1.
+  // Round 2: one more slot → goes to the least-loaded epic, tie broken by seam
+  // order → fn-1.2. fn-2.2 loses to fn-1's fair-share win and the now-full root.
+  const a = makeStackEpic("fn-1-a", 1, "/r", 2);
+  const b = makeStackEpic("fn-2-b", 2, "/r", 2);
+  const snap = runWithN([a.epic, b.epic], 3);
+  expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-a.2")).toEqual({ tag: "ready" });
+  // fn-2.2: fn-2 did receive a grant (fn-2.1) → its extra loses to its own
+  // fair share → single-task-per-epic.
+  expect(snap.perTask.get("fn-2-b.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 occupancy seeding: epic with 1 running + N=2 gets 1 MORE, not 2 (no bonus-round over-allocation)", () => {
+  // fn-1 has a running worker on /r (pre-consumes a root slot AND an epic slot)
+  // plus 2 ready tasks. N=2 → only 1 free slot remains → exactly 1 ready task
+  // is kept; the other demotes. The running task must NOT be offered 2 more.
+  const runningT = makeTask({
+    task_id: "fn-1-foo.1",
+    target_repo: "/r",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const r1 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    target_repo: "/r",
+  });
+  const r2 = makeTask({
+    task_id: "fn-1-foo.3",
+    task_number: 3,
+    target_repo: "/r",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [runningT, r1, r2],
+  });
+  const snap = runWithN([epic], 2);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+  // Only 1 free slot (N=2 − 1 running) → the 3rd is denied; the epic already had
+  // representation (running + a grant) → single-task-per-epic.
+  expect(snap.perTask.get("fn-1-foo.3")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 occupancy seeding: running occupant on a sibling epic pre-consumes a root slot (N=2, 1 free)", () => {
+  // fn-1 has a running worker on /r (no ready tasks). fn-2 has 2 ready tasks on
+  // /r. N=2 → fn-1's running consumes 1 slot, leaving 1 → fn-2.1 wins, fn-2.2
+  // demotes. fn-2 got a grant → its extra is single-task-per-epic.
+  const runningT = makeTask({
+    task_id: "fn-1-foo.1",
+    target_repo: "/r",
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [runningT],
+  });
+  const e2 = makeStackEpic("fn-2-bar", 2, "/r", 2).epic;
+  const snap = runWithN([e1, e2], 2);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 N>1 independent roots: each root fills its own N slots (no cross-root coupling)", () => {
+  // fn-1 on /r1 (2 ready), fn-2 on /r2 (2 ready), N=1. Each root has its OWN
+  // single slot → each epic keeps exactly its first task.
+  const a = makeStackEpic("fn-1-a", 1, "/r1", 2);
+  const b = makeStackEpic("fn-2-b", 2, "/r2", 2);
+  const snap = runWithN([a.epic, b.epic], 2);
+  // N=2 per root, each epic has 2 ready on its own root → both dispatch on each.
+  expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-a.2")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-b.2")).toEqual({ tag: "ready" });
+});
+
+test("fn-954 N>1 armed composition: an eligible epic claims free slots before an earlier-sorted ineligible sibling", () => {
+  // /r, N=2. fn-1 (seam-first, INELIGIBLE) has 2 ready; fn-2 (ELIGIBLE) has 1
+  // ready. Pass-2a fills eligible first → fn-2.1 takes a slot; pass-2b fills the
+  // 1 remaining slot with the ineligible fn-1 → fn-1.1 keeps, fn-1.2 demotes.
+  const a = makeStackEpic("fn-1-a", 1, "/r", 2);
+  const b = makeStackEpic("fn-2-b", 2, "/r", 1);
+  const snap = runWithN([a.epic, b.epic], 2, new Set(["fn-2-b"]));
+  expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-a.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 N>1 close-row eligibility gate intact (fn-835): ineligible ready close neither claims nor demotes", () => {
+  // Direct allocator call, N=2. fn-1 (UNARMED) has a ready close row on /repo;
+  // fn-2 (ELIGIBLE) has 1 ready task. The ineligible close must NOT consume a
+  // slot — fn-2's task dispatches and the close stays ready (launcher suppresses
+  // its actual launch).
+  const closeTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    status: "open",
+    tasks: [closeTask],
+  });
+  const t2 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/repo",
+  });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const perTask = new Map<string, Verdict>([
+    [closeTask.task_id, { tag: "completed" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+    ["fn-2-bar", blocked({ kind: "dep-on-task", upstream: "fn-2-bar.1" })],
+  ]);
+  applyPerRootRoundRobinAllocator(
+    [epic1, epic2],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(),
+    2,
+    new Set(["fn-2-bar"]),
+  );
+  expect(perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+  expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
+});
+
+test("fn-954 N>1 close-row consumes a slot: an eligible ready close + a same-root ready task share an N=2 root", () => {
+  // /repo, N=2. fn-1 (ELIGIBLE) ready close row + fn-2 (ELIGIBLE) 1 ready task.
+  // 2 slots → close takes one, task takes the other; both dispatch.
+  const closeTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    status: "open",
+    tasks: [closeTask],
+  });
+  const t2 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/repo",
+  });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const perTask = new Map<string, Verdict>([
+    [closeTask.task_id, { tag: "completed" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+    ["fn-2-bar", blocked({ kind: "dep-on-task", upstream: "fn-2-bar.1" })],
+  ]);
+  applyPerRootRoundRobinAllocator(
+    [epic1, epic2],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(),
+    2,
+    new Set(["fn-1-foo", "fn-2-bar"]),
+  );
+  expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
+  expect(perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+});
+
+test("fn-954 N>1 fallbackRoots seeding: a launch-window root entry pre-consumes a slot", () => {
+  // /repo, N=2, with /repo in fallbackRoots (a pending dispatch with no matching
+  // row). One epic with 2 ready tasks → the fallback consumes 1 slot, leaving 1
+  // → only the first task is kept.
+  const { epic } = makeStackEpic("fn-1-foo", 1, "/repo", 2);
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-foo.1", { tag: "ready" }],
+    ["fn-1-foo.2", { tag: "ready" }],
+  ]);
+  applyPerRootRoundRobinAllocator(
+    [epic],
+    perTask,
+    new Map(),
+    new Map(),
+    new Set(["/repo"]),
+    2,
+  );
+  expect(perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  // The epic got 1 grant → its extra is single-task-per-epic.
+  expect(perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("fn-954 N>1 global-cap AND: the allocator grants ≤ N per root, but the global budget further caps total launches", () => {
+  // This pins the COMPOSITION contract: the allocator is per-root; the global
+  // `maxConcurrentJobs` budget in the reconciler is a SEPARATE AND. Here we
+  // verify the allocator alone grants up to N (the budget gate lives in
+  // autopilot-worker and only counts `isRootOccupant` rows, which a `ready`
+  // grant is NOT — so granted-ready rows don't inflate the occupied count).
+  const { epic } = makeStackEpic("fn-1-foo", 1, "/r", 3);
+  const snap = runWithN([epic], 3);
+  // All 3 ready (allocator ceiling). None is an occupant, so the global budget
+  // (computed downstream over occupants) sees 0 occupied — the budget then caps
+  // how many of these 3 actually launch. Allocator + budget = AND.
+  for (const v of snap.perTask.values()) {
+    expect(v).toEqual({ tag: "ready" });
+    expect(isRootOccupant(v)).toBe(false);
+  }
+});
+
+test("fn-954 alloc terminates on exhausted ready work (N greater than ready count)", () => {
+  // N=5 but only 2 ready tasks across 2 epics on /r → both kept, no spin, no
+  // throw. Guards the fill-loop termination on exhausted queues.
+  const e1 = makeStackEpic("fn-1-a", 1, "/r", 1).epic;
+  const e2 = makeStackEpic("fn-2-b", 2, "/r", 1).epic;
+  const snap = runWithN([e1, e2], 5);
+  expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
 });
 
 test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {
