@@ -1,6 +1,7 @@
 {
   "branch_name": "runtime-settable-autopilot-config",
   "bundles": [],
+  "closer_done_at": "2026-06-25T04:18:52.161000Z",
   "created_at": "2026-06-24T23:43:32.356000Z",
   "depends_on_epics": [
     "fn-946-add-keeper-handoff-fire-and-forget"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-06-24T23:44:45.890000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Runtime-settable autopilot config",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-24T23:44:45.797000Z"
+  "updated_at": "2026-06-25T04:18:52.161000Z"
 }
