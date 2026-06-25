@@ -8730,6 +8730,17 @@ export interface DrainOptions {
    * callers leave this defaulted.
    */
   sleep?: (ms: number) => void;
+  /**
+   * Boot-drain checkpoint gate overrides (test-only). `drainToCompletion`'s
+   * periodic PASSIVE fires when events-since-last-checkpoint cross
+   * `checkpointEventInterval` OR the `-wal` file crosses `checkpointWalBytes`.
+   * Both default to the production constants; a test shrinks them to exercise
+   * the same checkpoint-caps-WAL contract at a fraction of the event/IO volume.
+   * PASSIVE is pure space reclamation, so changing WHEN it fires never affects
+   * fold output — production callers leave both defaulted.
+   */
+  checkpointEventInterval?: number;
+  checkpointWalBytes?: number;
 }
 
 /**

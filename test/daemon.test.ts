@@ -30,8 +30,6 @@ import {
   type BlockEscalationOutcome,
   type BlockEscalationSendResult,
   type BlockEscalationSweepDeps,
-  BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL,
-  BOOT_DRAIN_CHECKPOINT_WAL_BYTES,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildBlockEscalationBody,
@@ -360,14 +358,18 @@ test("withBootDrainCheckpointTuning still folds the boot backlog to completion",
 });
 
 test("boot drain checkpoints the WAL periodically so peak stays bounded, and the final TRUNCATE collapses it", () => {
-  // The in-drain PASSIVE is gated on a folded-event count (or `-wal` size),
-  // so the backlog must cross the real interval several times. With
-  // `wal_autocheckpoint=0` and NO in-drain checkpoint, the `-wal` file
-  // high-water would grow with the total drain length; the periodic PASSIVE
-  // caps it near the size-gate ceiling regardless of how long the drain runs.
-  // The `-wal` file never shrinks mid-drain, so its final size IS the peak
-  // high-water the drain reached.
-  const interval = BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL;
+  // The in-drain PASSIVE is gated on a folded-event count (or `-wal` size), so
+  // the backlog must cross the interval several times. A small TEST-SCALE
+  // interval exercises the identical periodic-PASSIVE-caps-WAL contract as the
+  // 10k production constant at ~1/50th the event/IO volume, so the case stays
+  // well under the suite timeout even on a loaded host. The size gate keeps its
+  // production default and never trips at this event count, leaving the count
+  // gate as the sole in-drain driver. With `wal_autocheckpoint=0` and NO
+  // in-drain checkpoint the `-wal` file grows with the whole drain length; the
+  // periodic PASSIVE lets SQLite reuse the file so the high-water plateaus near
+  // one interval. The `-wal` file never shrinks mid-drain, so its final size IS
+  // the peak high-water the drain reached.
+  const interval = 200;
 
   const walHigh = (path: string): number =>
     existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0;
@@ -395,7 +397,7 @@ test("boot drain checkpoints the WAL periodically so peak stays bounded, and the
 
     let peakWalBytes = 0;
     withBootDrainCheckpointTuning(db, () => {
-      drainToCompletion(db);
+      drainToCompletion(db, undefined, { checkpointEventInterval: interval });
       peakWalBytes = walHigh(path);
     });
     const folded = (
@@ -427,15 +429,15 @@ test("boot drain checkpoints the WAL periodically so peak stays bounded, and the
   // Every event folded — the periodic checkpoint never disturbed the cursor.
   expect(large.folded).toBe(total);
 
-  // Peak stays bounded near the size-gate ceiling even though the backlog is
-  // ~5.5× the control's. A linear, un-checkpointed WAL would balloon past the
-  // ceiling; the periodic PASSIVE caps the high-water within the size gate plus
-  // a single between-checkpoint interval of growth.
-  expect(large.peakWalBytes).toBeLessThan(BOOT_DRAIN_CHECKPOINT_WAL_BYTES * 2);
+  // The large backlog folds ~3.3× the control's events, but its periodic
+  // checkpoint holds the peak WAL within ~2× the (un-checkpointed) control's —
+  // NOT the ~3.3× a linear, un-checkpointed WAL would balloon to. This relative
+  // bound is what proves the peak does not scale with the drain length.
+  expect(large.peakWalBytes).toBeLessThan(control.peakWalBytes * 2);
 
   // The final TRUNCATE in the wrapper collapsed the WAL file to empty.
   expect(large.postTruncateWalBytes).toBe(0);
-}, 30_000);
+});
 
 test("boot drain spanning multiple batches catches up every event", () => {
   const { db } = freshMemDb();
@@ -971,7 +973,7 @@ test("starvation repro: a long-held writer lock (no yield) starves a concurrent 
   // hook into a dead-letter.
   expect(result.ok).toBe(false);
   expect(result.err).toMatch(/(?:locked|busy|SQLITE_BUSY)/i);
-}, 120_000);
+});
 
 test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock cleanly to a concurrent writer", async () => {
   // The mirror of the starvation repro: instead of one long-held
@@ -1036,7 +1038,7 @@ test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock c
   // cadence, the contender grabs the lock in the FIRST paced gap → ok.
   expect(result.ok).toBe(true);
   expect(result.err).toBeNull();
-}, 120_000);
+});
 
 test("isTransientBusyError classifies writer-lock starvation as transient and everything else as fatal", () => {
   // The discriminator the usage mint's drop-don't-crash hinges on. Transient =
@@ -1246,7 +1248,7 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
   // so the tolerant mint drops-and-survives instead of crashing the daemon.
   expect(thrown).toBeDefined();
   expect(isTransientBusyError(thrown)).toBe(true);
-}, 120_000);
+});
 
 test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {
   // The end-of-boot checkpoint runs in the `finally` AFTER the drain body. It
@@ -2720,9 +2722,9 @@ test("autopilot worker spawns with paused=true workerData and shuts down cleanly
       worker.postMessage({ type: "shutdown" });
     }
     return closed || null;
-  }, 60_000);
+  });
   expect(ok).toBe(true);
-}, 120_000);
+});
 
 test("autopilot worker accepts {type:'set-paused', paused} commands without crashing the loop", async () => {
   openDb(dbPath).db.close();
@@ -2761,9 +2763,9 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
       worker.postMessage({ type: "shutdown" });
     }
     return closed || null;
-  }, 60_000);
+  });
   expect(ok).toBe(true);
-}, 120_000);
+});
 
 // ---------------------------------------------------------------------------
 // fn-678 task .3 — pending_dispatches TTL sweep (producer-side, 60s heartbeat)
@@ -3652,7 +3654,7 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
         .query("SELECT job_id FROM jobs WHERE job_id = ?")
         .get(sessionId) as { job_id: string } | null;
       return row ?? null;
-    }, 30_000);
+    });
     reader.close();
     expect(projected).not.toBeNull();
 
@@ -3698,7 +3700,7 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
             f.rows.some((r) => r.job_id === sessionId),
         );
         return hit ?? null;
-      }, 30_000);
+      });
       expect(served).not.toBeNull();
     } finally {
       socket.end();
@@ -3713,7 +3715,7 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
   // — timeouts at 30001/30009ms, milliseconds past the old line). A ceiling is
   // free on the happy path; it only pays when the box is starved, where
   // "slower green" is the correct outcome, not a red build.
-}, 120_000);
+});
 
 // ---------------------------------------------------------------------------
 // fn-751 task .3 — set_autopilot_mode / set_epic_armed RPC round-trip
@@ -3751,7 +3753,7 @@ async function rpcRoundTrip(
           (f as { id?: string }).id === frame.id,
       );
       return hit ?? null;
-    }, 30_000);
+    });
     if (reply === null) {
       throw new Error(
         `no rpc_result/error frame for ${frame.method} (id ${frame.id}) within 10s`,
@@ -3786,13 +3788,13 @@ test("fn-751: set_autopilot_mode RPC round-trips and folds the autopilot_state s
           .query("SELECT mode FROM autopilot_state WHERE id = 1")
           .get() as { mode: string } | null;
         return row?.mode === "armed" ? row.mode : null;
-      }, 30_000);
+      });
       reader.close();
       expect(mode).toBe("armed");
     },
     { workers: ["wake", "server"] },
   );
-}, 120_000);
+});
 
 test("fn-751: set_autopilot_mode rejects an unknown enum value with a bad_params error (no fold)", async () => {
   await withInProcessDaemon(
@@ -3808,7 +3810,7 @@ test("fn-751: set_autopilot_mode rejects an unknown enum value with a bad_params
     },
     { workers: ["wake", "server"] },
   );
-}, 120_000);
+});
 
 test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence table (arm then disarm)", async () => {
   await withInProcessDaemon(
@@ -3833,7 +3835,7 @@ test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-42-armed") as { epic_id: string } | null;
         return row ?? null;
-      }, 30_000);
+      });
       expect(armed).not.toBeNull();
 
       // Disarm: the presence row is DELETEd.
@@ -3852,13 +3854,13 @@ test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence 
         // retryUntil treats a non-null return as "settled"; sentinel `true`
         // means "row is gone".
         return row === null ? true : null;
-      }, 30_000);
+      });
       reader.close();
       expect(gone).toBe(true);
     },
     { workers: ["wake", "server"] },
   );
-}, 120_000);
+});
 
 test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded arm and done-disarm", async () => {
   await withInProcessDaemon(
@@ -3891,7 +3893,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT status FROM epics WHERE epic_id = ?")
           .get("fn-91-open") as { status: string } | null;
         return done?.status === "done" && open?.status === "open" ? true : null;
-      }, 30_000);
+      });
       expect(folded).toBe(true);
 
       // 1) arm a `done` epic → rejected (rpc_failed), no EpicArmed appended,
@@ -3926,7 +3928,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-91-open") as { epic_id: string } | null;
         return row ?? null;
-      }, 30_000);
+      });
       expect(openArmed).not.toBeNull();
 
       // 3) arm a not-yet-folded epic (no `epics` row) → still allowed
@@ -3943,7 +3945,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-999-never-planned") as { epic_id: string } | null;
         return row ?? null;
-      }, 30_000);
+      });
       expect(unfoldedArmed).not.toBeNull();
 
       // 4) disarm a `done` epic → ALWAYS allowed (the guard gates only
@@ -3960,7 +3962,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
     },
     { workers: ["wake", "server"] },
   );
-}, 120_000);
+});
 
 // ---------------------------------------------------------------------------
 // fn-749 task .1 — worker-set selector

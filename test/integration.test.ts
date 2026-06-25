@@ -312,7 +312,7 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
     },
     { workers: ["wake", "server"] },
   );
-}, 30000);
+});
 
 test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends real event, flips waiting→recovered, session reappears", async () => {
   // fn-747: in-process daemon. The replay path is pure DB + RPC + fold (no file
@@ -492,7 +492,7 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
     },
     { workers: ["wake", "server"] },
   );
-}, 30000);
+});
 
 test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon inlines it into the event → handoffs projection carries the full doc", async () => {
   // The handoff doc (up to 64KB) overflows the ~8 KiB UDS send buffer when inlined
@@ -666,7 +666,7 @@ test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon 
       env: { KEEPER_HANDOFF_SPILL_DIR: spillDir },
     },
   );
-}, 30000);
+});
 
 test("end-to-end: plan worker → .keeper write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
@@ -1028,7 +1028,7 @@ test("end-to-end: plan worker → .keeper write → synthetic event → fold →
     // fold on MAIN and `server` serves the resulting epics/tasks rows.
     { env: { KEEPER_CONFIG: configPath }, workers: ["wake", "server", "plan"] },
   );
-}, 30000);
+});
 
 test("fn-684.4: keeper source carries NO `start-or-reload-plugin` argv (the retired keeper-side per-session-load mechanism stays retired)", async () => {
   // The original task .4 plan had keeper imperatively load the plugin into

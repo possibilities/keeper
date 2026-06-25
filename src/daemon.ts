@@ -201,22 +201,25 @@ export function drainToCompletion(
   // event-count gate alone).
   const walPath =
     db.filename && db.filename !== ":memory:" ? `${db.filename}-wal` : null;
+  // Gate thresholds default to the production constants; a test overrides them
+  // (smaller) to exercise the periodic-PASSIVE-caps-WAL contract cheaply.
+  const checkpointEventInterval =
+    options.checkpointEventInterval ?? BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL;
+  const checkpointWalBytes =
+    options.checkpointWalBytes ?? BOOT_DRAIN_CHECKPOINT_WAL_BYTES;
   let eventsSinceCheckpoint = 0;
   const maybeCheckpoint = (): void => {
     const sizeTripped =
       walPath !== null &&
       (() => {
         try {
-          return statSync(walPath).size >= BOOT_DRAIN_CHECKPOINT_WAL_BYTES;
+          return statSync(walPath).size >= checkpointWalBytes;
         } catch {
           // `-wal` absent (nothing written yet) or unreadable: no size pressure.
           return false;
         }
       })();
-    if (
-      eventsSinceCheckpoint < BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL &&
-      !sizeTripped
-    ) {
+    if (eventsSinceCheckpoint < checkpointEventInterval && !sizeTripped) {
       return;
     }
     eventsSinceCheckpoint = 0;

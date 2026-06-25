@@ -73,7 +73,7 @@ maybe("keeper→uv→util→JSON round-trip (real uv)", () => {
       expect(typeof result.error_type).toBe("string");
       expect(result.error_type.length).toBeGreaterThan(0);
     }
-  }, 90_000);
+  });
 
   test("WORKER: stdout non-empty inside a Bun Worker (bun#24690)", async () => {
     const worker = new Worker(
@@ -119,5 +119,5 @@ maybe("keeper→uv→util→JSON round-trip (real uv)", () => {
     } finally {
       worker.terminate();
     }
-  }, 90_000);
+  });
 });
