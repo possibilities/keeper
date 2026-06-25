@@ -251,6 +251,22 @@ async function gitCommonDir(cwd: string, run: GitRunner): Promise<string> {
 }
 
 /**
+ * Resolve the worktree root for `cwd` via `git -C <cwd> rev-parse --show-toplevel`.
+ * Every subsequent git op runs with `cwd: <this>`, so the whole pipeline is PINNED
+ * to one canonical (git-realpath'd) worktree path — robust to a symlinked cwd and
+ * to a concurrent producer perturbing ambient git-dir discovery mid-sequence. A
+ * non-repo cwd (or any git error) falls back to `cwd` unchanged.
+ */
+async function resolveWorktreeRoot(
+  cwd: string,
+  run: GitRunner,
+): Promise<string> {
+  const res = await run(["rev-parse", "--show-toplevel"], { cwd });
+  const top = res.stdout.trim();
+  return res.code === 0 && top.length > 0 ? top : cwd;
+}
+
+/**
  * Stage `files` with `git add -A -- <files>`. The `-A` is PATHSPEC-SCOPED, so
  * deleted paths stage as removals instead of erroring "did not match any
  * files"; it is NOT a tree-wide `git add -A`. Returns a failure envelope-like
@@ -400,6 +416,12 @@ function fail(payload: Record<string, unknown>): never {
  * spawn. Plain function params — no DI framework.
  */
 export interface CommitWorkDeps {
+  /**
+   * Starting working directory, resolved to the worktree root before any git op
+   * (default: `process.cwd()`). A test seam: the real-git suite points the
+   * pipeline at a linked worktree path without a global `process.chdir`.
+   */
+  cwd?: string;
   /** Git runner threaded to every git boundary (default: real {@link gitExec}). */
   gitRunner?: GitRunner;
   /** Session-attributed dirty file discovery (default: real attribution read). */
@@ -442,7 +464,7 @@ async function runInner(
   args: ParsedArgs,
   deps: CommitWorkDeps,
 ): Promise<number> {
-  const cwd = process.cwd();
+  const startCwd = deps.cwd ?? process.cwd();
   const git = deps.gitRunner ?? gitExec;
   const discoverFiles = deps.discoverFiles ?? discoverSessionFiles;
   const waitCaughtUp = deps.waitCaughtUp ?? defaultWaitCaughtUp;
@@ -462,15 +484,21 @@ async function runInner(
     });
   }
 
+  // Pin the whole pipeline to the resolved worktree root: every git op below runs
+  // with `cwd: worktree`, so a concurrent producer perturbing ambient git-dir
+  // discovery cannot make a commit land on the wrong branch (the env strip in
+  // git-exec closes the GIT_DIR/GIT_WORK_TREE side of the same hazard).
+  const worktree = await resolveWorktreeRoot(startCwd, git);
+
   // Read-side wait (fn-921.4): let the `.1` poll-only git producer fold a
   // GitSnapshot covering any just-landed edit so its attribution is charged
   // before we read. Bounded + fail-open — a wedged/slow producer never blocks
   // the commit; on timeout we fall back to the on-hook ∩ live read below.
-  await waitCaughtUp(sessionId, cwd);
+  await waitCaughtUp(sessionId, worktree);
 
   // Discover + gitignore-filter OUTSIDE the lock (pure reads, no mutation).
-  let files = discoverFiles(sessionId, cwd);
-  files = await filterGitignored(files, cwd, git);
+  let files = discoverFiles(sessionId, worktree);
+  files = await filterGitignored(files, worktree, git);
 
   // Hard-stop on a runaway POST-filter file list (the fn-684 incident shape).
   // `--max-files 0` disables the guard.
@@ -514,14 +542,14 @@ async function runInner(
   // Acquire the per-repo commit lock for the full stage → lint → commit → push
   // window. The lock path is under the git common dir so every worktree of the
   // repo coordinates through the same lock.
-  let common = await gitCommonDir(cwd, git);
-  if (!common.startsWith("/")) common = `${cwd}/${common}`;
+  let common = await gitCommonDir(worktree, git);
+  if (!common.startsWith("/")) common = `${worktree}/${common}`;
   const lockPath = `${common}/keeper-commit-work.lock`;
 
   const lock = acquireLock(lockPath);
   let exitCode = 0;
   try {
-    const stageErr = await gitStage(files, cwd, git);
+    const stageErr = await gitStage(files, worktree, git);
     if (stageErr !== null) {
       printCompact({ success: false, error: `git add failed: ${stageErr}` });
       return 1;
@@ -529,18 +557,18 @@ async function runInner(
 
     // Unstage any stale carryover (a previous worker that died between stage
     // and commit) so the commit + lint see ONLY the caller's files.
-    const allStaged = new Set(await stagedFileNames(cwd, git));
+    const allStaged = new Set(await stagedFileNames(worktree, git));
     const callerFiles = new Set(files);
     const stale = [...allStaged].filter((f) => !callerFiles.has(f)).sort();
     if (stale.length > 0) {
-      await git(["reset", "HEAD", "--", ...stale], { cwd });
+      await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
     }
     const stagedNames = [...allStaged].filter((f) => callerFiles.has(f)).sort();
 
     // Linters operate on file CONTENTS — skip paths deleted in this commit.
-    const lintNames = stagedNames.filter((n) => existsSync(`${cwd}/${n}`));
+    const lintNames = stagedNames.filter((n) => existsSync(`${worktree}/${n}`));
     try {
-      await runLint(lintNames, cwd);
+      await runLint(lintNames, worktree);
     } catch (err) {
       if (err instanceof LintFailure) {
         // Release the lock BEFORE printing (mirrors the Python finally-guard
@@ -559,7 +587,7 @@ async function runInner(
       throw err;
     }
 
-    const committed = await gitCommitStaged(msg, cwd, git);
+    const committed = await gitCommitStaged(msg, worktree, git);
     if ("error" in committed) {
       printCompact({
         success: false,
@@ -576,7 +604,7 @@ async function runInner(
     });
 
     // NDJSON line 2 — push envelope (COMPACT). Lock held through the push.
-    const pushResult = await pushCommitted(cwd, git);
+    const pushResult = await pushCommitted(worktree, git);
     printCompact(pushResult);
     if (!pushResult.success) exitCode = 1;
   } finally {

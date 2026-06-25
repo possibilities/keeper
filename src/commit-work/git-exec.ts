@@ -45,6 +45,43 @@ export type GitRunner = (
 ) => Promise<GitExecResult>;
 
 /**
+ * The git env vars that override cwd-based repo discovery. An ancestor process
+ * (or a git hook) that exported any of these would pin EVERY child `git` to that
+ * repo/index regardless of the `cwd` we pass — the classic cause of a commit made
+ * inside a linked worktree landing on `main` instead of its lane branch. We strip
+ * them so git ALWAYS discovers the repo from the explicit cwd. (`GIT_TERMINAL_PROMPT`
+ * and other non-discovery vars are deliberately NOT stripped.)
+ */
+export const GIT_DISCOVERY_ENV_VARS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+] as const;
+
+/**
+ * Build the child env for a git spawn: the ambient env with the
+ * {@link GIT_DISCOVERY_ENV_VARS} stripped, then `extra` merged over. `source`
+ * defaults to `process.env` (overridable so the fast tier unit-tests the strip
+ * with a synthetic env and zero global mutation). Caller-supplied `extra` wins —
+ * it is applied AFTER the strip, so a deliberate caller override (none today) is
+ * never clobbered, while inherited discovery vars are always removed.
+ */
+export function buildGitEnv(
+  extra?: Record<string, string>,
+  source: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...source };
+  for (const key of GIT_DISCOVERY_ENV_VARS) {
+    delete env[key];
+  }
+  if (extra) {
+    Object.assign(env, extra);
+  }
+  return env;
+}
+
+/**
  * Run `git <args>` as a real subprocess with both output streams drained
  * concurrently.
  *
@@ -52,6 +89,12 @@ export type GitRunner = (
  * responsible for never issuing tree-wide `git add -A/./*` (always pathspec-
  * scoped with a `--` separator per the epic's best-practices) and for holding
  * the commit-work flock around the stage→commit→push window.
+ *
+ * The env ALWAYS routes through {@link buildGitEnv}, so the
+ * {@link GIT_DISCOVERY_ENV_VARS} are stripped on every spawn and `git` discovers
+ * the repo from the explicit `cwd` — never from an inherited `GIT_DIR`/`GIT_WORK_TREE`
+ * an ancestor may have exported. PATH/HOME and the rest of the ambient env still
+ * ride through so git's credential + config discovery keeps working.
  */
 export async function spawnGitExec(
   args: string[],
@@ -62,9 +105,7 @@ export async function spawnGitExec(
     stdin: options.stdin ?? "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    // Merge caller env over the ambient environment; a bare `env` would drop
-    // PATH/HOME and break git's credential + config discovery.
-    env: options.env ? { ...process.env, ...options.env } : undefined,
+    env: buildGitEnv(options.env),
   });
 
   // Drain both pipes CONCURRENTLY. Awaiting stdout fully before stderr would

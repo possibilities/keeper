@@ -12,15 +12,22 @@
  * combined output before matching, exactly as the Python does.
  */
 
+import { resolveDefaultBranch } from "../worktree-git";
 import { type GitRunner, gitExec } from "./git-exec";
 
-/** A push-error class. Unmatched stderr falls back to `"other"`. */
+/**
+ * A push-error class. Unmatched git stderr falls back to `"other"`;
+ * `"protected_branch"` is NOT produced by {@link classifyPushError} — it is the
+ * defense-in-depth abort `pushCommitted` raises BEFORE shelling git, when a push
+ * would land lane work on the default/protected branch from a linked worktree.
+ */
 export type PushErrorClass =
   | "non_fast_forward"
   | "hook_rejected"
   | "auth"
   | "network"
   | "no_upstream"
+  | "protected_branch"
   | "other";
 
 /** Push succeeded — line 2 of the success NDJSON. */
@@ -94,36 +101,17 @@ export function classifyPushError(stderr: string): PushErrorClass {
   return "other";
 }
 
-/** Current branch name via `git rev-parse --abbrev-ref HEAD`. */
-async function currentBranch(cwd: string, run: GitRunner): Promise<string> {
-  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+/**
+ * Current branch name via `git rev-parse --abbrev-ref HEAD`, pinned to the
+ * explicit worktree path (the per-worktree HEAD is authoritative — never a cached
+ * string).
+ */
+async function currentBranch(
+  worktree: string,
+  run: GitRunner,
+): Promise<string> {
+  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktree });
   return r.stdout.trim();
-}
-
-/** A push success envelope for the current branch. */
-async function pushSuccessEnvelope(
-  cwd: string,
-  run: GitRunner,
-): Promise<PushSuccess> {
-  return {
-    success: true,
-    pushed: true,
-    remote: "origin",
-    branch: await currentBranch(cwd, run),
-  };
-}
-
-/** A push-skipped (linked worktree) envelope for the current branch. */
-async function pushSkippedEnvelope(
-  cwd: string,
-  run: GitRunner,
-): Promise<PushSkippedWorktree> {
-  return {
-    success: true,
-    pushed: false,
-    skipped: "worktree",
-    branch: await currentBranch(cwd, run),
-  };
 }
 
 /**
@@ -174,10 +162,31 @@ export async function inLinkedWorktree(
   return gitDir.stdout.trim() !== commonDir.stdout.trim();
 }
 
+/** The protected-branch abort envelope (defense-in-depth — never push lane work
+ * onto the default branch from a linked worktree). */
+function protectedBranchAbort(branch: string, worktree: string): PushFailure {
+  return {
+    success: false,
+    pushed: false,
+    push_error_class: "protected_branch",
+    push_error:
+      `refusing to push '${branch}' to origin from linked worktree ${worktree}: ` +
+      "lane work must merge to the default branch, never push to it",
+  };
+}
+
 /**
  * Push the just-landed commit to `origin`, auto-setting upstream on first push.
+ * `worktree` is the resolved, worktree-PINNED path the caller threads through
+ * every git op — every spawn here runs with `cwd: worktree`, so git discovers the
+ * repo from that explicit path (never a perturbed ambient cwd / GIT_DIR).
  *
  * Flow (parity with the Python):
+ *  0. SKIP the push entirely inside a linked git worktree (the commit is on a
+ *     per-lane branch that must never reach origin; autopilot pushes once at
+ *     merge-to-default). DEFENSE-IN-DEPTH: re-check linkage + HEAD immediately
+ *     before the push and ABORT if it would push the default/protected branch
+ *     from a linked worktree (a producer race can flip the skip gate's verdict).
  *  1. `git rev-parse --abbrev-ref --symbolic-full-name @{u}` — exit 128 means
  *     no upstream is configured, so push with `-u origin HEAD` to set it; that
  *     branch is the whole push (the caller returns early).
@@ -192,27 +201,45 @@ export async function inLinkedWorktree(
  * stderr goldens so `classifyPushError`'s branches stay covered with no network.
  */
 export async function pushCommitted(
-  cwd: string,
+  worktree: string,
   run: GitRunner = gitExec,
 ): Promise<PushEnvelope> {
   const env = { GIT_TERMINAL_PROMPT: "0" };
+
+  // Resolve the branch ONCE, at op time, pinned to the explicit worktree path.
+  const branch = await currentBranch(worktree, run);
 
   // 0. Skip the push leg entirely inside a linked git worktree — the commit is
   // on a per-lane branch that must never reach origin (autopilot pushes once at
   // merge-to-default). Submodule checkouts are guarded inside the detector and
   // still push. Generic: any linked worktree, not just autopilot's.
-  if (await inLinkedWorktree(cwd, run)) {
-    return pushSkippedEnvelope(cwd, run);
+  if (await inLinkedWorktree(worktree, run)) {
+    return { success: true, pushed: false, skipped: "worktree", branch };
+  }
+
+  // Defense-in-depth: immediately before the push, RE-CHECK the linked-worktree
+  // verdict + HEAD. The skip gate keys on `--git-dir` vs `--git-common-dir`,
+  // which a concurrent producer prune/add can momentarily perturb into a false
+  // negative; re-checking here closes that window. If we now resolve as a linked
+  // worktree AND would push the default/protected branch, ABORT LOUDLY rather
+  // than leak a lane commit onto the default branch via origin. (`&&`
+  // short-circuits, so the main worktree never pays the default-branch resolve.)
+  if (
+    (await inLinkedWorktree(worktree, run)) &&
+    (await currentBranch(worktree, run)) ===
+      (await resolveDefaultBranch(worktree, run))
+  ) {
+    return protectedBranchAbort(branch, worktree);
   }
 
   // 1. Detect missing upstream — exit 128 from @{u} resolution.
   const check = await run(
     ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    { cwd, env },
+    { cwd: worktree, env },
   );
   if (check.code === 128) {
     const pushU = await run(["push", "--no-progress", "-u", "origin", "HEAD"], {
-      cwd,
+      cwd: worktree,
       env,
     });
     if (pushU.code !== 0) {
@@ -224,11 +251,11 @@ export async function pushCommitted(
         push_error: combined,
       };
     }
-    return pushSuccessEnvelope(cwd, run);
+    return { success: true, pushed: true, remote: "origin", branch };
   }
 
   // 2. Upstream configured — regular push.
-  const push = await run(["push", "--no-progress"], { cwd, env });
+  const push = await run(["push", "--no-progress"], { cwd: worktree, env });
   if (push.code !== 0) {
     const combined = (push.stdout + push.stderr).trim();
     return {
@@ -238,5 +265,5 @@ export async function pushCommitted(
       push_error: combined,
     };
   }
-  return pushSuccessEnvelope(cwd, run);
+  return { success: true, pushed: true, remote: "origin", branch };
 }

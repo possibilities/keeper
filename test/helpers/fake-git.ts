@@ -35,10 +35,14 @@ export interface FakeGitRule {
   result: FakeGitOutcome;
 }
 
-/** A recorded call: the argv plus the stdin text fed (commit -F - messages). */
+/** A recorded call: the argv, the stdin text fed (commit -F - messages), and —
+ * for the async commit-work runner — the spawn `cwd` + extra `env` so a test can
+ * assert every git op is worktree-pinned. */
 export interface RecordedGitCall {
   args: string[];
   stdin?: string;
+  cwd?: string;
+  env?: Record<string, string>;
 }
 
 /** Helpers shared across the three runner flavors. */
@@ -84,7 +88,7 @@ export function fakeAsyncGit(rules: FakeGitRule[] = []): FakeAsyncGit {
       options.stdin !== undefined
         ? new TextDecoder().decode(options.stdin)
         : undefined;
-    calls.push({ args: [...args], stdin });
+    calls.push({ args: [...args], stdin, cwd: options.cwd, env: options.env });
     const out = applyRules(args, rules);
     return {
       code: out.exitCode ?? 0,

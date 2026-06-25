@@ -3181,9 +3181,16 @@ Crash/restart recovery is producer-only: detect `MERGE_HEAD` → abort →
 flight (`isEpicStarted`) are both rejected loud in worktree mode for v1; a
 drained / unstarted-open / zero-epic board toggles freely, so the operator's own
 interactive session no longer trips the guard (`keeper autopilot worktree on`
-has a `--force` escape hatch for the started-epic guard). `commit-work` skips its push leg whenever it runs
-inside a linked git worktree (submodule false-positive guarded), so per-lane
-branches never reach origin — autopilot pushes once at merge-to-default.
+has a `--force` escape hatch for the started-epic guard). `commit-work` pins every
+git op to the resolved worktree root (`git rev-parse --show-toplevel`, `cwd:` on
+every spawn) and strips `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`
+from each spawn's env, so a concurrent producer prune/add can never make a lane
+commit land on the default branch via a perturbed git-dir resolution. It skips its
+push leg whenever it runs inside a linked git worktree (submodule false-positive
+guarded), so per-lane branches never reach origin — autopilot pushes once at
+merge-to-default — and, defense-in-depth, re-checks linkage + HEAD immediately
+before the push and aborts loudly rather than push the default/protected branch
+from a linked worktree.
 
 The crash-restore set is derived RETROSPECTIVELY from `keeper.db` at READ TIME
 (`src/restore-set.ts`, epic fn-817) — there is no frozen snapshot to read and no
