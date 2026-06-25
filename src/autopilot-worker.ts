@@ -87,6 +87,7 @@ import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
   abortInterruptedMerge as gitAbortInterruptedMerge,
+  branchExists as gitBranchExists,
   currentBranch as gitCurrentBranch,
   ensureWorktree as gitEnsureWorktree,
   isAncestorOf as gitIsAncestorOf,
@@ -1449,7 +1450,11 @@ export function reconcile(
   // Kept as a SEPARATE pass over the assembled launches so the OFF path is
   // untouched and the worktree logic is isolated.
   const worktreeFinalize: WorktreeLaunchInfo[] = [];
-  if (snapshot.worktreeMode) {
+  // Gate ALL worktree producer work on not-paused, matching recover() (`:3126`):
+  // finalize merges the epic base into the default branch and pushes, which a
+  // paused autopilot must not do. Launches are already suppressed while paused, so
+  // the geometry attach has nothing to decorate either.
+  if (snapshot.worktreeMode && !state.paused) {
     attachWorktreeGeometry(
       snapshot.epics,
       launches,
@@ -2130,6 +2135,15 @@ export function createWorktreeDriver(
     async finalizeEpic(info) {
       const { repoDir, baseBranch, baseWorktreePath, laneOrder } = info;
       try {
+        // A never-forked epic (a `done` epic that completed before worktree mode,
+        // or one whose work landed straight on the default branch) has no
+        // `keeper/epic/<id>` base branch — nothing to merge or tear down, so skip
+        // cleanly. Mirrors recover pass-2, which is naturally safe by sourcing its
+        // candidates from live branches; the finalize set comes from `completedRowIds`
+        // (every done epic) instead, so it must guard the branch itself.
+        if (!(await gitBranchExists(repoDir, baseBranch, run))) {
+          return { ok: true };
+        }
         const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
         // Merge the epic base into the default branch IN THE MAIN worktree (the
         // repo dir is the main worktree, checked out on the default branch). This

@@ -4084,6 +4084,66 @@ test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed 
   });
 });
 
+test("worktree finalize is gated on not-paused — a paused board collects no finalize", () => {
+  // Same done epic that finalizes when playing, but PAUSED: the base merge + push
+  // is producer git work that must not run while paused (matching recover()).
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  expect(
+    reconcile(snap, makeState({ paused: true }), 0).worktreeFinalize,
+  ).toEqual([]);
+  // Control: unpaused, the SAME board collects the finalize request.
+  expect(reconcile(snap, makeState(), 0).worktreeFinalize.length).toBe(1);
+});
+
+test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no base branch) — no merge attempted", async () => {
+  // A `done` epic from before worktree mode has no `keeper/epic/<id>` base branch.
+  // finalize must be a clean no-op, NOT a phantom-merge "not something we can merge".
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    cmds.push(args.join(" "));
+    // The base branch does not exist → rev-parse --verify returns non-zero.
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const info: WorktreeLaunchInfo = {
+    assignment: {
+      // nodeId is inert for finalize (which keys off baseBranch); the close sink.
+      nodeId: "__close__",
+      isCloseSink: true,
+      branch: "keeper/epic/fn-1-foo",
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [],
+      assertBranch: "keeper/epic/fn-1-foo",
+    },
+    baseBranch: "keeper/epic/fn-1-foo",
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [],
+    parentBranch: "keeper/epic/fn-1-foo",
+  };
+  const res = await driver.finalizeEpic(info);
+  expect(res).toEqual({ ok: true });
+  // It checked the base branch and then stopped — no merge, no teardown.
+  expect(cmds.some((c) => c.startsWith("merge"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
 test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent tip, then asserts HEAD == branch", async () => {
   // Drive the real driver against a fake GitRunner — no real git. The driver must
   // ensure (add), list (registered check), and rev-parse HEAD against the branch.

@@ -11,6 +11,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  branchExists,
   commitWorkLockPath,
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
@@ -350,6 +351,35 @@ test("ensureWorktree: fresh path → prune then add -b off the commitish", async
     "/repo.worktrees/keeper-epic-e-B",
     "deadbeef",
   ]);
+});
+
+test("branchExists: rev-parse --verify exit 0 → true, non-zero → false", async () => {
+  const present = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "abc\n" },
+    },
+  ]);
+  expect(await branchExists("/repo", "keeper/epic/fn-1-foo", present.run)).toBe(
+    true,
+  );
+  // It verifies the fully-qualified ref, not the bare name.
+  expect(present.calls[0].args).toEqual([
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    "refs/heads/keeper/epic/fn-1-foo",
+  ]);
+
+  const absent = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 1 },
+    },
+  ]);
+  expect(await branchExists("/repo", "keeper/epic/fn-1-foo", absent.run)).toBe(
+    false,
+  );
 });
 
 test("ensureWorktree: branch already exists (crashed prior add) → checkout, no -b", async () => {

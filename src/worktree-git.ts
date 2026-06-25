@@ -252,6 +252,19 @@ export async function currentBranch(
   return r.stdout.trim();
 }
 
+/** True IFF local branch `branch` exists (`git rev-parse --verify refs/heads/<branch>`). */
+export async function branchExists(
+  cwd: string,
+  branch: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const r = await run(
+    ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+    { cwd },
+  );
+  return r.code === 0;
+}
+
 /** True IFF `cwd` is inside a linked git worktree (submodule-guarded). */
 export async function isLinkedWorktree(
   cwd: string,
