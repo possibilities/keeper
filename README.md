@@ -689,8 +689,10 @@ Keeper has no `install` verb. Wire it up manually:
    need a migrated schema — it migrates one `:memory:` DB per file-process,
    `serialize()`s it once, and deserializes a per-test clone (~0.2ms) instead of
    re-running the 63-version `migrate()` ladder on every `openDb(":memory:")`,
-   which is what made the default `bun test` fast (the slow process-level files
-   are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). A
+   which is what made the default `bun test` fast (slow process-level cases are
+   tiered behind `bun run test:full` — a whole heavy file, or a single heavy case
+   extracted into a `*.slow.test.ts` sibling while the rest of its file stays
+   fast; see CLAUDE.md `## Test isolation`). A
    third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
    async worker/daemon condition holds and is the canonical replacement for a
    fixed `Bun.sleep` deadline race. Both `bun run test` and `bun run test:full`

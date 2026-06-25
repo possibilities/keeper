@@ -11,7 +11,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
-  defaultTmuxCommandRunner,
   parseAgentwrapTmuxArgs,
   resolveAgentwrapBin,
   resolveTmuxBin,
@@ -679,19 +678,10 @@ describe("resolveTmuxBin", () => {
   });
 });
 
-describe("defaultTmuxCommandRunner timeout classification", () => {
-  test("a timed-out spawn yields a classifiable non-zero result, not a throw", () => {
-    // `sleep 30` exceeds the 5s default bound; Bun.spawnSync returns a result
-    // with exitCode null on timeout — the runner must map it, never throw.
-    // The test bound is set above the 5s spawn bound so the spawn timeout,
-    // not the runner timeout, is what the assertion observes.
-    const result = defaultTmuxCommandRunner(["sleep", "30"]);
-
-    expect(result.exitCode).not.toBe(0);
-    expect(result.exitCode).toBe(124);
-    expect(result.stderr).toContain("timed out");
-  }, 10_000);
-});
+// The `defaultTmuxCommandRunner` real-process timeout-classification test
+// (`sleep 30` against the 5s spawn floor) lives in the slow-tier sibling
+// `agent-tmux-launch-timeout.slow.test.ts` — too heavy for the fast tier; runs
+// under `bun run test:full`.
 
 describe("parseAgentwrapTmuxArgs --agentwrap-tmux-env", () => {
   test("split and joined forms both parse; repeatable; last-wins per KEY", () => {

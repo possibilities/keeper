@@ -4,8 +4,9 @@
  * proportionality, headroom scaling, stale-still-rotates, missing-usage→full-
  * headroom, new-entrant-no-catch-up-burst, over-100 clamp, garbage-multiplier
  * coercion, empty/skip paths, corrupt-state-reset-not-fatal, never-raises-on-
- * unreadable-state-dir, a REAL multi-process flock contention test, and the
- * rate-limit cooldown (future/past/all-cooling/malformed lift_at).
+ * unreadable-state-dir, and the rate-limit cooldown (future/past/all-cooling/
+ * malformed lift_at). The real multi-process flock-contention test lives in the
+ * slow-tier sibling `usage-picker-flock.slow.test.ts`.
  *
  * The picker reads two sources redirected into tmp: per-account envelopes under
  * the state dir (via `setStateDir`) and the catalog at
@@ -24,7 +25,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "bun";
 import {
   listProfiles,
   pickProfile,
@@ -381,50 +381,9 @@ describe("fail-open", () => {
   });
 });
 
-// ---------- concurrency (the flock) -----------------------------------------
-
-describe("concurrency", () => {
-  test("concurrent picks across processes distribute evenly (real flock)", async () => {
-    // Spawn N bun child processes each picking once against the shared ledger.
-    // The flock serializes every read-modify-write across PROCESSES; without it
-    // racing RMWs would lose updates (sum < N) and/or skew the distribution.
-    writeConfig(["p1", "p2", "p3"]);
-    for (const name of ["p1", "p2", "p3"]) {
-      writeEnvelope(name, { subscription_active: true });
-    }
-
-    const n = 30;
-    const fixture = join(import.meta.dir, "fixtures", "pick-once.ts");
-    const procs = Array.from({ length: n }, () =>
-      spawn({
-        cmd: ["bun", "run", fixture],
-        env: {
-          ...process.env,
-          AGENTUSAGE_TEST_STATE_DIR: stateDir,
-          XDG_CONFIG_HOME: configHome,
-        },
-        stdout: "pipe",
-        stderr: "pipe",
-      }),
-    );
-
-    const results = await Promise.all(
-      procs.map(async (p) => {
-        const out = await new Response(p.stdout).text();
-        const code = await p.exited;
-        expect(code).toBe(0);
-        return out.trim();
-      }),
-    );
-
-    expect(results.every((r) => ["p1", "p2", "p3"].includes(r))).toBe(true);
-    const counts = readCounts();
-    const sum = Object.values(counts).reduce((a, b) => a + b, 0);
-    expect(sum).toBe(n); // no lost updates
-    const vals = Object.values(counts);
-    expect(Math.max(...vals) - Math.min(...vals)).toBeLessThanOrEqual(1);
-  }, 30000);
-});
+// The real multi-process flock-contention test lives in
+// `usage-picker-flock.slow.test.ts` (spawns ~30 child processes — too heavy for
+// the fast tier; runs under `bun run test:full`).
 
 // ---------- rate-limit cooldown (lift_at) -----------------------------------
 

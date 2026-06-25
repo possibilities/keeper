@@ -102,10 +102,10 @@ imperative guardrails only.
   `freshMemDb()` / `freshDbFile()` instead of a full `migrate()`.
 - **Two tiers.** Default `bun test` runs the FAST tier only. **`bun run test:full` is mandatory
   before landing any change touching daemon / worker / db / hook / git process paths or a slow file.**
-- **Two independent test axes.** (1) Slow-tier: a too-slow test is named `*.slow.test.ts`, path-ignored
-  from the fast tier into `test:full`. (2) No real git in default tiers — test git-boundary DECISIONS
-  via a pure seam (synthetic inputs / golden strings); a test whose contract genuinely IS git's
-  execution must ALSO be allowlisted in `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene`).
+- **Two independent test axes.** (1) Slow-tier: a too-slow case is EXTRACTED (plus its setup) into a
+  `*.slow.test.ts` sibling while its file stays fast (path-ignored from the fast tier into `test:full`),
+  never the whole file or `test.skip`. (2) No real git in default tiers — test git-boundary DECISIONS via a
+  pure seam; a test whose contract genuinely IS git's execution must ALSO be allowlisted in `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene`).
 - **The host-wide test lock is un-bypassable** — `scripts/test-gate.ts` (parallelism cap + `flock`)
   and the `bunfig.toml` preload both apply it; every lock path fails open.
 - **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses `retryUntil`
