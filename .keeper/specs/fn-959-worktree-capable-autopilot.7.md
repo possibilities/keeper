@@ -39,5 +39,5 @@ Real-git `*.slow.test.ts`: simulate a crash leaving MERGE_HEAD → recovery abor
 - [ ] All recovery is producer-only; idempotent (no double-merge).
 
 ## Done summary
-
+Added producer-only worktree crash/restart recovery: abort+prune interrupted lane merges, and a deterministic done-but-unmerged keeper/epic/* backstop that merges orphaned bases to default + pushes, decoupled from the 1800s recent-done window via a pk-lookup done-ness probe. Wired into driveCycle (covers boot-drain), gated on worktree mode ON and not-paused.
 ## Evidence
