@@ -102,5 +102,5 @@ rejected above the ceiling. Extract any REAL-spawn detached-survival case into
 - [ ] No keeper.db write, no RPC path, no third-party deps; cli/pair.ts JSDoc + HELP document `panel start|wait`
 
 ## Done summary
-
+added keeper pair panel start|wait subcommand for cross-OS fan-out
 ## Evidence
