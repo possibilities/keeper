@@ -74,6 +74,7 @@ import type {
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
 import { extractMutationPath } from "./derivers";
+import { isRetryableDispatchKey } from "./dispatch-command";
 import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
@@ -262,6 +263,33 @@ export function drainToCompletion(
     eventsSinceCheckpoint += folded;
     maybeCheckpoint();
   }
+}
+
+/**
+ * One-shot GC for orphaned `dispatch_failures` rows. A row whose composite
+ * `${verb}::${id}` the `retry_dispatch` wire validator would reject is UN-retryable
+ * — a producer minted a key the operator surface can never clear (e.g. a pre-slug
+ * `worktree-recover:<abs-path>`), so it strands forever. This mints the sanctioned
+ * `DispatchCleared` for each via `mintClear` (the caller folds + pumps). Returns the
+ * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
+ */
+export function gcUnretryableDispatchFailures(
+  db: Database,
+  mintClear: (verb: string, id: string) => void,
+): number {
+  const rows = db.query("SELECT verb, id FROM dispatch_failures").all() as {
+    verb: string;
+    id: string;
+  }[];
+  let swept = 0;
+  for (const row of rows) {
+    if (isRetryableDispatchKey(row.verb, row.id)) {
+      continue;
+    }
+    mintClear(row.verb, row.id);
+    swept++;
+  }
+  return swept;
 }
 
 /**
@@ -2187,6 +2215,47 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  /**
+   * Append a `DispatchCleared` synthetic event — the SOLE legal way to DELETE a
+   * `dispatch_failures` row (the reducer's fold arm). The composite `${verb}::${id}`
+   * rides as the entity-key (`session_id`) overload so a re-fold correlates the clear
+   * to its row without re-parsing the data blob. Caller sets `wakePending` + pumps.
+   */
+  function mintDispatchClearedEvent(verb: string, id: string): void {
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: `${verb}::${id}`,
+      $pid: null,
+      $hook_event: "DispatchCleared",
+      $event_type: "dispatch_failures",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({ verb, id }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+    });
+  }
+
   // Step 2d — pre-warm the native @parcel/watcher addon ON MAIN before ANY
   // worker spawns. See {@link prewarmWatcherAddon}. Skip it when the watcher
   // workers won't dlopen the addon (in-process tier — loading it on main would
@@ -2750,45 +2819,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         const id = msg.id;
         let reply: RetryDispatchResultMessage;
         try {
-          const data = JSON.stringify({
-            verb: msg.verb,
-            id: msg.dispatch_id,
-          });
-          stmts.insertEvent.run({
-            $ts: Date.now() / 1000,
-            // The dispatch key rides as the entity-key overload so a re-fold can
-            // correlate the event to its dispatch_failures row without re-parsing
-            // the data blob. The composite `${verb}::${id}` is unambiguous.
-            $session_id: `${msg.verb}::${msg.dispatch_id}`,
-            $pid: null,
-            $hook_event: "DispatchCleared",
-            $event_type: "dispatch_failures",
-            $tool_name: null,
-            $matcher: null,
-            $cwd: null,
-            $permission_mode: null,
-            $agent_id: null,
-            $agent_type: null,
-            $stop_hook_active: null,
-            $data: data,
-            $subagent_agent_id: null,
-            $spawn_name: null,
-            $start_time: null,
-            $slash_command: null,
-            $skill_name: null,
-            $plan_op: null,
-            $plan_target: null,
-            $plan_epic_id: null,
-            $plan_task_id: null,
-            $plan_subject_present: null,
-            $config_dir: null,
-            $bash_mutation_kind: null,
-            $bash_mutation_targets: null,
-            $plan_files: null,
-            $backend_exec_type: null,
-            $backend_exec_session_id: null,
-            $backend_exec_pane_id: null,
-          });
+          // The wire `verb` / `dispatch_id` are validated handler-side; main treats
+          // both as opaque payload tokens.
+          mintDispatchClearedEvent(msg.verb, msg.dispatch_id);
           wakePending = true;
           pumpWakes();
           reply = { type: "retry-dispatch-result", id, ok: true };
@@ -2832,6 +2865,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // busy ROW, never throws) and the steady-state PASSIVE heartbeat reclaims the
   // space on the next cadence — an accepted, documented degrade.
   serveBootDrain();
+
+  // One-shot GC for orphaned dispatch_failures. The drain above folded the
+  // projection to head, so any UN-retryable row (a key the operator surface can
+  // never clear) is now visible. Sweep each by minting the sanctioned
+  // `DispatchCleared`, then pump so they fold before steady state. Idempotent and
+  // self-healing: once cleared, later boots find none — so it stays silent at zero
+  // and logs only when it acts.
+  {
+    const swept = gcUnretryableDispatchFailures(db, mintDispatchClearedEvent);
+    if (swept > 0) {
+      console.error(
+        `[keeperd] boot GC cleared ${swept} un-retryable dispatch_failures orphan(s)`,
+      );
+      wakePending = true;
+      pumpWakes();
+    }
+  }
 
   // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.
   // Flip the server worker's boot gate so mutating RPCs are accepted and the

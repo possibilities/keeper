@@ -369,6 +369,17 @@ export function dispatchKey(verb: Verb, id: string): DispatchKey {
 }
 
 /**
+ * The `dispatch_failures` id for a path-tied worktree recovery failure (one with no
+ * epic). Slugs the dir — path separators → `-`, no leading `-` — so the composite
+ * `close::worktree-recover:<slug>` passes the `retry_dispatch` wire validator and the
+ * operator can clear it via `keeper autopilot retry` (a raw path embeds `/`, which the
+ * validator rejects, stranding the row).
+ */
+export function worktreeRecoverDispatchId(dir: string): string {
+  return `worktree-recover:${dir.replace(/[/\\]+/g, "-").replace(/^-+/, "")}`;
+}
+
+/**
  * Pure cooldown predicate. `true` IFF `key` was dispatched within the last
  * `REDISPATCH_COOLDOWN_S` seconds. An absent entry is NOT in cooldown. Read
  * inside the pure `reconcile`; the Map is mutated only in the cycle glue.
@@ -3146,7 +3157,9 @@ function main(): void {
             for (const f of failures) {
               deps.emitDispatchFailed({
                 verb: "close",
-                id: f.epicId ?? `worktree-recover:${f.dir}`,
+                // A path-tied recovery failure (no epic) keys on a slug of the dir so
+                // the operator can clear the row — see worktreeRecoverDispatchId.
+                id: f.epicId ?? worktreeRecoverDispatchId(f.dir),
                 reason: f.reason,
                 dir: f.dir,
                 ts: deps.now(),

@@ -100,6 +100,17 @@ export function parseDispatchKey(value: unknown): ParseDispatchKeyResult {
 }
 
 /**
+ * True iff `${verb}::${id}` is a key the `retry_dispatch` wire path would accept
+ * — i.e. an operator could clear it via `keeper autopilot retry`. A
+ * `dispatch_failures` row whose key fails this is UN-retryable (a producer minted
+ * a key the validator rejects, e.g. a raw-path token); the daemon GC-sweeps such
+ * orphans on boot since the operator surface can never reach them. Pure; dep-free.
+ */
+export function isRetryableDispatchKey(verb: string, id: string): boolean {
+  return parseDispatchKey(`${verb}::${id}`).ok;
+}
+
+/**
  * True iff the `id` half is a safe token — non-empty, no path separators, no
  * embedded null, no leading dot. The id never feeds a filesystem path inside
  * the reconciler, but rejecting weaponizable shapes at the wire boundary is

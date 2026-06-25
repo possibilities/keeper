@@ -9,6 +9,7 @@ import { expect, test } from "bun:test";
 import {
   buildDispatchLaunchArgv,
   defaultPlanPrompt,
+  isRetryableDispatchKey,
   PROMPT_MAX_BYTES,
   parseDispatchKey,
   validatePromptBytes,
@@ -45,6 +46,23 @@ test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", 
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.length).toBeGreaterThan(0);
   }
+});
+
+test("isRetryableDispatchKey: a clearable composite vs. an un-retryable raw-path key", () => {
+  // A normal plan/close key is retryable (the operator can `keeper autopilot retry` it).
+  expect(isRetryableDispatchKey("close", "fn-1-foo")).toBe(true);
+  expect(isRetryableDispatchKey("work", "fn-1-foo.3")).toBe(true);
+  // A slugged recover key (separators stripped) is retryable too.
+  expect(
+    isRetryableDispatchKey("close", "worktree-recover:Users-mike-code-arthack"),
+  ).toBe(true);
+  // The legacy raw-path recover key embeds `/` → un-retryable; the boot GC sweeps it.
+  expect(
+    isRetryableDispatchKey(
+      "close",
+      "worktree-recover:/Users/mike/code/arthack",
+    ),
+  ).toBe(false);
 });
 
 test("parseDispatchKey: rejects unknown verbs", () => {

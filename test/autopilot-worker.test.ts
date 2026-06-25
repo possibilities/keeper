@@ -73,6 +73,7 @@ import {
   type WorktreeDriver,
   type WorktreeLaunchInfo,
   type WorktreeRecoveryFailure,
+  worktreeRecoverDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -4105,6 +4106,17 @@ test("worktree finalize is gated on not-paused — a paused board collects no fi
   ).toEqual([]);
   // Control: unpaused, the SAME board collects the finalize request.
   expect(reconcile(snap, makeState(), 0).worktreeFinalize.length).toBe(1);
+});
+
+test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
+  // The raw dir embeds `/`, which the retry_dispatch validator rejects (stranding
+  // the row); the slug strips separators and any leading dash.
+  expect(worktreeRecoverDispatchId("/Users/mike/code/arthack")).toBe(
+    "worktree-recover:Users-mike-code-arthack",
+  );
+  const id = worktreeRecoverDispatchId("/a/b/c");
+  expect(id.includes("/")).toBe(false);
+  expect(id.startsWith("worktree-recover:")).toBe(true);
 });
 
 test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no base branch) — no merge attempted", async () => {

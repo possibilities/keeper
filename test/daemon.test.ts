@@ -43,6 +43,7 @@ import {
   effectiveBlockEscalationRepo,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
+  gcUnretryableDispatchFailures,
   isTransientBusyError,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -162,6 +163,37 @@ test("boot drain is idempotent — a second pass folds nothing", () => {
   ).last_event_id;
 
   expect(secondCursor).toBe(firstCursor);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: sweeps only the rows the retry wire path can't clear", () => {
+  const { db } = freshMemDb();
+  // Two clearable rows (normal keys) and one orphan with a raw-path key the
+  // retry_dispatch validator rejects (the pre-slug worktree-recover shape).
+  const insert = db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 100, ?, 100, 100)`,
+  );
+  insert.run("close", "fn-1-foo", "some reason", "/repo", 10);
+  insert.run("work", "fn-2-bar.3", "some reason", "/repo", 11);
+  insert.run(
+    "close",
+    "worktree-recover:/Users/mike/code/arthack",
+    "worktree-recover-abort-failed: …",
+    "/Users/mike/code/arthack",
+    12,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
+    cleared.push({ verb, id }),
+  );
+
+  // Only the raw-path orphan is swept; the two clearable rows are left alone.
+  expect(swept).toBe(1);
+  expect(cleared).toEqual([
+    { verb: "close", id: "worktree-recover:/Users/mike/code/arthack" },
+  ]);
   db.close();
 });
 
