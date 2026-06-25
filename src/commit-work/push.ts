@@ -31,6 +31,20 @@ export interface PushSuccess {
   branch: string;
 }
 
+/**
+ * Push deliberately skipped because commit-work ran inside a LINKED git
+ * worktree. The commit landed on the worktree's local branch; pushing it would
+ * leak a per-lane branch to origin. This is a SUCCESS envelope — callers
+ * (keeper plan, the worker dispatch) must treat `skipped: "worktree"` as a
+ * pushless success, NOT a push failure. Autopilot pushes once at merge-to-default.
+ */
+export interface PushSkippedWorktree {
+  success: true;
+  pushed: false;
+  skipped: "worktree";
+  branch: string;
+}
+
 /** Push failed — emitted compact, then the process exits 1. */
 export interface PushFailure {
   success: false;
@@ -39,8 +53,9 @@ export interface PushFailure {
   push_error: string;
 }
 
-/** Discriminated push result. `success` keys the two arms. */
-export type PushEnvelope = PushSuccess | PushFailure;
+/** Discriminated push result. `success` keys success vs failure; on the
+ * success side, `pushed` distinguishes an actual push from a worktree skip. */
+export type PushEnvelope = PushSuccess | PushSkippedWorktree | PushFailure;
 
 /**
  * Classify a push failure into a named class. Matches the well-known git push
@@ -98,6 +113,67 @@ async function pushSuccessEnvelope(
   };
 }
 
+/** A push-skipped (linked worktree) envelope for the current branch. */
+async function pushSkippedEnvelope(
+  cwd: string,
+  run: GitRunner,
+): Promise<PushSkippedWorktree> {
+  return {
+    success: true,
+    pushed: false,
+    skipped: "worktree",
+    branch: await currentBranch(cwd, run),
+  };
+}
+
+/**
+ * GENERICALLY detect whether `cwd` sits inside a LINKED git worktree (one added
+ * via `git worktree add`), as opposed to the main worktree.
+ *
+ * Detection: in a linked worktree the per-worktree git dir
+ * (`$GIT_COMMON_DIR/worktrees/<name>`) differs from the shared common dir, so
+ * `--git-dir` != `--git-common-dir`. Both are taken with
+ * `--path-format=absolute` so the comparison is over canonical absolute paths
+ * (the bare forms emit `.git` vs an absolute common dir from a linked worktree,
+ * which would compare unequal for the WRONG reason — and equal-but-relative in
+ * the main tree).
+ *
+ * Submodule false-positive guard (mandatory): a SUBMODULE checkout ALSO has
+ * `--git-dir` != `--git-common-dir` (its git dir lives under the superproject's
+ * `.git/modules/<path>`), yet it is a legitimate independent repo whose commits
+ * SHOULD push. `--show-superproject-working-tree` is non-empty ONLY inside a
+ * submodule, so a non-empty result vetoes the worktree verdict.
+ *
+ * Fail-open: any git error (exit != 0) returns `false` so commit-work falls
+ * back to its normal push — a detection glitch must never silently suppress a
+ * legit push.
+ */
+export async function inLinkedWorktree(
+  cwd: string,
+  run: GitRunner,
+): Promise<boolean> {
+  const superproject = await run(
+    ["rev-parse", "--show-superproject-working-tree"],
+    { cwd },
+  );
+  // Inside a submodule → not a linked worktree; let the normal push run.
+  if (superproject.code === 0 && superproject.stdout.trim().length > 0) {
+    return false;
+  }
+
+  const gitDir = await run(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd },
+  );
+  const commonDir = await run(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { cwd },
+  );
+  if (gitDir.code !== 0 || commonDir.code !== 0) return false;
+
+  return gitDir.stdout.trim() !== commonDir.stdout.trim();
+}
+
 /**
  * Push the just-landed commit to `origin`, auto-setting upstream on first push.
  *
@@ -120,6 +196,14 @@ export async function pushCommitted(
   run: GitRunner = gitExec,
 ): Promise<PushEnvelope> {
   const env = { GIT_TERMINAL_PROMPT: "0" };
+
+  // 0. Skip the push leg entirely inside a linked git worktree — the commit is
+  // on a per-lane branch that must never reach origin (autopilot pushes once at
+  // merge-to-default). Submodule checkouts are guarded inside the detector and
+  // still push. Generic: any linked worktree, not just autopilot's.
+  if (await inLinkedWorktree(cwd, run)) {
+    return pushSkippedEnvelope(cwd, run);
+  }
 
   // 1. Detect missing upstream — exit 128 from @{u} resolution.
   const check = await run(

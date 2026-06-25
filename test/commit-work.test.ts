@@ -18,6 +18,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type CommitWorkDeps, runForTest } from "../cli/commit-work";
 import { LintFailure } from "../src/commit-work/lint-matrix";
+import { inLinkedWorktree, pushCommitted } from "../src/commit-work/push";
 import { PUSH_NON_FAST_FORWARD } from "./fixtures/git-push-goldens";
 import {
   argvStartsWith,
@@ -476,6 +477,133 @@ describe("commit-work: push failure", () => {
 });
 
 // ---------------------------------------------------------------------------
+// linked-worktree push skip (generic; submodule-guarded)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rules shaping the worktree DETECTION probes `pushCommitted` issues before the
+ * push leg. `kind` selects the topology:
+ *   - "main"      → git-dir == git-common-dir (the main worktree) → pushes.
+ *   - "worktree"  → git-dir != git-common-dir, no superproject → push SKIPPED.
+ *   - "submodule" → git-dir != git-common-dir BUT superproject non-empty →
+ *                   guarded false-positive → still pushes.
+ */
+function detectionRules(
+  kind: "main" | "worktree" | "submodule",
+): FakeGitRule[] {
+  const superproject = kind === "submodule" ? "/repo/super\n" : ""; // non-empty only in a submodule
+  const gitDir =
+    kind === "main" ? "/repo/.git\n" : "/repo/.git/worktrees/lane\n"; // linked worktree / submodule git dir differ
+  const commonDir = "/repo/.git\n";
+  return [
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--show-superproject-working-tree"),
+      result: { exitCode: 0, stdout: superproject },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+      result: { exitCode: 0, stdout: gitDir },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(
+          a,
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ),
+      result: { exitCode: 0, stdout: commonDir },
+    },
+  ];
+}
+
+describe("commit-work: linked-worktree push skip", () => {
+  test("in a linked worktree, commits but SKIPS push with a skipped:worktree envelope", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: [
+        ...detectionRules("worktree"),
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: in worktree", "--session-id", "s1"],
+      d,
+    );
+    // Skip is a SUCCESS — exit 0.
+    expect(code).toBe(0);
+
+    const lines = stdout.split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBe(2);
+    // Line 1 — the commit still landed.
+    expect(JSON.parse(lines[0]).success).toBe(true);
+    // Line 2 — the distinct skipped envelope (compact).
+    expect(JSON.parse(lines[1])).toEqual({
+      success: true,
+      pushed: false,
+      skipped: "worktree",
+      branch: "main",
+    });
+    expect(lines[1]).not.toMatch(/^\s/); // compact
+
+    // The DECISION: committed, never pushed.
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+
+  test("main-tree behavior unchanged — git-dir == common-dir → pushes", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: [
+        ...detectionRules("main"),
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: main tree", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    const lines = stdout.split("\n").filter((l) => l.length > 0);
+    expect(JSON.parse(lines[1])).toEqual({
+      success: true,
+      pushed: true,
+      remote: "origin",
+      branch: "main",
+    });
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(true);
+  });
+
+  test("submodule checkout still pushes (false-positive guarded by superproject)", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: [
+        ...detectionRules("submodule"),
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: in submodule", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    const lines = stdout.split("\n").filter((l) => l.length > 0);
+    // Despite git-dir != common-dir, the superproject guard vetoes the skip.
+    expect(JSON.parse(lines[1])).toEqual({
+      success: true,
+      pushed: true,
+      remote: "origin",
+      branch: "main",
+    });
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // deletion staging
 // ---------------------------------------------------------------------------
 
@@ -531,5 +659,75 @@ describe("commit-work: lint_failed", () => {
     expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
       false,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inLinkedWorktree / pushCommitted detection unit tests
+// ---------------------------------------------------------------------------
+
+describe("inLinkedWorktree", () => {
+  test("true when git-dir != git-common-dir and no superproject (linked worktree)", async () => {
+    const { run } = fakeAsyncGit(detectionRules("worktree"));
+    expect(await inLinkedWorktree("/repo/wt", run)).toBe(true);
+  });
+
+  test("false in the main worktree (git-dir == git-common-dir)", async () => {
+    const { run } = fakeAsyncGit(detectionRules("main"));
+    expect(await inLinkedWorktree("/repo", run)).toBe(false);
+  });
+
+  test("false in a submodule even though git-dir != git-common-dir (guarded)", async () => {
+    const { run, calls } = fakeAsyncGit(detectionRules("submodule"));
+    expect(await inLinkedWorktree("/repo/sub", run)).toBe(false);
+    // The superproject guard short-circuits — git-dir is never even probed.
+    expect(
+      calls.some((c) =>
+        argvStartsWith(
+          c.args,
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-dir",
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  test("fail-open: a git error on the dir probes returns false (push not suppressed)", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--show-superproject-working-tree"),
+        result: { exitCode: 0, stdout: "" },
+      },
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+        result: { exitCode: 128, stderr: "fatal: not a git repository" },
+      },
+    ]);
+    expect(await inLinkedWorktree("/nowhere", run)).toBe(false);
+  });
+});
+
+describe("pushCommitted: worktree skip gate", () => {
+  test("returns the skipped:worktree envelope without issuing a push", async () => {
+    const { run, calls } = fakeAsyncGit([
+      ...detectionRules("worktree"),
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+        result: { exitCode: 0, stdout: "keeper/epic/x/lane\n" },
+      },
+    ]);
+    const env = await pushCommitted("/repo/wt", run);
+    expect(env).toEqual({
+      success: true,
+      pushed: false,
+      skipped: "worktree",
+      branch: "keeper/epic/x/lane",
+    });
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+    // The @{u} upstream probe is also skipped — the gate is BEFORE it.
+    expect(calls.some((c) => c.args.includes("@{u}"))).toBe(false);
   });
 });
