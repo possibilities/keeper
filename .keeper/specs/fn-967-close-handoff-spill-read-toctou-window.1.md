@@ -23,5 +23,5 @@ region and land as one commit.
       remain green.
 
 ## Done summary
-
+Read resolved realDoc instead of unresolved msg.doc_path in the request_handoff spill read, closing the TOCTOU symlink-swap window; added an in-dir-symlink->out-of-dir integration test asserting the loud out-of-dir ok:false.
 ## Evidence

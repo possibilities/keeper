@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Read resolved spill path, test symlink",
-  "updated_at": "2026-06-25T08:26:04.479000Z"
+  "updated_at": "2026-06-25T08:35:22.268000Z",
+  "worker_done_at": "2026-06-25T08:35:22.268000Z"
 }
