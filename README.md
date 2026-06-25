@@ -21,7 +21,11 @@ spawned through `keeper plan`. The pair is fill-once: a resume preserves an
 already-bound pair, but a row that was minted with a NULL pair (an
 out-of-order `UserPromptSubmit` fork-seed landing before the session's
 SessionStart) COALESCE-heals to the spawn name's pair when the SessionStart
-folds, so a worker binds to its task regardless of fold order. Two paired stoppage annotations ride alongside
+folds, so a worker binds to its task regardless of fold order. A
+`handoff::<id>` spawn name (fn-946) is a SEPARATE spawn-name class, NOT a
+plan_verb: it is matched by its own anchored regex and binds the `handoffs`
+job→job edge — it MUST NOT populate `(plan_verb, plan_ref)` and never widens
+the `{plan, work, close}` whitelist. Two paired stoppage annotations ride alongside
 the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
 v24) marks a stoppage caused by a terminal Claude-API HTTP failure the
 human hasn't picked up since, and `(last_input_request_at,
@@ -290,7 +294,12 @@ singleton's `yolo`/`armed` mode column) and `set_epic_armed` (`EpicArmed` → th
 relay): the level-triggered reconciler re-reads mode + armed from the projection
 each cycle, woken by the fold's `data_version` bump. fn-774 gives `armed_epics`
 a SECOND writer — a fold-side prune (NOT an RPC) that deletes the row when an
-epic folds to `status='done'`, so a completed epic can't stay armed. RPC handlers — via the
+epic folds to `status='done'`, so a completed epic can't stay armed. A SIXTH
+mutating RPC (fn-946) is `request_handoff` — the `keeper handoff` enqueue:
+through the same main-bridge it mints a `HandoffRequested` synthetic event →
+the durable `handoffs` projection, the fire-and-forget hand-off of a contextful
+brief to a fresh worker (a separate keeperd worker dispatches it via a
+mint-before-launch transactional outbox). RPC handlers — via the
 scoped main-bridge — append real events to the log AND flip the `dead_letters`
 audit row in one transaction; never reducer projections directly (see
 [CLAUDE.md](./CLAUDE.md)'s DO NOT list). Example clients ship under the unified
@@ -308,8 +317,9 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   canonical writer each (the hook for hook events; main for synthetic
   events). The socket DOES carry `rpc` frames, but RPC handlers write only a
   tightly-scoped set of external surfaces — never the reducer's projections
-  directly. The write verbs (`replay_dead_letter`, `retry_dispatch`, and the
-  fn-751 autopilot pair `set_autopilot_mode` / `set_epic_armed`) APPEND a
+  directly. The six write verbs (`replay_dead_letter`, `retry_dispatch`, the
+  fn-751 autopilot pair `set_autopilot_mode` / `set_epic_armed`,
+  `set_autopilot_paused`, and the fn-946 `request_handoff`) APPEND a
   synthetic event through the scoped main-bridge so the reducer — still the sole
   projection writer — folds it on the next drain. Consumers may still read any of
   it directly from SQLite.
@@ -435,6 +445,11 @@ Keeper has no `install` verb. Wire it up manually:
      absent/empty leaves it unset (no prefix). Plan-form (`<verb>::<id>`)
      dispatches are never prefixed, and `keeper dispatch --no-prefix` bypasses
      it for one invocation.
+   - `handoff_prompt_prefix` — the sibling prefix for `keeper handoff`
+     dispatches (fn-946). When set (e.g. `/hack `), each fire-and-forget
+     handoff-ee worker boots into `<prefix><brief>`, so an unprefixed handoff
+     lands in `/hack`; `keeper handoff --no-prefix` bypasses it for one call.
+     A non-empty string only; absent/empty leaves it unset (no prefix).
    - `disable_autoclose` — a list of keeper-managed session names
      (`pair`/`panels`/`agentbus`) whose stopped tracked windows the reaper's
      managed-session arm leaves OPEN instead of autoclosing — the debug opt-out.
@@ -949,7 +964,14 @@ event-log/reducer/hook touch. Run any of them with
   quit; under non-TTY (piped, redirected, CI) the TUI gate resolves to
   snapshot mode (fn-772) — board is a 2-stream view, so the latch holds
   until both streams fold before printing one frame + `keeper-meta:` and
-  exiting (`--watch` forces the old live passthrough).
+  exiting (`--watch` forces the old live passthrough). The board also renders
+  the `keeper handoff` relationship (fn-946): UNLIKE the epic-anchored
+  creator/refiner edges, a handoff is a job→job edge folded from
+  `HandoffRequested` + the callee's `handoff::<id>` `SessionStart` bind, so it
+  has no epic header to sit under and renders off each job's own
+  `handoff_links` array — a `handoff-from` line on the initiator's row
+  (pointing at the handoff-ee) and a `handoff-to` line on the handoff-ee's row
+  (pointing back at the initiator). The dash mirrors it as a relation badge.
 
   ```sh
   keeper board            # epics-only board, default scope
@@ -1327,24 +1349,7 @@ event-log/reducer/hook touch. Run any of them with
   echo | keeper dash          # non-TTY → 'keeper dash: requires a TTY', exit 1
   ```
 
-  The dash is the FIRST of two OpenTUI host surfaces; the SECOND is the
-  experiment-flagged `--agentwrap-modal` modal overlay (fn-935,
-  `src/agent/modal-overlay.ts` + `src/agent/modal-host.ts`), reached via
-  `keeper agent claude --agentwrap-modal`. It hosts claude in a Bun PTY and keeps
-  an OpenTUI renderer built ONCE but SUSPENDED as the resting state — so the
-  modal-closed period is a raw passthrough, byte-identical to a normal launch. A
-  reserved hotkey (ctrl-], the GS byte) resumes the renderer and floats a
-  placeholder test modal (`BoxRenderable`) over a dim alpha-blended scrim
-  (`FrameBufferRenderable` + `setCellWithAlphaBlending`); Esc or a click on the
-  scrim suspends it and forces a SIGWINCH redraw of the agent. stdin is a strict
-  single-owner mutex (keeper's passthrough listener is detached BEFORE
-  `renderer.resume()` and re-attached AFTER `suspend()`), each frame is bracketed
-  in `?2026` (skipped under tmux), and — sharing the dash invariant — the modal
-  host MUST `renderer.destroy()` (restoring alt-screen/raw) BEFORE propagating the
-  child's disposition on EVERY exit path, including child-exit-while-open and a
-  crash. v0 is the scrim only; the faithful libghostty-vt grid backdrop is a
-  deferred follow-on. The flag is claude-only and rejected for codex/pi, `-p`/
-  `--print`, and any non-TTY invocation.
+  The dash is keeper's OpenTUI host surface.
 
   Named launch-config presets (fn-937) live in a single registry,
   `~/.config/agentwrap/presets.yaml`, read ONLY by the dep-free `src/agent/config.ts`
@@ -1863,6 +1868,15 @@ will live on the autopilot surface, never plan metadata/state). v85 dropped
 the `sort_path` / `queue_jump` / `created_by_closer_of` `epics` columns, the
 `events.plan_queue_jump` column, the `[slotted-after-closer]` board pill, and
 the `/queue` surface (`/plan:next` + `keeper plan epic queue-jump`). As of
+schema v87 (fn-946) the deterministic-replayed `handoffs` projection lands —
+the durable record of a `keeper handoff` enqueue (`HandoffRequested` → one row
+per `handoff_id`, carrying the ≤64KB doc inline, plus the dispatcher's
+transactional-outbox lifecycle `requested`→`dispatching`→bound) — and v88 adds
+the `jobs.handoff_links` column (APPEND-via-ALTER, default `'[]'`), the per-job
+home for the rendered job→job handoff edge (`handoff-from` written by the
+`HandoffRequested` fold onto the initiator, `handoff-to` by the callee's
+`handoff::<id>` `SessionStart` bind fold). Both re-fold byte-identically from a
+pre-feature log (empty / `'[]'`). As of
 schema v31, the `git` collection is
 rebuilt around per-(session, file) attribution: `events` gains
 `bash_mutation_kind` + `bash_mutation_targets` (hook-side derived columns
@@ -3330,7 +3344,18 @@ keeper plugin's `experimental.monitors` manifest); that Monitor is INVISIBLE to
 the hook stream, so it does NOT populate `jobs.monitors` — which is correct, bus
 presence is the `bus.db` registry, not the hook-fed projection.
 
-The thirteen workers are fully independent; main supervises all thirteen
+A **fourteenth** Worker thread is the handoff dispatcher (epic fn-946):
+level-triggered on `PRAGMA data_version`, it picks the oldest `requested`
+`handoffs` row, mints a durable `HandoffDispatching` marker via main (the
+mint-before-launch transactional outbox — a `handoff-dispatching-request`
+relayed for the synthetic-event write, ACK-correlated) BEFORE it spawns the
+fire-and-forget handoff-ee worker into the initiator's tmux session, so a
+daemon restart mid-dispatch never double-launches (the level-triggered bind
+check asks "does a `handoff::<id>` SessionStart exist?" before re-dispatching)
+and never strands the handoff. The dispatch side-effect lives in the worker,
+NOT the fold — the fold is the pure decider.
+
+The fourteen workers are fully independent; main supervises all fourteen
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,
