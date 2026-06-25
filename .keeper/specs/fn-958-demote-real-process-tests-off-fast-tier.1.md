@@ -60,5 +60,5 @@ case" not "rename the whole file."
 - [ ] CLAUDE.md + README `*.slow` wording tightened to "extract individual slow case" (in place, no new paragraph)
 
 ## Done summary
-
+Extracted the usage-picker real-flock test (~30 child procs) and the tmux defaultTmuxCommandRunner sleep-30 timeout test into *.slow.test.ts siblings, wired both into the fast-tier path-ignore list (neither in the real-git allowlist), and tightened the CLAUDE.md/README slow-tier wording to 'extract an individual case.' Fast tier dropped from ~8s to ~5s; test:full/hygiene/lint green, zero coverage loss.
 ## Evidence

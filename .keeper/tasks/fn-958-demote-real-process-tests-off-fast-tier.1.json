@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Extract real-process tests to slow tier",
-  "updated_at": "2026-06-25T02:15:59.318000Z"
+  "updated_at": "2026-06-25T05:29:26.823000Z",
+  "worker_done_at": "2026-06-25T05:29:26.823000Z"
 }
