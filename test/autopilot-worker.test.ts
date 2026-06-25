@@ -289,6 +289,12 @@ interface FakeDepsOptions {
    * on-default-branch assertion paths.
    */
   worktree?: WorktreeDriver;
+  /**
+   * Realpath-normalizer for the worktree lane env. Defaults to identity so
+   * fixture paths stay byte-stable (no real-FS stat in the fast tier); pass a
+   * mapper (e.g. `/var/`→`/private/var/`) to assert the normalization seam.
+   */
+  realpath?: (p: string) => string;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -370,6 +376,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       log.timeoutBackstops.push({ ...args });
     },
     worktree: opts.worktree,
+    realpath: opts.realpath ?? ((p: string) => p),
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
   };
@@ -3867,6 +3874,70 @@ test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched
   // The (drift-guarded) shell command rebuilt with the worktree cwd.
   expect(depsLog.launches[0]?.argv.join(" ")).toContain(`cd ${wtPath} `);
   expect(depsLog.emissions).toEqual([]); // no DispatchFailed
+});
+
+test("fn-976 runReconcileCycle: a worktree-mode launch carries the realpath-normalized lane on the LaunchSpec (KEEPER_PLAN_WORKTREE)", async () => {
+  const { driver } = makeFakeWorktreeDriver();
+  const {
+    deps,
+    log: depsLog,
+    setJobByKey,
+  } = makeFakeDeps({
+    worktree: driver,
+    // Model the macOS /var → /private/var normalization the producer applies so
+    // the lane env equals the worker's eventual process.cwd().
+    realpath: (p) => p.replace(`${homedir()}/`, "/private/normalized/"),
+  });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/home/me/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // The spec carries the REALPATH-NORMALIZED lane (not the raw worktree path).
+  expect(depsLog.launches).toHaveLength(1);
+  expect(depsLog.launches[0]?.spec?.worktreePath).toBe(
+    "/private/normalized/worktrees/repo--keeper-epic-fn-1-foo",
+  );
+});
+
+test("fn-976 runReconcileCycle: a worktree-OFF launch carries NO lane on the LaunchSpec (byte-identical spec)", async () => {
+  const { driver } = makeFakeWorktreeDriver(); // assertion passes, no geometry
+  const {
+    deps,
+    log: depsLog,
+    setJobByKey,
+  } = makeFakeDeps({ worktree: driver });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: false });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(depsLog.launches).toHaveLength(1);
+  expect(depsLog.launches[0]?.spec?.worktreePath).toBeUndefined();
 });
 
 test("fn-959 runReconcileCycle: worktree ON provision failure → sticky DispatchFailed, no launch", async () => {

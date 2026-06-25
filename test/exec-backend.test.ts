@@ -664,6 +664,86 @@ test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode"
   ]);
 });
 
+test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --agentwrap-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
+  expect(
+    buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: LAP,
+      session: "autopilot",
+      prompt: "/plan:work fn-1-x.1",
+      claudeName: "work::fn-1-x.1",
+      model: "sonnet",
+      effort: "max",
+      worktreePath: "/private/var/wt/repo--keeper-epic-fn-1-x",
+      noConfirm: true,
+    }),
+  ).toEqual([
+    ...LAP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "autopilot",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=autopilot",
+    // The 2nd repeated env entry — the worktree lane carrier, right after the
+    // session entry and BEFORE the model/effort/name flags.
+    "--agentwrap-tmux-env",
+    "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
+    "--model",
+    "sonnet",
+    "--effort",
+    "max",
+    "--agentwrap-no-confirm",
+    "--name",
+    "work::fn-1-x.1",
+    "/plan:work fn-1-x.1",
+  ]);
+});
+
+test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WORKTREE before --resume (byte-pinned)", () => {
+  // A resumed worktree worker must NOT re-resolve to the main checkout, so the
+  // lane env rides resume mode too — emitted before the `--resume` tail.
+  expect(
+    buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: LAP,
+      session: "autopilot",
+      prompt: "", // unused in resume mode
+      resumeTarget: "work::fn-1-x.1",
+      worktreePath: "/private/var/wt/repo--keeper-epic-fn-1-x",
+      noConfirm: true,
+    }),
+  ).toEqual([
+    ...LAP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "autopilot",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=autopilot",
+    "--agentwrap-tmux-env",
+    "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
+    "--agentwrap-no-confirm",
+    "--resume",
+    "work::fn-1-x.1",
+  ]);
+});
+
+test("buildAgentwrapLaunchArgv: an empty worktreePath emits NO 2nd env entry (byte-identical to non-worktree)", () => {
+  const base = {
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+    model: "sonnet",
+    effort: "max",
+    noConfirm: true,
+  } as const;
+  expect(buildAgentwrapLaunchArgv({ ...base, worktreePath: "" })).toEqual(
+    buildAgentwrapLaunchArgv(base),
+  );
+});
+
 // --- parseAgentwrapStdout ---
 
 test("parseAgentwrapStdout: a schema_version:1 line → ok", () => {

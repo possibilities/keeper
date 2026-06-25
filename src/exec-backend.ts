@@ -91,6 +91,18 @@ export interface LaunchSpec {
   readonly model?: string;
   /** `--effort <e>`. Omitted when absent. */
   readonly effort?: string;
+  /**
+   * Worktree-mode lane path. When set (non-empty), the launch emits a SECOND
+   * `--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<path>` so the worker's `keeper
+   * plan` subprocesses resolve `target_repo`/`primary_repo`/`state_repo` to the
+   * lane worktree, not the shared main checkout (concurrent lanes otherwise
+   * collide). Realpath-normalized by the producer so it equals the worker's
+   * eventual `process.cwd()` (macOS `/var`→`/private/var`). Emitted in BOTH
+   * prompt and resume mode — a resumed worktree worker must not re-resolve to
+   * main. Omitted for non-worktree / pair launches (they stay byte-identical). A
+   * producer-only runtime signal, NEVER a fold input / projection column.
+   */
+  readonly worktreePath?: string;
 }
 
 /** One row of a `list-panes -a` sweep: the server-global pane id, its window
@@ -761,6 +773,13 @@ export interface AgentwrapLaunchOpts {
   readonly effort?: string;
   /** Whether to pass `--agentwrap-no-confirm` (the cwd-confirm suppressor). */
   readonly noConfirm: boolean;
+  /**
+   * Worktree-mode lane path (realpath-normalized by the producer). When set
+   * (non-empty), emit a SECOND `--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<path>`
+   * right after the `KEEPER_TMUX_SESSION` entry — agentwrap accepts the repeated
+   * flag (last-wins per dup key). Omitted → argv is byte-identical to today.
+   */
+  readonly worktreePath?: string;
 }
 
 /**
@@ -772,6 +791,7 @@ export interface AgentwrapLaunchOpts {
  *   `<bun> <abs cli/keeper.ts> agent claude --agentwrap-tmux
  *     --agentwrap-tmux-detached --agentwrap-tmux-session <session>
  *     --agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>
+ *     [--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<lane>]
  *     [--model <m>] [--effort <e>] [--agentwrap-no-confirm]
  *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
  *
@@ -789,7 +809,11 @@ export interface AgentwrapLaunchOpts {
  * binding carrier: the launcher injects it into the pane env via tmux `-e`, so
  * the SessionStart hook stamps the session name on the bound `jobs` row exactly
  * as the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
- * reap/classify parsing. Pure — exported for byte-pin tests.
+ * reap/classify parsing. A worktree-mode launch ({@link
+ * AgentwrapLaunchOpts.worktreePath} set) emits a SECOND `--agentwrap-tmux-env
+ * KEEPER_PLAN_WORKTREE=<lane>` immediately after, BEFORE the conditional tail —
+ * so it rides BOTH prompt and resume launches (a resumed worktree worker must
+ * not re-resolve to the main checkout). Pure — exported for byte-pin tests.
  */
 export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
   const flags: string[] = [];
@@ -821,6 +845,12 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     opts.session,
     "--agentwrap-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
+    // Worktree-mode lane carrier — a SECOND repeated `--agentwrap-tmux-env`
+    // (agentwrap last-wins per dup key). Emitted BEFORE `...flags`/`...tail` so
+    // it rides resume mode too. Absent → byte-identical to a non-worktree launch.
+    ...(opts.worktreePath !== undefined && opts.worktreePath !== ""
+      ? ["--agentwrap-tmux-env", `KEEPER_PLAN_WORKTREE=${opts.worktreePath}`]
+      : []),
     ...flags,
     ...tail,
   ];
@@ -1011,6 +1041,9 @@ export async function agentwrapLaunch(
       : {}),
     ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
     ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
+    ...(deps.spec.worktreePath !== undefined
+      ? { worktreePath: deps.spec.worktreePath }
+      : {}),
     noConfirm: true,
   });
   // agentwrap has no cwd flag — it reads its own `process.cwd()` for the

@@ -38,7 +38,7 @@
  * state pause/play.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -348,20 +348,26 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
  * inputs {@link agentwrapLaunch} builds its invocation from. Mirrors
  * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/
  * prompt) — that parity is a drift guard kept alongside the shell-wrapped
- * `buildLaunchArgv` shape even though agentwrap reads only this spec. Pure —
- * exported for tests.
+ * `buildLaunchArgv` shape even though agentwrap reads only this spec. A
+ * non-empty `worktreePath` rides the spec as the `KEEPER_PLAN_WORKTREE` lane
+ * env (worktree-mode launches only); absent/empty leaves it off so non-worktree
+ * launches stay byte-identical. Pure — exported for tests.
  */
 export function buildPlannedLaunchSpec(
   verb: Verb,
   id: string,
   model: string = WORKER_MODEL,
   effort: string = WORKER_EFFORT,
+  worktreePath?: string,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
     claudeName: dispatchKey(verb, id),
     model,
     effort,
+    ...(worktreePath !== undefined && worktreePath !== ""
+      ? { worktreePath }
+      : {}),
   };
 }
 
@@ -804,6 +810,16 @@ export interface ConfirmRunningDeps {
    * `reconcile`/fold arm, so re-fold determinism holds.
    */
   dirExists?(dir: string): boolean;
+  /**
+   * Realpath-normalize a worktree lane path before it rides the launch as the
+   * `KEEPER_PLAN_WORKTREE` env, so it equals the worker's eventual
+   * `process.cwd()` (macOS resolves `/var`→`/private/var`). A PRODUCER-side fs
+   * read by contract — lives in `runReconcileCycle`, never a fold arm. Defaults
+   * to a `realpathSync` wrapper that falls back to the input on any error (a
+   * not-yet-materialized path stays usable). Injected so tests assert the
+   * normalization seam without a real dir.
+   */
+  realpath?(p: string): string;
   /**
    * Sleep `ms`, abortable via the worker's shutdown signal. Resolves
    * early when `signal.aborted` flips; the caller checks the flag and
@@ -1909,6 +1925,19 @@ export async function runReconcileCycle(
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
 ): Promise<void> {
+  // Realpath-normalize the worktree lane before it rides the launch as the
+  // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
+  // never a fold. Falls back to the input on any error so a not-yet-materialized
+  // path stays usable. Injectable for tests.
+  const realpath =
+    deps.realpath ??
+    ((p: string): string => {
+      try {
+        return realpathSync.native(p);
+      } catch {
+        return p;
+      }
+    });
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
@@ -1947,6 +1976,11 @@ export async function runReconcileCycle(
     // on a loud failure (cleared by `retry_dispatch`) and skip — per-key, so a
     // sibling launch keeps dispatching.
     let launchCwd = plan.cwd;
+    // The realpath-normalized lane carried as KEEPER_PLAN_WORKTREE — set ONLY for
+    // a worktree-GEOMETRY launch (`plan.worktree` present). OFF-mode launches (no
+    // geometry, just the on-default-branch assertion) leave it undefined so their
+    // launch argv stays byte-identical to today.
+    let worktreeLane: string | undefined;
     if (deps.worktree !== undefined) {
       const wt = await runWorktreeProducerStep(plan, launchCwd, deps.worktree);
       if (!wt.ok) {
@@ -1960,6 +1994,14 @@ export async function runReconcileCycle(
         continue;
       }
       launchCwd = wt.cwd;
+      // A provisioned lane runs in its worktree, not the shared main checkout.
+      // Carry the realpath-normalized lane so the worker's `keeper plan`
+      // subprocesses resolve target/primary/state repo to it (and its
+      // pwd==TARGET_REPO check matches process.cwd()). Producer-only signal,
+      // never a fold input.
+      if (plan.worktree !== undefined) {
+        worktreeLane = realpath(launchCwd);
+      }
     }
     state.inFlight.add(plan.key);
     // STAMP the cooldown at the SAME point as `inFlight.add`, BEFORE the confirm
@@ -1993,6 +2035,7 @@ export async function runReconcileCycle(
       plan.id,
       plan.model,
       plan.effort,
+      worktreeLane,
     );
     try {
       const outcome = await confirmRunning(
