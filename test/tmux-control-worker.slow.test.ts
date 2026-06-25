@@ -1,9 +1,14 @@
 /**
- * Slow-tier integration test for the tmux control-mode focus worker (epic
- * fn-952). Exercises a REAL `tmux -C` control client against a THROWAWAY `-L`
- * server (never the developer's live tmux), proving the end-to-end chain the
- * worker relies on: attach with the no-output-once `-f` flags → frame
- * `list-clients` / `list-panes -a` replies by command number → derive focus.
+ * Slow-tier integration test for the tmux control-mode worker (epic fn-952,
+ * extended by fn-968 — topology relocation). Exercises a REAL `tmux -C` control
+ * client against a THROWAWAY `-L` server (never the developer's live tmux),
+ * proving the end-to-end chain the worker relies on: attach with the
+ * no-output-once `-f` flags → frame `list-clients` / `list-panes -a` replies by
+ * command number → derive focus AND the whole-server topology over the SAME
+ * connection (fn-968 made this worker the SOLE topology producer). The
+ * generation-boundary recycle probe (`display-message -p '#{pid}'`) STAYED in the
+ * restore-worker; the live-tmux assertion here proves the server pid flips after a
+ * kill+restart, so the recycle guard the relocation depends on still fires.
  *
  * Named `*.slow.test.ts` (excluded from the fast tier, allowlisted in
  * `scripts/test-real-git-allowlist.txt`); runs only under `bun run test:full`.
@@ -21,7 +26,9 @@ import {
   deriveFocus,
   LIST_CLIENTS_FORMAT,
   LIST_PANES_FORMAT,
+  mapPaneRowsToTopology,
 } from "../src/tmux-control-worker";
+import { hashTopology, parsePaneLines } from "../src/tmux-focus-derive";
 import { retryUntil } from "./helpers/retry-until";
 
 /** A throwaway tmux server socket name (`-L`) unique per run so a parallel test
@@ -227,5 +234,177 @@ maybe("tmux-control-worker — live `tmux -C` attach", () => {
     }
     // Re-establish the throwaway server so afterAll teardown is a clean no-op.
     tmux(["new-session", "-d", "-s", ANCHOR, "-x", "80", "-y", "24"]);
+  });
+
+  test("the topology snapshot tracks a live window/session change over the SAME framed re-read", async () => {
+    // fn-968: the control worker maps its EXISTING `list-panes -a` re-read into a
+    // TmuxTopologySnapshot. Drive a real topology change on the server and assert
+    // the mapped panes + the shared `hashTopology` track it (the old restore-worker
+    // poll's dedup contract, now fed by the control feed).
+    control = spawnControlClient();
+    const child = control;
+    const lineBuf = new LineBuffer();
+    const decoder = new TextDecoder();
+    const replyQueue: ((lines: string[]) => void)[] = [];
+    let resolveFirstChunk: () => void = () => {};
+    const firstChunk = new Promise<void>((r) => {
+      resolveFirstChunk = r;
+    });
+    const reader = child.stdout.getReader();
+    let stopped = false;
+    const readerDone = (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done || stopped) break;
+          const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+          if (lines.length === 0) continue;
+          const events = parseControlStream(`${lines.join("\n")}\n`);
+          for (const ev of events) {
+            if (ev.kind === "reply") {
+              const waiter = replyQueue.shift();
+              if (waiter) waiter([...ev.lines]);
+            }
+          }
+          resolveFirstChunk();
+        }
+      } catch {
+        // cancelled at teardown
+      }
+    })();
+    const sendCommand = (text: string): Promise<string[]> =>
+      new Promise<string[]>((resolve) => {
+        replyQueue.push(resolve);
+        child.stdin.write(`${text}\n`);
+        child.stdin.flush?.();
+      });
+
+    await firstChunk;
+    await sendCommand("refresh-client -f no-output");
+
+    // The server pid is the topology generation handle — read it ONCE over the
+    // connection, exactly like the worker's first re-read.
+    const generationId = (
+      await sendCommand("display-message -p '#{pid}'")
+    )[0]?.trim();
+    expect(generationId).toMatch(/^\d+$/);
+
+    // Initial topology: map the framed re-read into the topology pane shape (no
+    // jobs → no job_id stamps, hash-irrelevant) and hash it.
+    const readTopology = async (): Promise<{
+      panes: ReturnType<typeof mapPaneRowsToTopology>;
+      hash: string;
+    }> => {
+      const panesBody = (
+        await sendCommand(`list-panes -a -F '${LIST_PANES_FORMAT}'`)
+      ).join("\n");
+      const panes = mapPaneRowsToTopology(parsePaneLines(panesBody), []);
+      return { panes, hash: hashTopology(generationId as string, panes) };
+    };
+
+    const before = await readTopology();
+    expect(before.panes.length).toBeGreaterThan(0);
+    expect(before.panes.some((p) => p.session_name === ANCHOR)).toBe(true);
+
+    // Drive a REAL topology change: create a brand-new session (a new pane in a
+    // new session_name). The control client observes it on its next re-read.
+    const NEW_SESSION = "fn968topo";
+    tmux(["new-session", "-d", "-s", NEW_SESSION, "-x", "80", "-y", "24"]);
+
+    // Poll the framed re-read until the new session's pane appears AND the shared
+    // hash has moved off the pre-change value — the topology tracked the change.
+    const tracked = await retryUntil(async () => {
+      const after = await readTopology();
+      const sawNew = after.panes.some((p) => p.session_name === NEW_SESSION);
+      return sawNew && after.hash !== before.hash ? after : null;
+    }, 5000);
+    expect(tracked).not.toBeNull();
+    expect(tracked?.panes.some((p) => p.session_name === NEW_SESSION)).toBe(
+      true,
+    );
+    expect(tracked?.hash).not.toBe(before.hash);
+
+    tmux(["kill-session", "-t", NEW_SESSION]);
+    stopped = true;
+    child.kill();
+    await reader.cancel().catch(() => {});
+    await Promise.race([readerDone, Bun.sleep(1000)]);
+    control = null;
+  });
+
+  test("the generation boundary re-fires after a kill+restart (the recycle guard survives the relocation)", async () => {
+    // The generation-boundary probe STAYED in the restore-worker; relocating the
+    // topology poll must not break it. Read the server pid over a control client,
+    // kill+restart the server, re-attach, and assert the pid (the generation
+    // handle) FLIPPED — a recycled `%N` in the new generation must not re-target a
+    // prior-generation job, which is exactly what the new pid scopes.
+    const readPid = async (): Promise<string> => {
+      const c = spawnControlClient();
+      const lineBuf = new LineBuffer();
+      const decoder = new TextDecoder();
+      const replyQueue: ((lines: string[]) => void)[] = [];
+      let resolveFirstChunk: () => void = () => {};
+      const firstChunk = new Promise<void>((r) => {
+        resolveFirstChunk = r;
+      });
+      const reader = c.stdout.getReader();
+      let stopped = false;
+      const readerDone = (async () => {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done || stopped) break;
+            const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+            if (lines.length === 0) continue;
+            const events = parseControlStream(`${lines.join("\n")}\n`);
+            for (const ev of events) {
+              if (ev.kind === "reply") {
+                const waiter = replyQueue.shift();
+                if (waiter) waiter([...ev.lines]);
+              }
+            }
+            resolveFirstChunk();
+          }
+        } catch {
+          // cancelled at teardown
+        }
+      })();
+      const sendCommand = (text: string): Promise<string[]> =>
+        new Promise<string[]>((resolve) => {
+          replyQueue.push(resolve);
+          c.stdin.write(`${text}\n`);
+          c.stdin.flush?.();
+        });
+      await firstChunk;
+      await sendCommand("refresh-client -f no-output");
+      const pid = (await sendCommand("display-message -p '#{pid}'"))[0]?.trim();
+      stopped = true;
+      c.kill();
+      await reader.cancel().catch(() => {});
+      await Promise.race([readerDone, Bun.sleep(1000)]);
+      return pid ?? "";
+    };
+
+    const gen1 = await readPid();
+    expect(gen1).toMatch(/^\d+$/);
+
+    // Kill the server entirely, then bring a fresh one up — a NEW server process
+    // (a new generation). Wait for the old server to be gone before re-creating.
+    tmux(["kill-server"]);
+    await retryUntil(
+      () => (tmux(["list-sessions"]).success ? null : true),
+      5000,
+    );
+    tmux(["new-session", "-d", "-s", ANCHOR, "-x", "80", "-y", "24"]);
+    await retryUntil(
+      () => (tmux(["list-sessions"]).success ? true : null),
+      5000,
+    );
+
+    const gen2 = await readPid();
+    expect(gen2).toMatch(/^\d+$/);
+    // The generation boundary re-fired: a fresh server pid scopes the recycle
+    // guard so a recycled `%N` can't resurrect a dead generation's job location.
+    expect(gen2).not.toBe(gen1);
   });
 });

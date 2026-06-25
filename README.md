@@ -83,7 +83,7 @@ a pane the human relocates out-of-band, so it folds onto the forensic
 LIVE `jobs.backend_exec_session_id` is owned by the `TmuxTopologySnapshot`
 live-only fold instead (see the projection-class taxonomy). A human-created tmux
 session carries no `KEEPER_TMUX_SESSION`; its live session name lands via that
-same topology poller. The generic `backend_exec_*` naming keeps a further backend slotting in
+same real-time control-worker topology feed. The generic `backend_exec_*` naming keeps a further backend slotting in
 without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every `keeper plan`
@@ -2112,10 +2112,11 @@ rewinding migration RESETS its floor + sets `seed_required` (via
 wiped-and-replayed alongside the deterministic ones. As of schema v83 (fn-907)
 the same live-producer-fed class covers a SECOND surface: the two tmux
 location columns on `jobs` — `backend_exec_session_id` (the pane's CURRENT tmux
-session) and `window_index` (its left-to-right visual position). A keeperd
-timer-poll producer reads `tmux list-panes -a` (whole-server, one shot) and mints
-one authoritative `TmuxTopologySnapshot` event; a live-only fold keyed on
-`(generation_id, pane_id)` overwrites those two columns within ~1-2s of any
+session) and `window_index` (its left-to-right visual position). The persistent
+`tmux -C` control worker (epic fn-968 — the tenth worker) reads the whole-server
+pane set over its existing framed re-read and mints one authoritative
+`TmuxTopologySnapshot` event; a live-only fold keyed on
+`(generation_id, pane_id)` overwrites those two columns in real time on any
 out-of-band `break-pane`/`move-window`, gated above
 `tmux_projection_state.floor` (a singleton `floor` + `seed_required` mirroring
 `git_projection_state`, boot-seeded after the drain before the actuator gate).
@@ -2251,8 +2252,8 @@ backend-exec coordinates are materialized as first-class columns on the
 synchronous `process.env` values on EVERY event for the tmux backend:
 `TMUX` → `backend_exec_type='tmux'`, `KEEPER_TMUX_SESSION` → `backend_exec_session_id`
 (present only on keeper-managed launches, injected via `-e`; a human-created
-tmux session gets it filled later by the restore-worker pane poller, epic
-fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
+tmux session gets its LIVE session name filled later by the control-worker's
+`TmuxTopologySnapshot` feed, epic fn-968), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
 PPID-walk; absent env ⇒ NULL coords, never a bogus `type`). The pane id is a
 two-step read: native `TMUX_PANE` first, else the keeper-owned carrier
 `KEEPER_TMUX_PANE` (the launcher strips `TMUX`/`TMUX_PANE` to let Claude emit
@@ -3260,19 +3261,11 @@ reducer arm, no `keeper/api.py` change (the `close_kind` v70 / `window_index` v7
 column bumps that power the DB-derived set are separate, and carry their
 `SUPPORTED_SCHEMA_VERSIONS` entries; see the Architecture schema history).
 
-Riding a ~1s timer wake (NOT gated on a live tmux job — a pane MOVE happens to an
-already-running worker), the worker spawns ONE whole-server `tmux list-panes -a`
-probe and, on a topology-hash change, posts a `TmuxTopologySnapshot` event
-carrying `{generation_id, panes:[{pane_id, session_name, window_index}]}`. As of
-schema v83 (fn-907) this is the SOLE owner of the two live location columns: the
-reducer's live-only fold matches each live tmux job by `pane_id`, verifies/adopts
-`generation_id` (the recycled-`%N` guard), and overwrites
-`jobs.backend_exec_session_id` + `jobs.window_index` only with present non-NULL
-values, gated above `tmux_projection_state.floor`. The earlier
-`WindowIndexSnapshot` + `TmuxPaneSnapshot` folds are now explicit reducer no-ops
-(a historical event of either type must not re-route into the projection, so the
-OTHER `jobs` columns still re-fold byte-identically). A THIRD post (epic fn-819) rides the
-same pulse but is UNGATED by a live tmux job: a `tmux display-message -p
+The window_index this worker mirrors into `restore.json` rides straight off each
+job's `jobs` projection row, kept fresh by the control-worker's
+`TmuxTopologySnapshot` fold (see the tenth worker) — the restore worker no longer
+probes tmux for topology. It retains a SINGLE event-log channel on its ~1s timer
+wake, UNGATED by a live tmux job (epic fn-819): a `tmux display-message -p
 '#{pid}'` probe reads the tmux SERVER pid (the backend "generation" handle), and
 on a change — pid-hash-gated, boot-seeded from the last logged event so a
 keeperd restart against an unchanged server is silent — the worker mints a
@@ -3281,11 +3274,38 @@ ungated precisely because the post-crash state has no live job, yet the
 freshly-respawned server is the generation crash-restore must scope to. The
 reducer folds `BackendExecStart` via an explicit NO-OP arm (the boundary lives
 in the event-log `id` order, read at restore time, NOT a projection column — no
-schema bump). Those three posts are the worker's only worker→main channel and
-only event-log contribution — the restore-file write path remains a pure
-consumer side-file. Write failures are swallowed to stderr (next pulse retries);
-only an unhandled throw out of the watch loop escalates to `onerror`/`close` →
+schema bump). That single post is the worker's only worker→main channel and only
+event-log contribution — the restore-file write path remains a pure consumer
+side-file. Write failures are swallowed to stderr (next pulse retries); only an
+unhandled throw out of the watch loop escalates to `onerror`/`close` →
 fatalExit.
+
+A **tenth** Worker thread is the tmux control-mode worker (epic fn-952, extended
+by fn-968): a persistent `tmux -C` control client parked on an anchor session,
+gated on `hasLiveTmuxJob` (no live tmux job ⇒ nothing to observe, so it stays
+disconnected and re-checks on a ~1s connect-gate poll). On connect it bootstraps
+the no-output flags and, debouncing the control-mode notification burst into one
+framed re-read, issues `list-clients` + `list-panes -a` over the SAME persistent
+connection (a framed command, NOT a subprocess) and parses both in one pass. From
+that single re-read it emits BOTH live-only surfaces: a `TmuxClientFocusSnapshot`
+(the current real (non-control) client's focused session/window/pane, UPSERTing
+the `tmux_client_focus` singleton) AND — as of fn-968, this worker is now the SOLE
+topology producer — a `TmuxTopologySnapshot` carrying `{generation_id,
+panes:[{pane_id, session_name, window_index}]}`, deduped via the shared
+`hashTopology` so a steady topology never re-posts within a connection. The
+topology emit is gated on `hasLiveTmuxJob` and posts NOTHING on a null generation,
+read fault, or empty pane set (a wiping empty snapshot would clobber every live
+job location — unlike focus, which posts `status:"none"`). Main mints both events;
+the `TmuxTopologySnapshot` fold (schema v83, fn-907) is the SOLE owner of the two
+live location columns, matching each live tmux job by `pane_id`, verifying/adopting
+`generation_id` (the recycled-`%N` guard), and overwriting
+`jobs.backend_exec_session_id` + `jobs.window_index` only with present non-NULL
+values, gated above `tmux_projection_state.floor`. The earlier
+`WindowIndexSnapshot` + `TmuxPaneSnapshot` folds are explicit reducer no-ops (a
+historical event of either type must not re-route into the projection, so the
+OTHER `jobs` columns still re-fold byte-identically). A `%exit` / EOF triggers a
+backoff reconnect (a fresh generation re-read on every connect); a flapping server
+escalates to `fatalExit` after the consecutive-failure cap.
 
 An **eleventh** Worker thread is the tmux window-renamer (epic fn-801): a
 pure EXTERNAL ACTUATOR that opens its own read-only connection, polls

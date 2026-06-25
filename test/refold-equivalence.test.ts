@@ -61,7 +61,12 @@ import {
   RETENTION_SHED_PREDICATE,
   retainColdPayloads,
 } from "../src/compaction";
-import { EPHEMERAL_PROJECTIONS, openDb, SCHEMA_VERSION } from "../src/db";
+import {
+  EPHEMERAL_PROJECTIONS,
+  openDb,
+  readTmuxProjectionFloor,
+  SCHEMA_VERSION,
+} from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { __resetMonitorProvenanceMemoForTest, drain } from "../src/reducer";
 import { resolveBridgeAgentId } from "../src/subagent-invocations";
@@ -2154,6 +2159,207 @@ test("NECESSARY (negative control): deleting the BROAD shed class instead diverg
 
   // The broad delete is NOT re-fold-safe — at least one projection differs.
   expect(diverged).not.toEqual(p0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-968 — MIXED-SOURCE `TmuxTopologySnapshot` re-fold (producer relocation).
+//
+// The topology producer moved from the restore-worker `list-panes -a` poll
+// (epic fn-907) to the persistent `tmux -C` control worker (epic fn-968) WITHOUT
+// touching the fold, the floor, the boot-seed, or the no-op arms. The two
+// producers mint a BYTE-IDENTICAL `TmuxTopologySnapshot` payload (the shared
+// `hashTopology` over the same `{pane_id, session_name, window_index}` triples),
+// so a single event log can carry events from BOTH eras. These tests pin two
+// invariants the relocation must preserve:
+//
+//   (1) the two LIVE-ONLY location columns (`backend_exec_session_id` +
+//       `window_index`) are CHARTER-EXCLUDED — a historical TmuxTopologySnapshot
+//       (`id <= tmux_projection_state.floor`) no-ops, exactly as in production
+//       where the boot-seed re-derives the surface and raises the floor;
+//   (2) the DETERMINISTIC-replayed projection class re-folds byte-identically
+//       over a mixed-source log — the cursor advances on every topology event
+//       regardless of which producer minted it, and no other projection moves.
+// ---------------------------------------------------------------------------
+
+/** Insert a live (`working`) tmux SessionStart carrying the backend-exec coords
+ *  the jobs fold reads from the EVENT columns (not the body). On re-fold this
+ *  re-creates the job row with `backend_exec_type='tmux'` + the pane id, so a
+ *  TmuxTopologySnapshot above the floor can resolve it. */
+function insertTmuxSessionStart(opts: {
+  sessionId: string;
+  paneId: string;
+  ts?: number;
+}): number {
+  const ts = opts.ts ?? tsCounter++;
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, data,
+       backend_exec_type, backend_exec_pane_id
+     ) VALUES (?, ?, ?, 'SessionStart', 'session_start', '{}', 'tmux', ?)`,
+    [ts, opts.sessionId, 4242, opts.paneId],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+
+/** Insert a `TmuxTopologySnapshot` synthetic event — the SAME payload shape BOTH
+ *  the restore-worker poll and the control-worker feed mint (the relocation is a
+ *  byte-identical contract). `source` only documents which producer era it
+ *  models; the event is identical either way (asserted below). */
+function insertTopologySnapshot(opts: {
+  generationId: string;
+  panes: Array<{
+    pane_id: string;
+    session_name: string;
+    window_index: number | null;
+  }>;
+  ts?: number;
+}): number {
+  return insertEvent({
+    hook_event: "TmuxTopologySnapshot",
+    session_id: "control-worker",
+    event_type: "tmux_topology",
+    ts: opts.ts,
+    data: JSON.stringify({
+      generation_id: opts.generationId,
+      panes: opts.panes,
+    }),
+  });
+}
+
+/** The live tmux location columns the TmuxTopologySnapshot fold OWNS — the
+ *  charter-excluded surface. */
+function tmuxJobLocation(jobId: string): {
+  backend_exec_session_id: string | null;
+  window_index: number | null;
+} | null {
+  return db
+    .query(
+      "SELECT backend_exec_session_id, window_index FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    backend_exec_session_id: string | null;
+    window_index: number | null;
+  } | null;
+}
+
+test("mixed-source TmuxTopologySnapshot events mint a byte-identical payload regardless of producer era", () => {
+  // The dedup contract (and thus the fold input) is producer-agnostic: a
+  // restore-worker-era event and a control-worker-era event for the SAME tmux
+  // state carry the IDENTICAL `data` blob. This is the relocation's load-bearing
+  // property — a single log can carry both, and the fold can't tell them apart.
+  const panes = [
+    { pane_id: "%42", session_name: "main", window_index: 3 },
+    { pane_id: "%10", session_name: "work", window_index: 1 },
+  ];
+  const restoreEraId = insertTopologySnapshot({ generationId: "g1", panes });
+  const controlEraId = insertTopologySnapshot({ generationId: "g1", panes });
+  const restoreData = db
+    .query("SELECT data FROM events WHERE id = ?")
+    .get(restoreEraId) as { data: string };
+  const controlData = db
+    .query("SELECT data FROM events WHERE id = ?")
+    .get(controlEraId) as { data: string };
+  expect(controlData.data).toBe(restoreData.data);
+});
+
+test("mixed-source re-fold: the live location columns are charter-excluded; a floor-gated historical topology no-ops", () => {
+  // A live tmux job whose pane is reported by topology snapshots from BOTH
+  // producer eras (an early restore-worker-era snapshot, then a later
+  // control-worker-era snapshot that MOVES the pane). The live drain lands the
+  // latest location on the jobs row.
+  insertTmuxSessionStart({ sessionId: SESS_A, paneId: "%42" });
+  insertTopologySnapshot({
+    generationId: "gen-1",
+    panes: [{ pane_id: "%42", session_name: "early", window_index: 0 }],
+  });
+  insertTopologySnapshot({
+    generationId: "gen-1",
+    panes: [{ pane_id: "%42", session_name: "moved", window_index: 5 }],
+  });
+  drainAll();
+
+  // The live surface tracks the LATEST snapshot (overwrite semantics).
+  expect(tmuxJobLocation(SESS_A)).toEqual({
+    backend_exec_session_id: "moved",
+    window_index: 5,
+  });
+
+  // Capture the DETERMINISTIC projection set (snapshotProjections compares
+  // `jobs` via SELECT *, but the byte-diff below RAISES the floor first so the
+  // live-only columns re-derive to their charter-excluded NULL default on the
+  // re-fold — exactly the production boot-seed shape).
+  rewindAndWipeProjections();
+  // Production boot-seed shape: raise the tmux floor ABOVE every historical
+  // topology event so the fold no-ops on replay (the live surface is re-derived
+  // by the boot-seed, NOT the event log). Without a boot-seed in this test the
+  // columns stay at their fresh-row NULL default.
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  db.run("UPDATE tmux_projection_state SET floor = ? WHERE id = 1", [maxId]);
+  expect(readTmuxProjectionFloor(db)).toBe(maxId);
+  drainAll();
+
+  // CHARTER EXCLUSION: every historical TmuxTopologySnapshot folded below the
+  // floor → no-op. The live-only columns are NOT replayed; they sit at their
+  // fresh-row NULL default (production re-derives them via the boot-seed).
+  expect(tmuxJobLocation(SESS_A)).toEqual({
+    backend_exec_session_id: null,
+    window_index: null,
+  });
+});
+
+test("mixed-source re-fold: two from-scratch re-folds over the floor-gated topology log are byte-identical (deterministic class)", () => {
+  // Seed a deterministic-class baseline ALONGSIDE the mixed-source topology log
+  // so the byte-diff has real deterministic rows to compare — the topology
+  // events must advance the cursor without perturbing them.
+  seedLiveShapedCorpus();
+  insertTmuxSessionStart({ sessionId: SESS_C, paneId: "%7" });
+  insertTopologySnapshot({
+    generationId: "gen-2",
+    panes: [{ pane_id: "%7", session_name: "alpha", window_index: 2 }],
+  });
+  insertTopologySnapshot({
+    generationId: "gen-2",
+    panes: [{ pane_id: "%7", session_name: "beta", window_index: 4 }],
+  });
+  drainAll();
+
+  // Raise the floor (boot-seed shape) so the topology events no-op on replay,
+  // then take two from-scratch re-folds and assert byte-identity over the
+  // DETERMINISTIC-replayed class (snapshotProjections, which excludes the
+  // ephemeral set). The live-only location columns re-derive to NULL on both
+  // re-folds, so they never diverge.
+  const raiseFloorToMax = (): void => {
+    const maxId = (
+      db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+    ).m;
+    db.run("UPDATE tmux_projection_state SET floor = ? WHERE id = 1", [maxId]);
+  };
+
+  rewindAndWipeProjections();
+  raiseFloorToMax();
+  drainAll();
+  const refold1 = snapshotProjections();
+
+  rewindAndWipeProjections();
+  raiseFloorToMax();
+  drainAll();
+  const refold2 = snapshotProjections();
+
+  expect(refold2).toEqual(refold1);
+  // The cursor advanced past every topology event (the deterministic projections
+  // folded normally beneath them).
+  const cursor = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  expect(cursor).toBe(maxId);
 });
 
 // ---------------------------------------------------------------------------
