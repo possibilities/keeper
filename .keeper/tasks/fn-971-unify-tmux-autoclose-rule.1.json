@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T15:46:03.185000Z",
+  "depends_on": [],
+  "epic": "fn-971-unify-tmux-autoclose-rule",
+  "id": "fn-971-unify-tmux-autoclose-rule.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "glob-capable disable_autoclose matcher",
+  "updated_at": "2026-06-25T15:46:03.185000Z"
+}
