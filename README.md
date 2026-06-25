@@ -3388,8 +3388,10 @@ the hook stream, so it does NOT populate `jobs.monitors` — which is correct, b
 presence is the `bus.db` registry, not the hook-fed projection.
 
 A **fourteenth** Worker thread is the handoff dispatcher (epic fn-946):
-level-triggered on `PRAGMA data_version`, it picks the oldest `requested`
-`handoffs` row, mints a durable `HandoffDispatching` marker via main (the
+level-triggered on `PRAGMA data_version`, it picks an actionable
+`requested`/stale-`dispatching` `handoffs` row (selection is
+`handoff_id`-lexicographic over a random UUID, not temporal — there is no
+created-at column to order on), mints a durable `HandoffDispatching` marker via main (the
 mint-before-launch transactional outbox — a `handoff-dispatching-request`
 relayed for the synthetic-event write, ACK-correlated) BEFORE it spawns the
 fire-and-forget handoff-ee worker into the initiator's tmux session, so a
