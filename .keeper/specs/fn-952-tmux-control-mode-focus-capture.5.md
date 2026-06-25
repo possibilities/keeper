@@ -36,5 +36,5 @@ unchanged and green. `bun run test:full` (touches compaction + re-fold).
 - [ ] A SAFE test proves deterministic projections re-fold byte-identical after the focus rows are deleted; a NECESSARY test proves the rows are eligible.
 
 ## Done summary
-
+Added separately-named TMUX_FOCUS_DELETE_PREDICATE + deleteColdTmuxFocusRows reclaiming the cold TmuxClientFocusSnapshot tail (wired into the daemon retention pass), leaving NOOP_SNAPSHOT_DELETE_PREDICATE and its three-class pinning test untouched. New SAFE+NECESSARY pair proves deterministic projections re-fold byte-identical after the live-only focus rows are deleted, and that the rows are a deletable cold tail.
 ## Evidence

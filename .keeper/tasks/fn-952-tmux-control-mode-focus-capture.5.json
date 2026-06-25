@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Separately-named live-only delete predicate for cold focus events",
-  "updated_at": "2026-06-24T23:22:22.683000Z"
+  "updated_at": "2026-06-25T03:53:01.189000Z",
+  "worker_done_at": "2026-06-25T03:53:01.189000Z"
 }
