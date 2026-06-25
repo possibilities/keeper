@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Handoff dispatcher worker and bind fold",
-  "updated_at": "2026-06-24T21:24:54.815000Z"
+  "updated_at": "2026-06-25T00:30:43.412000Z",
+  "worker_done_at": "2026-06-25T00:30:43.412000Z"
 }

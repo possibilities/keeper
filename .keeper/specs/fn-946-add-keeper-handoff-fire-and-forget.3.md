@@ -74,5 +74,5 @@ managed-session/orphan arms.
 - [ ] the handoff-ee window in the human session is not reaped; test:full green
 
 ## Done summary
-
+Built the handoff dispatch worker (src/handoff-worker.ts): level-triggered, read-only db, durable boot-recovery decision table + mint-before-launch confirm path; the handoff:: deriver + SessionStart bind fold + HandoffDispatching/HandoffLaunchFailed lifecycle folds (K=3 never-bound breaker) in the reducer; daemon spawn + mint glue (18 workers). test:full green.
 ## Evidence
