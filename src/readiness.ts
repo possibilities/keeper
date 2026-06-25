@@ -484,8 +484,7 @@ export function computeReadiness(
   // replaces the per-epic + per-root mutexes; until .2 lands this is threaded
   // through (so both consumers carry the SAME N) but the N=1 mutex still runs.
   // Appended LAST so default-reliant call sites stay valid.
-  // biome-ignore lint/correctness/noUnusedFunctionParameters: threaded now for client/reconciler parity; task .2's round-robin allocator consumes it.
-  maxConcurrentPerRoot: number = 1,
+  _maxConcurrentPerRoot: number = 1,
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
