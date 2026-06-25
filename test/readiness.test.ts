@@ -18,6 +18,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { buildLaneKeys } from "../src/autopilot-worker";
 import {
   applyPerRootRoundRobinAllocator,
   applySingleTaskPerEpicMutex,
@@ -42,6 +43,7 @@ import type {
   SubagentInvocation,
   Task,
 } from "../src/types";
+import { deriveWorktreePlan, worktreePathFor } from "../src/worktree-plan";
 
 // ---------------------------------------------------------------------------
 // Fixture builders — minimal, no defaults pollution
@@ -1947,6 +1949,250 @@ test("fn-954 alloc terminates on exhausted ready work (N greater than ready coun
   const snap = runWithN([e1, e2], 5);
   expect(snap.perTask.get("fn-1-a.1")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
+});
+
+// ---------------------------------------------------------------------------
+// fn-959 — worktree-mode LANE re-key of the allocator (task .5). The allocator
+// keys on the derived lane worktree path instead of `effectiveRoot`, so each
+// worktree is a CAP-1 lane (regardless of max_concurrent_per_root) and parallel
+// sibling lanes in ONE repo (even ONE epic) dispatch concurrently. OFF mode (an
+// empty lane map) is byte-identical to today.
+// ---------------------------------------------------------------------------
+
+// Run `computeReadiness` with the trailing worktree lane-key map.
+function runWithLanes(
+  epics: Epic[],
+  n: number,
+  laneKeyById: ReadonlyMap<string, string>,
+  eligible: Set<string> | undefined = undefined,
+) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    eligible,
+    new Set<string>(),
+    n,
+    laneKeyById,
+  );
+}
+
+test("fn-959 OFF byte-identical: an EMPTY lane map keys exactly as today (no behavior change)", () => {
+  // Same fixture as the N=1 equivalence gate. An explicit empty lane map MUST be
+  // indistinguishable from passing no lane arg at all — proves OFF mode is
+  // byte-identical (the whole rollout-safety contract).
+  const a = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/r",
+    tasks: [a],
+  });
+  const b = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/r",
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/r",
+    tasks: [b],
+  });
+  const off = runWithN([e1, e2], 1);
+  const empty = runWithLanes([e1, e2], 1, new Map());
+  expect([...empty.perTask]).toEqual([...off.perTask]);
+  // Even at N=3 (round-robin path) the empty map changes nothing.
+  const off3 = runWithN([e1, e2], 3);
+  const empty3 = runWithLanes([e1, e2], 3, new Map());
+  expect([...empty3.perTask]).toEqual([...off3.perTask]);
+});
+
+test("fn-959 cap-1 per lane: two ready tasks on the SAME lane → only the first stays ready (even at N=5)", () => {
+  // Two tasks keyed to the SAME lane path. A worktree index holds one agent; the
+  // second MUST be demoted regardless of max_concurrent_per_root. (In real DAGs a
+  // shared lane is a linear chain where the downstream isn't ready until the
+  // upstream is done — this drives the invariant directly.)
+  const t1 = makeTask({ task_id: "fn-1-foo.1", task_number: 1 });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1, t2],
+  });
+  const lane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const laneKeyById = new Map<string, string>([
+    ["fn-1-foo.1", lane],
+    ["fn-1-foo.2", lane],
+  ]);
+  const snap = runWithLanes([epic], 5, laneKeyById);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")?.tag).toBe("blocked");
+});
+
+test("fn-959 parallel sibling lanes in ONE epic run concurrently (the whole point)", () => {
+  // Fan-out P(done) → {A, B}. A inherits the base lane, B forks a rib → DISTINCT
+  // lane paths. Both are ready (P done). Under today's effectiveRoot keying they
+  // share the epic's one root and the per-epic mutex would keep only ONE; under
+  // the lane re-key they are distinct cap-1 lanes → BOTH dispatch, even at N=1.
+  const p = makeTask({
+    task_id: "P",
+    epic_id: "fn-1-foo",
+    task_number: 1,
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const a = makeTask({
+    task_id: "A",
+    epic_id: "fn-1-foo",
+    task_number: 2,
+    depends_on: ["P"],
+  });
+  const b = makeTask({
+    task_id: "B",
+    epic_id: "fn-1-foo",
+    task_number: 3,
+    depends_on: ["P"],
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [p, a, b],
+  });
+  // Sanity: under today's keying (N=1, no lanes) the per-epic mutex keeps only
+  // one of A/B ready.
+  const off = runWithN([epic], 1);
+  const offReady = ["A", "B"].filter(
+    (id) => off.perTask.get(id)?.tag === "ready",
+  );
+  expect(offReady.length).toBe(1);
+  // With the lane re-key (gate-built off the real plan), A and B are distinct
+  // lanes → both ready at N=1.
+  const laneKeyById = buildLaneKeys([epic]);
+  const snap = runWithLanes([epic], 1, laneKeyById);
+  expect(snap.perTask.get("A")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("B")).toEqual({ tag: "ready" });
+});
+
+test("fn-959 gate↔dispatch symmetry: buildLaneKeys maps each task to its plan's worktree path + epic to base", () => {
+  // The gate and the dispatch-side geometry pass MUST derive the SAME lanes. Pin
+  // `buildLaneKeys` to `deriveWorktreePlan` directly so a future drift in either
+  // is caught.
+  const p = makeTask({ task_id: "P", epic_id: "fn-1-foo", task_number: 1 });
+  const a = makeTask({
+    task_id: "A",
+    epic_id: "fn-1-foo",
+    task_number: 2,
+    depends_on: ["P"],
+  });
+  const b = makeTask({
+    task_id: "B",
+    epic_id: "fn-1-foo",
+    task_number: 3,
+    depends_on: ["P"],
+  });
+  const j = makeTask({
+    task_id: "J",
+    epic_id: "fn-1-foo",
+    task_number: 4,
+    depends_on: ["A", "B"],
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [p, a, b, j],
+  });
+  const lanes = buildLaneKeys([epic]);
+  const plan = deriveWorktreePlan("fn-1-foo", "/repo", epic.tasks);
+  const byNode = new Map(plan.assignments.map((x) => [x.nodeId, x]));
+  for (const id of ["P", "A", "B", "J"]) {
+    expect(lanes.get(id)).toBe(byNode.get(id)?.worktreePath);
+  }
+  // The close row (keyed by epic id at the gate) pins to the BASE lane.
+  expect(lanes.get("fn-1-foo")).toBe(plan.baseWorktreePath);
+  // P/A/J share the base lane; B is its own rib — distinct keys.
+  expect(lanes.get("A")).toBe(lanes.get("P"));
+  expect(lanes.get("J")).toBe(lanes.get("P"));
+  expect(lanes.get("B")).not.toBe(lanes.get("P"));
+});
+
+test("fn-959 buildLaneKeys: a MULTI-REPO epic is left un-keyed (rejected at dispatch, never lane-keyed)", () => {
+  // Two tasks resolving to different repos → worktree mode rejects the epic for
+  // v1. `buildLaneKeys` must emit NO entries for it (the rows fall through to
+  // effectiveRoot at the gate; the dispatch pass stamps the sticky reject).
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    task_number: 1,
+    target_repo: "/repo-a",
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    epic_id: "fn-1-foo",
+    task_number: 2,
+    target_repo: "/repo-b",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo-a",
+    tasks: [t1, t2],
+  });
+  const lanes = buildLaneKeys([epic]);
+  expect(lanes.size).toBe(0);
+});
+
+test("fn-959 buildLaneKeys: a cyclic DAG is skipped (no throw at the gate; rows fall through)", () => {
+  // A depends_on cycle makes deriveWorktreePlan throw. The gate-side builder must
+  // swallow it and leave the epic un-keyed (the dispatch geometry pass re-throws
+  // for the cycle backstop; no launch is ever emitted, so the gate verdict is
+  // moot). The builder MUST NOT throw and abort the whole cycle's gate.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    task_number: 1,
+    depends_on: ["fn-1-foo.2"],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    epic_id: "fn-1-foo",
+    task_number: 2,
+    depends_on: ["fn-1-foo.1"],
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1, t2],
+  });
+  expect(() => buildLaneKeys([epic])).not.toThrow();
+  expect(buildLaneKeys([epic]).size).toBe(0);
+});
+
+test("fn-959 distinct sibling lanes both cap-1 at N=5 (parallel, not stacked)", () => {
+  // Two independent roots in one epic on /repo: R1 inherits base, R2 forks a rib.
+  // Both ready, N=5. Under the lane re-key each is its OWN cap-1 lane → BOTH
+  // dispatch (parallelism), and neither lane could ever stack a 2nd (cap-1).
+  const r1 = makeTask({ task_id: "R1", epic_id: "fn-1-foo", task_number: 1 });
+  const r2 = makeTask({ task_id: "R2", epic_id: "fn-1-foo", task_number: 2 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [r1, r2],
+  });
+  const lanes = buildLaneKeys([epic]);
+  // Distinct lanes.
+  expect(lanes.get("R1")).not.toBe(lanes.get("R2"));
+  const snap = runWithLanes([epic], 5, lanes);
+  expect(snap.perTask.get("R1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("R2")).toEqual({ tag: "ready" });
 });
 
 test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {

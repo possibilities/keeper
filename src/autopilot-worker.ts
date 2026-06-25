@@ -1165,6 +1165,17 @@ export function reconcile(
       )
     : undefined;
 
+  // fn-959: the worktree-mode LANE re-key for the allocator. EMPTY (the default)
+  // whenever worktree mode is OFF — then `computeReadiness` keys on `effectiveRoot`,
+  // byte-identical to today. ON: each row keys on its derived lane worktree path so
+  // every worktree is a CAP-1 lane (two agents in one index = corruption) while
+  // parallel sibling lanes run concurrently. Built off the SAME `deriveWorktreePlan`
+  // the dispatch-side `attachWorktreeGeometry` post-pass uses, so the gate and the
+  // dispatch never diverge.
+  const laneKeyById = snapshot.worktreeMode
+    ? buildLaneKeys(snapshot.epics)
+    : new Map<string, string>();
+
   // Use `Number.NEGATIVE_INFINITY` for the sub-agent staleness `now`
   // when the caller didn't bother (matches `computeReadiness`'s default
   // — keeps the staleness branch inert if undefined).
@@ -1193,6 +1204,10 @@ export function reconcile(
     // across its epics. The board latches the SAME N off `BootStatus`, so both
     // consumers compute identical demotions. Default 1 = one-task-per-root.
     state.maxConcurrentPerRoot,
+    // fn-959: the worktree-mode lane re-key (empty when OFF). Re-keys the allocator
+    // onto lane paths (cap-1 per lane) without diverging from the dispatch-side
+    // worktree geometry, which derives the SAME plan in `attachWorktreeGeometry`.
+    laneKeyById,
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second
@@ -1509,6 +1524,65 @@ function attachWorktreeGeometry(
       }
     }
   }
+}
+
+/**
+ * fn-959 — the worktree-mode LANE re-key map fed to `computeReadiness`'s
+ * allocator (the GATE side of the symmetric re-key; `attachWorktreeGeometry` is
+ * the dispatch side). Maps each `task_id` → its lane worktree path and each
+ * `epic_id` → the epic BASE worktree path (the close sink's lane), so the
+ * allocator caps each worktree at one concurrent agent while parallel sibling
+ * lanes run concurrently.
+ *
+ * Derives from the SAME `deriveWorktreePlan` + the SAME multi-repo guard as the
+ * dispatch-side geometry pass, so the gate never diverges from dispatch:
+ *  - A MULTI-REPO epic (its tasks span >1 resolved repo dir) is REJECTED for v1 in
+ *    worktree mode — its rows are deliberately left UN-keyed so they fall through
+ *    to `effectiveRoot` at the gate; the dispatch-side pass stamps the sticky
+ *    `worktree-multi-repo` reject. No lane is provisioned, so no lane key exists.
+ *  - A cyclic `depends_on` DAG makes `deriveWorktreePlan` throw; the epic is
+ *    skipped here (rows fall through to `effectiveRoot`), and the dispatch-side
+ *    geometry pass re-throws so `driveCycle`'s cycle backstop fires — no launch is
+ *    ever emitted for a cyclic epic, so the gate verdict is moot.
+ *
+ * Pure: no fs/git (the topology module is a total function of the DAG). Exported
+ * for the readiness/dispatch symmetry unit tests.
+ */
+export function buildLaneKeys(epics: Epic[]): Map<string, string> {
+  const laneKeyById = new Map<string, string>();
+  for (const epic of epics) {
+    const repoDir = epic.project_dir ?? "";
+    // Multi-repo guard — IDENTICAL to `attachWorktreeGeometry`: distinct resolved
+    // repo dirs across the epic's tasks. >1 → rejected in worktree mode, leave the
+    // rows un-keyed (they key on `effectiveRoot` and the dispatch pass rejects).
+    const repoDirs = new Set<string>();
+    for (const t of epic.tasks) {
+      repoDirs.add(
+        t.target_repo != null && t.target_repo !== "" ? t.target_repo : repoDir,
+      );
+    }
+    if (repoDirs.size > 1) {
+      continue;
+    }
+    let plan: WorktreePlan;
+    try {
+      plan = deriveWorktreePlan(epic.epic_id, repoDir, epic.tasks);
+    } catch {
+      // A cyclic DAG — skip lane-keying (rows fall through to `effectiveRoot`).
+      // The dispatch-side geometry pass re-throws for the cycle backstop.
+      continue;
+    }
+    // The close sink's lane (the epic BASE) is keyed under the epic id, since the
+    // close row is keyed `close::<epic_id>` and resolves to `epic_id` at the gate.
+    laneKeyById.set(epic.epic_id, plan.baseWorktreePath);
+    for (const a of plan.assignments) {
+      if (a.isCloseSink) {
+        continue;
+      }
+      laneKeyById.set(a.nodeId, a.worktreePath);
+    }
+  }
+  return laneKeyById;
 }
 
 /**
