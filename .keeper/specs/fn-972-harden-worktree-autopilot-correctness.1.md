@@ -31,5 +31,5 @@
 - [ ] bun run test:full green
 
 ## Done summary
-
+Hardened keeper commit-work git resolution to be worktree-pinned and race-proof: resolve the worktree root and pass cwd to every git spawn, strip GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_COMMON_DIR in spawnGitExec, and add a defense-in-depth pre-push abort so a linked-worktree lane commit can never escape to the default branch. Fast + real-git slow tests added; test:full green.
 ## Evidence
