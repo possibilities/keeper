@@ -50,6 +50,10 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import {
+  gitExec,
+  type GitRunner as WorktreeGitRunner,
+} from "./commit-work/git-exec";
+import {
   DEFAULT_MAX_CONCURRENT_JOBS,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   openDb,
@@ -79,8 +83,23 @@ import {
   projectPendingDispatches,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
-import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
+import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
+import {
+  currentBranch as gitCurrentBranch,
+  ensureWorktree as gitEnsureWorktree,
+  listWorktrees as gitListWorktrees,
+  mergeBranchInto as gitMergeBranchInto,
+  removeWorktree as gitRemoveWorktree,
+  resolveDefaultBranch as gitResolveDefaultBranch,
+  type MergeResult,
+} from "./worktree-git";
+import {
+  CLOSE_SINK_ID,
+  deriveWorktreePlan,
+  type WorktreeAssignment,
+  type WorktreePlan,
+} from "./worktree-plan";
 
 /**
  * The two `keeper plan` verbs the reconciler dispatches: `work` for a `ready` task
@@ -583,6 +602,73 @@ export interface PlannedLaunch {
    * only. Set at the close-row push; absent/false on every task launch.
    */
   isEpicFinalizer?: boolean;
+  /**
+   * fn-959 — the pure worktree geometry for this launch, computed in `reconcile`
+   * (the topology is a total function of the DAG, so it stays in the pure layer).
+   * ABSENT whenever worktree mode is OFF (then dispatch is byte-identical to
+   * today, save the producer-side on-default-branch assertion). PRESENT in
+   * worktree mode: the producer (`runReconcileCycle`) consumes it to provision
+   * the lane worktree, run fan-in pre-merges, assert HEAD, and OVERRIDE `cwd`
+   * with the worktree path — all BEFORE `confirmRunning` mints the durable
+   * Dispatched. Never a fold input.
+   */
+  worktree?: WorktreeLaunchInfo;
+  /**
+   * fn-959 — set IFF this launch belongs to a multi-repo epic that worktree mode
+   * rejects for v1. The producer mints a sticky `worktree-multi-repo`
+   * `DispatchFailed` (cleared by `retry_dispatch`) and launches nothing. Mutually
+   * exclusive with {@link worktree}.
+   */
+  worktreeReject?: WorktreeReject;
+}
+
+/**
+ * The worktree geometry the producer needs for one launch (fn-959). Carries the
+ * pure topology {@link WorktreeAssignment} plus the epic-level context the
+ * producer's git side effects require. Computed in `reconcile`; consumed ONLY in
+ * `runReconcileCycle` (every git op lives there, never in a fold).
+ */
+export interface WorktreeLaunchInfo {
+  /** The pure per-node topology assignment (branch / path / pre-merges). */
+  assignment: WorktreeAssignment;
+  /** The epic base branch — `keeper/epic/<epic_id>`. */
+  baseBranch: string;
+  /** The epic base worktree path (the lane the closer + first root run on). */
+  baseWorktreePath: string;
+  /**
+   * The repo dir whose git the producer drives for this epic — the epic's
+   * `project_dir`. The worktree `add`/`list`/`merge`/`prune` commands run with
+   * this as cwd (it is the main worktree of the repo every lane forks off), and
+   * the default branch the epic base merges into at close is resolved here.
+   */
+  repoDir: string;
+  /**
+   * The deterministic ordered list of EVERY node's branch ↔ worktree-path pair
+   * for this epic, in toposort order. The producer walks it to resolve a
+   * pre-merge SOURCE branch's committed tip (the parent lane a rib forks off)
+   * without re-deriving the plan. Shared by reference across an epic's launches.
+   */
+  laneOrder: { nodeId: string; branch: string; worktreePath: string }[];
+  /**
+   * The PRIMARY parent's branch — the lane this node forked-off or inherited.
+   * For a rib, the producer forks the new worktree off THIS branch's committed
+   * tip; for an inheriting node (or a root) it is the node's own branch (or the
+   * base) and no fresh worktree is forked. Empty only for the synthetic close
+   * sink (always base).
+   */
+  parentBranch: string;
+}
+
+/**
+ * A loud worktree-mode rejection for one epic (fn-959) — a launch the producer
+ * must NOT run but instead surface as a sticky `DispatchFailed`. Multi-repo
+ * epics (per-task `target_repo` spanning more than one resolved repo dir) are
+ * unsupported in worktree mode for v1, so every launch they would emit is
+ * replaced by this marker; the producer mints `worktree-multi-repo: <reason>`
+ * (cleared by `retry_dispatch`) and launches nothing for that key.
+ */
+export interface WorktreeReject {
+  reason: string;
 }
 
 /**
@@ -609,6 +695,19 @@ export interface LiveDispatch {
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
   completedRowIds: Set<string>;
+  /**
+   * fn-959 — the per-epic worktree-finalize requests for this cycle: one entry
+   * per epic whose close-row verdict is `{tag:"completed"}` AND worktree mode is
+   * ON. The producer (`runReconcileCycle`) runs `worktree.finalizeEpic` for each
+   * AFTER the launch loop — merging the epic base into the default branch (once
+   * the closer that landed the close commit on `keeper/epic/<id>` has finished)
+   * and tearing the lanes down. EMPTY whenever worktree mode is OFF. The merge is
+   * driven from THIS producer step (not the recent-done reap window) so it never
+   * depends on the 1800s `DONE_EPICS_REAP_WINDOW_SEC`; the restart backstop that
+   * survives a daemon bounce between epic-done and merge-to-default is a separate
+   * recovery task. Idempotent: `finalizeEpic` skips an already-merged base.
+   */
+  worktreeFinalize: WorktreeLaunchInfo[];
 }
 
 /**
@@ -703,12 +802,62 @@ export interface ConfirmRunningDeps {
     stalenessMs: number | null;
   }): void;
   /**
+   * fn-959 — the producer git driver for worktree mode. ABSENT whenever the
+   * reconciler runs without worktree support (then every `worktree`/`worktreeReject`
+   * launch field is inert and dispatch is byte-identical to today). PRESENT in
+   * worktree mode: `runReconcileCycle` calls it to provision a lane worktree, run
+   * fan-in pre-merges, assert HEAD, and — after a closer reaches done — merge the
+   * epic base into the default branch + push + tear down. Every method shells git
+   * on the target repo (a producer side effect); none touches keeper.db or a fold.
+   * Injected so the fast tier drives the same code paths with a fake.
+   */
+  worktree?: WorktreeDriver;
+  /**
    * Tuning knobs — exposed as deps so tests can drive a 5ms / 50ms
    * cadence instead of seconds. Defaults applied in `runConfirmCycle`
    * when undefined.
    */
   pollIntervalMs?: number;
   ceilingMs?: number;
+}
+
+/**
+ * The producer git driver for worktree mode (fn-959) — the side-effect seam
+ * `runReconcileCycle` calls before `confirmRunning` (provision) and after a
+ * closer reaches done (finalize). Every method runs real git on the target repo
+ * and NEVER writes keeper.db / runs in a fold. Injected so tests fake it; the
+ * default impl wraps `src/worktree-git.ts`.
+ */
+export interface WorktreeDriver {
+  /**
+   * Provision the lane for one launch: ensure the worktree exists (lazily, off
+   * the parent lane's committed tip), run the assignment's fan-in pre-merges in
+   * order, then assert the worktree HEAD equals the derived branch. Returns the
+   * resolved worktree path on success (the producer overrides the launch cwd with
+   * it) or a `{ failed: <reason> }` the producer mints as a sticky DispatchFailed.
+   */
+  provision(
+    info: WorktreeLaunchInfo,
+  ): Promise<{ ok: true; cwd: string } | { ok: false; reason: string }>;
+  /**
+   * After the epic closer reaches done: merge the epic base branch into the repo's
+   * resolved default branch (sequential pairwise, pushed once), then tear the lane
+   * worktrees down. Returns `{ ok: true }` on a clean merge-and-teardown, or
+   * `{ ok: false, reason }` on a merge conflict / dirty-teardown refusal (the
+   * producer stops — no further merge, no teardown — and surfaces the reason).
+   */
+  finalizeEpic(
+    info: WorktreeLaunchInfo,
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
+   * Returns `{ ok: true }` when it is, else `{ ok: false, reason }` (a sticky
+   * `not-on-default-branch` DispatchFailed). This is the ONLY behavioral change
+   * worktree-OFF mode adds over today's dispatch.
+   */
+  assertOnDefaultBranch(
+    cwd: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -1234,7 +1383,178 @@ export function reconcile(
     }
   }
 
-  return { launches, completedRowIds };
+  // fn-959 — worktree-mode post-pass. OFF (the default): no worktree code runs,
+  // `worktreeFinalize` is empty, and every launch stays byte-identical to today
+  // (the producer adds only the on-default-branch assertion). ON: attach the pure
+  // topology geometry to each launch (or a multi-repo reject marker), and collect
+  // the per-epic finalize requests for the closers that reached done this cycle.
+  // Kept as a SEPARATE pass over the assembled launches so the OFF path is
+  // untouched and the worktree logic is isolated.
+  const worktreeFinalize: WorktreeLaunchInfo[] = [];
+  if (snapshot.worktreeMode) {
+    attachWorktreeGeometry(
+      snapshot.epics,
+      launches,
+      completedRowIds,
+      worktreeFinalize,
+    );
+  }
+
+  return { launches, completedRowIds, worktreeFinalize };
+}
+
+/**
+ * fn-959 — the pure worktree post-pass over `reconcile`'s assembled launches.
+ * For each epic (when worktree mode is ON):
+ *  - A MULTI-REPO epic (its tasks resolve to more than one distinct repo dir —
+ *    `target_repo ?? project_dir` spanning toplevels) is unsupported in worktree
+ *    mode for v1: every launch it produced is stamped `worktreeReject` so the
+ *    producer mints a sticky `worktree-multi-repo` DispatchFailed and runs no git.
+ *  - Else derive the deterministic {@link WorktreePlan} from the epic's task DAG
+ *    and stamp each launch's {@link PlannedLaunch.worktree} with its node's
+ *    assignment + the shared epic context (base branch/path, repo dir, the lane
+ *    order, the primary-parent branch). The close-row launch maps to the synthetic
+ *    {@link CLOSE_SINK_ID} sink (pinned to base).
+ *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every epic
+ *    whose close-row id is in `completedRowIds` (the closer reached done) — the
+ *    producer merges that base into the default branch + tears down.
+ *
+ * Pure: a total function of the epics + launches (the topology module touches no
+ * fs/git). A `WorktreeCycleError` from a bad DAG is left to surface — a cyclic
+ * `depends_on` is a data bug the topology module fails loud on, and that throw is
+ * caught by `driveCycle`'s cycle-level backstop (no launch is fired for a cyclic
+ * epic, which is the safe outcome).
+ */
+function attachWorktreeGeometry(
+  epics: Epic[],
+  launches: PlannedLaunch[],
+  completedRowIds: Set<string>,
+  worktreeFinalize: WorktreeLaunchInfo[],
+): void {
+  // Index launches by epic so each epic's plan is derived ONCE. A task launch
+  // belongs to the epic owning the task; a close launch's id IS the epic id.
+  const taskToEpic = new Map<string, string>();
+  for (const epic of epics) {
+    for (const t of epic.tasks) {
+      taskToEpic.set(t.task_id, epic.epic_id);
+    }
+  }
+  const epicOf = (l: PlannedLaunch): string | undefined =>
+    l.verb === "close" ? l.id : taskToEpic.get(l.id);
+
+  for (const epic of epics) {
+    const epicId = epic.epic_id;
+    const repoDir = epic.project_dir ?? "";
+    const epicLaunches = launches.filter((l) => epicOf(l) === epicId);
+    const needsFinalize = completedRowIds.has(epicId);
+    if (epicLaunches.length === 0 && !needsFinalize) {
+      continue;
+    }
+
+    // Multi-repo guard: distinct resolved repo dirs across the epic's tasks (the
+    // pure "spanning toplevels" v1 heuristic). A single distinct dir (the common
+    // case) is fine; >1 rejects loudly. An empty `project_dir` with no per-task
+    // override still resolves to one empty dir (a data bug caught elsewhere).
+    const repoDirs = new Set<string>();
+    for (const t of epic.tasks) {
+      repoDirs.add(
+        t.target_repo != null && t.target_repo !== "" ? t.target_repo : repoDir,
+      );
+    }
+    if (repoDirs.size > 1) {
+      const reason = `worktree-multi-repo: epic ${epicId} spans ${repoDirs.size} repos (${[...repoDirs].sort().join(", ")})`;
+      for (const l of epicLaunches) {
+        l.worktreeReject = { reason };
+      }
+      // A multi-repo epic never finalizes a worktree (none was provisioned).
+      continue;
+    }
+
+    const plan = deriveWorktreePlan(epicId, repoDir, epic.tasks);
+    const byNode = new Map<string, WorktreeAssignment>();
+    for (const a of plan.assignments) {
+      byNode.set(a.nodeId, a);
+    }
+    const laneOrder = plan.assignments.map((a) => ({
+      nodeId: a.nodeId,
+      branch: a.branch,
+      worktreePath: a.worktreePath,
+    }));
+    const infoFor = (assignment: WorktreeAssignment): WorktreeLaunchInfo => ({
+      assignment,
+      baseBranch: plan.baseBranch,
+      baseWorktreePath: plan.baseWorktreePath,
+      repoDir,
+      laneOrder,
+      parentBranch: parentBranchFor(assignment, plan, epic.tasks),
+    });
+
+    for (const l of epicLaunches) {
+      const nodeId = l.verb === "close" ? CLOSE_SINK_ID : l.id;
+      const assignment = byNode.get(nodeId);
+      if (assignment === undefined) {
+        // No topology node for this launch's id — a shell-element task with no
+        // DAG presence, or a close launch on an epic with no tasks. Leave the
+        // launch worktree-less; the producer's missing-worktree path mints a
+        // sticky failure rather than launching into an unprovisioned lane.
+        continue;
+      }
+      l.worktree = infoFor(assignment);
+    }
+
+    if (needsFinalize) {
+      const sink = byNode.get(CLOSE_SINK_ID);
+      if (sink !== undefined) {
+        worktreeFinalize.push(infoFor(sink));
+      }
+    }
+  }
+}
+
+/**
+ * fn-959 — resolve the PRIMARY-parent branch for a node's assignment: the lane a
+ * rib forks off (or the node's own branch for an inheriting node / the base for a
+ * root or the close sink). A rib's `inherited` is false and its primary parent is
+ * the earliest-in-toposort in-DAG parent on a DIFFERENT branch (the
+ * `worktree add ... <commitish>` source). Pure — re-derives the same fork source
+ * the topology module used.
+ */
+function parentBranchFor(
+  assignment: WorktreeAssignment,
+  plan: WorktreePlan,
+  tasks: Task[],
+): string {
+  if (assignment.inherited || assignment.isCloseSink) {
+    // Inherits its own lane (or base) — no fresh fork; the "parent" branch is the
+    // node's own branch (the producer skips the fork for an already-present lane).
+    return assignment.branch;
+  }
+  // A rib: find the in-DAG parent whose branch differs from the rib's branch and
+  // sorts earliest in the plan's toposort (the topology's primary-parent rule).
+  const task = tasks.find((t) => t.task_id === assignment.nodeId);
+  if (task === undefined) {
+    return plan.baseBranch;
+  }
+  const branchByNode = new Map<string, string>();
+  const orderIndex = new Map<string, number>();
+  plan.assignments.forEach((a, i) => {
+    branchByNode.set(a.nodeId, a.branch);
+    orderIndex.set(a.nodeId, i);
+  });
+  let best: string | undefined;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const dep of task.depends_on) {
+    const depBranch = branchByNode.get(dep);
+    if (depBranch === undefined) {
+      continue;
+    }
+    const rank = orderIndex.get(dep) ?? 0;
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = depBranch;
+    }
+  }
+  return best ?? plan.baseBranch;
 }
 
 /**
@@ -1427,6 +1747,28 @@ export async function runReconcileCycle(
       });
       continue;
     }
+    // fn-959 — worktree-mode producer step, BEFORE `confirmRunning` mints the
+    // durable Dispatched. `launchCwd` is the cwd `confirmRunning` actually launches
+    // into; it starts as the pure `plan.cwd` and is OVERRIDDEN to the lane worktree
+    // path when worktree mode provisions one. Every git side effect lives here in
+    // the producer (never a fold). All three branches mint sticky `DispatchFailed`
+    // on a loud failure (cleared by `retry_dispatch`) and skip — per-key, so a
+    // sibling launch keeps dispatching.
+    let launchCwd = plan.cwd;
+    if (deps.worktree !== undefined) {
+      const wt = await runWorktreeProducerStep(plan, launchCwd, deps.worktree);
+      if (!wt.ok) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason: wt.reason,
+          dir: wt.dir,
+          ts: deps.now(),
+        });
+        continue;
+      }
+      launchCwd = wt.cwd;
+    }
     state.inFlight.add(plan.key);
     // STAMP the cooldown at the SAME point as `inFlight.add`, BEFORE the confirm
     // await, so it covers BOTH the `ok` AND the `indoubt` outcomes — gating on
@@ -1439,7 +1781,21 @@ export async function runReconcileCycle(
     if (plan.isEpicFinalizer) {
       state.finalizerGuard.set(plan.id, deps.now());
     }
-    const argv = buildLaunchArgv(shell, plan.workerCommand);
+    // Rebuild the shell command body when worktree mode re-pointed the cwd, so the
+    // drift-guarded `cd <path>` prefix matches the actual launch cwd. (agentwrap
+    // reads `spec` + the `cwd` arg, not this string — but keeping them consistent
+    // preserves the parity the builders intend.)
+    const workerCommand =
+      launchCwd === plan.cwd
+        ? plan.workerCommand
+        : buildWorkerCommand(
+            plan.verb,
+            plan.id,
+            launchCwd,
+            plan.model,
+            plan.effort,
+          );
+    const argv = buildLaunchArgv(shell, workerCommand);
     const spec = buildPlannedLaunchSpec(
       plan.verb,
       plan.id,
@@ -1450,7 +1806,7 @@ export async function runReconcileCycle(
       const outcome = await confirmRunning(
         plan.verb,
         plan.id,
-        plan.cwd,
+        launchCwd,
         argv,
         spec,
         signal,
@@ -1490,7 +1846,7 @@ export async function runReconcileCycle(
           verb: plan.verb,
           id: plan.id,
           key: plan.key,
-          cwd: plan.cwd,
+          cwd: launchCwd,
           controller: new AbortController(),
         });
       }
@@ -1501,6 +1857,240 @@ export async function runReconcileCycle(
       state.inFlight.delete(plan.key);
     }
   }
+
+  // fn-959 — worktree-finalize pass. For each epic whose closer reached done this
+  // cycle, merge the epic base into the resolved default branch (pushing once) and
+  // tear the lanes down. Runs AFTER the launch loop (the closer that landed the
+  // close commit on `keeper/epic/<id>` is already gone — the cap-1 lane + the
+  // readiness gate guarantee no agent is live in the base when this fires). Driven
+  // from THIS producer step (not the recent-done reap window) so it never depends
+  // on `DONE_EPICS_REAP_WINDOW_SEC`. A merge conflict / dirty-teardown failure
+  // mints a sticky `worktree-finalize` DispatchFailed keyed on the close row
+  // (cleared by `retry_dispatch`) and STOPS that epic's finalize — no merge-to-
+  // default, no teardown. Idempotent: `finalizeEpic` skips an already-merged base.
+  if (deps.worktree !== undefined) {
+    for (const info of decision.worktreeFinalize) {
+      if (signal.aborted) {
+        return;
+      }
+      const result = await deps.worktree.finalizeEpic(info);
+      if (!result.ok) {
+        deps.emitDispatchFailed({
+          verb: "close",
+          id: closeKeyEpicId(info),
+          reason: result.reason,
+          dir: info.repoDir,
+          ts: deps.now(),
+        });
+      }
+    }
+  }
+}
+
+/**
+ * fn-959 — the epic id a worktree-finalize failure is keyed on. The finalize
+ * `WorktreeLaunchInfo` always carries the synthetic close-sink assignment, whose
+ * branch is `keeper/epic/<epicId>`; strip the `keeper/epic/` prefix back to the
+ * epic id so the sticky `DispatchFailed` lands on the SAME `close::<epicId>` key a
+ * `retry_dispatch` clears.
+ */
+function closeKeyEpicId(info: WorktreeLaunchInfo): string {
+  const prefix = "keeper/epic/";
+  return info.baseBranch.startsWith(prefix)
+    ? info.baseBranch.slice(prefix.length)
+    : info.baseBranch;
+}
+
+/**
+ * fn-959 — the producer's per-launch worktree step (the side-effect seam between
+ * the pure plan and `confirmRunning`). Returns the cwd to launch into on success,
+ * or a `{ ok:false, reason, dir }` the caller mints as a sticky `DispatchFailed`.
+ * Three branches, mutually exclusive per the geometry the pure post-pass stamped:
+ *  - `worktreeReject` → multi-repo epic, rejected loudly.
+ *  - `worktree` → provision the lane (ensure + pre-merges + assert HEAD), launch
+ *    into the worktree path.
+ *  - neither → OFF mode: assert the launch cwd is on the resolved default branch.
+ */
+async function runWorktreeProducerStep(
+  plan: PlannedLaunch,
+  launchCwd: string,
+  driver: WorktreeDriver,
+): Promise<
+  { ok: true; cwd: string } | { ok: false; reason: string; dir: string }
+> {
+  if (plan.worktreeReject !== undefined) {
+    return { ok: false, reason: plan.worktreeReject.reason, dir: launchCwd };
+  }
+  if (plan.worktree !== undefined) {
+    const provisioned = await driver.provision(plan.worktree);
+    if (!provisioned.ok) {
+      return { ok: false, reason: provisioned.reason, dir: launchCwd };
+    }
+    return { ok: true, cwd: provisioned.cwd };
+  }
+  // OFF mode (driver present, no worktree geometry): on-default-branch assertion.
+  const onDefault = await driver.assertOnDefaultBranch(launchCwd);
+  if (!onDefault.ok) {
+    return { ok: false, reason: onDefault.reason, dir: launchCwd };
+  }
+  return { ok: true, cwd: launchCwd };
+}
+
+/**
+ * fn-959 — build the production {@link WorktreeDriver} wrapping `worktree-git.ts`.
+ * Every method shells real git on the target repo (a producer side effect, never
+ * a fold). The `run` GitRunner is injectable so the slow real-git test drives the
+ * lifecycle and the fast tier fakes it; production passes the default `gitExec`.
+ *
+ * Provision: assert the parent lane's worktree HEAD is on its branch (the fork
+ * source must be the deterministic branch), ensure the node's worktree exists off
+ * that parent's committed tip, run the fan-in pre-merges in order, then assert the
+ * node's worktree HEAD equals the derived branch. Finalize: merge the epic base
+ * into the resolved default branch (in the MAIN worktree), push once, tear the
+ * lanes down. assertOnDefaultBranch: `currentBranch(cwd) === resolveDefaultBranch`.
+ */
+export function createWorktreeDriver(
+  run: WorktreeGitRunner = gitExec,
+): WorktreeDriver {
+  return {
+    async provision(info) {
+      const { assignment, repoDir, parentBranch } = info;
+      const { branch, worktreePath, preMerges } = assignment;
+      try {
+        // Fork the lane off the PRIMARY parent's branch tip (its own branch for an
+        // inheriting node / a root — then `ensureWorktree` is a no-op or a base
+        // checkout). `ensureWorktree` is idempotent + crash-recoverable.
+        await gitEnsureWorktree(
+          repoDir,
+          worktreePath,
+          branch,
+          parentBranch,
+          run,
+        );
+        // Run the fan-in pre-merges in order — sequential pairwise, each taking the
+        // shared commit-work flock. A conflict aborts + fails loud + stops.
+        for (const source of preMerges) {
+          const merge: MergeResult = await gitMergeBranchInto(
+            worktreePath,
+            source,
+            run,
+          );
+          if (merge.kind === "conflict") {
+            return {
+              ok: false,
+              reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
+            };
+          }
+        }
+        // Assert HEAD == derived branch AND the worktree is registered.
+        const registered = await gitListWorktrees(repoDir, run);
+        const entry = registered.find(
+          (e) =>
+            stripTrailingSlashPath(e.path) ===
+            stripTrailingSlashPath(worktreePath),
+        );
+        if (entry === undefined) {
+          return {
+            ok: false,
+            reason: `worktree-unregistered: ${worktreePath} is not a registered worktree`,
+          };
+        }
+        const head = await gitCurrentBranch(worktreePath, run);
+        if (head !== branch) {
+          return {
+            ok: false,
+            reason: `worktree-head-mismatch: ${worktreePath} HEAD is ${head}, expected ${branch}`,
+          };
+        }
+        return { ok: true, cwd: worktreePath };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `worktree-provision-failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
+    async finalizeEpic(info) {
+      const { repoDir, baseBranch, baseWorktreePath, laneOrder } = info;
+      try {
+        const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
+        // Merge the epic base into the default branch IN THE MAIN worktree (the
+        // repo dir is the main worktree, checked out on the default branch). This
+        // is the single push to origin (commit-work skipped per-lane pushes).
+        const onDefault = await gitCurrentBranch(repoDir, run);
+        if (onDefault !== defaultBranch) {
+          return {
+            ok: false,
+            reason: `worktree-finalize-not-on-default: ${repoDir} HEAD is ${onDefault}, expected ${defaultBranch} for the base merge`,
+          };
+        }
+        const merge: MergeResult = await gitMergeBranchInto(
+          repoDir,
+          baseBranch,
+          run,
+        );
+        if (merge.kind === "conflict") {
+          return {
+            ok: false,
+            reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+          };
+        }
+        // Push the single merge-to-default. A push failure stops finalize (no
+        // teardown) so the lanes survive for a retry.
+        const push = await run(["push"], { cwd: repoDir });
+        if (push.code !== 0) {
+          return {
+            ok: false,
+            reason: `worktree-finalize-push-failed: ${(push.stdout + push.stderr).trim()}`,
+          };
+        }
+        // Tear down every lane worktree (base + ribs). NEVER blind-`--force`; a
+        // dirty lane refuses and surfaces so the human drains it manually.
+        const paths = new Set<string>([baseWorktreePath]);
+        for (const lane of laneOrder) {
+          paths.add(lane.worktreePath);
+        }
+        for (const p of paths) {
+          const removed = await gitRemoveWorktree(repoDir, p, run);
+          if (removed.kind === "dirty") {
+            return {
+              ok: false,
+              reason: `worktree-teardown-dirty: ${p} has uncommitted changes — ${removed.stderr}`,
+            };
+          }
+        }
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `worktree-finalize-failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
+    async assertOnDefaultBranch(cwd) {
+      try {
+        const defaultBranch = await gitResolveDefaultBranch(cwd, run);
+        const head = await gitCurrentBranch(cwd, run);
+        if (head !== defaultBranch) {
+          return {
+            ok: false,
+            reason: `not-on-default-branch: ${cwd} HEAD is ${head}, expected ${defaultBranch}`,
+          };
+        }
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `default-branch-assert-failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
+  };
+}
+
+/** Trailing-slash-tolerant path compare helper for worktree-path equality. */
+function stripTrailingSlashPath(p: string): string {
+  return p.length > 1 && p.endsWith("/") ? p.replace(/\/+$/, "") : p;
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,9 +2344,10 @@ export async function loadReconcileSnapshot(
 
   // fn-959: the durable worktree-mode toggle rides the SAME singleton row —
   // resolve `worktree_mode truthy` (an absent/never-set row, NULL, or 0 = OFF,
-  // the byte-identical no-worktree dispatch; only a stored 1 = ON). Projection-pull
-  // only so a runtime `set_autopilot_config` lands the very next cycle. RESERVED
-  // for the downstream worktree tasks (carried but unconsumed now).
+  // the no-worktree dispatch; only a stored 1 = ON). Projection-pull only so a
+  // runtime `set_autopilot_config` lands the very next cycle. ON → `reconcile`
+  // stamps each launch with the pure worktree geometry; OFF → no geometry (the
+  // producer adds only the on-default-branch assertion).
   const worktreeRaw = (
     autopilotRows[0] as { worktree_mode?: unknown } | undefined
   )?.worktree_mode;
@@ -2107,6 +2698,12 @@ function main(): void {
     dirExists: (dir) => existsSync(dir),
     sleep: (ms, signal) => abortableSleep(ms, signal),
     recordTimeoutBackstop,
+    // fn-959 — the producer git driver. Wired unconditionally: when worktree mode
+    // is ON `reconcile` stamps each launch with geometry the driver provisions;
+    // when OFF the driver runs only the on-default-branch assertion. The branch-
+    // guard hook does NOT fire here — this is the daemon producer shelling git
+    // directly, not a plan-worker subagent's Bash.
+    worktree: createWorktreeDriver(),
   };
 
   // Single-flight reconcile drive. `watchLoop` fires this on every

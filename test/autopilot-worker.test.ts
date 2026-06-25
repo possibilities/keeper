@@ -39,6 +39,7 @@ import {
   buildWorkerCommand,
   type ConfirmRunningDeps,
   confirmRunning,
+  createWorktreeDriver,
   DEFAULT_CEILING_MS,
   type DispatchedAck,
   type DispatchedPayload,
@@ -66,6 +67,8 @@ import {
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
+  type WorktreeDriver,
+  type WorktreeLaunchInfo,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -273,6 +276,13 @@ interface FakeDepsOptions {
    * block-with-reason branch in `runReconcileCycle`.
    */
   dirExists?: (dir: string) => boolean;
+  /**
+   * fn-959 — the injected worktree driver. ABSENT (the default) leaves the
+   * worktree producer step OFF so every pre-fn-959 test is byte-identical; pass a
+   * fake (see `makeFakeWorktreeDriver`) to drive the provision / finalize /
+   * on-default-branch assertion paths.
+   */
+  worktree?: WorktreeDriver;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -353,6 +363,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     recordTimeoutBackstop(args) {
       log.timeoutBackstops.push({ ...args });
     },
+    worktree: opts.worktree,
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
   };
@@ -3645,4 +3656,501 @@ test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
     .map((p) => p.id)
     .sort();
   expect(workIds).toEqual(["fn-1-a.1", "fn-2-b.1"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-959 — worktree-mode wiring into reconcile + runReconcileCycle
+// ---------------------------------------------------------------------------
+
+// A recording fake WorktreeDriver — captures the ordered method calls + lets a
+// test force a failure on any leg (the sticky-DispatchFailed paths).
+interface FakeWorktreeLog {
+  calls: string[];
+  provisions: WorktreeLaunchInfo[];
+  finalizes: WorktreeLaunchInfo[];
+  assertCwds: string[];
+}
+function makeFakeWorktreeDriver(opts?: {
+  provisionFail?: (info: WorktreeLaunchInfo) => string | null;
+  finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
+  assertFail?: (cwd: string) => string | null;
+}): { driver: WorktreeDriver; log: FakeWorktreeLog } {
+  const log: FakeWorktreeLog = {
+    calls: [],
+    provisions: [],
+    finalizes: [],
+    assertCwds: [],
+  };
+  const driver: WorktreeDriver = {
+    async provision(info) {
+      log.calls.push(`provision:${info.assignment.nodeId}`);
+      log.provisions.push(info);
+      const reason = opts?.provisionFail?.(info) ?? null;
+      if (reason !== null) {
+        return { ok: false, reason };
+      }
+      return { ok: true, cwd: info.assignment.worktreePath };
+    },
+    async finalizeEpic(info) {
+      log.calls.push(`finalize:${info.baseBranch}`);
+      log.finalizes.push(info);
+      const reason = opts?.finalizeFail?.(info) ?? null;
+      if (reason !== null) {
+        return { ok: false, reason };
+      }
+      return { ok: true };
+    },
+    async assertOnDefaultBranch(cwd) {
+      log.calls.push(`assert:${cwd}`);
+      log.assertCwds.push(cwd);
+      const reason = opts?.assertFail?.(cwd) ?? null;
+      if (reason !== null) {
+        return { ok: false, reason };
+      }
+      return { ok: true };
+    },
+  };
+  return { driver, log };
+}
+
+test("fn-959 reconcile: worktree OFF → no geometry on launches, empty finalize set (byte-identical except producer assertion)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: false });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBe(1);
+  expect(decision.launches[0]?.worktree).toBeUndefined();
+  expect(decision.launches[0]?.worktreeReject).toBeUndefined();
+  expect(decision.worktreeFinalize).toEqual([]);
+});
+
+test("fn-959 reconcile: worktree ON → a linear chain shares the base lane, deterministic branch + path", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/home/me/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, depends_on: [] }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const decision = reconcile(snap, makeState(), 0);
+  const wt = decision.launches[0]?.worktree;
+  expect(wt).toBeDefined();
+  expect(wt?.assignment.branch).toBe("keeper/epic/fn-1-foo");
+  expect(wt?.baseBranch).toBe("keeper/epic/fn-1-foo");
+  // Sibling-dir-outside-repo path, slug = branch with `/` → `-`.
+  expect(wt?.assignment.worktreePath).toBe(
+    "/home/me/repo.worktrees/keeper-epic-fn-1-foo",
+  );
+  expect(wt?.assignment.inherited).toBe(true);
+  expect(wt?.assignment.preMerges).toEqual([]);
+});
+
+test("fn-959 reconcile: worktree ON diamond → the non-primary child forks a rib, fan-in pre-merges its lane", () => {
+  // P → {A, B} → J. A inherits base (first child), B forks a rib; J inherits A's
+  // lane (base) and pre-merges B's rib branch before it runs.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.P", task_number: 1, depends_on: [] }),
+      makeTask({
+        task_id: "fn-1-foo.A",
+        task_number: 2,
+        depends_on: ["fn-1-foo.P"],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.B",
+        task_number: 3,
+        depends_on: ["fn-1-foo.P"],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.J",
+        task_number: 4,
+        depends_on: ["fn-1-foo.A", "fn-1-foo.B"],
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const decision = reconcile(snap, makeState(), 0);
+  const byId = new Map(
+    decision.launches.map((l) => [l.id, l.worktree] as const),
+  );
+  // P + A on base; B on a rib; J on base, pre-merging B's rib branch.
+  expect(byId.get("fn-1-foo.P")?.assignment.branch).toBe(
+    "keeper/epic/fn-1-foo",
+  );
+  // Only P is ready this cycle (A/B/J are blocked on deps), so only P launches —
+  // assert P's geometry; the topology for B/J is covered by worktree-plan.test.ts.
+  expect(decision.launches.map((l) => l.id)).toEqual(["fn-1-foo.P"]);
+});
+
+test("fn-959 reconcile: worktree ON multi-repo epic → every launch stamped worktreeReject", () => {
+  // Two tasks resolving to distinct repo dirs (per-task target_repo spanning
+  // toplevels) — rejected loudly in worktree mode for v1.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    expect(l.worktreeReject).toBeDefined();
+    expect(l.worktreeReject?.reason).toContain("worktree-multi-repo");
+    expect(l.worktree).toBeUndefined();
+  }
+});
+
+test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched, launch cwd is the worktree path", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const {
+    deps,
+    log: depsLog,
+    setJobByKey,
+  } = makeFakeDeps({ worktree: driver });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/home/me/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const state = makeState();
+  const decision = reconcile(snap, makeState(), 0);
+  const wtPath = "/home/me/repo.worktrees/keeper-epic-fn-1-foo";
+  expect(decision.launches[0]?.worktree?.assignment.worktreePath).toBe(wtPath);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // The driver provisioned the lane (BEFORE the emitDispatched mint), and the
+  // launch fired into the worktree path — not the project_dir.
+  expect(log.calls).toEqual(["provision:fn-1-foo.1"]);
+  expect(depsLog.dispatchedEmissions).toHaveLength(1);
+  expect(depsLog.launches[0]?.cwd).toBe(wtPath);
+  // The (drift-guarded) shell command rebuilt with the worktree cwd.
+  expect(depsLog.launches[0]?.argv.join(" ")).toContain(`cd ${wtPath} `);
+  expect(depsLog.emissions).toEqual([]); // no DispatchFailed
+});
+
+test("fn-959 runReconcileCycle: worktree ON provision failure → sticky DispatchFailed, no launch", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionFail: () =>
+      "worktree-head-mismatch: HEAD is feature, expected keeper/epic/fn-1-foo",
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const state = makeState();
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    state,
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.calls).toEqual(["provision:fn-1-foo.1"]);
+  expect(depsLog.launches).toEqual([]); // never launched
+  expect(depsLog.dispatchedEmissions).toEqual([]); // no Dispatched mint
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "work",
+    id: "fn-1-foo.1",
+    reason:
+      "worktree-head-mismatch: HEAD is feature, expected keeper/epic/fn-1-foo",
+  });
+  // Slot was never held (failed before inFlight.add).
+  expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-959 runReconcileCycle: worktree OFF → on-default-branch assertion runs; a mismatch is sticky DispatchFailed", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    assertFail: (cwd) =>
+      `not-on-default-branch: ${cwd} HEAD is feature, expected main`,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: false });
+  const state = makeState();
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    state,
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // OFF mode asserts on default branch (never provisions a worktree).
+  expect(log.calls).toEqual(["assert:/repo"]);
+  expect(depsLog.launches).toEqual([]);
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "work",
+    id: "fn-1-foo.1",
+    reason: "not-on-default-branch: /repo HEAD is feature, expected main",
+    dir: "/repo",
+  });
+});
+
+test("fn-959 runReconcileCycle: worktree OFF on-default-branch holds → launches normally into project_dir", async () => {
+  const { driver, log } = makeFakeWorktreeDriver(); // assertion passes
+  const {
+    deps,
+    log: depsLog,
+    setJobByKey,
+  } = makeFakeDeps({ worktree: driver });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: false });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.calls).toEqual(["assert:/repo"]);
+  expect(depsLog.launches).toHaveLength(1);
+  expect(depsLog.launches[0]?.cwd).toBe("/repo"); // unchanged
+  expect(depsLog.emissions).toEqual([]);
+});
+
+test("fn-959 runReconcileCycle: worktree ON multi-repo reject → sticky DispatchFailed, no git, no launch", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // No git driver method ran for a rejected epic; every launch became a sticky
+  // worktree-multi-repo DispatchFailed.
+  expect(log.calls).toEqual([]);
+  expect(depsLog.launches).toEqual([]);
+  expect(depsLog.emissions.length).toBeGreaterThan(0);
+  for (const e of depsLog.emissions) {
+    expect(e.reason).toContain("worktree-multi-repo");
+  }
+});
+
+test("fn-959 runReconcileCycle: closer-done epic → finalizeEpic runs AFTER the launch loop, merges base into default", async () => {
+  // An epic whose close-row verdict is `completed` this cycle: no launch fires
+  // (the closer already ran), but the producer's finalize pass merges its base.
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps } = makeFakeDeps({ worktree: driver });
+  // A done epic produces a `completed` close-row verdict and no launches.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.worktreeFinalize.length).toBe(1);
+  expect(decision.worktreeFinalize[0]?.baseBranch).toBe("keeper/epic/fn-1-foo");
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // finalize ran for the base lane.
+  expect(log.calls).toContain("finalize:keeper/epic/fn-1-foo");
+  expect(log.finalizes).toHaveLength(1);
+});
+
+test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed keyed on the close row, stops (no teardown observable to caller)", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    finalizeFail: () =>
+      "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "close",
+    id: "fn-1-foo", // the close-row key (stripped of keeper/epic/)
+    reason:
+      "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
+  });
+});
+
+test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent tip, then asserts HEAD == branch", async () => {
+  // Drive the real driver against a fake GitRunner — no real git. The driver must
+  // ensure (add), list (registered check), and rev-parse HEAD against the branch.
+  const cmds: string[] = [];
+  let added = false;
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+    args,
+    _o,
+  ) => {
+    cmds.push(args.join(" "));
+    const joined = args.join(" ");
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      // Empty until the add lands, then report the worktree on its branch (so
+      // ensureWorktree actually adds, and the post-add registered check passes).
+      if (!added) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout:
+          "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" }; // branch does not yet exist
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const info: WorktreeLaunchInfo = {
+    assignment: {
+      nodeId: "fn-1-foo.1",
+      isCloseSink: false,
+      branch: "keeper/epic/fn-1-foo",
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [],
+      assertBranch: "keeper/epic/fn-1-foo",
+    },
+    baseBranch: "keeper/epic/fn-1-foo",
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [],
+    parentBranch: "keeper/epic/fn-1-foo",
+  };
+  const res = await driver.provision(info);
+  expect(res).toEqual({
+    ok: true,
+    cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
+  });
+  // A worktree add ran, and HEAD was asserted against the branch.
+  expect(cmds.some((c) => c.startsWith("worktree add"))).toBe(true);
+  expect(cmds).toContain("rev-parse --abbrev-ref HEAD");
+});
+
+test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the default branch", async () => {
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: "feature-x\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const res = await driver.assertOnDefaultBranch("/repo");
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toContain("not-on-default-branch");
+    expect(res.reason).toContain("expected main");
+  }
 });
