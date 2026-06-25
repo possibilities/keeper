@@ -38,5 +38,5 @@ Unit tests via fake-git: main tree → pushes; linked worktree → skips with th
 - [ ] Detection is generic (not autopilot-coupled).
 
 ## Done summary
-
+commit-work now generically detects a linked git worktree (git-dir != git-common-dir, submodule-guarded via --show-superproject-working-tree) and skips the push leg, returning a distinct skipped:worktree success envelope so per-lane branches never reach origin.
 ## Evidence
