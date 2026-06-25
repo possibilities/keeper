@@ -48,5 +48,5 @@ links are already folded by tasks .2 + .3; do NOT touch the reducer.
 - [ ] render-only (no reducer change); test:full green
 
 ## Done summary
-
+Render the handoff edge: renderHandoffLinkLines on the board (off jobs.handoff_links), a handoff-from/handoff-to glyph pair with a missing-glyph fallback in icon-theme, and a minimal handoff relation badge on the dash CardVM. Render-only; test:full green.
 ## Evidence
