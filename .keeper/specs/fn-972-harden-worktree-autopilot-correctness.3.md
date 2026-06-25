@@ -35,5 +35,5 @@ BUG 4 (recover pass-1 touches non-keeper worktrees): recoverWorktrees pass-1 (sr
 - [ ] fast-tier tests cover both the finalize trigger and the recover filter; bun run test:full green
 
 ## Done summary
-
+Decoupled worktree finalize from the main-worktree projection: it now triggers off the closer JOB finishing (closerJobFinished, durable jobs projection) confirmed by a git read of the lane base's status:done (epicBaseHasDoneState), then merges+pushes+tears down — producer-only, re-fold-safe, crash/restart-safe. Filtered recover pass-1 to keeper/epic lanes (isKeeperLaneEntry) so foreign .claude/worktrees lanes are never touched.
 ## Evidence

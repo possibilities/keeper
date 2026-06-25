@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "finalize trigger + recover lane filter",
-  "updated_at": "2026-06-25T17:02:05.510000Z"
+  "updated_at": "2026-06-25T18:17:31.969000Z",
+  "worker_done_at": "2026-06-25T18:17:31.969000Z"
 }
