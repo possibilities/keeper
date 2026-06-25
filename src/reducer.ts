@@ -34,6 +34,7 @@ import {
   usageIdForProfileName,
 } from "./epic-deps";
 import { allGatedRootsSeeded } from "./gated-roots";
+import { compileFnmatch, isGlobToken } from "./glob";
 import {
   type ClassifierInvocation,
   deriveEpicLinks,
@@ -1062,82 +1063,6 @@ interface SessionMutation {
  * directory-prefix or fnmatch.
  */
 const BASH_TREE_SENTINEL = "__TREE__";
-
-/**
- * Module-scope cache of fnmatch token → compiled RegExp. The deletion-
- * attribution path may probe the same stored bash_mutation_targets
- * token across many dirty files within a single snapshot; cache the
- * compiled RegExp so re-compilation cost stays O(distinct tokens).
- * Cleared only on process restart — re-fold determinism is unaffected
- * because the cache value is a pure function of the key.
- */
-const FNMATCH_CACHE = new Map<string, RegExp>();
-
-/**
- * Is `token` a glob pattern (contains an unescaped `*` or `?`)?
- * We only compile fnmatch for these — exact + directory-prefix cover
- * the rest and avoid the regex round-trip.
- */
-function isGlobToken(token: string): boolean {
-  for (let i = 0; i < token.length; i++) {
-    const c = token.charCodeAt(i);
-    if (c === 0x2a /* * */ || c === 0x3f /* ? */) return true;
-  }
-  return false;
-}
-
-/**
- * Compile a glob token to an anchored fnmatch RegExp. Dependency-free
- * (the hook forbids third-party imports; we keep the helper reducer-
- * side only, so it never enters the hook's import graph). Mapping:
- *
- *   - `*` → `[^/]*` (NEVER `.*` — `*` does not cross path separators)
- *   - `?` → `[^/]`  (single non-separator char)
- *   - every other regex meta (`. + ( ) [ ] { } ^ $ | \`) is escaped
- *   - anchored with `^` / `$` so a substring can't accidentally match
- *
- * NO `**` recursive-glob support, NO nested quantifiers, NO POSIX
- * character classes — every uncovered pattern degrades to "won't match
- * this token" (the dirty file simply doesn't attribute via that
- * token's row; pass-1 exact + directory-prefix still apply). ReDoS-
- * safe by construction: the regex is a flat sequence of `[^/]*` /
- * `[^/]` / single-char literals, no alternation, no backreferences,
- * no nested quantifiers — worst-case linear in `path.length`.
- */
-function compileFnmatch(token: string): RegExp {
-  const cached = FNMATCH_CACHE.get(token);
-  if (cached !== undefined) return cached;
-  let pattern = "^";
-  for (let i = 0; i < token.length; i++) {
-    const ch = token[i] as string;
-    if (ch === "*") {
-      pattern += "[^/]*";
-    } else if (ch === "?") {
-      pattern += "[^/]";
-    } else if (
-      ch === "." ||
-      ch === "+" ||
-      ch === "(" ||
-      ch === ")" ||
-      ch === "[" ||
-      ch === "]" ||
-      ch === "{" ||
-      ch === "}" ||
-      ch === "^" ||
-      ch === "$" ||
-      ch === "|" ||
-      ch === "\\"
-    ) {
-      pattern += `\\${ch}`;
-    } else {
-      pattern += ch;
-    }
-  }
-  pattern += "$";
-  const compiled = new RegExp(pattern);
-  FNMATCH_CACHE.set(token, compiled);
-  return compiled;
-}
 
 /**
  * Does a stored bash_mutation_targets `token` (absolute path or glob)

@@ -17,6 +17,7 @@ import {
   resolveAgentwrapPath,
   resolveConfig,
 } from "../src/db";
+import { resolveDisableAutoclose } from "../src/pair-command";
 
 let dir: string;
 let prevEnv: string | undefined;
@@ -304,4 +305,13 @@ test("disable_autoclose resolves independently of a malformed sibling key", () =
   const cfg = resolveConfig();
   expect(cfg.disableAutoclose).toEqual(["pair"]);
   expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+test("a disable_autoclose glob pattern parses and resolves through the matcher", () => {
+  writeConfig("disable_autoclose:\n  - 'panels:*'\n  - pair\n");
+  const isDisabled = resolveDisableAutoclose(resolveConfig().disableAutoclose);
+  // The glob arm matches any `panels:<id>` session; the bare arm matches exactly.
+  expect(isDisabled("panels:fn-1")).toBe(true);
+  expect(isDisabled("pair")).toBe(true);
+  expect(isDisabled("autopilot")).toBe(false);
 });

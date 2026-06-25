@@ -623,23 +623,43 @@ test("schema version constant is pinned at 1 (cross-repo contract)", () => {
   expect(PAIR_AGENTWRAP_SCHEMA_VERSION).toBe(1);
 });
 
-test("resolveDisableAutoclose: empty/absent list autocloses everything", () => {
+test("resolveDisableAutoclose: empty/absent list matches nothing (autocloses everything)", () => {
   // Default empty — `pair`/`panels` are NO LONGER exempt by default; every
   // managed session autocloses unless explicitly listed in `disable-autoclose`.
-  expect(resolveDisableAutoclose().size).toBe(0);
-  expect(resolveDisableAutoclose([]).size).toBe(0);
+  expect(resolveDisableAutoclose()("pair")).toBe(false);
+  expect(resolveDisableAutoclose([])("anything")).toBe(false);
   expect(DEFAULT_PAIR_SESSION).toBe("pair");
 });
 
-test("resolveDisableAutoclose: a session-name list becomes the exempt set", () => {
-  const set = resolveDisableAutoclose(["panels", "pair"]);
-  expect(set.has("panels")).toBe(true);
-  expect(set.has("pair")).toBe(true);
-  // An unlisted session autocloses.
-  expect(set.has("agentwrap")).toBe(false);
+test("resolveDisableAutoclose: a bare name matches exactly (backward compatible)", () => {
+  const isDisabled = resolveDisableAutoclose(["panels", "pair"]);
+  expect(isDisabled("panels")).toBe(true);
+  expect(isDisabled("pair")).toBe(true);
+  // An unlisted session autocloses; a bare token is an exact anchored match,
+  // never a substring/prefix.
+  expect(isDisabled("agentwrap")).toBe(false);
+  expect(isDisabled("panels-2")).toBe(false);
+  expect(isDisabled("xpanels")).toBe(false);
+});
+
+test("resolveDisableAutoclose: a glob token matches by fnmatch", () => {
+  const isDisabled = resolveDisableAutoclose(["panels:*"]);
+  // `:` is not a separator, so `panels:*` → `panels:<anything>`.
+  expect(isDisabled("panels:foo")).toBe(true);
+  expect(isDisabled("panels:bar-7")).toBe(true);
+  // The literal colon is required — `*` does not cover the missing `:`.
+  expect(isDisabled("panelsfoo")).toBe(false);
+  expect(isDisabled("panels")).toBe(false);
 });
 
 test("resolveDisableAutoclose: trims and drops empty entries", () => {
-  const set = resolveDisableAutoclose(["  panels  ", "", "  ", "my-debug"]);
-  expect([...set].sort()).toEqual(["my-debug", "panels"]);
+  const isDisabled = resolveDisableAutoclose([
+    "  panels  ",
+    "",
+    "  ",
+    "my-debug",
+  ]);
+  expect(isDisabled("panels")).toBe(true);
+  expect(isDisabled("my-debug")).toBe(true);
+  expect(isDisabled("")).toBe(false);
 });

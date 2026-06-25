@@ -343,10 +343,10 @@ export async function main(argv: string[]): Promise<void> {
   // agentwrap's race-safe launch lets concurrent partners share a named session
   // without a create race, so a stable name is safe.
   const sessionName = v.session ?? DEFAULT_PAIR_SESSION;
-  const disableAutoclose = resolveDisableAutoclose(
+  const isAutocloseDisabled = resolveDisableAutoclose(
     resolveConfig().disableAutoclose,
   );
-  const shouldReap = pairCli !== "claude" && !disableAutoclose.has(sessionName);
+  const shouldReap = pairCli !== "claude" && !isAutocloseDisabled(sessionName);
 
   // SIGTERM handler: a Monitor kills the process when its timeout_ms expires. We
   // MUST still emit a terminal line (so the orchestrating agent never hangs) AND

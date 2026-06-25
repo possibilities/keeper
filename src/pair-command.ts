@@ -31,6 +31,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
+import { compileFnmatch, isGlobToken } from "./glob";
 import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
 
 // ---------------------------------------------------------------------------
@@ -665,17 +666,41 @@ export function resolvePairKeeperAgentPath(
 export const DEFAULT_PAIR_SESSION = "pair";
 
 /**
- * Normalize a `disable-autoclose` session list into the exempt set the reap gate
- * checks against. This is the ONE knob shared CLI-side (the codex synchronous
- * reap below) and daemon-side (the reaper's managed-session arm, task .2): the
- * config-sourced list comes from `resolveConfig().disableAutoclose` (the
- * `disable_autoclose` YAML key, default EMPTY → every managed session
- * autocloses). Kept pure + dep-free of `src/db.ts` so this leaf never drags the
- * DB graph — the CLI passes `resolveConfig().disableAutoclose` in. Non-empty
- * trimmed entries only; an empty/absent list autocloses everything.
+ * Compile a `disable-autoclose` session list into a `(session) => boolean`
+ * matcher the reap gate checks against. This is the ONE knob shared CLI-side
+ * (the codex synchronous reap below) and daemon-side (the reaper's managed-
+ * session arm, task .2): the config-sourced list comes from
+ * `resolveConfig().disableAutoclose` (the `disable_autoclose` YAML key, default
+ * EMPTY → every managed session autocloses). Kept pure + dep-free of `src/db.ts`
+ * so this leaf never drags the DB graph — the CLI passes
+ * `resolveConfig().disableAutoclose` in.
+ *
+ * Each non-empty trimmed pattern compiles once: a glob token (`panels:*`) via
+ * the dep-free fnmatch leaf, a bare token (no `*`/`?`) to an exact anchored
+ * match. Glob is therefore a strict SUPERSET of the old exact-match — an
+ * existing bare-name config stays backward compatible. FAIL-OPEN: an
+ * empty/absent list (or one whose every pattern fails to compile) yields a
+ * matcher that matches NOTHING and NEVER throws at call time — the reaper
+ * compiles this at boot-frozen time, where a throw would crash the worker.
  */
 export function resolveDisableAutoclose(
   disableAutoclose: readonly string[] = [],
-): Set<string> {
-  return new Set(disableAutoclose.map((s) => s.trim()).filter((s) => s !== ""));
+): (session: string) => boolean {
+  const matchers: Array<(session: string) => boolean> = [];
+  for (const raw of disableAutoclose) {
+    const pattern = raw.trim();
+    if (pattern === "") continue;
+    try {
+      if (isGlobToken(pattern)) {
+        const re = compileFnmatch(pattern);
+        matchers.push((session) => re.test(session));
+      } else {
+        matchers.push((session) => session === pattern);
+      }
+    } catch {
+      // Drop a pattern that fails to compile — never let it reach call time.
+    }
+  }
+  if (matchers.length === 0) return () => false;
+  return (session) => matchers.some((m) => m(session));
 }
