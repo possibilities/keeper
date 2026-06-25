@@ -429,6 +429,69 @@ function validateSetAutopilotConfigParams(
 }
 
 /**
+ * Cross-field invariant coupling worktree mode and per-root concurrency:
+ * **worktree-off ⟹ `max_concurrent_per_root` = 1, always**. In worktree mode
+ * each epic forks onto its own git worktree lane, so concurrent same-repo
+ * workers never collide; with worktree mode OFF every worker of a repo runs in
+ * the SAME main checkout, so `max_concurrent_per_root > 1` makes them step on
+ * each other (shared working tree + index, interleaved commits, test runs seeing
+ * each other's half-finished edits).
+ *
+ * Enforced producer-side, BEFORE the `AutopilotConfigSet` event is minted: main
+ * reads the current folded `worktree_mode` and passes it as `currentWorktreeOn`
+ * (main folds each config append synchronously before the next message, so that
+ * read is race-free). Two coupled rules:
+ *
+ * - **Reject (hard, no `--force`):** when worktree mode is effectively OFF — set
+ *   OFF in this patch, or already OFF and untouched by it — and the patch sets
+ *   `max_concurrent_per_root` to anything other than 1 (or `null` = reset to the
+ *   default 1), throw {@link BadParamsError}. There is NO override.
+ * - **Coerce:** a patch that flips worktree mode OFF (`worktree_mode === false`)
+ *   without naming a per-root value forces `max_concurrent_per_root = 1` into the
+ *   SAME patch, so an ON→OFF flip can never leave a stale per-root > 1 in the
+ *   folded row.
+ *
+ * `max_concurrent_per_root > 1` is allowed ONLY while worktree mode is (or is
+ * being set) ON. Returns the effective patch to mint (coerced when applicable);
+ * throws on the hard reject. Pure — exported for direct unit tests.
+ */
+export function enforceWorktreeConcurrencyInvariant(
+  patch: SetAutopilotConfigParams,
+  currentWorktreeOn: boolean,
+): SetAutopilotConfigParams {
+  // Effective worktree mode AFTER this patch: the patch's own value wins, else
+  // the current folded state.
+  const worktreeOff =
+    "worktree_mode" in patch
+      ? patch.worktree_mode !== true
+      : !currentWorktreeOn;
+  if (!worktreeOff) {
+    // Worktree ON (or being turned ON) — per-root > 1 is legal, no constraint.
+    return patch;
+  }
+  // Worktree effectively OFF. An explicitly-set per-root must be 1 (or `null` =
+  // reset to the default 1); anything else is a hard reject with no escape hatch.
+  if ("max_concurrent_per_root" in patch) {
+    const v = patch.max_concurrent_per_root;
+    if (v !== null && v !== 1) {
+      throw new BadParamsError(
+        "set_autopilot_config: max_concurrent_per_root must be 1 while worktree mode is off — concurrent workers share the main checkout; enable worktree mode first",
+      );
+    }
+    return patch;
+  }
+  // Worktree being flipped OFF in this patch without naming a per-root value:
+  // coerce per-root → 1 in the same patch so the folded row can't keep a stale
+  // per-root > 1. (Worktree already OFF and untouched by the patch: nothing to
+  // coerce — the invariant already held, and a lone unrelated config change
+  // leaves per-root as-is.)
+  if (patch.worktree_mode === false) {
+    return { ...patch, max_concurrent_per_root: 1 };
+  }
+  return patch;
+}
+
+/**
  * `set_autopilot_config` handler — the GENERIC autopilot-config mutating RPC.
  * Validates a PARTIAL patch of the scalar config columns and bridges to main,
  * which APPENDS an `AutopilotConfigSet` synthetic event (folded into the

@@ -76,6 +76,9 @@ Subcommands:
            scalar autopilot config value. Keys: max_concurrent_jobs (a positive
            integer cap, or 'unlimited' to clear it); max_concurrent_per_root (a
            positive integer count of concurrent tasks per root, or 'default'/1).
+           max_concurrent_per_root > 1 is REJECTED while worktree mode is off
+           (workers would share the main checkout) — enable worktree mode first;
+           no --force override.
            e.g. keeper autopilot config max_concurrent_jobs 8
                 keeper autopilot config max_concurrent_per_root 3
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
@@ -84,7 +87,9 @@ Subcommands:
            toggle for worktree-shaped autopilot dispatch (OFF by default).
            REJECTED only when a started open epic is in flight (so a flip never
            half-migrates an in-progress epic); a drained / unstarted-open /
-           zero-epic board toggles freely. Pass --force to override.
+           zero-epic board toggles freely. Pass --force to override. Turning it
+           off also pins max_concurrent_per_root back to 1 (worktree-off workers
+           share the main checkout).
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3). verb is
            one of work|close|approve; approve clears a resurrected/phantom

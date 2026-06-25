@@ -120,6 +120,7 @@ import type {
   BackendExecStartMessage,
   RestoreWorkerData,
 } from "./restore-worker";
+import { enforceWorktreeConcurrencyInvariant } from "./rpc-handlers";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   BootCompleteMessage,
@@ -2536,6 +2537,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         const id = msg.id;
         let reply: SetAutopilotConfigResultMessage;
         try {
+          // Cross-field invariant: worktree-off ⟹ max_concurrent_per_root = 1.
+          // Read the CURRENT folded worktree mode (race-free — main folds each
+          // config append synchronously before the next message, so this read
+          // reflects every prior config event) and coerce/reject the patch before
+          // minting. A hard reject throws BadParamsError → the catch reports
+          // ok:false; the coerced patch is what we persist.
+          const cur = db
+            .query("SELECT worktree_mode FROM autopilot_state WHERE id = 1")
+            .get() as { worktree_mode: number | null } | null;
+          const effectivePatch = enforceWorktreeConcurrencyInvariant(
+            msg.patch,
+            cur?.worktree_mode === 1,
+          );
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
             $session_id: "autopilot",
@@ -2549,7 +2563,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $agent_id: null,
             $agent_type: null,
             $stop_hook_active: null,
-            $data: JSON.stringify(msg.patch),
+            $data: JSON.stringify(effectivePatch),
             $subagent_agent_id: null,
             $spawn_name: null,
             $start_time: null,

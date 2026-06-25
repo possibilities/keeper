@@ -24,6 +24,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  enforceWorktreeConcurrencyInvariant,
   parseDispatchKey,
   replayDeadLetterHandler,
   requestHandoffHandler,
@@ -499,6 +500,99 @@ test("set_autopilot_config throws rpc_failed when the bridge reports ok:false", 
   expect(
     setAutopilotConfigHandler({ max_concurrent_jobs: 4 }, bridge),
   ).rejects.toThrow(/insert lock contention/);
+});
+
+// ---------------------------------------------------------------------------
+// fn-972 — `enforceWorktreeConcurrencyInvariant`: worktree-off ⟹ per-root = 1.
+// Pure cross-field guard run producer-side (daemon main) before minting. The
+// second arg is the CURRENT folded worktree mode; the patch's own worktree_mode
+// wins when present. Coerce on the worktree-off transition; hard-reject per-root
+// > 1 while worktree is (or is being set) off — no --force.
+// ---------------------------------------------------------------------------
+
+const PER_ROOT_OFF_MSG =
+  /max_concurrent_per_root must be 1 while worktree mode is off/;
+
+test("invariant — worktree ON: per-root > 1 is allowed, patch returned unchanged (fn-972)", () => {
+  // Current on, lone per-root bump.
+  expect(
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 3 }, true),
+  ).toEqual({ max_concurrent_per_root: 3 });
+  // Turning worktree ON in the same patch as a per-root bump.
+  expect(
+    enforceWorktreeConcurrencyInvariant(
+      { worktree_mode: true, max_concurrent_per_root: 5 },
+      false,
+    ),
+  ).toEqual({ worktree_mode: true, max_concurrent_per_root: 5 });
+  // An unrelated cap change while worktree on is untouched.
+  expect(
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_jobs: 8 }, true),
+  ).toEqual({ max_concurrent_jobs: 8 });
+});
+
+test("invariant — coerce: flipping worktree OFF without naming per-root pins per-root to 1 (fn-972)", () => {
+  // ON → OFF transition: per-root coerced into the same patch.
+  expect(
+    enforceWorktreeConcurrencyInvariant({ worktree_mode: false }, true),
+  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
+  // Re-issuing `worktree off` while already off still pins per-root (idempotent
+  // self-heal).
+  expect(
+    enforceWorktreeConcurrencyInvariant({ worktree_mode: false }, false),
+  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
+});
+
+test("invariant — coerce no-op: an explicit per-root of 1 (or null) alongside worktree-off is left as-is (fn-972)", () => {
+  expect(
+    enforceWorktreeConcurrencyInvariant(
+      { worktree_mode: false, max_concurrent_per_root: 1 },
+      true,
+    ),
+  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
+  // null = reset to the default 1 — consistent with worktree off, allowed.
+  expect(
+    enforceWorktreeConcurrencyInvariant(
+      { worktree_mode: false, max_concurrent_per_root: null },
+      true,
+    ),
+  ).toEqual({ worktree_mode: false, max_concurrent_per_root: null });
+});
+
+test("invariant — reject: per-root > 1 with worktree currently off (untouched by the patch) throws (fn-972)", () => {
+  expect(() =>
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 3 }, false),
+  ).toThrow(PER_ROOT_OFF_MSG);
+  expect(() =>
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 2 }, false),
+  ).toThrow(BadParamsError);
+});
+
+test("invariant — reject: a single patch setting worktree OFF and per-root > 1 throws (reject wins over coerce) (fn-972)", () => {
+  expect(() =>
+    enforceWorktreeConcurrencyInvariant(
+      { worktree_mode: false, max_concurrent_per_root: 3 },
+      true,
+    ),
+  ).toThrow(PER_ROOT_OFF_MSG);
+});
+
+test("invariant — no coerce on an unrelated config change while worktree already off (per-root left as-is) (fn-972)", () => {
+  // A lone cap change while worktree off must NOT inject a per-root value — the
+  // invariant already held; only the explicit worktree-off flip coerces.
+  expect(
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_jobs: 8 }, false),
+  ).toEqual({ max_concurrent_jobs: 8 });
+  // An explicit per-root of 1 / null while off is allowed and unchanged.
+  expect(
+    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 1 }, false),
+  ).toEqual({ max_concurrent_per_root: 1 });
+  expect(
+    enforceWorktreeConcurrencyInvariant(
+      { max_concurrent_per_root: null },
+      false,
+    ),
+  ).toEqual({ max_concurrent_per_root: null });
 });
 
 // ---------------------------------------------------------------------------
