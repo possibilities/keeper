@@ -2641,7 +2641,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           }
           let doc: string;
           try {
-            doc = readFileSync(msg.doc_path, "utf8");
+            doc = readFileSync(realDoc, "utf8");
           } catch (readErr) {
             sw.postMessage({
               type: "request-handoff-result",

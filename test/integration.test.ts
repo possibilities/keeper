@@ -21,7 +21,13 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
@@ -602,6 +608,23 @@ test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon 
           target_session: "work",
         });
         throw new Error("expected a loud failure for an out-of-dir spill path");
+      } catch (e) {
+        expect(String(e)).toMatch(/resolves outside the spill dir|rpc_failed/);
+      }
+
+      // Loud-fail: an IN-DIR symlink whose target is out-of-dir is rejected by
+      // the realpath confinement — the guard resolves the symlink and the READ
+      // uses the resolved path, so a swapped-in symlink can never escape the
+      // spill dir (closes the TOCTOU window between check and read).
+      const symlinkPath = join(spillDir, "hr-e2e-symlink.txt");
+      symlinkSync(outOfDirPath, symlinkPath);
+      try {
+        await rpc("request_handoff", {
+          handoff_id: "hr-e2e-symlink",
+          doc_path: symlinkPath,
+          target_session: "work",
+        });
+        throw new Error("expected a loud failure for an in-dir symlink escape");
       } catch (e) {
         expect(String(e)).toMatch(/resolves outside the spill dir|rpc_failed/);
       }
