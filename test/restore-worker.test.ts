@@ -1,6 +1,6 @@
 /**
  * Restore-snapshot worker tests (epic fn-677 task .3; single-tier reshape
- * fn-817 T4).
+ * fn-817 T4; topology-producer relocation fn-968 T2).
  *
  * Exercise the pure `buildRestoreTier`, `serializeForHash`,
  * `serializeForWrite`, and `restorePulse` symbols against a fresh writer DB
@@ -13,17 +13,21 @@
  * user's real `~/.local/state/keeper/restore.json` (the sandboxed-base-env
  * pattern from CLAUDE.md's test-isolation rules).
  *
- * Coverage (single-tier dumb-current-mirror model — epic fn-817):
+ * Coverage (post-fn-968 — the restore-worker no longer polls tmux topology):
  *  - `buildRestoreTier`: filters to live jobs (`working`/`stopped`), drops
  *    `ended`/`killed`, drops `backend_exec_session_id == null`, drops empty
  *    job_id; groups by session; sorts agents by job_id; stamps `resume_target`
- *    as the latest name (job_id fallback); pre-resolves tier via the shared helper.
+ *    as the latest name (job_id fallback); pre-resolves tier; reads
+ *    `window_index` straight off the `jobs` projection row.
  *  - `serializeForHash`: strips `current.captured_at`; an index change rewrites.
  *  - `serializeForWrite`: keeps `captured_at`, schema v3, trailing \n, no
  *    `last_session` field.
  *  - `restorePulse`: write-on-change gate; the live set mirrors empty without a
- *    frozen `last_session` (the freeze machinery is GONE); window_index capture;
- *    tmux pane-snapshot + window-index posts.
+ *    frozen `last_session`; restore.json window_index re-sourced from the
+ *    projection; NO `list-panes -a` probe (topology silenced); the generation
+ *    boundary probe still fires.
+ *  - `probeServerGeneration` / `probeTmuxTopology` / `seedLastGenerationHash`:
+ *    retained exports (the boot-seed imports the two probes).
  */
 
 import type { Database } from "bun:sqlite";
@@ -42,7 +46,6 @@ import {
   type BackendExecStartMessage,
   buildRestoreTier,
   probeServerGeneration,
-  probeTmuxPanes,
   probeTmuxTopology,
   RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
@@ -52,51 +55,31 @@ import {
   seedLastGenerationHash,
   serializeForHash,
   serializeForWrite,
-  type TmuxPaneSnapshotMessage,
-  type TmuxTopologySnapshotMessage,
-  type WindowIndexSnapshotMessage,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
 
-/** Build a fresh single-tier PulseState for the pulse driver tests. */
+/** Build a fresh PulseState for the pulse driver tests. The topology /
+ *  window-index cache fields retired with fn-968 — only the file write gate and
+ *  the generation-boundary dedup remain. */
 function freshState(): {
   lastHash: string | null;
   parentDirEnsured: boolean;
-  lastSnapshotHash: string | null;
-  lastWindowIndexByJobId: Map<string, number>;
-  lastWindowIndexHash: string | null;
   lastGenerationHash: string | null;
-  lastTopologyHash: string | null;
 } {
   return {
     lastHash: null,
     parentDirEnsured: false,
-    lastSnapshotHash: null,
-    lastWindowIndexByJobId: new Map(),
-    lastWindowIndexHash: null,
     lastGenerationHash: null,
-    lastTopologyHash: null,
   };
-}
-
-/** A `SpawnSyncFn` that returns the given tab-delimited
- *  `#{pane_id}\t#{window_index}\t#{session_name}` lines as a successful
- *  `tmux list-panes` capture. */
-function stubTmuxPanes(lines: string[]): SpawnSyncFn {
-  return () => ({
-    success: true,
-    exitCode: 0,
-    stdout: Buffer.from(lines.join("\n")),
-  });
 }
 
 /**
  * A `SpawnSyncFn` that dispatches on the tmux subcommand: a `display-message`
  * probe (the server-pid generation handle) returns `pid`; a `list-panes` probe
- * returns the given pane lines. One stub feeds BOTH consumers the pulse drives
- * off a single injected `spawnSync`. A `null` `pid` makes the display-message
- * probe a failed (no-server) capture.
+ * (which the restore-worker no longer issues — used here only to PROVE it is
+ * never spawned) returns the given pane lines. A `null` `pid` makes the
+ * display-message probe a failed (no-server) capture.
  */
 function stubTmux(opts: { pid: string | null; panes?: string[] }): SpawnSyncFn {
   return (cmd: string[]) => {
@@ -115,27 +98,19 @@ function stubTmux(opts: { pid: string | null; panes?: string[] }): SpawnSyncFn {
 }
 
 /**
- * A `SpawnSyncFn` for the topology arm: a `display-message` probe returns `pid`
- * (the generation handle); a `list-panes` probe returns the configured outcome
- * — `panes` (success with lines), `gone` (non-zero + a server-gone stderr),
- * `transient` (non-zero + an unrelated stderr), or `empty` (exit0, no stdout).
+ * A `SpawnSyncFn` for {@link probeTmuxTopology} (retained for the boot-seed): a
+ * `list-panes` probe returns the configured outcome — `panes` (success with
+ * lines), `gone` (non-zero + a server-gone stderr), `transient` (non-zero + an
+ * unrelated stderr), or `empty` (exit0, no stdout).
  */
 function stubTopology(opts: {
-  pid: string | null;
   listPanes:
     | { kind: "panes"; lines: string[] }
     | { kind: "gone" }
     | { kind: "transient" }
     | { kind: "empty" };
 }): SpawnSyncFn {
-  return (cmd: string[]) => {
-    if (cmd.includes("display-message")) {
-      if (opts.pid == null) {
-        return { success: false, exitCode: 1, stdout: Buffer.from("") };
-      }
-      return { success: true, exitCode: 0, stdout: Buffer.from(opts.pid) };
-    }
-    // list-panes
+  return () => {
     const lp = opts.listPanes;
     if (lp.kind === "panes") {
       return {
@@ -224,7 +199,9 @@ afterEach(() => {
 
 /**
  * Insert one row into `jobs` with only the columns the descriptor builder
- * reads. Defaults match a freshly-spawned working session.
+ * reads. Defaults match a freshly-spawned working session. `window_index` is
+ * the live tmux position the control-worker's `TmuxTopologySnapshot` fold keeps
+ * fresh — the restore-worker now reads it straight off this column.
  */
 function insertJob(opts: {
   job_id: string;
@@ -236,6 +213,7 @@ function insertJob(opts: {
   backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
   backend_exec_pane_id?: string | null;
+  window_index?: number | null;
   created_at?: number;
 }): void {
   const state = opts.state ?? "working";
@@ -243,8 +221,9 @@ function insertJob(opts: {
     `INSERT INTO jobs (
        job_id, created_at, state, last_event_id, updated_at,
        cwd, title, plan_verb, plan_ref,
-       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
-     ) VALUES (?, ?, ?, 0, 1000, ?, ?, ?, ?, ?, ?, ?)`,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+       window_index
+     ) VALUES (?, ?, ?, 0, 1000, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       opts.job_id,
       opts.created_at ?? 1000,
@@ -256,6 +235,7 @@ function insertJob(opts: {
       opts.backend_exec_type ?? null,
       opts.backend_exec_session_id ?? null,
       opts.backend_exec_pane_id ?? null,
+      opts.window_index ?? null,
     ],
   );
 }
@@ -473,16 +453,26 @@ test("buildRestoreTier sets captured_at on the tier shape (empty live set)", () 
   expect(out.sessions).toEqual({});
 });
 
-test("buildRestoreTier stamps window_index from the cache and created_at from the job", () => {
+// ---------------------------------------------------------------------------
+// buildRestoreTier — window_index sourced from the jobs projection (fn-968)
+// ---------------------------------------------------------------------------
+
+test("buildRestoreTier reads window_index off the projection row and created_at off the job", () => {
   const jobs: Job[] = [
-    fakeJob({ job_id: "a", backend_exec_session_id: "s1", created_at: 7 }),
-    fakeJob({ job_id: "b", backend_exec_session_id: "s1", created_at: 9 }),
+    fakeJob({
+      job_id: "a",
+      backend_exec_session_id: "s1",
+      window_index: 2,
+      created_at: 7,
+    }),
+    fakeJob({
+      job_id: "b",
+      backend_exec_session_id: "s1",
+      window_index: 0,
+      created_at: 9,
+    }),
   ];
-  const cache = new Map<string, number>([
-    ["a", 2],
-    ["b", 0],
-  ]);
-  const out = buildRestoreTier(jobs, new Map(), 1000, cache);
+  const out = buildRestoreTier(jobs, new Map(), 1000);
   const byId = new Map(out.sessions.s1.agents.map((x) => [x.job_id, x]));
   expect(byId.get("a")?.window_index).toBe(2);
   expect(byId.get("a")?.created_at).toBe(7);
@@ -490,15 +480,10 @@ test("buildRestoreTier stamps window_index from the cache and created_at from th
   expect(byId.get("b")?.created_at).toBe(9);
 });
 
-test("buildRestoreTier stamps window_index null on a cache miss (pane gone)", () => {
-  const jobs: Job[] = [fakeJob({ job_id: "a", backend_exec_session_id: "s1" })];
-  // Empty cache → no entry for "a".
-  const out = buildRestoreTier(jobs, new Map(), 1000, new Map());
-  expect(out.sessions.s1.agents[0].window_index).toBeNull();
-});
-
-test("buildRestoreTier defaults to an empty cache (4th param omitted)", () => {
-  const jobs: Job[] = [fakeJob({ job_id: "a", backend_exec_session_id: "s1" })];
+test("buildRestoreTier stamps window_index null when the projection row has none", () => {
+  const jobs: Job[] = [
+    fakeJob({ job_id: "a", backend_exec_session_id: "s1", window_index: null }),
+  ];
   const out = buildRestoreTier(jobs, new Map(), 1000);
   expect(out.sessions.s1.agents[0].window_index).toBeNull();
 });
@@ -508,14 +493,14 @@ test("buildRestoreTier keeps the on-disk job_id sort regardless of window_index"
   // job_id sort — the on-disk array must still be job_id-sorted (visual order
   // is a restore-time concern, not the file's).
   const jobs: Job[] = [
-    fakeJob({ job_id: "zeta", backend_exec_session_id: "s1" }),
-    fakeJob({ job_id: "alpha", backend_exec_session_id: "s1" }),
+    fakeJob({ job_id: "zeta", backend_exec_session_id: "s1", window_index: 0 }),
+    fakeJob({
+      job_id: "alpha",
+      backend_exec_session_id: "s1",
+      window_index: 1,
+    }),
   ];
-  const cache = new Map<string, number>([
-    ["zeta", 0],
-    ["alpha", 1],
-  ]);
-  const out = buildRestoreTier(jobs, new Map(), 1000, cache);
+  const out = buildRestoreTier(jobs, new Map(), 1000);
   expect(out.sessions.s1.agents.map((x) => x.job_id)).toEqual([
     "alpha",
     "zeta",
@@ -563,18 +548,28 @@ test("serializeForHash changes when the current tier's content changes", () => {
 test("serializeForHash includes window_index (an index change rewrites the file)", () => {
   const base = descFor(
     buildRestoreTier(
-      [fakeJob({ job_id: "j1", backend_exec_session_id: "work" })],
+      [
+        fakeJob({
+          job_id: "j1",
+          backend_exec_session_id: "work",
+          window_index: 0,
+        }),
+      ],
       new Map(),
       1000,
-      new Map([["j1", 0]]),
     ),
   );
   const moved = descFor(
     buildRestoreTier(
-      [fakeJob({ job_id: "j1", backend_exec_session_id: "work" })],
+      [
+        fakeJob({
+          job_id: "j1",
+          backend_exec_session_id: "work",
+          window_index: 5,
+        }),
+      ],
       new Map(),
       1000,
-      new Map([["j1", 5]]),
     ),
   );
   // A pure window reorder (0 → 5) must change the file hash so the worker
@@ -701,7 +696,7 @@ test("restorePulse end-to-end pre-resolves tier and stamps the latest-name resum
       tier: "mint",
       plan_verb: "work",
       plan_ref: "fn-1-foo.2",
-      // No probe wired (pure-pulse path) and no pane id → unknown order.
+      // No window_index on the projection row → unknown order.
       window_index: null,
       created_at: 1000,
     },
@@ -709,285 +704,7 @@ test("restorePulse end-to-end pre-resolves tier and stamps the latest-name resum
 });
 
 // ---------------------------------------------------------------------------
-// KEEPER_RESTORE_FILE env-var isolation
-// ---------------------------------------------------------------------------
-
-test("resolveRestorePath honors KEEPER_RESTORE_FILE so the worker writes the sandbox path", () => {
-  // The beforeEach setter wires KEEPER_RESTORE_FILE → tmpDir/restore.json;
-  // confirm `resolveRestorePath` honors it (the worker calls this once at
-  // startup, so an override mishap would leak into the user's real file).
-  expect(resolveRestorePath()).toBe(restorePath);
-});
-
-// ---------------------------------------------------------------------------
-// Helpers (test-local)
-// ---------------------------------------------------------------------------
-
-/**
- * Build an in-memory `Job` for the pure tier builder. Only the fields
- * `buildRestoreTier` reads matter; defaults track a minimal live row.
- */
-function fakeJob(opts: {
-  job_id: string;
-  state?: string;
-  cwd?: string | null;
-  title?: string | null;
-  plan_verb?: string | null;
-  plan_ref?: string | null;
-  backend_exec_type?: string | null;
-  backend_exec_session_id?: string | null;
-  backend_exec_pane_id?: string | null;
-  created_at?: number;
-}): Job {
-  return {
-    job_id: opts.job_id,
-    created_at: opts.created_at ?? 1000,
-    state: opts.state ?? "working",
-    cwd: opts.cwd ?? null,
-    title: opts.title ?? null,
-    plan_verb: opts.plan_verb ?? null,
-    plan_ref: opts.plan_ref ?? null,
-    backend_exec_type: opts.backend_exec_type ?? null,
-    backend_exec_session_id: opts.backend_exec_session_id ?? null,
-    backend_exec_pane_id: opts.backend_exec_pane_id ?? null,
-  } as unknown as Job;
-}
-
-// ---------------------------------------------------------------------------
-// probeTmuxPanes — parse + degrade
-// ---------------------------------------------------------------------------
-
-test("probeTmuxPanes parses tab-delimited pane/index/session rows", () => {
-  const pairs = probeTmuxPanes(
-    stubTmuxPanes(["%1\t0\twork", "%2\t1\tplay", "%3\t2\twork"]),
-  );
-  expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "work", window_index: 0 },
-    { pane_id: "%2", session_name: "play", window_index: 1 },
-    { pane_id: "%3", session_name: "work", window_index: 2 },
-  ]);
-});
-
-test("probeTmuxPanes keeps session names containing spaces and tabs (name last)", () => {
-  // The session name is the variable-length field LAST, so an embedded space
-  // (or tab) cannot bleed into the numeric window_index.
-  const pairs = probeTmuxPanes(stubTmuxPanes(["%1\t3\tmy session name"]));
-  expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "my session name", window_index: 3 },
-  ]);
-});
-
-test("probeTmuxPanes drops malformed lines (missing tab / empty pane / empty session)", () => {
-  const pairs = probeTmuxPanes(
-    stubTmuxPanes([
-      "%1\t0\tok",
-      "garbage-no-tab",
-      "%2\tonlyonetab",
-      "\t0\tonlysession",
-      "%4\t0\t",
-      "",
-    ]),
-  );
-  expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "ok", window_index: 0 },
-  ]);
-});
-
-test("probeTmuxPanes coerces a non-numeric / empty window_index to null (pair kept)", () => {
-  const pairs = probeTmuxPanes(
-    stubTmuxPanes(["%1\tNaN\twork", "%2\t\tplay", "%3\t1.5\tmid"]),
-  );
-  // A bad index leaves the pair intact with window_index null (the agent sinks
-  // to the tail at restore time rather than being dropped); a non-integer
-  // (1.5) is also rejected — window indices are integers.
-  expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "work", window_index: null },
-    { pane_id: "%2", session_name: "play", window_index: null },
-    { pane_id: "%3", session_name: "mid", window_index: null },
-  ]);
-});
-
-test("probeTmuxPanes is invoked with a locale-defaulted env (TAB-faithful)", () => {
-  // The default spawn wraps env in localeDefaultedEnv so a C-locale TAB mangle
-  // can't drop every row; the injected spawn here just records that the probe
-  // ran and parsed a 3-field row end to end.
-  let calls = 0;
-  const pairs = probeTmuxPanes((cmd) => {
-    calls += 1;
-    expect(cmd).toContain("#{pane_id}\t#{window_index}\t#{session_name}");
-    return {
-      success: true,
-      exitCode: 0,
-      stdout: Buffer.from("%1\t4\twork"),
-    };
-  });
-  expect(calls).toBe(1);
-  expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "work", window_index: 4 },
-  ]);
-});
-
-test("probeTmuxPanes degrades to [] on a thrown spawn (ENOENT — no tmux binary)", () => {
-  const pairs = probeTmuxPanes(() => {
-    throw new Error("ENOENT");
-  });
-  expect(pairs).toEqual([]);
-});
-
-test("probeTmuxPanes degrades to [] on a non-zero exit (no server)", () => {
-  const pairs = probeTmuxPanes(() => ({
-    success: false,
-    exitCode: 1,
-    stdout: Buffer.from(""),
-  }));
-  expect(pairs).toEqual([]);
-});
-
-// ---------------------------------------------------------------------------
-// restorePulse — tmux pane-snapshot poll arm (gate / fill / dedup)
-// ---------------------------------------------------------------------------
-
-test("restorePulse posts a tmux-pane-snapshot when a live tmux job has a NULL session", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t0\twork", "%9\t1\tother"]),
-    post: (m) => posts.push(m),
-  });
-  expect(posts).toHaveLength(1);
-  // Only the pane matching the NULL-session live job is posted (fillable filter).
-  expect(posts[0].pairs).toEqual([
-    { pane_id: "%1", session_name: "work", window_index: 0 },
-  ]);
-});
-
-test("restorePulse poll arm is quiescent when NO live tmux job exists", () => {
-  // Only a non-tmux NULL-session job — the wider gate (any live tmux job) is
-  // false, so nothing spawns.
-  insertJob({
-    job_id: "non-tmux",
-    backend_exec_type: "other",
-    backend_exec_pane_id: "%2",
-    backend_exec_session_id: null,
-  });
-  let spawned = false;
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: () => {
-      spawned = true;
-      return { success: true, exitCode: 0, stdout: Buffer.from("%1\t0\twork") };
-    },
-    post: (m) => posts.push(m),
-  });
-  expect(spawned).toBe(false); // gate false → no probe spawn
-  expect(posts).toHaveLength(0);
-});
-
-test("restorePulse mints nothing when no probed pair would fill a NULL-session job", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  // The server only shows panes keeper never tracked — nothing fills %1.
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%7\t0\tghost", "%8\t1\tphantom"]),
-    post: (m) => posts.push(m),
-  });
-  expect(posts).toHaveLength(0);
-});
-
-test("restorePulse dedups: an unchanged topology does not re-post across pulses", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  const state = freshState();
-  const snapshot = {
-    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
-    post: (m: TmuxPaneSnapshotMessage) => posts.push(m),
-  };
-  restorePulse(db, restorePath, state, () => 1000, snapshot);
-  restorePulse(db, restorePath, state, () => 2000, snapshot);
-  restorePulse(db, restorePath, state, () => 3000, snapshot);
-  // The job stays NULL in this DB (no reducer here to fill it), so the gate
-  // stays armed every pulse — but the dedup hash suppresses the repeat posts.
-  expect(posts).toHaveLength(1);
-});
-
-test("restorePulse re-posts when the resolvable topology changes", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  const state = freshState();
-  restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
-    post: (m) => posts.push(m),
-  });
-  // The pane moved to a different session — a genuine topology change.
-  restorePulse(db, restorePath, state, () => 2000, {
-    spawnSync: stubTmuxPanes(["%1\t0\tmoved"]),
-    post: (m) => posts.push(m),
-  });
-  expect(posts).toHaveLength(2);
-  expect(posts[1].pairs).toEqual([
-    { pane_id: "%1", session_name: "moved", window_index: 0 },
-  ]);
-});
-
-test("restorePulse fill post does NOT re-fire on a pure window reorder (hashPairs excludes window_index)", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  const state = freshState();
-  // First pulse posts the fillable pair.
-  restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
-    post: (m) => posts.push(m),
-  });
-  // The window moved (index 0 → 5) but the (pane_id, session_name) pair is
-  // unchanged — the fill-snapshot hash must NOT see the index, so no re-post.
-  restorePulse(db, restorePath, state, () => 2000, {
-    spawnSync: stubTmuxPanes(["%1\t5\twork"]),
-    post: (m) => posts.push(m),
-  });
-  expect(posts).toHaveLength(1);
-});
-
-test("restorePulse poll arm is fully disabled when no post is wired (pure-pulse path)", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: null,
-  });
-  // No `snapshot` arg at all — the pure-pulse test path (no parentPort). The
-  // restore-file write still runs; the tmux probe arm is skipped entirely
-  // (no spawn, no post) even though the gate would otherwise be armed.
-  restorePulse(db, restorePath, freshState(), () => 1000);
-  expect(existsSync(restorePath)).toBe(true);
-});
-
-// ---------------------------------------------------------------------------
-// restorePulse — window-index capture (the producer side of visual order)
+// restorePulse — restore.json window_index re-sourced from the projection
 // ---------------------------------------------------------------------------
 
 /** Read one session bucket's agents keyed by job_id off disk. */
@@ -1008,12 +725,15 @@ function agentsById(
   return out;
 }
 
-test("restorePulse stamps window_index into restore.json from the probe (correlated by pane id)", () => {
+test("restorePulse carries window_index from the jobs projection into restore.json", () => {
+  // The control-worker's TmuxTopologySnapshot fold keeps `jobs.window_index`
+  // fresh; the restore-worker reads it straight off the column (no probe).
   insertJob({
     job_id: "j1",
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%1",
     backend_exec_session_id: "work",
+    window_index: 3,
     created_at: 11,
   });
   insertJob({
@@ -1021,15 +741,10 @@ test("restorePulse stamps window_index into restore.json from the probe (correla
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%2",
     backend_exec_session_id: "work",
+    window_index: 0,
     created_at: 22,
   });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    // j2's window sits LEFT of j1's (index 0 vs 3) — the visual order the
-    // restore-agents util will replay.
-    spawnSync: stubTmuxPanes(["%1\t3\twork", "%2\t0\twork"]),
-    post: (m) => posts.push(m),
-  });
+  restorePulse(db, restorePath, freshState(), () => 1000);
   const byId = agentsById(readFile(restorePath).current, "work");
   expect(byId.get("j1")?.window_index).toBe(3);
   expect(byId.get("j2")?.window_index).toBe(0);
@@ -1037,142 +752,76 @@ test("restorePulse stamps window_index into restore.json from the probe (correla
   expect(byId.get("j2")?.created_at).toBe(22);
 });
 
-test("restorePulse keeps capturing window_index after ALL sessions resolve (wider gate)", () => {
-  // The fill gate (NULL-session) is FALSE here — every job already has a
-  // session. The wider gate (any live tmux job) must still arm the probe so
-  // ongoing reorders are captured.
+test("restorePulse rewrites restore.json when the projection window_index changes", () => {
   insertJob({
     job_id: "j1",
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%1",
     backend_exec_session_id: "work",
+    window_index: 0,
   });
-  const posts: TmuxPaneSnapshotMessage[] = [];
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t5\twork"]),
-    post: (m) => posts.push(m),
-  });
-  // No fill post (no NULL-session job) but the index is still captured.
-  expect(posts).toHaveLength(0);
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000);
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBe(0);
+  const firstHash = state.lastHash;
+
+  // The control-worker fold moved the window (0 → 5) on the projection — the
+  // restore-file content hash flips, so the pulse rewrites the new position.
+  db.run("UPDATE jobs SET window_index = 5 WHERE job_id = 'j1'");
+  restorePulse(db, restorePath, state, () => 1000);
+  expect(state.lastHash).not.toBe(firstHash);
   expect(
     agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
   ).toBe(5);
 });
 
-test("restorePulse does NOT stamp window_index on a recycled pane (session mismatch)", () => {
-  // The pane id %1 hits, but the probe says it lives in session "other" while
-  // the job's resolved session is "work" — a recycled `%N`. Must not stamp.
+// ---------------------------------------------------------------------------
+// restorePulse — topology poll SILENCED (no list-panes -a; fn-968)
+// ---------------------------------------------------------------------------
+
+test("restorePulse issues NO list-panes -a probe (topology produced by the control-worker now)", () => {
+  // A live tmux job with an unresolved session — exactly the state the old
+  // pane-fill / topology arms would have probed for. The pulse must spawn NO
+  // `list-panes` command.
   insertJob({
     job_id: "j1",
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
+    backend_exec_session_id: null,
   });
+  const cmds: string[][] = [];
   restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t2\tother"]),
-    post: () => {},
+    spawnSync: (cmd) => {
+      cmds.push(cmd);
+      return stubTmux({ pid: "900", panes: ["%1\t0\twork"] })(cmd);
+    },
+    postBackendExecStart: () => {},
   });
-  expect(
-    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
-  ).toBeNull();
+  // The only tmux shell-out the pulse retains is the generation probe.
+  expect(cmds.some((c) => c.includes("list-panes"))).toBe(false);
+  expect(cmds.some((c) => c.includes("display-message"))).toBe(true);
 });
 
-test("restorePulse window-index cache prunes entries for jobs no longer live", () => {
+test("restorePulse spawns nothing tmux-related when no generation arm is wired (pure-pulse path)", () => {
   insertJob({
     job_id: "j1",
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%1",
     backend_exec_session_id: "work",
   });
-  const state = freshState();
-  restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t4\twork"]),
-    post: () => {},
+  let spawned = false;
+  // No `postBackendExecStart` and no injected spawnSync → the pulse runs purely
+  // off the projection, no tmux shell-out at all. The restore-file still writes.
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: () => {
+      spawned = true;
+      return { success: true, exitCode: 0, stdout: Buffer.from("") };
+    },
   });
-  expect(state.lastWindowIndexByJobId.get("j1")).toBe(4);
-  // The job ends → it is no longer live; the next pulse must drop its entry.
-  db.run(`UPDATE jobs SET state = 'ended' WHERE job_id = 'j1'`);
-  restorePulse(db, restorePath, state, () => 2000, {
-    spawnSync: stubTmuxPanes(["%1\t4\twork"]),
-    post: () => {},
-  });
-  expect(state.lastWindowIndexByJobId.has("j1")).toBe(false);
-});
-
-test("restorePulse posts a WindowIndexSnapshot when the layout changes, deduped on no change", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
-  });
-  insertJob({
-    job_id: "j2",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%2",
-    backend_exec_session_id: "work",
-  });
-  const wi: WindowIndexSnapshotMessage[] = [];
-  const state = freshState();
-  const pulse = (panes: string[], now: number): void => {
-    restorePulse(db, restorePath, state, () => now, {
-      spawnSync: stubTmuxPanes(panes),
-      post: () => {},
-      postWindowIndex: (m) => wi.push(m),
-    });
-  };
-  // First pulse: a layout exists → ONE post carrying both entries.
-  pulse(["%1\t0\twork", "%2\t1\twork"], 1000);
-  expect(wi).toHaveLength(1);
-  const entries0 = [...wi[0].entries].sort((a, b) =>
-    a.job_id < b.job_id ? -1 : 1,
-  );
-  expect(entries0).toEqual([
-    { job_id: "j1", window_index: 0 },
-    { job_id: "j2", window_index: 1 },
-  ]);
-  // Identical layout → deduped, no new post.
-  pulse(["%1\t0\twork", "%2\t1\twork"], 1500);
-  expect(wi).toHaveLength(1);
-  // A REORDER (swapped indices) re-fires — the layout hash includes the index.
-  pulse(["%1\t1\twork", "%2\t0\twork"], 2000);
-  expect(wi).toHaveLength(2);
-  const entries1 = [...wi[1].entries].sort((a, b) =>
-    a.job_id < b.job_id ? -1 : 1,
-  );
-  expect(entries1).toEqual([
-    { job_id: "j1", window_index: 1 },
-    { job_id: "j2", window_index: 0 },
-  ]);
-});
-
-test("restorePulse re-posts a WindowIndexSnapshot when a job leaves the live set (prune-driven change)", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
-  });
-  const wi: WindowIndexSnapshotMessage[] = [];
-  const state = freshState();
-  restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\t2\twork"]),
-    post: () => {},
-    postWindowIndex: (m) => wi.push(m),
-  });
-  expect(wi).toHaveLength(1);
-  expect(wi[0].entries).toEqual([{ job_id: "j1", window_index: 2 }]);
-  // The job ends → pruned from the cache → the layout shrank to empty → re-fire
-  // with an empty entry set. The fold leaves j1's last-folded DB value intact;
-  // the empty post simply records that no live window remains.
-  db.run(`UPDATE jobs SET state = 'ended' WHERE job_id = 'j1'`);
-  restorePulse(db, restorePath, state, () => 2000, {
-    spawnSync: stubTmuxPanes(["%1\t2\twork"]),
-    post: () => {},
-    postWindowIndex: (m) => wi.push(m),
-  });
-  expect(wi).toHaveLength(2);
-  expect(wi[1].entries).toEqual([]);
+  expect(spawned).toBe(false);
+  expect(existsSync(restorePath)).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -1216,7 +865,7 @@ test("probeServerGeneration returns null when spawnSync throws (no binary)", () 
 });
 
 // ---------------------------------------------------------------------------
-// restorePulse — BackendExecStart generation boundary
+// restorePulse — BackendExecStart generation boundary (still fires; fn-968 keep)
 // ---------------------------------------------------------------------------
 
 test("restorePulse posts a BackendExecStart on the first observed generation, deduped on no change", () => {
@@ -1227,7 +876,6 @@ test("restorePulse posts a BackendExecStart on the first observed generation, de
   const pulse = (pid: string, now: number): void => {
     restorePulse(db, restorePath, state, () => now, {
       spawnSync: stubTmux({ pid }),
-      post: () => {},
       postBackendExecStart: (m) => bes.push(m),
     });
   };
@@ -1253,7 +901,6 @@ test("restorePulse emits no BackendExecStart when no tmux server is running", ()
   const state = freshState();
   restorePulse(db, restorePath, state, () => 1000, {
     spawnSync: stubTmux({ pid: null }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(0);
@@ -1262,7 +909,6 @@ test("restorePulse emits no BackendExecStart when no tmux server is running", ()
   expect(state.lastGenerationHash).toBeNull();
   restorePulse(db, restorePath, state, () => 2000, {
     spawnSync: stubTmux({ pid: "55" }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(1);
@@ -1278,14 +924,12 @@ test("seedLastGenerationHash suppresses a same-pid re-emit across a keeperd rest
   seedLastGenerationHash(db, state);
   restorePulse(db, restorePath, state, () => 1000, {
     spawnSync: stubTmux({ pid: "9999" }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(0);
   // A genuine respawn after the restart (different pid) DOES still post.
   restorePulse(db, restorePath, state, () => 2000, {
     spawnSync: stubTmux({ pid: "10000" }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(1);
@@ -1302,7 +946,6 @@ test("seedLastGenerationHash reads the LATEST BackendExecStart by id, not ts", (
   // Server still on the latest generation (200) → silent.
   restorePulse(db, restorePath, state, () => 1000, {
     spawnSync: stubTmux({ pid: "200" }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(0);
@@ -1316,7 +959,6 @@ test("seedLastGenerationHash leaves the gate null when no BackendExecStart exist
   // With no seed, the first observed generation is treated as a boundary.
   restorePulse(db, restorePath, state, () => 1000, {
     spawnSync: stubTmux({ pid: "42" }),
-    post: () => {},
     postBackendExecStart: (m) => bes.push(m),
   });
   expect(bes).toHaveLength(1);
@@ -1334,40 +976,38 @@ test("seedLastGenerationHash tolerates a malformed payload (leaves gate null)", 
   expect(state.lastGenerationHash).toBeNull();
 });
 
-test("restorePulse generation arm is independent of the window-index / pane arms", () => {
-  // One live tmux job drives the pane + window arms; the generation arm fires off
-  // the SAME single injected spawnSync, dispatched by subcommand.
+test("restorePulse generation arm fires alongside the restore-file write", () => {
+  // One live tmux job drives the restore-file mirror; the generation arm fires
+  // off the injected spawnSync (dispatched by subcommand) — independent of any
+  // topology poll, which no longer exists here.
   insertJob({
     job_id: "j1",
     backend_exec_type: "tmux",
     backend_exec_pane_id: "%1",
     backend_exec_session_id: "work",
+    window_index: 0,
   });
-  const wi: WindowIndexSnapshotMessage[] = [];
   const bes: BackendExecStartMessage[] = [];
   const state = freshState();
   restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmux({ pid: "321", panes: ["%1\t0\twork"] }),
-    post: () => {},
-    postWindowIndex: (m) => wi.push(m),
+    spawnSync: stubTmux({ pid: "321" }),
     postBackendExecStart: (m) => bes.push(m),
   });
-  expect(wi).toHaveLength(1);
-  expect(wi[0].entries).toEqual([{ job_id: "j1", window_index: 0 }]);
   expect(bes).toHaveLength(1);
   expect(bes[0].generation_id).toBe("321");
+  // The restore-file still mirrors the live job with its projection window_index.
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
-// probeTmuxTopology — classify panes / gone / transient (epic fn-907)
+// probeTmuxTopology — classify panes / gone / transient (retained for boot-seed)
 // ---------------------------------------------------------------------------
 
 test("probeTmuxTopology classifies a successful probe as panes (panes may be empty)", () => {
   const ok = probeTmuxTopology(
-    stubTopology({
-      pid: "1",
-      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-    }),
+    stubTopology({ listPanes: { kind: "panes", lines: ["%1\t0\twork"] } }),
   );
   expect(ok).toEqual({
     kind: "panes",
@@ -1375,14 +1015,14 @@ test("probeTmuxTopology classifies a successful probe as panes (panes may be emp
   });
   // Server up with no panes is still a SUCCESS (not gone/transient).
   const empty = probeTmuxTopology(
-    stubTopology({ pid: "1", listPanes: { kind: "empty" } }),
+    stubTopology({ listPanes: { kind: "empty" } }),
   );
   expect(empty).toEqual({ kind: "panes", panes: [] });
 });
 
 test("probeTmuxTopology classifies a server-gone stderr as gone, an unrelated stderr as transient", () => {
   expect(
-    probeTmuxTopology(stubTopology({ pid: "1", listPanes: { kind: "gone" } })),
+    probeTmuxTopology(stubTopology({ listPanes: { kind: "gone" } })),
   ).toEqual({ kind: "gone" });
   // "failed to connect" is also a gone marker.
   const gone2 = probeTmuxTopology(() => ({
@@ -1393,9 +1033,7 @@ test("probeTmuxTopology classifies a server-gone stderr as gone, an unrelated st
   }));
   expect(gone2).toEqual({ kind: "gone" });
   expect(
-    probeTmuxTopology(
-      stubTopology({ pid: "1", listPanes: { kind: "transient" } }),
-    ),
+    probeTmuxTopology(stubTopology({ listPanes: { kind: "transient" } })),
   ).toEqual({ kind: "transient" });
 });
 
@@ -1413,173 +1051,48 @@ test("probeTmuxTopology classifies a non-zero exit with NO stderr as transient, 
 });
 
 // ---------------------------------------------------------------------------
-// restorePulse — TmuxTopologySnapshot live-location post (epic fn-907)
+// KEEPER_RESTORE_FILE env-var isolation
 // ---------------------------------------------------------------------------
 
-test("restorePulse posts ONE TmuxTopologySnapshot on a change, deduped on no change, re-fired on a pane move", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "autopilot",
-  });
-  const topo: TmuxTopologySnapshotMessage[] = [];
-  const state = freshState();
-  const pulse = (
-    listPanes: Parameters<typeof stubTopology>[0]["listPanes"],
-    now: number,
-  ): void => {
-    restorePulse(db, restorePath, state, () => now, {
-      topologySpawnSync: stubTopology({ pid: "900", listPanes }),
-      postTopology: (m) => topo.push(m),
-    });
-  };
-  // First observation → ONE post carrying generation_id + the pane map. The
-  // producer joins pane `%1` to its owning live tmux job and stamps `job_id`.
-  pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1000);
-  expect(topo).toHaveLength(1);
-  expect(topo[0]).toEqual({
-    kind: "tmux-topology-snapshot",
-    generation_id: "900",
-    panes: [
-      {
-        pane_id: "%1",
-        session_name: "autopilot",
-        window_index: 2,
-        job_id: "j1",
-      },
-    ],
-  });
-  // Unchanged topology → deduped (job_id is excluded from the hash, so it never
-  // gates a re-post on its own).
-  pulse({ kind: "panes", lines: ["%1\t2\tautopilot"] }, 1500);
-  expect(topo).toHaveLength(1);
-  // The pane MOVED to a new session + window — a real change re-fires, still
-  // carrying the owning job_id.
-  pulse({ kind: "panes", lines: ["%1\t0\tforeground"] }, 2000);
-  expect(topo).toHaveLength(2);
-  expect(topo[1].panes).toEqual([
-    {
-      pane_id: "%1",
-      session_name: "foreground",
-      window_index: 0,
-      job_id: "j1",
-    },
-  ]);
+test("resolveRestorePath honors KEEPER_RESTORE_FILE so the worker writes the sandbox path", () => {
+  // The beforeEach setter wires KEEPER_RESTORE_FILE → tmpDir/restore.json;
+  // confirm `resolveRestorePath` honors it (the worker calls this once at
+  // startup, so an override mishap would leak into the user's real file).
+  expect(resolveRestorePath()).toBe(restorePath);
 });
 
-test("restorePulse posts NO TmuxTopologySnapshot on a degraded probe (gone / transient / empty / no-generation)", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "autopilot",
-  });
-  const topo: TmuxTopologySnapshotMessage[] = [];
-  const state = freshState();
-  const pulseWith = (spawn: SpawnSyncFn, now: number): void => {
-    restorePulse(db, restorePath, state, () => now, {
-      topologySpawnSync: spawn,
-      postTopology: (m) => topo.push(m),
-    });
-  };
-  // Transient probe → no post, hash untouched.
-  pulseWith(
-    stubTopology({ pid: "900", listPanes: { kind: "transient" } }),
-    1000,
-  );
-  // Server gone → no post.
-  pulseWith(stubTopology({ pid: "900", listPanes: { kind: "gone" } }), 1100);
-  // Empty-but-success (server up, no panes) → no wiping post.
-  pulseWith(stubTopology({ pid: "900", listPanes: { kind: "empty" } }), 1200);
-  // No resolvable generation → can't stamp the recycle key → no post.
-  pulseWith(
-    stubTopology({
-      pid: null,
-      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-    }),
-    1300,
-  );
-  expect(topo).toHaveLength(0);
-  expect(state.lastTopologyHash).toBeNull();
-  // A subsequent real probe still posts (the degraded pulses didn't poison the gate).
-  pulseWith(
-    stubTopology({
-      pid: "900",
-      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-    }),
-    1400,
-  );
-  expect(topo).toHaveLength(1);
-});
+// ---------------------------------------------------------------------------
+// Helpers (test-local)
+// ---------------------------------------------------------------------------
 
-test("restorePulse topology arm is quiescent when no live tmux job exists", () => {
-  // A non-tmux live job does NOT arm the topology probe.
-  insertJob({ job_id: "j1", backend_exec_type: null });
-  const topo: TmuxTopologySnapshotMessage[] = [];
-  let probed = false;
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    topologySpawnSync: (cmd) => {
-      probed = true;
-      return stubTopology({
-        pid: "900",
-        listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-      })(cmd);
-    },
-    postTopology: (m) => topo.push(m),
-  });
-  expect(probed).toBe(false);
-  expect(topo).toHaveLength(0);
-});
-
-test("restorePulse topology arm is disabled when no postTopology is wired (pure-pulse path)", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
-  });
-  let probed = false;
-  // No `postTopology` → the topology arm never spawns.
-  restorePulse(db, restorePath, freshState(), () => 1000, {
-    topologySpawnSync: (cmd) => {
-      probed = true;
-      return stubTopology({
-        pid: "900",
-        listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-      })(cmd);
-    },
-  });
-  expect(probed).toBe(false);
-});
-
-test("restorePulse topology post re-fires on a server-generation flip even when the pane map is unchanged", () => {
-  insertJob({
-    job_id: "j1",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
-  });
-  const topo: TmuxTopologySnapshotMessage[] = [];
-  const state = freshState();
-  restorePulse(db, restorePath, state, () => 1000, {
-    topologySpawnSync: stubTopology({
-      pid: "100",
-      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-    }),
-    postTopology: (m) => topo.push(m),
-  });
-  // Same pane map, but the server respawned (new generation) — %1 is now a
-  // DIFFERENT pane, so the snapshot must re-fire so the fold's recycle guard sees
-  // the new generation.
-  restorePulse(db, restorePath, state, () => 2000, {
-    topologySpawnSync: stubTopology({
-      pid: "200",
-      listPanes: { kind: "panes", lines: ["%1\t0\twork"] },
-    }),
-    postTopology: (m) => topo.push(m),
-  });
-  expect(topo).toHaveLength(2);
-  expect(topo[0].generation_id).toBe("100");
-  expect(topo[1].generation_id).toBe("200");
-});
+/**
+ * Build an in-memory `Job` for the pure tier builder. Only the fields
+ * `buildRestoreTier` reads matter; defaults track a minimal live row.
+ */
+function fakeJob(opts: {
+  job_id: string;
+  state?: string;
+  cwd?: string | null;
+  title?: string | null;
+  plan_verb?: string | null;
+  plan_ref?: string | null;
+  backend_exec_type?: string | null;
+  backend_exec_session_id?: string | null;
+  backend_exec_pane_id?: string | null;
+  window_index?: number | null;
+  created_at?: number;
+}): Job {
+  return {
+    job_id: opts.job_id,
+    created_at: opts.created_at ?? 1000,
+    state: opts.state ?? "working",
+    cwd: opts.cwd ?? null,
+    title: opts.title ?? null,
+    plan_verb: opts.plan_verb ?? null,
+    plan_ref: opts.plan_ref ?? null,
+    backend_exec_type: opts.backend_exec_type ?? null,
+    backend_exec_session_id: opts.backend_exec_session_id ?? null,
+    backend_exec_pane_id: opts.backend_exec_pane_id ?? null,
+    window_index: opts.window_index ?? null,
+  } as unknown as Job;
+}

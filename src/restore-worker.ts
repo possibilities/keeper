@@ -32,36 +32,32 @@
  * read by `scripts/restore-agents.ts --snapshot-current` (the runnable-script
  * escape hatch over the live mirror).
  *
- * **Tmux poll arm (epic fn-789; window order epic fn-681).** Riding the SAME
- * data_version pulse, the worker self-gates on ANY live tmux job (resolved or
- * not) and spawns ONE `tmux list-panes` probe whose output feeds two
- * independent consumers:
- *  - the WINDOW-ORDER cache (`job_id → #{window_index}`), refreshed every pulse
- *    a live tmux job exists — the original tmux server is dead at restore time,
- *    so each agent's left-to-right window POSITION must be captured here and
- *    stamped onto its `RestoreAgent` so the restore-agents util replays windows
- *    in visual order; and
- *  - the PANE-FILL post: when a live tmux job carries a NULL
- *    `backend_exec_session_id`, the worker posts ONE
- *    `{kind:"tmux-pane-snapshot"}` message to main, which mints the sole
- *    `TmuxPaneSnapshot` synthetic event the reducer folds (fill-only).
- * Two more posts ride the same pulse (the pulse→event→fold family): the
- * `{kind:"window-index-snapshot"}` window-order channel (epic fn-817), and the
- * `{kind:"backend-exec-start"}` generation boundary (epic fn-819) — the latter
- * UNGATED by a live tmux job, since a post-crash respawn must be recorded when
- * no job is live. The restore-file write path stays a pure consumer side-file.
- * The pane/window arms are quiescent when no live tmux job exists; a
- * producer-side dedup hash per arm (the fill hash DELIBERATELY excludes
- * `window_index`) stops re-posting an unchanged payload, so a pure window
- * reorder never re-fires the fill post and an unchanged generation is silent.
+ * **Generation-boundary probe (epic fn-819).** Riding the SAME data_version
+ * pulse (plus a ~1s idle wake so a post-crash respawn is caught even when
+ * keeper's DB is idle), the worker runs ONE cheap `display-message -p '#{pid}'`
+ * server-generation probe — UNGATED by any live tmux job, since a post-crash
+ * respawn must be recorded precisely when no job is live. On a generation
+ * CHANGE it posts `{kind:"backend-exec-start"}` to main, which mints the
+ * `BackendExecStart` synthetic event (folded via an explicit no-op arm — the
+ * boundary lives in the event-log `id` order, not a projection column). A
+ * producer-side dedup hash (boot-seeded from the last logged boundary) keeps an
+ * unchanged generation silent. The restore-file write path stays a pure
+ * consumer side-file.
+ *
+ * The whole-server topology (`jobs.backend_exec_session_id` + `window_index`)
+ * is NO LONGER produced here: the persistent tmux control-mode worker emits
+ * `TmuxTopologySnapshot` from its existing over-the-connection re-read (epic
+ * fn-968), so this worker spawns no `tmux list-panes -a` and re-sources
+ * `restore.json`'s `window_index` from the live `jobs` projection (kept fresh
+ * by that fold). The cheap generation probe stays here because its ungated
+ * post-crash semantics can't move to the control-worker's live-job-gated path.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.
  *  - Own read-only `openDb` connection — `applyPragmas` runs inside `openDb`
  *    so `busy_timeout` is set on this connection too.
- *  - Typed message protocol: `{kind:"tmux-pane-snapshot"}` /
- *    `{kind:"window-index-snapshot"}` / `{kind:"backend-exec-start"}`
- *    worker→main, `{type:"shutdown"}` main→worker. Exit 0 clean / 1 crash.
+ *  - Typed message protocol: `{kind:"backend-exec-start"}` worker→main,
+ *    `{type:"shutdown"}` main→worker. Exit 0 clean / 1 crash.
  *  - Subsystem-style teardown: the read-only DB connection is closed in the
  *    shutdown handler before `process.exit(0)`.
  *
@@ -95,7 +91,7 @@ import {
 } from "./exec-backend";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
-import { hashTopology, type TmuxTopologyPane } from "./tmux-focus-derive";
+import type { TmuxTopologyPane } from "./tmux-focus-derive";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 
@@ -120,60 +116,17 @@ export interface ShutdownMessage {
 }
 
 /**
- * One `(pane_id, window_index, session_name)` row the tmux snapshot probe
- * observed. `pane_id` is the `%N` id (the durable handle the COALESCE fold
- * stamped `jobs.backend_exec_pane_id` from `TMUX_PANE`), `session_name` the
- * `#{session_name}` the reducer fills onto a NULL-session tmux job.
- * `window_index` is the `#{window_index}` (the window's left-to-right POSITION,
- * not its `@N` identity) the producer caches per job so the restore-agents util
- * can replay windows in original visual order; `null` when the field was
- * absent/non-numeric (degraded probe). NOT part of the pane-fill snapshot hash.
+ * One `(pane_id, window_index, session_name)` row a tmux `list-panes` probe
+ * observed. `pane_id` is the `%N` id, `session_name` the `#{session_name}`, and
+ * `window_index` the `#{window_index}` (left-to-right POSITION, not the `@N`
+ * identity); `null` when the field was absent/non-numeric (degraded probe). The
+ * parse output of {@link probeTmuxTopology}'s shared {@link parsePaneLines} — the
+ * topology probe stays here for the boot-seed, which imports it.
  */
 export interface TmuxPanePair {
   pane_id: string;
   session_name: string;
   window_index: number | null;
-}
-
-/**
- * Worker→main message: the live tmux pane topology, posted ONLY when a live
- * tmux job carries a NULL `backend_exec_session_id` (the gate) AND the probed
- * pairs differ from the last post (the dedup hash). Main — the sole synthetic
- * event writer — mints ONE `TmuxPaneSnapshot` event carrying `pairs`; the
- * reducer fills the session name onto each matching NULL-session tmux job
- * (fill-only, never overwrite). NEVER reuses the retired `BackendExecSnapshot`
- * name (its no-op fold arm must stay untouched for re-fold determinism).
- */
-export interface TmuxPaneSnapshotMessage {
-  kind: "tmux-pane-snapshot";
-  pairs: TmuxPanePair[];
-}
-
-/**
- * One `(job_id, window_index)` entry of a window-layout snapshot — the live
- * tmux `#{window_index}` (a window's left-to-right VISUAL position) keyed by the
- * agent's stable Claude session id. `window_index` is always a finite integer
- * here (a `null` index never enters the cache this is built from).
- */
-export interface WindowIndexEntry {
-  job_id: string;
-  window_index: number;
-}
-
-/**
- * Worker→main message: the live `job_id → window_index` map, posted ONLY when it
- * CHANGES (a layout hash dedups, so a steady topology doesn't re-post every
- * pulse — and, unlike {@link TmuxPaneSnapshotMessage}, a pure window REORDER DOES
- * re-fire because window order is exactly what this carries). Main — the sole
- * synthetic event writer — mints ONE `WindowIndexSnapshot` event carrying
- * `entries`; the reducer folds each `window_index` onto the matching `jobs` row
- * keyed by `job_id` (a pure integer copy, no probe in the fold). The DB-only
- * crash-restore derivation then replays original visual order without reading
- * restore.json. A NEW event name — never reuses a retired one.
- */
-export interface WindowIndexSnapshotMessage {
-  kind: "window-index-snapshot";
-  entries: WindowIndexEntry[];
 }
 
 /**
@@ -199,44 +152,21 @@ export interface BackendExecStartMessage {
 /**
  * One pane of a whole-server topology snapshot — the `(pane_id, session_name,
  * window_index, job_id?)` shape. Defined in the pure focus-derive seam so BOTH
- * this poll AND the control-worker feed map their rows through the SAME shape +
- * the SAME `hashTopology`, guaranteeing dedup-equivalence. Re-exported here for
- * existing importers (the daemon's restore-arm + the boot-seed test).
+ * the boot-seed AND the control-worker feed map their rows through the SAME shape.
+ * Re-exported here for existing importers (the boot-seed + its test) that reach
+ * the shape alongside {@link probeTmuxTopology}.
  */
 export type { TmuxTopologyPane };
 
 /**
- * Worker→main message: the LIVE whole-server tmux topology, posted on a ~1s
- * timer (NOT gated on a NULL-session job — a pane MOVE happens to an
- * already-resolved job) ONLY when the `(pane_id, session_name, window_index)`
- * set CHANGES since the last post (a topology hash dedups). Carries the server
- * `generation_id` (the pid) so the task-3 fold can run the recycle guard
- * (`(generation_id, pane_id)`). Main — the sole synthetic event writer — mints
- * ONE `TmuxTopologySnapshot` event carrying `{generation_id, panes}`; the
- * task-3 live-only fold OVERWRITES each matching tmux job's
- * `backend_exec_session_id` + `window_index` (this task ships only the
- * producer + the event mint — the fold lands in `.3`).
- *
- * NEVER posted on a degraded probe: a transient failure (timeout / EPIPE) or an
- * empty-but-successful probe (server up, no panes) must NOT emit a wiping empty
- * topology — see {@link probeTmuxTopology}'s discrimination.
- */
-export interface TmuxTopologySnapshotMessage {
-  kind: "tmux-topology-snapshot";
-  generation_id: string;
-  panes: TmuxTopologyPane[];
-}
-
-/**
- * `Bun.spawnSync`-shaped subset the tmux pane probe needs; injectable so tests
- * drive the gate / parse / dedup without a real tmux server. Mirrors the
- * git-worker's `gitOutput` spawnSync shape: `success` + `exitCode` + a
- * stdout `Buffer`. `stderr` is OPTIONAL — the original probes
- * ({@link probeTmuxPanes} / {@link probeServerGeneration}) collapse every
- * non-zero exit to a degraded-skip and never read it, but the whole-server
- * topology probe ({@link probeTmuxTopology}) needs it to tell SERVER-GONE
- * (`no server running` / `failed to connect`) from a TRANSIENT failure
- * (timeout / SIGKILL / EPIPE) so it doesn't post a wiping empty topology.
+ * `Bun.spawnSync`-shaped subset the tmux probes need; injectable so tests drive
+ * the parse / classify without a real tmux server. Mirrors the git-worker's
+ * `gitOutput` spawnSync shape: `success` + `exitCode` + a stdout `Buffer`.
+ * `stderr` is OPTIONAL — {@link probeServerGeneration} collapses every non-zero
+ * exit to a degraded-skip and never reads it, but the whole-server topology probe
+ * ({@link probeTmuxTopology}, retained for the boot-seed) needs it to tell
+ * SERVER-GONE (`no server running` / `failed to connect`) from a TRANSIENT
+ * failure (timeout / SIGKILL / EPIPE).
  */
 export type SpawnSyncFn = (cmd: string[]) => {
   success: boolean;
@@ -257,35 +187,19 @@ const defaultSpawnSync: SpawnSyncFn = (cmd) =>
     env: localeDefaultedEnv(process.env as Record<string, string | undefined>),
   });
 
-/**
- * Like {@link defaultSpawnSync} but PIPES `stderr` instead of ignoring it — the
- * whole-server topology probe ({@link probeTmuxTopology}) classifies a non-zero
- * exit by its stderr text ("no server running" / "failed to connect" = gone vs
- * any other = transient), so it must capture the channel. Same load-bearing
- * locale default + timeout as the pane probe.
- */
-const defaultTopologySpawnSync: SpawnSyncFn = (cmd) =>
-  Bun.spawnSync(cmd, {
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: TMUX_PROBE_TIMEOUT_MS,
-    env: localeDefaultedEnv(process.env as Record<string, string | undefined>),
-  });
-
-/** Upper bound on the `tmux list-panes` probe. A wedged tmux server degrades to
- *  "no pairs" (skip) rather than freezing the restore pulse. */
+/** Upper bound on the `tmux` probe spawns. A wedged tmux server degrades to a
+ *  skip rather than freezing the restore pulse. */
 const TMUX_PROBE_TIMEOUT_MS = 5000;
 
 /**
- * Idle-wake cadence (ms) for the restore-worker's `watchLoop` (epic fn-907). A
- * pane MOVE (`break-pane` / `move-window`) is OUT-OF-BAND — it writes nothing to
- * keeper.db, so the data_version wake never fires for it. This forces the
- * topology arm to pulse on a ~1s cadence regardless, coalesced with the
- * data_version wake (one probe per loop turn). The acceptance budget is ~2s; a
- * 1s idle wake clears it with margin while staying cheap (a `display-message` +
- * a `list-panes`, both gated on a live tmux job + dedup-suppressed when steady).
+ * Idle-wake cadence (ms) for the restore-worker's `watchLoop`. The generation
+ * boundary probe ({@link backendExecStartPulse}) must catch a post-crash tmux
+ * respawn even when keeper's `data_version` is idle (a crash + respawn writes
+ * nothing to keeper.db), so the loop pulses on a ~1s cadence regardless,
+ * coalesced with the data_version wake (one probe per loop turn). The probe is a
+ * single cheap `display-message -p '#{pid}'`, dedup-suppressed when unchanged.
  */
-const RESTORE_TOPOLOGY_IDLE_MS = 1000;
+const RESTORE_GENERATION_IDLE_MS = 1000;
 
 /**
  * Schema version of the restore-snapshot side-file. INDEPENDENT of the DB
@@ -331,12 +245,14 @@ export const RESTORE_SCHEMA_VERSION = 3;
  *  - `plan_verb` / `plan_ref` — informational (the restore-agents util surfaces
  *    these in the dry-run label); ride straight off the jobs row.
  *  - `window_index` — the live tmux `#{window_index}` (left-to-right POSITION)
- *    captured at pulse time from a `list-panes` probe correlated by
- *    `backend_exec_pane_id` (session-name cross-checked). The restore-agents
+ *    read straight off the `jobs` projection, which the control-worker's
+ *    `TmuxTopologySnapshot` fold keeps fresh (epic fn-968). The restore-agents
  *    util sorts restored windows by it so they come back in original visual
- *    order. `null` when the probe couldn't stamp it (no match, recycled pane,
- *    degraded probe, or a legacy file with no field) — those agents sink to the
- *    tail by `created_at` then `job_id`.
+ *    order. `null` when the projection has no position yet (not-yet-probed,
+ *    recycled pane, non-tmux job, or a legacy file with no field) — those agents
+ *    sink to the tail by `created_at` then `job_id`. Bounded staleness during a
+ *    control-worker reconnect gap is accepted (restore.json is a periodically
+ *    rewritten mirror; crash-restore re-derives from keeper.db).
  *  - `created_at` — the job's `jobs.created_at` (Claude session birth). The
  *    restore-agents util uses it as the tail tiebreaker for unknown-order
  *    agents, before `job_id`.
@@ -428,6 +344,10 @@ export interface RestoreDescriptor {
  * provided `epicsById` map, so the restore-agents util doesn't need to
  * re-fetch epics to rebuild the resume command — the tier rides the file.
  *
+ * `window_index` is read straight off each job's projection row — the
+ * control-worker's `TmuxTopologySnapshot` fold (epic fn-968) keeps that column
+ * fresh, so the restore-worker no longer caches it from a poll of its own.
+ *
  * The returned tier MAY be empty (`sessions: {}`); an empty live set yields an
  * empty `current` tier.
  */
@@ -435,7 +355,6 @@ export function buildRestoreTier(
   jobs: Job[],
   epicsById: Map<string, Epic>,
   capturedAt: number,
-  windowIndexByJobId: Map<string, number> = new Map(),
 ): RestoreTier {
   const sessions: Record<string, RestoreSession> = {};
   for (const job of jobs) {
@@ -450,7 +369,6 @@ export function buildRestoreTier(
     }
     const sessionId = job.backend_exec_session_id;
     const tier = tierForJobFromEpics(job, epicsById);
-    const windowIndex = windowIndexByJobId.get(job.job_id);
     const agent: RestoreAgent = {
       job_id: job.job_id,
       cwd: job.cwd,
@@ -458,7 +376,9 @@ export function buildRestoreTier(
       tier,
       plan_verb: job.plan_verb,
       plan_ref: job.plan_ref,
-      window_index: windowIndex ?? null,
+      // Read live off the projection (kept fresh by the control-worker's
+      // TmuxTopologySnapshot fold); a number|null already.
+      window_index: job.window_index ?? null,
       created_at: job.created_at,
     };
     // Backend tag for the bucket (schema v3): the job's `backend_exec_type`,
@@ -550,32 +470,6 @@ interface PulseState {
   lastHash: string | null;
   parentDirEnsured: boolean;
   /**
-   * Producer-side dedup for the tmux pane-snapshot post (mirrors `lastHash`).
-   * Hash of the last posted `pairs` set, so an unchanged tmux topology does NOT
-   * re-post every pulse while a pane the server can't resolve keeps a job NULL
-   * forever. `null` until the first post. Reset semantics: we only ever advance
-   * it on a post, so a transient "no pairs" pulse leaves it intact.
-   */
-  lastSnapshotHash: string | null;
-  /**
-   * Live-tmux window POSITION cache: `job_id → #{window_index}`. Populated each
-   * pulse from the single `list-panes` probe (the pane-id match cross-checked
-   * against the job's `backend_exec_session_id`) and pruned to the live job ids.
-   * At restore time the original tmux server is dead, so order MUST be captured
-   * here at pulse time; `buildRestoreTier` stamps each agent's `window_index`
-   * from this map and the `WindowIndexSnapshot` post folds it onto the DB column.
-   * job_ids are unique Claude session ids, so an entry is never re-keyed.
-   */
-  lastWindowIndexByJobId: Map<string, number>;
-  /**
-   * Producer-side dedup for the `WindowIndexSnapshot` post (mirrors
-   * `lastSnapshotHash`). Hash of the last posted `job_id → window_index` layout
-   * (via {@link hashWindowIndexCache}, which INCLUDES the index), so an unchanged
-   * layout doesn't re-post every pulse but a reorder does. `null` until the first
-   * post; advanced only on a post.
-   */
-  lastWindowIndexHash: string | null;
-  /**
    * Producer-side dedup for the `BackendExecStart` generation-boundary post. The
    * hash of the last posted generation id, so an unchanged server generation
    * does NOT re-post every pulse. Seeded ONCE at the first pulse from the last
@@ -586,63 +480,13 @@ interface PulseState {
    * non-empty probe is the first boundary and DOES post.
    */
   lastGenerationHash: string | null;
-  /**
-   * Producer-side dedup for the `TmuxTopologySnapshot` post (epic fn-907). The
-   * hash of the last posted `(generation_id, panes)` set (via
-   * {@link hashTopology}, which INCLUDES `session_name` AND `window_index` — a
-   * pane MOVE must re-fire so the live fold tracks it), so an unchanged
-   * whole-server topology does NOT re-post every ~1s pulse but any pane move /
-   * rename / generation flip does. `null` until the first post; advanced only on
-   * a post. A degraded probe (gone / transient / empty-success) leaves it
-   * intact — no wiping snapshot.
-   */
-  lastTopologyHash: string | null;
 }
 
-/**
- * True when at least one LIVE (`working`/`stopped`) tmux job carries a NULL
- * `backend_exec_session_id` — the gate that arms the tmux pane probe. When
- * false the poller is fully quiescent (no spawn, no post). Reads only the
- * projection rows; pure.
- */
-/**
- * True when at least one LIVE (`working`/`stopped`) tmux job exists, regardless
- * of whether its session is resolved. This is the gate that arms the per-pulse
- * tmux probe: a NULL-session-only gate would go false once every session
- * resolves, yet visual window order keeps shifting after that, so order capture
- * (and the one probe both arms share) must keep running. Reads only the
- * projection rows; pure.
- */
-function hasLiveTmuxJob(jobs: Job[]): boolean {
-  for (const job of jobs) {
-    if (job.state !== "working" && job.state !== "stopped") {
-      continue;
-    }
-    if (job.backend_exec_type === "tmux") {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Spawn `tmux list-panes -a -F '#{pane_id}\t#{window_index}\t#{session_name}'`
- * and parse the `(pane_id, window_index, session_name)` rows. NEVER throws: an
- * ENOENT (no tmux binary), a non-zero exit (no server / no panes), or a
- * malformed line degrades to `[]` (skip silently — no server means nothing to
- * resolve). The numeric `window_index` is the SECOND field (variable-length
- * `session_name` last) so a session name with spaces/tabs can't bleed into the
- * numeric field; the parse uses a two-tab slice and reads the name to end. A
- * line missing either tab, or with an empty `pane_id`/`session_name`, is
- * dropped; a non-numeric/empty `window_index` coerces to `null` (the pair still
- * counts — only the index is absent). Default-spawn env is locale-defaulted so
- * a C-locale TAB mangle can't drop every row. Pure relative to the injected
- * `spawnSync`.
- */
-/** The `tmux list-panes -a` argv shared by the pane probe and the topology
- *  probe. The `-F` format puts the variable-length `session_name` LAST (after
- *  the numeric `window_index`) so a name with spaces/tabs can't bleed into the
- *  numeric field. */
+/** The `tmux list-panes -a` argv the whole-server topology probe runs (retained
+ *  for the boot-seed, which imports {@link probeTmuxTopology}). The `-F` format
+ *  puts the variable-length `session_name` LAST (after the numeric
+ *  `window_index`) so a name with spaces/tabs can't bleed into the numeric
+ *  field. */
 const TMUX_LIST_PANES_ARGS = [
   "tmux",
   "list-panes",
@@ -693,19 +537,6 @@ function parsePaneLines(text: string): TmuxPanePair[] {
     });
   }
   return pairs;
-}
-
-export function probeTmuxPanes(spawnSync: SpawnSyncFn): TmuxPanePair[] {
-  let res: ReturnType<SpawnSyncFn>;
-  try {
-    res = spawnSync(TMUX_LIST_PANES_ARGS);
-  } catch {
-    return [];
-  }
-  if (!res.success || res.exitCode !== 0) {
-    return [];
-  }
-  return parsePaneLines(res.stdout.toString());
 }
 
 /**
@@ -763,314 +594,6 @@ export function probeTmuxTopology(spawnSync: SpawnSyncFn): TmuxTopologyProbe {
 }
 
 /**
- * Filter the probed pairs to those that would actually FILL a live NULL-session
- * tmux job (pane id matches AND session still NULL). Posting only fillable
- * pairs keeps the event from spamming when the tmux topology carries panes
- * keeper never launched. The reducer re-applies the same fill-only predicate, so
- * this is a producer-side narrowing, not the authority.
- */
-function fillablePairs(jobs: Job[], pairs: TmuxPanePair[]): TmuxPanePair[] {
-  const unresolved = new Set<string>();
-  for (const job of jobs) {
-    if (job.state !== "working" && job.state !== "stopped") {
-      continue;
-    }
-    if (
-      job.backend_exec_type === "tmux" &&
-      job.backend_exec_session_id == null &&
-      job.backend_exec_pane_id != null
-    ) {
-      unresolved.add(job.backend_exec_pane_id);
-    }
-  }
-  return pairs.filter((p) => unresolved.has(p.pane_id));
-}
-
-/**
- * Stamp the live-tmux window-index cache IN PLACE from one probe. For each live
- * tmux job, match `job.backend_exec_pane_id` to a probed pane and store its
- * `window_index` under `job_id` — but ONLY when the probe's `session_name`
- * equals the job's `backend_exec_session_id` (the recycled-`%N` guard: a pane id
- * is reused across kill/create, so a hit whose session differs belongs to a
- * different agent and must NOT stamp). A pane match with a `null` index, a
- * recycled hit, or no match leaves the prior entry untouched (a transient
- * degraded probe shouldn't wipe a good index). job_ids are unique Claude session
- * ids, so an entry is never silently re-keyed to another agent. Pruning of dead
- * job ids is a SEPARATE per-pulse step ({@link pruneWindowIndexCache}) so it
- * runs even when the probe gate is closed (all tmux jobs ended).
- */
-function stampWindowIndexCache(
-  jobs: Job[],
-  pairs: TmuxPanePair[],
-  cache: Map<string, number>,
-): void {
-  const byPaneId = new Map<string, TmuxPanePair>();
-  for (const p of pairs) {
-    byPaneId.set(p.pane_id, p);
-  }
-  for (const job of jobs) {
-    if (job.state !== "working" && job.state !== "stopped") {
-      continue;
-    }
-    if (job.backend_exec_type !== "tmux") {
-      continue;
-    }
-    if (typeof job.job_id !== "string" || job.job_id === "") {
-      continue;
-    }
-    const paneId = job.backend_exec_pane_id;
-    if (paneId == null) {
-      continue;
-    }
-    const probe = byPaneId.get(paneId);
-    if (probe == null || probe.window_index == null) {
-      continue;
-    }
-    // Recycled-`%N` cross-check: only stamp when the probed session matches the
-    // job's resolved session. A NULL-session job (not yet filled) can't be
-    // cross-checked, so it simply doesn't stamp this pulse.
-    if (probe.session_name !== job.backend_exec_session_id) {
-      continue;
-    }
-    cache.set(job.job_id, probe.window_index);
-  }
-}
-
-/**
- * Prune window-index cache entries for jobs no longer live, IN PLACE. Runs on
- * EVERY pulse (not gated on the probe) so a long-lived daemon doesn't accumulate
- * stale indices once every tmux job ends — the gated stamp arm can't reach this
- * because its gate closes the moment no live tmux job remains. Reads only the
- * projection rows; pure relative to the cache mutation.
- */
-function pruneWindowIndexCache(jobs: Job[], cache: Map<string, number>): void {
-  const liveIds = new Set<string>();
-  for (const job of jobs) {
-    if (job.state !== "working" && job.state !== "stopped") {
-      continue;
-    }
-    if (typeof job.job_id === "string" && job.job_id !== "") {
-      liveIds.add(job.job_id);
-    }
-  }
-  for (const id of cache.keys()) {
-    if (!liveIds.has(id)) {
-      cache.delete(id);
-    }
-  }
-}
-
-/**
- * Stable hash of a pairs set for the producer-side dedup gate. Sorts by
- * `(pane_id, session_name)` so SELECT / probe order doesn't churn the hash, then
- * hashes the joined string. A `null` / empty set is the empty-string hash.
- *
- * DELIBERATELY EXCLUDES `window_index`: this hash dedups the pane-fill snapshot
- * POST (which fills NULL sessions onto live jobs), and a pure window reorder
- * must NOT re-fire it. The window order lives in the restore FILE hash
- * (`serializeForHash`) instead, where a reorder rightly forces a rewrite.
- */
-function hashPairs(pairs: TmuxPanePair[]): string {
-  const sorted = [...pairs].sort((a, b) =>
-    a.pane_id < b.pane_id
-      ? -1
-      : a.pane_id > b.pane_id
-        ? 1
-        : a.session_name < b.session_name
-          ? -1
-          : a.session_name > b.session_name
-            ? 1
-            : 0,
-  );
-  return String(
-    Bun.hash(sorted.map((p) => `${p.pane_id}\t${p.session_name}`).join("\n")),
-  );
-}
-
-/**
- * Stable layout hash of a `job_id → window_index` map for the window-index post
- * dedup gate. Sorts by `job_id` so map iteration order doesn't churn the hash,
- * then hashes the `job_id\twindow_index` join. INCLUDES `window_index` (the
- * whole point: a reorder MUST re-fire the post so the DB column tracks visual
- * order), unlike {@link hashPairs} which deliberately excludes it. An empty map
- * is the empty-string hash.
- */
-function hashWindowIndexCache(cache: Map<string, number>): string {
-  const entries = [...cache.entries()].sort((a, b) =>
-    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
-  );
-  return String(
-    Bun.hash(entries.map(([id, idx]) => `${id}\t${idx}`).join("\n")),
-  );
-}
-
-/**
- * The tmux poll arm, run on each restore pulse. ONE `list-panes` probe feeds
- * TWO independent consumers (never two `list-panes` calls):
- *
- *  - the WINDOW-ORDER cache (`state.lastWindowIndexByJobId`) — refreshed
- *    whenever any live tmux job exists, regardless of session resolution, so
- *    order capture keeps running after every session resolves; and
- *  - the PANE-FILL snapshot post — minted only when a fillable NULL-session
- *    pair exists and the topology changed since the last post.
- *
- * Gate: `hasLiveTmuxJob` (the WIDER gate). When no live tmux job exists the
- * poller is fully quiescent (no spawn, no cache touch, no post). With a live
- * job, after the single probe:
- *  - the cache refresh runs unconditionally (correlate + prune);
- *  - the fill arm narrows to fillable pairs and posts on a topology change,
- *    deduped via `state.lastSnapshotHash` (which excludes `window_index`, so a
- *    pure reorder never re-fires the fill post).
- *
- * On a post, advances `state.lastSnapshotHash`. PURE relative to its injected
- * `spawnSync` + `post` — no I/O of its own beyond the probe, no env, no DB.
- */
-function tmuxSnapshotPulse(
-  jobs: Job[],
-  state: PulseState,
-  spawnSync: SpawnSyncFn,
-  post: (msg: TmuxPaneSnapshotMessage) => void,
-): void {
-  if (!hasLiveTmuxJob(jobs)) {
-    return;
-  }
-  const probed = probeTmuxPanes(spawnSync);
-  // Always refresh the window-order cache — order keeps shifting after every
-  // session resolves, which the NULL-session-only fill gate below would miss.
-  // (The dead-id prune is a separate per-pulse step in `restorePulse`, so it
-  // still runs once this gate closes on the last tmux job ending.)
-  stampWindowIndexCache(jobs, probed, state.lastWindowIndexByJobId);
-
-  const pairs = fillablePairs(jobs, probed);
-  if (pairs.length === 0) {
-    return;
-  }
-  const hash = hashPairs(pairs);
-  if (state.lastSnapshotHash === hash) {
-    return;
-  }
-  post({ kind: "tmux-pane-snapshot", pairs });
-  state.lastSnapshotHash = hash;
-}
-
-/**
- * Emit a `WindowIndexSnapshot` to main when the settled `job_id → window_index`
- * layout CHANGED since the last post. Runs AFTER the per-pulse stamp + prune so
- * the cache it reads is final for the pulse: a reorder, a newly-stamped index, or
- * a prune-driven removal all shift the layout hash and re-fire. The fold keys on
- * `job_id` and overwrites only the entries carried, so a job that just left the
- * cache (ended) keeps its last-folded DB value — the killed-job survival the
- * crash-restore derivation needs. PURE relative to its injected `post`: reads
- * only the cache, mutates only `state.lastWindowIndexHash` on a post.
- */
-function windowIndexSnapshotPulse(
-  state: PulseState,
-  post: (msg: WindowIndexSnapshotMessage) => void,
-): void {
-  const hash = hashWindowIndexCache(state.lastWindowIndexByJobId);
-  if (state.lastWindowIndexHash === hash) {
-    return;
-  }
-  const entries: WindowIndexEntry[] = [];
-  for (const [jobId, windowIndex] of state.lastWindowIndexByJobId) {
-    entries.push({ job_id: jobId, window_index: windowIndex });
-  }
-  post({ kind: "window-index-snapshot", entries });
-  state.lastWindowIndexHash = hash;
-}
-
-/**
- * Whole-server tmux topology arm (epic fn-907 — the LIVE-LOCATION producer).
- * Gated on {@link hasLiveTmuxJob} (no live tmux job → nothing to track, stay
- * quiescent). With a live job, it probes the server generation and the
- * whole-server pane topology, then posts ONE `TmuxTopologySnapshot` carrying
- * `{generation_id, panes}` — but ONLY when:
- *  - the generation probe yields a real pid (a degraded generation probe means
- *    we can't stamp the recycle-guard key, so skip); AND
- *  - the topology probe SUCCEEDS with a non-degraded result; AND
- *  - the `(generation_id, panes)` hash CHANGED since the last post.
- *
- * A degraded topology probe — `gone` (server down), `transient` (timeout /
- * EPIPE / SIGKILL / ENOENT), or an empty-but-successful probe (server up, no
- * panes) — posts NOTHING and leaves `state.lastTopologyHash` intact, so a blip
- * never wipes a job's last-known good location. (The empty-success case is
- * folded into the dedup: an empty pane set with the SAME generation hashes the
- * same as last time once seeded, but the FIRST observation could still post an
- * empty set; the gate below treats an empty `panes` as a no-assert skip so a
- * "server up, no panes" pulse is silent even on the first observation.)
- *
- * PURE relative to its injected `spawnSync` + `post`: the generation + topology
- * probes are the only side effects.
- */
-function topologySnapshotPulse(
-  jobs: Job[],
-  state: PulseState,
-  spawnSync: SpawnSyncFn,
-  post: (msg: TmuxTopologySnapshotMessage) => void,
-): void {
-  if (!hasLiveTmuxJob(jobs)) {
-    return;
-  }
-  const generationId = probeServerGeneration(spawnSync);
-  if (generationId == null) {
-    // No resolvable server generation this pulse (no server / garbage) — we
-    // can't stamp the recycle-guard key, so skip rather than post an
-    // unkeyable topology. Leaves the dedup hash intact.
-    return;
-  }
-  const probe = probeTmuxTopology(spawnSync);
-  if (probe.kind !== "panes") {
-    // gone / transient — keep last state, never wipe.
-    return;
-  }
-  if (probe.panes.length === 0) {
-    // Server up with no panes — nothing to assert; a wiping empty topology
-    // would clobber every live location. Skip without advancing the hash.
-    return;
-  }
-  const hash = hashTopology(generationId, probe.panes);
-  if (state.lastTopologyHash === hash) {
-    return;
-  }
-  post({
-    kind: "tmux-topology-snapshot",
-    generation_id: generationId,
-    panes: stampPaneJobIds(jobs, probe.panes),
-  });
-  state.lastTopologyHash = hash;
-}
-
-/**
- * Join each probed pane to the keeper job that owns it, stamping an OPTIONAL
- * `job_id` onto the pane so the dying-generation snapshot carries job identity
- * in the event payload (the topology-anchored crash-restore deriver reads it
- * there, not from the fold-lagged projection). Mirrors {@link fillablePairs}'
- * `pane_id → job` match, but over ALL live tmux jobs (not just NULL-session
- * fillable ones) — a pane MOVE happens to an already-resolved job, so the join
- * must cover resolved jobs too. A pane with no owning job is returned unchanged
- * (no `job_id`); the deriver tolerates the absence. EXCLUDED from `hashTopology`
- * — stamping job ids never gates a re-post. Pure: reads only the args.
- */
-function stampPaneJobIds(
-  jobs: Job[],
-  panes: TmuxTopologyPane[],
-): TmuxTopologyPane[] {
-  const jobByPaneId = new Map<string, string>();
-  for (const job of jobs) {
-    if (job.state !== "working" && job.state !== "stopped") {
-      continue;
-    }
-    if (job.backend_exec_type === "tmux" && job.backend_exec_pane_id != null) {
-      jobByPaneId.set(job.backend_exec_pane_id, job.job_id);
-    }
-  }
-  return panes.map((pane) => {
-    const jobId = jobByPaneId.get(pane.pane_id);
-    return jobId == null ? pane : { ...pane, job_id: jobId };
-  });
-}
-
-/**
  * Probe the backend's current generation handle (the tmux SERVER pid) via the
  * injected `spawnSync`. Returns the pid STRING when the probe yields a single
  * positive integer; `null` for every degraded case — ENOENT (no tmux binary),
@@ -1121,9 +644,9 @@ function hashGenerationId(generationId: string): string {
 /**
  * Mint a `BackendExecStart` generation-boundary post when the probed server
  * generation CHANGED since the last post (or is the first one recorded). Run
- * UNGATED by {@link hasLiveTmuxJob}: the post-crash state has no live tmux job,
- * yet the freshly-respawned server is precisely the generation that must be
- * recorded so crash-restore can scope to "the session you just lost".
+ * UNGATED by any live tmux job: the post-crash state has no live tmux job, yet
+ * the freshly-respawned server is precisely the generation that must be recorded
+ * so crash-restore can scope to "the session you just lost".
  *
  * A degraded probe ({@link probeServerGeneration} returning `null` — no binary,
  * no server, garbage) emits NOTHING and leaves `state.lastGenerationHash`
@@ -1195,9 +718,15 @@ export function seedLastGenerationHash(
 /**
  * Drive one restore pulse against the worker's read-only connection. Reads the
  * projections via the `read(collection)` helper (identical frame shape to the
- * autopilot worker's), refreshes the window-order cache from the tmux probe,
- * emits the two worker→main posts, builds the single-tier `current` mirror,
+ * autopilot worker's), runs the ungated generation-boundary probe, builds the
+ * single-tier `current` mirror (window_index read straight off the projection),
  * hashes the file, and writes on a content change.
+ *
+ * The whole-server topology is NO LONGER probed here — the control-worker emits
+ * `TmuxTopologySnapshot` (epic fn-968), and its fold keeps each tmux job's
+ * `window_index` fresh on the `jobs` projection, which `buildRestoreTier` reads
+ * directly. The ONLY tmux shell-out this pulse retains is the cheap
+ * `display-message -p '#{pid}'` generation probe.
  *
  * Single-tier write semantics (epic fn-817): `current` is the DUMB continuous
  * live mirror — rebuilt every pulse and written whenever the hashed content
@@ -1215,30 +744,14 @@ export function restorePulse(
   state: PulseState,
   now: () => number = () => Date.now() / 1000,
   snapshot?: {
-    /** Inject the tmux pane probe; omit to use {@link defaultSpawnSync}. */
+    /** Inject the generation probe's spawnSync; omit to use
+     *  {@link defaultSpawnSync}. */
     spawnSync?: SpawnSyncFn;
-    /** Post a `TmuxPaneSnapshot` to main; omit to disable the poll arm entirely
-     *  (the pure-pulse test path — no parentPort). */
-    post?: (msg: TmuxPaneSnapshotMessage) => void;
-    /** Post a `WindowIndexSnapshot` to main (the window-order DB channel). Omit
-     *  to disable the window-index post arm — the cache still refreshes for the
-     *  restore.json mirror, but no DB event is minted (the pure-pulse test
-     *  path, or a path that wants only the fill post). */
-    postWindowIndex?: (msg: WindowIndexSnapshotMessage) => void;
     /** Post a `BackendExecStart` generation boundary to main. Omit to disable
      *  the generation pulse arm (the pure-pulse test path). UNGATED by live
      *  tmux jobs — wired whenever a real worker runs so a post-crash respawn is
      *  recorded. */
     postBackendExecStart?: (msg: BackendExecStartMessage) => void;
-    /** Post a `TmuxTopologySnapshot` to main (the LIVE-LOCATION channel, epic
-     *  fn-907). Omit to disable the topology arm (the pure-pulse test path).
-     *  Gated on a live tmux job. */
-    postTopology?: (msg: TmuxTopologySnapshotMessage) => void;
-    /** Inject the topology probe's spawnSync (the stderr-capturing variant);
-     *  omit to use {@link defaultTopologySpawnSync}. Separate from `spawnSync`
-     *  because the topology probe must capture stderr to tell server-gone from
-     *  transient, while the pane/generation probes ignore it. */
-    topologySpawnSync?: SpawnSyncFn;
   },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -1259,42 +772,14 @@ export function restorePulse(
     epicsById.set(epic.epic_id, epic);
   }
 
-  // Tmux poll arm — runs on EVERY pulse (before the restore-file write's own
-  // dedup early-return), self-gated so it is quiescent unless a live tmux job
-  // exists. The single probe refreshes the window-order cache AND feeds the
-  // NULL-session pane-fill post. Disabled entirely when no `post` is wired (the
-  // pure-pulse test path that never spawns a Worker) — the cache then stays at
-  // whatever a prior pulse's probe left it.
-  if (snapshot?.post) {
-    tmuxSnapshotPulse(
-      jobs,
-      state,
-      snapshot.spawnSync ?? defaultSpawnSync,
-      snapshot.post,
-    );
-  }
-
-  // Prune dead job ids from the window-order cache on EVERY pulse, regardless of
-  // the probe gate above — the gate closes when no live tmux job remains, but
-  // the cache must still shed entries for jobs that just ended.
-  pruneWindowIndexCache(jobs, state.lastWindowIndexByJobId);
-
-  // Window-index DB channel — emit AFTER the stamp + prune so the cache is final
-  // for the pulse. Change-gated (layout hash) so a steady topology is silent but
-  // a reorder / new index / prune re-fires. Disabled when no `postWindowIndex`
-  // is wired (the pure-pulse test path) — the restore.json mirror below still
-  // carries window_index from the same cache regardless.
-  if (snapshot?.postWindowIndex) {
-    windowIndexSnapshotPulse(state, snapshot.postWindowIndex);
-  }
-
-  // Generation-boundary arm — runs UNGATED by `hasLiveTmuxJob` (unlike the two
-  // arms above): the post-crash state carries no live tmux job, yet the
-  // freshly-respawned server is exactly the generation crash-restore scopes to.
-  // Change-gated on `state.lastGenerationHash` (boot-seeded so an unchanged
-  // server across a keeperd restart is silent). A degraded probe (no server /
-  // garbage) emits nothing. Disabled when no `postBackendExecStart` is wired
-  // (the pure-pulse test path).
+  // Generation-boundary arm — runs UNGATED by any live tmux job: the post-crash
+  // state carries no live tmux job, yet the freshly-respawned server is exactly
+  // the generation crash-restore scopes to. Change-gated on
+  // `state.lastGenerationHash` (boot-seeded so an unchanged server across a
+  // keeperd restart is silent). A degraded probe (no server / garbage) emits
+  // nothing. Disabled when no `postBackendExecStart` is wired (the pure-pulse
+  // test path). This is the SOLE tmux shell-out the restore pulse retains — the
+  // whole-server topology is produced by the control-worker (epic fn-968).
   if (snapshot?.postBackendExecStart) {
     backendExecStartPulse(
       state,
@@ -1303,28 +788,9 @@ export function restorePulse(
     );
   }
 
-  // Whole-server topology arm (epic fn-907 — LIVE-LOCATION producer). Probes
-  // the server generation + whole-server pane topology and posts ONE
-  // `TmuxTopologySnapshot` on a real change. Gated on a live tmux job; a
-  // degraded/empty probe posts nothing (never wipes). Uses the stderr-capturing
-  // `defaultTopologySpawnSync` (the server-gone vs transient discrimination
-  // needs stderr) unless a `topologySpawnSync` is injected. Disabled when no
-  // `postTopology` is wired (the pure-pulse test path).
-  if (snapshot?.postTopology) {
-    topologySnapshotPulse(
-      jobs,
-      state,
-      snapshot.topologySpawnSync ?? defaultTopologySpawnSync,
-      snapshot.postTopology,
-    );
-  }
-
-  const current = buildRestoreTier(
-    jobs,
-    epicsById,
-    now(),
-    state.lastWindowIndexByJobId,
-  );
+  // window_index rides straight off each job's projection row (kept fresh by the
+  // control-worker's TmuxTopologySnapshot fold), so no cache is threaded here.
+  const current = buildRestoreTier(jobs, epicsById, now());
 
   const descriptor: RestoreDescriptor = {
     schema_version: RESTORE_SCHEMA_VERSION,
@@ -1397,11 +863,7 @@ function main(): void {
   const state: PulseState = {
     lastHash: null,
     parentDirEnsured: false,
-    lastSnapshotHash: null,
-    lastWindowIndexByJobId: new Map(),
-    lastWindowIndexHash: null,
     lastGenerationHash: null,
-    lastTopologyHash: null,
   };
   // Boot-seed the generation gate from the last logged BackendExecStart BEFORE
   // the first pulse so a keeperd restart against an UNCHANGED server emits no
@@ -1409,24 +871,13 @@ function main(): void {
   seedLastGenerationHash(db, state);
   let shutdown = false;
 
-  // Worker→main posts (main is the sole synthetic-event writer). The worker is
-  // otherwise a pure consumer; these `postMessage` calls are its ONLY
-  // worker→main channels: the pane-fill `TmuxPaneSnapshot`, the window-order
-  // `WindowIndexSnapshot`, the generation-boundary `BackendExecStart`, and the
-  // live-location `TmuxTopologySnapshot`. All ride the same parentPort; main
-  // discriminates on `msg.kind`.
+  // Worker→main post (main is the sole synthetic-event writer). The worker is
+  // otherwise a pure consumer; this `postMessage` is its ONLY worker→main
+  // channel: the generation-boundary `BackendExecStart`. (The topology channel
+  // moved to the control-worker in epic fn-968.)
   const port = parentPort;
   const snapshot = {
-    post: (msg: TmuxPaneSnapshotMessage): void => {
-      port.postMessage(msg);
-    },
-    postWindowIndex: (msg: WindowIndexSnapshotMessage): void => {
-      port.postMessage(msg);
-    },
     postBackendExecStart: (msg: BackendExecStartMessage): void => {
-      port.postMessage(msg);
-    },
-    postTopology: (msg: TmuxTopologySnapshotMessage): void => {
       port.postMessage(msg);
     },
   };
@@ -1477,10 +928,10 @@ function main(): void {
     },
     () => shutdown,
     data.pollMs,
-    // Idle-wake the pulse ~1s so the out-of-band topology probe (epic fn-907)
-    // fires even when keeper's data_version is idle — coalesced with the
-    // data_version wake (one probe per loop turn).
-    RESTORE_TOPOLOGY_IDLE_MS,
+    // Idle-wake the pulse ~1s so the generation-boundary probe catches a
+    // post-crash tmux respawn even when keeper's data_version is idle —
+    // coalesced with the data_version wake (one probe per loop turn).
+    RESTORE_GENERATION_IDLE_MS,
   )
     .then(() => {
       closeDb();

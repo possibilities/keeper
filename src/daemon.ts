@@ -118,9 +118,6 @@ import type { RenamerWorkerData } from "./renamer-worker";
 import type {
   BackendExecStartMessage,
   RestoreWorkerData,
-  TmuxPaneSnapshotMessage,
-  TmuxTopologySnapshotMessage,
-  WindowIndexSnapshotMessage,
 } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
@@ -148,6 +145,7 @@ import type {
   TmuxControlLivenessMessage,
   TmuxControlWorkerData,
   TmuxControlWorkerMessage,
+  TmuxTopologySnapshotMessage,
 } from "./tmux-control-worker";
 import type {
   ApiErrorMessage,
@@ -4970,9 +4968,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `data_version`, and rewrites `~/.local/state/keeper/restore.json` (a derived
   // side-file, NOT a projection) only when the content hash differs. Write
   // failures are swallowed to stderr; only an unhandled throw escalates to
-  // fatalExit. Riding the same pulse, it self-gates a tmux pane-snapshot probe
-  // and posts `{kind:"tmux-pane-snapshot"}` (its ONLY worker→main channel) —
-  // `rw.onmessage` mints the `TmuxPaneSnapshot` synthetic event below.
+  // fatalExit. Riding the same pulse (plus a ~1s idle wake), it runs ONE cheap
+  // `display-message -p '#{pid}'` generation probe and posts
+  // `{kind:"backend-exec-start"}` (its ONLY worker→main channel) — `rw.onmessage`
+  // mints the `BackendExecStart` synthetic event below. The whole-server topology
+  // is produced by the control-worker (epic fn-968), not here.
   //
   // The maintenance worker hosts the heavy SQLite schedules (verified backup,
   // integrity probe, boot catch-up) OFF main's fold thread — synchronous
@@ -5037,79 +5037,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (restoreWorker) {
     const rw = restoreWorker;
-    // Worker → main: the restore-worker posts, all on this one port. Main is the
-    // SOLE synthetic-event writer — mint ONE row carrying the post's payload in
-    // `data`. Discriminate on `msg.kind`:
-    //  - `tmux-pane-snapshot` → `TmuxPaneSnapshot` carrying the probed
-    //    `(pane_id, session_name)` pairs; the reducer's fill-only fold stamps
-    //    each matching NULL-session tmux job's session name.
-    //  - `window-index-snapshot` → `WindowIndexSnapshot` carrying the
-    //    `(job_id, window_index)` layout; the reducer folds each index onto the
-    //    matching `jobs` row (pure integer copy keyed by `job_id`).
-    //  - `backend-exec-start` → `BackendExecStart` carrying the backend type +
-    //    server-pid generation boundary (folded via an explicit no-op arm).
-    //  - `tmux-topology-snapshot` → `TmuxTopologySnapshot` carrying the
-    //    whole-server `{generation_id, panes}` map (epic fn-907); the task-3
-    //    live-only fold OVERWRITES each tmux job's live session + window_index.
-    // The restore file write path stays a pure consumer (no message). The worker
-    // self-gates + dedups, so a post here always carries a changed payload.
+    // Worker → main: the restore-worker's ONLY worker→main channel is the
+    // `backend-exec-start` generation boundary. Main is the SOLE synthetic-event
+    // writer — mint ONE `BackendExecStart` row carrying the payload in `data`,
+    // folded via an explicit reducer NO-OP arm (the boundary lives in the
+    // event-log `id` order, not a projection column). The whole-server topology
+    // channel moved to the control-worker (epic fn-968), and the pane-fill /
+    // window-index channels retired with it. The restore-file write path stays a
+    // pure consumer (no message). The worker dedups, so a post here always
+    // carries a changed payload.
     rw.onmessage = (
-      ev: MessageEvent<
-        | TmuxPaneSnapshotMessage
-        | WindowIndexSnapshotMessage
-        | BackendExecStartMessage
-        | TmuxTopologySnapshotMessage
-        | undefined
-      >,
+      ev: MessageEvent<BackendExecStartMessage | undefined>,
     ): void => {
       const msg = ev.data;
       if (!msg) return;
-      let hookEvent: string;
-      let eventType: string;
-      // Stable synthetic `session_id` — `events.session_id` is NOT NULL, and
-      // these folds key on the payload (never `event.session_id`), so a constant
-      // per kind both satisfies the constraint and keeps re-fold deterministic.
-      let sessionId: string;
-      let data: string;
-      if (msg.kind === "tmux-pane-snapshot") {
-        hookEvent = "TmuxPaneSnapshot";
-        eventType = "tmux_pane_snapshot";
-        sessionId = "tmux-pane-snapshot";
-        data = JSON.stringify({ pairs: msg.pairs });
-      } else if (msg.kind === "window-index-snapshot") {
-        hookEvent = "WindowIndexSnapshot";
-        eventType = "window_index_snapshot";
-        sessionId = "window-index-snapshot";
-        data = JSON.stringify({ entries: msg.entries });
-      } else if (msg.kind === "backend-exec-start") {
-        // epic fn-819 — a backend generation boundary. The payload (backend_type
-        // + generation_id) rides `$data`; the reducer folds it via an explicit
-        // NO-OP arm (the boundary lives in the event-log `id` order, not a
-        // projection column). Stable synthetic session_id per kind, as above.
-        hookEvent = "BackendExecStart";
-        eventType = "backend_exec_start";
-        sessionId = "backend-exec-start";
-        data = JSON.stringify({
-          backend_type: msg.backend_type,
-          generation_id: msg.generation_id,
-        });
-      } else if (msg.kind === "tmux-topology-snapshot") {
-        // epic fn-907 — the LIVE-LOCATION channel. The payload (generation_id +
-        // the whole-server pane map) rides `$data`; the task-3 live-only fold
-        // OVERWRITES each matching tmux job's `backend_exec_session_id` +
-        // `window_index`, gated above `tmux_projection_state.floor` and
-        // recycle-guarded on `(generation_id, pane_id)`. Stable synthetic
-        // session_id per kind, as above.
-        hookEvent = "TmuxTopologySnapshot";
-        eventType = "tmux_topology_snapshot";
-        sessionId = "tmux-topology-snapshot";
-        data = JSON.stringify({
-          generation_id: msg.generation_id,
-          panes: msg.panes,
-        });
-      } else {
-        return;
-      }
+      if (msg.kind !== "backend-exec-start") return;
+      // Stable synthetic `session_id` — `events.session_id` is NOT NULL, and the
+      // no-op fold keys on nothing, so a constant satisfies the constraint and
+      // keeps re-fold deterministic.
+      const hookEvent = "BackendExecStart";
+      const eventType = "backend_exec_start";
+      const sessionId = "backend-exec-start";
+      const data = JSON.stringify({
+        backend_type: msg.backend_type,
+        generation_id: msg.generation_id,
+      });
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
         $session_id: sessionId,
