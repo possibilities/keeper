@@ -1,80 +1,86 @@
 ## Description
 
-**Size:** S
-**Files:** cli/control-rpc.ts, test/control-rpc.test.ts, src/board-render.ts
+**Size:** M
+**Files:** cli/handoff.ts, src/rpc-handlers.ts, src/server-worker.ts, src/daemon.ts, cli/control-rpc.ts, test/handoff.test.ts, test/control-rpc.test.ts
 
 ### Approach
 
-Make `roundTrip` (`cli/control-rpc.ts`) write the FULL encoded frame with
-backpressure handling instead of a single fire-and-forget `s.write()`:
-encode the frame to bytes (`new TextEncoder().encode(encodeFrame(send))`),
-then in the `open` handler run a byte-offset loop calling
-`socket.write(bytes, offset, bytes.byteLength - offset)` — advance `offset`
-by the return value while `>= 1`, stop and stash the remaining `offset` when
-it returns `0` (send buffer full), and `settle`-reject if it returns `-1`
-(closing). Add a `drain(s)` handler to the `Bun.connect` `socket` config that
-resumes the loop from the stashed `offset` (state captured in the `roundTrip`
-Promise closure), with a re-entrancy guard and a `socket.readyState` check.
-Mirror the server-side `writeFrames`/`flush`/`resumePending` shape
-(`src/server-worker.ts:2110-2190`) but keep it one-shot — no `conns` set, no
-pending-reaper.
+Route the handoff doc through the filesystem instead of inlining it in the
+`request_handoff` RPC frame (the inline frame exceeds the ~8 KiB UDS send
+buffer and silently hangs). Mirror the spill pattern already in `cli/bus.ts`
+(large bodies → file + compact pointer, aged out) and the file-passing in
+`keeper pair`.
 
-Apply the SAME fix to the duplicate hand-rolled `roundTrip` in
-`src/board-render.ts:942` (the `replay_dead_letter` path) — either refactor it
-to import the fixed `roundTrip` from `cli/control-rpc.ts`, or apply the
-identical backpressure-aware write. Prefer sharing the write path so a single
-site owns the logic. (Its params are small today, but it is the same latent
-bug; leave no one-shot client that ignores backpressure.)
-
-Update the `cli/control-rpc.ts` file-header comment and the `roundTrip` JSDoc
-to describe the backpressure-aware write (the current text claims it "writes a
-single frame"). Forward-facing only — no change-history, fn-ids, or dates.
+- **CLI (`cli/handoff.ts`):** after assembling the doc (already capped at
+  `HANDOFF_DOC_MAX_BYTES` = 64 KB), write it to a spill file under a keeper
+  state dir (reuse/mirror bus's spill helper + dir + age-out). Change
+  `buildRequestHandoffFrame` to carry `doc_path` (the spill path) instead of
+  inline `doc`. The wire frame is now small. On a successful enqueue ack,
+  best-effort remove the spill file (the daemon has inlined it by then); rely
+  on age-out as the backstop.
+- **Validation/types (`src/rpc-handlers.ts`):** `validateRequestHandoffParams`
+  validates `doc_path` (non-empty string) instead of `doc`; update
+  `RequestHandoffParams` and the `buildRequestHandoffFrame` return type.
+- **Bridge (`src/server-worker.ts`):** `RequestHandoffRequestMessage` carries
+  `doc_path` worker→main (small) — neither the socket frame nor the worker→main
+  message carries the large blob.
+- **Daemon (`src/daemon.ts` `request-handoff-request` handler, ~:2556):** read
+  the doc from `doc_path`, then inline it into the `HandoffRequested` event's
+  `$data` EXACTLY as today (durability, `keeper handoff show`, and the
+  `handoffs` projection unchanged). A missing/unreadable/oversized file →
+  `ok:false` reply with a clear error (a real, loud failure mode now).
+- **Loud-fail guard (`cli/control-rpc.ts`):** in the one-shot client, if an
+  encoded frame would exceed a conservative size under the smallest common
+  `SO_SNDBUF` (~7-8 KiB), reject with a clear "control frame too large; pass
+  bulk via a file" error BEFORE writing — converting the silent-hang failure
+  mode into an actionable one for any future oversized frame.
 
 ### Investigation targets
 
 **Required** (read before coding):
-- cli/control-rpc.ts:40-138 — `roundTrip` (the single-write bug at :85, the `Bun.connect` socket config with no `drain`); :150-207 `queryCollection`/`sendControlRpc`; RESPONSE_TIMEOUT_MS=5000 at :32.
-- src/server-worker.ts:2110-2190 — `writeFrames`/`flush`/`resumePending`: the canonical byte-loop + stash-tail + drain-resume to mirror; :2959 the `drain(socket){ resumePending }` wiring.
-- src/protocol.ts:363-471 — `encodeFrame` (appends `\n`), `LineBuffer`, `MAX_LINE_LENGTH` (1 MiB; read side is fine — confirms send-side-only bug).
-- test/control-rpc.test.ts:29-162 — `listenEcho` real `Bun.listen` UDS echo harness under `mkdtempSync`, and the assert/reject test shape to follow for the new regression test.
-- src/board-render.ts:942 — the duplicate hand-rolled `roundTrip` to fix/unify.
+- cli/handoff.ts:54,88,178-232 — `HANDOFF_DOC_MAX_BYTES`, `buildRequestHandoffFrame`, the enqueue `main()` that reads `--prompt`/`--prompt-file` into `doc` and sends the frame.
+- cli/bus.ts:~77 + its spill helper/dir + `SPILL_MAX_AGE_MS` — the established spill-to-file pattern to mirror (compact pointer over the wire, file aged out).
+- src/daemon.ts:2556-2636 — the `request-handoff-request` handler that inlines the doc into the event (change to read `doc_path` first); compare the working `set-epic-armed-request` handler at :2480-2554.
+- src/rpc-handlers.ts:334-426 — `RequestHandoffParams`, `validateRequestHandoffParams`, `requestHandoffHandler`.
+- src/server-worker.ts:~3356-3381 (bridge `requestHandoff`) + the `RequestHandoffRequestMessage` type + the main-side handler wiring — the worker→main message shape.
+- cli/control-rpc.ts:40-138 — `roundTrip` (where the loud-size guard goes); `RESPONSE_TIMEOUT_MS` = 5000.
+- test/handoff.test.ts, test/control-rpc.test.ts — validator/frame tests + the `listenEcho` real-UDS harness for an end-to-end test.
 
 **Optional** (reference as needed):
-- cli/handoff.ts:54,88 — `HANDOFF_DOC_MAX_BYTES` (64 KB), `buildRequestHandoffFrame` (the large-payload frame shape; no change needed).
+- src/protocol.ts — `encodeFrame` (to measure encoded frame size for the guard).
 
 ### Risks
 
-- **Bun #32087 (open through v1.3.6):** mixing app-level buffering with Bun's
-  internal write buffer in `writeOrEndBuffered` miscomputes the remainder →
-  byte duplication/loss. Mitigation: write the encoded bytes DIRECTLY with
-  explicit offset tracking (what the diagnostic probe did); do NOT introduce
-  `ArrayBufferSink` corking in this path.
-- **String vs bytes:** `encodeFrame` returns a string; `socket.write` ignores
-  `byteOffset`/`byteLength` for strings and the return is the UTF-8 byte count.
-  Must encode to a `Uint8Array` and loop on byte offsets.
-- **`drain` re-entrancy / closed socket:** guard against recursive flush and
-  check `socket.readyState` before writing in `drain`.
-- **Duplicate site decision:** refactor board-render to share the fixed path vs
-  fix-in-place — pick one and leave no third copy.
+- **Durability must be preserved:** the doc has to land inline in the event
+  (read from the spill on the daemon side), NOT as a bare file pointer — a
+  deleted spill must never orphan a handoff. `keeper handoff show` reads the
+  projection, so as long as main inlines, it is unchanged.
+- **Spill lifecycle:** main reads the file during enqueue before acking; the CLI
+  removes it on success; age-out is the backstop. Treat missing/unreadable as a
+  LOUD `ok:false` error.
+- **Wire-contract change spans CLI + rpc-handlers + server-worker + daemon** —
+  keep the frame field, validator, bridge message, and handler read consistent
+  in one change.
+- **Same-host assumption:** daemon and CLI share the filesystem (UDS → same
+  machine), so main can read the CLI's spill file. True for keeper.
 
 ### Test notes
 
-Add a regression test in test/control-rpc.test.ts using the existing
-`listenEcho` UDS harness: send a frame whose encoded size is well over 8 KiB
-(e.g. a `request_handoff`/`query` frame with a ~32-64 KB doc field) and assert
-`roundTrip` (via `queryCollection`/`sendControlRpc` or `roundTrip` directly)
-RESOLVES — it would reject/time-out at RESPONSE_TIMEOUT_MS=5000 pre-fix. Keep a
-small-frame case too (no regression). `bun run lint` (biome over cli/src/test)
-and `bun test` must pass.
+Update test/handoff.test.ts for the new `doc_path` frame shape + validator. Add
+an end-to-end test (test/control-rpc.test.ts `listenEcho`, or a daemon-level
+test) that enqueues a handoff with a >8 KB doc via a spill file and asserts it
+succeeds (small frame) and the doc is recoverable (inlined). Add a test for the
+loud-size guard: an oversized frame rejects with the clear error, not a timeout.
+`bun run lint` (biome over cli/src/test) and `bun test` must pass.
 
 ## Acceptance
 
-- [ ] `roundTrip` writes the full encoded frame with backpressure handling: bytes encoded once, an offset loop on `socket.write`'s return value, a `drain` handler resuming the stashed tail (re-entrancy-guarded, `readyState`-checked), and a settle-reject on a closing socket (`-1`).
-- [ ] A frame well over 8 KiB (~32-64 KB doc) round-trips end-to-end through the real UDS transport without hanging — new test in test/control-rpc.test.ts passes (times out pre-fix), and a small-frame case still passes.
-- [ ] The duplicate one-shot client in src/board-render.ts:942 is fixed the same way or refactored to reuse the fixed write path — no remaining single-`write()`-ignoring-backpressure one-shot UDS client in the codebase.
-- [ ] The write path writes encoded bytes directly with offset tracking — no `ArrayBufferSink`/app-buffer mixing with Bun's internal buffer (avoids bun#32087).
-- [ ] cli/control-rpc.ts file-header + `roundTrip` JSDoc describe the backpressure-aware write, forward-facing (no change-history).
-- [ ] `bun run lint` and `bun test` pass.
+- [ ] The handoff doc is passed by file path: `cli/handoff.ts` spills the doc to a file and `buildRequestHandoffFrame` carries `doc_path`, not inline `doc`; the `request_handoff` wire frame is small regardless of doc size.
+- [ ] The daemon reads the doc from `doc_path` and inlines it into the `HandoffRequested` event unchanged — `keeper handoff show <id>` returns the full doc and the `handoffs` projection is identical to before.
+- [ ] `keeper handoff --prompt-file <a >8 KB file>` enqueues successfully (no "no response from daemon within 5000ms"); a 40-64 KB brief works.
+- [ ] A missing/unreadable/oversized `doc_path` produces a LOUD, clear error (`ok:false`), never a silent hang; the spill file is removed on success and aged out as a backstop.
+- [ ] The one-shot UDS client rejects an encoded frame that would exceed the safe send-buffer size with a clear error instead of writing-and-hanging.
+- [ ] Tests cover the new frame shape, an end-to-end >8 KB handoff enqueue, and the loud guard; `bun run lint` and `bun test` pass.
 
 ## Done summary
 
