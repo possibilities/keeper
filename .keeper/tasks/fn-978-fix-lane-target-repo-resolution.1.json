@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T22:58:04.409000Z",
+  "depends_on": [],
+  "epic": "fn-978-fix-lane-target-repo-resolution",
+  "id": "fn-978-fix-lane-target-repo-resolution.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Resolve worktree lane geometry repos to git toplevels",
+  "updated_at": "2026-06-25T22:58:04.409000Z"
+}
