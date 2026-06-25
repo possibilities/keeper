@@ -56,5 +56,5 @@ ONLY if it actually spawns git).
 - [ ] `bun run test`, `bun run test:full`, `bun run test:hygiene`, `bun run lint` all green
 
 ## Done summary
-
+Spawn-test fate DECIDED: skip demotion. Measured against .1's numbers — full daemon.test.ts is 11.22s/97 tests (124.7s->11.2s = ~11x, the epic's order-of-magnitude goal already met by .1); the 12 genuine spawn/Worker/subprocess tests (starvation/usage-mint/autopilot-worker/fn-747/751/774/seed-sweep) are only 5.17s of that. Demoting would yield ~5s for the cost of moving real daemon-boot coverage out of mandatory test:full + duplicating helper scaffolding — net negative, so NO daemon.slow.test.ts created. opts.workers thinning already in place: 4/5 withInProcessDaemon bodies use {workers:[wake,server]}; the 5th (fn-747) is the deliberate full-boot keystone smoke. Docs (freshDb->freshMemDb in CLAUDE.md L102 + README L688, slow-tier/real-git-allowlist orthogonalization in CLAUDE.md L105-108) were all landed by .1 — verified present. No source changes needed; tree clean. NOTE: bun run lint is RED on a PRE-EXISTING unrelated break in src/agent/cwd-ordinal.ts (import-format nit committed today in b0a8f008 refactor(usage)), not touched by this task; test:hygiene green.
 ## Evidence
