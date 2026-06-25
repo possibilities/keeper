@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "explicit topology snapshot retention",
-  "updated_at": "2026-06-24T23:47:12.247000Z"
+  "updated_at": "2026-06-25T05:12:19.376000Z",
+  "worker_done_at": "2026-06-25T05:12:19.376000Z"
 }

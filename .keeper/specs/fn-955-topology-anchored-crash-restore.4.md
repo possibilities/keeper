@@ -32,5 +32,5 @@ Add a test asserting a `TmuxTopologySnapshot` body+row survives a retention pass
 - [ ] Test proves the snapshot survives compaction; `bun run test:full` green
 
 ## Done summary
-
+Made TmuxTopologySnapshot retention explicit: added RETENTION_KEEP_CLASS_PREDICATE (cheap-column class gate) AND-NOTed into the body-NULL shed gate and every row-delete pass, so a future allow-list widen can never destroy crash-restore's source-of-truth snapshot. Tests prove the snapshot row+body survive a pass that sheds/deletes its neighbors; the no-op delete set stays pinned to exactly three classes.
 ## Evidence
