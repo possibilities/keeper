@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T21:26:50.522000Z",
+  "depends_on": [
+    "fn-976-rescue-worktree-mode-lane-isolation.1"
+  ],
+  "epic": "fn-976-rescue-worktree-mode-lane-isolation",
+  "id": "fn-976-rescue-worktree-mode-lane-isolation.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Durable re-dispatch guard on TOOLING_FAILURE block",
+  "updated_at": "2026-06-25T21:26:50.522000Z"
+}

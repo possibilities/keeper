@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T21:26:50.522000Z",
+  "depends_on": [],
+  "epic": "fn-976-rescue-worktree-mode-lane-isolation",
+  "id": "fn-976-rescue-worktree-mode-lane-isolation.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Inject lane worktree path into worker launch env",
+  "updated_at": "2026-06-25T21:26:50.522000Z"
+}
