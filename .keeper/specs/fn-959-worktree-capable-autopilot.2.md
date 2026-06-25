@@ -47,5 +47,5 @@ cycle (throws), single task. Assert byte-identical re-derivation.
 - [ ] Pure module (no fs/git/clock); fast-tier unit tests cover chain/diamond/fan-out/multi-root/cycle/single.
 
 ## Done summary
-
+Added src/worktree-plan.ts: a pure, deterministic DAG->worktree topology (Kahn toposort, (task_number, task_id) tiebreak, fail-loud on cycle) deriving per-task {branch, worktreePath, preMerges, assertBranch} plus a synthetic __close__ sink pinned to base. Fast-tier tests cover chain/diamond/fan-out/multi-root/cycle/single + byte-identical re-derivation (11/11 green).
 ## Evidence
