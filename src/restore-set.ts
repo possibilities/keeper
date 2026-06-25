@@ -62,6 +62,7 @@
 
 import type { Database } from "bun:sqlite";
 import type { CloseKind } from "./exec-backend";
+import { extractTmuxTopologySnapshot } from "./reducer";
 
 /**
  * Idle cutoff (seconds): a killed row whose last activity is older than this is
@@ -142,6 +143,15 @@ export interface RestoreSetResult {
   /** Count of crash-like rows excluded ONLY because they were idle past the
    *  cutoff (a false-negative risk we make visible — never a silent drop). */
   excludedIdleCount: number;
+  /**
+   * A human-readable note set ONLY when {@link deriveLastGenerationSetFromTopology}
+   * degraded to the retrospective {@link deriveLastGenerationSet} fallback (no
+   * dying-generation `TmuxTopologySnapshot` survived). `undefined` on the
+   * topology-anchored happy path and on the non-last-generation derivers.
+   * Mirrors the `[paused]` banner convention so a degraded restore is VISIBLE —
+   * the consumer surfaces it, never silently downgrades the restore set.
+   */
+  fallbackNote?: string;
 }
 
 /** Injectable knobs (tests pin `now`/cutoff; production takes the defaults). */
@@ -400,9 +410,18 @@ function collectCrashCandidates(
 }
 
 /**
- * Derive the LAST-GENERATION crash-restore set: the crash candidates bounded to
- * the kill-anchored tmux-server generation window — "the session you just lost",
- * not the 7-day pool {@link deriveRestoreSet} returns. (epic fn-819, T2)
+ * RETROSPECTIVE last-generation crash-restore set — the LABELED FALLBACK behind
+ * {@link deriveLastGenerationSetFromTopology}. The primary path derives the
+ * restore set from POSITIVE pre-crash evidence (the dying generation's last
+ * `TmuxTopologySnapshot`, immune to the server-restart race). This retrospective
+ * model — reconstruct "what was live at the crash" from `state='killed'` rows +
+ * a kill-anchored `BackendExecStart` window — is used ONLY when the dying
+ * generation left no surviving snapshot; the consumer surfaces a labeled note
+ * (`fallbackNote`) when it fires so a degraded restore is VISIBLE.
+ *
+ * Bounds the crash candidates to the kill-anchored tmux-server generation window
+ * — "the session you just lost", not the 7-day pool {@link deriveRestoreSet}
+ * returns. (epic fn-819, T2)
  *
  * Membership/filters are IDENTICAL to {@link deriveRestoreSet} (shared via
  * {@link collectCrashCandidates}); the only addition is the generation bound:
@@ -506,6 +525,266 @@ export function deriveLastGenerationSet(
   const candidates = kept.map((c) => c.candidate);
   candidates.sort(compareCandidates);
   return { candidates, excludedIdleCount };
+}
+
+/**
+ * Injectable knobs for {@link deriveLastGenerationSetFromTopology}: the standard
+ * idle/now knobs PLUS `currentGenerationId` — `G_now`, the CURRENT tmux server
+ * pid the consumer probed at restore time (NEVER inside a fold). The deriver
+ * selects the DYING generation as the newest `TmuxTopologySnapshot` whose
+ * `generation_id != G_now`. `null` means no server is up (the post-crash,
+ * pre-respawn read), so the newest snapshot overall IS the dying generation.
+ */
+export interface DeriveFromTopologyOptions extends DeriveRestoreSetOptions {
+  /** The current tmux server pid (`probeServerGeneration` result), or `null`
+   *  when no server is running. The dying generation is the newest snapshot
+   *  whose `generation_id` differs from this. */
+  currentGenerationId: string | null;
+}
+
+/** The minimal `jobs` columns the topology deriver reads to turn a snapshot pane
+ *  into a {@link RestoreCandidate} (job identity already resolved). */
+interface TopologyJobRow {
+  job_id: string;
+  created_at: number;
+  title: string | null;
+  cwd: string | null;
+  backend_exec_session_id: string | null;
+  plan_verb: string | null;
+}
+
+/**
+ * PRIMARY last-generation crash-restore deriver — derives the restore set from
+ * POSITIVE pre-crash evidence: the DYING generation's last `TmuxTopologySnapshot`
+ * event, written BEFORE the crash and so immune to the server-restart race that
+ * defeats the retrospective `close_kind`/killed-cohort model (epic fn-955).
+ *
+ * SELECTION. Probe `G_now` (the current server pid) in the CONSUMER and pass it
+ * as `currentGenerationId`. Scan `events` for `TmuxTopologySnapshot` rows ORDER
+ * BY id DESC and take the newest whose decoded `generation_id != G_now` — that
+ * is the dying generation (boot ordering posts the dead-gen snapshot with a LOWER
+ * rowid than the new server's first post, so the `!= G_now` scan, NOT a
+ * `BackendExecStart`-id anchor, is what isolates it). `G_now == null` (no server
+ * up) ⇒ the newest snapshot overall is the dying generation. A MALFORMED newest
+ * snapshot (un-decodable payload) is SKIPPED to the next-newest `!= G_now`, never
+ * dropped straight to the fallback. Only the SINGLE newest non-`G_now`
+ * generation is used — older crashes are manual escalation.
+ *
+ * CANDIDATES. Each surviving snapshot pane resolves a keeper `job_id` from the
+ * EVENT PAYLOAD (`pane.job_id`), with the `(generation_id, pane_id)` projection
+ * join as the per-pane fallback when the payload carries none. The job's row
+ * supplies the latest name (`title`, `job_id` fallback) for `resume_target` /
+ * `label`, its `cwd`, and `created_at`. The pane's `session_name` is the restore
+ * location (`backend_exec_session_id`) and its `window_index` the visual order.
+ * The {@link collectCrashCandidates} idempotence filters are reused VERBATIM:
+ * require backend coords, exclude `plan_verb='work'` (reconciler-managed), and
+ * exclude any `job_id` already occupying a LIVE backend (the double-spawn guard).
+ * Candidates sort by {@link compareCandidates} (window_index ascending).
+ *
+ * FALLBACK. No non-`G_now` snapshot survives (none recorded, or every candidate
+ * snapshot is malformed) ⇒ delegate to {@link deriveLastGenerationSet} (the
+ * retrospective killed-cohort model) and set `fallbackNote` so the consumer
+ * surfaces a VISIBLE degraded-restore banner. A snapshot that decodes but yields
+ * zero post-filter candidates is NOT the fallback — it is a genuine "the dying
+ * generation had nothing to restore" answer.
+ *
+ * PURE relative to the read-only `db` + injected `currentGenerationId` — no
+ * probe, no env, no wall-clock outside the injected `now`. Reads only `events` +
+ * `jobs` (daemon-down OK). Never throws on data: a malformed snapshot decodes to
+ * a skip, a missing job row drops the pane.
+ */
+export function deriveLastGenerationSetFromTopology(
+  db: Database,
+  options: DeriveFromTopologyOptions,
+): RestoreSetResult {
+  const dying = selectDyingGenerationSnapshot(db, options.currentGenerationId);
+  if (dying === null) {
+    // No surviving non-`G_now` snapshot — degrade to the retrospective model and
+    // LABEL it so the degraded restore is visible (never a silent downgrade).
+    const fallback = deriveLastGenerationSet(db, options);
+    return {
+      ...fallback,
+      fallbackNote:
+        "no dying-generation topology snapshot — using the retrospective killed-cohort fallback (restore set may be approximate)",
+    };
+  }
+
+  const { liveJobIds } = loadRows(db);
+  const candidates: RestoreCandidate[] = [];
+  const seen = new Set<string>();
+  for (const pane of dying.panes) {
+    const jobId =
+      pane.job_id ??
+      resolvePaneJobId(db, dying.generation_id, pane.pane_id) ??
+      null;
+    if (jobId === null || jobId === "" || seen.has(jobId)) {
+      continue; // unowned pane (never launched / no job row), or a dup pane.
+    }
+    const row = loadTopologyJobRow(db, jobId);
+    if (row === null) {
+      continue; // job row gone — nothing to resume.
+    }
+    // Idempotence filters reused VERBATIM from collectCrashCandidates:
+    //  - autopilot workers are reconciler-managed; never restore them.
+    if (row.plan_verb === "work") {
+      continue;
+    }
+    //  - already live under this UUID ⇒ restoring would double-spawn.
+    if (liveJobIds.has(jobId)) {
+      continue;
+    }
+    // Restore LOCATION is the pane's live session (the snapshot's whole point);
+    // fall back to the job's recorded backend coords. No location ⇒ skip.
+    const backendSession =
+      pane.session_name !== ""
+        ? pane.session_name
+        : (row.backend_exec_session_id ?? "");
+    if (backendSession === "") {
+      continue;
+    }
+    seen.add(jobId);
+    const label = row.title != null && row.title !== "" ? row.title : jobId;
+    candidates.push({
+      job_id: jobId,
+      resume_target: label,
+      label,
+      window_index:
+        typeof pane.window_index === "number" &&
+        Number.isFinite(pane.window_index)
+          ? pane.window_index
+          : null,
+      cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
+      backend_exec_session_id: backendSession,
+      created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+    });
+  }
+
+  candidates.sort(compareCandidates);
+  // The topology path has no idle-cutoff concept (the snapshot panes were all
+  // live at crash time); excludedIdleCount is 0 on this path.
+  return { candidates, excludedIdleCount: 0 };
+}
+
+/**
+ * The decoded dying-generation snapshot {@link deriveLastGenerationSetFromTopology}
+ * builds candidates from: the newest `TmuxTopologySnapshot` whose `generation_id`
+ * differs from `currentGenerationId` (`G_now`). `null` ⇒ no surviving non-`G_now`
+ * snapshot at all (the deriver falls back). A malformed newest snapshot is
+ * SKIPPED to the next-newest `!= G_now` — a decode failure is not a "no snapshot"
+ * verdict. Reads only the read-only `events` table ORDER BY id DESC, following
+ * the daemon-down `seedLastGenerationHash` template (never throws). Returns the
+ * decoded `{generation_id, panes}` so callers join panes to jobs.
+ */
+function selectDyingGenerationSnapshot(
+  db: Database,
+  currentGenerationId: string | null,
+): { generation_id: string; panes: TmuxTopologyPaneLike[] } | null {
+  let rows: { id: number; data: string | null }[];
+  try {
+    rows = db
+      .query(
+        "SELECT id, data FROM events WHERE hook_event = 'TmuxTopologySnapshot' ORDER BY id DESC",
+      )
+      .all() as { id: number; data: string | null }[];
+  } catch {
+    return null;
+  }
+  for (const row of rows) {
+    let snapshot: ReturnType<typeof extractTmuxTopologySnapshot>;
+    try {
+      // extractTmuxTopologySnapshot reads only event.data; shape the row into the
+      // Event-like the decoder needs (id + data + a stable ts placeholder it
+      // never reads for the payload decode).
+      snapshot = extractTmuxTopologySnapshot({
+        id: row.id,
+        data: row.data,
+      } as Parameters<typeof extractTmuxTopologySnapshot>[0]);
+    } catch {
+      snapshot = null;
+    }
+    if (snapshot === null) {
+      continue; // malformed newest ⇒ skip to the next-newest, never fall back early.
+    }
+    // The dying generation is the newest snapshot whose generation differs from
+    // G_now; G_now == null ⇒ the newest overall (no server up to exclude).
+    if (
+      currentGenerationId !== null &&
+      snapshot.generation_id === currentGenerationId
+    ) {
+      continue;
+    }
+    return { generation_id: snapshot.generation_id, panes: snapshot.panes };
+  }
+  return null;
+}
+
+/** A snapshot pane as decoded by {@link extractTmuxTopologySnapshot} — the shape
+ *  the topology deriver joins to jobs. Mirrors the reducer's pane entry without
+ *  importing its type (the optional `job_id` is the payload-carried identity). */
+interface TmuxTopologyPaneLike {
+  pane_id: string;
+  session_name: string;
+  window_index: number | null;
+  job_id?: string;
+}
+
+/**
+ * Per-pane projection-join fallback: resolve the keeper `job_id` owning a pane
+ * when the snapshot payload carried none. Match on `(backend_exec_generation_id,
+ * backend_exec_pane_id)` — the same recycle-guarded key the topology fold writes
+ * — so a recycled `%N` from a different generation never resolves to the wrong
+ * job. Returns `null` on no match or a degenerate (empty/non-string) id. Reads
+ * only the read-only `jobs` projection; never throws.
+ */
+function resolvePaneJobId(
+  db: Database,
+  generationId: string,
+  paneId: string,
+): string | null {
+  try {
+    const row = db
+      .query(
+        `SELECT job_id FROM jobs
+          WHERE backend_exec_type = 'tmux'
+            AND backend_exec_generation_id = ?
+            AND backend_exec_pane_id = ?
+          LIMIT 1`,
+      )
+      .get(generationId, paneId) as { job_id: string } | null;
+    const jobId = row != null ? seg(row.job_id) : "";
+    return jobId === "" ? null : jobId;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load the `jobs` columns the topology deriver needs to materialize one resolved
+ * pane into a candidate (latest name, cwd, created_at, backend coords, plan_verb
+ * for the worker filter). `backend_exec_session_id` COALESCEs the live session
+ * over the forensic birth session, mirroring {@link loadRows}. Returns `null`
+ * when the job row is absent; never throws.
+ */
+function loadTopologyJobRow(
+  db: Database,
+  jobId: string,
+): TopologyJobRow | null {
+  try {
+    const row = db
+      .query(
+        `SELECT job_id, created_at, title, cwd,
+                COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
+                  AS backend_exec_session_id,
+                plan_verb
+           FROM jobs
+          WHERE job_id = ?
+          LIMIT 1`,
+      )
+      .get(jobId) as TopologyJobRow | null;
+    return row ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**

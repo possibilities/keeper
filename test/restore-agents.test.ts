@@ -119,6 +119,39 @@ function seedBackendExecStart(db: Database, id: number): void {
   );
 }
 
+/** Insert a synthetic `TmuxTopologySnapshot` at an explicit rowid carrying the
+ *  dying generation's live panes (each with the producer-stamped job_id) — the
+ *  positive pre-crash evidence the topology-anchored deriver reads. */
+function seedTmuxTopologySnapshot(
+  db: Database,
+  id: number,
+  generationId: string,
+  panes: {
+    pane_id: string;
+    session_name: string;
+    window_index?: number | null;
+    job_id?: string;
+  }[],
+): void {
+  db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
+    [
+      id,
+      RECENT,
+      JSON.stringify({
+        generation_id: generationId,
+        panes: panes.map((p) => ({
+          pane_id: p.pane_id,
+          session_name: p.session_name,
+          window_index: p.window_index ?? null,
+          ...(p.job_id !== undefined ? { job_id: p.job_id } : {}),
+        })),
+      }),
+    ],
+  );
+}
+
 /** Build a `RestoreCandidate` for the pure presenter tests. */
 function fakeCandidate(opts: {
   job_id: string;
@@ -706,4 +739,65 @@ test("loadLastGenerationSet composes with the --session filter", () => {
   const plan = planRestore(candidates, "work");
   expect(plan).toHaveLength(1);
   expect(plan[0].candidate.job_id).toBe("work-agent");
+});
+
+test("loadLastGenerationSet: topology-anchored — offers ONLY the dying-gen snapshot panes (injected G_now)", () => {
+  // The dying generation (gen-dead) left a snapshot with 2 live panes; a day of
+  // historically-closed killed rows the OLD retrospective model would sweep in
+  // also sits in the DB. The injected G_now (a respawned-server pid != gen-dead)
+  // selects the dying generation; the topology model offers only its 2 panes.
+  for (let i = 0; i < 10; i++) {
+    seedJob(kdb.db, {
+      job_id: `historical-${i}`,
+      close_kind: "server_gone",
+      window_index: i,
+      last_event_id: 150 + i,
+      backend_exec_session_id: "work",
+    });
+  }
+  seedJob(kdb.db, {
+    job_id: "live-a",
+    state: "killed",
+    title: "alpha",
+    window_index: 0,
+    backend_exec_session_id: "work",
+  });
+  seedJob(kdb.db, {
+    job_id: "live-b",
+    state: "killed",
+    title: "beta",
+    window_index: 1,
+    backend_exec_session_id: "work",
+  });
+  seedTmuxTopologySnapshot(kdb.db, 900, "gen-dead", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "live-a" },
+    { pane_id: "%2", session_name: "work", window_index: 1, job_id: "live-b" },
+  ]);
+  kdb.db.close();
+
+  // The full set offers the whole pool; the topology-anchored last-gen offers
+  // only the dying-gen snapshot's 2 panes. G_now injected as a fresh pid.
+  expect(loadRestoreSet(dbPath).candidates.length).toBeGreaterThan(2);
+  const set = loadLastGenerationSet(dbPath, () => "gen-now");
+  expect(set.candidates.map((c) => c.job_id)).toEqual(["live-a", "live-b"]);
+  expect(set.fallbackNote).toBeUndefined();
+});
+
+test("loadLastGenerationSet: no snapshot ⇒ labeled fallback, killed cohort offered", () => {
+  // No TmuxTopologySnapshot — the deriver degrades to the retrospective model and
+  // surfaces a visible fallbackNote. The injected G_now is irrelevant (no
+  // snapshot to exclude).
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "killed-cohort",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+    backend_exec_session_id: "work",
+  });
+  kdb.db.close();
+
+  const set = loadLastGenerationSet(dbPath, () => "gen-now");
+  expect(set.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
+  expect(set.fallbackNote).toBeDefined();
 });

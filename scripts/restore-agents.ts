@@ -66,6 +66,7 @@ import {
   buildAgentwrapLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
+  localeDefaultedEnv,
 } from "../src/exec-backend";
 import {
   buildLauncherArgvPrefix,
@@ -73,10 +74,11 @@ import {
 } from "../src/keeper-agent-path";
 import {
   deriveCurrentSet,
-  deriveLastGenerationSet,
+  deriveLastGenerationSetFromTopology,
   deriveRestoreSet,
   type RestoreCandidate,
 } from "../src/restore-set";
+import { probeServerGeneration } from "../src/restore-worker";
 import { buildResumeCommand } from "../src/resume-descriptor";
 
 const HELP = `restore-agents — replay crash-killed Claude Code agents derived from keeper.db
@@ -482,23 +484,56 @@ export function loadRestoreSet(dbPath: string): {
 }
 
 /**
- * Read the LAST-GENERATION crash-restore set off a read-only `keeper.db` in one
- * open span — the `--last-generation` source. Same membership/filters as
- * {@link loadRestoreSet}, bounded to the kill-anchored generation window (see
- * {@link deriveLastGenerationSet}). Re-throws on open failure (the caller maps
- * it to `die`). Exported for tests so the read path is assertable against a
- * seeded DB.
+ * Probe `G_now` — the CURRENT tmux server pid — at restore time via
+ * {@link probeServerGeneration}, wrapped in the LOAD-BEARING locale default (a
+ * C-locale daemon client corrupts tmux output). Returns the pid string, or
+ * `null` when no server is up / the probe degrades. The topology deriver excludes
+ * the snapshot of this (still-running) generation, isolating the dying one.
+ * Injectable for tests.
  */
-export function loadLastGenerationSet(dbPath: string): {
+export type ProbeGenerationFn = () => string | null;
+
+const defaultProbeGeneration: ProbeGenerationFn = () =>
+  probeServerGeneration((cmd) =>
+    Bun.spawnSync(cmd, {
+      stdout: "pipe",
+      stderr: "ignore",
+      env: localeDefaultedEnv(
+        process.env as Record<string, string | undefined>,
+      ),
+    }),
+  );
+
+/**
+ * Read the LAST-GENERATION crash-restore set off a read-only `keeper.db` in one
+ * open span — the `--last-generation` source. PRIMARY path: derive from the
+ * DYING generation's last `TmuxTopologySnapshot`
+ * ({@link deriveLastGenerationSetFromTopology}), selected by probing `G_now`
+ * (the current server pid) and excluding its still-live snapshot. When no
+ * dying-generation snapshot survives, the deriver degrades to the retrospective
+ * killed-cohort model and sets `fallbackNote` (a VISIBLE degraded-restore
+ * banner). Re-throws on open failure (the caller maps it to `die`). `probeNow`
+ * is injectable for tests; production probes the live server. Exported for tests
+ * so the read path is assertable against a seeded DB.
+ */
+export function loadLastGenerationSet(
+  dbPath: string,
+  probeNow: ProbeGenerationFn = defaultProbeGeneration,
+): {
   candidates: RestoreCandidate[];
   excludedIdleCount: number;
+  fallbackNote?: string;
 } {
+  const currentGenerationId = probeNow();
   const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
   try {
-    const set = deriveLastGenerationSet(db);
+    const set = deriveLastGenerationSetFromTopology(db, {
+      currentGenerationId,
+    });
     return {
       candidates: set.candidates,
       excludedIdleCount: set.excludedIdleCount,
+      fallbackNote: set.fallbackNote,
     };
   } finally {
     try {
@@ -572,14 +607,27 @@ async function main(): Promise<void> {
   // path is identical.
   let candidates: RestoreCandidate[];
   let excludedIdleCount: number;
+  let fallbackNote: string | undefined;
   try {
-    const set = args.lastGeneration
-      ? loadLastGenerationSet(dbPath)
-      : loadRestoreSet(dbPath);
-    candidates = set.candidates;
-    excludedIdleCount = set.excludedIdleCount;
+    if (args.lastGeneration) {
+      const set = loadLastGenerationSet(dbPath);
+      candidates = set.candidates;
+      excludedIdleCount = set.excludedIdleCount;
+      fallbackNote = set.fallbackNote;
+    } else {
+      const set = loadRestoreSet(dbPath);
+      candidates = set.candidates;
+      excludedIdleCount = set.excludedIdleCount;
+    }
   } catch (err) {
     die(`failed to open keeper.db at ${dbPath}: ${(err as Error).message}`);
+  }
+
+  // Surface the degraded-restore banner BEFORE the plan (mirrors the [paused]
+  // convention) so a topology-anchored miss is never silent. Goes to stderr so
+  // it never pollutes a `--snapshot-current`-style stdout consumer.
+  if (fallbackNote !== undefined) {
+    process.stderr.write(`restore-agents: [fallback] ${fallbackNote}\n`);
   }
 
   const plan = planRestore(candidates, args.session);

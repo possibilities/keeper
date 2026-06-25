@@ -25,6 +25,7 @@ import {
   DEFAULT_IDLE_CUTOFF_SECS,
   deriveCurrentSet,
   deriveLastGenerationSet,
+  deriveLastGenerationSetFromTopology,
   deriveRestoreSet,
   isCrashLike,
 } from "../src/restore-set";
@@ -66,6 +67,11 @@ interface SeedJob {
   backend_exec_birth_session_id?: string | null;
   plan_verb?: string | null;
   last_event_id?: number | null;
+  /** Backend coords the topology deriver's projection-join fallback keys on
+   *  (`(backend_exec_generation_id, backend_exec_pane_id)`). */
+  backend_exec_type?: string | null;
+  backend_exec_pane_id?: string | null;
+  backend_exec_generation_id?: string | null;
 }
 
 /** Insert one jobs row with sensible defaults; only the fields a test cares
@@ -75,8 +81,9 @@ function seedJob(db: Database, j: SeedJob): void {
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
-       last_event_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       last_event_id, backend_exec_type, backend_exec_pane_id,
+       backend_exec_generation_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -94,6 +101,9 @@ function seedJob(db: Database, j: SeedJob): void {
       j.backend_exec_birth_session_id ?? null,
       j.plan_verb ?? null,
       j.last_event_id ?? null,
+      j.backend_exec_type ?? null,
+      j.backend_exec_pane_id ?? null,
+      j.backend_exec_generation_id ?? null,
     ],
   );
 }
@@ -930,6 +940,303 @@ test("deriveLastGenerationSet: works against a read-only connection (daemon-down
   try {
     const res = deriveLastGenerationSet(ro, { now: NOW });
     expect(res.candidates.map((c) => c.job_id)).toEqual(["ro"]);
+  } finally {
+    ro.close();
+  }
+  kdb = { db: ro, stmts: kdb.stmts };
+});
+
+// ---------------------------------------------------------------------------
+// deriveLastGenerationSetFromTopology — the PRIMARY topology-anchored deriver
+// (epic fn-955). Derives the restore set from the DYING generation's last
+// TmuxTopologySnapshot (positive pre-crash evidence), not the retrospective
+// killed cohort. Selected by probing G_now and excluding its still-live snapshot.
+// ---------------------------------------------------------------------------
+
+function deriveTopo(currentGenerationId: string | null) {
+  return deriveLastGenerationSetFromTopology(kdb.db, {
+    now: NOW,
+    currentGenerationId,
+  });
+}
+
+test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot panes (job_id from payload)", () => {
+  // The dying generation (gen-dead) left a snapshot carrying its live panes,
+  // each with the producer-stamped job_id. The respawned server is gen-now.
+  seedJob(kdb.db, {
+    job_id: "agent-a",
+    state: "killed",
+    title: "alpha",
+    window_index: 1,
+  });
+  seedJob(kdb.db, {
+    job_id: "agent-b",
+    state: "killed",
+    title: "beta",
+    window_index: 0,
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%1", session_name: "work", window_index: 1, job_id: "agent-a" },
+    { pane_id: "%2", session_name: "work", window_index: 0, job_id: "agent-b" },
+  ]);
+  // G_now is a fresh server pid != gen-dead.
+  const res = deriveTopo("gen-now");
+  // Ordered by window_index ascending (beta=0 before alpha=1).
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["agent-b", "agent-a"]);
+  expect(res.candidates.map((c) => c.resume_target)).toEqual(["beta", "alpha"]);
+  expect(res.candidates[0]?.backend_exec_session_id).toBe("work");
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback when payload carries no job_id", () => {
+  // The snapshot pane omits job_id (a pane whose job row was not yet written at
+  // post time); the deriver resolves it via the (generation_id, pane_id) join.
+  seedJob(kdb.db, {
+    job_id: "join-resolved",
+    state: "killed",
+    title: "joined",
+    window_index: 0,
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%7",
+    backend_exec_generation_id: "gen-dead",
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%7", session_name: "work", window_index: 0 }, // no job_id
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["join-resolved"]);
+  expect(res.candidates[0]?.resume_target).toBe("joined");
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot overall is the dying generation", () => {
+  // No server up at restore time. The newest snapshot (id 600, gen-late) is the
+  // dying generation; an older snapshot (id 500, gen-early) is ignored.
+  seedJob(kdb.db, { job_id: "early", state: "killed", title: "early-a" });
+  seedJob(kdb.db, { job_id: "late", state: "killed", title: "late-a" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-early", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "early" },
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 600, "gen-late", [
+    { pane_id: "%2", session_name: "work", window_index: 0, job_id: "late" },
+  ]);
+  const res = deriveTopo(null);
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["late"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: multiple dead generations ⇒ the SINGLE newest non-G_now generation only", () => {
+  // gen-now is live; gen-dead-2 (id 600) is the most-recent crash; gen-dead-1
+  // (id 500) is an older crash (manual escalation, NOT swept in). G_now's own
+  // snapshot (id 700) is excluded.
+  seedJob(kdb.db, { job_id: "older-crash", state: "killed", title: "old" });
+  seedJob(kdb.db, { job_id: "recent-crash", state: "killed", title: "recent" });
+  seedJob(kdb.db, { job_id: "live-now", state: "working", title: "now" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead-1", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 0,
+      job_id: "older-crash",
+    },
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 600, "gen-dead-2", [
+    {
+      pane_id: "%2",
+      session_name: "work",
+      window_index: 0,
+      job_id: "recent-crash",
+    },
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 700, "gen-now", [
+    {
+      pane_id: "%3",
+      session_name: "work",
+      window_index: 0,
+      job_id: "live-now",
+    },
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["recent-crash"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: a malformed newest snapshot is SKIPPED to the next-newest != G_now", () => {
+  seedJob(kdb.db, { job_id: "good-agent", state: "killed", title: "good" });
+  // A good dying-gen snapshot at id 500.
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 0,
+      job_id: "good-agent",
+    },
+  ]);
+  // A malformed newest TmuxTopologySnapshot at id 600 (un-decodable data) — the
+  // scan must skip it, NOT drop straight to the fallback.
+  kdb.db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
+    [600, NOW - 100, "{not valid json"],
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["good-agent"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: no snapshot ⇒ labeled fallback to the killed-cohort model", () => {
+  // No TmuxTopologySnapshot at all — degrade to deriveLastGenerationSet and set
+  // the visible fallback note.
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "killed-cohort",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
+  expect(res.fallbackNote).toBeDefined();
+  expect(res.fallbackNote).toContain("retrospective");
+});
+
+test("deriveLastGenerationSetFromTopology: every snapshot is G_now ⇒ labeled fallback (no dying generation)", () => {
+  // The only snapshot belongs to the still-live server (gen-now) — there is no
+  // dying generation to anchor on, so fall back (labeled).
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "killed-cohort",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  seedJob(kdb.db, { job_id: "live-now", state: "working", title: "now" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-now", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 0,
+      job_id: "live-now",
+    },
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
+  expect(res.fallbackNote).toBeDefined();
+});
+
+test("deriveLastGenerationSetFromTopology: reuses the idempotence filters (worker / live-UUID / no-coords excluded)", () => {
+  // An autopilot worker (plan_verb='work') — reconciler-managed, never restored.
+  seedJob(kdb.db, {
+    job_id: "worker",
+    state: "killed",
+    title: "worker-agent",
+    plan_verb: "work",
+  });
+  // A job already live under its UUID (would double-spawn) — excluded.
+  seedJob(kdb.db, {
+    job_id: "still-live",
+    state: "working",
+    title: "live-agent",
+  });
+  // A genuine crash candidate — kept.
+  seedJob(kdb.db, { job_id: "keepme", state: "killed", title: "survivor" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "worker" },
+    {
+      pane_id: "%2",
+      session_name: "work",
+      window_index: 1,
+      job_id: "still-live",
+    },
+    { pane_id: "%3", session_name: "work", window_index: 2, job_id: "keepme" },
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["keepme"]);
+});
+
+test("deriveLastGenerationSetFromTopology: an unowned pane (no job_id, no projection match) is dropped", () => {
+  seedJob(kdb.db, { job_id: "owned", state: "killed", title: "owned-agent" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "owned" },
+    { pane_id: "%99", session_name: "work", window_index: 1 }, // unowned, no join
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["owned"]);
+});
+
+test("deriveLastGenerationSetFromTopology: REGRESSION — respawned server + day-old killed rows offers ONLY the live windows", () => {
+  // The real-incident scenario this epic fixes: the tmux server respawned (so
+  // G_now is the NEW pid), and a full day of historically-closed killed rows
+  // sits in the DB. The retrospective killed-cohort model swept those in; the
+  // topology-anchored model offers ONLY the dying generation's 2 live panes.
+
+  // A day of older killed rows (close_kind-NULL legacy + crash-like), all from a
+  // prior generation, plus a stale BackendExecStart anchor the OLD model would
+  // sweep from. None of these belong to the dying-gen snapshot.
+  const DAY_AGO = NOW - 24 * 60 * 60;
+  seedBackendExecStart(kdb.db, 100, "gen-ancient");
+  for (let i = 0; i < 38; i++) {
+    seedJob(kdb.db, {
+      job_id: `historical-${i}`,
+      close_kind: "server_gone",
+      window_index: i,
+      last_event_id: 150 + i, // a contiguous day-old burst the old model loved
+      title: `hist-${i}`,
+      created_at: DAY_AGO,
+      updated_at: NOW - 3600,
+    });
+  }
+
+  // The dying generation's snapshot: exactly 2 panes that were genuinely live at
+  // the crash. The jobs are also present as killed rows (the boot sweep killed
+  // them), but the snapshot is what anchors the restore.
+  seedJob(kdb.db, {
+    job_id: "live-1",
+    state: "killed",
+    close_kind: "server_gone",
+    title: "genuinely-live-1",
+    window_index: 0,
+    last_event_id: 900,
+    updated_at: NOW - 60,
+  });
+  seedJob(kdb.db, {
+    job_id: "live-2",
+    state: "killed",
+    close_kind: "server_gone",
+    title: "genuinely-live-2",
+    window_index: 1,
+    last_event_id: 901,
+    updated_at: NOW - 60,
+  });
+  seedTmuxTopologySnapshot(kdb.db, 800, "gen-dying", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "live-1" },
+    { pane_id: "%2", session_name: "work", window_index: 1, job_id: "live-2" },
+  ]);
+
+  // The OLD retrospective model swept the whole day-old pool + the 2 live (40).
+  const old = deriveLastGenerationSet(kdb.db, { now: NOW });
+  expect(old.candidates.length).toBeGreaterThan(2);
+
+  // The topology-anchored model (respawned server = gen-now) offers ONLY the 2
+  // genuinely-live windows.
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["live-1", "live-2"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: works against a read-only connection (daemon-down path)", () => {
+  seedJob(kdb.db, { job_id: "ro-topo", state: "killed", title: "ro-agent" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "ro-topo" },
+  ]);
+  kdb.db.close();
+  const ro = new Database(dbPath, { readonly: true });
+  try {
+    const res = deriveLastGenerationSetFromTopology(ro, {
+      now: NOW,
+      currentGenerationId: "gen-now",
+    });
+    expect(res.candidates.map((c) => c.job_id)).toEqual(["ro-topo"]);
   } finally {
     ro.close();
   }

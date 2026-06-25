@@ -35,7 +35,8 @@ import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
-import { deriveLastGenerationSet } from "../src/restore-set";
+import { deriveLastGenerationSetFromTopology } from "../src/restore-set";
+import { probeServerGeneration } from "../src/restore-worker";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
 
@@ -666,9 +667,23 @@ export type CandidateCountFn = () => Record<string, number>;
 
 const defaultCandidateCount: CandidateCountFn = () => {
   try {
+    // Probe G_now (the current server pid) under the LOAD-BEARING locale default
+    // so the topology deriver excludes the still-live generation and isolates the
+    // dying one. A degraded probe → null → the newest snapshot overall is taken.
+    const currentGenerationId = probeServerGeneration((cmd) =>
+      Bun.spawnSync(cmd, {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: localeDefaultedEnv(
+          process.env as Record<string, string | undefined>,
+        ),
+      }),
+    );
     const { db } = openDb(resolveDbPath(), { readonly: true });
     try {
-      const { candidates } = deriveLastGenerationSet(db);
+      const { candidates } = deriveLastGenerationSetFromTopology(db, {
+        currentGenerationId,
+      });
       const counts: Record<string, number> = {};
       for (const c of candidates) {
         counts[c.backend_exec_session_id] =
