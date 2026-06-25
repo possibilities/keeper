@@ -28,6 +28,7 @@
 test/git-worker-realgit.slow.test.ts
 test/git-boot-seed-realgit.slow.test.ts
 test/git-wrapper.slow.test.ts
+test/worktree-git-realgit.slow.test.ts
 
 # fn-952 — the live `tmux -C` control-client attach against a throwaway `-L`
 # server. No real git, but a real-process slow test kept off the fast tier.
