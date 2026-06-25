@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-25T18:29:53.210000Z",
   "created_at": "2026-06-25T12:49:36.114000Z",
   "depends_on_epics": [
     "fn-937-agent-launch-config-presets"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-06-25T12:49:36.133000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "panel runner subagent",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T12:49:36.114000Z"
+  "updated_at": "2026-06-25T18:29:53.210000Z"
 }
