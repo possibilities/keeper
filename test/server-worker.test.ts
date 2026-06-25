@@ -1037,6 +1037,9 @@ function asyncCtxStub(opts: {
     async setEpicArmed() {
       return { ok: true };
     },
+    async requestHandoff() {
+      return { ok: true };
+    },
   };
   const ctx: DispatchAsyncCtx = {
     bridge,
@@ -1318,6 +1321,9 @@ test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (roun
       async setEpicArmed() {
         return { ok: true };
       },
+      async requestHandoff() {
+        return { ok: true };
+      },
     };
     const ctx: DispatchAsyncCtx = {
       bridge,
@@ -1368,6 +1374,9 @@ test("dispatchLine async rpc → handler reaches bridge.retryDispatch with the s
         return { ok: true };
       },
       async setEpicArmed() {
+        return { ok: true };
+      },
+      async requestHandoff() {
         return { ok: true };
       },
     };

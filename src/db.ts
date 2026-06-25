@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 87;
+export const SCHEMA_VERSION = 88;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5202,6 +5202,26 @@ function migrate(db: Database): void {
       // this bump MUST add 87 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
       // in the SAME commit, or every keeper-py read fails host-wide;
       // test/schema-version.test.ts enforces this.
+
+      // v87→v88 (fn-946 task .2): the `jobs.handoff_links` column — the per-job
+      // home for the rendered handoff edge (sibling of `epic_links`). The
+      // `HandoffRequested` fold writes the `handoff-from` `HandoffLinkEntry` onto
+      // the initiator job here; the `SessionStart` bind fold (task .3) writes the
+      // `handoff-to` entry onto the callee. APPEND-via-ALTER (NOT in the
+      // `CREATE_JOBS` literal — mirrors `window_index`/v71): the ALTER appends it
+      // LAST on BOTH the fresh and migrated paths, so the `PRAGMA table_info`
+      // column-shape parity tests stay byte-identical. Default `'[]'` matches the
+      // zero-event projection — a re-fold over a pre-feature log re-derives `'[]'`
+      // for every job that never initiated/received a handoff, so re-fold stays
+      // byte-identical. Whitelist-only Python read (keeper-py never reads this
+      // column) — this bump MUST add 88 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces.
+      addColumnIfMissing(
+        db,
+        "jobs",
+        "handoff_links",
+        "TEXT NOT NULL DEFAULT '[]'",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

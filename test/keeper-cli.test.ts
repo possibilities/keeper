@@ -84,6 +84,7 @@ function makeHarness(): Harness {
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),
+      handoff: mkHandler("handoff"),
       pair: mkHandler("pair"),
       agent: mkHandler("agent"),
       reclaim: mkHandler("reclaim"),

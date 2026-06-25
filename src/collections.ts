@@ -131,6 +131,12 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // VISUAL position), folded from `WindowIndexSnapshot`. The dash sorts cards
     // within a session band on it client-side. Display/sort-only.
     "window_index",
+    // `handoff_links`: JSON-TEXT array of the job→job handoff edge
+    // (`HandoffLinkEntry`), the `handoff-from` entry written by the
+    // `HandoffRequested` fold onto the initiator job and the `handoff-to` entry
+    // written by the `SessionStart` bind fold onto the callee. Decoded at the
+    // read boundary for the board render. Sibling of `epic_links`.
+    "handoff_links",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -148,8 +154,9 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   // subscribe is exempt (a detail read of a terminal job still resolves).
   defaultFilter: { state: { not_in: ["ended", "killed"] } },
   // `epic_links`: JSON-TEXT array of the creator/refiner cross-references
-  // `syncPlanLinks` maintains, decoded at the read boundary for display.
-  jsonColumns: new Set(["epic_links"]),
+  // `syncPlanLinks` maintains; `handoff_links`: the job→job handoff edge — both
+  // decoded at the read boundary for display.
+  jsonColumns: new Set(["epic_links", "handoff_links"]),
 };
 
 /**
@@ -664,6 +671,44 @@ export const BLOCK_ESCALATIONS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `handoffs` descriptor — one row per `keeper handoff` enqueue, keyed on
+ * `handoff_id`. A DETERMINISTIC-replayed reducer projection (`HandoffRequested`
+ * → row + the dispatcher's transactional-outbox lifecycle). Registering it here
+ * is what lets `keeper handoff show <id>` read the stored `doc` body over the
+ * UDS socket and the board read the edge. `doc` is the contextful brief the
+ * dispatched fire-and-forget worker reads back. All scalar columns (no JSON).
+ */
+export const HANDOFFS_DESCRIPTOR: CollectionDescriptor = {
+  name: "handoffs",
+  table: "handoffs",
+  columns: [
+    "handoff_id",
+    "status",
+    "doc",
+    "title",
+    "target_session",
+    "initiator_session",
+    "initiator_pane",
+    "initiator_job_id",
+    "callee_job_id",
+    "claimed_at",
+    "never_bound_count",
+    "last_event_id",
+  ],
+  pk: "handoff_id",
+  version: "last_event_id",
+  sortable: new Set(["handoff_id", "status", "claimed_at", "last_event_id"]),
+  defaultSort: { column: "handoff_id", dir: "asc" },
+  filters: {
+    handoff_id: "handoff_id",
+    status: "status",
+    initiator_job_id: "initiator_job_id",
+    callee_job_id: "callee_job_id",
+  },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -680,6 +725,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
   [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
+  [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

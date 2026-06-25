@@ -137,6 +137,29 @@ test("openDb creates the handoffs table with the documented columns (fn-946)", (
   db.close();
 });
 
+test("openDb adds the jobs.handoff_links column defaulting '[]' (fn-946 task .2)", () => {
+  // The v87→v88 step (`addColumnIfMissing(jobs, handoff_links)`) is the per-job
+  // home for the rendered handoff edge. A fresh row reads the zero-event default
+  // `'[]'` so a re-fold over a pre-feature log re-derives byte-identical rows.
+  const { db } = openDb(dbPath);
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const col = cols.find((c) => c.name === "handoff_links");
+  expect(col).toBeDefined();
+  expect(col?.notnull).toBe(1);
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('jh', 1, 0, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT handoff_links FROM jobs WHERE job_id = 'jh'")
+    .get() as { handoff_links: string };
+  expect(r.handoff_links).toBe("[]");
+  db.close();
+});
+
 test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
   // The schema default matches the zero-event projection: a fresh DB with no
   // `HandoffRequested` events drains to an empty `handoffs` table. (Folds land
@@ -2209,9 +2232,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // (comment-only no-op — created via CREATE_BLOCK_ESCALATIONS, populated from
   // the fold arms); v87 adds the `handoffs` durable `keeper handoff` projection
   // table, fn-946 (comment-only no-op — created via CREATE_HANDOFFS, populated
-  // from the fold arms in tasks .2/.3). The v62→v63 epics-shape migration this
-  // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(87);
+  // from the fold arms in tasks .2/.3); v88 appends the `jobs.handoff_links`
+  // column (the per-job home for the rendered handoff edge), fn-946 task .2 —
+  // an additive ALTER (mirrors `window_index`/v71), not an epics-shape change.
+  // The v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(88);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

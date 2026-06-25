@@ -117,6 +117,8 @@ import type {
   KickMessage,
   ReplayRequestMessage,
   ReplayResultMessage,
+  RequestHandoffRequestMessage,
+  RequestHandoffResultMessage,
   RetryDispatchRequestMessage,
   RetryDispatchResultMessage,
   ServerWorkerData,
@@ -2246,6 +2248,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | RetryDispatchRequestMessage
         | SetAutopilotModeRequestMessage
         | SetEpicArmedRequestMessage
+        | RequestHandoffRequestMessage
         | { kind: "ready" }
         | undefined
       >,
@@ -2484,6 +2487,88 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           reply = {
             type: "set-epic-armed-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "request-handoff-request") {
+        // APPEND a `HandoffRequested` synthetic event into the durable `handoffs`
+        // projection (status=`requested`), then pump a wake. APPEND-ONLY, same
+        // NO-relay contract as set-epic-armed: the dispatcher worker re-reads the
+        // requested set each cycle. MAIN owns the full `jobs` projection, so it
+        // resolves `initiator_job_id` best-effort by the raw pane HERE (the
+        // worker-side handler is forbidden a DB connection); a null resolution is
+        // tolerated (the raw coords always ride on the row + event).
+        const id = msg.id;
+        let reply: RequestHandoffResultMessage;
+        try {
+          let initiatorJobId: string | null = null;
+          if (msg.initiator_pane != null && msg.initiator_pane.length > 0) {
+            // Newest live job on this pane wins (a pane is recycled across
+            // sessions); `state` ordering keeps a live binder ahead of a terminal
+            // one. Null-tolerant — an unfolded pane yields no row.
+            const jobRow = db
+              .query(
+                `SELECT job_id FROM jobs
+                  WHERE backend_exec_pane_id = ?
+                  ORDER BY created_at DESC
+                  LIMIT 1`,
+              )
+              .get(msg.initiator_pane) as { job_id: string } | null;
+            initiatorJobId = jobRow?.job_id ?? null;
+          }
+          stmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            // The handoff_id rides as the entity-key overload so a re-fold can
+            // correlate the event to its `handoffs` row.
+            $session_id: msg.handoff_id,
+            $pid: null,
+            $hook_event: "HandoffRequested",
+            $event_type: "handoffs",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({
+              handoff_id: msg.handoff_id,
+              doc: msg.doc,
+              title: msg.title,
+              target_session: msg.target_session,
+              initiator_session: msg.initiator_session,
+              initiator_pane: msg.initiator_pane,
+              initiator_job_id: initiatorJobId,
+            }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $plan_op: null,
+            $plan_target: null,
+            $plan_epic_id: null,
+            $plan_task_id: null,
+            $plan_subject_present: null,
+            $config_dir: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $plan_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "request-handoff-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "request-handoff-result",
             id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),

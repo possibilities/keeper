@@ -5285,3 +5285,239 @@ test("scheduled_tasks is re-fold deterministic: rewind + DELETE + re-drain repro
     .all() as unknown[];
   expect(after).toEqual(before);
 });
+
+// ---------------------------------------------------------------------------
+// `HandoffRequested` (fn-946 task .2): folds into the durable `handoffs`
+// projection (status='requested') AND writes the `handoff-from` HandoffLinkEntry
+// onto the initiator job's `handoff_links` array. Pure (no Date.now/env), never
+// throws (malformed → no-op), byte-identical re-fold.
+// ---------------------------------------------------------------------------
+
+function handoffRequestedEvent(opts: {
+  handoff_id: string;
+  doc: string;
+  title?: string | null;
+  target_session?: string | null;
+  initiator_session?: string | null;
+  initiator_pane?: string | null;
+  initiator_job_id?: string | null;
+}): number {
+  return insertEvent({
+    hook_event: "HandoffRequested",
+    event_type: "handoffs",
+    session_id: opts.handoff_id,
+    data: JSON.stringify({
+      handoff_id: opts.handoff_id,
+      doc: opts.doc,
+      title: opts.title ?? null,
+      target_session: opts.target_session ?? null,
+      initiator_session: opts.initiator_session ?? null,
+      initiator_pane: opts.initiator_pane ?? null,
+      initiator_job_id: opts.initiator_job_id ?? null,
+    }),
+  });
+}
+
+/** Seed a jobs row via a SessionStart (the initiator-job substrate). */
+function seedJobSession(sessionId: string): number {
+  return insertEvent({ hook_event: "SessionStart", session_id: sessionId });
+}
+
+function getHandoffs() {
+  return db
+    .query("SELECT * FROM handoffs ORDER BY handoff_id ASC")
+    .all() as Array<{
+    handoff_id: string;
+    status: string;
+    doc: string;
+    title: string | null;
+    target_session: string | null;
+    initiator_session: string | null;
+    initiator_pane: string | null;
+    initiator_job_id: string | null;
+    callee_job_id: string | null;
+    claimed_at: number | null;
+    never_bound_count: number;
+    last_event_id: number;
+  }>;
+}
+
+test("zero-event projection: a fresh DB has zero handoffs rows (fn-946)", () => {
+  const n = (
+    db.query("SELECT COUNT(*) AS n FROM handoffs").get() as { n: number }
+  ).n;
+  expect(n).toBe(0);
+});
+
+test("HandoffRequested folds into a handoffs row status=requested + advances the cursor (fn-946)", () => {
+  const eventId = handoffRequestedEvent({
+    handoff_id: "h-1",
+    doc: "investigate X; context: ...",
+    title: "explore X",
+    target_session: "work",
+    initiator_session: "dash",
+    initiator_pane: "%7",
+  });
+  expect(drainAll()).toBeGreaterThanOrEqual(1);
+  const rows = getHandoffs();
+  expect(rows.length).toBe(1);
+  expect(rows[0]).toMatchObject({
+    handoff_id: "h-1",
+    status: "requested",
+    doc: "investigate X; context: ...",
+    title: "explore X",
+    target_session: "work",
+    initiator_session: "dash",
+    initiator_pane: "%7",
+    initiator_job_id: null,
+    callee_job_id: null,
+    claimed_at: null,
+    never_bound_count: 0,
+    last_event_id: eventId,
+  });
+  expect(getCursor()).toBe(eventId);
+});
+
+test("HandoffRequested writes the handoff-from link onto the initiator job (fn-946)", () => {
+  seedJobSession("job-init");
+  handoffRequestedEvent({
+    handoff_id: "h-2",
+    doc: "do Y",
+    target_session: "work",
+    initiator_job_id: "job-init",
+  });
+  drainAll();
+  const job = db
+    .query("SELECT handoff_links FROM jobs WHERE job_id = ?")
+    .get("job-init") as { handoff_links: string };
+  const links = JSON.parse(job.handoff_links) as Array<{
+    kind: string;
+    handoff_id: string;
+    peer_job_id: string;
+    status: string;
+  }>;
+  expect(links.length).toBe(1);
+  expect(links[0]).toMatchObject({
+    kind: "handoff-from",
+    handoff_id: "h-2",
+    peer_job_id: "",
+    status: "requested",
+  });
+});
+
+test("HandoffRequested with a null/orphan initiator_job_id writes the row but no from-link (fn-946)", () => {
+  handoffRequestedEvent({
+    handoff_id: "h-3",
+    doc: "orphan",
+    target_session: "work",
+    initiator_job_id: null,
+  });
+  drainAll();
+  const rows = getHandoffs();
+  expect(rows.length).toBe(1);
+  expect(rows[0]?.initiator_job_id).toBeNull();
+  // No jobs row was seeded → no from-link to write; the row still lands.
+});
+
+test("HandoffRequested from-link is a no-op when the initiator job isn't yet folded (fn-946)", () => {
+  // initiator_job_id is set but the backing jobs row does not exist (the pane
+  // hasn't folded a SessionStart). The handoffs row lands; no orphan write.
+  handoffRequestedEvent({
+    handoff_id: "h-4",
+    doc: "unfolded initiator",
+    target_session: "work",
+    initiator_job_id: "job-not-yet-folded",
+  });
+  drainAll();
+  expect(getHandoffs().length).toBe(1);
+  const job = db
+    .query("SELECT job_id FROM jobs WHERE job_id = ?")
+    .get("job-not-yet-folded");
+  expect(job).toBeNull();
+});
+
+test("HandoffRequested with a malformed payload is a safe no-op (cursor still advances) (fn-946)", () => {
+  const id = insertEvent({
+    hook_event: "HandoffRequested",
+    event_type: "handoffs",
+    session_id: "h-bad",
+    data: "{not json",
+  });
+  expect(drainAll()).toBeGreaterThanOrEqual(1);
+  expect(getHandoffs().length).toBe(0);
+  expect(getCursor()).toBe(id);
+});
+
+test("HandoffRequested missing handoff_id/doc folds to a no-op (fn-946)", () => {
+  insertEvent({
+    hook_event: "HandoffRequested",
+    event_type: "handoffs",
+    session_id: "h-bad2",
+    data: JSON.stringify({ doc: "no id" }),
+  });
+  insertEvent({
+    hook_event: "HandoffRequested",
+    event_type: "handoffs",
+    session_id: "h-bad3",
+    data: JSON.stringify({ handoff_id: "h-bad3" }),
+  });
+  drainAll();
+  expect(getHandoffs().length).toBe(0);
+});
+
+test("from-scratch re-fold reproduces handoffs + jobs.handoff_links byte-identically (fn-946)", () => {
+  seedJobSession("job-a");
+  seedJobSession("job-b");
+  handoffRequestedEvent({
+    handoff_id: "hr-1",
+    doc: "first brief",
+    title: "first",
+    target_session: "work",
+    initiator_session: "dash",
+    initiator_pane: "%1",
+    initiator_job_id: "job-a",
+  });
+  handoffRequestedEvent({
+    handoff_id: "hr-2",
+    doc: "second brief",
+    target_session: "work",
+    initiator_job_id: "job-b",
+  });
+  // A re-request on the same id (idempotency-key UPSERT) refreshes the requested
+  // fields without doubling the row or the from-link.
+  handoffRequestedEvent({
+    handoff_id: "hr-1",
+    doc: "first brief (revised)",
+    title: "first revised",
+    target_session: "work",
+    initiator_session: "dash",
+    initiator_pane: "%1",
+    initiator_job_id: "job-a",
+  });
+  drainAll();
+  const handoffsBefore = getHandoffs();
+  const jobsBefore = db
+    .query(
+      "SELECT job_id, handoff_links FROM jobs WHERE handoff_links != '[]' ORDER BY job_id ASC",
+    )
+    .all();
+  // Sanity: the UPSERT collapsed to one row per id with the revised doc.
+  expect(handoffsBefore.length).toBe(2);
+  expect(handoffsBefore.find((r) => r.handoff_id === "hr-1")?.doc).toBe(
+    "first brief (revised)",
+  );
+
+  // Rewind + wipe handoffs + jobs + re-drain → byte-identical.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM handoffs");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const handoffsAfter = getHandoffs();
+  const jobsAfter = db
+    .query(
+      "SELECT job_id, handoff_links FROM jobs WHERE handoff_links != '[]' ORDER BY job_id ASC",
+    )
+    .all();
+  expect(handoffsAfter).toEqual(handoffsBefore);
+  expect(jobsAfter).toEqual(jobsBefore);
+});

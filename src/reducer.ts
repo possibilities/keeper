@@ -56,6 +56,7 @@ import type {
   BlockEscalationRequestedPayload,
   Epic,
   Event,
+  HandoffLinkEntry,
   InputRequestKind,
   JobLinkEntry,
   PermissionPromptKind,
@@ -4313,6 +4314,133 @@ function foldEpicArmed(db: Database, event: Event): void {
 }
 
 /**
+ * `HandoffRequested` synthetic-event payload — the durable record of a
+ * `keeper handoff` enqueue, minted main-side. `handoff_id` is the stably-minted
+ * idempotency key; `doc` is the contextful brief (capped at WRITE time, never
+ * here); the raw `initiator_*` coords always ride even when `initiator_job_id`
+ * resolved null (initiator pane not yet folded). `target_session` is the
+ * resolved tmux session the dispatcher launches the handoff-ee into.
+ */
+interface HandoffRequestedPayload {
+  handoff_id: string;
+  doc: string;
+  title: string | null;
+  target_session: string | null;
+  initiator_session: string | null;
+  initiator_pane: string | null;
+  initiator_job_id: string | null;
+}
+
+/**
+ * Parse a `HandoffRequested` event payload. Returns null on any structural miss
+ * — {@link foldHandoffRequested} folds null to a safe no-op (cursor still
+ * advances). STRICT on the load-bearing fields: `handoff_id` MUST be a non-empty
+ * string and `doc` MUST be a string. The nullable coordinate fields coerce a
+ * non-string to null (re-fold-stable). NEVER throws (a throw inside the fold
+ * wedges the reducer).
+ */
+function extractHandoffRequestedPayload(
+  event: Event,
+): HandoffRequestedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<HandoffRequestedPayload>;
+    if (
+      typeof parsed.handoff_id !== "string" ||
+      parsed.handoff_id.length === 0 ||
+      typeof parsed.doc !== "string"
+    ) {
+      return null;
+    }
+    const str = (v: unknown): string | null =>
+      typeof v === "string" ? v : null;
+    return {
+      handoff_id: parsed.handoff_id,
+      doc: parsed.doc,
+      title: str(parsed.title),
+      target_session: str(parsed.target_session),
+      initiator_session: str(parsed.initiator_session),
+      initiator_pane: str(parsed.initiator_pane),
+      initiator_job_id: str(parsed.initiator_job_id),
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse HandoffRequested payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `HandoffRequested` event. Two writes, both pure functions
+ * of the payload + persisted state:
+ *
+ * 1. UPSERT the `handoffs` row (status=`requested`) keyed on `handoff_id`. The
+ *    dispatcher's later lifecycle events (task .3) advance the same row, so this
+ *    is an INSERT-or-leave: a re-fold replays this event before any dispatcher
+ *    event, so the `requested` row is correctly re-established. ON CONFLICT
+ *    refreshes only the requested-time fields (never `claimed_at` /
+ *    `callee_job_id` / `never_bound_count`, which the dispatcher/bind own) so a
+ *    re-fold lands byte-identical rows regardless of arm order.
+ * 2. Write the `handoff-from` {@link HandoffLinkEntry} onto the initiator job's
+ *    `handoff_links` array (no-op when the initiator job is an orphan / unfolded
+ *    — the raw coords on the row still anchor the edge). The `peer_job_id` is
+ *    the callee, NOT YET KNOWN at request time → the empty string; the bind fold
+ *    (task .3) re-stamps both endpoints once the callee binds.
+ *
+ * Pure — no `Date.now()`, no env/liveness read; `claimed_at` stays NULL here
+ * (the dispatcher stamps it from its own event ts). Malformed payload → safe
+ * no-op (cursor still advances). NEVER throws.
+ */
+function foldHandoffRequested(db: Database, event: Event): void {
+  const payload = extractHandoffRequestedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO handoffs (
+       handoff_id, status, doc, title, target_session,
+       initiator_session, initiator_pane, initiator_job_id,
+       callee_job_id, claimed_at, never_bound_count, last_event_id
+     ) VALUES (?, 'requested', ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+     ON CONFLICT(handoff_id) DO UPDATE SET
+       doc = excluded.doc,
+       title = excluded.title,
+       target_session = excluded.target_session,
+       initiator_session = excluded.initiator_session,
+       initiator_pane = excluded.initiator_pane,
+       initiator_job_id = excluded.initiator_job_id,
+       last_event_id = excluded.last_event_id`,
+    [
+      payload.handoff_id,
+      payload.doc,
+      payload.title,
+      payload.target_session,
+      payload.initiator_session,
+      payload.initiator_pane,
+      payload.initiator_job_id,
+      event.id,
+    ],
+  );
+  // Write the handoff-from edge onto the initiator job. The callee is unknown at
+  // request time (peer_job_id = "") — the bind fold (.3) re-stamps it.
+  if (payload.initiator_job_id != null && payload.initiator_job_id.length > 0) {
+    writeHandoffLinkOnJob(
+      db,
+      payload.initiator_job_id,
+      "handoff-from",
+      payload.handoff_id,
+      "",
+      "requested",
+      event.id,
+      event.ts,
+    );
+  }
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -5518,6 +5646,171 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
     last_permission_prompt_at: row.last_permission_prompt_at,
     last_permission_prompt_kind: row.last_permission_prompt_kind,
   };
+}
+
+/**
+ * Parse a persisted `jobs.handoff_links` JSON-TEXT array into
+ * {@link HandoffLinkEntry}[]. A NULL/empty/malformed cell folds to `[]` — NEVER
+ * throws inside the open BEGIN IMMEDIATE transaction. Sibling of
+ * {@link parseEmbeddedLinks} (which is type-constrained to the epic/job link
+ * shapes, hence a dedicated reader here).
+ */
+function parseHandoffLinks(
+  text: string | null | undefined,
+): HandoffLinkEntry[] {
+  if (text == null || text.length === 0) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed as HandoffLinkEntry[];
+    }
+  } catch {
+    // malformed stored array → treat as empty.
+  }
+  return [];
+}
+
+/**
+ * Deterministic sort for a `jobs.handoff_links` array. Total-order ASC on the
+ * full `(kind, handoff_id)` tuple — a single-field sort would leave equal-`kind`
+ * ties in implementation-defined order, breaking byte-identical re-fold (each
+ * job carries at most one `handoff-from` + one `handoff-to`, but the locked
+ * total order is what keeps the bytes stable).
+ */
+function sortHandoffLinks(links: HandoffLinkEntry[]): void {
+  links.sort((a, b) => {
+    if (a.kind < b.kind) return -1;
+    if (a.kind > b.kind) return 1;
+    if (a.handoff_id < b.handoff_id) return -1;
+    if (a.handoff_id > b.handoff_id) return 1;
+    return 0;
+  });
+}
+
+/**
+ * Enrich a `(kind, handoff_id, peer_job_id, status)` tuple into the widened
+ * {@link HandoffLinkEntry} carried on `jobs.handoff_links`, denormalizing the
+ * peer job's display + annotation fields off its post-write `jobs` row at the
+ * reducer's write boundary so renderers read straight off the projection.
+ *
+ * On a missing peer `jobs` row (the initiator pane not yet folded, or the callee
+ * before its `SessionStart`), returns the re-fold-safe defaults with the api-
+ * error columns as explicit JSON nulls (NOT omitted — omitting keys vs. emitting
+ * nulls produces different `JSON.stringify` bytes). KEY ORDER IS LOCKED for
+ * byte-identical re-fold; the order MUST match {@link HandoffLinkEntry}'s field
+ * declaration. NEVER throws inside the transaction. Mirrors {@link enrichJobLink}.
+ */
+function enrichHandoffLink(
+  db: Database,
+  kind: HandoffLinkEntry["kind"],
+  handoff_id: string,
+  peer_job_id: string,
+  status: string,
+): HandoffLinkEntry {
+  const row = db
+    .query(
+      "SELECT title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind FROM jobs WHERE job_id = ?",
+    )
+    .get(peer_job_id) as {
+    title: string | null;
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+    last_input_request_at: number | null;
+    last_input_request_kind: string | null;
+    last_permission_prompt_at: number | null;
+    last_permission_prompt_kind: string | null;
+  } | null;
+  if (row == null) {
+    return {
+      kind,
+      handoff_id,
+      peer_job_id,
+      status,
+      title: null,
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    };
+  }
+  return {
+    kind,
+    handoff_id,
+    peer_job_id,
+    status,
+    title: row.title,
+    state: row.state,
+    last_api_error_at: row.last_api_error_at,
+    last_api_error_kind: row.last_api_error_kind,
+    last_input_request_at: row.last_input_request_at,
+    last_input_request_kind: row.last_input_request_kind,
+    last_permission_prompt_at: row.last_permission_prompt_at,
+    last_permission_prompt_kind: row.last_permission_prompt_kind,
+  };
+}
+
+/**
+ * Replace-by-key merge of one handoff's entry into a job's `handoff_links`
+ * array. MERGE ONLY — drop EVERY entry matching the same `(kind, handoff_id)`,
+ * append the freshly-built `replacement`, re-sort by the locked `(kind,
+ * handoff_id)` total order. Returns a NEW array; mutates no input. Idempotent
+ * and non-additive so a re-fold reproduces the same bytes (an additive append
+ * would double). Every OTHER entry is preserved verbatim. Mirrors
+ * {@link mergeJobLinkSlice}.
+ */
+function mergeHandoffLinkSlice(
+  existing: readonly HandoffLinkEntry[],
+  replacement: HandoffLinkEntry,
+): HandoffLinkEntry[] {
+  const merged = existing.filter(
+    (e) =>
+      !(e.kind === replacement.kind && e.handoff_id === replacement.handoff_id),
+  );
+  merged.push(replacement);
+  sortHandoffLinks(merged);
+  return merged;
+}
+
+/**
+ * Write/refresh ONE {@link HandoffLinkEntry} onto a backing `jobs` row's
+ * `handoff_links` array. Reads the pre-state array, merges the freshly-enriched
+ * entry by `(kind, handoff_id)`, and UPDATEs. NO-OP when the backing jobs row is
+ * absent (an orphan endpoint — the initiator pane not yet folded, or a bind
+ * before the callee's jobs row): the raw coords / id live on the `handoffs` row
+ * regardless, so the edge is half-anchored in that rare case with no backfill.
+ * Pure function of the event id + persisted state (the jobs row exists
+ * deterministically at this cursor position), so re-fold stays byte-identical.
+ * NEVER throws.
+ */
+function writeHandoffLinkOnJob(
+  db: Database,
+  jobId: string,
+  kind: HandoffLinkEntry["kind"],
+  handoff_id: string,
+  peer_job_id: string,
+  status: string,
+  eventId: number,
+  ts: number,
+): void {
+  const jobRow = db
+    .query("SELECT handoff_links FROM jobs WHERE job_id = ?")
+    .get(jobId) as { handoff_links: string | null } | null;
+  if (jobRow == null) {
+    return; // orphan endpoint — no backing jobs row to write onto.
+  }
+  const existing = parseHandoffLinks(jobRow.handoff_links);
+  const enriched = enrichHandoffLink(db, kind, handoff_id, peer_job_id, status);
+  const merged = mergeHandoffLinkSlice(existing, enriched);
+  db.run(
+    "UPDATE jobs SET handoff_links = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
+    [JSON.stringify(merged), eventId, ts, jobId],
+  );
 }
 
 /**
@@ -7740,6 +8033,8 @@ export function applyEvent(
       foldAutopilotMode(db, event);
     } else if (event.hook_event === "EpicArmed") {
       foldEpicArmed(db, event);
+    } else if (event.hook_event === "HandoffRequested") {
+      foldHandoffRequested(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {
       // retired fn-684 — fold to no-op so historical events advance the
       // cursor without touching the jobs projection. MUST stay an explicit

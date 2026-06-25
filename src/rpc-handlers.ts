@@ -326,6 +326,106 @@ export async function setEpicArmedHandler(
 }
 
 // ---------------------------------------------------------------------------
+// `request_handoff` (async — the SIXTH mutating RPC; bridges through main to
+// APPEND a `HandoffRequested` synthetic event into the durable `handoffs`
+// projection; fn-946 task .2)
+// ---------------------------------------------------------------------------
+
+/** `request_handoff` wire params. */
+export interface RequestHandoffParams {
+  /** Stably-minted idempotency key (CLI-minted, the `handoffs` row PK). */
+  handoff_id: string;
+  /** The contextful brief (already capped CLI-side at 64KB — NOT re-checked here). */
+  doc: string;
+  /** Optional human title. */
+  title: string | null;
+  /** The resolved target tmux session the handoff-ee launches into. */
+  target_session: string;
+  /** Raw initiator coords — always carried even when the pane isn't yet folded. */
+  initiator_session: string | null;
+  initiator_pane: string | null;
+}
+
+/** Successful return shape for `request_handoff`. */
+export interface RequestHandoffResult {
+  ok: true;
+  handoff_id: string;
+}
+
+function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "request_handoff: params must be an object with `handoff_id: string, doc: string, target_session: string`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (typeof obj.handoff_id !== "string" || obj.handoff_id.length === 0) {
+    throw new BadParamsError(
+      "request_handoff: `handoff_id` must be a non-empty string",
+    );
+  }
+  if (typeof obj.doc !== "string" || obj.doc.length === 0) {
+    throw new BadParamsError(
+      "request_handoff: `doc` must be a non-empty string",
+    );
+  }
+  if (
+    typeof obj.target_session !== "string" ||
+    obj.target_session.length === 0
+  ) {
+    throw new BadParamsError(
+      "request_handoff: `target_session` must be a non-empty string",
+    );
+  }
+  // The nullable coordinate fields accept string OR null (absent → null).
+  const optStr = (v: unknown, field: string): string | null => {
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "string") {
+      throw new BadParamsError(
+        `request_handoff: \`${field}\` must be a string or null`,
+      );
+    }
+    return v;
+  };
+  const title = optStr(obj.title, "title");
+  const initiator_session = optStr(obj.initiator_session, "initiator_session");
+  const initiator_pane = optStr(obj.initiator_pane, "initiator_pane");
+  return {
+    handoff_id: obj.handoff_id,
+    doc: obj.doc,
+    title,
+    target_session: obj.target_session,
+    initiator_session,
+    initiator_pane,
+  };
+}
+
+/**
+ * `request_handoff` handler — the SIXTH mutating RPC. Validates the
+ * `{ handoff_id, doc, target_session, ... }` shape and bridges to main, which
+ * resolves `initiator_job_id` best-effort by pane then APPENDS a
+ * `HandoffRequested` synthetic event onto the writable connection and pumps a
+ * wake (no relay — the dispatcher worker re-reads the requested set each cycle).
+ *
+ * The 64KB doc cap is enforced CLI-side (the doc rides inline in `events.data`
+ * forever, a replay-cost cap), NOT here — a foreign caller hitting this RPC
+ * directly only bypasses a courtesy guard, never a correctness one (the cap is a
+ * replay-budget protection, and the event log already bounds line size). Returns
+ * `{ ok: true, handoff_id }` once main has appended. Fn-946 task .2.
+ */
+export async function requestHandoffHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<RequestHandoffResult> {
+  const req = validateRequestHandoffParams(params);
+  const result = await bridge.requestHandoff(req);
+  if (!result.ok) {
+    throw new Error(result.error ?? "request_handoff: main reported failure");
+  }
+  return { ok: true, handoff_id: req.handoff_id };
+}
+
+// ---------------------------------------------------------------------------
 // `retry_dispatch` (async — bridges through main to mint a `DispatchCleared`
 // synthetic event; fn-661 task .4)
 // ---------------------------------------------------------------------------
@@ -426,4 +526,5 @@ export function installRpcHandlers(): void {
   registerAsyncRpc("set_autopilot_mode", setAutopilotModeHandler);
   registerAsyncRpc("set_epic_armed", setEpicArmedHandler);
   registerAsyncRpc("retry_dispatch", retryDispatchHandler);
+  registerAsyncRpc("request_handoff", requestHandoffHandler);
 }

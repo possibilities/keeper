@@ -26,6 +26,7 @@ import { join } from "node:path";
 import {
   parseDispatchKey,
   replayDeadLetterHandler,
+  requestHandoffHandler,
   retryDispatchHandler,
   setAutopilotModeHandler,
   setAutopilotPausedHandler,
@@ -106,6 +107,9 @@ function stubBridge(
     async setEpicArmed() {
       return { ok: true };
     },
+    async requestHandoff() {
+      return { ok: true };
+    },
   };
   return { bridge, state };
 }
@@ -180,6 +184,7 @@ function autopilotStubBridge(opts: {
   retry?: { ok: boolean; error?: string };
   setMode?: { ok: boolean; error?: string };
   setArmed?: { ok: boolean; error?: string };
+  requestHandoff?: { ok: boolean; error?: string };
 }): {
   bridge: ReplayBridge;
   state: {
@@ -187,6 +192,14 @@ function autopilotStubBridge(opts: {
     retryCalls: Array<{ verb: string; id: string }>;
     setModeCalls: string[];
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
+    requestHandoffCalls: Array<{
+      handoff_id: string;
+      doc: string;
+      title: string | null;
+      target_session: string;
+      initiator_session: string | null;
+      initiator_pane: string | null;
+    }>;
   };
 } {
   const state = {
@@ -194,6 +207,14 @@ function autopilotStubBridge(opts: {
     retryCalls: [] as Array<{ verb: string; id: string }>,
     setModeCalls: [] as string[],
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
+    requestHandoffCalls: [] as Array<{
+      handoff_id: string;
+      doc: string;
+      title: string | null;
+      target_session: string;
+      initiator_session: string | null;
+      initiator_pane: string | null;
+    }>,
   };
   const bridge: ReplayBridge = {
     async replay() {
@@ -214,6 +235,10 @@ function autopilotStubBridge(opts: {
     async setEpicArmed(epic_id, armed) {
       state.setArmedCalls.push({ epic_id, armed });
       return opts.setArmed ?? { ok: true };
+    },
+    async requestHandoff(req) {
+      state.requestHandoffCalls.push(req);
+      return opts.requestHandoff ?? { ok: true };
     },
   };
   return { bridge, state };
@@ -357,6 +382,96 @@ test("set_epic_armed throws rpc_failed when the bridge reports ok:false", async 
   });
   expect(
     setEpicArmedHandler({ epic_id: "fn-1-foo", armed: true }, bridge),
+  ).rejects.toThrow(/writer lock contention/);
+});
+
+// ---------------------------------------------------------------------------
+// fn-946 task .2 — `request_handoff`
+// ---------------------------------------------------------------------------
+
+test("request_handoff forwards the validated request to the bridge and returns ok+handoff_id", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await requestHandoffHandler(
+    {
+      handoff_id: "h-1",
+      doc: "investigate X",
+      title: "explore X",
+      target_session: "work",
+      initiator_session: "dash",
+      initiator_pane: "%3",
+    },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, handoff_id: "h-1" });
+  expect(state.requestHandoffCalls).toEqual([
+    {
+      handoff_id: "h-1",
+      doc: "investigate X",
+      title: "explore X",
+      target_session: "work",
+      initiator_session: "dash",
+      initiator_pane: "%3",
+    },
+  ]);
+});
+
+test("request_handoff coerces absent optional coords to null", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await requestHandoffHandler(
+    { handoff_id: "h-2", doc: "do Y", target_session: "work" },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, handoff_id: "h-2" });
+  expect(state.requestHandoffCalls).toEqual([
+    {
+      handoff_id: "h-2",
+      doc: "do Y",
+      title: null,
+      target_session: "work",
+      initiator_session: null,
+      initiator_pane: null,
+    },
+  ]);
+});
+
+test("request_handoff throws BadParamsError on non-object params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, "h", 1, true, [], undefined]) {
+    expect(requestHandoffHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("request_handoff throws BadParamsError on a bad-shape payload", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    {}, // no handoff_id/doc/target_session
+    { doc: "x", target_session: "work" }, // missing handoff_id
+    { handoff_id: "", doc: "x", target_session: "work" }, // empty handoff_id
+    { handoff_id: "h", target_session: "work" }, // missing doc
+    { handoff_id: "h", doc: "", target_session: "work" }, // empty doc
+    { handoff_id: "h", doc: "x" }, // missing target_session
+    { handoff_id: "h", doc: "x", target_session: "" }, // empty target_session
+    { handoff_id: "h", doc: "x", target_session: "work", title: 1 }, // non-string title
+    { handoff_id: "h", doc: "x", target_session: "work", initiator_pane: 1 },
+  ]) {
+    expect(requestHandoffHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.requestHandoffCalls).toEqual([]);
+});
+
+test("request_handoff throws rpc_failed when the bridge reports ok:false", async () => {
+  const { bridge } = autopilotStubBridge({
+    requestHandoff: { ok: false, error: "writer lock contention" },
+  });
+  expect(
+    requestHandoffHandler(
+      { handoff_id: "h", doc: "x", target_session: "work" },
+      bridge,
+    ),
   ).rejects.toThrow(/writer lock contention/);
 });
 

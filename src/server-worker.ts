@@ -255,6 +255,31 @@ export interface SetEpicArmedResultMessage {
 }
 
 /**
+ * Worker→main bridge request: APPEND a `HandoffRequested` synthetic event (the
+ * SIXTH mutating RPC). Carries the stably-minted idempotency key + the capped
+ * doc + the raw initiator coords; main resolves `initiator_job_id` best-effort
+ * by pane. Paired with {@link RequestHandoffResultMessage}.
+ */
+export interface RequestHandoffRequestMessage {
+  kind: "request-handoff-request";
+  id: string;
+  handoff_id: string;
+  doc: string;
+  title: string | null;
+  target_session: string;
+  initiator_session: string | null;
+  initiator_pane: string | null;
+}
+
+/** Main→worker reply paired with {@link RequestHandoffRequestMessage}. */
+export interface RequestHandoffResultMessage {
+  type: "request-handoff-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
  * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
  * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
  * burning a core.
@@ -1407,6 +1432,24 @@ export interface ReplayBridge {
     ok: boolean;
     error?: string;
   }>;
+  /**
+   * APPEND a `HandoffRequested` synthetic event (folded into the durable
+   * `handoffs` projection, status=`requested`) and pump a wake. Main resolves
+   * `initiator_job_id` best-effort by pane before the append (it owns the full
+   * `jobs` projection); null-tolerant. APPEND-ONLY (no relay) — the dispatcher
+   * worker reads the requested set each cycle.
+   */
+  requestHandoff(req: {
+    handoff_id: string;
+    doc: string;
+    title: string | null;
+    target_session: string;
+    initiator_session: string | null;
+    initiator_pane: string | null;
+  }): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
 }
 
 /**
@@ -1981,6 +2024,7 @@ const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
   "set_autopilot_mode",
   "set_epic_armed",
   "retry_dispatch",
+  "request_handoff",
 ]);
 
 /**
@@ -3190,6 +3234,15 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  /** Pending `request_handoff` requests, correlated by id. */
+  const pendingRequestHandoff = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   const bridge: ReplayBridge = {
     replay(): Promise<ReplayResolution> {
       return new Promise<ReplayResolution>((resolve, reject) => {
@@ -3300,6 +3353,32 @@ function main(): void {
         } satisfies SetEpicArmedRequestMessage);
       });
     },
+    requestHandoff(req): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingRequestHandoff.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingRequestHandoff.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "request-handoff-request",
+          id: reqId,
+          handoff_id: req.handoff_id,
+          doc: req.doc,
+          title: req.title,
+          target_session: req.target_session,
+          initiator_session: req.initiator_session,
+          initiator_pane: req.initiator_pane,
+        } satisfies RequestHandoffRequestMessage);
+      });
+    },
   };
 
   // fn-897 B1 boot gate. The server worker now spawns right after `migrate()`,
@@ -3374,6 +3453,7 @@ function main(): void {
         | RetryDispatchResultMessage
         | SetAutopilotModeResultMessage
         | SetEpicArmedResultMessage
+        | RequestHandoffResultMessage
         | undefined,
     ) => {
       if (!msg) return;
@@ -3453,6 +3533,17 @@ function main(): void {
         const entry = pendingSetArmed.get(r.id);
         if (!entry) return;
         pendingSetArmed.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
+      }
+      if (
+        (msg as RequestHandoffResultMessage).type === "request-handoff-result"
+      ) {
+        const r = msg as RequestHandoffResultMessage;
+        const entry = pendingRequestHandoff.get(r.id);
+        if (!entry) return;
+        pendingRequestHandoff.delete(r.id);
         clearTimeout(entry.timer);
         entry.resolve({ ok: r.ok, error: r.error });
         return;
