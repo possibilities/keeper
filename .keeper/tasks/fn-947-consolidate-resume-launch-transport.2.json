@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Migrate crash-restore, delete old transport",
-  "updated_at": "2026-06-24T21:25:56.099000Z"
+  "updated_at": "2026-06-25T01:14:50.035000Z",
+  "worker_done_at": "2026-06-25T01:14:50.035000Z"
 }

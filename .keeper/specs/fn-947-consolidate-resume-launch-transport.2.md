@@ -94,5 +94,5 @@ by `renderSnapshotScript`) and `buildResumeCommand` (the DISPLAY form).
 - [ ] `bun run test:full` + `bun run test:hygiene` pass.
 
 ## Done summary
-
+Migrated crash-restore (--apply + --snapshot-current) onto agentwrapLaunch resume mode, the same transport keeper bus wake uses; deleted the orphaned shell-wrapper transport (restoreReplayLaunch/launchIntoTmux/buildResumeLaunchForm/buildResumeLaunchArgv), the dead @keeper_managed marker, and now-dead buildTmuxNewWindowArgs. One launch transport remains; full suite + hygiene + tsc clean.
 ## Evidence
