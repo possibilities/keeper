@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Backpressure-aware write in one-shot UDS client + regression test",
-  "updated_at": "2026-06-25T03:44:16.505000Z"
+  "updated_at": "2026-06-25T07:38:20.757000Z",
+  "worker_done_at": "2026-06-25T07:38:20.757000Z"
 }

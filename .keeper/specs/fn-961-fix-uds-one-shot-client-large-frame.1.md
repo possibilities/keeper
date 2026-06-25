@@ -83,5 +83,5 @@ loud-size guard: an oversized frame rejects with the clear error, not a timeout.
 - [ ] Tests cover the new frame shape, an end-to-end >8 KB handoff enqueue, and the loud guard; `bun run lint` and `bun test` pass.
 
 ## Done summary
-
+Route the handoff brief through a spill file: the CLI writes the doc to a file and sends doc_path on the wire (small frame), the daemon reads it back and inlines it into the HandoffRequested event so durability and the handoffs projection are unchanged. Added a loud-fail size guard on the one-shot UDS client and a loud ok:false for a missing/unreadable/oversized spill file.
 ## Evidence
