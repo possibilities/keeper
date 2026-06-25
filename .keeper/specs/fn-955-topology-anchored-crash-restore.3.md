@@ -33,5 +33,5 @@ Cases: unpaused + no `--force` → non-zero, zero launches; unpaused + `--force`
 - [ ] CLAUDE.md gains one imperative line: `restore-agents --apply` exits non-zero while autopilot is unpaused (fail closed, never warn-and-continue)
 
 ## Done summary
-
+restore-agents --apply now fails closed (non-zero, launches nothing) while autopilot is unpaused, reading last-durable autopilot_state.paused daemon-down; --force overrides with a stderr double-dispatch warning, unknown/absent paused reads as paused.
 ## Evidence

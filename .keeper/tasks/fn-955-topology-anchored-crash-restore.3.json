@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "fail-closed apply autopilot gate",
-  "updated_at": "2026-06-24T23:47:12.247000Z"
+  "updated_at": "2026-06-25T05:06:27.263000Z",
+  "worker_done_at": "2026-06-25T05:06:27.263000Z"
 }
