@@ -138,6 +138,12 @@ import type {
 } from "./server-worker";
 import { seedTmuxProjection } from "./tmux-boot-seed";
 import type {
+  TmuxClientFocusSnapshotMessage,
+  TmuxControlLivenessMessage,
+  TmuxControlWorkerData,
+  TmuxControlWorkerMessage,
+} from "./tmux-control-worker";
+import type {
   ApiErrorMessage,
   InputRequestMessage,
   SubagentTurnMessage,
@@ -937,6 +943,38 @@ export function decideGitSeedWatchdog(inputs: {
   return reseedAttempts < maxReseedAttempts ? "reseed" : "escalate";
 }
 
+// ── fn-952 tmux-control liveness watchdog ──────────────────────────────────────
+/** How often the supervisor checks the tmux-control liveness verdict. */
+export const TMUX_CONTROL_WATCHDOG_INTERVAL_MS = 30_000;
+/**
+ * How long since the last tmux-control liveness pulse before the worker is judged
+ * MUTE (alive-but-stuck — a wedged reader / re-read). The worker pulses every ~15s
+ * (even during long idle), so several pulses' worth of slack keeps transient
+ * scheduling jitter from reading as mute.
+ */
+export const TMUX_CONTROL_LIVENESS_STUCK_THRESHOLD_MS = 90_000;
+
+/**
+ * Pure verdict for the tmux-control liveness watchdog (fn-952). Mirrors the
+ * MUTE-check half of {@link decideGitSeedWatchdog} — clock arithmetic only, no
+ * I/O — so the decision is unit-testable with plain inputs. There is no "reseed"
+ * middle state: the control worker has no seed surface, so a mute worker escalates
+ * straight to a process restart (the single recovery path; no in-process respawn).
+ *
+ * Returns `"ok"` when the worker has not yet pulsed (never trip before the first
+ * pulse — the worker may be mid-attach/backoff) OR it pulsed recently enough;
+ * `"escalate"` when it has gone silent past `livenessThresholdMs`.
+ */
+export function decideTmuxControlWatchdog(inputs: {
+  lastLivenessAtMs: number | null;
+  nowMs: number;
+  livenessThresholdMs: number;
+}): "ok" | "escalate" {
+  const { lastLivenessAtMs, nowMs, livenessThresholdMs } = inputs;
+  if (lastLivenessAtMs == null) return "ok";
+  return nowMs - lastLivenessAtMs >= livenessThresholdMs ? "escalate" : "ok";
+}
+
 /**
  * Scan the dead-letter dir and import each NDJSON file's records into the
  * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`) — a
@@ -1668,7 +1706,8 @@ export type WorkerName =
   | "restore"
   | "renamer"
   | "reaper"
-  | "bus";
+  | "bus"
+  | "tmuxControl";
 
 /**
  * The full worker set, in spawn order — the production boot ({@link runDaemon}
@@ -1694,6 +1733,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "renamer",
   "reaper",
   "bus",
+  "tmuxControl",
 ] as const;
 
 /**
@@ -2067,6 +2107,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let lastGitProgressAtMs = Date.now();
   let gitSeedReseedAttempts = 0;
   let gitSeedWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+  // fn-952 tmux-control liveness watchdog state. The control worker posts a
+  // `tmux-control-liveness` pulse on a steady cadence (even during long idle — no
+  // focus change ≠ unhealthy), so a SILENTLY-HUNG client (alive but its reader /
+  // re-read wedged) escalates instead of going invisible to the crash-only
+  // `onerror`/`close` supervision. `null` until the first pulse — the watchdog
+  // never trips before the worker has pulsed once (it may be mid-attach/backoff).
+  let lastTmuxControlLivenessAtMs: number | null = null;
+  let tmuxControlWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   // Autopilot in-memory paused flag. Initialized PAUSED (safety default), then
   // re-seeded from the durable `autopilot_state.paused` column after the boot
@@ -5069,6 +5118,93 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
+  // fn-952 — the persistent `tmux -C` control-focus worker. Gated on the selector
+  // AND `!disableNativeWatcher`: it attaches a REAL tmux control client, so the
+  // in-process test tier (always `disableNativeWatcher:true`) must never spawn it.
+  // Posts `tmux-client-focus-snapshot` (a focus observation) + `tmux-control-
+  // liveness` (a supervisor pulse) — main, the SOLE synthetic-event writer, mints
+  // ONE `TmuxClientFocusSnapshot` event from the focus post; the liveness pulse is
+  // a pure side channel (never folded).
+  const tmuxControlWorker =
+    want("tmuxControl") && !opts.disableNativeWatcher
+      ? new Worker(new URL("./tmux-control-worker.ts", import.meta.url).href, {
+          workerData: { dbPath } satisfies TmuxControlWorkerData,
+        } as WorkerOptions & { workerData: unknown })
+      : null;
+
+  if (tmuxControlWorker) {
+    const tw = tmuxControlWorker;
+    tw.onmessage = (
+      ev: MessageEvent<TmuxControlWorkerMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "tmux-control-liveness") {
+        // Supervisor liveness pulse — the watchdog reads the time since this to
+        // tell "alive + observing" from "alive but stuck". Pure side channel;
+        // never folded.
+        lastTmuxControlLivenessAtMs = (msg as TmuxControlLivenessMessage).at_ms;
+        return;
+      }
+      if (msg.kind === "tmux-client-focus-snapshot") {
+        // Mint ONE synthetic `TmuxClientFocusSnapshot` event carrying exactly the
+        // fold's `{status, generation_id, session_name, window_index, pane_id}`
+        // payload in `$data`. Stable synthetic `session_id` (events.session_id is
+        // NOT NULL and the live-only fold keys on `id=1`, never `event.session_id`).
+        const focus = msg as TmuxClientFocusSnapshotMessage;
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: "tmux-client-focus-snapshot",
+          $pid: null,
+          $hook_event: "TmuxClientFocusSnapshot",
+          $event_type: "tmux_client_focus_snapshot",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({
+            status: focus.status,
+            generation_id: focus.generation_id,
+            session_name: focus.session_name,
+            window_index: focus.window_index,
+            pane_id: focus.pane_id,
+          }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+        });
+        wakePending = true;
+        pumpWakes();
+      }
+    };
+
+    tw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] tmux-control worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    tw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -5144,6 +5280,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }, GIT_SEED_WATCHDOG_INTERVAL_MS);
   }
 
+  // fn-952 tmux-control liveness watchdog. The control worker pulses on a steady
+  // cadence (even during long idle), so a SILENTLY-HUNG client (alive but its
+  // reader / re-read wedged) is invisible to the crash-only onerror/close guards.
+  // This timer reads the verdict ({@link decideTmuxControlWatchdog}) and escalates
+  // to a process restart on a mute worker — no in-process respawn. Gated on the
+  // worker actually being spawned (selector + `!disableNativeWatcher`).
+  if (tmuxControlWorker) {
+    tmuxControlWatchdogTimer = setInterval(() => {
+      if (shuttingDown) return;
+      const verdict = decideTmuxControlWatchdog({
+        lastLivenessAtMs: lastTmuxControlLivenessAtMs,
+        nowMs: Date.now(),
+        livenessThresholdMs: TMUX_CONTROL_LIVENESS_STUCK_THRESHOLD_MS,
+      });
+      if (verdict === "escalate") {
+        console.error(
+          "[keeperd] tmux-control liveness watchdog: control client mute — " +
+            "exiting for LaunchAgent restart",
+        );
+        if (!shuttingDown) fatalExit();
+      }
+    }, TMUX_CONTROL_WATCHDOG_INTERVAL_MS);
+  }
+
   // Unrecoverable async errors that escape every guard also take the single
   // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
   // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
@@ -5190,6 +5350,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     clearInterval(mutationPathBackfillTimer);
     clearInterval(walCheckpointTimer);
     if (gitSeedWatchdogTimer != null) clearInterval(gitSeedWatchdogTimer);
+    if (tmuxControlWatchdogTimer != null)
+      clearInterval(tmuxControlWatchdogTimer);
 
     // The workers actually spawned this boot (filter out the `null`s). Teardown
     // iterates THIS list, so a minimal-set boot signals only what it spawned.
@@ -5212,6 +5374,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       renamerWorker,
       reaperWorker,
       busWorker,
+      tmuxControlWorker,
     ].filter((w): w is Worker => w !== null);
 
     // Wrap each shutdown post per-worker: an already-exited worker makes

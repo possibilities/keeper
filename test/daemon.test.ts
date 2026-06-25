@@ -3947,6 +3947,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "renamer-worker.ts": "renamer",
   "reaper-worker.ts": "reaper",
   "bus-worker.ts": "bus",
+  "tmux-control-worker.ts": "tmuxControl",
 };
 
 /**
@@ -4036,7 +4037,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -4050,10 +4051,13 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen wo
   // runtime — `spawnedWorkerNames` pins the config keys; no watcher, no message
   // minter — writes only on-disk envelopes the `usage` consumer folds); fn-946
   // added `handoff` (the `keeper handoff` dispatch worker; no watcher, mints
-  // HandoffDispatching/HandoffLaunchFailed, reads keeper.db read-only).
+  // HandoffDispatching/HandoffLaunchFailed, reads keeper.db read-only); fn-952
+  // added `tmuxControl` (the persistent `tmux -C` control-focus worker; gated on
+  // `!disableNativeWatcher` — it attaches a REAL tmux client, so it spawns under
+  // the spy boot's default `disableNativeWatcher:false` but never in-process).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(18);
+  expect(spawned).toHaveLength(19);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -4075,6 +4079,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen wo
     "renamer",
     "reaper",
     "bus",
+    "tmuxControl",
   ]);
 });
 
