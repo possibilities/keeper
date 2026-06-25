@@ -19,7 +19,9 @@ import { join } from "node:path";
 import {
   BUILDS_DESCRIPTOR,
   DEAD_LETTERS_DESCRIPTOR,
+  DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
+  EPICS_RECENT_DONE_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
@@ -139,6 +141,10 @@ function seedJob(
 test("getCollection resolves epics; the dropped tasks collection is gone", () => {
   expect(getCollection("epics")).toBe(EPICS_DESCRIPTOR);
   expect(getCollection("tasks")).toBeUndefined();
+});
+
+test("getCollection resolves the epics_recent_done collection (fn-950)", () => {
+  expect(getCollection("epics_recent_done")).toBe(EPICS_RECENT_DONE_DESCRIPTOR);
 });
 
 test("getCollection resolves the git status collection", () => {
@@ -840,6 +846,96 @@ test("epics descriptor defaults the view scope to status open", () => {
   // The per-key `defaultFilter` map is unused on epics — only the
   // generated-column clause applies.
   expect(EPICS_DESCRIPTOR.defaultFilter).toBeUndefined();
+});
+
+test("epics_recent_done mirrors EPICS_DESCRIPTOR's row shape (full Epic columns/jsonColumns)", () => {
+  // The merged done rows are consumed as full `Epic` objects in
+  // `loadReconcileSnapshot` (tasks/jobs/job_links/resolved_epic_deps). `runQuery`
+  // projects ONLY `columns` and decodes ONLY `jsonColumns`, so trimming either
+  // would silently degrade the reap — they MUST mirror the open descriptor.
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.table).toBe("epics");
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.columns).toEqual(
+    EPICS_DESCRIPTOR.columns,
+  );
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.pk).toBe(EPICS_DESCRIPTOR.pk);
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.version).toBe(EPICS_DESCRIPTOR.version);
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.sortable).toBe(EPICS_DESCRIPTOR.sortable);
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.jsonColumns).toBe(
+    EPICS_DESCRIPTOR.jsonColumns,
+  );
+  // `updated_at` is the recencyBound + default-sort column, so it must be in the
+  // (mirrored) sortable allowlist.
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
+});
+
+test("epics_recent_done scopes to done and time-bounds on updated_at (NOT default_visible)", () => {
+  // Scope is `status='done'` — it must NOT inherit `default_visible = 1` (which
+  // serves only OPEN rows and would return zero done rows).
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.defaultClause).toEqual({
+    sql: "status = ?",
+    params: ["done"],
+  });
+  // The time bound replacing the old count LIMIT: `updated_at >= now - WINDOW`.
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.recencyBound).toEqual({
+    column: "updated_at",
+    windowSec: DONE_EPICS_REAP_WINDOW_SEC,
+  });
+  expect(DONE_EPICS_REAP_WINDOW_SEC).toBe(1800);
+  // Default sort preserves the prior `updated_at desc` ordering.
+  expect(EPICS_RECENT_DONE_DESCRIPTOR.defaultSort).toEqual({
+    column: "updated_at",
+    dir: "desc",
+  });
+});
+
+test("runQuery on epics_recent_done: in-window done rows included, stale excluded (boundary at >=)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // Pin the recency cutoff explicitly via `nowSec` (the 5th runQuery arg) so the
+  // boundary is deterministic — `updated_at` is Unix SECONDS, same unit as the
+  // cutoff. Mirrors the recencyBound template's NOW_SEC anchor.
+  const NOW_SEC = 2_000_000_000;
+  const cutoff = NOW_SEC - DONE_EPICS_REAP_WINDOW_SEC;
+  seedEpic(db, "fn-1-fresh", {
+    epic_number: 1,
+    status: "done",
+    updated_at: NOW_SEC,
+  });
+  seedEpic(db, "fn-2-boundary", {
+    epic_number: 2,
+    status: "done",
+    updated_at: cutoff, // exactly at the floor — `>=` includes it
+  });
+  seedEpic(db, "fn-3-juststale", {
+    epic_number: 3,
+    status: "done",
+    updated_at: cutoff - 1, // one second past the floor — excluded
+  });
+  seedEpic(db, "fn-4-ancient", {
+    epic_number: 4,
+    status: "done",
+    updated_at: cutoff - DONE_EPICS_REAP_WINDOW_SEC, // far past — excluded
+  });
+  // An OPEN row must be invisible regardless of recency (scope is done-only).
+  seedEpic(db, "fn-5-open", {
+    epic_number: 5,
+    status: "open",
+    updated_at: NOW_SEC,
+  });
+  const res = asResult(
+    runQuery(
+      db,
+      0,
+      { type: "query", collection: "epics_recent_done" },
+      undefined,
+      NOW_SEC,
+    ),
+  );
+  expect(res.rows.map((r) => String(r.epic_id)).sort()).toEqual([
+    "fn-1-fresh",
+    "fn-2-boundary",
+  ]);
+  expect(res.total).toBe(2);
+  db.close();
 });
 
 test("runQuery applies the default open scope when no filter is given", () => {

@@ -258,7 +258,9 @@ peg, fn-921: `subagent_invocations` grew to ~5k rows / ~1MB and each new subagen
 flipped the token → every board/dash client refetched the full collection). A
 descriptor may declare a `recencyBound` (`<column> >= ?`) that floors EVERY
 non-pk query of that collection to a recent window (`subagent_invocations`: 1
-day on `ts`). The floor threads through ONE `ResolvedFilter`, so the token, the
+day on `ts`; `epics_recent_done`: 1800s on `updated_at`, the duration a done epic
+stays visible for the autopilot close-row reap). The floor threads through ONE
+`ResolvedFilter`, so the token, the
 page, and `COUNT(*)` all scope to the same window and stay in agreement — it is a
 WHERE floor, NOT a `LIMIT` (which would trim the page but not the count and break
 render's count/stuck). The cutoff is wall-clock at query-resolve time (the live
@@ -3244,8 +3246,10 @@ single-flight cycle from BOTH `PRAGMA data_version` pulses (via the shared
 telemetry, because the 60s completion threshold elapsing writes NOTHING to the
 DB, so no pulse fires on aging alone and time itself must wake the cycle. Each
 cycle loads the SAME `loadReconcileSnapshot` the autopilot reconciler uses
-(including the merged recently-done epics read that makes close-row `completed`
-verdicts observable), runs `computeReadiness` at unix-seconds now, and selects
+(including the merged recently-done epics read — the `epics_recent_done`
+collection, time-bounded to `updated_at >= now - 1800s` — that keeps a done
+epic's close-row `completed` verdict observable through its done→idle wind-down),
+runs `computeReadiness` at unix-seconds now, and selects
 reap candidates from TWO disjoint arms. The autopilot arm selects the rows
 passing the FULL predicate: managed session (`autopilot`) AND a `work`/`close`
 verb with a `plan_ref` AND `state='stopped'` for over 60s AND a non-null pane id

@@ -25,7 +25,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   countAndToken,
+  DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
+  EPICS_RECENT_DONE_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
   type Row,
@@ -3369,6 +3371,17 @@ test("resolveFilter: recencyBound floor uses `floor(nowSec)` so a fractional clo
     NOW_SEC + 0.97,
   );
   expect(where.params).toEqual([NOW_SEC - SUBAGENT_INVOCATIONS_RECENCY_SEC]);
+});
+
+test("resolveFilter: epics_recent_done ANDs the done-scope clause with the updated_at recency floor (fn-950)", () => {
+  const where = resolveFilter(EPICS_RECENT_DONE_DESCRIPTOR, undefined, NOW_SEC);
+  // The bare read ANDs the done-scope `defaultClause` with the `updated_at`
+  // recency floor — done epics, time-bounded, never count-bounded.
+  expect(where.clause).toBe("WHERE status = ? AND updated_at >= ?");
+  expect(where.params).toEqual([
+    "done",
+    Math.floor(NOW_SEC) - DONE_EPICS_REAP_WINDOW_SEC,
+  ]);
 });
 
 test("countAndToken + page agree: the recency floor bounds total, token, AND page consistently", () => {

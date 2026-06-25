@@ -240,6 +240,63 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * Recency window (seconds) bounding the recently-done epics read merged into the
+ * autopilot reconcile snapshot (see `loadReconcileSnapshot`). A done epic must
+ * stay observable long enough for the close-row COMPLETION reap to see its
+ * `{tag:"completed"}` verdict — a DURATION requirement (keep it visible through
+ * its done→idle close-row wind-down), not a count. The window must exceed a
+ * healthy close-row wind-down with headroom over (fold-lag + reconcile cadence +
+ * wind-down); 1800s tracks `MONITOR_RELEASE_SEC` (the hard closer-release
+ * ceiling) and is ~10-30x a healthy wind-down. Over-observing is free (the reap
+ * is idempotent); only UNDER-observing leaks, so the bound has headroom. A
+ * closer wedged PAST the window is caught by the exit-watcher dead-pid reprobe,
+ * not this window — the window is a backstop, not the sole safeguard.
+ */
+export const DONE_EPICS_REAP_WINDOW_SEC = 1800;
+
+/**
+ * The `epics_recent_done` descriptor — the recently-DONE epics window the
+ * autopilot reconciler merges into its snapshot so the close-row completion reap
+ * stays reachable. MIRRORS {@link EPICS_DESCRIPTOR}'s full `columns` / `pk` /
+ * `version` / `sortable` / `jsonColumns` surface (NOT minimized): `runQuery`
+ * projects only `descriptor.columns` and decodes only `descriptor.jsonColumns`,
+ * and the merged rows are consumed as full `Epic` objects (with
+ * `tasks`/`jobs`/`job_links`/`resolved_epic_deps`) — trimming any column would
+ * silently degrade the reap.
+ *
+ * Two deviations from `EPICS_DESCRIPTOR`: (1) scoped to `status='done'` via
+ * `defaultClause` (it must NOT inherit `default_visible = 1`, which serves only
+ * OPEN rows and would return zero done rows); (2) `recencyBound` on `updated_at`
+ * floors the read to `now - DONE_EPICS_REAP_WINDOW_SEC`, the time bound replacing
+ * the old count `LIMIT`. `updated_at` folds from `event.ts` in Unix SECONDS, and
+ * the cutoff is seconds (`resolveFilter` floors `Date.now()/1000`), so the units
+ * agree. Default sort `updated_at desc` preserves the prior ordering.
+ */
+export const EPICS_RECENT_DONE_DESCRIPTOR: CollectionDescriptor = {
+  name: "epics_recent_done",
+  table: "epics",
+  columns: EPICS_DESCRIPTOR.columns,
+  pk: EPICS_DESCRIPTOR.pk,
+  version: EPICS_DESCRIPTOR.version,
+  sortable: EPICS_DESCRIPTOR.sortable,
+  defaultSort: { column: "updated_at", dir: "desc" },
+  filters: EPICS_DESCRIPTOR.filters,
+  // Scope to DONE rows. A `defaultClause` (NOT the inherited `default_visible =
+  // 1`, which serves only OPEN) so any explicit wire filter still overrides; the
+  // reconciler reads with no wire filter, so this is the live scope.
+  defaultClause: {
+    sql: "status = ?",
+    params: ["done"],
+  },
+  // Time floor replacing the old count `LIMIT`: `updated_at >= now - windowSec`.
+  recencyBound: {
+    column: "updated_at",
+    windowSec: DONE_EPICS_REAP_WINDOW_SEC,
+  },
+  jsonColumns: EPICS_DESCRIPTOR.jsonColumns,
+};
+
+/**
  * The `git` descriptor — one row per watched git worktree (membership gate:
  * `.keeper present || dirty || ahead of upstream > 0`, recomputed each
  * reconcile). A current-status snapshot plus derived per-live-job dirty/orphan
@@ -713,6 +770,7 @@ export const HANDOFFS_DESCRIPTOR: CollectionDescriptor = {
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
+  [EPICS_RECENT_DONE_DESCRIPTOR.name, EPICS_RECENT_DONE_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],

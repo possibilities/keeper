@@ -128,22 +128,6 @@ export const FINALIZER_GUARD_S = REDISPATCH_COOLDOWN_S;
 const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close"]);
 
 /**
- * The bounded recently-done epics window merged into the reconcile snapshot so
- * the close-row COMPLETION reap is reachable. The default epics read scopes to
- * `status='open'`, so a DONE epic would fall off the snapshot before its
- * close-row's done arm emits `{tag:"completed"}` — that arm now gates on
- * close-scope liveness, so the epic must stay observable through the whole
- * done→idle wind-down, not just the instant it flips done. A SECOND read with an
- * explicit `filter:{status:"done"}`, sorted `updated_at` DESC and LIMITed to
- * this window, is merged in (dedup by `epic_id`, open rows win). The bound keeps
- * the snapshot O(limit), never O(all done history). The limit is generous versus
- * a closer's wind-down. Over-observing is free (the reap is idempotent); only
- * UNDER-observing leaks, so the window has headroom over (fold-lag + reconcile
- * cadence + closer wind-down).
- */
-export const DONE_EPICS_REAP_LIMIT = 32;
-
-/**
  * `true` IFF the epic-level finalizer for `epicId` is `close` (the sole
  * finalizer verb). A close-row verdict mapping to `null` is not a finalizer and
  * is never stamped or gated.
@@ -1581,12 +1565,14 @@ type IncomingMessage =
  * scope applies (epics: open; jobs: live-only) — the live work set the
  * reconciler acts on.
  *
- * ONE deliberate exception: a SECOND epics read with `filter:{status:"done"}`,
- * sorted `updated_at` DESC and LIMITed to {@link DONE_EPICS_REAP_LIMIT}, is
- * MERGED in (dedup by `epic_id`, open rows win) so a done epic stays visible
- * long enough for the close-row COMPLETION reap to observe its
- * `{tag:"completed"}` verdict. Done rows produce ONLY completed verdicts, so no
- * dispatch arm or mutex occupancy is perturbed.
+ * ONE deliberate exception: the `epics_recent_done` collection — a SECOND read
+ * scoped to `status='done'` and TIME-bounded to `updated_at >= now -
+ * DONE_EPICS_REAP_WINDOW_SEC` (its descriptor's `recencyBound`) — is MERGED in
+ * (dedup by `epic_id`, open rows win) so a done epic stays visible long enough
+ * for the close-row COMPLETION reap to observe its `{tag:"completed"}` verdict.
+ * The bound is a DURATION (it tracks the close-row wind-down), not a count. Done
+ * rows produce ONLY completed verdicts, so no dispatch arm or mutex occupancy is
+ * perturbed.
  *
  * Mirrors the readiness client's assembly: sub-agents collapsed same-name →
  * most-recent (orphaned `running` rows must not false-block predicate 6); git
@@ -1614,24 +1600,15 @@ export async function loadReconcileSnapshot(
     return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
   };
 
-  // The default-scope (open) epics — the live work set — MERGED with a bounded
-  // recently-DONE window so the close-row completion reap is reachable. Dedup
-  // keys on `epic_id` with the OPEN row winning (a collision is only a fold-lag
-  // transient; preferring the live row keeps dispatch arms on the freshest view).
+  // The default-scope (open) epics — the live work set — MERGED with the
+  // recently-DONE window (`epics_recent_done`, time-bounded by its descriptor's
+  // `recencyBound` on `updated_at`) so the close-row completion reap is
+  // reachable. The `read()` helper passes no `nowSec`, so `runQuery` defaults the
+  // recency cutoff to live `Date.now()/1000`. Dedup keys on `epic_id` with the
+  // OPEN row winning (a collision is only a fold-lag transient; preferring the
+  // live row keeps dispatch arms on the freshest view).
   const openEpics = read("epics") as unknown as Epic[];
-  const doneFrame = {
-    type: "query" as const,
-    collection: "epics",
-    id: "autopilot-epics-done",
-    filter: { status: "done" },
-    sort: { column: "updated_at", dir: "desc" as const },
-    limit: DONE_EPICS_REAP_LIMIT,
-  };
-  const doneRes = runQuery(db, 0, doneFrame);
-  const doneEpics =
-    doneRes.type === "result"
-      ? (doneRes.rows as unknown as Epic[])
-      : ([] as Epic[]);
+  const doneEpics = read("epics_recent_done") as unknown as Epic[];
   const seenEpicIds = new Set<string>();
   const dedupedEpics: Epic[] = [];
   for (const epic of openEpics) {

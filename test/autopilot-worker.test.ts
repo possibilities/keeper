@@ -44,7 +44,6 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type DispatchKey,
-  DONE_EPICS_REAP_LIMIT,
   FINALIZER_GUARD_S,
   type FoundJob,
   isEpicInFlight,
@@ -68,6 +67,7 @@ import {
   WORKER_EFFORT,
   WORKER_MODEL,
 } from "../src/autopilot-worker";
+import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -2863,6 +2863,11 @@ test("reconcile: a non-completed task id is NOT in completedRowIds", () => {
  * Seed one `epics` row directly (mirrors test/collections.test.ts `seedEpic`):
  * only the schema-required columns are populated. The default board order is
  * `epic_number ASC`, so the seeded `epic_number` makes that order stable.
+ *
+ * `updated_at` defaults to a RECENT epoch-seconds value (within the
+ * `epics_recent_done` window) so a seeded done epic lands inside the
+ * `loadReconcileSnapshot` time bound by default; tests probing the window
+ * boundary pass an explicit `updated_at`.
  */
 function seedEpicRow(
   db: Database,
@@ -2886,7 +2891,7 @@ function seedEpicRow(
     "/repo",
     opts.status,
     0,
-    opts.updated_at ?? 1,
+    opts.updated_at ?? Math.floor(Date.now() / 1000),
     "[]",
     "[]",
     JSON.stringify(opts.jobs ?? []),
@@ -3019,31 +3024,51 @@ test("fn-764: done epics in the snapshot yield ZERO dispatches and no mutex occu
   });
 });
 
-test("fn-764: the done-epics read is BOUNDED — exactly DONE_EPICS_REAP_LIMIT, most-recently-updated", async () => {
+test("fn-950: the done-epics read is TIME-bounded — in-window done epics carried, stale ones dropped", async () => {
   await withSeededDb(async (db) => {
-    // Seed strictly MORE done epics than the limit, with monotonically rising
-    // updated_at so the sort order is unambiguous. The merge must carry exactly
-    // the limit, and exactly the most-recently-updated ones (fn-748 anti-pattern
-    // guard: never O(all done history)).
-    const total = DONE_EPICS_REAP_LIMIT + 8;
-    for (let i = 1; i <= total; i++) {
-      seedEpicRow(db, `fn-${i}-done`, {
-        epic_number: i,
-        status: "done",
-        updated_at: i, // higher i = more recently updated
-      });
-    }
+    // The bound is a DURATION, not a count: `updated_at >= now - WINDOW`.
+    // `loadReconcileSnapshot` reads with live `Date.now()`, so anchor the seed
+    // epochs to it. `updated_at` is Unix SECONDS (folds from `event.ts`), the
+    // same unit as the cutoff — the seconds-vs-ms trap the spec flags.
+    const now = Math.floor(Date.now() / 1000);
+    // INSIDE the window: comfortably inside, and at the inclusive boundary
+    // (`>=` cutoff). The cutoff is `now - WINDOW`; a row AT it is carried.
+    seedEpicRow(db, "fn-1-fresh", {
+      epic_number: 1,
+      status: "done",
+      updated_at: now,
+    });
+    seedEpicRow(db, "fn-2-midwindow", {
+      epic_number: 2,
+      status: "done",
+      updated_at: now - Math.floor(DONE_EPICS_REAP_WINDOW_SEC / 2),
+    });
+    seedEpicRow(db, "fn-3-boundary", {
+      epic_number: 3,
+      status: "done",
+      updated_at: now - DONE_EPICS_REAP_WINDOW_SEC,
+    });
+    // OUTSIDE the window: one second past the floor, and far past it. Both must
+    // drop — the time bound, not a count, is the sole guard against O(all done).
+    seedEpicRow(db, "fn-4-juststale", {
+      epic_number: 4,
+      status: "done",
+      updated_at: now - DONE_EPICS_REAP_WINDOW_SEC - 1,
+    });
+    seedEpicRow(db, "fn-5-ancient", {
+      epic_number: 5,
+      status: "done",
+      updated_at: now - DONE_EPICS_REAP_WINDOW_SEC * 10,
+    });
     const snap = await loadReconcileSnapshot(db);
-    // Bounded: exactly the window, never the full done set.
-    expect(snap.epics.length).toBe(DONE_EPICS_REAP_LIMIT);
-    // The carried set is the most-recently-updated tail (updated_at desc).
     const carried = new Set(snap.epics.map((e) => e.epic_id));
-    for (let i = total; i > total - DONE_EPICS_REAP_LIMIT; i--) {
-      expect(carried.has(`fn-${i}-done`)).toBe(true);
-    }
-    // The oldest are dropped (e.g. fn-1, fn-8 are below the cutoff).
-    expect(carried.has("fn-1-done")).toBe(false);
-    expect(carried.has(`fn-${total - DONE_EPICS_REAP_LIMIT}-done`)).toBe(false);
+    // In-window (including the inclusive boundary) carried.
+    expect(carried.has("fn-1-fresh")).toBe(true);
+    expect(carried.has("fn-2-midwindow")).toBe(true);
+    expect(carried.has("fn-3-boundary")).toBe(true);
+    // Stale dropped — no count LIMIT, the duration floor is the only bound.
+    expect(carried.has("fn-4-juststale")).toBe(false);
+    expect(carried.has("fn-5-ancient")).toBe(false);
   });
 });
 
