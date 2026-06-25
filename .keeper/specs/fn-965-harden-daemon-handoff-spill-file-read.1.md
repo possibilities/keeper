@@ -26,5 +26,5 @@ in the same test.
 - [ ] Tests assert the empty-file and oversized-file `ok:false` error strings, plus the new out-of-dir rejection.
 
 ## Done summary
-
+Confined the daemon's handoff spill-file read under resolveHandoffSpillDir(), rejecting out-of-dir doc_path with a loud ok:false before any read (closes the arbitrary-file-read primitive); added integration coverage for the out-of-dir, empty, and oversized ok:false branches under a sandboxed spill dir.
 ## Evidence
