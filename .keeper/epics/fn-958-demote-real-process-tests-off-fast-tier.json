@@ -2,9 +2,11 @@
   "branch_name": "fn-b-fast-tier-headroom",
   "bundles": [],
   "created_at": "2026-06-25T02:15:59.318000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-952-tmux-control-mode-focus-capture"
+  ],
   "id": "fn-958-demote-real-process-tests-off-fast-tier",
-  "last_validated_at": "2026-06-25T02:15:59.340000Z",
+  "last_validated_at": "2026-06-25T02:16:05.420000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T02:15:59.318000Z"
+  "updated_at": "2026-06-25T02:16:05.401000Z"
 }
