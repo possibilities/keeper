@@ -40,5 +40,5 @@ focus present/absent × dead-letter present/absent. No real tmux needed (drive v
 - [ ] `keeper jobs` renders `[focus <session>:<win> %<pane>]` / `[focus: none]` composed with `[dead-letter:N]`, stamped before the byte-compare short-circuit, and the flash-restore timer rebuilds both pills.
 
 ## Done summary
-
+Registered the tmux_client_focus singleton collection + subscribed it onto snap.tmuxFocus (first-paint gated, empty serves rows:[]); composed a [focus <s>:<w> %<p>] / [focus: none] banner pill with [dead-letter:N] in keeper jobs, rebuilt by the flash-restore timer.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Deliver tmux_client_focus over subscribe socket and render on jobs banner",
-  "updated_at": "2026-06-24T23:22:22.683000Z"
+  "updated_at": "2026-06-25T03:19:30.809000Z",
+  "worker_done_at": "2026-06-25T03:19:30.809000Z"
 }
