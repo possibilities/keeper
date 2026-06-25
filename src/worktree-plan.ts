@@ -22,14 +22,18 @@
  * Branch names are a pure function of stable ids only:
  *  - base: `keeper/epic/<epic_id>`
  *  - rib:  `keeper/epic/<epic_id>/<task_id>`
- * Worktree paths resolve to a SIBLING directory OUTSIDE the repo tree, derived
- * purely from the repo dir's parent + a slug of the branch.
+ * Worktree paths resolve to a directory under `~/worktrees/`, OUTSIDE the repo
+ * tree, named `<repoName>--<branch-slug>`. The home dir is the one environment
+ * read here — constant within the daemon process, so re-derivation stays
+ * byte-identical — and safe because this runs producer-only, never in a fold.
  *
  * Determinism is sacred: the toposort breaks ties on the existing
  * `(task_number, task_id)` order, the inheritance walk consumes that one order,
  * and every derived name is a pure function of stable ids — so re-deriving the
  * plan from the same DAG is byte-identical. A `depends_on` cycle FAILS LOUD.
  */
+
+import { homedir } from "node:os";
 
 import type { Task } from "./types";
 
@@ -130,19 +134,18 @@ export function ribBranchFor(epicId: string, taskId: string): string {
 }
 
 /**
- * Resolve a branch to its worktree path: a SIBLING dir outside the repo tree,
- * a pure function of the repo dir + branch. `<parent>/<repoName>.worktrees/<slug>`
- * where `slug` is the branch with `/` → `-` (filesystem-safe, collision-free
- * because branch names are themselves unique per lane). Kept OUTSIDE the repo
- * tree (a sibling under `<repoName>.worktrees`) so a worktree is never nested
- * inside the repo it forks from.
+ * Resolve a branch to its worktree path: a dir under `~/worktrees/`, OUTSIDE the
+ * repo tree, named `<repoName>--<branch-slug>` where `slug` is the branch with
+ * `/` → `-` (filesystem-safe; branch names are unique per lane, so the slug is
+ * collision-free and the `<repoName>--` prefix keeps sibling-repo lanes legible).
+ * Kept outside the repo tree so a worktree is never nested inside the repo it
+ * forks from. Resolves the home dir from the environment — safe because this runs
+ * PRODUCER-ONLY (the autopilot worktree driver), never inside a fold.
  */
 export function worktreePathFor(repoDir: string, branch: string): string {
-  const normalizedRepo = stripTrailingSlash(repoDir);
-  const parent = parentDir(normalizedRepo);
-  const repoName = baseName(normalizedRepo) || "repo";
+  const repoName = baseName(stripTrailingSlash(repoDir)) || "repo";
   const slug = branch.replace(/\//g, "-");
-  return `${parent}/${repoName}.worktrees/${slug}`;
+  return `${homedir()}/worktrees/${repoName}--${slug}`;
 }
 
 /**
@@ -429,17 +432,6 @@ function computePreMergesForBranches(
 
 function stripTrailingSlash(p: string): string {
   return p.length > 1 && p.endsWith("/") ? p.replace(/\/+$/, "") : p;
-}
-
-function parentDir(p: string): string {
-  const idx = p.lastIndexOf("/");
-  if (idx < 0) {
-    return ".";
-  }
-  if (idx === 0) {
-    return "/";
-  }
-  return p.slice(0, idx);
 }
 
 function baseName(p: string): string {

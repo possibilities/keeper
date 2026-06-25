@@ -30,7 +30,7 @@
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
 import {
@@ -3753,9 +3753,9 @@ test("fn-959 reconcile: worktree ON → a linear chain shares the base lane, det
   expect(wt).toBeDefined();
   expect(wt?.assignment.branch).toBe("keeper/epic/fn-1-foo");
   expect(wt?.baseBranch).toBe("keeper/epic/fn-1-foo");
-  // Sibling-dir-outside-repo path, slug = branch with `/` → `-`.
+  // ~/worktrees/<repoName>--<branch-slug>, slug = branch with `/` → `-`.
   expect(wt?.assignment.worktreePath).toBe(
-    "/home/me/repo.worktrees/keeper-epic-fn-1-foo",
+    `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`,
   );
   expect(wt?.assignment.inherited).toBe(true);
   expect(wt?.assignment.preMerges).toEqual([]);
@@ -3845,7 +3845,7 @@ test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched
   const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
   const state = makeState();
   const decision = reconcile(snap, makeState(), 0);
-  const wtPath = "/home/me/repo.worktrees/keeper-epic-fn-1-foo";
+  const wtPath = `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`;
   expect(decision.launches[0]?.worktree?.assignment.worktreePath).toBe(wtPath);
 
   await runReconcileCycle(

@@ -15,6 +15,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { homedir } from "node:os";
 import type { Task } from "../src/types";
 import {
   baseBranchFor,
@@ -204,14 +205,14 @@ test("branch + path names are pure functions of stable ids", () => {
   expect(ribBranchFor("fn-42-x", "fn-42-x.3")).toBe(
     "keeper/epic/fn-42-x/fn-42-x.3",
   );
-  // Worktree path: SIBLING dir outside the repo tree, branch slugged.
+  // Worktree path: under ~/worktrees, `<repoName>--<branch-slug>`, branch slugged.
   expect(worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo")).toBe(
-    "/Users/x/code/foo.worktrees/keeper-epic-fn-1-foo",
+    `${homedir()}/worktrees/foo--keeper-epic-fn-1-foo`,
   );
   expect(
     worktreePathFor("/Users/x/code/foo/", "keeper/epic/fn-1-foo/fn-1-foo.2"),
-  ).toBe("/Users/x/code/foo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2");
-  // The worktree is OUTSIDE the repo tree (a sibling, never nested under it).
+  ).toBe(`${homedir()}/worktrees/foo--keeper-epic-fn-1-foo-fn-1-foo.2`);
+  // The worktree is OUTSIDE the repo tree (never nested under it).
   const wt = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
   expect(wt.startsWith("/Users/x/code/foo/")).toBe(false);
 });
