@@ -4203,10 +4203,11 @@ function makeRecoveryGit(state: {
   pushFails?: boolean;
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
-  calls: { cwd: string; args: string }[];
+  calls: { cwd: string; args: string; env?: Record<string, string> }[];
   lock: NonNullable<Parameters<typeof recoverWorktrees>[3]>;
 } {
-  const calls: { cwd: string; args: string }[] = [];
+  const calls: { cwd: string; args: string; env?: Record<string, string> }[] =
+    [];
   // A no-op lock acquirer so the merge path never touches the real FFI flock
   // (the slow real-git test covers the actual flock-around-merge contract).
   const lock: NonNullable<Parameters<typeof recoverWorktrees>[3]> = () => ({
@@ -4215,7 +4216,7 @@ function makeRecoveryGit(state: {
   const run: Parameters<typeof recoverWorktrees>[2] = async (args, o) => {
     const cwd = o?.cwd ?? "";
     const joined = args.join(" ");
-    calls.push({ cwd, args: joined });
+    calls.push({ cwd, args: joined, env: o?.env });
     if (joined.startsWith("worktree list")) {
       return { code: 0, stdout: state.worktreeList ?? "", stderr: "" };
     }
@@ -4342,7 +4343,11 @@ test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default +
         c.cwd === "/repo" && c.args === "merge --no-edit keeper/epic/fn-1-foo",
     ),
   ).toBe(true);
-  expect(calls.some((c) => c.cwd === "/repo" && c.args === "push")).toBe(true);
+  // The single recover push leg fails fast on a credential-needing origin —
+  // GIT_TERMINAL_PROMPT=0 keeps git from opening /dev/tty inside the reconcile
+  // cycle (matches the commit-work push leg).
+  const recoverPush = calls.find((c) => c.cwd === "/repo" && c.args === "push");
+  expect(recoverPush?.env).toEqual({ GIT_TERMINAL_PROMPT: "0" });
 });
 
 test("fn-959.7 recoverWorktrees: already-merged base → idempotent skip (no merge, no push)", async () => {

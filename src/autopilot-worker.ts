@@ -2154,7 +2154,10 @@ export function createWorktreeDriver(
         }
         // Push the single merge-to-default. A push failure stops finalize (no
         // teardown) so the lanes survive for a retry.
-        const push = await run(["push"], { cwd: repoDir });
+        const push = await run(["push"], {
+          cwd: repoDir,
+          env: { GIT_TERMINAL_PROMPT: "0" },
+        });
         if (push.code !== 0) {
           return {
             ok: false,
@@ -2348,7 +2351,10 @@ export async function recoverWorktrees(
           continue;
         }
         // Push the recovered merge once (the per-lane pushes were skipped).
-        const push = await run(["push"], { cwd: repo });
+        const push = await run(["push"], {
+          cwd: repo,
+          env: { GIT_TERMINAL_PROMPT: "0" },
+        });
         if (push.code !== 0) {
           failures.push({
             epicId: base.epicId,
