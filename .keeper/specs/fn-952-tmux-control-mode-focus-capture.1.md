@@ -54,5 +54,5 @@ notifications mid-block, unknown verbs, `%exit` with/without reason, multi-clien
 - [ ] Both modules are pure (no db/daemon imports) and run in the fast tier.
 
 ## Done summary
-
+Added two pure, dependency-free fast-tier seams: src/tmux-control-parser.ts (command-number-framed control-mode stream parser with notification decode, %exit, max-iteration bail-out, octal/extended-output presentation helpers) and src/tmux-focus-derive.ts (client/pane -F parsers + pickCurrentClient with control-mode filter, activity/created/name tiebreak, session→active-window→active-pane composition). 41 fast-tier tests.
 ## Evidence
