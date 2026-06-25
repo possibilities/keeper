@@ -81,6 +81,7 @@ import type {
   Job,
   ScheduledTask,
   SubagentInvocation,
+  TmuxClientFocus,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,9 @@ const SCHEDULED_TASKS_PAGE_LIMIT = 0;
 // One row per currently-blocked plan task — intrinsically bounded by the board's
 // blocked-task count, so unbounded (0) like the other latch collections.
 const BLOCK_ESCALATIONS_PAGE_LIMIT = 0;
+// The `tmux_client_focus` singleton (fn-952) — at most one row (`id = 1`), so
+// unbounded (0) like the other singleton collections.
+const TMUX_CLIENT_FOCUS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -178,6 +182,12 @@ export interface ReadinessClientSnapshot {
   // to PAUSED, mirroring `cli/autopilot.ts`'s coercion). Pairs with
   // `blockEscalations` for the escalated-but-paused await softening.
   readonly autopilotPaused: boolean;
+  // fn-952: the `tmux_client_focus` singleton row (`id = 1`) — the persistent
+  // control worker's view of the current real client's focused
+  // session/window/pane. `undefined` when the singleton is empty (no-tmux env or
+  // a worker that never connected) OR its `status` is `'none'`; the `keeper jobs`
+  // banner renders `[focus: none]` in both cases.
+  readonly tmuxFocus?: TmuxClientFocus;
   readonly readiness: ReadinessSnapshot;
 }
 
@@ -1410,6 +1420,7 @@ export function subscribeReadiness(
   const armedEpicsSubId = `${idPrefix}-armed-epics`;
   const scheduledTasksSubId = `${idPrefix}-scheduled-tasks`;
   const blockEscalationsSubId = `${idPrefix}-block-escalations`;
+  const tmuxClientFocusSubId = `${idPrefix}-tmux-client-focus`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1535,6 +1546,23 @@ export function subscribeReadiness(
       limit: BLOCK_ESCALATIONS_PAGE_LIMIT,
     },
   );
+  // `tmux_client_focus` (fn-952) — the persistent control worker's live-only
+  // singleton view of the current real client's focused session/window/pane. The
+  // wire pk is `id` (always `1`), so the snapshot reads `byId.get(order[0])`. The
+  // table exists from migration, so an empty / never-populated singleton (no-tmux
+  // env, or no worker ever connecting) still produces a `result` with `rows: []`
+  // — clearing the first-paint gate without wedging.
+  const tmuxClientFocus = makeState(
+    "tmux_client_focus",
+    tmuxClientFocusSubId,
+    "id",
+    {
+      type: "query",
+      collection: "tmux_client_focus",
+      id: tmuxClientFocusSubId,
+      limit: TMUX_CLIENT_FOCUS_PAGE_LIMIT,
+    },
+  );
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1546,6 +1574,7 @@ export function subscribeReadiness(
     armedEpics,
     scheduledTasks,
     blockEscalations,
+    tmuxClientFocus,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1567,7 +1596,13 @@ export function subscribeReadiness(
       !scheduledTasks.gotResult ||
       // `block_escalations` (fn-941) — the escalation latch feed. Empty produces
       // a `result` with `rows: []`, so it still clears the gate.
-      !blockEscalations.gotResult
+      !blockEscalations.gotResult ||
+      // `tmux_client_focus` (fn-952) — the control-worker focus singleton. The
+      // table exists from migration, so an empty / never-populated singleton
+      // (no-tmux env) produces a `result` with `rows: []` and still clears the
+      // gate. Gating on it keeps the focus pill from painting on a pre-paint
+      // blank.
+      !tmuxClientFocus.gotResult
     ) {
       return;
     }
@@ -1667,6 +1702,13 @@ export function subscribeReadiness(
     // symmetry with the other projections.
     const blockEscalationsTyped =
       projectRows<BlockEscalation>(blockEscalations);
+    // fn-952: the `tmux_client_focus` singleton — read the one row (`id = 1`)
+    // off `byId` like `autopilot_state`. Absent (no-tmux env, or a worker that
+    // never connected) → `undefined`, which the banner renders as `[focus:
+    // none]`.
+    const tmuxFocus = tmuxClientFocus.byId.get(
+      tmuxClientFocus.order[0] ?? "",
+    ) as TmuxClientFocus | undefined;
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1679,6 +1721,7 @@ export function subscribeReadiness(
       scheduledTasks: scheduledTasksTyped,
       blockEscalations: blockEscalationsTyped,
       autopilotPaused,
+      ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });
   }

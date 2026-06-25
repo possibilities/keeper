@@ -49,14 +49,16 @@
  * `/tmp/keeper-jobs.<pid>.meta.txt`. Lifecycle events append to
  * `/tmp/keeper-jobs.<pid>.lifecycle.txt`.
  *
- * Persistent banner: the `[dead-letter:N]` warn pill from
- * `src/board-render.ts:renderDeadLetterPill` is re-stamped on EVERY
- * snapshot via `liveShell.setStatus()` — done BEFORE the body
- * byte-compare short-circuit so the pill reflects every snapshot, even
- * snapshots whose body is byte-stable (the count can change
- * independently of the rendered rows). `c` (copy) and `r` (replay-
- * dead-letter) share one banner-flash timer that restores the
- * persistent pill ~1.5s after a flash.
+ * Persistent banner: the `[focus <session>:<win> %<pane>]` pill
+ * (`src/board-render.ts:renderTmuxFocusPill`, `[focus: none]` floor)
+ * COMPOSED with the `[dead-letter:N]` warn pill
+ * (`renderDeadLetterPill`) is re-stamped on EVERY snapshot via
+ * `liveShell.setStatus()` — done BEFORE the body byte-compare
+ * short-circuit so both pills reflect every snapshot, even snapshots
+ * whose body is byte-stable (the dead-letter count or the focused pane
+ * can change independently of the rendered rows). `c` (copy) and `r`
+ * (replay-dead-letter) share one banner-flash timer that restores the
+ * composed persistent pill ~1.5s after a flash.
  *
  * `r` (replay-dead-letter) runs `sendReplayDeadLetterRpc` on a SEPARATE
  * connection (the subscribe socket is read-only — RPCs ride their own
@@ -83,6 +85,7 @@ import {
   pillOrEmpty,
   planVerbLabel,
   renderDeadLetterPill,
+  renderTmuxFocusPill,
   scheduledTaskLinesFor,
   sendReplayDeadLetterRpc,
   subagentLinesFor,
@@ -598,6 +601,11 @@ export async function main(argv: string[]): Promise<void> {
   // snapshot, BEFORE the body byte-compare short-circuit, so the pill
   // reflects every snapshot regardless of body stability.
   let waitingDeadLetterCount = 0;
+  // fn-952: the latest `tmux_client_focus` singleton row, refreshed in
+  // `emitFrame` on every snapshot (BEFORE the body byte-compare short-circuit)
+  // so the composed focus pill reflects every snapshot regardless of body
+  // stability. `undefined` ⇒ `[focus: none]`.
+  let tmuxFocus: ReadinessClientSnapshot["tmuxFocus"];
   // `colorEnabled` is owned by the view-shell, but we need the same
   // gate here to decide whether to colorize the banner pill text the
   // view-shell will hand back to us via `persistentBannerPill`. Same
@@ -607,11 +615,17 @@ export async function main(argv: string[]): Promise<void> {
     process.stdout.isTTY === true &&
     process.stdin.isTTY === true &&
     process.env.NO_COLOR == null;
+  // fn-952: the persistent banner composes the focus pill with the dead-letter
+  // warn pill. The focus pill is ALWAYS present (`[focus: none]` floor); the
+  // dead-letter pill drops to "" when the backlog is empty. Order: focus first,
+  // then dead-letter (the actionable warn pill sits closest to the edge). The
+  // ~1.5s flash-restore timer in `view-shell` calls THIS function, so both pills
+  // rebuild on restore for free.
   function persistentBannerPill(): string {
-    const raw = renderDeadLetterPill(waitingDeadLetterCount);
-    if (raw === "") {
-      return "";
-    }
+    const focusRaw = renderTmuxFocusPill(tmuxFocus);
+    const deadLetterRaw = renderDeadLetterPill(waitingDeadLetterCount);
+    const raw =
+      deadLetterRaw === "" ? focusRaw : `${focusRaw} ${deadLetterRaw}`;
     return colorEnabled ? colorizePillsInLine(raw) : raw;
   }
 
@@ -923,6 +937,11 @@ export async function main(argv: string[]): Promise<void> {
     // reflects every snapshot. `setStatus` is itself a no-op when the
     // string is unchanged.
     waitingDeadLetterCount = snap.deadLetters.length;
+    // fn-952: refresh the focus backing-store alongside the dead-letter count,
+    // BEFORE the byte-compare short-circuit — the focus pill can change while
+    // the rendered job rows stay byte-stable (a window switch never touches the
+    // job list).
+    tmuxFocus = snap.tmuxFocus;
     view.liveShell.setStatus(persistentBannerPill());
     view.emit(snap);
   }

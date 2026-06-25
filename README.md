@@ -185,7 +185,7 @@ without blocking.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Eight collections register today —
+page that doubles as a live subscription. Nine collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection), `subagent_invocations` (the per-job timeline of Task-tool
@@ -241,7 +241,12 @@ composite `(job_id, cron_id)`; folded from the `CronCreate` / `CronDelete`
 resurrects) and a CronDelete flips it to `deleted`; carries the payload's
 pre-rendered `human_schedule`, the `recurring` / `durable` boolean lifts, and a
 deterministically truncated `prompt_summary`; served to the jobs TUI's
-expanded-row cron detail section). The
+expanded-row cron detail section), and `tmux_client_focus` (schema v89, fn-952 —
+the live-only singleton (`id = 1`) the persistent `tmux -C` control worker UPSERTs
+with the current real (non-control) client's focused session/window/pane; an empty
+/ never-populated table (no-tmux env, or a worker that never connects) serves
+`rows: []` so the `keeper jobs` first-paint gate still clears, and the banner
+renders `[focus: none]`). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -1008,7 +1013,12 @@ event-log/reducer/hook touch. Run any of them with
   reappears in the next frame and `N` drops by one. The pill is
   re-stamped on every snapshot BEFORE the body byte-compare
   short-circuit, so the count tracks reality even when the rendered
-  body is byte-stable. Each job row also carries an optional trailing
+  body is byte-stable. The same banner COMPOSES a persistent
+  `[focus <session>:<win> %<pane>]` pill (schema v89, fn-952 — `[focus: none]`
+  when no real client is focused or no worker has connected) from the
+  `tmux_client_focus` singleton, stamped on the same pre-byte-compare path so a
+  pane/window switch updates it even when the job rows stay byte-stable; the
+  ~1.5 s flash-restore timer rebuilds BOTH pills. Each job row also carries an optional trailing
   `[p<pane>]` pane pill (schema v48 / fn-668) — the terminal-multiplexer
   backend-exec pane coordinate lifted off the three live
   `jobs.backend_exec_{type,session_id,pane_id}` columns by the shared

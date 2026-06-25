@@ -899,6 +899,26 @@ export interface BlockEscalation {
 }
 
 /**
+ * The `tmux_client_focus` singleton projection row (fn-952) — the persistent
+ * `tmux -C` control worker's last-write-wins view of which session/window/pane
+ * the current real (non-control) tmux client is focused on. At most one row
+ * (`id = 1`). `status` is `'focused'` when a real client's active pane resolved,
+ * `'none'` when no real client / no resolvable active pane (the worker's
+ * `pickCurrentClient` derivation). On `'none'` the location fields are absent /
+ * null. The `keeper jobs` banner reads this to render its focus pill.
+ */
+export interface TmuxClientFocus {
+  id: number;
+  status: string | null;
+  generation_id: string | null;
+  session_name: string | null;
+  window_index: number | null;
+  pane_id: string | null;
+  last_event_id: number | null;
+  updated_at: number | null;
+}
+
+/**
  * Pre-flattened `BlockEscalationRequested` synthetic event payload — the daemon
  * block-escalation producer (task 3) mints it for a `pending` `block_escalations`
  * latch row right before it spawns the one-way bus-send helper, advancing the

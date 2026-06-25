@@ -766,6 +766,40 @@ export const HANDOFFS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `tmux_client_focus` singleton descriptor (fn-952) — the persistent
+ * `tmux -C` control worker's live-only view of which session/window/pane the
+ * current real (non-control) tmux client is focused on. One row at most
+ * (`id = 1`, last-write-wins UPSERT). Modeled on `AUTOPILOT_STATE_DESCRIPTOR`:
+ * single-row singleton, `version: 'last_event_id'` so the diff fires on every
+ * fold, unbounded page limit (the page can only ever hold the one row). The
+ * `keeper jobs` banner subscribes over the socket and renders the focus pill; an
+ * empty / never-populated table returns `rows: []` so the no-tmux env still
+ * first-paints.
+ */
+export const TMUX_CLIENT_FOCUS_DESCRIPTOR: CollectionDescriptor = {
+  name: "tmux_client_focus",
+  table: "tmux_client_focus",
+  columns: [
+    "id",
+    "status",
+    "generation_id",
+    "session_name",
+    "window_index",
+    "pane_id",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "id",
+  version: "last_event_id",
+  sortable: new Set(["id", "last_event_id", "updated_at"]),
+  defaultSort: { column: "id", dir: "asc" },
+  filters: {
+    id: "id",
+  },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -784,6 +818,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
+  [TMUX_CLIENT_FOCUS_DESCRIPTOR.name, TMUX_CLIENT_FOCUS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

@@ -630,6 +630,53 @@ export function renderDeadLetterPill(waitingCount: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// tmux client-focus banner pill (fn-952)
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the persistent `[focus <session>:<win> %<pane>]` banner pill from the
+ * `tmux_client_focus` singleton (fn-952). Renders `[focus: none]` when the
+ * singleton is absent (no-tmux env or a worker that never connected) OR its
+ * `status` is anything other than `'focused'` (the worker's `'none'` derivation),
+ * OR the location fields are missing/malformed. `pane_id` already carries tmux's
+ * `%` prefix (e.g. `%9`), so it renders verbatim. A null `window_index` collapses
+ * the `:<win>` segment (`[focus main %9]`) rather than printing `null`.
+ *
+ * The token is informational (no `focus`/`focus:` entry in the icon theme or
+ * `PILL_COLORS`), so it renders icon-free + uncolored — distinct from the warn
+ * `[dead-letter:N]` pill it composes with on the banner. Module-level + exported
+ * so the banner-composition test can assert the shape without the subscribe loop.
+ */
+export function renderTmuxFocusPill(
+  focus:
+    | {
+        status?: string | null;
+        session_name?: string | null;
+        window_index?: number | null;
+        pane_id?: string | null;
+      }
+    | null
+    | undefined,
+): string {
+  if (
+    focus == null ||
+    focus.status !== "focused" ||
+    typeof focus.session_name !== "string" ||
+    focus.session_name === "" ||
+    typeof focus.pane_id !== "string" ||
+    focus.pane_id === ""
+  ) {
+    return "[focus: none]";
+  }
+  const win =
+    typeof focus.window_index === "number" &&
+    Number.isInteger(focus.window_index)
+      ? `:${focus.window_index}`
+      : "";
+  return `[focus ${focus.session_name}${win} ${focus.pane_id}]`;
+}
+
+// ---------------------------------------------------------------------------
 // Sub-agent collapse line builder
 // ---------------------------------------------------------------------------
 

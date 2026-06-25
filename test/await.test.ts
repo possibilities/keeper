@@ -129,13 +129,14 @@ function errorFrame(code: string, message: string, rev = 0): ServerFrame {
 }
 
 /**
- * Deliver a single readiness "all-ten-empty" frame batch under the
+ * Deliver a single readiness "all-eleven-empty" frame batch under the
  * given idPrefix so the helper's first-paint gate clears. fn-721 added
  * `pending_dispatches` as the 6th gated collection; fn-770 added
  * `autopilot_state` + `armed_epics` as the 7th + 8th (the armed-mode
  * eligibility feeds the board/CLI readiness pass mirrors); fn-813 added
  * `scheduled_tasks` as the 9th (the jobs-TUI cron detail feed); fn-941 added
- * `block_escalations` as the 10th (the escalation latch feed).
+ * `block_escalations` as the 10th (the escalation latch feed); fn-952 added
+ * `tmux_client_focus` as the 11th (the control-worker focus singleton).
  */
 function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
   sock.deliver([
@@ -149,11 +150,12 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
   ]);
 }
 
 /**
- * Deliver a ten-collection frame where `epics` carries one row.
+ * Deliver an eleven-collection frame where `epics` carries one row.
  */
 function deliverFiveWithEpic(
   sock: MockSocket,
@@ -171,11 +173,12 @@ function deliverFiveWithEpic(
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
   ]);
 }
 
 /**
- * Deliver a ten-collection readiness frame carrying explicit git + jobs
+ * Deliver an eleven-collection readiness frame carrying explicit git + jobs
  * rows (for AND combos that read git/jobs off the readiness snapshot).
  */
 function deliverFiveWith(
@@ -210,6 +213,7 @@ function deliverFiveWith(
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, [], rev),
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, [], rev),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, [], rev),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, [], rev),
   ]);
 }
 
@@ -1764,12 +1768,12 @@ test("server-up: opens a readiness subscribe and fires met on first snapshot", a
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // server-up rides a full readiness subscribe (ten collections — fn-770
+  // server-up rides a full readiness subscribe (eleven collections — fn-770
   // added `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`;
-  // fn-941 added `block_escalations`), so the initial frame batch is the ten
-  // queries — NOT a bare git/jobs single.
+  // fn-941 added `block_escalations`; fn-952 added `tmux_client_focus`), so the
+  // initial frame batch is the eleven queries — NOT a bare git/jobs single.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
-  expect(outbound.length).toBe(10);
+  expect(outbound.length).toBe(11);
 
   // No terminal before the first snapshot — it blocks.
   expect(h.exitCode).toBeNull();
@@ -2471,9 +2475,10 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A plan-bearing combo rides subscribeReadiness only — its nine
+  // A plan-bearing combo rides subscribeReadiness only — its eleven
   // collections (fn-721 added `pending_dispatches`; fn-770 added
-  // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`), NOT a
+  // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`; fn-941
+  // added `block_escalations`; fn-952 added `tmux_client_focus`), NOT a
   // separate dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
@@ -2488,6 +2493,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "pending_dispatches",
     "scheduled_tasks",
     "subagent_invocations",
+    "tmux_client_focus",
   ]);
 
   // First paint: task not done + repo dirty → armed, no met.

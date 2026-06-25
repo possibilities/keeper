@@ -219,7 +219,7 @@ function errorFrame(
 //     collections produce a result.
 // ---------------------------------------------------------------------------
 
-test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine collections have a result", () => {
+test("subscribeReadiness: first-paint gate withholds onSnapshot until all collections have a result", () => {
   const { factory, socketRef } = makeMockConnect();
   const snapshots: ReadinessClientSnapshot[] = [];
   const handle = subscribeReadiness({
@@ -242,7 +242,7 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine c
   // by fn-637.4 (predicate 9 and the board pill now read
   // `epic.resolved_epic_deps` off the projection).
   const initial = sock.takeOutbound();
-  expect(initial).toHaveLength(10);
+  expect(initial).toHaveLength(11);
   expect(
     initial.map((f) => (f as { collection: string }).collection).sort(),
   ).toEqual([
@@ -256,6 +256,7 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine c
     "pending_dispatches",
     "scheduled_tasks",
     "subagent_invocations",
+    "tmux_client_focus",
   ]);
 
   // Deliver only `epics` first: gate must hold.
@@ -309,12 +310,19 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine c
   sock.deliver([emptyResult("armed_epics", "test-paintgate-armed-epics")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `block_escalations` (empty result — the common no-escalation steady
-  // state): gate clears, snapshot fires exactly once. The empty result is what
-  // clears the gate (the dead_letters / pending_dispatches precedent — an empty
-  // steady-state collection still produces a `result` frame).
+  // Add `block_escalations` (empty result): still missing `tmux_client_focus`
+  // (fn-952), so the gate holds.
   sock.deliver([
     emptyResult("block_escalations", "test-paintgate-block-escalations"),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // Add `tmux_client_focus` (empty result — the common no-tmux / never-connected
+  // steady state): gate clears, snapshot fires exactly once. The empty result is
+  // what clears the gate (the dead_letters / pending_dispatches precedent — an
+  // empty steady-state collection still produces a `result` frame).
+  sock.deliver([
+    emptyResult("tmux_client_focus", "test-paintgate-tmux-client-focus"),
   ]);
   expect(snapshots).toHaveLength(1);
   expect(snapshots[0]?.epics).toEqual([]);
@@ -420,6 +428,7 @@ test("subscribeReadiness: boot-status header fires onBootStatus and forces readi
     "armed_epics",
     "scheduled_tasks",
     "block_escalations",
+    "tmux_client_focus",
   ]) {
     sock.deliver([emptyResult(c, `test-boot-${c.replace(/_/g, "-")}`)]);
   }
@@ -466,6 +475,7 @@ test("subscribeReadiness: snapshot carries every scheduled_tasks row (multi-cron
     emptyResult("autopilot_state", "test-cron-autopilot-state"),
     emptyResult("armed_epics", "test-cron-armed-epics"),
     emptyResult("block_escalations", "test-cron-block-escalations"),
+    emptyResult("tmux_client_focus", "test-cron-tmux-client-focus"),
   ]);
   expect(snapshots).toHaveLength(0);
 
@@ -511,7 +521,7 @@ test("subscribeReadiness: refetch fired while queryInFlight is coalesced into on
   // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
   // fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
   // `armed_epics`).
-  expect(sock.takeOutbound()).toHaveLength(10);
+  expect(sock.takeOutbound()).toHaveLength(11);
 
   // BEFORE the `epics` result resolves the in-flight query, deliver TWO
   // `meta` nudges for `epics` — both should fold into one pending
@@ -579,6 +589,7 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
     emptyResult("scheduled_tasks", "test-dispose-scheduled-tasks"),
     emptyResult("armed_epics", "test-dispose-armed-epics"),
     emptyResult("block_escalations", "test-dispose-block-escalations"),
+    emptyResult("tmux_client_focus", "test-dispose-tmux-client-focus"),
   ]);
   expect(snapshots).toHaveLength(1);
 
@@ -638,6 +649,7 @@ test("subscribeReadiness: dispose() terminate()s the socket (fn-750.3 leak fix)"
     emptyResult("scheduled_tasks", "test-term-scheduled-tasks"),
     emptyResult("armed_epics", "test-term-armed-epics"),
     emptyResult("block_escalations", "test-term-block-escalations"),
+    emptyResult("tmux_client_focus", "test-term-tmux-client-focus"),
   ]);
 
   expect(sock.terminated ?? 0).toBe(0);
@@ -674,6 +686,7 @@ test("subscribeReadiness: a post-paint disconnect terminate()s the dropped socke
     emptyResult("scheduled_tasks", "test-term2-scheduled-tasks"),
     emptyResult("armed_epics", "test-term2-armed-epics"),
     emptyResult("block_escalations", "test-term2-block-escalations"),
+    emptyResult("tmux_client_focus", "test-term2-tmux-client-focus"),
   ]);
   expect(sock1.terminated ?? 0).toBe(0);
 
@@ -739,7 +752,7 @@ test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal
     // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
     // fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
     // `armed_epics`).
-    expect(sock.takeOutbound()).toHaveLength(10);
+    expect(sock.takeOutbound()).toHaveLength(11);
     // The helper installed its steady-poll `setInterval` in `open`; the
     // spy must have observed it.
     expect(pending.size).toBe(1);
@@ -1335,12 +1348,13 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
 
     const slowAt1s = lifecycle.filter((e) => e.event === "query_slow_flight");
-    // Ten collections all in flight, all crossed 1 s — ten emits (fn-626
+    // Eleven collections all in flight, all crossed 1 s — eleven emits (fn-626
     // added `git`; fn-637.4 deleted the completed-epics resolver-only sub;
     // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`;
     // fn-770 added `autopilot_state` + `armed_epics`; fn-813 added
-    // `scheduled_tasks`; fn-941 added `block_escalations`).
-    expect(slowAt1s).toHaveLength(10);
+    // `scheduled_tasks`; fn-941 added `block_escalations`; fn-952 added
+    // `tmux_client_focus`).
+    expect(slowAt1s).toHaveLength(11);
     expect(slowAt1s.map((e) => e.detail?.collection).sort()).toEqual([
       "armed_epics",
       "autopilot_state",
@@ -1352,6 +1366,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
       "pending_dispatches",
       "scheduled_tasks",
       "subagent_invocations",
+      "tmux_client_focus",
     ]);
 
     // t=2500 ms: another poll, latch must hold — no NEW slow-flight events.
@@ -1359,7 +1374,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
     expect(
       lifecycle.filter((e) => e.event === "query_slow_flight"),
-    ).toHaveLength(10);
+    ).toHaveLength(11);
 
     // t=5001 ms: timeout fires. Single-flight `reconnecting` guard means
     // exactly one `query_timeout` event for the FIRST stuck state.
@@ -1483,12 +1498,13 @@ test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh w
     const slowCountAfter = lifecycle.filter(
       (e) => e.event === "query_slow_flight",
     ).length;
-    // Ten collections in the new window, ten fresh emits (fn-626 added
+    // Eleven collections in the new window, eleven fresh emits (fn-626 added
     // `git`; fn-637.4 deleted the completed-epics resolver-only sub;
     // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`;
     // fn-770 added `autopilot_state` + `armed_epics`; fn-813 added
-    // `scheduled_tasks`; fn-941 added `block_escalations`).
-    expect(slowCountAfter - slowCountBefore).toBe(10);
+    // `scheduled_tasks`; fn-941 added `block_escalations`; fn-952 added
+    // `tmux_client_focus`).
+    expect(slowCountAfter - slowCountBefore).toBe(11);
 
     handle.dispose();
   } finally {
@@ -1639,7 +1655,7 @@ test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on t
 
   // Resolve the eight initial queries so subsequent in-flight tracking
   // is clean — refetch coalesce is exercised here, not first-paint.
-  expect(sock.takeOutbound()).toHaveLength(10);
+  expect(sock.takeOutbound()).toHaveLength(11);
   sock.deliver([
     emptyResult("epics", "test-idroute-epics"),
     emptyResult("jobs", "test-idroute-jobs"),
@@ -1651,6 +1667,7 @@ test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on t
     emptyResult("scheduled_tasks", "test-idroute-scheduled-tasks"),
     emptyResult("armed_epics", "test-idroute-armed-epics"),
     emptyResult("block_escalations", "test-idroute-block-escalations"),
+    emptyResult("tmux_client_focus", "test-idroute-tmux-client-focus"),
   ]);
   sock.takeOutbound();
 
@@ -1682,7 +1699,7 @@ test("subscribeReadiness: legacy server compat — patch with no id falls back t
     throw new Error("mock socket never installed");
   }
 
-  expect(sock.takeOutbound()).toHaveLength(10);
+  expect(sock.takeOutbound()).toHaveLength(11);
   sock.deliver([
     emptyResult("epics", "test-legacy-epics"),
     emptyResult("jobs", "test-legacy-jobs"),
@@ -1694,6 +1711,7 @@ test("subscribeReadiness: legacy server compat — patch with no id falls back t
     emptyResult("scheduled_tasks", "test-legacy-scheduled-tasks"),
     emptyResult("armed_epics", "test-legacy-armed-epics"),
     emptyResult("block_escalations", "test-legacy-block-escalations"),
+    emptyResult("tmux_client_focus", "test-legacy-tmux-client-focus"),
   ]);
   sock.takeOutbound();
 
@@ -1777,7 +1795,7 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #1 never installed");
   }
   const initial1 = sock1.takeOutbound();
-  expect(initial1).toHaveLength(10);
+  expect(initial1).toHaveLength(11);
   const initialIds1 = initial1.map((f) => (f as { id: string }).id).sort();
   // fn-770: the reconnect re-primes the two new armed-mode subscriptions
   // (`autopilot_state` + `armed_epics`) with the SAME stable subIds — they're
@@ -1794,6 +1812,7 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     "test-reconnect-pending-dispatches",
     "test-reconnect-scheduled-tasks",
     "test-reconnect-subagent-invocations",
+    "test-reconnect-tmux-client-focus",
   ]);
 
   // Force a close so `connectWithRetry` re-runs `connectOnce` and
@@ -1807,7 +1826,7 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #2 never installed");
   }
   const initial2 = sock2.takeOutbound();
-  expect(initial2).toHaveLength(10);
+  expect(initial2).toHaveLength(11);
   const initialIds2 = initial2.map((f) => (f as { id: string }).id).sort();
   // EXACT same subIds — they're constants in subscribeReadiness, and the
   // states[] list is built once at the top of the helper and reused
@@ -2217,6 +2236,7 @@ test("subscribeReadiness: armed mode — the eligible epic wins the shared-root 
       { epic_id: "fn-2-bar", last_event_id: 6 },
     ]),
     emptyResult("block_escalations", "test-armed-block-escalations"),
+    emptyResult("tmux_client_focus", "test-armed-tmux-client-focus"),
   ]);
 
   expect(snapshots).toHaveLength(1);
@@ -2269,6 +2289,7 @@ test("subscribeReadiness: empty autopilot_state defaults to yolo — no eligibil
       { epic_id: "fn-2-bar", last_event_id: 6 },
     ]),
     emptyResult("block_escalations", "test-yolo-block-escalations"),
+    emptyResult("tmux_client_focus", "test-yolo-tmux-client-focus"),
   ]);
 
   expect(snapshots).toHaveLength(1);
@@ -2402,7 +2423,7 @@ test("fn-775: pre-paint max_connections frame → reconnect, never onFatal (no r
     if (!sock1) {
       throw new Error("mock socket #1 never installed");
     }
-    expect(sock1.takeOutbound()).toHaveLength(10);
+    expect(sock1.takeOutbound()).toHaveLength(11);
 
     // Deliver the cap reject BEFORE any collection produced a result, then the
     // server `socket.end()`s — simulate that with `closeFromServer()`.
@@ -2578,7 +2599,7 @@ test("fn-775: a malformed-query error frame still terminates (onFatal), cap path
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  expect(sock.takeOutbound()).toHaveLength(10);
+  expect(sock.takeOutbound()).toHaveLength(11);
 
   sock.deliver([errorFrame("unknown_collection", "no such collection", 0)]);
 
