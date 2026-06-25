@@ -116,5 +116,5 @@ Steps:
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Replaced the count LIMIT 32 done-epics window in loadReconcileSnapshot with the time-bounded epics_recent_done collection (recencyBound updated_at >= now - 1800s, mirroring EPICS_DESCRIPTOR's full row shape). Migrated done-epic reconcile tests to real-epoch updated_at, added in/at/out-of-window boundary tests; full suite green.
 ## Evidence
