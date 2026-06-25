@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-25T07:43:21.346000Z",
   "created_at": "2026-06-25T03:36:49.855000Z",
   "depends_on_epics": [],
   "id": "fn-961-fix-uds-one-shot-client-large-frame",
   "last_validated_at": "2026-06-25T03:44:16.527000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix UDS one-shot client large-frame write hang",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T03:44:16.505000Z"
+  "updated_at": "2026-06-25T07:43:21.346000Z"
 }
