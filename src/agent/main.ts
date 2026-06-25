@@ -53,11 +53,6 @@ import {
   VERSION,
 } from "./dispatch";
 import {
-  defaultModalHostDeps,
-  type ModalHostDeps,
-  runModalHost,
-} from "./modal-host";
-import {
   resolveHandle,
   runShowLastMessage,
   runWaitForStop,
@@ -107,17 +102,6 @@ export interface MainDeps {
   env: NodeJS.ProcessEnv;
   cwd: string;
   spawn: SpawnFn;
-  /**
-   * PTY-host launch seam for `--agentwrap-modal` (claude only). Injected so the
-   * modal branch is testable without a real PTY/TTY. `deps` defaults to the
-   * production process surfaces; tests pass a recording host.
-   */
-  runModalHostFn: (runCmd: string[], deps?: ModalHostDeps) => Promise<never>;
-  /**
-   * True iff both stdin and stdout are interactive TTYs — the `--agentwrap-modal`
-   * precondition. Injected so the non-TTY rejection is testable.
-   */
-  isInteractive: () => boolean;
   readChar: () => string;
   listProfilesFn: () => string[];
   pickProfileFn: () => string;
@@ -186,10 +170,6 @@ export function realDeps(): MainDeps {
     env: process.env,
     cwd: process.cwd(),
     spawn: defaultSpawn,
-    runModalHostFn: (runCmd, deps) =>
-      runModalHost(runCmd, deps ?? defaultModalHostDeps()),
-    isInteractive: () =>
-      process.stdin.isTTY === true && process.stdout.isTTY === true,
     readChar: readSingleChar,
     listProfilesFn: listProfiles,
     pickProfileFn: pickProfile,
@@ -862,7 +842,7 @@ export async function main(deps: MainDeps): Promise<never> {
   const { remainingArgs, hasContinueOrResume, hasForkSession, hasPrint } =
     parsed;
   const { agentwrapVerbose, agentwrapVeryVerbose, agentwrapNoConfirm } = parsed;
-  const { agentwrapCodexSessionName, agentwrapModal } = parsed;
+  const { agentwrapCodexSessionName } = parsed;
   let { agentwrapProfile, explicitAgentwrapProfile } = parsed;
 
   // Named preset resolution: the `--agentwrap-preset` flag (or the harnessless
@@ -891,33 +871,6 @@ export async function main(deps: MainDeps): Promise<never> {
     }
     actionLog.push(
       `Resolved preset '${presetName}' (${resolvedPreset.harness})`,
-    );
-  }
-
-  // Experimental --agentwrap-modal precondition gate (claude-only, interactive
-  // TTY-only). Reject early — before any state-sharing / profile setup — so the
-  // error is clear and the no-flag / codex / pi paths stay byte-identical.
-  if (agentwrapModal) {
-    if (agent !== "claude") {
-      deps.writeErr(
-        `Error: --agentwrap-modal is supported only for claude, not ${agent}.\n`,
-      );
-      return deps.exit(2);
-    }
-    if (hasPrint) {
-      deps.writeErr(
-        "Error: --agentwrap-modal requires an interactive session; it cannot be used with -p/--print.\n",
-      );
-      return deps.exit(2);
-    }
-    if (!deps.isInteractive()) {
-      deps.writeErr(
-        "Error: --agentwrap-modal requires an interactive TTY on both stdin and stdout.\n",
-      );
-      return deps.exit(2);
-    }
-    actionLog.push(
-      "Parsed --agentwrap-modal: PTY-host modal overlay (experimental)",
     );
   }
 
@@ -1481,14 +1434,6 @@ export async function main(deps: MainDeps): Promise<never> {
 
   if (sectionsOn) {
     deps.write(`~ launching ${agent}\n`);
-  }
-
-  // Experimental modal host (claude-only, already precondition-gated): host the
-  // child in a Bun PTY under the OpenTUI modal-overlay shell. The no-flag path
-  // (and the entire codex tail above) stay byte-identical on the existing
-  // runWithJobControl seam.
-  if (agentwrapModal) {
-    return deps.runModalHostFn(runCmd);
   }
 
   return runWithJobControl(runCmd, deps.spawn, deps.exit);

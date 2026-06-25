@@ -107,16 +107,6 @@ describe("parseArgs", () => {
     expect(p.remainingArgs).toEqual([]);
   });
 
-  test("--agentwrap-modal is a bare bool, stripped from the residual argv", () => {
-    const p = parseArgs(["--agentwrap-modal", "hello"]);
-    expect(p.agentwrapModal).toBe(true);
-    expect(p.remainingArgs).toEqual(["hello"]);
-  });
-
-  test("--agentwrap-modal defaults to false", () => {
-    expect(parseArgs(["hi"]).agentwrapModal).toBe(false);
-  });
-
   test("--agentwrap-preset split form is consumed and stripped", () => {
     const p = parseArgs(["--agentwrap-preset", "claude-opus-xhigh", "hi"]);
     expect(p.agentwrapPreset).toBe("claude-opus-xhigh");
