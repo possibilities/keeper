@@ -70,5 +70,5 @@ no fn-ids in prose).
       `model=`), and the absence of the stale claim; `bun test` fast tier green.
 
 ## Done summary
-
+Reduced /plan:panel to a thin shim that Task()s plan:panel-runner (no model=) and renders its return, surfacing the PANEL_RUN_FAILED marker as a panel failure; renamed the dispatch surface across panel.md/panel-judge.md/CLAUDE.md, dropped the stale never-in-a-subagent claim, and added consistency-skills coverage for the runner frontmatter + shim spawn shape.
 ## Evidence
