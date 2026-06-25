@@ -21,4 +21,5 @@ Before `killWindow`, verify the live pane at `backend_exec_pane_id` still belong
 - [ ] a matching (generation, pane) for a cleanly-stopped keeper job is still reaped
 - [ ] reaper stays read-only on jobs; no throw on missing topology (degrades to skip)
 ## Done summary
+Window-reaper now cross-checks the latest TmuxTopologySnapshot before each kill (livePaneOwned guard): a kill fires only when the live pane still belongs to this job at its recorded generation; a recycled %N, reassigned pane, absent pane, or unavailable snapshot degrades to skip. Threaded backend_exec_generation_id through the jobs read and ReapCandidate.
 ## Evidence
