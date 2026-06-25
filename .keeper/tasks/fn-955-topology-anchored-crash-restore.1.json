@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "carry job_id in topology snapshot payload",
-  "updated_at": "2026-06-24T23:47:12.247000Z"
+  "updated_at": "2026-06-25T04:48:43.069000Z",
+  "worker_done_at": "2026-06-25T04:48:43.069000Z"
 }

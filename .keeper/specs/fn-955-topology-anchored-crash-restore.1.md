@@ -35,5 +35,5 @@ Add a `seedTmuxTopologySnapshot(db, id, generationId, panes)` helper (mirrors `s
 - [ ] `seedTmuxTopologySnapshot` test helper added; decoder + fold-invariance tests green
 
 ## Done summary
-
+Added optional per-pane job_id to TmuxTopologySnapshot: producer stamps it via a pane_id-to-job join (excluded from hashTopology), the reducer decoder type-narrows and round-trips it, and the fold stays unchanged for re-fold determinism. Added seedTmuxTopologySnapshot helper plus decoder + fold-invariance tests.
 ## Evidence
