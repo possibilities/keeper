@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T12:09:56.644000Z",
+  "depends_on": [],
+  "epic": "fn-969-fix-autopilot-banner-and-worktree-gate",
+  "id": "fn-969-fix-autopilot-banner-and-worktree-gate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Serve worktree_mode on the autopilot_state wire descriptor",
+  "updated_at": "2026-06-25T12:09:56.644000Z"
+}
