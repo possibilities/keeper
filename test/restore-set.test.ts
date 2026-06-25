@@ -1009,6 +1009,41 @@ test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback whe
   expect(res.fallbackNote).toBeUndefined();
 });
 
+test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded — a recycled pane_id from another generation never resolves the wrong job", () => {
+  // F5 regression pin: the join keys on (generation_id, pane_id) precisely so a
+  // tmux pane id reused across server generations cannot cross-resolve. Two jobs
+  // share pane %3 under two distinct generations. The wrong-generation row is
+  // seeded FIRST (lower rowid) so an unqualified pane_id-only scan would return
+  // it under LIMIT 1 — i.e. dropping generation_id from the join key fails here.
+  seedJob(kdb.db, {
+    job_id: "wrong-gen",
+    state: "killed",
+    title: "stale-occupant",
+    window_index: 0,
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%3",
+    backend_exec_generation_id: "gen-stale",
+  });
+  seedJob(kdb.db, {
+    job_id: "right-gen",
+    state: "killed",
+    title: "dying-occupant",
+    window_index: 0,
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%3",
+    backend_exec_generation_id: "gen-dead",
+  });
+  // The dying generation's snapshot omits job_id, forcing the projection join.
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    { pane_id: "%3", session_name: "work", window_index: 0 }, // no job_id
+  ]);
+  const res = deriveTopo("gen-now");
+  // Only the dying generation's job resolves; the recycled-pane row is never hit.
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["right-gen"]);
+  expect(res.candidates[0]?.resume_target).toBe("dying-occupant");
+  expect(res.fallbackNote).toBeUndefined();
+});
+
 test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot overall is the dying generation", () => {
   // No server up at restore time. The newest snapshot (id 600, gen-late) is the
   // dying generation; an older snapshot (id 500, gen-early) is ignored.
