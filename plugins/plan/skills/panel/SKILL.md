@@ -11,180 +11,71 @@ argument-hint: "[hard question]"
 
 # Panel
 
-Panel turns one question into a panel. The question goes to the panel's members **at the same time**, each
-answering independently — with web search and bash, and with no knowledge of the others. Then the
-`plan:panel-judge` subagent reads every answer, extracts the structure of the panel's reasoning (what
-they agree on, where they conflict, what only one saw, what they all missed), and writes a final answer
-grounded in that analysis.
+Panel turns one question into a panel: the question goes to several models **at the same time**, each
+answering independently — with web search and bash, blind to the others — and the `plan:panel-judge`
+subagent reads every answer, extracts the structure of the panel's reasoning (what they agree on, where
+they conflict, what only one saw, what they all missed), and writes a final answer grounded in that
+analysis.
 
 The whole mechanism is **independence, then synthesis**. The diversity that makes a panel beat a single
 model is harvested, not manufactured: running the same question independently yields different reasoning
 paths, tool calls, and sources. So there are no assigned "lenses" or personas — every panelist gets the
 human's task verbatim and answers it straight. Read `references/panel.md` for the independence rules.
 
-**Architecture (read before you start).** You — the orchestrator — run in the MAIN session because the
-Monitor tool that drives `keeper pair` works only here, never in a subagent (verified). So you do the fan-out in
-your own context, then hand the judging to the `plan:panel-judge` subagent. You **never read panelist
-answer content into your context**: you collect only the answer-file PATHS from the completed events and
-pass those paths to the judge. That keeps you lean — the full transcripts live in files the judge reads in
-its own context.
+**Architecture.** You are a thin shim. The entire fan-out — resolving the panel, launching the panelists,
+waiting for them token-free, and spawning the judge — runs inside the `plan:panel-runner` subagent, which
+you spawn with one `Task()` call. The runner owns the blocking fan-out, so a panel can be convened from
+anywhere — the main session, another skill, or a worker — and panelist transcripts never enter your
+context. You hand the runner the question and render what it returns; you never read a panelist's answer
+yourself.
 
-## Step 0 — Resolve the panel
+## Spawn the runner
 
-The panel's members come from a named `panels.<name>` array in the launch-config registry
-(`~/.config/agentwrap/presets.yaml`), resolved through the launcher's `presets resolve` verb. Default to
-the `default` panel unless the human named another. Resolve it once:
-
-```bash
-PANEL=default   # or the panel name the human named
-keeper agent presets resolve "$PANEL"
-```
-
-On a hit this prints one JSON line — `{"kind":"panel","name":"<panel>","members":[{"name":"<preset>","harness":"claude|codex"},...]}` —
-listing the panelists in declaration order, each named by its **preset** (not its harness), so two
-panelists on the same harness but different models stay distinguishable. Capture that JSON for Step 2.
-
-**Backward-compat fallback.** When no registry exists, or the named panel is undefined, `presets resolve`
-exits non-zero. Treat that as a clean signal to fall back to the legacy two-model form — **Opus 4.8
-(`--cli claude`) + GPT-5.5 (`--cli codex`)** — so the panel works with zero config and presets are a pure
-opt-in upgrade. (An empty `members` array, by contrast, is a misconfigured panel — surface that error, do
-not fan out.) Both members run read-only and in parallel either way.
-
-An example registry an operator would define:
-
-```yaml
-# ~/.config/agentwrap/presets.yaml
-presets:
-  claude-opus-xhigh: { harness: claude, model: opus, effort: xhigh }
-  codex-gpt55-high:  { harness: codex,  model: gpt-5.5, effort: high }
-panels:
-  default: [claude-opus-xhigh, codex-gpt55-high]
-```
-
-## Step 1 — Build the panelist prompt
-
-Create the panel's scratch dir, then write ONE prompt file with the human's task **verbatim** plus the
-short independence instruction — the same file goes to both panelists (no lenses, no per-panelist
-framing):
-
-```bash
-mkdir -p /tmp/panel-${CLAUDE_CODE_SESSION_ID}
-cat > /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md <<'PROMPT'
-<the human's task, VERBATIM — do not summarize, reframe, or pre-digest it>
-
----
-You are one of several independent experts answering this question. You will NOT see the other experts'
-answers, and they will not see yours. Research it cold with web search and bash, then return a complete,
-self-contained answer to the question above. Do not hedge about being on a panel — just answer.
-PROMPT
-```
-
-Pass the task verbatim. Never add a lens, a stance, or your own read of the problem — that corrupts the
-independence the panel runs on.
-
-## Step 2 — Fan out, in parallel and blind
-
-Launch **every panelist in a single turn** (one Monitor call per member, all in one message) so they run
-concurrently. Each writes to its own `--output` file, named by its **preset** so two same-harness members
-stay distinguishable. keeper-pair partners have full filesystem access — the prompt gives directions and
-the verbatim task, never pre-read content.
-
-**Preset form (registry hit).** Parse the Step-0 JSON with `jq` and emit one Monitor call per member,
-binding that member's preset:
-
-```bash
-echo "$PANEL_JSON" | jq -r '.members[].name'   # one preset name per line
-```
-
-For each preset name `<member>` returned, issue:
+Pass the human's task **verbatim** — never summarize, reframe, or pre-read referenced content into it; that
+corrupts the independence the panel runs on. If the human named a specific panel, name it; otherwise the
+runner defaults to the `default` panel.
 
 ```
-Monitor(
-    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --preset <member> --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/<member>.yaml',
-    description="panel <member>",
-    timeout_ms=3600000,
-    persistent=false,
+Task(
+    subagent_type="plan:panel-runner",
+    description="convene panel",
+    prompt="""<the human's task, VERBATIM — do not summarize, reframe, or pre-digest it>
+
+Panel: <the panel name the human named, or omit this line for the default panel>"""
 )
 ```
 
-All member Monitor calls go out in ONE message — same parallel fan-out, same two-line per-run contract as
-before. The `--output` file is labeled by preset name; keep that `<member> → <path>` mapping for the judge
-in Step 3.
+No `model=` kwarg — the agent file owns the model and effort. The runner resolves the panel composition,
+fans the panelists out, waits for every leg, spawns the judge, and returns the judge's fused answer. Pass
+neutral evidence only — the verbatim task, and a panel name if the human gave one — never your own read of
+the problem.
 
-**Legacy form (no registry / undefined panel).** When Step 0 fell back, emit the two-model form instead —
-one Monitor call each, in the same single turn:
+## On a panel failure
 
-```
-Monitor(
-    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli claude --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/opus.yaml',
-    description="panel opus",
-    timeout_ms=3600000,
-    persistent=false,
-)
-Monitor(
-    command='keeper pair send /tmp/panel-${CLAUDE_CODE_SESSION_ID}/prompt.md --cli codex --read-only --session panels --output /tmp/panel-${CLAUDE_CODE_SESSION_ID}/codex.yaml',
-    description="panel codex",
-    timeout_ms=1860000,
-    persistent=false,
-)
-```
+The runner returns the sentinel `PANEL_RUN_FAILED` (with a `reason:` line and the per-leg status) when any
+leg fails, times out, or never produces its output — or when the panel resolves to zero members. On that
+marker, tell the human that **the panel failed** and why; do **not** present the failure text as an answer.
+No judge ran, so there is no panel answer to render.
 
-- Neither panelist gets an assigned role or persona — every member answers the human's task straight. The
-  diversity the panel harvests is the spread of models the panel array (or the legacy claude+codex pair)
-  spans.
-- `--read-only` on every member: claude strips its edit tools; codex carries read-only via its prompt
-  directive. Each panelist runs as an interactive TUI; a codex panelist's cwd directory-trust is pre-seeded
-  (fail-open) so its window never hangs on the trust prompt.
-- `--session panels` on every member: panelists land in a dedicated `panels` tmux session. A claude panelist
-  registers as a tracked job; its stopped window is autoclosed by keeperd's daemon reaper past an idle
-  grace, so attach promptly (`tmux attach -t panels`) to inspect a panelist's full session. To keep the
-  windows open for inspection, add `panels` to the `disable_autoclose` config key (default empty).
-  Concurrent legs share the session safely — `keeper agent` recovers from the create race.
-- `keeper pair` emits a strict two-line contract on stdout: one `[keeper-pair] started …` line, then one
-  terminal line. When `started` arrives, do nothing until the terminal line for that run. On
-  `[keeper-pair] completed …`, note the exact `--output` path you passed — **do not read its content into
-  your context**. On `[keeper-pair] failed …`, surface the `error=…` field; that panelist produced no
-  usable answer.
+## Absorb, then answer
 
-The `--output` file is a YAML whose `message` is the panelist's own final answer; `completed` fires only
-after its atomic temp-then-rename, so the moment you see it the file is whole. That file IS the answer-file
-path you hand to the judge — the judge reads it in its own context, not you.
-
-## Step 3 — Spawn the judge subagent
-
-Once all runs have completed, spawn `plan:panel-judge` via the Agent tool with the original question
-verbatim and the answer-file PATHS — never the content. Give the judge:
-
-- The **original question**, verbatim (the same text the panelists got).
-- **Answer-file paths**, one per panelist, each labeled by its **preset name** so two same-harness members
-  stay distinguishable — e.g. `claude-opus-xhigh → /tmp/panel-<sid>/claude-opus-xhigh.yaml`,
-  `codex-gpt55-high → /tmp/panel-<sid>/codex-gpt55-high.yaml`. (On the legacy fallback the labels are the
-  two-model names — `opus → …/opus.yaml`, `gpt-5.5 → …/codex.yaml`.)
-
-The judge reads every answer file in full in its own context, classifies
-the deliverable (artifact → merge & verify; research → five-section synthesis), and returns the final
-answer plus the audit. You do not read the panelist files; the judge is the only place the answers meet.
-
-## Step 4 — Absorb, then answer
-
-Treat the judge's final answer as your own conclusion — data you received, now your thinking — and answer
-the human in whatever shape the question needs: a plain answer, a report, a sketch, a ready-to-plan
-proposal, an open question. Never wrap it in a "here's what the panel did" container, never dump the
-five-section audit, never add a composition note, and don't name the panel by default. For a directly
-invoked `/plan:panel`, answer the question in its natural shape as your own answer.
+On success the runner returns the judge's fused answer. Treat it as your own conclusion — data you
+received, now your thinking — and answer the human in whatever shape the question needs: a plain answer, a
+report, a sketch, a ready-to-plan proposal, an open question. Never wrap it in a "here's what the panel
+did" container, never dump the judge's audit, never add a composition note, and don't name the panel by
+default. For a directly invoked `/plan:panel`, answer the question in its natural shape as your own answer.
 
 **Reveal on demand.** If the human asks how you reached the answer / what contributed / to see the panel,
-*then* surface the audit and composition and point to each panelist's `transcript_path` (from its
-`--output` YAML) / `claudectl show-session` for the full runs. A substance follow-up ("are you sure?",
-"why?") is not that trigger — answer it
-substantively in your own voice, not with a panel reveal.
+*then* surface the composition and point them at the panelist runs — each lands in the `panels` tmux
+session, one `tmux attach -t panels` / `claudectl show-session` away. A substance follow-up ("are you
+sure?", "why?") is not that trigger — answer it substantively in your own voice, not with a panel reveal.
 
-**Hedge as yourself.** When the judge's contradictions or blind spots tell you the answer is genuinely
-uncertain, express that low confidence in your own voice — you are unsure, not "the panel disagreed."
+**Hedge as yourself.** When the fused answer's contradictions or blind spots tell you the answer is
+genuinely uncertain, express that low confidence in your own voice — you are unsure, not "the panel
+disagreed."
 
-Never paste panelist transcripts. The judge's audit is retained for the reveal path; the full panelist
-runs are one `transcript_path` read (from the `--output` YAML) / `claudectl show-session` call away if the
-human wants to dig in.
+Never paste panelist transcripts. The full panelist runs live in the `panels` tmux session if the human
+wants to dig in.
 
 ## Cost & latency note
 

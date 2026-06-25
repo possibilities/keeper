@@ -1,9 +1,9 @@
 # The panel
 
 The panel's power comes from **independent answers, synthesized** — not from a clever prompt or assigned
-personas. You dispatch the same question to several models at once, each works the problem cold with no
-knowledge of the others, and the judge fuses their answers. Independent agreement is high-confidence;
-independent disagreement is exactly the signal worth surfacing.
+personas. The `plan:panel-runner` subagent dispatches the same question to several models at once, each
+works the problem cold with no knowledge of the others, and the judge fuses their answers. Independent
+agreement is high-confidence; independent disagreement is exactly the signal worth surfacing.
 
 ## No lenses, no personas
 
