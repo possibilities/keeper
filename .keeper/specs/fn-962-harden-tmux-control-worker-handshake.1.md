@@ -39,5 +39,5 @@ lands in the same commit.
 - [ ] `bun run test:full` is green (touches the worker/git process path).
 
 ## Done summary
-
+Gate the tmux control bootstrap release on the unsolicited attach handshake reply fully settling (via a connection-scoped stateful parser that reassembles a split %begin/%end), not on a mere chunk-with-line, so no reply is mis-correlated. Added a fast-tier synthetic-child test over the ControlChild seam pinning the split-handshake drop, FIFO no-mis-match, and exactly-one redirty re-arm.
 ## Evidence

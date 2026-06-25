@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Deterministic handshake-drop and test",
-  "updated_at": "2026-06-25T03:56:45.431000Z"
+  "updated_at": "2026-06-25T07:46:17.167000Z",
+  "worker_done_at": "2026-06-25T07:46:17.167000Z"
 }
