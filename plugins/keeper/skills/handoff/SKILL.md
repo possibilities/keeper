@@ -84,15 +84,17 @@ Flags:
 | `--session <s>` | Target tmux session. Default: `$KEEPER_TMUX_SESSION` > current > `work`. |
 | `--no-prefix` | Skip the configured `handoff_prompt_prefix` for this one call (so the brief does NOT boot into `/hack`). |
 
-On success it prints the `handoff_id` and the resolved target session, and
-exits 0. The keeperd dispatcher mints a durable pre-launch marker and launches
+On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
+keeperd dispatcher resolves the target session internally; the CLI does not echo
+it. The keeperd dispatcher mints a durable pre-launch marker and launches
 the handoff-ee — a daemon restart mid-dispatch never double-launches.
 
 ## Step 3 — Report
 
 Surface to the human:
 
-- The `handoff_id` and the target session it dispatched into.
+- The `handoff_id`. (The CLI does not report the target session; it dispatches
+  into your current/`--session` tmux session per the precedence above.)
 - How to inspect: `keeper board` (the handoff-from → handoff-to relationship
   renders on your row and the handoff-ee's once it binds), and
   `keeper handoff show <handoff_id>` (prints the stored brief — also the
@@ -104,7 +106,7 @@ Then stop. This is fire-and-forget — do not wait on or monitor the handoff-ee.
 
 | Exit | Meaning | Your action |
 |---|---|---|
-| 0 | Enqueued. | Surface the `handoff_id` + target session + how to inspect. |
+| 0 | Enqueued. | Surface the `handoff_id` + how to inspect. |
 | 1 | Enqueue failure (e.g. daemon unreachable). | Read the message and surface it — keeperd may be down. |
 | 2 | Arg fault: both `--prompt` and `--prompt-file`, neither, an over-64KB brief, or a NUL byte. | For a large brief, write it to a file and use `--prompt-file`. |
 
