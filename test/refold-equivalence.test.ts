@@ -56,6 +56,7 @@ import {
   countAbsentBlobs,
   deleteNoopSnapshotRows,
   NOOP_SNAPSHOT_DELETE_PREDICATE,
+  RETENTION_KEEP_CLASS_PREDICATE,
   RETENTION_SHED_CLASS_PREDICATE,
   RETENTION_SHED_PREDICATE,
   retainColdPayloads,
@@ -1998,6 +1999,10 @@ test("no-op-snapshot delete predicate is pinned to exactly the three retired no-
     // predicate (`TMUX_FOCUS_DELETE_PREDICATE`, re-fold-safe via the LIVE-ONLY
     // singleton), NEVER folded into THIS pinned three-class set.
     ["TmuxClientFocusSnapshot", null],
+    // The epic fn-955 restore source-of-truth class is EXPLICITLY KEPT
+    // (`RETENTION_KEEP_CLASS_PREDICATE`), never deletable — it must NOT appear in
+    // the no-op delete set (adding the explicit keep does not perturb this set).
+    ["TmuxTopologySnapshot", null],
   ] as Array<[string, string | null]>) {
     expect({ he, tool, match: matches(he, tool) }).toEqual({
       he,
@@ -2012,6 +2017,45 @@ test("no-op-snapshot delete predicate is pinned to exactly the three retired no-
   expect(NOOP_SNAPSHOT_DELETE_PREDICATE).not.toBe(
     RETENTION_SHED_CLASS_PREDICATE,
   );
+  probe.close();
+});
+
+test("the explicit TmuxTopologySnapshot keep predicate is a cheap-column gate, AND-NOTed into the shed gate, and never sheds the snapshot (fn-955.4)", () => {
+  // The restore source-of-truth class is retained by an EXPLICIT positive keep
+  // invariant. Pin the three contract properties: cheap-column class gate (no
+  // json parse — so it composes into the body-NULL gate without re-parsing a
+  // possibly-NULL body), AND-NOTed into RETENTION_SHED_PREDICATE as the defensive
+  // backstop, and never selected by the shed predicate over a real snapshot row.
+  expect(RETENTION_KEEP_CLASS_PREDICATE).not.toContain("json_extract");
+  expect(RETENTION_KEEP_CLASS_PREDICATE).not.toContain("json_valid");
+  expect(RETENTION_KEEP_CLASS_PREDICATE).toContain("TmuxTopologySnapshot");
+  expect(RETENTION_SHED_PREDICATE).toContain(
+    `NOT (${RETENTION_KEEP_CLASS_PREDICATE})`,
+  );
+
+  const probe = new Database(":memory:");
+  probe.run(
+    `CREATE TABLE events (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, hook_event TEXT, tool_name TEXT,
+       plan_op TEXT, subagent_agent_id TEXT, mutation_path TEXT, data TEXT
+     )`,
+  );
+  // A TmuxTopologySnapshot row carrying the panes+job_id body the deriver reads
+  // is NEVER selected by the body-NULL shed predicate — its body survives.
+  probe.run(
+    `INSERT INTO events (hook_event, data)
+     VALUES ('TmuxTopologySnapshot', ?)`,
+    [JSON.stringify({ generation_id: 1, panes: [{ job_id: "fn-x.1" }] })],
+  );
+  expect(
+    (
+      probe
+        .query(
+          `SELECT COUNT(*) AS n FROM events WHERE ${RETENTION_SHED_PREDICATE}`,
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
   probe.close();
 });
 

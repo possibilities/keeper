@@ -168,6 +168,39 @@ export const RETENTION_SHED_CLASS_PREDICATE = `(
       )`;
 
 /**
+ * The EXPLICIT class-level KEEP invariant — `TmuxTopologySnapshot` rows AND their
+ * bodies are retained unconditionally, never shed and never deleted.
+ *
+ * Crash-restore's topology-anchored deriver reads each snapshot's panes (+ the
+ * per-pane `job_id`) straight from the EVENT PAYLOAD of the dying server
+ * generation's last `TmuxTopologySnapshot`, so the body is restore's source of
+ * truth — NULLing it or deleting the row would silently destroy the anchor.
+ *
+ * Today the class survives only INCIDENTALLY: it is absent from
+ * {@link RETENTION_SHED_CLASS_PREDICATE} (a positive shed allow-list whose
+ * complement is the keep-set) AND from {@link NOOP_SNAPSHOT_DELETE_PREDICATE} /
+ * {@link TMUX_FOCUS_DELETE_PREDICATE} (the row-delete allow-lists). A future
+ * widen of ANY of those could capture it by accident. This positive keep
+ * predicate makes the retention contract DEFENSIVE: it is AND-NOTed into the
+ * body-NULL gate ({@link RETENTION_SHED_PREDICATE}) AND into every row-delete
+ * pass ({@link deleteColdRowsByPredicate}), so the snapshot survives even if a
+ * later edit widens a shed/delete allow-list to nominally include it.
+ *
+ * It also DOMINATES the live-only skip-floor: `TmuxTopologySnapshot` is a
+ * live-only fold arm, so a historical (id ≤ floor) snapshot no-ops on re-fold and
+ * would otherwise be delete-safe — but the keep guard sits in the SQL shed/delete
+ * gates, not the fold, so restore's source survives regardless of the floor.
+ *
+ * Cheap-column class gate ONLY (a `hook_event` match, never `json_extract`) — the
+ * same hard contract as the shed/delete predicates, so it composes into them and
+ * into {@link countAbsentBlobs}'s header-only probe without ever re-parsing a body.
+ * Unconditional retention is cheap because snapshots are small and change-gated; a
+ * generation-aware "last N" prune (which would need a new indexed `generation_id`
+ * column) is a deferred follow-up, only if accumulation is ever observed.
+ */
+export const RETENTION_KEEP_CLASS_PREDICATE = `hook_event = 'TmuxTopologySnapshot'`;
+
+/**
  * The SHED-CLASS retention predicate — the class allow-list AND the
  * mutation-tool backfill guard.
  *
@@ -184,9 +217,14 @@ export const RETENTION_SHED_CLASS_PREDICATE = `(
  * file_path-less mutation body (extract NULL) is freely sheddable — the fold
  * reads NULL either way.
  *
- * Keep-set bodies structurally fail the class match and are NEVER touched.
+ * Keep-set bodies structurally fail the class match and are NEVER touched. The
+ * explicit {@link RETENTION_KEEP_CLASS_PREDICATE} (`TmuxTopologySnapshot`) is
+ * AND-NOTed in as a DEFENSIVE backstop: that class is not in the shed allow-list
+ * today, but the hard exclusion guarantees a future allow-list widen can never
+ * NULL restore's source-of-truth body.
  */
 export const RETENTION_SHED_PREDICATE = `${RETENTION_SHED_CLASS_PREDICATE}
+   AND NOT (${RETENTION_KEEP_CLASS_PREDICATE})
    AND NOT (
          mutation_path IS NULL
          AND CASE WHEN json_valid(data)
@@ -672,11 +710,15 @@ function deleteColdRowsByPredicate(
   // One prepared statement set, reused across batches. The SELECT picks the next
   // cold matching batch by id; the DELETE removes the SAME ids. Both share the
   // `id <= ceiling AND <predicate>` filter so a row the SELECT picked is exactly
-  // the row the DELETE removes.
+  // the row the DELETE removes. The explicit {@link RETENTION_KEEP_CLASS_PREDICATE}
+  // is AND-NOTed in as a DEFENSIVE backstop: no current delete predicate matches
+  // `TmuxTopologySnapshot`, but the hard exclusion guarantees a future delete-set
+  // widen can never physically remove restore's source-of-truth row.
   const selectBatch = db.prepare(
     `SELECT id FROM events
       WHERE id <= ?
-        AND ${predicate}
+        AND (${predicate})
+        AND NOT (${RETENTION_KEEP_CLASS_PREDICATE})
       ORDER BY id ASC
       LIMIT ?`,
   );

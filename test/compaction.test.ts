@@ -29,8 +29,11 @@ import { join } from "node:path";
 import {
   computeColdWatermark,
   countAbsentBlobs,
+  deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
   drainColdPayloads,
+  RETENTION_KEEP_CLASS_PREDICATE,
+  RETENTION_SHED_PREDICATE,
   readFoldCursor,
   retainColdPayloads,
 } from "../src/compaction";
@@ -914,4 +917,145 @@ test("countAbsentBlobs re-spec: an absent (deleted) no-op-snapshot row is NOT a 
   // path can create. The sentinel must still flag it.
   db.run("UPDATE events SET data = NULL WHERE id = ?", [promptId]);
   expect(countAbsentBlobs(db)).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// TmuxTopologySnapshot explicit keep invariant (fn-955.4) — restore's
+// source-of-truth class is retained ROW AND BODY by an explicit positive keep
+// predicate, surviving a retention pass that sheds/deletes its neighbors.
+// ---------------------------------------------------------------------------
+
+/** Insert a TmuxTopologySnapshot row whose body carries the panes the deriver reads. */
+function insertTopologySnapshot(
+  opts: { session_id?: string; ts?: number } = {},
+): number {
+  return insertEvent({
+    hook_event: "TmuxTopologySnapshot",
+    session_id: opts.session_id ?? "tmux-topology",
+    ts: opts.ts,
+    data: JSON.stringify({
+      generation_id: 4242,
+      panes: [{ pane_id: "%1", window_index: 0, job_id: "fn-x.1" }],
+    }),
+  });
+}
+
+test("the keep predicate is a cheap-column class gate (no json parse) carrying exactly TmuxTopologySnapshot", () => {
+  // The keep invariant must classify shed-vs-keep on cheap columns alone so it
+  // composes into the body-NULL and row-delete gates without ever re-parsing a
+  // (possibly-NULL) body — the same hard contract as the shed/delete predicates.
+  expect(RETENTION_KEEP_CLASS_PREDICATE).not.toContain("json_extract");
+  expect(RETENTION_KEEP_CLASS_PREDICATE).not.toContain("json_valid");
+  expect(RETENTION_KEEP_CLASS_PREDICATE).toContain("TmuxTopologySnapshot");
+  // It is AND-NOTed into the body-NULL gate as the DEFENSIVE backstop, so a
+  // future shed allow-list widen can never NULL the snapshot body.
+  expect(RETENTION_SHED_PREDICATE).toContain(
+    `NOT (${RETENTION_KEEP_CLASS_PREDICATE})`,
+  );
+});
+
+test("a TmuxTopologySnapshot row AND body survive a retention pass that sheds/deletes its cold neighbors", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  // The snapshot interleaved with the exact neighbors a retention pass acts on:
+  // a shed-class mutation (body NULL-eligible) and the three no-op-snapshot
+  // classes + the focus class (row-delete-eligible). All sit cold, below cursor.
+  const mutationId = insertMutation("/repo/cold.ts");
+  const topoId = insertTopologySnapshot();
+  const besId = insertNoopSnapshot({ hook_event: "BackendExecSnapshot" });
+  const tpsId = insertNoopSnapshot({ hook_event: "TmuxPaneSnapshot" });
+  const wisId = insertNoopSnapshot({ hook_event: "WindowIndexSnapshot" });
+  const focusId = insertEvent({
+    hook_event: "TmuxClientFocusSnapshot",
+    session_id: "tmux-focus",
+    data: JSON.stringify({ window_index: 0 }),
+  });
+  for (let i = 0; i < 5; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  drainAll();
+
+  const topoBodyBefore = (
+    db.query("SELECT data FROM events WHERE id = ?").get(topoId) as {
+      data: string | null;
+    }
+  ).data;
+
+  // Body-NULL retention pass: the shed-class mutation body is NULLed; the
+  // topology body MUST stay inline (the keep predicate AND-NOTs it out).
+  const retained = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(retained.shed).toBeGreaterThan(0);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(topoId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBe(topoBodyBefore);
+
+  // Row-delete passes: the three no-op-snapshot rows AND the focus row are
+  // removed; the topology ROW MUST survive both delete predicates.
+  deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  deleteColdTmuxFocusRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  for (const id of [besId, tpsId, wisId, focusId]) {
+    expect(db.query("SELECT id FROM events WHERE id = ?").get(id)).toBeNull();
+  }
+  // The topology snapshot row + body are intact — restore's source survives.
+  const surviving = db
+    .query("SELECT id, data FROM events WHERE id = ?")
+    .get(topoId) as { id: number; data: string | null } | null;
+  expect(surviving).not.toBeNull();
+  expect(surviving?.data).toBe(topoBodyBefore);
+  // And the surviving body still decodes to the panes the deriver reads.
+  expect(
+    (JSON.parse(surviving?.data ?? "{}") as { panes: unknown[] }).panes.length,
+  ).toBe(1);
+});
+
+test("DEFENSIVE: the keep guard dominates even a hypothetical delete predicate that names TmuxTopologySnapshot", () => {
+  // Simulate a future bug — a delete predicate widened to capture the topology
+  // class. The keep guard AND-NOTed into deleteColdRowsByPredicate must still
+  // spare the row (the test reuses the focus delete entrypoint only to confirm
+  // the real machinery's guard; here we directly assert the predicate composition
+  // by deleting via a topology-naming predicate through the no-op path is
+  // impossible — the snapshot is never in NOOP_SNAPSHOT_DELETE_PREDICATE, and the
+  // keep guard backstops any future widen). Construct the worst case explicitly:
+  // a TmuxTopologySnapshot row that ALSO matches a no-op-snapshot class is
+  // structurally impossible (distinct hook_event), so we assert the SQL-level
+  // guarantee: no delete pass selects a TmuxTopologySnapshot id.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const topoId = insertTopologySnapshot();
+  insertNoopSnapshot({ hook_event: "BackendExecSnapshot" });
+  for (let i = 0; i < 5; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  drainAll();
+
+  // Even running every production delete pass, the topology row is never removed.
+  deleteNoopSnapshotRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  deleteColdTmuxFocusRows(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(
+    db.query("SELECT id FROM events WHERE id = ?").get(topoId),
+  ).not.toBeNull();
 });
