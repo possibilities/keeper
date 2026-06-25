@@ -2235,8 +2235,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // from the fold arms in tasks .2/.3); v88 appends the `jobs.handoff_links`
   // column (the per-job home for the rendered handoff edge), fn-946 task .2 —
   // an additive ALTER (mirrors `window_index`/v71), not an epics-shape change.
-  // The v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(88);
+  // v89 adds the `tmux_client_focus` LIVE-ONLY client-focus singleton, fn-952
+  // task .2 (comment-only no-op — created via CREATE_TMUX_CLIENT_FOCUS,
+  // populated from the fold arm; no seed/floor, registered in
+  // LIVE_ONLY_PROJECTIONS). The v62→v63 epics-shape migration this test
+  // exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(89);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

@@ -362,6 +362,11 @@ from pathlib import Path
 # v87 (fn-946 task .1) adds the ``handoffs`` reducer projection — the durable
 # ``keeper handoff`` enqueue + dispatcher transactional-outbox record. keeper-py
 # never reads this table, so only the version whitelist gains 87.
+#
+# v89 (fn-952 task .2) adds the ``tmux_client_focus`` LIVE-ONLY singleton — the
+# current tmux client's focused session/window/pane, fed by keeperd's persistent
+# ``tmux -C`` control worker. keeper-py never reads this table, so only the
+# version whitelist gains 89.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -422,6 +427,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         86,
         87,
         88,
+        89,
     }
 )
 

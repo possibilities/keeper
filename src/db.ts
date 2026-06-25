@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 88;
+export const SCHEMA_VERSION = 89;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1520,6 +1520,40 @@ CREATE TABLE IF NOT EXISTS tmux_projection_state (
 `;
 
 /**
+ * LIVE-ONLY singleton (fn-952) holding the current real (non-control) tmux
+ * client's focused session/window/pane, as observed by keeperd's persistent
+ * `tmux -C` control client. Singleton (`CHECK id = 1`), mirroring
+ * {@link CREATE_REDUCER_STATE}.
+ *
+ * Pure LIVE-ONLY — NO floor, NO seed flag, NO boot-seed singleton row. Unlike
+ * the git/tmux-topology surfaces, focus has NO replay-worthy history: the
+ * control worker is the SOLE source of truth and re-bootstraps the whole focus
+ * read on EVERY connect, so a cold DB simply has no row (the collection emits
+ * `rows: []` and `keeper jobs` renders `[focus: none]`). The fold last-write-wins
+ * UPSERTs id=1 from the worker's `TmuxClientFocusSnapshot` events; an empty log
+ * leaves the table empty. Registered in {@link LIVE_ONLY_PROJECTIONS} so a
+ * rewinding migration wipes it via {@link rewindLiveProjection}, never a bare
+ * DELETE, and it is excluded from the byte-identical re-fold charter.
+ *
+ * `generation_id` is the tmux server pid the focus was read under (discarded +
+ * re-read on every reconnect); `window_index` is the focused window's position;
+ * `status` carries the worker's connection liveness ('connected' / 'disconnected'
+ * / 'none'). `last_event_id` / `updated_at` are event id/ts, never wall-clock.
+ */
+const CREATE_TMUX_CLIENT_FOCUS = `
+CREATE TABLE IF NOT EXISTS tmux_client_focus (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    status TEXT,
+    generation_id TEXT,
+    session_name TEXT,
+    window_index INTEGER,
+    pane_id TEXT,
+    last_event_id INTEGER,
+    updated_at REAL
+)
+`;
+
+/**
  * Projection-class taxonomy (Marten's "Live projection lifecycle"). The central
  * source of truth for which projection tables are LIVE-PRODUCER-FED — re-derived
  * by a boot-seed producer + kept current by incremental folds ABOVE a skip-floor,
@@ -1545,6 +1579,11 @@ CREATE TABLE IF NOT EXISTS tmux_projection_state (
 export const LIVE_ONLY_PROJECTIONS = [
   "git_status",
   "file_attributions",
+  // fn-952 — the tmux client-focus singleton. NO floor/seed of its own: the
+  // control worker re-bootstraps focus on every connect, so a bare wipe (the
+  // `rewindLiveProjection` loop's `DELETE FROM`) leaving the table empty is the
+  // correct rewind — no floor to reset, no seed flag to raise.
+  "tmux_client_focus",
 ] as const;
 
 /**
@@ -2237,6 +2276,7 @@ function migrate(db: Database): void {
       db.run(CREATE_REDUCER_STATE);
       db.run(CREATE_GIT_PROJECTION_STATE);
       db.run(CREATE_TMUX_PROJECTION_STATE);
+      db.run(CREATE_TMUX_CLIENT_FOCUS);
       db.run(CREATE_META);
       db.run(CREATE_SUBAGENT_INVOCATIONS);
       for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
@@ -5222,6 +5262,23 @@ function migrate(db: Database): void {
         "handoff_links",
         "TEXT NOT NULL DEFAULT '[]'",
       );
+
+      // v88→v89 (fn-952 task .2): the `tmux_client_focus` LIVE-ONLY singleton —
+      // the current real tmux client's focused session/window/pane, observed by
+      // keeperd's persistent `tmux -C` control worker. Comment-only no-op: the
+      // table is created above via `CREATE_TMUX_CLIENT_FOCUS` in the steady-state
+      // schema-setup block (`IF NOT EXISTS`, so both fresh and migrated paths
+      // converge) and folds from the `TmuxClientFocusSnapshot` arm (the producer
+      // worker lands in task .3). NO seed row, NO floor, NO boot-seed — a pure
+      // live-only singleton with no replay-worthy history; the worker is the sole
+      // source of truth and re-bootstraps focus on every connect, so a cold DB
+      // simply has no row. LIVE-ONLY (in `LIVE_ONLY_PROJECTIONS`): a rewinding
+      // migration wipes it via `rewindLiveProjection`, never a bare DELETE, and it
+      // is excluded from the byte-identical re-fold charter (an empty log re-folds
+      // to an empty table). Whitelist-only Python read (keeper-py never reads this
+      // table) — this bump MUST add 89 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit, or every keeper-py read fails
+      // host-wide; test/schema-version.test.ts enforces this.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -3329,6 +3329,120 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
 }
 
 /**
+ * The decoded `TmuxClientFocusSnapshot` payload (epic fn-952): the current real
+ * (non-control) tmux client's focused location, as observed by keeperd's
+ * persistent `tmux -C` control worker. `status` is the worker's connection
+ * liveness ('connected' / 'disconnected' / 'none'); `generation_id` is the tmux
+ * server pid the focus was read under (discarded + re-read on every reconnect);
+ * `session_name` / `pane_id` identify the focused pane and `window_index` is its
+ * window's left-to-right position. Every field is nullable — an idle / no-focus /
+ * disconnected snapshot carries a `status` with the location fields NULL, which
+ * the fold writes verbatim (the singleton is last-write-wins, never fill-only).
+ */
+interface TmuxClientFocusSnapshot {
+  status: string | null;
+  generation_id: string | null;
+  session_name: string | null;
+  window_index: number | null;
+  pane_id: string | null;
+}
+
+/**
+ * Null-safe decode of a `TmuxClientFocusSnapshot` event's `data` blob into the
+ * validated `{status, generation_id, session_name, window_index, pane_id}`
+ * payload. Returns `null` on a missing / empty / malformed blob (the fold folds a
+ * null payload to a no-op); NEVER throws.
+ *
+ * Each field is type-narrowed INDEPENDENTLY so a partial / garbage field is
+ * normalized to NULL rather than poisoning the whole payload: the string fields
+ * (`status` / `generation_id` / `session_name` / `pane_id`) keep a non-empty
+ * string and normalize everything else (including `""`) to `null`;
+ * `window_index` keeps a finite integer and normalizes a NULL / non-integer /
+ * NaN to `null`. Reads ONLY `event.data` — no probe, no env, no wall-clock —
+ * keeping the fold a pure function of the event payload.
+ *
+ * Mirrors the never-throw, per-field type-narrow skeleton of
+ * {@link extractTmuxTopologySnapshot}, but simpler: a flat single-row payload
+ * with no per-pane array and no generation gate (the fold is a pure
+ * last-write-wins UPSERT, no recycle guard).
+ */
+function extractTmuxClientFocusSnapshot(
+  event: Event,
+): TmuxClientFocusSnapshot | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(event.data) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== "object") {
+    return null;
+  }
+  const narrowString = (v: unknown): string | null =>
+    typeof v === "string" && v !== "" ? v : null;
+  const rawIndex = parsed.window_index;
+  return {
+    status: narrowString(parsed.status),
+    generation_id: narrowString(parsed.generation_id),
+    session_name: narrowString(parsed.session_name),
+    window_index:
+      typeof rawIndex === "number" && Number.isInteger(rawIndex)
+        ? rawIndex
+        : null,
+    pane_id: narrowString(parsed.pane_id),
+  };
+}
+
+/**
+ * Fold one synthetic `TmuxClientFocusSnapshot` event (epic fn-952) into the
+ * LIVE-ONLY `tmux_client_focus` singleton — a last-write-wins UPSERT on `id = 1`.
+ * The persistent `tmux -C` control worker (task .3) observes the current real
+ * client's focus and posts this event; the fold simply overwrites the singleton
+ * with the latest payload + `event.ts` freshness stamp.
+ *
+ * NO floor gate, NO seed: focus has no replay-worthy history (the worker
+ * re-bootstraps on every connect), so this fold runs unconditionally and a
+ * pre-feature / empty log leaves the table empty (the `keeper jobs` banner then
+ * renders `[focus: none]`). Pure: reads ONLY the event payload + `event.id` /
+ * `event.ts` — no probe, no env, no wall-clock (re-fold safe; the singleton is
+ * live-only and excluded from the byte-identical charter regardless). A malformed
+ * / empty payload folds to a no-op (null payload) with the cursor still advancing
+ * at the dispatch site — NEVER throws.
+ */
+function foldTmuxClientFocusSnapshot(db: Database, event: Event): void {
+  const snapshot = extractTmuxClientFocusSnapshot(event);
+  if (snapshot === null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO tmux_client_focus (
+       id, status, generation_id, session_name, window_index, pane_id,
+       last_event_id, updated_at
+     ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       status = excluded.status,
+       generation_id = excluded.generation_id,
+       session_name = excluded.session_name,
+       window_index = excluded.window_index,
+       pane_id = excluded.pane_id,
+       last_event_id = excluded.last_event_id,
+       updated_at = excluded.updated_at`,
+    [
+      snapshot.status,
+      snapshot.generation_id,
+      snapshot.session_name,
+      snapshot.window_index,
+      snapshot.pane_id,
+      event.id,
+      event.ts,
+    ],
+  );
+}
+
+/**
  * Wire payload for a synthetic `BuildSnapshot` event — the projection-meaningful
  * fields of one buildbot builder's latest build. The pk (the builder NAME) does
  * NOT ride here; it travels in `event.session_id` (the generic entity-key
@@ -8291,6 +8405,16 @@ export function applyEvent(
       // so this fold no-ops below the floor and the columns are excluded from the
       // byte-identical re-fold charter.
       foldTmuxTopologySnapshot(db, event);
+    } else if (event.hook_event === "TmuxClientFocusSnapshot") {
+      // epic fn-952 — the LIVE-ONLY client-focus singleton fold (sole owner of
+      // `tmux_client_focus`). Last-write-wins UPSERT on id=1 from the persistent
+      // `tmux -C` control worker's focus observation. NO floor/seed: focus has no
+      // replay-worthy history (the worker re-bootstraps on every connect), so the
+      // fold runs unconditionally and an empty log leaves the table empty. The
+      // singleton is LIVE-ONLY (in `LIVE_ONLY_PROJECTIONS`) — excluded from the
+      // byte-identical re-fold charter. A malformed payload no-ops; the cursor
+      // still advances here.
+      foldTmuxClientFocusSnapshot(db, event);
     } else if (event.hook_event === "TmuxPaneSnapshot") {
       // retired fn-907 — the fill-only session resolver (epic fn-789) is
       // superseded by the `TmuxTopologySnapshot` live-location fold above. Fold
