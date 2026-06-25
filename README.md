@@ -449,10 +449,14 @@ Keeper has no `install` verb. Wire it up manually:
      dispatches are never prefixed, and `keeper dispatch --no-prefix` bypasses
      it for one invocation.
    - `handoff_prompt_prefix` — the sibling prefix for `keeper handoff`
-     dispatches (fn-946). When set (e.g. `/hack `), each fire-and-forget
-     handoff-ee worker boots into `<prefix><brief>`, so an unprefixed handoff
-     lands in `/hack`; `keeper handoff --no-prefix` bypasses it for one call.
-     A non-empty string only; absent/empty leaves it unset (no prefix).
+     dispatches (fn-946). When set (e.g. `/hack`), the dispatcher boots each
+     handoff-ee with `<prefix> <pointer>` — the pointer sends it to
+     `keeper handoff show <id>` to load the stored (raw, unprefixed) brief as its
+     REQUEST, so the handoff-ee runs the FULL `/hack` workflow (investigate, then
+     park at the confirm beat) instead of executing the brief blind. The prefix
+     is applied at this ONE site, the launch prompt — never to the doc body.
+     A non-empty string only; absent/empty leaves it unset (the launch prompt is
+     the bare pointer, no skill boot).
    - `disable_autoclose` — a list of keeper-managed session names
      (`pair`/`panels`/`agentbus`) whose stopped tracked windows the reaper's
      managed-session arm leaves OPEN instead of autoclosing — the debug opt-out.

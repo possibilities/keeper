@@ -18,14 +18,19 @@ argument-hint: --prompt "<brief>" [--title "<t>"]
 # handoff
 
 Turn a "hand this off" request into a single `keeper handoff` Bash call.
-`keeper handoff` enqueues a contextful brief for a fresh fire-and-forget
-`claude` worker; a keeperd worker dispatches that brief into a new worker
-window in your tmux session, preloaded (via the configured
-`handoff_prompt_prefix`, `/hack` on this machine) with the doc. The enqueue is
-event-sourced and durable — you fire it once and walk away.
+`keeper handoff` enqueues a contextful brief for a fresh `claude` worker; a
+keeperd worker opens a new window in your tmux session and boots it into the
+configured `handoff_prompt_prefix` (`/hack` on this machine), pointed at your
+brief. The handoff-ee reads the brief as its `/hack` REQUEST and runs the full
+`/hack` workflow — investigate first, and for work-shaped briefs park at
+`/hack`'s confirm beat with a concrete proposal, awaiting a plain-text greenlight
+in that window before any code lands. A handoff SEEDS a `/hack` session; it does
+NOT run the work autonomously. The enqueue is event-sourced and durable.
 
-This is fire-and-forget: you do NOT use the Agent Bus, you do NOT start a
-Monitor, and you do NOT wait on the handoff-ee. Run the one call and report.
+Fire-and-forget describes YOUR posture, not the handoff-ee's: you fire the one
+call and walk away — do NOT use the Agent Bus, do NOT start a Monitor, do NOT
+wait on the handoff-ee. The primed window waits for you whenever you switch to
+it. Run the one call and report.
 
 ## When this fires
 
@@ -49,10 +54,14 @@ move on:
 Assemble three things from the conversation:
 
 1. **The doc / brief** — the contextful instructions for the handoff-ee:
-   what to do, plus the surrounding context it needs to start cold (paths,
-   findings, constraints). This is the worker's whole world — be generous, but
-   the brief is capped at 64KB (an over-cap brief is REJECTED, never
-   truncated). If you've already written it to a file, use `--prompt-file`.
+   what to investigate or build, plus the surrounding context it needs to start
+   cold (paths, findings, constraints). This is the worker's whole world — be
+   generous, but the brief is capped at 64KB (an over-cap brief is REJECTED,
+   never truncated). The brief is the handoff-ee's `/hack` REQUEST, so it deeply
+   shapes what happens — but write it as a request, NOT an order: avoid "just do
+   it / land it / commit it" phrasing, which pushes the handoff-ee past `/hack`'s
+   confirm beat and back into executing blind. If you've already written it to a
+   file, use `--prompt-file`.
 2. **A title** (`--title`) — a short human label for the handoff (optional but
    recommended; it surfaces on the board).
 3. **The target session** (`--session`, optional) — defaults to
@@ -82,7 +91,6 @@ Flags:
 | `--prompt-file <path>` | Read the brief from a file (use for large briefs). |
 | `--title <t>` | Human title for the handoff (surfaces on the board). |
 | `--session <s>` | Target tmux session. Default: `$KEEPER_TMUX_SESSION` > current > `work`. |
-| `--no-prefix` | Skip the configured `handoff_prompt_prefix` for this one call (so the brief does NOT boot into `/hack`). |
 
 On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
 keeperd dispatcher resolves the target session internally; the CLI does not echo

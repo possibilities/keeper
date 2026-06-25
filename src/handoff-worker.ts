@@ -300,15 +300,20 @@ export async function dispatchOneHandoff(
 /**
  * Compose the launch prompt: the configured `handoff_prompt_prefix` (e.g.
  * `/hack`, so the handoff-ee boots into the skill) followed by a short pointer
- * to the brief. The full contextful doc lives in `handoffs.doc` and is read back
- * via `keeper handoff show <id>` — the prompt stays small (it rides the launch
- * argv, capped by agentwrap, NOT the 64KB doc cap). Pure; exported for tests.
+ * that frames the brief as the session's REQUEST — handled under the skill's
+ * normal workflow (investigate, then confirm before any code lands), NOT a
+ * pre-approved order to execute blind. The pointer carries no execute verb on
+ * purpose: an execute order would override `/hack`'s confirm-before-acting beat,
+ * which is exactly what a handoff-ee must run. The full contextful doc lives in
+ * `handoffs.doc` and is read back via `keeper handoff show <id>` — the prompt
+ * stays small (it rides the launch argv, capped by agentwrap, NOT the 64KB doc
+ * cap). Pure; exported for tests.
  */
 export function buildHandoffPrompt(
   handoffId: string,
   promptPrefix: string | undefined,
 ): string {
-  const pointer = `First run \`keeper handoff show ${handoffId}\` to load your brief, then carry it out.`;
+  const pointer = `First run \`keeper handoff show ${handoffId}\` to load your brief — its contents are your request for this session, NOT a pre-approved order to execute. Handle it under your normal workflow.`;
   if (promptPrefix !== undefined && promptPrefix !== "") {
     return `${promptPrefix} ${pointer}`;
   }

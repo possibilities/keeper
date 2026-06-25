@@ -2,8 +2,11 @@
  * `keeper handoff` — enqueue a contextful document + instructions for a fresh
  * fire-and-forget claude worker, dispatched by a keeperd worker into the
  * INITIATOR's tmux session. The enqueue is event-sourced: this CLI mints a
- * stable `handoff_id`, applies the configured `handoff_prompt_prefix`, caps the
- * doc at 64KB (REJECT over cap — never truncate, since the body rides inline in
+ * stable `handoff_id` and stores the brief RAW (the dispatcher worker, not this
+ * CLI, applies the `handoff_prompt_prefix` to the launch prompt — so the brief
+ * rides `keeper handoff show` unprefixed and is read back as the handoff-ee's
+ * `/hack` request, not as a second slash-command). It caps the doc at 64KB
+ * (REJECT over cap — never truncate, since the body rides inline in
  * `events.data` forever and a fold reads it back), and sends a `request_handoff`
  * RPC (the SIXTH mutating RPC) → main APPENDs a `HandoffRequested` event → the
  * durable `handoffs` projection (status=`requested`). The dispatcher worker
@@ -14,18 +17,13 @@
  * body so the handoff-ee can load its brief.
  *
  * Two forms mirror `keeper dispatch`'s free-form half: `--prompt "<doc>"` or
- * `--prompt-file <path>`, plus `--title`, `--session`, and `--no-prefix` (bypass
- * the configured prefix for a single invocation).
+ * `--prompt-file <path>`, plus `--title` and `--session`.
  */
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import {
-  resolveConfig,
-  resolveHandoffSpillDir,
-  resolveSockPath,
-} from "../src/db";
+import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
 import type { ClientFrame, ServerFrame } from "../src/protocol";
 import { queryCollection, roundTrip } from "./control-rpc";
 import { resolveSession } from "./dispatch";
@@ -33,8 +31,8 @@ import { resolveSession } from "./dispatch";
 const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
 
 Usage:
-  keeper handoff --prompt "<doc>" [--title "<t>"] [--session <s>] [--no-prefix]
-  keeper handoff --prompt-file <path> [--title "<t>"] [--session <s>] [--no-prefix]
+  keeper handoff --prompt "<doc>" [--title "<t>"] [--session <s>]
+  keeper handoff --prompt-file <path> [--title "<t>"] [--session <s>]
   keeper handoff show <handoff_id>
 
 Enqueue flags:
@@ -42,7 +40,6 @@ Enqueue flags:
   --prompt-file <path>  Read the brief from a file instead of --prompt
   --title <t>           Optional human title for the handoff
   --session <s>         Target tmux session (default: KEEPER_TMUX_SESSION > current > work)
-  --no-prefix           Skip the configured handoff_prompt_prefix for this one call
   --sock <path>         Override the daemon socket path
 
   show <handoff_id>     Print the stored doc body for a handoff (the dispatched
@@ -145,7 +142,6 @@ export async function main(argv: string[]): Promise<void> {
       "prompt-file": { type: "string" },
       title: { type: "string" },
       session: { type: "string" },
-      "no-prefix": { type: "boolean", default: false },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -210,17 +206,11 @@ export async function main(argv: string[]): Promise<void> {
     doc = parsed.values.prompt as string;
   }
 
-  // Apply the configured `handoff_prompt_prefix` (e.g. `/hack`) so the
-  // handoff-ee boots into the prefix skill before reading its brief. `--no-prefix`
-  // bypasses it for a single invocation. The prefix prepends `<prefix> ` to the
-  // brief; the cap below runs on the FINAL prefixed doc.
-  if (!(parsed.values["no-prefix"] ?? false)) {
-    const prefix = resolveConfig().handoffPromptPrefix;
-    if (prefix !== undefined && prefix !== "") {
-      doc = `${prefix} ${doc}`;
-    }
-  }
-
+  // The brief is stored RAW — the dispatcher worker applies the configured
+  // `handoff_prompt_prefix` to the small launch prompt (a pointer at
+  // `keeper handoff show <id>`), never to the doc body. Prefixing here would
+  // embed a stray `/hack` in the brief that the handoff-ee reads back as bash
+  // output (inert noise), so the prefix lives at exactly one site: the launcher.
   const docCheck = validateHandoffDoc(doc);
   if (!docCheck.ok) {
     // Over-cap / NUL / empty brief is CLI misuse — exit 2.

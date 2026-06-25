@@ -116,6 +116,11 @@ test("buildHandoffPrompt prepends the configured prefix + the brief pointer", ()
   const p = buildHandoffPrompt("abc-123", "/hack");
   expect(p.startsWith("/hack ")).toBe(true);
   expect(p).toContain("keeper handoff show abc-123");
+  // The pointer frames the brief as the session's REQUEST, never an execute
+  // order — an order would override `/hack`'s confirm-before-acting beat, which
+  // is the whole behavior a handoff-ee must run. Regression guard.
+  expect(p).not.toContain("carry it out");
+  expect(p.toLowerCase()).toContain("request");
 });
 
 test("buildHandoffPrompt with no prefix is just the pointer", () => {
