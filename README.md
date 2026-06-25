@@ -1088,8 +1088,10 @@ event-log/reducer/hook touch. Run any of them with
   (`--- current ---` from `jobs` correlated by `plan_verb`+`plan_ref`,
   `--- failed ---` from the `dispatch_failures` projection, `--- armed ---`
   from `armed_epics`) plus a banner showing the paused/playing pill, the
-  `yolo`/`armed` mode, the armed count, and the concurrency cap, and exposes
-  these control RPCs:
+  `yolo`/`armed` mode, the armed count, the global concurrency cap (`max N`),
+  the per-root count (`per-root N`, always rendered — NULL/unset reads the
+  default 1), and the durable worktree-mode state (`worktree:on`/`worktree:off`),
+  and exposes these control RPCs:
 
   - `keeper autopilot play` / `keeper autopilot pause` — flip the autopilot
     pause flag on the daemon via `set_autopilot_paused`. The RPC appends an
@@ -3175,9 +3177,11 @@ never `fatalExit`. Every merge/prune takes the shared
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
 `keeper/epic/*` scan decoupled from the recent-done window. Multi-repo epics
-(per-task `target_repo`) and enabling the toggle mid-epic are both rejected loud
-in worktree mode for v1 (`keeper autopilot worktree on` has a `--force` escape
-hatch for the mid-epic guard). `commit-work` skips its push leg whenever it runs
+(per-task `target_repo`) and toggling the mode while a STARTED open epic is in
+flight (`isEpicStarted`) are both rejected loud in worktree mode for v1; a
+drained / unstarted-open / zero-epic board toggles freely, so the operator's own
+interactive session no longer trips the guard (`keeper autopilot worktree on`
+has a `--force` escape hatch for the started-epic guard). `commit-work` skips its push leg whenever it runs
 inside a linked git worktree (submodule false-positive guarded), so per-lane
 branches never reach origin — autopilot pushes once at merge-to-default.
 

@@ -27,6 +27,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import {
+  assertNoMidEpicDispatch,
   autopilotBannerLabel,
   buildCurrentRows,
   buildRetryFrame,
@@ -40,6 +41,7 @@ import {
   projectAutopilotPaused,
   projectFailedRows,
   projectMaxConcurrentJobs,
+  projectMaxConcurrentPerRoot,
   projectWorktreeMode,
   renderBody,
   renderDependencyGraph,
@@ -881,11 +883,12 @@ test("autopilotBannerLabel — yolo mode + finite cap renders `[playing] · yolo
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: 3,
+      maxConcurrentPerRoot: 2,
       mode: "yolo",
       armedCount: 0,
       worktreeMode: false,
     }),
-  ).toBe("[playing] · yolo · max 3 · worktree:off");
+  ).toBe("[playing] · yolo · max 3 · per-root 2 · worktree:off");
 });
 
 test("autopilotBannerLabel — yolo mode never shows an armed count even with a nonzero count (fn-751)", () => {
@@ -895,11 +898,12 @@ test("autopilotBannerLabel — yolo mode never shows an armed count even with a 
     autopilotBannerLabel({
       paused: true,
       maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
       mode: "yolo",
       armedCount: 4,
       worktreeMode: false,
     }),
-  ).toBe("[paused] · yolo · max ∞ · worktree:off");
+  ).toBe("[paused] · yolo · max ∞ · per-root 1 · worktree:off");
 });
 
 test("autopilotBannerLabel — armed mode shows the armed count (fn-751)", () => {
@@ -907,11 +911,12 @@ test("autopilotBannerLabel — armed mode shows the armed count (fn-751)", () =>
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: 2,
+      maxConcurrentPerRoot: 1,
       mode: "armed",
       armedCount: 2,
       worktreeMode: false,
     }),
-  ).toBe("[playing] · armed · 2 armed · max 2 · worktree:off");
+  ).toBe("[playing] · armed · 2 armed · max 2 · per-root 1 · worktree:off");
 });
 
 test("autopilotBannerLabel — armed mode with NOTHING armed renders distinctly (idle-by-design, not broken) (fn-751)", () => {
@@ -920,11 +925,14 @@ test("autopilotBannerLabel — armed mode with NOTHING armed renders distinctly 
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
       mode: "armed",
       armedCount: 0,
       worktreeMode: false,
     }),
-  ).toBe("[playing] · armed · nothing armed · max ∞ · worktree:off");
+  ).toBe(
+    "[playing] · armed · nothing armed · max ∞ · per-root 1 · worktree:off",
+  );
 });
 
 test("autopilotBannerLabel — paused flag drives the pill independent of mode/cap (fn-725/fn-751)", () => {
@@ -932,20 +940,22 @@ test("autopilotBannerLabel — paused flag drives the pill independent of mode/c
     autopilotBannerLabel({
       paused: true,
       maxConcurrentJobs: 5,
+      maxConcurrentPerRoot: 3,
       mode: "armed",
       armedCount: 1,
       worktreeMode: false,
     }),
-  ).toBe("[paused] · armed · 1 armed · max 5 · worktree:off");
+  ).toBe("[paused] · armed · 1 armed · max 5 · per-root 3 · worktree:off");
   expect(
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
       mode: "yolo",
       armedCount: 0,
       worktreeMode: false,
     }),
-  ).toBe("[playing] · yolo · max ∞ · worktree:off");
+  ).toBe("[playing] · yolo · max ∞ · per-root 1 · worktree:off");
 });
 
 test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` segment for BOTH yolo and armed (fn-959)", () => {
@@ -955,20 +965,118 @@ test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` seg
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: 3,
+      maxConcurrentPerRoot: 2,
       mode: "yolo",
       armedCount: 0,
       worktreeMode: true,
     }),
-  ).toBe("[playing] · yolo · max 3 · worktree:on");
+  ).toBe("[playing] · yolo · max 3 · per-root 2 · worktree:on");
   expect(
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
       mode: "armed",
       armedCount: 2,
       worktreeMode: true,
     }),
-  ).toBe("[playing] · armed · 2 armed · max ∞ · worktree:on");
+  ).toBe("[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on");
+});
+
+// ---------------------------------------------------------------------------
+// projectMaxConcurrentPerRoot — coerce the singleton `autopilot_state.
+// max_concurrent_per_root` column to the banner's per-root count. Unlike the
+// global cap there is NO unlimited sentinel: NULL / empty / non-positive /
+// non-integer all resolve to DEFAULT_MAX_CONCURRENT_PER_ROOT (= 1). Always a
+// concrete positive integer.
+// ---------------------------------------------------------------------------
+
+test("projectMaxConcurrentPerRoot — positive integer row → that value", () => {
+  const rows = [{ id: 1, max_concurrent_per_root: 3 }];
+  expect(projectMaxConcurrentPerRoot(rows)).toBe(3);
+});
+
+test("projectMaxConcurrentPerRoot — empty rows (singleton not folded yet) → 1", () => {
+  expect(projectMaxConcurrentPerRoot([])).toBe(1);
+});
+
+test("projectMaxConcurrentPerRoot — NULL / missing column → 1 (the default, NOT unlimited)", () => {
+  expect(
+    projectMaxConcurrentPerRoot([{ id: 1, max_concurrent_per_root: null }]),
+  ).toBe(1);
+  expect(projectMaxConcurrentPerRoot([{ id: 1 }])).toBe(1);
+});
+
+test("projectMaxConcurrentPerRoot — non-positive / non-integer values → 1", () => {
+  const mk = (v: unknown) => [{ id: 1, max_concurrent_per_root: v }];
+  expect(projectMaxConcurrentPerRoot(mk(0))).toBe(1);
+  expect(projectMaxConcurrentPerRoot(mk(-2))).toBe(1);
+  expect(projectMaxConcurrentPerRoot(mk(2.5))).toBe(1);
+  expect(projectMaxConcurrentPerRoot(mk("3"))).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// assertNoMidEpicDispatch — the worktree-toggle started-epic guard. Dies ONLY
+// when a started open epic exists (isEpicStarted); a drained / unstarted-open /
+// zero-epic board toggles freely; a transport error fails closed. The injected
+// `query` keeps this off the daemon socket (fast tier).
+// ---------------------------------------------------------------------------
+
+class GateDie extends Error {}
+const gateDie = (msg: string): never => {
+  throw new GateDie(msg);
+};
+
+test("assertNoMidEpicDispatch — a STARTED open epic dies and enumerates its id", async () => {
+  const started = makeEpic({
+    epic_id: "fn-7-live",
+    tasks: [makeTask({ runtime_status: "in_progress" })],
+  });
+  const query = async () => [started] as unknown as Record<string, unknown>[];
+  let caught: unknown;
+  await assertNoMidEpicDispatch("/sock", false, gateDie, query).catch((e) => {
+    caught = e;
+  });
+  expect(caught).toBeInstanceOf(GateDie);
+  expect((caught as Error).message).toContain("fn-7-live");
+  expect((caught as Error).message).toContain("started open epic");
+});
+
+test("assertNoMidEpicDispatch — an UNSTARTED open epic toggles freely (no die)", async () => {
+  // All-todo, no jobs / job_links → isEpicStarted false.
+  const unstarted = makeEpic({
+    epic_id: "fn-8-fresh",
+    tasks: [makeTask({ runtime_status: "todo" })],
+  });
+  const query = async () => [unstarted] as unknown as Record<string, unknown>[];
+  await assertNoMidEpicDispatch("/sock", false, gateDie, query);
+});
+
+test("assertNoMidEpicDispatch — a ZERO-epic board (drained) toggles freely (no die)", async () => {
+  const query = async () => [] as Record<string, unknown>[];
+  await assertNoMidEpicDispatch("/sock", false, gateDie, query);
+});
+
+test("assertNoMidEpicDispatch — a transport error fails closed (dies, suggests --force)", async () => {
+  const query = async () => {
+    throw new Error("connection refused");
+  };
+  let caught: unknown;
+  await assertNoMidEpicDispatch("/sock", false, gateDie, query).catch((e) => {
+    caught = e;
+  });
+  expect(caught).toBeInstanceOf(GateDie);
+  expect((caught as Error).message).toContain("--force");
+});
+
+test("assertNoMidEpicDispatch — --force bypasses the gate without querying", async () => {
+  let queried = false;
+  const query = async () => {
+    queried = true;
+    return [] as Record<string, unknown>[];
+  };
+  await assertNoMidEpicDispatch("/sock", true, gateDie, query);
+  expect(queried).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
