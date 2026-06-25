@@ -37,9 +37,9 @@ is wrong and we reconsider where classification lives.
 
 ## References
 
-- Mirrors the fn-921 toplevel-normalization pattern (`resolveGitToplevel`/`memoizedGitToplevel`, landed); fixes the fn-959 worktree geometry (landed) — the one read site that skipped normalization.
-- Reverse-dep / overlap with `fn-976-rescue-worktree-mode-lane-isolation` (open, `.2` in-flight): fn-976 is the WORKER/consumer side (honors the producer's lane path via `KEEPER_PLAN_WORKTREE`); this epic is the PRODUCER geometry side. Hard-wired to land AFTER fn-976 (shared `src/autopilot-worker.ts` + suppression stack; avoids the in-flight merge conflict, builds on fn-976's settled lane base). fn-976.2's `KEEPER_PLAN_WORKTREE` path assertions may need updating to the resolved (not raw) path.
-- Coordinate with `fn-975` (thin-test-suite) which reshapes the same test files; this epic's tests are pure-seam, aligned with that direction.
+- Mirrors the fn-921 toplevel-normalization pattern (`resolveGitToplevel`/`memoizedGitToplevel`); fixes the fn-959 worktree geometry — the one read site that skipped normalization.
+- `fn-976-rescue-worktree-mode-lane-isolation` (the WORKER/consumer side — makes the worker honor the producer's lane path via `KEEPER_PLAN_WORKTREE`) has landed. This epic is the PRODUCER geometry counterpart and builds directly on that lane-isolation base; no dep edge is needed. fn-976's `KEEPER_PLAN_WORKTREE` path assertions may need updating to the resolved (not raw) lane path once this lands.
+- Coordinate with `fn-975` (thin-test-suite, open) which reshapes the same test files; this epic's tests are pure-seam, aligned with that direction (no blocking dep).
 - README §169-171 (normalize at every non-fold read site) and §3196-3198 (multi-repo "rejected loud for v1").
 
 ## Docs gaps
@@ -52,4 +52,4 @@ is wrong and we reconsider where classification lives.
 
 - **Mirror `git rev-parse --show-toplevel`** (the existing resolver) — do NOT introduce `--git-common-dir`; the whole codebase keys on `--show-toplevel`.
 - **Fresh per-cycle memo, cache null within a build but GC at cycle end** so a transient failure re-resolves next cycle rather than permanently darkening an epic.
-- **No raw-string fast-path** before resolution (`/tmp`→`/private/tmp`, subdir vs root); **short-circuit empty input** before spawning `git -C ""` (resolves to the daemon's own cwd); **strip `GIT_DIR`/`GIT_WORK_TREE`** from the resolve subprocess env (can poison `--show-toplevel`).
+- **No raw-string fast-path** before resolution (`/tmp`->`/private/tmp`, subdir vs root); **short-circuit empty input** before spawning `git -C ""` (resolves to the daemon's own cwd); **strip `GIT_DIR`/`GIT_WORK_TREE`** from the resolve subprocess env (can poison `--show-toplevel`).

@@ -6,7 +6,7 @@
     "fn-976-rescue-worktree-mode-lane-isolation"
   ],
   "id": "fn-978-fix-lane-target-repo-resolution",
-  "last_validated_at": "2026-06-25T22:58:04.432000Z",
+  "last_validated_at": "2026-06-25T22:59:52.618000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T22:58:04.409000Z"
+  "updated_at": "2026-06-25T22:59:52.486000Z"
 }
