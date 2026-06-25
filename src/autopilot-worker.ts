@@ -69,7 +69,10 @@ import {
   type PaneInfo,
 } from "./exec-backend";
 import { unseededGatedRoots } from "./gated-roots";
-import { memoizedGitToplevel } from "./git-toplevel";
+import {
+  memoizedGitToplevel,
+  memoizedNullableGitToplevel,
+} from "./git-toplevel";
 import {
   computeReadiness,
   isRootOccupant,
@@ -107,6 +110,7 @@ import {
   CLOSE_SINK_ID,
   deriveWorktreePlan,
   type WorktreeAssignment,
+  WorktreeCycleError,
   type WorktreePlan,
 } from "./worktree-plan";
 
@@ -537,7 +541,39 @@ export interface ReconcileSnapshot {
    * (.2+); until they land it is carried but unconsumed (dispatch is unchanged).
    */
   worktreeMode: boolean;
+  /**
+   * fn-978: each epic's repos RESOLVED to a single git toplevel — the producer
+   * snapshot-build's one git-resolution pass for the worktree lane geometry,
+   * mirroring {@link unseededRoots}. Built in {@link loadReconcileSnapshot} via
+   * {@link classifyWorktreeRepos} + {@link memoizedNullableGitToplevel}, gated on
+   * {@link worktreeMode} so an OFF-mode cycle adds ZERO git spawns (an EMPTY map).
+   * Threaded into the pure {@link prepareWorktreeGeometry} so both the gate
+   * (`computeReadiness` lane keys) and dispatch (`attachWorktreeGeometry`) compare
+   * and place lanes by RESOLVED toplevel — never raw `target_repo`/`project_dir`
+   * strings — and the pure layer never shells git. Each epic resolves to exactly
+   * one of: `ok` (one toplevel, the lane base), `multi-repo` (>1 distinct
+   * toplevel), or `unresolved` (a required root resolved null). NEVER a fold input.
+   */
+  worktreeRepoByEpicId: Map<string, WorktreeRepoResolution>;
 }
+
+/**
+ * fn-978: an epic's worktree-mode repo classification — the result of resolving
+ * every task's effective root (`target_repo || project_dir`) to a git toplevel in
+ * the producer snapshot-build. Drives the pure lane geometry:
+ *  - `ok` — every required root resolved to ONE toplevel; `repoDir` is that
+ *    toplevel, the base every lane forks off (and the close lane merges into).
+ *  - `multi-repo` — the required roots resolved to >1 distinct toplevel; the epic
+ *    is rejected for v1 with a sticky `worktree-multi-repo` reject.
+ *  - `unresolved` — a required root resolved `null` (empty, non-repo, or a
+ *    transient git failure); the epic is rejected with a distinct sticky
+ *    `worktree-repo-unresolved` reject (re-resolves next cycle via the per-cycle
+ *    memo). The `reason` is a free-form `<prefix>: <detail>` literal.
+ */
+export type WorktreeRepoResolution =
+  | { kind: "ok"; repoDir: string }
+  | { kind: "multi-repo"; reason: string }
+  | { kind: "unresolved"; reason: string };
 
 /**
  * In-memory reconciler state — the paused flag plus the set of
@@ -687,11 +723,17 @@ export interface WorktreeLaunchInfo {
 
 /**
  * A loud worktree-mode rejection for one epic (fn-959) — a launch the producer
- * must NOT run but instead surface as a sticky `DispatchFailed`. Multi-repo
- * epics (per-task `target_repo` spanning more than one resolved repo dir) are
- * unsupported in worktree mode for v1, so every launch they would emit is
- * replaced by this marker; the producer mints `worktree-multi-repo: <reason>`
- * (cleared by `retry_dispatch`) and launches nothing for that key.
+ * must NOT run but instead surface as a sticky `DispatchFailed`. The epic's repos
+ * are RESOLVED to git toplevels ONCE in the producer snapshot-build (fn-978), so
+ * two distinct kinds reach here, each a distinct `reason` literal (both cleared by
+ * `retry_dispatch`):
+ *  - `worktree-multi-repo: <detail>` — the tasks resolve to MORE THAN ONE distinct
+ *    toplevel (unsupported in worktree mode for v1).
+ *  - `worktree-repo-unresolved: <detail>` — a required root resolved `null` (empty,
+ *    not inside a git worktree, or a transient resolve failure). Re-resolves on the
+ *    next cycle via the snapshot's per-cycle memo, so a transient failure self-heals.
+ * Every launch the rejected epic would emit is replaced by this marker; the
+ * producer launches nothing for that key.
  */
 export interface WorktreeReject {
   reason: string;
@@ -1273,16 +1315,22 @@ export function reconcile(
       )
     : undefined;
 
-  // fn-959: the worktree-mode LANE re-key for the allocator. EMPTY (the default)
-  // whenever worktree mode is OFF — then `computeReadiness` keys on `effectiveRoot`,
-  // byte-identical to today. ON: each row keys on its derived lane worktree path so
-  // every worktree is a CAP-1 lane (two agents in one index = corruption) while
-  // parallel sibling lanes run concurrently. Built off the SAME `deriveWorktreePlan`
-  // the dispatch-side `attachWorktreeGeometry` post-pass uses, so the gate and the
-  // dispatch never diverge.
-  const laneKeyById = snapshot.worktreeMode
-    ? buildLaneKeys(snapshot.epics)
-    : new Map<string, string>();
+  // fn-959/fn-978: the worktree lane geometry, derived ONCE per cycle off the
+  // snapshot's RESOLVED `worktreeRepoByEpicId` classification (toplevels resolved
+  // git-side in `loadReconcileSnapshot`; the pure layer never shells git). EMPTY
+  // (the default) whenever worktree mode is OFF — then `computeReadiness` keys on
+  // `effectiveRoot`, byte-identical to today. ON: `laneKeyById` re-keys each row on
+  // its derived lane worktree path so every worktree is a CAP-1 lane (two agents in
+  // one index = corruption) while parallel sibling lanes run concurrently, and
+  // `byEpicId` feeds the dispatch-side `attachWorktreeGeometry` post-pass — both
+  // consuming the SAME plan, so the gate and dispatch never diverge.
+  const worktreeGeometry: PreparedWorktreeGeometry = snapshot.worktreeMode
+    ? prepareWorktreeGeometry(snapshot.epics, snapshot.worktreeRepoByEpicId)
+    : {
+        laneKeyById: new Map<string, string>(),
+        byEpicId: new Map<string, EpicWorktreeGeometry>(),
+      };
+  const laneKeyById = worktreeGeometry.laneKeyById;
 
   // Use `Number.NEGATIVE_INFINITY` for the sub-agent staleness `now`
   // when the caller didn't bother (matches `computeReadiness`'s default
@@ -1540,6 +1588,7 @@ export function reconcile(
       completedRowIds,
       closerFinishedIds,
       worktreeFinalize,
+      worktreeGeometry.byEpicId,
     );
   }
 
@@ -1547,30 +1596,196 @@ export function reconcile(
 }
 
 /**
- * fn-959 — the pure worktree post-pass over `reconcile`'s assembled launches.
- * For each epic (when worktree mode is ON):
- *  - A MULTI-REPO epic (its tasks resolve to more than one distinct repo dir —
- *    `target_repo ?? project_dir` spanning toplevels) is unsupported in worktree
- *    mode for v1: every launch it produced is stamped `worktreeReject` so the
- *    producer mints a sticky `worktree-multi-repo` DispatchFailed and runs no git.
- *  - Else derive the deterministic {@link WorktreePlan} from the epic's task DAG
- *    and stamp each launch's {@link PlannedLaunch.worktree} with its node's
- *    assignment + the shared epic context (base branch/path, repo dir, the lane
- *    order, the primary-parent branch). The close-row launch maps to the synthetic
- *    {@link CLOSE_SINK_ID} sink (pinned to base).
- *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every epic
- *    that needs finalizing — its close-row id is in `completedRowIds` (the MAIN
+ * fn-978 — classify each epic's repos to a single git toplevel for the worktree
+ * lane geometry. The PRODUCER's one resolution pass (mirrors the injectable
+ * resolver of `unseededGatedRoots`): `loadReconcileSnapshot` calls this with
+ * {@link memoizedNullableGitToplevel}; tests inject a synthetic resolver so the
+ * fast tier stays real-git-free. The pure `reconcile` / {@link prepareWorktreeGeometry}
+ * layer then compares + places lanes by the RESOLVED toplevel and never shells git.
+ *
+ * Per epic: collect each task's RAW effective root (`target_repo || project_dir`;
+ * an epic with no tasks falls back to its own `project_dir`). An empty root, or a
+ * root the resolver maps to `null`, makes the epic `unresolved` (every required
+ * root must resolve). Otherwise the distinct resolved toplevels decide: >1 →
+ * `multi-repo`; exactly 1 → `ok` with that toplevel as the lane base. The resolver
+ * MAY shell git, so this is NEVER called from a fold.
+ */
+export function classifyWorktreeRepos(
+  epics: readonly Epic[],
+  resolve: (root: string) => string | null,
+): Map<string, WorktreeRepoResolution> {
+  const out = new Map<string, WorktreeRepoResolution>();
+  for (const epic of epics) {
+    out.set(epic.epic_id, classifyEpicRepo(epic, resolve));
+  }
+  return out;
+}
+
+/** Classify ONE epic's repos — see {@link classifyWorktreeRepos}. */
+function classifyEpicRepo(
+  epic: Epic,
+  resolve: (root: string) => string | null,
+): WorktreeRepoResolution {
+  const projectDir = epic.project_dir ?? "";
+  // The required RAW roots: each task's effective root (`target_repo` when set,
+  // else the epic `project_dir`). An epic with no tasks still has a close lane, so
+  // resolve its own `project_dir`.
+  const rawRoots =
+    epic.tasks.length > 0
+      ? epic.tasks.map((t) =>
+          t.target_repo != null && t.target_repo !== ""
+            ? t.target_repo
+            : projectDir,
+        )
+      : [projectDir];
+  const resolved = new Set<string>();
+  for (const raw of rawRoots) {
+    // Short-circuit empties BEFORE the resolver (a `git -C ""` resolves against the
+    // daemon's own cwd; the nullable resolver guards this too, belt-and-suspenders).
+    if (raw === "") {
+      return {
+        kind: "unresolved",
+        reason: `worktree-repo-unresolved: epic ${epic.epic_id} has a task with no repo root (no target_repo and no project_dir)`,
+      };
+    }
+    const top = resolve(raw);
+    if (top === null) {
+      return {
+        kind: "unresolved",
+        reason: `worktree-repo-unresolved: epic ${epic.epic_id} root ${raw} is not inside a git worktree`,
+      };
+    }
+    resolved.add(top);
+  }
+  if (resolved.size > 1) {
+    return {
+      kind: "multi-repo",
+      reason: `worktree-multi-repo: epic ${epic.epic_id} spans ${resolved.size} repos (${[...resolved].sort().join(", ")})`,
+    };
+  }
+  // Exactly one toplevel — `rawRoots` is always non-empty and every element either
+  // returned early or added to `resolved`, so `resolved.size === 1` here. The guard
+  // keeps the type checker honest for the empty-iterator case it cannot prove away.
+  const repoDir = [...resolved][0];
+  if (repoDir === undefined) {
+    return {
+      kind: "unresolved",
+      reason: `worktree-repo-unresolved: epic ${epic.epic_id} resolved no repo root`,
+    };
+  }
+  return { kind: "ok", repoDir };
+}
+
+/**
+ * fn-978 — the per-epic worktree geometry {@link prepareWorktreeGeometry} resolves
+ * to, consumed by the dispatch-side {@link attachWorktreeGeometry}:
+ *  - `ok` — the derived plan + the RESOLVED repo dir (the lane base).
+ *  - `reject` — a loud multi-repo / unresolved epic; the `reason` is minted as a
+ *    sticky `DispatchFailed`. No lane was provisioned, so the epic never finalizes.
+ *  - `cycle` — a cyclic `depends_on` DAG; the gate already skipped lane-keying, and
+ *    dispatch re-throws the carried error to `driveCycle`'s backstop.
+ */
+type EpicWorktreeGeometry =
+  | { kind: "ok"; plan: WorktreePlan; repoDir: string }
+  | { kind: "reject"; reason: string }
+  | { kind: "cycle"; error: WorktreeCycleError };
+
+/** fn-978 — the gate + dispatch geometry from ONE {@link prepareWorktreeGeometry} pass. */
+interface PreparedWorktreeGeometry {
+  /** Each `task_id` / `epic_id` → its lane worktree path (the gate's cap-1 re-key). */
+  laneKeyById: Map<string, string>;
+  /** Each `epic_id` → its resolved geometry (`ok` plan / `reject` / `cycle`). */
+  byEpicId: Map<string, EpicWorktreeGeometry>;
+}
+
+/**
+ * fn-959/fn-978 — the SINGLE pure worktree-geometry derivation, consumed by BOTH
+ * the gate (`computeReadiness` lane keys, via `laneKeyById`) AND dispatch
+ * ({@link attachWorktreeGeometry}, via `byEpicId`), so the two never re-derive
+ * lanes from raw strings and never diverge. Off the snapshot's RESOLVED
+ * {@link WorktreeRepoResolution} classification:
+ *  - `ok` → derive the deterministic {@link WorktreePlan} off the RESOLVED toplevel;
+ *    emit lane keys (task → its lane path, epic id → the base lane) + an `ok` geometry.
+ *  - `multi-repo` / `unresolved` → a `reject` geometry carrying the sticky reason
+ *    and NO lane keys (the gate keys those rows on `effectiveRoot`; the dispatch
+ *    pass stamps the reject).
+ *  - a cyclic `depends_on` DAG → `deriveWorktreePlan` throws {@link WorktreeCycleError};
+ *    caught HERE as a `cycle` geometry (NO lane keys — the gate skips) and RE-THROWN
+ *    by `attachWorktreeGeometry` so `driveCycle`'s cycle backstop fires. Catching it
+ *    here (not at the call site) keeps one bad DAG from aborting the lane-key build
+ *    for every OTHER epic.
+ *
+ * Pure: no fs/git (resolution already happened in the snapshot build). Exported for
+ * the readiness/dispatch symmetry unit tests.
+ */
+export function prepareWorktreeGeometry(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+): PreparedWorktreeGeometry {
+  const laneKeyById = new Map<string, string>();
+  const byEpicId = new Map<string, EpicWorktreeGeometry>();
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined || resolution.kind !== "ok") {
+      // Unclassified (a producer bug — every epic IS classified when worktree mode
+      // is ON) or a loud reject: stamp a `reject` geometry, NO lane keys. Never fall
+      // back to a raw-string lane.
+      const reason =
+        resolution === undefined
+          ? `worktree-repo-unresolved: epic ${epic.epic_id} was not classified`
+          : resolution.reason;
+      byEpicId.set(epic.epic_id, { kind: "reject", reason });
+      continue;
+    }
+    const repoDir = resolution.repoDir;
+    let plan: WorktreePlan;
+    try {
+      plan = deriveWorktreePlan(epic.epic_id, repoDir, epic.tasks);
+    } catch (err) {
+      if (err instanceof WorktreeCycleError) {
+        byEpicId.set(epic.epic_id, { kind: "cycle", error: err });
+        continue;
+      }
+      throw err;
+    }
+    byEpicId.set(epic.epic_id, { kind: "ok", plan, repoDir });
+    // The close sink's lane (the epic BASE) is keyed under the epic id, since the
+    // close row is keyed `close::<epic_id>` and resolves to `epic_id` at the gate.
+    laneKeyById.set(epic.epic_id, plan.baseWorktreePath);
+    for (const a of plan.assignments) {
+      if (a.isCloseSink) {
+        continue;
+      }
+      laneKeyById.set(a.nodeId, a.worktreePath);
+    }
+  }
+  return { laneKeyById, byEpicId };
+}
+
+/**
+ * fn-959/fn-978 — the pure worktree post-pass over `reconcile`'s assembled
+ * launches, consuming the SAME {@link prepareWorktreeGeometry} `byEpicId` the gate
+ * keyed off (so dispatch never re-derives from raw `target_repo`/`project_dir`).
+ * For each epic with launches or a pending finalize (when worktree mode is ON):
+ *  - `reject` (multi-repo / unresolved) → stamp `worktreeReject` on every launch so
+ *    the producer mints the sticky `worktree-multi-repo` / `worktree-repo-unresolved`
+ *    DispatchFailed and runs no git. No lane was provisioned, so no finalize.
+ *  - `cycle` → RE-THROW the carried {@link WorktreeCycleError} so `driveCycle`'s
+ *    cycle backstop fires (the gate already skipped lane-keying); no launch is ever
+ *    emitted for the cyclic epic, which is the safe outcome.
+ *  - `ok` → stamp each launch's {@link PlannedLaunch.worktree} with its node's
+ *    assignment + the shared epic context (base branch/path, the RESOLVED repo dir,
+ *    the lane order, the primary-parent branch). The close-row launch maps to the
+ *    synthetic {@link CLOSE_SINK_ID} sink (pinned to base).
+ *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every `ok`
+ *    epic that needs finalizing — its close-row id is in `completedRowIds` (the MAIN
  *    projection folded `status:done`) OR `closerFinishedIds` (fn-972 BUG 3: the
  *    closer JOB finished on the lane, the producer-observable signal that fires
  *    BEFORE the projection can ever see done, since the close commit is on the
  *    lane). The producer merges that base into the default branch + tears down,
  *    confirming the lane carries done via git first (`finalizeEpic`).
  *
- * Pure: a total function of the epics + launches + the two id sets (the topology
- * module touches no fs/git). A `WorktreeCycleError` from a bad DAG is left to
- * surface — a cyclic `depends_on` is a data bug the topology module fails loud
- * on, and that throw is caught by `driveCycle`'s cycle-level backstop (no launch
- * is fired for a cyclic epic, which is the safe outcome).
+ * Pure: a total function of the epics + launches + id sets + the resolved geometry.
  */
 function attachWorktreeGeometry(
   epics: Epic[],
@@ -1578,9 +1793,10 @@ function attachWorktreeGeometry(
   completedRowIds: Set<string>,
   closerFinishedIds: Set<string>,
   worktreeFinalize: WorktreeLaunchInfo[],
+  byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
 ): void {
-  // Index launches by epic so each epic's plan is derived ONCE. A task launch
-  // belongs to the epic owning the task; a close launch's id IS the epic id.
+  // Index launches by epic. A task launch belongs to the epic owning the task; a
+  // close launch's id IS the epic id.
   const taskToEpic = new Map<string, string>();
   for (const epic of epics) {
     for (const t of epic.tasks) {
@@ -1592,7 +1808,6 @@ function attachWorktreeGeometry(
 
   for (const epic of epics) {
     const epicId = epic.epic_id;
-    const repoDir = epic.project_dir ?? "";
     const epicLaunches = launches.filter((l) => epicOf(l) === epicId);
     const needsFinalize =
       completedRowIds.has(epicId) || closerFinishedIds.has(epicId);
@@ -1600,26 +1815,26 @@ function attachWorktreeGeometry(
       continue;
     }
 
-    // Multi-repo guard: distinct resolved repo dirs across the epic's tasks (the
-    // pure "spanning toplevels" v1 heuristic). A single distinct dir (the common
-    // case) is fine; >1 rejects loudly. An empty `project_dir` with no per-task
-    // override still resolves to one empty dir (a data bug caught elsewhere).
-    const repoDirs = new Set<string>();
-    for (const t of epic.tasks) {
-      repoDirs.add(
-        t.target_repo != null && t.target_repo !== "" ? t.target_repo : repoDir,
-      );
-    }
-    if (repoDirs.size > 1) {
-      const reason = `worktree-multi-repo: epic ${epicId} spans ${repoDirs.size} repos (${[...repoDirs].sort().join(", ")})`;
+    const geom = byEpicId.get(epicId);
+    if (geom === undefined || geom.kind === "reject") {
+      // A multi-repo / unresolved (or — defensively — unclassified) epic: stamp the
+      // sticky reject on every launch; never provision or finalize a lane (none
+      // exists). Mirrors the gate, which left these rows un-keyed.
+      const reason =
+        geom?.kind === "reject"
+          ? geom.reason
+          : `worktree-repo-unresolved: epic ${epicId} was not classified`;
       for (const l of epicLaunches) {
         l.worktreeReject = { reason };
       }
-      // A multi-repo epic never finalizes a worktree (none was provisioned).
       continue;
     }
+    if (geom.kind === "cycle") {
+      // A cyclic DAG — re-throw to `driveCycle`'s backstop; no launch is emitted.
+      throw geom.error;
+    }
 
-    const plan = deriveWorktreePlan(epicId, repoDir, epic.tasks);
+    const { plan, repoDir } = geom;
     const byNode = new Map<string, WorktreeAssignment>();
     for (const a of plan.assignments) {
       byNode.set(a.nodeId, a);
@@ -1658,65 +1873,6 @@ function attachWorktreeGeometry(
       }
     }
   }
-}
-
-/**
- * fn-959 — the worktree-mode LANE re-key map fed to `computeReadiness`'s
- * allocator (the GATE side of the symmetric re-key; `attachWorktreeGeometry` is
- * the dispatch side). Maps each `task_id` → its lane worktree path and each
- * `epic_id` → the epic BASE worktree path (the close sink's lane), so the
- * allocator caps each worktree at one concurrent agent while parallel sibling
- * lanes run concurrently.
- *
- * Derives from the SAME `deriveWorktreePlan` + the SAME multi-repo guard as the
- * dispatch-side geometry pass, so the gate never diverges from dispatch:
- *  - A MULTI-REPO epic (its tasks span >1 resolved repo dir) is REJECTED for v1 in
- *    worktree mode — its rows are deliberately left UN-keyed so they fall through
- *    to `effectiveRoot` at the gate; the dispatch-side pass stamps the sticky
- *    `worktree-multi-repo` reject. No lane is provisioned, so no lane key exists.
- *  - A cyclic `depends_on` DAG makes `deriveWorktreePlan` throw; the epic is
- *    skipped here (rows fall through to `effectiveRoot`), and the dispatch-side
- *    geometry pass re-throws so `driveCycle`'s cycle backstop fires — no launch is
- *    ever emitted for a cyclic epic, so the gate verdict is moot.
- *
- * Pure: no fs/git (the topology module is a total function of the DAG). Exported
- * for the readiness/dispatch symmetry unit tests.
- */
-export function buildLaneKeys(epics: Epic[]): Map<string, string> {
-  const laneKeyById = new Map<string, string>();
-  for (const epic of epics) {
-    const repoDir = epic.project_dir ?? "";
-    // Multi-repo guard — IDENTICAL to `attachWorktreeGeometry`: distinct resolved
-    // repo dirs across the epic's tasks. >1 → rejected in worktree mode, leave the
-    // rows un-keyed (they key on `effectiveRoot` and the dispatch pass rejects).
-    const repoDirs = new Set<string>();
-    for (const t of epic.tasks) {
-      repoDirs.add(
-        t.target_repo != null && t.target_repo !== "" ? t.target_repo : repoDir,
-      );
-    }
-    if (repoDirs.size > 1) {
-      continue;
-    }
-    let plan: WorktreePlan;
-    try {
-      plan = deriveWorktreePlan(epic.epic_id, repoDir, epic.tasks);
-    } catch {
-      // A cyclic DAG — skip lane-keying (rows fall through to `effectiveRoot`).
-      // The dispatch-side geometry pass re-throws for the cycle backstop.
-      continue;
-    }
-    // The close sink's lane (the epic BASE) is keyed under the epic id, since the
-    // close row is keyed `close::<epic_id>` and resolves to `epic_id` at the gate.
-    laneKeyById.set(epic.epic_id, plan.baseWorktreePath);
-    for (const a of plan.assignments) {
-      if (a.isCloseSink) {
-        continue;
-      }
-      laneKeyById.set(a.nodeId, a.worktreePath);
-    }
-  }
-  return laneKeyById;
 }
 
 /**
@@ -1949,6 +2105,22 @@ export async function runReconcileCycle(
       // double-queue. Skip to keep one-at-a-time honest.
       continue;
     }
+    // fn-978 — a worktree-mode reject (multi-repo / unresolved) is evaluated AHEAD
+    // of the cwd-missing stat: an unresolved epic's `plan.cwd` is the RAW
+    // (un-normalized) effective root, which may not exist on disk, so the generic
+    // `cwd-missing` would mask the distinct `worktree-repo-unresolved` reason. Mint
+    // the sticky reject (cleared by `retry_dispatch`) and skip — per-key, so a
+    // sibling launch keeps dispatching.
+    if (plan.worktreeReject !== undefined) {
+      deps.emitDispatchFailed({
+        verb: plan.verb,
+        id: plan.id,
+        reason: plan.worktreeReject.reason,
+        dir: plan.cwd,
+        ts: deps.now(),
+      });
+      continue;
+    }
     // Fail-loud on a stale (renamed-away) launch cwd. The resolved cwd is
     // stamped into `plan.cwd` by the pure `reconcile`; the on-disk stat lives
     // HERE in the producer (never in a fold) so re-fold determinism holds. A
@@ -2140,8 +2312,9 @@ function closeKeyEpicId(info: WorktreeLaunchInfo): string {
  * fn-959 — the producer's per-launch worktree step (the side-effect seam between
  * the pure plan and `confirmRunning`). Returns the cwd to launch into on success,
  * or a `{ ok:false, reason, dir }` the caller mints as a sticky `DispatchFailed`.
- * Three branches, mutually exclusive per the geometry the pure post-pass stamped:
- *  - `worktreeReject` → multi-repo epic, rejected loudly.
+ * Two branches, mutually exclusive per the geometry the pure post-pass stamped
+ * (a `worktreeReject` launch never reaches here — the caller short-circuits it
+ * AHEAD of the cwd-missing stat):
  *  - `worktree` → provision the lane (ensure + pre-merges + assert HEAD), launch
  *    into the worktree path.
  *  - neither → OFF mode: assert the launch cwd is on the resolved default branch.
@@ -2153,9 +2326,6 @@ async function runWorktreeProducerStep(
 ): Promise<
   { ok: true; cwd: string } | { ok: false; reason: string; dir: string }
 > {
-  if (plan.worktreeReject !== undefined) {
-    return { ok: false, reason: plan.worktreeReject.reason, dir: launchCwd };
-  }
   if (plan.worktree !== undefined) {
     const provisioned = await driver.provision(plan.worktree);
     if (!provisioned.ok) {
@@ -2530,18 +2700,28 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * fn-959.7 — the deduped, non-empty repo dirs to sweep in the worktree recovery
- * pass: every snapshot epic's `project_dir` (the main worktree each epic's lanes
- * fork off). The recovery scan itself enumerates `keeper/epic/*` bases per repo
- * from live git, so this only narrows the sweep to repos autopilot actually
- * tracks (an empty/absent `project_dir` contributes nothing).
+ * fn-959.7/fn-978 — the deduped, non-empty repo dirs to sweep in the worktree
+ * recovery pass: each epic's RESOLVED git toplevel (the main worktree its lanes
+ * fork off), sourced from the snapshot's {@link WorktreeRepoResolution} so it keys
+ * on the SAME toplevel the lane geometry provisioned — never a raw `project_dir`.
+ * A multi-repo / unresolved epic is SKIPPED: no lane was ever provisioned for it,
+ * so there is nothing to recover. The recovery scan itself enumerates
+ * `keeper/epic/*` bases per repo from live git, so this only narrows the sweep to
+ * repos autopilot actually tracks.
  */
-export function reposForRecovery(epics: readonly Epic[]): string[] {
+export function reposForRecovery(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const epic of epics) {
-    const dir = epic.project_dir;
-    if (dir == null || dir === "" || seen.has(dir)) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined || resolution.kind !== "ok") {
+      continue;
+    }
+    const dir = resolution.repoDir;
+    if (dir === "" || seen.has(dir)) {
       continue;
     }
     seen.add(dir);
@@ -2887,6 +3067,16 @@ export async function loadReconcileSnapshot(
   const { model: workerModel, effort: workerEffort } =
     resolveWorkerLaunchConfig();
 
+  // fn-978: resolve every epic's repos to a single git toplevel for the worktree
+  // lane geometry — the ONE git-resolution pass (mirrors `unseededRoots`), gated on
+  // `worktreeMode` so an OFF cycle adds ZERO git spawns (empty map). A FRESH
+  // per-cycle nullable memo so a transient resolve failure re-resolves next cycle
+  // rather than permanently darkening an epic. The pure `reconcile` layer then
+  // compares + places lanes by the RESOLVED toplevel and never shells git.
+  const worktreeRepoByEpicId = worktreeMode
+    ? classifyWorktreeRepos(epics, memoizedNullableGitToplevel())
+    : new Map<string, WorktreeRepoResolution>();
+
   return {
     epics,
     jobs,
@@ -2904,6 +3094,7 @@ export async function loadReconcileSnapshot(
     maxConcurrentJobs,
     maxConcurrentPerRoot,
     worktreeMode,
+    worktreeRepoByEpicId,
   };
 }
 
@@ -3275,7 +3466,10 @@ function main(): void {
         // Wrapped so a producer git failure can't wedge the wake loop.
         if (snapshot.worktreeMode && !state.paused && deps.worktree) {
           try {
-            const repos = reposForRecovery(snapshot.epics);
+            const repos = reposForRecovery(
+              snapshot.epics,
+              snapshot.worktreeRepoByEpicId,
+            );
             const failures = await deps.worktree.recover(repos, (epicId) =>
               isEpicDoneById(db, epicId),
             );

@@ -167,9 +167,12 @@ recovered without a manual bounce by the supervisor-side seed-liveness watchdog
 (fn-921): it re-runs the boot-seed on main a capped number of times, then
 `fatalExit → LaunchAgent restart` as the last resort (a mute git-worker — no
 liveness pulse — escalates straight to restart). The gated read key is normalized to
-the toplevel write key (`resolveGitToplevel`) at every non-fold read site so a
-subdir/symlink `target_repo` un-darks correctly; the reducer's own self-clear keeps
-the raw key (it cannot shell out to git, and the keys agree for the common case).
+the toplevel write key (`resolveGitToplevel`) at every non-fold read site — the
+git-status seed gate AND the autopilot worktree lane geometry (`classifyWorktreeRepos`
+resolves each epic's `target_repo`/`project_dir` to one toplevel before placing
+lanes) — so a subdir/symlink `target_repo` un-darks / lanes correctly; the reducer's
+own self-clear keeps the raw key (it cannot shell out to git, and the keys agree for
+the common case).
 
 The end-of-boot WAL checkpoint is `TRUNCATE`. With the early read socket now
 attached during the drain, main's writer is no longer the SOLE connection — but
@@ -3201,9 +3204,17 @@ Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
 pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
-`keeper/epic/*` scan decoupled from the recent-done window. Multi-repo epics
-(per-task `target_repo`) and toggling the mode while a STARTED open epic is in
-flight (`isEpicStarted`) are both rejected loud in worktree mode for v1; a
+`keeper/epic/*` scan decoupled from the recent-done window. Each epic's
+`target_repo`/`project_dir` are RESOLVED to git toplevels ONCE in the producer
+snapshot-build (`classifyWorktreeRepos` + the nullable `memoizedNullableGitToplevel`,
+a fresh per-cycle memo) before the lane geometry compares + places lanes, so the
+gate and dispatch never re-derive from raw strings — a single-repo epic whose raw
+roots differ only by subdir/symlink/trailing-slash is NO LONGER falsely rejected.
+Two distinct sticky rejects survive: `worktree-multi-repo` (the tasks resolve to >1
+distinct toplevel — genuinely unsupported for v1) and `worktree-repo-unresolved` (a
+required root resolved null; re-resolves next cycle via the per-cycle memo). Those,
+plus toggling the mode while a STARTED open epic is in flight (`isEpicStarted`), are
+rejected loud in worktree mode (both reject kinds cleared by `retry_dispatch`); a
 drained / unstarted-open / zero-epic board toggles freely, so the operator's own
 interactive session no longer trips the guard (`keeper autopilot worktree on`
 has a `--force` escape hatch for the started-epic guard). `commit-work` pins every

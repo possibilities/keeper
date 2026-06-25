@@ -38,6 +38,7 @@ import {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   type ConfirmRunningDeps,
+  classifyWorktreeRepos,
   closerJobFinished,
   confirmRunning,
   createWorktreeDriver,
@@ -57,6 +58,7 @@ import {
   type LaunchResult,
   type LiveDispatch,
   loadReconcileSnapshot,
+  prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
@@ -167,7 +169,7 @@ function makeJob(overrides: Partial<Job>): Job {
 function makeSnapshot(
   overrides: Partial<ReconcileSnapshot>,
 ): ReconcileSnapshot {
-  return {
+  const snapshot: ReconcileSnapshot = {
     epics: [],
     jobs: new Map(),
     subagentInvocations: [],
@@ -210,8 +212,20 @@ function makeSnapshot(
     // `worktree_mode truthy`. Default OFF (`false`) so every pre-fn-959 test sees
     // byte-for-byte identical dispatch; RESERVED for the downstream worktree tasks.
     worktreeMode: false,
+    // fn-978: the per-epic resolved-repo classification. Filled in below (post
+    // `...overrides`) via IDENTITY resolution over the final epics — each raw root
+    // is its own toplevel, byte-identical to the pre-fn-978 raw-string geometry —
+    // unless a test pins it explicitly (to drive subdir/symlink/unresolved cases).
+    worktreeRepoByEpicId: new Map(),
     ...overrides,
   };
+  if (overrides.worktreeRepoByEpicId === undefined) {
+    snapshot.worktreeRepoByEpicId = classifyWorktreeRepos(
+      snapshot.epics,
+      (r) => r,
+    );
+  }
+  return snapshot;
 }
 
 function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
@@ -3869,6 +3883,353 @@ test("fn-959 reconcile: worktree ON multi-repo epic → every launch stamped wor
   }
 });
 
+// ---------------------------------------------------------------------------
+// fn-978 — lane geometry resolves RAW target_repo/project_dir to git toplevels
+// ONCE in the producer snapshot-build, so the pure gate + dispatch compare and
+// place lanes by RESOLVED toplevel. All resolution is fed by an INJECTED
+// synthetic resolver (no real git in the fast tier).
+// ---------------------------------------------------------------------------
+
+/** A worktree-ON snapshot whose repo classification uses a synthetic resolver. */
+function worktreeSnap(
+  epics: Epic[],
+  resolve: (root: string) => string | null,
+): ReconcileSnapshot {
+  return makeSnapshot({
+    epics,
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(epics, resolve),
+  });
+}
+
+test("fn-978 classifyWorktreeRepos: subdir + trailing-slash roots resolving to ONE toplevel → ok on that toplevel", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1 }), // → project_dir /repo
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo/packages/app", // a subdir
+      }),
+      makeTask({
+        task_id: "fn-1-foo.3",
+        task_number: 3,
+        target_repo: "/repo/", // trailing slash
+      }),
+    ],
+  });
+  const map = classifyWorktreeRepos([epic], (r) =>
+    r.startsWith("/repo") ? "/repo" : null,
+  );
+  expect(map.get("fn-1-foo")).toEqual({ kind: "ok", repoDir: "/repo" });
+});
+
+test("fn-978 classifyWorktreeRepos: >1 distinct resolved toplevel → multi-repo (reason names the toplevels)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a/x",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b/y",
+      }),
+    ],
+  });
+  const map = classifyWorktreeRepos([epic], (r) =>
+    r.startsWith("/repo-a")
+      ? "/repo-a"
+      : r.startsWith("/repo-b")
+        ? "/repo-b"
+        : null,
+  );
+  const res = map.get("fn-1-foo");
+  expect(res?.kind).toBe("multi-repo");
+  expect(res?.kind === "multi-repo" && res.reason).toContain(
+    "worktree-multi-repo",
+  );
+  // The RESOLVED toplevels, not the raw subdir strings.
+  expect(res?.kind === "multi-repo" && res.reason).toContain("/repo-a");
+  expect(res?.kind === "multi-repo" && res.reason).toContain("/repo-b");
+});
+
+test("fn-978 classifyWorktreeRepos: a required root resolving null → unresolved (distinct from multi-repo)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/not/a/repo",
+      }),
+    ],
+  });
+  const res = classifyWorktreeRepos([epic], (r) =>
+    r === "/repo" ? "/repo" : null,
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("unresolved");
+  expect(res?.kind === "unresolved" && res.reason).toContain(
+    "worktree-repo-unresolved",
+  );
+});
+
+test("fn-978 classifyWorktreeRepos: an empty root → unresolved WITHOUT calling the resolver", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "", // empty → empty effective root
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: null }),
+    ],
+  });
+  let calls = 0;
+  const map = classifyWorktreeRepos([epic], (r) => {
+    calls++;
+    return r;
+  });
+  expect(map.get("fn-1-foo")?.kind).toBe("unresolved");
+  expect(calls).toBe(0); // empty short-circuited BEFORE the resolver (no spawn)
+});
+
+test("fn-978 classifyWorktreeRepos: a no-task epic resolves its own project_dir", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo/sub",
+    tasks: [],
+  });
+  const res = classifyWorktreeRepos([epic], (r) =>
+    r.startsWith("/repo") ? "/repo" : null,
+  ).get("fn-1-foo");
+  expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
+});
+
+test("fn-978 reconcile: raw roots differing but resolving to ONE toplevel are NOT multi-repo — lane on the resolved toplevel", () => {
+  // The false-rejection bug: under raw-string comparison the three distinct roots
+  // would be rejected `worktree-multi-repo`; resolving them to one toplevel un-darks
+  // the epic and provisions its lane on the resolved toplevel.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1 }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo/packages/app",
+        depends_on: ["fn-1-foo.1"],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.3",
+        task_number: 3,
+        target_repo: "/repo/",
+        depends_on: ["fn-1-foo.1"],
+      }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) =>
+    r.startsWith("/repo") ? "/repo" : null,
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  // No launch is rejected, and the ready root's lane is on the RESOLVED toplevel.
+  expect(decision.launches.every((l) => l.worktreeReject === undefined)).toBe(
+    true,
+  );
+  const root = decision.launches.find((l) => l.id === "fn-1-foo.1");
+  expect(root?.worktree?.repoDir).toBe("/repo");
+  expect(root?.worktree?.assignment.worktreePath).toBe(
+    `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`,
+  );
+});
+
+test("fn-978 reconcile: tasks sharing a target_repo != project_dir derive the lane base from the RESOLVED target", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/created-here", // where the epic was created — NOT a task root
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/target/sub",
+      }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) =>
+    r.startsWith("/target")
+      ? "/target"
+      : r === "/created-here"
+        ? "/created-here"
+        : null,
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  const launch = decision.launches.find((l) => l.id === "fn-1-foo.1");
+  expect(launch?.worktreeReject).toBeUndefined();
+  // repoDir + the lane base use the RESOLVED target "/target", never raw project_dir.
+  expect(launch?.worktree?.repoDir).toBe("/target");
+  expect(launch?.worktree?.baseWorktreePath).toBe(
+    `${homedir()}/worktrees/target--keeper-epic-fn-1-foo`,
+  );
+});
+
+test("fn-978 reconcile: tasks resolving to >1 distinct toplevel are still rejected worktree-multi-repo", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a/x",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b/y",
+      }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) =>
+    r.startsWith("/repo-a")
+      ? "/repo-a"
+      : r.startsWith("/repo-b")
+        ? "/repo-b"
+        : null,
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    expect(l.worktreeReject?.reason).toContain("worktree-multi-repo");
+    expect(l.worktree).toBeUndefined();
+  }
+});
+
+test("fn-978 reconcile: a required root resolving null → distinct sticky worktree-repo-unresolved (not multi-repo)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/not/a/repo",
+      }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) => (r === "/repo" ? "/repo" : null));
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    expect(l.worktreeReject?.reason).toContain("worktree-repo-unresolved");
+    expect(l.worktreeReject?.reason).not.toContain("worktree-multi-repo");
+    expect(l.worktree).toBeUndefined();
+  }
+});
+
+test("fn-978 runReconcileCycle: an unresolved epic surfaces worktree-repo-unresolved AHEAD of cwd-missing (raw cwd never stat'd)", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({
+    worktree: driver,
+    // Even if the raw root's dir were "missing", the reject is evaluated first.
+    dirExists: () => false,
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/not/a/repo",
+      }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) => (r === "/repo" ? "/repo" : null));
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // No git driver ran; every emission is the distinct unresolved reject, NOT a
+  // generic cwd-missing.
+  expect(log.calls).toEqual([]);
+  expect(depsLog.launches).toEqual([]);
+  expect(depsLog.emissions.length).toBeGreaterThan(0);
+  for (const e of depsLog.emissions) {
+    expect(e.reason).toContain("worktree-repo-unresolved");
+    expect(e.reason).not.toContain("cwd-missing");
+  }
+});
+
+test("fn-978 prepareWorktreeGeometry: gate laneKeyById ↔ dispatch byEpicId derive from the SAME resolved map", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "P", task_number: 1 }),
+      makeTask({ task_id: "A", task_number: 2, depends_on: ["P"] }),
+      makeTask({ task_id: "B", task_number: 3, depends_on: ["P"] }),
+    ],
+  });
+  // A subdir effective root resolves to /repo, so BOTH the gate keys and the
+  // dispatch plan place lanes on /repo (not the raw root).
+  const repoMap = classifyWorktreeRepos([epic], (r) =>
+    r.startsWith("/repo") ? "/repo" : null,
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  const geom = prepared.byEpicId.get("fn-1-foo");
+  expect(geom?.kind).toBe("ok");
+  if (geom?.kind !== "ok") throw new Error("expected ok geometry");
+  expect(geom.repoDir).toBe("/repo");
+  const byNode = new Map(geom.plan.assignments.map((a) => [a.nodeId, a]));
+  for (const id of ["P", "A", "B"]) {
+    expect(prepared.laneKeyById.get(id)).toBe(byNode.get(id)?.worktreePath);
+  }
+  // The close row (epic id) keys on the base lane.
+  expect(prepared.laneKeyById.get("fn-1-foo")).toBe(geom.plan.baseWorktreePath);
+});
+
+test("fn-978 cyclic-DAG asymmetry: the gate skips (no key, no throw); reconcile (dispatch) re-throws", () => {
+  // A ready root R plus a separate {C1↔C2} cycle: the toposort fails for the whole
+  // epic, so the gate leaves it un-keyed (no throw) while the dispatch geometry pass
+  // re-throws — and reconcile only re-throws BECAUSE the ready root produced a launch.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.R", task_number: 1, depends_on: [] }),
+      makeTask({
+        task_id: "fn-1-foo.C1",
+        task_number: 2,
+        depends_on: ["fn-1-foo.C2"],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.C2",
+        task_number: 3,
+        depends_on: ["fn-1-foo.C1"],
+      }),
+    ],
+  });
+  const repoMap = classifyWorktreeRepos([epic], (r) => r);
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  // Gate: no lane key, no throw, recorded as a cycle.
+  expect(prepared.laneKeyById.size).toBe(0);
+  expect(prepared.byEpicId.get("fn-1-foo")?.kind).toBe("cycle");
+  // Dispatch: reconcile re-throws the cycle to driveCycle's backstop.
+  const snap = worktreeSnap([epic], (r) => r);
+  expect(() => reconcile(snap, makeState(), 0)).toThrow(/cycle/);
+});
+
 test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched, launch cwd is the worktree path", async () => {
   const { driver, log } = makeFakeWorktreeDriver();
   const {
@@ -4658,15 +5019,18 @@ test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the defa
 // hand-built fake GitRunner; the real-git lifecycle lives in the slow test.
 // ---------------------------------------------------------------------------
 
-test("fn-959.7 reposForRecovery: deduped, non-empty project_dirs", () => {
+test("fn-959.7/fn-978 reposForRecovery: deduped, RESOLVED toplevels; multi-repo/unresolved skipped", () => {
   const epics = [
     makeEpic({ epic_id: "fn-1-a", project_dir: "/repo-a" }),
     makeEpic({ epic_id: "fn-2-b", project_dir: "/repo-a" }), // shares /repo-a
     makeEpic({ epic_id: "fn-3-c", project_dir: "/repo-c" }),
-    makeEpic({ epic_id: "fn-4-d", project_dir: null }), // absent → skipped
-    makeEpic({ epic_id: "fn-5-e", project_dir: "" }), // empty → skipped
+    makeEpic({ epic_id: "fn-4-d", project_dir: null }), // unresolved → skipped
+    makeEpic({ epic_id: "fn-5-e", project_dir: "" }), // unresolved → skipped
   ];
-  expect(reposForRecovery(epics)).toEqual(["/repo-a", "/repo-c"]);
+  // Identity resolution (raw root = its own toplevel); empty/null project_dir
+  // classifies `unresolved`, so those epics are skipped (no lane was provisioned).
+  const repoMap = classifyWorktreeRepos(epics, (r) => r);
+  expect(reposForRecovery(epics, repoMap)).toEqual(["/repo-a", "/repo-c"]);
 });
 
 /**
