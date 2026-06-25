@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AUTOPILOT_STATE_DESCRIPTOR,
   BUILDS_DESCRIPTOR,
   DEAD_LETTERS_DESCRIPTOR,
   DONE_EPICS_REAP_WINDOW_SEC,
@@ -395,6 +396,36 @@ test("runQuery pages a seeded pending_dispatches row with the served columns (sc
   // Served columns match the descriptor's column list.
   expect(Object.keys(row).sort()).toEqual(
     [...PENDING_DISPATCHES_DESCRIPTOR.columns].sort(),
+  );
+  db.close();
+});
+
+test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", () => {
+  // Regression: worktree_mode is in the write path (db column + reducer fold)
+  // but was absent from AUTOPILOT_STATE_DESCRIPTOR.columns, so runQuery never
+  // projected it and the banner read undefined → permanent worktree:off.
+  // worktree_mode is an INTEGER (0/1) and must NOT be a jsonColumn.
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  db.query(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode, max_concurrent_per_root, worktree_mode)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(0, 7, 100.0, 200.0, 3, "yolo", 2, 1);
+  const res = asResult(
+    runQuery(db, 7, { type: "query", collection: "autopilot_state" }),
+  );
+  expect(res.total).toBe(1);
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected one autopilot_state row");
+  expect(row.worktree_mode).toBe(1);
+  expect(row.max_concurrent_per_root).toBe(2);
+  // worktree_mode stays out of jsonColumns (it is a scalar INTEGER).
+  expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("worktree_mode")).toBe(
+    false,
+  );
+  // Served columns match the descriptor's column list exactly.
+  expect(Object.keys(row).sort()).toEqual(
+    [...AUTOPILOT_STATE_DESCRIPTOR.columns].sort(),
   );
   db.close();
 });

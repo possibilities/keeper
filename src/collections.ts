@@ -608,6 +608,9 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // per-root slot count the reconciler dispatches against. NULL = the in-memory
     // DEFAULT_MAX_CONCURRENT_PER_ROOT (= 1).
     "max_concurrent_per_root",
+    // Durable worktree-mode toggle (INTEGER 0/1), served so the banner reflects
+    // the real durable state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
+    "worktree_mode",
   ],
   pk: "id",
   version: "last_event_id",
