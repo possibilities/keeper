@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T12:49:36.114000Z",
+  "depends_on": [
+    "fn-970-panel-runner-subagent.1"
+  ],
+  "epic": "fn-970-panel-runner-subagent",
+  "id": "fn-970-panel-runner-subagent.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "panel skill shim and tests",
+  "updated_at": "2026-06-25T12:49:36.114000Z"
+}
