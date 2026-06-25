@@ -44,6 +44,7 @@ import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
 import {
   countAbsentBlobs,
+  deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
   retainColdPayloads,
 } from "./compaction";
@@ -4644,6 +4645,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (deleted > 0) {
         console.error(
           `[keeperd] retention: deleted ${deleted} cold no-op-snapshot row(s) in ${del.batches} batch(es), reclaimed ${del.reclaimedPages} page(s) (watermark id<=${del.coldWatermark}, cursor<${del.cursor}${del.moreLikely ? ", more remain" : ""})`,
+        );
+      }
+      // Row-growth bound for the epic fn-952 `TmuxClientFocusSnapshot` tail —
+      // active window/session navigation logs a slow trickle of focus snapshots.
+      // Re-fold-safe for an INDEPENDENT reason from the no-op classes: the focus
+      // fold writes ONLY the `tmux_client_focus` LIVE-ONLY singleton and the rows
+      // carry no producer-scanned column, so deleting a cold one leaves every
+      // deterministic projection byte-identical (its own SAFE+NECESSARY pair pins
+      // this). A SEPARATELY-NAMED predicate, never folded into the no-op set.
+      const focusDel = deleteColdTmuxFocusRows(db);
+      deleted += focusDel.deleted;
+      if (focusDel.deleted > 0) {
+        console.error(
+          `[keeperd] retention: deleted ${focusDel.deleted} cold tmux-focus row(s) in ${focusDel.batches} batch(es), reclaimed ${focusDel.reclaimedPages} page(s) (watermark id<=${focusDel.coldWatermark}, cursor<${focusDel.cursor}${focusDel.moreLikely ? ", more remain" : ""})`,
         );
       }
       // The re-spec'd data-loss sentinel: a NULL body that is NOT shed-class is a

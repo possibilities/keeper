@@ -231,6 +231,39 @@ export const NOOP_SNAPSHOT_DELETE_PREDICATE = `hook_event IN (
         'BackendExecSnapshot','TmuxPaneSnapshot','WindowIndexSnapshot'
       )`;
 
+/**
+ * The SEPARATELY-NAMED physical-delete predicate for the epic fn-952
+ * `TmuxClientFocusSnapshot` cold tail — a distinct symbol from
+ * {@link NOOP_SNAPSHOT_DELETE_PREDICATE}, deliberately NOT folded into it.
+ *
+ * The producer (the `tmux -C` control worker) holds idle volume at zero, but
+ * active window/session navigation logs a slow trickle of focus snapshots. Their
+ * fold ({@link foldTmuxClientFocusSnapshot} in `src/reducer.ts`) writes ONLY the
+ * `tmux_client_focus` LIVE-ONLY singleton (in `LIVE_ONLY_PROJECTIONS`), which is
+ * EXCLUDED from the byte-identical re-fold charter — the worker re-bootstraps the
+ * singleton from a framed re-read on every connect, so the rows carry no
+ * replay-worthy history. The arm reads only the event payload + `event.id` /
+ * `event.ts`, and the rows carry NONE of the producer-scanned cheap columns
+ * (`mutation_path` / `bash_mutation_*`, `background_task_id`, `plan_op`,
+ * `subagent_agent_id`). So deleting a cold focus ROW is indistinguishable from it
+ * never having existed: a from-scratch re-fold over the surviving rows reproduces
+ * every DETERMINISTIC projection byte-identically (the live-only singleton is
+ * outside that charter regardless). The SAFE + NECESSARY pair in
+ * test/tmux-focus-compaction.test.ts pins both halves of that contract.
+ *
+ * Why a DISTINCT symbol, not a widening of {@link NOOP_SNAPSHOT_DELETE_PREDICATE}:
+ * that constant is pinned by the `no-op-snapshot delete predicate is pinned to
+ * exactly the three retired no-op-arm classes` test in
+ * test/refold-equivalence.test.ts to match EXACTLY the three retired no-op-arm
+ * classes — a fourth member would fail that guard. The two delete sets are
+ * re-fold-safe for INDEPENDENT reasons (no-op fold arm vs. live-only projection),
+ * so they stay independent predicates with independent proofs.
+ *
+ * Expressed over the cheap `hook_event` column only (no json parse), the same
+ * contract as {@link NOOP_SNAPSHOT_DELETE_PREDICATE}.
+ */
+export const TMUX_FOCUS_DELETE_PREDICATE = `hook_event = 'TmuxClientFocusSnapshot'`;
+
 export interface RetentionOptions {
   /** Rows per transaction. Defaults to {@link DEFAULT_RETENTION_BATCH_SIZE}. */
   batchSize?: number;
@@ -546,30 +579,71 @@ export interface DeleteResult {
 /**
  * PHYSICALLY DELETE cold rows of the no-op-arm snapshot classes
  * ({@link NOOP_SNAPSHOT_DELETE_PREDICATE}), paced — the ROW-growth bound
- * complementing {@link retainColdPayloads}'s body-NULL pass. Runs on MAIN's
- * writable connection; NEVER call inside a fold transaction.
+ * complementing {@link retainColdPayloads}'s body-NULL pass. Re-fold-safe because
+ * the three classes' fold arms are no-ops and they carry no producer-scanned
+ * column (proven in test/refold-equivalence.test.ts). Batched mechanics +
+ * cursor/watermark gate live in {@link deleteColdRowsByPredicate}.
+ */
+export function deleteNoopSnapshotRows(
+  db: Database,
+  options: RetentionOptions = {},
+): DeleteResult {
+  return deleteColdRowsByPredicate(db, NOOP_SNAPSHOT_DELETE_PREDICATE, options);
+}
+
+/**
+ * PHYSICALLY DELETE the cold `TmuxClientFocusSnapshot` tail
+ * ({@link TMUX_FOCUS_DELETE_PREDICATE}), paced — the epic fn-952 sibling of
+ * {@link deleteNoopSnapshotRows}. Same MAIN-writable-connection / paced /
+ * cursor-gated discipline; NEVER call inside a fold transaction.
  *
- * Each batch is one transaction: DELETE the next `batchSize` cold no-op-snapshot
- * ids (`id <= coldWatermark AND id < cursor AND <NOOP_SNAPSHOT_DELETE_PREDICATE>`).
- * After each batch, `PRAGMA incremental_vacuum(pages)` returns the freed pages to
- * the file tail. The same `id < cursor` + cold-watermark gate as the NULL pass —
- * a row is removed only AFTER the fold has advanced past it, so a forward fold
- * never iterates a row this pass deletes, and a from-scratch re-fold over the
- * surviving rows is byte-identical (the three classes' fold arms are no-ops and
- * carry no producer-scanned column — proven in test/refold-equivalence.test.ts).
+ * Re-fold-safe for an INDEPENDENT reason from the no-op-snapshot classes: the
+ * focus fold writes ONLY the `tmux_client_focus` LIVE-ONLY singleton (outside the
+ * byte-identical re-fold charter, re-bootstrapped by the worker on connect), and
+ * the rows carry no producer-scanned cheap column. So deleting a cold focus row
+ * leaves every DETERMINISTIC projection byte-identical on a from-scratch re-fold
+ * — proven by the SAFE + NECESSARY pair in test/tmux-focus-compaction.test.ts.
+ * Kept a DISTINCT predicate (not a widening of
+ * {@link NOOP_SNAPSHOT_DELETE_PREDICATE}, whose pinning test allows exactly the
+ * three retired no-op-arm classes).
+ */
+export function deleteColdTmuxFocusRows(
+  db: Database,
+  options: RetentionOptions = {},
+): DeleteResult {
+  return deleteColdRowsByPredicate(db, TMUX_FOCUS_DELETE_PREDICATE, options);
+}
+
+/**
+ * The shared batched-DELETE body behind {@link deleteNoopSnapshotRows} and
+ * {@link deleteColdTmuxFocusRows} — the ROW-growth bound complementing
+ * {@link retainColdPayloads}'s body-NULL pass. Runs on MAIN's writable
+ * connection; NEVER call inside a fold transaction. `predicate` is a TRUSTED
+ * INTERNAL `events`-row SQL fragment over the cheap `hook_event` column (a module
+ * constant, never caller/user text) selecting a re-fold-safe delete set.
  *
- * UNLIKE the NULL pass, this is NOT keyed on `data IS NOT NULL`: a snapshot row
- * whose body the NULL pass already shed is still DELETE-able (its row overhead is
- * the bytes this pass reclaims). Idempotent across passes — once a row is gone it
- * cannot re-match.
+ * Each batch is one transaction: DELETE the next `batchSize` cold matching ids
+ * (`id <= coldWatermark AND id < cursor AND <predicate>`). After each batch,
+ * `PRAGMA incremental_vacuum(pages)` returns the freed pages to the file tail. The
+ * same `id < cursor` + cold-watermark gate as the NULL pass — a row is removed
+ * only AFTER the fold has advanced past it, so a forward fold never iterates a row
+ * this pass deletes, and a from-scratch re-fold over the surviving rows is
+ * byte-identical (the caller's predicate guarantees the delete set is re-fold-safe;
+ * proven per-predicate in the test suite).
+ *
+ * UNLIKE the NULL pass, this is NOT keyed on `data IS NOT NULL`: a row whose body
+ * the NULL pass already shed is still DELETE-able (its row overhead is the bytes
+ * this pass reclaims). Idempotent across passes — once a row is gone it cannot
+ * re-match.
  *
  * The per-batch `incremental_vacuum` only reclaims if the DB was born with
  * `auto_vacuum=INCREMENTAL`; on a non-INCREMENTAL DB the pragma is a no-op and the
  * freed pages sit on the freelist for a later full reclaim (the DELETE removes the
  * row either way — re-fold safety does not depend on the reclaim).
  */
-export function deleteNoopSnapshotRows(
+function deleteColdRowsByPredicate(
   db: Database,
+  predicate: string,
   options: RetentionOptions = {},
 ): DeleteResult {
   const batchSize = options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE;
@@ -596,13 +670,13 @@ export function deleteNoopSnapshotRows(
   }
 
   // One prepared statement set, reused across batches. The SELECT picks the next
-  // cold no-op-snapshot batch by id; the DELETE removes the SAME ids. Both share
-  // the `id <= ceiling AND <NOOP_SNAPSHOT_DELETE_PREDICATE>` predicate so a row
-  // the SELECT picked is exactly the row the DELETE removes.
+  // cold matching batch by id; the DELETE removes the SAME ids. Both share the
+  // `id <= ceiling AND <predicate>` filter so a row the SELECT picked is exactly
+  // the row the DELETE removes.
   const selectBatch = db.prepare(
     `SELECT id FROM events
       WHERE id <= ?
-        AND ${NOOP_SNAPSHOT_DELETE_PREDICATE}
+        AND ${predicate}
       ORDER BY id ASC
       LIMIT ?`,
   );

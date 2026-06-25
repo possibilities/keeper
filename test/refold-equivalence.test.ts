@@ -1993,6 +1993,10 @@ test("no-op-snapshot delete predicate is pinned to exactly the three retired no-
     ["SubagentStart", null],
     ["SubagentStop", null],
     ["Notification", null],
+    // The epic fn-952 focus class is reclaimed by its OWN separately-named
+    // predicate (`TMUX_FOCUS_DELETE_PREDICATE`, re-fold-safe via the LIVE-ONLY
+    // singleton), NEVER folded into THIS pinned three-class set.
+    ["TmuxClientFocusSnapshot", null],
   ] as Array<[string, string | null]>) {
     expect({ he, tool, match: matches(he, tool) }).toEqual({
       he,
