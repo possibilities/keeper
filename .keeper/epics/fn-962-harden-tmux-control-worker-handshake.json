@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-25T03:56:45.431000Z",
+  "created_by_close_of": "fn-952-tmux-control-mode-focus-capture",
+  "depends_on_epics": [
+    "fn-952-tmux-control-mode-focus-capture"
+  ],
+  "id": "fn-962-harden-tmux-control-worker-handshake",
+  "last_validated_at": "2026-06-25T03:56:45.446000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden tmux control-worker handshake-drop determinism",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-25T03:56:45.431000Z"
+}

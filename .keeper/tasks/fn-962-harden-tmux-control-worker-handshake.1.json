@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T03:56:45.431000Z",
+  "depends_on": [],
+  "epic": "fn-962-harden-tmux-control-worker-handshake",
+  "id": "fn-962-harden-tmux-control-worker-handshake.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Deterministic handshake-drop and test",
+  "updated_at": "2026-06-25T03:56:45.431000Z"
+}
