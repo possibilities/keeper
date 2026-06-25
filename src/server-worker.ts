@@ -234,6 +234,29 @@ export interface SetAutopilotModeResultMessage {
 }
 
 /**
+ * Worker→main request bridge for `set_autopilot_config` — the GENERIC autopilot
+ * config patch. Main APPENDS an `AutopilotConfigSet` synthetic event carrying the
+ * partial patch (folded into the `autopilot_state` singleton, setting ONLY the
+ * patched columns) and pumps a wake. Same APPEND-ONLY / no-relay contract as
+ * {@link SetAutopilotModeRequestMessage}: the reconciler re-reads the config
+ * columns from the projection each cycle. `patch` is the validated wire patch
+ * (handler-validated; main JSON-stringifies it verbatim into `events.data`).
+ */
+export interface SetAutopilotConfigRequestMessage {
+  kind: "set-autopilot-config-request";
+  id: string;
+  patch: { max_concurrent_jobs?: number | null };
+}
+
+/** Main→worker reply paired with {@link SetAutopilotConfigRequestMessage}. */
+export interface SetAutopilotConfigResultMessage {
+  type: "set-autopilot-config-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
  * Worker→main request bridge for `set_epic_armed`. Main APPENDS an `EpicArmed`
  * synthetic event (folded into the `armed_epics` PRESENCE table) and pumps a
  * wake — same APPEND-ONLY / no-relay contract as
@@ -1421,6 +1444,16 @@ export interface ReplayBridge {
     error?: string;
   }>;
   /**
+   * APPEND an `AutopilotConfigSet` synthetic event carrying a PARTIAL config
+   * patch (folded into the `autopilot_state` singleton, setting ONLY the patched
+   * columns) and pump a wake. APPEND-ONLY (no relay) — the reconciler re-reads
+   * the config columns from the projection each cycle.
+   */
+  setAutopilotConfig(patch: { max_concurrent_jobs?: number | null }): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
+  /**
    * APPEND an `EpicArmed` synthetic event (folded into the `armed_epics` PRESENCE
    * table) and pump a wake. APPEND-ONLY (no relay), no existence validation on
    * `epic_id` — appends unconditionally to dodge the fold-lag race.
@@ -2014,14 +2047,15 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
   };
 }
 
-/** Mutating RPC methods (fn-897 B1) — the five state-changing async handlers,
- *  gated behind boot-complete so a consumer never acts on partial state. A read
- *  RPC (none today) would NOT appear here. Kept in sync with
- *  `installRpcHandlers()` in `src/rpc-handlers.ts`. */
+/** Mutating RPC methods (fn-897 B1) — the state-changing async handlers, gated
+ *  behind boot-complete so a consumer never acts on partial state. A read RPC
+ *  (none today) would NOT appear here. Kept in sync with `installRpcHandlers()`
+ *  in `src/rpc-handlers.ts`. */
 const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
   "replay_dead_letter",
   "set_autopilot_paused",
   "set_autopilot_mode",
+  "set_autopilot_config",
   "set_epic_armed",
   "retry_dispatch",
   "request_handoff",
@@ -3225,6 +3259,15 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  /** Pending `set_autopilot_config` requests, correlated by id. */
+  const pendingSetConfig = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   /** Pending `set_epic_armed` requests, correlated by id. */
   const pendingSetArmed = new Map<
     string,
@@ -3329,6 +3372,29 @@ function main(): void {
           id: reqId,
           mode,
         } satisfies SetAutopilotModeRequestMessage);
+      });
+    },
+    setAutopilotConfig(patch: {
+      max_concurrent_jobs?: number | null;
+    }): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingSetConfig.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingSetConfig.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "set-autopilot-config-request",
+          id: reqId,
+          patch,
+        } satisfies SetAutopilotConfigRequestMessage);
       });
     },
     setEpicArmed(epic_id: string, armed: boolean): Promise<SimpleResolution> {
@@ -3452,6 +3518,7 @@ function main(): void {
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
         | SetAutopilotModeResultMessage
+        | SetAutopilotConfigResultMessage
         | SetEpicArmedResultMessage
         | RequestHandoffResultMessage
         | undefined,
@@ -3524,6 +3591,18 @@ function main(): void {
         const entry = pendingSetMode.get(r.id);
         if (!entry) return;
         pendingSetMode.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
+      }
+      if (
+        (msg as SetAutopilotConfigResultMessage).type ===
+        "set-autopilot-config-result"
+      ) {
+        const r = msg as SetAutopilotConfigResultMessage;
+        const entry = pendingSetConfig.get(r.id);
+        if (!entry) return;
+        pendingSetConfig.delete(r.id);
         clearTimeout(entry.timer);
         entry.resolve({ ok: r.ok, error: r.error });
         return;

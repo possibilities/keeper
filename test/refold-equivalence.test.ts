@@ -140,6 +140,7 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "BlockEscalationAttempted",
   "AutopilotPaused",
   "AutopilotCapSet",
+  "AutopilotConfigSet",
   "AutopilotMode",
   "EpicArmed",
   "TmuxPaneSnapshot",

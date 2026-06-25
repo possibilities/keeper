@@ -50,6 +50,7 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import {
+  DEFAULT_MAX_CONCURRENT_JOBS,
   openDb,
   readGitProjectionFloor,
   readGitProjectionSeedRequired,
@@ -458,6 +459,16 @@ export interface ReconcileSnapshot {
    */
   workerModel: string;
   workerEffort: string;
+  /**
+   * The global concurrency cap, read FRESH from the `autopilot_state` singleton's
+   * `max_concurrent_jobs` column each cycle (resolved `column ?? DEFAULT` — an
+   * absent/never-set row or NULL = the in-memory {@link DEFAULT_MAX_CONCURRENT_JOBS}
+   * default, `null` = unlimited). Projection-pull only (no `workerData`, no config)
+   * so a runtime `set_autopilot_config` lands on the very next cycle and the cap
+   * survives a restart for free. Refreshed onto {@link ReconcileState.maxConcurrentJobs}
+   * in the cycle glue before `reconcile` reads it.
+   */
+  maxConcurrentJobs: number | null;
 }
 
 /**
@@ -496,8 +507,12 @@ export interface ReconcileState {
   finalizerGuard: Map<string, number>;
   /**
    * Global ceiling on root-occupants this reconciler dispatches at once across
-   * ALL epics/roots. `null` = unlimited. Threaded daemon → workerData → here so
-   * the cap rides `state` and `reconcile()` stays pure.
+   * ALL epics/roots. `null` = unlimited. REFRESHED each cycle from
+   * {@link ReconcileSnapshot.maxConcurrentJobs} (the `autopilot_state` projection
+   * `?? DEFAULT`) in the cycle glue BEFORE `reconcile()` reads it — so a runtime
+   * `set_autopilot_config` lands on the next cycle. Held on `state` (not read
+   * straight off the snapshot in `reconcile`) so the pure `reconcile()` keeps its
+   * existing `state`-sourced cap signature.
    */
   maxConcurrentJobs: number | null;
 }
@@ -1478,11 +1493,6 @@ export interface AutopilotWorkerData {
    */
   launcherArgvPrefix?: string[];
   /**
-   * Global root-occupant cap across ALL epics/roots. `null`/absent = unlimited.
-   * Threaded in from `resolveConfig()`.
-   */
-  maxConcurrentJobs?: number | null;
-  /**
    * Worker-role discriminator. The bottom-of-file entrypoint runs `main()`
    * ONLY when this is `"autopilot"`. The reaper worker imports this module
    * for its `loadReconcileSnapshot` export and runs as `!isMainThread`
@@ -1675,6 +1685,19 @@ export async function loadReconcileSnapshot(
   const modeRaw = (autopilotRows[0] as { mode?: unknown } | undefined)?.mode;
   const mode: "yolo" | "armed" = modeRaw === "armed" ? "armed" : "yolo";
 
+  // The global concurrency cap rides the SAME singleton row — resolve
+  // `max_concurrent_jobs ?? DEFAULT` (the in-memory default, NOT config). An
+  // absent/never-set row OR a non-positive / non-integer value → DEFAULT
+  // (`null` = unlimited); only a positive integer is a real cap. Projection-pull
+  // only so a runtime `set_autopilot_config` lands the very next cycle.
+  const capRaw = (
+    autopilotRows[0] as { max_concurrent_jobs?: unknown } | undefined
+  )?.max_concurrent_jobs;
+  const maxConcurrentJobs: number | null =
+    typeof capRaw === "number" && Number.isInteger(capRaw) && capRaw > 0
+      ? capRaw
+      : DEFAULT_MAX_CONCURRENT_JOBS;
+
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -1736,6 +1759,7 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     workerModel,
     workerEffort,
+    maxConcurrentJobs,
   };
 }
 
@@ -1784,7 +1808,10 @@ function main(): void {
     // projection regardless of paused/playing). In-memory only.
     redispatchCooldown: new Map(),
     finalizerGuard: new Map(),
-    maxConcurrentJobs: data.maxConcurrentJobs ?? null,
+    // Seed the in-memory DEFAULT; the FIRST `driveCycle` refreshes it from the
+    // `autopilot_state` projection (`?? DEFAULT`) before `reconcile` reads it, so
+    // a runtime-set cap takes effect immediately and survives a restart.
+    maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
   };
   // In-flight surfaces this reconciler owns confirm/reap work for. Boots EMPTY:
   // a cold restart re-derives "already running" from the durable `jobs`
@@ -2078,6 +2105,11 @@ function main(): void {
             err,
           );
         }
+        // Refresh the cap from the projection BEFORE `reconcile` reads it off
+        // `state` — so a runtime `set_autopilot_config` (folded into
+        // `autopilot_state.max_concurrent_jobs`) takes effect this very cycle.
+        // Snapshot already resolved `column ?? DEFAULT`.
+        state.maxConcurrentJobs = snapshot.maxConcurrentJobs;
         const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(
           decision,

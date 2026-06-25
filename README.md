@@ -441,10 +441,6 @@ Keeper has no `install` verb. Wire it up manually:
      its second arm autocloses a stopped tracked NON-plan job in a keeper-managed
      session (`pair`/`panels`/`agentbus`) past an idle grace; every other window
      stays open for inspection.
-   - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
-     jobs. A positive integer enforces the cap; omit or set non-positive
-     (the default) to leave it unlimited. The cap bounds only `work`/`close`
-     launches.
    - `dispatch_prompt_prefix` — a global prompt prefix for `keeper dispatch`
      FREE-FORM dispatches (`--prompt`/`--prompt-file`). When set (e.g. `/hack`),
      a free-form prompt launches as `<prefix> <prompt>` (single space) — handy
@@ -496,7 +492,6 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/src
    claude_projects_root: ~/.claude/projects
    # keeper_agent_path: ~/code/keeper/cli/keeper.ts   # launcher re-exec entry
-   max_concurrent_jobs: 3
    # disable_autoclose: [pair]   # leave these managed sessions' windows open
    # disable_orphan_reap: [flock_peer]   # exempt these exe-signatures from the orphan reaper
    # usage_scraper_uv_path: /opt/homebrew/bin/uv      # absolute uv binary
@@ -2380,6 +2375,26 @@ board flags armed epics with an `[armed]` pill (both subscribe the new
 `armed_epics` collection over the UDS socket). keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `62` (whitelist-only; keeper-py
 reads neither `autopilot_state` nor `armed_epics`).
+The scalar autopilot CONFIG settings are RUNTIME-settable through ONE generic
+RPC. `set_autopilot_config` takes a PARTIAL patch of the scalar config columns
+(today just `max_concurrent_jobs`, extensible without a new RPC) and round-trips
+a single `AutopilotConfigSet` synthetic event; `foldAutopilotConfigSet` UPSERTs
+the `autopilot_state` singleton setting ONLY the patched columns and PRESERVING
+the rest (`paused` / `mode` / any unpatched config column) — the same
+preserve-siblings discipline every singleton fold follows. The concurrency cap is
+NO LONGER config-file-frozen: `max_concurrent_jobs` is dropped from
+`resolveConfig`/`KeeperConfig`, its default becomes the in-memory
+`DEFAULT_MAX_CONCURRENT_JOBS` (`null` = unlimited), and the daemon's old
+`AutopilotCapSet` boot-append is REMOVED (the `AutopilotCapSet` fold arm survives
+for historical replay only — never minted). A fresh board simply has NO
+`autopilot_state` row: the reconciler + viewer resolve `max_concurrent_jobs ??
+DEFAULT` and the in-memory boots-paused default carries `paused`, so the row
+materializes lazily on the first pause/play/mode/config event (its INSERT path
+defaults `paused=1`). The reconcile worker reads the cap FRESH from the projection
+each cycle (`loadReconcileSnapshot` → `state.maxConcurrentJobs`, refreshed before
+`reconcile` reads it), so `keeper autopilot config max_concurrent_jobs N` takes
+effect on the next tick and survives a restart. No schema bump: the
+`max_concurrent_jobs` column already exists (v60).
 As of schema v65 (fn-784), the nullable `jobs.active_since REAL` column is a
 "most-recent-activity-started" recency stamp — `event.ts` written ONLY on the
 rising edge into `working` (the UserPromptSubmit arm's `state != 'working'`

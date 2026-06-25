@@ -112,58 +112,22 @@ test("a non-string agentwrap_path leaves agentwrapPath undefined → default", (
 });
 
 // ---------------------------------------------------------------------------
-// max_concurrent_jobs (fn-725) — positive-int-only, else null (unlimited)
+// max_concurrent_jobs (fn-953) — config-file support is REMOVED. The cap is now
+// RUNTIME-settable via `set_autopilot_config` and `resolveConfig` no longer
+// surfaces it; `DEFAULT_MAX_CONCURRENT_JOBS` survives as the in-memory default.
 // ---------------------------------------------------------------------------
 
-test("maxConcurrentJobs defaults to null (unlimited) when the file is absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
+test("DEFAULT_MAX_CONCURRENT_JOBS is null (unlimited) — the in-memory default", () => {
   expect(DEFAULT_MAX_CONCURRENT_JOBS).toBe(null);
 });
 
-test("maxConcurrentJobs defaults to null when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test("max_concurrent_jobs: 3 → 3 (a positive integer overrides)", () => {
-  writeConfig("max_concurrent_jobs: 3\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(3);
-});
-
-test("max_concurrent_jobs: 0 → null (zero is not a positive cap)", () => {
-  writeConfig("max_concurrent_jobs: 0\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test("max_concurrent_jobs: -1 → null (negative is rejected)", () => {
-  writeConfig("max_concurrent_jobs: -1\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test("max_concurrent_jobs: 2.5 → null (fractional is rejected)", () => {
-  writeConfig("max_concurrent_jobs: 2.5\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test('max_concurrent_jobs: "x" → null (a string is rejected)', () => {
-  writeConfig('max_concurrent_jobs: "x"\n');
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test("max_concurrent_jobs: null → null (explicit null stays unlimited)", () => {
-  writeConfig("max_concurrent_jobs: null\n");
-  expect(resolveConfig().maxConcurrentJobs).toBe(null);
-});
-
-test("a malformed max_concurrent_jobs leaves a sibling key intact (independence)", () => {
-  // A junk cap value must not strand `agentwrap_path` — the keys resolve
-  // independently from the same parsed document.
-  writeConfig(
-    'max_concurrent_jobs: "nope"\nagentwrap_path: /opt/bin/agentwrap\n',
-  );
+test("KeeperConfig no longer carries maxConcurrentJobs (config-file support removed)", () => {
+  // A config file SETTING `max_concurrent_jobs` is now silently IGNORED — the
+  // resolved config object has no such key (the cap rides the runtime RPC), and
+  // a sibling key still resolves independently from the same document.
+  writeConfig("max_concurrent_jobs: 3\nagentwrap_path: /opt/bin/agentwrap\n");
   const cfg = resolveConfig();
-  expect(cfg.maxConcurrentJobs).toBe(null);
+  expect("maxConcurrentJobs" in cfg).toBe(false);
   expect(cfg.agentwrapPath).toBe("/opt/bin/agentwrap");
 });
 

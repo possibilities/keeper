@@ -63,9 +63,9 @@ imperative guardrails only.
 ## Writes are tightly scoped — DO NOT widen them
 
 - **No general write path into the reducer.** The socket carries `query` (read) and `rpc` (mutate).
-  RPC may write ONLY these six surfaces, each round-tripping through a synthetic event:
-  `replay_dead_letter`, `retry_dispatch`, `set_autopilot_paused`, `set_autopilot_mode`,
-  `set_epic_armed`, `request_handoff`. RPC handlers never write `jobs`/`epics` directly.
+  RPC may write ONLY these seven surfaces, each round-tripping through a synthetic event:
+  `replay_dead_letter`, `retry_dispatch`, `set_autopilot_paused`, `set_autopilot_mode`, `set_autopilot_config`,
+  `set_epic_armed`, `request_handoff` — `set_autopilot_config` is GENERIC (a partial `autopilot_state` config patch; a future setting = a column + patch field, no new RPC). Never write `jobs`/`epics` directly.
 - **Plans are READ-ONLY.** The plan worker folds `.keeper/{epics,tasks}` snapshots into `epics`; no RPC writes a plan field.
 - **Sole-writer rules.** The events-writer hook writes ONLY per-pid NDJSON files; the sidecar-writer
   + docs-pusher write ONLY the `~/docs` repo. The events-log ingester is the sole writer of

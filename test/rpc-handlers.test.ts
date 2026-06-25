@@ -28,6 +28,7 @@ import {
   replayDeadLetterHandler,
   requestHandoffHandler,
   retryDispatchHandler,
+  setAutopilotConfigHandler,
   setAutopilotModeHandler,
   setAutopilotPausedHandler,
   setEpicArmedHandler,
@@ -102,6 +103,9 @@ function stubBridge(
       return { ok: true };
     },
     async setAutopilotMode() {
+      return { ok: true };
+    },
+    async setAutopilotConfig() {
       return { ok: true };
     },
     async setEpicArmed() {
@@ -183,6 +187,7 @@ function autopilotStubBridge(opts: {
   setPaused?: { ok: boolean; error?: string };
   retry?: { ok: boolean; error?: string };
   setMode?: { ok: boolean; error?: string };
+  setConfig?: { ok: boolean; error?: string };
   setArmed?: { ok: boolean; error?: string };
   requestHandoff?: { ok: boolean; error?: string };
 }): {
@@ -191,6 +196,7 @@ function autopilotStubBridge(opts: {
     setPausedCalls: boolean[];
     retryCalls: Array<{ verb: string; id: string }>;
     setModeCalls: string[];
+    setConfigCalls: Array<{ max_concurrent_jobs?: number | null }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
       handoff_id: string;
@@ -206,6 +212,7 @@ function autopilotStubBridge(opts: {
     setPausedCalls: [] as boolean[],
     retryCalls: [] as Array<{ verb: string; id: string }>,
     setModeCalls: [] as string[],
+    setConfigCalls: [] as Array<{ max_concurrent_jobs?: number | null }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
       handoff_id: string;
@@ -231,6 +238,10 @@ function autopilotStubBridge(opts: {
     async setAutopilotMode(mode) {
       state.setModeCalls.push(mode);
       return opts.setMode ?? { ok: true };
+    },
+    async setAutopilotConfig(patch) {
+      state.setConfigCalls.push(patch);
+      return opts.setConfig ?? { ok: true };
     },
     async setEpicArmed(epic_id, armed) {
       state.setArmedCalls.push({ epic_id, armed });
@@ -324,6 +335,79 @@ test("set_autopilot_mode throws rpc_failed when the bridge reports ok:false", as
   expect(setAutopilotModeHandler({ mode: "armed" }, bridge)).rejects.toThrow(
     /insert lock contention/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-953 — `set_autopilot_config` (the generic runtime config-patch RPC)
+// ---------------------------------------------------------------------------
+
+test("set_autopilot_config forwards the validated patch to the bridge and returns ok+patch", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_jobs: 8 },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, patch: { max_concurrent_jobs: 8 } });
+  expect(state.setConfigCalls).toEqual([{ max_concurrent_jobs: 8 }]);
+});
+
+test("set_autopilot_config accepts an explicit null cap (= unlimited)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_jobs: null },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, patch: { max_concurrent_jobs: null } });
+  expect(state.setConfigCalls).toEqual([{ max_concurrent_jobs: null }]);
+});
+
+test("set_autopilot_config throws BadParamsError on non-object params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, "8", 8, true, [], undefined]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("set_autopilot_config rejects an unknown config key", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  expect(
+    setAutopilotConfigHandler({ bogus_key: 1 }, bridge),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  // The unknown key never reaches the bridge.
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config rejects an empty patch (no config key set)", async () => {
+  const { bridge } = autopilotStubBridge({});
+  expect(setAutopilotConfigHandler({}, bridge)).rejects.toBeInstanceOf(
+    BadParamsError,
+  );
+});
+
+test("set_autopilot_config rejects a non-positive / non-integer max_concurrent_jobs", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { max_concurrent_jobs: 0 },
+    { max_concurrent_jobs: -2 },
+    { max_concurrent_jobs: 2.5 },
+    { max_concurrent_jobs: "3" },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config throws rpc_failed when the bridge reports ok:false", async () => {
+  const { bridge } = autopilotStubBridge({
+    setConfig: { ok: false, error: "insert lock contention" },
+  });
+  expect(
+    setAutopilotConfigHandler({ max_concurrent_jobs: 4 }, bridge),
+  ).rejects.toThrow(/insert lock contention/);
 });
 
 // ---------------------------------------------------------------------------

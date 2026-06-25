@@ -2128,6 +2128,157 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with mixe
 });
 
 // ---------------------------------------------------------------------------
+// fn-953 — `AutopilotConfigSet{<partial patch>}` is the GENERIC runtime config
+// event that REPLACES the boot-frozen `AutopilotCapSet` for setting the cap.
+// The fold UPSERTs the singleton row setting ONLY the patched columns and
+// preserving the rest (paused / mode / any unpatched config column). The
+// `AutopilotCapSet` fold arm is retained for historical replay only.
+// ---------------------------------------------------------------------------
+
+function autopilotConfigSetEvent(
+  patch: { max_concurrent_jobs?: number | null },
+  sessionId = "autopilot",
+): number {
+  return insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: sessionId,
+    data: JSON.stringify(patch),
+  });
+}
+
+function getAutopilotStateConfig() {
+  return db.query("SELECT * FROM autopilot_state WHERE id = 1").get() as {
+    id: number;
+    paused: number;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+    max_concurrent_jobs: number | null;
+    mode: string;
+  } | null;
+}
+
+test("AutopilotConfigSet sets max_concurrent_jobs and advances the cursor (fn-953)", () => {
+  const eventId = autopilotConfigSetEvent({ max_concurrent_jobs: 8 });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row).not.toBeNull();
+  expect(row?.id).toBe(1);
+  expect(row?.max_concurrent_jobs).toBe(8);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AutopilotConfigSet INSERT path (first autopilot_state event) defaults paused=1 + mode yolo (fn-953)", () => {
+  // With the boot-append gone, an `AutopilotConfigSet` can be the FIRST event to
+  // touch the row — its INSERT path must still materialize a boots-paused
+  // singleton (paused=1) and the mode column's DEFAULT 'yolo'.
+  autopilotConfigSetEvent({ max_concurrent_jobs: 2 });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.max_concurrent_jobs).toBe(2);
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet explicit null clears the cap to SQL NULL (= unlimited) (fn-953)", () => {
+  autopilotConfigSetEvent({ max_concurrent_jobs: 5 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(5);
+  autopilotConfigSetEvent({ max_concurrent_jobs: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBeNull();
+});
+
+test("AutopilotConfigSet PRESERVES paused and mode (sibling columns it does not own) (fn-953)", () => {
+  // Establish a non-default paused (play) AND a non-default mode (armed), then a
+  // config patch must leave BOTH untouched while landing the cap.
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateConfig()?.paused).toBe(0);
+  expect(getAutopilotStateConfig()?.mode).toBe("armed");
+  autopilotConfigSetEvent({ max_concurrent_jobs: 4 });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.max_concurrent_jobs).toBe(4); // cap landed
+  expect(row?.paused).toBe(0); // play PRESERVED
+  expect(row?.mode).toBe("armed"); // mode PRESERVED
+});
+
+test("a paused toggle and a mode flip both PRESERVE a config-set cap (fn-953)", () => {
+  // The reverse direction: a cap set via AutopilotConfigSet must survive a later
+  // pause toggle AND a later mode flip (sibling folds preserve the cap column).
+  autopilotConfigSetEvent({ max_concurrent_jobs: 7 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(7);
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(7); // preserved
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(7); // preserved
+});
+
+test("AutopilotConfigSet malformed/empty/non-positive payloads behave like the cap parser (fn-953)", () => {
+  // Seed a cap first so the row exists, then fold each payload. An EMPTY patch
+  // (no recognized field) and a structurally-bad blob fold to a NO-OP (the cap
+  // is preserved); a present-but-bad value coerces to NULL (= unlimited).
+  autopilotConfigSetEvent({ max_concurrent_jobs: 6 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(6);
+
+  // Empty patch → no-op (cap preserved).
+  insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: "autopilot",
+    data: JSON.stringify({}),
+  });
+  // Malformed JSON → no-op (cap preserved).
+  insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: "autopilot",
+    data: "{ not json",
+  });
+  drainAll();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(6);
+
+  // A present-but-non-positive / non-integer / non-number value coerces to NULL.
+  for (const bad of [0, -3, 2.5, "9"]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({ max_concurrent_jobs: bad }),
+    });
+    drainAll();
+    expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBeNull();
+    // Re-establish a positive cap for the next iteration.
+    autopilotConfigSetEvent({ max_concurrent_jobs: 6 });
+    drainAll();
+  }
+});
+
+test("from-scratch re-fold reproduces autopilot_state byte-identically with mixed paused/mode/config events (fn-953)", () => {
+  autopilotConfigSetEvent({ max_concurrent_jobs: 3 });
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({ max_concurrent_jobs: 9 });
+  autopilotPausedEvent(true);
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  expect(getAutopilotStateConfig()?.paused).toBe(1);
+  expect(getAutopilotStateConfig()?.mode).toBe("armed");
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v62 (fn-751) — `AutopilotMode{mode}` folds the explicit autopilot
 // mode enum into the SAME singleton `autopilot_state` row as `paused` /
 // `max_concurrent_jobs`, and `EpicArmed{epic_id,armed}` folds the per-epic

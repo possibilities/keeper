@@ -4221,16 +4221,15 @@ function foldAutopilotPaused(db: Database, event: Event): void {
 }
 
 /**
- * `AutopilotCapSet` synthetic-event payload (fn-725) — the global autopilot
- * concurrency cap surfaced on the `keeper autopilot` viewer banner.
+ * `AutopilotCapSet` synthetic-event payload (fn-725) — the LEGACY global
+ * autopilot concurrency-cap event. NO LONGER PRODUCED: the cap is now set at
+ * runtime via the generic `set_autopilot_config` RPC → `AutopilotConfigSet`
+ * event (see {@link AutopilotConfigSetPayload}). The fold arm is RETAINED so an
+ * OLD DB carrying historical `AutopilotCapSet` events still re-folds
+ * byte-identically; never mint a new one.
  *
  * `max_concurrent_jobs`: a positive integer ceiling on concurrent
- * root-occupants, or `null` for unlimited (the default). The daemon's
- * boot-append FREEZES `resolveConfig().maxConcurrentJobs` into this payload
- * on main at mint time — the config is NEVER read in the fold (re-fold
- * determinism). Like {@link AutopilotPausedPayload}, a typed value-carrying
- * event rather than a generic `SettingChanged{key,value}` so per-knob
- * invariants stay co-located (planetgeek event-versioning playbook).
+ * root-occupants, or `null` for unlimited (the default).
  */
 interface AutopilotCapSetPayload {
   max_concurrent_jobs: number | null;
@@ -4296,6 +4295,126 @@ function foldAutopilotCapSet(db: Database, event: Event): void {
        -- pause/play flag. created_at preserved (first-observation "since").
        updated_at = excluded.updated_at`,
     [event.id, event.ts, event.ts, payload.max_concurrent_jobs],
+  );
+}
+
+/**
+ * The scalar autopilot CONFIG columns a `set_autopilot_config` patch may set —
+ * the SINGLE source of truth shared by the reducer fold, the RPC validator, and
+ * the worker→main mint site. Each entry maps a wire patch field to its
+ * `autopilot_state` column. Adding a future scalar setting = one entry here + a
+ * column + a parse/validate clause; NO new RPC and NO new event type. `paused`
+ * and `mode` are DELIBERATELY absent — they keep their own live RPCs; this
+ * surface owns only the config half (the config-file-frozen settings).
+ */
+const AUTOPILOT_CONFIG_COLUMNS = {
+  max_concurrent_jobs: "max_concurrent_jobs",
+} as const satisfies Record<string, string>;
+
+type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
+
+/**
+ * `AutopilotConfigSet` synthetic-event payload — a PARTIAL patch of the scalar
+ * autopilot config columns (currently just `max_concurrent_jobs`, extensible via
+ * {@link AUTOPILOT_CONFIG_COLUMNS}). Round-trips through the generic
+ * `set_autopilot_config` RPC → main append → this fold, which UPSERTs the
+ * `autopilot_state` singleton setting ONLY the patched columns and PRESERVING
+ * every other column (mirror of the `AutopilotCapSet`/`Mode`/`Paused` discipline).
+ * A partial patch — an absent field is "leave the column as-is", NOT "null it".
+ */
+interface AutopilotConfigSetPayload {
+  /** A positive-integer concurrency cap, or `null` for unlimited. Present iff
+   *  the patch touches the cap. */
+  max_concurrent_jobs?: number | null;
+}
+
+/**
+ * Parse an `AutopilotConfigSet` event payload into the validated partial patch.
+ * Returns null on a structurally-invalid blob OR an EMPTY patch (no recognized
+ * field) — {@link foldAutopilotConfigSet} folds null to a safe no-op so the
+ * cursor still advances. NEVER throws (a throw inside the fold wedges the
+ * reducer). Per-field tolerance MIRRORS the cap parser: `max_concurrent_jobs`
+ * coerces a non-positive / non-integer / non-number to `null` (= unlimited),
+ * matching the config parser's contract; an explicit `null` is a first-class
+ * value (= unlimited). An ABSENT field is dropped from the patch (preserve the
+ * column), distinct from a present `null` (set the column to NULL).
+ */
+function extractAutopilotConfigSetPayload(
+  event: Event,
+): AutopilotConfigSetPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    if (parsed == null || typeof parsed !== "object") {
+      return null;
+    }
+    const patch: AutopilotConfigSetPayload = {};
+    if ("max_concurrent_jobs" in parsed) {
+      const raw = parsed.max_concurrent_jobs;
+      // null/non-positive/non-integer → unlimited (NULL); a positive int wins.
+      patch.max_concurrent_jobs =
+        typeof raw === "number" && Number.isInteger(raw) && raw > 0
+          ? raw
+          : null;
+    }
+    // An empty patch (no recognized field) folds to a safe no-op.
+    return Object.keys(patch).length === 0 ? null : patch;
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse AutopilotConfigSet payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `AutopilotConfigSet` event. UPSERT on the singleton
+ * `id = 1`, setting ONLY the patched config columns and PRESERVING `paused` +
+ * `mode` + every unpatched config column on conflict — the arms share `id = 1`,
+ * so each MUST preserve the others' columns or a patch clobbers a sibling. The
+ * INSERT path binds `paused = 1` (boots-paused contract), the defensive fallback
+ * now that the `AutopilotCapSet` boot-append is gone: an `AutopilotConfigSet`
+ * that is the FIRST event to touch the row still materializes a paused singleton.
+ * Pure function of the payload + persisted row — no `Date.now()`, no env read.
+ * Malformed/empty payload → safe no-op, never a throw.
+ */
+function foldAutopilotConfigSet(db: Database, event: Event): void {
+  const payload = extractAutopilotConfigSetPayload(event);
+  if (payload == null) {
+    return;
+  }
+  // Build the INSERT column list + the ON CONFLICT SET clause dynamically from
+  // exactly the patched fields, so an unpatched config column is left untouched
+  // (preserved) on conflict — the partial-patch contract. `paused` defaults to 1
+  // on the INSERT path (boots-paused); on conflict it is NEVER in the SET clause,
+  // so the durable pause/play flag survives. Column names come from the
+  // compile-time `AUTOPILOT_CONFIG_COLUMNS` allowlist (never foreign input), so
+  // interpolating them into the SQL is injection-safe.
+  const insertCols: string[] = [
+    "id",
+    "paused",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+  ];
+  const insertVals: (number | null)[] = [1, 1, event.id, event.ts, event.ts];
+  const setClauses: string[] = ["last_event_id = excluded.last_event_id"];
+  for (const field of Object.keys(payload) as AutopilotConfigField[]) {
+    const column = AUTOPILOT_CONFIG_COLUMNS[field];
+    insertCols.push(column);
+    insertVals.push(payload[field] ?? null);
+    setClauses.push(`${column} = excluded.${column}`);
+  }
+  setClauses.push("updated_at = excluded.updated_at");
+  const placeholders = insertCols.map(() => "?").join(", ");
+  db.run(
+    `INSERT INTO autopilot_state (${insertCols.join(", ")})
+       VALUES (${placeholders})
+     ON CONFLICT(id) DO UPDATE SET
+       ${setClauses.join(",\n       ")}`,
+    insertVals,
   );
 }
 
@@ -8380,6 +8499,8 @@ export function applyEvent(
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {
       foldAutopilotCapSet(db, event);
+    } else if (event.hook_event === "AutopilotConfigSet") {
+      foldAutopilotConfigSet(db, event);
     } else if (event.hook_event === "AutopilotMode") {
       foldAutopilotMode(db, event);
     } else if (event.hook_event === "EpicArmed") {

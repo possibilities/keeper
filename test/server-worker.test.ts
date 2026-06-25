@@ -1036,6 +1036,9 @@ function asyncCtxStub(opts: {
     async setAutopilotMode() {
       return { ok: true };
     },
+    async setAutopilotConfig() {
+      return { ok: true };
+    },
     async setEpicArmed() {
       return { ok: true };
     },
@@ -1320,6 +1323,9 @@ test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (roun
       async setAutopilotMode() {
         return { ok: true };
       },
+      async setAutopilotConfig() {
+        return { ok: true };
+      },
       async setEpicArmed() {
         return { ok: true };
       },
@@ -1373,6 +1379,9 @@ test("dispatchLine async rpc → handler reaches bridge.retryDispatch with the s
         return { ok: true };
       },
       async setAutopilotMode() {
+        return { ok: true };
+      },
+      async setAutopilotConfig() {
         return { ok: true };
       },
       async setEpicArmed() {

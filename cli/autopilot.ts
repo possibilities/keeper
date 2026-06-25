@@ -12,14 +12,16 @@
  * Data plumbing: the readiness collections ride one `subscribeReadiness`
  * connection; `dispatch_failures`, the `autopilot_state` singleton (the
  * banner-truth substrate), and `armed_epics` each ride their own
- * `subscribeCollection`. The daemon boot-appends `AutopilotCapSet` before the
- * server worker spawns (and resumes the durable `paused` flag rather than
- * re-pausing), so the viewer reads a real singleton row immediately.
+ * `subscribeCollection`. There is NO daemon boot-append — a fresh board has no
+ * `autopilot_state` row at all; the viewer seeds `[paused] · yolo · max ∞` and
+ * the first folded edge overwrites it. The singleton materializes lazily on the
+ * first pause/play/mode/config event.
  *
  * Usage:
  *   keeper autopilot [--sock <path>]            # viewer
  *   keeper autopilot pause [--sock <path>]      # control
  *   keeper autopilot play  [--sock <path>]      # control
+ *   keeper autopilot config <key> <value> [--sock <path>]  # control
  *   keeper autopilot retry <verb::id> [--sock <path>]  # control
  *   keeper autopilot --help
  */
@@ -50,6 +52,7 @@ Usage:
   keeper autopilot pause [--sock <path>]
   keeper autopilot play  [--sock <path>]
   keeper autopilot mode <yolo|armed> [--sock <path>]
+  keeper autopilot config <key> <value> [--sock <path>]
   keeper autopilot arm <epic-id> [--sock <path>]
   keeper autopilot disarm <epic-id> [--sock <path>]
   keeper autopilot retry <verb::id> [--sock <path>]
@@ -64,6 +67,10 @@ Subcommands:
   mode     Send set_autopilot_mode {mode:<yolo|armed>} and exit. yolo works
            every ready epic; armed works ONLY explicitly-armed epics plus
            their transitive upstream dep-closure.
+  config   Send set_autopilot_config {<key>:<value>} and exit. Runtime-sets a
+           scalar autopilot config value. Key: max_concurrent_jobs (a positive
+           integer cap, or 'unlimited' to clear it). e.g.
+           keeper autopilot config max_concurrent_jobs 8
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
@@ -482,6 +489,24 @@ export function buildSetArmedFrame(
   };
 }
 
+/**
+ * Build a well-formed RPC client frame for `set_autopilot_config` — the generic
+ * config-patch setter. `patch` is a partial of the scalar config columns (e.g.
+ * `{ max_concurrent_jobs: 8 }`). Pure — exported so tests can assert the wire
+ * shape.
+ */
+export function buildSetConfigFrame(
+  id: string,
+  patch: { max_concurrent_jobs?: number | null },
+): ClientFrame {
+  return {
+    type: "rpc",
+    id,
+    method: "set_autopilot_config",
+    params: patch,
+  };
+}
+
 function die(message: string): never {
   process.stderr.write(`autopilot: ${message}\n`);
   process.exit(1);
@@ -851,8 +876,47 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (subcommand === "config") {
+    // `config <key> <value>` — the generic runtime config setter. Validate the
+    // key + value CLI-side so a typo dies with a clear message before the
+    // round-trip (the server re-validates). Currently the only key is
+    // `max_concurrent_jobs`; a positive integer sets a cap, `unlimited`/`null`
+    // clears it (→ unlimited).
+    if (rest.length !== 2) {
+      die(
+        `'config' takes exactly two positionals <key> <value> (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const [key, value] = rest;
+    if (key !== "max_concurrent_jobs") {
+      die(
+        `'config' key must be one of max_concurrent_jobs (got ${JSON.stringify(key)})`,
+      );
+    }
+    let cap: number | null;
+    if (value === "unlimited" || value === "null") {
+      cap = null;
+    } else {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n <= 0) {
+        die(
+          `'config max_concurrent_jobs' value must be a positive integer or 'unlimited' (got ${JSON.stringify(value)})`,
+        );
+      }
+      cap = n;
+    }
+    const id = crypto.randomUUID();
+    await sendControlRpc(
+      sockPath,
+      buildSetConfigFrame(id, { max_concurrent_jobs: cap }),
+      id,
+      die,
+    );
+    return;
+  }
+
   die(
-    `unknown subcommand '${subcommand}' (expected pause | play | mode | arm | disarm | retry); pass --help for usage.`,
+    `unknown subcommand '${subcommand}' (expected pause | play | mode | config | arm | disarm | retry); pass --help for usage.`,
   );
 }
 

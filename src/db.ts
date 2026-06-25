@@ -160,9 +160,6 @@ export interface KeeperConfig {
   // the `KEEPER_AGENT_PATH` env override + tilde-expansion. Supersedes
   // `agentwrapPath` (read as a deprecated alias).
   keeperAgentPath?: string;
-  // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
-  // Enforced as a reconcile-level budget, not a readiness verdict.
-  maxConcurrentJobs?: number | null;
   // Keeper-managed sessions (`pair`/`panels`/`agentbus`) whose stopped tracked
   // windows the reaper's managed-session arm leaves OPEN instead of autoclosing
   // — the debug opt-out. Default EMPTY (every managed session autocloses).
@@ -180,9 +177,13 @@ export interface KeeperConfig {
 }
 
 /**
- * `null` = unlimited. `null` (not `Infinity`) at rest — `Infinity` serializes to
- * `null` via JSON and fails SQLite, so the unlimited sentinel stays `null`
- * end-to-end and becomes a fast-path bypass only at the budget gate.
+ * The IN-MEMORY default for the runtime-settable autopilot concurrency cap —
+ * used until a `set_autopilot_config` sets `autopilot_state.max_concurrent_jobs`
+ * (the cap is NO LONGER config-file-frozen). `null` = unlimited. `null` (not
+ * `Infinity`) at rest — `Infinity` serializes to `null` via JSON and fails
+ * SQLite, so the unlimited sentinel stays `null` end-to-end and becomes a
+ * fast-path bypass only at the budget gate. The reconciler + viewer resolve
+ * `column ?? DEFAULT_MAX_CONCURRENT_JOBS`.
  */
 export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
 
@@ -223,7 +224,6 @@ export function resolveConfig(): KeeperConfig {
   // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
-  let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let disableAutoclose: string[] = [];
   let disableOrphanReap: string[] = [];
   let accountAliases: Record<string, string> = {};
@@ -233,7 +233,6 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentusageRoot,
-        maxConcurrentJobs,
         disableAutoclose,
         disableOrphanReap,
         accountAliases,
@@ -310,12 +309,6 @@ export function resolveConfig(): KeeperConfig {
       if (typeof kap === "string" && kap.length > 0) {
         keeperAgentPath = kap;
       }
-      // Only a POSITIVE INTEGER overrides the unlimited (`null`) default.
-      const mcj = (raw as { max_concurrent_jobs?: unknown })
-        .max_concurrent_jobs;
-      if (typeof mcj === "number" && Number.isInteger(mcj) && mcj > 0) {
-        maxConcurrentJobs = mcj;
-      }
       // Best-effort string list — keep only non-empty trimmed strings; a
       // non-array/absent value leaves the default (empty → autoclose every
       // managed session).
@@ -358,7 +351,6 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
-      maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
       disableAutoclose: [],
       disableOrphanReap: [],
       accountAliases: {},
@@ -375,7 +367,6 @@ export function resolveConfig(): KeeperConfig {
     handoffPromptPrefix,
     agentwrapPath,
     keeperAgentPath,
-    maxConcurrentJobs,
     disableAutoclose,
     disableOrphanReap,
     accountAliases,
@@ -1268,15 +1259,17 @@ CREATE TABLE IF NOT EXISTS event_blobs (
  * makes a stray non-singleton write fail loudly instead of letting the viewer
  * read whichever row sorts first. `created_at` is preserved on UPSERT and
  * sourced from `event.ts` for re-fold determinism. `max_concurrent_jobs` is
- * frozen from config at boot-append mint time (read on main, never in the fold);
- * `foldAutopilotPaused` / `foldAutopilotCapSet` each preserve the other's column
- * on conflict so a toggle never clobbers the cap. No migration seed row: on a
- * fresh board the unconditional `AutopilotCapSet` boot-append's INSERT path
- * (`VALUES (1, 1, …)`) materializes the singleton with the `paused=1` default
- * before any viewer reads it, keeping `created_at` purely event-log-derived. The
- * daemon does NOT re-pause at boot — it resumes the durable `paused` flag — so an
- * existing row's `paused` survives a restart untouched (the CapSet re-arm's ON
- * CONFLICT branch preserves it).
+ * RUNTIME-settable via the `set_autopilot_config` RPC → `AutopilotConfigSet`
+ * event (NOT config-file-frozen); each singleton fold
+ * (`foldAutopilotPaused`/`Mode`/`ConfigSet`, plus the legacy `CapSet`) preserves
+ * the columns it does not own on conflict, so a toggle never clobbers a sibling.
+ * No migration seed row, and NO boot-append: a fresh board simply has NO row,
+ * which is correct — the reconciler/viewer resolve `max_concurrent_jobs ?? DEFAULT`
+ * (unlimited) and the in-memory boots-paused default carries `paused`. The row
+ * materializes lazily on the first pause/play/mode/config event; its INSERT path
+ * defaults `paused=1`. The daemon does NOT re-pause at boot — it resumes the
+ * durable `paused` flag — so an existing row's `paused` survives a restart
+ * untouched (every fold's ON CONFLICT branch preserves it).
  */
 const CREATE_AUTOPILOT_STATE = `
 CREATE TABLE IF NOT EXISTS autopilot_state (

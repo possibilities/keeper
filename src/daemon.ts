@@ -130,6 +130,8 @@ import type {
   RetryDispatchRequestMessage,
   RetryDispatchResultMessage,
   ServerWorkerData,
+  SetAutopilotConfigRequestMessage,
+  SetAutopilotConfigResultMessage,
   SetAutopilotModeRequestMessage,
   SetAutopilotModeResultMessage,
   SetAutopilotPausedRequestMessage,
@@ -1970,62 +1972,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     withBootDrainCheckpointTuning(db, () => {
       drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
       seedKilledSweep(db);
-      // Unconditional boot-append of an `AutopilotCapSet` re-arm carrying the
-      // global concurrency cap, minted BEFORE the trailing `drainToCompletion`. The
-      // daemon does NOT re-pause at boot — it resumes the last durable `paused`
-      // flag (seeded into the in-memory `autopilotPaused` after the drain, below).
-      // On a FRESH board with no `AutopilotPaused` history this CapSet fold is the
-      // SOLE carrier of the `paused=1` default: its INSERT path mints
-      // `VALUES (1, 1, …)` (paused), and its ON CONFLICT branch leaves an existing
-      // durable `paused` untouched. The cap value is read from config HERE, on main,
-      // and FROZEN into the payload — `resolveConfig()` is NEVER called inside the
-      // fold (re-fold determinism). The column LAGS config until the next restart
-      // re-mints. Raw `db.run` INSERT — column list MUST stay in sync with
-      // `prepareStmts`.
-      db.run(
-        `INSERT INTO events (
-         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
-         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-         plan_op, plan_target, plan_epic_id, plan_task_id,
-         plan_subject_present, tool_use_id, config_dir,
-         bash_mutation_kind, bash_mutation_targets, plan_files
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          Date.now() / 1000, // unix seconds as REAL
-          "autopilot", // stable synthetic session_id
-          null, // pid
-          "AutopilotCapSet",
-          "autopilot_state", // synthetic event_type tag
-          null, // tool_name
-          null, // matcher
-          null, // cwd
-          null, // permission_mode
-          null, // agent_id
-          null, // agent_type
-          null, // stop_hook_active
-          // Config read on MAIN, frozen into the payload. `?? null` = unlimited.
-          JSON.stringify({
-            max_concurrent_jobs: resolveConfig().maxConcurrentJobs ?? null,
-          }),
-          null, // subagent_agent_id
-          null, // spawn_name
-          null, // start_time
-          null, // slash_command
-          null, // skill_name
-          null, // plan_op
-          null, // plan_target
-          null, // plan_epic_id
-          null, // plan_task_id
-          null, // plan_subject_present
-          null, // tool_use_id
-          null, // config_dir
-          null, // bash_mutation_kind
-          null, // bash_mutation_targets
-          null, // plan_files
-        ],
-      );
-      drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
+      // No autopilot boot-append. The concurrency cap is now RUNTIME-settable via
+      // `set_autopilot_config` (→ `AutopilotConfigSet`), not config-file-frozen at
+      // boot — so the daemon never mints a synthetic cap event. A fresh board with
+      // no `autopilot_state` row at all is correct: the in-memory `autopilotPaused`
+      // default (`true`, seeded after the drain below) carries boots-paused, and the
+      // reconciler/viewer resolve `max_concurrent_jobs ?? DEFAULT` (unlimited) from
+      // the absent row. The singleton materializes lazily on the first
+      // pause/play/mode/config event.
     });
 
     // Step 2a.5 — LIVE-ONLY git boot-seed. The v79 skip-floor makes every
@@ -2306,6 +2260,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetAutopilotPausedRequestMessage
         | RetryDispatchRequestMessage
         | SetAutopilotModeRequestMessage
+        | SetAutopilotConfigRequestMessage
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
         | { kind: "ready" }
@@ -2470,6 +2425,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           reply = {
             type: "set-autopilot-mode-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "set-autopilot-config-request") {
+        // APPEND an `AutopilotConfigSet` synthetic event carrying the validated
+        // partial config patch so the reducer folds it into the `autopilot_state`
+        // singleton (setting ONLY the patched columns, preserving the rest), then
+        // pump a wake. APPEND-ONLY, same NO-relay contract as set-autopilot-mode:
+        // the level-triggered reconciler re-reads the config columns from the
+        // projection every cycle. Config is durable user intent (persisted), not a
+        // safety reset like `paused`, so there is no in-memory flag and no boot
+        // re-arm. The handler validated the patch; main JSON-stringifies it
+        // verbatim into `events.data` (the reducer re-validates per-field).
+        const id = msg.id;
+        let reply: SetAutopilotConfigResultMessage;
+        try {
+          stmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: "autopilot",
+            $pid: null,
+            $hook_event: "AutopilotConfigSet",
+            $event_type: "autopilot_state",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify(msg.patch),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $plan_op: null,
+            $plan_target: null,
+            $plan_epic_id: null,
+            $plan_task_id: null,
+            $plan_subject_present: null,
+            $config_dir: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $plan_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "set-autopilot-config-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "set-autopilot-config-result",
             id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
@@ -3777,8 +3791,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // so the worker resumes the last durable state (PLAYING if a `play` was the
   // last durable intent) and a fresh board boots PAUSED. Steady-state the flag
   // flips ONLY via the `set_autopilot_paused` RPC → bridge → `{type:"set-paused"}`
-  // relay. Config is read here on main and threaded into workerData so the worker
-  // never opens config itself.
+  // relay. The concurrency cap is NO LONGER threaded from config here — it is
+  // RUNTIME-settable via `set_autopilot_config` and the reconciler reads it from
+  // the `autopilot_state` projection each cycle. `apConfig` survives for the other
+  // worker-launch knobs (the launcher prefix prefixes / handoff prompt prefix).
   const apConfig = resolveConfig();
   // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the reconciler
   // spawns to reach the folded `keeper agent` launcher — keeper's sole launch
@@ -3805,7 +3821,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           dbPath,
           paused: autopilotPaused,
           launcherArgvPrefix,
-          maxConcurrentJobs: apConfig.maxConcurrentJobs,
           role: "autopilot",
         } satisfies AutopilotWorkerData,
       } as WorkerOptions & { workerData: unknown })

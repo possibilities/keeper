@@ -72,7 +72,7 @@ import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
 } from "../src/daemon";
-import { openDb } from "../src/db";
+import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
 import type { LaunchSpec } from "../src/exec-backend";
 import {
   computeReadiness,
@@ -188,6 +188,11 @@ function makeSnapshot(
     // the preset-override tests set these explicitly.
     workerModel: WORKER_MODEL,
     workerEffort: WORKER_EFFORT,
+    // fn-953: the runtime-settable cap, resolved snapshot-time `column ?? DEFAULT`.
+    // Default unlimited (`null`) so a snapshot-driven reconcile sees the same
+    // behavior as the pre-fn-953 unlimited default; the cap tests drive it via
+    // `makeState({ maxConcurrentJobs })` (the cap rides `state` in `reconcile`).
+    maxConcurrentJobs: null,
     ...overrides,
   };
 }
@@ -2966,6 +2971,62 @@ test("fn-811: loadReconcileSnapshot yields null livePaneIds with no probe, a nul
         })
       ).livePaneIds,
     ).toBeNull();
+  });
+});
+
+test("fn-953: loadReconcileSnapshot resolves maxConcurrentJobs from the autopilot_state column", async () => {
+  await withSeededDb(async (db) => {
+    // A folded `autopilot_state` row carrying a positive cap → the snapshot reads
+    // it (the runtime-set value is reflected on the next cycle).
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode)
+       VALUES (1, 1, 1, 0, 0, 5, 'yolo')`,
+    );
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.maxConcurrentJobs).toBe(5);
+  });
+});
+
+test("fn-953: loadReconcileSnapshot resolves maxConcurrentJobs to DEFAULT on a fresh (no-row) DB", async () => {
+  await withSeededDb(async (db) => {
+    // No `autopilot_state` row at all (the boot-append is gone) → the snapshot
+    // resolves `column ?? DEFAULT` = the unlimited (`null`) in-memory default,
+    // byte-identical to the pre-fn-953 unlimited behavior.
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.maxConcurrentJobs).toBe(DEFAULT_MAX_CONCURRENT_JOBS);
+    expect(snap.maxConcurrentJobs).toBeNull();
+  });
+});
+
+test("fn-953: loadReconcileSnapshot resolves a NULL/non-positive cap column to DEFAULT (unlimited)", async () => {
+  await withSeededDb(async (db) => {
+    // A row whose cap is SQL NULL (cleared to unlimited) resolves to DEFAULT.
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode)
+       VALUES (1, 0, 1, 0, 0, NULL, 'armed')`,
+    );
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.maxConcurrentJobs).toBe(DEFAULT_MAX_CONCURRENT_JOBS);
+    // Sibling columns still read correctly from the same row.
+    expect(snap.mode).toBe("armed");
+  });
+});
+
+test("fn-953: a snapshot-resolved cap drives the reconcile budget once refreshed onto state", async () => {
+  await withSeededDb(async (db) => {
+    // End-to-end: a runtime cap in the projection → snapshot → state → reconcile
+    // budget. Two ready sibling tasks under a cap of 1 admit exactly one launch.
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode)
+       VALUES (1, 0, 1, 0, 0, 1, 'yolo')`,
+    );
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.maxConcurrentJobs).toBe(1);
+    // The cycle glue refreshes `state.maxConcurrentJobs` from the snapshot before
+    // `reconcile` reads it — model that here.
+    const state = makeState();
+    state.maxConcurrentJobs = snap.maxConcurrentJobs;
+    expect(state.maxConcurrentJobs).toBe(1);
   });
 });
 

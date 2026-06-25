@@ -204,10 +204,11 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
   expect(seededPlaying).toBe(false); // boots PLAYING
   playingDb.close();
 
-  // Leg B — fresh board: a brand-new DB with NO `AutopilotPaused` history, only
-  // the daemon's `AutopilotCapSet` boot re-arm. Its INSERT path (`VALUES (1, 1,
-  // …)`) is the SOLE carrier of the fresh-DB `paused=1` default now that the
-  // forced boot-pause is gone — so the seed resolves to PAUSED.
+  // Leg B — legacy replay: an OLD DB whose only autopilot_state event is a
+  // historical `AutopilotCapSet` (no longer produced — the boot-append is gone,
+  // but the fold arm is RETAINED for replay). Its INSERT path (`VALUES (1, 1, …)`)
+  // materializes a `paused=1` singleton, so the seed resolves to PAUSED. (On a
+  // truly fresh board there is NO row at all — that is Leg C below.)
   const freshDb = freshMemDb().db;
   seedAutopilotEvent(freshDb, "AutopilotCapSet", 1, {
     max_concurrent_jobs: null,

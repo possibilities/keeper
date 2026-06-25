@@ -326,6 +326,97 @@ export async function setEpicArmedHandler(
 }
 
 // ---------------------------------------------------------------------------
+// `set_autopilot_config` (async — the GENERIC autopilot-config mutating RPC;
+// bridges through main to APPEND an `AutopilotConfigSet` synthetic event that
+// upserts the `autopilot_state` singleton. A PARTIAL patch of the scalar config
+// columns — for now just `max_concurrent_jobs`, extensible without a new RPC.)
+// ---------------------------------------------------------------------------
+
+/**
+ * `set_autopilot_config` wire params — a PARTIAL patch of the scalar autopilot
+ * config columns. Every field is OPTIONAL; an absent field leaves its column
+ * untouched (the fold preserves it). `max_concurrent_jobs`: a positive-integer
+ * concurrency cap, or `null` for unlimited.
+ */
+export interface SetAutopilotConfigParams {
+  max_concurrent_jobs?: number | null;
+}
+
+/** Successful return shape for `set_autopilot_config` — echoes the applied patch. */
+export interface SetAutopilotConfigResult {
+  ok: true;
+  patch: SetAutopilotConfigParams;
+}
+
+function validateSetAutopilotConfigParams(
+  params: unknown,
+): SetAutopilotConfigParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "set_autopilot_config: params must be an object with a partial config patch (e.g. `{ max_concurrent_jobs: 8 }`)",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  // Reject any field that isn't a known config column — an unknown key is a
+  // typo or a param-injection probe; surface it as a typed bad_params rather
+  // than silently dropping it (the reducer would fold it to a no-op).
+  const known = new Set(["max_concurrent_jobs"]);
+  const stray = Object.keys(obj).filter((k) => !known.has(k));
+  if (stray.length > 0) {
+    throw new BadParamsError(
+      `set_autopilot_config: unknown config key(s): ${stray.join(", ")} (known: ${[...known].join(", ")})`,
+    );
+  }
+  const patch: SetAutopilotConfigParams = {};
+  if ("max_concurrent_jobs" in obj) {
+    const raw = obj.max_concurrent_jobs;
+    // null = unlimited (first-class); otherwise a POSITIVE INTEGER only.
+    if (raw === null) {
+      patch.max_concurrent_jobs = null;
+    } else if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+      patch.max_concurrent_jobs = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`max_concurrent_jobs\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  // An empty patch is a no-op request — reject so a caller gets a clear signal
+  // rather than minting a content-free event.
+  if (Object.keys(patch).length === 0) {
+    throw new BadParamsError(
+      "set_autopilot_config: patch must set at least one config key",
+    );
+  }
+  return patch;
+}
+
+/**
+ * `set_autopilot_config` handler — the GENERIC autopilot-config mutating RPC.
+ * Validates a PARTIAL patch of the scalar config columns and bridges to main,
+ * which APPENDS an `AutopilotConfigSet` synthetic event (folded into the
+ * `autopilot_state` singleton, setting ONLY the patched columns) and pumps a
+ * wake. APPEND-ONLY, NO relay to the autopilot worker — the level-triggered
+ * reconciler re-reads the config columns from the projection each cycle (same
+ * contract as {@link setAutopilotModeHandler}). Config is DURABLE user intent
+ * (persisted), not a safety reset — no in-memory flag, no boot re-arm. Returns
+ * `{ ok: true, patch }` once main has appended.
+ */
+export async function setAutopilotConfigHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<SetAutopilotConfigResult> {
+  const patch = validateSetAutopilotConfigParams(params);
+  const result = await bridge.setAutopilotConfig(patch);
+  if (!result.ok) {
+    throw new Error(
+      result.error ?? "set_autopilot_config: main reported failure",
+    );
+  }
+  return { ok: true, patch };
+}
+
+// ---------------------------------------------------------------------------
 // `request_handoff` (async — the SIXTH mutating RPC; bridges through main to
 // APPEND a `HandoffRequested` synthetic event into the durable `handoffs`
 // projection; fn-946 task .2)
@@ -524,6 +615,7 @@ export function installRpcHandlers(): void {
   registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
   registerAsyncRpc("set_autopilot_paused", setAutopilotPausedHandler);
   registerAsyncRpc("set_autopilot_mode", setAutopilotModeHandler);
+  registerAsyncRpc("set_autopilot_config", setAutopilotConfigHandler);
   registerAsyncRpc("set_epic_armed", setEpicArmedHandler);
   registerAsyncRpc("retry_dispatch", retryDispatchHandler);
   registerAsyncRpc("request_handoff", requestHandoffHandler);

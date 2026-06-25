@@ -31,6 +31,7 @@ import {
   buildCurrentRows,
   buildRetryFrame,
   buildSetArmedFrame,
+  buildSetConfigFrame,
   buildSetModeFrame,
   buildSetPausedFrame,
   type FailedRow,
@@ -621,6 +622,32 @@ test("buildSetArmedFrame — disarm emits armed:false (fn-751)", () => {
     id: "rpc-uuid-8",
     method: "set_epic_armed",
     params: { epic_id: "fn-1-foo", armed: false },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSetConfigFrame — fn-953 generic config-patch control-RPC frame builder.
+// ---------------------------------------------------------------------------
+
+test("buildSetConfigFrame — a cap patch emits set_autopilot_config {max_concurrent_jobs} (fn-953)", () => {
+  expect(buildSetConfigFrame("rpc-uuid-9", { max_concurrent_jobs: 8 })).toEqual(
+    {
+      type: "rpc",
+      id: "rpc-uuid-9",
+      method: "set_autopilot_config",
+      params: { max_concurrent_jobs: 8 },
+    },
+  );
+});
+
+test("buildSetConfigFrame — an explicit null cap (unlimited) rides verbatim (fn-953)", () => {
+  expect(
+    buildSetConfigFrame("rpc-uuid-10", { max_concurrent_jobs: null }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-10",
+    method: "set_autopilot_config",
+    params: { max_concurrent_jobs: null },
   });
 });
 
