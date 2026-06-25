@@ -2090,16 +2090,17 @@ export function createWorktreeDriver(
       const { assignment, repoDir, parentBranch } = info;
       const { branch, worktreePath, preMerges } = assignment;
       try {
-        // Fork the lane off the PRIMARY parent's branch tip (its own branch for an
-        // inheriting node / a root — then `ensureWorktree` is a no-op or a base
-        // checkout). `ensureWorktree` is idempotent + crash-recoverable.
-        await gitEnsureWorktree(
-          repoDir,
-          worktreePath,
-          branch,
-          parentBranch,
-          run,
-        );
+        // Fork the lane off the PRIMARY parent's branch tip. A rib forks off its
+        // (already-committed) parent lane. The BASE lane's "parent" is its own
+        // branch — which does NOT exist yet, since THIS add is what creates it —
+        // so fork off the repo's resolved default branch instead. An inheriting
+        // node's lane already exists, so `ensureWorktree` no-ops and the source is
+        // unused. `ensureWorktree` is idempotent + crash-recoverable.
+        const forkSource =
+          parentBranch === branch
+            ? await gitResolveDefaultBranch(repoDir, run)
+            : parentBranch;
+        await gitEnsureWorktree(repoDir, worktreePath, branch, forkSource, run);
         // Run the fan-in pre-merges in order — sequential pairwise, each taking the
         // shared commit-work flock. A conflict aborts + fails loud + stops.
         for (const source of preMerges) {

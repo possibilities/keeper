@@ -90,7 +90,6 @@ export function resolveEpicDep(
  * persisted in epic/board state. An epic counts as started when ANY of:
  *   - it carries an epic-form job (`jobs`) whose verb is NOT `plan` — i.e. a
  *     `close`/`approve` (or any non-planner) verb ran,
- *   - it carries a provenance `job_links` entry — a session created/refined it,
  *   - any task carries a task-form job (`task.jobs`) — a `work`/`approve` ran,
  *   - any task's `runtime_status` has advanced off `"todo"`.
  *
@@ -101,6 +100,13 @@ export function resolveEpicDep(
  * planned-but-unworked epic started and collapse the tiering to a no-op — so a
  * planner job is NOT real worker activity. A genuine `plan`-then-worked epic is
  * already caught by the close/task-job/runtime_status signals above.
+ *
+ * Deliberately does NOT count `job_links`: every entry is `creator`/`refiner`
+ * planning provenance (the symmetric per-epic view of the very `plan` sessions
+ * excluded above), so a freshly planned-but-unworked epic carries one yet has had
+ * zero worker activity. Counting it would mark every planned epic started — the
+ * same collapse the `plan`-verb skip avoids. Real execution surfaces in
+ * `jobs` / `task.jobs` / `runtime_status`, never a provenance link.
  *
  * Deliberately does NOT key on `task.worker_phase`: its resting value on a
  * never-worked task shell is `"open"` (not null), so counting it would mark
@@ -117,9 +123,6 @@ export function isEpicStarted(epic: Epic): boolean {
     if (job?.plan_verb !== "plan") {
       return true;
     }
-  }
-  if ((epic.job_links?.length ?? 0) > 0) {
-    return true;
   }
   for (const task of epic.tasks ?? []) {
     if ((task.jobs?.length ?? 0) > 0) {

@@ -4219,6 +4219,123 @@ test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent
   expect(cmds).toContain("rev-parse --abbrev-ref HEAD");
 });
 
+test("fn-959 createWorktreeDriver: provision forks the BASE lane off the resolved default branch, not its own (uncreated) branch", async () => {
+  // Regression: the base branch does not exist yet (this add CREATES it), so
+  // forking off `parentBranch === branch` was `git worktree add -b X <path> X`
+  // → "invalid reference". The fork source must be the repo's default branch.
+  const cmds: string[] = [];
+  let added = false;
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    cmds.push(args.join(" "));
+    const joined = args.join(" ");
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" }; // default = main
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" }; // base branch not created yet
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const info: WorktreeLaunchInfo = {
+    assignment: {
+      nodeId: "fn-1-foo.1",
+      isCloseSink: false,
+      branch: "keeper/epic/fn-1-foo",
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [],
+      assertBranch: "keeper/epic/fn-1-foo",
+    },
+    baseBranch: "keeper/epic/fn-1-foo",
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [],
+    parentBranch: "keeper/epic/fn-1-foo", // === branch: the base lane
+  };
+  const res = await driver.provision(info);
+  expect(res.ok).toBe(true);
+  // Forks off `main` (resolved default), NOT the uncreated base branch.
+  expect(cmds).toContain(
+    "worktree add -b keeper/epic/fn-1-foo /repo.worktrees/keeper-epic-fn-1-foo main",
+  );
+});
+
+test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (default branch not consulted)", async () => {
+  const cmds: string[] = [];
+  let added = false;
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    cmds.push(args.join(" "));
+    const joined = args.join(" ");
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return {
+        code: 0,
+        stdout: "keeper/epic/fn-1-foo/fn-1-foo.2\n",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const info: WorktreeLaunchInfo = {
+    assignment: {
+      nodeId: "fn-1-foo.2",
+      isCloseSink: false,
+      branch: "keeper/epic/fn-1-foo/fn-1-foo.2",
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2",
+      inherited: false,
+      preMerges: [],
+      assertBranch: "keeper/epic/fn-1-foo/fn-1-foo.2",
+    },
+    baseBranch: "keeper/epic/fn-1-foo",
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [],
+    parentBranch: "keeper/epic/fn-1-foo", // the parent lane (!== branch)
+  };
+  const res = await driver.provision(info);
+  expect(res.ok).toBe(true);
+  // Forks off the parent lane; the default-branch resolution is never consulted.
+  expect(cmds).toContain(
+    "worktree add -b keeper/epic/fn-1-foo/fn-1-foo.2 /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2 keeper/epic/fn-1-foo",
+  );
+  expect(cmds.some((c) => c.startsWith("symbolic-ref"))).toBe(false);
+});
+
 test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the default branch", async () => {
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");

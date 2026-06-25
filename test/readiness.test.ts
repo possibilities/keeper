@@ -4800,12 +4800,17 @@ test("isEpicStarted: a plan job alongside genuine activity still marks started",
   expect(isEpicStarted(epic)).toBe(true);
 });
 
-test("isEpicStarted: any job_links provenance entry marks started", () => {
-  const epic = makeEpic({
-    job_links: [makeLink({ kind: "creator", job_id: "planner-job" })],
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
-  });
-  expect(isEpicStarted(epic)).toBe(true);
+test("isEpicStarted: a job_links provenance entry alone does NOT mark started", () => {
+  // `creator`/`refiner` links are plan-authoring provenance (the symmetric view
+  // of the `plan` sessions the plan-verb skip already excludes), not worker
+  // activity — a freshly planned, all-todo epic carries one yet is NOT started.
+  for (const kind of ["creator", "refiner"] as const) {
+    const epic = makeEpic({
+      job_links: [makeLink({ kind, job_id: "planner-job" })],
+      tasks: [makeTask({ task_id: "fn-1-foo.1", runtime_status: "todo" })],
+    });
+    expect(isEpicStarted(epic)).toBe(false);
+  }
 });
 
 test("isEpicStarted: any task-form job marks started", () => {
