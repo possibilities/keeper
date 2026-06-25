@@ -689,6 +689,24 @@ export interface BlockEscalationSweepDeps {
     blockedReason: string;
     repo: string;
   }) => Promise<BlockEscalationSendResult>;
+  /** True IFF an OPEN sticky `dispatch_failures` row already exists for
+   *  `work::<taskId>` — the once-only guard for {@link suppressRedispatch}. Reads
+   *  the live projection on the writable connection in production; the sweep skips
+   *  the mint when this is true so the 60s cadence never re-emits the row. */
+  readonly hasOpenWorkFailure: (taskId: string) => boolean;
+  /** Durably suppress autopilot re-dispatch of `work::<taskId>` after a
+   *  surface-and-stop block (`TOOLING_FAILURE` / absent-or-unparseable category):
+   *  mint a sticky `DispatchFailed` on the key so the existing `failedKeys`
+   *  reconcile arm holds the task out independent of the transient
+   *  `runtime_status='blocked'` / `block_escalations` latch (BOTH deleted on
+   *  leave-blocked, so neither can hold the task out past the transient window).
+   *  Cleared only by `retry_dispatch` (the human-cleared `failedKeys` contract).
+   *  Producer-side mint; fail-open. */
+  readonly suppressRedispatch: (args: {
+    taskId: string;
+    reason: string;
+    dir: string | null;
+  }) => void;
   /** Warn sink for non-fatal diagnostics. */
   readonly noteLine?: (line: string) => void;
 }
@@ -754,6 +772,24 @@ export async function runBlockEscalationSweep(
       // terminal outcome so it never re-evaluates.
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
+      // Durable re-dispatch guard: a surface-and-stop block must NOT auto-requeue.
+      // The `block_escalations` latch (now leaving `pending`) and the transient
+      // `runtime_status='blocked'` flag are both deleted on leave-blocked, so
+      // neither holds the task out past the block window — a long-running worker
+      // that ends, or fold lag, otherwise re-dispatches it every cycle. Mint a
+      // sticky `DispatchFailed` on `work::<task>` so the existing `failedKeys`
+      // reconcile arm suppresses cold re-dispatch until a human `retry_dispatch`
+      // clears it. Once-only: skip the mint when a row already exists so the 60s
+      // sweep never re-emits.
+      if (!deps.hasOpenWorkFailure(row.task_id)) {
+        deps.suppressRedispatch({
+          taskId: row.task_id,
+          reason: `blocked: ${category ?? "unparseable"}`,
+          dir:
+            effectiveBlockEscalationRepo(row.target_repo, row.project_dir) ||
+            null,
+        });
+      }
       continue;
     }
 
@@ -4739,6 +4775,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           outcome,
         ),
       notifyPlanner: notifyPlannerOfBlock,
+      hasOpenWorkFailure: (taskId) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
+              )
+              .get(taskId) != null
+          );
+        } catch {
+          // Fail-open: a read miss re-mints, which is an idempotent UPSERT (the
+          // row's `created_at` is preserved), so the worst case is one redundant
+          // event — never a missed suppression.
+          return false;
+        }
+      },
+      suppressRedispatch: ({ taskId, reason, dir }) =>
+        handleDispatchFailedMint({
+          verb: "work",
+          id: taskId,
+          reason,
+          dir,
+          ts: Date.now() / 1000,
+        }),
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }

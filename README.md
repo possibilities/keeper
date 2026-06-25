@@ -3054,7 +3054,15 @@ is still blocked (cancellation guard), reads `blocked_reason` from the plan stat
 file (producer-side fs read, never a fold), and escalates to the task's
 `planner@<epic>` over the Agent Bus — gated by a DENYLIST (every category escalates
 except `TOOLING_FAILURE` and an absent/unparseable reason) and COALESCED per
-recipient (one send per planner per cycle). It mints `BlockEscalationRequested`
+recipient (one send per planner per cycle). A surface-and-stop skip (the DENYLIST
+branch) additionally mints a sticky `DispatchFailed` on `work::<task>` ONCE, so the
+existing `failedKeys` reconcile arm DURABLY suppresses cold re-dispatch independent
+of the transient `runtime_status='blocked'` flag and `block_escalations` latch (both
+deleted on leave-blocked) — a `TOOLING_FAILURE` is permanent, not transient, and
+requires human recovery. Cleared only by `retry_dispatch` (the human-cleared
+`failedKeys` contract: `keeper plan unblock` flips the board, `keeper autopilot
+retry work::<task>` clears the guard so the resolved task re-dispatches). It mints
+`BlockEscalationRequested`
 (latch `pending→requested`), spawns a short-lived one-way CLI helper ASYNC (`keeper
 bus chat send` with the body via stdin so the free-text reason is never
 shell-interpolated, + `keeper bus wake` on `queued_for_wake`), then mints

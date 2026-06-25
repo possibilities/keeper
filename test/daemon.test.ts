@@ -3260,6 +3260,9 @@ interface MintCall {
 function fakeSweepDeps(opts: {
   pending: PendingBlockEscalation[];
   reasons?: Record<string, string | null>;
+  /** Task ids whose `work::<id>` already has an open `dispatch_failures` row —
+   *  drives the once-only guard for the durable re-dispatch suppression. */
+  alreadyFailed?: Set<string>;
   notify?: (args: {
     epicId: string;
     taskId: string;
@@ -3268,9 +3271,12 @@ function fakeSweepDeps(opts: {
   deps: BlockEscalationSweepDeps;
   mints: MintCall[];
   notifies: { epicId: string; taskId: string }[];
+  suppressions: { taskId: string; reason: string; dir: string | null }[];
 } {
   const mints: MintCall[] = [];
   const notifies: { epicId: string; taskId: string }[] = [];
+  const suppressions: { taskId: string; reason: string; dir: string | null }[] =
+    [];
   const deps: BlockEscalationSweepDeps = {
     selectPending: () => opts.pending,
     readBlockedReason: (_projectDir, taskId) => opts.reasons?.[taskId] ?? null,
@@ -3287,8 +3293,10 @@ function fakeSweepDeps(opts: {
         }
       );
     },
+    hasOpenWorkFailure: (taskId) => opts.alreadyFailed?.has(taskId) ?? false,
+    suppressRedispatch: (args) => suppressions.push(args),
   };
-  return { deps, mints, notifies };
+  return { deps, mints, notifies, suppressions };
 }
 
 test("runBlockEscalationSweep: an escalatable block mints Requested→Attempted{sent} in order, sends once", async () => {
@@ -3366,6 +3374,100 @@ test("runBlockEscalationSweep: an absent/unparseable reason is skipped (surface-
   expect(mints.map((m) => m.kind === "attempted" && m.outcome)).toContain(
     "skipped_category",
   );
+});
+
+test("runBlockEscalationSweep: a TOOLING_FAILURE block mints a durable DispatchFailed on work::<task> (re-dispatch suppression)", async () => {
+  const { deps, suppressions } = fakeSweepDeps({
+    pending: [
+      {
+        epic_id: "fn-1-foo",
+        task_id: "fn-1-foo.1",
+        project_dir: "/proj",
+        runtime_status: "blocked",
+        target_repo: "/lane",
+      },
+    ],
+    reasons: { "fn-1-foo.1": "TOOLING_FAILURE: the runner is broken" },
+  });
+  await runBlockEscalationSweep(deps);
+
+  // The surface-and-stop block durably suppresses re-dispatch via a sticky
+  // failure on the WORK key, carrying the effective repo as `dir`.
+  expect(suppressions).toEqual([
+    { taskId: "fn-1-foo.1", reason: "blocked: TOOLING_FAILURE", dir: "/lane" },
+  ]);
+});
+
+test("runBlockEscalationSweep: an absent/unparseable block also durably suppresses (surface-and-stop)", async () => {
+  const { deps, suppressions } = fakeSweepDeps({
+    pending: [
+      {
+        epic_id: "fn-1-foo",
+        task_id: "fn-1-foo.1",
+        project_dir: "/proj",
+        runtime_status: "blocked",
+        target_repo: null,
+      },
+    ],
+    reasons: {},
+  });
+  await runBlockEscalationSweep(deps);
+
+  // No target_repo → `dir` falls back to the epic project_dir.
+  expect(suppressions).toEqual([
+    { taskId: "fn-1-foo.1", reason: "blocked: unparseable", dir: "/proj" },
+  ]);
+});
+
+test("runBlockEscalationSweep: the durable suppression is once-only — skipped when a work failure row already exists", async () => {
+  const { deps, mints, suppressions } = fakeSweepDeps({
+    pending: [
+      {
+        epic_id: "fn-1-foo",
+        task_id: "fn-1-foo.1",
+        project_dir: "/proj",
+        runtime_status: "blocked",
+        target_repo: null,
+      },
+    ],
+    reasons: { "fn-1-foo.1": "TOOLING_FAILURE: still broken" },
+    alreadyFailed: new Set(["fn-1-foo.1"]),
+  });
+  await runBlockEscalationSweep(deps);
+
+  // The sticky row already exists → no re-mint (the 60s sweep never re-emits) ...
+  expect(suppressions).toEqual([]);
+  // ... but the latch still advances pending→requested→attempted exactly once.
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.1",
+      outcome: "skipped_category",
+    },
+  ]);
+});
+
+test("runBlockEscalationSweep: an escalatable block does NOT durably suppress (only surface-and-stop categories do)", async () => {
+  const { deps, suppressions, notifies } = fakeSweepDeps({
+    pending: [
+      {
+        epic_id: "fn-1-foo",
+        task_id: "fn-1-foo.1",
+        project_dir: "/proj",
+        runtime_status: "blocked",
+        target_repo: null,
+      },
+    ],
+    reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: ambiguous acceptance" },
+  });
+  await runBlockEscalationSweep(deps);
+
+  // SPEC_UNCLEAR escalates to the planner (who unblocks + resumes); the autopilot
+  // re-dispatch path stays open, so NO durable failure is minted.
+  expect(notifies).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  expect(suppressions).toEqual([]);
 });
 
 test("runBlockEscalationSweep: cancellation guard — a task that left blocked is skipped_unblocked, no send", async () => {

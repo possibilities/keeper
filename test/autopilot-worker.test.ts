@@ -893,6 +893,37 @@ test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky fai
   expect(decision.launches).toEqual([]);
 });
 
+test("fn-976 durable re-dispatch guard: a TOOLING_FAILURE block's sticky DispatchFailed holds the task out even while the projection still shows in_progress; retry_dispatch clears it", () => {
+  // The daemon block-escalation sweep mints a sticky DispatchFailed on
+  // work::<task> when a worker blocks TOOLING_FAILURE, so failedKeys holds the
+  // key. The task is otherwise ready (no live occupant) and the projection's
+  // runtime_status still reads `in_progress` — the transient blocked status lags
+  // the block / the long-running worker just ended — yet reconcile must NOT
+  // cold-re-dispatch it. This is the durable arm outliving the transient
+  // runtime-blocked gate.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", runtime_status: "in_progress" })],
+  });
+  const suppressed = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      failedKeys: new Set(["work::fn-1-foo.1"]),
+    }),
+    makeState(),
+    0,
+  );
+  expect(suppressed.launches).toEqual([]);
+
+  // retry_dispatch mints DispatchCleared → the sticky row leaves dispatch_failures
+  // → failedKeys empty → the resolved task re-dispatches.
+  const cleared = reconcile(
+    makeSnapshot({ epics: [epic], failedKeys: new Set() }),
+    makeState(),
+    0,
+  );
+  expect(cleared.launches.map((p) => p.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
 test("reconcile dedup (fn-674): liveTabKeys.has(key) blocks re-dispatch in the launch → SessionStart window", () => {
   // The launch → SessionStart blind window: the autopilot launched
   // a worker into a verb::id-named tab, the tab is live, but the
