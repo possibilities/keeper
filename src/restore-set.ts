@@ -165,6 +165,18 @@ export interface DeriveRestoreSetOptions {
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
+ * DESC-head bound for the dying-generation snapshot scan. The dying generation
+ * is the newest `TmuxTopologySnapshot` whose generation differs from `G_now`, so
+ * selection stops at the first non-`G_now` row scanned newest-first — it only
+ * ever reads past `G_now`'s own leading snapshots (plus any malformed rows ahead
+ * of the dying generation). Retention keeps every snapshot row unconditionally
+ * (`RETENTION_KEEP_CLASS_PREDICATE`), so without a bound the scan would load the
+ * whole snapshot history. This LIMIT is sized far above any plausible count of
+ * `G_now`-or-malformed rows stacked ahead of the dying generation, so a deep
+ * dying generation is never truncated below its correct snapshot. */
+const DYING_GENERATION_SCAN_LIMIT = 256;
+
+/**
  * Total-order comparator placing candidates in original visual (left-to-right)
  * tmux window order: a known `window_index` sorts ascending and precedes an
  * unknown (`null`) one; equal or both-unknown tiebreak by `created_at` then
@@ -673,7 +685,9 @@ export function deriveLastGenerationSetFromTopology(
  * SKIPPED to the next-newest `!= G_now` — a decode failure is not a "no snapshot"
  * verdict. Reads only the read-only `events` table ORDER BY id DESC, following
  * the daemon-down `seedLastGenerationHash` template (never throws). Returns the
- * decoded `{generation_id, panes}` so callers join panes to jobs.
+ * decoded `{generation_id, panes}` so callers join panes to jobs. The scan is
+ * bounded to {@link DYING_GENERATION_SCAN_LIMIT} rows off the DESC head so the
+ * read does not load the full retained snapshot history.
  */
 function selectDyingGenerationSnapshot(
   db: Database,
@@ -683,9 +697,12 @@ function selectDyingGenerationSnapshot(
   try {
     rows = db
       .query(
-        "SELECT id, data FROM events WHERE hook_event = 'TmuxTopologySnapshot' ORDER BY id DESC",
+        "SELECT id, data FROM events WHERE hook_event = 'TmuxTopologySnapshot' ORDER BY id DESC LIMIT ?",
       )
-      .all() as { id: number; data: string | null }[];
+      .all(DYING_GENERATION_SCAN_LIMIT) as {
+      id: number;
+      data: string | null;
+    }[];
   } catch {
     return null;
   }
