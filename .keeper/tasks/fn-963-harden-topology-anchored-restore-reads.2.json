@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-25T05:16:00.618000Z",
+  "depends_on": [],
+  "epic": "fn-963-harden-topology-anchored-restore-reads",
+  "id": "fn-963-harden-topology-anchored-restore-reads.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "pin recycle-guard join test",
+  "updated_at": "2026-06-25T05:16:00.618000Z"
+}
