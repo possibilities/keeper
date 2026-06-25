@@ -23,5 +23,5 @@ the re-fold time-bomb invariant; the fix is purely to stop loading all of histor
       never truncated below its correct snapshot.
 
 ## Done summary
-
+Bounded the dying-generation TmuxTopologySnapshot scan in selectDyingGenerationSnapshot with a DESC-head LIMIT (DYING_GENERATION_SCAN_LIMIT=256) so the restore read no longer loads the full retained snapshot history. Selection behavior is unchanged — the dying gen always sits just past G_now's leading rows.
 ## Evidence
