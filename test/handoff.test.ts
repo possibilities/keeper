@@ -6,11 +6,17 @@
  */
 
 import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MAX_CONTROL_FRAME_BYTES } from "../cli/control-rpc";
 import {
   buildRequestHandoffFrame,
   HANDOFF_DOC_MAX_BYTES,
+  spillHandoffDoc,
   validateHandoffDoc,
 } from "../cli/handoff";
+import { encodeFrame } from "../src/protocol";
 
 test("validateHandoffDoc: accepts an ordinary brief", () => {
   expect(validateHandoffDoc("investigate X; context: ...")).toEqual({
@@ -50,10 +56,10 @@ test("validateHandoffDoc: counts UTF-8 bytes, not code points (multibyte over th
   expect(validateHandoffDoc(doc).ok).toBe(false);
 });
 
-test("buildRequestHandoffFrame: emits the request_handoff RPC wire shape", () => {
+test("buildRequestHandoffFrame: carries doc_path, not the inline doc (small wire frame)", () => {
   const frame = buildRequestHandoffFrame("rpc-1", {
     handoff_id: "h-1",
-    doc: "brief",
+    doc_path: "/state/handoff/h-1.txt",
     title: "t",
     target_session: "work",
     initiator_session: "dash",
@@ -65,11 +71,48 @@ test("buildRequestHandoffFrame: emits the request_handoff RPC wire shape", () =>
     method: "request_handoff",
     params: {
       handoff_id: "h-1",
-      doc: "brief",
+      doc_path: "/state/handoff/h-1.txt",
       title: "t",
       target_session: "work",
       initiator_session: "dash",
       initiator_pane: "%2",
     },
   });
+});
+
+test("buildRequestHandoffFrame: stays small even for a 64KB doc (the doc rides a file, not the wire)", () => {
+  // Mirror the boundary that motivated the fix: a 64KB brief inlined into the
+  // frame overflowed the ~8 KiB UDS send buffer and hung. With doc_path the
+  // encoded frame is well under MAX_CONTROL_FRAME_BYTES regardless of doc size.
+  const frame = buildRequestHandoffFrame("rpc-1", {
+    handoff_id: "h-1",
+    doc_path: "/state/handoff/h-1.txt",
+    title: null,
+    target_session: "work",
+    initiator_session: null,
+    initiator_pane: null,
+  });
+  const encoded = encodeFrame(frame);
+  expect(Buffer.byteLength(encoded, "utf8")).toBeLessThan(
+    MAX_CONTROL_FRAME_BYTES,
+  );
+});
+
+test("spillHandoffDoc: writes the doc to a file under the spill dir and returns its path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-handoff-spill-"));
+  const prev = process.env.KEEPER_HANDOFF_SPILL_DIR;
+  process.env.KEEPER_HANDOFF_SPILL_DIR = dir;
+  try {
+    const big = "x".repeat(40_000); // well over the 8 KiB send-buffer boundary
+    const path = spillHandoffDoc("h-99", big);
+    expect(path.startsWith(dir)).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(big);
+  } finally {
+    if (prev === undefined) {
+      delete process.env.KEEPER_HANDOFF_SPILL_DIR;
+    } else {
+      process.env.KEEPER_HANDOFF_SPILL_DIR = prev;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

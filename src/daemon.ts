@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
+import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
   AutopilotWorkerData,
   DispatchExpiredMessage,
@@ -2588,6 +2589,47 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         const id = msg.id;
         let reply: RequestHandoffResultMessage;
         try {
+          // Read the brief back from the CLI's spill file and inline it into the
+          // event EXACTLY as before — the doc rode through the filesystem (not the
+          // wire) only because a 64KB inline frame overflows the UDS send buffer.
+          // Durability is unchanged: the doc lands in `events.data`, so `keeper
+          // handoff show` and the `handoffs` projection are byte-identical. A
+          // missing/unreadable/oversized file is a LOUD `ok:false` failure (the new
+          // real failure mode), never a silent hang.
+          let doc: string;
+          try {
+            doc = readFileSync(msg.doc_path, "utf8");
+          } catch (readErr) {
+            sw.postMessage({
+              type: "request-handoff-result",
+              id,
+              ok: false,
+              error: `cannot read handoff spill file \`${msg.doc_path}\`: ${
+                readErr instanceof Error ? readErr.message : String(readErr)
+              }`,
+            });
+            return;
+          }
+          if (doc.length === 0) {
+            sw.postMessage({
+              type: "request-handoff-result",
+              id,
+              ok: false,
+              error: `handoff spill file \`${msg.doc_path}\` is empty`,
+            });
+            return;
+          }
+          const docBytes = Buffer.byteLength(doc, "utf8");
+          if (docBytes > HANDOFF_DOC_MAX_BYTES) {
+            sw.postMessage({
+              type: "request-handoff-result",
+              id,
+              ok: false,
+              error: `handoff spill file \`${msg.doc_path}\` is ${docBytes} bytes, over the ${HANDOFF_DOC_MAX_BYTES}-byte cap`,
+            });
+            return;
+          }
+
           let initiatorJobId: string | null = null;
           if (msg.initiator_pane != null && msg.initiator_pane.length > 0) {
             // Newest live job on this pane wins (a pane is recycled across
@@ -2620,7 +2662,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $stop_hook_active: null,
             $data: JSON.stringify({
               handoff_id: msg.handoff_id,
-              doc: msg.doc,
+              doc,
               title: msg.title,
               target_session: msg.target_session,
               initiator_session: msg.initiator_session,

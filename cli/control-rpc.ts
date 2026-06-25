@@ -32,6 +32,17 @@ import {
 export const RESPONSE_TIMEOUT_MS = 5000;
 
 /**
+ * Conservative ceiling (bytes) on an encoded control frame written in one shot.
+ * The macOS UDS socket-send buffer (`SO_SNDBUF`) is ~8 KiB; a frame over it leans
+ * on Bun's partial-write path (oven-sh/bun#32087) and silently HANGS — the worst
+ * possible failure mode for a control RPC. We reject above this bound BEFORE
+ * writing so an oversized frame fails LOUDLY and actionably instead. Bulk payloads
+ * (e.g. a handoff brief) must ride through the filesystem, not the wire — see
+ * `cli/handoff.ts`'s doc-spill.
+ */
+export const MAX_CONTROL_FRAME_BYTES = 7 * 1024;
+
+/**
  * One round-trip on a fresh UDS connection. Opens, writes the frame, awaits
  * the server frame whose `id === matchId`, closes. Resolves with the matching
  * frame; rejects on connect-fail, transport error, malformed frame, server
@@ -42,6 +53,20 @@ export async function roundTrip(
   send: ClientFrame,
   matchId: string,
 ): Promise<ServerFrame> {
+  // Encode once and reject an oversized frame BEFORE opening the connection:
+  // a frame over the smallest common `SO_SNDBUF` would silently hang on write
+  // (oven-sh/bun#32087). Converting that into a loud, actionable error is the
+  // whole point of the guard — bulk payloads must ride a file, not the wire.
+  const encoded = encodeFrame(send);
+  const encodedBytes = Buffer.byteLength(encoded, "utf8");
+  if (encodedBytes > MAX_CONTROL_FRAME_BYTES) {
+    return Promise.reject(
+      new Error(
+        `control frame too large: ${encodedBytes} bytes exceeds the ${MAX_CONTROL_FRAME_BYTES}-byte safe send-buffer limit (id ${matchId}); pass bulk payloads via a file, not inline in the frame`,
+      ),
+    );
+  }
+
   return new Promise<ServerFrame>((resolve, reject) => {
     const buffer = new LineBuffer();
     let settled = false;
@@ -82,7 +107,7 @@ export async function roundTrip(
       socket: {
         open(s) {
           sock = s;
-          s.write(encodeFrame(send));
+          s.write(encoded);
         },
         data(_s, chunk) {
           let lines: string[];

@@ -204,7 +204,7 @@ function autopilotStubBridge(opts: {
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
       handoff_id: string;
-      doc: string;
+      doc_path: string;
       title: string | null;
       target_session: string;
       initiator_session: string | null;
@@ -224,7 +224,7 @@ function autopilotStubBridge(opts: {
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
       handoff_id: string;
-      doc: string;
+      doc_path: string;
       title: string | null;
       target_session: string;
       initiator_session: string | null;
@@ -569,7 +569,7 @@ test("request_handoff forwards the validated request to the bridge and returns o
   const result = await requestHandoffHandler(
     {
       handoff_id: "h-1",
-      doc: "investigate X",
+      doc_path: "/state/handoff/h-1.txt",
       title: "explore X",
       target_session: "work",
       initiator_session: "dash",
@@ -581,7 +581,7 @@ test("request_handoff forwards the validated request to the bridge and returns o
   expect(state.requestHandoffCalls).toEqual([
     {
       handoff_id: "h-1",
-      doc: "investigate X",
+      doc_path: "/state/handoff/h-1.txt",
       title: "explore X",
       target_session: "work",
       initiator_session: "dash",
@@ -593,14 +593,18 @@ test("request_handoff forwards the validated request to the bridge and returns o
 test("request_handoff coerces absent optional coords to null", async () => {
   const { bridge, state } = autopilotStubBridge({});
   const result = await requestHandoffHandler(
-    { handoff_id: "h-2", doc: "do Y", target_session: "work" },
+    {
+      handoff_id: "h-2",
+      doc_path: "/state/handoff/h-2.txt",
+      target_session: "work",
+    },
     bridge,
   );
   expect(result).toEqual({ ok: true, handoff_id: "h-2" });
   expect(state.requestHandoffCalls).toEqual([
     {
       handoff_id: "h-2",
-      doc: "do Y",
+      doc_path: "/state/handoff/h-2.txt",
       title: null,
       target_session: "work",
       initiator_session: null,
@@ -621,15 +625,20 @@ test("request_handoff throws BadParamsError on non-object params", async () => {
 test("request_handoff throws BadParamsError on a bad-shape payload", async () => {
   const { bridge, state } = autopilotStubBridge({});
   for (const bad of [
-    {}, // no handoff_id/doc/target_session
-    { doc: "x", target_session: "work" }, // missing handoff_id
-    { handoff_id: "", doc: "x", target_session: "work" }, // empty handoff_id
-    { handoff_id: "h", target_session: "work" }, // missing doc
-    { handoff_id: "h", doc: "", target_session: "work" }, // empty doc
-    { handoff_id: "h", doc: "x" }, // missing target_session
-    { handoff_id: "h", doc: "x", target_session: "" }, // empty target_session
-    { handoff_id: "h", doc: "x", target_session: "work", title: 1 }, // non-string title
-    { handoff_id: "h", doc: "x", target_session: "work", initiator_pane: 1 },
+    {}, // no handoff_id/doc_path/target_session
+    { doc_path: "/p", target_session: "work" }, // missing handoff_id
+    { handoff_id: "", doc_path: "/p", target_session: "work" }, // empty handoff_id
+    { handoff_id: "h", target_session: "work" }, // missing doc_path
+    { handoff_id: "h", doc_path: "", target_session: "work" }, // empty doc_path
+    { handoff_id: "h", doc_path: "/p" }, // missing target_session
+    { handoff_id: "h", doc_path: "/p", target_session: "" }, // empty target_session
+    { handoff_id: "h", doc_path: "/p", target_session: "work", title: 1 }, // non-string title
+    {
+      handoff_id: "h",
+      doc_path: "/p",
+      target_session: "work",
+      initiator_pane: 1,
+    },
   ]) {
     expect(requestHandoffHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,
@@ -644,7 +653,7 @@ test("request_handoff throws rpc_failed when the bridge reports ok:false", async
   });
   expect(
     requestHandoffHandler(
-      { handoff_id: "h", doc: "x", target_session: "work" },
+      { handoff_id: "h", doc_path: "/p", target_session: "work" },
       bridge,
     ),
   ).rejects.toThrow(/writer lock contention/);

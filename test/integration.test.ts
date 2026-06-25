@@ -487,6 +487,104 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
   );
 }, 30000);
 
+test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon inlines it into the event → handoffs projection carries the full doc", async () => {
+  // The handoff doc (up to 64KB) overflows the ~8 KiB UDS send buffer when inlined
+  // in the frame, so the CLI spills it to a file and sends only `doc_path`. Drive
+  // the full board→server→main path with a raw RPC frame (bypassing the CLI guard)
+  // pointing at a >8KB spill file, and assert the daemon reads it back and inlines
+  // the FULL doc into the event — so `handoffs.doc` is byte-identical to the spill.
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      const handoffId = "hr-e2e-1";
+      // 40KB — comfortably past the send-buffer boundary that hung the inline path,
+      // but under the 64KB cap.
+      const bigDoc = "Z".repeat(40 * 1024);
+      const spillPath = join(tmpDir, `${handoffId}.txt`);
+      writeFileSync(spillPath, bigDoc, "utf8");
+
+      async function rpc(
+        method: string,
+        params: Record<string, unknown>,
+      ): Promise<unknown> {
+        const buffer = new LineBuffer();
+        const id = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+          Bun.connect({
+            unix: sockPath,
+            socket: {
+              open(s) {
+                s.write(encodeFrame({ type: "rpc", id, method, params }));
+              },
+              data(s, chunk) {
+                for (const line of buffer.push(chunk.toString("utf8"))) {
+                  if (line.trim().length === 0) continue;
+                  const frame = JSON.parse(line) as ServerFrame;
+                  if ((frame as { id?: string }).id !== id) continue;
+                  if (frame.type === "rpc_result") {
+                    resolve(frame.value);
+                  } else if (frame.type === "error") {
+                    reject(
+                      new Error(
+                        `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                      ),
+                    );
+                  }
+                  s.end();
+                  return;
+                }
+              },
+              close() {},
+              error(_s, err) {
+                reject(err);
+              },
+            },
+          }).catch(reject);
+        });
+      }
+
+      // Enqueue: small wire frame (carries the PATH), big doc rides the file.
+      const ack = (await rpc("request_handoff", {
+        handoff_id: handoffId,
+        doc_path: spillPath,
+        title: "big brief",
+        target_session: "work",
+      })) as { ok: boolean; handoff_id: string };
+      expect(ack).toEqual({ ok: true, handoff_id: handoffId });
+
+      // Durability: the daemon inlined the FULL doc into the event, so the
+      // `handoffs` projection row carries it byte-identically.
+      const row = await retryUntil(() => {
+        const { db } = openDb(dbPath, { readonly: true });
+        try {
+          return (
+            (db
+              .query("SELECT doc, status FROM handoffs WHERE handoff_id = ?")
+              .get(handoffId) as { doc: string; status: string } | null) ?? null
+          );
+        } finally {
+          db.close();
+        }
+      }, 3000);
+      expect(row).not.toBeNull();
+      expect(row?.doc).toBe(bigDoc);
+      expect(row?.status).toBe("requested");
+
+      // Loud-fail: a missing spill path is an `ok:false` rpc error, never a hang.
+      try {
+        await rpc("request_handoff", {
+          handoff_id: "hr-e2e-missing",
+          doc_path: join(tmpDir, "does-not-exist.txt"),
+          target_session: "work",
+        });
+        throw new Error("expected a loud failure for a missing spill file");
+      } catch (e) {
+        expect(String(e)).toMatch(/cannot read handoff spill file|rpc_failed/);
+      }
+    },
+    { workers: ["wake", "server"] },
+  );
+}, 30000);
+
 test("end-to-end: plan worker → .keeper write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
   const taskId = `${epicId}.1`;

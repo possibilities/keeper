@@ -18,11 +18,16 @@
  * the configured prefix for a single invocation).
  */
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { resolveConfig, resolveSockPath } from "../src/db";
-import type { ClientFrame } from "../src/protocol";
-import { queryCollection, sendControlRpc } from "./control-rpc";
+import {
+  resolveConfig,
+  resolveHandoffSpillDir,
+  resolveSockPath,
+} from "../src/db";
+import type { ClientFrame, ServerFrame } from "../src/protocol";
+import { queryCollection, roundTrip } from "./control-rpc";
 import { resolveSession } from "./dispatch";
 
 const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
@@ -82,14 +87,17 @@ export function validateHandoffDoc(doc: string): ValidateDocResult {
 }
 
 /**
- * Build a well-formed RPC client frame for `request_handoff`. Pure — exported
- * so tests can assert the wire shape.
+ * Build a well-formed RPC client frame for `request_handoff`. The brief itself is
+ * NOT inlined — it rides through the filesystem (`doc_path` points at a spill file
+ * the daemon reads back), so the wire frame stays small regardless of doc size
+ * (the inline doc overflowed the ~8 KiB UDS send buffer and silently hung). Pure —
+ * exported so tests can assert the wire shape.
  */
 export function buildRequestHandoffFrame(
   id: string,
   req: {
     handoff_id: string;
-    doc: string;
+    doc_path: string;
     title: string | null;
     target_session: string;
     initiator_session: string | null;
@@ -102,6 +110,21 @@ export function buildRequestHandoffFrame(
     method: "request_handoff",
     params: { ...req },
   };
+}
+
+/**
+ * Spill the (already validated + capped) handoff doc to a file under the handoff
+ * spill dir and return its absolute path. The daemon reads it back to inline the
+ * doc into the `HandoffRequested` event, so durability is unchanged — the spill is
+ * a transport detail, not the system of record (the CLI removes it on a successful
+ * ack; age-out is the backstop). Pure-ish — exported for the round-trip test.
+ */
+export function spillHandoffDoc(handoffId: string, doc: string): string {
+  const dir = resolveHandoffSpillDir();
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${handoffId}.txt`);
+  writeFileSync(path, doc, "utf8");
+  return path;
 }
 
 function die(message: string): never {
@@ -217,17 +240,52 @@ export async function main(argv: string[]): Promise<void> {
   const title = parsed.values.title ?? null;
   const handoffId = crypto.randomUUID();
   const rpcId = crypto.randomUUID();
-  await sendControlRpc(
-    sockPath,
-    buildRequestHandoffFrame(rpcId, {
-      handoff_id: handoffId,
-      doc,
-      title,
-      target_session: session,
-      initiator_session: initiatorSession,
-      initiator_pane: initiatorPane,
-    }),
-    rpcId,
-    die,
-  );
+
+  // Spill the doc to a file and send only its PATH over the wire. The inline doc
+  // (up to 64KB) overflowed the ~8 KiB UDS send buffer and silently hung; the
+  // small `doc_path` frame never crosses that boundary. The daemon reads the file
+  // back and inlines the doc into the event (durability unchanged), so this file
+  // is transient — removed on a successful ack, aged out as a backstop.
+  let docPath: string;
+  try {
+    docPath = spillHandoffDoc(handoffId, doc);
+  } catch (err) {
+    die(`cannot write the handoff spill file: ${(err as Error).message}`);
+  }
+
+  let response: ServerFrame;
+  try {
+    response = await roundTrip(
+      sockPath,
+      buildRequestHandoffFrame(rpcId, {
+        handoff_id: handoffId,
+        doc_path: docPath,
+        title,
+        target_session: session,
+        initiator_session: initiatorSession,
+        initiator_pane: initiatorPane,
+      }),
+      rpcId,
+    );
+  } catch (err) {
+    // Leave the spill for age-out — a failed enqueue may be retried, and the
+    // daemon never inlined it.
+    die((err as Error).message);
+  }
+
+  if (response.type === "rpc_result") {
+    // The daemon has inlined the doc into the event by now; best-effort remove
+    // the spill (age-out is the backstop if this fails).
+    try {
+      rmSync(docPath, { force: true });
+    } catch {
+      // best-effort — age-out cleans it up.
+    }
+    process.stdout.write(`${JSON.stringify(response.value)}\n`);
+    process.exit(0);
+  }
+  if (response.type === "error") {
+    die(`server error ${response.code}: ${response.message}`);
+  }
+  die(`unexpected frame type: ${response.type}`);
 }

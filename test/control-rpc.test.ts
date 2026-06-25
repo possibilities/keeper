@@ -13,8 +13,13 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { queryCollection } from "../cli/control-rpc";
 import {
+  MAX_CONTROL_FRAME_BYTES,
+  queryCollection,
+  roundTrip,
+} from "../cli/control-rpc";
+import {
+  type ClientFrame,
   encodeFrame,
   LineBuffer,
   type QueryFrame,
@@ -159,4 +164,49 @@ test("queryCollection: a non-matching frame id is ignored; server close rejects"
   await expect(queryCollection(sockPath, "epics")).rejects.toThrow(
     /closed connection before responding/,
   );
+});
+
+test("roundTrip: rejects an oversized frame LOUDLY before writing (no silent hang)", async () => {
+  // A frame whose encoding exceeds the safe send-buffer bound would silently hang
+  // on write under the macOS UDS SO_SNDBUF (oven-sh/bun#32087). The guard must
+  // reject it up-front with a clear error — never connect, never hit the 5s
+  // timeout. No server is listening; a reject here proves we short-circuited
+  // before the connect path.
+  const big: ClientFrame = {
+    type: "rpc",
+    id: "rpc-big",
+    method: "request_handoff",
+    // params big enough to push the encoded frame over the bound.
+    params: { blob: "x".repeat(MAX_CONTROL_FRAME_BYTES + 1000) },
+  } as unknown as ClientFrame;
+  expect(encodeFrame(big).length).toBeGreaterThan(MAX_CONTROL_FRAME_BYTES);
+
+  const start = Date.now();
+  await expect(roundTrip(sockPath, big, "rpc-big")).rejects.toThrow(
+    /control frame too large/,
+  );
+  // Fast reject, not a 5s connect/timeout — well under the response timeout.
+  expect(Date.now() - start).toBeLessThan(1000);
+});
+
+test("roundTrip: a small frame is NOT rejected by the size guard", async () => {
+  // Below the bound the guard is transparent; the round-trip proceeds and (with a
+  // real echo server) completes normally.
+  listenEcho((q) => ({
+    type: "result",
+    id: q.id,
+    collection: q.collection,
+    rev: 1,
+    total: 0,
+    rows: [],
+  }));
+  const small: ClientFrame = {
+    type: "query",
+    id: "rpc-small",
+    collection: "epics",
+    limit: 0,
+  } as unknown as ClientFrame;
+  expect(encodeFrame(small).length).toBeLessThan(MAX_CONTROL_FRAME_BYTES);
+  const frame = await roundTrip(sockPath, small, "rpc-small");
+  expect(frame.type).toBe("result");
 });

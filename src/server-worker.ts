@@ -288,15 +288,17 @@ export interface SetEpicArmedResultMessage {
 
 /**
  * Worker→main bridge request: APPEND a `HandoffRequested` synthetic event (the
- * SIXTH mutating RPC). Carries the stably-minted idempotency key + the capped
- * doc + the raw initiator coords; main resolves `initiator_job_id` best-effort
- * by pane. Paired with {@link RequestHandoffResultMessage}.
+ * SIXTH mutating RPC). Carries the stably-minted idempotency key + the spill-file
+ * PATH (NOT the large doc — neither the socket frame nor this message inlines the
+ * blob) + the raw initiator coords; main reads the doc back from `doc_path` and
+ * resolves `initiator_job_id` best-effort by pane. Paired with
+ * {@link RequestHandoffResultMessage}.
  */
 export interface RequestHandoffRequestMessage {
   kind: "request-handoff-request";
   id: string;
   handoff_id: string;
-  doc: string;
+  doc_path: string;
   title: string | null;
   target_session: string;
   initiator_session: string | null;
@@ -1487,7 +1489,7 @@ export interface ReplayBridge {
    */
   requestHandoff(req: {
     handoff_id: string;
-    doc: string;
+    doc_path: string;
     title: string | null;
     target_session: string;
     initiator_session: string | null;
@@ -3475,7 +3477,7 @@ function main(): void {
           kind: "request-handoff-request",
           id: reqId,
           handoff_id: req.handoff_id,
-          doc: req.doc,
+          doc_path: req.doc_path,
           title: req.title,
           target_session: req.target_session,
           initiator_session: req.initiator_session,

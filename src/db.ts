@@ -100,6 +100,21 @@ export function resolveRestorePath(): string {
   return join(homedir(), ".local", "state", "keeper", "restore.json");
 }
 
+/**
+ * The handoff doc-spill directory: `<state>/handoff/`. `KEEPER_HANDOFF_SPILL_DIR`
+ * overrides it for tests. A `keeper handoff` brief (up to 64KB) is spilled here as
+ * a small file; the CLI sends only the path over the wire (control frames stay
+ * small — see `cli/control-rpc.ts`'s size guard), and the daemon reads it back to
+ * inline the doc into the `HandoffRequested` event. Same-host only (UDS implies
+ * shared filesystem). Pure. */
+export function resolveHandoffSpillDir(): string {
+  const override = process.env.KEEPER_HANDOFF_SPILL_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "handoff");
+}
+
 const DEFAULT_PLAN_ROOTS = ["~/code"];
 
 const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";

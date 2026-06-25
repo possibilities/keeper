@@ -463,8 +463,10 @@ export async function setAutopilotConfigHandler(
 export interface RequestHandoffParams {
   /** Stably-minted idempotency key (CLI-minted, the `handoffs` row PK). */
   handoff_id: string;
-  /** The contextful brief (already capped CLI-side at 64KB — NOT re-checked here). */
-  doc: string;
+  /** Path to the CLI's spill file holding the brief. Main reads it back and
+   *  inlines the doc into the event — the large blob rides the filesystem, not
+   *  the wire (the inline doc overflowed the UDS send buffer and hung). */
+  doc_path: string;
   /** Optional human title. */
   title: string | null;
   /** The resolved target tmux session the handoff-ee launches into. */
@@ -483,7 +485,7 @@ export interface RequestHandoffResult {
 function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
   if (params === null || typeof params !== "object" || Array.isArray(params)) {
     throw new BadParamsError(
-      "request_handoff: params must be an object with `handoff_id: string, doc: string, target_session: string`",
+      "request_handoff: params must be an object with `handoff_id: string, doc_path: string, target_session: string`",
     );
   }
   const obj = params as Record<string, unknown>;
@@ -492,9 +494,9 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
       "request_handoff: `handoff_id` must be a non-empty string",
     );
   }
-  if (typeof obj.doc !== "string" || obj.doc.length === 0) {
+  if (typeof obj.doc_path !== "string" || obj.doc_path.length === 0) {
     throw new BadParamsError(
-      "request_handoff: `doc` must be a non-empty string",
+      "request_handoff: `doc_path` must be a non-empty string",
     );
   }
   if (
@@ -520,7 +522,7 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
   const initiator_pane = optStr(obj.initiator_pane, "initiator_pane");
   return {
     handoff_id: obj.handoff_id,
-    doc: obj.doc,
+    doc_path: obj.doc_path,
     title,
     target_session: obj.target_session,
     initiator_session,
@@ -530,16 +532,18 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
 
 /**
  * `request_handoff` handler — the SIXTH mutating RPC. Validates the
- * `{ handoff_id, doc, target_session, ... }` shape and bridges to main, which
- * resolves `initiator_job_id` best-effort by pane then APPENDS a
- * `HandoffRequested` synthetic event onto the writable connection and pumps a
- * wake (no relay — the dispatcher worker re-reads the requested set each cycle).
+ * `{ handoff_id, doc_path, target_session, ... }` shape and bridges to main, which
+ * reads the brief back from `doc_path`, resolves `initiator_job_id` best-effort by
+ * pane, then APPENDS a `HandoffRequested` synthetic event (with the doc inlined)
+ * onto the writable connection and pumps a wake (no relay — the dispatcher worker
+ * re-reads the requested set each cycle).
  *
- * The 64KB doc cap is enforced CLI-side (the doc rides inline in `events.data`
- * forever, a replay-cost cap), NOT here — a foreign caller hitting this RPC
- * directly only bypasses a courtesy guard, never a correctness one (the cap is a
- * replay-budget protection, and the event log already bounds line size). Returns
- * `{ ok: true, handoff_id }` once main has appended. Fn-946 task .2.
+ * The brief rides through the filesystem (`doc_path`), not inline in the frame —
+ * a 64KB inline doc overflowed the UDS send buffer and silently hung. The 64KB
+ * doc cap is enforced CLI-side (the doc rides inline in `events.data` forever, a
+ * replay-cost cap); main also re-caps the file read defensively. A
+ * missing/unreadable/oversized file is a LOUD `ok:false` failure, never a hang.
+ * Returns `{ ok: true, handoff_id }` once main has appended.
  */
 export async function requestHandoffHandler(
   params: unknown,
