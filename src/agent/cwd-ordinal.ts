@@ -21,12 +21,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
-  FLOCK_CONSTANTS,
-  flockFd,
-  loadLibc,
-  setCloexec,
-} from "../usage-flock";
+import { FLOCK_CONSTANTS, flockFd, loadLibc, setCloexec } from "../usage-flock";
 
 function stateDir(): string {
   return join(homedir(), ".local", "state", "agentwrap");
