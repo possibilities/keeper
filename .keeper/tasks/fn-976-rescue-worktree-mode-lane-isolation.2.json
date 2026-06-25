@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Resolve worker repos to the lane via env override",
-  "updated_at": "2026-06-25T21:26:50.522000Z"
+  "updated_at": "2026-06-25T22:15:43.557000Z",
+  "worker_done_at": "2026-06-25T22:15:43.557000Z"
 }

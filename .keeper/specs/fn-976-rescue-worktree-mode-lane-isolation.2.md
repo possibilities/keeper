@@ -60,5 +60,5 @@ fall through to the 3-level fallback when unset/empty.
 - [ ] Pure-unit tests cover set + unset; no real-git test.
 
 ## Done summary
-
+Plan verbs honor KEEPER_PLAN_WORKTREE: resolve-task/worker-resume/reconcile resolve target_repo, primary_repo, and state_repo to the lane when set, falling through to the 3-level fallback when empty/unset. Closer stays cwd-bound via resolveProject (no dead-function patch). Docstring corrected, CLAUDE.md updated, pure-unit tests added.
 ## Evidence
