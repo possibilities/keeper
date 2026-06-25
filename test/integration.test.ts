@@ -24,6 +24,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import { openDb } from "../src/db";
 import { epicNumberFromId, taskNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
@@ -493,13 +494,19 @@ test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon 
   // the full board→server→main path with a raw RPC frame (bypassing the CLI guard)
   // pointing at a >8KB spill file, and assert the daemon reads it back and inlines
   // the FULL doc into the event — so `handoffs.doc` is byte-identical to the spill.
+  // The daemon confines the spill read under `resolveHandoffSpillDir()`, captured
+  // at boot from `KEEPER_HANDOFF_SPILL_DIR`. Sandbox it under the per-test tmpdir
+  // (the production default `~/.local/state/keeper/handoff` is NOT touched) and
+  // spill the legit briefs there so they pass the boundary check.
+  const spillDir = join(tmpDir, "handoff-spill");
+  mkdirSync(spillDir, { recursive: true });
   await withInProcessDaemon(
     async ({ dbPath, sockPath }) => {
       const handoffId = "hr-e2e-1";
       // 40KB — comfortably past the send-buffer boundary that hung the inline path,
       // but under the 64KB cap.
       const bigDoc = "Z".repeat(40 * 1024);
-      const spillPath = join(tmpDir, `${handoffId}.txt`);
+      const spillPath = join(spillDir, `${handoffId}.txt`);
       writeFileSync(spillPath, bigDoc, "utf8");
 
       async function rpc(
@@ -569,19 +576,72 @@ test("end-to-end: request_handoff routes a >8KB doc via a spill file → daemon 
       expect(row?.doc).toBe(bigDoc);
       expect(row?.status).toBe("requested");
 
-      // Loud-fail: a missing spill path is an `ok:false` rpc error, never a hang.
+      // Loud-fail: a missing IN-DIR spill path is an `ok:false` rpc error, never a
+      // hang. (The path sits under the spill dir, so it clears the boundary check
+      // and reaches the `readFileSync` catch.)
       try {
         await rpc("request_handoff", {
           handoff_id: "hr-e2e-missing",
-          doc_path: join(tmpDir, "does-not-exist.txt"),
+          doc_path: join(spillDir, "does-not-exist.txt"),
           target_session: "work",
         });
         throw new Error("expected a loud failure for a missing spill file");
       } catch (e) {
         expect(String(e)).toMatch(/cannot read handoff spill file|rpc_failed/);
       }
+
+      // Loud-fail: an out-of-dir `doc_path` is rejected BEFORE any read — the
+      // arbitrary-file-read guard. A foreign caller naming a daemon-readable path
+      // outside the spill dir must never have its bytes inlined.
+      const outOfDirPath = join(tmpDir, "secret.txt");
+      writeFileSync(outOfDirPath, "TOPSECRET", "utf8");
+      try {
+        await rpc("request_handoff", {
+          handoff_id: "hr-e2e-out-of-dir",
+          doc_path: outOfDirPath,
+          target_session: "work",
+        });
+        throw new Error("expected a loud failure for an out-of-dir spill path");
+      } catch (e) {
+        expect(String(e)).toMatch(/resolves outside the spill dir|rpc_failed/);
+      }
+
+      // Loud-fail: a 0-byte spill file is an `ok:false` rpc error.
+      const emptyPath = join(spillDir, "hr-e2e-empty.txt");
+      writeFileSync(emptyPath, "", "utf8");
+      try {
+        await rpc("request_handoff", {
+          handoff_id: "hr-e2e-empty",
+          doc_path: emptyPath,
+          target_session: "work",
+        });
+        throw new Error("expected a loud failure for an empty spill file");
+      } catch (e) {
+        expect(String(e)).toMatch(/is empty|rpc_failed/);
+      }
+
+      // Loud-fail: a spill file over the 64KB cap is an `ok:false` rpc error.
+      const oversizedPath = join(spillDir, "hr-e2e-oversized.txt");
+      writeFileSync(
+        oversizedPath,
+        "Y".repeat(HANDOFF_DOC_MAX_BYTES + 1),
+        "utf8",
+      );
+      try {
+        await rpc("request_handoff", {
+          handoff_id: "hr-e2e-oversized",
+          doc_path: oversizedPath,
+          target_session: "work",
+        });
+        throw new Error("expected a loud failure for an oversized spill file");
+      } catch (e) {
+        expect(String(e)).toMatch(/over the .*-byte cap|rpc_failed/);
+      }
     },
-    { workers: ["wake", "server"] },
+    {
+      workers: ["wake", "server"],
+      env: { KEEPER_HANDOFF_SPILL_DIR: spillDir },
+    },
   );
 }, 30000);
 

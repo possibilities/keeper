@@ -15,10 +15,11 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve as resolvePath, sep } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
@@ -59,6 +60,7 @@ import {
   resolveDbPath,
   resolveDeadLetterDir,
   resolveEventsLogDir,
+  resolveHandoffSpillDir,
   resolveKeeperAgentPath,
   resolvePlanRoots,
   resolveSockPath,
@@ -1975,6 +1977,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   mkdirSync(eventsLogDir, { recursive: true });
   scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
 
+  // Captured ONCE at boot (the resolver reads `process.env`, restored by the
+  // in-process test harness right after the synchronous boot window). The
+  // handoff spill-file read confines `doc_path` under this dir — without the
+  // confinement a foreign same-user `request_handoff` caller could name any
+  // daemon-readable path and exfiltrate its bytes into the durable `handoffs`
+  // projection. See the read site below.
+  const handoffSpillDir = resolveHandoffSpillDir();
+
   // fn-897 B1: the boot drain + seed + ephemeral-truncate runs in `serveBootDrain`
   // below, INVOKED after the server-worker spawn so the read socket is up during
   // this synchronous catch-up. The sequence is byte-for-byte the pre-fn-897 order.
@@ -2596,6 +2606,39 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // handoff show` and the `handoffs` projection are byte-identical. A
           // missing/unreadable/oversized file is a LOUD `ok:false` failure (the new
           // real failure mode), never a silent hang.
+          //
+          // CONFINE the read to `handoffSpillDir` BEFORE touching the file: the
+          // wire carries a fully caller-controlled `doc_path`, and an unconstrained
+          // `readFileSync` is an arbitrary-file-read primitive (a foreign same-user
+          // RPC could name `~/.ssh/id_ed25519` and exfiltrate it into the durable
+          // `handoffs` projection). Resolve the realpath of both the dir and the
+          // target (defeating symlink escapes) and require the target to sit under
+          // the dir. `realpathSync` throws on a non-existent path; fall back to a
+          // lexical resolve so a missing IN-DIR spill still flows to the loud
+          // "cannot read" branch below rather than masquerading as out-of-dir.
+          const realDir = ((): string => {
+            try {
+              return realpathSync(handoffSpillDir);
+            } catch {
+              return resolvePath(handoffSpillDir);
+            }
+          })();
+          const realDoc = ((): string => {
+            try {
+              return realpathSync(msg.doc_path);
+            } catch {
+              return resolvePath(msg.doc_path);
+            }
+          })();
+          if (realDoc !== realDir && !realDoc.startsWith(realDir + sep)) {
+            sw.postMessage({
+              type: "request-handoff-result",
+              id,
+              ok: false,
+              error: `handoff spill file \`${msg.doc_path}\` resolves outside the spill dir \`${handoffSpillDir}\``,
+            });
+            return;
+          }
           let doc: string;
           try {
             doc = readFileSync(msg.doc_path, "utf8");
