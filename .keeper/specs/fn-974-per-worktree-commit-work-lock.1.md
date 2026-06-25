@@ -124,5 +124,5 @@ each site; do not trust the numbers.
 - [ ] `src/doc-commit.ts` and its tests are untouched.
 
 ## Done summary
-
+Keyed the commit-work advisory flock per-worktree via 'git rev-parse --path-format=absolute --git-dir' at both lock sites (cli/commit-work.ts + commitWorkLockPath), so disjoint linked worktrees take distinct locks while a base-merge and a commit-work in the same worktree still serialize. Main worktree path unchanged; full + hygiene + slow real-git suites green.
 ## Evidence
