@@ -22,5 +22,5 @@ the env hardening is what makes the prompt path fail-fast and assertable.
 - [ ] Behavior matches the commit-work push leg's `GIT_TERMINAL_PROMPT=0` pattern.
 
 ## Done summary
-
+Pass env { GIT_TERMINAL_PROMPT: 0 } to both producer push legs (finalizeEpic :2157 and recoverWorktrees :2351) so a credential-needing origin fails fast instead of hanging the reconcile cycle, matching the commit-work push leg. Added a recover-leg env assertion.
 ## Evidence

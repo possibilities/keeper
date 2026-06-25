@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Set GIT_TERMINAL_PROMPT on producer pushes",
-  "updated_at": "2026-06-25T07:12:07.050000Z"
+  "updated_at": "2026-06-25T08:15:12.131000Z",
+  "worker_done_at": "2026-06-25T08:15:12.131000Z"
 }
