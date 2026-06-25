@@ -47,5 +47,5 @@ Fast tier carries the re-fold + golden-equivalence tests; the real-tmux attach/r
 - [ ] README architecture reflects the control-worker as topology producer and the restore-worker shed of its topology poll (current-behavior-only).
 
 ## Done summary
-
+Pinned the topology producer relocation byte-identical: a mixed-source TmuxTopologySnapshot re-fold in refold-equivalence proves the live location columns are charter-excluded (floor-gated historical topology no-ops) and the deterministic class re-folds identically across both producer eras; extended the slow real-tmux test to assert the topology tracks a live session change AND the generation boundary re-fires after a kill+restart; updated README to make the control-worker the documented topology producer (new tenth-worker paragraph) and shed the restore-worker of its topology poll.
 ## Evidence
