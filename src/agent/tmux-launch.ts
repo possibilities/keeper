@@ -83,7 +83,14 @@ export interface TmuxCommandResult {
   stderr: string;
 }
 
-export type TmuxCommandRunner = (cmd: string[]) => TmuxCommandResult;
+// `timeoutMs` overrides the per-command spawn bound when set; callers omit it
+// and get the new-session vs default floor. A test exercising the timeout-
+// classification path passes a tiny value so a real `sleep` spawn trips the
+// timeout in milliseconds instead of blocking on the multi-second floor.
+export type TmuxCommandRunner = (
+  cmd: string[],
+  timeoutMs?: number,
+) => TmuxCommandResult;
 
 export class TmuxLaunchError extends Error {
   constructor(
@@ -366,15 +373,18 @@ export function defaultAgentwrapStateDir(env: NodeJS.ProcessEnv): string {
 
 export const defaultTmuxCommandRunner: TmuxCommandRunner = (
   cmd: string[],
+  timeoutMs?: number,
 ): TmuxCommandResult => {
   try {
     const proc = Bun.spawnSync(cmd, {
       stdout: "pipe",
       stderr: "pipe",
       env: tmuxSpawnEnv(process.env),
-      timeout: cmd.includes("new-session")
-        ? TMUX_NEW_SESSION_TIMEOUT_MS
-        : TMUX_DEFAULT_TIMEOUT_MS,
+      timeout:
+        timeoutMs ??
+        (cmd.includes("new-session")
+          ? TMUX_NEW_SESSION_TIMEOUT_MS
+          : TMUX_DEFAULT_TIMEOUT_MS),
     });
     if (proc.exitedDueToTimeout || proc.exitCode === null) {
       return {

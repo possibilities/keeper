@@ -1,7 +1,0 @@
-# A raw `bun test` (not via `bun run test` / `test:full`) bypasses the gate
-# script `scripts/test-gate.ts`. This preload re-applies the gate's host-wide
-# flock in-process at the start of EVERY `bun test` so an ad-hoc/agent run cannot
-# oversubscribe the shared host (fn-934). The gate sets `KEEPER_TEST_GATED=1` on
-# its spawned child so the preload skips re-locking and never self-deadlocks.
-[test]
-preload = ["./scripts/test-preload.ts"]

@@ -105,8 +105,8 @@ imperative guardrails only.
   `*.slow.test.ts` sibling while its file stays fast (path-ignored from the fast tier into `test:full`),
   never the whole file or `test.skip`. (2) No real git in default tiers — test git-boundary DECISIONS via a
   pure seam; a test whose contract genuinely IS git's execution must ALSO be allowlisted in `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene`).
-- **The host-wide test lock is un-bypassable** — `scripts/test-gate.ts` (parallelism cap + `flock`)
-  and the `bunfig.toml` preload both apply it; every lock path fails open.
+- **Test runs are lock-free** — `scripts/test-gate.ts` (`test` / `test:full` route through it) caps
+  `--parallel` (`KEEPER_TEST_PARALLEL`, default 5) + adds `--no-orphans`. Never add a host-wide lock — a hung holder wedges every runner.
 - **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses `retryUntil`
   (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep`.
 
