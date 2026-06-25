@@ -843,10 +843,12 @@ event-log/reducer/hook touch. Run any of them with
   subagent pill` ⇒ `ok`. The convention is documented in each view's
   `--help` (`keeper board --help` / `keeper jobs --help`). Each
   epic renders as a header line —
-  `({dir}) {epic_number} {title} [#dep,#dep] [validated]?
-  [ready|completed|blocked:<reason>]` (the
+  `({dir}) {epic_number} {title} [#dep,#dep] [validated]? [armed]?
+  [started]? [ready|completed|blocked:<reason>]` (the
   `[validated]` pill appears ONLY when the epic is validated; its absence
-  encodes `unvalidated`) — followed by indented task lines
+  encodes `unvalidated`. `[armed]` / `[started]` are likewise omit-default —
+  present only when the epic is explicitly armed / has been started) —
+  followed by indented task lines
   (the `{epic_number} {title}` label falls back to `{epic_id}` when BOTH
   are null — a pre-`EpicSnapshot` stub row in the partial-projection
   window between the `EpicSnapshot` and `TaskSnapshot` folds — so the
@@ -854,9 +856,13 @@ event-log/reducer/hook touch. Run any of them with
   blank `({dir})` line — under fn-708's omit-default an unvalidated stub
   no longer even carries a trailing `[unvalidated]` pill; the row is
   never hidden, fn-700)
-  (epics render in `epic_number ASC` creation order — a neutral seed
-  consumers reorder through readiness's `orderEpicsForScheduling` seam;
-  no priority/ordering signal lives in epic/board state)
+  (epics reorder through readiness's `orderEpicsForScheduling` seam:
+  STARTED epics — any associated job OR any task advanced off `todo`,
+  marked by a `[started]` pill — sort ahead of unstarted ones, then
+  `epic_number ASC` creation order within each tier (`epic_id` final
+  tiebreak). "Prefer the started epic" is a pure read-time computation;
+  no priority/ordering signal lives in epic/board state, and the per-root
+  single-task mutex self-bounds it — no aging/floor)
   (with omit-default `[<runtime>]? [worker-done]?
   [ready|completed|blocked:<reason>]` pills — the two native fields
   consolidated per fn-708: the plan runtime enum elides its `todo`
@@ -1862,9 +1868,13 @@ As of schema v85 (fn-936), the `epics` projection carries NO static
 priority/ordering machinery: `EPICS_DESCRIPTOR.defaultSort` is
 `epic_number asc` (tie-break `epic_id`) — plain creation order, a neutral
 seed. Clients (board, autopilot, the `keeper autopilot` viewer) consume that
-order through readiness's `orderEpicsForScheduling` seam — an identity
-passthrough today, the single future home for any runtime priority (which
-will live on the autopilot surface, never plan metadata/state). v85 dropped
+order through readiness's `orderEpicsForScheduling` seam, which applies Rule #1
+("prefer the started epic") as a PURE read-time reorder: started epics
+(`isEpicStarted` — any associated job OR any task off `todo`) sort ahead of
+unstarted ones, then `epic_number ASC` (`epic_id` tiebreak) within each tier.
+No priority is persisted — it is recomputed each call from task/job activity,
+and the per-root single-task mutex self-bounds it (hard-categorical, no aging).
+v85 dropped
 the `sort_path` / `queue_jump` / `created_by_closer_of` `epics` columns, the
 `events.plan_queue_jump` column, the `[slotted-after-closer]` board pill, and
 the `/queue` surface (`/plan:next` + `keeper plan epic queue-jump`). As of

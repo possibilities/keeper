@@ -172,6 +172,7 @@ export const FA_CLASSIC: IconTheme = {
 
     // --- markers ---
     armed: FA.bolt,
+    started: FA.play,
   },
   prefix: {
     "blocked:": FA.ban, // ONE glyph for every block reason (reason via text)

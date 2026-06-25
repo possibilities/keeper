@@ -125,7 +125,8 @@ function shortTaskId(taskId: string, epicId: string): string {
 
 /**
  * Render the open-task dependency graph as an ASCII DAG. One block per epic
- * in board (creation, `epic_number ASC`) order via `orderEpicsForScheduling`;
+ * in board scheduling order via `orderEpicsForScheduling` (started epics first,
+ * then `epic_number ASC` within each tier);
  * within a block, one line per task carrying a status glyph, the short `.M` id,
  * and a `← <deps>` clause naming the `depends_on` upstreams it waits for. An
  * epic that itself waits on other epics annotates its header with `← epic:<id>`

@@ -24,7 +24,9 @@ import {
   type BlockReason,
   computeReadiness,
   formatPill,
+  isEpicStarted,
   isRootOccupant,
+  orderEpicsForScheduling,
   PENDING_DISPATCH_STALE_CEILING_SEC,
   type PendingDispatch,
   type RunningReason,
@@ -4103,4 +4105,343 @@ test("fn-905: a rootless row (no target_repo, no project_dir) is never gated", (
     tag: "blocked",
     reason: { kind: "unknown" },
   });
+});
+
+// ---------------------------------------------------------------------------
+// fn-949: isEpicStarted — pure "has real worker activity touched this epic?"
+// predicate behind Rule #1 (prefer the started epic).
+// ---------------------------------------------------------------------------
+
+test("isEpicStarted: fresh epic (no jobs, all-todo) is NOT started", () => {
+  const epic = makeEpic({
+    jobs: [],
+    job_links: [],
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", runtime_status: "todo" }),
+      makeTask({ task_id: "fn-1-foo.2", runtime_status: "todo" }),
+    ],
+  });
+  expect(isEpicStarted(epic)).toBe(false);
+});
+
+test("isEpicStarted: resting worker_phase 'open' alone does NOT mark started", () => {
+  // The resting `worker_phase` on a never-worked task shell is "open" (not
+  // null) — counting it would mark every epic started and collapse the tiering.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" })],
+  });
+  expect(isEpicStarted(epic)).toBe(false);
+});
+
+test("isEpicStarted: any epic-form job marks started", () => {
+  const epic = makeEpic({
+    jobs: [makeEmbeddedJob({ plan_verb: "close" })],
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  expect(isEpicStarted(epic)).toBe(true);
+});
+
+test("isEpicStarted: any job_links provenance entry marks started", () => {
+  const epic = makeEpic({
+    job_links: [makeLink({ kind: "creator", job_id: "planner-job" })],
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  expect(isEpicStarted(epic)).toBe(true);
+});
+
+test("isEpicStarted: any task-form job marks started", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        jobs: [makeEmbeddedJob({ plan_verb: "work" })],
+      }),
+    ],
+  });
+  expect(isEpicStarted(epic)).toBe(true);
+});
+
+test("isEpicStarted: any task runtime_status off 'todo' marks started", () => {
+  for (const rt of ["in_progress", "done", "blocked"]) {
+    const epic = makeEpic({
+      tasks: [
+        makeTask({ task_id: "fn-1-foo.1", runtime_status: "todo" }),
+        makeTask({ task_id: "fn-1-foo.2", runtime_status: rt }),
+      ],
+    });
+    expect(isEpicStarted(epic)).toBe(true);
+  }
+});
+
+test("isEpicStarted: null/malformed fields do NOT throw (null-safe)", () => {
+  // The board feeds the seam an untyped `snap.epics as Epic[]` cast — a `.length`
+  // on `undefined` in the predicate would crash the render path.
+  const malformed = {
+    epic_id: "fn-1-foo",
+    epic_number: null,
+    // jobs / job_links / tasks all absent.
+  } as unknown as Epic;
+  expect(() => isEpicStarted(malformed)).not.toThrow();
+  expect(isEpicStarted(malformed)).toBe(false);
+
+  const malformedTask = makeEpic({
+    jobs: undefined as unknown as Epic["jobs"],
+    job_links: undefined as unknown as Epic["job_links"],
+    tasks: [
+      {
+        task_id: "fn-1-foo.1",
+        // jobs / runtime_status absent.
+      } as unknown as Task,
+    ],
+  });
+  expect(() => isEpicStarted(malformedTask)).not.toThrow();
+  expect(isEpicStarted(malformedTask)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-949: orderEpicsForScheduling — stable total-order sort (started-first,
+// epic_number ASC null-last, epic_id tiebreak); pure; fresh array.
+// ---------------------------------------------------------------------------
+
+function startedEpic(overrides: Partial<Epic>): Epic {
+  // A minimally-started epic: one task with a work job.
+  return makeEpic({
+    tasks: [
+      makeTask({
+        task_id: `${overrides.epic_id ?? "fn-1-foo"}.1`,
+        epic_id: overrides.epic_id ?? "fn-1-foo",
+        runtime_status: "in_progress",
+      }),
+    ],
+    ...overrides,
+  });
+}
+
+function unstartedEpic(overrides: Partial<Epic>): Epic {
+  return makeEpic({
+    jobs: [],
+    job_links: [],
+    tasks: [
+      makeTask({
+        task_id: `${overrides.epic_id ?? "fn-1-foo"}.1`,
+        epic_id: overrides.epic_id ?? "fn-1-foo",
+        runtime_status: "todo",
+      }),
+    ],
+    ...overrides,
+  });
+}
+
+test("orderEpicsForScheduling: started epics sort ahead of unstarted ones", () => {
+  const e1 = unstartedEpic({ epic_id: "fn-1-foo", epic_number: 1 });
+  const e2 = startedEpic({ epic_id: "fn-2-bar", epic_number: 2 });
+  const ordered = orderEpicsForScheduling([e1, e2]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-2-bar", "fn-1-foo"]);
+});
+
+test("orderEpicsForScheduling: creation order (epic_number ASC) within a tier", () => {
+  const e3 = unstartedEpic({ epic_id: "fn-3-c", epic_number: 3 });
+  const e1 = unstartedEpic({ epic_id: "fn-1-a", epic_number: 1 });
+  const e2 = unstartedEpic({ epic_id: "fn-2-b", epic_number: 2 });
+  const ordered = orderEpicsForScheduling([e3, e1, e2]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-1-a", "fn-2-b", "fn-3-c"]);
+});
+
+test("orderEpicsForScheduling: null epic_number sorts LAST within its tier", () => {
+  const e1 = unstartedEpic({ epic_id: "fn-1-a", epic_number: 1 });
+  const eNull = unstartedEpic({ epic_id: "fn-z-null", epic_number: null });
+  const e2 = unstartedEpic({ epic_id: "fn-2-b", epic_number: 2 });
+  const ordered = orderEpicsForScheduling([eNull, e2, e1]);
+  expect(ordered.map((e) => e.epic_id)).toEqual([
+    "fn-1-a",
+    "fn-2-b",
+    "fn-z-null",
+  ]);
+});
+
+test("orderEpicsForScheduling: epic_id breaks a same-tier same-number tie", () => {
+  const eb = unstartedEpic({ epic_id: "fn-9-bbb", epic_number: 9 });
+  const ea = unstartedEpic({ epic_id: "fn-9-aaa", epic_number: 9 });
+  const ordered = orderEpicsForScheduling([eb, ea]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-9-aaa", "fn-9-bbb"]);
+});
+
+test("orderEpicsForScheduling: same output on a shuffled input (cycle-invariance)", () => {
+  const epics = [
+    startedEpic({ epic_id: "fn-2-started", epic_number: 2 }),
+    unstartedEpic({ epic_id: "fn-1-unstarted", epic_number: 1 }),
+    startedEpic({ epic_id: "fn-4-started", epic_number: 4 }),
+    unstartedEpic({ epic_id: "fn-3-unstarted", epic_number: 3 }),
+    unstartedEpic({ epic_id: "fn-x-null", epic_number: null }),
+  ];
+  const expected = [
+    "fn-2-started",
+    "fn-4-started",
+    "fn-1-unstarted",
+    "fn-3-unstarted",
+    "fn-x-null",
+  ];
+  expect(orderEpicsForScheduling(epics).map((e) => e.epic_id)).toEqual(
+    expected,
+  );
+  // Reverse + rotate the input — the unique tiebreak makes output invariant.
+  const shuffled = [epics[3], epics[0], epics[4], epics[1], epics[2]];
+  expect(orderEpicsForScheduling(shuffled).map((e) => e.epic_id)).toEqual(
+    expected,
+  );
+});
+
+test("orderEpicsForScheduling: pure — returns a fresh array, never mutates input", () => {
+  const e1 = startedEpic({ epic_id: "fn-2-bar", epic_number: 2 });
+  const e2 = unstartedEpic({ epic_id: "fn-1-foo", epic_number: 1 });
+  const input = [e2, e1];
+  const ordered = orderEpicsForScheduling(input);
+  expect(ordered).not.toBe(input);
+  // Input order untouched.
+  expect(input.map((e) => e.epic_id)).toEqual(["fn-1-foo", "fn-2-bar"]);
+  // Same Epic object references (reorder, not clone).
+  expect(ordered[0]).toBe(e1);
+  expect(ordered[1]).toBe(e2);
+});
+
+// ---------------------------------------------------------------------------
+// fn-949: composed reorder→mutex — the load-bearing integration. A started
+// epic's ready task must win a shared root over an unstarted same-root sibling
+// once the seam reorder feeds the per-root mutex's "first ready row wins" walk.
+// ---------------------------------------------------------------------------
+
+test("composed reorder→mutex: started epic beats a LOWER-epic_number unstarted same-root sibling for the shared root", () => {
+  // fn-1 is the lower epic_number but UNSTARTED; fn-2 is STARTED. Both ready on
+  // /repo. Without the reorder, fn-1 (iterating first in creation order) would
+  // claim the root and demote fn-2. The seam reorders started-first, so fn-2
+  // claims /repo and fn-1 demotes to single-task-per-root.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/repo",
+    runtime_status: "todo",
+  });
+  const e1 = unstartedEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1],
+  });
+  const t2 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/repo",
+    runtime_status: "in_progress",
+  });
+  const e2 = startedEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  // Feed the mutex the SAME array the production path would: seam-ordered.
+  const ordered = orderEpicsForScheduling([e1, e2]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-2-bar", "fn-1-foo"]);
+  const perTask = new Map<string, Verdict>([
+    [t1.task_id, { tag: "ready" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex(ordered, perTask, new Map());
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("composed reorder→mutex: armed eligibility composes INNER to the started-first order (eligible+unstarted beats ineligible+started)", () => {
+  // Started-first is the SEED order; armed-mode eligibility is the inner
+  // tiebreak in the per-root mutex's pass-2a. An ELIGIBLE-but-unstarted epic's
+  // task still claims the shared root over an INELIGIBLE-but-started sibling —
+  // armed precedence dominates the reorder.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/repo",
+    runtime_status: "in_progress",
+  });
+  const e1 = startedEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1],
+  });
+  const t2 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/repo",
+    runtime_status: "todo",
+  });
+  const e2 = unstartedEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  // Seam order puts the STARTED fn-1 first.
+  const ordered = orderEpicsForScheduling([e1, e2]);
+  expect(ordered.map((e) => e.epic_id)).toEqual(["fn-1-foo", "fn-2-bar"]);
+  const perTask = new Map<string, Verdict>([
+    [t1.task_id, { tag: "ready" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  // Only fn-2 is eligible (armed). Pass-2a awards the root to the eligible task
+  // FIRST, regardless of its later seam position.
+  applySingleTaskPerRootMutex(
+    ordered,
+    perTask,
+    new Map(),
+    new Map(),
+    new Set(),
+    new Set(["fn-2-bar"]),
+  );
+  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("composed reorder→mutex: a pass-1 live occupant is NOT preempted by a started sibling", () => {
+  // fn-1 holds /repo via a live worker (job-running, a pass-1 root occupant).
+  // fn-2 is STARTED with a ready task on the same root and sorts first after the
+  // reorder — but pass-1's eligibility-blind occupancy claim wins, so the
+  // started sibling's ready task demotes; the live worker is never preempted.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    target_repo: "/repo",
+    runtime_status: "in_progress",
+  });
+  const e1 = startedEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1],
+  });
+  const t2 = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    target_repo: "/repo",
+    runtime_status: "in_progress",
+  });
+  const e2 = startedEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const ordered = orderEpicsForScheduling([e1, e2]);
+  const perTask = new Map<string, Verdict>([
+    [t1.task_id, running({ kind: "job-running" })],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  applySingleTaskPerRootMutex(ordered, perTask, new Map());
+  expect(perTask.get("fn-1-foo.1")).toEqual(running({ kind: "job-running" }));
+  expect(perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
 });

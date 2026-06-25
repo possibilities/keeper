@@ -48,6 +48,7 @@ import {
   planVerbLabel,
   renderClosePills,
   renderTaskPills,
+  startedPill,
   subagentLinesFor,
   validatedPill,
 } from "../src/board-render";
@@ -55,6 +56,7 @@ import { resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
   formatPill,
+  isEpicStarted,
   orderEpicsForScheduling,
   type Verdict,
 } from "../src/readiness";
@@ -563,10 +565,13 @@ export async function main(argv: string[]): Promise<void> {
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
     // The `{epic_number} {title}` label falls back to `epic_id` when both are
     // null (a pre-`EpicSnapshot` stub row), so the header is never blank.
-    // `validatedPill` and `armedPill` both omit their default and self-delimit,
-    // emitting their pill only at the non-resting value.
+    // `validatedPill`, `armedPill`, and `startedPill` all omit their default and
+    // self-delimit, emitting their pill only at the non-resting value.
     const armedSeg = armedPill(armedSet.has(epicId));
-    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${armedSeg}`;
+    // `isEpicStarted` is null-safe, so the untyped-row → `Epic` cast (same trust
+    // boundary as the seam's `snap.epics as Epic[]`) can't throw the renderer.
+    const startedSeg = startedPill(isEpicStarted(row as unknown as Epic));
+    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${armedSeg}${startedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
@@ -634,8 +639,8 @@ export async function main(argv: string[]): Promise<void> {
       return "";
     }
     const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
-    // Route the creation-order seed through the single scheduling-order seam (an
-    // identity passthrough today; the future home for any runtime priority).
+    // Route the creation-order seed through the single scheduling-order seam:
+    // started epics sort first (Rule #1), then `epic_number` within each tier.
     const epicsList = orderEpicsForScheduling(snap.epics as Epic[]);
     return epicsList
       .map((e) =>

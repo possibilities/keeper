@@ -288,6 +288,18 @@ export function armedPill(isArmed: boolean): string {
 }
 
 /**
+ * Render the trailing `[started]` pill segment for a board EPIC HEADER. Marks
+ * the started-first reorder (`orderEpicsForScheduling`) legible: ` [started]`
+ * when the epic has real worker activity (`isEpicStarted`), `""` otherwise —
+ * absence ≡ not started. Same omit-default convention as `armedPill`; routes
+ * through `pill` for the icon theme and returns its own leading space so the
+ * caller appends self-delimited. Pure.
+ */
+export function startedPill(isStarted: boolean): string {
+  return isStarted ? ` ${pill("started")}` : "";
+}
+
+/**
  * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
  * the consolidated `[${runtime_status}] [${worker_phase}]` closure. Pure
  * `f(task, verdict)` — no readiness recompute, no wall-clock, no env;

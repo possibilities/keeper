@@ -46,6 +46,7 @@ import {
   pillOrEmpty,
   renderClosePills,
   renderTaskPills,
+  startedPill,
   subagentLinesFor,
   validatedPill,
 } from "../src/board-render";
@@ -1656,6 +1657,19 @@ test("armedPill: armed epic → ' [armed]'", () => {
 
 test("armedPill: unarmed epic → '' (omit-default)", () => {
   expect(armedPill(false)).toBe("");
+});
+
+// ---------------------------------------------------------------------------
+// fn-949: startedPill — omit-default (render [started] only when started),
+// mirroring armedPill.
+// ---------------------------------------------------------------------------
+
+test("startedPill: started epic → ' [started]'", () => {
+  expect(startedPill(true)).toBe(` ${pill("started")}`);
+});
+
+test("startedPill: unstarted epic → '' (omit-default)", () => {
+  expect(startedPill(false)).toBe("");
 });
 
 // ---------------------------------------------------------------------------

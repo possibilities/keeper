@@ -84,21 +84,95 @@ export function resolveEpicDep(
 }
 
 /**
+ * Whether an epic has been STARTED — i.e. real worker activity has touched it.
+ * The pure read-time signal behind Rule #1 ("prefer the started epic"); never
+ * persisted in epic/board state. An epic counts as started when ANY of:
+ *   - it carries an epic-form job (`jobs`) — a `plan`/`close`/`approve` verb ran,
+ *   - it carries a provenance `job_links` entry — a session created/refined it,
+ *   - any task carries a task-form job (`task.jobs`) — a `work`/`approve` ran,
+ *   - any task's `runtime_status` has advanced off `"todo"`.
+ *
+ * Deliberately does NOT key on `task.worker_phase`: its resting value on a
+ * never-worked task shell is `"open"` (not null), so counting it would mark
+ * every epic started and collapse the tiering to a no-op. A fresh epic — no
+ * jobs, all tasks `runtime_status === "todo"` — is NOT started.
+ *
+ * Null-safe on every field (missing arrays read as empty, missing
+ * `runtime_status` reads as the `"todo"` default): the board calls the seam via
+ * an untyped `snap.epics as Epic[]` cast, so a throw here would crash the render
+ * path. Pure.
+ */
+export function isEpicStarted(epic: Epic): boolean {
+  if ((epic.jobs?.length ?? 0) > 0 || (epic.job_links?.length ?? 0) > 0) {
+    return true;
+  }
+  for (const task of epic.tasks ?? []) {
+    if ((task.jobs?.length ?? 0) > 0) {
+      return true;
+    }
+    if ((task.runtime_status ?? "todo") !== "todo") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The single ordering seam every scheduling consumer (the board, the autopilot
  * reconciler, the `keeper autopilot` viewer) routes its epic list through.
  *
  * The backend serves epics in a NEUTRAL `epic_number ASC` creation order (the
  * `EPICS_DESCRIPTOR` default sort); no priority/ordering signal lives in
- * epic/board STATE. This is an IDENTITY passthrough today — it preserves the
- * creation-order seed verbatim — and is the SINGLE future home for any runtime
- * priority (which will live on the autopilot surface, never plan metadata). A
- * consumer that wants a priority-aware order changes ONLY this function.
+ * epic/board STATE. This seam applies Rule #1 ("prefer the started epic") as a
+ * pure read-time reorder over that seed: STARTED epics (`isEpicStarted`) sort
+ * ahead of unstarted ones, so the autopilot finishes in-progress epics before
+ * opening new ones and every consuming view stays consistent. No priority is
+ * ever persisted — it is recomputed each call from task/job activity. A
+ * consumer that wants a different scheduling order changes ONLY this function.
  *
- * Pure: no I/O, no clock, never throws. Returns a fresh array (never mutates the
- * input) so callers can rely on the seed staying intact.
+ * STABLE TOTAL ORDER: `tier (started=0, unstarted=1) → epic_number ASC (null
+ * sorts last) → epic_id`. The unique `epic_id` final tiebreak makes the result
+ * cycle-invariant — the same set in any input order yields the same output, so
+ * the reconciler's per-tick `dedupedEpics` ordering can't oscillate the board.
+ * Hard-categorical: no aging/floor/threshold — the per-root single-task mutex
+ * serializes same-root epics, self-bounding "prefer started" to "finish A, then
+ * B, then C" in creation order.
+ *
+ * Pure: no I/O, no clock, never throws. The tier is snapshotted per epic before
+ * sorting (so the comparator stays a cheap field read), and the comparator is
+ * null-safe. Returns a fresh array (never mutates the input).
  */
 export function orderEpicsForScheduling(epics: readonly Epic[]): Epic[] {
-  return epics.slice();
+  const tiered = epics.map((epic) => ({
+    epic,
+    tier: isEpicStarted(epic) ? 0 : 1,
+  }));
+  tiered.sort((a, b) => {
+    if (a.tier !== b.tier) {
+      return a.tier - b.tier;
+    }
+    // null `epic_number` sorts LAST within its tier; never subtract (a null →
+    // NaN comparator breaks the total order). Both null falls through to the
+    // `epic_id` tiebreak.
+    const an = a.epic.epic_number;
+    const bn = b.epic.epic_number;
+    if (an !== bn) {
+      if (an == null) {
+        return 1;
+      }
+      if (bn == null) {
+        return -1;
+      }
+      return an - bn;
+    }
+    // Unique final tiebreak — guarantees a total order (cycle-invariance).
+    return a.epic.epic_id < b.epic.epic_id
+      ? -1
+      : a.epic.epic_id > b.epic.epic_id
+        ? 1
+        : 0;
+  });
+  return tiered.map((t) => t.epic);
 }
 
 // ---------------------------------------------------------------------------

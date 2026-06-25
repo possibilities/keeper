@@ -1648,8 +1648,9 @@ export async function loadReconcileSnapshot(
     seenEpicIds.add(epic.epic_id);
     dedupedEpics.push(epic);
   }
-  // Route the creation-order seed through the single scheduling-order seam (an
-  // identity passthrough today; the future home for any runtime priority).
+  // Route the creation-order seed through the single scheduling-order seam:
+  // started epics sort first (Rule #1) so the reconciler finishes in-progress
+  // epics before opening new ones, then `epic_number` within each tier.
   const epics = orderEpicsForScheduling(dedupedEpics);
 
   const jobs = new Map<string, Job>();
