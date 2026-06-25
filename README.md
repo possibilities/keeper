@@ -3027,13 +3027,15 @@ on partial failure). The terminal-surface mechanics live in
 dispatch and the manual `keeper dispatch` re-exec the `keeper agent
 <claude|codex|pi>` subcommand (which owns the tmux window) — the in-binary
 launcher is the sole launch path (keeperd probes its launchability at boot). tmux
-is used DIRECTLY for everything else: the pane ops
+is used DIRECTLY only for the pane ops
 (`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer,
 and `killWindow`, the reaper's only kill op; there is no general sweep-close
-path) and the crash-recovery restore replay (`restore-agents.ts`, which spawns the
-alias-independent resume LAUNCH argv into a get-or-created session via its own
-per-call mint). Each reconciler dispatch opens as a new window in the
-hardcoded managed session (`autopilot`); the launch and pane ops each run a cheap
+path). Crash-recovery restore (`restore-agents.ts`) and bus wake both ride the
+SAME in-binary launcher in resume mode (`agentwrapLaunch` with a `resumeTarget` —
+agentwrap get-or-creates the recorded session and re-attaches via
+`--resume <target>`), so there is ONE launch transport, not a second
+shell-wrapper replay. Each reconciler dispatch opens as a new window in the
+hardcoded managed session (`autopilot`); the pane ops run a cheap
 per-call `has-session` probe and mint via `new-session -d` only when the
 session is absent, so a stale/EXITED corpse is rebuilt rather than resurrected;
 a probe short-circuits before any mint when the target is already LIVE. The confirm step
@@ -3133,21 +3135,20 @@ mutable session name — a RENAMED session restores correctly.
 
 `scripts/restore-agents.ts` is a thin presenter over that ordered set: its dry-run
 prints the plan (using the human-facing `buildResumeCommand` DISPLAY form),
-`--apply` relaunches each survivor into its original session via
-`restoreReplayLaunch` (`src/exec-backend.ts`) using the shared
-`buildResumeLaunchForm` / `resumeTarget` substrate (`src/resume-descriptor`),
-pacing window creation 0.5s apart. The substrate is ONE DISPLAY form
-(`buildResumeCommand`, the bare `claude --resume` string `scripts/resume.ts`
-prints) plus ONE LAUNCH form (`buildResumeLaunchForm`, fn-940) shared by the TWO
-launch producers — this crash-restore util and `keeper bus wake`. The LAUNCH form
-is alias-independent and quoting-safe: an absolute `keeper agent` launcher prefix
-+ `claude --resume <target> --agentwrap-no-confirm` riding as positional `"$@"`
-args, so it needs no `claude` alias and a session name with shell metacharacters
-is handled safely. The restore replay is a direct tmux launch: it execs that argv
-into a get-or-created session via its own per-call mint (the crash-recovery path
-stays on tmux directly, distinct from the `keeper agent` dispatch launch). cwd is
-applied by the tmux transport via `new-window -c`, not interpolated into the
-launch body.
+`--apply` relaunches each survivor into its recorded `backend_exec_session_id`
+via keeper's SOLE launch transport — `agentwrapLaunch` in resume mode
+(`src/exec-backend.ts`), the same seam `keeper bus wake` uses — pacing launches
+0.5s apart. agentwrap builds the `claude --agentwrap-tmux … --resume <target>`
+invocation off an absolute `keeper agent` launcher prefix (alias-independent, and
+a session name with shell metacharacters is handled safely), get-or-creates the
+session itself, and holds the pane open after claude exits. `src/resume-descriptor`
+now exposes ONLY the DISPLAY form (`buildResumeCommand`, the bare `claude --resume`
+string `scripts/resume.ts` prints); `resumeTarget` is the shared key both the
+wake and restore paths resolve. cwd is set on the `agentwrapLaunch` spawn
+(agentwrap reads its own `process.cwd()`), not interpolated into a launch body.
+`--snapshot-current` emits the BARE agentwrap resume argv per candidate
+(shell-quoted, byte-aligned with what `--apply` spawns — no `tmux new-window`
+wrapper, since agentwrap mints its own window).
 `--last-generation` swaps the candidate source to `deriveLastGenerationSet`
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.
@@ -3310,11 +3311,12 @@ and fails loud (exit 1, stderr) on every other result — a non-delivery is neve
 silent exit-0. A `queued_for_wake` send can be RESUMED now by the CLIENT-SIDE
 `keeper bus wake "planner@<epic_id>"` verb (fn-918): it resolves the epic's
 creator from the trusted `job_links` edge and resumes it into a dedicated
-`agentbus` tmux session via the alias-independent resume LAUNCH form
-(`buildResumeLaunchForm`, fn-940 — an absolute `keeper agent` launcher prefix +
-`claude --resume <target>` as positional `"$@"` args, so no `claude` alias is
-needed and a session name with shell metacharacters is safe; one DISPLAY form +
-two LAUNCH producers, shared with crash-restore), single-flighted per session,
+`agentbus` tmux session via keeper's SOLE launch transport — `agentwrapLaunch` in
+resume mode (the same seam crash-restore uses): agentwrap builds the
+`claude --agentwrap-tmux … --resume <target>` invocation off an absolute
+`keeper agent` launcher prefix (alias-independent, shell-metacharacter-safe),
+mints/owns the window, and holds the pane open after claude exits — so there is
+ONE launch transport, not a separate shell-wrapper. Single-flighted per session,
 liveness- and cooldown-gated, fail-open. The relay itself NEVER spawns — wake is entirely the
 CLI verb — and a stopped tracked `agentbus` window is autoclosed by the
 window-reaper's managed-session arm (epic fn-920) past the idle grace, alongside

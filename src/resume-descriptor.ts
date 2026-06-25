@@ -1,18 +1,15 @@
 /**
- * Pure resume-descriptor helpers — ONE DISPLAY form plus ONE LAUNCH form,
- * shared by the resume producers.
+ * Pure resume-descriptor helpers — ONE DISPLAY form, shared by the resume
+ * surfaces.
  *
  *  - DISPLAY ({@link buildResumeCommand}): the human-facing
  *    `claude --resume "<target>"` shell string `scripts/resume.ts` prints.
  *    Byte-unchanged, alias-shaped (a bare `claude` token a human pastes).
- *  - LAUNCH ({@link buildResumeLaunchForm}): the alias-independent,
- *    quoting-safe argv the crash-restore util
- *    ({@link import("../scripts/restore-agents").buildResumeLaunchArgv}) spawns.
- *    It rides an ABSOLUTE `keeper agent` launcher prefix (injected by the
- *    caller) + the resume tokens as positional `"$@"` args, so no `claude`
- *    alias is needed and no shell metacharacter in the session name can fire.
- *    (`keeper bus wake` now resumes via the unified `agentwrapLaunch` transport,
- *    not this form.)
+ *
+ * There is NO separate LAUNCH form here: `keeper bus wake` and crash-restore
+ * both resume via keeper's sole launch transport (`agentwrapLaunch` in resume
+ * mode, `src/exec-backend.ts`), which builds the `--resume <target>` invocation
+ * itself. {@link resumeTarget} is the shared key both paths resolve.
  *
  * Everything in this module is PURE — no socket, no fs, no `Date.now()`, no
  * env reads. `scripts/resume.ts` still owns the lazy per-epic UDS fetch loop
@@ -51,9 +48,11 @@ export function resumeTarget(job: Pick<Job, "title" | "job_id">): string {
  * (same degenerate-path rule as `buildWorkerCommand`).
  *
  * This is the DISPLAY form — the bare `claude --resume` string a human pastes
- * (`scripts/resume.ts`). The LAUNCH producers do NOT use it (a bare `claude`
- * relies on the `claude → keeper agent claude` alias, which is shell-specific
- * and absent under a `-c` body); they call {@link buildResumeLaunchForm}.
+ * (`scripts/resume.ts`). The launch surfaces (`keeper bus wake`, crash-restore)
+ * do NOT use it (a bare `claude` relies on the `claude → keeper agent claude`
+ * alias, which is shell-specific); they resume via `agentwrapLaunch` in resume
+ * mode (`src/exec-backend.ts`), which builds the `--resume <target>` argv off an
+ * absolute launcher prefix.
  *
  * fn-10 inverted tier routing: the resume command no longer carries a
  * `--plugin-dir` tier-plugin flag. `claude --resume` re-attaches to an
@@ -76,57 +75,6 @@ export function buildResumeCommand(
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
   return `${cdPrefix}claude --resume "${target}" --agentwrap-no-confirm`;
-}
-
-/**
- * Build the LAUNCH-form resume argv — the alias-independent, quoting-safe
- * command the two launch producers spawn into a tmux window. Mirrors
- * `buildDispatchLaunchArgv` (`src/dispatch-command.ts`): a login+interactive
- * shell wrapper whose `-c` body is the FIXED literal `"$@" ; exec "$0" -l -i`
- * — NO caller data is interpolated, so a `target` carrying single quotes,
- * `$VAR`, backticks, `$(...)`, a newline, `;`, or a leading dash crosses the
- * shell boundary as a literal positional with zero escaping and cannot fire.
- *
- * Every command token rides as a positional in `"$@"`: the injected absolute
- * launcher `prefix` (`[<bun>, <abs cli/keeper.ts>, "agent"]` from
- * `buildLauncherArgvPrefix`), then `claude`, `--resume`, `<target>`,
- * `--agentwrap-no-confirm`. The absolute prefix is PATH-independent, so the
- * launch never depends on the `claude` alias or on `~/.bun/bin` being on PATH
- * — it survives both the login (profile PATH) and interactive (rc) shells
- * drifting. `prefix` is INJECTED so this builder stays PURE (the same shape
- * by which `shell` is injected).
- *
- * UNLIKE `buildDispatchLaunchArgv`, the command part is NOT `exec`'d: claude
- * must be a child so the trailing `exec "$0" -l -i` hold-open shell survives
- * claude exiting and holds the pane open. The `$0` slot is filled by repeating
- * `shell` so the first real positional is `$1` and `"$@"` runs the full
- * command (without it the prefix's first token is eaten as `$0` → claude
- * launches with no resume). No `cd` and no `--agentwrap-tmux*`: the tmux
- * transport already applies cwd via `new-window -c`, and the launch already
- * runs inside the tmux window the transport opened (a second would
- * double-nest). Identical positional mapping under bash and zsh. Pure.
- */
-export function buildResumeLaunchForm(
-  shell: string,
-  prefix: string[],
-  target: string,
-): string[] {
-  const body = `"$@" ; exec "$0" -l -i`;
-  // `shell` fills the explicit `$0` slot so the first prefix token is NOT
-  // eaten as $0; the resume tokens then ride as $1.. positionals.
-  return [
-    shell,
-    "-l",
-    "-i",
-    "-c",
-    body,
-    shell,
-    ...prefix,
-    "claude",
-    "--resume",
-    target,
-    "--agentwrap-no-confirm",
-  ];
 }
 
 /**

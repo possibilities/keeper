@@ -1,13 +1,14 @@
 /**
  * The terminal-surface launch + pane seams keeper dispatches workers through.
- * agentwrap is the sole launch transport: {@link agentwrapLaunch} invokes the
+ * agentwrap is the SOLE launch transport: {@link agentwrapLaunch} invokes the
  * patched agentwrap CLI (which OWNS the tmux window — session-create + handoff)
- * for both autopilot dispatch and manual `keeper dispatch`. tmux is used DIRECTLY
- * for the surviving direct seams — the session-agnostic pane ops
+ * for autopilot dispatch, manual `keeper dispatch`, bus wake, AND crash-recovery
+ * restore (all in resume mode for the latter two). tmux is used DIRECTLY only for
+ * the surviving pane-ops seam — the session-agnostic pane ops
  * ({@link createTmuxPaneOps}: focus / list / rename / kill, consumed by the
- * reaper / renamer / jobs CLI / autopilot liveness probe) and the crash-recovery
- * restore replay ({@link restoreReplayLaunch}). No `ExecBackend` interface, no
- * backend toggle: the launch transport is agentwrap, the pane ops are tmux.
+ * reaper / renamer / jobs CLI / autopilot liveness probe). No `ExecBackend`
+ * interface, no backend toggle: the launch transport is agentwrap, the pane ops
+ * are the only remaining direct tmux surface.
  *
  * Every function is pure / side-effect-free at module scope; tests inject a fake
  * `spawn` to assert argv without launching real processes.
@@ -336,53 +337,6 @@ export function buildTmuxNewSessionArgs(session: string): string[] {
 }
 
 /**
- * Build the tmux `new-window` launch argv. Pure — exported for tests. Dispatched
- * windows inherit the global `remain-on-exit off`, so a window closes natively
- * once its whole process tree exits — exactly like a hand-created pane. The
- * hosted `claude` exiting does NOT close the window: the launch wrapper's
- * trailing `exec $SHELL -l -i` login shell keeps the pane occupied, which both
- * leaves a usable shell for inspection and keeps the pane LISTED so
- * `classifyCloseKind`'s `list-panes` probe still reads `pid_died`.
- *
- * Targets `=<session>:` (the `=` prefix forces an EXACT session match — tmux
- * otherwise does an fnmatch glob + prefix match, so `back` would land in
- * `background`; the trailing colon = the session's window list) so the new
- * window lands in exactly the named session. `-c <cwd>` sets the working dir; the
- * `-e KEEPER_TMUX_SESSION=<session>` injection re-stamps the session name on the
- * new window's pane env (a window does NOT inherit the session-mint `-e`).
- * `-P -F '#{pane_id}'` prints the new pane's id to stdout — the durable handle
- * for every later targeted op. `argv` is passed after `--` so tmux execs it
- * directly with no shell layer.
- *
- * `name`, when non-empty, labels the window via `-n` (the restore caller's seam
- * — managed `launch` always passes empty so windows stay unnamed). Window names
- * never carry `.`/`:` — colons break target parsing.
- */
-export function buildTmuxNewWindowArgs(
-  session: string,
-  cwd: string,
-  argv: string[],
-  name?: string,
-): string[] {
-  return [
-    "tmux",
-    "new-window",
-    "-t",
-    `=${session}:`,
-    "-c",
-    cwd,
-    "-e",
-    `KEEPER_TMUX_SESSION=${session}`,
-    ...(name != null && name !== "" ? ["-n", name] : []),
-    "-P",
-    "-F",
-    "#{pane_id}",
-    "--",
-    ...argv,
-  ];
-}
-
-/**
  * Build the tmux `select-window -t <paneId>` argv. Pure — exported for tests.
  * Targeting by PANE id (server-global `%N`) brings its window forward; a paired
  * `select-pane` then focuses the pane within it. NEVER name-based — colons in
@@ -589,24 +543,6 @@ export function buildTmuxKillWindowArgs(paneId: string): string[] {
   return ["tmux", "kill-window", "-t", paneId];
 }
 
-/**
- * Build the tmux `set-option -w -t <target> <name> <value>` window-option argv.
- * Pure — exported for tests. Targets the WINDOW scope (`-w`); the caller passes
- * `=<session>:` (exact session, current window — the just-spawned window is
- * current after a non-detached `new-window`) per the `setup-tmux.ts` precedent.
- * Used to stamp the cleanup system's managed-window user-option marker on each
- * `agentbus` spawn so the external reaper can identify + reap keeper's windows
- * precisely and never touch a human's hand-opened window. keeper only SETS the
- * marker here; it never reaps.
- */
-export function buildTmuxSetWindowOptionArgs(
-  target: string,
-  name: string,
-  value: string,
-): string[] {
-  return ["tmux", "set-option", "-w", "-t", target, name, value];
-}
-
 /** Dep bag for {@link createTmuxPaneOps} — the direct session-agnostic pane
  *  operations seam. `spawn` is injectable for tests; `captureTimeoutMs` tunes
  *  the per-call kill-timeout. */
@@ -768,111 +704,6 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
       return { ok: true };
     },
   };
-}
-
-/** Dep bag for {@link restoreReplayLaunch} — the kept spec-less tmux replay
- *  launch as a direct seam. `spawn` injectable for tests; `captureTimeoutMs`
- *  tunes the per-call kill-timeout. */
-export interface RestoreReplayDeps {
-  readonly noteLine: (line: string) => void;
-  readonly spawn?: SpawnFn;
-  readonly captureTimeoutMs?: number;
-}
-
-/**
- * Direct seam for the ONE surviving tmux launch — the crash-recovery restore
- * replay (scripts/restore-agents.ts). Get-or-creates the per-call `session`
- * then execs the recorded shell-wrapped `argv` verbatim in a new window via
- * `new-window` (named `name` when supplied). This is a spec-less replay: the
- * restore caller holds only a recorded `argv`, never a structured `LaunchSpec`,
- * so it stays on the direct tmux launch (this epic does not migrate restore to
- * agentwrap — a deferred follow-up). Behavior is verbatim the prior launch shape
- * (a regression here is invisible until the next crash, so it is preserved
- * exactly). NEVER throws.
- */
-export async function restoreReplayLaunch(
-  session: string,
-  argv: string[],
-  cwd: string,
-  deps: RestoreReplayDeps,
-  name?: string,
-): Promise<LaunchResult> {
-  const spawn = deps.spawn ?? defaultSpawn;
-  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
-  const runCapture = makeRunCapture({
-    spawn,
-    captureTimeoutMs,
-    noteLine: deps.noteLine,
-    kind: "tmux",
-  });
-  return launchIntoTmux(
-    runCapture,
-    deps.noteLine,
-    session,
-    argv,
-    name ?? "",
-    cwd,
-    `session=${session}`,
-  );
-}
-
-/**
- * Shared tmux get-or-create + `new-window` launch, factored to module scope as
- * the implementation behind the {@link restoreReplayLaunch} seam. Runs a
- * per-call `has-session` probe → `new-session` mint when absent (the mint
- * carries color + locale env so a keeperd-minted server is not colorblind /
- * non-ASCII-blind), then a chained `new-window`. NEVER throws.
- */
-async function launchIntoTmux(
-  runCapture: ReturnType<typeof makeRunCapture>,
-  noteLine: (line: string) => void,
-  targetSession: string,
-  argv: string[],
-  name: string,
-  cwd: string,
-  label: string,
-): Promise<LaunchResult> {
-  // Per-call get-or-create: a `has-session -t =<session>` probe (exit 0 = live)
-  // and a `new-session -d` mint when absent. The mint spawn carries
-  // color-capable TERM/COLORTERM + a UTF-8 locale default — keeperd runs as a
-  // LaunchAgent with env stripped, so a server minted here would otherwise
-  // render every worker pane colorblind and treat non-ASCII window names as
-  // unprintable. A probe `null` (ENOENT) skips the mint and the `new-window`
-  // then fails loud with `{ ok: false }`.
-  const has = await runCapture(buildTmuxHasSessionArgs(targetSession));
-  if (has == null) {
-    noteLine(
-      `# warn: tmux has-session failed (binary missing?); subsequent launches will no-op`,
-    );
-  } else if (has.exitCode !== 0) {
-    // Locale-defaulted alongside the color env: a server minted by a C-locale
-    // client treats non-ASCII window names as unprintable server-wide.
-    await runCapture(buildTmuxNewSessionArgs(targetSession), {
-      env: {
-        ...localeDefaultedEnv(
-          process.env as Record<string, string | undefined>,
-        ),
-        TERM: process.env.TERM ?? "xterm-256color",
-        COLORTERM: process.env.COLORTERM ?? "truecolor",
-      },
-    });
-  }
-  const args = buildTmuxNewWindowArgs(targetSession, cwd, argv, name);
-  const res = await runCapture(args);
-  if (res == null) {
-    const error = `tmux new-window for ${label} failed (ENOENT? binary missing)`;
-    noteLine(`# warn: ${error}`);
-    return { ok: false, error };
-  }
-  if (res.stderr.length > 0) {
-    noteLine(`# launch stderr (${label}): ${res.stderr.trim()}`);
-  }
-  if (res.exitCode !== 0) {
-    const error = `tmux new-window for ${label} exited non-zero (${res.exitCode})`;
-    noteLine(`# warn: ${error}`);
-    return { ok: false, error };
-  }
-  return { ok: true };
 }
 
 // ===========================================================================

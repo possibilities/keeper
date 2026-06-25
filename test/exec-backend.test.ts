@@ -3,12 +3,9 @@
  *
  * Coverage:
  *  - Pure tmux argv builders (`buildTmuxHasSessionArgs`,
- *    `buildTmuxNewSessionArgs`, `buildTmuxNewWindowArgs`,
- *    `buildTmuxSelectWindowArgs`, `buildTmuxSelectPaneArgs`) produce the tmux
- *    CLI shape the live spec calls for.
- *  - `restoreReplayLaunch` — the surviving direct tmux launch (crash-restore
- *    replay): get-or-create + chained `new-window`, per-call session + the `-n`
- *    label seam, the timeout-kill degrade, and ENOENT/non-zero failure envelopes.
+ *    `buildTmuxNewSessionArgs`, `buildTmuxSelectWindowArgs`,
+ *    `buildTmuxSelectPaneArgs`) produce the tmux CLI shape the live spec calls
+ *    for.
  *  - `createTmuxPaneOps` — the direct session-agnostic pane ops: `focusPane`
  *    id-based select-window+select-pane, `listPanes` tab-safe sweep + null
  *    degrade, `renameWindow`/`killWindow` `@N`/`%N` targets + TOCTOU no-op.
@@ -36,12 +33,10 @@ import {
   buildTmuxKillWindowArgs,
   buildTmuxListPanesArgs,
   buildTmuxNewSessionArgs,
-  buildTmuxNewWindowArgs,
   buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
   buildTmuxServerPidArgs,
-  buildTmuxSetWindowOptionArgs,
   classifyCloseKind,
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
@@ -51,7 +46,6 @@ import {
   MANAGED_EXEC_SESSION,
   mapAgentwrapExit,
   parseAgentwrapStdout,
-  restoreReplayLaunch,
   type SpawnFn,
   type SyncProbeFn,
 } from "../src/exec-backend";
@@ -151,61 +145,6 @@ test("buildTmuxNewSessionArgs: detached mint injects KEEPER_TMUX_SESSION via -e"
   ]);
 });
 
-test("buildTmuxNewWindowArgs: =-exact trailing-colon session target, -e injection, -P -F pane id, argv after --, no -n when unnamed", () => {
-  const got = buildTmuxNewWindowArgs("autopilot", "/Users/mike/code/keeper", [
-    "/bin/zsh",
-    "-l",
-    "-i",
-    "-c",
-    "echo hi",
-  ]);
-  expect(got).toEqual([
-    "tmux",
-    "new-window",
-    "-t",
-    "=autopilot:",
-    "-c",
-    "/Users/mike/code/keeper",
-    "-e",
-    "KEEPER_TMUX_SESSION=autopilot",
-    "-P",
-    "-F",
-    "#{pane_id}",
-    "--",
-    "/bin/zsh",
-    "-l",
-    "-i",
-    "-c",
-    "echo hi",
-  ]);
-  // No chained set-option — dispatched windows inherit the global
-  // `remain-on-exit off` and close natively on full-tree exit.
-  expect(got).not.toContain(";");
-  expect(got).not.toContain("remain-on-exit");
-  // No window name when unnamed (managed-launch contract).
-  expect(got).not.toContain("-n");
-});
-
-test("buildTmuxNewWindowArgs: inserts -n <name> before -P when provided (restore seam)", () => {
-  const got = buildTmuxNewWindowArgs(
-    "restored",
-    "/abs",
-    ["sh"],
-    "work::fn-1-x.1",
-  );
-  const nameIdx = got.indexOf("-n");
-  const pIdx = got.indexOf("-P");
-  expect(nameIdx).toBeGreaterThan(-1);
-  expect(got[nameIdx + 1]).toBe("work::fn-1-x.1");
-  // -n lands before the -P -F print spec and the -- argv boundary.
-  expect(nameIdx).toBeLessThan(pIdx);
-});
-
-test("buildTmuxNewWindowArgs: omits -n for empty/absent name", () => {
-  expect(buildTmuxNewWindowArgs("s", "/abs", ["sh"], "")).not.toContain("-n");
-  expect(buildTmuxNewWindowArgs("s", "/abs", ["sh"])).not.toContain("-n");
-});
-
 test("buildTmuxSelectWindowArgs / buildTmuxSelectPaneArgs: id-based targets only", () => {
   expect(buildTmuxSelectWindowArgs("%7")).toEqual([
     "tmux",
@@ -278,291 +217,12 @@ test("buildTmuxKillWindowArgs: targets the %N pane id, exact argv", () => {
 });
 
 // ---------------------------------------------------------------------------
-// AGENTBUS_EXEC_SESSION + buildTmuxSetWindowOptionArgs — the wake managed
-// session + the cleanup-system managed-window marker
+// AGENTBUS_EXEC_SESSION — the wake managed session
 // ---------------------------------------------------------------------------
 
 test("AGENTBUS_EXEC_SESSION is 'agentbus', distinct from the autopilot session", () => {
   expect(AGENTBUS_EXEC_SESSION).toBe("agentbus");
   expect(AGENTBUS_EXEC_SESSION).not.toBe(MANAGED_EXEC_SESSION);
-});
-
-test("buildTmuxSetWindowOptionArgs: window-scoped set-option with target/name/value", () => {
-  expect(
-    buildTmuxSetWindowOptionArgs("=agentbus:", "@keeper_managed", "agentbus"),
-  ).toEqual([
-    "tmux",
-    "set-option",
-    "-w",
-    "-t",
-    "=agentbus:",
-    "@keeper_managed",
-    "agentbus",
-  ]);
-});
-
-// ---------------------------------------------------------------------------
-// restoreReplayLaunch — the surviving direct tmux launch (crash-restore replay):
-// get-or-create + chained new-window
-// ---------------------------------------------------------------------------
-
-test("restoreReplayLaunch: live session (has-session exit 0) → new-window only, no mint, unnamed when name absent", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%3\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch(
-    MANAGED_EXEC_SESSION,
-    ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
-    "/abs/dir",
-    { noteLine: () => {}, spawn },
-  );
-  expect(res).toEqual({ ok: true });
-  // has-session probe fired against the session, then new-window.
-  expect(calls[0]).toEqual(buildTmuxHasSessionArgs(MANAGED_EXEC_SESSION));
-  const win = calls.find((c) => c[1] === "new-window");
-  expect(win?.[3]).toBe(`=${MANAGED_EXEC_SESSION}:`);
-  // No mint — the live session was respected.
-  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
-  // No name passed → window stays UNNAMED.
-  expect(win).not.toContain("-n");
-});
-
-test("restoreReplayLaunch: absent session (has-session non-zero) → new-session mint then new-window", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 1 },
-      "tmux:new-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
-    noteLine: () => {},
-    spawn,
-  });
-  expect(res).toEqual({ ok: true });
-  // Order: has-session (absent) → new-session mint → new-window.
-  expect(calls[0]?.[1]).toBe("has-session");
-  expect(calls[1]).toEqual(buildTmuxNewSessionArgs(MANAGED_EXEC_SESSION));
-  expect(calls[2]?.[1]).toBe("new-window");
-});
-
-test("restoreReplayLaunch: new-session mint carries color env (TERM/COLORTERM); has-session/new-window do not", async () => {
-  const calls: string[][] = [];
-  const envByCall: Array<Record<string, string> | undefined> = [];
-  const spawn: SpawnFn = (cmd, options) => {
-    calls.push([...cmd]);
-    envByCall.push(options.env);
-    const exitCode = cmd[1] === "has-session" ? 1 : 0;
-    return {
-      exited: Promise.resolve(exitCode),
-      stdout: new Response(cmd[1] === "new-window" ? "%1\n" : "").body,
-      stderr: new Response("").body,
-      kill: () => {},
-    };
-  };
-  await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
-    noteLine: () => {},
-    spawn,
-  });
-  const mintIdx = calls.findIndex((c) => c[1] === "new-session");
-  expect(mintIdx).toBeGreaterThan(-1);
-  const mintEnv = envByCall[mintIdx];
-  expect(mintEnv?.TERM).toBeDefined();
-  expect(mintEnv?.COLORTERM).toBeDefined();
-  // Control commands carry NO env override (Bun inherits process.env).
-  const hasIdx = calls.findIndex((c) => c[1] === "has-session");
-  const winIdx = calls.findIndex((c) => c[1] === "new-window");
-  expect(envByCall[hasIdx]).toBeUndefined();
-  expect(envByCall[winIdx]).toBeUndefined();
-});
-
-test("restoreReplayLaunch: a never-resolving new-window is killed at the timeout and degrades to { ok: false }", async () => {
-  // A wedged `tmux` subprocess (server hang) would freeze proc.exited forever.
-  // runCapture must race a kill-timeout: on expiry it kills the child and
-  // returns null, which the launch folds into the { ok: false } envelope. We
-  // shrink the timeout via captureTimeoutMs so the test doesn't wait the real 5s.
-  const calls: string[][] = [];
-  const notes: string[] = [];
-  let windowKilled = false;
-  const spawn: SpawnFn = (cmd, _options) => {
-    calls.push([...cmd]);
-    // has-session resolves immediately (session is live); the new-window never
-    // resolves, modelling a hung tmux IPC.
-    if (cmd[1] === "has-session") {
-      return {
-        exited: Promise.resolve(0),
-        stdout: new Response("").body,
-        stderr: new Response("").body,
-        kill: () => {},
-      };
-    }
-    return {
-      // Never resolves — the wedge.
-      exited: new Promise<number>(() => {}),
-      stdout: new Response("").body,
-      stderr: new Response("").body,
-      kill: () => {
-        windowKilled = true;
-      },
-    };
-  };
-  const res = await restoreReplayLaunch(
-    MANAGED_EXEC_SESSION,
-    ["/bin/zsh", "-c", "echo hi"],
-    "/tmp/proj",
-    { noteLine: (s) => notes.push(s), spawn, captureTimeoutMs: 20 },
-  );
-  // runCapture timed out → null → the ENOENT-shaped { ok: false } envelope.
-  expect(res.ok).toBe(false);
-  // The hung child was force-killed (no leaked zombie).
-  expect(windowKilled).toBe(true);
-  // A timeout warn was emitted for observability.
-  expect(notes.some((n) => n.includes("exceeded 20ms"))).toBe(true);
-});
-
-test("restoreReplayLaunch: non-zero new-window exit → { ok: false, error }", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stderr: "no such session", exitCode: 1 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
-    noteLine: () => {},
-    spawn,
-  });
-  expect(res.ok).toBe(false);
-  if (res.ok === false) {
-    expect(res.error).toContain("exited non-zero");
-  }
-});
-
-test("restoreReplayLaunch: session-gone new-window stderr → exactly one new-window, NO re-ensure/retry", async () => {
-  // The launch runs get-or-create → `new-window` exactly ONCE per op: a per-call
-  // `has-session` probe is cheap, so a session-gone failure surfaces
-  // `{ ok: false }` rather than re-minting and retrying. This pins that contract.
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      // Probe says live, so no mint fires; the window then dies session-gone.
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stderr: "can't find session: x", exitCode: 1 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
-    noteLine: () => {},
-    spawn,
-  });
-  expect(res.ok).toBe(false);
-  // Exactly one new-window spawn — no second attempt.
-  expect(calls.filter((c) => c[1] === "new-window").length).toBe(1);
-  // Exactly one has-session probe — no re-ensure after the failure.
-  expect(calls.filter((c) => c[1] === "has-session").length).toBe(1);
-  // No mint at all on this path (probe said live), and certainly no second one.
-  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
-});
-
-test("restoreReplayLaunch: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
-  const spawn: SpawnFn = () => {
-    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-  };
-  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
-    noteLine: () => {},
-    spawn,
-  });
-  expect(res.ok).toBe(false);
-  if (res.ok === false) {
-    expect(res.error).toContain("failed");
-  }
-});
-
-test("restoreReplayLaunch: live per-call session → new-window with -e KEEPER_TMUX_SESSION=<target>, omits -n when absent", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%4\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch("human-session", ["sh"], "/proj", {
-    noteLine: () => {},
-    spawn,
-  });
-  expect(res).toEqual({ ok: true });
-  // has-session probed the per-call session.
-  expect(calls[0]).toEqual(buildTmuxHasSessionArgs("human-session"));
-  const win = calls.find((c) => c[1] === "new-window");
-  expect(win?.[3]).toBe("=human-session:");
-  // -e carries the per-call session name for the hook's session stamp.
-  const eIdx = win?.indexOf("-e") ?? -1;
-  expect(win?.[eIdx + 1]).toBe("KEEPER_TMUX_SESSION=human-session");
-  // No mint (live), no -n (unnamed restore).
-  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
-  expect(win).not.toContain("-n");
-});
-
-test("restoreReplayLaunch: absent per-call session mints then new-window with -n <name>", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 1 },
-      "tmux:new-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%2\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const res = await restoreReplayLaunch(
-    "restored",
-    ["sh"],
-    "/abs",
-    { noteLine: () => {}, spawn },
-    "work::fn-9-y.2",
-  );
-  expect(res).toEqual({ ok: true });
-  // mint targets the per-call session.
-  expect(calls.find((c) => c[1] === "new-session")).toEqual(
-    buildTmuxNewSessionArgs("restored"),
-  );
-  const win = calls.find((c) => c[1] === "new-window");
-  const nameIdx = win?.indexOf("-n") ?? -1;
-  expect(nameIdx).toBeGreaterThan(-1);
-  expect(win?.[nameIdx + 1]).toBe("work::fn-9-y.2");
-});
-
-test("restoreReplayLaunch: new-session mint env carries a locale alongside TERM/COLORTERM", async () => {
-  const cmds: string[][] = [];
-  const envByCall: Array<Record<string, string> | undefined> = [];
-  const spawn: SpawnFn = (cmd, options) => {
-    cmds.push([...cmd]);
-    envByCall.push(options.env);
-    return {
-      exited: Promise.resolve(cmd[1] === "has-session" ? 1 : 0),
-      stdout: new Response("").body,
-      stderr: new Response("").body,
-      kill: () => {},
-    };
-  };
-  await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["claude"], "/tmp", {
-    noteLine: () => {},
-    spawn,
-  });
-  const mintIdx = cmds.findIndex((c) => c[1] === "new-session");
-  expect(mintIdx).toBeGreaterThanOrEqual(0);
-  const mintEnv = envByCall[mintIdx];
-  expect(Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG)).toBe(
-    true,
-  );
 });
 
 // ---------------------------------------------------------------------------

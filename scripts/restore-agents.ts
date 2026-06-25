@@ -10,19 +10,20 @@
  * (a read-only `keeper.db` connection, no socket round-trip).
  *
  * Each surviving candidate is replayed back into its original backend session
- * via `ExecBackend.ensureLaunched` (T2) using the shared resume LAUNCH form
- * (`buildResumeLaunchForm` / `resumeTarget` from `src/resume-descriptor` — the
- * alias-independent positional argv this and `keeper bus wake` are the TWO
- * producers of; `scripts/resume.ts` keeps the human-facing DISPLAY form). The
- * resume key is the job's LATEST name (`title`, `job_id` fallback) — read live
- * from the jobs projection at restore time, never a frozen one — so a renamed
- * session restores to the name keeper currently knows.
+ * via keeper's SOLE launch transport — `agentwrapLaunch` in resume mode (the
+ * same transport `keeper dispatch` and `keeper bus wake` use). agentwrap owns
+ * the tmux window (session get-or-create + handoff), re-attaches via
+ * `--resume <target>`, and holds the pane open after claude exits;
+ * `scripts/resume.ts` keeps the human-facing DISPLAY form
+ * (`buildResumeCommand`). The resume key is the job's LATEST name (`title`,
+ * `job_id` fallback) — read live from the jobs projection at restore time,
+ * never a frozen one — so a renamed session restores to the name keeper
+ * currently knows.
  *
  * The candidate set already excludes any `job_id` still occupying a live
  * backend (`restore-set.ts`'s UUID-liveness dedup, computed from the same DB
- * read) — so there is no UDS round-trip and no separate skip-set probe. tmux
- * is the sole exec backend, so every candidate routes through one resolved
- * backend instance.
+ * read) — so there is no UDS round-trip and no separate skip-set probe. Every
+ * candidate routes through the one `agentwrapLaunch` resume seam.
  *
  * Across every mode, restored windows come back in their ORIGINAL visual
  * (left-to-right) tmux order: `restore-set.ts` sorts candidates by the captured
@@ -61,10 +62,10 @@
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
 import {
+  agentwrapLaunch,
+  buildAgentwrapLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
-  buildTmuxNewWindowArgs,
-  restoreReplayLaunch,
 } from "../src/exec-backend";
 import {
   buildLauncherArgvPrefix,
@@ -76,10 +77,7 @@ import {
   deriveRestoreSet,
   type RestoreCandidate,
 } from "../src/restore-set";
-import {
-  buildResumeCommand,
-  buildResumeLaunchForm,
-} from "../src/resume-descriptor";
+import { buildResumeCommand } from "../src/resume-descriptor";
 
 const HELP = `restore-agents — replay crash-killed Claude Code agents derived from keeper.db
 
@@ -111,9 +109,10 @@ recent crash burst when no generation boundary is recorded yet).
 
 --snapshot-current is the manual safety net: it reads the CURRENT live set
 (every working/stopped session) and emits a runnable bash script that revives
-each into its own tmux window (get-or-create the session first), byte-aligned
-with what --apply spawns. Pipe it to a file and run it later — a dump you can
-trust independent of the automatic crash path.
+each via the bare 'keeper agent claude --agentwrap-tmux … --resume' argv
+(agentwrap owns the session+window), byte-aligned with what --apply spawns. Pipe
+it to a file and run it later — a dump you can trust independent of the
+automatic crash path.
 
 Restored windows come back in their original visual (left-to-right) tmux order
 (by the captured window_index; unknown order sinks to the tail). --apply and
@@ -128,12 +127,6 @@ When --apply runs while autopilot is unpaused, restored tabs are not
 double-dispatch — pause autopilot before --apply.
 `;
 
-/**
- * Default `$SHELL` fallback used when env isn't set (e.g. when invoked from
- * a barebones LaunchAgent). Mirrors the autopilot worker's resolution.
- */
-const DEFAULT_SHELL = "/bin/zsh" as const;
-
 interface ParsedArgs {
   session: string | null;
   apply: boolean;
@@ -147,11 +140,10 @@ interface ParsedArgs {
  * Outcome of one restore attempt — fed into the summary counts and (for the
  * dry-run path) the per-agent label lines. PURE shape — no I/O leaks out. The
  * candidate carries everything the launch needs: `resume_target` (the latest-name
- * resume key), `backend_exec_session_id` (the tmux session to relaunch
- * into), and `cwd` (the directory the resumed window opens in, applied by the
- * tmux transport via `new-window -c`). `tier` is irrelevant — fn-10 inverted
- * tier routing dropped the `--plugin-dir` flag, so a resume command never
- * carries a tier.
+ * resume key), `backend_exec_session_id` (the tmux session to relaunch into), and
+ * `cwd` (the directory the resumed window opens in, set on the `agentwrapLaunch`
+ * spawn). `tier` is irrelevant — fn-10 inverted tier routing dropped the
+ * `--plugin-dir` flag, so a resume command never carries a tier.
  */
 export type AgentOutcome =
   | { kind: "would-restore"; candidate: RestoreCandidate }
@@ -190,31 +182,6 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
 }
 
 /**
- * Pure: assemble the agent's resume LAUNCH argv. Delegates to the shared
- * {@link buildResumeLaunchForm}: the alias-independent, quoting-safe positional
- * form (absolute launcher `prefix` + `claude --resume <target>
- * --agentwrap-no-confirm` riding as `"$@"`, no `claude` alias needed) wrapped
- * in a login+interactive shell whose trailing `exec "$0" -l -i` holds the pane
- * open after the resumed claude exits.
- *
- * The resume key is the candidate's `resume_target` (the latest name). `shell`
- * is injected for testability (the live util passes
- * `process.env.SHELL ?? DEFAULT_SHELL`); the absolute `prefix` is likewise
- * injected (resolved once in `main` from `process.execPath` +
- * `resolveKeeperAgentPathDepFree`) so this stays pure. cwd is no longer
- * interpolated — the tmux transport applies it via `new-window -c`.
- *
- * Exported for tests.
- */
-export function buildResumeLaunchArgv(
-  shell: string,
-  prefix: string[],
-  candidate: RestoreCandidate,
-): string[] {
-  return buildResumeLaunchForm(shell, prefix, candidate.resume_target);
-}
-
-/**
  * Pure: turn the candidate set into the per-agent pre-action plan, narrowed by
  * the optional `--session` filter (matched against the candidate's backend
  * session). Candidates arrive already sorted by visual window order from
@@ -239,22 +206,24 @@ export function planRestore(
 }
 
 /**
- * The `ensureLaunched` shape the action loop uses. Real binding in `main()`
- * routes through the resolved tmux backend's `ensureLaunched`; tests inject a
- * capturing fake so `--apply` can be asserted without spawning a real
- * multiplexer.
+ * The launch shape the action loop uses. Real binding in `main()` routes through
+ * `agentwrapLaunch` in resume mode (keeper's sole launch transport); tests inject
+ * a capturing fake so `--apply` can be asserted without spawning a real
+ * multiplexer. Carries the RESUME TARGET (not a pre-wrapped argv) — agentwrap
+ * builds the `--resume <target>` invocation and owns the tmux window, mirroring
+ * the `keeper bus wake` seam.
  */
 export type EnsureLaunchedFn = (
   session: string,
-  argv: string[],
+  resumeTarget: string,
   cwd: string,
 ) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 /**
  * Sleep injection for {@link applyRestore} — `main()` passes the real
  * `Bun.sleep`, tests pass a no-op so the apply suite never actually waits. The
- * pause spaces out window creation so a burst of `new-window` launches don't
- * race the multiplexer.
+ * pause spaces out window creation so a burst of launches don't race the
+ * multiplexer.
  */
 export type SleepFn = (ms: number) => Promise<void>;
 
@@ -280,8 +249,6 @@ const defaultSleep: SleepFn = (ms) => Bun.sleep(ms);
 export async function applyRestore(
   plan: AgentOutcome[],
   ensureLaunched: EnsureLaunchedFn,
-  shell: string,
-  prefix: string[],
   sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
   const out: AgentOutcome[] = [];
@@ -296,11 +263,14 @@ export async function applyRestore(
       await sleep(INTER_WINDOW_PAUSE_MS);
     }
     launched++;
-    const argv = buildResumeLaunchArgv(shell, prefix, entry.candidate);
     const cwd = entry.candidate.cwd == null ? "" : seg(entry.candidate.cwd);
     const session = entry.candidate.backend_exec_session_id;
     try {
-      const res = await ensureLaunched(session, argv, cwd);
+      const res = await ensureLaunched(
+        session,
+        entry.candidate.resume_target,
+        cwd,
+      );
       if (res.ok) {
         out.push({ kind: "restored", candidate: entry.candidate });
       } else {
@@ -384,24 +354,28 @@ export function shellQuote(arg: string): string {
 
 /**
  * Pure renderer: turn the CURRENT live candidate set into a RUNNABLE bash script
- * that revives each session into its own tmux window. Byte-aligned with what
- * `--apply` spawns — the same `buildResumeLaunchArgv` inner argv wrapped in the
- * same `buildTmuxNewWindowArgs` new-window — but preceded by a per-session
- * `has-session || new-session` get-or-create guard and emitted as shell text, so
- * it can be piped to a file and run later (daemon-independent).
+ * that revives each session via the SAME `agentwrapLaunch` transport `--apply`
+ * uses. Each candidate emits the BARE `buildAgentwrapLaunchArgv` resume argv
+ * (`keeper agent claude --agentwrap-tmux … --resume <target>`) shell-quoted —
+ * byte-aligned with what `--apply` spawns, with NO `tmux new-window` wrapper
+ * (agentwrap creates its OWN session+window; a `new-window` wrapper would
+ * DOUBLE-create). A `cd <cwd> &&` prefix sets the directory agentwrap reads from
+ * `process.cwd()` (the `--apply` path sets it on the spawn). Each session is
+ * still preceded by a redundant-but-explicit `has-session || new-session`
+ * get-or-create guard so the script reads self-contained even though agentwrap
+ * mints the session itself.
  *
  * Sessions emit in alpha order; candidates within a session in the visual window
  * order `deriveCurrentSet` already sorted them into. A `sleep 0.5` line separates
- * consecutive `new-window` emissions (tracked globally across session boundaries
- * — never before the first window or after the last) so the revived windows don't
- * race the multiplexer. `sleep 0.5` is portable across BSD/GNU with a dot decimal.
- * Every argv token is single-quoted via {@link shellQuote}. The `--session` filter
- * narrows to one bucket. Exported for tests.
+ * consecutive launches (tracked globally across session boundaries — never before
+ * the first or after the last) so the revived windows don't race the multiplexer.
+ * `sleep 0.5` is portable across BSD/GNU with a dot decimal. Every argv token is
+ * single-quoted via {@link shellQuote}. The `--session` filter narrows to one
+ * bucket. Exported for tests.
  */
 export function renderSnapshotScript(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
-  shell: string,
   prefix: string[],
   sourcePath: string,
 ): string {
@@ -410,7 +384,7 @@ export function renderSnapshotScript(
     "#!/usr/bin/env bash",
     "# restore-agents --snapshot-current — runnable snapshot of the CURRENT live set.",
     `# Source: ${sourcePath}. Pipe to a file and run to revive these tabs.`,
-    "# Each window relaunches via claude --resume by its LATEST name; the session is get-or-created.",
+    "# Each window relaunches via agentwrap claude --resume by its LATEST name; the session is get-or-created.",
     "set -euo pipefail",
   ];
   // Group candidates by backend session, preserving the incoming visual order
@@ -430,9 +404,9 @@ export function renderSnapshotScript(
     }
   }
   let sessionCount = 0;
-  // Tracks whether any new-window has been emitted yet, ACROSS session boundaries
-  // — `sleep 0.5` precedes every new-window after the first, so it lands strictly
-  // between consecutive windows (no leading or trailing sleep).
+  // Tracks whether any launch has been emitted yet, ACROSS session boundaries —
+  // `sleep 0.5` precedes every launch after the first, so it lands strictly
+  // between consecutive launches (no leading or trailing sleep).
   let windowsEmitted = 0;
   for (const sessionName of [...bySession.keys()].sort()) {
     const bucket = bySession.get(sessionName);
@@ -443,24 +417,32 @@ export function renderSnapshotScript(
     const n = bucket.length;
     lines.push("");
     lines.push(`# session: ${sessionName} (${n} window${n === 1 ? "" : "s"})`);
-    // Get-or-create the session so the new-window targets land. `|| ` keeps
-    // `set -e` from tripping when has-session exits non-zero (session absent).
+    // Get-or-create the session up front. agentwrap also mints it, so this is
+    // redundant — kept so the script reads self-contained. `|| ` keeps `set -e`
+    // from tripping when has-session exits non-zero (session absent).
     lines.push(
       `${quoteArgv(buildTmuxHasSessionArgs(sessionName))} 2>/dev/null || ` +
         `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
     );
     for (const candidate of bucket) {
       const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
-      const innerArgv = buildResumeLaunchArgv(shell, prefix, candidate);
-      // No window name — mirrors --apply (ensureLaunched passes none), so the
-      // revived window stays unnamed and the renamer worker labels it later.
+      // The BARE agentwrap resume argv — byte-aligned with what --apply spawns.
+      // agentwrap owns the session+window, so NO `tmux new-window` wrapper.
+      const launchArgv = buildAgentwrapLaunchArgv({
+        launcherArgvPrefix: prefix,
+        session: sessionName,
+        prompt: "",
+        resumeTarget: candidate.resume_target,
+        noConfirm: true,
+      });
       if (windowsEmitted > 0) {
         lines.push("sleep 0.5");
       }
       lines.push(`# ${candidate.label}`);
-      lines.push(
-        quoteArgv(buildTmuxNewWindowArgs(sessionName, cwd, innerArgv)),
-      );
+      // `cd <cwd> &&` sets agentwrap's process.cwd() (the directory it reads for
+      // the launch-script `cd`); the --apply path sets it on the spawn instead.
+      const cdPrefix = cwd === "" ? "" : `cd ${shellQuote(cwd)} && `;
+      lines.push(`${cdPrefix}${quoteArgv(launchArgv)}`);
       windowsEmitted++;
     }
   }
@@ -559,10 +541,9 @@ async function main(): Promise<void> {
   }
 
   const dbPath = args.db ?? resolveDbPath();
-  const shell = process.env.SHELL ?? DEFAULT_SHELL;
   // The absolute `keeper agent` launcher prefix — PATH-independent, so a
-  // restored tab never depends on the `claude` alias (the resume launch form
-  // rides it as positional `"$@"` tokens; see buildResumeLaunchArgv).
+  // restored tab never depends on the `claude` alias. `agentwrapLaunch` builds
+  // the `claude --agentwrap-tmux … --resume <target>` invocation off it.
   const launcherPrefix = buildLauncherArgvPrefix(
     process.execPath,
     resolveKeeperAgentPathDepFree(),
@@ -580,13 +561,7 @@ async function main(): Promise<void> {
       die(`failed to open keeper.db at ${dbPath}: ${(err as Error).message}`);
     }
     process.stdout.write(
-      renderSnapshotScript(
-        current,
-        args.session,
-        shell,
-        launcherPrefix,
-        dbPath,
-      ),
+      renderSnapshotScript(current, args.session, launcherPrefix, dbPath),
     );
     process.exit(0);
   }
@@ -619,22 +594,25 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // --apply path. The restore replay is the ONE surviving direct tmux launch —
-  // route every candidate through the `restoreReplayLaunch` seam (a spec-less
-  // get-or-create + new-window of the recorded shell-wrapped argv).
+  // --apply path. Route every candidate through keeper's sole launch transport —
+  // `agentwrapLaunch` in resume mode (the same seam `keeper bus wake` uses).
+  // agentwrap mints/owns the recorded `backend_exec_session_id` and re-attaches
+  // via `--resume <target>`; cwd is set on the spawn (agentwrap has no cwd flag).
+  // Per-candidate failure isolation rides on the returned LaunchResult verdict.
   const noteLine = (line: string): void => {
     process.stderr.write(`${line}\n`);
   };
-  const ensureLaunched: EnsureLaunchedFn = (session, argv, cwd) =>
-    restoreReplayLaunch(session, argv, cwd, { noteLine });
+  const ensureLaunched: EnsureLaunchedFn = (session, resumeTarget, cwd) =>
+    agentwrapLaunch({
+      noteLine,
+      launcherArgvPrefix: launcherPrefix,
+      session,
+      cwd,
+      label: `restore resume ${resumeTarget}`,
+      spec: { prompt: "", resumeTarget },
+    });
 
-  const outcomes = await applyRestore(
-    plan,
-    ensureLaunched,
-    shell,
-    launcherPrefix,
-    defaultSleep,
-  );
+  const outcomes = await applyRestore(plan, ensureLaunched, defaultSleep);
   process.stdout.write(renderOutcomes(outcomes, true, excludedIdleCount));
   process.exit(0);
 }
