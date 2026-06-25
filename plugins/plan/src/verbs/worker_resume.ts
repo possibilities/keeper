@@ -22,7 +22,7 @@ import { emitError, formatOutput, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
 import { resolveProject } from "../project.ts";
-import { expectedWorkerCwd } from "../runtime_status.ts";
+import { expectedWorkerCwd, worktreeOverride } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { LocalFileStateStore, loadJsonSafe } from "../store.ts";
 import { getVcs } from "../vcs.ts";
@@ -104,7 +104,9 @@ export function runWorkerResume(opts: {
   const projPath = ctx.projectPath;
   const targetRepo = realpathOr(expectedWorkerCwd(taskDef, epicDef, projPath));
   const primaryRepo = realpathOr(
-    (epicDef.primary_repo as string | null | undefined) || projPath,
+    worktreeOverride() ||
+      (epicDef.primary_repo as string | null | undefined) ||
+      projPath,
   );
   const stateRepo = primaryRepo;
 

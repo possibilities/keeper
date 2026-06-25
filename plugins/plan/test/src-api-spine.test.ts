@@ -21,7 +21,11 @@ import {
 } from "../src/api.ts";
 import { isEpicId, isTaskId } from "../src/ids.ts";
 import type { ProjectContext } from "../src/project.ts";
-import { expectedCloserCwd, expectedWorkerCwd } from "../src/runtime_status.ts";
+import {
+  expectedCloserCwd,
+  expectedWorkerCwd,
+  worktreeOverride,
+} from "../src/runtime_status.ts";
 import { loadJson } from "../src/store.ts";
 
 function projectCtx(root: string): ProjectContext {
@@ -75,6 +79,75 @@ describe("runtime_status cwd fallbacks", () => {
   test("closer cwd: primary_repo -> proj", () => {
     expect(expectedCloserCwd({ primary_repo: "/p" }, "/proj")).toBe("/p");
     expect(expectedCloserCwd({ primary_repo: null }, "/proj")).toBe("/proj");
+  });
+
+  test("KEEPER_PLAN_WORKTREE override wins over the worker fallback chain", () => {
+    const prev = process.env.KEEPER_PLAN_WORKTREE;
+    try {
+      process.env.KEEPER_PLAN_WORKTREE = "/lane";
+      // The override beats an explicit target_repo (worktree-mode isolation).
+      expect(
+        expectedWorkerCwd(
+          { target_repo: "/t" },
+          { primary_repo: "/p" },
+          "/proj",
+        ),
+      ).toBe("/lane");
+      expect(worktreeOverride()).toBe("/lane");
+    } finally {
+      if (prev === undefined) {
+        delete process.env.KEEPER_PLAN_WORKTREE;
+      } else {
+        process.env.KEEPER_PLAN_WORKTREE = prev;
+      }
+    }
+  });
+
+  test("empty/unset KEEPER_PLAN_WORKTREE falls through to the 3-level fallback", () => {
+    const prev = process.env.KEEPER_PLAN_WORKTREE;
+    try {
+      // Empty string is treated as absent.
+      process.env.KEEPER_PLAN_WORKTREE = "";
+      expect(worktreeOverride()).toBeUndefined();
+      expect(
+        expectedWorkerCwd(
+          { target_repo: "/t" },
+          { primary_repo: "/p" },
+          "/proj",
+        ),
+      ).toBe("/t");
+
+      // Unset → identical to today's fallback at every level.
+      delete process.env.KEEPER_PLAN_WORKTREE;
+      expect(worktreeOverride()).toBeUndefined();
+      expect(
+        expectedWorkerCwd(
+          { target_repo: "/t" },
+          { primary_repo: "/p" },
+          "/proj",
+        ),
+      ).toBe("/t");
+      expect(
+        expectedWorkerCwd(
+          { target_repo: null },
+          { primary_repo: "/p" },
+          "/proj",
+        ),
+      ).toBe("/p");
+      expect(
+        expectedWorkerCwd(
+          { target_repo: null },
+          { primary_repo: null },
+          "/proj",
+        ),
+      ).toBe("/proj");
+    } finally {
+      if (prev === undefined) {
+        delete process.env.KEEPER_PLAN_WORKTREE;
+      } else {
+        process.env.KEEPER_PLAN_WORKTREE = prev;
+      }
+    }
   });
 });
 
