@@ -52,7 +52,7 @@ import {
   subagentLinesFor,
   validatedPill,
 } from "../src/board-render";
-import { resolveSockPath } from "../src/db";
+import { DEFAULT_MAX_CONCURRENT_PER_ROOT, resolveSockPath } from "../src/db";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
   formatPill,
@@ -75,6 +75,19 @@ import type {
   SubagentInvocation,
 } from "../src/types";
 import { createViewShell } from "../src/view-shell";
+// Autopilot banner — the SAME metadata `keeper autopilot` pins at its top, so
+// `keeper board` reuses its pure projections + label rather than duplicating
+// the wire-decode (single source of truth; these stay byte-identical to the
+// autopilot viewer). The module is import-inert (its `import.meta.main` guard
+// is neutralized), so pulling these symbols in spins up no second CLI.
+import {
+  autopilotBannerLabel,
+  projectAutopilotMode,
+  projectAutopilotPaused,
+  projectMaxConcurrentJobs,
+  projectMaxConcurrentPerRoot,
+  projectWorktreeMode,
+} from "./autopilot";
 
 // Re-export shims: `test/board.test.ts` and `scripts/drain-dead-letters.ts`
 // import these symbols from `../cli/board`, but their definitions live in
@@ -454,6 +467,31 @@ export async function main(argv: string[]): Promise<void> {
   const armedSet = new Set<string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
+  // Autopilot banner state — the metadata `keeper autopilot` pins at its top
+  // (paused/mode/caps/worktree), sourced over the socket from the
+  // `autopilot_state` singleton; the armed count reuses `armedSet` above.
+  // Seeded to the daemon's boot-safe defaults (paused · yolo · max ∞ · per-root
+  // 1 · worktree:off); the first `autopilot_state` edge overwrites them. The
+  // banner repaints from the `apBanner()` snapshot of this state on every
+  // autopilot_state OR armed_epics edge, and the view-shell restores it after a
+  // copy-key flash via the `persistentBannerPill` below.
+  const apState = {
+    paused: true,
+    maxConcurrentJobs: null as number | null,
+    maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
+    mode: "yolo" as "yolo" | "armed",
+    worktreeMode: false,
+  };
+  const apBanner = (): string =>
+    autopilotBannerLabel({
+      paused: apState.paused,
+      maxConcurrentJobs: apState.maxConcurrentJobs,
+      maxConcurrentPerRoot: apState.maxConcurrentPerRoot,
+      mode: apState.mode,
+      armedCount: armedSet.size,
+      worktreeMode: apState.worktreeMode,
+    });
+
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
     jobsArr: unknown,
@@ -673,13 +711,17 @@ export async function main(argv: string[]): Promise<void> {
   const view = createViewShell<ReadinessClientSnapshot>({
     script: "board",
     title: "board",
-    // Board folds TWO streams — the readiness composite + the `armed_epics`
-    // presence table — so the snapshot latch holds until BOTH report (readiness
-    // via the auto-report in `view.emit`, armed_epics via the explicit
-    // `reportSnapshotStream` below).
+    // Board folds THREE streams — the readiness composite, the `armed_epics`
+    // presence table, and the `autopilot_state` singleton (the banner-metadata
+    // substrate) — so the snapshot latch holds until ALL THREE report (readiness
+    // via the auto-report in `view.emit`; armed_epics + autopilot_state via the
+    // explicit `reportSnapshotStream` calls below).
     mode: mode === "snapshot" ? "snapshot" : "live",
-    streamCount: 2,
+    streamCount: 3,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    // The fixed banner row carries the autopilot metadata, mirroring the top of
+    // `keeper autopilot`. Restored here after a copy-key flash expires.
+    persistentBannerPill: apBanner,
     renderBody: (snap) => {
       // Per-frame `job_id → invocations` index — re-entrant sub-agents within
       // one session share a bucket, ordered by `turn_seq asc`.
@@ -701,6 +743,11 @@ export async function main(argv: string[]): Promise<void> {
       };
     },
   });
+
+  // Seed the banner immediately so the autopilot metadata is on screen before
+  // the first `autopilot_state` edge lands (mirrors the autopilot viewer's
+  // pre-snapshot seed).
+  view.liveShell.setStatus(apBanner());
 
   // Retain the last readiness snapshot so an `armed_epics` edge landing between
   // readiness frames can repaint the `[armed]` pill immediately. Null until the
@@ -745,6 +792,8 @@ export async function main(argv: string[]): Promise<void> {
           armedSet.add(id);
         }
       }
+      // The armed count rides the autopilot banner — repaint it on every edge.
+      view.liveShell.setStatus(apBanner());
       if (!armedStreamReported) {
         armedStreamReported = true;
         view.reportSnapshotStream();
@@ -756,15 +805,49 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
+  // The `autopilot_state` singleton feeds the banner's paused/mode/caps/worktree
+  // metadata — the same wire row + pure projections `keeper autopilot` reads, so
+  // the two banners can't drift. Keyed on `id = 1`; at most one row. An empty
+  // result (singleton not yet folded on a fresh board) leaves the boot-default
+  // seed untouched. Report to the snapshot latch exactly once (BEFORE the
+  // empty-rows path's no-op return so a freshly-booted daemon doesn't hang the
+  // snapshot until timeout); inert in live mode.
+  let autopilotStreamReported = false;
+  const autopilotHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "board",
+    collection: "autopilot_state",
+    onRows: (rows) => {
+      if (!autopilotStreamReported) {
+        autopilotStreamReported = true;
+        view.reportSnapshotStream();
+      }
+      const paused = projectAutopilotPaused(rows);
+      if (paused === null) {
+        // Singleton not yet folded — keep the seed and wait for the next edge.
+        return;
+      }
+      apState.paused = paused;
+      apState.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
+      apState.maxConcurrentPerRoot = projectMaxConcurrentPerRoot(rows);
+      apState.mode = projectAutopilotMode(rows) ?? "yolo";
+      apState.worktreeMode = projectWorktreeMode(rows) ?? false;
+      view.liveShell.setStatus(apBanner());
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
   if (mode === "snapshot") {
     view.runSnapshot(() => {
       handle.dispose();
       armedHandle.dispose();
+      autopilotHandle.dispose();
     });
   } else {
     view.installSigintHandler(() => {
       handle.dispose();
       armedHandle.dispose();
+      autopilotHandle.dispose();
     });
   }
 }
