@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Rewire blocked-worker escalation to bus-resume",
-  "updated_at": "2026-06-25T03:20:27.741000Z"
+  "updated_at": "2026-06-25T07:27:24.996000Z",
+  "worker_done_at": "2026-06-25T07:27:24.996000Z"
 }

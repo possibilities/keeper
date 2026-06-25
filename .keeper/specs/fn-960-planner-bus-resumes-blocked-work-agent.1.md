@@ -61,5 +61,5 @@ Concrete edits:
 - [ ] No new reducer/RPC write path; double-dispatch safety documented via the existing occupancy gate; autopilot verified read-only (or a real gap surfaced via BLOCKED); `bun run test:full` + prompt-plugin parity green.
 
 ## Done summary
-
+Rewrote the blocked-worker escalation loop: planner bus-resumes the still-live work::<task> orchestrator in-context (PRIMARY), autopilot cold-re-dispatch is the dead-worker FALLBACK. Updated daemon directive + test, planner/work/worker prompts, bus skill, README to one consistent story; double-dispatch safety documented via the existing live-pane occupancy gate, no new reducer/RPC write.
 ## Evidence
