@@ -862,6 +862,85 @@ test("autopilot_state has a nullable worktree_mode column (NULL = OFF, the defau
   db.close();
 });
 
+test("v91→v92 migration NULLs backend_exec pane/generation on terminal jobs; live jobs untouched (fn-977 v92)", () => {
+  // Open a fresh DB (migrated to current), rewind the schema stamp to 91, then
+  // hand-seed terminal + live jobs carrying tmux pane/generation coords. The
+  // modern `jobs` table already has both columns (pane id since early, generation
+  // since v83), so no hand-built fixture is needed. Reopen via openDb → the
+  // version-guarded v91→v92 data-fix UPDATE runs once, clearing only the dead
+  // rows. No rewind-and-redrain sits between 91 and 92, so the hand-seeded rows
+  // survive and are observable directly after migrate.
+  const { db: seed } = openDb(dbPath);
+  seed.run("UPDATE meta SET value = '91' WHERE key = 'schema_version'");
+  const ins = (
+    jobId: string,
+    state: string,
+    pane: string | null,
+    gen: string | null,
+  ) =>
+    seed
+      .prepare(
+        `INSERT INTO jobs (job_id, created_at, updated_at, state, backend_exec_type,
+                           backend_exec_pane_id, backend_exec_generation_id)
+         VALUES (?, 1, 1, ?, 'tmux', ?, ?)`,
+      )
+      .run(jobId, state, pane, gen);
+  ins("mig-ended", "ended", "%300", "gen-dead-a");
+  ins("mig-killed", "killed", "%301", "gen-dead-b");
+  // A killed row that already lost its pane (idempotency: the WHERE must skip it
+  // without error and it stays NULL).
+  ins("mig-killed-clean", "killed", null, null);
+  // A live worker on a recycled-into pane id — MUST keep its coords.
+  ins("mig-live", "working", "%300", "gen-live");
+  seed.close();
+
+  // Reopen → migrate() runs the v91→v92 clear.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+
+  const read = (jobId: string) =>
+    db
+      .prepare(
+        "SELECT state, backend_exec_pane_id, backend_exec_generation_id FROM jobs WHERE job_id = ?",
+      )
+      .get(jobId) as {
+      state: string;
+      backend_exec_pane_id: string | null;
+      backend_exec_generation_id: string | null;
+    };
+
+  const ended = read("mig-ended");
+  expect(ended.state).toBe("ended");
+  expect(ended.backend_exec_pane_id).toBeNull();
+  expect(ended.backend_exec_generation_id).toBeNull();
+
+  const killed = read("mig-killed");
+  expect(killed.backend_exec_pane_id).toBeNull();
+  expect(killed.backend_exec_generation_id).toBeNull();
+
+  const clean = read("mig-killed-clean");
+  expect(clean.backend_exec_pane_id).toBeNull();
+
+  // The LIVE job keeps its coords — only terminal rows are cleared.
+  const live = read("mig-live");
+  expect(live.state).toBe("working");
+  expect(live.backend_exec_pane_id).toBe("%300");
+  expect(live.backend_exec_generation_id).toBe("gen-live");
+  db.close();
+
+  // Idempotent re-open — the version guard (preMigrateStoredVersion < 92) is now
+  // false, so the live row is untouched on a second migrate.
+  const { db: db3 } = openDb(dbPath);
+  const liveAgain = db3
+    .prepare("SELECT backend_exec_pane_id FROM jobs WHERE job_id = 'mig-live'")
+    .get() as { backend_exec_pane_id: string | null };
+  expect(liveAgain.backend_exec_pane_id).toBe("%300");
+  db3.close();
+});
+
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
   const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
@@ -2292,9 +2371,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `autopilot_state.max_concurrent_per_root` config column (an additive ALTER,
   // not an epics-shape change), fn-954 task .1. v91 appends the nullable
   // `autopilot_state.worktree_mode` config column (an additive ALTER, not an
-  // epics-shape change), fn-959 task .1. The v62→v63 epics-shape migration this
-  // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(91);
+  // epics-shape change), fn-959 task .1. v92 NULLs `backend_exec_pane_id` +
+  // `backend_exec_generation_id` on existing terminal (ended/killed) jobs so a
+  // dead job stops holding a tmux-recyclable pane id the reaper could
+  // collateral-kill, fn-977 task .2 (a one-time data-fix UPDATE, no column/shape
+  // change, version-guarded). The v62→v63 epics-shape migration this test
+  // exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(92);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

@@ -3913,6 +3913,144 @@ test("TmuxTopologySnapshot with malformed / no-generation payload folds to a no-
 });
 
 // ---------------------------------------------------------------------------
+// Terminal-state pane/generation clear (fn-977 task .2). A job folding to
+// ended/killed must drop its `backend_exec_pane_id` + `backend_exec_generation_id`:
+// tmux recycles a pane id `%N`, so a dead job that keeps its stale pane id lets
+// the window-reaper collateral-kill the fresh window that later inherits it. The
+// post-switch COALESCE arm carries a matching terminal guard so a late hook
+// event can't re-stamp the pane in the same (or a later) event.
+// ---------------------------------------------------------------------------
+
+function getBackendExec(jobId: string) {
+  return db
+    .query(
+      "SELECT state, backend_exec_pane_id, backend_exec_generation_id FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    state: string;
+    backend_exec_pane_id: string | null;
+    backend_exec_generation_id: string | null;
+  } | null;
+}
+
+test("SessionEnd NULLs the backend_exec pane + generation coords (recycle guard)", () => {
+  seedTmuxJob("term-end", "%200");
+  // Adopt a live generation so we prove BOTH coords clear, not just the pane.
+  tmuxTopologyEvent("gen-end", [
+    { pane_id: "%200", session_name: "fg", window_index: 2 },
+  ]);
+  drainAll();
+  const live = getBackendExec("term-end");
+  expect(live?.backend_exec_pane_id).toBe("%200");
+  expect(live?.backend_exec_generation_id).toBe("gen-end");
+
+  // The SessionEnd itself carries the stale env pane id (the hook stamps every
+  // event). The terminal arm clears the coords AND the post-switch COALESCE arm
+  // must NOT re-stamp them in the same event — proving the terminal guard.
+  insertEvent({
+    hook_event: "SessionEnd",
+    session_id: "term-end",
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: "%200",
+  });
+  drainAll();
+
+  const dead = getBackendExec("term-end");
+  expect(dead?.state).toBe("ended");
+  expect(dead?.backend_exec_pane_id).toBeNull();
+  expect(dead?.backend_exec_generation_id).toBeNull();
+});
+
+test("Killed NULLs the backend_exec pane + generation coords (recycle guard)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "term-kill",
+    pid: 9191,
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: "%201",
+  });
+  tmuxTopologyEvent("gen-kill", [
+    { pane_id: "%201", session_name: "fg", window_index: 4 },
+  ]);
+  drainAll();
+  const live = getBackendExec("term-kill");
+  expect(live?.backend_exec_pane_id).toBe("%201");
+  expect(live?.backend_exec_generation_id).toBe("gen-kill");
+
+  // The Killed payload matches the seeded (pid, start_time=null) → terminal flip.
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "term-kill",
+    data: JSON.stringify({ pid: 9191, start_time: null }),
+  });
+  drainAll();
+
+  const dead = getBackendExec("term-kill");
+  expect(dead?.state).toBe("killed");
+  expect(dead?.backend_exec_pane_id).toBeNull();
+  expect(dead?.backend_exec_generation_id).toBeNull();
+});
+
+test("a late backend_exec event after a job is terminal does NOT re-stamp the pane id", () => {
+  seedTmuxJob("term-late", "%202");
+  // End the job WITHOUT backend coords on the SessionEnd, so only the terminal
+  // arm clears the pane.
+  insertEvent({ hook_event: "SessionEnd", session_id: "term-late" });
+  drainAll();
+  expect(getBackendExec("term-late")?.backend_exec_pane_id).toBeNull();
+
+  // A straggler hook event (e.g. a late Stop the kernel delivered post-end)
+  // carries the stale env pane id. The COALESCE arm's terminal guard must reject
+  // the re-stamp — a recycled `%202` must never resurrect onto the dead row.
+  insertEvent({
+    hook_event: "Stop",
+    session_id: "term-late",
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: "%202",
+  });
+  drainAll();
+
+  const stillDead = getBackendExec("term-late");
+  expect(stillDead?.state).toBe("ended");
+  expect(stillDead?.backend_exec_pane_id).toBeNull();
+});
+
+test("terminal pane/generation clear is re-fold deterministic: rewind + re-drain reproduces NULL coords", () => {
+  seedTmuxJob("term-refold", "%203");
+  tmuxTopologyEvent("gen-refold", [
+    { pane_id: "%203", session_name: "fg", window_index: 1 },
+  ]);
+  insertEvent({
+    hook_event: "SessionEnd",
+    session_id: "term-refold",
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "launch-sess",
+    backend_exec_pane_id: "%203",
+  });
+  drainAll();
+  const pre = getBackendExec("term-refold");
+  expect(pre?.state).toBe("ended");
+  expect(pre?.backend_exec_pane_id).toBeNull();
+
+  // Rewind cursor + wipe + re-drain. `backend_exec_pane_id` is a
+  // deterministic-replayed column, so the post-rewind terminal row must be
+  // byte-identical (pane NULL). `backend_exec_generation_id` is live-only (the
+  // topology fold no-ops below the boot-seed floor on replay), so it re-folds to
+  // NULL on a terminal row too — the SessionEnd clear is a NULL→NULL no-op there.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+
+  const post = getBackendExec("term-refold");
+  expect(post?.state).toBe("ended");
+  expect(post?.backend_exec_pane_id).toBeNull();
+  expect(post?.backend_exec_generation_id).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // Retired `BackendExecSnapshot` arm (fn-710). The synthetic-event TYPE and its
 // historical rows persist in the immutable log, but the producer feed that
 // produced them is gone and the dispatch arm is now an EXPLICIT empty no-op.

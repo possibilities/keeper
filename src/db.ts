@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 91;
+export const SCHEMA_VERSION = 92;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5346,6 +5346,39 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces this.
       addColumnIfMissing(db, "autopilot_state", "worktree_mode", "INTEGER");
+
+      // v91→v92 (fn-977 task .2): NULL `backend_exec_pane_id` +
+      // `backend_exec_generation_id` on EXISTING terminal (ended/killed) jobs.
+      // tmux recycles a pane id `%N`, so a long-dead job that keeps its stale
+      // pane id lets the window-reaper collateral-kill the fresh window that
+      // later inherits it. The reducer's terminal fold arms now clear these
+      // coords going forward; this one-time pass brings the ~113 already-terminal
+      // rows (pane ids spanning %0-%519) in line so the reaper's recycle-guard
+      // (fn-977 task .1) has no stale pane → job mapping to trip over.
+      //
+      // VERSION-GUARDED (`preMigrateStoredVersion < 92`): the clear is a data
+      // fix, not a column add. It is also naturally idempotent (the WHERE matches
+      // zero rows once cleared), but the guard avoids re-scanning `jobs` on every
+      // boot. NO cursor rewind: `backend_exec_pane_id` is a deterministic-replayed
+      // column whose post-change fold output for a terminal job is NULL, and
+      // `backend_exec_generation_id` is live-only (boot-seeded for LIVE jobs only),
+      // so a terminal row stays NULL on both axes without a re-fold — this pass
+      // simply converges the existing rows the daemon will not re-fold.
+      //
+      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
+      // socket, not these projection internals) — this bump MUST add 92 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      if (preMigrateStoredVersion < 92) {
+        db.run(
+          `UPDATE jobs
+              SET backend_exec_pane_id = NULL,
+                  backend_exec_generation_id = NULL
+            WHERE state IN ('ended', 'killed')
+              AND (backend_exec_pane_id IS NOT NULL
+                   OR backend_exec_generation_id IS NOT NULL)`,
+        );
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

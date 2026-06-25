@@ -438,6 +438,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         89,
         90,
         91,
+        92,
     }
 )
 

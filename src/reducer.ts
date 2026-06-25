@@ -7700,10 +7700,18 @@ function projectJobsRow(db: Database, event: Event): void {
       // The terminal guard keeps this idempotent on 'ended' AND prevents a late
       // SessionEnd from clobbering a 'killed' row (the killed signal carries
       // proven-dead evidence and outranks). Clears `monitors='[]'` in the same
-      // UPDATE (terminal jobs have no live monitors). Matches zero rows for a
-      // terminal event with no prior SessionStart — a correct no-op.
+      // UPDATE (terminal jobs have no live monitors). NULLs the backend-exec
+      // pane + generation coords too: tmux recycles `%N`, so a dead job that
+      // keeps its pane id lets the window-reaper collateral-kill the live window
+      // that later inherits it (the post-switch COALESCE arm carries a matching
+      // terminal guard so a late hook event can't re-stamp the pane). Matches
+      // zero rows for a terminal event with no prior SessionStart — a correct
+      // no-op.
       const res = db.run(
-        `UPDATE jobs SET state = 'ended', monitors = '[]', last_event_id = ?, updated_at = ?
+        `UPDATE jobs SET state = 'ended', monitors = '[]',
+                         backend_exec_pane_id = NULL,
+                         backend_exec_generation_id = NULL,
+                         last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
@@ -7766,8 +7774,15 @@ function projectJobsRow(db: Database, event: Event): void {
             break; // stale/recycled — safe no-op.
           }
         }
+        // NULL the backend-exec pane + generation coords on the terminal flip
+        // (same recycle-guard rationale as SessionEnd): a dead job must not keep
+        // a tmux pane id `%N` that a fresh window can inherit, or the reaper
+        // collateral-kills the live window.
         db.run(
-          `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?, last_event_id = ?, updated_at = ?
+          `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?,
+                           backend_exec_pane_id = NULL,
+                           backend_exec_generation_id = NULL,
+                           last_event_id = ?, updated_at = ?
              WHERE job_id = ?`,
           [payload.close_kind, event.id, ts, jobId],
         );
@@ -8045,6 +8060,13 @@ function projectJobsRow(db: Database, event: Event): void {
   // tracks reality across moves. Consumers fall back to birth when the live
   // session is unresolved. `backend_exec_type` + `backend_exec_pane_id` stay as
   // pure env reads (a pane's TYPE + `%N` identity don't move out from under it).
+  //
+  // TERMINAL GUARD: skip a job already folded to ended/killed. The terminal
+  // arms NULL `backend_exec_pane_id` (tmux recycles `%N`, so a dead job holding
+  // a live-recyclable pane id lets the reaper collateral-kill a fresh window);
+  // without this guard a late hook event carrying the stale env pane id would
+  // COALESCE it straight back onto the dead row, undoing the clear in the very
+  // same event. Mirrors the `TmuxTopologySnapshot` fold's live-state filter.
   if (event.backend_exec_type != null) {
     db.run(
       `UPDATE jobs SET
@@ -8053,7 +8075,7 @@ function projectJobsRow(db: Database, event: Event): void {
          backend_exec_pane_id = COALESCE(?, backend_exec_pane_id),
          last_event_id = ?,
          updated_at = ?
-       WHERE job_id = ?`,
+       WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
       [
         event.backend_exec_type,
         event.backend_exec_session_id,
