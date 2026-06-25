@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Generic autopilot config RPC, drop config file",
-  "updated_at": "2026-06-24T23:43:32.356000Z"
+  "updated_at": "2026-06-25T04:16:45.427000Z",
+  "worker_done_at": "2026-06-25T04:16:45.427000Z"
 }

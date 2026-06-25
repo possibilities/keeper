@@ -50,5 +50,5 @@ paused/mode (live RPCs) and armed (per-epic) untouched.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added a generic set_autopilot_config RPC that round-trips one AutopilotConfigSet event upserting only the patched autopilot_state columns (preserving siblings); removed config-file max_concurrent_jobs (now runtime-set, defaulting to the in-memory DEFAULT) and the AutopilotCapSet boot-append, with the reconciler reading cap ?? DEFAULT from the projection each cycle. Added a keeper autopilot config setter verb.
 ## Evidence
