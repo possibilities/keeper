@@ -184,6 +184,45 @@ describe("ensureAgentwrapProfileDir", () => {
       realpathSync(settings),
     );
   });
+
+  test("repairs session-resource drift for an explicit profile", () => {
+    const canonicalDir = join(home, ".claude");
+    mkdirSync(canonicalDir, { recursive: true });
+    const settings = join(canonicalDir, "settings.json");
+    writeFileSync(settings, '{"theme":"dark"}\n');
+    writeFileSync(join(canonicalDir, "CLAUDE.md"), "# Default Claude\n");
+    mkdirSync(join(canonicalDir, "session-env", "main-session"), {
+      recursive: true,
+    });
+
+    const profileDir = join(home, ".claude-profiles", "multi-claude-1");
+    mkdirSync(join(profileDir, "session-env", "profile-session"), {
+      recursive: true,
+    });
+
+    const [, changed] = ensureAgentwrapProfileDir(
+      "multi-claude-1",
+      null,
+      null,
+      home,
+    );
+
+    expect(changed).toBe(true);
+    expect(lstatSync(join(profileDir, "session-env")).isSymbolicLink()).toBe(
+      true,
+    );
+    expect(realpathSync(join(profileDir, "session-env"))).toBe(
+      realpathSync(join(canonicalDir, "session-env")),
+    );
+    expect(
+      lstatSync(join(canonicalDir, "session-env", "main-session")).isDirectory(),
+    ).toBe(true);
+    expect(
+      lstatSync(
+        join(canonicalDir, "session-env", "profile-session"),
+      ).isDirectory(),
+    ).toBe(true);
+  });
 });
 
 // ── ensureProfileClaudeJson onboarding/trust merge ──────────────────────────
@@ -286,9 +325,15 @@ describe("ensureClaudeStateSharing", () => {
 
     writeFileSync(join(canonicalDir, "history.jsonl"), "default history\n");
     mkdirSync(join(canonicalDir, "projects"), { recursive: true });
+    mkdirSync(join(canonicalDir, "session-env", "main-session"), {
+      recursive: true,
+    });
     writeFileSync(join(profileDir, "history.jsonl"), "profile history\n");
     mkdirSync(join(profileDir, "projects"), { recursive: true });
     writeFileSync(join(profileDir, "projects", "drift.jsonl"), "drift\n");
+    mkdirSync(join(profileDir, "session-env", "profile-session"), {
+      recursive: true,
+    });
 
     ensureClaudeStateSharing(() => ["multi-claude-1"], [], home);
 
@@ -308,6 +353,20 @@ describe("ensureClaudeStateSharing", () => {
     expect(realpathSync(join(profileDir, "projects"))).toBe(
       realpathSync(join(canonicalDir, "projects")),
     );
+    expect(lstatSync(join(profileDir, "session-env")).isSymbolicLink()).toBe(
+      true,
+    );
+    expect(realpathSync(join(profileDir, "session-env"))).toBe(
+      realpathSync(join(canonicalDir, "session-env")),
+    );
+    expect(
+      lstatSync(join(canonicalDir, "session-env", "main-session")).isDirectory(),
+    ).toBe(true);
+    expect(
+      lstatSync(
+        join(canonicalDir, "session-env", "profile-session"),
+      ).isDirectory(),
+    ).toBe(true);
   });
 });
 

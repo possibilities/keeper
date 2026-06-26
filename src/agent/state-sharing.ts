@@ -56,6 +56,11 @@ export const DEFAULT_SHARED_PATHS: readonly string[] = [
   "todos",
   "plugins",
   "sessions",
+  "session-env",
+  "shell-snapshots",
+  "file-history",
+  "paste-cache",
+  "jobs",
   "session-monitor-state.json",
   "stats-cache.json",
   "mcp-needs-auth-cache.json",
@@ -80,10 +85,17 @@ export const DEFAULT_PI_SHARED_PATHS: readonly string[] = [
 ];
 
 // Shared paths that may hold real per-profile data we preserve into the
-// canonical ~/.claude/ location instead of wipe-and-replace. `sessions/`
-// qualifies: Claude Code writes per-PID sidecar JSONs there (live session name/
-// status). Wiping them erases live state for any claude on another profile dir.
-const PRESERVING_SHARED_PATHS: ReadonlySet<string> = new Set(["sessions"]);
+// canonical ~/.claude/ location instead of wipe-and-replace. These are runtime
+// session-resource dirs; replacing them without migration can strand resume,
+// history, shell snapshot, or paste metadata in a profile-local silo.
+const PRESERVING_SHARED_PATHS: ReadonlySet<string> = new Set([
+  "sessions",
+  "session-env",
+  "shell-snapshots",
+  "file-history",
+  "paste-cache",
+  "jobs",
+]);
 
 const PI_PRESERVING_SHARED_PATHS: ReadonlySet<string> = new Set([
   "sessions",
@@ -394,6 +406,17 @@ export function ensureAgentwrapProfileDir(
     actionLog?.push(
       `Linked profile CLAUDE.md: ${profileClaudeMd} -> ${sharedClaudeMd}`,
     );
+  }
+
+  if (
+    ensureProfileSharedLinks(
+      profileDir,
+      sharedConfigDir,
+      DEFAULT_SHARED_PATHS,
+      actionLog,
+    )
+  ) {
+    changed = true;
   }
 
   return [profileDir, changed];
@@ -715,6 +738,11 @@ export function ensureClaudeStateSharing(
       "history.jsonl",
       "plans",
       "sessions",
+      "session-env",
+      "shell-snapshots",
+      "file-history",
+      "paste-cache",
+      "jobs",
     ]) {
       const linkPath = join(defaultProfileDir, sharedName);
       const target = join(canonicalDir, sharedName);
