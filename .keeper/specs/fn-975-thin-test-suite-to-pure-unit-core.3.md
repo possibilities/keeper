@@ -50,5 +50,5 @@ After cuts, grep the touched files for any surviving `withInProcessDaemon` /
 - [ ] Husked files removed; the ~45 promote-set triaged (cut vs promote noted); db.test.ts measured <10s under load
 
 ## Done summary
-
+Cut every real-infra/real-git test from the 16 in-process unit-core files: whole-file deleted agent-tty/history-read-verbs/plan-contract (entirely real infra), surgically removed the withInProcessDaemon/new Worker/bun --eval/real-subprocess/real-git tests elsewhere while keeping pure logic + bounded spawnSync KEEPs and pruning orphaned helpers/imports. Triaged the ~16-file promote-set (all pure-unit, safe; builds-watch/watchdog path-ignore entries are now no-op) and measured db.test.ts <10s/test under parallel-5 load. Touched files 559 pass / fast tier 3366 pass, 0 fail; biome clean.
 ## Evidence
