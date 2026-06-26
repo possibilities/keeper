@@ -34,12 +34,65 @@ import type { Job } from "../src/types";
  * must call this explicitly to observe the re-folded state. (v12 is a
  * non-rewind sidecar ADD — no drain required for the v11→v12 step.)
  */
-function drainAll(db: import("bun:sqlite").Database): void {
+function drainAll(
+  db: import("bun:sqlite").Database,
+  drainFn: (db: import("bun:sqlite").Database) => number = drain,
+): void {
+  const readCursor = (): number =>
+    (
+      db
+        .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+        .get() as { last_event_id: number } | null
+    )?.last_event_id ?? 0;
+  // Absolute iteration ceiling — a backstop in case the cursor-advance check
+  // ever false-negatives on a real corpus. Each drain() folds up to one batch,
+  // so the log drains in (events / batchSize) iterations; this ceiling sits far
+  // above any migration corpus a test could build, while still making a runaway
+  // synchronous spin structurally impossible.
+  const MAX_ITERATIONS = 100_000;
+  let iterations = 0;
   let n: number;
   do {
-    n = drain(db);
+    const before = readCursor();
+    n = drainFn(db);
+    const after = readCursor();
+    // A non-advancing fold — drain() reports work but the cursor stayed put —
+    // is a re-fold determinism bug, not a benign stall. applyEvent co-advances
+    // reducer_state.last_event_id in the same transaction as every fold, so a
+    // healthy drain() returning >0 always moves the cursor. Surface the stall
+    // loudly instead of spinning silently.
+    if (n > 0 && after <= before) {
+      throw new Error(
+        `drainAll: non-advancing fold — drain() processed ${n} event(s) but ` +
+          `reducer_state.last_event_id did not advance (stuck at ${after}). ` +
+          `This is a re-fold determinism bug.`,
+      );
+    }
+    if (++iterations > MAX_ITERATIONS) {
+      throw new Error(
+        `drainAll: exceeded ${MAX_ITERATIONS} iterations (cursor at ${after}); ` +
+          `aborting to avoid a synchronous spin.`,
+      );
+    }
   } while (n > 0);
 }
+
+test("drainAll throws on a non-advancing fold instead of spinning", () => {
+  const { db } = openDb(":memory:");
+  // Synthetic non-advancing fold: claims one event folded on every call but
+  // never moves the cursor. The real drain() can never do this (applyEvent
+  // advances the cursor in the same transaction as the fold), so inject a fake
+  // to exercise the guard without monkeypatching the module.
+  let calls = 0;
+  const stuckDrain = (): number => {
+    calls += 1;
+    return 1;
+  };
+  expect(() => drainAll(db, stuckDrain)).toThrow(/non-advancing fold/);
+  // Bounded: it threw on the first non-advancing iteration, not after a spin.
+  expect(calls).toBe(1);
+  db.close();
+});
 
 let tmpDir: string;
 let dbPath: string;
