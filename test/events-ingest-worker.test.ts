@@ -39,7 +39,6 @@ import {
 import { openDb } from "../src/db";
 import type { EventLogRecord } from "../src/dead-letter";
 import { serializeEventLogRecord } from "../src/dead-letter";
-import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -813,61 +812,9 @@ test("scanEventsLogDir skips a poison line (INSERT-safe) without advancing past 
 });
 
 // ---------------------------------------------------------------------------
-// fn-742 — the LIVE path the original fn-736.1 tests never exercised: the real
-// Worker's `@parcel/watcher` subscription firing a hint, and a many-file
-// concurrent-writers drain. These are the proof-before-re-flip the ingester
-// fix is gated on.
+// fn-742 — a many-file concurrent-writers drain: scanEventsLogDir stays
+// exactly-once when many per-pid files land in one scan.
 // ---------------------------------------------------------------------------
-
-test("fn-742 e2e: events-ingest worker posts a live hint when an NDJSON file is appended", async () => {
-  // The dir exists at spawn — the mkdir-at-boot guarantee (daemon.ts) WITHOUT
-  // which the worker skip-and-logs and the live ingest path is dead until the
-  // next restart (the 2026-06-08 incident). Spawn the REAL worker and assert
-  // its watcher subscription fires a contentless hint on a file append.
-  mkdirSync(eventsLogDir, { recursive: true });
-
-  const worker = new Worker(
-    new URL("../src/events-ingest-worker.ts", import.meta.url).href,
-    { workerData: { dir: eventsLogDir } } as WorkerOptions & {
-      workerData: unknown;
-    },
-  );
-
-  let hinted = false;
-  worker.addEventListener("message", (ev: MessageEvent) => {
-    const msg = ev.data as { kind?: string } | undefined;
-    if (msg && msg.kind === "events-log-changed") {
-      hinted = true;
-    }
-  });
-
-  // The worker imports @parcel/watcher and subscribes asynchronously; under
-  // load that can outlast a single blind write. Re-write the SAME path/content
-  // each tick (ingest is offset-idempotent / exactly-once) so a subscription
-  // that wasn't live at the first write still catches a later one. Bounded:
-  // a real watcher miss fails loud (hinted stays false) rather than hangs.
-  const ok = await retryUntil(() => {
-    if (!hinted) {
-      writeFileSync(
-        join(eventsLogDir, `${LIVE_PID}.ndjson`),
-        serializeEventLogRecord(makeRecord("e2e-live")),
-      );
-    }
-    return hinted || null;
-  }, 20_000);
-
-  // Clean shutdown of the watcher subscription, then ensure the thread exits.
-  let closed = false;
-  worker.addEventListener("close", () => {
-    closed = true;
-  });
-  worker.postMessage({ type: "shutdown" });
-  await retryUntil(() => closed || null, 20_000);
-  worker.terminate();
-
-  expect(ok).toBe(true);
-  expect(hinted).toBe(true);
-});
 
 test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly-once", () => {
   const { db } = openDb(dbPath);

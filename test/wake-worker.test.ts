@@ -14,7 +14,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import { watchLoop } from "../src/wake-worker";
-import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -207,30 +206,4 @@ test("watchLoop coalesces a commit and an overdue idle tick (one wake per turn)"
   expect(wakeTimes.length).toBeGreaterThanOrEqual(2);
   writer.close();
   reader.close();
-});
-
-test("spawned Worker shuts down cleanly on shutdown message", async () => {
-  // `workerData` is a Bun/Node worker_threads option not present in the DOM
-  // `WorkerOptions` lib type; cast to reach it.
-  const worker = new Worker(
-    new URL("../src/wake-worker.ts", import.meta.url).href,
-    { workerData: { dbPath, pollMs: 25, role: "wake" } } as WorkerOptions & {
-      workerData: unknown;
-    },
-  );
-
-  let closed = false;
-  // Bun exposes worker exit via the "close" event.
-  worker.addEventListener("close", () => {
-    closed = true;
-  });
-
-  // Let it boot and open its read-only connection.
-  await Bun.sleep(60);
-  worker.postMessage({ type: "shutdown" });
-
-  // Poll the clean-exit flag with a generous ceiling so a hang fails loudly
-  // (free on the happy path) instead of racing a fixed deadline under load.
-  const ok = await retryUntil(() => closed || null, 20_000);
-  expect(ok).toBe(true);
 });

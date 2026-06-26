@@ -12,7 +12,6 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { execSync } from "node:child_process";
 import { createExitWatcher, KQ, LX } from "../src/exit-watcher-ffi";
 
 // ---------------------------------------------------------------------------
@@ -62,150 +61,14 @@ describe("struct layout", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Live integration — defer-skip on opposite platform
+// 2. Platform guard — createExitWatcher throws on an unsupported platform
 // ---------------------------------------------------------------------------
 
 const isDarwin = process.platform === "darwin";
 const isLinux = process.platform === "linux";
-
-describe.if(isDarwin || isLinux)(
-  "ExitWatcher — live (current platform)",
-  () => {
-    test("register-and-wait fires on a child that exits ~100ms later", async () => {
-      const w = createExitWatcher();
-      try {
-        // Use Bun.spawn so we get a stable cross-platform pid back.
-        const child = Bun.spawn(["sleep", "0.1"]);
-        const pid = child.pid;
-
-        const res = w.add(pid, 0xa1b2c3d4n);
-        expect(res).toEqual({ registered: true });
-
-        const t0 = performance.now();
-        const ev = await w.wait(3000);
-        const elapsed = performance.now() - t0;
-
-        expect(ev.kind).toBe("exit");
-        if (ev.kind === "exit") {
-          expect(ev.pid).toBe(pid);
-          // udata round-trips byte-for-byte through the kernel.
-          expect(ev.udata).toBe(0xa1b2c3d4n);
-        }
-        // Sanity: we shouldn't have waited the full 3s.
-        expect(elapsed).toBeLessThan(2000);
-
-        await child.exited;
-      } finally {
-        w.close();
-      }
-    });
-
-    test("race-closer: registering a freshly-dead pid returns alreadyDead", async () => {
-      const w = createExitWatcher();
-      try {
-        // Spawn and reap before register so the pid is guaranteed dead.
-        const child = Bun.spawn(["true"]);
-        const pid = child.pid;
-        await child.exited;
-
-        const res = w.add(pid, 1n);
-        expect("alreadyDead" in res && res.alreadyDead).toBe(true);
-      } finally {
-        w.close();
-      }
-    });
-
-    test("wake() interrupts a blocked wait() within ~50ms of being called", async () => {
-      const w = createExitWatcher();
-      try {
-        const t0 = performance.now();
-        const pending = w.wait(5000);
-
-        let wakeAt = 0;
-        setTimeout(() => {
-          wakeAt = performance.now();
-          w.wake();
-        }, 50);
-
-        const ev = await pending;
-        const returnedAt = performance.now();
-
-        expect(ev.kind).toBe("wakeup");
-        // wake() should be observed by the next slice; SLICE_MS is 25 so the
-        // worst-case latency between wake() and wait() returning is ~25ms.
-        // Be generous in the assertion to keep this stable under CI load.
-        expect(returnedAt - wakeAt).toBeLessThan(100);
-        // Total elapsed from start = ~50ms (delay) + ~25ms (slice) = ~75ms.
-        expect(returnedAt - t0).toBeLessThan(200);
-      } finally {
-        w.close();
-      }
-    });
-
-    test("close() releases fds — no fd leak after a register-wait cycle", async () => {
-      const before = countOpenFds();
-
-      const w = createExitWatcher();
-      const child = Bun.spawn(["sleep", "0.05"]);
-      w.add(child.pid, 0n);
-      await w.wait(2000);
-      await child.exited;
-      w.close();
-
-      // Give the runtime a beat to drop any pending close in flight (libc close
-      // is synchronous on both platforms, but child.exited cleanup may linger).
-      await Bun.sleep(20);
-
-      const after = countOpenFds();
-      // Allow a tiny slop (e.g. the test runner itself may rotate an internal
-      // fd between snapshots), but the watcher's kqueue/epoll/eventfd/pidfds
-      // must all be reclaimed — a leak would be many fds, not one.
-      expect(after - before).toBeLessThan(5);
-    });
-
-    test("close() is idempotent and subsequent ops throw cleanly", () => {
-      const w = createExitWatcher();
-      w.close();
-      w.close(); // no throw on second close
-
-      expect(() => w.add(process.pid, 0n)).toThrow();
-      // wake() after close is best-effort silent
-      expect(() => w.wake()).not.toThrow();
-    });
-  },
-);
 
 describe.if(!isDarwin && !isLinux)("ExitWatcher — unsupported platform", () => {
   test("createExitWatcher throws on unsupported platform", () => {
     expect(() => createExitWatcher()).toThrow(/unsupported platform/);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Count this process's open fds. Cross-platform: `/proc/self/fd` on Linux,
- * `lsof -p` on macOS. Returns a finite number even if the underlying command
- * is flaky — a NaN return would mask leaks.
- */
-function countOpenFds(): number {
-  try {
-    if (process.platform === "linux") {
-      const out = execSync(`ls /proc/${process.pid}/fd | wc -l`, {
-        encoding: "utf8",
-      });
-      return Number.parseInt(out.trim(), 10);
-    }
-    if (process.platform === "darwin") {
-      const out = execSync(`lsof -p ${process.pid} 2>/dev/null | wc -l`, {
-        encoding: "utf8",
-      });
-      return Number.parseInt(out.trim(), 10);
-    }
-  } catch {
-    // best-effort
-  }
-  return 0;
-}

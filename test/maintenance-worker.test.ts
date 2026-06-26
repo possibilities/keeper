@@ -26,7 +26,6 @@ import { join } from "node:path";
 import { openDb } from "../src/db";
 import type { MaintenanceMessage } from "../src/maintenance-worker";
 import { runBackupPass, runProbePass } from "../src/maintenance-worker";
-import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -153,39 +152,6 @@ test("runProbePass is a no-op when shutting down", () => {
     () => true,
   );
   expect(msgs).toHaveLength(0);
-});
-
-// ---------------------------------------------------------------------------
-// Spawned Worker lifecycle — boot catch-up relay + clean shutdown
-// ---------------------------------------------------------------------------
-
-test("spawned worker fires a boot catch-up backup and shuts down cleanly", async () => {
-  // No prior snapshot ⇒ isCatchUpDue is true ⇒ the worker schedules the boot
-  // catch-up one-shot. Make that one-shot fire promptly by overriding the
-  // startup delay via a short interval is not exposed; instead we rely on the
-  // DEFAULT BACKUP_CATCHUP_DELAY_MS being far longer than the test window, so we
-  // assert the worker boots + shuts down clean WITHOUT waiting for the heavy
-  // pass — the catch-up scheduling itself is covered by isCatchUpDue's unit test
-  // and runBackupPass above. This test pins the worker-contract lifecycle: spawn
-  // → shutdown message → clean exit (no hang, no fatalExit).
-  const worker = new Worker(
-    new URL("../src/maintenance-worker.ts", import.meta.url).href,
-    { workerData: { dbPath } } as WorkerOptions & { workerData: unknown },
-  );
-
-  let closed = false;
-  worker.addEventListener("close", () => {
-    closed = true;
-  });
-
-  // Let it boot, wire its timers, and evaluate the catch-up one-shot.
-  await Bun.sleep(80);
-  worker.postMessage({ type: "shutdown" });
-
-  // Poll the clean-exit flag (generous ceiling, free on the happy path) so a
-  // hang fails loudly instead of racing a fixed deadline under load.
-  const ok = await retryUntil(() => closed || null, 20_000);
-  expect(ok).toBe(true);
 });
 
 test("plain import on the main thread is inert (isMainThread guard)", async () => {

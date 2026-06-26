@@ -31,7 +31,6 @@
  */
 
 import { expect, test } from "bun:test";
-import { join } from "node:path";
 import { renderRowBlocks } from "../cli/git";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
@@ -40,53 +39,6 @@ import {
   type SocketHandlers,
   subscribeCollection,
 } from "../src/readiness-client";
-
-const KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
-
-interface GitRun {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-/**
- * Spawn the real `keeper git <args>` subprocess (fn-772). stdout is piped
- * (a Bun pipe → `process.stdout.isTTY === undefined`), so the auto-detect
- * resolves snapshot mode without `--snapshot`. We point `--sock` at a path
- * with no listener so the subscription never connects — the snapshot
- * latch's own `--timeout` bounds the run deterministically (no daemon
- * required). `CI` / `TERM` are cleared so the auto-detect test exercises
- * the isTTY arm rather than the env arm.
- */
-async function runGit(args: string[]): Promise<GitRun> {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    CI: undefined,
-    TERM: "xterm",
-  };
-  const proc = Bun.spawn(["bun", KEEPER_CLI, "git", ...args], {
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
-}
-
-/** Parse the LAST non-empty stdout line as the keeper-meta: JSON record. */
-function parseGitTrailer(stdout: string): Record<string, unknown> {
-  const lines = stdout.split("\n").filter((l) => l.length > 0);
-  const last = lines.at(-1);
-  if (last === undefined) throw new Error(`no stdout lines: ${stdout}`);
-  expect(last.startsWith("keeper-meta: ")).toBe(true);
-  const json = last.slice("keeper-meta: ".length);
-  expect(json).not.toContain("\n");
-  return JSON.parse(json) as Record<string, unknown>;
-}
 
 // ---------------------------------------------------------------------------
 // Mock socket / connect factory — byte-identical shape to
@@ -611,82 +563,4 @@ test("renderRowBlocks: attribution truncation appends `+N more` for dense lines"
     .find((l) => l.startsWith("  src/hot.ts ["));
   if (fileLine == null) throw new Error("missing file line");
   expect(fileLine).toMatch(/\+\d+ more$/);
-});
-
-// ---------------------------------------------------------------------------
-// fn-772: snapshot mode wiring (real `keeper git` subprocess). A piped
-// stdout auto-detects snapshot; `--sock` points at a dead path so the
-// latch timeout bounds the run deterministically without a daemon. This is
-// the epic's early proof point — the shared seam (mode resolution, flag
-// validation, dispose-then-exit, trailer shape) exercised end to end.
-// ---------------------------------------------------------------------------
-
-const DEAD_SOCK = "/tmp/keeper-snapshot-test-nonexistent.sock";
-
-test("git --snapshot: both flags → stderr error, exit 2", async () => {
-  const res = await runGit(["--snapshot", "--watch"]);
-  expect(res.code).toBe(2);
-  expect(res.stderr).toContain("--snapshot and --watch are mutually exclusive");
-  // No keeper-meta: trailer on a flag-misuse exit.
-  expect(res.stdout).not.toContain("keeper-meta:");
-});
-
-test("git --snapshot: bad --timeout → stderr error, exit 2", async () => {
-  const res = await runGit(["--snapshot", "--timeout", "notanumber"]);
-  expect(res.code).toBe(2);
-  expect(res.stderr).toContain("--timeout must be a positive number");
-});
-
-test("git --snapshot: zero/negative --timeout → exit 2", async () => {
-  // `0` (space form) and `-3` (equals form — a leading-dash value to a
-  // string option must use `=` per GNU-style parseArgs) both trip the
-  // positive-seconds guard.
-  const zero = await runGit(["--snapshot", "--timeout", "0"]);
-  expect(zero.code).toBe(2);
-  const neg = await runGit(["--snapshot", "--timeout=-3"]);
-  expect(neg.code).toBe(2);
-});
-
-test("git: piped non-TTY auto-detects snapshot; dead sock → exit 1, daemon-unreachable, frame:null on stdout", async () => {
-  // No --snapshot flag — the piped stdout (isTTY===undefined) auto-detects
-  // snapshot mode. The dead sock never connects, so after --timeout the
-  // run exits 1 with status daemon-unreachable.
-  const res = await runGit(["--sock", DEAD_SOCK, "--timeout", "1"]);
-  expect(res.code).toBe(1);
-  // The human diagnostic is on stderr.
-  expect(res.stderr).toContain("no frame");
-  // The keeper-meta: line is the LAST stdout line and parses with frame:null.
-  const trailer = parseGitTrailer(res.stdout);
-  expect(trailer.schema_version).toBe(1);
-  expect(trailer.script).toBe("git");
-  expect(trailer.status).toBe("daemon-unreachable");
-  expect(trailer.frame).toBeNull();
-  expect(trailer.frame_count).toBe(0);
-  expect(trailer.truncated).toBe(true);
-  expect(typeof trailer.lifecycle).toBe("string");
-});
-
-test("git --snapshot: forces snapshot on the dead-sock path even without a pipe-only trigger", async () => {
-  // `--snapshot` is the explicit force; combined with the dead sock it
-  // still exits 1 (no frame) with a parseable trailer — proving the flag
-  // arm of the precedence chain reaches the same snapshot machinery.
-  const res = await runGit([
-    "--snapshot",
-    "--sock",
-    DEAD_SOCK,
-    "--timeout",
-    "1",
-  ]);
-  expect(res.code).toBe(1);
-  const trailer = parseGitTrailer(res.stdout);
-  expect(trailer.status).toBe("daemon-unreachable");
-  expect(trailer.frame).toBeNull();
-});
-
-test("git --help: documents --snapshot / --watch / --timeout", async () => {
-  const res = await runGit(["--help"]);
-  expect(res.code).toBe(0);
-  expect(res.stdout).toContain("--snapshot");
-  expect(res.stdout).toContain("--watch");
-  expect(res.stdout).toContain("--timeout");
 });

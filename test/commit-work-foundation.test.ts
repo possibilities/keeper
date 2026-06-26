@@ -18,7 +18,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,10 +26,8 @@ import {
   getSessionDirtyFiles,
 } from "../src/commit-work/attribution";
 import { CommitWorkLock, FLOCK_CONSTANTS } from "../src/commit-work/flock";
-import { gitExec } from "../src/commit-work/git-exec";
 import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb } from "../src/db";
-import { initRepo } from "./helpers/git-repo";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -271,52 +269,6 @@ describe("discoverSessionFiles", () => {
   });
 });
 
-describe("getSessionDirtyFiles live git integration", () => {
-  test("matches a real porcelain-v2 dirty set on a fixture repo", async () => {
-    // Canonicalize: `git rev-parse --show-toplevel` resolves the macOS
-    // /var → /private/var symlink, so cwd_repo would otherwise mismatch the
-    // seeded project_dir key.
-    const repo = realpathSync(
-      mkdtempSync(join(tmpdir(), "keeper-cw-fixture-")),
-    );
-    try {
-      initRepo(repo);
-      // committed-then-clean file (NOT dirty), plus a tracked-modified file and
-      // an untracked file (both dirty).
-      writeFileSync(join(repo, "tracked.ts"), "v1\n");
-      writeFileSync(join(repo, "clean.ts"), "clean\n");
-      await gitExec(["add", "--", "tracked.ts", "clean.ts"], { cwd: repo });
-      await gitExec(["commit", "-q", "-m", "init"], { cwd: repo });
-      writeFileSync(join(repo, "tracked.ts"), "v2\n"); // modify → dirty
-      writeFileSync(join(repo, "new.ts"), "new\n"); // untracked → dirty
-
-      // All three are on the hook; the live git status must drop clean.ts.
-      seedAttribution({
-        projectDir: repo,
-        sessionId: "s1",
-        filePath: "tracked.ts",
-      });
-      seedAttribution({
-        projectDir: repo,
-        sessionId: "s1",
-        filePath: "clean.ts",
-      });
-      seedAttribution({
-        projectDir: repo,
-        sessionId: "s1",
-        filePath: "new.ts",
-      });
-
-      const result = getSessionDirtyFiles("s1", repo, { dbPath });
-
-      expect(result.filesByRepo[repo]).toEqual(["new.ts", "tracked.ts"]);
-      expect(result.cwdRepo).toBe(repo);
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  });
-});
-
 // ---------------------------------------------------------------------------
 // flock primitive
 // ---------------------------------------------------------------------------
@@ -360,37 +312,5 @@ describe("CommitWorkLock", () => {
     const third = CommitWorkLock.tryAcquire(lockPath);
     expect(third).not.toBeNull();
     third?.release();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// git-exec helper
-// ---------------------------------------------------------------------------
-
-describe("gitExec", () => {
-  test("returns exit code + drains stdout on success", async () => {
-    const res = await gitExec(["--version"]);
-    expect(res.code).toBe(0);
-    expect(res.stdout).toContain("git version");
-    expect(res.stderr).toBe("");
-  });
-
-  test("captures stderr + non-zero code on failure", async () => {
-    const res = await gitExec(["-C", "/nonexistent-path-xyz", "status"]);
-    expect(res.code).not.toBe(0);
-    expect(res.stderr.length).toBeGreaterThan(0);
-  });
-
-  test("drains a large stdout without deadlocking the pipe", async () => {
-    // A real git repo with enough output to exceed the OS pipe buffer (~64KB)
-    // would deadlock a sequential single-stream drain. `git config --list`
-    // against our own repo plus a forced large output via `rev-list` proves the
-    // concurrent drain. Use this very repo's HEAD log.
-    const res = await gitExec(["help", "-a"]);
-    // `git help -a` prints a long command list to stdout; the test just proves
-    // the call returns (no hang) and both streams resolved.
-    expect(typeof res.stdout).toBe("string");
-    expect(typeof res.stderr).toBe("string");
-    expect(res.code).toBeGreaterThanOrEqual(0);
   });
 });

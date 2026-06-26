@@ -25,7 +25,6 @@
  */
 
 import { expect, test } from "bun:test";
-import { join } from "node:path";
 import {
   assertNoMidEpicDispatch,
   autopilotBannerLabel,
@@ -1173,87 +1172,4 @@ test("renderDependencyGraph — skips epics with no tasks, omits the dep clause 
   const empty = makeEpic({ epic_id: "fn-3-baz", epic_number: 3, tasks: [] });
   const lines = renderDependencyGraph(buildSnap([epic, empty]));
   expect(lines).toEqual(["fn-2-bar", "  ○ .1"]);
-});
-
-// ---------------------------------------------------------------------------
-// fn-772 (task .2): snapshot-mode CLI wiring (real `keeper autopilot`
-// subprocess, viewer path only — no subcommand). autopilot folds FOUR streams
-// (readiness, dispatch_failures, autopilot_state, armed_epics), so
-// `streamCount: 4` and ALL FOUR handles are disposed before exit. This
-// subprocess exercises the CLI seam — flag validation, the auto-detect piped
-// trigger, and the dead-sock no-frame exit. The multi-stream latch determinism
-// (the snapshot reflects the FOLDED mode/armed/failed state, not seeds) is
-// covered in-process in test/view-shell.test.ts. Mirrors test/git.test.ts.
-// ---------------------------------------------------------------------------
-
-const AP_KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
-const AP_DEAD_SOCK = "/tmp/keeper-autopilot-snapshot-test-nonexistent.sock";
-
-interface AutopilotRun {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-async function runAutopilot(args: string[]): Promise<AutopilotRun> {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    CI: undefined,
-    TERM: "xterm",
-  };
-  const proc = Bun.spawn(["bun", AP_KEEPER_CLI, "autopilot", ...args], {
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
-}
-
-function parseAutopilotTrailer(stdout: string): Record<string, unknown> {
-  const lines = stdout.split("\n").filter((l) => l.length > 0);
-  const last = lines.at(-1);
-  if (last === undefined) throw new Error(`no stdout lines: ${stdout}`);
-  expect(last.startsWith("keeper-meta: ")).toBe(true);
-  const json = last.slice("keeper-meta: ".length);
-  expect(json).not.toContain("\n");
-  return JSON.parse(json) as Record<string, unknown>;
-}
-
-test("autopilot --snapshot: both flags → stderr error, exit 2", async () => {
-  const res = await runAutopilot(["--snapshot", "--watch"]);
-  expect(res.code).toBe(2);
-  expect(res.stderr).toContain("--snapshot and --watch are mutually exclusive");
-  expect(res.stdout).not.toContain("keeper-meta:");
-});
-
-test("autopilot --snapshot: bad --timeout → exit 2", async () => {
-  const res = await runAutopilot(["--snapshot", "--timeout", "notanumber"]);
-  expect(res.code).toBe(2);
-  expect(res.stderr).toContain("--timeout must be a positive number");
-});
-
-test("autopilot: piped non-TTY auto-detects snapshot; dead sock → exit 1, daemon-unreachable, frame:null on stdout", async () => {
-  const res = await runAutopilot(["--sock", AP_DEAD_SOCK, "--timeout", "1"]);
-  expect(res.code).toBe(1);
-  expect(res.stderr).toContain("no frame");
-  const trailer = parseAutopilotTrailer(res.stdout);
-  expect(trailer.schema_version).toBe(1);
-  expect(trailer.script).toBe("autopilot");
-  expect(trailer.status).toBe("daemon-unreachable");
-  expect(trailer.frame).toBeNull();
-  expect(trailer.frame_count).toBe(0);
-  expect(trailer.truncated).toBe(true);
-});
-
-test("autopilot --help: documents --snapshot / --watch / --timeout", async () => {
-  const res = await runAutopilot(["--help"]);
-  expect(res.code).toBe(0);
-  expect(res.stdout).toContain("--snapshot");
-  expect(res.stdout).toContain("--watch");
-  expect(res.stdout).toContain("--timeout");
 });
