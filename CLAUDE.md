@@ -94,20 +94,17 @@ imperative guardrails only.
 
 ## Test isolation
 
-- **Sandbox ALL SIX state classes** under the per-test tmpdir for any test spawning the real
-  hook/daemon/CLI: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`,
-  `KEEPER_BACKSTOP_LOG`, and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never
-  `{ ...process.env, KEEPER_DB }`; build via `sandboxEnv(...)`. Pure in-process unit tests use
-  `freshMemDb()` / `freshDbFile()` instead of a full `migrate()`.
-- **Two tiers.** Default `bun test` runs the FAST tier only. **`bun run test:full` is mandatory
-  before landing any change touching daemon / worker / db / hook / git process paths or a slow file.**
-- **Two independent test axes.** (1) Slow-tier: a too-slow case is EXTRACTED (plus its setup) into a
-  `*.slow.test.ts` sibling while its file stays fast (path-ignored from the fast tier into `test:full`),
-  never the whole file or `test.skip`. (2) No real git in default tiers — test git-boundary DECISIONS via a
-  pure seam; a test whose contract genuinely IS git's execution must ALSO be allowlisted in `scripts/test-real-git-allowlist.txt` (`bun run test:hygiene`).
-- **Test runs are lock-free** — `scripts/test-gate.ts` (`test` / `test:full` route through it) caps
+- **One fast pure-in-process tier.** `bun test` is the whole suite (only `test:opentui` splits out).
+  NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary
+  DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never
+  hang or synchronously spin; production is the integration safety net.
+- **Sandbox ALL SIX state classes** under the per-test tmpdir for any test on the real state surface:
+  `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
+  and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never `{ ...process.env, KEEPER_DB }`;
+  build via `sandboxEnv(...)`. Pure unit tests use `freshMemDb()` / `freshDbFile()` over a full `migrate()`.
+- **Test runs are lock-free** — `scripts/test-gate.ts` (the `test` script routes through it) caps
   `--parallel` (`KEEPER_TEST_PARALLEL`, default 5) + adds `--no-orphans`. Never add a host-wide lock — a hung holder wedges every runner.
-- **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses `retryUntil`
+- **Poll, don't sleep.** Any assertion waiting on async state uses `retryUntil`
   (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep`.
 
 ## Autopilot

@@ -682,26 +682,26 @@ Keeper has no `install` verb. Wire it up manually:
    path list at each spawn site (it sets the state paths LAST so a caller can't
    strand one). The
    suite carries TWO complementary test helpers (fn-769): `sandboxEnv` isolates
-   the state paths for any test that launches a real subprocess (hook / daemon /
-   CLI), while the template-DB helper in `test/helpers/template-db.ts`
+   the state paths for any test that exercises the real state surface, while the
+   template-DB helper in `test/helpers/template-db.ts`
    (`freshMemDb()` / `freshDbFile()`) serves pure in-process unit tests that only
    need a migrated schema — it migrates one `:memory:` DB per file-process,
    `serialize()`s it once, and deserializes a per-test clone (~0.2ms) instead of
    re-running the 63-version `migrate()` ladder on every `openDb(":memory:")`,
-   which is what made the default `bun test` fast (slow process-level cases are
-   tiered behind `bun run test:full` — a whole heavy file, or a single heavy case
-   extracted into a `*.slow.test.ts` sibling while the rest of its file stays
-   fast; see CLAUDE.md `## Test isolation`). A
+   which keeps the whole `bun test` suite fast. The suite is a SINGLE fast
+   pure-in-process tier: no test boots a real daemon / Worker thread / UDS socket /
+   subprocess / git / tmux, and — because a synchronous spin defeats every
+   in-process timeout — no test may hang or sync-spin; there is no watchdog, and
+   production is the integration safety net (see CLAUDE.md `## Test isolation`). A
    third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
-   async worker/daemon condition holds and is the canonical replacement for a
-   fixed `Bun.sleep` deadline race. Both `bun run test` and `bun run test:full`
-   route through the concurrency gate `scripts/test-gate.ts` (fn-904), which caps
-   per-run parallelism (`KEEPER_TEST_PARALLEL`, default 4) and serializes
-   concurrent agent runs behind a host-wide `flock` so they queue instead of
-   thrashing the CPU; the default tiers also spawn ZERO real git (producers test
-   against synthetic porcelain/snapshot fixtures, commit/push surfaces against a
-   faked runner), enforced by `bun run test:hygiene`
-   (`scripts/lint-no-real-git.ts` + `scripts/test-real-git-allowlist.txt`). The
+   async condition holds and is the canonical replacement for a
+   fixed `Bun.sleep` deadline race. `bun run test` routes through the concurrency
+   gate `scripts/test-gate.ts` (fn-904), which caps per-run parallelism
+   (`KEEPER_TEST_PARALLEL`, default 5) and adds `--no-orphans` so concurrent agent
+   runs coexist by bounding each run rather than a host-wide lock; git-boundary
+   surfaces are tested through a pure seam (producers against synthetic
+   porcelain/snapshot fixtures, commit/push against a faked runner), never real
+   git. The
    restore worker (epic fn-677) writes
    `~/.local/state/keeper/restore.json` as a dumb single-tier
    `{schema_version, current}` live mirror — a DISASTER FALLBACK only, since the

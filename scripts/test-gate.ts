@@ -5,11 +5,10 @@
  * on the same box; isolation comes from capping each run, not from serializing
  * runs against each other.
  *
- * `package.json`'s `test` / `test:full` scripts route through this wrapper. It
- * spawns `bun test`, forwarding ALL of the gate's own args verbatim (each
- * package.json script owns its divergent `--path-ignore-patterns` list — the gate
- * is generic and holds no ignore-list, so `test` vs `test:full` never drift), and
- * injecting two bounds when the forwarded args don't already set them:
+ * `package.json`'s `test` script routes through this wrapper. It spawns
+ * `bun test`, forwarding ALL of the gate's own args verbatim (the script owns its
+ * `--path-ignore-patterns` list — the gate is generic and holds no ignore-list),
+ * and injecting two bounds when the forwarded args don't already set them:
  *
  *  - `--parallel=${KEEPER_TEST_PARALLEL:-5}` — worker-process cap. `--parallel`
  *    implies `--isolate`; the suite is import-bound, so a low cap keeps a single
