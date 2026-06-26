@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Delete dedicated real-infra test files + slow-tier machinery",
-  "updated_at": "2026-06-25T18:52:30.251000Z"
+  "updated_at": "2026-06-26T00:33:08.663000Z",
+  "worker_done_at": "2026-06-26T00:33:08.663000Z"
 }

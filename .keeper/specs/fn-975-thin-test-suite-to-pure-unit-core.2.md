@@ -44,5 +44,5 @@ runs green (until task .5 collapses it).
 - [ ] `bun test` runs green with the (now no-op) path-ignore entries still present
 
 ## Done summary
-
+Deleted the four real-infra test files (server-worker, bus-worker.integration, integration, control-rpc) and all 14 *.slow.test.ts, removed lint-no-real-git.ts + the real-git allowlist, and dropped the test:hygiene script. Left the now-no-op path-ignore entries intact (bun tolerates a non-matching glob); both test tiers green.
 ## Evidence
