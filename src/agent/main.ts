@@ -212,6 +212,29 @@ export function realDeps(): MainDeps {
   };
 }
 
+const CLAUDE_SESSION_ENV_VARS_TO_SCRUB: readonly string[] = [
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+];
+
+function scrubInheritedClaudeSessionEnv(
+  env: NodeJS.ProcessEnv,
+  actionLog: string[],
+): void {
+  const scrubbed: string[] = [];
+  for (const key of CLAUDE_SESSION_ENV_VARS_TO_SCRUB) {
+    if (env[key] !== undefined) {
+      delete env[key];
+      scrubbed.push(key);
+    }
+  }
+  if (scrubbed.length > 0) {
+    actionLog.push(
+      `Scrubbed inherited Claude session env: ${scrubbed.join(", ")}`,
+    );
+  }
+}
+
 function resolveCodexBin(env: NodeJS.ProcessEnv): string {
   for (const pathEntry of (env.PATH ?? "").split(delimiter)) {
     const dir = pathEntry || ".";
@@ -1411,6 +1434,10 @@ export async function main(deps: MainDeps): Promise<never> {
     delete deps.env.TMUX;
     delete deps.env.TMUX_PANE;
     actionLog.push("Stripped TMUX/TMUX_PANE for truecolor");
+  }
+
+  if (agent === "claude") {
+    scrubInheritedClaudeSessionEnv(deps.env, actionLog);
   }
 
   if (agentwrapVeryVerbose) {

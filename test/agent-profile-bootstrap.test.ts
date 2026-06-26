@@ -523,6 +523,26 @@ describe("main() auto profile routing", () => {
   });
 });
 
+describe("main() Claude session env scrub", () => {
+  test("fresh launches drop inherited Claude session identity env", async () => {
+    const h = makeHarness({
+      argv: ["--print"],
+      env: {
+        CLAUDE_CODE_SESSION_ID: "parent-session",
+        CLAUDE_CODE_CHILD_SESSION: "1",
+        CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+      },
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CODE_CHILD_SESSION).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE).toBe("1");
+    expect(h.deps.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe("1");
+  });
+});
+
 describe("main() explicit + env profile precedence", () => {
   test("an explicit profile bypasses the router", async () => {
     const h = makeHarness({
