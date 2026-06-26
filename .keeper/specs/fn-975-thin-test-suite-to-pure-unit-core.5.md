@@ -52,5 +52,5 @@ run exits 0, none time out. biome + tsc green. lint-claude-md green.
 - [ ] Suite runs 20×+ under load with zero hangs/spins, all green; biome + tsc green
 
 ## Done summary
-
+Collapsed test/test:full into one fast pure-in-process tier (dropped the dead path-ignore list), deleted the orphaned daemon/git helpers plus the real-daemon soak relic, and rewrote the CLAUDE.md + README test narrative. Suite runs 4537 tests in ~7-30s, 20/20 green with zero hangs/spins; biome + tsc + lint-claude-md green.
 ## Evidence

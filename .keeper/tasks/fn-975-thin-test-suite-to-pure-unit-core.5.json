@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Collapse to one tier, prune helpers + docs, verify",
-  "updated_at": "2026-06-25T18:52:30.251000Z"
+  "updated_at": "2026-06-26T01:48:50.545000Z",
+  "worker_done_at": "2026-06-26T01:48:50.545000Z"
 }
