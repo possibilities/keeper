@@ -191,39 +191,56 @@ async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
 }
 
-/** Emit the PreToolUse deny envelope (exit-0 + JSON; exit 2 would skip JSON
- * processing). The hookSpecificOutput shape is canonical on PreToolUse. */
-function emitDeny(reason: string): void {
-  process.stdout.write(
-    `${JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: reason,
-      },
-    })}\n`,
-  );
+/** The PreToolUse hook payload fields the branch-guard decision reads. */
+export interface BranchGuardPayload {
+  tool_name?: string;
+  agent_id?: string;
+  agent_type?: string;
+  tool_input?: { command?: string };
+}
+
+/** The canonical PreToolUse deny envelope (exit-0 + JSON; exit 2 would skip
+ * JSON processing). `hookSpecificOutput` is the canonical PreToolUse shape. */
+export interface BranchGuardDenyEnvelope {
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse";
+    permissionDecision: "deny";
+    permissionDecisionReason: string;
+  };
+}
+
+/**
+ * Pure decision: the deny envelope to emit for this payload, or null to allow
+ * (no output). Encodes the load-bearing INVERSION of commit-guard — deny ONLY
+ * in subagent context: `agent_id` (or `agent_type`) present means a worker
+ * subagent, so a branch-mutating command DENIES; an absent/empty field means
+ * main context (the human or the content-blind orchestrator — INCLUDING main's
+ * own in-daemon worktree producer, which shells git with no `agent_id`) and
+ * always ALLOWS. A non-Bash tool or a non-branch-mutating command also allows.
+ */
+export function decideBranchGuard(
+  payload: BranchGuardPayload,
+): BranchGuardDenyEnvelope | null {
+  if (payload.tool_name !== "Bash") return null;
+  if (!payload.agent_id && !payload.agent_type) return null;
+  const command = payload.tool_input?.command ?? "";
+  if (!isBranchMutatingCommand(command)) return null;
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: DENY_REASON,
+    },
+  };
 }
 
 async function main(): Promise<void> {
   const raw = await readStdin();
-  const payload = JSON.parse(raw) as {
-    tool_name?: string;
-    agent_id?: string;
-    agent_type?: string;
-    tool_input?: { command?: string };
-  };
-
-  if (payload.tool_name !== "Bash") return;
-  // Load-bearing INVERSION of commit-guard: deny ONLY in subagent context.
-  // `agent_id` (or `agent_type`) present means a worker subagent; an absent /
-  // empty field means main context (the human or the orchestrator) — allow.
-  if (!payload.agent_id && !payload.agent_type) return;
-
-  const command = payload.tool_input?.command ?? "";
-  if (!isBranchMutatingCommand(command)) return;
-
-  emitDeny(DENY_REASON);
+  const payload = JSON.parse(raw) as BranchGuardPayload;
+  const decision = decideBranchGuard(payload);
+  if (decision !== null) {
+    process.stdout.write(`${JSON.stringify(decision)}\n`);
+  }
 }
 
 main().catch(() => {

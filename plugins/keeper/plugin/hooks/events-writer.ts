@@ -308,7 +308,7 @@ export function backendExecCoordsFromEnv(
  * /proc unreadable). The hook MUST stay exit-0, so every failure path lands
  * here as `null` rather than throwing.
  */
-type SpawnInfo = { name: string | null; startTime: string | null };
+export type SpawnInfo = { name: string | null; startTime: string | null };
 
 /**
  * Scrape the spawn name AND start_time from the parent process via a single
@@ -595,16 +595,37 @@ function writeDropLog(line: string): void {
   }
 }
 
-async function main(): Promise<void> {
-  const raw = await readStdin();
-  const data = JSON.parse(raw) as Record<string, unknown>;
-
+/**
+ * Build the full bare-column `events` binding map from a parsed hook payload —
+ * the pure record builder the hook appends as one NDJSON line. Returns null for
+ * a keepalive-shaped payload with an empty `hook_event_name` (no row written).
+ *
+ * Every non-pure input is INJECTED so this is unit-testable with zero fork / fs:
+ *  - `raw` is the verbatim stdin string (stored as the `data` column);
+ *  - `pid` is `process.ppid` (the recycle-safe identity's pid half);
+ *  - `env` feeds `configDirFromEnv` + `backendExecCoordsFromEnv` (pure reads);
+ *  - `spawnInfo` is the already-scraped parent identity — `main` forks `ps`
+ *    ONLY on SessionStart, and this builder re-applies the SessionStart gate
+ *    purely so a non-SessionStart payload can never carry spawn fields;
+ *  - `ts` is the event timestamp (seconds).
+ *
+ * The returned key set MUST equal {@link KNOWN_EVENT_COLUMNS} (the LOCKSTEP
+ * test pins all three of: this map, that Set, and the live `events` columns).
+ */
+export function buildEventBindings(
+  data: Record<string, unknown>,
+  raw: string,
+  pid: number,
+  env: NodeJS.ProcessEnv,
+  spawnInfo: SpawnInfo,
+  ts: number,
+): DeadLetterBindings | null {
   const hookEvent = strField(data, "hook_event_name") ?? "";
   if (!hookEvent) {
     // Empty hook_event_name matches the python reference's silent skip
     // behavior — Claude Code occasionally sends keepalive-shaped payloads
     // that aren't real events. Don't write a row for them.
-    return;
+    return null;
   }
 
   // Notification events carry the notification subtype in `notification_type`;
@@ -621,8 +642,6 @@ async function main(): Promise<void> {
     eventType = snakeCase(hookEvent);
   }
 
-  const ts = Date.now() / 1000;
-  const pid = process.ppid;
   const sessionId = strField(data, "session_id") ?? "unknown";
   const toolName = strField(data, "tool_name");
   const matcher = strField(data, "matcher");
@@ -691,30 +710,28 @@ async function main(): Promise<void> {
   const bashMutationTargets =
     bashMutation === null ? null : JSON.stringify(bashMutation.targets);
 
-  // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
-  // process start_time in one probe, so the reducer can seed `jobs.title` from
-  // the first event AND store the recycle-safe `(pid, start_time)` identity.
-  // Gated here (not every hook) to stay inside the cold-start budget;
-  // `scrapeSpawnInfo` swallows every failure to `{null, null}`.
-  const spawnInfo: SpawnInfo =
-    hookEvent === "SessionStart"
-      ? await scrapeSpawnInfo()
-      : { name: null, startTime: null };
+  // SessionStart only: the parent claude argv `--name`/`-n` token AND the
+  // process start_time, so the reducer can seed `jobs.title` from the first
+  // event AND store the recycle-safe `(pid, start_time)` identity. `main` does
+  // the actual `ps` probe (the one non-pure step, SessionStart-gated for the
+  // cold-start budget); this builder re-applies the gate so a non-SessionStart
+  // payload can never carry an injected spawn field.
+  const spawnName = hookEvent === "SessionStart" ? spawnInfo.name : null;
+  const startTime = hookEvent === "SessionStart" ? spawnInfo.startTime : null;
 
-  // SessionStart only: capture `CLAUDE_CONFIG_DIR` from the hook process's own
-  // env (the parent claude env propagates into the hook subprocess). Every
-  // other hook event sends NULL, so `events.config_dir` is set-once per
-  // SessionStart and the reducer's `COALESCE(excluded, jobs)` handles
-  // latest-non-NULL-wins for resume. `configDirFromEnv` normalizes.
-  const configDir =
-    hookEvent === "SessionStart" ? configDirFromEnv(process.env) : null;
+  // SessionStart only: capture `CLAUDE_CONFIG_DIR` from the injected env (the
+  // parent claude env propagates into the hook subprocess). Every other hook
+  // event sends NULL, so `events.config_dir` is set-once per SessionStart and
+  // the reducer's `COALESCE(excluded, jobs)` handles latest-non-NULL-wins for
+  // resume. `configDirFromEnv` normalizes.
+  const configDir = hookEvent === "SessionStart" ? configDirFromEnv(env) : null;
 
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
   // (`TMUX` unset/empty) ⇒ all three NULL — never a bogus `type` on a session
   // launched outside tmux. See {@link backendExecCoordsFromEnv}.
-  const backendExecCoords = backendExecCoordsFromEnv(process.env);
+  const backendExecCoords = backendExecCoordsFromEnv(env);
 
   // The launched background-task id on PostToolUse:Monitor
   // (`tool_response.taskId`) and PostToolUse:Bash with `run_in_background`
@@ -733,63 +750,94 @@ async function main(): Promise<void> {
   // deriver). The ingester recomputes it for any line a pre-deriver hook wrote.
   const mutationPath = extractMutationPath(hookEvent, toolName, data);
 
-  // Resolve the full named-bindings map ONCE up front. It is the canonical
-  // source the dead-letter record reads from on failure, so the on-disk record
-  // carries every column the hook would have produced — including
-  // SessionStart-scraped fields (`spawn_name`, `start_time`, `config_dir`)
-  // that are NOT in stdin and unrecoverable later. Each `$`-prefixed key
-  // strips its prefix when projected into the bare-column dead-letter
-  // `bindings` map.
-  const insertBindings = {
-    $ts: ts,
-    $session_id: sessionId,
-    $pid: pid,
-    $hook_event: hookEvent,
-    $event_type: eventType,
-    $tool_name: toolName,
-    $matcher: matcher,
-    $cwd: cwd,
-    $permission_mode: permissionMode,
-    $agent_id: agentId,
-    $agent_type: agentType,
-    $stop_hook_active: stopHookActive,
-    $data: raw,
-    $subagent_agent_id: subagentAgentId,
-    $spawn_name: spawnInfo.name,
-    $start_time: spawnInfo.startTime,
-    $slash_command: slashCommand,
-    $skill_name: skillName,
-    $plan_op: planOp,
-    $plan_target: planTarget,
-    $plan_epic_id: planEpicId,
-    $plan_task_id: planTaskId,
-    $plan_subject_present: planSubjectPresent,
-    $tool_use_id: toolUseId,
-    $config_dir: configDir,
-    $bash_mutation_kind: bashMutationKind,
-    $bash_mutation_targets: bashMutationTargets,
-    $plan_files: planFiles,
-    $backend_exec_type: backendExecCoords.type,
-    $backend_exec_session_id: backendExecCoords.sessionId,
-    $backend_exec_pane_id: backendExecCoords.paneId,
-    $background_task_id: backgroundTaskId,
-    $mutation_path: mutationPath,
+  // The canonical bare-column binding map — the on-disk NDJSON shape is bare
+  // column names (no `$` prefix). The daemon's ingester (`scanEventsLogDir`)
+  // intersects these with the live `events` columns at ingest time, so the
+  // column-skew degrade lives entirely daemon-side (post-migrate, race-free).
+  // It is ALSO the canonical source the dead-letter record reads on failure, so
+  // the on-disk record carries every column the hook would have produced —
+  // including SessionStart-scraped fields (`spawn_name`, `start_time`,
+  // `config_dir`) that are NOT in stdin and unrecoverable later. Key set MUST
+  // equal KNOWN_EVENT_COLUMNS (LOCKSTEP test pins it).
+  const bindings: DeadLetterBindings = {
+    ts,
+    session_id: sessionId,
+    pid,
+    hook_event: hookEvent,
+    event_type: eventType,
+    tool_name: toolName,
+    matcher,
+    cwd,
+    permission_mode: permissionMode,
+    agent_id: agentId,
+    agent_type: agentType,
+    stop_hook_active: stopHookActive,
+    data: raw,
+    subagent_agent_id: subagentAgentId,
+    spawn_name: spawnName,
+    start_time: startTime,
+    slash_command: slashCommand,
+    skill_name: skillName,
+    plan_op: planOp,
+    plan_target: planTarget,
+    plan_epic_id: planEpicId,
+    plan_task_id: planTaskId,
+    plan_subject_present: planSubjectPresent,
+    tool_use_id: toolUseId,
+    config_dir: configDir,
+    bash_mutation_kind: bashMutationKind,
+    bash_mutation_targets: bashMutationTargets,
+    plan_files: planFiles,
+    backend_exec_type: backendExecCoords.type,
+    backend_exec_session_id: backendExecCoords.sessionId,
+    backend_exec_pane_id: backendExecCoords.paneId,
+    background_task_id: backgroundTaskId,
+    mutation_path: mutationPath,
   };
+  return bindings;
+}
+
+async function main(): Promise<void> {
+  const raw = await readStdin();
+  const data = JSON.parse(raw) as Record<string, unknown>;
+
+  const hookEvent = strField(data, "hook_event_name") ?? "";
+  if (!hookEvent) {
+    return;
+  }
+
+  const ts = Date.now() / 1000;
+  const pid = process.ppid;
+  const sessionId = strField(data, "session_id") ?? "unknown";
+
+  // SessionStart only: scrape the parent claude argv `--name`/`-n` AND the
+  // process start_time in one probe. This is the SOLE non-pure step (it forks
+  // `ps` / reads `/proc`), gated here to stay inside the cold-start budget;
+  // `scrapeSpawnInfo` swallows every failure to `{null, null}`. The pure
+  // `buildEventBindings` re-applies the SessionStart gate over the result.
+  const spawnInfo: SpawnInfo =
+    hookEvent === "SessionStart"
+      ? await scrapeSpawnInfo()
+      : { name: null, startTime: null };
+
+  const bindings = buildEventBindings(
+    data,
+    raw,
+    pid,
+    process.env,
+    spawnInfo,
+    ts,
+  );
+  if (bindings === null) {
+    return;
+  }
 
   // Dead-letter on events-log APPEND failure. When `writeEventLog` fails hard
   // (EACCES/ENOSPC/EROFS/ENOENT-after-retry), this closure routes the event to
   // the dead-letter recovery file so the daemon recovers it — never silently
-  // lost. Inline so it closes over the resolved bindings + SessionStart-scraped
-  // fields without re-plumbing them through a long argument list.
+  // lost. Closes over the resolved bindings so the on-disk record carries every
+  // column the hook would have produced.
   const deadLetter = (lastError: unknown): void => {
-    // Bare-column bindings (strip the `$` prefix the events-log/INSERT path
-    // uses) so the daemon-side dead-letter import / replay can map it 1:1 to
-    // the `events` columns.
-    const bindings: DeadLetterBindings = {};
-    for (const [key, value] of Object.entries(insertBindings)) {
-      const column = key.startsWith("$") ? key.slice(1) : key;
-      bindings[column] = value;
-    }
     const record: DeadLetterRecord = {
       dl_id: crypto.randomUUID(),
       session_id: sessionId,
@@ -830,18 +878,7 @@ async function main(): Promise<void> {
     );
   };
 
-  // Build the events-log record from the resolved bindings (strip the `$`
-  // prefix every key carries — the on-disk shape is bare column names). The
-  // happy path: no SQLite open, just a single per-pid append. The daemon's
-  // ingester (`scanEventsLogDir`) intersects these bindings with the live
-  // `events` columns at ingest time, so the column-skew degrade lives entirely
-  // daemon-side (post-migrate, race-free).
-  const eventLogBindings: DeadLetterBindings = {};
-  for (const [key, value] of Object.entries(insertBindings)) {
-    const column = key.startsWith("$") ? key.slice(1) : key;
-    eventLogBindings[column] = value;
-  }
-  const appended = writeEventLog({ bindings: eventLogBindings });
+  const appended = writeEventLog({ bindings });
   if (!appended) {
     // Hard append failure (ENOSPC / EACCES / EROFS / ENOENT-after-retry): route
     // the event to the dead-letter recovery path so the daemon recovers it.

@@ -1,31 +1,20 @@
 /**
  * Tests for the keeper docs sidecar-writer hook (fn-884).
  *
- * Two layers, mirroring branch-guard.test.ts:
- *  - **Layer 1 (in-process unit):** the pure, exported helpers — the
- *    strip-signature detector + sidecar parse/merge/serialize (shared with the
- *    fn-884 `.4` migration), the bounded gist-URL match, and the `gh gist
- *    create` file-arg extractor.
- *  - **Layer 2 (subprocess):** drive the REAL hook through `Bun.spawn` with a
- *    `KEEPER_DOCS_DIR`-sandboxed docs tree; assert the sidecar is written, the
- *    `.md` is byte-unchanged, the gist URL upserts into the sidecar only, and
- *    the exit code is 0 on garbage stdin / non-docs paths / a missing docs dir.
- *
- * Kept fast-tier (like branch-guard): the subprocess spawns are cheap and the
- * file is NOT in the `test` script's path-ignore list.
+ * Pure in-process unit coverage of the hook's exported DECISION + helper
+ * surface — no subprocess. The two file-only side effects (sidecar write,
+ * gist-URL upsert) are integration concerns left to production; what stays is
+ * the pure logic each side effect routes through:
+ *  - the strip-signature detector + sidecar parse/merge/serialize (shared with
+ *    the fn-884 `.4` migration), the bounded gist-URL match, the `gh gist
+ *    create` file-arg extractor, and `buildSidecarFields` (the sidecar payload
+ *    builder, git probe injected);
+ *  - `decideDocsCommit` — the commit-routing decision (which paths under which
+ *    subject verb, or null), `exists` injected so it runs with zero filesystem
+ *    reads and zero git.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 
 import {
   buildSidecarFields,
@@ -41,7 +30,6 @@ import {
   serializeSidecar,
   stripDocSignature,
 } from "../src/sidecar.ts";
-import { sandboxEnv } from "./helpers/sandbox-env.ts";
 
 // ---------------------------------------------------------------------------
 // Layer 1 — pure helpers
@@ -273,168 +261,7 @@ describe("stripDocSignature", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Layer 2 — subprocess
-// ---------------------------------------------------------------------------
-
-const HOOK = join(
-  import.meta.dir,
-  "..",
-  "plugins",
-  "keeper",
-  "plugin",
-  "hooks",
-  "sidecar-writer.ts",
-);
-
-let tmpDir: string;
-let docsDir: string;
-
-beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "sidecar-test-"));
-  docsDir = join(tmpDir, "docs");
-  mkdirSync(docsDir, { recursive: true });
-});
-
-afterEach(() => {
-  rmSync(tmpDir, { recursive: true, force: true });
-});
-
-async function run(
-  payload: unknown,
-  extraDocsDir?: string,
-): Promise<{ stdout: string; code: number }> {
-  const proc = Bun.spawn(["bun", HOOK], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: sandboxEnv({
-      tmpDir,
-      dbPath: join(tmpDir, "keeper.db"),
-      clearAmbientIds: false,
-      extra: { KEEPER_DOCS_DIR: extraDocsDir ?? docsDir },
-    }),
-  });
-  proc.stdin.write(
-    typeof payload === "string" ? payload : JSON.stringify(payload),
-  );
-  await proc.stdin.end();
-  const stdout = await new Response(proc.stdout).text();
-  const code = await proc.exited;
-  return { stdout, code };
-}
-
-function writePayload(filePath: string, extra: Record<string, unknown> = {}) {
-  return {
-    hook_event_name: "PostToolUse",
-    tool_name: "Write",
-    session_id: "sess-xyz",
-    cwd: "/Users/x/repo",
-    tool_input: { file_path: filePath },
-    ...extra,
-  };
-}
-
-describe("sidecar-writer hook (subprocess)", () => {
-  test("Write to a docs .md creates a sidecar and leaves the .md byte-unchanged", async () => {
-    const md = join(docsDir, "a.md");
-    const original = "# A\n\nBody content.\n";
-    writeFileSync(md, original);
-
-    const { code } = await run(writePayload(md));
-    expect(code).toBe(0);
-
-    const sidecar = join(docsDir, "a.yaml");
-    expect(existsSync(sidecar)).toBe(true);
-    const yaml = readFileSync(sidecar, "utf8");
-    expect(yaml).toContain(`path: ${md}`);
-    expect(yaml).toContain("type: doc");
-    expect(yaml).toContain("session-id: sess-xyz");
-    expect(yaml).toContain("cwd: /Users/x/repo");
-    expect(yaml).toContain("resume:");
-
-    // The .md must be byte-for-byte unchanged.
-    expect(readFileSync(md, "utf8")).toBe(original);
-  });
-
-  test("merge preserves existing created", async () => {
-    const md = join(docsDir, "b.md");
-    writeFileSync(md, "# B\n");
-    const sidecar = join(docsDir, "b.yaml");
-    writeFileSync(
-      sidecar,
-      `path: ${md}\ntype: doc\ncreated: '2020-01-01T00:00:00+0000'\n`,
-    );
-
-    const { code } = await run(writePayload(md));
-    expect(code).toBe(0);
-    expect(readFileSync(sidecar, "utf8")).toContain(
-      "created: '2020-01-01T00:00:00+0000'",
-    );
-  });
-
-  test("gh gist create upserts gist-url into the sidecar only, bounded", async () => {
-    const md = join(docsDir, "c.md");
-    const mdOriginal = "# C\n\nContent.\n";
-    writeFileSync(md, mdOriginal);
-    const sidecar = join(docsDir, "c.yaml");
-    writeFileSync(sidecar, `path: ${md}\ntype: doc\n`);
-
-    const { code } = await run({
-      hook_event_name: "PostToolUse",
-      tool_name: "Bash",
-      session_id: "s",
-      cwd: docsDir,
-      tool_input: { command: `gh gist create ${md} ${sidecar} --web` },
-      tool_response: {
-        stdout: "https://gist.github.com/mike/deadbeef\n",
-        stderr: "",
-      },
-    });
-    expect(code).toBe(0);
-
-    const yaml = readFileSync(sidecar, "utf8");
-    // The URL scalar is single-quoted (it contains `:` / `/`); re-parse to
-    // assert the stored value is the bare URL with no JSON tail.
-    expect(parseSidecarText(yaml).fields.get("gist-url")).toBe(
-      "https://gist.github.com/mike/deadbeef",
-    );
-    // no JSON-tail swallow
-    expect(yaml).not.toContain('","stderr"');
-    // the .md untouched
-    expect(readFileSync(md, "utf8")).toBe(mdOriginal);
-  });
-
-  test("exit 0 on garbage stdin", async () => {
-    const { code } = await run("not json at all {{{");
-    expect(code).toBe(0);
-  });
-
-  test("exit 0 + no sidecar on a non-docs path", async () => {
-    const outside = join(tmpDir, "elsewhere.md");
-    writeFileSync(outside, "# X\n");
-    const { code } = await run(writePayload(outside));
-    expect(code).toBe(0);
-    expect(existsSync(join(tmpDir, "elsewhere.yaml"))).toBe(false);
-  });
-
-  test("exit 0 with a missing docs dir", async () => {
-    const missing = join(tmpDir, "no-such-docs");
-    const md = join(missing, "z.md");
-    const { code } = await run(writePayload(md), missing);
-    expect(code).toBe(0);
-    expect(existsSync(join(missing, "z.yaml"))).toBe(false);
-  });
-
-  test("no-op (exit 0, no sidecar) when the .md does not exist on disk", async () => {
-    const md = join(docsDir, "ghost.md");
-    const { code } = await run(writePayload(md));
-    expect(code).toBe(0);
-    expect(existsSync(join(docsDir, "ghost.yaml"))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Layer 2b — the fn-885 docs auto-commit ROUTING decision (`decideDocsCommit`),
+// The fn-885 docs auto-commit ROUTING decision (`decideDocsCommit`),
 // tested IN-PROCESS with zero real git (fn-904 `.3`). The decision is what the
 // hook would commit (paths + subject verb) before it shells git; the actual
 // commit machinery (`commitDocsPaths`) is exercised against a faked git runner

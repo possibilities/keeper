@@ -1,15 +1,18 @@
 // Unit tests for plugins/keeper/plugin/hooks/branch-guard.ts.
 //
-// Two layers: (1) the branch-mutation classifier truth table — the load-bearing
-// predicate — exercised in-process over `isBranchMutatingCommand`; (2) the
-// decision ladder driven through a real subprocess, covering the agent-gate
-// inversion (deny only when agent_id present), the deny/allow split, and the
-// fail-open short-circuits with true stdin/stdout discipline.
+// Two layers, both pure in-process (no subprocess): (1) the branch-mutation
+// classifier truth table — the load-bearing predicate — over
+// `isBranchMutatingCommand`; (2) the `decideBranchGuard` decision ladder,
+// covering the load-bearing agent-gate INVERSION in BOTH directions (deny a
+// subagent branch op, allow main's own in-daemon worktree producer), the
+// deny/allow split, and the canonical deny-envelope shape.
 
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
 
-import { isBranchMutatingCommand } from "../plugins/keeper/plugin/hooks/branch-guard.ts";
+import {
+  decideBranchGuard,
+  isBranchMutatingCommand,
+} from "../plugins/keeper/plugin/hooks/branch-guard.ts";
 
 describe("isBranchMutatingCommand", () => {
   const deny = [
@@ -122,36 +125,10 @@ describe("isBranchMutatingCommand", () => {
 });
 
 // ---------------------------------------------------------------------------
-// decision ladder — subprocess
+// decision ladder — pure `decideBranchGuard`
 // ---------------------------------------------------------------------------
 
-const GUARD = join(
-  import.meta.dir,
-  "..",
-  "plugins",
-  "keeper",
-  "plugin",
-  "hooks",
-  "branch-guard.ts",
-);
-
-async function run(
-  payload: unknown,
-): Promise<{ stdout: string; code: number }> {
-  const proc = Bun.spawn(["bun", GUARD], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env },
-  });
-  proc.stdin.write(JSON.stringify(payload));
-  await proc.stdin.end();
-  const stdout = await new Response(proc.stdout).text();
-  const code = await proc.exited;
-  return { stdout, code };
-}
-
-function bashPayload(extra: Record<string, unknown> = {}): unknown {
+function bashPayload(extra: Record<string, unknown> = {}) {
   return {
     hook_event_name: "PreToolUse",
     session_id: "sess-branch",
@@ -161,123 +138,95 @@ function bashPayload(extra: Record<string, unknown> = {}): unknown {
   };
 }
 
-describe("branch-guard ladder", () => {
-  test("denies a branch-create form when agent_id is present", async () => {
-    const { stdout, code } = await run(bashPayload({ agent_id: "agent-7" }));
-    expect(code).toBe(0);
-    const env = JSON.parse(stdout.trim());
-    expect(env.hookSpecificOutput.hookEventName).toBe("PreToolUse");
-    expect(env.hookSpecificOutput.permissionDecision).toBe("deny");
-    expect(env.hookSpecificOutput.permissionDecisionReason).toContain(
+describe("decideBranchGuard ladder", () => {
+  test("denies a branch-create form when agent_id is present (deny-envelope shape)", () => {
+    const decision = decideBranchGuard(bashPayload({ agent_id: "agent-7" }));
+    expect(decision).not.toBeNull();
+    expect(decision?.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
       "work IN PLACE",
     );
   });
 
-  test("denies a branch-switch form when agent_type is present (no agent_id)", async () => {
-    const { stdout, code } = await run(
+  test("denies a branch-switch form when agent_type is present (no agent_id)", () => {
+    const decision = decideBranchGuard(
       bashPayload({
         agent_type: "plan:worker-xhigh",
         tool_input: { command: "git switch other" },
       }),
     );
-    expect(code).toBe(0);
-    expect(
-      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
-    ).toBe("deny");
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
-  test("denies a compound `cd x && git checkout -b y` for a subagent", async () => {
-    const { stdout, code } = await run(
+  test("denies a compound `cd x && git checkout -b y` for a subagent", () => {
+    const decision = decideBranchGuard(
       bashPayload({
         agent_id: "agent-7",
         tool_input: { command: "cd sub && git checkout -b y" },
       }),
     );
-    expect(code).toBe(0);
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  // The allow-main-producer direction is load-bearing: main's own in-daemon
+  // worktree producer shells `git worktree add` with NO agent_id, and MUST be
+  // allowed — the gate inversion that this branch asserts against the deny one.
+  test("allows a branch-create form when agent_id is absent (main context)", () => {
+    expect(decideBranchGuard(bashPayload())).toBeNull();
+  });
+
+  test("allows main's own worktree-add producer (no agent_id)", () => {
     expect(
-      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
-    ).toBe("deny");
+      decideBranchGuard(
+        bashPayload({
+          tool_input: { command: "git worktree add ../wt feature" },
+        }),
+      ),
+    ).toBeNull();
   });
 
-  test("allows a branch-create form when agent_id is absent (main context)", async () => {
-    const { stdout, code } = await run(bashPayload());
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
+  test("empty-string agent_id counts as absent — allow", () => {
+    expect(decideBranchGuard(bashPayload({ agent_id: "" }))).toBeNull();
   });
 
-  test("empty-string agent_id counts as absent — allow", async () => {
-    const { stdout, code } = await run(bashPayload({ agent_id: "" }));
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
-  });
-
-  test("allows ordinary git for a subagent", async () => {
-    const { stdout, code } = await run(
-      bashPayload({
-        agent_id: "agent-7",
-        tool_input: { command: "git status" },
-      }),
-    );
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
-  });
-
-  test("allows a file-restore checkout for a subagent", async () => {
-    const { stdout, code } = await run(
-      bashPayload({
-        agent_id: "agent-7",
-        tool_input: { command: "git checkout -- src/x.ts" },
-      }),
-    );
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
-  });
-
-  test("non-Bash tool passes for a subagent", async () => {
-    const { stdout, code } = await run(
-      bashPayload({
-        agent_id: "agent-7",
-        tool_name: "Read",
-        tool_input: { file_path: "/x" },
-      }),
-    );
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
-  });
-
-  test("no escape-hatch env var bypasses the deny", async () => {
-    const proc = Bun.spawn(["bun", GUARD], {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        PLANCTL_GUARD_BYPASS: "1",
-        KEEPER_BRANCH_GUARD_BYPASS: "1",
-      },
-    });
-    proc.stdin.write(JSON.stringify(bashPayload({ agent_id: "agent-7" })));
-    await proc.stdin.end();
-    const stdout = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    expect(code).toBe(0);
+  test("allows ordinary git for a subagent", () => {
     expect(
-      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
-    ).toBe("deny");
+      decideBranchGuard(
+        bashPayload({
+          agent_id: "agent-7",
+          tool_input: { command: "git status" },
+        }),
+      ),
+    ).toBeNull();
   });
 
-  test("unparseable stdin fails open", async () => {
-    const proc = Bun.spawn(["bun", GUARD], {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env },
-    });
-    proc.stdin.write("{not json");
-    await proc.stdin.end();
-    const stdout = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
+  test("allows a file-restore checkout for a subagent", () => {
+    expect(
+      decideBranchGuard(
+        bashPayload({
+          agent_id: "agent-7",
+          tool_input: { command: "git checkout -- src/x.ts" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("non-Bash tool passes for a subagent", () => {
+    expect(
+      decideBranchGuard(
+        bashPayload({
+          agent_id: "agent-7",
+          tool_name: "Read",
+          tool_input: { file_path: "/x" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("a subagent Bash with no command allows (nothing to mutate)", () => {
+    expect(
+      decideBranchGuard({ tool_name: "Bash", agent_id: "agent-7" }),
+    ).toBeNull();
   });
 });
