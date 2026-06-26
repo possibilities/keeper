@@ -44,5 +44,5 @@ every existing db.test.ts migration test still passes.
 - [ ] All existing db.test.ts migration tests still pass
 
 ## Done summary
-
+Bounded the drainAll test helper: replaced the unbounded drain loop with a cursor-non-advance guard that throws on a non-progressing fold plus an absolute iteration ceiling backstop, and added a test proving it throws (not hangs) on a synthetic non-advancing fold. All 132 db.test.ts tests pass.
 ## Evidence

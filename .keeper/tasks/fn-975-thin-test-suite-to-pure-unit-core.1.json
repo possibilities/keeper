@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Bound the drainAll sync-spinner",
-  "updated_at": "2026-06-25T18:52:30.251000Z"
+  "updated_at": "2026-06-26T00:29:55.029000Z",
+  "worker_done_at": "2026-06-26T00:29:55.029000Z"
 }
