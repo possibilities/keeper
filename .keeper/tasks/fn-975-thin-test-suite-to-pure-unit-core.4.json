@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Keep hook decision logic as pure smoke",
-  "updated_at": "2026-06-25T18:52:30.251000Z"
+  "updated_at": "2026-06-26T01:34:17.636000Z",
+  "worker_done_at": "2026-06-26T01:34:17.636000Z"
 }

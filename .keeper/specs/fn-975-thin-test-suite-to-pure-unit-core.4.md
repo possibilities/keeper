@@ -42,5 +42,5 @@ asserted by direct calls against constructed inputs.
 - [ ] Pure in-process tests cover: events-writer exit-0 + record build, sidecar decision, branch-guard deny-subagent AND allow-main-producer + deny-envelope shape
 
 ## Done summary
-
+Factored pure decision seams (branch-guard decideBranchGuard, events-writer buildEventBindings) and converted all three hook tests to in-process calls — zero subprocess spawns; covers both gate directions, the events record build + exit-0 totality, and the sidecar commit decision.
 ## Evidence
