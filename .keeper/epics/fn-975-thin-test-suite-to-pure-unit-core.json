@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-26T01:51:38.242000Z",
   "created_at": "2026-06-25T18:52:30.251000Z",
   "depends_on_epics": [
     "fn-973-pair-panel-runner-subcommand"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-06-25T18:52:53.712000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Thin test suite to pure-unit core",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-25T18:52:53.688000Z"
+  "updated_at": "2026-06-26T01:51:38.242000Z"
 }
