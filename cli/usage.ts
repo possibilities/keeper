@@ -423,8 +423,12 @@ export function renderRowLines(
       swReset: hasSonnet
         ? resetCell(seg(row.sonnet_week_resets_at), nowMs, isStale)
         : "",
-      cssBar: hasCodexSparkSession ? bar(row.codex_spark_session_percent) : null,
-      cssPct: hasCodexSparkSession ? pct(row.codex_spark_session_percent) : null,
+      cssBar: hasCodexSparkSession
+        ? bar(row.codex_spark_session_percent)
+        : null,
+      cssPct: hasCodexSparkSession
+        ? pct(row.codex_spark_session_percent)
+        : null,
       cssReset: hasCodexSparkSession
         ? resetCell(seg(row.codex_spark_session_resets_at), nowMs, isStale)
         : "",

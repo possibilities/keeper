@@ -346,7 +346,6 @@ test("codex-spark body lines appear when spark usage data exists", () => {
   expect(bodyLineExact(lines, "spark-week") ?? "").toContain("48%");
 });
 
-
 test("label padding widens to 'sonnet' only when sonnet rows exist", () => {
   // No sonnet → labels pool is {session, week} → widest = 7
   // ("session"). `week` padEnd(7) leaves 3 trailing spaces.

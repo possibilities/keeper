@@ -2257,7 +2257,6 @@ test("usage snapshot folds codex-spark quota columns end-to-end", () => {
   db.close();
 });
 
-
 test("fn-651: a no-subscription envelope folds subscription_active = 0 so the renderer redacts it", () => {
   // The `mc1` case from the epic spec: subscription_active=false on the
   // wire becomes 0 in the column, which is what `cli/usage.ts`'s

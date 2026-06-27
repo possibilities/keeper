@@ -259,9 +259,7 @@ function eligibleProfiles(
 
 function isUsageEndpointRateLimited(envelope: Envelope): boolean {
   const error = envelope.error;
-  return (
-    isRecord(error) && error.type === "ClaudeUsageEndpointRateLimited"
-  );
+  return isRecord(error) && error.type === "ClaudeUsageEndpointRateLimited";
 }
 
 /**
