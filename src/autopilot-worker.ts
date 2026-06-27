@@ -42,7 +42,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { ConfigError, loadPresetRegistry, type Preset } from "./agent/config";
+import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
 import { computeEligibleEpics } from "./armed-closure";
 import {
   BackstopCounters,
@@ -316,11 +316,11 @@ export const WORKER_EFFORT = "max" as const;
  * exists. Read PRODUCER-SIDE (per dispatch, not a fold input) — the resolved
  * model never enters `events` as a fold key, so re-fold stays byte-identical.
  *
- * Fail-SAFE: a missing registry yields an empty registry (constants), and a
- * malformed registry's `ConfigError` is SWALLOWED-to-constants here — the daemon
- * must never crash on a bad `presets.yaml`. Re-resolved per cycle (cheap
- * single-file parse) so a preset edit lands without a daemon bounce; never
- * file-watched.
+ * Fail-SAFE — the SOLE fail-open carve-out to the required-catalog posture: a
+ * missing OR malformed catalog throws a `ConfigError` that is SWALLOWED-to-
+ * constants here, so the daemon never crashes on bad config. Re-resolved per
+ * cycle (cheap single-file parse) so a preset edit lands without a daemon bounce;
+ * never file-watched.
  */
 export function resolveWorkerLaunchConfig(configPath?: string): {
   model: string;
@@ -328,14 +328,14 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
 } {
   let preset: Preset | undefined;
   try {
-    const registry = loadPresetRegistry(
+    const catalog = loadPresetCatalog(
       ...(configPath === undefined ? [] : ([configPath] as const)),
     );
-    preset = registry.presets.worker;
+    preset = catalog.presets.worker;
   } catch (err) {
     if (err instanceof ConfigError) {
       console.error(
-        "[autopilot-worker] malformed presets.yaml — falling back to worker defaults:",
+        "[autopilot-worker] preset catalog missing or invalid — using worker defaults:",
         err.message,
       );
     } else {

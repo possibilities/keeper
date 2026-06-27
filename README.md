@@ -1370,28 +1370,33 @@ event-log/reducer/hook touch. Run any of them with
 
   The dash is keeper's OpenTUI host surface.
 
-  Named launch-config presets (fn-937) live in a single registry,
-  `~/.config/agentwrap/presets.yaml`, read ONLY by the dep-free `src/agent/config.ts`
-  island (the launcher import graph never reaches `src/db.ts`). A preset is a
-  named `{harness, model?, effort?, thinking?, role?}` triple
-  (`presets.<name>`); a panel is an ordered list of preset names
-  (`panels.<name>`). `keeper agent --x-preset <name> [args...]` applies
-  one — harnessless, the harness comes from the preset — and `keeper agent
-  presets resolve <name>` emits the resolved preset/panel JSON. Resolution is
-  per-field `explicit flag > effort env > preset > per-harness yaml > native
-  default`, so a preset never overrides an explicit `--model`/`--effort` and a
-  partial preset layers over the yaml rather than replacing it; with no
-  `--x-preset` the launch is byte-identical to today. The registry is
-  fail-open on a missing file and fail-loud on a malformed/invalid entry or an
-  unknown preset name. Presets are producer-side launch config, never a fold
-  input — no RPC writes a preset and the registry is re-parsed per dispatch (no
-  watcher), so an edit lands without a daemon bounce. The autopilot worker launch
-  resolves its `--model`/`--effort` from a `worker` preset, COALESCING per-field
-  onto the `WORKER_MODEL`/`WORKER_EFFORT` constants (today's `sonnet`/`max`) when
-  the preset (or the whole registry) is absent — so with no `worker` preset the
-  dispatched command is byte-identical to the old hardcoded launch. Re-resolved
-  per dispatch and fail-SAFE: a malformed `presets.yaml` is swallowed-to-constants
-  in the dispatch path so the daemon never crashes on a bad registry.
+  Named launch-config lives in TWO purpose-scoped files under `~/.config/keeper/`,
+  read ONLY by the dep-free `src/agent/config.ts` island (the launcher import graph
+  never reaches `src/db.ts`): `presets.yaml` is the CATALOG of available presets —
+  each a named `{harness, model?, effort?, thinking?, role?}` triple
+  (`presets.<name>`) — and `panel.yaml` is the panel SELECTIONS — named panels
+  (`panels.<name>`, each an ordered list of catalog preset names) plus an optional
+  `default:` naming the panel a bare `keeper pair panel start` assembles.
+  `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
+  `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
+  harness comes from the preset — and `keeper agent presets resolve <name>` emits
+  the resolved preset/panel JSON. Per-field resolution is `explicit flag > effort
+  env > preset > per-harness yaml > native default`, so a preset never overrides an
+  explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
+  `--x-preset` the launch is byte-identical to a no-preset run. The posture is
+  REQUIRED + validated: any preset referenced by name (`keeper pair --preset`,
+  `keeper dispatch --preset`, `keeper agent --agentwrap-preset`) and EVERY panel op
+  hard-fail (exit 2) on a missing or invalid `presets.yaml`/`panel.yaml`, with a
+  message naming the file, the bad name, and the sorted available names (and a
+  migration hint naming any leftover `~/.config/agentwrap/presets.yaml`). Panel
+  members are claude|codex only (pi is rejected at load). Presets are producer-side
+  launch config, never a fold input — no RPC writes one and both files are
+  re-parsed per dispatch (no watcher), so an edit lands without a daemon bounce.
+  The autopilot worker launch is the SOLE fail-open carve-out: it resolves its
+  `--model`/`--effort` from a `worker` preset, COALESCING per-field onto the
+  `WORKER_MODEL`/`WORKER_EFFORT` constants (`sonnet`/`max`) and SWALLOWING a missing
+  or malformed catalog's `ConfigError` to those constants, so the daemon never
+  crashes on bad config.
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,

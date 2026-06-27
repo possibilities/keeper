@@ -31,13 +31,15 @@ import {
   type LauncherDefaults,
   loadClaudeStowDir,
   loadLauncherDefaults,
+  loadPanelSelections,
   loadPiLauncherDefaults,
   loadPluginSources,
-  loadPresetRegistry,
+  loadPresetCatalog,
+  type PanelSelections,
   type PiLauncherDefaults,
   type PluginSources,
   type Preset,
-  type PresetRegistry,
+  type PresetCatalog,
   pluginConfigPath,
   resolvePreset,
 } from "./config";
@@ -124,11 +126,16 @@ export interface MainDeps {
   loadClaudeStowDirFn: () => string | null;
   loadPluginSourcesFn: () => PluginSources;
   /**
-   * Read the named-preset registry from `presets.yaml`. Producer-side launch
-   * config only — never a fold input; re-parsed per dispatch (no watcher) so an
-   * edit lands without a daemon bounce.
+   * Read the preset catalog from `presets.yaml` (required + validated).
+   * Producer-side launch config only — never a fold input; re-parsed per dispatch
+   * (no watcher) so an edit lands without a daemon bounce.
    */
-  loadPresetRegistryFn: () => PresetRegistry;
+  loadPresetCatalogFn: () => PresetCatalog;
+  /**
+   * Read the panel selections from `panel.yaml`, resolved against the catalog.
+   * Required + validated; consulted only when a name is not a catalog preset.
+   */
+  loadPanelSelectionsFn: (catalog: PresetCatalog) => PanelSelections;
   ensureClaudeStateSharingFn: (
     listProfilesFn: () => string[],
     actionLog: string[],
@@ -187,7 +194,8 @@ export function realDeps(): MainDeps {
     loadPiLauncherDefaultsFn: loadPiLauncherDefaults,
     loadClaudeStowDirFn: loadClaudeStowDir,
     loadPluginSourcesFn: loadPluginSources,
-    loadPresetRegistryFn: loadPresetRegistry,
+    loadPresetCatalogFn: loadPresetCatalog,
+    loadPanelSelectionsFn: (catalog) => loadPanelSelections(catalog),
     ensureClaudeStateSharingFn: (listProfilesFn, actionLog, claudeStowDir) =>
       ensureClaudeStateSharing(
         listProfilesFn,
@@ -668,9 +676,9 @@ async function runTranscriptSubcommand(
  * matching neither is fail-loud (exit 2).
  */
 function runPresetsResolve(deps: MainDeps, name: string): never {
-  let registry: PresetRegistry;
+  let catalog: PresetCatalog;
   try {
-    registry = deps.loadPresetRegistryFn();
+    catalog = deps.loadPresetCatalogFn();
   } catch (exc) {
     if (exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
@@ -679,42 +687,55 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
     throw exc;
   }
 
-  const panelMembers = registry.panels[name];
-  if (panelMembers !== undefined) {
-    const members: { name: string; harness: string }[] = [];
-    for (const memberName of panelMembers) {
-      // Load-time validation already guarantees the member resolves. claude,
-      // codex, and pi all pair-launch, so every member harness is accepted —
-      // matching pair-send + panel.ts so no accept/reject inconsistency remains.
-      const preset = registry.presets[memberName] as Preset;
-      members.push({ name: memberName, harness: preset.harness });
+  // A catalog preset wins and needs no `panel.yaml` read; only a non-preset name
+  // falls through to panel resolution (which DOES require `panel.yaml`).
+  const direct = catalog.presets[name];
+  if (direct !== undefined) {
+    deps.write(
+      `${JSON.stringify({
+        kind: "preset",
+        name,
+        harness: direct.harness,
+        model: direct.model,
+        effort: direct.effort,
+        thinking: direct.thinking,
+        role: direct.role,
+      })}\n`,
+    );
+    return deps.exit(0);
+  }
+
+  let selections: PanelSelections;
+  try {
+    selections = deps.loadPanelSelectionsFn(catalog);
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
     }
+    throw exc;
+  }
+
+  const panelMembers = selections.panels[name];
+  if (panelMembers !== undefined) {
+    // Load-time validation already guarantees each member resolves to a
+    // panel-launchable (claude|codex) catalog preset.
+    const members = panelMembers.map((memberName) => {
+      const preset = catalog.presets[memberName] as Preset;
+      return { name: memberName, harness: preset.harness };
+    });
     deps.write(`${JSON.stringify({ kind: "panel", name, members })}\n`);
     return deps.exit(0);
   }
 
-  let preset: Preset;
-  try {
-    preset = resolvePreset(registry, name);
-  } catch (exc) {
-    if (exc instanceof ConfigError) {
-      deps.writeErr(`Error: ${exc.message}\n`);
-      return deps.exit(2);
-    }
-    throw exc;
-  }
-  deps.write(
-    `${JSON.stringify({
-      kind: "preset",
-      name,
-      harness: preset.harness,
-      model: preset.model,
-      effort: preset.effort,
-      thinking: preset.thinking,
-      role: preset.role,
-    })}\n`,
+  const presetNames = Object.keys(catalog.presets).sort();
+  const panelNames = Object.keys(selections.panels).sort();
+  deps.writeErr(
+    `Error: '${name}' is not a known preset or panel. ` +
+      `Presets: ${presetNames.length > 0 ? presetNames.join(", ") : "(none)"}. ` +
+      `Panels: ${panelNames.length > 0 ? panelNames.join(", ") : "(none)"}.\n`,
   );
-  return deps.exit(0);
+  return deps.exit(2);
 }
 
 export async function main(deps: MainDeps): Promise<never> {
@@ -764,7 +785,7 @@ export async function main(deps: MainDeps): Promise<never> {
     dispatchPresetName = dispatch.presetName;
     let preset: Preset;
     try {
-      preset = resolvePreset(deps.loadPresetRegistryFn(), dispatch.presetName);
+      preset = resolvePreset(deps.loadPresetCatalogFn(), dispatch.presetName);
     } catch (exc) {
       if (exc instanceof ConfigError) {
         deps.writeErr(`Error: ${exc.message}\n`);
@@ -872,7 +893,7 @@ export async function main(deps: MainDeps): Promise<never> {
   let resolvedPreset: Preset | null = null;
   if (presetName !== null) {
     try {
-      resolvedPreset = resolvePreset(deps.loadPresetRegistryFn(), presetName);
+      resolvedPreset = resolvePreset(deps.loadPresetCatalogFn(), presetName);
     } catch (exc) {
       if (exc instanceof ConfigError) {
         deps.writeErr(`Error: ${exc.message}\n`);

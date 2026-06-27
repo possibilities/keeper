@@ -38,8 +38,10 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
-  loadPresetRegistry,
-  type PresetRegistry,
+  loadPanelSelections,
+  loadPresetCatalog,
+  type PanelSelections,
+  type PresetCatalog,
 } from "../agent/config";
 import {
   PAIR_CLIS,
@@ -51,8 +53,6 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Panel name used when `--panel` is absent (the panel-runner default). */
-export const DEFAULT_PANEL_NAME = "default";
 /** Per-leg `keeper pair send --timeout` default (seconds). */
 export const DEFAULT_PANEL_TIMEOUT_SECONDS = 1800;
 /** Default `wait --chunk` (seconds) — the panel-runner's ≤9-min window. */
@@ -125,14 +125,22 @@ export type PanelSpawnFn = (
   opts: { env: Record<string, string | undefined>; cwd: string },
 ) => void;
 
+/** The launch-config a panel op needs: the catalog (member harnesses) plus the
+ *  panel selections (the panel definitions + the default panel). Both files are
+ *  required for any panel op, so they load together. */
+export interface PanelConfig {
+  catalog: PresetCatalog;
+  selections: PanelSelections;
+}
+
 /** Injectable seams (exec-backend house style): spawn / clock / sleep / pid
- *  probe / registry loader / output streams, plus the resolved launcher path. */
+ *  probe / config loader / output streams, plus the resolved launcher path. */
 export interface PanelDeps {
   keeperBin: string;
   keeperAgentPath: string;
   env: Record<string, string | undefined>;
   cwd: string;
-  loadRegistry: () => PresetRegistry;
+  loadRegistry: () => PanelConfig;
   spawn: PanelSpawnFn;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -151,26 +159,26 @@ export type ResolveMembersResult =
   | { ok: false; error: string };
 
 // ---------------------------------------------------------------------------
-// Member resolution (mirrors src/agent/main.ts runPresetsResolve, plus the
-// panel-runner legacy fallback)
+// Member resolution (mirrors src/agent/main.ts runPresetsResolve)
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a panel name to its members. Precedence: a registry PANEL hit → its
- * members (each named by its preset, validated pair-launchable); else a single
- * PRESET hit → a one-member panel; else (unknown/undefined name) → the legacy
- * two-model fallback `opus`(claude) + `codex`(codex), launched via `--cli`. A
- * panel/preset member pinning a harness outside claude|codex|pi fails loud. Pure.
+ * Resolve a panel name to its members against the catalog + panel selections.
+ * Precedence: a PANEL hit → its members (each named by its preset); else a
+ * single catalog PRESET hit → a one-member panel; else an unknown name → fail
+ * loud (the caller exits 2 — there is no zero-config fallback). A member pinning
+ * a harness outside claude|codex|pi fails loud. Pure.
  */
 export function resolvePanelMembers(
-  registry: PresetRegistry,
+  catalog: PresetCatalog,
+  selections: PanelSelections,
   name: string,
 ): ResolveMembersResult {
-  const panelMembers = registry.panels[name];
+  const panelMembers = selections.panels[name];
   if (panelMembers !== undefined) {
     const members: PanelMember[] = [];
     for (const memberName of panelMembers) {
-      const preset = registry.presets[memberName];
+      const preset = catalog.presets[memberName];
       if (preset === undefined) {
         return {
           ok: false,
@@ -195,7 +203,7 @@ export function resolvePanelMembers(
     return { ok: true, members };
   }
 
-  const preset = registry.presets[name];
+  const preset = catalog.presets[name];
   if (preset !== undefined) {
     if (!PAIR_CLIS.has(preset.harness)) {
       return {
@@ -209,14 +217,7 @@ export function resolvePanelMembers(
     };
   }
 
-  // Legacy two-model fallback — works with zero config.
-  return {
-    ok: true,
-    members: [
-      { name: "opus", harness: "claude" },
-      { name: "codex", harness: "codex" },
-    ],
-  };
+  return { ok: false, error: `'${name}' is not a known panel or preset` };
 }
 
 // ---------------------------------------------------------------------------
@@ -468,10 +469,10 @@ export function parseManifest(
 // Orchestrators
 // ---------------------------------------------------------------------------
 
-/** Inputs to {@link panelStart}. */
+/** Inputs to {@link panelStart}. `panel` undefined → the `panel.yaml` default. */
 export interface PanelStartArgs {
   promptFile: string;
-  panel: string;
+  panel: string | undefined;
   dir?: string;
   timeoutSeconds: number;
 }
@@ -487,16 +488,29 @@ export async function panelStart(
   args: PanelStartArgs,
   deps: PanelDeps,
 ): Promise<number> {
-  let registry: PresetRegistry;
+  let config: PanelConfig;
   try {
-    registry = deps.loadRegistry();
+    config = deps.loadRegistry();
   } catch (err) {
     const msg = err instanceof ConfigError ? err.message : String(err);
     deps.writeErr(`pair panel start: ${msg}\n`);
     return 2;
   }
 
-  const resolved = resolvePanelMembers(registry, args.panel);
+  // `--panel` absent → the panel.yaml `default`; neither present is fail-loud.
+  const panelName = args.panel ?? config.selections.default;
+  if (panelName === null || panelName === "") {
+    deps.writeErr(
+      "pair panel start: no --panel given and no default panel set in panel.yaml\n",
+    );
+    return 2;
+  }
+
+  const resolved = resolvePanelMembers(
+    config.catalog,
+    config.selections,
+    panelName,
+  );
   if (!resolved.ok) {
     deps.writeErr(`pair panel start: ${resolved.error}\n`);
     return 2;
@@ -664,7 +678,11 @@ export function buildPanelDeps(): PanelDeps {
     keeperAgentPath: resolvePairKeeperAgentPath(),
     env: process.env as Record<string, string | undefined>,
     cwd: process.cwd(),
-    loadRegistry: () => loadPresetRegistry(),
+    loadRegistry: () => {
+      const catalog = loadPresetCatalog();
+      const selections = loadPanelSelections(catalog);
+      return { catalog, selections };
+    },
     spawn: (argv, opts) => {
       const proc = Bun.spawn(argv, {
         env: opts.env,
@@ -690,10 +708,11 @@ Usage:
   keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper pair panel wait --dir <d> [--chunk <s>]
 
-start  resolves the panel members (registry panel, single preset, or the legacy
-       opus+codex fallback), launches each as a DETACHED read-only \`keeper pair
-       send\` leg in the 'panels' session, writes <dir>/manifest.json, prints it,
-       and exits 0 immediately. Prints {dir, members:[{name,harness,yaml,log,pidfile}]}.
+start  resolves the panel members (a panel.yaml panel or a single catalog
+       preset; a missing/invalid catalog or panel.yaml is fail-loud exit 2),
+       launches each as a DETACHED read-only \`keeper pair send\` leg in the
+       'panels' session, writes <dir>/manifest.json, prints it, and exits 0
+       immediately. Prints {dir, members:[{name,harness,yaml,log,pidfile}]}.
 wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        Exit 0 + verdict JSON {dir, ok, members:[{name,harness,status,yaml,reason}]}
        when all legs are terminal; exit 124 when the chunk elapses (re-issue it);
@@ -701,7 +720,7 @@ wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        not all-success — key off the verdict's 'ok' flag.
 
 Options:
-  --panel <name>    Panel/preset name (default: ${DEFAULT_PANEL_NAME})
+  --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
   --dir <d>         Scratch dir (start: minted when absent; wait: required)
   --timeout <s>     Per-leg keeper pair send timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
   --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
@@ -763,7 +782,7 @@ export async function runPanel(argv: string[]): Promise<void> {
     const code = await panelStart(
       {
         promptFile,
-        panel: parsed.values.panel ?? DEFAULT_PANEL_NAME,
+        panel: parsed.values.panel,
         dir: parsed.values.dir,
         timeoutSeconds,
       },

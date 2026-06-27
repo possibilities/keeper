@@ -6,7 +6,7 @@
  * the `worker` preset default (plan form only) — by capturing the `LaunchSpec` the
  * injected `launch` seam receives, never a real tmux/daemon.
  *
- * The preset registry path is sandboxed via KEEPER_PRESETS_CONFIG (os.homedir()
+ * The preset catalog dir is sandboxed via KEEPER_CONFIG_DIR (os.homedir()
  * ignores $HOME on macOS). `main()` calls process.exit() directly on failures, so
  * we patch it (throwing a tagged ExitError) around the call.
  */
@@ -28,14 +28,14 @@ class ExitError extends Error {
 }
 
 let dir: string;
-const TOUCHED = ["KEEPER_PRESETS_CONFIG"] as const;
+const TOUCHED = ["KEEPER_CONFIG_DIR"] as const;
 let saved: Record<string, string | undefined>;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "dispatch-cli-"));
   saved = {};
   for (const k of TOUCHED) saved[k] = process.env[k];
-  process.env.KEEPER_PRESETS_CONFIG = join(dir, "presets.yaml");
+  process.env.KEEPER_CONFIG_DIR = dir;
 });
 
 afterEach(() => {
@@ -148,7 +148,7 @@ test("plan form defaults to the worker preset model/effort", async () => {
 });
 
 test("plan form with no worker preset falls back to sonnet/max", async () => {
-  // No presets file → empty registry → worker defaults.
+  // No catalog file → the worker carve-out swallows the throw → worker defaults.
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",

@@ -11,11 +11,16 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
+  keeperConfigDir,
   loadClaudeStowDir,
   loadLauncherDefaults,
+  loadPanelSelections,
   loadPiLauncherDefaults,
   loadPluginSources,
-  loadPresetRegistry,
+  loadPresetCatalog,
+  type PresetCatalog,
+  panelConfigPath,
+  presetsCatalogPath,
   resolvePreset,
 } from "../src/agent/config";
 
@@ -123,17 +128,69 @@ describe("loadClaudeStowDir", () => {
   });
 });
 
-describe("loadPresetRegistry", () => {
-  test("missing file → empty registry (fail-open)", () => {
-    expect(loadPresetRegistry(join(tmpDir, "nope.yaml"))).toEqual({
-      presets: {},
-      panels: {},
-    });
+/** A catalog with claude (a), codex (b), and pi (z) presets for panel tests. */
+function catalogFixture(): PresetCatalog {
+  return {
+    presets: {
+      a: {
+        harness: "claude",
+        model: null,
+        effort: null,
+        thinking: null,
+        role: null,
+      },
+      b: {
+        harness: "codex",
+        model: null,
+        effort: null,
+        thinking: null,
+        role: null,
+      },
+      z: {
+        harness: "pi",
+        model: null,
+        effort: null,
+        thinking: null,
+        role: null,
+      },
+    },
+  };
+}
+
+describe("loadPresetCatalog", () => {
+  test("a missing file is fail-loud (the required-catalog reversal)", () => {
+    // No legacy file at the supplied (nonexistent) legacy path → no hint.
+    expect(() =>
+      loadPresetCatalog(
+        join(tmpDir, "nope.yaml"),
+        join(tmpDir, "no-legacy.yaml"),
+      ),
+    ).toThrow(ConfigError);
+  });
+
+  test("an empty presets mapping is valid (worker tolerance)", () => {
+    const p = writeYaml("presets.yaml", "presets: {}\n");
+    expect(loadPresetCatalog(p)).toEqual({ presets: {} });
+  });
+
+  test("a whitespace-only file parses to an empty catalog", () => {
+    const p = writeYaml("presets.yaml", "\n");
+    expect(loadPresetCatalog(p)).toEqual({ presets: {} });
+  });
+
+  test("an unknown top-level key is fail-loud (strict reject)", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  a:\n    harness: claude\npanels:\n  duo:\n    - a\n",
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /Unknown top-level key 'panels'/,
+    );
   });
 
   test("malformed YAML is fail-loud", () => {
     const p = writeYaml("presets.yaml", "presets: [unterminated\n");
-    expect(() => loadPresetRegistry(p)).toThrow(ConfigError);
+    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
   });
 
   test("a full preset (claude) is read", () => {
@@ -149,8 +206,8 @@ describe("loadPresetRegistry", () => {
         "",
       ].join("\n"),
     );
-    const reg = loadPresetRegistry(p);
-    expect(reg.presets["claude-opus-xhigh"]).toEqual({
+    const cat = loadPresetCatalog(p);
+    expect(cat.presets["claude-opus-xhigh"]).toEqual({
       harness: "claude",
       model: "opus",
       effort: "xhigh",
@@ -164,7 +221,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  m-only:\n    harness: claude\n    model: opus\n",
     );
-    expect(loadPresetRegistry(p).presets["m-only"]).toEqual({
+    expect(loadPresetCatalog(p).presets["m-only"]).toEqual({
       harness: "claude",
       model: "opus",
       effort: null,
@@ -175,7 +232,7 @@ describe("loadPresetRegistry", () => {
 
   test("invalid harness is fail-loud", () => {
     const p = writeYaml("presets.yaml", "presets:\n  bad:\n    harness: gpt\n");
-    expect(() => loadPresetRegistry(p)).toThrow(ConfigError);
+    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
   });
 
   test("effort + thinking on the same preset is fail-loud", () => {
@@ -183,7 +240,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  both:\n    harness: pi\n    effort: high\n    thinking: deep\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(ConfigError);
+    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
   });
 
   test("thinking on a non-pi harness is fail-loud", () => {
@@ -191,7 +248,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  t:\n    harness: claude\n    thinking: deep\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/pi-only/);
+    expect(() => loadPresetCatalog(p)).toThrow(/pi-only/);
   });
 
   test("effort on a pi harness is fail-loud", () => {
@@ -199,7 +256,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  e:\n    harness: pi\n    effort: high\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/claude\/codex-only/);
+    expect(() => loadPresetCatalog(p)).toThrow(/claude\/codex-only/);
   });
 
   test("a reserved preset name is fail-loud", () => {
@@ -207,7 +264,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  default:\n    harness: claude\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/reserved/);
+    expect(() => loadPresetCatalog(p)).toThrow(/reserved/);
   });
 
   test("a YAML-1.1-boolean-looking name is fail-loud", () => {
@@ -215,7 +272,7 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  yes:\n    harness: claude\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/reserved/);
+    expect(() => loadPresetCatalog(p)).toThrow(/reserved/);
   });
 
   test("a non-matching name (uppercase) is fail-loud", () => {
@@ -223,91 +280,169 @@ describe("loadPresetRegistry", () => {
       "presets.yaml",
       "presets:\n  Opus:\n    harness: claude\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/\[a-z0-9_-\]/);
+    expect(() => loadPresetCatalog(p)).toThrow(/\[a-z0-9_-\]/);
+  });
+
+  test("a missing-file error names the leftover legacy path + new layout", () => {
+    const legacy = writeYaml("legacy-presets.yaml", "presets: {}\n");
+    let msg = "";
+    try {
+      loadPresetCatalog(join(tmpDir, "absent.yaml"), legacy);
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    expect(msg).toContain(legacy);
+    expect(msg).toContain("presets.yaml");
+    expect(msg).toContain("panel.yaml");
+  });
+});
+
+describe("loadPanelSelections", () => {
+  test("a missing file is fail-loud (the required-panel reversal)", () => {
+    expect(() =>
+      loadPanelSelections(
+        catalogFixture(),
+        join(tmpDir, "nope.yaml"),
+        join(tmpDir, "no-legacy.yaml"),
+      ),
+    ).toThrow(ConfigError);
   });
 
   test("a panel of existing presets is read in order", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      [
-        "presets:",
-        "  a:",
-        "    harness: claude",
-        "  b:",
-        "    harness: codex",
-        "panels:",
-        "  duo:",
-        "    - a",
-        "    - b",
-        "",
-      ].join("\n"),
-    );
-    expect(loadPresetRegistry(p).panels.duo).toEqual(["a", "b"]);
+    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
+    expect(loadPanelSelections(catalogFixture(), p).panels.duo).toEqual([
+      "a",
+      "b",
+    ]);
   });
 
-  test("a panel referencing an undefined preset is fail-loud", () => {
+  test("a member referencing no catalog preset is fail-loud", () => {
     const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  a:\n    harness: claude\npanels:\n  duo:\n    - a\n    - ghost\n",
+      "panel.yaml",
+      "panels:\n  duo:\n    - a\n    - ghost\n",
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/undefined preset 'ghost'/);
+    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+      /undefined preset 'ghost'/,
+    );
+  });
+
+  test("a pi member is rejected at load (claude|codex only)", () => {
+    const p = writeYaml("panel.yaml", "panels:\n  mixed:\n    - a\n    - z\n");
+    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+      /not panel-launchable/,
+    );
   });
 
   test("an empty panel list is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  a:\n    harness: claude\npanels:\n  empty: []\n",
+    const p = writeYaml("panel.yaml", "panels:\n  empty: []\n");
+    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+      /non-empty list/,
     );
-    expect(() => loadPresetRegistry(p)).toThrow(/non-empty list/);
+  });
+
+  test("an unknown top-level key is fail-loud (strict reject)", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - a\npresets:\n  x:\n    harness: claude\n",
+    );
+    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+      /Unknown top-level key 'presets'/,
+    );
+  });
+
+  test("the default key names a defined panel", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - a\n    - b\ndefault: duo\n",
+    );
+    const sel = loadPanelSelections(catalogFixture(), p);
+    expect(sel.default).toBe("duo");
+  });
+
+  test("no default key leaves default null", () => {
+    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
+    expect(loadPanelSelections(catalogFixture(), p).default).toBeNull();
+  });
+
+  test("a default naming an undefined panel is fail-loud", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - a\n    - b\ndefault: ghost\n",
+    );
+    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+      /default panel 'ghost'/,
+    );
   });
 
   test("two same-harness-different-model panelists are expressible", () => {
+    const catalog: PresetCatalog = {
+      presets: {
+        opus: {
+          harness: "claude",
+          model: "opus",
+          effort: null,
+          thinking: null,
+          role: null,
+        },
+        sonnet: {
+          harness: "claude",
+          model: "sonnet",
+          effort: null,
+          thinking: null,
+          role: null,
+        },
+      },
+    };
     const p = writeYaml(
-      "presets.yaml",
-      [
-        "presets:",
-        "  opus:",
-        "    harness: claude",
-        "    model: opus",
-        "  sonnet:",
-        "    harness: claude",
-        "    model: sonnet",
-        "panels:",
-        "  claude-duo:",
-        "    - opus",
-        "    - sonnet",
-        "",
-      ].join("\n"),
+      "panel.yaml",
+      "panels:\n  claude-duo:\n    - opus\n    - sonnet\n",
     );
-    const reg = loadPresetRegistry(p);
-    expect(reg.panels["claude-duo"]).toEqual(["opus", "sonnet"]);
-    expect(reg.presets.opus.model).toBe("opus");
-    expect(reg.presets.sonnet.model).toBe("sonnet");
+    expect(loadPanelSelections(catalog, p).panels["claude-duo"]).toEqual([
+      "opus",
+      "sonnet",
+    ]);
+  });
+});
+
+describe("KEEPER_CONFIG_DIR single seam", () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env.KEEPER_CONFIG_DIR;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = saved;
+  });
+
+  test("derives both file paths from one env var", () => {
+    process.env.KEEPER_CONFIG_DIR = "/cfg/keeper";
+    expect(keeperConfigDir()).toBe("/cfg/keeper");
+    expect(presetsCatalogPath()).toBe("/cfg/keeper/presets.yaml");
+    expect(panelConfigPath()).toBe("/cfg/keeper/panel.yaml");
   });
 });
 
 describe("resolvePreset", () => {
-  const reg = {
+  const cat: PresetCatalog = {
     presets: {
       a: {
-        harness: "claude" as const,
+        harness: "claude",
         model: null,
         effort: null,
         thinking: null,
         role: null,
       },
     },
-    panels: {},
   };
 
   test("resolves an existing preset", () => {
-    expect(resolvePreset(reg, "a").harness).toBe("claude");
+    expect(resolvePreset(cat, "a").harness).toBe("claude");
   });
 
   test("a missing name is fail-loud listing the available names + path", () => {
     let msg = "";
     try {
-      resolvePreset(reg, "nope", "/cfg/presets.yaml");
+      resolvePreset(cat, "nope", "/cfg/presets.yaml");
     } catch (e) {
       msg = e instanceof Error ? e.message : String(e);
     }

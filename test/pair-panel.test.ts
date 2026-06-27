@@ -9,9 +9,9 @@
  * that legs outlive `start`'s exit on macOS) is the REAL-spawn sibling in
  * `test/pair-panel.slow.test.ts`.
  *
- * Coverage: member resolution (registry panel / single preset / legacy fallback
- * / pi reject); leg + detach-wrapper argv shape (zero setsid/timeout/gtimeout);
- * `start` manifest persist+print + legacy `--cli` legs; `wait` full-success
+ * Coverage: member resolution (panel hit / single preset / unknown fail-loud);
+ * leg + detach-wrapper argv shape (zero setsid/timeout/gtimeout);
+ * `start` manifest persist+print + per-member `--preset` legs; `wait` full-success
  * N-of-N (exit 0, ok:true), mixed-fail (exit 0, ok:false, reason populated),
  * 124-timeout, crash-fail via dead pid past grace, content-blindness, manifest
  * round-trip, `--chunk` ceiling, and corrupt/missing manifest.
@@ -23,8 +23,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
+  type PanelSelections,
   type Preset,
-  type PresetRegistry,
+  type PresetCatalog,
 } from "../src/agent/config";
 import {
   buildDetachWrapperArgv,
@@ -55,6 +56,16 @@ function preset(harness: Preset["harness"]): Preset {
   return { harness, model: null, effort: null, thinking: null, role: null };
 }
 
+/** A two-member `default` panel of opus(claude)+codex(codex) catalog presets —
+ *  the stand-in for the removed zero-config fallback in the start/wait tests. */
+const DEFAULT_CATALOG: PresetCatalog = {
+  presets: { opus: preset("claude"), codex: preset("codex") },
+};
+const DEFAULT_SELECTIONS: PanelSelections = {
+  panels: { default: ["opus", "codex"] },
+  default: "default",
+};
+
 const KEEPER_BIN = "/usr/local/bin/bun";
 const KEEPER_AGENT = "/abs/cli/keeper.ts";
 
@@ -65,7 +76,8 @@ interface SpawnCall {
 }
 
 function makeDeps(opts: {
-  registry?: PresetRegistry;
+  catalog?: PresetCatalog;
+  selections?: PanelSelections;
   clock?: { ms: number };
   pidAlive?: (pid: number) => boolean;
   graceMs?: number;
@@ -86,7 +98,10 @@ function makeDeps(opts: {
     keeperAgentPath: KEEPER_AGENT,
     env: { PATH: "/usr/bin" },
     cwd: "/work/repo",
-    loadRegistry: () => opts.registry ?? { presets: {}, panels: {} },
+    loadRegistry: () => ({
+      catalog: opts.catalog ?? { presets: {} },
+      selections: opts.selections ?? { panels: {}, default: null },
+    }),
     spawn: (argv, o) => {
       if (opts.throwOnSpawn?.(argv)) {
         throw new Error("spawn boom");
@@ -124,12 +139,17 @@ function readManifest(): PanelManifest {
 
 // ---- member resolution ----------------------------------------------------
 
-test("resolvePanelMembers: registry panel hit → preset-named members", () => {
-  const registry: PresetRegistry = {
+const EMPTY_SELECTIONS: PanelSelections = { panels: {}, default: null };
+
+test("resolvePanelMembers: panel hit → preset-named members", () => {
+  const catalog: PresetCatalog = {
     presets: { rA: preset("claude"), rB: preset("codex") },
-    panels: { default: ["rA", "rB"] },
   };
-  const r = resolvePanelMembers(registry, "default");
+  const sel: PanelSelections = {
+    panels: { default: ["rA", "rB"] },
+    default: "default",
+  };
+  const r = resolvePanelMembers(catalog, sel, "default");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
   expect(r.members).toEqual([
@@ -139,11 +159,8 @@ test("resolvePanelMembers: registry panel hit → preset-named members", () => {
 });
 
 test("resolvePanelMembers: a single preset → a one-member panel", () => {
-  const registry: PresetRegistry = {
-    presets: { solo: preset("claude") },
-    panels: {},
-  };
-  const r = resolvePanelMembers(registry, "solo");
+  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
+  const r = resolvePanelMembers(catalog, EMPTY_SELECTIONS, "solo");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
   expect(r.members).toEqual([
@@ -151,27 +168,21 @@ test("resolvePanelMembers: a single preset → a one-member panel", () => {
   ]);
 });
 
-test("resolvePanelMembers: unknown/empty registry → legacy opus+codex fallback", () => {
-  const r = resolvePanelMembers({ presets: {}, panels: {} }, "default");
-  expect(r.ok).toBe(true);
-  if (!r.ok) return;
-  // Legacy members carry NO preset → launched via --cli.
-  expect(r.members).toEqual([
-    { name: "opus", harness: "claude" },
-    { name: "codex", harness: "codex" },
-  ]);
+test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
+  const r = resolvePanelMembers({ presets: {} }, EMPTY_SELECTIONS, "default");
+  expect(r.ok).toBe(false);
+  if (r.ok) return;
+  expect(r.error).toContain("default");
 });
 
-test("resolvePanelMembers: a pi panel member is accepted (pair-launchable)", () => {
-  const registry: PresetRegistry = {
-    presets: { thinker: preset("pi"), rA: preset("claude") },
-    panels: { mixed: ["rA", "thinker"] },
-  };
-  const r = resolvePanelMembers(registry, "mixed");
+test("resolvePanelMembers: a pi single-preset is accepted (pair-launchable)", () => {
+  // Panel.yaml rejects pi members at load; a single pi catalog preset used
+  // directly as --panel still pairs (resolvePanelMembers gates on PAIR_CLIS).
+  const catalog: PresetCatalog = { presets: { thinker: preset("pi") } };
+  const r = resolvePanelMembers(catalog, EMPTY_SELECTIONS, "thinker");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
   expect(r.members).toEqual([
-    { name: "rA", harness: "claude", preset: "rA" },
     { name: "thinker", harness: "pi", preset: "thinker" },
   ]);
 });
@@ -234,11 +245,14 @@ test("buildPanelLegArgv: preset member uses --preset; legacy uses --cli; no bann
 // ---- start -----------------------------------------------------------------
 
 test("start: persists + prints a manifest, launches every leg detached", async () => {
-  const registry: PresetRegistry = {
+  const catalog: PresetCatalog = {
     presets: { rA: preset("claude"), rB: preset("codex") },
-    panels: { default: ["rA", "rB"] },
   };
-  const { deps, spawns, stdout } = makeDeps({ registry });
+  const selections: PanelSelections = {
+    panels: { default: ["rA", "rB"] },
+    default: "default",
+  };
+  const { deps, spawns, stdout } = makeDeps({ catalog, selections });
   const code = await panelStart(
     { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 900 },
     deps,
@@ -269,27 +283,45 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   );
 });
 
-test("start: legacy fallback launches opus(--cli claude) + codex(--cli codex)", async () => {
-  const { deps, spawns } = makeDeps({});
+test("start: an absent --panel uses the panel.yaml default, launching each via --preset", async () => {
+  const { deps, spawns } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+  });
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
+    { promptFile: writePrompt(), panel: undefined, dir, timeoutSeconds: 1800 },
     deps,
   );
   expect(code).toBe(0);
   expect(spawns.length).toBe(2);
   const opusLeg = spawns[0]?.argv ?? [];
   const codexLeg = spawns[1]?.argv ?? [];
-  expect(opusLeg).toContain("--cli");
-  expect(opusLeg).toContain("claude");
-  expect(opusLeg).not.toContain("--preset");
-  expect(codexLeg).toContain("--cli");
+  expect(opusLeg).toContain("--preset");
+  expect(opusLeg).toContain("opus");
+  expect(opusLeg).not.toContain("--cli");
+  expect(codexLeg).toContain("--preset");
   expect(codexLeg).toContain("codex");
+});
+
+test("start: no --panel and no default panel is fail-loud (exit 2)", async () => {
+  const { deps, stderr } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: { panels: { default: ["opus", "codex"] }, default: null },
+  });
+  const code = await panelStart(
+    { promptFile: writePrompt(), panel: undefined, dir, timeoutSeconds: 1800 },
+    deps,
+  );
+  expect(code).toBe(2);
+  expect(stderr()).toContain("no default panel");
 });
 
 test("start: a per-leg spawn failure records a null pidfile (no crash)", async () => {
   // opus spawns fine; codex's spawn throws.
   const { deps } = makeDeps({
-    throwOnSpawn: (argv) => argv.join(" ").includes("--cli codex"),
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+    throwOnSpawn: (argv) => argv.join(" ").includes("--preset codex"),
   });
   const code = await panelStart(
     { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
@@ -302,7 +334,7 @@ test("start: a per-leg spawn failure records a null pidfile (no crash)", async (
   expect(m.members[1]?.pidfile).toBeNull();
 });
 
-test("start: a ConfigError from the registry exits 2", async () => {
+test("start: a ConfigError from the config load exits 2", async () => {
   const { deps, stderr } = makeDeps({});
   deps.loadRegistry = () => {
     throw new ConfigError("bad presets.yaml");
@@ -317,9 +349,13 @@ test("start: a ConfigError from the registry exits 2", async () => {
 
 // ---- wait ------------------------------------------------------------------
 
-/** Drive start (recording spawn) then return the manifest dir for wait. */
+/** Drive start (recording spawn) against the default opus+codex panel, then
+ *  return so the caller can simulate leg outcomes for wait. */
 async function startLegacy(): Promise<void> {
-  const { deps } = makeDeps({});
+  const { deps } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+  });
   await panelStart(
     { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
     deps,

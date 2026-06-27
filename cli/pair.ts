@@ -50,7 +50,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
-  loadPresetRegistry,
+  loadPresetCatalog,
   type Preset,
   resolvePreset,
 } from "../src/agent/config";
@@ -255,7 +255,7 @@ export async function main(argv: string[]): Promise<void> {
   let preset: Preset | undefined;
   if (presetName !== undefined && presetName !== "") {
     try {
-      preset = resolvePreset(loadPresetRegistry(), presetName);
+      preset = resolvePreset(loadPresetCatalog(), presetName);
     } catch (err) {
       const msg = err instanceof ConfigError ? err.message : String(err);
       process.stderr.write(`pair: ${msg}\n`);

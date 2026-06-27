@@ -1,15 +1,20 @@
 /**
- * Launcher config adapters — the
- * `~/.config/agentwrap/{claude,codex,pi,plugins}.yaml`
- * readers. YAML parsing is isolated behind one adapter (`parseYaml`) so a
- * js-yaml swap stays a one-line change. Bun.YAML targets YAML 1.2 (no
- * `yes/no/on/off` booleans); the config corpus is boolean-free.
+ * Launcher config adapters — the dep-free island that reads both the
+ * `~/.config/agentwrap/{claude,codex,pi,plugins}.yaml` launcher defaults and the
+ * `~/.config/keeper/{presets.yaml,panel.yaml}` agent launch-config. YAML parsing
+ * is isolated behind one adapter (`parseYaml`) so a js-yaml swap stays a one-line
+ * change. Bun.YAML targets YAML 1.2 (no `yes/no/on/off` booleans); the config
+ * corpus is boolean-free.
  *
  * `claude.yaml` and `codex.yaml` supply `model`/`effort` startup defaults;
  * `pi.yaml` supplies Pi's `model`/`thinking` startup defaults (fail-open: a
  * missing key or file sends no override). `plugins.yaml` supplies the Claude
- * plugin sources (fail-loud on a missing file). Each reader documents its own
- * absence semantics below.
+ * plugin sources (fail-loud on a missing file). The preset catalog
+ * (`presets.yaml`) and panel selections (`panel.yaml`) under `~/.config/keeper/`
+ * are REQUIRED + validated: any preset referenced by name and every panel op
+ * fail-loud (`ConfigError`) on a missing or invalid file — the autopilot worker
+ * is the sole fail-open consumer (it catches the throw and coalesces to its
+ * constants). Each reader documents its own absence semantics below.
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -68,14 +73,33 @@ export function pluginConfigPath(): string {
   return join(homedir(), ".config", "agentwrap", "plugins.yaml");
 }
 
-export function presetsConfigPath(): string {
-  // `KEEPER_PRESETS_CONFIG` overrides the default location — the test-isolation
-  // seam (os.homedir() ignores $HOME on macOS) and a production override. Read
-  // producer-side at resolve time, never a fold input.
-  const override = process.env.KEEPER_PRESETS_CONFIG;
+/**
+ * The `~/.config/keeper/` base dir both agent-launch-config files live under.
+ * `KEEPER_CONFIG_DIR` overrides it — the single env seam (the test-isolation
+ * lever, since os.homedir() ignores $HOME on macOS, and a production override).
+ * Parallels `src/db.ts` `resolveConfigPath()` WITHOUT importing it: db.ts is the
+ * SQLite island, so the launcher's dep-free import graph must never reach it.
+ */
+export function keeperConfigDir(): string {
+  const override = process.env.KEEPER_CONFIG_DIR;
   if (override !== undefined && override !== "") {
     return override;
   }
+  return join(homedir(), ".config", "keeper");
+}
+
+/** The preset catalog (`<config-dir>/presets.yaml`). */
+export function presetsCatalogPath(): string {
+  return join(keeperConfigDir(), "presets.yaml");
+}
+
+/** The panel selections (`<config-dir>/panel.yaml`). */
+export function panelConfigPath(): string {
+  return join(keeperConfigDir(), "panel.yaml");
+}
+
+/** The pre-relocation single-file location, named only in migration hints. */
+export function legacyAgentwrapPresetsPath(): string {
   return join(homedir(), ".config", "agentwrap", "presets.yaml");
 }
 
@@ -247,13 +271,25 @@ export interface Preset {
 }
 
 /**
- * The single launch-config registry parsed from `presets.yaml`: named presets
- * plus named panels (each an ordered list of preset names). Read ONLY by this
- * dep-free config island — the launcher import graph never reaches `src/db.ts`.
+ * The catalog of available presets, parsed from `presets.yaml`: the full set of
+ * named `{harness, model?, effort?, thinking?, role?}` triples a launch may pin.
+ * Read ONLY by this dep-free config island — the launcher import graph never
+ * reaches `src/db.ts`. An empty `presets:` mapping is valid (worker tolerance).
  */
-export interface PresetRegistry {
+export interface PresetCatalog {
   presets: Record<string, Preset>;
+}
+
+/**
+ * The panel selections, parsed from `panel.yaml`: named panels (each an ordered
+ * list of catalog preset names) plus an optional `default` naming the panel a
+ * bare `keeper pair panel start` (no `--panel`) assembles. Resolved against a
+ * {@link PresetCatalog} — every panel member must name a catalog preset whose
+ * harness is panel-launchable (claude|codex; pi is rejected at load).
+ */
+export interface PanelSelections {
   panels: Record<string, string[]>;
+  default: string | null;
 }
 
 const PRESET_HARNESSES: ReadonlySet<string> = new Set([
@@ -358,20 +394,61 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
   };
 }
 
+/** Top-level keys each file admits — anything else is a strict-reject. */
+const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set(["presets"]);
+const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
+
 /**
- * Read the named-preset registry from `presets.yaml`. Fail-OPEN on a missing
- * file (an empty registry — presets are recommended, never mandatory), and
- * fail-LOUD (ConfigError) on malformed YAML or any invalid entry: a bad
- * harness, cross-harness effort+thinking, a reserved / non-matching name, or a
- * panel member that references no defined preset.
+ * Suffix appended to a missing-file `ConfigError` when the pre-relocation
+ * single-file config is still sitting at the old agentwrap path — names the old
+ * path and the new two-file layout so the cutover is self-explaining (no
+ * back-compat shim). Empty string when no leftover exists.
  */
-export function loadPresetRegistry(
-  configPath: string = presetsConfigPath(),
-): PresetRegistry {
+function migrationHint(legacyPath: string): string {
+  if (!isFile(legacyPath)) {
+    return "";
+  }
+  return (
+    ` A legacy launch-config remains at ${legacyPath}; the agent launch-config ` +
+    `moved to ${presetsCatalogPath()} (preset catalog) + ${panelConfigPath()} ` +
+    "(panel selections) — split the old file across those two."
+  );
+}
+
+/** Reject any unknown top-level key in a config mapping (no silent typos). */
+function rejectUnknownKeys(
+  raw: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  configPath: string,
+): void {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) {
+      throw new ConfigError(
+        `Unknown top-level key '${key}' in ${configPath} (allowed: ${[...allowed].join(", ")})`,
+      );
+    }
+  }
+}
+
+/**
+ * Read the preset catalog from `presets.yaml`. REQUIRED + validated: a missing
+ * file is fail-LOUD (ConfigError, with a migration hint when the legacy agentwrap
+ * file lingers) — the reversal of the old fail-open posture. An empty `presets:`
+ * mapping is still valid (the worker tolerates a catalog with no presets). Also
+ * fail-loud on malformed YAML, an unknown top-level key, or any invalid entry: a
+ * bad harness, cross-harness effort+thinking, or a reserved / non-matching name.
+ */
+export function loadPresetCatalog(
+  configPath: string = presetsCatalogPath(),
+  legacyPath: string = legacyAgentwrapPresetsPath(),
+): PresetCatalog {
   if (!isFile(configPath)) {
-    return { presets: {}, panels: {} };
+    throw new ConfigError(
+      `Preset catalog missing at ${configPath}.${migrationHint(legacyPath)}`,
+    );
   }
   const raw = readMapping(configPath);
+  rejectUnknownKeys(raw, ALLOWED_CATALOG_KEYS, configPath);
 
   const presets: Record<string, Preset> = {};
   const presetsRaw = raw.presets ?? {};
@@ -382,6 +459,31 @@ export function loadPresetRegistry(
     validatePresetName(name, configPath);
     presets[name] = parsePreset(name, value, configPath);
   }
+  return { presets };
+}
+
+/**
+ * Read the panel selections from `panel.yaml`, resolved against an already-parsed
+ * {@link PresetCatalog}. REQUIRED + validated: a missing file is fail-LOUD
+ * (ConfigError, with a migration hint when the legacy agentwrap file lingers).
+ * Each panel member must name a catalog preset whose harness is panel-launchable
+ * (claude|codex — pi is rejected AT LOAD). The optional top-level `default` key
+ * (a structural key, exempt from `validatePresetName` though `default` is a
+ * reserved preset name) must name a defined panel. Fail-loud on malformed YAML,
+ * an unknown top-level key, an empty panel list, or any of the above.
+ */
+export function loadPanelSelections(
+  catalog: PresetCatalog,
+  configPath: string = panelConfigPath(),
+  legacyPath: string = legacyAgentwrapPresetsPath(),
+): PanelSelections {
+  if (!isFile(configPath)) {
+    throw new ConfigError(
+      `Panel selections missing at ${configPath}.${migrationHint(legacyPath)}`,
+    );
+  }
+  const raw = readMapping(configPath);
+  rejectUnknownKeys(raw, ALLOWED_PANEL_KEYS, configPath);
 
   const panels: Record<string, string[]> = {};
   const panelsRaw = raw.panels ?? {};
@@ -403,9 +505,15 @@ export function loadPresetRegistry(
         );
       }
       const memberName = member.trim();
-      if (!(memberName in presets)) {
+      const preset = catalog.presets[memberName];
+      if (preset === undefined) {
         throw new ConfigError(
           `Panel '${name}' references undefined preset '${memberName}' in ${configPath}`,
+        );
+      }
+      if (preset.harness !== "claude" && preset.harness !== "codex") {
+        throw new ConfigError(
+          `Panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not panel-launchable (claude|codex only) in ${configPath}`,
         );
       }
       out.push(memberName);
@@ -413,22 +521,39 @@ export function loadPresetRegistry(
     panels[name] = out;
   }
 
-  return { presets, panels };
+  let defaultPanel: string | null = null;
+  const rawDefault = raw.default;
+  if (rawDefault !== undefined && rawDefault !== null) {
+    if (typeof rawDefault !== "string" || !rawDefault.trim()) {
+      throw new ConfigError(
+        `default must be a non-empty string naming a panel in ${configPath}`,
+      );
+    }
+    const d = rawDefault.trim();
+    if (!(d in panels)) {
+      throw new ConfigError(
+        `default panel '${d}' is not a defined panel in ${configPath}`,
+      );
+    }
+    defaultPanel = d;
+  }
+
+  return { panels, default: defaultPanel };
 }
 
 /**
- * Resolve a single preset by name. Fail-loud with a specific message naming the
- * file, the requested name, and the available names — never a silent fallback to
- * a default (a typo must be visible).
+ * Resolve a single preset by name against the catalog. Fail-loud with a specific
+ * message naming the file, the requested name, and the sorted available names —
+ * never a silent fallback to a default (a typo must be visible).
  */
 export function resolvePreset(
-  registry: PresetRegistry,
+  catalog: PresetCatalog,
   name: string,
-  configPath: string = presetsConfigPath(),
+  configPath: string = presetsCatalogPath(),
 ): Preset {
-  const preset = registry.presets[name];
+  const preset = catalog.presets[name];
   if (preset === undefined) {
-    const available = Object.keys(registry.presets);
+    const available = Object.keys(catalog.presets).sort();
     const list = available.length > 0 ? available.join(", ") : "(none)";
     throw new ConfigError(
       `Preset '${name}' not found in ${configPath}. Available: ${list}`,

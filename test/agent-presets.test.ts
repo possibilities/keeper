@@ -9,7 +9,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type { Preset, PresetRegistry } from "../src/agent/config";
+import type {
+  PanelSelections,
+  Preset,
+  PresetCatalog,
+} from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
   expectExit,
@@ -30,11 +34,15 @@ function preset(
   };
 }
 
-function registry(
-  presets: Record<string, Preset>,
-  panels: Record<string, string[]> = {},
-): PresetRegistry {
-  return { presets, panels };
+function catalog(presets: Record<string, Preset>): PresetCatalog {
+  return { presets };
+}
+
+function selections(
+  panels: Record<string, string[]>,
+  def: string | null = null,
+): PanelSelections {
+  return { panels, default: def };
 }
 
 describe("--x-preset precedence (claude)", () => {
@@ -42,7 +50,7 @@ describe("--x-preset precedence (claude)", () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
       }),
     });
@@ -55,7 +63,7 @@ describe("--x-preset precedence (claude)", () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--x-preset", "p", "--model", "sonnet", "hi"],
       listProfiles: () => ["default"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
       }),
     });
@@ -70,7 +78,7 @@ describe("--x-preset precedence (claude)", () => {
       argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
       listProfiles: () => ["default"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
       }),
     });
@@ -85,7 +93,7 @@ describe("--x-preset precedence (claude)", () => {
       argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
       launcherEffort: "high",
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus" }),
       }),
     });
@@ -99,7 +107,7 @@ describe("--x-preset precedence (claude)", () => {
       argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
       launcherModel: "sonnet",
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus" }),
       }),
     });
@@ -113,7 +121,7 @@ describe("--x-preset precedence (codex + pi)", () => {
     const h = makeHarness({
       agent: "codex",
       argv: ["--x-no-confirm", "--x-preset", "c", "hi"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         c: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
       }),
     });
@@ -127,7 +135,7 @@ describe("--x-preset precedence (codex + pi)", () => {
       agent: "pi",
       argv: ["--x-no-confirm", "--x-preset", "pp", "hi"],
       listProfiles: () => ["default"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         pp: preset({ harness: "pi", model: "pi-pro", thinking: "deep" }),
       }),
     });
@@ -142,7 +150,7 @@ describe("harnessless run-preset + harness agreement", () => {
     const h = makeHarness({
       argv: ["--x-preset", "c", "--x-no-confirm", "hi"],
       rawArgv: true,
-      presetRegistry: registry({
+      presetCatalog: catalog({
         c: preset({ harness: "codex", model: "gpt-5.5" }),
       }),
     });
@@ -155,7 +163,7 @@ describe("harnessless run-preset + harness agreement", () => {
     const h = makeHarness({
       argv: ["codex", "--x-no-confirm", "--x-preset", "p", "hi"],
       rawArgv: true,
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus" }),
       }),
     });
@@ -169,7 +177,7 @@ describe("harnessless run-preset + harness agreement", () => {
     const h = makeHarness({
       argv: ["claude", "--x-no-confirm", "--x-preset", "ghost"],
       rawArgv: true,
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude" }),
       }),
     });
@@ -190,7 +198,7 @@ describe("no preset → byte-identical to today", () => {
     const withRegistry = makeHarness({
       argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
       }),
     });
@@ -206,7 +214,7 @@ describe("presets resolve JSON contract", () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "p"],
       rawArgv: true,
-      presetRegistry: registry({
+      presetCatalog: catalog({
         p: preset({
           harness: "claude",
           model: "opus",
@@ -228,17 +236,15 @@ describe("presets resolve JSON contract", () => {
     });
   });
 
-  test("a panel emits an ordered members array", async () => {
+  test("a panel emits an ordered members array (catalog + panel selections)", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "duo"],
       rawArgv: true,
-      presetRegistry: registry(
-        {
-          a: preset({ harness: "claude", model: "opus" }),
-          b: preset({ harness: "codex", model: "gpt-5.5" }),
-        },
-        { duo: ["a", "b"] },
-      ),
+      presetCatalog: catalog({
+        a: preset({ harness: "claude", model: "opus" }),
+        b: preset({ harness: "codex", model: "gpt-5.5" }),
+      }),
+      panelSelections: selections({ duo: ["a", "b"] }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
@@ -252,39 +258,30 @@ describe("presets resolve JSON contract", () => {
     });
   });
 
-  test("a panel with a pi member is accepted (pi is pair-launchable)", async () => {
+  test("a catalog preset resolves without consulting panel.yaml", async () => {
+    // A catalog-preset name wins before panel resolution — the empty default
+    // panel selections (which would fail-loud a panel lookup) is never reached.
     const h = makeHarness({
-      argv: ["presets", "resolve", "mixed"],
+      argv: ["presets", "resolve", "solo"],
       rawArgv: true,
-      presetRegistry: registry(
-        {
-          a: preset({ harness: "claude" }),
-          z: preset({ harness: "pi" }),
-        },
-        { mixed: ["a", "z"] },
-      ),
+      presetCatalog: catalog({ solo: preset({ harness: "claude" }) }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
-    expect(JSON.parse(h.out.join(""))).toEqual({
-      kind: "panel",
-      name: "mixed",
-      members: [
-        { name: "a", harness: "claude" },
-        { name: "z", harness: "pi" },
-      ],
-    });
+    expect(JSON.parse(h.out.join("")).kind).toBe("preset");
   });
 
-  test("an unknown name fails loud", async () => {
+  test("an unknown name fails loud naming presets and panels", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "ghost"],
       rawArgv: true,
-      presetRegistry: registry({ p: preset({ harness: "claude" }) }),
+      presetCatalog: catalog({ p: preset({ harness: "claude" }) }),
+      panelSelections: selections({ duo: ["p"] }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
     expect(h.err.join("")).toContain("ghost");
+    expect(h.err.join("")).toContain("duo");
   });
 });
 

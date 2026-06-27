@@ -43,7 +43,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
-  loadPresetRegistry,
+  loadPresetCatalog,
   type Preset,
   resolvePreset,
 } from "../src/agent/config";
@@ -416,7 +416,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   if (v.preset !== undefined && v.preset !== "") {
     let preset: Preset;
     try {
-      preset = resolvePreset(loadPresetRegistry(), v.preset);
+      preset = resolvePreset(loadPresetCatalog(), v.preset);
     } catch (err) {
       argFault(err instanceof ConfigError ? err.message : String(err));
     }

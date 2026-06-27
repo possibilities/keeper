@@ -10,7 +10,7 @@
  */
 
 import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
-import type { PresetRegistry } from "../../src/agent/config";
+import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { MainDeps } from "../../src/agent/main";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
@@ -78,8 +78,10 @@ export interface HarnessOptions {
   codexLauncherEffort?: string | null;
   piLauncherModel?: string | null;
   piLauncherThinking?: string | null;
-  /** Preset registry loadPresetRegistryFn returns (default empty). */
-  presetRegistry?: PresetRegistry;
+  /** Preset catalog loadPresetCatalogFn returns (default empty). */
+  presetCatalog?: PresetCatalog;
+  /** Panel selections loadPanelSelectionsFn returns (default empty). */
+  panelSelections?: PanelSelections;
   claudeStowDir?: string | null;
   spawn?: SpawnFn;
   nextCwdOrdinal?: (dirName: string) => number;
@@ -154,8 +156,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
     }),
     loadClaudeStowDirFn: () => opts.claudeStowDir ?? null,
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
-    loadPresetRegistryFn: () =>
-      opts.presetRegistry ?? { presets: {}, panels: {} },
+    loadPresetCatalogFn: () => opts.presetCatalog ?? { presets: {} },
+    loadPanelSelectionsFn: () =>
+      opts.panelSelections ?? { panels: {}, default: null },
     ensureClaudeStateSharingFn: () => {},
     ensureAgentwrapProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);

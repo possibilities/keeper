@@ -56,9 +56,9 @@ const TOUCHED_ENV_KEYS = [
   "KEEPER_BUS_DB",
   "KEEPER_BUS_SOCK",
   "KEEPER_CONFIG",
-  // The preset registry path is sandboxed via KEEPER_PRESETS_CONFIG (os.homedir()
+  // The preset catalog dir is sandboxed via KEEPER_CONFIG_DIR (os.homedir()
   // ignores $HOME on macOS, so the default `~/.config/...` can't be redirected).
-  "KEEPER_PRESETS_CONFIG",
+  "KEEPER_CONFIG_DIR",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -80,9 +80,10 @@ beforeEach(() => {
       // resolves to its EMPTY default (the user's real config never bleeds in):
       // the codex reap path is then exercised against an autoclosing session.
       KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
-      // Sandbox the preset registry under the tmpdir so the user's real presets
-      // never bleed in (default points absent → empty registry).
-      KEEPER_PRESETS_CONFIG: join(dir, "presets.yaml"),
+      // Sandbox the preset catalog dir under the tmpdir so the user's real
+      // presets never bleed in (a bare `keeper pair` with no --preset reads no
+      // config; a --preset hard-fails exit 2 unless a fixture catalog is written).
+      KEEPER_CONFIG_DIR: dir,
     },
   });
   for (const k of TOUCHED_ENV_KEYS) {
@@ -186,7 +187,7 @@ test("started precedes failed on the failure path", async () => {
   expect(failedIdx).toBeGreaterThan(startedIdx);
 });
 
-/** Write the sandboxed `presets.yaml` (KEEPER_PRESETS_CONFIG points at it). */
+/** Write the sandboxed `presets.yaml` (KEEPER_CONFIG_DIR/presets.yaml). */
 function writePresets(body: string): void {
   writeFileSync(join(dir, "presets.yaml"), body);
 }
