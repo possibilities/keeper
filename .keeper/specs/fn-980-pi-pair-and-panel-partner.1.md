@@ -73,5 +73,5 @@ Fast in-process tier only, faked (no real pi/subprocess/tmux — the live probe 
 - [ ] fast-tier tests added/inverted (nativePiArgs RO/RW, buildPairLaunchArgv pi, inverted pi-preset test, positive --cli pi); `bun test` green; `ty` clean; committed via keeper commit-work
 
 ## Done summary
-
+pi is now a first-class keeper pair AND panel partner in read-only and read-write: widened PairCli/PAIR_CLIS to include pi, added nativePiArgs (-na always, --model when set, --exclude-tools edit,write in RO only, never effort) with 3-way buildPairLaunchArgv dispatch, and removed the pi-reject sites in pair-send, panel, and presets-resolve so accept is consistent. Live probe confirmed pi auto-runs tools (no per-tool approval gate) and honors --exclude-tools edit,write.
 ## Evidence
