@@ -205,18 +205,44 @@ test("branch + path names are pure functions of stable ids", () => {
   expect(ribBranchFor("fn-42-x", "fn-42-x.3")).toBe(
     "keeper/epic/fn-42-x--fn-42-x.3",
   );
-  // Worktree path: under ~/worktrees, `<repoName>--<branch-slug>`, branch slugged.
-  expect(worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo")).toBe(
-    `${homedir()}/worktrees/foo--keeper-epic-fn-1-foo`,
+  // Worktree path: under ~/worktrees, `<repoName>-<hash>--<branch-slug>`, branch
+  // slugged. The hash is a stable digest of the repo dir (disambiguates
+  // same-basename repos); assert the legible shape without pinning the digest.
+  const base = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
+  expect(base).toMatch(
+    new RegExp(`^${homedir()}/worktrees/foo-[0-9a-z]+--keeper-epic-fn-1-foo$`),
   );
   // A rib slug carries `--` twice (the prefix separator + the rib's own), still
-  // collision-free.
+  // collision-free. A trailing slash on the repo dir folds to the same lane.
   expect(
     worktreePathFor("/Users/x/code/foo/", "keeper/epic/fn-1-foo--fn-1-foo.2"),
-  ).toBe(`${homedir()}/worktrees/foo--keeper-epic-fn-1-foo--fn-1-foo.2`);
+  ).toMatch(
+    new RegExp(
+      `^${homedir()}/worktrees/foo-[0-9a-z]+--keeper-epic-fn-1-foo--fn-1-foo.2$`,
+    ),
+  );
+  // A trailing slash hashes to the same dir-hash as the bare repo dir.
+  expect(worktreePathFor("/Users/x/code/foo/", "keeper/epic/fn-1-foo")).toBe(
+    base,
+  );
   // The worktree is OUTSIDE the repo tree (never nested under it).
   const wt = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
   expect(wt.startsWith("/Users/x/code/foo/")).toBe(false);
+});
+
+test("worktreePathFor disambiguates same-basename repos; stable + pure", () => {
+  // Two repos with the SAME basename (`foo`) hosting a SAME-id epic must NOT
+  // collide onto one worktree dir — the dir-hash separates them.
+  const a = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
+  const b = worktreePathFor("/Users/y/work/foo", "keeper/epic/fn-1-foo");
+  expect(a).not.toBe(b);
+  // Both still legible under ~/worktrees with the `foo` basename preserved.
+  expect(a.startsWith(`${homedir()}/worktrees/foo-`)).toBe(true);
+  expect(b.startsWith(`${homedir()}/worktrees/foo-`)).toBe(true);
+
+  // Same repo + same branch → byte-identical across calls (pure, deterministic):
+  // the producer (provision) and teardown (removeWorktree) derive one path.
+  expect(worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo")).toBe(a);
 });
 
 test("re-derivation from the same DAG is byte-identical", () => {

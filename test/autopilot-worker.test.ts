@@ -101,6 +101,7 @@ import type {
   ResolvedEpicDep,
   Task,
 } from "../src/types";
+import { worktreePathFor } from "../src/worktree-plan";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
@@ -3821,9 +3822,9 @@ test("fn-959 reconcile: worktree ON → a linear chain shares the base lane, det
   expect(wt).toBeDefined();
   expect(wt?.assignment.branch).toBe("keeper/epic/fn-1-foo");
   expect(wt?.baseBranch).toBe("keeper/epic/fn-1-foo");
-  // ~/worktrees/<repoName>--<branch-slug>, slug = branch with `/` → `-`.
+  // ~/worktrees/<repoName>-<hash>--<branch-slug>, slug = branch with `/` → `-`.
   expect(wt?.assignment.worktreePath).toBe(
-    `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`,
+    worktreePathFor("/home/me/repo", "keeper/epic/fn-1-foo"),
   );
   expect(wt?.assignment.inherited).toBe(true);
   expect(wt?.assignment.preMerges).toEqual([]);
@@ -4058,7 +4059,7 @@ test("fn-978 reconcile: raw roots differing but resolving to ONE toplevel are NO
   const root = decision.launches.find((l) => l.id === "fn-1-foo.1");
   expect(root?.worktree?.repoDir).toBe("/repo");
   expect(root?.worktree?.assignment.worktreePath).toBe(
-    `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`,
+    worktreePathFor("/repo", "keeper/epic/fn-1-foo"),
   );
 });
 
@@ -4087,7 +4088,7 @@ test("fn-978 reconcile: tasks sharing a target_repo != project_dir derive the la
   // repoDir + the lane base use the RESOLVED target "/target", never raw project_dir.
   expect(launch?.worktree?.repoDir).toBe("/target");
   expect(launch?.worktree?.baseWorktreePath).toBe(
-    `${homedir()}/worktrees/target--keeper-epic-fn-1-foo`,
+    worktreePathFor("/target", "keeper/epic/fn-1-foo"),
   );
 });
 
@@ -4260,7 +4261,7 @@ test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched
   const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
   const state = makeState();
   const decision = reconcile(snap, makeState(), 0);
-  const wtPath = `${homedir()}/worktrees/repo--keeper-epic-fn-1-foo`;
+  const wtPath = worktreePathFor("/home/me/repo", "keeper/epic/fn-1-foo");
   expect(decision.launches[0]?.worktree?.assignment.worktreePath).toBe(wtPath);
 
   await runReconcileCycle(
@@ -4314,7 +4315,10 @@ test("fn-976 runReconcileCycle: a worktree-mode launch carries the realpath-norm
   // The spec carries the REALPATH-NORMALIZED lane (not the raw worktree path).
   expect(depsLog.launches).toHaveLength(1);
   expect(depsLog.launches[0]?.spec?.worktreePath).toBe(
-    "/private/normalized/worktrees/repo--keeper-epic-fn-1-foo",
+    worktreePathFor("/home/me/repo", "keeper/epic/fn-1-foo").replace(
+      `${homedir()}/`,
+      "/private/normalized/",
+    ),
   );
 });
 

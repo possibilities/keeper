@@ -25,9 +25,10 @@
  *    rib from ever being a path-prefix of the base ref — git rejects that as a
  *    directory/file ref conflict)
  * Worktree paths resolve to a directory under `~/worktrees/`, OUTSIDE the repo
- * tree, named `<repoName>--<branch-slug>`. The home dir is the one environment
- * read here — constant within the daemon process, so re-derivation stays
- * byte-identical — and safe because this runs producer-only, never in a fold.
+ * tree, named `<repoName>-<hash>--<branch-slug>` (the dir-hash disambiguates
+ * same-basename repos). The home dir is the one environment read here — constant
+ * within the daemon process, so re-derivation stays byte-identical — and safe
+ * because this runs producer-only, never in a fold.
  *
  * Determinism is sacred: the toposort breaks ties on the existing
  * `(task_number, task_id)` order, the inheritance walk consumes that one order,
@@ -142,20 +143,47 @@ export function ribBranchFor(epicId: string, taskId: string): string {
 
 /**
  * Resolve a branch to its worktree path: a dir under `~/worktrees/`, OUTSIDE the
- * repo tree, named `<repoName>--<branch-slug>` where `slug` is the branch with
- * `/` → `-` (filesystem-safe; branch names are unique per lane, so the slug is
- * collision-free and the `<repoName>--` prefix keeps sibling-repo lanes legible).
- * A rib slug therefore carries `--` twice (`<repoName>--keeper-epic-<id>--<task>`):
- * the prefix separator and the rib's own — still unambiguous + collision-free,
- * since the slug is an injective image of the unique branch name.
+ * repo tree, named `<repoName>-<hash>--<branch-slug>` where `slug` is the branch
+ * with `/` → `-` (filesystem-safe; branch names are unique per lane, so the slug
+ * is collision-free) and `<hash>` is a short stable digest of the repo dir. The
+ * hash disambiguates two SAME-BASENAME repos (e.g. `~/a/foo` and `~/b/foo`) that
+ * each host a same-id epic: the basename alone would collide their lanes onto one
+ * worktree dir; the dir-hash keeps them distinct. A rib slug carries `--` twice
+ * (`<repoName>-<hash>--keeper-epic-<id>--<task>`): the prefix separator and the
+ * rib's own — still unambiguous + collision-free, since the slug is an injective
+ * image of the unique branch name.
+ *
+ * PURE function of (repoDir, branch): the hash folds only the (already realpath'd
+ * by the producer) repo dir, no wall-clock / random / syscall, so the producer
+ * (provision) and teardown (removeWorktree) derive a byte-identical path and the
+ * path-equality comparisons on both sides still hold. The trailing slash is
+ * stripped before hashing so `<dir>` and `<dir>/` map to the same lane.
  * Kept outside the repo tree so a worktree is never nested inside the repo it
  * forks from. Resolves the home dir from the environment — safe because this runs
  * PRODUCER-ONLY (the autopilot worktree driver), never inside a fold.
  */
 export function worktreePathFor(repoDir: string, branch: string): string {
-  const repoName = baseName(stripTrailingSlash(repoDir)) || "repo";
+  const stripped = stripTrailingSlash(repoDir);
+  const repoName = baseName(stripped) || "repo";
+  const hash = shortHash(stripped);
   const slug = branch.replace(/\//g, "-");
-  return `${homedir()}/worktrees/${repoName}--${slug}`;
+  return `${homedir()}/worktrees/${repoName}-${hash}--${slug}`;
+}
+
+/**
+ * Short stable digest of a string — FNV-1a 32-bit, base36-encoded. Pure +
+ * dependency-free (no `node:crypto`, no new dep): a deterministic total function
+ * of its input, identical across processes and runs. Used only to disambiguate
+ * same-basename repo dirs in a worktree path — collision resistance need only be
+ * good enough to separate a handful of local repo dirs, not cryptographic.
+ */
+function shortHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
 }
 
 /**
