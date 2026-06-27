@@ -38,5 +38,5 @@ Before the LOCAL merge in finalizeEpic (~src/autopilot-worker.ts:2588) and recov
 - [ ] pure + slow tests cover it; typecheck + lint green.
 
 ## Done summary
-
+Added a pre-merge turn-key push gate (remotePushTurnKey: remote + @{push} + dry-run, reusing classifyPushError) so finalize + recover degrade to a distinct non-sticky skip-retry before the local merge instead of merging-then-dying; fixed remotePushFastForwardable to treat an unresolved remote-tracking ref as not fast-forwardable.
 ## Evidence
