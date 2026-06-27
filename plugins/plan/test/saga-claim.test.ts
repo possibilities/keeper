@@ -57,6 +57,7 @@ function errCode(out: string): unknown {
 
 describe("claim happy path + brief schema", () => {
   const getProj = withProject("planctl-claim-");
+  const getLane = withTmpdir("planctl-claim-lane-");
 
   test("envelope is content-blind; brief file carries the full schema", () => {
     // test_claim.py::test_claim_happy_path_envelope
@@ -124,6 +125,38 @@ describe("claim happy path + brief schema", () => {
     expect(inv.op).toBe("claim");
     expect(inv.subject).toBeNull();
     expect(inv.files).toBeNull();
+  });
+
+  test("KEEPER_PLAN_WORKTREE routes target_repo to the lane, plan-state to the primary repo", () => {
+    // claim is the FIRST call /plan:work makes and the source of the worker's
+    // TARGET_REPO. In worktree mode it MUST honor the lane override (like
+    // resolve-task / worker-resume) or the worker cds into the shared main
+    // checkout and the lane stays empty. plan STATE (primary_repo) stays primary.
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const lane = getLane();
+
+    const r = runCli(["claim", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { ...ALICE, KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(r.code).toBe(0);
+    const payload = parseCliOutput(r.output);
+    // target_repo follows the lane...
+    expect(payload.target_repo).toBe(lane);
+    // ...primary_repo (and the brief's state_repo) stay in the primary repo.
+    const mainRepo = realpathSync(proj.root);
+    expect(payload.primary_repo).toBe(mainRepo);
+    expect(payload.primary_repo).not.toBe(lane);
+
+    const brief = JSON.parse(
+      readFileSync(payload.brief_ref as string, "utf-8"),
+    ) as Record<string, unknown>;
+    expect(brief.target_repo).toBe(lane);
+    expect(brief.primary_repo).toBe(mainRepo);
+    expect(brief.state_repo).toBe(mainRepo);
   });
 
   test("null persisted tier -> worker_agent null (claimability is the contract)", () => {

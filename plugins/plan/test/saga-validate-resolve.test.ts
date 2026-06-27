@@ -224,7 +224,9 @@ describe("resolve-task routing envelope", () => {
     const obj = resolveEnvelope(
       run(["resolve-task", taskId, "--project", project.root]).output,
     );
-    expect([..."medium high xhigh max".split(" "), null]).toContain(obj.tier as string | null);
+    expect([..."medium high xhigh max".split(" "), null]).toContain(
+      obj.tier as string | null,
+    );
   });
 
   test("envelope carries a read-only invocation footer (subject/files null)", () => {

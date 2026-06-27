@@ -23,6 +23,7 @@ import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
+import { expectedWorkerCwd } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { hasDataDir, resolveDataDirOrDefault } from "../state_path.ts";
 import {
@@ -188,13 +189,17 @@ export function runClaim(args: ClaimArgs): void {
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   const epicDef = existsSync(epicPath) ? (loadJsonSafe(epicPath) ?? {}) : {};
 
-  // 4. resolve target_repo / primary_repo (three-level fallback, realpath-normalized)
+  // 4. resolve target_repo / primary_repo (realpath-normalized). target_repo
+  // follows the worker's lane: the KEEPER_PLAN_WORKTREE override wins (worktree
+  // mode), then task.target_repo -> epic.primary_repo -> proj. The worker cds
+  // into target_repo for code work, so a worktree-mode claim MUST return the lane
+  // (the same expectedWorkerCwd resolve-task / worker-resume use) — else the
+  // worker works in the shared main checkout and the lane stays empty. Plan STATE
+  // (primary_repo) ALWAYS resolves to the primary repo, never the lane.
   const projPath = ctx.projectPath;
-  const expectedCwd =
-    (taskDef.target_repo as string | null | undefined) ||
-    (epicDef.primary_repo as string | null | undefined) ||
-    projPath;
-  const targetRepo = resolveExpand(expectedCwd);
+  const targetRepo = resolveExpand(
+    expectedWorkerCwd(taskDef, epicDef, projPath),
+  );
   const primaryRepo = resolveExpand(
     (epicDef.primary_repo as string | null | undefined) || projPath,
   );
