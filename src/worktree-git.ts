@@ -65,6 +65,15 @@ export type MergeResult =
   /** The source was already an ancestor of the target — nothing to do. */
   | { kind: "already-merged" }
   /**
+   * The source lane branch does not resolve — a *phantom* lane that was never
+   * created because its task's work landed on the default branch instead
+   * (mixed-mode board history). A provably lossless no-op: the rib was never
+   * created, so there is no unmerged work to lose. The caller SKIPS this
+   * pre-merge rather than failing loud. Sourced ONLY from the pre-merge ref
+   * probe — never from a merge/is-ancestor failure, which stays a real error.
+   */
+  | { kind: "missing-source" }
+  /**
    * The merge hit a conflict and was ABORTED (`git merge --abort` ran iff a
    * `MERGE_HEAD` was present). The caller fails loud + stops; `stderr` carries
    * git's conflict output for the sticky DispatchFailed.
@@ -569,6 +578,28 @@ export async function mergeBranchInto(
   run: GitRunner = gitExec,
   acquireLock: LockAcquirer = defaultLockAcquirer,
 ): Promise<MergeResult> {
+  // Phantom-lane guard: probe the source ref BEFORE any lock or merge-base. On a
+  // mixed-mode board a fan-in can reference a lane branch that was never created
+  // (its task's work landed on the default branch), and that unresolvable source
+  // is a lossless no-op — NOT a conflict. Mirror `branchExists`'s `refs/heads/`
+  // idiom (so a phantom name cannot DWIM-match a remote-tracking ref/tag);
+  // `^{commit}` peels tags and `--end-of-options` guards a `-`-leading name.
+  // Only THIS non-zero exit yields `missing-source`; a later merge/is-ancestor
+  // failure stays a genuine error.
+  const sourceExists = await run(
+    [
+      "rev-parse",
+      "--quiet",
+      "--verify",
+      "--end-of-options",
+      `refs/heads/${sourceBranch}^{commit}`,
+    ],
+    { cwd: worktreePath },
+  );
+  if (sourceExists.code !== 0) {
+    return { kind: "missing-source" };
+  }
+
   // Idempotent skip: already merged in (or fast-forward-equal).
   const isAncestor = await run(
     ["merge-base", "--is-ancestor", sourceBranch, "HEAD"],

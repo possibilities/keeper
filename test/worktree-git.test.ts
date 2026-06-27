@@ -617,6 +617,15 @@ test("mergeBranchInto: clean merge → merged, lock acquired+released around mer
 test("mergeBranchInto: conflict with MERGE_HEAD → abort, conflict, lock released", async () => {
   const { run, calls } = fakeAsyncGit([
     {
+      // Source resolves (`refs/heads/<src>^{commit}` exit 0) — NOT a phantom, so
+      // the merge path runs. Keyed on the `^{commit}` suffix, not the shared
+      // `rev-parse --verify` prefix, so it can't collide with the MERGE_HEAD rule.
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+        a.some((t) => t.endsWith("^{commit}")),
+      result: { exitCode: 0 },
+    },
+    {
       when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
       result: { exitCode: 1 },
     },
@@ -652,6 +661,14 @@ test("mergeBranchInto: conflict with MERGE_HEAD → abort, conflict, lock releas
 test("mergeBranchInto: merge fails with NO MERGE_HEAD → no spurious abort", async () => {
   const { run, calls } = fakeAsyncGit([
     {
+      // Source resolves — the genuine no-MERGE_HEAD conflict path stays covered
+      // (this is NOT classified as `missing-source`).
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+        a.some((t) => t.endsWith("^{commit}")),
+      result: { exitCode: 0 },
+    },
+    {
       when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
       result: { exitCode: 1 },
     },
@@ -674,6 +691,33 @@ test("mergeBranchInto: merge fails with NO MERGE_HEAD → no spurious abort", as
   expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
     false,
   );
+});
+
+test("mergeBranchInto: phantom/unresolvable source → missing-source, no merge, no abort, no lock", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      // `refs/heads/<src>^{commit}` does not resolve — a phantom lane never
+      // created (its task's work landed on the default branch).
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+        a.some((t) => t.endsWith("^{commit}")),
+      result: { exitCode: 1 },
+    },
+  ]);
+  const lock = recordingLock();
+  const res = await mergeBranchInto("/wt", "src", run, lock.acquire);
+  expect(res).toEqual({ kind: "missing-source" });
+  // The probe short-circuits BEFORE merge-base, any merge, and any abort.
+  expect(
+    calls.some((c) => argvStartsWith(c.args, "merge-base", "--is-ancestor")),
+  ).toBe(false);
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--no-edit"))).toBe(
+    false,
+  );
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    false,
+  );
+  expect(lock.events).toEqual([]); // no lock taken on the phantom path
 });
 
 // ---------------------------------------------------------------------------

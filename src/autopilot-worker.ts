@@ -2204,13 +2204,18 @@ export function createWorktreeDriver(
             : parentBranch;
         await gitEnsureWorktree(repoDir, worktreePath, branch, forkSource, run);
         // Run the fan-in pre-merges in order — sequential pairwise, each taking the
-        // shared commit-work flock. A conflict aborts + fails loud + stops.
+        // shared commit-work flock. A content conflict aborts + fails loud + stops;
+        // a `missing-source` phantom lane (a branch never created because its task's
+        // work landed on the default branch) is a lossless no-op we skip.
         for (const source of preMerges) {
           const merge: MergeResult = await gitMergeBranchInto(
             worktreePath,
             source,
             run,
           );
+          if (merge.kind === "missing-source") {
+            continue; // phantom lane: nothing to merge, never created
+          }
           if (merge.kind === "conflict") {
             return {
               ok: false,
@@ -2282,6 +2287,8 @@ export function createWorktreeDriver(
             reason: `worktree-finalize-not-on-default: ${repoDir} HEAD is ${onDefault}, expected ${defaultBranch} for the base merge`,
           };
         }
+        // Pre-guarded by gitBranchExists above, so `missing-source` is unreachable
+        // here; any non-conflict result is an idempotently safe fall-through.
         const merge: MergeResult = await gitMergeBranchInto(
           repoDir,
           baseBranch,
@@ -2489,6 +2496,8 @@ export async function recoverWorktrees(
           });
           continue;
         }
+        // Sources from a live branch, so `missing-source` is unreachable here;
+        // any non-conflict result is an idempotently safe fall-through.
         const merge: MergeResult = acquireLock
           ? await gitMergeBranchInto(repo, base.branch, run, acquireLock)
           : await gitMergeBranchInto(repo, base.branch, run);

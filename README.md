@@ -3193,9 +3193,14 @@ OFF → repo on its default branch), and sets the launch cwd to the worktree pat
 Both HEAD assertions fail as sticky `DispatchFailed` (cleared by `retry_dispatch`),
 never `fatalExit`. Every merge takes the base worktree's own per-worktree
 `<--git-dir>/keeper-commit-work.lock` flock, serializing it against a
-`commit-work` in that SAME worktree (disjoint lanes take distinct locks); a
-conflict aborts (`git merge --abort`) + fails loud + stops (no merge-to-default,
-no teardown).
+`commit-work` in that SAME worktree (disjoint lanes take distinct locks). A
+pre-merge whose source ref does not resolve (a *phantom* lane never created
+because its task's work landed on the default branch — mixed-mode board history)
+is a lossless `missing-source` no-op: nothing to merge, so the pre-merge is
+skipped and the close still proceeds (probed before any lock/merge-base, so a
+real merge/is-ancestor failure is never masked). A genuine content conflict still
+aborts (`git merge --abort`) + fails loud + stops (no merge-to-default, no
+teardown).
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 (pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
