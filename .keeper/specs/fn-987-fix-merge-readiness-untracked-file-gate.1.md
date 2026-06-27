@@ -23,5 +23,5 @@ and folds into this same task/commit.
 - [ ] A `mergeReadiness` test asserts the untracked-only `ready` behavior (F4)
 
 ## Done summary
-
+Scoped mergeReadiness clean-tree probe to --untracked-files=no so a benign untracked file in the shared checkout no longer forces a never-finalizing skip-and-retry; staged/modified/unmerged WIP still blocks. Added the untracked-only ready test (F4).
 ## Evidence

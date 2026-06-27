@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Scope dirty gate to tracked state",
-  "updated_at": "2026-06-27T17:50:17.330000Z"
+  "updated_at": "2026-06-27T18:03:23.550000Z",
+  "worker_done_at": "2026-06-27T18:03:23.550000Z"
 }
