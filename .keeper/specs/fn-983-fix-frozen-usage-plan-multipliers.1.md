@@ -67,5 +67,5 @@
 - [ ] New tests cover the padded >1 MB valid-file resolution and the episode-throttled warning (once across two failures, again after recovery); `bun test test/usage-scraper-worker.test.ts` green
 
 ## Done summary
-
+Bumped MAX_CLAUDE_JSON_BYTES to 16MB so real multi-MB .claude.json files resolve the live tier; added an injected homeDir seam on resolveMultiplierOrNull and an exported episode-throttled reResolveMultiplier helper that warns once per failure onset. New tests cover >1MB resolution and the throttled-warning lifecycle.
 ## Evidence

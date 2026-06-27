@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Bump cap, seam, warn on resolve fail",
-  "updated_at": "2026-06-27T13:25:33.866000Z"
+  "updated_at": "2026-06-27T13:33:23.830000Z",
+  "worker_done_at": "2026-06-27T13:33:23.830000Z"
 }
