@@ -825,6 +825,25 @@ test("mergeReadiness: on-branch but a dirty/occupied tree → dirty with the por
   }
 });
 
+test("mergeReadiness: an untracked-only shared checkout → ready (probe excludes untracked)", async () => {
+  // The human's checkout holds a benign untracked file (editor temp, .env, an
+  // un-ignored artifact) a merge cannot disturb. The probe runs with
+  // `--untracked-files=no`, so real git reports an empty tree → ready, NOT a
+  // never-finalizing skip-and-retry.
+  const { run, calls } = fakeAsyncGit([
+    onBranchRule("main"),
+    {
+      when: (a) =>
+        argvStartsWith(a, "status", "--porcelain") &&
+        argvHas(a, "--untracked-files=no"),
+      // -uno suppresses the untracked `?? scratch.txt` line → empty output.
+      result: { exitCode: 0, stdout: "" },
+    },
+  ]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({ kind: "ready" });
+  expect(calls.some((c) => argvHas(c.args, "--untracked-files=no"))).toBe(true);
+});
+
 test("mergeReadiness: a mid-merge's unmerged entries surface as dirty (no separate MERGE_HEAD shell)", async () => {
   const { run, calls } = fakeAsyncGit([
     onBranchRule("main"),

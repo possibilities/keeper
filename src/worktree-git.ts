@@ -437,11 +437,14 @@ export async function isAncestorOf(
  * `expectedBranch`, clean working tree, no merge/rebase mid-flight. Two git reads:
  *  1. `git rev-parse --abbrev-ref HEAD` — off `expectedBranch` (incl. a detached
  *     HEAD from a mid-rebase, which reports `HEAD`) → `{ kind: "off-branch" }`.
- *  2. `git status --porcelain` — any output (uncommitted edits, staged work, or a
- *     stopped merge's unmerged entries) → `{ kind: "dirty" }`. A non-zero status
- *     exit is itself treated as not-ready (`dirty`, conservative). This single
- *     probe covers the mid-MERGE and conflict-paused-rebase cases without a
- *     separate `MERGE_HEAD` shell.
+ *  2. `git status --porcelain --untracked-files=no` — any output (uncommitted
+ *     edits, staged work, or a stopped merge's unmerged entries) → `{ kind:
+ *     "dirty" }`. Untracked files are EXCLUDED: a benign untracked file in the
+ *     human's shared checkout (editor temp, un-ignored artifact, a `.env`) a
+ *     merge cannot disturb must not force a never-finalizing skip-and-retry. A
+ *     non-zero status exit is itself treated as not-ready (`dirty`,
+ *     conservative). This single probe covers the mid-MERGE and conflict-paused-
+ *     rebase cases without a separate `MERGE_HEAD` shell.
  * Otherwise `{ kind: "ready" }`. Pure git reads — never a fetch / write. The
  * caller degrades a not-`ready` result to a clean skip-and-retry, never a merge.
  */
@@ -454,7 +457,9 @@ export async function mergeReadiness(
   if (head !== expectedBranch) {
     return { kind: "off-branch", head };
   }
-  const status = await run(["status", "--porcelain"], { cwd });
+  const status = await run(["status", "--porcelain", "--untracked-files=no"], {
+    cwd,
+  });
   const detail = (status.stdout + status.stderr).trim();
   if (status.code !== 0 || detail.length > 0) {
     return { kind: "dirty", detail };
