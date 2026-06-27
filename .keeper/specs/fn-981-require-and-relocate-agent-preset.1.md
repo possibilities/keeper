@@ -59,5 +59,5 @@ shared `PresetRegistry` type ripples every DI seam and won't compile half-done.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Relocated the agent launch-config into ~/.config/keeper/, split presets.yaml (catalog) + panel.yaml (selections), reversed the posture to required+validated (exit 2) across pair/dispatch/agent/panel with the worker as the sole fail-open carve-out. KEEPER_CONFIG_DIR is the single env seam; import-graph guards stay green.
 ## Evidence
