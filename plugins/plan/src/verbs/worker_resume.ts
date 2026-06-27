@@ -14,15 +14,15 @@
 // `resume`). The typed-error path is the plain {success:false, error:msg}
 // emitError shape (the invalid-id / spec-not-found message text carries the id).
 
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { join, resolve as resolveAbs } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { assembleBrief, writeBrief } from "../brief.ts";
 import { emitError, formatOutput, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
 import { resolveProject } from "../project.ts";
-import { expectedWorkerCwd } from "../runtime_status.ts";
+import { resolveWorkerRepos } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { LocalFileStateStore, loadJsonSafe } from "../store.ts";
 import { getVcs } from "../vcs.ts";
@@ -40,16 +40,6 @@ function readGitState(): string {
  * _find_source_commit_sha. */
 function findSourceCommitSha(taskId: string): string | null {
   return getVcs().firstSourceShaShort(taskId, process.cwd());
-}
-
-/** realpath(p), falling back to the absolute path when it can't be resolved. */
-function realpathOr(p: string): string {
-  const abs = resolveAbs(p);
-  try {
-    return realpathSync(abs);
-  } catch {
-    return abs;
-  }
 }
 
 export function runWorkerResume(opts: {
@@ -101,13 +91,14 @@ export function runWorkerResume(opts: {
     epicDef = loadJsonSafe(epicPath) ?? {};
   }
 
+  // target_repo follows the worker's lane (KEEPER_PLAN_WORKTREE override-aware);
+  // primary_repo / state_repo ALWAYS stay in the primary repo, never the lane —
+  // both via the one runtime seam.
   const projPath = ctx.projectPath;
-  const targetRepo = realpathOr(expectedWorkerCwd(taskDef, epicDef, projPath));
-  // Plan STATE always lives in the primary repo, never the lane worktree —
-  // resolve it from epic.primary_repo (populated at scaffold), NOT the
-  // KEEPER_PLAN_WORKTREE override. Only targetRepo follows the lane.
-  const primaryRepo = realpathOr(
-    (epicDef.primary_repo as string | null | undefined) || projPath,
+  const { targetRepo, primaryRepo } = resolveWorkerRepos(
+    taskDef,
+    epicDef,
+    projPath,
   );
   const stateRepo = primaryRepo;
 

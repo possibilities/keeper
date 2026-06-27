@@ -1,8 +1,11 @@
 // Runtime-status overlay helpers for the TS dispatcher (the sole plan runtime).
-// expectedWorkerCwd reads the KEEPER_PLAN_WORKTREE override and so is NOT pure —
-// see its note. The remaining helpers are deterministic given their inputs.
-// resolve-task and the post-worker verbs read the expected worker/closer cwd off
-// these.
+// resolveWorkerRepos is the ONE seam every runtime emitter (claim, resolve-task,
+// worker-resume, reconcile) routes through to get its {targetRepo, primaryRepo}
+// pair; it reads the KEEPER_PLAN_WORKTREE override via expectedWorkerCwd and so
+// is NOT pure. The remaining helpers are deterministic given their inputs.
+
+import { realpathSync } from "node:fs";
+import { resolve as resolveAbs } from "node:path";
 
 /** The worktree-lane override: KEEPER_PLAN_WORKTREE. Empty/unset → undefined so
  * callers fall through to the ordinary fallback chain. Set producer-only at the
@@ -15,13 +18,29 @@ export function worktreeOverride(): string | undefined {
   return v ? v : undefined;
 }
 
-/** Expected cwd for a worker dispatched for `task` in `epic`. In worktree mode
- * the KEEPER_PLAN_WORKTREE lane override wins outright so concurrent lanes don't
- * collide in the shared main checkout; otherwise the three-level fallback
- * applies: task.target_repo -> epic.primary_repo -> proj (a null/empty level
- * falls through, so a record with both null lands on `proj`). Reads env via
- * worktreeOverride, so this helper is NOT pure. */
-export function expectedWorkerCwd(
+/** realpath(p), falling back to the absolute path when it can't be resolved —
+ * the Path(...).resolve() contract (resolve symlinks, but a non-existent path
+ * still normalizes to absolute). The ONE normalization the seam applies, so the
+ * value a worker's pwd check compares against has a single definition. Private:
+ * runtime emitters get the normalized pair from resolveWorkerRepos, never this. */
+function realpathOr(p: string): string {
+  const abs = resolveAbs(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/** Expected cwd for a worker dispatched for `task` in `epic` — the raw,
+ * un-normalized three-level fallback. In worktree mode the KEEPER_PLAN_WORKTREE
+ * lane override wins outright so concurrent lanes don't collide in the shared
+ * main checkout; otherwise: task.target_repo -> epic.primary_repo -> proj (a
+ * null/empty level falls through, so a record with both null lands on `proj`).
+ * Reads env via worktreeOverride, so this helper is NOT pure. PRIVATE to this
+ * module — the only override-aware fallback chain; runtime emitters route
+ * through resolveWorkerRepos so no verb re-derives it. */
+function expectedWorkerCwd(
   task: Record<string, unknown>,
   epic: Record<string, unknown>,
   proj: string,
@@ -32,6 +51,29 @@ export function expectedWorkerCwd(
     (epic.primary_repo as string | null | undefined) ||
     proj
   );
+}
+
+/** The canonical worker-repo resolver — the ONE seam every runtime emitter
+ * (claim, resolve-task, worker-resume, reconcile) routes through. Returns the
+ * realpath-normalized pair:
+ *   - targetRepo: override-aware (the worker's lane in worktree mode) via the
+ *     three-level fallback in expectedWorkerCwd; the worker cds here for code.
+ *   - primaryRepo: ALWAYS the primary repo (epic.primary_repo -> proj), NEVER
+ *     the lane — plan STATE must never persist a lane path.
+ * Persistence/report verbs (scaffold, refine-apply, mv-repo,
+ * task-set-target-repo, close-preflight, show) MUST NOT call this: routing them
+ * through the lane override would write a lane path into plan state. */
+export function resolveWorkerRepos(
+  task: Record<string, unknown>,
+  epic: Record<string, unknown>,
+  proj: string,
+): { targetRepo: string; primaryRepo: string } {
+  return {
+    targetRepo: realpathOr(expectedWorkerCwd(task, epic, proj)),
+    primaryRepo: realpathOr(
+      (epic.primary_repo as string | null | undefined) || proj,
+    ),
+  };
 }
 
 /** Expected cwd for a closer dispatched for `epic`. Two-level fallback:

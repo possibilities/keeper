@@ -23,7 +23,7 @@ import { isEpicId, isTaskId } from "../src/ids.ts";
 import type { ProjectContext } from "../src/project.ts";
 import {
   expectedCloserCwd,
-  expectedWorkerCwd,
+  resolveWorkerRepos,
   worktreeOverride,
 } from "../src/runtime_status.ts";
 import { loadJson } from "../src/store.ts";
@@ -64,15 +64,31 @@ describe("taskSortKey / taskPriority", () => {
 });
 
 describe("runtime_status cwd fallbacks", () => {
-  test("worker cwd: target_repo -> primary_repo -> proj", () => {
+  // resolveWorkerRepos realpath-normalizes; non-existent absolute paths fall
+  // back to their lexical form unchanged, so the fallback chain is observable.
+  test("worker target_repo: target_repo -> primary_repo -> proj", () => {
     expect(
-      expectedWorkerCwd({ target_repo: "/t" }, { primary_repo: "/p" }, "/proj"),
+      resolveWorkerRepos({ target_repo: "/t" }, { primary_repo: "/p" }, "/proj")
+        .targetRepo,
     ).toBe("/t");
     expect(
-      expectedWorkerCwd({ target_repo: null }, { primary_repo: "/p" }, "/proj"),
+      resolveWorkerRepos({ target_repo: null }, { primary_repo: "/p" }, "/proj")
+        .targetRepo,
     ).toBe("/p");
     expect(
-      expectedWorkerCwd({ target_repo: null }, { primary_repo: null }, "/proj"),
+      resolveWorkerRepos({ target_repo: null }, { primary_repo: null }, "/proj")
+        .targetRepo,
+    ).toBe("/proj");
+  });
+
+  test("worker primary_repo: epic.primary_repo -> proj, never the lane", () => {
+    expect(
+      resolveWorkerRepos({ target_repo: "/t" }, { primary_repo: "/p" }, "/proj")
+        .primaryRepo,
+    ).toBe("/p");
+    expect(
+      resolveWorkerRepos({ target_repo: "/t" }, { primary_repo: null }, "/proj")
+        .primaryRepo,
     ).toBe("/proj");
   });
 
@@ -81,18 +97,19 @@ describe("runtime_status cwd fallbacks", () => {
     expect(expectedCloserCwd({ primary_repo: null }, "/proj")).toBe("/proj");
   });
 
-  test("KEEPER_PLAN_WORKTREE override wins over the worker fallback chain", () => {
+  test("KEEPER_PLAN_WORKTREE override moves target_repo only, not primary_repo", () => {
     const prev = process.env.KEEPER_PLAN_WORKTREE;
     try {
       process.env.KEEPER_PLAN_WORKTREE = "/lane";
-      // The override beats an explicit target_repo (worktree-mode isolation).
-      expect(
-        expectedWorkerCwd(
-          { target_repo: "/t" },
-          { primary_repo: "/p" },
-          "/proj",
-        ),
-      ).toBe("/lane");
+      // The override beats an explicit target_repo (worktree-mode isolation)...
+      const repos = resolveWorkerRepos(
+        { target_repo: "/t" },
+        { primary_repo: "/p" },
+        "/proj",
+      );
+      expect(repos.targetRepo).toBe("/lane");
+      // ...but plan STATE stays on the primary repo, never the lane.
+      expect(repos.primaryRepo).toBe("/p");
       expect(worktreeOverride()).toBe("/lane");
     } finally {
       if (prev === undefined) {
@@ -110,36 +127,36 @@ describe("runtime_status cwd fallbacks", () => {
       process.env.KEEPER_PLAN_WORKTREE = "";
       expect(worktreeOverride()).toBeUndefined();
       expect(
-        expectedWorkerCwd(
+        resolveWorkerRepos(
           { target_repo: "/t" },
           { primary_repo: "/p" },
           "/proj",
-        ),
+        ).targetRepo,
       ).toBe("/t");
 
       // Unset → identical to today's fallback at every level.
       delete process.env.KEEPER_PLAN_WORKTREE;
       expect(worktreeOverride()).toBeUndefined();
       expect(
-        expectedWorkerCwd(
+        resolveWorkerRepos(
           { target_repo: "/t" },
           { primary_repo: "/p" },
           "/proj",
-        ),
+        ).targetRepo,
       ).toBe("/t");
       expect(
-        expectedWorkerCwd(
+        resolveWorkerRepos(
           { target_repo: null },
           { primary_repo: "/p" },
           "/proj",
-        ),
+        ).targetRepo,
       ).toBe("/p");
       expect(
-        expectedWorkerCwd(
+        resolveWorkerRepos(
           { target_repo: null },
           { primary_repo: null },
           "/proj",
-        ),
+        ).targetRepo,
       ).toBe("/proj");
     } finally {
       if (prev === undefined) {
