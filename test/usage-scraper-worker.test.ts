@@ -16,6 +16,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -40,6 +41,8 @@ import {
   liftIsInFuture,
   localIsoWithOffset,
   ProfileGate,
+  reResolveMultiplier,
+  resolveMultiplierOrNull,
   TargetMutex,
 } from "../src/usage-scraper-worker";
 import { isUsageFilename } from "../src/usage-worker";
@@ -619,5 +622,88 @@ describe("ProfileGate / TargetMutex serialization", () => {
     const release = await gate.acquire(liveSignal);
     expect(typeof release).toBe("function");
     release();
+  });
+});
+
+// Write `<tmpHome>/.claude-profiles/<profile>/.claude.json` with the given tier,
+// padded past `padBytes` so the size guard is exercised against a realistic file.
+function writeProfileClaudeJson(
+  home: string,
+  profile: string,
+  tier: string | null,
+  padBytes = 0,
+): void {
+  const dir = join(home, ".claude-profiles", profile);
+  mkdirSync(dir, { recursive: true });
+  const body: Record<string, unknown> = {
+    oauthAccount: tier === null ? {} : { organizationRateLimitTier: tier },
+    _pad: "x".repeat(padBytes),
+  };
+  writeFileSync(join(dir, ".claude.json"), JSON.stringify(body));
+}
+
+describe("resolveMultiplierOrNull (injected home seam)", () => {
+  test("resolves a >1 MB valid .claude.json to the correct multiplier", () => {
+    writeProfileClaudeJson(
+      tmpDir,
+      "default",
+      "default_claude_max_20x",
+      2 * 1024 * 1024,
+    );
+    const path = join(tmpDir, ".claude-profiles", "default", ".claude.json");
+    // The file is genuinely past the old 1 MB cap that froze multipliers at 1x.
+    expect(readFileSync(path, "utf8").length).toBeGreaterThan(1024 * 1024);
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBe(20);
+  });
+
+  test("maps the 5x tier and returns null on an unknown/missing tier", () => {
+    writeProfileClaudeJson(tmpDir, "multi-claude-1", "default_claude_max_5x");
+    expect(resolveMultiplierOrNull("multi-claude-1", tmpDir)).toBe(5);
+    writeProfileClaudeJson(tmpDir, "mystery", "default_claude_ultra_99x");
+    expect(resolveMultiplierOrNull("mystery", tmpDir)).toBeNull();
+    expect(resolveMultiplierOrNull("absent", tmpDir)).toBeNull();
+  });
+});
+
+describe("reResolveMultiplier episode-throttled warning", () => {
+  test("logs once across consecutive failures and re-arms after a recovery", () => {
+    const logs: string[] = [];
+    const log = (msg: string) => logs.push(msg);
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 20,
+    };
+
+    // No .claude.json yet → resolve fails: keep prior 20x, log exactly once.
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBe(20);
+    expect(acct.tierResolveFailed).toBe(true);
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("default");
+    expect(logs[0]).toContain("20");
+
+    // Second consecutive failure: still kept, no new log (episode throttle).
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBe(20);
+    expect(logs.length).toBe(1);
+
+    // Recovery re-arms the warning and clears the flag.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBe(5);
+    expect(acct.tierResolveFailed).toBe(false);
+    expect(logs.length).toBe(1);
+
+    // A subsequent failure logs again (the episode re-opened).
+    rmSync(join(tmpDir, ".claude-profiles", "default"), {
+      recursive: true,
+      force: true,
+    });
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBe(5);
+    expect(acct.tierResolveFailed).toBe(true);
+    expect(logs.length).toBe(2);
   });
 });

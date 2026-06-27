@@ -89,8 +89,12 @@ const MIN_PROFILE_USE_INTERVAL_S = 60.0;
 const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MIN_S = 15 * 60;
 const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MAX_S = 30 * 60;
 
-/** Cap a `.claude.json` read so a pathological file never balloons boot memory. */
-const MAX_CLAUDE_JSON_BYTES = 1024 * 1024;
+/**
+ * Cap a `.claude.json` read so a runaway file never balloons boot memory. Real
+ * configs run 1.7-2.4 MB and grow with history, so the cap only fences off a
+ * pathological file — set well above the live range with headroom to spare.
+ */
+const MAX_CLAUDE_JSON_BYTES = 16 * 1024 * 1024;
 
 /**
  * Plan-tier string → multiplier. Source of truth:
@@ -112,6 +116,8 @@ export interface Account {
   profile: string;
   /** Mutable multiplier — the keep-prior carrier across a failed tier re-resolve. */
   multiplier: number;
+  /** Per-account episode flag: a tier resolve is currently failing (warning already fired). */
+  tierResolveFailed?: boolean;
 }
 
 /** Canonical envelope key order — every variant emits exactly these keys. */
@@ -182,8 +188,11 @@ export function loadProfileNames(): string[] {
  * on `null` so a transient blip never downgrades a Max account. Mirrors the
  * daemon's `_resolve_multiplier_or_none`. Pure-ish (reads the fs); never throws.
  */
-export function resolveMultiplierOrNull(profile: string): number | null {
-  const path = join(homedir(), ".claude-profiles", profile, ".claude.json");
+export function resolveMultiplierOrNull(
+  profile: string,
+  homeDir: string = homedir(),
+): number | null {
+  const path = join(homeDir, ".claude-profiles", profile, ".claude.json");
   let data: unknown;
   try {
     const st = statSync(path);
@@ -208,6 +217,32 @@ export function resolveMultiplierOrNull(profile: string): number | null {
 /** Boot-time multiplier with a 1x fallback (no prior to keep at boot). */
 function resolveMultiplier(profile: string): number {
   return resolveMultiplierOrNull(profile) ?? 1;
+}
+
+/**
+ * Per-cycle tier re-resolve with keep-prior + episode-throttled warning. On a
+ * non-null result, adopt it and clear the failure flag (re-arming the warning).
+ * On `null`, KEEP `acct.multiplier` and — only at failure onset, gated by
+ * `tierResolveFailed` — fire exactly one `log(...)` so a silent freeze (file
+ * past the cap, unknown tier) becomes visible instead of recurring per cycle.
+ */
+export function reResolveMultiplier(
+  acct: Account,
+  homeDir: string = homedir(),
+  log: (msg: string) => void = console.error,
+): void {
+  const resolved = resolveMultiplierOrNull(acct.profile, homeDir);
+  if (resolved !== null) {
+    acct.multiplier = resolved;
+    acct.tierResolveFailed = false;
+    return;
+  }
+  if (!acct.tierResolveFailed) {
+    acct.tierResolveFailed = true;
+    log(
+      `[usage-scraper] tier resolve failed for ${JSON.stringify(acct.id)}; keeping prior multiplier ${acct.multiplier}x`,
+    );
+  }
 }
 
 /**
@@ -718,10 +753,7 @@ export class AccountLoop {
     // the envelope within one window). KEEP THE PRIOR on a null read — the
     // mutable `acct.multiplier` is the carrier, so a Max account never downgrades.
     if (acct.target === "claude") {
-      const resolved = resolveMultiplierOrNull(acct.profile);
-      if (resolved !== null) {
-        acct.multiplier = resolved;
-      }
+      reResolveMultiplier(acct);
     }
 
     // Idle / cooldown gates — only when a prior envelope exists AND it is not
