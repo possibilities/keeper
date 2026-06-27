@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "single worker-repo resolution seam",
-  "updated_at": "2026-06-27T14:59:28.511000Z"
+  "updated_at": "2026-06-27T15:14:52.213000Z",
+  "worker_done_at": "2026-06-27T15:14:52.213000Z"
 }

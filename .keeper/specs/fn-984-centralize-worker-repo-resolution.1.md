@@ -35,5 +35,5 @@ Mirror the existing saga-* override cases against the centralized seam: every ro
 - [ ] saga-claim / saga-worker-resume / saga-validate-resolve / saga-reconcile pass unchanged; typecheck + lint green.
 
 ## Done summary
-
+Centralized worker repo resolution into one runtime seam (resolveWorkerRepos in runtime_status.ts); claim/resolve_task/worker_resume/reconcile route through it, the 3-level fallback is now module-private, and the six persistence verbs stay unrouted. Existing override tests green, default bun test stays pure.
 ## Evidence
