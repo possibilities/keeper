@@ -51,6 +51,6 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `keeper plan
 |------|---------|
 | Lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
 | Typecheck | `bun run typecheck` — `tsc --noEmit` |
-| Test (fast gate) | `bun test` — the living suite, fully in-process + zero real git; the only skips are src-commit.test.ts's real-git `autoCommitFromInvocation` blocks (gated `describe.skipIf(!SLOW_ENABLED)`) |
-| Test (real-git slow tier) | `bun run test:slow` (`KEEPER_PLAN_RUN_SLOW=1 bun test`) — adds src-commit.test.ts's real-git commit blocks (index.lock contention-retry + prev-sha resolution, the only behaviors with no fake-VCS analogue). No `bun run build` needed — no test spawns the compiled binary |
+| Test (fast gate) | `bun test` — the living suite, fully in-process + zero real git; the only skips are the real-git slow-tier blocks gated `describe.skipIf(!SLOW_ENABLED)` (src-commit.test.ts's `autoCommitFromInvocation` blocks + worktree-lifecycle.test.ts) |
+| Test (real-git slow tier) | `bun run test:slow` (`KEEPER_PLAN_RUN_SLOW=1 bun test`) — adds the real-git blocks with no fake-VCS analogue: src-commit.test.ts's commit path (index.lock contention-retry + prev-sha resolution) and worktree-lifecycle.test.ts's full lane cycle (provision → claim-in-lane → commit → merge → teardown under polluted GIT_*). No `bun run build` needed — no test spawns the compiled binary |
 | Build | `bun run build` — compiles `dist/keeper-plan-bun` via `bun build --compile` (Bun pinned at 1.3.14) |
