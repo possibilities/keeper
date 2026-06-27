@@ -48,5 +48,5 @@ resolve to the MAIN repo while `target_repo` follows the lane.
 - [ ] `ty` clean; `bun test` green; committed via keeper commit-work
 
 ## Done summary
-
+Removed KEEPER_PLAN_WORKTREE override from primaryRepo/stateRepo resolution in reconcile/resolve-task/worker-resume so plan state always resolves to the primary repo (mirrors close_finalize); target_repo still follows the lane. Narrowed the CLAUDE.md doc and added fast-tier coverage.
 ## Evidence

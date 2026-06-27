@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Plan-state repo always resolves to primary",
-  "updated_at": "2026-06-27T05:02:45.222000Z"
+  "updated_at": "2026-06-27T07:23:46.877000Z",
+  "worker_done_at": "2026-06-27T07:23:46.877000Z"
 }
