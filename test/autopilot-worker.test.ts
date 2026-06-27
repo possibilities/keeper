@@ -43,6 +43,7 @@ import {
   confirmRunning,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
+  type DispatchClearedPayload,
   type DispatchedAck,
   type DispatchedPayload,
   type DispatchFailedPayload,
@@ -55,6 +56,7 @@ import {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isWorktreeRecoverReason,
   type LaunchResult,
   type LiveDispatch,
   loadReconcileSnapshot,
@@ -63,6 +65,7 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
+  recoverFailuresToClear,
   recoverWorktrees,
   refreshSuppressionForOpenPending,
   reposForRecovery,
@@ -175,6 +178,7 @@ function makeSnapshot(
     subagentInvocations: [],
     gitStatusByProjectDir: new Map(),
     failedKeys: new Set(),
+    recoverFailureIds: new Set(),
     liveTabKeys: new Set(),
     // fn-811: read-time backend liveness. Default `null` (probe unavailable) so
     // every pre-fn-811 test keeps the old stopped-always-occupies behavior; the
@@ -254,6 +258,7 @@ interface FakeDepsLog {
     spec?: LaunchSpec;
   }>;
   emissions: DispatchFailedPayload[];
+  clears: DispatchClearedPayload[];
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
   maxEventIdCalls: number;
@@ -320,6 +325,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
   const log: FakeDepsLog = {
     launches: [],
     emissions: [],
+    clears: [],
     dispatchedEmissions: [],
     findJobCalls: [],
     maxEventIdCalls: 0,
@@ -345,6 +351,9 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     emitDispatchFailed(payload) {
       log.emissions.push({ ...payload });
+    },
+    emitDispatchCleared(payload) {
+      log.clears.push({ ...payload });
     },
     async emitDispatched(payload) {
       log.dispatchedEmissions.push({ ...payload });
@@ -5554,4 +5563,176 @@ test("fn-959.7 isEpicDoneById: pk-lookup resolves a DONE epic unbounded by the r
     const snap = await loadReconcileSnapshot(db);
     expect(snap.epics.map((e) => e.epic_id)).not.toContain("fn-1-done");
   });
+});
+
+// ---------------------------------------------------------------------------
+// fn-982.1 — recover-failure level-triggered auto-clear + prune-at-close
+// ---------------------------------------------------------------------------
+
+test("fn-982 isWorktreeRecoverReason: recover reasons match, finalize/other reasons do not", () => {
+  // Every recoverWorktrees failure carries the `worktree-recover` marker.
+  expect(isWorktreeRecoverReason("worktree-recover-conflict: …")).toBe(true);
+  expect(isWorktreeRecoverReason("worktree-recover-push-failed: …")).toBe(true);
+  expect(isWorktreeRecoverReason("worktree-recover-not-on-default: …")).toBe(
+    true,
+  );
+  // The close-sink (finalizeEpic) failures share the `close::<id>` key but are
+  // NOT recover-originated — the clobber guard hinges on excluding them.
+  expect(isWorktreeRecoverReason("worktree-finalize-conflict: …")).toBe(false);
+  expect(isWorktreeRecoverReason("worktree-teardown-dirty: …")).toBe(false);
+  expect(isWorktreeRecoverReason("not-on-default-branch: …")).toBe(false);
+});
+
+test("fn-982 recoverFailuresToClear: an open recover id with NO fresh failure this cycle → cleared", () => {
+  // The branch was deleted / conflict resolved / epic reaped — recover emits no
+  // failure for it this cycle, so its sticky row auto-clears (no retry_dispatch).
+  const open = new Set(["fn-1-foo", "fn-2-bar"]);
+  const fresh: WorktreeRecoveryFailure[] = [
+    {
+      epicId: "fn-2-bar",
+      reason: "worktree-recover-conflict: …",
+      dir: "/repo",
+    },
+  ];
+  // fn-1-foo resolved (absent from fresh) → cleared; fn-2-bar still failing → kept.
+  expect(recoverFailuresToClear(open, fresh)).toEqual(["fn-1-foo"]);
+});
+
+test("fn-982 recoverFailuresToClear: a still-failing recover id is NOT cleared (fail-loud preserved)", () => {
+  const open = new Set(["fn-1-foo"]);
+  const fresh: WorktreeRecoveryFailure[] = [
+    {
+      epicId: "fn-1-foo",
+      reason: "worktree-recover-conflict: …",
+      dir: "/repo",
+    },
+  ];
+  expect(recoverFailuresToClear(open, fresh)).toEqual([]);
+});
+
+test("fn-982 recoverFailuresToClear: a path-tied recover id keys on the dir slug", () => {
+  // A no-epic recovery failure keys on worktreeRecoverDispatchId(dir); the clear
+  // set must match that same id form so a resolved path-tied row clears too.
+  const pathId = worktreeRecoverDispatchId("/repo");
+  const open = new Set([pathId]);
+  // This cycle the same dir STILL fails (path-tied) → not cleared.
+  const stillFailing: WorktreeRecoveryFailure[] = [
+    { epicId: null, reason: "worktree-recover-abort-failed: …", dir: "/repo" },
+  ];
+  expect(recoverFailuresToClear(open, stillFailing)).toEqual([]);
+  // Next cycle the dir is clean (no failure) → the path-tied row clears.
+  expect(recoverFailuresToClear(open, [])).toEqual([pathId]);
+});
+
+test("fn-982 loadReconcileSnapshot.recoverFailureIds: scopes to recover-reason close rows, excludes finalize close rows (clobber guard)", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (verb: string, id: string, reason: string): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [verb, id, reason, "/repo", 1, 1, 1, 1],
+      );
+    };
+    // A recover-originated close failure → eligible for auto-clear.
+    insert("close", "fn-1-foo", "worktree-recover-conflict: merging …");
+    // A NORMAL close-sink (finalize) failure sharing the close key shape → must
+    // be EXCLUDED so the auto-clear never dismisses a legitimate block.
+    insert("close", "fn-2-bar", "worktree-finalize-conflict: merging …");
+    // A path-tied recover row keys on the slug, verb close → eligible.
+    insert(
+      "close",
+      worktreeRecoverDispatchId("/repo"),
+      "worktree-recover-abort-failed: …",
+    );
+    // A non-close failure even with a recover-ish reason → excluded (verb gate).
+    insert("work", "fn-9-baz.1", "worktree-recover-conflict: …");
+
+    const snap = await loadReconcileSnapshot(db);
+    expect([...snap.recoverFailureIds].sort()).toEqual(
+      ["fn-1-foo", worktreeRecoverDispatchId("/repo")].sort(),
+    );
+    // Every row still gates dispatch via failedKeys (auto-clear scoping is
+    // orthogonal to the suppression arm).
+    expect(snap.failedKeys.has("close::fn-2-bar")).toBe(true);
+  });
+});
+
+test("fn-982 finalizeEpic: a fully-merged lane base is pruned (branch -D) after teardown", async () => {
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base exists / source exists
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // already an ancestor → fully merged
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+  );
+  expect(res).toEqual({ ok: true });
+  // The fully-merged base branch was force-deleted so a DONE epic leaves no
+  // recover-able `keeper/epic/<id>` branch behind (the fn-973 pileup fix).
+  expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
+});
+
+test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ancestor of default is never force-deleted", async () => {
+  // The prune re-checks is-ancestor against the resolved DEFAULT BRANCH as its
+  // gate (a distinct call from mergeBranchInto's internal is-ancestor-vs-HEAD
+  // skip). Force that gate FALSE — the base is not contained in default — and the
+  // branch survives: `branch -D` force-deletes regardless of merge state, so an
+  // unmerged/diverged base would lose work. (A real diverged base hits the merge-
+  // conflict early-return, which takes the FFI flock the fast tier stubs out — so
+  // this isolates the guard via the gate's own distinct arg.)
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo HEAD") {
+      return { code: 0, stdout: "", stderr: "" }; // merge: already-merged skip (no flock)
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      return { code: 1, stdout: "", stderr: "" }; // prune gate: NOT an ancestor → skip
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+  );
+  expect(res).toEqual({ ok: true });
+  // The gate said "not an ancestor" → the branch was preserved, never deleted.
+  expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
 });

@@ -24,6 +24,7 @@ import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
   AutopilotWorkerData,
+  DispatchClearedMessage,
   DispatchExpiredMessage,
   DispatchedAckMessage,
   DispatchedMessage,
@@ -4046,6 +4047,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     aw.onmessage = (
       ev: MessageEvent<
         | DispatchFailedMessage
+        | DispatchClearedMessage
         | DispatchedMessage
         | DispatchExpiredMessage
         | BackstopMessage
@@ -4062,6 +4064,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       if (msg.kind === "dispatch-failed") {
         handleDispatchFailedMint(msg.payload);
+      } else if (msg.kind === "dispatch-cleared") {
+        handleDispatchClearedMint(msg.payload);
       } else if (msg.kind === "dispatched-request") {
         // Durable mint-before-launch: insert the `Dispatched` event, then reply
         // `dispatched-ack{id, ok}` so the worker only `launch()`es AFTER the row
@@ -4341,6 +4345,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // an extra retry round-trip, not a correctness hazard).
       console.error(
         `[keeperd] DispatchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint a synthetic `DispatchCleared` event on behalf of the recover glue's
+   * level-triggered auto-clear, symmetric with {@link handleDispatchFailedMint}.
+   * Reuses {@link mintDispatchClearedEvent} — the EXACT path the `retry_dispatch`
+   * RPC drives — so the clear round-trips through one event arm. NON-FATAL on
+   * insert failure: the row stays sticky and the next recover cycle re-clears.
+   */
+  function handleDispatchClearedMint(
+    payload: DispatchClearedMessage["payload"],
+  ): void {
+    try {
+      mintDispatchClearedEvent(payload.verb, payload.id);
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] DispatchCleared mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

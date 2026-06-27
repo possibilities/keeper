@@ -92,6 +92,7 @@ import {
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
   currentBranch as gitCurrentBranch,
+  deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
   epicBaseHasDoneState as gitEpicBaseHasDoneState,
   isAncestorOf as gitIsAncestorOf,
@@ -392,6 +393,47 @@ export function worktreeRecoverDispatchId(dir: string): string {
 }
 
 /**
+ * The `reason` prefix every {@link recoverWorktrees} failure carries
+ * (`worktree-recover-conflict`, `-push-failed`, `-not-on-default`, …). The
+ * level-triggered auto-clear keys on it to scope clearing to RECOVER-originated
+ * `dispatch_failures` rows ONLY: a normal close-sink failure (`finalizeEpic`'s
+ * `worktree-finalize-*`) can share the same `close::<epicId>` key, and clearing
+ * that one would silently dismiss a legitimate block.
+ */
+export const WORKTREE_RECOVER_REASON_PREFIX = "worktree-recover";
+
+/** Whether a `dispatch_failures.reason` originated in {@link recoverWorktrees}. */
+export function isWorktreeRecoverReason(reason: string): boolean {
+  return reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX);
+}
+
+/**
+ * Level-triggered auto-clear set: given the OPEN recover-originated dispatch ids
+ * (`snapshot.recoverFailureIds`) and THIS cycle's fresh recover failures, return
+ * the ids whose underlying git has since resolved (the junk branch was deleted,
+ * the conflict was merged, or the epic was reaped) — i.e. an open recover row
+ * with NO matching fresh failure this cycle. The caller mints a `DispatchCleared`
+ * for each so a human just fixes the git and the next cycle clears the block, no
+ * `retry_dispatch`. Pure: a function of the two inputs, no git, no clock.
+ */
+export function recoverFailuresToClear(
+  openRecoverIds: ReadonlySet<string>,
+  freshFailures: readonly WorktreeRecoveryFailure[],
+): string[] {
+  const stillFailing = new Set<string>();
+  for (const f of freshFailures) {
+    stillFailing.add(f.epicId ?? worktreeRecoverDispatchId(f.dir));
+  }
+  const cleared: string[] = [];
+  for (const id of openRecoverIds) {
+    if (!stillFailing.has(id)) {
+      cleared.push(id);
+    }
+  }
+  return cleared;
+}
+
+/**
  * Pure cooldown predicate. `true` IFF `key` was dispatched within the last
  * `REDISPATCH_COOLDOWN_S` seconds. An absent entry is NOT in cooldown. Read
  * inside the pure `reconcile`; the Map is mutated only in the cycle glue.
@@ -446,6 +488,15 @@ export interface ReconcileSnapshot {
    * are sticky until a human `retry_dispatch` mints a `DispatchCleared`.
    */
   failedKeys: Set<DispatchKey>;
+  /**
+   * The `id`s of every OPEN `close::<id>` dispatch-failure row minted by the
+   * worktree RECOVER pass (its `reason` carries the {@link
+   * WORKTREE_RECOVER_REASON_PREFIX} marker). The recover glue level-clears any of
+   * these absent from the current cycle's fresh recover failures (the underlying
+   * git resolved). SCOPED to the recover reason so a normal close-sink failure
+   * (`finalizeEpic`) sharing the `close::<id>` key is NEVER auto-dismissed.
+   */
+  recoverFailureIds: Set<string>;
   /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
@@ -805,6 +856,14 @@ export interface ConfirmRunningDeps {
    */
   emitDispatchFailed(payload: DispatchFailedPayload): void;
   /**
+   * Emit a synthetic `DispatchCleared` event (via the parent thread — workers
+   * never write the DB), symmetric with {@link emitDispatchFailed}. Reuses the
+   * SAME `mintDispatchClearedEvent` path `retry_dispatch` drives. The recover
+   * glue calls this to level-triggered-clear a sticky recover failure once its
+   * underlying git is resolved, so no operator `retry_dispatch` is needed.
+   */
+  emitDispatchCleared(payload: DispatchClearedPayload): void;
+  /**
    * Emit a synthetic `Dispatched` event (via main — workers never write the DB)
    * AND AWAIT a durable ack. Outbox-ordered intent: the reconciler mints this
    * BEFORE `launch()` and AWAITS the ack before launching — a fire-and-forget
@@ -1002,6 +1061,17 @@ export interface DispatchFailedPayload {
   reason: string;
   dir: string | null;
   ts: number;
+}
+
+/**
+ * Payload the reconciler hands to `emitDispatchCleared` — the `(verb, id)` whose
+ * sticky `dispatch_failures` row to DELETE. No `ts`: the clear is an idempotent
+ * fold-arm DELETE, so re-fold determinism needs no producer stamp (unlike a
+ * failure's `created_at`).
+ */
+export interface DispatchClearedPayload {
+  verb: Verb;
+  id: string;
 }
 
 /**
@@ -2497,6 +2567,17 @@ export function createWorktreeDriver(
             };
           }
         }
+        // Prune the now-merged lane base so a DONE epic never leaves a recover-able
+        // `keeper/epic/<id>` branch behind (the fn-973 pileup). AFTER teardown (the
+        // base worktree held the branch checked out, blocking the delete) and gated
+        // on is-ancestor: the merge above made the base an ancestor of default, so
+        // this is the fully-merged path ONLY — an unmerged/diverged base is NEVER
+        // deleted (that would lose work; it goes through the merge→conflict→fail-
+        // loud path instead). Best-effort: a delete refusal is a no-op (the recover
+        // pass skips the already-merged leftover as a backstop), never a failure.
+        if (await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run)) {
+          await gitDeleteBranch(repoDir, baseBranch, run);
+        }
         return { ok: true };
       } catch (err) {
         return {
@@ -2829,6 +2910,17 @@ export interface DispatchFailedMessage {
 }
 
 /**
+ * Worker → main: DispatchCleared mint request, symmetric with
+ * {@link DispatchFailedMessage}. Main is the sole writer of the synthetic event;
+ * the worker only describes the `(verb, id)` to clear. Drives the SAME
+ * `mintDispatchClearedEvent` path as the `retry_dispatch` RPC.
+ */
+export interface DispatchClearedMessage {
+  kind: "dispatch-cleared";
+  payload: DispatchClearedPayload;
+}
+
+/**
  * Worker → main: Dispatched mint request (id-correlated + durable-acked). Main
  * is the sole writer; the worker describes what to mint. Outbox-ordered intent —
  * posted BEFORE `launch()` so a crash between mint and the tab spawn leaves a
@@ -2959,11 +3051,23 @@ export async function loadReconcileSnapshot(
   );
 
   const failedKeys = new Set<DispatchKey>();
+  const recoverFailureIds = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
       failedKeys.add(dispatchKey(verb as Verb, id));
+      // A recover-originated `close::<id>` row is eligible for the glue's
+      // level-triggered auto-clear. Scope on the reason marker so a non-recover
+      // close failure sharing the key is excluded (the clobber guard).
+      const reason = (row as { reason?: unknown }).reason;
+      if (
+        verb === "close" &&
+        typeof reason === "string" &&
+        isWorktreeRecoverReason(reason)
+      ) {
+        recoverFailureIds.add(id);
+      }
     }
   }
 
@@ -3092,6 +3196,7 @@ export async function loadReconcileSnapshot(
     subagentInvocations,
     gitStatusByProjectDir,
     failedKeys,
+    recoverFailureIds,
     liveTabKeys,
     livePaneIds,
     pendingDispatches,
@@ -3322,6 +3427,12 @@ function main(): void {
         payload,
       } satisfies DispatchFailedMessage);
     },
+    emitDispatchCleared: (payload) => {
+      parentPort?.postMessage({
+        kind: "dispatch-cleared",
+        payload,
+      } satisfies DispatchClearedMessage);
+    },
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
         // Post an id-correlated request and AWAIT main's durable insert ack.
@@ -3492,6 +3603,21 @@ function main(): void {
                 dir: f.dir,
                 ts: deps.now(),
               });
+            }
+            // Level-triggered auto-clear: a recover failure is a permanent state
+            // for the current refs — fail LOUD and block the lane, but the moment
+            // the git is resolved (junk branch deleted / conflict merged / epic
+            // reaped) the next cycle observes NO matching failure and clears the
+            // sticky row, so a human never needs `retry_dispatch`. Scoped to
+            // recover-reason rows (recoverFailureIds) so a normal close-sink
+            // failure sharing the `close::<id>` key is never clobbered. Runs ONLY
+            // inside this not-paused worktree-mode block — i.e. only when the
+            // recover pass actually ran — so a pause never clears a live block.
+            for (const id of recoverFailuresToClear(
+              snapshot.recoverFailureIds,
+              failures,
+            )) {
+              deps.emitDispatchCleared({ verb: "close", id });
             }
           } catch (err) {
             console.error(

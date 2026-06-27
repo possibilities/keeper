@@ -3214,7 +3214,18 @@ Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
 pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
-`keeper/epic/*` scan decoupled from the recent-done window. Each epic's
+`keeper/epic/*` scan decoupled from the recent-done window. A recover merge
+conflict still fails LOUD and blocks ONLY its own `close::<epic>` key (per-key
+`failedKeys`) — but it is LEVEL-TRIGGERED, never a sticky board-jam: each cycle
+re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the sticky
+row (a synthetic `DispatchCleared`, the same fold arm `retry_dispatch` mints) the
+moment the git resolves — junk branch deleted, conflict merged, or epic reaped —
+so a human just fixes the git, never `retry_dispatch`. The auto-clear is SCOPED to
+recover-reason rows (`worktree-recover*`) so a normal close-sink (`finalizeEpic`)
+failure sharing the `close::<epic>` key is never clobbered. A successful close
+prunes its now-merged lane base (`git branch -D keeper/epic/<id>`, gated on
+is-ancestor so an unmerged/diverged branch is NEVER force-deleted), so a DONE epic
+leaves no recover-able branch behind. Each epic's
 `target_repo`/`project_dir` are RESOLVED to git toplevels ONCE in the producer
 snapshot-build (`classifyWorktreeRepos` + the nullable `memoizedNullableGitToplevel`,
 a fresh per-cycle memo) before the lane geometry compares + places lanes, so the

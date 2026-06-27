@@ -288,6 +288,24 @@ export async function branchExists(
   return r.code === 0;
 }
 
+/**
+ * Delete a local branch (`git branch -D <branch>`), best-effort. Returns `true`
+ * when the delete succeeded, `false` when git refused it — most commonly because
+ * the branch is still checked out in a live worktree (the caller deletes only
+ * AFTER teardown) or never existed. NEVER throws: the prune is a leftover cleanup,
+ * never a hard failure, so a refusal is a silent no-op the recover backstop sweeps
+ * later. Caller MUST gate on `isAncestorOf` first — `-D` force-deletes regardless
+ * of merge state, so an unmerged/diverged branch would lose work.
+ */
+export async function deleteBranch(
+  cwd: string,
+  branch: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const r = await run(["branch", "-D", branch], { cwd });
+  return r.code === 0;
+}
+
 /** True IFF `cwd` is inside a linked git worktree (submodule-guarded). */
 export async function isLinkedWorktree(
   cwd: string,

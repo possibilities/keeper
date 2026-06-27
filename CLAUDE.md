@@ -113,4 +113,4 @@ imperative guardrails only.
   `PRAGMA data_version`. An unpaused autopilot that "does nothing" is almost always a readiness gate
   firing correctly (`src/readiness.ts` `computeReadiness`); the `[paused]` banner is authoritative. For
   modes, caps, cooldown, reaps, and the four reapers, read `src/autopilot-worker.ts` + README.
-- **Worktree mode** (durable `autopilot_state` column, default OFF, set via `set_autopilot_config` — no new RPC) **is PRODUCER-ONLY**: lanes re-derived each cycle from the DAG + live git, never a fold (see README).
+- **Worktree mode** (durable `autopilot_state` column, default OFF, set via `set_autopilot_config` — no new RPC) **is PRODUCER-ONLY**: lanes re-derived each cycle from the DAG + live git, never a fold (see README). The recover pass's level-triggered auto-clear of a `close::<epic>` failure MUST stay scoped to recover-reason rows (`worktree-recover*`) — a `finalizeEpic` close-sink failure shares that key and must NEVER be auto-dismissed.
