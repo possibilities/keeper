@@ -438,7 +438,7 @@ test("ensureWorktree: path occupied by a DIFFERENT branch → throws loud", asyn
       "worktree /repo.worktrees/keeper-epic-e-B\nHEAD x\nbranch refs/heads/other\n\n",
     ),
   ]);
-  await expect(
+  expect(
     ensureWorktree(
       "/repo",
       "/repo.worktrees/keeper-epic-e-B",
@@ -549,7 +549,7 @@ test("ensureWorktree: a failing add throws with git stderr", async () => {
       result: { exitCode: 128, stderr: "fatal: boom" },
     },
   ]);
-  await expect(ensureWorktree("/repo", "/p", "b", "c", run)).rejects.toThrow(
+  expect(ensureWorktree("/repo", "/p", "b", "c", run)).rejects.toThrow(
     /fatal: boom/,
   );
 });
