@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-27T17:50:17.330000Z",
+  "depends_on": [],
+  "epic": "fn-987-fix-merge-readiness-untracked-file-gate",
+  "id": "fn-987-fix-merge-readiness-untracked-file-gate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Scope dirty gate to tracked state",
+  "updated_at": "2026-06-27T17:50:17.330000Z"
+}
