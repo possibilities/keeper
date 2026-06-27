@@ -133,8 +133,11 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     const baseLane = realpathSync(reserved);
     commitEpicDone(baseLane, epicId);
 
-    // The human has uncommitted work in the shared main checkout.
+    // The human has uncommitted work in the shared main checkout. Stage it so
+    // the readiness check (status --porcelain --untracked-files=no) sees it as
+    // dirty — an untracked-only tree is intentionally treated as clean now.
     writeFileSync(join(main, "human-wip.txt"), "do not stomp me\n");
+    git(["add", "human-wip.txt"], main);
     const mainHeadBefore = headSha(main);
 
     const res = await createWorktreeDriver().finalizeEpic(

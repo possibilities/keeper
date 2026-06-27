@@ -5333,7 +5333,7 @@ function makeRecoveryGit(state: {
         stderr: "",
       };
     }
-    if (joined === "status --porcelain") {
+    if (joined.startsWith("status --porcelain")) {
       return { code: 0, stdout: state.dirtyStatus ?? "", stderr: "" };
     }
     if (
@@ -5984,7 +5984,7 @@ function makeFinalizeReadinessRun(opts: {
     if (joined === "rev-parse --abbrev-ref HEAD") {
       return { code: 0, stdout: `${opts.head ?? "main"}\n`, stderr: "" };
     }
-    if (joined === "status --porcelain") {
+    if (joined.startsWith("status --porcelain")) {
       return { code: 0, stdout: opts.status ?? "", stderr: "" };
     }
     if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
@@ -6061,7 +6061,7 @@ test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure
     if (joined === "rev-parse --abbrev-ref HEAD") {
       return { code: 0, stdout: "main\n", stderr: "" };
     }
-    if (joined === "status --porcelain") {
+    if (joined.startsWith("status --porcelain")) {
       return { code: 0, stdout: "", stderr: "" }; // the prior merge is COMMITTED → clean
     }
     if (joined.startsWith("worktree list")) {
