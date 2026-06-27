@@ -85,6 +85,10 @@ const IDLE_THRESHOLD_S = 15 * 60;
 /** Min interval between profile launches — the global profile-gate cadence. */
 const MIN_PROFILE_USE_INTERVAL_S = 60.0;
 
+/** Backoff for Claude's transient `/usage` endpoint throttle. */
+const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MIN_S = 15 * 60;
+const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MAX_S = 30 * 60;
+
 /** Cap a `.claude.json` read so a pathological file never balloons boot memory. */
 const MAX_CLAUDE_JSON_BYTES = 1024 * 1024;
 
@@ -911,7 +915,7 @@ export class AccountLoop {
     const { acct } = this;
     const { clock, stateDir } = this.deps;
     const failedAt = clock.now();
-    const delay = clock.uniform(60, 180);
+    const delay = failureRetryDelaySeconds(result, clock);
     const nextFetch = new Date(failedAt.getTime() + delay * 1000);
 
     const { errorType, message, screenExcerpt } = describeFailure(result);
@@ -959,6 +963,7 @@ export class AccountLoop {
       event: "scrape_failed",
       error_type: errorType,
       message,
+      next_fetch_at: localIsoWithOffset(nextFetch),
       ...(screenExcerpt.length > 0 ? { screen_excerpt: screenExcerpt } : {}),
     });
     return delay;
@@ -994,6 +999,28 @@ function describeFailure(result: Exclude<ScrapeResult, { kind: "ok" }>): {
     message: result.message,
     screenExcerpt: [],
   };
+}
+
+function failureRetryDelaySeconds(
+  result: Exclude<ScrapeResult, { kind: "ok" }>,
+  clock: LoopClock,
+): number {
+  if (isUsageEndpointRateLimited(result)) {
+    return clock.uniform(
+      USAGE_ENDPOINT_RATE_LIMIT_RETRY_MIN_S,
+      USAGE_ENDPOINT_RATE_LIMIT_RETRY_MAX_S,
+    );
+  }
+  return clock.uniform(60, 180);
+}
+
+function isUsageEndpointRateLimited(
+  result: Exclude<ScrapeResult, { kind: "ok" }>,
+): boolean {
+  if (result.kind !== "error") {
+    return false;
+  }
+  return result.error_type === "ClaudeUsageEndpointRateLimited";
 }
 
 // ---------- worker data + entrypoint ----------------------------------------

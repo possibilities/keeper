@@ -249,9 +249,19 @@ function eligibleProfiles(
     if (!includeRateLimited && isRateLimitedNow(envelope, now)) {
       continue;
     }
+    if (isUsageEndpointRateLimited(envelope)) {
+      continue;
+    }
     eligible.push([name, envelope]);
   }
   return eligible;
+}
+
+function isUsageEndpointRateLimited(envelope: Envelope): boolean {
+  const error = envelope.error;
+  return (
+    isRecord(error) && error.type === "ClaudeUsageEndpointRateLimited"
+  );
 }
 
 /**

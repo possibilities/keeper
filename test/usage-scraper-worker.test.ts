@@ -293,6 +293,36 @@ describe("AccountLoop failure path (no-throw)", () => {
     expect(events).toContain('"event":"scrape_failed"');
   });
 
+  test("Claude /usage endpoint throttle backs off for 15m", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 1,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({
+        kind: "error",
+        error_type: "ClaudeUsageEndpointRateLimited",
+        message: "claude /usage endpoint is rate limited — retry later",
+        screen_excerpt: [],
+      }),
+    });
+
+    const delay = await new AccountLoop(acct, deps).runCycleNoThrow();
+    const env = readEnvelope(tmpDir, "default");
+    const events = readFileSync(join(tmpDir, "events.jsonl"), "utf8");
+
+    expect(delay).toBe(15 * 60);
+    expect(new Date(env.next_fetch_at).getTime()).toBe(
+      new Date("2026-06-24T12:15:00-04:00").getTime(),
+    );
+    expect(events).toContain('"error_type":"ClaudeUsageEndpointRateLimited"');
+    expect(events).toContain('"next_fetch_at"');
+  });
+
   test("failure preserves prior last-good usage/subscription on the stale envelope", async () => {
     const acct: Account = {
       id: "default",

@@ -76,6 +76,7 @@ interface EnvelopeOpts {
   multiplier?: unknown;
   session_percent?: unknown;
   usage?: unknown;
+  error?: unknown;
 }
 
 function writeEnvelope(name: string, opts: EnvelopeOpts): void {
@@ -95,6 +96,9 @@ function writeEnvelope(name: string, opts: EnvelopeOpts): void {
     usage,
     lift_at: opts.lift_at ?? null,
   };
+  if (opts.error !== undefined) {
+    envelope.error = opts.error;
+  }
   if (opts.multiplier !== undefined && opts.multiplier !== UNSET) {
     envelope.multiplier = opts.multiplier;
   }
@@ -158,6 +162,25 @@ describe("rotation", () => {
     const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
 
     expect(picks).toEqual(new Set(["p1", "p2"]));
+  });
+
+  test("stale Claude /usage endpoint throttle is skipped", () => {
+    installMonotonicClock();
+    writeConfig(["ok", "throttled"]);
+    writeEnvelope("ok", { subscription_active: true, status: "active" });
+    writeEnvelope("throttled", {
+      subscription_active: true,
+      status: "stale",
+      error: {
+        type: "ClaudeUsageEndpointRateLimited",
+        message: "retry later",
+        at: isoOffset(-60),
+      },
+    });
+
+    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["ok"]));
   });
 });
 
