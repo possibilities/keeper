@@ -20,6 +20,7 @@ import {
   loadRolePrompt,
   nativeClaudeArgs,
   nativeCodexArgs,
+  nativePiArgs,
   PAIR_AGENTWRAP_SCHEMA_VERSION,
   PAIR_ROLES,
   parseGitPorcelain,
@@ -199,6 +200,67 @@ test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () 
 });
 
 // ---------------------------------------------------------------------------
+// native flag sets — pi
+// ---------------------------------------------------------------------------
+
+test("nativePiArgs: write posture — only -na, no tool strip, no codex/claude/effort flags", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    readOnly: false,
+  });
+  expect(args).toEqual(["-na"]);
+  // Write posture never strips tools.
+  expect(args).not.toContain("--exclude-tools");
+  // NEVER codex's YOLO flag (would crash a pi launch) or claude's permission flags.
+  expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  expect(args).not.toContain("--dangerously-skip-permissions");
+  expect(args).not.toContain("--permission-mode");
+  expect(args).not.toContain("--disallowed-tools");
+  // pi uses thinking, never effort — pairing routes neither through here.
+  expect(args).not.toContain("-c");
+});
+
+test("nativePiArgs: read-only adds --exclude-tools edit,write reinforcement (exact lowercase tokens)", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    readOnly: true,
+  });
+  expect(args).toEqual(["-na", "--exclude-tools", "edit,write"]);
+  // The `--exclude-tools` value is a single comma-joined token (not variadic), so
+  // it sits safely before the trailing prompt positional.
+  const idx = args.indexOf("--exclude-tools");
+  expect(args[idx + 1]).toBe("edit,write");
+});
+
+test("nativePiArgs: --model appended when supplied", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    readOnly: false,
+    model: "gpt-5.5",
+  });
+  expect(args).toEqual(["-na", "--model", "gpt-5.5"]);
+});
+
+test("nativePiArgs: --effort is never emitted even when supplied (pi uses thinking)", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    readOnly: false,
+    effort: "high",
+  });
+  expect(args).toEqual(["-na"]);
+  expect(args).not.toContain("-c");
+  expect(args).not.toContain("high");
+});
+
+// ---------------------------------------------------------------------------
 // launch argv — full composition
 // ---------------------------------------------------------------------------
 
@@ -274,6 +336,35 @@ test("buildPairLaunchArgv: codex — agent token is codex, interactive native fl
   expect(argv).not.toContain("web_search_request");
   expect(argv).toContain("--dangerously-bypass-approvals-and-sandbox");
   expect(argv.at(-1)).toBe("P");
+});
+
+test("buildPairLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no carrier, prompt last", () => {
+  const argv = buildPairLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "THE PI PROMPT",
+    readOnly: true,
+    model: "gpt-5.5",
+    session: "panels",
+  });
+  // The agent token is pi (NOT codex — codex's YOLO flag would crash a pi launch).
+  expect(argv[LAP.length]).toBe("pi");
+  expect(argv).toContain("-na");
+  const xtIdx = argv.indexOf("--exclude-tools");
+  expect(xtIdx).toBeGreaterThanOrEqual(0);
+  expect(argv[xtIdx + 1]).toBe("edit,write");
+  // NONE of codex's or claude's native flags leak onto the pi argv.
+  expect(argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  expect(argv).not.toContain("--permission-mode");
+  expect(argv).not.toContain("--disallowed-tools");
+  // Interactive tracked-job shape is claude-only — never the headless --print.
+  expect(argv).not.toContain("--print");
+  // pi fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION carrier,
+  // even with a session named for the window.
+  expect(argv).not.toContain("--agentwrap-tmux-env");
+  expect(argv).toContain("--agentwrap-tmux-session");
+  // The prompt is ALWAYS the final positional element.
+  expect(argv.at(-1)).toBe("THE PI PROMPT");
 });
 
 test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session supplied", () => {

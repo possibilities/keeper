@@ -265,7 +265,7 @@ describe("presets resolve JSON contract", () => {
     });
   });
 
-  test("a panel with a pi member fails loud", async () => {
+  test("a panel with a pi member is accepted (pi is pair-launchable)", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "mixed"],
       rawArgv: true,
@@ -278,8 +278,15 @@ describe("presets resolve JSON contract", () => {
       ),
     });
     const code = await expectExit(main(h.deps));
-    expect(code).toBe(2);
-    expect(h.err.join("")).toContain("pins harness pi");
+    expect(code).toBe(0);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      kind: "panel",
+      name: "mixed",
+      members: [
+        { name: "a", harness: "claude" },
+        { name: "z", harness: "pi" },
+      ],
+    });
   });
 
   test("an unknown name fails loud", async () => {

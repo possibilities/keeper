@@ -162,16 +162,18 @@ test("resolvePanelMembers: unknown/empty registry → legacy opus+codex fallback
   ]);
 });
 
-test("resolvePanelMembers: a pi panel member fails loud", () => {
+test("resolvePanelMembers: a pi panel member is accepted (pair-launchable)", () => {
   const registry: PresetRegistry = {
     presets: { thinker: preset("pi"), rA: preset("claude") },
     panels: { mixed: ["rA", "thinker"] },
   };
   const r = resolvePanelMembers(registry, "mixed");
-  expect(r.ok).toBe(false);
-  if (r.ok) return;
-  expect(r.error).toContain("pi");
-  expect(r.error).toContain("not pair-launchable");
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  expect(r.members).toEqual([
+    { name: "rA", harness: "claude", preset: "rA" },
+    { name: "thinker", harness: "pi", preset: "thinker" },
+  ]);
 });
 
 // ---- argv shape ------------------------------------------------------------

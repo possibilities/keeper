@@ -662,10 +662,10 @@ async function runTranscriptSubcommand(
  * `presets resolve <name>`: emit the resolved launch-config JSON to stdout. A
  * name matching a single preset emits `{kind:"preset", name, harness, model,
  * effort, thinking, role}` (absent fields null); a name matching a panel emits
- * `{kind:"panel", name, members:[{name, harness}, ...]}` in declaration order,
- * validating each member is pair-launchable (claude|codex) and failing loud if a
- * member pins pi. A `kind` discriminator pins the contract task 4's panel SKILL
- * parses with jq. A name matching neither is fail-loud (exit 2).
+ * `{kind:"panel", name, members:[{name, harness}, ...]}` in declaration order —
+ * every member harness (claude|codex|pi) is pair-launchable. A `kind`
+ * discriminator pins the contract task 4's panel SKILL parses with jq. A name
+ * matching neither is fail-loud (exit 2).
  */
 function runPresetsResolve(deps: MainDeps, name: string): never {
   let registry: PresetRegistry;
@@ -683,15 +683,10 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
   if (panelMembers !== undefined) {
     const members: { name: string; harness: string }[] = [];
     for (const memberName of panelMembers) {
-      // Load-time validation already guarantees the member resolves.
+      // Load-time validation already guarantees the member resolves. claude,
+      // codex, and pi all pair-launch, so every member harness is accepted —
+      // matching pair-send + panel.ts so no accept/reject inconsistency remains.
       const preset = registry.presets[memberName] as Preset;
-      if (preset.harness === "pi") {
-        deps.writeErr(
-          `Error: panel '${name}' member '${memberName}' pins harness pi, ` +
-            "which is not pair-launchable (claude|codex only).\n",
-        );
-        return deps.exit(2);
-      }
       members.push({ name: memberName, harness: preset.harness });
     }
     deps.write(`${JSON.stringify({ kind: "panel", name, members })}\n`);

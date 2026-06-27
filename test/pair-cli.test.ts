@@ -257,11 +257,17 @@ test("--preset disagreeing with --cli fails loud (exit 2, no started line)", asy
   expect(countEvent(r.stdout, "started")).toBe(0);
 });
 
-test("a pi preset handed to pair fails loud (exit 2)", async () => {
-  writePresets("presets:\n  thinker:\n    harness: pi\n    model: pi-1\n");
+test("a pi preset is accepted: reaches launch (exit 1, started cli=pi)", async () => {
+  // The fixture uses model:/thinking: (pi-valid), never effort: (pi-forbidden).
+  writePresets(
+    "presets:\n  thinker:\n    harness: pi\n    model: pi-1\n    thinking: high\n",
+  );
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "think");
 
+  // pi is a first-class pair partner now: --preset thinker reaches the LAUNCH
+  // (failing there on the sandboxed bad-launcher path) like the claude preset,
+  // instead of the old exit-2 reject — no accept/reject inconsistency remains.
   const r = await runMain([
     "send",
     promptFile,
@@ -270,9 +276,31 @@ test("a pi preset handed to pair fails loud (exit 2)", async () => {
     "--output",
     join(dir, "result.yaml"),
   ]);
-  expect(r.code).toBe(2);
-  expect(r.stderr).toContain("pairing does not support");
-  expect(countEvent(r.stdout, "started")).toBe(0);
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(1);
+  expect(r.stdout).toContain("[keeper-pair] started cli=pi");
+  expect(r.stdout).toContain("preset=thinker");
+  expect(r.stdout).toContain("error=agentwrap launch exited");
+});
+
+test("--cli pi is accepted: reaches launch (exit 1)", async () => {
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "explore this");
+
+  const r = await runMain([
+    "send",
+    promptFile,
+    "--cli",
+    "pi",
+    "--output",
+    join(dir, "result.yaml"),
+  ]);
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(1);
+  expect(r.stdout).toContain("[keeper-pair] started cli=pi");
+  expect(r.stdout).toContain("error=agentwrap launch exited");
 });
 
 test("a missing preset name fails loud naming the available presets (exit 2)", async () => {

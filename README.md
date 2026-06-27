@@ -3118,14 +3118,19 @@ is KEPT, `inFlight` releases, and the 120s TTL sweep
 (`PENDING_DISPATCH_TTL_MS > ceilingMs (60s)`, an invariant pinned by a test)
 emits `DispatchExpired` only if the bind truly never lands.
 
-The **`cli/pair.ts` codex pre-launch trust-seed** is the ONLY keeper surface that
-writes codex's own config dir (`${CODEX_HOME:-~/.codex}/config.toml`). Before a
-codex pair/panel partner launches as an interactive TUI, `ensureCodexDirTrust`
-(`src/codex-trust.ts`, a dep-free leaf) seeds `[projects."<realpath(cwd)>"]
-trust_level = "trusted"` so the detached window does not hang on codex's
-directory-trust prompt. It is exact-header idempotent (trust is NOT inherited), takes
-an O_EXCL lock + post-acquire re-check for concurrent launches, and FAIL-OPEN (never
-throws, never blocks the launch; `KEEPER_CODEX_TRUST_LOG` overrides the log path).
+The **`cli/pair.ts` codex pre-launch trust-seed** writes codex's own config dir
+(`${CODEX_HOME:-~/.codex}/config.toml`) — the only partner that needs a seeder.
+Before a codex pair/panel partner launches as an interactive TUI,
+`ensureCodexDirTrust` (`src/codex-trust.ts`, a dep-free leaf) seeds
+`[projects."<realpath(cwd)>"] trust_level = "trusted"` so the detached window does
+not hang on codex's directory-trust prompt. It is exact-header idempotent (trust
+is NOT inherited), takes an O_EXCL lock + post-acquire re-check for concurrent
+launches, and FAIL-OPEN (never throws, never blocks the launch;
+`KEEPER_CODEX_TRUST_LOG` overrides the log path). A **pi** partner has the
+analogous directory-trust prompt but gets NO seeder: the launch passes pi's
+per-run `-na` (`--no-approve`) flag, which ignores the cwd's project-local `.pi/`
+resources and so never triggers the prompt. pi's `trust.json` is a shared profile
+path (state-sharing), so a seeder would collide there — `-na` replaces it.
 
 keeper closes a managed window ONLY through the window-reaper worker, via ONE
 rule (no arms, no readiness verdict): a job's window closes iff keeper created

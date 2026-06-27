@@ -84,7 +84,7 @@ const HELP = `keeper pair — fan a task out to another model CLI via keeper age
 
 Usage:
   keeper pair send <prompt-file> --preset <name> --output <path> [options]
-  keeper pair send <prompt-file> --cli <claude|codex> --output <path> [options]
+  keeper pair send <prompt-file> --cli <claude|codex|pi> --output <path> [options]
   keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper pair panel wait --dir <d> [--chunk <s>]
   keeper pair --help
@@ -103,8 +103,8 @@ notification, then read --output.
 Options:
   --preset <name>        Named launch-config preset (~/.config/agentwrap/presets.yaml);
                          drives harness + model/effort. The recommended interface.
-  --cli <claude|codex>   Partner CLI (required unless --preset given; a
-                         compatibility alias whose harness must agree with --preset)
+  --cli <claude|codex|pi>  Partner CLI (required unless --preset given; a
+                           compatibility alias whose harness must agree with --preset)
   --model <m>            Native model (claude --model / codex -m)
   --effort <e>           Reasoning effort (codex only)
   --role <r>             Role prompt: default|planner|codereviewer|coplanner
@@ -261,11 +261,12 @@ export async function main(argv: string[]): Promise<void> {
       process.stderr.write(`pair: ${msg}\n`);
       process.exit(2);
     }
-    // PairCli excludes pi: a preset pinning pi handed to pair fails loud.
+    // claude|codex|pi all pair-launch, so this only guards a harness outside
+    // PAIR_CLIS (a hypothetical future kind), never pi.
     if (!PAIR_CLIS.has(preset.harness)) {
       process.stderr.write(
         `pair: preset '${presetName}' pins harness ${preset.harness}, ` +
-          "which pairing does not support (claude|codex only)\n",
+          "which pairing does not support (claude|codex|pi only)\n",
       );
       process.exit(2);
     }
@@ -316,7 +317,7 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (cli === undefined || !PAIR_CLIS.has(cli)) {
     process.stderr.write(
-      `pair: --cli must be claude|codex (got ${cli ?? "none"}) — ` +
+      `pair: --cli must be claude|codex|pi (got ${cli ?? "none"}) — ` +
         "pass --cli or --preset\n",
     );
     process.exit(2);
