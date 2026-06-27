@@ -3346,6 +3346,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
  */
 function spawnedWorkerNames(opts?: {
   workers?: readonly WorkerName[];
+  enableReaper?: boolean;
 }): WorkerName[] {
   const captured: WorkerName[] = [];
 
@@ -3396,14 +3397,24 @@ function spawnedWorkerNames(opts?: {
   };
   const prior: Record<string, string | undefined> = {};
   for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
+  // The reaper is an OPT-IN feature gate (default OFF in prod). Pin it ON for the
+  // full-set worker contract — mirroring the builds/usageScraper gate pins above —
+  // so the no-selector boot deterministically spawns every ALL_WORKERS member; pass
+  // {enableReaper:false} to exercise the production default. Managed explicitly here
+  // (outside `sandbox`, which only ever SETS keys) so an inherited launchctl value
+  // can't leak into the boot.
+  const priorReaper = process.env.KEEPER_ENABLE_REAPER;
+  const reaperOn = opts?.enableReaper !== false;
 
   let handle: DaemonHandle | null = null;
   try {
     (globalThis as { Worker: unknown }).Worker = WorkerSpy;
     for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
+    if (reaperOn) process.env.KEEPER_ENABLE_REAPER = "1";
+    else delete process.env.KEEPER_ENABLE_REAPER;
     // Boot is fully synchronous up to the returned handle (every `new Worker`
     // fires here, under the spy).
-    handle = startDaemon(opts);
+    handle = startDaemon({ workers: opts?.workers });
   } finally {
     (globalThis as { Worker: unknown }).Worker = realWorker;
     for (const k of Object.keys(sandbox)) {
@@ -3411,6 +3422,8 @@ function spawnedWorkerNames(opts?: {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    if (priorReaper === undefined) delete process.env.KEEPER_ENABLE_REAPER;
+    else process.env.KEEPER_ENABLE_REAPER = priorReaper;
   }
   void handle;
   return captured;
@@ -3467,6 +3480,22 @@ test("fn-749: passing the full ALL_WORKERS set is identical to passing no select
   expect(spawnedWorkerNames({ workers: ALL_WORKERS })).toEqual([
     ...ALL_WORKERS,
   ]);
+});
+
+test("reaper: opt-in — absent from the default boot, present only with KEEPER_ENABLE_REAPER=1", () => {
+  // The autopilot window-reaper is OFF BY DEFAULT (a deliberate operator toggle, not
+  // a resource gate): a fresh production boot must NOT spawn it, so no session silently
+  // runs with reaping/autoclose on. KEEPER_ENABLE_REAPER=1 opts back in. (The full-set
+  // tests above pin it ON via the helper default; here we exercise both edges.)
+  const off = spawnedWorkerNames({ enableReaper: false });
+  expect(off).not.toContain("reaper");
+  expect(off).toEqual([...ALL_WORKERS].filter((w) => w !== "reaper"));
+  expect(off).toHaveLength(18);
+
+  const on = spawnedWorkerNames({ enableReaper: true });
+  expect(on).toContain("reaper");
+  expect(on).toEqual([...ALL_WORKERS]);
+  expect(on).toHaveLength(19);
 });
 
 test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worker)", () => {
