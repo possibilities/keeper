@@ -38,13 +38,16 @@ import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
 // CLIs, roles, read-only directive
 // ---------------------------------------------------------------------------
 
-/** The partner CLIs `keeper pair` can fan out to — agentwrap's agent kinds
- *  minus `pi` (no pairing posture is defined for pi). */
-export type PairCli = "claude" | "codex";
+/** The partner CLIs `keeper pair` can fan out to — agentwrap's full agent-kind
+ *  set. pi pairs read-only and read-write like claude/codex; its read-only
+ *  posture is the directive + git backstop, reinforced by `--exclude-tools
+ *  edit,write` (pi has no native sandbox of its own). */
+export type PairCli = "claude" | "codex" | "pi";
 
 export const PAIR_CLIS: ReadonlySet<string> = new Set<PairCli>([
   "claude",
   "codex",
+  "pi",
 ]);
 
 /** The ported role prompts, keyed by `--role`. Each maps to an in-repo asset
@@ -159,7 +162,7 @@ export interface PairLaunchOpts {
   cli: PairCli;
   /** The assembled prompt — the FINAL positional argv element. */
   prompt: string;
-  /** `--model <m>` (claude `--model`, codex `-m`). Omitted when absent. */
+  /** `--model <m>` (claude/pi `--model`, codex `-m`). Omitted when absent. */
   model?: string;
   /** Reasoning effort (codex only — maps to `-c model_reasoning_effort=`).
    *  Ignored for claude (no effort flag fits the headless surface). */
@@ -225,7 +228,11 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
     }
   }
   const native =
-    opts.cli === "claude" ? nativeClaudeArgs(opts) : nativeCodexArgs(opts);
+    opts.cli === "claude"
+      ? nativeClaudeArgs(opts)
+      : opts.cli === "codex"
+        ? nativeCodexArgs(opts)
+        : nativePiArgs(opts);
   return [
     ...opts.launcherArgvPrefix,
     opts.cli,
@@ -296,6 +303,35 @@ export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
   if (opts.effort !== undefined && opts.effort !== "") {
     // codex `-c` parses TOML, so the value is quoted.
     args.push("-c", `model_reasoning_effort="${opts.effort}"`);
+  }
+  return args;
+}
+
+/**
+ * Native pi flags for a one-turn pairing partner launched as an INTERACTIVE TUI.
+ * pi has NO per-tool approval gate and NO native sandbox — tools are gated only
+ * by allow/deny lists, so it never stalls on an approval prompt (no
+ * `--dangerously-*` analog exists or is needed). `-na` (`--no-approve`) makes the
+ * partner IGNORE the repo's project-local `.pi/` resources for this run — partner
+ * isolation mirroring the CLAUDE*-env strip — which ALSO sidesteps pi's
+ * directory-trust prompt (the one headless hang), so pi needs no trust-seeder the
+ * way codex does (its `trust.json` is a shared profile path a seeder would
+ * collide with). Read-only ADDS `--exclude-tools edit,write` (pi's lowercase
+ * built-in tool names) as REINFORCEMENT only — the directive + git changed-files
+ * snapshot stay the real read-only guards (bash stays leaky, so the strip is not
+ * a sandbox). pi uses `thinking`, never `effort`; pairing routes neither here.
+ * pi's `--exclude-tools` takes a single comma-joined value (NOT variadic like
+ * claude's `--disallowed-tools`), so it can sit last before the trailing prompt
+ * positional `buildPairLaunchArgv` appends. Pure — exported for tests.
+ */
+export function nativePiArgs(opts: PairLaunchOpts): string[] {
+  // `-na` (--no-approve): ignore project-local `.pi/` resources for this run.
+  const args = ["-na"];
+  if (opts.model !== undefined && opts.model !== "") {
+    args.push("--model", opts.model);
+  }
+  if (opts.readOnly) {
+    args.push("--exclude-tools", "edit,write");
   }
   return args;
 }

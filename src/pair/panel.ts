@@ -160,7 +160,7 @@ export type ResolveMembersResult =
  * members (each named by its preset, validated pair-launchable); else a single
  * PRESET hit → a one-member panel; else (unknown/undefined name) → the legacy
  * two-model fallback `opus`(claude) + `codex`(codex), launched via `--cli`. A
- * panel/preset member pinning a non-pairable harness (pi) fails loud. Pure.
+ * panel/preset member pinning a harness outside claude|codex|pi fails loud. Pure.
  */
 export function resolvePanelMembers(
   registry: PresetRegistry,
@@ -180,7 +180,7 @@ export function resolvePanelMembers(
       if (!PAIR_CLIS.has(preset.harness)) {
         return {
           ok: false,
-          error: `panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex only)`,
+          error: `panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
         };
       }
       members.push({
@@ -200,7 +200,7 @@ export function resolvePanelMembers(
     if (!PAIR_CLIS.has(preset.harness)) {
       return {
         ok: false,
-        error: `preset '${name}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex only)`,
+        error: `preset '${name}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
       };
     }
     return {

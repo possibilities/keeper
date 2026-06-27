@@ -1,7 +1,7 @@
 ---
 name: pair
 description: >-
-  Pair with another model CLI — fan ONE task out to claude or codex, wait in
+  Pair with another model CLI — fan ONE task out to claude, codex, or pi, wait in
   silence, then read its answer. Use when the user wants a second opinion, a
   cross-check, or to "ask claude / ask codex / ask another model", a code
   review or co-plan from a different model, or a read-only audit by a partner —
@@ -12,18 +12,20 @@ description: >-
   RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
   (that is `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash, Monitor
-argument-hint: <what to ask> [--preset <name> | --cli claude|codex] [--role …] [--read-only] | panel start|wait
+argument-hint: <what to ask> [--preset <name> | --cli claude|codex|pi] [--role …] [--read-only] | panel start|wait
 ---
 
 # pair
 
-`keeper pair send` fans ONE task out to another model CLI — `claude` or
-`codex` — launched as a detached **interactive TUI** partner via `keeper agent`,
+`keeper pair send` fans ONE task out to another model CLI — `claude`, `codex`, or
+`pi` — launched as a detached **interactive TUI** partner via `keeper agent`,
 waits for it to stop, and writes the partner's final answer to a `--output` file.
 It is keeper's pairing surface: a second opinion, a cross-vendor cross-check, a
 code review or co-plan from a different model, or a read-only audit. For a codex
 partner keeper seeds the cwd's codex directory-trust before launch (fail-open) so
-the interactive window never hangs on codex's "trust this directory?" prompt.
+the interactive window never hangs on codex's "trust this directory?" prompt; a
+pi partner launches with `-na` (`--no-approve`) instead, ignoring the cwd's
+project-local `.pi/` resources so it likewise never stalls on pi's trust prompt.
 
 How you drive it depends on where you run. From the **main session**, use the
 **Monitor tool** (below): the partner runs in its own detached window for as
@@ -115,9 +117,9 @@ expected path.
 
 | Flag | Meaning |
 |---|---|
-| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude-vs-codex orchestration from the preset's `harness` and its optional `role`. A preset pinning `pi`, or a `--cli` whose harness disagrees, fails loud. A claude preset's `effort` is honored — the launcher pushes `--effort` from the preset on the interactive claude pair path; a codex preset's effort is honored too. |
-| `--cli claude\|codex` | The partner CLI. **Required unless `--preset` is given** (then a compatibility alias whose harness must agree with the preset). Both launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open) so it never stalls on the trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
-| `--model <m>` | Native model id, passed through (`claude --model` / `codex -m`). Omit for the CLI's default. With `--preset` the launcher owns model resolution. |
+| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude/codex/pi orchestration from the preset's `harness` and its optional `role`. pi pairs too (a pi preset uses `thinking:`, never `effort:`); only a `--cli` whose harness disagrees with the preset fails loud. A claude preset's `effort` is honored — the launcher pushes `--effort` from the preset on the interactive claude pair path; a codex preset's effort is honored too. |
+| `--cli claude\|codex\|pi` | The partner CLI. **Required unless `--preset` is given** (then a compatibility alias whose harness must agree with the preset). All three launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open), and pi launches with `-na` (ignore project-local `.pi/` resources), so neither stalls on a trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex -m`). Omit for the CLI's default. With `--preset` the launcher owns model resolution. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
@@ -133,8 +135,9 @@ chose — don't stall.
 `--read-only` is **layered, and honest about its limits**:
 
 - It prepends a read-only directive to the prompt (the primary guard),
-- strips edit tools per-CLI (claude `--disallowed-tools Edit,Write,…`; codex
-  keeps web search), and
+- strips edit tools per-CLI (claude `--disallowed-tools Edit,Write,…`; pi
+  `--exclude-tools edit,write`; codex keeps web search — pi `bash` stays leaky,
+  so the strip is reinforcement, not a sandbox), and
 - snapshots `git status` in the partner's cwd around the turn as a backstop.
 
 It is **detection, not prevention**: a tool strip + directive do not stop Bash
