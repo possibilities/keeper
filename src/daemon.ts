@@ -5295,15 +5295,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // lifetime; a config change takes effect on the next bounce, same as the other
   // tunables).
   const reaperConfig = resolveConfig();
-  const reaperWorker = want("reaper")
-    ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          disableAutoclose: reaperConfig.disableAutoclose,
-          autocloseGraceSeconds: reaperConfig.autocloseGraceSeconds,
-        } satisfies ReaperWorkerData,
-      } as WorkerOptions & { workerData: unknown })
-    : null;
+  // The reaper worker is OFF BY DEFAULT (deliberate operator default): a fresh
+  // boot does NOT spawn it, so no launch silently runs with reaping/autoclose on.
+  // Set KEEPER_ENABLE_REAPER=1 to opt back in. Revisit once the reaper's
+  // recycled-pane retry loop no longer interrupts live resumed panes.
+  const reaperEnabled = process.env.KEEPER_ENABLE_REAPER === "1";
+  const reaperWorker =
+    want("reaper") && reaperEnabled
+      ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
+          workerData: {
+            dbPath,
+            disableAutoclose: reaperConfig.disableAutoclose,
+            autocloseGraceSeconds: reaperConfig.autocloseGraceSeconds,
+          } satisfies ReaperWorkerData,
+        } as WorkerOptions & { workerData: unknown })
+      : null;
 
   if (reaperWorker) {
     const rpw = reaperWorker;
