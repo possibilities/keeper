@@ -191,7 +191,7 @@ describe("resolve-task routing envelope", () => {
     expect(obj.epic_id).toBe(epicId);
     expect(obj.tier).toBe("high");
     expect(obj.worker_agent).toBe("plan:worker-high");
-    expect(["todo", "in_progress"]).toContain(obj.status);
+    expect(["todo", "in_progress"]).toContain(obj.status as string);
     expect((obj.target_repo as string).startsWith("/")).toBe(true);
     expect((obj.primary_repo as string).startsWith("/")).toBe(true);
     expect((obj.project_path as string).startsWith("/")).toBe(true);
@@ -224,7 +224,7 @@ describe("resolve-task routing envelope", () => {
     const obj = resolveEnvelope(
       run(["resolve-task", taskId, "--project", project.root]).output,
     );
-    expect([..."medium high xhigh max".split(" "), null]).toContain(obj.tier);
+    expect([..."medium high xhigh max".split(" "), null]).toContain(obj.tier as string | null);
   });
 
   test("envelope carries a read-only invocation footer (subject/files null)", () => {

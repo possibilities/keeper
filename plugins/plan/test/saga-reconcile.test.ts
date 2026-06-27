@@ -16,7 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { VERDICTS } from "../src/verbs/reconcile.ts";
+import { VERDICTS, type Verdict } from "../src/verbs/reconcile.ts";
 import {
   fakeCommitTaskJson,
   fakeSourceCommit,
@@ -32,7 +32,7 @@ import {
 } from "./harness.ts";
 
 // Exhaustiveness handler set — mirrors the /plan:work post-worker switch.
-const ORCHESTRATOR_HANDLERS = new Set([
+const ORCHESTRATOR_HANDLERS = new Set<Verdict>([
   "done",
   "in_progress_committed",
   "in_progress_uncommitted",
@@ -624,7 +624,7 @@ describe("reconcile errors + contract + meta", () => {
 
   test("every Verdict member has an orchestrator handler and vice versa", () => {
     // test_reconcile.py::test_reconcile_verdict_exhaustiveness
-    const members = new Set(Object.values(VERDICTS));
+    const members = new Set(Object.values(VERDICTS) as Verdict[]);
     expect(members).toEqual(ORCHESTRATOR_HANDLERS);
   });
 
