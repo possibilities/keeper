@@ -215,7 +215,9 @@ describe("ensureAgentwrapProfileDir", () => {
       realpathSync(join(canonicalDir, "session-env")),
     );
     expect(
-      lstatSync(join(canonicalDir, "session-env", "main-session")).isDirectory(),
+      lstatSync(
+        join(canonicalDir, "session-env", "main-session"),
+      ).isDirectory(),
     ).toBe(true);
     expect(
       lstatSync(
@@ -360,7 +362,9 @@ describe("ensureClaudeStateSharing", () => {
       realpathSync(join(canonicalDir, "session-env")),
     );
     expect(
-      lstatSync(join(canonicalDir, "session-env", "main-session")).isDirectory(),
+      lstatSync(
+        join(canonicalDir, "session-env", "main-session"),
+      ).isDirectory(),
     ).toBe(true);
     expect(
       lstatSync(
@@ -380,7 +384,7 @@ function profileEnv(h: ReturnType<typeof makeHarness>): string | undefined {
 describe("main() passthrough commands", () => {
   test("a profiled `auth status` passes through without session flags", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-profile", "multi-claude-1", "auth", "status"],
+      argv: ["--x-profile", "multi-claude-1", "auth", "status"],
       env: {},
       homeBin: join(home, ".local", "bin", "claude"),
       profileDir: join(home, ".claude-profiles", "multi-claude-1"),
@@ -434,9 +438,9 @@ describe("main() auto profile routing", () => {
     expect(profileEnv(h)).toBe("default");
   });
 
-  test("an explicit --agentwrap-profile auto still invokes the router", async () => {
+  test("an explicit --x-profile auto still invokes the router", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-profile", "auto", "--print"],
+      argv: ["--x-profile", "auto", "--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "default",
@@ -510,7 +514,7 @@ describe("main() auto profile routing", () => {
 
   test("a picker failure falls back to the native default account", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-profile", "auto", "--print"],
+      argv: ["--x-profile", "auto", "--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => {
@@ -546,7 +550,7 @@ describe("main() Claude session env scrub", () => {
 describe("main() explicit + env profile precedence", () => {
   test("an explicit profile bypasses the router", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-profile", "multi-claude-1", "--print"],
+      argv: ["--x-profile", "multi-claude-1", "--print"],
       env: {},
       pickProfile: () => {
         throw new Error("router should not run for explicit profiles");
@@ -574,7 +578,7 @@ describe("main() explicit + env profile precedence", () => {
 
   test("a CLI profile wins over the env profile", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-profile", "multi-claude-1", "--print"],
+      argv: ["--x-profile", "multi-claude-1", "--print"],
       env: { AGENTWRAP_PROFILE: "multi-claude-2" },
       profileDir: join(home, ".claude-profiles", "multi-claude-1"),
     });

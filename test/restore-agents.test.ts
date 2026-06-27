@@ -4,7 +4,7 @@
  * Drive the pure pieces of `scripts/restore-agents.ts` against in-memory
  * candidate fixtures and a seeded read-only `keeper.db`:
  *  - `renderSnapshotScript` — the --snapshot-current revive script: each
- *    candidate emits the BARE `keeper agent claude --agentwrap-tmux … --resume`
+ *    candidate emits the BARE `keeper agent claude --x-tmux … --resume`
  *    argv (byte-aligned with --apply, NO `tmux new-window` wrapper).
  *  - `planRestore` — `--session` filter over the candidate's backend session.
  *  - `applyRestore` — apply-vs-dry-run via a capturing fake ensureLaunched
@@ -231,9 +231,9 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE agentwrap re
   expect(script).not.toContain("'tmux' 'new-window'");
   expect(script).toContain("cd '/repo/a' && '/abs/bun' '/abs/cli/keeper.ts'");
   expect(script).toContain(
-    "'agent' 'claude' '--agentwrap-tmux' '--agentwrap-tmux-detached' " +
-      "'--agentwrap-tmux-session' 'work' '--agentwrap-tmux-env' " +
-      "'KEEPER_TMUX_SESSION=work' '--agentwrap-no-confirm' '--resume' 'first-name'",
+    "'agent' 'claude' '--x-tmux' '--x-tmux-detached' " +
+      "'--x-tmux-session' 'work' '--x-tmux-env' " +
+      "'KEEPER_TMUX_SESSION=work' '--x-no-confirm' '--resume' 'first-name'",
   );
   // Resume by the LATEST name, never the job_id UUID.
   expect(script).toContain("'--resume' 'first-name'");
@@ -266,9 +266,9 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare agentw
   );
   expect(script).toContain(
     "cd '/repo' && '/abs/bun' '/abs/cli/keeper.ts' 'agent' 'claude' " +
-      "'--agentwrap-tmux' '--agentwrap-tmux-detached' '--agentwrap-tmux-session' " +
-      "'work' '--agentwrap-tmux-env' 'KEEPER_TMUX_SESSION=work' " +
-      "'--agentwrap-no-confirm' '--resume' 'name'",
+      "'--x-tmux' '--x-tmux-detached' '--x-tmux-session' " +
+      "'work' '--x-tmux-env' 'KEEPER_TMUX_SESSION=work' " +
+      "'--x-no-confirm' '--resume' 'name'",
   );
   expect(script).not.toContain('"$@"');
   expect(script).not.toContain("exec ");

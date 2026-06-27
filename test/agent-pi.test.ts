@@ -54,7 +54,7 @@ describe("Pi parse signals", () => {
 
 describe("Pi command assembly", () => {
   test("fresh interactive launch adds Pi session flags without Claude-only flags", async () => {
-    const h = piHarness(["--agentwrap-no-confirm", "hello"]);
+    const h = piHarness(["--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
       h.deps.piBin,
@@ -94,7 +94,7 @@ describe("Pi command assembly", () => {
   });
 
   test("explicit wrapper profile maps to PI_CODING_AGENT_DIR", async () => {
-    const h = piHarness(["--agentwrap-profile", "work", "--print", "hello"], {
+    const h = piHarness(["--x-profile", "work", "--print", "hello"], {
       profileDir: "/fake-home/.pi-profiles/work",
     });
     const cmd = await runAndCapture(h, main);
@@ -159,7 +159,7 @@ describe("Pi passthrough commands", () => {
   });
 
   test("explicit profile still sets PI_CODING_AGENT_DIR for passthrough", async () => {
-    const h = piHarness(["--agentwrap-profile", "work", "list"], {
+    const h = piHarness(["--x-profile", "work", "list"], {
       profileDir: "/fake-home/.pi-profiles/work",
     });
     const cmd = await runAndCapture(h, main);

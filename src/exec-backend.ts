@@ -93,7 +93,7 @@ export interface LaunchSpec {
   readonly effort?: string;
   /**
    * Worktree-mode lane path. When set (non-empty), the launch emits a SECOND
-   * `--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<path>` so the worker's `keeper
+   * `--x-tmux-env KEEPER_PLAN_WORKTREE=<path>` so the worker's `keeper
    * plan` subprocesses resolve `target_repo`/`primary_repo`/`state_repo` to the
    * lane worktree, not the shared main checkout (concurrent lanes otherwise
    * collide). Realpath-normalized by the producer so it equals the worker's
@@ -715,8 +715,8 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
 //
 // Cross-repo contract (NO shared module — matching comments are the drift
 // guard, byte-pinned by a fixture in test/exec-backend.test.ts):
-//   - CLI flags: `claude --agentwrap-tmux --agentwrap-tmux-detached
-//     --agentwrap-tmux-session <s> --agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>`.
+//   - CLI flags: `claude --x-tmux --x-tmux-detached
+//     --x-tmux-session <s> --x-tmux-env KEEPER_TMUX_SESSION=<s>`.
 //   - stdout: exactly one line of `schema_version:1` JSON (`session`/`windowId`/
 //     `paneId` at top level). keeper DISCARDS `paneId` — binding is hook-based.
 //   - exit codes (agentwrap `TMUX_EXIT`): 0=launched, 1=INTERNAL, 2=BAD_ARGS,
@@ -757,7 +757,7 @@ export interface AgentwrapLaunchOpts {
    *  `<bun> <keeper.ts> agent claude …`. Supersedes the standalone agentwrap
    *  binary path — the launcher folded into `keeper agent`. */
   readonly launcherArgvPrefix: readonly string[];
-  /** Managed tmux session agentwrap mints/targets via `--agentwrap-tmux-session`. */
+  /** Managed tmux session agentwrap mints/targets via `--x-tmux-session`. */
   readonly session: string;
   /** The initial interactive prompt — the FINAL positional argv element. Dropped
    *  in resume mode ({@link resumeTarget} set). */
@@ -771,11 +771,11 @@ export interface AgentwrapLaunchOpts {
   readonly model?: string;
   /** `--effort <e>`. Omitted when absent. */
   readonly effort?: string;
-  /** Whether to pass `--agentwrap-no-confirm` (the cwd-confirm suppressor). */
+  /** Whether to pass `--x-no-confirm` (the cwd-confirm suppressor). */
   readonly noConfirm: boolean;
   /**
    * Worktree-mode lane path (realpath-normalized by the producer). When set
-   * (non-empty), emit a SECOND `--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<path>`
+   * (non-empty), emit a SECOND `--x-tmux-env KEEPER_PLAN_WORKTREE=<path>`
    * right after the `KEEPER_TMUX_SESSION` entry — agentwrap accepts the repeated
    * flag (last-wins per dup key). Omitted → argv is byte-identical to today.
    */
@@ -788,11 +788,11 @@ export interface AgentwrapLaunchOpts {
  * folded launcher owns the tmux window, so keeper delegates session-create +
  * handoff to it:
  *
- *   `<bun> <abs cli/keeper.ts> agent claude --agentwrap-tmux
- *     --agentwrap-tmux-detached --agentwrap-tmux-session <session>
- *     --agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>
- *     [--agentwrap-tmux-env KEEPER_PLAN_WORKTREE=<lane>]
- *     [--model <m>] [--effort <e>] [--agentwrap-no-confirm]
+ *   `<bun> <abs cli/keeper.ts> agent claude --x-tmux
+ *     --x-tmux-detached --x-tmux-session <session>
+ *     --x-tmux-env KEEPER_TMUX_SESSION=<session>
+ *     [--x-tmux-env KEEPER_PLAN_WORKTREE=<lane>]
+ *     [--model <m>] [--effort <e>] [--x-no-confirm]
  *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
  *
  * The tail is the ONLY conditional: prompt mode (the default) ends with the
@@ -805,12 +805,12 @@ export interface AgentwrapLaunchOpts {
  * the caller from `process.execPath` + `resolveKeeperAgentPath`), since under
  * keeper `process.argv[1]` is `cli/keeper.ts` (CLI) / `src/daemon.ts` (keeperd) —
  * neither carries the `agent` token, and `daemon.ts` is the wrong binary. The
- * `--agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>` is the load-bearing
+ * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is the load-bearing
  * binding carrier: the launcher injects it into the pane env via tmux `-e`, so
  * the SessionStart hook stamps the session name on the bound `jobs` row exactly
  * as the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
  * reap/classify parsing. A worktree-mode launch ({@link
- * AgentwrapLaunchOpts.worktreePath} set) emits a SECOND `--agentwrap-tmux-env
+ * AgentwrapLaunchOpts.worktreePath} set) emits a SECOND `--x-tmux-env
  * KEEPER_PLAN_WORKTREE=<lane>` immediately after, BEFORE the conditional tail —
  * so it rides BOTH prompt and resume launches (a resumed worktree worker must
  * not re-resolve to the main checkout). Pure — exported for byte-pin tests.
@@ -824,7 +824,7 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     flags.push("--effort", opts.effort);
   }
   if (opts.noConfirm) {
-    flags.push("--agentwrap-no-confirm");
+    flags.push("--x-no-confirm");
   }
   if (opts.claudeName !== undefined) {
     flags.push("--name", opts.claudeName);
@@ -839,17 +839,17 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
   return [
     ...opts.launcherArgvPrefix,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     opts.session,
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
-    // Worktree-mode lane carrier — a SECOND repeated `--agentwrap-tmux-env`
+    // Worktree-mode lane carrier — a SECOND repeated `--x-tmux-env`
     // (agentwrap last-wins per dup key). Emitted BEFORE `...flags`/`...tail` so
     // it rides resume mode too. Absent → byte-identical to a non-worktree launch.
     ...(opts.worktreePath !== undefined && opts.worktreePath !== ""
-      ? ["--agentwrap-tmux-env", `KEEPER_PLAN_WORKTREE=${opts.worktreePath}`]
+      ? ["--x-tmux-env", `KEEPER_PLAN_WORKTREE=${opts.worktreePath}`]
       : []),
     ...flags,
     ...tail,
@@ -1012,7 +1012,7 @@ export interface AgentwrapLaunchDeps {
  * reads its own `process.cwd()` for the launch-script `cd`; keeperd's cwd is NOT
  * the worker's target repo), parses the one-line JSON defensively, and maps the
  * exit code through the central {@link mapAgentwrapExit}. Session-create is
- * DELEGATED to agentwrap (`--agentwrap-tmux-session`, minting with
+ * DELEGATED to agentwrap (`--x-tmux-session`, minting with
  * C.UTF-8 + TERM/COLORTERM) — keeper runs no tmux session-ensure on this path.
  * Drives BOTH autopilot dispatch (the managed session) and manual `keeper
  * dispatch` (a per-call session). NEVER throws.

@@ -936,11 +936,9 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
       const recorded = s.readArgvLog();
       // The launch argv reached the launcher — the `agent` token prefixes it,
       // then the round-1 contract flags.
-      expect(recorded).toContain("agent claude --agentwrap-tmux");
-      expect(recorded).toContain("--agentwrap-tmux-session scratch");
-      expect(recorded).toContain(
-        "--agentwrap-tmux-env KEEPER_TMUX_SESSION=scratch",
-      );
+      expect(recorded).toContain("agent claude --x-tmux");
+      expect(recorded).toContain("--x-tmux-session scratch");
+      expect(recorded).toContain("--x-tmux-env KEEPER_TMUX_SESSION=scratch");
       // The structured prompt rides as the final positional.
       expect(recorded).toContain("hello agentwrap");
     } finally {
@@ -958,7 +956,7 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
       );
       expect(r.code).toBeUndefined();
       // `keeper agent` still fired despite `exec_backend: tmux` in config.
-      expect(s.readArgvLog()).toContain("agent claude --agentwrap-tmux");
+      expect(s.readArgvLog()).toContain("agent claude --x-tmux");
     } finally {
       s.cleanup();
     }

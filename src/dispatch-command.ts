@@ -186,7 +186,7 @@ export interface DispatchLaunchOpts {
   model?: string;
   /** `--effort <e>` — emitted only when supplied. */
   effort?: string;
-  /** Whether to pass `--agentwrap-no-confirm` (the live cwd-confirm suppressor). */
+  /** Whether to pass `--x-no-confirm` (the live cwd-confirm suppressor). */
   noConfirm: boolean;
 }
 
@@ -203,7 +203,7 @@ export interface DispatchLaunchOpts {
  * positional would shift by one. The trailing `exec "$0" -l -i` leaves a usable
  * login+interactive shell if `claude` exits.
  *
- * `flags` carries `--agentwrap-no-confirm` (the LIVE cwd-confirm suppressor —
+ * `flags` carries `--x-no-confirm` (the LIVE cwd-confirm suppressor —
  * `src/autopilot-worker.ts:258`) always, and `--name <claudeName>` / `--model` /
  * `--effort` ONLY when supplied. cwd is NOT a flag — `ensureLaunched` applies
  * it via tmux `-c`, mirroring autopilot.
@@ -221,7 +221,7 @@ export function buildDispatchLaunchArgv(
   const flags: string[] = [];
   if (opts.model !== undefined) flags.push("--model", opts.model);
   if (opts.effort !== undefined) flags.push("--effort", opts.effort);
-  if (opts.noConfirm) flags.push("--agentwrap-no-confirm");
+  if (opts.noConfirm) flags.push("--x-no-confirm");
   // `--name <key>` is emitted only when supplied (mirrors `--model`/`--effort`).
   // When present its adjacency is load-bearing for reap/classify parsing.
   if (opts.claudeName !== undefined) flags.push("--name", opts.claudeName);

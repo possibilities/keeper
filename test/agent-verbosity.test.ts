@@ -1,10 +1,10 @@
 /**
  * The startup verbosity ladder (src/main.ts): level 0 (default) is silent before
- * claude is exec'd; level 1 (--agentwrap-verbose) prints one line per startup
+ * claude is exec'd; level 1 (--x-verbose) prints one line per startup
  * section plus milestone markers (profile, prompts, session); level 2
- * (--agentwrap-very-verbose, implying level 1) adds the full action log + composed
+ * (--x-very-verbose, implying level 1) adds the full action log + composed
  * command dump. All three still spawn claude; assertions read the captured
- * stdout sink. `--agentwrap-no-confirm` keeps the interactive path while skipping
+ * stdout sink. `--x-no-confirm` keeps the interactive path while skipping
  * the cwd-confirm prompt so section lines surface.
  */
 
@@ -22,13 +22,13 @@ function harness(argv: string[]) {
 
 describe("startup verbosity", () => {
   test("default is silent before launch", async () => {
-    const h = harness(["--agentwrap-no-confirm"]);
+    const h = harness(["--x-no-confirm"]);
     await runAndCapture(h, main);
     expect(h.out.join("")).toBe("");
   });
 
-  test("--agentwrap-verbose prints section + milestone lines, no dump", async () => {
-    const h = harness(["--agentwrap-verbose", "--agentwrap-no-confirm"]);
+  test("--x-verbose prints section + milestone lines, no dump", async () => {
+    const h = harness(["--x-verbose", "--x-no-confirm"]);
     await runAndCapture(h, main);
     const out = h.out.join("");
     expect(out).toContain("~ ensure shared Claude state\n");
@@ -40,8 +40,8 @@ describe("startup verbosity", () => {
     expect(out).not.toContain("Command:");
   });
 
-  test("--agentwrap-very-verbose adds the action log + command dump", async () => {
-    const h = harness(["--agentwrap-very-verbose", "--agentwrap-no-confirm"]);
+  test("--x-very-verbose adds the action log + command dump", async () => {
+    const h = harness(["--x-very-verbose", "--x-no-confirm"]);
     await runAndCapture(h, main);
     const out = h.out.join("");
     // section lines still present (level 2 implies level 1)
@@ -52,8 +52,8 @@ describe("startup verbosity", () => {
     expect(out).toContain("Command:\n");
   });
 
-  test("--print stays clean even at --agentwrap-verbose", async () => {
-    const h = harness(["--print", "--agentwrap-verbose"]);
+  test("--print stays clean even at --x-verbose", async () => {
+    const h = harness(["--print", "--x-verbose"]);
     await runAndCapture(h, main);
     expect(h.out.join("")).toBe("");
   });

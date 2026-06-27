@@ -787,9 +787,9 @@ export async function main(deps: MainDeps): Promise<never> {
   const agentLabel = displayAgent(agent);
 
   // Wrapper-owned help short-circuits before the tmux pre-pass, passthrough
-  // detection, and launch — `agentwrap <agent> --agentwrap-help` prints the
+  // detection, and launch — `agentwrap <agent> --x-help` prints the
   // overlay help and exits without reaching the native agent. Native `--help`
-  // carries no `--agentwrap-help` token, so it still passes through unchanged.
+  // carries no `--x-help` token, so it still passes through unchanged.
   if (hasAgentwrapHelpFlag(argv)) {
     deps.write(AGENTWRAP_HELP);
     return deps.exit(0);
@@ -863,7 +863,7 @@ export async function main(deps: MainDeps): Promise<never> {
   const { agentwrapCodexSessionName } = parsed;
   let { agentwrapProfile, explicitAgentwrapProfile } = parsed;
 
-  // Named preset resolution: the `--agentwrap-preset` flag (or the harnessless
+  // Named preset resolution: the `--x-preset` flag (or the harnessless
   // head, already mirrored onto parsed.agentwrapPreset). Resolve it once here so
   // its model/effort/thinking can layer into the resolver default slots BELOW
   // the explicit-flag / effort-env precedence. A head agent disagreeing with the
@@ -882,7 +882,7 @@ export async function main(deps: MainDeps): Promise<never> {
     }
     if (dispatch.kind === "run" && resolvedPreset.harness !== agent) {
       deps.writeErr(
-        `Error: --agentwrap-preset ${presetName} pins harness ` +
+        `Error: --x-preset ${presetName} pins harness ` +
           `${resolvedPreset.harness}, but the ${agent} subcommand was given.\n`,
       );
       return deps.exit(2);
@@ -899,13 +899,11 @@ export async function main(deps: MainDeps): Promise<never> {
     actionLog.push(`Detected ${agentLabel} headless mode`);
   }
   if (agentwrapNoConfirm) {
-    actionLog.push(
-      "Parsed --agentwrap-no-confirm: cwd confirmation suppressed",
-    );
+    actionLog.push("Parsed --x-no-confirm: cwd confirmation suppressed");
   }
   if (agentwrapCodexSessionName !== null) {
     actionLog.push(
-      `Parsed --agentwrap-codex-session-name: ${agentwrapCodexSessionName}`,
+      `Parsed --x-codex-session-name: ${agentwrapCodexSessionName}`,
     );
   }
 
@@ -921,12 +919,12 @@ export async function main(deps: MainDeps): Promise<never> {
   }
 
   if (explicitAgentwrapProfile && agentwrapProfile) {
-    actionLog.push(`Parsed --agentwrap-profile: ${agentwrapProfile}`);
+    actionLog.push(`Parsed --x-profile: ${agentwrapProfile}`);
     if (agentwrapProfile !== "auto") {
       const normalized = normalizeAgentwrapProfileArg(agentwrapProfile);
       if (normalized !== agentwrapProfile) {
         actionLog.push(
-          `Normalized --agentwrap-profile default to native ${agentLabel} account`,
+          `Normalized --x-profile default to native ${agentLabel} account`,
         );
       }
       agentwrapProfile = normalized;
@@ -950,8 +948,8 @@ export async function main(deps: MainDeps): Promise<never> {
   }
 
   // Verbosity ladder: level 0 (default) is silent before claude is exec'd;
-  // level 1 (--agentwrap-verbose) prints one line per startup section; level 2
-  // (--agentwrap-very-verbose, which implies level 1) adds per-phase timing plus
+  // level 1 (--x-verbose) prints one line per startup section; level 2
+  // (--x-very-verbose, which implies level 1) adds per-phase timing plus
   // the full action log and composed command. --print/passthrough force clean
   // stdout, so section lines never appear there regardless of level.
   const verbose = agentwrapVerbose || agentwrapVeryVerbose;
@@ -981,7 +979,7 @@ export async function main(deps: MainDeps): Promise<never> {
     });
   } else if (agentwrapNoConfirm && !shouldPassthrough && !hasPrint) {
     actionLog.push(
-      "Skipped cwd confirmation (--agentwrap-no-confirm): " +
+      "Skipped cwd confirmation (--x-no-confirm): " +
         `${deps.env.PWD || deps.cwd}`,
     );
   }

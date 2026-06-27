@@ -6,7 +6,7 @@
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
  *
  * Named launch-config presets (harness/model/effort) live in a single registry,
- * `~/.config/agentwrap/presets.yaml`: `keeper agent --agentwrap-preset <name>
+ * `~/.config/agentwrap/presets.yaml`: `keeper agent --x-preset <name>
  * [args...]` applies one (the harness comes from the preset when no agent token
  * is given), and `keeper agent presets resolve <name>` emits the resolved
  * preset/panel JSON. A preset supplies defaults BELOW any explicit

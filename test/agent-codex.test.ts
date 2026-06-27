@@ -50,7 +50,7 @@ describe("Codex parse signals", () => {
 
   test("synthetic session name is a wrapper-only flag", () => {
     const p = parseArgsForAgent(
-      ["--agentwrap-codex-session-name", "work item", "hello"],
+      ["--x-codex-session-name", "work item", "hello"],
       "codex",
     );
     expect(p.agentwrapCodexSessionName).toBe("work item");
@@ -60,7 +60,7 @@ describe("Codex parse signals", () => {
 
 describe("Codex command assembly", () => {
   test("fresh interactive launch derives a synthetic Codex session name", async () => {
-    const h = codexHarness(["--agentwrap-no-confirm", "hello"], {
+    const h = codexHarness(["--x-no-confirm", "hello"], {
       env: { CODEX_HOME: "/fake-home/.codex" },
       cwd: "/fake-home/code/proj",
     });
@@ -81,7 +81,7 @@ describe("Codex command assembly", () => {
   });
 
   test("slug-shaped prompts feed the Codex session indexer", async () => {
-    const h = codexHarness(["--agentwrap-no-confirm", "/work fn-53"], {
+    const h = codexHarness(["--x-no-confirm", "/work fn-53"], {
       env: { CODEX_HOME: "/fake-home/.codex" },
       cwd: "/fake-home/code/proj",
     });
@@ -94,12 +94,7 @@ describe("Codex command assembly", () => {
   });
 
   test("explicit wrapper profile maps to Codex --profile", async () => {
-    const h = codexHarness([
-      "--agentwrap-no-confirm",
-      "--agentwrap-profile",
-      "work",
-      "hello",
-    ]);
+    const h = codexHarness(["--x-no-confirm", "--x-profile", "work", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
       h.deps.codexBin,
@@ -113,8 +108,8 @@ describe("Codex command assembly", () => {
 
   test("native Codex --profile suppresses wrapper profile injection", async () => {
     const h = codexHarness([
-      "--agentwrap-no-confirm",
-      "--agentwrap-profile",
+      "--x-no-confirm",
+      "--x-profile",
       "work",
       "--profile",
       "native",
@@ -131,7 +126,7 @@ describe("Codex command assembly", () => {
   });
 
   test("env profile maps to Codex --profile", async () => {
-    const h = codexHarness(["--agentwrap-no-confirm", "hello"], {
+    const h = codexHarness(["--x-no-confirm", "hello"], {
       env: { AGENTWRAP_PROFILE: "work" },
     });
     const cmd = await runAndCapture(h, main);
@@ -184,7 +179,7 @@ describe("Codex command assembly", () => {
 
   test("explicit permissions and search config suppress wrapper defaults", async () => {
     const h = codexHarness([
-      "--agentwrap-no-confirm",
+      "--x-no-confirm",
       "--sandbox",
       "workspace-write",
       "-c",
@@ -204,11 +199,7 @@ describe("Codex command assembly", () => {
 
   test("synthetic session name starts Codex indexer without forwarding flag", async () => {
     const h = codexHarness(
-      [
-        "--agentwrap-no-confirm",
-        "--agentwrap-codex-session-name=work item",
-        "hello",
-      ],
+      ["--x-no-confirm", "--x-codex-session-name=work item", "hello"],
       {
         env: { CODEX_HOME: "/fake-home/.codex" },
         cwd: "/fake-home/code/agentwrap",
@@ -216,7 +207,7 @@ describe("Codex command assembly", () => {
     );
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.codexBin, ...CODEX_WRAPPER_DEFAULTS, "hello"]);
-    expect(cmd).not.toContain("--agentwrap-codex-session-name=work item");
+    expect(cmd).not.toContain("--x-codex-session-name=work item");
     expect(h.codexSessionNameIndexers).toHaveLength(1);
     expect(h.codexSessionNameIndexers[0]).toMatchObject({
       codexHome: "/fake-home/.codex",
@@ -243,7 +234,7 @@ describe("Codex passthrough commands", () => {
 
   test("synthetic session name is ignored for passthrough commands", async () => {
     const h = codexHarness([
-      "--agentwrap-codex-session-name",
+      "--x-codex-session-name",
       "work item",
       "plugin",
       "list",

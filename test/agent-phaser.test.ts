@@ -1,7 +1,7 @@
 /**
  * Phaser: quiet mode prints nothing and still runs the body; chatty mode prints
  * one line per section (`~ label`). The `  (Nms)` timing line appears only when
- * showTiming is set (--agentwrap-very-verbose) and the phase is slow (>=50ms).
+ * showTiming is set (--x-very-verbose) and the phase is slow (>=50ms).
  * The clock and the write sink are injected.
  */
 

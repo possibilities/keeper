@@ -1,6 +1,6 @@
 /**
  * The post-launch transcript verbs: `wait-for-stop` and `show-last-message`.
- * They decouple a detached `--agentwrap-tmux --agentwrap-tmux-detached` launch
+ * They decouple a detached `--x-tmux --x-tmux-detached` launch
  * from reading its result, so a caller composes `launch-detached → wait-for-stop
  * → show-last-message` instead of a single blocking flag.
  *

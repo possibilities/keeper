@@ -30,9 +30,9 @@ export type Dispatch =
   | { kind: "usage"; unknown?: string };
 
 /** The wrapper-owned help flag, consumed before passthrough and launch. */
-export const AGENTWRAP_HELP_FLAG = "--agentwrap-help";
+export const AGENTWRAP_HELP_FLAG = "--x-help";
 
-/** True when argv contains the wrapper-owned `--agentwrap-help` flag. */
+/** True when argv contains the wrapper-owned `--x-help` flag. */
 export function hasAgentwrapHelpFlag(argv: string[]): boolean {
   return argv.includes(AGENTWRAP_HELP_FLAG);
 }
@@ -44,7 +44,7 @@ Usage:
   agentwrap claude [args...]        Launch Claude Code.
   agentwrap codex [args...]         Launch Codex CLI.
   agentwrap pi [args...]            Launch pi.
-  agentwrap --agentwrap-preset <name> [args...]
+  agentwrap --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
   agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
@@ -53,9 +53,9 @@ Usage:
   agentwrap --help                  Show this help.
   agentwrap --version               Show the version.
 
-Agentwrap transport flags such as --agentwrap-tmux are consumed by the wrapper;
+Agentwrap transport flags such as --x-tmux are consumed by the wrapper;
 all other args after the agent subcommand pass through to that launcher unchanged.
-A detached launch (--agentwrap-tmux --agentwrap-tmux-detached) prints a JSON
+A detached launch (--x-tmux --x-tmux-detached) prints a JSON
 handle; pass its "id" (or a transcript path) to wait-for-stop / show-last-message.
 `;
 
@@ -63,7 +63,7 @@ handle; pass its "id" (or a transcript path) to wait-for-stop / show-last-messag
 export const VERSION = `agentwrap ${(pkg as { version: string }).version}\n`;
 
 /**
- * Wrapper-owned overlay help. Documents only the `--agentwrap-*` surface the
+ * Wrapper-owned overlay help. Documents only the `--x-*` surface the
  * wrapper consumes — common flags, the tmux transport flags, and the
  * agent-specific wrapper flag. Native agent flags are NOT listed here; reach a
  * launcher's own help with `agentwrap <agent> --help`.
@@ -80,14 +80,14 @@ subcommand passes through to that launcher unchanged. For a launcher's own
 options, run \`agentwrap <agent> --help\`.
 
 Wrapper flags:
-  --agentwrap-help                  Show this wrapper help and exit.
-  --agentwrap-verbose               Print one line per startup section.
-  --agentwrap-very-verbose          Add per-phase timing and the composed
-                                    agent command. Implies --agentwrap-verbose.
-  --agentwrap-no-confirm            Skip the cwd-confirmation prompt.
-  --agentwrap-profile <name>        Select a profile ('default' = native
+  --x-help                  Show this wrapper help and exit.
+  --x-verbose               Print one line per startup section.
+  --x-very-verbose          Add per-phase timing and the composed
+                                    agent command. Implies --x-verbose.
+  --x-no-confirm            Skip the cwd-confirmation prompt.
+  --x-profile <name>        Select a profile ('default' = native
                                     account; 'auto' picks via the ledger).
-  --agentwrap-preset <name>         Apply a named launch-config preset from
+  --x-preset <name>         Apply a named launch-config preset from
                                     ~/.config/agentwrap/presets.yaml
                                     (harness/model/effort defaults BELOW any
                                     explicit --model/--effort or effort env).
@@ -102,13 +102,13 @@ Preset resolution:
                                     {name,harness} members).
 
 tmux transport flags (any one implies tmux mode):
-  --agentwrap-tmux                  Open the invocation in a new tmux window.
-  --agentwrap-tmux-detached         Create the window without moving focus.
-  --agentwrap-tmux-session <name>   Target/create the named tmux session.
-  --agentwrap-tmux-window-name <n>  Name the created tmux window.
-  --agentwrap-tmux-socket-name <n>  tmux server socket name (-L).
-  --agentwrap-tmux-socket-path <p>  tmux server socket path (-S).
-  --agentwrap-tmux-env KEY=VALUE    Inject env into the pane via tmux -e
+  --x-tmux                  Open the invocation in a new tmux window.
+  --x-tmux-detached         Create the window without moving focus.
+  --x-tmux-session <name>   Target/create the named tmux session.
+  --x-tmux-window-name <n>  Name the created tmux window.
+  --x-tmux-socket-name <n>  tmux server socket name (-L).
+  --x-tmux-socket-path <p>  tmux server socket path (-S).
+  --x-tmux-env KEY=VALUE    Inject env into the pane via tmux -e
                                     (repeatable; LD_*/DYLD_* keys rejected).
   --no-artifacts                    Suppress the launch.sh/run.json run-dir
                                     trail; JSON result carries runDir:null.
@@ -128,7 +128,7 @@ tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit)
                                     4  transient/retryable (timeout, lock contention)
 
 Agent-specific wrapper flags:
-  --agentwrap-codex-session-name <name>
+  --x-codex-session-name <name>
                                     Index this synthetic name for the Codex
                                     session once its live id is known.
 
@@ -140,12 +140,12 @@ Top-level flags:
 /**
  * Classify the leading argv token. `claude`/`codex`/`pi` → run with the remaining
  * args (even when empty, so a bare `agentwrap claude`, `agentwrap codex`, or `agentwrap pi`
- * still launches interactively); a leading `--agentwrap-preset <name>` (no head
+ * still launches interactively); a leading `--x-preset <name>` (no head
  * agent token) → the harnessless run-preset form whose harness comes from the
  * preset (the whole argv stays in `rest` so parseArgs strips the flag);
  * `presets resolve <name>` → emit the resolved preset/panel JSON;
  * `wait-for-stop`/`show-last-message` → the
- * post-launch transcript verbs with the remaining args (the handle); `--agentwrap-help`
+ * post-launch transcript verbs with the remaining args (the handle); `--x-help`
  * → wrapper help; `-h`/`--help` → short usage; `-v`/`--version` → version; an empty
  * argv or any other leading token → usage (carrying the unknown subcommand name when
  * present). Strips exactly one token so a repeated agent name preserves the second.
@@ -170,15 +170,15 @@ export function splitSubcommand(argv: string[]): Dispatch {
     }
     return { kind: "usage", unknown: `presets ${argv[1] ?? ""}`.trim() };
   }
-  if (head === "--agentwrap-preset" || head.startsWith("--agentwrap-preset=")) {
+  if (head === "--x-preset" || head.startsWith("--x-preset=")) {
     // Harnessless launch: harness comes from the named preset. Keep the WHOLE
     // argv in `rest` so parseArgs strips the flag and main() resolves it.
     const presetName =
-      head === "--agentwrap-preset"
+      head === "--x-preset"
         ? (argv[1] ?? "").trim()
-        : head.slice("--agentwrap-preset=".length).trim();
+        : head.slice("--x-preset=".length).trim();
     if (presetName === "") {
-      return { kind: "usage", unknown: "--agentwrap-preset" };
+      return { kind: "usage", unknown: "--x-preset" };
     }
     return { kind: "run-preset", presetName, rest: argv };
   }

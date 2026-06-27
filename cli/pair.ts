@@ -19,8 +19,8 @@
  * SIGTERM/timeout (a Monitor kill) and early validation errors.
  *
  * Compose flow (the `keeper agent` subcommand contract):
- *   1. `keeper agent <cli> --agentwrap-tmux --agentwrap-tmux-detached
- *      --agentwrap-no-confirm <native flags> <prompt>` → launch JSON `id`.
+ *   1. `keeper agent <cli> --x-tmux --x-tmux-detached
+ *      --x-no-confirm <native flags> <prompt>` → launch JSON `id`.
  *   2. `keeper agent wait-for-stop <id> --stop-timeout-ms <ms>` → block until the
  *      partner stops; keeper's `--timeout` drives the ms budget (overriding
  *      the subcommand's 600s default) and the widened subprocess-kill margin.
@@ -250,7 +250,7 @@ export async function main(argv: string[]): Promise<void> {
   // ---- resolve the named preset (dep-free registry; no src/db.ts) ----
   // A preset drives the harness (claude-vs-codex orchestration: env strip, reap
   // policy, codex trust-seed) and an optional role; model/effort are NOT read here
-  // — they ride to the launcher via `--agentwrap-preset` so the launcher owns
+  // — they ride to the launcher via `--x-preset` so the launcher owns
   // resolution. A preset-not-found / malformed registry is CLI misuse → exit 2.
   let preset: Preset | undefined;
   if (presetName !== undefined && presetName !== "") {

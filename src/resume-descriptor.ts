@@ -74,7 +74,7 @@ export function buildResumeCommand(
   _tier: string | null,
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
-  return `${cdPrefix}claude --resume "${target}" --agentwrap-no-confirm`;
+  return `${cdPrefix}claude --resume "${target}" --x-no-confirm`;
 }
 
 /**

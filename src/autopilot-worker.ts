@@ -278,9 +278,9 @@ export const ARTHACK_ROOT: string = ((): string => {
  * byte-for-byte by `test/autopilot-worker.test.ts`. Lives here rather than
  * re-exported to keep this worker's import graph narrow. The launcher carries
  * no tier flag — the `plan` plugin is always loaded and `/plan:work` spawns the
- * tier worker_agent. `--arthack-no-confirm` is an arthack-launcher flag (parsed
- * and stripped before the real claude binary) that suppresses the cwd
- * confirmation prompt so automated dispatch never hangs on a keystroke.
+ * tier worker_agent. `--x-no-confirm` is an extended launcher flag (parsed and
+ * stripped before the real claude binary) that suppresses the cwd confirmation
+ * prompt so automated dispatch never hangs on a keystroke.
  * Pure — exported for tests.
  */
 export function buildWorkerCommand(
@@ -295,7 +295,7 @@ export function buildWorkerCommand(
   // Model/effort default to the `WORKER_*` constants; the `worker` preset (when
   // present in `presets.yaml`) overrides them, resolved producer-side per cycle.
   flags.push("--model", model, "--effort", effort);
-  flags.push("--agentwrap-no-confirm");
+  flags.push("--x-no-confirm");
   // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;

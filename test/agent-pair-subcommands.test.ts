@@ -487,7 +487,7 @@ describe("removed --wait-for-stop flag", () => {
     // It is not a tmux flag anymore, so tmux mode is NOT entered and it falls
     // through verbatim into the agent argv (the agent would reject it loudly).
     const h = makeHarness({
-      argv: ["codex", "--agentwrap-no-confirm", "--wait-for-stop", "hi"],
+      argv: ["codex", "--x-no-confirm", "--wait-for-stop", "hi"],
       rawArgv: true,
     });
 
@@ -704,7 +704,7 @@ describe("inner --session-id pin", () => {
     // id the outer recorded in run.json transcriptSessionId.
     const sessionId = "66666666-6666-6666-6666-666666666666";
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-no-confirm", "hi"],
+      argv: ["claude", "--x-no-confirm", "hi"],
       rawArgv: true,
       env: { AGENTWRAP_TMUX_SESSION_ID: sessionId },
     });
@@ -723,12 +723,7 @@ describe("inner --session-id pin", () => {
     const cwd = "/fake-home/code/proj";
     const sessionId = "77777777-7777-7777-7777-777777777777";
     const h = makeHarness({
-      argv: [
-        "claude",
-        "--agentwrap-tmux-session=work",
-        "--agentwrap-tmux-detached",
-        "hi",
-      ],
+      argv: ["claude", "--x-tmux-session=work", "--x-tmux-detached", "hi"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,

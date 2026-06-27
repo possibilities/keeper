@@ -2,7 +2,7 @@
  * Keeper-spawned worker/resume panes run `cd <dir> && claude …` through
  * interactive zsh; whenever the target dir is not exactly two levels under home
  * the cwd gate would block on a keystroke and hang the pane.
- * `--agentwrap-no-confirm` suppresses that gate at every depth. The contract:
+ * `--x-no-confirm` suppresses that gate at every depth. The contract:
  * (1) with the flag in a non-project cwd the cwd check never runs, (2) the flag
  * is stripped from the claude argv, (3) without the flag the check still runs.
  *
@@ -37,10 +37,10 @@ function ranCwdCheck(out: string[]): boolean {
   return out.some((s) => s.includes("not a project directory"));
 }
 
-describe("--agentwrap-no-confirm", () => {
+describe("--x-no-confirm", () => {
   test("skips the cwd check in a non-project cwd", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "hello"],
+      argv: ["--x-no-confirm", "hello"],
       env: { PWD: NON_PROJECT_PWD },
     });
     await runAndCapture(h, main);
@@ -49,11 +49,11 @@ describe("--agentwrap-no-confirm", () => {
 
   test("strips the flag from the claude command", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "hello"],
+      argv: ["--x-no-confirm", "hello"],
       env: { PWD: NON_PROJECT_PWD },
     });
     const cmd = await runAndCapture(h, main);
-    expect(cmd).not.toContain("--agentwrap-no-confirm");
+    expect(cmd).not.toContain("--x-no-confirm");
   });
 
   test("without the flag the cwd check still runs (behavior unchanged)", async () => {

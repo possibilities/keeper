@@ -106,20 +106,14 @@ function parseJsonOutput(out: string[]): Record<string, unknown> {
   return JSON.parse(lastLine) as Record<string, unknown>;
 }
 
-describe("--agentwrap-tmux", () => {
+describe("--x-tmux", () => {
   test("inside tmux, opens a new focused unnamed window and returns metadata", async () => {
     const stateDir = tempDir();
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
-      argv: [
-        "codex",
-        "--agentwrap-tmux",
-        "--agentwrap-profile",
-        "work",
-        "hello",
-      ],
+      argv: ["codex", "--x-tmux", "--x-profile", "work", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
@@ -177,9 +171,9 @@ describe("--agentwrap-tmux", () => {
       'AGENTWRAP_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--agentwrap-profile' 'work' 'hello'`,
+      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
     );
-    expect(script).not.toContain("--agentwrap-tmux");
+    expect(script).not.toContain("--x-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
     expect(h.out.join("").trim().split("\n")).toHaveLength(1);
     expect(parseJsonOutput(h.out)).toMatchObject({
@@ -202,7 +196,7 @@ describe("--agentwrap-tmux", () => {
     const sessionId = "22222222-2222-2222-2222-222222222222";
     writeClaudeTranscript(home, cwd, sessionId);
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux", "hello"],
+      argv: ["claude", "--x-tmux", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
@@ -251,7 +245,7 @@ describe("--agentwrap-tmux", () => {
     const sessionId = "44444444-4444-4444-4444-444444444444";
     writeClaudeTranscript(home, cwd, sessionId);
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux", "hello"],
+      argv: ["claude", "--x-tmux", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
@@ -304,12 +298,12 @@ describe("--agentwrap-tmux", () => {
     const h = makeHarness({
       argv: [
         "pi",
-        "--agentwrap-tmux-L",
+        "--x-tmux-L",
         "agents",
-        "--agentwrap-tmux-session=work",
-        "--agentwrap-tmux-window-name",
+        "--x-tmux-session=work",
+        "--x-tmux-window-name",
         "review",
-        "--agentwrap-tmux-detached",
+        "--x-tmux-detached",
         "hello",
       ],
       rawArgv: true,
@@ -377,7 +371,7 @@ describe("--agentwrap-tmux", () => {
     expect(script).toContain(
       `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
     );
-    expect(script).not.toContain("--agentwrap-tmux-L");
+    expect(script).not.toContain("--x-tmux-L");
   });
 
   test("a launch records run.json with agent/cwd/session for the subcommands", async () => {
@@ -385,7 +379,7 @@ describe("--agentwrap-tmux", () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
     const h = makeHarness({
-      argv: ["codex", "--agentwrap-tmux", "--agentwrap-tmux-detached", "hello"],
+      argv: ["codex", "--x-tmux", "--x-tmux-detached", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
@@ -433,7 +427,7 @@ describe("--agentwrap-tmux", () => {
 
   test("missing tmux flag values fail before any tmux command", async () => {
     const h = makeHarness({
-      argv: ["codex", "--agentwrap-tmux-session"],
+      argv: ["codex", "--x-tmux-session"],
       rawArgv: true,
     });
 
@@ -441,9 +435,7 @@ describe("--agentwrap-tmux", () => {
 
     expect(code).toBe(2);
     expect(h.tmuxCommands).toEqual([]);
-    expect(h.err.join("")).toContain(
-      "--agentwrap-tmux-session requires a value",
-    );
+    expect(h.err.join("")).toContain("--x-tmux-session requires a value");
     // Structured JSON error is emitted even on a bad-args exit (Pattern A).
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,
@@ -459,7 +451,7 @@ describe("--agentwrap-tmux", () => {
     const cwd = "/fake-home/code/proj";
     writeClaudeTranscript(home, cwd, "44444444-4444-4444-4444-444444444444");
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux", "hello"],
+      argv: ["claude", "--x-tmux", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
@@ -486,7 +478,7 @@ describe("--agentwrap-tmux", () => {
   });
 });
 
-describe("--agentwrap-tmux exit-code taxonomy", () => {
+describe("--x-tmux exit-code taxonomy", () => {
   test("the taxonomy codes are distinct", () => {
     const codes = [
       TMUX_EXIT.INTERNAL,
@@ -500,13 +492,13 @@ describe("--agentwrap-tmux exit-code taxonomy", () => {
 
   test("tmux-not-found exits 3 with a structured prerequisite_missing error", async () => {
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux-L", "scratch", "hello"],
+      argv: ["claude", "--x-tmux-L", "scratch", "hello"],
       rawArgv: true,
       agentwrapStateDir: tempDir(),
       cwd: "/fake-home/code/proj",
       tmuxCommand: () => {
         throw new TmuxLaunchError(
-          "tmux command not found. Install tmux or remove --agentwrap-tmux.",
+          "tmux command not found. Install tmux or remove --x-tmux.",
           TMUX_EXIT.NOOP,
         );
       },
@@ -526,7 +518,7 @@ describe("--agentwrap-tmux exit-code taxonomy", () => {
 
   test("a timeout result exits 4 with a structured transient error", async () => {
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux-L", "scratch", "hello"],
+      argv: ["claude", "--x-tmux-L", "scratch", "hello"],
       rawArgv: true,
       agentwrapStateDir: tempDir(),
       cwd: "/fake-home/code/proj",
@@ -559,7 +551,7 @@ describe("--agentwrap-tmux exit-code taxonomy", () => {
 
   test("a malformed created-window line exits 1 with a structured internal error", async () => {
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-tmux-L", "scratch", "hello"],
+      argv: ["claude", "--x-tmux-L", "scratch", "hello"],
       rawArgv: true,
       agentwrapStateDir: tempDir(),
       cwd: "/fake-home/code/proj",
@@ -683,13 +675,13 @@ describe("resolveTmuxBin", () => {
 // `agent-tmux-launch-timeout.slow.test.ts` — too heavy for the fast tier; runs
 // under `bun run test:full`.
 
-describe("parseAgentwrapTmuxArgs --agentwrap-tmux-env", () => {
+describe("parseAgentwrapTmuxArgs --x-tmux-env", () => {
   test("split and joined forms both parse; repeatable; last-wins per KEY", () => {
     const parsed = parseAgentwrapTmuxArgs([
-      "--agentwrap-tmux-env",
+      "--x-tmux-env",
       "KEEPER_TMUX_SESSION=probe",
-      "--agentwrap-tmux-env=KEEPER_DB=/tmp/test.db",
-      "--agentwrap-tmux-env",
+      "--x-tmux-env=KEEPER_DB=/tmp/test.db",
+      "--x-tmux-env",
       "KEEPER_TMUX_SESSION=final",
       "hello",
     ]);
@@ -704,20 +696,20 @@ describe("parseAgentwrapTmuxArgs --agentwrap-tmux-env", () => {
   });
 
   test("a value may itself contain '=' (split only on the first)", () => {
-    const parsed = parseAgentwrapTmuxArgs(["--agentwrap-tmux-env=FOO=a=b=c"]);
+    const parsed = parseAgentwrapTmuxArgs(["--x-tmux-env=FOO=a=b=c"]);
 
     expect(parsed.error).toBeNull();
     expect(parsed.options.env).toEqual([["FOO", "a=b=c"]]);
   });
 
   test("a missing '=' is rejected with bad-args", () => {
-    const parsed = parseAgentwrapTmuxArgs(["--agentwrap-tmux-env", "NOEQ"]);
+    const parsed = parseAgentwrapTmuxArgs(["--x-tmux-env", "NOEQ"]);
     expect(parsed.error).toContain("missing '='");
   });
 
   test("a malformed key (lowercase / leading digit / dash) is rejected", () => {
     for (const bad of ["foo=1", "1FOO=1", "FO-O=1"]) {
-      const parsed = parseAgentwrapTmuxArgs(["--agentwrap-tmux-env", bad]);
+      const parsed = parseAgentwrapTmuxArgs(["--x-tmux-env", bad]);
       expect(parsed.error).toContain("key must match");
     }
   });
@@ -728,27 +720,27 @@ describe("parseAgentwrapTmuxArgs --agentwrap-tmux-env", () => {
       "DYLD_INSERT_LIBRARIES=/x.dylib",
       "LD_LIBRARY_PATH=/x",
     ]) {
-      const parsed = parseAgentwrapTmuxArgs(["--agentwrap-tmux-env", bad]);
+      const parsed = parseAgentwrapTmuxArgs(["--x-tmux-env", bad]);
       expect(parsed.error).toContain("dynamic-linker");
     }
   });
 
   test("control chars are stripped from the value", () => {
     const parsed = parseAgentwrapTmuxArgs([
-      "--agentwrap-tmux-env",
+      "--x-tmux-env",
       "FOO=a\x00b\x1fc\x7fd\te",
     ]);
     expect(parsed.error).toBeNull();
     expect(parsed.options.env).toEqual([["FOO", "abcde"]]);
   });
 
-  test("a trailing --agentwrap-tmux-env with no value is rejected", () => {
-    const parsed = parseAgentwrapTmuxArgs(["--agentwrap-tmux-env"]);
+  test("a trailing --x-tmux-env with no value is rejected", () => {
+    const parsed = parseAgentwrapTmuxArgs(["--x-tmux-env"]);
     expect(parsed.error).toContain("requires a value");
   });
 });
 
-describe("--agentwrap-tmux-env injection", () => {
+describe("--x-tmux-env injection", () => {
   test("injected env reaches the pane via -e on new-window (warm start) and never leaks", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -758,11 +750,11 @@ describe("--agentwrap-tmux-env injection", () => {
     const h = makeHarness({
       argv: [
         "codex",
-        "--agentwrap-tmux-session=work",
-        "--agentwrap-tmux-detached",
-        "--agentwrap-tmux-env",
+        "--x-tmux-session=work",
+        "--x-tmux-detached",
+        "--x-tmux-env",
         "KEEPER_TMUX_SESSION=work",
-        "--agentwrap-tmux-env=KEEPER_DB=/tmp/t.db",
+        "--x-tmux-env=KEEPER_DB=/tmp/t.db",
         "hello",
       ],
       rawArgv: true,
@@ -797,7 +789,7 @@ describe("--agentwrap-tmux-env injection", () => {
       "launch.sh",
     );
     const script = readFileSync(launchScript, "utf8");
-    expect(script).not.toContain("--agentwrap-tmux-env");
+    expect(script).not.toContain("--x-tmux-env");
     expect(script).not.toContain("KEEPER_TMUX_SESSION=work");
   });
 
@@ -810,11 +802,11 @@ describe("--agentwrap-tmux-env injection", () => {
     const h = makeHarness({
       argv: [
         "codex",
-        "--agentwrap-tmux-L",
+        "--x-tmux-L",
         "scratch",
-        "--agentwrap-tmux-session=cold",
-        "--agentwrap-tmux-detached",
-        "--agentwrap-tmux-env",
+        "--x-tmux-session=cold",
+        "--x-tmux-detached",
+        "--x-tmux-env",
         "KEEPER_TMUX_SESSION=cold",
         "hello",
       ],
@@ -849,9 +841,9 @@ describe("--agentwrap-tmux-env injection", () => {
     const h = makeHarness({
       argv: [
         "claude",
-        "--agentwrap-tmux-L",
+        "--x-tmux-L",
         "scratch",
-        "--agentwrap-tmux-env",
+        "--x-tmux-env",
         "LD_PRELOAD=/evil.so",
         "hello",
       ],
@@ -973,10 +965,10 @@ describe("--no-artifacts", () => {
     const h = makeHarness({
       argv: [
         "codex",
-        "--agentwrap-tmux-L",
+        "--x-tmux-L",
         "scratch",
-        "--agentwrap-tmux-session=work",
-        "--agentwrap-tmux-detached",
+        "--x-tmux-session=work",
+        "--x-tmux-detached",
         "--no-artifacts",
         "hello",
       ],

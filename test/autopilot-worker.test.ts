@@ -692,7 +692,7 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
   expect(plan?.key).toBe("work::fn-1-foo.1");
   expect(plan?.cwd).toBe("/repo");
   expect(plan?.workerCommand).toBe(
-    "cd /repo && claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+    "cd /repo && claude --model sonnet --effort max --x-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
 });
 
@@ -708,7 +708,7 @@ test("fn-937: a snapshot's resolved worker preset flows into the launch's comman
   const decision = reconcile(snap, makeState(), 0);
   const plan = decision.launches[0];
   expect(plan?.workerCommand).toBe(
-    "cd /repo && claude --model opus --effort high --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+    "cd /repo && claude --model opus --effort high --x-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
   // The same resolved values ride on the launch so the cycle glue feeds
   // buildPlannedLaunchSpec identically (drift-guard parity).
@@ -2770,14 +2770,14 @@ test("runReconcileCycle: a tiered `work` task launches directly — no work-plug
 
 test("buildWorkerCommand: work / close flag shapes (fn-756: approve verb gone)", () => {
   expect(buildWorkerCommand("work", "fn-1-foo.1", "/repo")).toBe(
-    "cd /repo && claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+    "cd /repo && claude --model sonnet --effort max --x-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
   expect(buildWorkerCommand("close", "fn-1-foo", "/repo")).toBe(
-    "cd /repo && claude --model sonnet --effort max --agentwrap-no-confirm --name close::fn-1-foo '/plan:close fn-1-foo'",
+    "cd /repo && claude --model sonnet --effort max --x-no-confirm --name close::fn-1-foo '/plan:close fn-1-foo'",
   );
   // Empty projectDir → no `cd` prefix (degenerate test path).
   expect(buildWorkerCommand("work", "fn-1-foo.1", "")).toBe(
-    "claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+    "claude --model sonnet --effort max --x-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
 });
 
@@ -2788,7 +2788,7 @@ test("buildWorkerCommand: work / close flag shapes (fn-756: approve verb gone)",
 test("buildWorkerCommand / buildPlannedLaunchSpec: a resolved preset overrides BOTH builders in lockstep", () => {
   const cmd = buildWorkerCommand("work", "fn-1-foo.1", "/repo", "opus", "high");
   expect(cmd).toBe(
-    "cd /repo && claude --model opus --effort high --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
+    "cd /repo && claude --model opus --effort high --x-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
   const spec = buildPlannedLaunchSpec("work", "fn-1-foo.1", "opus", "high");
   expect(spec).toEqual({

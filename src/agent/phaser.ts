@@ -2,8 +2,8 @@
  * Startup section progress — a `phase(label)` wrapper that prints one line per
  * section (`~ <label>`) to stdout. Falls silent when `quiet` is true (the
  * default run, `--print`, and passthrough modes) so clean stdout is never
- * polluted; section lines surface at `--agentwrap-verbose`. When `showTiming` is
- * set (`--agentwrap-very-verbose`) a slow phase (>=50ms) adds a `  (Nms)` line
+ * polluted; section lines surface at `--x-verbose`. When `showTiming` is
+ * set (`--x-very-verbose`) a slow phase (>=50ms) adds a `  (Nms)` line
  * beneath its label.
  */
 

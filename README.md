@@ -1375,13 +1375,13 @@ event-log/reducer/hook touch. Run any of them with
   island (the launcher import graph never reaches `src/db.ts`). A preset is a
   named `{harness, model?, effort?, thinking?, role?}` triple
   (`presets.<name>`); a panel is an ordered list of preset names
-  (`panels.<name>`). `keeper agent --agentwrap-preset <name> [args...]` applies
+  (`panels.<name>`). `keeper agent --x-preset <name> [args...]` applies
   one — harnessless, the harness comes from the preset — and `keeper agent
   presets resolve <name>` emits the resolved preset/panel JSON. Resolution is
   per-field `explicit flag > effort env > preset > per-harness yaml > native
   default`, so a preset never overrides an explicit `--model`/`--effort` and a
   partial preset layers over the yaml rather than replacing it; with no
-  `--agentwrap-preset` the launch is byte-identical to today. The registry is
+  `--x-preset` the launch is byte-identical to today. The registry is
   fail-open on a missing file and fail-loud on a malformed/invalid entry or an
   unknown preset name. Presets are producer-side launch config, never a fold
   input — no RPC writes a preset and the registry is re-parsed per dispatch (no
@@ -3283,7 +3283,7 @@ prints the plan (using the human-facing `buildResumeCommand` DISPLAY form),
 `--apply` relaunches each survivor into its recorded `backend_exec_session_id`
 via keeper's SOLE launch transport — `agentwrapLaunch` in resume mode
 (`src/exec-backend.ts`), the same seam `keeper bus wake` uses — pacing launches
-0.5s apart. agentwrap builds the `claude --agentwrap-tmux … --resume <target>`
+0.5s apart. agentwrap builds the `claude --x-tmux … --resume <target>`
 invocation off an absolute `keeper agent` launcher prefix (alias-independent, and
 a session name with shell metacharacters is handled safely), get-or-creates the
 session itself, and holds the pane open after claude exits. `src/resume-descriptor`
@@ -3456,7 +3456,7 @@ silent exit-0. A `queued_for_wake` send can be RESUMED now by the CLIENT-SIDE
 creator from the trusted `job_links` edge and resumes it into a dedicated
 `agentbus` tmux session via keeper's SOLE launch transport — `agentwrapLaunch` in
 resume mode (the same seam crash-restore uses): agentwrap builds the
-`claude --agentwrap-tmux … --resume <target>` invocation off an absolute
+`claude --x-tmux … --resume <target>` invocation off an absolute
 `keeper agent` launcher prefix (alias-independent, shell-metacharacter-safe),
 mints/owns the window, and holds the pane open after claude exits — so there is
 ONE launch transport, not a separate shell-wrapper. Single-flighted per session,

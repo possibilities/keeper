@@ -16,8 +16,8 @@
  *
  * Compose flow keeper drives, mirroring the agentwrap subcommand contract
  * (task .1):
- *   1. `agentwrap <cli> --agentwrap-tmux --agentwrap-tmux-detached
- *      --agentwrap-no-confirm <native flags> <prompt>` → one launch-JSON line
+ *   1. `agentwrap <cli> --x-tmux --x-tmux-detached
+ *      --x-no-confirm <native flags> <prompt>` → one launch-JSON line
  *      carrying the `id` handle.
  *   2. `agentwrap wait-for-stop <id> --stop-timeout-ms <ms>` → blocks until the
  *      partner's next stop; the ms budget forwards keeper's `--timeout` so
@@ -171,7 +171,7 @@ export interface PairLaunchOpts {
   readOnly: boolean;
   /** Target tmux session agentwrap mints/targets. Omitted = agentwrap default. */
   session?: string;
-  /** A named launch-config preset forwarded as `--agentwrap-preset <name>` so the
+  /** A named launch-config preset forwarded as `--x-preset <name>` so the
    *  launcher owns model/effort resolution — pair never re-derives them. Omitted
    *  = no preset flag (model/effort fall to the explicit `--model`/`--effort`). */
   preset?: string;
@@ -180,21 +180,21 @@ export interface PairLaunchOpts {
 /**
  * Build the detached `keeper agent` launch argv for a pairing partner. Shape:
  *
- *   `<bun> <abs cli/keeper.ts> agent <cli> --agentwrap-tmux
- *     --agentwrap-tmux-detached --agentwrap-no-confirm
- *     [--agentwrap-preset <name>]
- *     [--agentwrap-tmux-session <s>] [--agentwrap-tmux-env KEEPER_TMUX_SESSION=<s>]
+ *   `<bun> <abs cli/keeper.ts> agent <cli> --x-tmux
+ *     --x-tmux-detached --x-no-confirm
+ *     [--x-preset <name>]
+ *     [--x-tmux-session <s>] [--x-tmux-env KEEPER_TMUX_SESSION=<s>]
  *     <native cli flags> <prompt>`
  *
  * The `[<bun>, <keeper.ts>, "agent"]` prefix is `launcherArgvPrefix` (resolved by
  * the caller from `process.execPath` + `resolvePairKeeperAgentPath`), since under
  * keeper `process.argv[1]` is `cli/keeper.ts` / `src/daemon.ts` — neither carries
  * the `agent` token. The native flags differ per CLI (see {@link nativeClaudeArgs}
- * / {@link nativeCodexArgs}). The `--agentwrap-no-confirm` flag suppresses the
- * cwd-confirm prompt; `--agentwrap-tmux-detached` creates the window without
+ * / {@link nativeCodexArgs}). The `--x-no-confirm` flag suppresses the
+ * cwd-confirm prompt; `--x-tmux-detached` creates the window without
  * stealing focus, so the orchestrating session keeps control.
  *
- * `--agentwrap-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
+ * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
  * CLAUDE path only (mirroring `buildAgentwrapLaunchArgv` in
  * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
  * the `jobs` projection as a tracked job — the launcher injects it into the pane
@@ -208,23 +208,20 @@ export interface PairLaunchOpts {
  */
 export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
   const wrapperFlags: string[] = [
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-no-confirm",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-no-confirm",
   ];
   // The named preset rides as a launcher flag so `keeper agent` owns model/effort
   // resolution (explicit > env > preset > yaml > native). pair never re-derives
   // model/effort from the preset — it only reads the preset's harness/role itself.
   if (opts.preset !== undefined && opts.preset !== "") {
-    wrapperFlags.push("--agentwrap-preset", opts.preset);
+    wrapperFlags.push("--x-preset", opts.preset);
   }
   if (opts.session !== undefined && opts.session !== "") {
-    wrapperFlags.push("--agentwrap-tmux-session", opts.session);
+    wrapperFlags.push("--x-tmux-session", opts.session);
     if (opts.cli === "claude") {
-      wrapperFlags.push(
-        "--agentwrap-tmux-env",
-        `KEEPER_TMUX_SESSION=${opts.session}`,
-      );
+      wrapperFlags.push("--x-tmux-env", `KEEPER_TMUX_SESSION=${opts.session}`);
     }
   }
   const native =

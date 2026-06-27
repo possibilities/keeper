@@ -126,7 +126,7 @@ export interface TmuxLaunchOptions {
    * Caller-injected env, last-wins per duplicate KEY, forwarded to the pane via
    * tmux `-e KEY=VALUE` on both new-session and new-window. Keys are validated
    * and dynamic-linker keys are rejected at parse time; values have control
-   * chars stripped. Empty when `--agentwrap-tmux-env` is never passed, so the
+   * chars stripped. Empty when `--x-tmux-env` is never passed, so the
    * built tmux argv stays byte-identical to the pre-flag form.
    */
   env: [string, string][];
@@ -176,16 +176,16 @@ export interface TmuxLaunchResult {
 }
 
 const VALUE_FLAGS = new Set([
-  "--agentwrap-tmux-session",
-  "--agentwrap-tmux-window-name",
-  "--agentwrap-tmux-socket-name",
-  "--agentwrap-tmux-socket-path",
-  "--agentwrap-tmux-L",
-  "--agentwrap-tmux-S",
+  "--x-tmux-session",
+  "--x-tmux-window-name",
+  "--x-tmux-socket-name",
+  "--x-tmux-socket-path",
+  "--x-tmux-L",
+  "--x-tmux-S",
 ]);
 
 /** Repeatable env-injection flag, parsed separately from the scalar VALUE_FLAGS. */
-const ENV_FLAG = "--agentwrap-tmux-env";
+const ENV_FLAG = "--x-tmux-env";
 
 /** Env keys whose injection would alter the dynamic linker; hard-blocked. */
 const BLOCKED_ENV_KEY = /^(LD_|DYLD_)/;
@@ -222,16 +222,16 @@ export function parseAgentwrapTmuxArgs(args: string[]): ParsedTmuxLaunch {
       continue;
     }
 
-    if (arg === "--agentwrap-tmux") {
+    if (arg === "--x-tmux") {
       enabled = true;
       continue;
     }
-    if (arg === "--agentwrap-tmux-detached") {
+    if (arg === "--x-tmux-detached") {
       options.detached = true;
       enabled = true;
       continue;
     }
-    if (arg === "--no-artifacts" || arg === "--agentwrap-no-artifacts") {
+    if (arg === "--no-artifacts" || arg === "--x-no-artifacts") {
       options.noArtifacts = true;
       enabled = true;
       continue;
@@ -286,7 +286,7 @@ export function parseAgentwrapTmuxArgs(args: string[]): ParsedTmuxLaunch {
       remainingArgs,
       options,
       error:
-        "--agentwrap-tmux-L/--agentwrap-tmux-socket-name and --agentwrap-tmux-S/--agentwrap-tmux-socket-path are mutually exclusive",
+        "--x-tmux-L/--x-tmux-socket-name and --x-tmux-S/--x-tmux-socket-path are mutually exclusive",
     };
   }
 
@@ -315,26 +315,20 @@ function setTmuxValue(
     return `${flag} requires a non-empty value`;
   }
 
-  if (flag === "--agentwrap-tmux-session") {
+  if (flag === "--x-tmux-session") {
     options.session = value;
-  } else if (flag === "--agentwrap-tmux-window-name") {
+  } else if (flag === "--x-tmux-window-name") {
     options.windowName = value;
-  } else if (
-    flag === "--agentwrap-tmux-socket-name" ||
-    flag === "--agentwrap-tmux-L"
-  ) {
+  } else if (flag === "--x-tmux-socket-name" || flag === "--x-tmux-L") {
     options.socketName = value;
-  } else if (
-    flag === "--agentwrap-tmux-socket-path" ||
-    flag === "--agentwrap-tmux-S"
-  ) {
+  } else if (flag === "--x-tmux-socket-path" || flag === "--x-tmux-S") {
     options.socketPath = value;
   }
   return null;
 }
 
 /**
- * Validate and accumulate one `--agentwrap-tmux-env KEY=VALUE` pair (last-wins
+ * Validate and accumulate one `--x-tmux-env KEY=VALUE` pair (last-wins
  * per duplicate KEY). The KEY is matched against a strict env-name regex and
  * dynamic-linker keys are hard-blocked; control chars are stripped from VALUE.
  * Returns a non-null error string on a malformed/blocked key, which the parse
@@ -403,7 +397,7 @@ export const defaultTmuxCommandRunner: TmuxCommandRunner = (
   } catch (exc) {
     if (isSpawnNotFound(exc)) {
       throw new TmuxLaunchError(
-        "tmux command not found. Install tmux or remove --agentwrap-tmux.",
+        "tmux command not found. Install tmux or remove --x-tmux.",
         TMUX_EXIT.NOOP,
       );
     }
@@ -659,7 +653,7 @@ function windowNameArgs(windowName: string | null): string[] {
 
 /**
  * Caller-injected env as tmux `-e KEY=VALUE` argv elements (exec-array, never
- * shell-interpolated). Empty when no `--agentwrap-tmux-env` was passed, so the
+ * shell-interpolated). Empty when no `--x-tmux-env` was passed, so the
  * built tmux argv stays byte-identical to the pre-flag form.
  */
 function envArgs(env: [string, string][]): string[] {

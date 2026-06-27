@@ -1,8 +1,8 @@
 /**
- * Launcher flag-parse pins: the consumed `--agentwrap-*` flags are stripped from
+ * Launcher flag-parse pins: the consumed `--x-*` flags are stripped from
  * the residual argv, value forms (split / joined) both resolve, the launch-mode
  * signals (continue/resume/fork/print) fire, and passthrough tokens survive
- * verbatim. Only the canonical `--agentwrap-*` spelling is consumed; any other
+ * verbatim. Only the canonical `--x-*` spelling is consumed; any other
  * token (including a retired `--arthack-*` flag) falls through to remainingArgs.
  */
 
@@ -27,19 +27,14 @@ describe("normalizeAgentwrapProfileArg", () => {
 
 describe("parseArgs", () => {
   test("strips agentwrap flags, keeps the rest in order", () => {
-    const p = parseArgs([
-      "--agentwrap-verbose",
-      "--resume",
-      "--agentwrap-no-confirm",
-      "hello",
-    ]);
+    const p = parseArgs(["--x-verbose", "--resume", "--x-no-confirm", "hello"]);
     expect(p.agentwrapVerbose).toBe(true);
     expect(p.agentwrapNoConfirm).toBe(true);
     expect(p.remainingArgs).toEqual(["--resume", "hello"]);
   });
 
-  test("--agentwrap-very-verbose is a bare bool, stripped", () => {
-    const p = parseArgs(["--agentwrap-very-verbose", "hi"]);
+  test("--x-very-verbose is a bare bool, stripped", () => {
+    const p = parseArgs(["--x-very-verbose", "hi"]);
     expect(p.agentwrapVeryVerbose).toBe(true);
     expect(p.agentwrapVerbose).toBe(false);
     expect(p.remainingArgs).toEqual(["hi"]);
@@ -51,15 +46,15 @@ describe("parseArgs", () => {
     expect(p.agentwrapVeryVerbose).toBe(false);
   });
 
-  test("--agentwrap-profile split form", () => {
-    const p = parseArgs(["--agentwrap-profile", "work", "hi"]);
+  test("--x-profile split form", () => {
+    const p = parseArgs(["--x-profile", "work", "hi"]);
     expect(p.agentwrapProfile).toBe("work");
     expect(p.explicitAgentwrapProfile).toBe(true);
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
-  test("--agentwrap-profile=joined form", () => {
-    const p = parseArgs(["--agentwrap-profile=work", "hi"]);
+  test("--x-profile=joined form", () => {
+    const p = parseArgs(["--x-profile=work", "hi"]);
     expect(p.agentwrapProfile).toBe("work");
     expect(p.explicitAgentwrapProfile).toBe(true);
     expect(p.remainingArgs).toEqual(["hi"]);
@@ -99,38 +94,38 @@ describe("parseArgs", () => {
     expect(parseArgsForAgent(["--mode", "json"], "pi").hasPrint).toBe(true);
   });
 
-  test("a value that follows --agentwrap-profile is consumed, not passed through", () => {
-    // The token after a bare --agentwrap-profile is the value even if flag-shaped
+  test("a value that follows --x-profile is consumed, not passed through", () => {
+    // The token after a bare --x-profile is the value even if flag-shaped
     // is NOT special-cased — the very next token is consumed verbatim.
-    const p = parseArgs(["--agentwrap-profile", "work"]);
+    const p = parseArgs(["--x-profile", "work"]);
     expect(p.agentwrapProfile).toBe("work");
     expect(p.remainingArgs).toEqual([]);
   });
 
-  test("--agentwrap-preset split form is consumed and stripped", () => {
-    const p = parseArgs(["--agentwrap-preset", "claude-opus-xhigh", "hi"]);
+  test("--x-preset split form is consumed and stripped", () => {
+    const p = parseArgs(["--x-preset", "claude-opus-xhigh", "hi"]);
     expect(p.agentwrapPreset).toBe("claude-opus-xhigh");
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
-  test("--agentwrap-preset=joined form is consumed and stripped", () => {
-    const p = parseArgs(["--agentwrap-preset=codex-gpt55-high", "hi"]);
+  test("--x-preset=joined form is consumed and stripped", () => {
+    const p = parseArgs(["--x-preset=codex-gpt55-high", "hi"]);
     expect(p.agentwrapPreset).toBe("codex-gpt55-high");
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
-  test("--agentwrap-preset defaults to null (no auto)", () => {
+  test("--x-preset defaults to null (no auto)", () => {
     expect(parseArgs(["hi"]).agentwrapPreset).toBeNull();
   });
 
-  test("--agentwrap-help is dispatch-owned, not a parser-consumed flag", () => {
-    // main() short-circuits --agentwrap-help before parseArgs ever runs; the
+  test("--x-help is dispatch-owned, not a parser-consumed flag", () => {
+    // main() short-circuits --x-help before parseArgs ever runs; the
     // parser sets no launch-mode signal for it and treats it like any unknown
     // token (forwarded verbatim), so it can never silently rewrite the argv.
-    const p = parseArgs(["--agentwrap-help"]);
+    const p = parseArgs(["--x-help"]);
     expect(p.agentwrapVerbose).toBe(false);
     expect(p.agentwrapNoConfirm).toBe(false);
-    expect(p.remainingArgs).toEqual(["--agentwrap-help"]);
+    expect(p.remainingArgs).toEqual(["--x-help"]);
   });
 });
 

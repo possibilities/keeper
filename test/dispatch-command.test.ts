@@ -116,7 +116,7 @@ test("buildDispatchLaunchArgv: emits the `$@` positional form with an explicit a
     'exec claude "$@" ; exec "$0" -l -i',
     // explicit $0 slot — without it the first flag is eaten as $0
     "/bin/zsh",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--name",
     "work::fn-1-foo.1",
     // prompt is the FINAL positional element
@@ -144,7 +144,7 @@ test("buildDispatchLaunchArgv: includes --model / --effort ONLY when supplied", 
     "sonnet",
     "--effort",
     "max",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--name",
     "scratch",
     "investigate X",
@@ -165,7 +165,7 @@ test("buildDispatchLaunchArgv: omits --name entirely when claudeName is absent",
     "-c",
     'exec claude "$@" ; exec "$0" -l -i',
     "/bin/zsh",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     // no --name pair — prompt is the FINAL positional
     "investigate X",
   ]);
@@ -183,14 +183,14 @@ test("buildDispatchLaunchArgv: emits --name verbatim when claudeName is supplied
   expect(argv[i + 1]).toBe("scratch");
 });
 
-test("buildDispatchLaunchArgv: omits --agentwrap-no-confirm when noConfirm is false", () => {
+test("buildDispatchLaunchArgv: omits --x-no-confirm when noConfirm is false", () => {
   const argv = buildDispatchLaunchArgv("/bin/bash", {
     cwd: "/repo",
     claudeName: "scratch",
     prompt: "hi",
     noConfirm: false,
   });
-  expect(argv).not.toContain("--agentwrap-no-confirm");
+  expect(argv).not.toContain("--x-no-confirm");
   expect(argv).not.toContain("--model");
   expect(argv).not.toContain("--effort");
   // Still has the fixed scaffold + name + prompt.

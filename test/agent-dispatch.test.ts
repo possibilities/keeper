@@ -90,43 +90,41 @@ describe("splitSubcommand", () => {
     expect(splitSubcommand(["--version"])).toEqual({ kind: "version" });
   });
 
-  test("leading --agentwrap-help classifies as wrapper help", () => {
-    expect(splitSubcommand(["--agentwrap-help"])).toEqual({
+  test("leading --x-help classifies as wrapper help", () => {
+    expect(splitSubcommand(["--x-help"])).toEqual({
       kind: "help-wrapper",
     });
   });
 
-  test("--agentwrap-help after an agent token lands in rest", () => {
-    expect(splitSubcommand(["claude", "--agentwrap-help"])).toEqual({
+  test("--x-help after an agent token lands in rest", () => {
+    expect(splitSubcommand(["claude", "--x-help"])).toEqual({
       kind: "run",
       agent: "claude",
-      rest: ["--agentwrap-help"],
+      rest: ["--x-help"],
     });
   });
 
-  test("leading --agentwrap-preset is the harnessless run-preset form", () => {
-    expect(
-      splitSubcommand(["--agentwrap-preset", "claude-opus-xhigh", "/p"]),
-    ).toEqual({
+  test("leading --x-preset is the harnessless run-preset form", () => {
+    expect(splitSubcommand(["--x-preset", "claude-opus-xhigh", "/p"])).toEqual({
       kind: "run-preset",
       presetName: "claude-opus-xhigh",
       // The whole argv stays in rest so parseArgs strips the flag.
-      rest: ["--agentwrap-preset", "claude-opus-xhigh", "/p"],
+      rest: ["--x-preset", "claude-opus-xhigh", "/p"],
     });
   });
 
-  test("leading --agentwrap-preset=joined form classifies as run-preset", () => {
-    expect(splitSubcommand(["--agentwrap-preset=codex-gpt55-high"])).toEqual({
+  test("leading --x-preset=joined form classifies as run-preset", () => {
+    expect(splitSubcommand(["--x-preset=codex-gpt55-high"])).toEqual({
       kind: "run-preset",
       presetName: "codex-gpt55-high",
-      rest: ["--agentwrap-preset=codex-gpt55-high"],
+      rest: ["--x-preset=codex-gpt55-high"],
     });
   });
 
-  test("--agentwrap-preset with no name is usage", () => {
-    expect(splitSubcommand(["--agentwrap-preset"])).toEqual({
+  test("--x-preset with no name is usage", () => {
+    expect(splitSubcommand(["--x-preset"])).toEqual({
       kind: "usage",
-      unknown: "--agentwrap-preset",
+      unknown: "--x-preset",
     });
   });
 
@@ -165,7 +163,7 @@ describe("splitSubcommand", () => {
 
 describe("main() dispatch routing", () => {
   test("claude + args reaches the spawn recorder", async () => {
-    const h = harness(["claude", "--agentwrap-no-confirm", "hello"]);
+    const h = harness(["claude", "--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.claudeBin);
     expect(cmd).toContain("hello");
@@ -174,7 +172,7 @@ describe("main() dispatch routing", () => {
   });
 
   test("parity: stripping `claude` leaves the composed argv identical", async () => {
-    const args = ["--agentwrap-no-confirm", "--print", "hello world"];
+    const args = ["--x-no-confirm", "--print", "hello world"];
     const withSub = await runAndCapture(harness(["claude", ...args]), main);
     // Re-derive the same argv directly via splitSubcommand to prove the strip
     // is the only transform: feeding `rest` straight in must match.
@@ -192,7 +190,7 @@ describe("main() dispatch routing", () => {
   });
 
   test("codex + args reaches the spawn recorder", async () => {
-    const h = harness(["codex", "--agentwrap-no-confirm", "hello"]);
+    const h = harness(["codex", "--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.codexBin);
     expect(cmd).toContain("hello");
@@ -200,7 +198,7 @@ describe("main() dispatch routing", () => {
   });
 
   test("pi + args reaches the spawn recorder", async () => {
-    const h = harness(["pi", "--agentwrap-no-confirm", "hello"]);
+    const h = harness(["pi", "--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.piBin);
     expect(cmd).toContain("hello");
@@ -208,7 +206,7 @@ describe("main() dispatch routing", () => {
   });
 
   test("bare claude launches interactively (spawn fires)", async () => {
-    const h = harness(["claude", "--agentwrap-no-confirm"]);
+    const h = harness(["claude", "--x-no-confirm"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.claudeBin);
   });
@@ -247,34 +245,34 @@ describe("main() dispatch routing", () => {
     expect(h.spawned.length).toBe(0);
   });
 
-  test("--agentwrap-help → stdout wrapper help + exit 0", async () => {
-    const h = harness(["--agentwrap-help"]);
+  test("--x-help → stdout wrapper help + exit 0", async () => {
+    const h = harness(["--x-help"]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(h.out.join("")).toContain("Wrapper flags:");
-    expect(h.out.join("")).toContain("--agentwrap-tmux");
+    expect(h.out.join("")).toContain("--x-tmux");
     expect(h.err.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });
 
-  test("claude --agentwrap-help → wrapper help + exit 0, no launch", async () => {
-    const h = harness(["claude", "--agentwrap-help"]);
+  test("claude --x-help → wrapper help + exit 0, no launch", async () => {
+    const h = harness(["claude", "--x-help"]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.spawned.length).toBe(0);
   });
 
-  test("codex --agentwrap-help → wrapper help + exit 0, no launch", async () => {
-    const h = harness(["codex", "--agentwrap-help"]);
+  test("codex --x-help → wrapper help + exit 0, no launch", async () => {
+    const h = harness(["codex", "--x-help"]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.spawned.length).toBe(0);
   });
 
-  test("pi --agentwrap-help → wrapper help + exit 0, no launch", async () => {
-    const h = harness(["pi", "--agentwrap-help"]);
+  test("pi --x-help → wrapper help + exit 0, no launch", async () => {
+    const h = harness(["pi", "--x-help"]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(h.out.join("")).toContain("Wrapper flags:");

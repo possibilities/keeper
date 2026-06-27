@@ -1,5 +1,5 @@
 /**
- * Named-preset launch-config wiring (task 1): the `--agentwrap-preset` flag and
+ * Named-preset launch-config wiring (task 1): the `--x-preset` flag and
  * `presets resolve` verb drive harness/model/effort through main()'s resolver
  * default slots at `explicit > env > preset > yaml > native` per field, the
  * harnessless form drives the harness from the preset, a head agent disagreeing
@@ -37,10 +37,10 @@ function registry(
   return { presets, panels };
 }
 
-describe("--agentwrap-preset precedence (claude)", () => {
+describe("--x-preset precedence (claude)", () => {
   test("preset model + effort feed the default slot", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
       presetRegistry: registry({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
@@ -53,14 +53,7 @@ describe("--agentwrap-preset precedence (claude)", () => {
 
   test("explicit --model wins over the preset; preset effort still applies", async () => {
     const h = makeHarness({
-      argv: [
-        "--agentwrap-no-confirm",
-        "--agentwrap-preset",
-        "p",
-        "--model",
-        "sonnet",
-        "hi",
-      ],
+      argv: ["--x-no-confirm", "--x-preset", "p", "--model", "sonnet", "hi"],
       listProfiles: () => ["default"],
       presetRegistry: registry({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
@@ -74,7 +67,7 @@ describe("--agentwrap-preset precedence (claude)", () => {
 
   test("CLAUDE_CODE_EFFORT_LEVEL env beats the preset effort", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
       listProfiles: () => ["default"],
       presetRegistry: registry({
@@ -89,7 +82,7 @@ describe("--agentwrap-preset precedence (claude)", () => {
 
   test("a model-only preset leaves effort falling through to yaml", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
       launcherEffort: "high",
       presetRegistry: registry({
@@ -103,7 +96,7 @@ describe("--agentwrap-preset precedence (claude)", () => {
 
   test("the preset model layers over yaml when both are set", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
       launcherModel: "sonnet",
       presetRegistry: registry({
@@ -115,11 +108,11 @@ describe("--agentwrap-preset precedence (claude)", () => {
   });
 });
 
-describe("--agentwrap-preset precedence (codex + pi)", () => {
+describe("--x-preset precedence (codex + pi)", () => {
   test("codex preset model + effort feed the resolver default slot", async () => {
     const h = makeHarness({
       agent: "codex",
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "c", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "c", "hi"],
       presetRegistry: registry({
         c: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
       }),
@@ -132,7 +125,7 @@ describe("--agentwrap-preset precedence (codex + pi)", () => {
   test("pi preset model + thinking feed the resolver default slot", async () => {
     const h = makeHarness({
       agent: "pi",
-      argv: ["--agentwrap-no-confirm", "--agentwrap-preset", "pp", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "pp", "hi"],
       listProfiles: () => ["default"],
       presetRegistry: registry({
         pp: preset({ harness: "pi", model: "pi-pro", thinking: "deep" }),
@@ -147,7 +140,7 @@ describe("--agentwrap-preset precedence (codex + pi)", () => {
 describe("harnessless run-preset + harness agreement", () => {
   test("the harnessless form drives the harness from the preset (codex)", async () => {
     const h = makeHarness({
-      argv: ["--agentwrap-preset", "c", "--agentwrap-no-confirm", "hi"],
+      argv: ["--x-preset", "c", "--x-no-confirm", "hi"],
       rawArgv: true,
       presetRegistry: registry({
         c: preset({ harness: "codex", model: "gpt-5.5" }),
@@ -160,13 +153,7 @@ describe("harnessless run-preset + harness agreement", () => {
 
   test("a head agent disagreeing with the preset harness fails loud", async () => {
     const h = makeHarness({
-      argv: [
-        "codex",
-        "--agentwrap-no-confirm",
-        "--agentwrap-preset",
-        "p",
-        "hi",
-      ],
+      argv: ["codex", "--x-no-confirm", "--x-preset", "p", "hi"],
       rawArgv: true,
       presetRegistry: registry({
         p: preset({ harness: "claude", model: "opus" }),
@@ -180,7 +167,7 @@ describe("harnessless run-preset + harness agreement", () => {
 
   test("a missing preset name fails loud", async () => {
     const h = makeHarness({
-      argv: ["claude", "--agentwrap-no-confirm", "--agentwrap-preset", "ghost"],
+      argv: ["claude", "--x-no-confirm", "--x-preset", "ghost"],
       rawArgv: true,
       presetRegistry: registry({
         p: preset({ harness: "claude" }),
@@ -194,14 +181,14 @@ describe("harnessless run-preset + harness agreement", () => {
 });
 
 describe("no preset → byte-identical to today", () => {
-  test("no --agentwrap-preset leaves the spawned argv unchanged", async () => {
+  test("no --x-preset leaves the spawned argv unchanged", async () => {
     const base = makeHarness({
-      argv: ["--agentwrap-no-confirm", "hi"],
+      argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
     });
     const baseCmd = await runAndCapture(base, main);
     const withRegistry = makeHarness({
-      argv: ["--agentwrap-no-confirm", "hi"],
+      argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
       presetRegistry: registry({
         p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),

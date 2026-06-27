@@ -117,7 +117,7 @@ recent crash burst when no generation boundary is recorded yet).
 
 --snapshot-current is the manual safety net: it reads the CURRENT live set
 (every working/stopped session) and emits a runnable bash script that revives
-each via the bare 'keeper agent claude --agentwrap-tmux … --resume' argv
+each via the bare 'keeper agent claude --x-tmux … --resume' argv
 (agentwrap owns the session+window), byte-aligned with what --apply spawns. Pipe
 it to a file and run it later — a dump you can trust independent of the
 automatic crash path.
@@ -370,7 +370,7 @@ export function shellQuote(arg: string): string {
  * Pure renderer: turn the CURRENT live candidate set into a RUNNABLE bash script
  * that revives each session via the SAME `agentwrapLaunch` transport `--apply`
  * uses. Each candidate emits the BARE `buildAgentwrapLaunchArgv` resume argv
- * (`keeper agent claude --agentwrap-tmux … --resume <target>`) shell-quoted —
+ * (`keeper agent claude --x-tmux … --resume <target>`) shell-quoted —
  * byte-aligned with what `--apply` spawns, with NO `tmux new-window` wrapper
  * (agentwrap creates its OWN session+window; a `new-window` wrapper would
  * DOUBLE-create). A `cd <cwd> &&` prefix sets the directory agentwrap reads from
@@ -652,7 +652,7 @@ async function main(): Promise<void> {
   const dbPath = args.db ?? resolveDbPath();
   // The absolute `keeper agent` launcher prefix — PATH-independent, so a
   // restored tab never depends on the `claude` alias. `agentwrapLaunch` builds
-  // the `claude --agentwrap-tmux … --resume <target>` invocation off it.
+  // the `claude --x-tmux … --resume <target>` invocation off it.
   const launcherPrefix = buildLauncherArgvPrefix(
     process.execPath,
     resolveKeeperAgentPathDepFree(),

@@ -276,14 +276,14 @@ test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt la
   expect(argv.slice(0, LAP.length)).toEqual([...LAP]);
   expect(argv[LAP.length]).toBe("claude");
   expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-no-confirm",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-no-confirm",
   ]);
   // Interactive tracked-job shape — never the headless --print -p.
   expect(argv).not.toContain("--print");
   // No session supplied → no binding carrier (nothing to name).
-  expect(argv).not.toContain("--agentwrap-tmux-env");
+  expect(argv).not.toContain("--x-tmux-env");
   // The prompt is ALWAYS the final positional element.
   expect(argv.at(-1)).toBe("THE PROMPT");
 });
@@ -298,11 +298,11 @@ test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION b
   });
   // The carrier is what binds the partner into `jobs` as a tracked job, mirroring
   // buildAgentwrapLaunchArgv. Its value names the same session as the window.
-  const envIdx = argv.indexOf("--agentwrap-tmux-env");
+  const envIdx = argv.indexOf("--x-tmux-env");
   expect(envIdx).toBeGreaterThanOrEqual(0);
   expect(argv[envIdx + 1]).toBe("KEEPER_TMUX_SESSION=panels");
   // And the window session flag is still present + names the same session.
-  const sessIdx = argv.indexOf("--agentwrap-tmux-session");
+  const sessIdx = argv.indexOf("--x-tmux-session");
   expect(sessIdx).toBeGreaterThanOrEqual(0);
   expect(argv[sessIdx + 1]).toBe("panels");
 });
@@ -317,8 +317,8 @@ test("buildPairLaunchArgv: codex never gets the binding carrier (stays untracked
   });
   // codex fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION
   // carrier, even with a session named for the window.
-  expect(argv).not.toContain("--agentwrap-tmux-env");
-  expect(argv).toContain("--agentwrap-tmux-session");
+  expect(argv).not.toContain("--x-tmux-env");
+  expect(argv).toContain("--x-tmux-session");
 });
 
 test("buildPairLaunchArgv: codex — agent token is codex, interactive native flags, prompt last", () => {
@@ -361,13 +361,13 @@ test("buildPairLaunchArgv: pi routes to nativePiArgs — never codex/claude flag
   expect(argv).not.toContain("--print");
   // pi fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION carrier,
   // even with a session named for the window.
-  expect(argv).not.toContain("--agentwrap-tmux-env");
-  expect(argv).toContain("--agentwrap-tmux-session");
+  expect(argv).not.toContain("--x-tmux-env");
+  expect(argv).toContain("--x-tmux-session");
   // The prompt is ALWAYS the final positional element.
   expect(argv.at(-1)).toBe("THE PI PROMPT");
 });
 
-test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session supplied", () => {
+test("buildPairLaunchArgv: --x-tmux-session appended when session supplied", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "claude",
@@ -375,12 +375,12 @@ test("buildPairLaunchArgv: --agentwrap-tmux-session appended when session suppli
     readOnly: false,
     session: "pair-sess",
   });
-  const idx = argv.indexOf("--agentwrap-tmux-session");
+  const idx = argv.indexOf("--x-tmux-session");
   expect(idx).toBeGreaterThanOrEqual(0);
   expect(argv[idx + 1]).toBe("pair-sess");
 });
 
-test("buildPairLaunchArgv: --preset forwards --agentwrap-preset so the launcher owns model/effort", () => {
+test("buildPairLaunchArgv: --preset forwards --x-preset so the launcher owns model/effort", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "claude",
@@ -388,28 +388,28 @@ test("buildPairLaunchArgv: --preset forwards --agentwrap-preset so the launcher 
     readOnly: false,
     preset: "claude-opus-xhigh",
   });
-  const idx = argv.indexOf("--agentwrap-preset");
+  const idx = argv.indexOf("--x-preset");
   expect(idx).toBeGreaterThanOrEqual(0);
   expect(argv[idx + 1]).toBe("claude-opus-xhigh");
   // The base wrapper-flag triad stays the first three flags after the cli token —
   // preset rides AFTER them, never reordering the load-bearing prefix.
   expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-no-confirm",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-no-confirm",
   ]);
   // The prompt is still the final positional.
   expect(argv.at(-1)).toBe("P");
 });
 
-test("buildPairLaunchArgv: no preset → no --agentwrap-preset flag (zero behavior change)", () => {
+test("buildPairLaunchArgv: no preset → no --x-preset flag (zero behavior change)", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
     readOnly: false,
   });
-  expect(argv).not.toContain("--agentwrap-preset");
+  expect(argv).not.toContain("--x-preset");
 });
 
 test("buildWaitForStopArgv / buildShowLastMessageArgv: handle composition", () => {

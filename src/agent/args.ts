@@ -1,14 +1,14 @@
 /**
  * Launcher flag parsing — the pre-pass that strips the launcher's own
- * `--agentwrap-*` flags from argv before the residual is handed to the agent, and
+ * `--x-*` flags from argv before the residual is handed to the agent, and
  * surfaces the launch mode signals (continuation, headless, fork, profile) the
  * rest of main() branches on.
  *
- * Three consumed flags carry no value (`--agentwrap-verbose`,
- * `--agentwrap-very-verbose`, `--agentwrap-no-confirm`) and wrapper value flags
- * (`--agentwrap-profile`, `--agentwrap-preset`,
- * `--agentwrap-codex-session-name`) take either split (`--agentwrap-profile x`)
- * or joined (`--agentwrap-profile=x`) form. Every other token passes through verbatim into
+ * Three consumed flags carry no value (`--x-verbose`,
+ * `--x-very-verbose`, `--x-no-confirm`) and wrapper value flags
+ * (`--x-profile`, `--x-preset`,
+ * `--x-codex-session-name`) take either split (`--x-profile x`)
+ * or joined (`--x-profile=x`) form. Every other token passes through verbatim into
  * `remainingArgs`, preserving order — the agent sees exactly what the human
  * typed minus the launcher flags. A stray non-launcher flag (including the
  * retired `--arthack-*` spelling) is forwarded to the agent, which rejects it
@@ -36,14 +36,14 @@ export interface ParsedArgs {
   hasForkSession: boolean;
   /** Agent-native headless mode was seen. */
   hasPrint: boolean;
-  /** `--agentwrap-verbose` seen — print one line per startup section. */
+  /** `--x-verbose` seen — print one line per startup section. */
   agentwrapVerbose: boolean;
   /**
-   * `--agentwrap-very-verbose` seen — section lines plus the full action log and
-   * composed claude command. Implies `--agentwrap-verbose`.
+   * `--x-very-verbose` seen — section lines plus the full action log and
+   * composed claude command. Implies `--x-verbose`.
    */
   agentwrapVeryVerbose: boolean;
-  /** `--agentwrap-no-confirm` seen — suppress the cwd-confirm prompt. */
+  /** `--x-no-confirm` seen — suppress the cwd-confirm prompt. */
   agentwrapNoConfirm: boolean;
   /** Resolved profile selector: `"auto"`, `""` (default account), or a name. */
   agentwrapProfile: string;
@@ -52,7 +52,7 @@ export interface ParsedArgs {
   /** Synthetic Codex session name to index once the live session id is known. */
   agentwrapCodexSessionName: string | null;
   /**
-   * `--agentwrap-preset <name>` — a named launch-config preset resolved from
+   * `--x-preset <name>` — a named launch-config preset resolved from
    * `presets.yaml` that supplies harness/model/effort defaults BELOW any
    * explicit flag or effort env. `null` when unset (no "auto"); the preset
    * never overrides an explicit `--model`/`--effort`.
@@ -112,27 +112,27 @@ export function parseArgsForAgent(
       parsingAgentwrapPreset = false;
       continue;
     }
-    if (arg === "--agentwrap-verbose") {
+    if (arg === "--x-verbose") {
       agentwrapVerbose = true;
-    } else if (arg === "--agentwrap-very-verbose") {
+    } else if (arg === "--x-very-verbose") {
       agentwrapVeryVerbose = true;
-    } else if (arg === "--agentwrap-no-confirm") {
+    } else if (arg === "--x-no-confirm") {
       agentwrapNoConfirm = true;
-    } else if (arg === "--agentwrap-profile") {
+    } else if (arg === "--x-profile") {
       parsingAgentwrapProfile = true;
       explicitAgentwrapProfile = true;
-    } else if (arg.startsWith("--agentwrap-profile=")) {
-      agentwrapProfile = arg.slice("--agentwrap-profile=".length);
+    } else if (arg.startsWith("--x-profile=")) {
+      agentwrapProfile = arg.slice("--x-profile=".length);
       explicitAgentwrapProfile = true;
-    } else if (arg === "--agentwrap-codex-session-name") {
+    } else if (arg === "--x-codex-session-name") {
       parsingAgentwrapCodexSessionName = true;
-    } else if (arg.startsWith("--agentwrap-codex-session-name=")) {
+    } else if (arg.startsWith("--x-codex-session-name=")) {
       agentwrapCodexSessionName =
-        arg.slice("--agentwrap-codex-session-name=".length).trim() || null;
-    } else if (arg === "--agentwrap-preset") {
+        arg.slice("--x-codex-session-name=".length).trim() || null;
+    } else if (arg === "--x-preset") {
       parsingAgentwrapPreset = true;
-    } else if (arg.startsWith("--agentwrap-preset=")) {
-      agentwrapPreset = arg.slice("--agentwrap-preset=".length).trim() || null;
+    } else if (arg.startsWith("--x-preset=")) {
+      agentwrapPreset = arg.slice("--x-preset=".length).trim() || null;
     } else {
       remainingArgs.push(arg);
       if (agent !== "codex" && isContinueOrResumeArg(arg, agent)) {

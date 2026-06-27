@@ -578,17 +578,17 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "autopilot",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     "--model",
     "sonnet",
     "--effort",
     "max",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--name",
     "work::fn-1-x.1",
     "/plan:work fn-1-x.1",
@@ -606,11 +606,11 @@ test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confir
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "autopilot",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     "do a thing",
   ]);
@@ -628,13 +628,13 @@ test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trail
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "agentbus",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=agentbus",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--resume",
     "planner-session",
   ]);
@@ -654,17 +654,17 @@ test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode"
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "agentbus",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=agentbus",
     "fallback prompt",
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --agentwrap-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
+test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
   expect(
     buildAgentwrapLaunchArgv({
       launcherArgvPrefix: LAP,
@@ -679,21 +679,21 @@ test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --agentwrap-t
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "autopilot",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     // The 2nd repeated env entry — the worktree lane carrier, right after the
     // session entry and BEFORE the model/effort/name flags.
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
     "--model",
     "sonnet",
     "--effort",
     "max",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--name",
     "work::fn-1-x.1",
     "/plan:work fn-1-x.1",
@@ -715,15 +715,15 @@ test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WO
   ).toEqual([
     ...LAP,
     "claude",
-    "--agentwrap-tmux",
-    "--agentwrap-tmux-detached",
-    "--agentwrap-tmux-session",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
     "autopilot",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
-    "--agentwrap-tmux-env",
+    "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
-    "--agentwrap-no-confirm",
+    "--x-no-confirm",
     "--resume",
     "work::fn-1-x.1",
   ]);
@@ -797,7 +797,7 @@ test("AGENTWRAP_SCHEMA_VERSION is pinned at 1 (cross-repo contract)", () => {
  * module (agentwrap `src/main.ts` `tmuxMetadata` / `tmux-launch.ts` `TMUX_EXIT`
  * on one side, keeper `parseAgentwrapStdout` / `AGENTWRAP_TMUX_EXIT` on the
  * other). `test/fixtures/agentwrap-launch-stdout.json` is ONE line of real
- * `agentwrap claude --agentwrap-tmux --agentwrap-tmux-detached …` stdout
+ * `agentwrap claude --x-tmux --x-tmux-detached …` stdout
  * (captured from the binary, not hand-authored), so these tests fail loudly the
  * moment agentwrap's emitted shape or keeper's parser drifts apart. Recapture
  * the fixture from real output when the contract is intentionally bumped.
@@ -927,7 +927,7 @@ test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv wit
   // "agent" prefix), into the managed session, with the worker cwd set on the
   // spawn (the launcher has no cwd flag).
   expect(records[0]?.cmd.slice(0, LAP.length)).toEqual([...LAP]);
-  expect(records[0]?.cmd).toContain("--agentwrap-tmux");
+  expect(records[0]?.cmd).toContain("--x-tmux");
   expect(records[0]?.cmd).toContain("autopilot"); // the managed session
   expect(records[0]?.cwd).toBe("/repo");
 });

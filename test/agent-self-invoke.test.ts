@@ -206,7 +206,7 @@ describe("launch script embeds the launcherArgvPrefix (not argv[1])", () => {
     const cwd = "/fake-home/code/proj";
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
-      argv: ["codex", "--agentwrap-tmux", "hello"],
+      argv: ["codex", "--x-tmux", "hello"],
       rawArgv: true,
       agentwrapStateDir: stateDir,
       transcriptHomeDir: home,
