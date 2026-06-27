@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "launch always sets KEEPER_PLAN_WORKTREE",
-  "updated_at": "2026-06-27T15:17:02.979000Z"
+  "updated_at": "2026-06-27T15:26:20.271000Z",
+  "worker_done_at": "2026-06-27T15:26:20.271000Z"
 }

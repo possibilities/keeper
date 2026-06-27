@@ -31,5 +31,5 @@ Fast-tier: assert buildAgentwrapLaunchArgv ALWAYS includes exactly one KEEPER_PL
 - [ ] Byte-pin / argv tests updated to the new serial shape; typecheck + lint green; the default fast `bun test` stays pure.
 
 ## Done summary
-
+buildAgentwrapLaunchArgv now always emits a single --x-tmux-env KEEPER_PLAN_WORKTREE entry (lane in worktree mode, empty in serial) so a reused tmux session can never leak a stale lane into target_repo resolution; serial resolution is unchanged since empty resolves identically to unset. Byte-pin/argv tests updated.
 ## Evidence
