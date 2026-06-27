@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-27T02:26:51.459000Z",
+  "depends_on": [
+    "fn-981-require-and-relocate-agent-preset.1"
+  ],
+  "epic": "fn-981-require-and-relocate-agent-preset",
+  "id": "fn-981-require-and-relocate-agent-preset.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Surface preset discovery to agents",
+  "updated_at": "2026-06-27T02:26:51.459000Z"
+}
