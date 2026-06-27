@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "real-git worktree-lifecycle slow test",
-  "updated_at": "2026-06-27T14:59:28.511000Z"
+  "updated_at": "2026-06-27T15:20:08.563000Z",
+  "worker_done_at": "2026-06-27T15:20:08.563000Z"
 }

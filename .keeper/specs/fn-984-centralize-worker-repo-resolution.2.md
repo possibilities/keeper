@@ -36,5 +36,5 @@ The default `bun test` MUST stay pure (no real git) — the new test is skipped 
 - [ ] Default `bun test` does NOT run it (stays pure); `bun run test:slow` runs and passes it. Root CLAUDE.md / README invariant untouched.
 
 ## Done summary
-
+Added a real-git slow-tier worktree-lane lifecycle test (provision -> claim-in-lane -> commit -> merge -> teardown under polluted GIT_*), gated describe.skipIf(!SLOW_ENABLED) so the default bun test stays pure.
 ## Evidence
