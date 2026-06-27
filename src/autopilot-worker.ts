@@ -53,6 +53,7 @@ import {
   gitExec,
   type GitRunner as WorktreeGitRunner,
 } from "./commit-work/git-exec";
+import { describePushNotReady, remotePushTurnKey } from "./commit-work/push";
 import {
   DEFAULT_MAX_CONCURRENT_JOBS,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
@@ -2570,6 +2571,22 @@ export function createWorktreeDriver(
             reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
           };
         }
+        // Turn-key-push precheck BEFORE the merge: confirm the eventual push is
+        // runnable non-interactively (remote + `@{push}` target + a clean
+        // `--dry-run`) so a non-turn-key push never advances local default into a
+        // merge-then-die state. A non-turn-key push degrades to a DISTINCT
+        // NON-STICKY skip-retry — `worktree-finalize-push-not-turn-key` is NOT
+        // `worktree-recover*`-prefixed (the recover auto-clear never touches it) and
+        // carries `retry: true` (no sticky DispatchFailed), so the next cycle
+        // retries once the push is turn-key.
+        const finalizePushReady = await remotePushTurnKey(repoDir, run);
+        if (!finalizePushReady.ready) {
+          return {
+            ok: false,
+            retry: true,
+            reason: `worktree-finalize-push-not-turn-key: ${describePushNotReady(finalizePushReady.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
+          };
+        }
         // Pre-guarded by gitBranchExists above, so `missing-source` is unreachable
         // here; any non-conflict result is an idempotently safe fall-through.
         const merge: MergeResult = await gitMergeBranchInto(
@@ -2821,6 +2838,21 @@ export async function recoverWorktrees(
           failures.push({
             epicId: base.epicId,
             reason: `worktree-recover-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the merge of ${base.branch} (no fetch/rebase/force)`,
+            dir: repo,
+          });
+          continue;
+        }
+        // Turn-key-push precheck BEFORE the merge (recover-side analogue of
+        // finalize's): a non-turn-key push (no remote / no `@{push}` target /
+        // would-prompt dry-run) degrades to a skip-and-retry rather than merge-then-
+        // die. `worktree-recover-push-not-turn-key` KEEPS the `worktree-recover*`
+        // prefix so the level-triggered auto-clear lifts the block the moment the
+        // push becomes turn-key (no `retry_dispatch`).
+        const recoverPushReady = await remotePushTurnKey(repo, run);
+        if (!recoverPushReady.ready) {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-push-not-turn-key: ${describePushNotReady(recoverPushReady.reason)} — skipping the merge of ${base.branch} until the push is turn-key`,
             dir: repo,
           });
           continue;

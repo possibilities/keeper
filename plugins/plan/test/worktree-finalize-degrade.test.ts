@@ -159,6 +159,42 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     expect(git(["branch", "--list", base], main).trim()).not.toBe("");
   });
 
+  test("a NON-TURN-KEY push (origin unreachable) → skip-and-retry (retry:true), no merge, lane survives", async () => {
+    // origin/main is a CACHED ancestor (ff-able) so the non-ff precheck passes —
+    // but the bare remote is gone, so `git push --dry-run` fails. The turn-key
+    // precheck must catch this BEFORE the merge and degrade to a non-sticky retry
+    // with a DISTINCT, non-`worktree-recover*` reason — never merge-then-die.
+    const epicId = "fn-988-noremote";
+    const base = `keeper/epic/${epicId}`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    commitEpicDone(baseLane, epicId);
+
+    // Drop the bare origin out from under the (still-configured) remote: the cached
+    // origin/main tracking ref + `remote get-url` survive, but the push cannot reach it.
+    rmSync(origin, { recursive: true, force: true });
+    const mainHeadBefore = headSha(main);
+
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.retry).toBe(true); // NON-sticky
+      expect(res.reason).toContain("worktree-finalize-push-not-turn-key");
+      expect(res.reason.startsWith("worktree-recover")).toBe(false);
+    }
+    // The base was NOT merged into main — never merge-then-die on the push.
+    expect(headSha(main)).toBe(mainHeadBefore);
+    // The lane survives for a retry once the remote is reachable again.
+    expect(
+      git(["worktree", "list", "--porcelain"], main).includes(baseLane),
+    ).toBe(true);
+    expect(git(["branch", "--list", base], main).trim()).not.toBe("");
+  });
+
   test("idempotent re-run after a post-push teardown crash → already-merged no-op merge + teardown resumes to completion", async () => {
     const epicId = "fn-985-idem";
     const base = `keeper/epic/${epicId}`;

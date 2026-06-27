@@ -473,9 +473,12 @@ export async function mergeReadiness(
  * fetch. `refs/remotes/origin/<defaultBranch>` that resolves but is NOT an ancestor
  * of the local branch means origin moved ahead since the last fetch → a push would
  * be rejected non-fast-forward, so the caller degrades to a skip-and-retry (NEVER
- * an auto-fetch / rebase / force on a shared checkout). A remote ref that does not
- * resolve (never pushed) is fast-forwardable by definition (nothing to be behind).
- * `true` ⟹ safe to push.
+ * an auto-fetch / rebase / force on a shared checkout). A remote-tracking ref that
+ * does NOT resolve is NOT fast-forwardable either (conservative): with no cached
+ * `origin/<default>` we cannot prove the push lands cleanly, so the caller skips-
+ * and-retries rather than merge-then-discover the push is non-turn-key. The
+ * complementary turn-key probe (`remotePushTurnKey`) catches the never-pushed /
+ * no-target case before the merge. `true` ⟹ safe to push.
  */
 export async function remotePushFastForwardable(
   cwd: string,
@@ -487,7 +490,7 @@ export async function remotePushFastForwardable(
     cwd,
   });
   if (exists.code !== 0) {
-    return true; // never pushed → no divergence possible
+    return false; // unresolved tracking ref → cannot prove a clean push
   }
   return isAncestorOf(cwd, remoteRef, defaultBranch, run);
 }

@@ -102,6 +102,95 @@ export function classifyPushError(stderr: string): PushErrorClass {
 }
 
 /**
+ * Why a worktree base merge's eventual push is NOT turn-key — surfaced by
+ * {@link remotePushTurnKey} so the autopilot finalize / recover degrade to a clean
+ * skip-and-retry BEFORE the local merge, never merge-then-die on the push.
+ *  - `no-remote` — `origin` is not configured.
+ *  - `no-push-target` — the branch has no push destination (`@{push}` does not
+ *    resolve; checked via `@{push}`, NOT `@{upstream}`, since `push.default=current`
+ *    pushes with no upstream).
+ *  - `dry-run-rejected` — `git push --dry-run` failed (a no-remote-branch race, a
+ *    would-prompt auth wall, a server reject); `class` reuses {@link classifyPushError}.
+ */
+export type PushNotReadyReason =
+  | { kind: "no-remote" }
+  | { kind: "no-push-target" }
+  | {
+      kind: "dry-run-rejected";
+      pushErrorClass: PushErrorClass;
+      detail: string;
+    };
+
+/** Turn-key-push probe result. `ready` keys a clean push path vs a degrade. */
+export type PushReadiness =
+  | { ready: true }
+  | { ready: false; reason: PushNotReadyReason };
+
+/** One-line human description of a not-turn-key push, for the skip-retry reason. */
+export function describePushNotReady(reason: PushNotReadyReason): string {
+  switch (reason.kind) {
+    case "no-remote":
+      return "origin remote is not configured";
+    case "no-push-target":
+      return "the branch has no push target (@{push} does not resolve)";
+    case "dry-run-rejected":
+      return `push --dry-run was rejected (${reason.pushErrorClass}) — ${reason.detail}`;
+  }
+}
+
+/**
+ * Probe whether pushing the shared checkout to `origin` is TURN-KEY — runnable
+ * non-interactively, right now, with no fetch / rebase / force. The autopilot's
+ * worktree finalize + recover gate the LOCAL base merge on this so a non-turn-key
+ * push never advances local default into a stuck merge-then-die state; a not-ready
+ * result degrades to a clean skip-and-retry instead.
+ *
+ * Gate order (cheap → costly): (1) `origin` exists → (2) the branch resolves a push
+ * target via `@{push}` (NOT `@{upstream}`) → (3) `git push --dry-run` succeeds.
+ * `GIT_TERMINAL_PROMPT=0` + ssh `BatchMode=yes` make a credential wall fail fast
+ * (classified, not hung). The dry-run is a PROBE, not an auth oracle — it catches
+ * no-remote / no-target / would-prompt / server-reject, which is the goal; it never
+ * licenses a force-push. Pure git reads + a no-transfer dry-run — never a fetch /
+ * write. Injectable {@link GitRunner} keeps it fast-tier coverable with goldens.
+ */
+export async function remotePushTurnKey(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<PushReadiness> {
+  const env = {
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+  };
+  // 1. origin must exist — no remote, nothing to push to.
+  const remote = await run(["remote", "get-url", "origin"], { cwd, env });
+  if (remote.code !== 0) {
+    return { ready: false, reason: { kind: "no-remote" } };
+  }
+  // 2. the branch must resolve a push target (@{push}, NOT @{upstream}).
+  const target = await run(
+    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"],
+    { cwd, env },
+  );
+  if (target.code !== 0) {
+    return { ready: false, reason: { kind: "no-push-target" } };
+  }
+  // 3. the dry-run push must succeed (probe, not an auth guarantee).
+  const dry = await run(["push", "--dry-run", "--no-progress"], { cwd, env });
+  if (dry.code !== 0) {
+    const detail = (dry.stdout + dry.stderr).trim();
+    return {
+      ready: false,
+      reason: {
+        kind: "dry-run-rejected",
+        pushErrorClass: classifyPushError(detail),
+        detail,
+      },
+    };
+  }
+  return { ready: true };
+}
+
+/**
  * Current branch name via `git rev-parse --abbrev-ref HEAD`, pinned to the
  * explicit worktree path (the per-worktree HEAD is authoritative — never a cached
  * string).

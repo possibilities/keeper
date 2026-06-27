@@ -5275,6 +5275,9 @@ function makeRecoveryGit(state: {
   repoHead?: string; // main worktree current branch
   dirtyStatus?: string; // git status --porcelain stdout on the main checkout
   remoteAhead?: boolean; // cached origin ref NOT an ancestor of local → non-ff
+  noRemote?: boolean; // `remote get-url origin` fails → not turn-key
+  noPushTarget?: boolean; // `@{push}` does not resolve → not turn-key
+  dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   mergeConflict?: boolean; // a real merge hits a conflict
   pushFails?: boolean;
 }): {
@@ -5360,6 +5363,23 @@ function makeRecoveryGit(state: {
     }
     if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
       return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
+    }
+    if (joined === "remote get-url origin") {
+      return state.noRemote
+        ? { code: 1, stdout: "", stderr: "error: No such remote 'origin'" }
+        : { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return state.noPushTarget
+        ? { code: 1, stdout: "", stderr: "fatal: no push destination" }
+        : { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
+      return state.dryRunReject !== undefined
+        ? { code: 1, stdout: "", stderr: state.dryRunReject }
+        : { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("merge --no-edit")) {
       return state.mergeConflict
@@ -5576,6 +5596,45 @@ test("fn-985 recoverWorktrees: a NON-FAST-FORWARD remote (origin ahead) → skip
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
   expect(calls.some((c) => c.args === "push")).toBe(false);
   expect(calls.some((c) => c.args.startsWith("fetch"))).toBe(false);
+});
+
+test("fn-988 recoverWorktrees: a non-turn-key push (no @{push} target) → skip-retry, recover-prefixed (auto-clearable), no merge", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    noPushTarget: true,
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-push-not-turn-key");
+  // Recover-side KEEPS the prefix so the level-triggered auto-clear lifts it.
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // The merge is skipped — never merge-then-die on the push.
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  expect(calls.some((c) => c.args === "push")).toBe(false);
+});
+
+test("fn-988 recoverWorktrees: a non-turn-key push (dry-run rejected) → skip-retry, recover-prefixed, no merge", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    dryRunReject: "fatal: could not read from remote repository",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-push-not-turn-key");
+  expect(failures[0]?.reason).toContain("network"); // classifyPushError reuse
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: push failure on a recovered merge → keyed failure", async () => {
@@ -5963,11 +6022,35 @@ function makeFinalizeReadinessRun(opts: {
   head?: string; // rev-parse --abbrev-ref HEAD
   status?: string; // git status --porcelain stdout
   remoteAhead?: boolean; // origin ref NOT an ancestor of local → non-ff
+  noRemote?: boolean; // `remote get-url origin` fails → not turn-key
+  noPushTarget?: boolean; // `@{push}` does not resolve → not turn-key
+  dryRunReject?: string; // `push --dry-run` stderr → not turn-key
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (joined === "remote get-url origin") {
+      return opts.noRemote
+        ? { code: 1, stdout: "", stderr: "error: No such remote 'origin'" }
+        : { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return opts.noPushTarget
+        ? {
+            code: 1,
+            stdout: "",
+            stderr: "fatal: no push destination configured",
+          }
+        : { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
+      return opts.dryRunReject !== undefined
+        ? { code: 1, stdout: "", stderr: opts.dryRunReject }
+        : { code: 0, stdout: "", stderr: "" };
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin ref exists
     }
@@ -6033,6 +6116,51 @@ test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and
   }
   // Never an auto-fetch / rebase / force, and the base merge is skipped entirely.
   expect(cmds.some((c) => c.startsWith("fetch"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-988 finalizeEpic: no origin remote (non-turn-key push) → distinct non-sticky skip-retry, no merge/push", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({ noRemote: true });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // NON-sticky
+    expect(res.reason).toContain("worktree-finalize-push-not-turn-key");
+    // Finalize-side reason MUST NOT carry the recover prefix (else auto-cleared).
+    expect(res.reason.startsWith("worktree-recover")).toBe(false);
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // The merge is skipped entirely — never merge-then-die on the push.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-988 finalizeEpic: no @{push} target (non-turn-key push) → non-sticky skip-retry, no merge", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({ noPushTarget: true });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true);
+    expect(res.reason).toContain("worktree-finalize-push-not-turn-key");
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-988 finalizeEpic: push --dry-run rejected (would-prompt) → non-sticky skip-retry, no merge", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({
+    dryRunReject: "fatal: Authentication failed for 'https://host/repo.git'",
+  });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true);
+    expect(res.reason).toContain("worktree-finalize-push-not-turn-key");
+    expect(res.reason).toContain("auth"); // classifyPushError reuse surfaces the class
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
 });

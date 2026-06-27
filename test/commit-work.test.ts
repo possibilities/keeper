@@ -18,7 +18,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type CommitWorkDeps, runForTest } from "../cli/commit-work";
 import { LintFailure } from "../src/commit-work/lint-matrix";
-import { inLinkedWorktree, pushCommitted } from "../src/commit-work/push";
+import {
+  describePushNotReady,
+  inLinkedWorktree,
+  pushCommitted,
+  remotePushTurnKey,
+} from "../src/commit-work/push";
 import { PUSH_NON_FAST_FORWARD } from "./fixtures/git-push-goldens";
 import {
   argvStartsWith,
@@ -742,5 +747,71 @@ describe("pushCommitted: worktree skip gate", () => {
     expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
     // The @{u} upstream probe is also skipped — the gate is BEFORE it.
     expect(calls.some((c) => c.args.includes("@{u}"))).toBe(false);
+  });
+});
+
+describe("remotePushTurnKey: pre-merge push-readiness probe", () => {
+  test("all gates pass → ready, in order, no fetch", async () => {
+    const { run, calls } = fakeAsyncGit([]); // every call defaults to exit 0
+    expect(await remotePushTurnKey("/repo", run)).toEqual({ ready: true });
+    expect(calls.map((c) => c.args.join(" "))).toEqual([
+      "remote get-url origin",
+      "rev-parse --abbrev-ref --symbolic-full-name @{push}",
+      "push --dry-run --no-progress",
+    ]);
+    expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
+    // GIT_TERMINAL_PROMPT=0 + ssh BatchMode so a credential wall fails fast.
+    expect(calls[2]?.env?.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(calls[2]?.env?.GIT_SSH_COMMAND).toContain("BatchMode=yes");
+  });
+
+  test("no origin remote → not ready (no-remote), never probes @{push} or dry-run", async () => {
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) => argvStartsWith(a, "remote", "get-url"),
+        result: { exitCode: 2, stderr: "error: No such remote 'origin'" },
+      },
+    ]);
+    expect(await remotePushTurnKey("/repo", run)).toEqual({
+      ready: false,
+      reason: { kind: "no-remote" },
+    });
+    expect(calls.some((c) => c.args.includes("@{push}"))).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+
+  test("no @{push} target → not ready (no-push-target), uses @{push} NOT @{upstream}", async () => {
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) => a.includes("@{push}"),
+        result: { exitCode: 128, stderr: "fatal: no push destination" },
+      },
+    ]);
+    expect(await remotePushTurnKey("/repo", run)).toEqual({
+      ready: false,
+      reason: { kind: "no-push-target" },
+    });
+    expect(calls.some((c) => c.args.includes("@{upstream}"))).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+
+  test("dry-run rejected → not ready, reason carries the classified push-error class", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) => argvStartsWith(a, "push", "--dry-run"),
+        result: {
+          exitCode: 1,
+          stderr: "fatal: Authentication failed for 'https://host/r.git'",
+        },
+      },
+    ]);
+    const res = await remotePushTurnKey("/repo", run);
+    expect(res.ready).toBe(false);
+    if (!res.ready && res.reason.kind === "dry-run-rejected") {
+      expect(res.reason.pushErrorClass).toBe("auth");
+      expect(describePushNotReady(res.reason)).toContain("auth");
+    } else {
+      throw new Error("expected a dry-run-rejected reason");
+    }
   });
 });

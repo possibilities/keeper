@@ -905,13 +905,15 @@ test("remotePushFastForwardable: origin ahead of local (not an ancestor) → NOT
   expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
 });
 
-test("remotePushFastForwardable: no cached remote ref (never pushed) → fast-forwardable, no is-ancestor probe", async () => {
+test("remotePushFastForwardable: unresolved remote-tracking ref → NOT fast-forwardable (conservative), no is-ancestor probe", async () => {
   const { run, calls } = fakeAsyncGit([
     {
       when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
       result: { exitCode: 1 }, // origin/main does not resolve
     },
   ]);
-  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(true);
+  // With no cached origin/<default> we cannot prove a clean push, so degrade to
+  // skip-retry rather than merge-then-discover the push is non-turn-key.
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(false);
   expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });
