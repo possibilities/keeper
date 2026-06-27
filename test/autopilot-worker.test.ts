@@ -5258,6 +5258,18 @@ test("fn-959.7/fn-978 reposForRecovery: deduped, RESOLVED toplevels; multi-repo/
   expect(reposForRecovery(epics, repoMap)).toEqual(["/repo-a", "/repo-c"]);
 });
 
+test("fn-988 reposForRecovery: knownRoots union in repos with no current epic (out-of-snapshot sweep), deduped", () => {
+  const epics = [makeEpic({ epic_id: "fn-1-a", project_dir: "/repo-a" })];
+  const repoMap = classifyWorktreeRepos(epics, (r) => r);
+  // /repo-b carries a done-but-unmerged base but its epic was already reaped from
+  // the snapshot — knownRoots brings it into the sweep. /repo-a (already sourced
+  // from its epic) is NOT duplicated, and an empty root is dropped.
+  expect(reposForRecovery(epics, repoMap, ["/repo-a", "/repo-b", ""])).toEqual([
+    "/repo-a",
+    "/repo-b",
+  ]);
+});
+
 /**
  * A stateful fake GitRunner for the recovery passes. Models a per-cwd MERGE_HEAD
  * flag, a registered worktree list, the `keeper/epic/*` base set, the default
@@ -5496,6 +5508,51 @@ test("fn-959.7 recoverWorktrees: already-merged base → idempotent skip (no mer
   expect(failures).toEqual([]);
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
   expect(calls.some((c) => c.args === "push")).toBe(false);
+});
+
+test("fn-988 recoverWorktrees pass-3: a merged orphan rib (worktree + branch) is pruned, is-ancestor-gated, bases-only merge", async () => {
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [rib], // live git sees ONLY the orphan rib (its base already gone)
+    defaultBranch: "main",
+    ancestors: new Set([rib]), // the rib is fully merged → safe to prune
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  // The merge path is bases-only: a rib is NEVER merged to default.
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  // Pass-3 tore the merged orphan rib down — worktree removed, then branch deleted,
+  // never `git branch --contains`.
+  expect(calls.some((c) => c.args === `worktree remove ${ribPath}`)).toBe(true);
+  expect(calls.some((c) => c.args === `branch -D ${rib}`)).toBe(true);
+  expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+test("fn-988 recoverWorktrees pass-3: an UNMERGED orphan rib is preserved (never force-deleted)", async () => {
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [rib],
+    defaultBranch: "main",
+    ancestors: new Set(), // NOT an ancestor of default → unmerged work, leave it
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === `worktree remove ${ribPath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${rib}`)).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: open (not-done) epic base → skipped, never merged", async () => {
@@ -5951,6 +6008,62 @@ test("fn-985 finalizeEpic: fully-merged rib worktrees + branches are pruned alon
   expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
 });
 
+test("fn-988 finalizeEpic teardown: an orphan rib NOT in laneOrder (live-git enumerated) is still torn down", async () => {
+  // The snapshot's laneOrder carries only the base, but live git knows of a rib
+  // forked in a cycle the snapshot never saw. Teardown must enumerate it from
+  // `for-each-ref` and prune both its worktree and its (merged) branch.
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.9";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.9";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
+      // Live git enumerates the base AND the orphan rib laneOrder never carried.
+      return { code: 0, stdout: `keeper/epic/fn-1-foo\n${rib}\n`, stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n" +
+          `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // every lane fully merged
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  // laneOrder default is base-only (makeFinalizeInfo) — the rib is an orphan.
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+  );
+  expect(res).toEqual({ ok: true });
+  // The orphan rib's worktree AND branch were pruned, never `--contains`.
+  expect(cmds).toContain(`worktree remove ${ribPath}`);
+  expect(cmds).toContain(`branch -D ${rib}`);
+  expect(cmds.some((c) => c.includes("--contains"))).toBe(false);
+});
+
 test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while the merged base is pruned", async () => {
   const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
   const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
@@ -6025,6 +6138,8 @@ function makeFinalizeReadinessRun(opts: {
   noRemote?: boolean; // `remote get-url origin` fails → not turn-key
   noPushTarget?: boolean; // `@{push}` does not resolve → not turn-key
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
+  untracked?: string; // ls-files --others --exclude-standard (main's untracked)
+  incomingTracked?: string; // ls-tree -r --name-only <base> (incoming tracked)
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
@@ -6069,6 +6184,12 @@ function makeFinalizeReadinessRun(opts: {
     }
     if (joined.startsWith("status --porcelain")) {
       return { code: 0, stdout: opts.status ?? "", stderr: "" };
+    }
+    if (joined.startsWith("ls-files --others --exclude-standard")) {
+      return { code: 0, stdout: opts.untracked ?? "", stderr: "" };
+    }
+    if (joined.startsWith("ls-tree -r --name-only")) {
+      return { code: 0, stdout: opts.incomingTracked ?? "", stderr: "" };
     }
     if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
       return { code: opts.remoteAhead ? 1 : 0, stdout: "", stderr: "" };
@@ -6163,6 +6284,36 @@ test("fn-988 finalizeEpic: push --dry-run rejected (would-prompt) → non-sticky
   }
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-988 finalizeEpic: a would-clobber untracked file (incoming ∩ main-untracked) → non-sticky skip-retry, no merge", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({
+    untracked: "docs/new.md\nscratch.txt\n",
+    incomingTracked: "src/a.ts\ndocs/new.md\n", // docs/new.md collides
+  });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // NON-sticky
+    expect(res.reason).toContain("worktree-finalize-would-clobber");
+    expect(res.reason).toContain("docs/new.md");
+    // Finalize-side reason MUST NOT carry the recover prefix (else auto-cleared).
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // The base merge is skipped — `git merge` never hard-aborts on the would-clobber.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-988 finalizeEpic: a benign untracked-only tree (no incoming overlap) → finalizes (no fn-987 regression)", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({
+    untracked: ".env\neditor.tmp\n", // benign — no incoming path collides
+    incomingTracked: "src/a.ts\ndocs/new.md\n",
+  });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res).toEqual({ ok: true });
+  // The merge proceeded — a benign untracked file never blocks finalize.
+  expect(cmds.some((c) => c.startsWith("merge-base --is-ancestor"))).toBe(true);
 });
 
 test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure RESUMES teardown (already-merged base, lane still registered)", async () => {

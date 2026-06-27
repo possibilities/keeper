@@ -98,6 +98,7 @@ import {
   epicBaseHasDoneState as gitEpicBaseHasDoneState,
   isAncestorOf as gitIsAncestorOf,
   listEpicBaseBranches as gitListEpicBaseBranches,
+  listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
@@ -609,6 +610,15 @@ export interface ReconcileSnapshot {
    * toplevel), or `unresolved` (a required root resolved null). NEVER a fold input.
    */
   worktreeRepoByEpicId: Map<string, WorktreeRepoResolution>;
+  /**
+   * fn-988: every git-tracked project dir (the git-status projection's roots)
+   * RESOLVED to its toplevel — the recover sweep's extra KNOWN-ROOTS set, unioned
+   * into {@link reposForRecovery} so a repo whose only worktree epic was already
+   * reaped from the projection still gets its lingering `keeper/epic/*` bases +
+   * orphan ribs swept. EMPTY when worktree mode is OFF (zero extra git spawns).
+   * Optional so a test snapshot may omit it (defaults to no extra roots).
+   */
+  worktreeKnownRoots?: readonly string[];
 }
 
 /**
@@ -2543,7 +2553,12 @@ export function createWorktreeDriver(
         // is never an un-clearable close); the next cycle retries once the tree
         // settles. This converts ONLY the human's-WIP-blocks-the-merge case — a
         // genuine divergent-content conflict still fails loud below.
-        const ready = await gitMergeReadiness(repoDir, defaultBranch, run);
+        const ready = await gitMergeReadiness(
+          repoDir,
+          defaultBranch,
+          run,
+          baseBranch,
+        );
         if (ready.kind === "off-branch") {
           return {
             ok: false,
@@ -2556,6 +2571,19 @@ export function createWorktreeDriver(
             ok: false,
             retry: true,
             reason: `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${ready.detail}`,
+          };
+        }
+        // A would-clobber: merging the lane base would overwrite an untracked
+        // file the human left in the shared checkout — `git merge` hard-aborts on
+        // it. Degrade to a DISTINCT non-`worktree-recover*` skip-retry (so the
+        // recover auto-clear never touches it, and no sticky DispatchFailed), the
+        // same family as the dirty/off-branch finalize degrades. A benign
+        // untracked file that no incoming path collides with still reads `ready`.
+        if (ready.kind === "would-clobber") {
+          return {
+            ok: false,
+            retry: true,
+            reason: `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${ready.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
           };
         }
         // Non-fast-forward precheck BEFORE the merge (so a diverged remote never
@@ -2612,11 +2640,42 @@ export function createWorktreeDriver(
             reason: `worktree-finalize-push-failed: ${(push.stdout + push.stderr).trim()}`,
           };
         }
+        // Enumerate EVERY rib of this epic — the snapshot's `laneOrder` ribs UNIONED
+        // with EVERY live-git `keeper/epic/<id>--*` ref, so a rib forked in a cycle
+        // the snapshot never saw (or one a crash orphaned) is torn down rather than
+        // leaked into a recover-able rib ref, while a known laneOrder rib is still
+        // pruned even if the for-each-ref enumeration comes back empty.
+        const ribBranches = new Set<string>();
+        for (const lane of laneOrder) {
+          if (lane.branch !== baseBranch) {
+            ribBranches.add(lane.branch);
+          }
+        }
+        for (const lane of await gitListEpicLaneBranches(repoDir, run)) {
+          if (lane.epicId === epicId && lane.isRib) {
+            ribBranches.add(lane.branch);
+          }
+        }
         // Tear down every lane worktree (base + ribs). NEVER blind-`--force`; a
-        // dirty lane refuses and surfaces so the human drains it manually.
+        // dirty lane refuses and surfaces so the human drains it manually. The
+        // path set unions the snapshot's known lane paths with EVERY registered
+        // worktree checked out on one of this epic's lane branches (a rib worktree
+        // `laneOrder` omitted), so no orphan worktree survives teardown.
+        const laneBranchShorts = new Set<string>([baseBranch, ...ribBranches]);
         const paths = new Set<string>([baseWorktreePath]);
         for (const lane of laneOrder) {
           paths.add(lane.worktreePath);
+        }
+        for (const entry of await gitListWorktrees(repoDir, run)) {
+          if (entry.branch === null) {
+            continue;
+          }
+          const short = entry.branch.startsWith("refs/heads/")
+            ? entry.branch.slice("refs/heads/".length)
+            : entry.branch;
+          if (laneBranchShorts.has(short)) {
+            paths.add(entry.path);
+          }
         }
         for (const p of paths) {
           const removed = await gitRemoveWorktree(repoDir, p, run);
@@ -2627,22 +2686,20 @@ export function createWorktreeDriver(
             };
           }
         }
-        // Prune the now-merged lane branches (ribs THEN base) so a DONE epic never
+        // Prune the worktree admin entries BEFORE deleting branches: a checked-out
+        // branch blocks its delete, and a crash-orphaned admin entry (its dir
+        // already gone) would block the next `ensureWorktree` re-add.
+        await gitPruneWorktrees(repoDir, run);
+        // Delete the now-merged lane branches (ribs THEN base) so a DONE epic never
         // leaves a recover-able `keeper/epic/<id>...` ref or rib branch behind (the
-        // fn-973 pileup + the rib leak). AFTER worktree teardown (a checked-out
-        // branch blocks its delete) and each gated on is-ancestor-of-default: the
+        // fn-973 pileup + the rib leak). Each gated on is-ancestor-of-default: the
         // merge+push above placed every lane's work in default, so an is-ancestor
         // branch is the fully-merged path ONLY — an unmerged/diverged ref is NEVER
         // deleted (that would lose work; the base goes through the merge→conflict→
         // fail-loud path instead, and an orphan rib is simply left for a human).
-        // Best-effort: a delete refusal is a no-op (the recover pass skips the
-        // already-merged leftover as a backstop), never a failure.
-        const ribBranches = new Set<string>();
-        for (const lane of laneOrder) {
-          if (lane.branch !== baseBranch) {
-            ribBranches.add(lane.branch);
-          }
-        }
+        // NEVER `git branch --contains` (it force-deletes siblings). Best-effort: a
+        // delete refusal is a no-op (the recover pass skips the already-merged
+        // leftover as a backstop), never a failure.
         for (const rib of ribBranches) {
           if (await gitIsAncestorOf(repoDir, rib, defaultBranch, run)) {
             await gitDeleteBranch(repoDir, rib, run);
@@ -2773,6 +2830,21 @@ export async function recoverWorktrees(
       }
     }
 
+    // Resolve the default branch ONCE per repo — both the pass-2 base merge and
+    // the pass-3 rib prune need it, and pass-3 must run even when there is no base
+    // to merge (an orphan rib whose base is already gone).
+    let defaultBranch: string;
+    try {
+      defaultBranch = await gitResolveDefaultBranch(repo, run);
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-default-branch-failed: ${errMsg(err)}`,
+        dir: repo,
+      });
+      continue;
+    }
+
     // --- Pass 2: merge any done-but-unmerged epic base into the default branch. ---
     let bases: { branch: string; epicId: string }[];
     try {
@@ -2781,20 +2853,6 @@ export async function recoverWorktrees(
       failures.push({
         epicId: null,
         reason: `worktree-recover-base-list-failed: ${errMsg(err)}`,
-        dir: repo,
-      });
-      continue;
-    }
-    if (bases.length === 0) {
-      continue;
-    }
-    let defaultBranch: string;
-    try {
-      defaultBranch = await gitResolveDefaultBranch(repo, run);
-    } catch (err) {
-      failures.push({
-        epicId: null,
-        reason: `worktree-recover-default-branch-failed: ${errMsg(err)}`,
         dir: repo,
       });
       continue;
@@ -2814,7 +2872,12 @@ export async function recoverWorktrees(
         // the `worktree-recover*` prefix, so the level-triggered auto-clear lifts
         // the block the moment the tree settles (no `retry_dispatch` needed) — the
         // recover-side analogue of finalize's `retry` skip.
-        const ready = await gitMergeReadiness(repo, defaultBranch, run);
+        const ready = await gitMergeReadiness(
+          repo,
+          defaultBranch,
+          run,
+          base.branch,
+        );
         if (ready.kind === "off-branch") {
           failures.push({
             epicId: base.epicId,
@@ -2827,6 +2890,19 @@ export async function recoverWorktrees(
           failures.push({
             epicId: base.epicId,
             reason: `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — skipping the merge of ${base.branch} until it is clean — ${ready.detail}`,
+            dir: repo,
+          });
+          continue;
+        }
+        // A would-clobber: merging this base would overwrite an untracked file in
+        // the shared checkout (`git merge` hard-aborts). Skip-and-retry, KEEPING
+        // the `worktree-recover*` prefix so the level-triggered auto-clear lifts
+        // the block the moment the path is cleared. A benign untracked file that
+        // no incoming path collides with still merges (no fn-987 regression).
+        if (ready.kind === "would-clobber") {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-would-clobber: merging ${base.branch} into ${defaultBranch} would overwrite untracked file(s) in ${repo} — ${ready.paths.join(", ")} — skipping until the path(s) are cleared`,
             dir: repo,
           });
           continue;
@@ -2890,6 +2966,64 @@ export async function recoverWorktrees(
         });
       }
     }
+
+    // --- Pass 3: prune orphan ribs (`keeper/epic/<id>--*`) left by a crash. ---
+    // A rib that is an ancestor of default is fully merged — its worktree + branch
+    // are safe to remove (the fan-in landed its work, the base merge above placed
+    // it in default). is-ancestor-gated, prune-before-delete, NEVER `git branch
+    // --contains` (which force-deletes siblings). An UNMERGED rib is LEFT for a
+    // human. Mirrors the finalize-teardown rib sweep for the crash/restart path.
+    let laneBranches: { branch: string; epicId: string; isRib: boolean }[];
+    try {
+      laneBranches = await gitListEpicLaneBranches(repo, run);
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-lane-list-failed: ${errMsg(err)}`,
+        dir: repo,
+      });
+      continue;
+    }
+    const wtByShortBranch = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.branch === null) {
+        continue;
+      }
+      const short = entry.branch.startsWith("refs/heads/")
+        ? entry.branch.slice("refs/heads/".length)
+        : entry.branch;
+      wtByShortBranch.set(short, entry.path);
+    }
+    for (const rib of laneBranches) {
+      if (!rib.isRib) {
+        continue;
+      }
+      try {
+        if (!(await gitIsAncestorOf(repo, rib.branch, defaultBranch, run))) {
+          continue; // unmerged rib — leave it for a human, never force-delete
+        }
+        const wt = wtByShortBranch.get(rib.branch);
+        if (wt !== undefined) {
+          const removed = await gitRemoveWorktree(repo, wt, run);
+          if (removed.kind === "dirty") {
+            failures.push({
+              epicId: rib.epicId,
+              reason: `worktree-recover-rib-teardown-dirty: ${wt} has uncommitted changes — ${removed.stderr}`,
+              dir: repo,
+            });
+            continue;
+          }
+          await gitPruneWorktrees(repo, run);
+        }
+        await gitDeleteBranch(repo, rib.branch, run);
+      } catch (err) {
+        failures.push({
+          epicId: rib.epicId,
+          reason: `worktree-recover-rib-prune-failed: ${rib.branch} — ${errMsg(err)}`,
+          dir: repo,
+        });
+      }
+    }
   }
   return failures;
 }
@@ -2905,27 +3039,37 @@ function errMsg(err: unknown): string {
  * fork off), sourced from the snapshot's {@link WorktreeRepoResolution} so it keys
  * on the SAME toplevel the lane geometry provisioned — never a raw `project_dir`.
  * A multi-repo / unresolved epic is SKIPPED: no lane was ever provisioned for it,
- * so there is nothing to recover. The recovery scan itself enumerates
- * `keeper/epic/*` bases per repo from live git, so this only narrows the sweep to
- * repos autopilot actually tracks.
+ * so there is nothing to recover. `knownRoots` unions in extra RESOLVED toplevels
+ * that carry NO current epic (a done epic reaped from the projection beyond the
+ * recent-done window) so its lingering `keeper/epic/<id>` base is still swept —
+ * the recovery scan enumerates `keeper/epic/*` per repo from live git, so a repo
+ * with no visible epic still surfaces its orphan bases once the dir is in the
+ * sweep set. The recovery scan itself enumerates the bases, so this only decides
+ * WHICH repos autopilot sweeps.
  */
 export function reposForRecovery(
   epics: readonly Epic[],
   worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  knownRoots: readonly string[] = [],
 ): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
+  const push = (dir: string): void => {
+    if (dir === "" || seen.has(dir)) {
+      return;
+    }
+    seen.add(dir);
+    out.push(dir);
+  };
   for (const epic of epics) {
     const resolution = worktreeRepoByEpicId.get(epic.epic_id);
     if (resolution === undefined || resolution.kind !== "ok") {
       continue;
     }
-    const dir = resolution.repoDir;
-    if (dir === "" || seen.has(dir)) {
-      continue;
-    }
-    seen.add(dir);
-    out.push(dir);
+    push(resolution.repoDir);
+  }
+  for (const root of knownRoots) {
+    push(root);
   }
   return out;
 }
@@ -3296,9 +3440,27 @@ export async function loadReconcileSnapshot(
   // per-cycle nullable memo so a transient resolve failure re-resolves next cycle
   // rather than permanently darkening an epic. The pure `reconcile` layer then
   // compares + places lanes by the RESOLVED toplevel and never shells git.
+  // ONE resolver (shared memo) for BOTH the per-epic classification and the
+  // known-roots resolution below, so a root resolved once is never re-spawned.
+  const toplevelResolver = memoizedNullableGitToplevel();
   const worktreeRepoByEpicId = worktreeMode
-    ? classifyWorktreeRepos(epics, memoizedNullableGitToplevel())
+    ? classifyWorktreeRepos(epics, toplevelResolver)
     : new Map<string, WorktreeRepoResolution>();
+  // fn-988: the recover sweep's KNOWN-ROOTS set — every git-tracked project dir
+  // (from the git-status projection) RESOLVED to its toplevel, so a repo carrying
+  // a done-but-unmerged base whose epic was already reaped from the projection is
+  // still swept (it has no current epic to source its root from). Gated on
+  // `worktreeMode` so an OFF cycle adds ZERO git spawns; the shared memo dedups
+  // roots already resolved for `worktreeRepoByEpicId`.
+  const worktreeKnownRoots = worktreeMode
+    ? Array.from(
+        new Set(
+          Array.from(gitStatusByProjectDir.keys())
+            .map((dir) => toplevelResolver(dir))
+            .filter((top): top is string => top !== null && top.length > 0),
+        ),
+      )
+    : [];
 
   return {
     epics,
@@ -3319,6 +3481,7 @@ export async function loadReconcileSnapshot(
     maxConcurrentPerRoot,
     worktreeMode,
     worktreeRepoByEpicId,
+    worktreeKnownRoots,
   };
 }
 
@@ -3699,6 +3862,7 @@ function main(): void {
             const repos = reposForRecovery(
               snapshot.epics,
               snapshot.worktreeRepoByEpicId,
+              snapshot.worktreeKnownRoots ?? [],
             );
             const failures = await deps.worktree.recover(repos, (epicId) =>
               isEpicDoneById(db, epicId),

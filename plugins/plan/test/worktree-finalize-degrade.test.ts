@@ -195,6 +195,108 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     expect(git(["branch", "--list", base], main).trim()).not.toBe("");
   });
 
+  test("a WOULD-CLOBBER untracked file (incoming tracked path ∩ main untracked) → skip-and-retry, no merge, file untouched", async () => {
+    // The lane adds a NEW tracked file; main has an UNTRACKED file at the same
+    // path. A real `git merge` hard-aborts ("untracked working tree files would be
+    // overwritten"); the would-clobber precheck must catch it BEFORE the merge and
+    // degrade to a non-sticky retry, never stomping the human's untracked content.
+    const epicId = "fn-988-clobber";
+    const base = `keeper/epic/${epicId}`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    // The lane commits a new tracked file the merge would bring into main.
+    writeFileSync(join(baseLane, "incoming.txt"), "from the lane\n");
+    git(["add", "incoming.txt"], baseLane);
+    git(["commit", "-q", "-m", "add incoming.txt"], baseLane);
+    commitEpicDone(baseLane, epicId);
+    // The human left an UNTRACKED file at the very path the merge would write.
+    writeFileSync(
+      join(main, "incoming.txt"),
+      "human untracked — do not stomp\n",
+    );
+    const mainHeadBefore = headSha(main);
+
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.retry).toBe(true);
+      expect(res.reason).toContain("worktree-finalize-would-clobber");
+      expect(res.reason).toContain("incoming.txt");
+    }
+    // The base was NOT merged and the untracked content survives verbatim.
+    expect(headSha(main)).toBe(mainHeadBefore);
+    expect(await Bun.file(join(main, "incoming.txt")).text()).toBe(
+      "human untracked — do not stomp\n",
+    );
+    // The lane survives for a retry once the path is cleared.
+    expect(
+      git(["worktree", "list", "--porcelain"], main).includes(baseLane),
+    ).toBe(true);
+    expect(git(["branch", "--list", base], main).trim()).not.toBe("");
+  });
+
+  test("a BENIGN untracked-only main checkout (no incoming overlap) → finalize merges + tears down", async () => {
+    // fn-987 must not regress: an untracked file that NO incoming path collides
+    // with stays clean — finalize merges the base and completes teardown.
+    const epicId = "fn-988-benign";
+    const base = `keeper/epic/${epicId}`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    writeFileSync(join(baseLane, "incoming.txt"), "from the lane\n");
+    git(["add", "incoming.txt"], baseLane);
+    git(["commit", "-q", "-m", "add incoming.txt"], baseLane);
+    commitEpicDone(baseLane, epicId);
+    // A benign untracked file at a path the incoming tree never touches.
+    writeFileSync(join(main, ".env"), "SECRET=1\n");
+
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+    );
+
+    expect(res).toEqual({ ok: true });
+    // The base merged (incoming.txt now tracked in main) and teardown completed.
+    expect(git(["ls-files", "incoming.txt"], main).trim()).toBe("incoming.txt");
+    expect(
+      git(["worktree", "list", "--porcelain"], main).includes(baseLane),
+    ).toBe(false);
+    expect(git(["branch", "--list", base], main).trim()).toBe("");
+  });
+
+  test("an ORPHAN rib NOT in laneOrder (live-git enumerated) is torn down alongside the base", async () => {
+    // A rib forked in a cycle the snapshot never saw — laneOrder carries only the
+    // base. Teardown must enumerate the rib from live git (`for-each-ref`), and —
+    // since it is an ancestor of default — prune both its worktree and its branch.
+    const epicId = "fn-988-orphanrib";
+    const base = `keeper/epic/${epicId}`;
+    const rib = `keeper/epic/${epicId}--${epicId}.2`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    commitEpicDone(baseLane, epicId);
+    // Provision the orphan rib worktree at HEAD (an ancestor of default) — it is
+    // NEVER added to finalizeInfo.laneOrder.
+    const ribReserved = reserveLane();
+    git(["worktree", "add", "-b", rib, ribReserved, "HEAD"], main);
+    const ribLane = realpathSync(ribReserved);
+
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+    );
+
+    expect(res).toEqual({ ok: true });
+    // The orphan rib's worktree AND branch were pruned — nothing leaks.
+    const wt = git(["worktree", "list", "--porcelain"], main);
+    expect(wt.includes(ribLane)).toBe(false);
+    expect(wt.includes(baseLane)).toBe(false);
+    expect(git(["branch", "--list", rib], main).trim()).toBe("");
+    expect(git(["branch", "--list", base], main).trim()).toBe("");
+  });
+
   test("idempotent re-run after a post-push teardown crash → already-merged no-op merge + teardown resumes to completion", async () => {
     const epicId = "fn-985-idem";
     const base = `keeper/epic/${epicId}`;
