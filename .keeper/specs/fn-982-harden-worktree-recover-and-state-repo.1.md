@@ -74,5 +74,5 @@ Fast in-process tier, faked git (makeRecoveryGit, test/autopilot-worker.test.ts:
 - [ ] Fast-tier tests cover fail-loud, auto-clear-on-resolve, clobber-guard, prune-at-close, idempotency; `ty` clean; `bun test` green; committed via keeper commit-work
 
 ## Done summary
-
+Recover failures now level-triggered auto-clear once the git resolves (scoped to worktree-recover* reasons, never clobbering a finalizeEpic close failure); successful close prunes its fully-merged lane base (is-ancestor gated). Added emitDispatchCleared dep + daemon dispatch-cleared handler reusing mintDispatchClearedEvent.
 ## Evidence
