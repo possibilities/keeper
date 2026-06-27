@@ -14,7 +14,7 @@
 // injection (a fabricated source-commit sha) is python_only and dropped.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -23,6 +23,7 @@ import {
   runCli,
   scaffoldEpic,
   withProject,
+  withTmpdir,
 } from "./harness.ts";
 
 function briefPath(root: string, taskId: string): string {
@@ -47,6 +48,7 @@ function envelope(out: string): Record<string, unknown> {
 
 describe("worker resume", () => {
   const getProj = withProject("planctl-resume-");
+  const getLane = withTmpdir("planctl-resume-lane-");
 
   test("typed envelope: brief_ref + nudge + repos, no prose", () => {
     // test_worker_resume.py::test_worker_resume_typed_envelope
@@ -114,6 +116,36 @@ describe("worker resume", () => {
     expect(parsed.task_id).toBe(taskId);
     expect(parsed.schema_version).toBe(1);
     expect((JSON.parse(first) as Record<string, unknown>).task_id).toBe(taskId);
+  });
+
+  test("KEEPER_PLAN_WORKTREE routes target_repo to the lane, plan-state to the primary repo", () => {
+    // The lane override governs target_repo ONLY; plan STATE (primary_repo /
+    // state_repo) always resolves to the primary repo, never the lane worktree.
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const lane = getLane();
+
+    const r = runCli(["worker", "resume", taskId], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(r.code).toBe(0);
+    const payload = envelope(r.stdout);
+    // target_repo follows the lane...
+    expect(payload.target_repo).toBe(lane);
+    // ...primary_repo (and the brief's state_repo) stay in the primary repo.
+    const mainRepo = realpathSync(proj.root);
+    expect(payload.primary_repo).toBe(mainRepo);
+    expect(payload.primary_repo).not.toBe(lane);
+
+    const brief = JSON.parse(
+      readFileSync(briefPath(proj.root, taskId), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(brief.state_repo).toBe(mainRepo);
+    expect(brief.primary_repo).toBe(mainRepo);
+    expect(brief.target_repo).toBe(lane);
   });
 
   test("read-only: regenerating the brief lands no commit", () => {

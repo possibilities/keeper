@@ -24,7 +24,7 @@ import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, normalizeTask } from "../models.ts";
 import { contextForRoot, type ProjectContext } from "../project.ts";
-import { expectedWorkerCwd, worktreeOverride } from "../runtime_status.ts";
+import { expectedWorkerCwd } from "../runtime_status.ts";
 import { DATA_DIR_NAMES, hasDataDir } from "../state_path.ts";
 import {
   LocalFileStateStore,
@@ -289,10 +289,11 @@ export function runReconcile(opts: {
   //    state cat-file runs against state_repo — a DISTINCT cwd.
   const projPath = ctx.projectPath;
   const targetRepo = realpathOr(expectedWorkerCwd(taskDef, epicDef, projPath));
+  // Plan STATE always lives in the primary repo, never the lane worktree —
+  // resolve it from epic.primary_repo (populated at scaffold), NOT the
+  // KEEPER_PLAN_WORKTREE override. Only targetRepo follows the lane.
   const primaryRepo = realpathOr(
-    worktreeOverride() ||
-      (epicDef.primary_repo as string | null | undefined) ||
-      projPath,
+    (epicDef.primary_repo as string | null | undefined) || projPath,
   );
   const stateRepo = primaryRepo;
 

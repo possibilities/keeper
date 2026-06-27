@@ -43,7 +43,7 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `keeper plan
 
 - `KEEPER_PLAN_ACTOR` overrides actor identity.
 - `KEEPER_PLAN_NOW` overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it.
-- `KEEPER_PLAN_WORKTREE` overrides the worktree-mode lane path: when set non-empty it wins over the ordinary fallback chain so a worker's `target_repo`, `primary_repo`, and `state_repo` all resolve to the lane (resolve-task / worker-resume / reconcile), keeping concurrent lanes from colliding in the shared main checkout. Producer-only (set at the worker's child boundary by autopilot worktree mode, realpath-normalized); never written to the event log as a fold key. Empty/unset falls through to the 3-level fallback unchanged.
+- `KEEPER_PLAN_WORKTREE` overrides the worktree-mode lane path for a worker's `target_repo` ONLY (via `expectedWorkerCwd`): when set non-empty it wins over the ordinary fallback chain so concurrent lanes don't collide in the shared main checkout. Plan STATE (`primary_repo` / `state_repo` in resolve-task / worker-resume / reconcile) always resolves to the primary repo from `epic.primary_repo`, never the lane. Producer-only (set at the worker's child boundary by autopilot worktree mode, realpath-normalized); never written to the event log as a fold key. Empty/unset falls through to the fallback chain unchanged.
 
 ## Running Things
 

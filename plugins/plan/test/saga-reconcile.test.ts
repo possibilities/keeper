@@ -84,6 +84,7 @@ function errCode(out: string): unknown {
 
 describe("reconcile verdicts", () => {
   const getProj = withProject("planctl-reconcile-");
+  const getLane = withTmpdir("planctl-reconcile-lane-");
 
   test("freshly-seeded todo -> not_started", () => {
     // test_reconcile.py::test_reconcile_not_started
@@ -239,6 +240,32 @@ describe("reconcile verdicts", () => {
     const obj = envObj(r.output);
     expect(obj.verdict).toBe("done");
     expect(obj.status).toBe("done");
+    expect(obj.state_head_visible).toBe(true);
+  });
+
+  test("KEEPER_PLAN_WORKTREE does not redirect plan-state off the primary repo", () => {
+    // The lane override governs target_repo ONLY; state_repo (the committed-stamp
+    // cat-file cwd) stays in the primary repo. Were it redirected to the lane (a
+    // real dir but NOT a git work tree) stateHeadVisible would throw → the done
+    // verdict could never be reached.
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, {
+      title: "Reconcile epic",
+      nTasks: 1,
+    });
+    const taskId = taskIds[0] as string;
+    setRuntime(proj.root, taskId, { status: "done" });
+    commitTaskJsonWithDoneStamp(proj.root, taskId);
+
+    const lane = getLane();
+    const r = runCli(["reconcile", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(r.code).toBe(0);
+    const obj = envObj(r.output);
+    expect(obj.verdict).toBe("done");
     expect(obj.state_head_visible).toBe(true);
   });
 

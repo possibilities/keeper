@@ -22,7 +22,7 @@ import {
   workerAgentForTier,
 } from "../models.ts";
 import { contextForRoot, type ProjectContext } from "../project.ts";
-import { expectedWorkerCwd, worktreeOverride } from "../runtime_status.ts";
+import { expectedWorkerCwd } from "../runtime_status.ts";
 import { hasDataDir } from "../state_path.ts";
 import { LocalFileStateStore, loadJson, loadJsonSafe } from "../store.ts";
 
@@ -107,10 +107,11 @@ export function runResolveTask(opts: {
 
   const projPath = ctx.projectPath;
   const targetRepo = realpathOr(expectedWorkerCwd(taskDef, epicDef, projPath));
+  // Plan STATE always lives in the primary repo, never the lane worktree —
+  // resolve it from epic.primary_repo (populated at scaffold), NOT the
+  // KEEPER_PLAN_WORKTREE override. Only targetRepo follows the lane.
   const primaryRepo = realpathOr(
-    worktreeOverride() ||
-      (epicDef.primary_repo as string | null | undefined) ||
-      projPath,
+    (epicDef.primary_repo as string | null | undefined) || projPath,
   );
 
   const store = new LocalFileStateStore(ctx.stateDir);

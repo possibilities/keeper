@@ -12,7 +12,7 @@
 // multi-project nodes are pinned by verbs-query.test.ts and cited).
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -160,6 +160,7 @@ describe("multi-repo create → validate gate", () => {
 describe("resolve-task routing envelope", () => {
   let project: ProjectHandle;
   const getProject = withProject("planctl-resolve-");
+  const getLane = withTmpdir("planctl-resolve-lane-");
   beforeEach(() => {
     project = getProject();
   });
@@ -194,6 +195,25 @@ describe("resolve-task routing envelope", () => {
     expect((obj.target_repo as string).startsWith("/")).toBe(true);
     expect((obj.primary_repo as string).startsWith("/")).toBe(true);
     expect((obj.project_path as string).startsWith("/")).toBe(true);
+  });
+
+  test("KEEPER_PLAN_WORKTREE routes target_repo to the lane, plan-state to the primary repo", () => {
+    // The lane override governs target_repo ONLY; plan STATE (primary_repo)
+    // always resolves to the primary repo, never the lane worktree.
+    const { taskIds } = scaffoldEpic(project, { title: "Resolve epic" });
+    const taskId = taskIds[0] as string;
+    const lane = getLane();
+
+    const r = runCli(["resolve-task", taskId, "--project", project.root], {
+      cwd: project.root,
+      home: project.home,
+      env: { KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(r.code).toBe(0);
+    const obj = resolveEnvelope(r.output);
+    expect(obj.target_repo).toBe(lane);
+    expect(obj.primary_repo).toBe(realpathSync(project.root));
+    expect(obj.primary_repo).not.toBe(lane);
   });
 
   test("returned tier is in the medium|high|xhigh|max|null vocabulary", () => {
