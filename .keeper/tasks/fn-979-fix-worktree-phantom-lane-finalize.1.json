@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Tolerate phantom lane branch in pre-merge",
-  "updated_at": "2026-06-27T01:21:08.900000Z"
+  "updated_at": "2026-06-27T01:33:20.580000Z",
+  "worker_done_at": "2026-06-27T01:33:20.580000Z"
 }

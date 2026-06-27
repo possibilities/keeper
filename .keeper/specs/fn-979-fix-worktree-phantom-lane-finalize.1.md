@@ -76,5 +76,5 @@ Fast in-process tier only, via the faked git runner seam (NO real git; the `.slo
 - [ ] `ty` clean; `bun test` green; committed via `keeper commit-work`
 
 ## Done summary
-
+mergeBranchInto now probes the source ref before any lock/merge-base and returns a new missing-source MergeResult for a phantom lane branch; provision's pre-merge loop skips it so a mixed-mode close no longer hard-fails, while real conflicts and post-probe git errors still fail loud.
 ## Evidence
