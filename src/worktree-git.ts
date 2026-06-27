@@ -539,31 +539,45 @@ async function wouldClobberUntracked(
 }
 
 /**
+ * Tri-state verdict of {@link remotePushFastForwardable}:
+ *  - `"fast-forwardable"` — the cached `origin/<default>` is an ancestor of local
+ *    → a push fast-forwards; safe to push.
+ *  - `"non-fast-forwardable"` — the cached ref resolves but is NOT an ancestor →
+ *    origin moved ahead; a push would be rejected non-fast-forward → the caller
+ *    degrades to a skip-and-retry (NEVER an auto-fetch / rebase / force).
+ *  - `"unknown"` — the remote-tracking ref does not resolve (a never-pushed
+ *    default) → DEFER, do NOT block. The authoritative turn-key probe
+ *    (`remotePushTurnKey`, run FIRST) already admits a legitimate first push via
+ *    its dry-run; treating an unresolved ref as a hard non-FF would permanently
+ *    deadlock a never-pushed-default repo even after turn-key passes.
+ */
+export type RemotePushFastForwardability =
+  | "fast-forwardable"
+  | "non-fast-forwardable"
+  | "unknown";
+
+/**
  * Whether pushing local `defaultBranch` to `origin/<defaultBranch>` would
  * FAST-FORWARD, decided from the CACHED remote-tracking ref ONLY — no network
- * fetch. `refs/remotes/origin/<defaultBranch>` that resolves but is NOT an ancestor
- * of the local branch means origin moved ahead since the last fetch → a push would
- * be rejected non-fast-forward, so the caller degrades to a skip-and-retry (NEVER
- * an auto-fetch / rebase / force on a shared checkout). A remote-tracking ref that
- * does NOT resolve is NOT fast-forwardable either (conservative): with no cached
- * `origin/<default>` we cannot prove the push lands cleanly, so the caller skips-
- * and-retries rather than merge-then-discover the push is non-turn-key. The
- * complementary turn-key probe (`remotePushTurnKey`) catches the never-pushed /
- * no-target case before the merge. `true` ⟹ safe to push.
+ * fetch. Returns a {@link RemotePushFastForwardability} tri-state: the caller
+ * blocks ONLY on `"non-fast-forwardable"`; `"unknown"` (unresolved ref) defers to
+ * the turn-key probe rather than minting a false permanent non-FF skip.
  */
 export async function remotePushFastForwardable(
   cwd: string,
   defaultBranch: string,
   run: GitRunner = gitExec,
-): Promise<boolean> {
+): Promise<RemotePushFastForwardability> {
   const remoteRef = `refs/remotes/origin/${defaultBranch}`;
   const exists = await run(["rev-parse", "--verify", "--quiet", remoteRef], {
     cwd,
   });
   if (exists.code !== 0) {
-    return false; // unresolved tracking ref → cannot prove a clean push
+    return "unknown"; // unresolved tracking ref (never-pushed default) → defer
   }
-  return isAncestorOf(cwd, remoteRef, defaultBranch, run);
+  return (await isAncestorOf(cwd, remoteRef, defaultBranch, run))
+    ? "fast-forwardable"
+    : "non-fast-forwardable";
 }
 
 /**

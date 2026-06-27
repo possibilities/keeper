@@ -83,6 +83,7 @@ import {
   worktreeRecoverDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
+import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -4940,6 +4941,100 @@ test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: '
   expect(res).toEqual({ kind: "push-failed", detail: "remote rejected" });
 });
 
+test("fn-990 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) → { kind: 'push-timeout' }, not push-failed", async () => {
+  // A bounded push spawn that exceeds its timeout surfaces the GNU-timeout
+  // sentinel exit code → a TRANSIENT push-timeout, distinct from a hard reject.
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "push") {
+      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "push-timeout" });
+});
+
+test("fn-990 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF precheck, and an UNRESOLVED origin/<default> (never-pushed) is admitted, not deadlocked", async () => {
+  // The never-pushed-default scenario: origin/<default> does not resolve, so the
+  // cached-ref FF precheck is "unknown". With turn-key FIRST + admitting (its
+  // dry-run passes), the first finalize push proceeds rather than dead-locking.
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    // origin/<default> tracking ref does NOT resolve → FF precheck returns "unknown".
+    if (
+      args[0] === "rev-parse" &&
+      args.includes("--verify") &&
+      joined.includes("refs/remotes/origin/")
+    ) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base/source refs exist
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // base ahead of default
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    // turn-key probe arms (remote get-url / @{push} / push --dry-run) + push all OK.
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merged" });
+  // Ordering: the turn-key dry-run precedes the cached-ref FF probe.
+  const dryIdx = cmds.findIndex((c) => c.startsWith("push --dry-run"));
+  const ffIdx = cmds.findIndex(
+    (c) => c.includes("--verify") && c.includes("refs/remotes/origin/"),
+  );
+  expect(dryIdx).toBeGreaterThanOrEqual(0);
+  expect(ffIdx).toBeGreaterThanOrEqual(0);
+  expect(dryIdx).toBeLessThan(ffIdx);
+});
+
 test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
   // The raw dir embeds `/`, which the retry_dispatch validator rejects (stranding
   // the row); the slug strips separators and any leading dash.
@@ -5417,6 +5512,7 @@ function makeRecoveryGit(state: {
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   mergeConflict?: boolean; // a real merge hits a conflict
   pushFails?: boolean;
+  pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
@@ -5535,6 +5631,9 @@ function makeRecoveryGit(state: {
         : { code: 0, stdout: "", stderr: "" };
     }
     if (joined === "push") {
+      if (state.pushTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
       return state.pushFails
         ? { code: 1, stdout: "", stderr: "remote rejected\n" }
         : { code: 0, stdout: "", stderr: "" };
@@ -5625,10 +5724,13 @@ test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default +
     ),
   ).toBe(true);
   // The single recover push leg fails fast on a credential-needing origin —
-  // GIT_TERMINAL_PROMPT=0 keeps git from opening /dev/tty inside the reconcile
-  // cycle (matches the commit-work push leg).
+  // GIT_TERMINAL_PROMPT=0 keeps git from opening /dev/tty, and ssh BatchMode +
+  // ConnectTimeout keep an SSH stall from hanging the reconcile cycle.
   const recoverPush = calls.find((c) => c.cwd === "/repo" && c.args === "push");
-  expect(recoverPush?.env).toEqual({ GIT_TERMINAL_PROMPT: "0" });
+  expect(recoverPush?.env).toEqual({
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
+  });
 });
 
 test("fn-959.7 recoverWorktrees: already-merged base → idempotent skip (no merge, no push)", async () => {
@@ -5930,6 +6032,30 @@ test("fn-959.7 recoverWorktrees: push failure on a recovered merge → keyed fai
   expect(failures).toHaveLength(1);
   expect(failures[0]?.epicId).toBe("fn-1-foo");
   expect(failures[0]?.reason).toContain("worktree-recover-push-failed");
+});
+
+test("fn-990 recoverWorktrees: a push TIMEOUT on a recovered merge → transient worktree-recover-push-timeout (auto-clearable), not push-failed", async () => {
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    pushTimeout: true,
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-push-timeout");
+  expect(failures[0]?.reason).not.toContain("push-failed");
+  // The recover-side timeout stays INSIDE the auto-clear scope (level-triggered).
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
 });
 
 test("fn-959.7 recoverWorktrees: rib branches are excluded from the base backstop", async () => {
@@ -6554,6 +6680,58 @@ test("fn-988 finalizeEpic: a would-clobber untracked file (incoming ∩ main-unt
   // The base merge is skipped — `git merge` never hard-aborts on the would-clobber.
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-finalize-push-timeout), NOT the sticky push-failed", async () => {
+  // The merge lands locally but the push spawn times out (the GNU-timeout
+  // sentinel). That is a TRANSIENT stall → retry:true + a distinct timeout reason
+  // OUTSIDE the recover auto-clear scope, never the sticky push-failed block.
+  const cmds: string[] = [];
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      return { code: 1, stdout: "", stderr: "" }; // base AHEAD of default → proceed
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      // base-vs-HEAD: already-merged → the inner merge takes the no-lock skip
+      // (the real FFI flock is the slow real-git test's contract), then the
+      // routine still runs the single push leg — which times out here.
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "push") {
+      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // TRANSIENT, never sticky
+    expect(res.reason).toContain("worktree-finalize-push-timeout");
+    expect(res.reason).not.toContain("push-failed");
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // No teardown after a failed push — the lanes survive for the retry.
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
 test("fn-988 finalizeEpic: a benign untracked-only tree (no incoming overlap) → finalizes (no fn-987 regression)", async () => {

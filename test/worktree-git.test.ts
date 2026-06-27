@@ -921,7 +921,9 @@ test("remotePushFastForwardable: cached origin ref is an ancestor of local → f
       result: { exitCode: 0 }, // origin is contained in local
     },
   ]);
-  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(true);
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(
+    "fast-forwardable",
+  );
   // It checked the CACHED remote-tracking ref — never a fetch.
   expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
   expect(
@@ -948,19 +950,22 @@ test("remotePushFastForwardable: origin ahead of local (not an ancestor) → NOT
       result: { exitCode: 1 }, // origin has commits local lacks
     },
   ]);
-  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(false);
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(
+    "non-fast-forwardable",
+  );
   expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
 });
 
-test("remotePushFastForwardable: unresolved remote-tracking ref → NOT fast-forwardable (conservative), no is-ancestor probe", async () => {
+test("remotePushFastForwardable: unresolved remote-tracking ref → 'unknown' (defer, do NOT block), no is-ancestor probe", async () => {
   const { run, calls } = fakeAsyncGit([
     {
       when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
-      result: { exitCode: 1 }, // origin/main does not resolve
+      result: { exitCode: 1 }, // origin/main does not resolve (never-pushed default)
     },
   ]);
-  // With no cached origin/<default> we cannot prove a clean push, so degrade to
-  // skip-retry rather than merge-then-discover the push is non-turn-key.
-  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(false);
+  // An unresolved origin/<default> is NOT a proven non-FF — it DEFERS to the
+  // authoritative turn-key probe rather than minting a false permanent skip that
+  // would deadlock a never-pushed-default first finalize push.
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe("unknown");
   expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });

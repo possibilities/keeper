@@ -50,6 +50,8 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import {
+  GIT_PUSH_TIMEOUT_MS,
+  GIT_SPAWN_TIMEOUT_CODE,
   gitExec,
   type GitRunner as WorktreeGitRunner,
 } from "./commit-work/git-exec";
@@ -212,7 +214,7 @@ export function sweepFinalizerGuard(
 
 /**
  * Re-anchor the cooldown + per-epic finalizer guard to the DURABLE
- * `pending_dispatches` lifetime — the fn-778 slow-cold-boot fix.
+ * `pending_dispatches` lifetime — the slow-cold-boot fix.
  *
  * The 2026-06-10 dup-close fired because a `close::<epic>` worker took 317s to
  * emit its first SessionStart (a far-tail `claude` cold boot under conn-cap
@@ -221,8 +223,7 @@ export function sweepFinalizerGuard(
  * dispatch and refreshed ONCE at the indoubt resolution (cover-end dispatch+260s)
  * — lapsed 1s before the re-dispatch at dispatch+261s. Every suppression arm was
  * legitimately clear; the single non-compounding indoubt re-stamp was the sole
- * cover and it was too short for the tail. (See the Evidence in the fn-778.2 spec
- * for the event-log timeline.)
+ * cover and it was too short for the tail.
  *
  * The fix: each cycle, while a key still has an OPEN `pending_dispatches` row
  * (`openKeys`, sourced from `snapshot.liveTabKeys`), refresh its cooldown stamp to
@@ -545,7 +546,7 @@ export interface ReconcileSnapshot {
    */
   armedIds: Set<string>;
   /**
-   * fn-905: the PER-ROOT unseeded-git set. While `git_projection_state.seed_required`
+   * The PER-ROOT unseeded-git set. While `git_projection_state.seed_required`
    * is set (post-restart, before the boot-seed establishes every gated root), this
    * holds each `effectiveRoot` lacking a `git_status` row above the floor — so
    * `reconcile` forces UNKNOWN (via `computeReadiness`) and dispatches NOTHING into
@@ -600,7 +601,7 @@ export interface ReconcileSnapshot {
    */
   worktreeMode: boolean;
   /**
-   * fn-978: each epic's repos RESOLVED to a single git toplevel — the producer
+   * Each epic's repos RESOLVED to a single git toplevel — the producer
    * snapshot-build's one git-resolution pass for the worktree lane geometry,
    * mirroring {@link unseededRoots}. Built in {@link loadReconcileSnapshot} via
    * {@link classifyWorktreeRepos} + {@link memoizedNullableGitToplevel}, gated on
@@ -614,7 +615,7 @@ export interface ReconcileSnapshot {
    */
   worktreeRepoByEpicId: Map<string, WorktreeRepoResolution>;
   /**
-   * fn-988: every git-tracked project dir (the git-status projection's roots)
+   * Every git-tracked project dir (the git-status projection's roots)
    * RESOLVED to its toplevel — the recover sweep's extra KNOWN-ROOTS set, unioned
    * into {@link reposForRecovery} so a repo whose only worktree epic was already
    * reaped from the projection still gets its lingering `keeper/epic/*` bases +
@@ -625,7 +626,7 @@ export interface ReconcileSnapshot {
 }
 
 /**
- * fn-978: an epic's worktree-mode repo classification — the result of resolving
+ * An epic's worktree-mode repo classification — the result of resolving
  * every task's effective root (`target_repo || project_dir`) to a git toplevel in
  * the producer snapshot-build. Drives the pure lane geometry:
  *  - `ok` — every required root resolved to ONE toplevel; `repoDir` is that
@@ -649,7 +650,7 @@ export type WorktreeRepoResolution =
  * the key) through the `confirmRunning` resolution path (clear on
  * either success OR failure). NEVER persisted — the reconciler restarts
  * cold; the durable signal is the `jobs` projection itself PLUS the
- * fn-674 per-cycle `liveTabKeys` probe, which re-derives the launch →
+ * per-cycle `liveTabKeys` probe, which re-derives the launch →
  * SessionStart occupation against the exec backend on every wake so a daemon
  * restart never double-dispatches a slot already claimed by a live
  * worker tab.
@@ -732,7 +733,7 @@ export interface PlannedLaunch {
    */
   isEpicFinalizer?: boolean;
   /**
-   * fn-959 — the pure worktree geometry for this launch, computed in `reconcile`
+   * The pure worktree geometry for this launch, computed in `reconcile`
    * (the topology is a total function of the DAG, so it stays in the pure layer).
    * ABSENT whenever worktree mode is OFF (then dispatch is byte-identical to
    * today, save the producer-side on-default-branch assertion). PRESENT in
@@ -743,7 +744,7 @@ export interface PlannedLaunch {
    */
   worktree?: WorktreeLaunchInfo;
   /**
-   * fn-959 — set IFF this launch belongs to a multi-repo epic that worktree mode
+   * Set IFF this launch belongs to a multi-repo epic that worktree mode
    * rejects for v1. The producer mints a sticky `worktree-multi-repo`
    * `DispatchFailed` (cleared by `retry_dispatch`) and launches nothing. Mutually
    * exclusive with {@link worktree}.
@@ -752,7 +753,7 @@ export interface PlannedLaunch {
 }
 
 /**
- * The worktree geometry the producer needs for one launch (fn-959). Carries the
+ * The worktree geometry the producer needs for one launch. Carries the
  * pure topology {@link WorktreeAssignment} plus the epic-level context the
  * producer's git side effects require. Computed in `reconcile`; consumed ONLY in
  * `runReconcileCycle` (every git op lives there, never in a fold).
@@ -789,9 +790,9 @@ export interface WorktreeLaunchInfo {
 }
 
 /**
- * A loud worktree-mode rejection for one epic (fn-959) — a launch the producer
+ * A loud worktree-mode rejection for one epic — a launch the producer
  * must NOT run but instead surface as a sticky `DispatchFailed`. The epic's repos
- * are RESOLVED to git toplevels ONCE in the producer snapshot-build (fn-978), so
+ * are RESOLVED to git toplevels ONCE in the producer snapshot-build, so
  * two distinct kinds reach here, each a distinct `reason` literal (both cleared by
  * `retry_dispatch`):
  *  - `worktree-multi-repo: <detail>` — the tasks resolve to MORE THAN ONE distinct
@@ -831,7 +832,7 @@ export interface ReconcileDecision {
   launches: PlannedLaunch[];
   completedRowIds: Set<string>;
   /**
-   * fn-959 — the per-epic worktree-finalize requests for this cycle: one entry
+   * The per-epic worktree-finalize requests for this cycle: one entry
    * per epic whose close-row verdict is `{tag:"completed"}` AND worktree mode is
    * ON. The producer (`runReconcileCycle`) runs `worktree.finalizeEpic` for each
    * AFTER the launch loop — merging the epic base into the default branch (once
@@ -955,7 +956,7 @@ export interface ConfirmRunningDeps {
     stalenessMs: number | null;
   }): void;
   /**
-   * fn-959 — the producer git driver for worktree mode. ABSENT whenever the
+   * The producer git driver for worktree mode. ABSENT whenever the
    * reconciler runs without worktree support (then every `worktree`/`worktreeReject`
    * launch field is inert and dispatch is byte-identical to today). PRESENT in
    * worktree mode: `runReconcileCycle` calls it to provision a lane worktree, run
@@ -966,7 +967,7 @@ export interface ConfirmRunningDeps {
    */
   worktree?: WorktreeDriver;
   /**
-   * fn-990 — the MAIN-projection done-ness probe ({@link isEpicDoneById} bound to
+   * The MAIN-projection done-ness probe ({@link isEpicDoneById} bound to
    * the reconciler's read-only connection), threaded into `worktree.finalizeEpic`
    * so finalize merges a lane ONLY when its epic is done in the projection. The
    * closer writes `done` to the PRIMARY repo, so the projection — not a lane-read —
@@ -984,7 +985,7 @@ export interface ConfirmRunningDeps {
 }
 
 /**
- * The producer git driver for worktree mode (fn-959) — the side-effect seam
+ * The producer git driver for worktree mode — the side-effect seam
  * `runReconcileCycle` calls before `confirmRunning` (provision) and after a
  * closer reaches done (finalize). Every method runs real git on the target repo
  * and NEVER writes keeper.db / runs in a fold. Injected so tests fake it; the
@@ -1037,7 +1038,7 @@ export interface WorktreeDriver {
     cwd: string,
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
   /**
-   * fn-959.7 — producer-only crash/restart recovery, run BEFORE each reconcile
+   * Producer-only crash/restart recovery, run BEFORE each reconcile
    * cycle (so it also covers the boot drain — the first cycle is the post-restart
    * sweep). Two idempotent passes over LIVE git, never a window-bounded projection
    * read, so a restart between an epic-done and its merge-to-default cannot orphan
@@ -1063,7 +1064,7 @@ export interface WorktreeDriver {
 }
 
 /**
- * fn-959.7 — one recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
+ * One recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
  * `epicId` is set for a done-but-unmerged backstop failure (keyed onto the
  * `close::<epicId>` sticky DispatchFailed); `null` for a merge-abort/prune failure
  * tied to a worktree path rather than an epic. `dir` is the repo the failure
@@ -1116,8 +1117,8 @@ export interface DispatchClearedPayload {
 }
 
 /**
- * Payload shape the reconciler hands to `emitDispatched` (fn-678,
- * schema v50). Mirrors the `DispatchedPayload` interface in
+ * Payload shape the reconciler hands to `emitDispatched` (schema v50).
+ * Mirrors the `DispatchedPayload` interface in
  * `src/reducer.ts` exactly — the producer-side stamp (`ts`) is the
  * unix-seconds wall-clock at mint time and flows through the fold as
  * `pending_dispatches.dispatched_at`, so a re-fold reproduces the row
@@ -1135,12 +1136,12 @@ export interface DispatchedPayload {
 
 /**
  * Durable-ack reply shape for {@link ConfirmRunningDeps.emitDispatched}
- * (fn-724). `ok:true` means main DURABLY inserted the `Dispatched` event
+ * `ok:true` means main DURABLY inserted the `Dispatched` event
  * onto the writable connection before replying; `ok:false` means the
  * insert threw (a writer-lock contention or DB failure). The reconciler
  * launches ONLY on `ok:true`; an `ok:false` (or a rejected ack-wait —
  * timeout / shutdown) aborts WITHOUT launching, so the SessionStart-
- * drains-before-`Dispatched` race that re-opened the fn-627 double-
+ * drains-before-`Dispatched` race that would re-open the double-
  * dispatch window is closed.
  */
 export interface DispatchedAck {
@@ -1149,7 +1150,7 @@ export interface DispatchedAck {
 
 /**
  * Payload shape for the producer-side TTL sweep's `DispatchExpired`
- * mint (fn-678, schema v50). Mirrors `src/reducer.ts`'s
+ * mint (schema v50). Mirrors `src/reducer.ts`'s
  * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
  * only (`(verb, id)`), no `ts` carried (the fold is a DELETE; no row
  * field to populate). Strictly `verb` + `id`, mirroring
@@ -1240,7 +1241,7 @@ export function buildLaunchArgv(
  *   - Everything else → `null` (running / blocked / completed / undefined
  *     verdict).
  *
- * fn-756: the `blocked:job-pending → "approve"` arm is gone — there is no
+ * The `blocked:job-pending → "approve"` arm is gone — there is no
  * approval window and no `job-pending` verdict to dispatch against.
  *
  * Pure — exported for tests. Mirrors the dispatch table in
@@ -1425,7 +1426,7 @@ export function reconcile(
       )
     : undefined;
 
-  // fn-959/fn-978: the worktree lane geometry, derived ONCE per cycle off the
+  // The worktree lane geometry, derived ONCE per cycle off the
   // snapshot's RESOLVED `worktreeRepoByEpicId` classification (toplevels resolved
   // git-side in `loadReconcileSnapshot`; the pure layer never shells git). EMPTY
   // (the default) whenever worktree mode is OFF — then `computeReadiness` keys on
@@ -1460,17 +1461,17 @@ export function reconcile(
     // mutex's pass-2 tiebreak so an armed epic claims a free root over an
     // earlier-sorted unarmed sibling.
     eligible,
-    // fn-905: the per-root unseeded-git set → force UNKNOWN only for rows whose
+    // The per-root unseeded-git set → force UNKNOWN only for rows whose
     // `effectiveRoot` is unseeded (dispatch nothing into an unseeded root, while a
     // seeded sibling root still dispatches). Empty whenever `seed_required` is clear.
     snapshot.unseededRoots,
-    // fn-954: the per-root dispatch concurrency count N (refreshed each cycle from
+    // The per-root dispatch concurrency count N (refreshed each cycle from
     // `autopilot_state.max_concurrent_per_root`) — drives the round-robin
     // allocator so up to N tasks dispatch concurrently into one root, spread
     // across its epics. The board latches the SAME N off `BootStatus`, so both
     // consumers compute identical demotions. Default 1 = one-task-per-root.
     state.maxConcurrentPerRoot,
-    // fn-959: the worktree-mode lane re-key (empty when OFF). Re-keys the allocator
+    // The worktree-mode lane re-key (empty when OFF). Re-keys the allocator
     // onto lane paths (cap-1 per lane) without diverging from the dispatch-side
     // worktree geometry, which derives the SAME plan in `attachWorktreeGeometry`.
     laneKeyById,
@@ -1655,7 +1656,7 @@ export function reconcile(
           model: snapshot.workerModel,
           effort: snapshot.workerEffort,
           tier: null,
-          // fn-742 — every close-row launch is an epic finalizer (`close`);
+          // Every close-row launch is an epic finalizer (`close`);
           // the cycle glue stamps the per-epic guard for these.
           isEpicFinalizer: true,
         });
@@ -1664,7 +1665,7 @@ export function reconcile(
     }
   }
 
-  // fn-959 — worktree-mode post-pass. OFF (the default): no worktree code runs,
+  // Worktree-mode post-pass. OFF (the default): no worktree code runs,
   // `worktreeFinalize` is empty, and every launch stays byte-identical to today
   // (the producer adds only the on-default-branch assertion). ON: attach the pure
   // topology geometry to each launch (or a multi-repo reject marker), and collect
@@ -1677,7 +1678,7 @@ export function reconcile(
   // paused autopilot must not do. Launches are already suppressed while paused, so
   // the geometry attach has nothing to decorate either.
   if (snapshot.worktreeMode && !state.paused) {
-    // fn-990 — the producer-observable finalize trigger. Collect the epics whose
+    // The producer-observable finalize trigger. Collect the epics whose
     // CLOSER JOB finished (the durable jobs projection, re-fold-safe + restart-safe)
     // — a BROADER trigger than `completedRowIds` (the close-row's `completed`
     // verdict, gated on the main `epics` projection folding `done`). `finalizeEpic`
@@ -1706,7 +1707,7 @@ export function reconcile(
 }
 
 /**
- * fn-978 — classify each epic's repos to a single git toplevel for the worktree
+ * Classify each epic's repos to a single git toplevel for the worktree
  * lane geometry. The PRODUCER's one resolution pass (mirrors the injectable
  * resolver of `unseededGatedRoots`): `loadReconcileSnapshot` calls this with
  * {@link memoizedNullableGitToplevel}; tests inject a synthetic resolver so the
@@ -1787,7 +1788,7 @@ function classifyEpicRepo(
 }
 
 /**
- * fn-978 — the per-epic worktree geometry {@link prepareWorktreeGeometry} resolves
+ * The per-epic worktree geometry {@link prepareWorktreeGeometry} resolves
  * to, consumed by the dispatch-side {@link attachWorktreeGeometry}:
  *  - `ok` — the derived plan + the RESOLVED repo dir (the lane base).
  *  - `reject` — a loud multi-repo / unresolved epic; the `reason` is minted as a
@@ -1800,7 +1801,7 @@ type EpicWorktreeGeometry =
   | { kind: "reject"; reason: string }
   | { kind: "cycle"; error: WorktreeCycleError };
 
-/** fn-978 — the gate + dispatch geometry from ONE {@link prepareWorktreeGeometry} pass. */
+/** The gate + dispatch geometry from ONE {@link prepareWorktreeGeometry} pass. */
 interface PreparedWorktreeGeometry {
   /** Each `task_id` / `epic_id` → its lane worktree path (the gate's cap-1 re-key). */
   laneKeyById: Map<string, string>;
@@ -1809,7 +1810,7 @@ interface PreparedWorktreeGeometry {
 }
 
 /**
- * fn-959/fn-978 — the SINGLE pure worktree-geometry derivation, consumed by BOTH
+ * The SINGLE pure worktree-geometry derivation, consumed by BOTH
  * the gate (`computeReadiness` lane keys, via `laneKeyById`) AND dispatch
  * ({@link attachWorktreeGeometry}, via `byEpicId`), so the two never re-derive
  * lanes from raw strings and never diverge. Off the snapshot's RESOLVED
@@ -1873,7 +1874,7 @@ export function prepareWorktreeGeometry(
 }
 
 /**
- * fn-959/fn-978 — the pure worktree post-pass over `reconcile`'s assembled
+ * The pure worktree post-pass over `reconcile`'s assembled
  * launches, consuming the SAME {@link prepareWorktreeGeometry} `byEpicId` the gate
  * keyed off (so dispatch never re-derives from raw `target_repo`/`project_dir`).
  * For each epic with launches or a pending finalize (when worktree mode is ON):
@@ -1986,7 +1987,7 @@ function attachWorktreeGeometry(
 }
 
 /**
- * fn-959 — resolve the PRIMARY-parent branch for a node's assignment: the lane a
+ * Resolve the PRIMARY-parent branch for a node's assignment: the lane a
  * rib forks off (or the node's own branch for an inheriting node / the base for a
  * root or the close sink). A rib's `inherited` is false and its primary parent is
  * the earliest-in-toposort in-DAG parent on a DIFFERENT branch (the
@@ -2164,8 +2165,8 @@ export async function confirmRunning(
   // ceiling < TTL: a sweep < ceiling would clear the row mid-confirm and re-open
   // the dispatch. TTL < cooldown: the cooldown must outlast the worst-case
   // round-trip (the row surviving a full TTL plus the sweep tick) so suppression
-  // never lapses while a phantom is in flight. fn-778 CORRECTION: this chain
-  // bounds the FOLD-LAG round-trip, but NOT an arbitrary `claude` cold-boot tail —
+  // never lapses while a phantom is in flight. NOTE: this chain bounds the
+  // FOLD-LAG round-trip, but NOT an arbitrary `claude` cold-boot tail —
   // the 2026-06-10 dup-close booted 317s late, so the fixed dispatch-anchored
   // cooldown (cover-end dispatch+260s with one indoubt re-stamp) lapsed before the
   // bind. `refreshSuppressionForOpenPending` now re-anchors the cooldown each cycle
@@ -2215,7 +2216,7 @@ export async function runReconcileCycle(
       // double-queue. Skip to keep one-at-a-time honest.
       continue;
     }
-    // fn-978 — a worktree-mode reject (multi-repo / unresolved) is evaluated AHEAD
+    // A worktree-mode reject (multi-repo / unresolved) is evaluated AHEAD
     // of the cwd-missing stat: an unresolved epic's `plan.cwd` is the RAW
     // (un-normalized) effective root, which may not exist on disk, so the generic
     // `cwd-missing` would mask the distinct `worktree-repo-unresolved` reason. Mint
@@ -2250,7 +2251,7 @@ export async function runReconcileCycle(
       });
       continue;
     }
-    // fn-959 — worktree-mode producer step, BEFORE `confirmRunning` mints the
+    // Worktree-mode producer step, BEFORE `confirmRunning` mints the
     // durable Dispatched. `launchCwd` is the cwd `confirmRunning` actually launches
     // into; it starts as the pure `plan.cwd` and is OVERRIDDEN to the lane worktree
     // path when worktree mode provisions one. Every git side effect lives here in
@@ -2375,7 +2376,7 @@ export async function runReconcileCycle(
     }
   }
 
-  // fn-959 — worktree-finalize pass. For each epic whose closer reached done this
+  // Worktree-finalize pass. For each epic whose closer reached done this
   // cycle, merge the epic base into the resolved default branch (pushing once) and
   // tear the lanes down. Runs AFTER the launch loop (the closer that landed the
   // close commit on `keeper/epic/<id>` is already gone — the cap-1 lane + the
@@ -2412,7 +2413,7 @@ export async function runReconcileCycle(
 }
 
 /**
- * fn-959 — the epic id a worktree-finalize failure is keyed on. The finalize
+ * The epic id a worktree-finalize failure is keyed on. The finalize
  * `WorktreeLaunchInfo` always carries the synthetic close-sink assignment, whose
  * branch is `keeper/epic/<epicId>`; strip the `keeper/epic/` prefix back to the
  * epic id so the sticky `DispatchFailed` lands on the SAME `close::<epicId>` key a
@@ -2426,7 +2427,7 @@ function closeKeyEpicId(info: WorktreeLaunchInfo): string {
 }
 
 /**
- * fn-959 — the producer's per-launch worktree step (the side-effect seam between
+ * The producer's per-launch worktree step (the side-effect seam between
  * the pure plan and `confirmRunning`). Returns the cwd to launch into on success,
  * or a `{ ok:false, reason, dir }` the caller mints as a sticky `DispatchFailed`.
  * Two branches, mutually exclusive per the geometry the pure post-pass stamped
@@ -2459,7 +2460,7 @@ async function runWorktreeProducerStep(
 }
 
 /**
- * fn-959 — build the production {@link WorktreeDriver} wrapping `worktree-git.ts`.
+ * Build the production {@link WorktreeDriver} wrapping `worktree-git.ts`.
  * Every method shells real git on the target repo (a producer side effect, never
  * a fold). The `run` GitRunner is injectable so the slow real-git test drives the
  * lifecycle and the fast tier fakes it; production passes the default `gitExec`.
@@ -2550,7 +2551,7 @@ export function createWorktreeDriver(
         if (!(await gitBranchExists(repoDir, baseBranch, run))) {
           return { ok: true };
         }
-        // fn-990 — the producer-observable finalize trigger (`closerFinishedIds`)
+        // The producer-observable finalize trigger (`closerFinishedIds`)
         // flags this epic for ANY finished closer job, even a CRASHED one that
         // committed code-but-not-`done`; merging that lane would push incomplete
         // work to the default branch. Confirm the epic is DONE in the MAIN
@@ -2562,9 +2563,22 @@ export function createWorktreeDriver(
         // guard (the lane-ahead half is the shared routine's `not-ahead` check).
         const epicId = closeKeyEpicId(info);
         if (!(await isEpicDone(epicId))) {
+          // Diagnose the silent no-op: a finished closer that has NOT yet folded
+          // `done` into the main projection (the merge defers to a later cycle).
+          console.error(
+            `[autopilot-worker] finalize ${epicId}: done-guard miss — closer finished but epic not yet done in the main projection; deferring the base merge`,
+          );
           return { ok: true };
         }
         const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
+        // A degrade that mints NO sticky DispatchFailed (retry:true) is otherwise
+        // invisible; log it so the silent finalize skip paths stay diagnosable.
+        const retrySkip = (
+          reason: string,
+        ): { ok: false; reason: string; retry: true } => {
+          console.error(`[autopilot-worker] finalize ${epicId}: ${reason}`);
+          return { ok: false, retry: true, reason };
+        };
         // The base merge lands IN THE MAIN worktree (the repo dir is the human's
         // shared checkout) via the ONE shared {@link mergeLaneBaseIntoDefault}
         // routine. It degrades — NEVER stomps WIP or fights an in-flight
@@ -2583,35 +2597,29 @@ export function createWorktreeDriver(
         );
         switch (merge.kind) {
           case "off-branch":
-            return {
-              ok: false,
-              retry: true,
-              reason: `worktree-finalize-off-branch: ${repoDir} HEAD is ${merge.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
-            };
+            return retrySkip(
+              `worktree-finalize-off-branch: ${repoDir} HEAD is ${merge.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
+            );
           case "dirty":
-            return {
-              ok: false,
-              retry: true,
-              reason: `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
-            };
+            return retrySkip(
+              `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
+            );
           case "would-clobber":
-            return {
-              ok: false,
-              retry: true,
-              reason: `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
-            };
+            return retrySkip(
+              `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
+            );
           case "non-ff":
-            return {
-              ok: false,
-              retry: true,
-              reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
-            };
+            return retrySkip(
+              `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
+            );
           case "not-turn-key":
-            return {
-              ok: false,
-              retry: true,
-              reason: `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
-            };
+            return retrySkip(
+              `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
+            );
+          case "push-timeout":
+            return retrySkip(
+              `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying the push next cycle`,
+            );
           case "conflict":
             return {
               ok: false,
@@ -2676,7 +2684,7 @@ export function createWorktreeDriver(
         await gitPruneWorktrees(repoDir, run);
         // Delete the now-merged lane branches (ribs THEN base) so a DONE epic never
         // leaves a recover-able `keeper/epic/<id>...` ref or rib branch behind (the
-        // fn-973 pileup + the rib leak). Each gated on is-ancestor-of-default: the
+        // pileup + the rib leak). Each gated on is-ancestor-of-default: the
         // merge+push above placed every lane's work in default, so an is-ancestor
         // branch is the fully-merged path ONLY — an unmerged/diverged ref is NEVER
         // deleted (that would lose work; the base goes through the merge→conflict→
@@ -2725,7 +2733,7 @@ export function createWorktreeDriver(
 }
 
 /**
- * fn-990 — the structured result of {@link mergeLaneBaseIntoDefault}. A pure
+ * The structured result of {@link mergeLaneBaseIntoDefault}. A pure
  * DISCRIMINANT carrying NO reason strings: each caller maps it to its own reason
  * family ({@link finalizeEpic} → `worktree-finalize-*`, OUTSIDE the recover
  * auto-clear prefix; {@link recoverWorktrees} pass-2 → `worktree-recover-*`,
@@ -2739,22 +2747,28 @@ export type MergeLaneResult =
   | { kind: "non-ff" }
   | { kind: "not-turn-key"; reason: PushNotReadyReason }
   | { kind: "conflict"; stderr: string }
+  | { kind: "push-timeout" }
   | { kind: "push-failed"; detail: string }
   | { kind: "merged" };
 
 /**
- * fn-990 — the ONE guarded lane-base→default merge sequence shared by
+ * The ONE guarded lane-base→default merge sequence shared by
  * {@link WorktreeDriver.finalizeEpic} and {@link recoverWorktrees} pass-2. Runs IN
  * the main checkout (`repo`, already resolved to be on `defaultBranch`) and never
  * stamps a reason string — it returns a {@link MergeLaneResult} discriminant the
  * caller maps to its own reason family. Ordered ahead-check → mergeReadiness →
- * non-ff precheck → turn-key-push precheck → merge → push:
+ * turn-key-push precheck → non-ff precheck → merge → push:
  *  - ahead-check: the base must carry real commits (NOT already an ancestor of
  *    default) → `not-ahead` is the idempotent already-merged no-op.
  *  - mergeReadiness degrades a dirty / off-branch / would-clobber shared checkout.
- *  - the two push prechecks degrade a non-fast-forward / non-turn-key push BEFORE
- *    the local merge, so a push that cannot land never advances local default into
- *    a merge-then-die state.
+ *  - the AUTHORITATIVE turn-key probe runs FIRST (it admits a legitimate first
+ *    push to a never-pushed default via its dry-run); the cached-ref non-ff
+ *    precheck then blocks ONLY a PROVEN non-fast-forward (`"non-fast-forwardable"`)
+ *    — an `"unknown"` unresolved `origin/<default>` defers to turn-key, never a
+ *    permanent skip. Both gate BEFORE the local merge so a push that cannot land
+ *    never advances local default into a merge-then-die state.
+ *  - the push runs with ssh `BatchMode`/`ConnectTimeout` + a spawn timeout; a
+ *    timeout is a TRANSIENT `push-timeout`, distinct from a hard `push-failed`.
  * `acquireLock` is optional (recover passes the fast-tier-stubbable lock; finalize
  * omits it for the default flock). Pure git side effects — never a fetch / rebase /
  * force on the shared checkout.
@@ -2779,12 +2793,20 @@ export async function mergeLaneBaseIntoDefault(
   if (ready.kind === "would-clobber") {
     return { kind: "would-clobber", paths: ready.paths };
   }
-  if (!(await gitRemotePushFastForwardable(repo, defaultBranch, run))) {
-    return { kind: "non-ff" };
-  }
+  // Authoritative turn-key probe FIRST — it admits a legitimate first push to a
+  // never-pushed default via its dry-run and carries the accurate reason.
   const pushReady = await remotePushTurnKey(repo, run);
   if (!pushReady.ready) {
     return { kind: "not-turn-key", reason: pushReady.reason };
+  }
+  // Cached-ref non-ff precheck second: block ONLY a PROVEN non-fast-forward. An
+  // `"unknown"` unresolved origin/<default> (never-pushed default) defers to the
+  // turn-key verdict above rather than minting a false permanent non-FF skip.
+  if (
+    (await gitRemotePushFastForwardable(repo, defaultBranch, run)) ===
+    "non-fast-forwardable"
+  ) {
+    return { kind: "non-ff" };
   }
   const merge: MergeResult = acquireLock
     ? await gitMergeBranchInto(repo, baseBranch, run, acquireLock)
@@ -2792,10 +2814,20 @@ export async function mergeLaneBaseIntoDefault(
   if (merge.kind === "conflict") {
     return { kind: "conflict", stderr: merge.stderr };
   }
+  // BatchMode + ConnectTimeout fail fast on a credential / connect stall;
+  // timeoutMs is the post-connect backstop. A timeout surfaces as the GNU-timeout
+  // sentinel code → a TRANSIENT retry, never the sticky push-failed.
   const push = await run(["push"], {
     cwd: repo,
-    env: { GIT_TERMINAL_PROMPT: "0" },
+    env: {
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
+    },
+    timeoutMs: GIT_PUSH_TIMEOUT_MS,
   });
+  if (push.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "push-timeout" };
+  }
   if (push.code !== 0) {
     return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
   }
@@ -2803,7 +2835,7 @@ export async function mergeLaneBaseIntoDefault(
 }
 
 /**
- * fn-959.7 — the producer-only crash/restart recovery sweep wrapped by
+ * The producer-only crash/restart recovery sweep wrapped by
  * {@link WorktreeDriver.recover}. Exported so the fast tier drives both passes
  * with a fake {@link WorktreeGitRunner}; the real-git lifecycle lives in the slow
  * test. Pure of keeper.db / folds / the wall clock — it reads ONLY live git plus
@@ -2863,7 +2895,7 @@ export async function recoverWorktrees(
       if (entry.bare || entry.branch === null) {
         continue; // a bare/detached entry carries no lane merge to recover
       }
-      // fn-972 BUG 4 — only KEEPER-managed lanes (`keeper/epic/*`). A foreign
+      // Only KEEPER-managed lanes (`keeper/epic/*`). A foreign
       // linked worktree (e.g. a `.claude/worktrees/<name>` lane another tool
       // registered) is never keeper's to abort-merge or prune, and if its dir was
       // removed out from under git the abort-merge `git` spawn ENOENTs against the
@@ -2924,7 +2956,7 @@ export async function recoverWorktrees(
         if (!(await isEpicDone(base.epicId))) {
           continue; // epic still open — its base is merged by `finalizeEpic`, not here
         }
-        // fn-990 — the ONE shared {@link mergeLaneBaseIntoDefault} routine, the same
+        // The ONE shared {@link mergeLaneBaseIntoDefault} routine, the same
         // finalize drives. The merge runs in the MAIN worktree (the repo dir).
         // `not-ahead` is the idempotency skip (an already-merged base is an ancestor
         // of default). Every degrade maps to a `worktree-recover-*` reason: the
@@ -2983,6 +3015,13 @@ export async function recoverWorktrees(
             failures.push({
               epicId: base.epicId,
               reason: `worktree-recover-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+              dir: repo,
+            });
+            continue;
+          case "push-timeout":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall) merging ${base.branch} — retrying next cycle`,
               dir: repo,
             });
             continue;
@@ -3080,7 +3119,7 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * fn-959.7/fn-978 — the deduped, non-empty repo dirs to sweep in the worktree
+ * The deduped, non-empty repo dirs to sweep in the worktree
  * recovery pass: each epic's RESOLVED git toplevel (the main worktree its lanes
  * fork off), sourced from the snapshot's {@link WorktreeRepoResolution} so it keys
  * on the SAME toplevel the lane geometry provisioned — never a raw `project_dir`.
@@ -3121,7 +3160,7 @@ export function reposForRecovery(
 }
 
 /**
- * fn-959.7 — the done-ness probe the recovery backstop threads into the driver.
+ * The done-ness probe the recovery backstop threads into the driver.
  * A pk-lookup read of the `epics` projection by `epic_id` (which bypasses the
  * default OPEN scope AND any recency floor in `resolveFilter`), so a DONE epic is
  * resolved UNBOUNDED by `DONE_EPICS_REAP_WINDOW_SEC` — the whole point of the
@@ -3407,7 +3446,7 @@ export async function loadReconcileSnapshot(
       ? capRaw
       : DEFAULT_MAX_CONCURRENT_JOBS;
 
-  // fn-954: the per-root dispatch concurrency count N rides the SAME singleton
+  // The per-root dispatch concurrency count N rides the SAME singleton
   // row — resolve `max_concurrent_per_root ?? DEFAULT` (= 1, the one-task-per-root
   // mutex). An absent/never-set row, NULL, or a non-positive / non-integer value
   // → DEFAULT. Projection-pull only so a runtime `set_autopilot_config` lands the
@@ -3422,7 +3461,7 @@ export async function loadReconcileSnapshot(
       ? perRootRaw
       : DEFAULT_MAX_CONCURRENT_PER_ROOT;
 
-  // fn-959: the durable worktree-mode toggle rides the SAME singleton row —
+  // The durable worktree-mode toggle rides the SAME singleton row —
   // resolve `worktree_mode truthy` (an absent/never-set row, NULL, or 0 = OFF,
   // the no-worktree dispatch; only a stored 1 = ON). Projection-pull only so a
   // runtime `set_autopilot_config` lands the very next cycle. ON → `reconcile`
@@ -3460,7 +3499,7 @@ export async function loadReconcileSnapshot(
     }
   }
 
-  // fn-905: compute the PER-ROOT unseeded set so `reconcile` forces UNKNOWN only
+  // Compute the PER-ROOT unseeded set so `reconcile` forces UNKNOWN only
   // for rows whose `effectiveRoot` is unseeded (a stale/failed root never darks
   // the whole board). The read connection is the autopilot's own. The gate is
   // bounded to the `seed_required`-set window: while the flag is CLEAR the set is
@@ -3469,7 +3508,7 @@ export async function loadReconcileSnapshot(
   // `git_status` row with `last_event_id > floor`. The seed-read helper degrades
   // a missing control row to `true` (treat unknown as unseeded).
   const unseededRoots = readGitProjectionSeedRequired(db)
-    ? // fn-921: normalize the gated read key to the toplevel write key (memoized)
+    ? // normalize the gated read key to the toplevel write key (memoized)
       // so a subdir/symlink `target_repo` un-darks once its toplevel-keyed row
       // lands.
       unseededGatedRoots(db, readGitProjectionFloor(db), memoizedGitToplevel())
@@ -3480,7 +3519,7 @@ export async function loadReconcileSnapshot(
   const { model: workerModel, effort: workerEffort } =
     resolveWorkerLaunchConfig();
 
-  // fn-978: resolve every epic's repos to a single git toplevel for the worktree
+  // Resolve every epic's repos to a single git toplevel for the worktree
   // lane geometry — the ONE git-resolution pass (mirrors `unseededRoots`), gated on
   // `worktreeMode` so an OFF cycle adds ZERO git spawns (empty map). A FRESH
   // per-cycle nullable memo so a transient resolve failure re-resolves next cycle
@@ -3492,7 +3531,7 @@ export async function loadReconcileSnapshot(
   const worktreeRepoByEpicId = worktreeMode
     ? classifyWorktreeRepos(epics, toplevelResolver)
     : new Map<string, WorktreeRepoResolution>();
-  // fn-988: the recover sweep's KNOWN-ROOTS set — every git-tracked project dir
+  // The recover sweep's KNOWN-ROOTS set — every git-tracked project dir
   // (from the git-status projection) RESOLVED to its toplevel, so a repo carrying
   // a done-but-unmerged base whose epic was already reaped from the projection is
   // still swept (it has no current epic to source its root from). Gated on
@@ -3580,7 +3619,7 @@ function main(): void {
     // `autopilot_state` projection (`?? DEFAULT`) before `reconcile` reads it, so
     // a runtime-set cap takes effect immediately and survives a restart.
     maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
-    // fn-954: seed the in-memory per-root DEFAULT (= 1); the FIRST `driveCycle`
+    // Seed the in-memory per-root DEFAULT (= 1); the FIRST `driveCycle`
     // refreshes it from the projection before `reconcile` reads it.
     maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
   };
@@ -3815,13 +3854,13 @@ function main(): void {
     dirExists: (dir) => existsSync(dir),
     sleep: (ms, signal) => abortableSleep(ms, signal),
     recordTimeoutBackstop,
-    // fn-959 — the producer git driver. Wired unconditionally: when worktree mode
+    // The producer git driver. Wired unconditionally: when worktree mode
     // is ON `reconcile` stamps each launch with geometry the driver provisions;
     // when OFF the driver runs only the on-default-branch assertion. The branch-
     // guard hook does NOT fire here — this is the daemon producer shelling git
     // directly, not a plan-worker subagent's Bash.
     worktree: createWorktreeDriver(),
-    // fn-990 — the MAIN-projection done-ness probe finalize gates on (the closer
+    // The MAIN-projection done-ness probe finalize gates on (the closer
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
     isEpicDone: (epicId) => isEpicDoneById(db, epicId),
@@ -3872,7 +3911,7 @@ function main(): void {
             err,
           );
         }
-        // fn-778: re-anchor the cooldown + finalizer guard to any key still
+        // Re-anchor the cooldown + finalizer guard to any key still
         // backed by an OPEN `pending_dispatches` row (`snapshot.liveTabKeys`), so
         // suppression tracks a slow-cold-boot worker's DURABLE phantom lifetime
         // instead of lapsing at the fixed dispatch-anchored window. AFTER the
@@ -3897,11 +3936,11 @@ function main(): void {
         // `autopilot_state.max_concurrent_jobs`) takes effect this very cycle.
         // Snapshot already resolved `column ?? DEFAULT`.
         state.maxConcurrentJobs = snapshot.maxConcurrentJobs;
-        // fn-954: refresh N the same way so a runtime `set_autopilot_config`
+        // Refresh N the same way so a runtime `set_autopilot_config`
         // {max_concurrent_per_root} takes effect this cycle. Snapshot already
         // resolved `column ?? DEFAULT` (= 1).
         state.maxConcurrentPerRoot = snapshot.maxConcurrentPerRoot;
-        // fn-959.7 — producer-only worktree crash/restart recovery, BEFORE the
+        // Producer-only worktree crash/restart recovery, BEFORE the
         // dispatch decision (so the first boot cycle is the post-restart sweep).
         // Gated on worktree mode ON AND not-paused (recovery does git merges +
         // pushes, the same side-effect class the dispatch loop suppresses while

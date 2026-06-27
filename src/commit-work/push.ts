@@ -13,7 +13,7 @@
  */
 
 import { resolveDefaultBranch } from "../worktree-git";
-import { type GitRunner, gitExec } from "./git-exec";
+import { GIT_PUSH_TIMEOUT_MS, type GitRunner, gitExec } from "./git-exec";
 
 /**
  * A push-error class. Unmatched git stderr falls back to `"other"`;
@@ -157,9 +157,11 @@ export async function remotePushTurnKey(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<PushReadiness> {
+  // `ConnectTimeout=10` bounds an SSH TCP connect stall (which does NOT trip
+  // GIT_TERMINAL_PROMPT); `BatchMode=yes` keeps a credential wall failing fast.
   const env = {
     GIT_TERMINAL_PROMPT: "0",
-    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
   };
   // 1. origin must exist — no remote, nothing to push to.
   const remote = await run(["remote", "get-url", "origin"], { cwd, env });
@@ -174,8 +176,13 @@ export async function remotePushTurnKey(
   if (target.code !== 0) {
     return { ready: false, reason: { kind: "no-push-target" } };
   }
-  // 3. the dry-run push must succeed (probe, not an auth guarantee).
-  const dry = await run(["push", "--dry-run", "--no-progress"], { cwd, env });
+  // 3. the dry-run push must succeed (probe, not an auth guarantee). Bounded so a
+  // post-connect stall can't hang the precheck.
+  const dry = await run(["push", "--dry-run", "--no-progress"], {
+    cwd,
+    env,
+    timeoutMs: GIT_PUSH_TIMEOUT_MS,
+  });
   if (dry.code !== 0) {
     const detail = (dry.stdout + dry.stderr).trim();
     return {

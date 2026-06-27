@@ -31,7 +31,31 @@ export interface GitExecOptions {
   stdin?: Uint8Array;
   /** Extra env merged over `process.env` for the child. */
   env?: Record<string, string>;
+  /**
+   * Wall-clock bound (ms) for the spawn. On expiry the child is SIGKILLed and the
+   * result's `code` is {@link GIT_SPAWN_TIMEOUT_CODE}, distinct from git's own
+   * 0/1/128 so a caller maps a TRANSIENT stall to a retry, never a hard failure.
+   * Omitted / non-positive ⟹ no timeout. The backstop for an SSH TCP stall that
+   * `GIT_TERMINAL_PROMPT` + ssh `ConnectTimeout` do not catch.
+   */
+  timeoutMs?: number;
 }
+
+/**
+ * Exit code {@link spawnGitExec} reports when a spawn exceeds its `timeoutMs` —
+ * the GNU `timeout(1)` convention, chosen so it never collides with git's real
+ * exit codes (0 success, 1 generic, 128 fatal). A caller keys a transient-retry
+ * degrade on this code.
+ */
+export const GIT_SPAWN_TIMEOUT_CODE = 124;
+
+/**
+ * Default wall-clock bound (ms) for a NETWORK git op (push / push --dry-run)
+ * spawned via {@link spawnGitExec}. Generous so a legitimately-progressing push
+ * is never killed, while still bounding a post-connect SSH stall that would
+ * otherwise wedge the reconcile cycle indefinitely.
+ */
+export const GIT_PUSH_TIMEOUT_MS = 120_000;
 
 /**
  * The function shape every commit-work git boundary depends on. Production uses
@@ -108,17 +132,37 @@ export async function spawnGitExec(
     env: buildGitEnv(options.env),
   });
 
-  // Drain both pipes CONCURRENTLY. Awaiting stdout fully before stderr would
-  // deadlock on any child whose stderr fills the pipe buffer mid-run (and
-  // vice-versa) — the pipe-buffer-backpressure hang the epic's best-practices
-  // call out. `Bun.readableStreamToText` consumes the whole stream.
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+  // A bounded spawn SIGKILLs the child on expiry so a stalled network git op
+  // (an SSH TCP stall that does not trip GIT_TERMINAL_PROMPT) cannot hang the
+  // caller forever. The kill closes both pipes, so the concurrent drain below
+  // resolves promptly with whatever partial output arrived.
+  let timedOut = false;
+  const timer =
+    options.timeoutMs !== undefined && options.timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          proc.kill("SIGKILL");
+        }, options.timeoutMs)
+      : undefined;
 
-  return { code, stdout, stderr };
+  try {
+    // Drain both pipes CONCURRENTLY. Awaiting stdout fully before stderr would
+    // deadlock on any child whose stderr fills the pipe buffer mid-run (and
+    // vice-versa) — the pipe-buffer-backpressure hang the epic's best-practices
+    // call out. `Bun.readableStreamToText` consumes the whole stream.
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    // A timeout-kill reports as GIT_SPAWN_TIMEOUT_CODE regardless of the signal's
+    // raw exit so the caller's transient/hard classification stays unambiguous.
+    return { code: timedOut ? GIT_SPAWN_TIMEOUT_CODE : code, stdout, stderr };
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
