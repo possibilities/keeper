@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-27T15:17:02.979000Z",
+  "depends_on": [],
+  "epic": "fn-984-centralize-worker-repo-resolution",
+  "id": "fn-984-centralize-worker-repo-resolution.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "launch always sets KEEPER_PLAN_WORKTREE",
+  "updated_at": "2026-06-27T15:17:02.979000Z"
+}
