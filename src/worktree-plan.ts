@@ -152,8 +152,10 @@ export function worktreePathFor(repoDir: string, branch: string): string {
  * Derive the deterministic worktree plan for an epic's task DAG.
  *
  * @param epicId  The epic id — drives every derived branch name.
- * @param repoDir The epic's repo dir (its `project_dir`) — drives worktree
- *                paths. Must be non-empty; an empty repo dir is a producer bug.
+ * @param repoDir The epic's RESOLVED git toplevel (the producer resolves each
+ *                epic's `target_repo`/`project_dir` to one toplevel before calling
+ *                — see `classifyWorktreeRepos`) — drives worktree paths. Must be
+ *                non-empty; an empty repo dir is a producer bug.
  * @param tasks   The epic's tasks (`epic.tasks`). Read-only; not mutated.
  * @returns The {@link WorktreePlan} — base lane + every node assignment in
  *          toposort order, `__close__` last.

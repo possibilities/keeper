@@ -18,7 +18,10 @@
  */
 
 import { expect, test } from "bun:test";
-import { buildLaneKeys } from "../src/autopilot-worker";
+import {
+  classifyWorktreeRepos,
+  prepareWorktreeGeometry,
+} from "../src/autopilot-worker";
 import {
   applyPerRootRoundRobinAllocator,
   applySingleTaskPerEpicMutex,
@@ -86,6 +89,19 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     last_validated_at: "2026-05-24T00:00:00Z",
     ...overrides,
   };
+}
+
+/**
+ * fn-978 — the gate-side lane-key map for a set of epics, the way `reconcile`
+ * builds it: classify repos (IDENTITY resolution — each raw root is its own
+ * toplevel, byte-identical to the pre-fn-978 raw geometry), then run the SINGLE
+ * pure `prepareWorktreeGeometry` derivation the gate + dispatch both consume.
+ */
+function laneKeysFor(epics: Epic[]): Map<string, string> {
+  return prepareWorktreeGeometry(
+    epics,
+    classifyWorktreeRepos(epics, (r) => r),
+  ).laneKeyById;
 }
 
 /**
@@ -2073,16 +2089,16 @@ test("fn-959 parallel sibling lanes in ONE epic run concurrently (the whole poin
   expect(offReady.length).toBe(1);
   // With the lane re-key (gate-built off the real plan), A and B are distinct
   // lanes → both ready at N=1.
-  const laneKeyById = buildLaneKeys([epic]);
+  const laneKeyById = laneKeysFor([epic]);
   const snap = runWithLanes([epic], 1, laneKeyById);
   expect(snap.perTask.get("A")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("B")).toEqual({ tag: "ready" });
 });
 
-test("fn-959 gate↔dispatch symmetry: buildLaneKeys maps each task to its plan's worktree path + epic to base", () => {
-  // The gate and the dispatch-side geometry pass MUST derive the SAME lanes. Pin
-  // `buildLaneKeys` to `deriveWorktreePlan` directly so a future drift in either
-  // is caught.
+test("fn-959 gate↔dispatch symmetry: prepareWorktreeGeometry maps each task to its plan's worktree path + epic to base", () => {
+  // The gate and the dispatch-side geometry pass MUST derive the SAME lanes — they
+  // now share ONE `prepareWorktreeGeometry` pass. Pin its `laneKeyById` to
+  // `deriveWorktreePlan` directly so a future drift in either is caught.
   const p = makeTask({ task_id: "P", epic_id: "fn-1-foo", task_number: 1 });
   const a = makeTask({
     task_id: "A",
@@ -2108,7 +2124,7 @@ test("fn-959 gate↔dispatch symmetry: buildLaneKeys maps each task to its plan'
     project_dir: "/repo",
     tasks: [p, a, b, j],
   });
-  const lanes = buildLaneKeys([epic]);
+  const lanes = laneKeysFor([epic]);
   const plan = deriveWorktreePlan("fn-1-foo", "/repo", epic.tasks);
   const byNode = new Map(plan.assignments.map((x) => [x.nodeId, x]));
   for (const id of ["P", "A", "B", "J"]) {
@@ -2122,10 +2138,10 @@ test("fn-959 gate↔dispatch symmetry: buildLaneKeys maps each task to its plan'
   expect(lanes.get("B")).not.toBe(lanes.get("P"));
 });
 
-test("fn-959 buildLaneKeys: a MULTI-REPO epic is left un-keyed (rejected at dispatch, never lane-keyed)", () => {
+test("fn-959/fn-978 prepareWorktreeGeometry: a MULTI-REPO epic is left un-keyed (rejected at dispatch, never lane-keyed)", () => {
   // Two tasks resolving to different repos → worktree mode rejects the epic for
-  // v1. `buildLaneKeys` must emit NO entries for it (the rows fall through to
-  // effectiveRoot at the gate; the dispatch pass stamps the sticky reject).
+  // v1. The gate `laneKeyById` must emit NO entries for it (the rows fall through
+  // to effectiveRoot at the gate; the dispatch pass stamps the sticky reject).
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     epic_id: "fn-1-foo",
@@ -2144,15 +2160,15 @@ test("fn-959 buildLaneKeys: a MULTI-REPO epic is left un-keyed (rejected at disp
     project_dir: "/repo-a",
     tasks: [t1, t2],
   });
-  const lanes = buildLaneKeys([epic]);
+  const lanes = laneKeysFor([epic]);
   expect(lanes.size).toBe(0);
 });
 
-test("fn-959 buildLaneKeys: a cyclic DAG is skipped (no throw at the gate; rows fall through)", () => {
-  // A depends_on cycle makes deriveWorktreePlan throw. The gate-side builder must
-  // swallow it and leave the epic un-keyed (the dispatch geometry pass re-throws
-  // for the cycle backstop; no launch is ever emitted, so the gate verdict is
-  // moot). The builder MUST NOT throw and abort the whole cycle's gate.
+test("fn-959 prepareWorktreeGeometry: a cyclic DAG is skipped (no throw at the gate; rows fall through)", () => {
+  // A depends_on cycle makes deriveWorktreePlan throw. The gate-side `laneKeyById`
+  // must swallow it and leave the epic un-keyed (the dispatch geometry pass
+  // re-throws for the cycle backstop; no launch is ever emitted, so the gate
+  // verdict is moot). The build MUST NOT throw and abort the whole cycle's gate.
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     epic_id: "fn-1-foo",
@@ -2171,8 +2187,8 @@ test("fn-959 buildLaneKeys: a cyclic DAG is skipped (no throw at the gate; rows 
     project_dir: "/repo",
     tasks: [t1, t2],
   });
-  expect(() => buildLaneKeys([epic])).not.toThrow();
-  expect(buildLaneKeys([epic]).size).toBe(0);
+  expect(() => laneKeysFor([epic])).not.toThrow();
+  expect(laneKeysFor([epic]).size).toBe(0);
 });
 
 test("fn-959 distinct sibling lanes both cap-1 at N=5 (parallel, not stacked)", () => {
@@ -2187,7 +2203,7 @@ test("fn-959 distinct sibling lanes both cap-1 at N=5 (parallel, not stacked)", 
     project_dir: "/repo",
     tasks: [r1, r2],
   });
-  const lanes = buildLaneKeys([epic]);
+  const lanes = laneKeysFor([epic]);
   // Distinct lanes.
   expect(lanes.get("R1")).not.toBe(lanes.get("R2"));
   const snap = runWithLanes([epic], 5, lanes);
