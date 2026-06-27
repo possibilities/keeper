@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-27T01:21:08.900000Z",
+  "depends_on": [],
+  "epic": "fn-979-fix-worktree-phantom-lane-finalize",
+  "id": "fn-979-fix-worktree-phantom-lane-finalize.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Tolerate phantom lane branch in pre-merge",
+  "updated_at": "2026-06-27T01:21:08.900000Z"
+}
