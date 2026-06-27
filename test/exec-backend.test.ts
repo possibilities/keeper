@@ -584,6 +584,10 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
     "autopilot",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
+    // Serial launch ALWAYS carries an empty lane entry so a stale tmux
+    // session-env KEEPER_PLAN_WORKTREE can never be inherited.
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
     "--model",
     "sonnet",
     "--effort",
@@ -612,6 +616,8 @@ test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confir
     "autopilot",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
     "do a thing",
   ]);
 });
@@ -634,6 +640,8 @@ test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trail
     "agentbus",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=agentbus",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
     "--x-no-confirm",
     "--resume",
     "planner-session",
@@ -660,6 +668,8 @@ test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode"
     "agentbus",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=agentbus",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
     "fallback prompt",
   ]);
 });
@@ -729,7 +739,7 @@ test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WO
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: an empty worktreePath emits NO 2nd env entry (byte-identical to non-worktree)", () => {
+test("buildAgentwrapLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits one empty KEEPER_PLAN_WORKTREE entry — so a stale tmux session-env lane can never leak in", () => {
   const base = {
     launcherArgvPrefix: LAP,
     session: "autopilot",
@@ -739,9 +749,16 @@ test("buildAgentwrapLaunchArgv: an empty worktreePath emits NO 2nd env entry (by
     effort: "max",
     noConfirm: true,
   } as const;
+  // An explicit empty worktreePath is byte-identical to omitting it: both emit
+  // the single empty lane entry that OVERWRITES any stale `-e` session value.
+  const absent = buildAgentwrapLaunchArgv(base);
   expect(buildAgentwrapLaunchArgv({ ...base, worktreePath: "" })).toEqual(
-    buildAgentwrapLaunchArgv(base),
+    absent,
   );
+  const laneEntries = absent.filter((a) =>
+    a.startsWith("KEEPER_PLAN_WORKTREE="),
+  );
+  expect(laneEntries).toEqual(["KEEPER_PLAN_WORKTREE="]);
 });
 
 // --- parseAgentwrapStdout ---

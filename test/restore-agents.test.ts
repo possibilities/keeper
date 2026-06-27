@@ -233,7 +233,8 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE agentwrap re
   expect(script).toContain(
     "'agent' 'claude' '--x-tmux' '--x-tmux-detached' " +
       "'--x-tmux-session' 'work' '--x-tmux-env' " +
-      "'KEEPER_TMUX_SESSION=work' '--x-no-confirm' '--resume' 'first-name'",
+      "'KEEPER_TMUX_SESSION=work' '--x-tmux-env' 'KEEPER_PLAN_WORKTREE=' " +
+      "'--x-no-confirm' '--resume' 'first-name'",
   );
   // Resume by the LATEST name, never the job_id UUID.
   expect(script).toContain("'--resume' 'first-name'");
@@ -268,6 +269,7 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare agentw
     "cd '/repo' && '/abs/bun' '/abs/cli/keeper.ts' 'agent' 'claude' " +
       "'--x-tmux' '--x-tmux-detached' '--x-tmux-session' " +
       "'work' '--x-tmux-env' 'KEEPER_TMUX_SESSION=work' " +
+      "'--x-tmux-env' 'KEEPER_PLAN_WORKTREE=' " +
       "'--x-no-confirm' '--resume' 'name'",
   );
   expect(script).not.toContain('"$@"');

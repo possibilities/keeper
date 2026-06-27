@@ -809,11 +809,14 @@ export interface AgentwrapLaunchOpts {
  * binding carrier: the launcher injects it into the pane env via tmux `-e`, so
  * the SessionStart hook stamps the session name on the bound `jobs` row exactly
  * as the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
- * reap/classify parsing. A worktree-mode launch ({@link
- * AgentwrapLaunchOpts.worktreePath} set) emits a SECOND `--x-tmux-env
- * KEEPER_PLAN_WORKTREE=<lane>` immediately after, BEFORE the conditional tail —
- * so it rides BOTH prompt and resume launches (a resumed worktree worker must
- * not re-resolve to the main checkout). Pure — exported for byte-pin tests.
+ * reap/classify parsing. EVERY launch emits a SECOND `--x-tmux-env
+ * KEEPER_PLAN_WORKTREE=<lane-or-empty>` immediately after — the lane when {@link
+ * AgentwrapLaunchOpts.worktreePath} is set, EMPTY otherwise. tmux persists `-e`
+ * into the session env, so an always-present entry OVERWRITES any stale lane a
+ * prior worktree launch left in a reused session (an empty value resolves
+ * identically to unset, so serial resolution is unchanged). It rides BOTH prompt
+ * and resume launches (a resumed worktree worker must not re-resolve to the main
+ * checkout). Pure — exported for byte-pin tests.
  */
 export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
   const flags: string[] = [];
@@ -845,12 +848,12 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     opts.session,
     "--x-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
-    // Worktree-mode lane carrier — a SECOND repeated `--x-tmux-env`
-    // (agentwrap last-wins per dup key). Emitted BEFORE `...flags`/`...tail` so
-    // it rides resume mode too. Absent → byte-identical to a non-worktree launch.
-    ...(opts.worktreePath !== undefined && opts.worktreePath !== ""
-      ? ["--x-tmux-env", `KEEPER_PLAN_WORKTREE=${opts.worktreePath}`]
-      : []),
+    // Worktree-lane carrier — ALWAYS a SECOND repeated `--x-tmux-env` (agentwrap
+    // last-wins per dup key): the lane in worktree mode, EMPTY in serial. Always
+    // present so the `-e` OVERWRITES any stale lane a prior worktree launch left
+    // in a reused tmux session env; an empty value resolves identically to unset.
+    "--x-tmux-env",
+    `KEEPER_PLAN_WORKTREE=${opts.worktreePath ?? ""}`,
     ...flags,
     ...tail,
   ];
