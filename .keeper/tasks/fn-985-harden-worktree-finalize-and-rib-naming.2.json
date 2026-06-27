@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "finalize and recover graceful degradation",
-  "updated_at": "2026-06-27T16:40:56.292000Z"
+  "updated_at": "2026-06-27T17:24:46.023000Z",
+  "worker_done_at": "2026-06-27T17:24:46.023000Z"
 }

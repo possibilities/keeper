@@ -37,5 +37,5 @@ Make finalize/recover degrade gracefully instead of sticky-jamming the close. (1
 - [ ] Pure-tier + real-git slow tests cover all of the above; default `bun test` stays pure; keeper/CLAUDE.md:116 + README updated; typecheck + lint green.
 
 ## Done summary
-
+finalize/recover now degrade to a clean skip-and-retry on a dirty/off-branch/mid-rebase shared main checkout or a non-fast-forward push (distinct non-worktree-recover* reason, no sticky close), via new mergeReadiness + remotePushFastForwardable probes; finalize is idempotent on a partial-teardown re-run. Genuine content conflicts still fail loud. Pure fake-runner + real-git slow tests added; README + CLAUDE.md updated.
 ## Evidence
