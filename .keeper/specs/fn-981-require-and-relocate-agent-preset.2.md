@@ -41,5 +41,5 @@ pass real names. Add a discovery surface and point every agent-facing doc at it.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added 'keeper agent presets list [--json]' discovery subcommand (catalog presets + panels, exit 2 on missing/invalid config) and pointed every agent-facing doc (pair/dispatch/panel skills, --help/--agent-help, panel-runner) at the required ~/.config/keeper/presets.yaml + the list command; deleted panel.md's zero-config fallback.
 ## Evidence
