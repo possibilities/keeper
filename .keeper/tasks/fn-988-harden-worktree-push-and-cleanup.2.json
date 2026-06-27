@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "finalize/recover/teardown completeness",
-  "updated_at": "2026-06-27T19:08:10.773000Z"
+  "updated_at": "2026-06-27T20:29:31.795000Z",
+  "worker_done_at": "2026-06-27T20:29:31.795000Z"
 }

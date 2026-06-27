@@ -41,5 +41,5 @@
 - [ ] pure + slow tests; typecheck + lint green.
 
 ## Done summary
-
+Added a would-clobber merge gate (incoming tracked paths ∩ main untracked) that degrades finalize + recover to distinct non-sticky skip-retries while keeping benign-untracked finalizing; widened teardown + recover to prune EVERY rib (laneOrder ∪ live-git, is-ancestor-gated, prune-before-delete, never --contains) with merge staying bases-only; and gave reposForRecovery knownRoots so out-of-snapshot done bases are swept.
 ## Evidence
