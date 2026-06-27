@@ -51,5 +51,5 @@ disk this session).
 - [ ] slow real-git lifecycle leaves no orphan base branch or worktree dir
 
 ## Done summary
-
+Generalized recover pass-3 from a ribs-only sweep to an is-ancestor-gated teardown covering epic BASES too, so a done epic's merged base worktree + keeper/epic/<id> branch are reclaimed (no orphan branch/worktree dir); dirty base teardown accumulates a recover failure and an unmerged base is left intact.
 ## Evidence
