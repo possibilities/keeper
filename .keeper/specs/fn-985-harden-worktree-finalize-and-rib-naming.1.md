@@ -38,5 +38,5 @@ Rename ribBranchFor (src/worktree-plan.ts:132) from `keeper/epic/<id>/<task>` to
 - [ ] A real-git base+rib+fan-in slow test passes (opt-in); the default `bun test` stays pure; exact-string test assertions updated; README updated; typecheck + lint green.
 
 ## Done summary
-
+Renamed ribBranchFor to the flat keeper/epic/<id>--<task> scheme (no path-prefix D/F ref collision), switched listEpicBaseBranches' base-vs-rib discriminator to -- in lockstep, and added rib branch+worktree pruning (is-ancestor-gated) to finalizeEpic. Covered by a new real-git base+rib+fan-in slow test plus pure finalize rib-prune tests.
 ## Evidence
