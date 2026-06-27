@@ -113,7 +113,19 @@ export type MergeReadiness =
    * rebase is in flight (which leaves HEAD detached, so `currentBranch` reports
    * `HEAD`). Either way the base merge must wait for the checkout to return.
    */
-  | { kind: "off-branch"; head: string };
+  | { kind: "off-branch"; head: string }
+  /**
+   * The incoming lane's tracked paths would OVERWRITE an untracked file already
+   * sitting in the main checkout — the intersection of `git ls-files --others
+   * --exclude-standard` (main's untracked) and the lane base's tracked tree. A
+   * real `git merge` hard-ABORTS on this ("untracked working tree files would be
+   * overwritten"), so the caller degrades to a clean skip-and-retry instead of a
+   * loud merge failure. Detected ONLY when an `incomingBranch` is supplied;
+   * `paths` carries the colliding paths for the skip reason. Distinct from
+   * `dirty`: a BENIGN untracked file the merge cannot disturb (no incoming path
+   * collides) still reads `ready` — the fn-987 untracked-is-clean behavior holds.
+   */
+  | { kind: "would-clobber"; paths: string[] };
 
 /** One parsed `git worktree list --porcelain` entry. */
 export interface WorktreeEntry {
@@ -445,13 +457,20 @@ export async function isAncestorOf(
  *     non-zero status exit is itself treated as not-ready (`dirty`,
  *     conservative). This single probe covers the mid-MERGE and conflict-paused-
  *     rebase cases without a separate `MERGE_HEAD` shell.
- * Otherwise `{ kind: "ready" }`. Pure git reads — never a fetch / write. The
- * caller degrades a not-`ready` result to a clean skip-and-retry, never a merge.
+ * When `incomingBranch` is supplied, a clean tree gets ONE further probe: a
+ * would-clobber intersection (`incomingBranch`'s tracked paths ∩ the main
+ * checkout's untracked files) — a non-empty overlap a `git merge` would hard-
+ * abort on returns `{ kind: "would-clobber" }`. Omitting it skips that probe
+ * (the bare clean-tree verdict). Otherwise `{ kind: "ready" }`. Pure git reads —
+ * never a fetch / write. `run` precedes `incomingBranch` so existing two-/three-
+ * arg callers keep the bare-readiness behavior unchanged. The caller degrades a
+ * not-`ready` result to a clean skip-and-retry, never a merge.
  */
 export async function mergeReadiness(
   cwd: string,
   expectedBranch: string,
   run: GitRunner = gitExec,
+  incomingBranch?: string,
 ): Promise<MergeReadiness> {
   const head = await currentBranch(cwd, run);
   if (head !== expectedBranch) {
@@ -464,7 +483,59 @@ export async function mergeReadiness(
   if (status.code !== 0 || detail.length > 0) {
     return { kind: "dirty", detail };
   }
+  if (incomingBranch !== undefined && incomingBranch.length > 0) {
+    const clobbered = await wouldClobberUntracked(cwd, incomingBranch, run);
+    if (clobbered.length > 0) {
+      return { kind: "would-clobber", paths: clobbered };
+    }
+  }
   return { kind: "ready" };
+}
+
+/**
+ * The paths a merge of `incomingBranch` into the main checkout would OVERWRITE:
+ * `git ls-files --others --exclude-standard` (main's untracked, ignore-aware) ∩
+ * `git ls-tree -r --name-only <incomingBranch>` (the incoming tracked tree). A
+ * non-empty result is exactly the set `git merge` refuses to clobber and aborts
+ * on. `git merge-tree` is NOT used — it never sees untracked files. Either probe
+ * failing folds to an EMPTY result (no proven collision → let the merge run; its
+ * own abort is the loud backstop), never a manufactured block. Pure git reads.
+ */
+async function wouldClobberUntracked(
+  cwd: string,
+  incomingBranch: string,
+  run: GitRunner,
+): Promise<string[]> {
+  const untrackedR = await run(["ls-files", "--others", "--exclude-standard"], {
+    cwd,
+  });
+  if (untrackedR.code !== 0) {
+    return [];
+  }
+  const untracked = new Set(
+    untrackedR.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0),
+  );
+  if (untracked.size === 0) {
+    return [];
+  }
+  const incomingR = await run(
+    ["ls-tree", "-r", "--name-only", incomingBranch],
+    { cwd },
+  );
+  if (incomingR.code !== 0) {
+    return [];
+  }
+  const clobbered: string[] = [];
+  for (const raw of incomingR.stdout.split("\n")) {
+    const path = raw.trim();
+    if (path.length > 0 && untracked.has(path)) {
+      clobbered.push(path);
+    }
+  }
+  return clobbered;
 }
 
 /**
@@ -540,6 +611,30 @@ export async function listEpicBaseBranches(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<{ branch: string; epicId: string }[]> {
+  // The merge candidate set is BASES ONLY — filter the ribs out so a rib never
+  // reaches the merge-to-default path (a misclassified rib would push lane work
+  // to default). The CLEANUP enumeration (`listEpicLaneBranches`) keeps the ribs.
+  const lanes = await listEpicLaneBranches(cwd, run);
+  return lanes
+    .filter((l) => !l.isRib)
+    .map(({ branch, epicId }) => ({ branch, epicId }));
+}
+
+/**
+ * Enumerate EVERY keeper lane branch — the epic BASES (`keeper/epic/<epic_id>`)
+ * AND the ribs (`keeper/epic/<epic_id>--<task_id>`) — that still exists as a local
+ * ref, each tagged `isRib`. The CLEANUP enumeration the teardown/recover prune
+ * sweeps off: a leaked rib (one a snapshot's `laneOrder` never carried, or a
+ * crash orphaned) is only prunable once it is SEEN here. Sourced from LIVE git
+ * (`git for-each-ref refs/heads/keeper/epic`, the prefix match folding in every
+ * descendant ref), so it survives a daemon restart. The `--` separator splits a
+ * rib's `<epic_id>--<task_id>` so `epicId` is recovered for BOTH a base and a
+ * rib. {@link listEpicBaseBranches} filters this to the merge-eligible bases.
+ */
+export async function listEpicLaneBranches(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<{ branch: string; epicId: string; isRib: boolean }[]> {
   const r = await run(
     ["for-each-ref", "--format=%(refname:short)", "refs/heads/keeper/epic"],
     { cwd },
@@ -547,20 +642,25 @@ export async function listEpicBaseBranches(
   if (r.code !== 0) {
     return [];
   }
-  const out: { branch: string; epicId: string }[] = [];
+  const out: { branch: string; epicId: string; isRib: boolean }[] = [];
   for (const raw of r.stdout.split("\n")) {
     const branch = raw.trim();
     if (!branch.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) {
       continue;
     }
     const rest = branch.slice(KEEPER_EPIC_BRANCH_PREFIX.length);
-    // A rib branch carries a `--` (`<epic_id>--<task_id>`); the base does not, so
-    // its whole `rest` IS the epic id. Excluding ribs here keeps them off the
-    // merge-to-default path (a misclassified rib would push lane work to default).
-    if (rest.length === 0 || rest.includes("--")) {
+    if (rest.length === 0) {
       continue;
     }
-    out.push({ branch, epicId: rest });
+    // A rib carries the `--` separator (`<epic_id>--<task_id>`); a base does not,
+    // so its whole `rest` IS the epic id. Split on the FIRST `--` to recover the
+    // epic id of a rib.
+    const sep = rest.indexOf("--");
+    if (sep === -1) {
+      out.push({ branch, epicId: rest, isRib: false });
+    } else {
+      out.push({ branch, epicId: rest.slice(0, sep), isRib: true });
+    }
   }
   return out;
 }

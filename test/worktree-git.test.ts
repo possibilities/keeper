@@ -19,6 +19,7 @@ import {
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
+  listEpicLaneBranches,
   mergeBranchInto,
   mergeReadiness,
   parseWorktreeList,
@@ -857,6 +858,105 @@ test("mergeReadiness: a mid-merge's unmerged entries surface as dirty (no separa
 test("mergeReadiness: a non-zero status exit fails safe to dirty (never spuriously ready)", async () => {
   const { run } = fakeAsyncGit([onBranchRule("main"), statusRule("", 128)]);
   expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
+});
+
+// fn-988 — the would-clobber probe (an incoming lane path ∩ a main-untracked file)
+const lsFilesOthersRule = (untracked: string): FakeGitRule => ({
+  when: (a) => argvStartsWith(a, "ls-files", "--others", "--exclude-standard"),
+  result: { exitCode: 0, stdout: untracked },
+});
+const lsTreeRule = (branch: string, tracked: string): FakeGitRule => ({
+  when: (a) => argvStartsWith(a, "ls-tree", "-r", "--name-only", branch),
+  result: { exitCode: 0, stdout: tracked },
+});
+
+test("mergeReadiness: an incoming path that collides with a main-untracked file → would-clobber", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(""), // -uno → clean
+    lsFilesOthersRule("docs/new.md\nscratch.txt\n"),
+    lsTreeRule("keeper/epic/fn-1-foo", "src/a.ts\ndocs/new.md\n"),
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    "keeper/epic/fn-1-foo",
+  );
+  expect(res.kind).toBe("would-clobber");
+  if (res.kind === "would-clobber") {
+    // ONLY the overlap (docs/new.md) blocks — scratch.txt + src/a.ts don't collide.
+    expect(res.paths).toEqual(["docs/new.md"]);
+  }
+});
+
+test("mergeReadiness: a benign untracked-only tree (no incoming overlap) → ready (no fn-987 regression)", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(""), // -uno → clean
+    lsFilesOthersRule(".env\neditor.tmp\n"), // benign untracked
+    lsTreeRule("keeper/epic/fn-1-foo", "src/a.ts\ndocs/new.md\n"), // no overlap
+  ]);
+  expect(
+    await mergeReadiness("/repo", "main", run, "keeper/epic/fn-1-foo"),
+  ).toEqual({ kind: "ready" });
+});
+
+test("mergeReadiness: no incomingBranch → the would-clobber probe is skipped entirely", async () => {
+  const { run, calls } = fakeAsyncGit([onBranchRule("main"), statusRule("")]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({ kind: "ready" });
+  // No incoming branch → never enumerates untracked/incoming paths.
+  expect(calls.some((c) => argvStartsWith(c.args, "ls-files"))).toBe(false);
+  expect(calls.some((c) => argvStartsWith(c.args, "ls-tree"))).toBe(false);
+});
+
+test("mergeReadiness: a clean main checkout with NO untracked files → ready (no ls-tree probe)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(""),
+    lsFilesOthersRule(""), // no untracked at all
+  ]);
+  expect(
+    await mergeReadiness("/repo", "main", run, "keeper/epic/fn-1-foo"),
+  ).toEqual({ kind: "ready" });
+  // An empty untracked set short-circuits BEFORE listing the incoming tree.
+  expect(calls.some((c) => argvStartsWith(c.args, "ls-tree"))).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-988 — listEpicLaneBranches (base + rib cleanup enumeration)
+// ---------------------------------------------------------------------------
+
+test("listEpicLaneBranches: enumerates bases AND ribs, each tagged + epicId recovered", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "for-each-ref"),
+      result: {
+        exitCode: 0,
+        stdout: [
+          "keeper/epic/fn-1-foo",
+          "keeper/epic/fn-1-foo--fn-1-foo.2",
+          "keeper/epic/fn-1-foo--fn-1-foo.3",
+          "keeper/epic/fn-2-bar",
+          "refs/heads/not-a-lane", // ignored (no prefix)
+        ].join("\n"),
+      },
+    },
+  ]);
+  expect(await listEpicLaneBranches("/repo", run)).toEqual([
+    { branch: "keeper/epic/fn-1-foo", epicId: "fn-1-foo", isRib: false },
+    {
+      branch: "keeper/epic/fn-1-foo--fn-1-foo.2",
+      epicId: "fn-1-foo",
+      isRib: true,
+    },
+    {
+      branch: "keeper/epic/fn-1-foo--fn-1-foo.3",
+      epicId: "fn-1-foo",
+      isRib: true,
+    },
+    { branch: "keeper/epic/fn-2-bar", epicId: "fn-2-bar", isRib: false },
+  ]);
 });
 
 // ---------------------------------------------------------------------------
