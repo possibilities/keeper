@@ -20,14 +20,17 @@ import {
   isLinkedWorktree,
   isLinkedWorktreePure,
   mergeBranchInto,
+  mergeReadiness,
   parseWorktreeList,
   pruneWorktrees,
+  remotePushFastForwardable,
   removeWorktree,
   resolveDefaultBranch,
   resolveDefaultBranchPure,
   type WorktreeEntry,
 } from "../src/worktree-git";
 import {
+  argvHas,
   argvStartsWith,
   type FakeGitRule,
   fakeAsyncGit,
@@ -767,4 +770,129 @@ test("removeWorktree: dirty tree → remove fails → dirty result, never forced
   expect(
     calls.filter((c) => argvStartsWith(c.args, "worktree", "remove")),
   ).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// fn-985 — mergeReadiness (the finalize/recover pre-merge clean-tree guard)
+// ---------------------------------------------------------------------------
+
+const onBranchRule = (branch: string): FakeGitRule => ({
+  when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+  result: { exitCode: 0, stdout: `${branch}\n` },
+});
+const statusRule = (porcelain: string, exitCode = 0): FakeGitRule => ({
+  when: (a) => argvStartsWith(a, "status", "--porcelain"),
+  result: { exitCode, stdout: porcelain },
+});
+
+test("mergeReadiness: on the expected branch + clean tree → ready", async () => {
+  const { run, calls } = fakeAsyncGit([onBranchRule("main"), statusRule("")]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({ kind: "ready" });
+  // It probed the branch THEN the working tree (cheapest discriminant first).
+  expect(calls[0].args).toEqual(["rev-parse", "--abbrev-ref", "HEAD"]);
+  expect(
+    calls.some((c) => argvStartsWith(c.args, "status", "--porcelain")),
+  ).toBe(true);
+});
+
+test("mergeReadiness: HEAD on another branch → off-branch (no status probe)", async () => {
+  const { run, calls } = fakeAsyncGit([onBranchRule("feature-x")]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({
+    kind: "off-branch",
+    head: "feature-x",
+  });
+  // Off-branch short-circuits BEFORE the working-tree probe.
+  expect(calls.some((c) => argvStartsWith(c.args, "status"))).toBe(false);
+});
+
+test("mergeReadiness: detached HEAD (mid-rebase reports `HEAD`) → off-branch", async () => {
+  const { run } = fakeAsyncGit([onBranchRule("HEAD")]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({
+    kind: "off-branch",
+    head: "HEAD",
+  });
+});
+
+test("mergeReadiness: on-branch but a dirty/occupied tree → dirty with the porcelain detail", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(" M src/foo.ts\n?? scratch.txt\n"),
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("src/foo.ts");
+  }
+});
+
+test("mergeReadiness: a mid-merge's unmerged entries surface as dirty (no separate MERGE_HEAD shell)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule("UU src/conflict.ts\n"),
+  ]);
+  expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
+  // The clean-tree verdict comes from status --porcelain alone — no MERGE_HEAD probe.
+  expect(calls.some((c) => argvHas(c.args, "MERGE_HEAD"))).toBe(false);
+});
+
+test("mergeReadiness: a non-zero status exit fails safe to dirty (never spuriously ready)", async () => {
+  const { run } = fakeAsyncGit([onBranchRule("main"), statusRule("", 128)]);
+  expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
+});
+
+// ---------------------------------------------------------------------------
+// fn-985 — remotePushFastForwardable (non-fast-forward precheck, no fetch)
+// ---------------------------------------------------------------------------
+
+test("remotePushFastForwardable: cached origin ref is an ancestor of local → fast-forwardable (no fetch)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "abc\n" }, // origin/main resolves
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+      result: { exitCode: 0 }, // origin is contained in local
+    },
+  ]);
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(true);
+  // It checked the CACHED remote-tracking ref — never a fetch.
+  expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
+  expect(
+    calls.some((c) =>
+      argvStartsWith(
+        c.args,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "refs/remotes/origin/main",
+      ),
+    ),
+  ).toBe(true);
+});
+
+test("remotePushFastForwardable: origin ahead of local (not an ancestor) → NOT fast-forwardable", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "abc\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+      result: { exitCode: 1 }, // origin has commits local lacks
+    },
+  ]);
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(false);
+  expect(calls.some((c) => argvStartsWith(c.args, "fetch"))).toBe(false);
+});
+
+test("remotePushFastForwardable: no cached remote ref (never pushed) → fast-forwardable, no is-ancestor probe", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 1 }, // origin/main does not resolve
+    },
+  ]);
+  expect(await remotePushFastForwardable("/repo", "main", run)).toBe(true);
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });

@@ -3741,6 +3741,7 @@ interface FakeWorktreeLog {
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
+  finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
   recoverFailures?: WorktreeRecoveryFailure[];
 }): { driver: WorktreeDriver; log: FakeWorktreeLog } {
@@ -3764,6 +3765,10 @@ function makeFakeWorktreeDriver(opts?: {
     async finalizeEpic(info) {
       log.calls.push(`finalize:${info.baseBranch}`);
       log.finalizes.push(info);
+      const retry = opts?.finalizeRetry?.(info) ?? null;
+      if (retry !== null) {
+        return { ok: false, retry: true, reason: retry };
+      }
       const reason = opts?.finalizeFail?.(info) ?? null;
       if (reason !== null) {
         return { ok: false, reason };
@@ -4558,6 +4563,42 @@ test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed 
   });
 });
 
+test("fn-985 runReconcileCycle: a finalize RETRY result (dirty/off-branch/non-ff main checkout) mints NO sticky DispatchFailed", async () => {
+  // The transient skip path: finalizeEpic returns `retry:true`, so the producer
+  // STOPS the epic's finalize cleanly but never mints a sticky close-row failure —
+  // never an un-clearable close; the next cycle retries once the tree settles.
+  const { driver } = makeFakeWorktreeDriver({
+    finalizeRetry: () =>
+      "worktree-finalize-dirty-checkout: /repo has a dirty working tree",
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // No DispatchFailed emission — the retry skip is invisible to the close row.
+  expect(depsLog.emissions).toHaveLength(0);
+});
+
 test("worktree finalize is gated on not-paused — a paused board collects no finalize", () => {
   // Same done epic that finalizes when playing, but PAUSED: the base merge + push
   // is producer git work that must not run while paused (matching recover()).
@@ -5232,6 +5273,8 @@ function makeRecoveryGit(state: {
   defaultBranch?: string; // resolved via symbolic-ref
   ancestors?: Set<string>; // branches already an ancestor of default
   repoHead?: string; // main worktree current branch
+  dirtyStatus?: string; // git status --porcelain stdout on the main checkout
+  remoteAhead?: boolean; // cached origin ref NOT an ancestor of local → non-ff
   mergeConflict?: boolean; // a real merge hits a conflict
   pushFails?: boolean;
 }): {
@@ -5289,6 +5332,16 @@ function makeRecoveryGit(state: {
         stdout: `${state.defaultBranch ?? "main"}\n`,
         stderr: "",
       };
+    }
+    if (joined === "status --porcelain") {
+      return { code: 0, stdout: state.dirtyStatus ?? "", stderr: "" };
+    }
+    if (
+      joined.startsWith("merge-base --is-ancestor") &&
+      args[2]?.startsWith("refs/remotes/origin/")
+    ) {
+      // Non-fast-forward precheck: ff-able (origin is an ancestor) unless remoteAhead.
+      return { code: state.remoteAhead ? 1 : 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("merge-base --is-ancestor")) {
       const branch = args[2];
@@ -5480,6 +5533,49 @@ test("fn-959.7 recoverWorktrees: main worktree off the default branch → loud f
   expect(failures).toHaveLength(1);
   expect(failures[0]?.reason).toContain("worktree-recover-not-on-default");
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-985 recoverWorktrees: a DIRTY main checkout → skip-and-retry (worktree-recover-dirty-checkout), no merge", async () => {
+  // The recover-side analogue of finalize's dirty skip: a `worktree-recover*` reason
+  // (so the level-triggered auto-clear lifts it the moment the tree is clean), never
+  // a stomp of the human's WIP.
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main", // on default…
+    dirtyStatus: " M src/foo.ts\n", // …but the human has uncommitted work
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-dirty-checkout");
+  // The reason stays inside the recover auto-clear scope (never sticky).
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-985 recoverWorktrees: a NON-FAST-FORWARD remote (origin ahead) → skip-and-retry, no merge/push/fetch", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    remoteAhead: true, // origin moved ahead since the last fetch
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => true, run);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-non-fast-forward");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // No merge, no push, and emphatically no fetch on a shared checkout.
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  expect(calls.some((c) => c.args === "push")).toBe(false);
+  expect(calls.some((c) => c.args.startsWith("fetch"))).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: push failure on a recovered merge → keyed failure", async () => {
@@ -5852,5 +5948,143 @@ test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while t
   expect(res).toEqual({ ok: true });
   // The unmerged rib survived (force-delete would lose work); the base still pruned.
   expect(cmds.some((c) => c === `branch -D ${rib}`)).toBe(false);
+  expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
+});
+
+// ---------------------------------------------------------------------------
+// fn-985 — finalize degrades gracefully (skip-and-retry, never a sticky jam) on a
+// dirty / off-branch / non-fast-forward SHARED main checkout, and is idempotent.
+// ---------------------------------------------------------------------------
+
+/** A finalize fakeRun past the branch-exists + done-state guards, parameterized on
+ *  the main checkout's HEAD branch, `git status --porcelain`, and whether the
+ *  cached origin ref is an ancestor of local (fast-forwardable). */
+function makeFinalizeReadinessRun(opts: {
+  head?: string; // rev-parse --abbrev-ref HEAD
+  status?: string; // git status --porcelain stdout
+  remoteAhead?: boolean; // origin ref NOT an ancestor of local → non-ff
+}): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
+  const cmds: string[] = [];
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin ref exists
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${opts.head ?? "main"}\n`, stderr: "" };
+    }
+    if (joined === "status --porcelain") {
+      return { code: 0, stdout: opts.status ?? "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: opts.remoteAhead ? 1 : 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // base already-merged + prune gates
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, cmds };
+}
+
+test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true), distinct reason, no merge/push/teardown", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({ status: " M src/foo.ts\n" });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true);
+    expect(res.reason).toContain("worktree-finalize-dirty-checkout");
+  }
+  // A clean skip — the human's WIP is never stomped, the lanes survive for a retry.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no working-tree probe past the branch", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({ head: "feature-x" });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true);
+    expect(res.reason).toContain("worktree-finalize-off-branch");
+  }
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and-retry, no merge/push/fetch", async () => {
+  const { run, cmds } = makeFinalizeReadinessRun({ remoteAhead: true });
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true);
+    expect(res.reason).toContain("worktree-finalize-non-fast-forward");
+  }
+  // Never an auto-fetch / rebase / force, and the base merge is skipped entirely.
+  expect(cmds.some((c) => c.startsWith("fetch"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure RESUMES teardown (already-merged base, lane still registered)", async () => {
+  // The first run merged + pushed but crashed before teardown — so the merge is now
+  // an ancestor of default (already-merged no-op) and the working tree is CLEAN, yet
+  // the base worktree + branch still linger. The re-run must resume teardown.
+  const cmds: string[] = [];
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined === "status --porcelain") {
+      return { code: 0, stdout: "", stderr: "" }; // the prior merge is COMMITTED → clean
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // already-merged + ff + prune gates
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  expect(res).toEqual({ ok: true });
+  // The merge was the idempotent no-op (already an ancestor → no `merge --no-edit`),
+  // and teardown RESUMED: the lingering base worktree + branch were cleaned up.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds).toContain(
+    "worktree remove /repo.worktrees/keeper-epic-fn-1-foo",
+  );
   expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
 });

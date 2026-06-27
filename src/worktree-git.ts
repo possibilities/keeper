@@ -90,6 +90,31 @@ export type RemoveResult =
    */
   | { kind: "dirty"; stderr: string };
 
+/**
+ * Whether the SHARED main checkout is safe to merge an epic base into RIGHT NOW —
+ * the finalize/recover pre-merge guard, result-kind shaped like {@link RemoveResult}.
+ * A finalize/recover merge lands in the human's own main worktree, so it must never
+ * stomp work-in-progress or fight an in-flight merge/rebase: a not-`ready` result is
+ * a clean SKIP-AND-RETRY (the caller stops that epic's finalize and retries next
+ * cycle once the tree settles), NEVER a sticky failure.
+ */
+export type MergeReadiness =
+  /** On the expected branch, clean working tree, no merge/rebase in flight. */
+  | { kind: "ready" }
+  /**
+   * The working tree / index is not clean (`git status --porcelain` non-empty).
+   * Subsumes a mid-MERGE on the main checkout — a stopped/`--no-commit` merge
+   * leaves unmerged or staged entries that show here — and a mid-rebase paused on
+   * a conflict. `detail` carries the porcelain lines for the skip reason.
+   */
+  | { kind: "dirty"; detail: string }
+  /**
+   * HEAD is not on `expectedBranch` — a human checked out a feature branch, or a
+   * rebase is in flight (which leaves HEAD detached, so `currentBranch` reports
+   * `HEAD`). Either way the base merge must wait for the checkout to return.
+   */
+  | { kind: "off-branch"; head: string };
+
 /** One parsed `git worktree list --porcelain` entry. */
 export interface WorktreeEntry {
   /** Absolute worktree path. */
@@ -405,6 +430,61 @@ export async function isAncestorOf(
     cwd,
   });
   return r.code === 0;
+}
+
+/**
+ * Probe whether `cwd`'s shared main checkout is ready for a base merge: on
+ * `expectedBranch`, clean working tree, no merge/rebase mid-flight. Two git reads:
+ *  1. `git rev-parse --abbrev-ref HEAD` — off `expectedBranch` (incl. a detached
+ *     HEAD from a mid-rebase, which reports `HEAD`) → `{ kind: "off-branch" }`.
+ *  2. `git status --porcelain` — any output (uncommitted edits, staged work, or a
+ *     stopped merge's unmerged entries) → `{ kind: "dirty" }`. A non-zero status
+ *     exit is itself treated as not-ready (`dirty`, conservative). This single
+ *     probe covers the mid-MERGE and conflict-paused-rebase cases without a
+ *     separate `MERGE_HEAD` shell.
+ * Otherwise `{ kind: "ready" }`. Pure git reads — never a fetch / write. The
+ * caller degrades a not-`ready` result to a clean skip-and-retry, never a merge.
+ */
+export async function mergeReadiness(
+  cwd: string,
+  expectedBranch: string,
+  run: GitRunner = gitExec,
+): Promise<MergeReadiness> {
+  const head = await currentBranch(cwd, run);
+  if (head !== expectedBranch) {
+    return { kind: "off-branch", head };
+  }
+  const status = await run(["status", "--porcelain"], { cwd });
+  const detail = (status.stdout + status.stderr).trim();
+  if (status.code !== 0 || detail.length > 0) {
+    return { kind: "dirty", detail };
+  }
+  return { kind: "ready" };
+}
+
+/**
+ * Whether pushing local `defaultBranch` to `origin/<defaultBranch>` would
+ * FAST-FORWARD, decided from the CACHED remote-tracking ref ONLY — no network
+ * fetch. `refs/remotes/origin/<defaultBranch>` that resolves but is NOT an ancestor
+ * of the local branch means origin moved ahead since the last fetch → a push would
+ * be rejected non-fast-forward, so the caller degrades to a skip-and-retry (NEVER
+ * an auto-fetch / rebase / force on a shared checkout). A remote ref that does not
+ * resolve (never pushed) is fast-forwardable by definition (nothing to be behind).
+ * `true` ⟹ safe to push.
+ */
+export async function remotePushFastForwardable(
+  cwd: string,
+  defaultBranch: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const remoteRef = `refs/remotes/origin/${defaultBranch}`;
+  const exists = await run(["rev-parse", "--verify", "--quiet", remoteRef], {
+    cwd,
+  });
+  if (exists.code !== 0) {
+    return true; // never pushed → no divergence possible
+  }
+  return isAncestorOf(cwd, remoteRef, defaultBranch, run);
 }
 
 /**

@@ -3217,12 +3217,29 @@ skipped and the close still proceeds (probed before any lock/merge-base, so a
 real merge/is-ancestor failure is never masked). A genuine content conflict still
 aborts (`git merge --abort`) + fails loud + stops (no merge-to-default, no
 teardown).
+The merge-to-default + push at close run in the shared MAIN checkout, so finalize
+DEGRADES GRACEFULLY rather than stomping it: before the merge it probes the
+checkout (`mergeReadiness` — `git status --porcelain` + the current branch, which
+reports `HEAD` mid-rebase) and prechecks the push for fast-forwardability against
+the CACHED `origin/<default>` ref (`remotePushFastForwardable`, never a fetch). A
+dirty / off-branch / mid-rebase tree or a non-fast-forward remote is a clean
+SKIP-AND-RETRY keyed on a DISTINCT `worktree-finalize-*` reason that mints NO
+sticky `DispatchFailed` — finalize stops and the next cycle retries once the tree
+settles, never an un-clearable close and never an auto-fetch/rebase/force. (A
+genuine divergent-CONTENT conflict still fails loud + sticky, above — only the
+human's-WIP-blocks-the-merge case degrades.) Finalize is idempotent: a re-run
+after a partial post-merge/post-push crash sees the base already an ancestor of
+default (no-op merge), an up-to-date push, and resumes teardown (an already-gone
+worktree removal no-ops).
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 (pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
 pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
-`keeper/epic/*` scan decoupled from the recent-done window. A recover merge
+`keeper/epic/*` scan decoupled from the recent-done window. Pass-2 runs the SAME
+shared-checkout prechecks as finalize (dirty / off-branch / non-fast-forward →
+skip), but surfaces them as `worktree-recover-*` reasons so the level-triggered
+auto-clear lifts the block the moment the tree settles. A recover merge
 conflict still fails LOUD and blocks ONLY its own `close::<epic>` key (per-key
 `failedKeys`) — but it is LEVEL-TRIGGERED, never a sticky board-jam: each cycle
 re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the sticky

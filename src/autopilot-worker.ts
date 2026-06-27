@@ -99,7 +99,9 @@ import {
   listEpicBaseBranches as gitListEpicBaseBranches,
   listWorktrees as gitListWorktrees,
   mergeBranchInto as gitMergeBranchInto,
+  mergeReadiness as gitMergeReadiness,
   pruneWorktrees as gitPruneWorktrees,
+  remotePushFastForwardable as gitRemotePushFastForwardable,
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
   isKeeperLaneEntry,
@@ -979,13 +981,21 @@ export interface WorktreeDriver {
   /**
    * After the epic closer reaches done: merge the epic base branch into the repo's
    * resolved default branch (sequential pairwise, pushed once), then tear the lane
-   * worktrees down. Returns `{ ok: true }` on a clean merge-and-teardown, or
-   * `{ ok: false, reason }` on a merge conflict / dirty-teardown refusal (the
-   * producer stops — no further merge, no teardown — and surfaces the reason).
+   * worktrees down. Returns `{ ok: true }` on a clean merge-and-teardown.
+   *
+   * A failure is one of two kinds, distinguished by `retry`:
+   *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
+   *    conflict, a dirty-LANE teardown refusal). The producer mints a STICKY
+   *    `close::<epic>` DispatchFailed a human clears with `retry_dispatch`.
+   *  - `{ ok: false, retry: true, reason }` — a transient environment state on the
+   *    SHARED main checkout (dirty / off-branch / mid-rebase, or a non-fast-forward
+   *    push). The producer STOPS this epic's finalize but mints NO sticky failure;
+   *    the next cycle retries once the tree settles. NEVER an un-clearable close,
+   *    and NEVER the divergent-content case (that stays a loud sticky block).
    */
   finalizeEpic(
     info: WorktreeLaunchInfo,
-  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
   /**
    * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
    * Returns `{ ok: true }` when it is, else `{ ok: false, reason }` (a sticky
@@ -2341,17 +2351,24 @@ export async function runReconcileCycle(
   // close commit on `keeper/epic/<id>` is already gone — the cap-1 lane + the
   // readiness gate guarantee no agent is live in the base when this fires). Driven
   // from THIS producer step (not the recent-done reap window) so it never depends
-  // on `DONE_EPICS_REAP_WINDOW_SEC`. A merge conflict / dirty-teardown failure
-  // mints a sticky `worktree-finalize` DispatchFailed keyed on the close row
-  // (cleared by `retry_dispatch`) and STOPS that epic's finalize — no merge-to-
-  // default, no teardown. Idempotent: `finalizeEpic` skips an already-merged base.
+  // on `DONE_EPICS_REAP_WINDOW_SEC`. A GENUINE block (a content merge conflict /
+  // dirty-LANE teardown refusal) mints a sticky `worktree-finalize` DispatchFailed
+  // keyed on the close row (cleared by `retry_dispatch`) and STOPS that epic's
+  // finalize. A transient shared-checkout state (dirty/off-branch/non-ff main
+  // checkout) instead returns `retry` → STOP with NO sticky row, retried next
+  // cycle. Idempotent: `finalizeEpic` skips an already-merged base + resumes a
+  // partial teardown (already-gone worktrees no-op).
   if (deps.worktree !== undefined) {
     for (const info of decision.worktreeFinalize) {
       if (signal.aborted) {
         return;
       }
       const result = await deps.worktree.finalizeEpic(info);
-      if (!result.ok) {
+      // A `retry` failure is a transient environment skip (dirty/off-branch/
+      // non-ff main checkout): STOP this epic's finalize but mint NO sticky
+      // DispatchFailed — the next cycle retries once the tree settles. Only a
+      // GENUINE block (no `retry`) becomes the sticky `close::<epic>` row.
+      if (!result.ok && result.retry !== true) {
         deps.emitDispatchFailed({
           verb: "close",
           id: closeKeyEpicId(info),
@@ -2517,14 +2534,40 @@ export function createWorktreeDriver(
           return { ok: true };
         }
         const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
-        // Merge the epic base into the default branch IN THE MAIN worktree (the
-        // repo dir is the main worktree, checked out on the default branch). This
-        // is the single push to origin (commit-work skipped per-lane pushes).
-        const onDefault = await gitCurrentBranch(repoDir, run);
-        if (onDefault !== defaultBranch) {
+        // The base merge lands IN THE MAIN worktree (the repo dir is the human's
+        // shared checkout). Degrade — NEVER stomp WIP or fight an in-flight
+        // merge/rebase. A dirty / off-branch / mid-rebase checkout is a clean
+        // SKIP-AND-RETRY (a distinct, non-`worktree-recover*` reason so the
+        // recover auto-clear never touches it, AND no sticky DispatchFailed so it
+        // is never an un-clearable close); the next cycle retries once the tree
+        // settles. This converts ONLY the human's-WIP-blocks-the-merge case — a
+        // genuine divergent-content conflict still fails loud below.
+        const ready = await gitMergeReadiness(repoDir, defaultBranch, run);
+        if (ready.kind === "off-branch") {
           return {
             ok: false,
-            reason: `worktree-finalize-not-on-default: ${repoDir} HEAD is ${onDefault}, expected ${defaultBranch} for the base merge`,
+            retry: true,
+            reason: `worktree-finalize-off-branch: ${repoDir} HEAD is ${ready.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
+          };
+        }
+        if (ready.kind === "dirty") {
+          return {
+            ok: false,
+            retry: true,
+            reason: `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${ready.detail}`,
+          };
+        }
+        // Non-fast-forward precheck BEFORE the merge (so a diverged remote never
+        // advances local default into a stuck divergence): if the cached
+        // `origin/<default>` moved ahead, a push would be rejected — skip-and-retry,
+        // NEVER an auto-fetch / rebase / force on the shared checkout.
+        if (
+          !(await gitRemotePushFastForwardable(repoDir, defaultBranch, run))
+        ) {
+          return {
+            ok: false,
+            retry: true,
+            reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
           };
         }
         // Pre-guarded by gitBranchExists above, so `missing-source` is unreachable
@@ -2748,14 +2791,36 @@ export async function recoverWorktrees(
         if (await gitIsAncestorOf(repo, base.branch, defaultBranch, run)) {
           continue;
         }
-        // The merge runs in the MAIN worktree (the repo dir), which must be on the
-        // default branch for the base to land there. A non-default HEAD means a
-        // human (or another lane) is mid-checkout — fail loud, retry next cycle.
-        const head = await gitCurrentBranch(repo, run);
-        if (head !== defaultBranch) {
+        // The merge runs in the MAIN worktree (the repo dir). Degrade gracefully
+        // when the shared checkout is occupied: a dirty / off-branch / mid-rebase
+        // tree is a SKIP-AND-RETRY, never a stomp. The recover failures all carry
+        // the `worktree-recover*` prefix, so the level-triggered auto-clear lifts
+        // the block the moment the tree settles (no `retry_dispatch` needed) — the
+        // recover-side analogue of finalize's `retry` skip.
+        const ready = await gitMergeReadiness(repo, defaultBranch, run);
+        if (ready.kind === "off-branch") {
           failures.push({
             epicId: base.epicId,
-            reason: `worktree-recover-not-on-default: ${repo} HEAD is ${head}, expected ${defaultBranch} to merge ${base.branch}`,
+            reason: `worktree-recover-not-on-default: ${repo} HEAD is ${ready.head}, expected ${defaultBranch} to merge ${base.branch}`,
+            dir: repo,
+          });
+          continue;
+        }
+        if (ready.kind === "dirty") {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — skipping the merge of ${base.branch} until it is clean — ${ready.detail}`,
+            dir: repo,
+          });
+          continue;
+        }
+        // Non-fast-forward precheck BEFORE the merge: a cached `origin/<default>`
+        // ahead of local means a push would be rejected — skip-and-retry, never an
+        // auto-fetch / rebase / force on the shared checkout.
+        if (!(await gitRemotePushFastForwardable(repo, defaultBranch, run))) {
+          failures.push({
+            epicId: base.epicId,
+            reason: `worktree-recover-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the merge of ${base.branch} (no fetch/rebase/force)`,
             dir: repo,
           });
           continue;
