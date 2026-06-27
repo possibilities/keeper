@@ -5417,6 +5417,7 @@ function makeRecoveryGit(state: {
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   mergeConflict?: boolean; // a real merge hits a conflict
   pushFails?: boolean;
+  dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
   calls: { cwd: string; args: string; env?: Record<string, string> }[];
@@ -5450,6 +5451,16 @@ function makeRecoveryGit(state: {
     }
     if (joined.startsWith("worktree prune")) {
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree remove ")) {
+      const path = args[2] ?? "";
+      return state.dirtyRemoveAt?.has(path)
+        ? {
+            code: 1,
+            stdout: "",
+            stderr: "contains modified or untracked files",
+          }
+        : { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
       return {
@@ -5678,6 +5689,87 @@ test("fn-988 recoverWorktrees pass-3: an UNMERGED orphan rib is preserved (never
     false,
   );
   expect(calls.some((c) => c.args === `branch -D ${rib}`)).toBe(false);
+});
+
+test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) is torn down, is-ancestor-gated", async () => {
+  // The orphan class found on disk this session: a done epic whose base merged
+  // into default but whose base worktree + `keeper/epic/<id>` branch were never
+  // swept (finalize no-op'd, recover pass-3 was ribs-only). Pass-3 now reclaims
+  // it once it is provably merged (an ancestor of default) — independent of
+  // whether THIS run did the merge.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // already merged → no pass-2 merge, safe to sweep
+    repoHead: "main",
+  });
+  // isEpicDone false: the epic was reaped past the recent-done window, yet the
+  // is-ancestor gate still proves the orphan base merged → it is swept anyway.
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  // No pass-2 merge (already an ancestor), but the base worktree + branch ARE
+  // torn down: worktree removed, then branch deleted, never `--contains`.
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    true,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
+  expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+test("fn-990 recoverWorktrees pass-3: an UNMERGED orphan base is preserved (never force-deleted)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // NOT an ancestor → unmerged work, leave it for a human
+    repoHead: "main",
+  });
+  // Open epic, base not merged: pass-2 skips (not done), pass-3 leaves it intact.
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failure and continues (never throws)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // merged → eligible for teardown
+    repoHead: "main",
+    dirtyRemoveAt: new Set([basePath]), // but the base worktree refuses (dirty)
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // Recover ACCUMULATES — a base-keyed failure, OUTSIDE the merge-skip family,
+  // and the branch is NEVER deleted while its worktree is dirty.
+  expect(failures).toEqual([
+    {
+      epicId: "fn-1-foo",
+      reason: `worktree-recover-base-teardown-dirty: ${basePath} has uncommitted changes — contains modified or untracked files`,
+      dir: "/repo",
+    },
+  ]);
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: open (not-done) epic base → skipped, never merged", async () => {

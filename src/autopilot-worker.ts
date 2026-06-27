@@ -3003,12 +3003,18 @@ export async function recoverWorktrees(
       }
     }
 
-    // --- Pass 3: prune orphan ribs (`keeper/epic/<id>--*`) left by a crash. ---
-    // A rib that is an ancestor of default is fully merged — its worktree + branch
-    // are safe to remove (the fan-in landed its work, the base merge above placed
-    // it in default). is-ancestor-gated, prune-before-delete, NEVER `git branch
-    // --contains` (which force-deletes siblings). An UNMERGED rib is LEFT for a
-    // human. Mirrors the finalize-teardown rib sweep for the crash/restart path.
+    // --- Pass 3: prune orphan lanes (`keeper/epic/<id>` bases AND ribs) merged
+    // into default. --- An INDEPENDENT is-ancestor-of-default sweep over BOTH a
+    // base and a rib: an ancestor of default is provably merged (its content is
+    // already on local default), so its worktree + branch are safe to remove —
+    // gated ONLY on the ancestry, NOT on whether THIS run did the merge, so a
+    // crash between the pass-2 base merge and teardown (OR a done epic reaped
+    // past the recent-done window, which `finalizeEpic` never swept) is reclaimed
+    // on the next cycle instead of leaking an orphan base branch + `~/worktrees`
+    // dir. is-ancestor-gated, prune-before-delete, NEVER `git branch --contains`
+    // (which force-deletes siblings). An UNMERGED lane is LEFT for a human. The
+    // candidate set is enumerated from LIVE git (no laneOrder snapshot — recover
+    // has none). Mirrors the finalize-teardown sweep for the crash/restart path.
     let laneBranches: { branch: string; epicId: string; isRib: boolean }[];
     try {
       laneBranches = await gitListEpicLaneBranches(repo, run);
@@ -3030,32 +3036,36 @@ export async function recoverWorktrees(
         : entry.branch;
       wtByShortBranch.set(short, entry.path);
     }
-    for (const rib of laneBranches) {
-      if (!rib.isRib) {
-        continue;
-      }
+    for (const lane of laneBranches) {
+      // Bases AND ribs share ONE sweep — both are torn down ONLY once they are an
+      // ancestor of default (a base via the pass-2/finalize merge, a rib via its
+      // fan-in). On a dirty teardown recover ACCUMULATES a failure and continues
+      // (never throws) — the recover contract; finalize's inline sweep returns a
+      // hard result instead. `kind` labels the reason so a base and a rib stay
+      // distinguishable in the failure feed.
+      const kind = lane.isRib ? "rib" : "base";
       try {
-        if (!(await gitIsAncestorOf(repo, rib.branch, defaultBranch, run))) {
-          continue; // unmerged rib — leave it for a human, never force-delete
+        if (!(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))) {
+          continue; // unmerged lane — leave it for a human, never force-delete
         }
-        const wt = wtByShortBranch.get(rib.branch);
+        const wt = wtByShortBranch.get(lane.branch);
         if (wt !== undefined) {
           const removed = await gitRemoveWorktree(repo, wt, run);
           if (removed.kind === "dirty") {
             failures.push({
-              epicId: rib.epicId,
-              reason: `worktree-recover-rib-teardown-dirty: ${wt} has uncommitted changes — ${removed.stderr}`,
+              epicId: lane.epicId,
+              reason: `worktree-recover-${kind}-teardown-dirty: ${wt} has uncommitted changes — ${removed.stderr}`,
               dir: repo,
             });
             continue;
           }
           await gitPruneWorktrees(repo, run);
         }
-        await gitDeleteBranch(repo, rib.branch, run);
+        await gitDeleteBranch(repo, lane.branch, run);
       } catch (err) {
         failures.push({
-          epicId: rib.epicId,
-          reason: `worktree-recover-rib-prune-failed: ${rib.branch} — ${errMsg(err)}`,
+          epicId: lane.epicId,
+          reason: `worktree-recover-${kind}-prune-failed: ${lane.branch} — ${errMsg(err)}`,
           dir: repo,
         });
       }
