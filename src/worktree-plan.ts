@@ -21,7 +21,9 @@
  *
  * Branch names are a pure function of stable ids only:
  *  - base: `keeper/epic/<epic_id>`
- *  - rib:  `keeper/epic/<epic_id>/<task_id>`
+ *  - rib:  `keeper/epic/<epic_id>--<task_id>` (FLAT: the `--` separator keeps a
+ *    rib from ever being a path-prefix of the base ref — git rejects that as a
+ *    directory/file ref conflict)
  * Worktree paths resolve to a directory under `~/worktrees/`, OUTSIDE the repo
  * tree, named `<repoName>--<branch-slug>`. The home dir is the one environment
  * read here — constant within the daemon process, so re-derivation stays
@@ -62,7 +64,7 @@ export interface WorktreeAssignment {
   isCloseSink: boolean;
   /**
    * The git branch this node runs on. `keeper/epic/<epic_id>` for any node that
-   * inherits the base lane; `keeper/epic/<epic_id>/<task_id>` for a rib.
+   * inherits the base lane; `keeper/epic/<epic_id>--<task_id>` for a rib.
    */
   branch: string;
   /**
@@ -128,9 +130,14 @@ export function baseBranchFor(epicId: string): string {
   return `keeper/epic/${epicId}`;
 }
 
-/** The rib branch for a forked task — `keeper/epic/<epic_id>/<task_id>`. */
+/**
+ * The rib branch for a forked task — the FLAT `keeper/epic/<epic_id>--<task_id>`.
+ * The `--` separator (never `/`) keeps a rib from being a path-prefix of the base
+ * ref `keeper/epic/<epic_id>`, which git rejects as a directory/file ref conflict
+ * the moment a forked epic provisions its first rib alongside the base.
+ */
 export function ribBranchFor(epicId: string, taskId: string): string {
-  return `keeper/epic/${epicId}/${taskId}`;
+  return `keeper/epic/${epicId}--${taskId}`;
 }
 
 /**
@@ -138,6 +145,9 @@ export function ribBranchFor(epicId: string, taskId: string): string {
  * repo tree, named `<repoName>--<branch-slug>` where `slug` is the branch with
  * `/` → `-` (filesystem-safe; branch names are unique per lane, so the slug is
  * collision-free and the `<repoName>--` prefix keeps sibling-repo lanes legible).
+ * A rib slug therefore carries `--` twice (`<repoName>--keeper-epic-<id>--<task>`):
+ * the prefix separator and the rib's own — still unambiguous + collision-free,
+ * since the slug is an injective image of the unique branch name.
  * Kept outside the repo tree so a worktree is never nested inside the repo it
  * forks from. Resolves the home dir from the environment — safe because this runs
  * PRODUCER-ONLY (the autopilot worktree driver), never inside a fold.

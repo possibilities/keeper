@@ -3198,8 +3198,11 @@ re-fold-safe + restart-safe) plus a `git show` of the lane base's spec
 (`epicBaseHasDoneState`), never the projection's done-status. A crashed closer
 that never committed done leaves the lane base not-done, so finalize no-ops and
 retries rather than pushing incomplete work to default.
-Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>/<task>`
-ribs). Before `confirmRunning` mints the durable `Dispatched`, the producer
+Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>--<task>`
+ribs — the FLAT `--` separator keeps a rib from being a path-prefix of the base
+ref, which git would otherwise reject as a directory/file ref conflict the moment a
+forked epic provisions its first rib). Before `confirmRunning` mints the durable
+`Dispatched`, the producer
 lazily ensures the lane worktree exists, runs any pre-merges, asserts HEAD
 (ON → worktree HEAD equals the derived branch and the worktree is registered;
 OFF → repo on its default branch), and sets the launch cwd to the worktree path.
@@ -3228,9 +3231,10 @@ moment the git resolves — junk branch deleted, conflict merged, or epic reaped
 so a human just fixes the git, never `retry_dispatch`. The auto-clear is SCOPED to
 recover-reason rows (`worktree-recover*`) so a normal close-sink (`finalizeEpic`)
 failure sharing the `close::<epic>` key is never clobbered. A successful close
-prunes its now-merged lane base (`git branch -D keeper/epic/<id>`, gated on
-is-ancestor so an unmerged/diverged branch is NEVER force-deleted), so a DONE epic
-leaves no recover-able branch behind. Each epic's
+prunes its now-merged lane branches — every rib (`keeper/epic/<id>--<task>`) THEN
+the base (`git branch -D`), each AFTER its worktree teardown and each gated on
+is-ancestor-of-default so an unmerged/diverged ref is NEVER force-deleted — so a
+DONE epic leaves no recover-able base branch and no leaked rib behind. Each epic's
 `target_repo`/`project_dir` are RESOLVED to git toplevels ONCE in the producer
 snapshot-build (`classifyWorktreeRepos` + the nullable `memoizedNullableGitToplevel`,
 a fresh per-cycle memo) before the lane geometry compares + places lanes, so the

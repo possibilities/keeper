@@ -409,7 +409,7 @@ export async function isAncestorOf(
 
 /**
  * The branch-ref prefix every keeper worktree lane checks out: the base
- * `keeper/epic/<epic_id>` and the ribs `keeper/epic/<epic_id>/<task_id>`. The
+ * `keeper/epic/<epic_id>` and the ribs `keeper/epic/<epic_id>--<task_id>`. The
  * single classifier of a keeper-managed lane — a worktree on a branch under this
  * prefix is keeper's to recover/finalize; anything else (a foreign
  * `.claude/worktrees/<name>` lane from another tool) is NOT.
@@ -442,7 +442,7 @@ export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
  * local refs — the done-but-unmerged backstop's candidate set, sourced from LIVE
  * git (never a window-bounded projection read), so a daemon restart between an
  * epic-done and its merge-to-default can never orphan the merge. RIB branches
- * (`keeper/epic/<epic_id>/<task_id>`, which carry an extra `/` segment) are
+ * (`keeper/epic/<epic_id>--<task_id>`, distinguished by the `--` separator) are
  * EXCLUDED: only the base merges into the default branch. Returns each match as
  * `{ branch, epicId }` with the `keeper/epic/` prefix stripped to recover the
  * epic id. Order is git's ref order (stable enough; the caller cross-references
@@ -466,8 +466,10 @@ export async function listEpicBaseBranches(
       continue;
     }
     const rest = branch.slice(KEEPER_EPIC_BRANCH_PREFIX.length);
-    // A rib branch carries a `/` (`<epic_id>/<task_id>`); the base does not.
-    if (rest.length === 0 || rest.includes("/")) {
+    // A rib branch carries a `--` (`<epic_id>--<task_id>`); the base does not, so
+    // its whole `rest` IS the epic id. Excluding ribs here keeps them off the
+    // merge-to-default path (a misclassified rib would push lane work to default).
+    if (rest.length === 0 || rest.includes("--")) {
       continue;
     }
     out.push({ branch, epicId: rest });

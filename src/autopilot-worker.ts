@@ -2567,14 +2567,27 @@ export function createWorktreeDriver(
             };
           }
         }
-        // Prune the now-merged lane base so a DONE epic never leaves a recover-able
-        // `keeper/epic/<id>` branch behind (the fn-973 pileup). AFTER teardown (the
-        // base worktree held the branch checked out, blocking the delete) and gated
-        // on is-ancestor: the merge above made the base an ancestor of default, so
-        // this is the fully-merged path ONLY — an unmerged/diverged base is NEVER
-        // deleted (that would lose work; it goes through the merge→conflict→fail-
-        // loud path instead). Best-effort: a delete refusal is a no-op (the recover
-        // pass skips the already-merged leftover as a backstop), never a failure.
+        // Prune the now-merged lane branches (ribs THEN base) so a DONE epic never
+        // leaves a recover-able `keeper/epic/<id>...` ref or rib branch behind (the
+        // fn-973 pileup + the rib leak). AFTER worktree teardown (a checked-out
+        // branch blocks its delete) and each gated on is-ancestor-of-default: the
+        // merge+push above placed every lane's work in default, so an is-ancestor
+        // branch is the fully-merged path ONLY — an unmerged/diverged ref is NEVER
+        // deleted (that would lose work; the base goes through the merge→conflict→
+        // fail-loud path instead, and an orphan rib is simply left for a human).
+        // Best-effort: a delete refusal is a no-op (the recover pass skips the
+        // already-merged leftover as a backstop), never a failure.
+        const ribBranches = new Set<string>();
+        for (const lane of laneOrder) {
+          if (lane.branch !== baseBranch) {
+            ribBranches.add(lane.branch);
+          }
+        }
+        for (const rib of ribBranches) {
+          if (await gitIsAncestorOf(repoDir, rib, defaultBranch, run)) {
+            await gitDeleteBranch(repoDir, rib, run);
+          }
+        }
         if (await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run)) {
           await gitDeleteBranch(repoDir, baseBranch, run);
         }

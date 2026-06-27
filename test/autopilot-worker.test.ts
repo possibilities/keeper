@@ -4959,7 +4959,7 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
         ? {
             code: 0,
             stdout:
-              "worktree /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n",
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n",
             stderr: "",
           }
         : { code: 0, stdout: "", stderr: "" };
@@ -4967,7 +4967,7 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
     if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
       return {
         code: 0,
-        stdout: "keeper/epic/fn-1-foo/fn-1-foo.2\n",
+        stdout: "keeper/epic/fn-1-foo--fn-1-foo.2\n",
         stderr: "",
       };
     }
@@ -4981,11 +4981,11 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
     assignment: {
       nodeId: "fn-1-foo.2",
       isCloseSink: false,
-      branch: "keeper/epic/fn-1-foo/fn-1-foo.2",
+      branch: "keeper/epic/fn-1-foo--fn-1-foo.2",
       worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2",
       inherited: false,
       preMerges: [],
-      assertBranch: "keeper/epic/fn-1-foo/fn-1-foo.2",
+      assertBranch: "keeper/epic/fn-1-foo--fn-1-foo.2",
     },
     baseBranch: "keeper/epic/fn-1-foo",
     baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
@@ -4997,7 +4997,7 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
   expect(res.ok).toBe(true);
   // Forks off the parent lane; the default-branch resolution is never consulted.
   expect(cmds).toContain(
-    "worktree add -b keeper/epic/fn-1-foo/fn-1-foo.2 /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2 keeper/epic/fn-1-foo",
+    "worktree add -b keeper/epic/fn-1-foo--fn-1-foo.2 /repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.2 keeper/epic/fn-1-foo",
   );
   expect(cmds.some((c) => c.startsWith("symbolic-ref"))).toBe(false);
 });
@@ -5107,7 +5107,7 @@ function makeFanInInfo(preMerges: string[]): WorktreeLaunchInfo {
 }
 
 test("fn-979 createWorktreeDriver: provision skips a phantom pre-merge (missing-source) and still succeeds", async () => {
-  const phantom = "keeper/epic/fn-1-foo/fn-1-foo.2";
+  const phantom = "keeper/epic/fn-1-foo--fn-1-foo.2";
   const { run, cmds } = makePhantomFanInRun({ phantomSources: [phantom] });
   const driver = createWorktreeDriver(run);
   const res = await driver.provision(makeFanInInfo([phantom]));
@@ -5128,8 +5128,8 @@ test("fn-979 createWorktreeDriver: provision skips a phantom pre-merge (missing-
 });
 
 test("fn-979 createWorktreeDriver: provision skips a phantom but a LATER real conflict still fails loud (phantom-then-conflict)", async () => {
-  const phantom = "keeper/epic/fn-1-foo/fn-1-foo.2";
-  const conflict = "keeper/epic/fn-1-foo/fn-1-foo.3";
+  const phantom = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const conflict = "keeper/epic/fn-1-foo--fn-1-foo.3";
   const lockDir = mkdtempSync(join(tmpdir(), "kpr-wt-phantom-"));
   try {
     const { run, cmds } = makePhantomFanInRun({
@@ -5154,8 +5154,8 @@ test("fn-979 createWorktreeDriver: provision skips a phantom but a LATER real co
 });
 
 test("fn-979 createWorktreeDriver: a real conflict BEFORE a phantom fails loud immediately (conflict-then-phantom)", async () => {
-  const conflict = "keeper/epic/fn-1-foo/fn-1-foo.2";
-  const phantom = "keeper/epic/fn-1-foo/fn-1-foo.3";
+  const conflict = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const phantom = "keeper/epic/fn-1-foo--fn-1-foo.3";
   const lockDir = mkdtempSync(join(tmpdir(), "kpr-wt-phantom-"));
   try {
     const { run, cmds } = makePhantomFanInRun({
@@ -5326,7 +5326,7 @@ function makeRecoveryGit(state: {
 test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane → abort + prune", async () => {
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
   const { run, calls } = makeRecoveryGit({
-    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n`,
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
     mergeHeadAt: new Set([lane]),
     epicBases: [], // no done-but-unmerged work in this scenario
   });
@@ -5344,7 +5344,7 @@ test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane → abort + pr
 test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async () => {
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
   const { run, calls } = makeRecoveryGit({
-    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2\n\n`,
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
     mergeHeadAt: new Set(), // clean
     epicBases: [],
   });
@@ -5507,8 +5507,8 @@ test("fn-959.7 recoverWorktrees: rib branches are excluded from the base backsto
   const { run, calls, lock } = makeRecoveryGit({
     worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
     mergeHeadAt: new Set(),
-    // A rib (extra `/` segment) plus the base; only the base may merge to default.
-    epicBases: ["keeper/epic/fn-1-foo", "keeper/epic/fn-1-foo/fn-1-foo.2"],
+    // A rib (`--` separator) plus the base; only the base may merge to default.
+    epicBases: ["keeper/epic/fn-1-foo", "keeper/epic/fn-1-foo--fn-1-foo.2"],
     defaultBranch: "main",
     ancestors: new Set(),
     repoHead: "main",
@@ -5735,4 +5735,122 @@ test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ances
   expect(res).toEqual({ ok: true });
   // The gate said "not an ancestor" → the branch was preserved, never deleted.
   expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
+});
+
+test("fn-985 finalizeEpic: fully-merged rib worktrees + branches are pruned alongside the base (no rib leak)", async () => {
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n" +
+          `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // every lane fully merged
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const info = makeFinalizeInfo();
+  info.laneOrder = [
+    {
+      nodeId: "__close__",
+      branch: info.baseBranch,
+      worktreePath: info.baseWorktreePath,
+    },
+    { nodeId: "fn-1-foo.2", branch: rib, worktreePath: ribPath },
+  ];
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(info);
+  expect(res).toEqual({ ok: true });
+  // Both the rib worktree AND the base worktree were torn down — nothing leaks.
+  expect(cmds).toContain(`worktree remove ${ribPath}`);
+  expect(cmds).toContain(
+    "worktree remove /repo.worktrees/keeper-epic-fn-1-foo",
+  );
+  // Both the rib branch AND the base branch were force-deleted, each is-ancestor-gated.
+  expect(cmds).toContain(`branch -D ${rib}`);
+  expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
+});
+
+test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while the merged base is pruned", async () => {
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (args[0] === "show") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n" +
+          `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+        stderr: "",
+      };
+    }
+    // The rib is NOT contained in default → its prune gate is false (preserve it);
+    // every other is-ancestor (merge skip + base prune gate) is true.
+    if (joined === `merge-base --is-ancestor ${rib} main`) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const info = makeFinalizeInfo();
+  info.laneOrder = [
+    {
+      nodeId: "__close__",
+      branch: info.baseBranch,
+      worktreePath: info.baseWorktreePath,
+    },
+    { nodeId: "fn-1-foo.2", branch: rib, worktreePath: ribPath },
+  ];
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(info);
+  expect(res).toEqual({ ok: true });
+  // The unmerged rib survived (force-delete would lose work); the base still pruned.
+  expect(cmds.some((c) => c === `branch -D ${rib}`)).toBe(false);
+  expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
 });

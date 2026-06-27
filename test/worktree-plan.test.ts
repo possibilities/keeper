@@ -203,15 +203,17 @@ test("dangling depends_on token is ignored (treated as a root)", () => {
 test("branch + path names are pure functions of stable ids", () => {
   expect(baseBranchFor("fn-42-x")).toBe("keeper/epic/fn-42-x");
   expect(ribBranchFor("fn-42-x", "fn-42-x.3")).toBe(
-    "keeper/epic/fn-42-x/fn-42-x.3",
+    "keeper/epic/fn-42-x--fn-42-x.3",
   );
   // Worktree path: under ~/worktrees, `<repoName>--<branch-slug>`, branch slugged.
   expect(worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo")).toBe(
     `${homedir()}/worktrees/foo--keeper-epic-fn-1-foo`,
   );
+  // A rib slug carries `--` twice (the prefix separator + the rib's own), still
+  // collision-free.
   expect(
-    worktreePathFor("/Users/x/code/foo/", "keeper/epic/fn-1-foo/fn-1-foo.2"),
-  ).toBe(`${homedir()}/worktrees/foo--keeper-epic-fn-1-foo-fn-1-foo.2`);
+    worktreePathFor("/Users/x/code/foo/", "keeper/epic/fn-1-foo--fn-1-foo.2"),
+  ).toBe(`${homedir()}/worktrees/foo--keeper-epic-fn-1-foo--fn-1-foo.2`);
   // The worktree is OUTSIDE the repo tree (never nested under it).
   const wt = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
   expect(wt.startsWith("/Users/x/code/foo/")).toBe(false);

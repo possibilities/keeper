@@ -141,14 +141,14 @@ test("parseWorktreeList: parses path/HEAD/branch records split by blank lines", 
     "",
     "worktree /repo.worktrees/keeper-epic-fn-1-B",
     "HEAD def456",
-    "branch refs/heads/keeper/epic/fn-1/B",
+    "branch refs/heads/keeper/epic/fn-1--B",
     "",
   ].join("\n");
   expect(parseWorktreeList(stdout)).toEqual([
     { path: "/repo", branch: "refs/heads/main", head: "abc123", bare: false },
     {
       path: "/repo.worktrees/keeper-epic-fn-1-B",
-      branch: "refs/heads/keeper/epic/fn-1/B",
+      branch: "refs/heads/keeper/epic/fn-1--B",
       head: "def456",
       bare: false,
     },
@@ -195,7 +195,7 @@ test("isKeeperLaneEntry: a keeper base/rib branch → true; a foreign or detache
   ).toBe(true);
   expect(
     isKeeperLaneEntry(
-      entry({ branch: "refs/heads/keeper/epic/fn-1-foo/fn-1-foo.2" }),
+      entry({ branch: "refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2" }),
     ),
   ).toBe(true);
   // A foreign linked worktree (e.g. another tool's `.claude/worktrees` lane) on a
@@ -414,13 +414,13 @@ function worktreeListRule(stdout: string): FakeGitRule {
 test("ensureWorktree: already registered on the wanted branch → no add", async () => {
   const { run, calls } = fakeAsyncGit([
     worktreeListRule(
-      "worktree /repo.worktrees/keeper-epic-e-B\nHEAD x\nbranch refs/heads/keeper/epic/e/B\n\n",
+      "worktree /repo.worktrees/keeper-epic-e-B\nHEAD x\nbranch refs/heads/keeper/epic/e--B\n\n",
     ),
   ]);
   await ensureWorktree(
     "/repo",
     "/repo.worktrees/keeper-epic-e-B",
-    "keeper/epic/e/B",
+    "keeper/epic/e--B",
     "abc",
     run,
   );
@@ -439,7 +439,7 @@ test("ensureWorktree: path occupied by a DIFFERENT branch → throws loud", asyn
     ensureWorktree(
       "/repo",
       "/repo.worktrees/keeper-epic-e-B",
-      "keeper/epic/e/B",
+      "keeper/epic/e--B",
       "abc",
       run,
     ),
@@ -458,7 +458,7 @@ test("ensureWorktree: fresh path → prune then add -b off the commitish", async
   await ensureWorktree(
     "/repo",
     "/repo.worktrees/keeper-epic-e-B",
-    "keeper/epic/e/B",
+    "keeper/epic/e--B",
     "deadbeef",
     run,
   );
@@ -475,7 +475,7 @@ test("ensureWorktree: fresh path → prune then add -b off the commitish", async
     "worktree",
     "add",
     "-b",
-    "keeper/epic/e/B",
+    "keeper/epic/e--B",
     "/repo.worktrees/keeper-epic-e-B",
     "deadbeef",
   ]);
@@ -521,7 +521,7 @@ test("ensureWorktree: branch already exists (crashed prior add) → checkout, no
   await ensureWorktree(
     "/repo",
     "/repo.worktrees/keeper-epic-e-B",
-    "keeper/epic/e/B",
+    "keeper/epic/e--B",
     "deadbeef",
     run,
   );
@@ -530,7 +530,7 @@ test("ensureWorktree: branch already exists (crashed prior add) → checkout, no
     "worktree",
     "add",
     "/repo.worktrees/keeper-epic-e-B",
-    "keeper/epic/e/B",
+    "keeper/epic/e--B",
   ]);
 });
 
