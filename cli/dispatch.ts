@@ -133,9 +133,11 @@ Options:
   --name <n>           claude --name (OPTIONAL pass-through in free form)
   --session <s>        Target tmux session (overrides every fallback)
   --cwd <dir>          Working dir (free form; defaults to process.cwd())
-  --preset <name>      Named launch-config preset (~/.config/agentwrap/presets.yaml,
-                       claude-only); supplies --model/--effort. Plan form defaults
-                       to the same 'worker' preset the autopilot uses.
+  --preset <name>      Named launch-config preset from ~/.config/keeper/presets.yaml
+                       (claude-only); supplies --model/--effort. Must be a real
+                       catalog entry (exit 2 otherwise); run \`keeper agent presets
+                       list\` to see the names. Plan form defaults to the same
+                       'worker' preset the autopilot uses.
   --model <m>          Pass --model to claude (overrides the preset)
   --effort <e>         Pass --effort to claude (overrides the preset)
   --force              Plan form: skip the race guard

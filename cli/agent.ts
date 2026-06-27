@@ -5,10 +5,12 @@
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
  *
- * Named launch-config presets (harness/model/effort) live in a single registry,
- * `~/.config/agentwrap/presets.yaml`: `keeper agent --x-preset <name>
- * [args...]` applies one (the harness comes from the preset when no agent token
- * is given), and `keeper agent presets resolve <name>` emits the resolved
+ * Named launch-config presets (harness/model/effort) live in the catalog
+ * `~/.config/keeper/presets.yaml` (panel selections in `panel.yaml`): `keeper
+ * agent --x-preset <name> [args...]` applies one — REQUIRED, an unknown name or
+ * missing catalog exits 2 (the harness comes from the preset when no agent token
+ * is given). `keeper agent presets list [--json]` enumerates the configured
+ * presets + panels, and `keeper agent presets resolve <name>` emits the resolved
  * preset/panel JSON. A preset supplies defaults BELOW any explicit
  * `--model`/`--effort` or effort env, so with no preset behavior is unchanged.
  *

@@ -9,10 +9,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type {
-  PanelSelections,
-  Preset,
-  PresetCatalog,
+import {
+  ConfigError,
+  type PanelSelections,
+  type Preset,
+  type PresetCatalog,
 } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
@@ -282,6 +283,81 @@ describe("presets resolve JSON contract", () => {
     expect(code).toBe(2);
     expect(h.err.join("")).toContain("ghost");
     expect(h.err.join("")).toContain("duo");
+  });
+});
+
+describe("presets list discovery surface", () => {
+  test("--json emits catalog presets + panels for machine use", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      presetCatalog: catalog({
+        a: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
+        b: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
+      }),
+      panelSelections: selections({ duo: ["a", "b"] }, "duo"),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      kind: "presets-list",
+      presets: [
+        {
+          name: "a",
+          harness: "claude",
+          model: "opus",
+          effort: "xhigh",
+          thinking: null,
+          role: null,
+        },
+        {
+          name: "b",
+          harness: "codex",
+          model: "gpt-5.5",
+          effort: "high",
+          thinking: null,
+          role: null,
+        },
+      ],
+      panels: [
+        {
+          name: "duo",
+          members: [
+            { name: "a", harness: "claude" },
+            { name: "b", harness: "codex" },
+          ],
+        },
+      ],
+      default: "duo",
+    });
+  });
+
+  test("human-readable default lists names + harnesses", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list"],
+      rawArgv: true,
+      presetCatalog: catalog({
+        a: preset({ harness: "claude", model: "opus" }),
+      }),
+      panelSelections: selections({ duo: ["a"] }),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const text = h.out.join("");
+    expect(text).toContain("a");
+    expect(text).toContain("claude");
+    expect(text).toContain("model=opus");
+    expect(text).toContain("duo");
+  });
+
+  test("a missing catalog yields the discovery error (exit 2), not a crash", async () => {
+    const h = makeHarness({ argv: ["presets", "list"], rawArgv: true });
+    h.deps.loadPresetCatalogFn = () => {
+      throw new ConfigError("Preset catalog missing at /x/presets.yaml.");
+    };
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("Preset catalog missing");
   });
 });
 

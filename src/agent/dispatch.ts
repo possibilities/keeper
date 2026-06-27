@@ -23,6 +23,7 @@ export type Dispatch =
   | { kind: "run"; agent: AgentKind; rest: string[] }
   | { kind: "run-preset"; presetName: string; rest: string[] }
   | { kind: "presets-resolve"; presetName: string }
+  | { kind: "presets-list"; json: boolean }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
@@ -47,6 +48,7 @@ Usage:
   agentwrap --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
   agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
+  agentwrap presets list [--json]   List configured presets + panels.
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   agentwrap show-last-message <h>   Print a detached run's final message.
@@ -88,18 +90,22 @@ Wrapper flags:
   --x-profile <name>        Select a profile ('default' = native
                                     account; 'auto' picks via the ledger).
   --x-preset <name>         Apply a named launch-config preset from
-                                    ~/.config/agentwrap/presets.yaml
+                                    ~/.config/keeper/presets.yaml — REQUIRED;
+                                    an unknown name or missing catalog exits 2
                                     (harness/model/effort defaults BELOW any
                                     explicit --model/--effort or effort env).
                                     With no agent token the harness comes from
                                     the preset; with one, a disagreeing harness
-                                    is rejected.
+                                    is rejected. Run \`agentwrap presets list\`
+                                    to see the configured names.
 
 Preset resolution:
   agentwrap presets resolve <name>  Emit the resolved JSON for a single preset
                                     ({name,harness,model,effort|thinking,role})
                                     or a panel (an ordered array of
                                     {name,harness} members).
+  agentwrap presets list [--json]   List the configured catalog presets
+                                    (name + harness/model/effort) and panels.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.
@@ -167,6 +173,9 @@ export function splitSubcommand(argv: string[]): Dispatch {
         return { kind: "usage", unknown: "presets resolve" };
       }
       return { kind: "presets-resolve", presetName: presetName.trim() };
+    }
+    if (argv[1] === "list") {
+      return { kind: "presets-list", json: argv.slice(2).includes("--json") };
     }
     return { kind: "usage", unknown: `presets ${argv[1] ?? ""}`.trim() };
   }

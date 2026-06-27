@@ -76,7 +76,7 @@ Optional flags (both forms unless noted):
 | `--dry-run` | Print the resolved launch plan (`session` / `cwd` / `key` / `prompt-from` / `argv`) and launch NOTHING. Run this first to preview. |
 | `--session <s>` | Target tmux session (overrides every fallback). Default precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX` current > `work`. |
 | `--cwd <dir>` | Free form only: working dir (defaults to `process.cwd()`). Plan form resolves cwd from the board. |
-| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` (claude-only — a codex/pi preset is an arg fault). Supplies `--model`/`--effort`. Plan form defaults to the SAME `worker` preset the autopilot resolves, so a hand-fired plan worker is byte-identical to an automated one; `--model`/`--effort` override per field. |
+| `--preset <name>` | Named launch-config preset from the catalog `~/.config/keeper/presets.yaml` (claude-only — a codex/pi preset is an arg fault). Must be a real catalog entry: an unknown name or missing catalog exits 2 (run `keeper agent presets list` to see the configured names). Supplies `--model`/`--effort`. Plan form defaults to the SAME `worker` preset the autopilot resolves, so a hand-fired plan worker is byte-identical to an automated one; `--model`/`--effort` override per field. |
 | `--model <m>` | Pass `--model` through to claude (overrides the preset). |
 | `--effort <e>` | Pass `--effort` through to claude (overrides the preset). |
 | `--name <n>` | Free form only: a PURE claude pass-through, NOT a keeper label (see Guardrails). Plan form bakes `--name <verb>::<id>` automatically — never set it there. |

@@ -117,7 +117,7 @@ expected path.
 
 | Flag | Meaning |
 |---|---|
-| `--preset <name>` | Named launch-config preset from `~/.config/agentwrap/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Drives the claude/codex/pi orchestration from the preset's `harness` and its optional `role`. pi pairs too (a pi preset uses `thinking:`, never `effort:`); only a `--cli` whose harness disagrees with the preset fails loud. A claude preset's `effort` is honored — the launcher pushes `--effort` from the preset on the interactive claude pair path; a codex preset's effort is honored too. |
+| `--preset <name>` | Named launch-config preset from the catalog `~/.config/keeper/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Must be a real catalog entry: an unknown name or missing catalog exits 2 (run `keeper agent presets list` to see the configured names). Drives the claude/codex/pi orchestration from the preset's `harness` and its optional `role`. pi pairs too (a pi preset uses `thinking:`, never `effort:`); only a `--cli` whose harness disagrees with the preset fails loud. A claude preset's `effort` is honored — the launcher pushes `--effort` from the preset on the interactive claude pair path; a codex preset's effort is honored too. |
 | `--cli claude\|codex\|pi` | The partner CLI. **Required unless `--preset` is given** (then a compatibility alias whose harness must agree with the preset). All three launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open), and pi launches with `-na` (ignore project-local `.pi/` resources), so neither stalls on a trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
 | `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex -m`). Omit for the CLI's default. With `--preset` the launcher owns model resolution. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
@@ -161,8 +161,9 @@ keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s
 keeper pair panel wait  --dir <d> [--chunk <s>]
 ```
 
-- **`start`** resolves the panel members (a registry panel, a single preset, or the legacy `opus`+`codex`
-  fallback when the name is unknown), mints a scratch dir, copies the prompt in, launches every member as
+- **`start`** resolves the panel members from `~/.config/keeper/panel.yaml` (each a preset in the catalog
+  `~/.config/keeper/presets.yaml`; a missing/invalid config or unknown panel exits 2 — `keeper agent
+  presets list` shows what is configured), mints a scratch dir, copies the prompt in, launches every member as
   a detached `keeper pair send --read-only` leg in the `panels` session, writes `<dir>/manifest.json`,
   prints it, and **exits 0 immediately** — it never blocks. Stdout is one line of manifest JSON:
   `{"dir":"…","members":[{"name","harness","yaml","log","pidfile"},…]}`. Capture `.dir` for the wait.

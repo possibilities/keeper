@@ -101,8 +101,10 @@ from your session's Monitor tool: launch it, then do nothing until the terminal
 notification, then read --output.
 
 Options:
-  --preset <name>        Named launch-config preset (~/.config/agentwrap/presets.yaml);
+  --preset <name>        Named launch-config preset from ~/.config/keeper/presets.yaml;
                          drives harness + model/effort. The recommended interface.
+                         Must be a real catalog entry (exit 2 otherwise); run
+                         \`keeper agent presets list\` to see the configured names.
   --cli <claude|codex|pi>  Partner CLI (required unless --preset given; a
                            compatibility alias whose harness must agree with --preset)
   --model <m>            Native model (claude --model / codex -m)

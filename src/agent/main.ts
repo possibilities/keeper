@@ -40,7 +40,9 @@ import {
   type PluginSources,
   type Preset,
   type PresetCatalog,
+  panelConfigPath,
   pluginConfigPath,
+  presetsCatalogPath,
   resolvePreset,
 } from "./config";
 import { checkCwdInProjectRoot } from "./cwd-confirm";
@@ -738,6 +740,99 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
   return deps.exit(2);
 }
 
+/**
+ * `presets list [--json]`: the discovery surface so an agent passes a real
+ * `--preset` name. Enumerates every catalog preset (name + harness/model/effort)
+ * and every panel (name + ordered members) from `presets.yaml` + `panel.yaml`.
+ * Human-readable by default, `--json` ({kind:"presets-list", presets, panels,
+ * default}) for machine consumption. A missing/invalid catalog or panel file is
+ * fail-loud (exit 2) carrying task 1's migration hint — `presets list` IS the
+ * entry point that surfaces the config gap, never a crash.
+ */
+function runPresetsList(deps: MainDeps, json: boolean): never {
+  let catalog: PresetCatalog;
+  try {
+    catalog = deps.loadPresetCatalogFn();
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+
+  let selections: PanelSelections;
+  try {
+    selections = deps.loadPanelSelectionsFn(catalog);
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+
+  const presetNames = Object.keys(catalog.presets).sort();
+  const panelNames = Object.keys(selections.panels).sort();
+
+  if (json) {
+    const presets = presetNames.map((name) => {
+      const p = catalog.presets[name] as Preset;
+      return {
+        name,
+        harness: p.harness,
+        model: p.model,
+        effort: p.effort,
+        thinking: p.thinking,
+        role: p.role,
+      };
+    });
+    const panels = panelNames.map((name) => ({
+      name,
+      members: (selections.panels[name] as string[]).map((member) => ({
+        name: member,
+        harness: (catalog.presets[member] as Preset).harness,
+      })),
+    }));
+    deps.write(
+      `${JSON.stringify({
+        kind: "presets-list",
+        presets,
+        panels,
+        default: selections.default,
+      })}\n`,
+    );
+    return deps.exit(0);
+  }
+
+  const lines: string[] = [`Presets (${presetsCatalogPath()}):`];
+  if (presetNames.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const name of presetNames) {
+      const p = catalog.presets[name] as Preset;
+      const parts: string[] = [p.harness];
+      if (p.model !== null) parts.push(`model=${p.model}`);
+      if (p.effort !== null) parts.push(`effort=${p.effort}`);
+      if (p.thinking !== null) parts.push(`thinking=${p.thinking}`);
+      if (p.role !== null) parts.push(`role=${p.role}`);
+      lines.push(`  ${name}  ${parts.join(" ")}`);
+    }
+  }
+  lines.push(`Panels (${panelConfigPath()}):`);
+  if (panelNames.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const name of panelNames) {
+      const members = selections.panels[name] as string[];
+      const marker = selections.default === name ? " (default)" : "";
+      lines.push(`  ${name}  [${members.join(", ")}]${marker}`);
+    }
+  }
+  deps.write(`${lines.join("\n")}\n`);
+  return deps.exit(0);
+}
+
 export async function main(deps: MainDeps): Promise<never> {
   const actionLog: string[] = [];
 
@@ -771,6 +866,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "presets-resolve") {
     return runPresetsResolve(deps, dispatch.presetName);
+  }
+  if (dispatch.kind === "presets-list") {
+    return runPresetsList(deps, dispatch.json);
   }
 
   // Resolve the leading-token harness. `run` carries it directly; the

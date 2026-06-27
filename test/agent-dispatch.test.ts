@@ -142,10 +142,24 @@ describe("splitSubcommand", () => {
     });
   });
 
-  test("presets with an unknown verb is usage", () => {
+  test("presets list classifies (bare → human-readable)", () => {
     expect(splitSubcommand(["presets", "list"])).toEqual({
+      kind: "presets-list",
+      json: false,
+    });
+  });
+
+  test("presets list --json classifies", () => {
+    expect(splitSubcommand(["presets", "list", "--json"])).toEqual({
+      kind: "presets-list",
+      json: true,
+    });
+  });
+
+  test("presets with an unknown verb is usage", () => {
+    expect(splitSubcommand(["presets", "frobnicate"])).toEqual({
       kind: "usage",
-      unknown: "presets list",
+      unknown: "presets frobnicate",
     });
   });
 

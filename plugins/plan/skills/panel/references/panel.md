@@ -23,8 +23,9 @@ answers meet. Cross-pollination before the judge defeats the entire mechanism.
 
 ## Defining the panel
 
-The panel's members come from a named `panels.<name>` array in the launch-config registry
-(`~/.config/agentwrap/presets.yaml`), each member a named preset — a `{harness, model, effort}` triple.
+The panel's members come from a named `panels.<name>` array in `~/.config/keeper/panel.yaml`, each
+member a named preset in the catalog `~/.config/keeper/presets.yaml` — a `{harness, model, effort}`
+triple. Run `keeper agent presets list` to see the configured presets + panels.
 `keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
 **preset name** (not its harness), so two panelists on the same harness but different models stay
 distinguishable. Every member answers **in parallel** via `keeper pair send --preset <member> --read-only`,
@@ -41,12 +42,12 @@ then the `plan:panel-judge` subagent fuses them:
 No member gets an assigned role or persona — every member answers the human's task straight, and the
 diversity comes from running the panel's preset spread cold (see "No lenses, no personas" above).
 
-**Zero-config fallback.** With no registry or no defined panel, `presets resolve` exits non-zero and the
-panel falls back to the legacy two-model form — **Opus 4.8 (`--cli claude`)** + **GPT-5.5
-(`--cli codex`)** — so the panel works with zero config and presets are a pure opt-in upgrade. An example
-registry: `presets: { claude-opus-xhigh: {harness: claude, model: opus, effort: xhigh}, codex-gpt55-high:
-{harness: codex, model: gpt-5.5, effort: high} }` with `panels: { default: [claude-opus-xhigh,
-codex-gpt55-high] }`.
+**Config is required.** With no catalog, no `panel.yaml`, or an unknown panel name, `presets resolve`
+exits 2 with a specific message (file path + bad name + sorted available names) — there is no silent
+fallback. Run `keeper agent presets list` to see what is configured. An example catalog
+(`~/.config/keeper/presets.yaml`): `presets: { claude-opus-xhigh: {harness: claude, model: opus, effort:
+xhigh}, codex-gpt55-high: {harness: codex, model: gpt-5.5, effort: high} }`, with the panel selection in
+`~/.config/keeper/panel.yaml`: `panels: { default: [claude-opus-xhigh, codex-gpt55-high] }`.
 
 The judge is kept separate from the panelists — it runs in the `plan:panel-judge` subagent, reading
 both answer files fresh in its own context rather than defending an answer it wrote itself.
