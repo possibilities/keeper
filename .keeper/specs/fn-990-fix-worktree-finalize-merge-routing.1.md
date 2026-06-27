@@ -77,5 +77,5 @@ lane — the exact config the old :2544 gate failed on.
 - [ ] stale "closer commits done to the lane" comments corrected to present-tense reality
 
 ## Done summary
-
+finalizeEpic now gates on the MAIN-projection done-state (isEpicDone) instead of the broken lane-read; finalize + recover pass-2 share one mergeLaneBaseIntoDefault routine returning a structured discriminant with no reason strings.
 ## Evidence
