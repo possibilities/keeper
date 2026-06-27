@@ -63,5 +63,5 @@ no-upstream / never-pushed repo completes its first finalize push.
 - [ ] no fn-id provenance remains in the touched autopilot-worker.ts comments
 
 ## Done summary
-
+Hardened the worktree finalize/recover push: turn-key probe now runs before the cached-ref FF precheck and an unresolved origin/<default> defers instead of forcing a permanent non-FF skip (admitting a never-pushed-default first push); the real push + dry-run are bounded by a spawn timeout + ssh BatchMode/ConnectTimeout with timeouts degrading to a transient retry, finalize done-guard-miss/retry-skip reasons are logged, and fn-id provenance was stripped.
 ## Evidence
