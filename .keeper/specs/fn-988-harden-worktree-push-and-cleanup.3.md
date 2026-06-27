@@ -35,5 +35,5 @@ Add a stable repo disambiguator to worktreePathFor (src/worktree-plan.ts:155-159
 - [ ] pure tests + the existing slow tests green; typecheck + lint green.
 
 ## Done summary
-
+worktreePathFor folds an FNV-1a digest of the repo dir into the lane path (<repoName>-<hash>--<slug>), disambiguating same-basename repos hosting a same-id epic. Pure + deterministic so provision and teardown derive identical paths; pure + slow tests + typecheck + lint green.
 ## Evidence
