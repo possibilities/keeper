@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-27T23:43:15.110000Z",
+  "created_by_close_of": "fn-990-fix-worktree-finalize-merge-routing",
+  "depends_on_epics": [
+    "fn-990-fix-worktree-finalize-merge-routing"
+  ],
+  "id": "fn-991-fix-worktree-base-teardown-guard-and",
+  "last_validated_at": "2026-06-27T23:43:15.126000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix worktree base teardown guard and stale finalize docs",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-27T23:43:15.110000Z"
+}
