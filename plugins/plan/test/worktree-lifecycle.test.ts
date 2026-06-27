@@ -157,7 +157,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree-lane lifecycle (real git)", () => {
       // The work commit advanced the LANE branch and left main untouched.
       expect(sha).not.toBeNull();
       expect(git(["rev-parse", `refs/heads/${laneBranch}`], main).trim()).toBe(
-        sha!,
+        sha as string,
       );
       expect(git(["rev-parse", "refs/heads/main"], main).trim()).toBe(seedSha);
       expect(commitCount(main)).toBe(1); // seed only — no leak

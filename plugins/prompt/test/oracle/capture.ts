@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
-// Golden-fixture capture against the live Python `promptctl` oracle.
+// Golden-fixture capture against the production `keeper prompt` engine.
 //
-// Run this ONCE (and re-run only deliberately, when the corpus or plan-plugin
-// templates change) to refresh the parity goldens the verb-port tasks assert
-// against:
+// Re-run deliberately, when the arthack corpus or the plan-plugin templates
+// change, to refresh the render goldens the parity suite asserts against:
 //
 //     bun run capture-oracle           # from plugins/prompt/
 //     bun test/oracle/capture.ts
@@ -15,7 +14,7 @@
 //
 // Resolution: the arthack corpus root comes from --arthack-root / $ARTHACK_ROOT
 // with a ~/code/arthack fallback; the keeper root is this checkout (three dirs
-// up from here). The Python oracle must be on PATH as `promptctl`.
+// up from here). `keeper` must be on PATH and expose the `prompt` subcommand.
 
 import { spawnSync } from "node:child_process";
 import {
@@ -72,15 +71,17 @@ function resolveArthackRoot(): string {
 }
 
 function assertOracleOnPath(): string {
-  const probe = spawnSync("promptctl", ["--help"], { encoding: "utf-8" });
+  const probe = spawnSync("keeper", ["prompt", "--help"], {
+    encoding: "utf-8",
+  });
   if (probe.error || probe.status !== 0) {
     throw new Error(
-      "the live `promptctl` oracle is not on PATH (or errored) — capture " +
-        "requires it; do not delete apps/promptctl before cutover",
+      "`keeper prompt` is not on PATH (or errored) — capture requires the " +
+        "production prompt engine to source the render goldens",
     );
   }
-  const which = spawnSync("which", ["promptctl"], { encoding: "utf-8" });
-  return (which.stdout ?? "promptctl").trim();
+  const which = spawnSync("which", ["keeper"], { encoding: "utf-8" });
+  return (which.stdout ?? "keeper").trim();
 }
 
 interface RunResult {
@@ -89,9 +90,10 @@ interface RunResult {
   code: number;
 }
 
-/** Run the oracle with a fixed cwd, returning raw stdout bytes + exit code. */
+/** Run `keeper prompt <args>` with a fixed cwd, returning raw stdout bytes +
+ *  exit code. */
 function runOracle(args: string[], cwd: string): RunResult {
-  const proc = spawnSync("promptctl", args, { cwd });
+  const proc = spawnSync("keeper", ["prompt", ...args], { cwd });
   return {
     stdout: proc.stdout ?? Buffer.alloc(0),
     stderr: (proc.stderr ?? Buffer.alloc(0)).toString("utf-8"),
@@ -104,7 +106,8 @@ function runOracle(args: string[], cwd: string): RunResult {
 // ---------------------------------------------------------------------------
 
 /** Parse bare snippet names out of the YAML index without a YAML dep — the
- *  index is `build-snippets`-generated with one `- name: <id>` per entry. */
+ *  index is `build-snippets`-generated as a `snippets:` sequence, one
+ *  `- name: <id>` entry per snippet (indented under the top-level key). */
 function snippetRefs(arthackRoot: string): string[] {
   const indexPath = join(
     arthackRoot,
@@ -118,7 +121,7 @@ function snippetRefs(arthackRoot: string): string[] {
   const text = readFileSync(indexPath, "utf-8");
   const refs: string[] = [];
   for (const line of text.split("\n")) {
-    const m = line.match(/^- name:\s*(\S+)\s*$/);
+    const m = line.match(/^\s*- name:\s*(\S+)\s*$/);
     if (m?.[1]) {
       refs.push(m[1]);
     }

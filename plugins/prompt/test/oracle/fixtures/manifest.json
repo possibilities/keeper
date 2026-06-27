@@ -1,6 +1,6 @@
 {
   "arthack_root": "/Users/mike/code/arthack",
   "keeper_root": "/Users/mike/code/keeper",
-  "oracle_path": "/Users/mike/.local/bin/promptctl",
-  "captured_at": "2026-06-21T20:31:12.824Z"
+  "oracle_path": "/Users/mike/.local/bin/keeper",
+  "captured_at": "2026-06-27T17:37:39.915Z"
 }
