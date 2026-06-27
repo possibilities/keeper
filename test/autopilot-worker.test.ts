@@ -60,6 +60,7 @@ import {
   type LaunchResult,
   type LiveDispatch,
   loadReconcileSnapshot,
+  mergeLaneBaseIntoDefault,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
@@ -315,6 +316,12 @@ interface FakeDepsOptions {
    * mapper (e.g. `/var/`→`/private/var/`) to assert the normalization seam.
    */
   realpath?: (p: string) => string;
+  /**
+   * fn-990 — the MAIN-projection done-ness probe threaded into
+   * `worktree.finalizeEpic`. Defaults to `() => true` (the fake worktree driver
+   * ignores it anyway); override to drive a crashed-closer (false) gate path.
+   */
+  isEpicDone?: (epicId: string) => Promise<boolean>;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -401,6 +408,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     worktree: opts.worktree,
     realpath: opts.realpath ?? ((p: string) => p),
+    isEpicDone: opts.isEpicDone ?? (async () => true),
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
   };
@@ -4748,7 +4756,7 @@ test("fn-972 BUG 3 reconcile: a finished closer JOB collects the finalize WITHOU
   expect(reconcile(noJob, makeState(), 0).worktreeFinalize).toEqual([]);
 });
 
-test("fn-972 BUG 3 finalizeEpic: lane base WITHOUT done-state → no-op, never merges (a crashed closer's incomplete lane is not pushed to default)", async () => {
+test("fn-990 finalizeEpic: a crashed closer (NOT done in the main projection) → no-op, never merges (incomplete lane is not pushed to default)", async () => {
   const cmds: string[] = [];
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
@@ -4756,34 +4764,26 @@ test("fn-972 BUG 3 finalizeEpic: lane base WITHOUT done-state → no-op, never m
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch EXISTS
     }
-    if (args[0] === "show") {
-      // The lane base tip's epic spec is still open (closer never committed done).
-      return {
-        code: 0,
-        stdout: JSON.stringify({ id: "fn-1-foo", status: "open" }),
-        stderr: "",
-      };
-    }
     return { code: 0, stdout: "", stderr: "" };
   };
+  // The closer JOB finished (the trigger fired) but the epic is NOT done in the
+  // main projection — a crashed closer that committed code-but-not-`done`.
   const res = await createWorktreeDriver(fakeRun).finalizeEpic(
     makeFinalizeInfo(),
+    async () => false,
   );
   expect(res).toEqual({ ok: true });
-  // It checked the branch + the lane done-state via git, then stopped — no merge.
-  expect(cmds.some((c) => c.startsWith("show keeper/epic/fn-1-foo:"))).toBe(
-    true,
-  );
+  // The projection-done gate rejected it — no default resolve, no merge, no teardown.
+  expect(cmds.some((c) => c.startsWith("symbolic-ref"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("merge"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
-test("fn-972 BUG 3 finalizeEpic: lane base CARRYING done-state → passes the guard, pushes the merge-to-default (off the lane, not the projection)", async () => {
-  // The done-state git confirm lets finalize PROCEED past the branch-exists guard:
-  // it resolves the default branch and pushes the merge-to-default. (The full
-  // real-merge + teardown — which takes the commit-work flock — is the slow
-  // real-git test; here the base is already an ancestor of default so the merge
-  // is the idempotent no-lock skip, isolating the trigger/guard contrast.)
+test("fn-990 finalizeEpic: done in the projection but the lane is NOT ahead of default → proceeds to teardown, never merges/pushes", async () => {
+  // The lane base is already an ancestor of default (already merged, or no real
+  // lane commits) — the shared routine's `not-ahead` skip. Finalize merges
+  // nothing and pushes nothing, but still tears the lane down (the idempotent
+  // resume). No commit-work flock is taken (no `merge --no-edit`).
   const cmds: string[] = [];
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
@@ -4791,32 +4791,153 @@ test("fn-972 BUG 3 finalizeEpic: lane base CARRYING done-state → passes the gu
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
     }
-    if (args[0] === "show") {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
-        stderr: "",
-      };
-    }
     if (joined.startsWith("symbolic-ref")) {
       return { code: 0, stdout: "origin/main\n", stderr: "" };
     }
     if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" }; // main worktree on default
+      return { code: 0, stdout: "main\n", stderr: "" };
     }
     if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 0, stdout: "", stderr: "" }; // already an ancestor → no-lock skip
+      return { code: 0, stdout: "", stderr: "" }; // base already an ancestor → not-ahead
     }
-    // worktree list (empty → teardown no-op) + push fall through to code 0.
     return { code: 0, stdout: "", stderr: "" };
   };
   const res = await createWorktreeDriver(fakeRun).finalizeEpic(
     makeFinalizeInfo(),
+    async () => true,
   );
   expect(res).toEqual({ ok: true });
-  // Passed the done-state guard → resolved the default branch and pushed.
-  expect(cmds.some((c) => c.startsWith("symbolic-ref"))).toBe(true);
+  // not-ahead short-circuited the merge sequence — no merge, no push.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c === "push")).toBe(false);
+});
+
+test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (fake lock, no real flock)", async () => {
+  // The shared merge routine both finalize and recover pass-2 drive. A lane base
+  // that is NOT an ancestor of default carries real commits → it merges (under the
+  // injected fake lock, never the FFI flock) and pushes once → `{ kind: "merged" }`.
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs exist
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" }; // clean main checkout
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      return { code: 1, stdout: "", stderr: "" }; // base is AHEAD → merge it
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // not already-merged vs HEAD
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const fakeLock = () => ({ release() {} });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    fakeLock,
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(cmds.some((c) => c === "merge --no-edit keeper/epic/fn-1-foo")).toBe(
+    true,
+  );
   expect(cmds.some((c) => c === "push")).toBe(true);
+});
+
+test("fn-990 mergeLaneBaseIntoDefault: a real merge CONFLICT → { kind: 'conflict' }, no push (the shared core stamps no reason)", async () => {
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // base ahead + not already-merged
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res.kind).toBe("conflict");
+  if (res.kind === "conflict") {
+    // A raw discriminant — never a reason string. The CALLER maps it (finalize →
+    // `worktree-finalize-conflict`, recover → `worktree-recover-conflict`), so the
+    // core can carry no `worktree-recover*` reason that would auto-clear a finalize.
+    expect(isWorktreeRecoverReason(res.stderr)).toBe(false);
+    expect(res.stderr).toContain("CONFLICT");
+  }
+});
+
+test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: 'push-failed' }", async () => {
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "push") {
+      return { code: 1, stdout: "", stderr: "remote rejected" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "push-failed", detail: "remote rejected" });
 });
 
 test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
@@ -4860,7 +4981,7 @@ test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no ba
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo",
   };
-  const res = await driver.finalizeEpic(info);
+  const res = await driver.finalizeEpic(info, async () => true);
   expect(res).toEqual({ ok: true });
   // It checked the base branch and then stopped — no merge, no teardown.
   expect(cmds.some((c) => c.startsWith("merge"))).toBe(false);
@@ -5902,6 +6023,7 @@ test("fn-982 finalizeEpic: a fully-merged lane base is pruned (branch -D) after 
   };
   const res = await createWorktreeDriver(fakeRun).finalizeEpic(
     makeFinalizeInfo(),
+    async () => true,
   );
   expect(res).toEqual({ ok: true });
   // The fully-merged base branch was force-deleted so a DONE epic leaves no
@@ -5947,6 +6069,7 @@ test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ances
   };
   const res = await createWorktreeDriver(fakeRun).finalizeEpic(
     makeFinalizeInfo(),
+    async () => true,
   );
   expect(res).toEqual({ ok: true });
   // The gate said "not an ancestor" → the branch was preserved, never deleted.
@@ -6000,7 +6123,10 @@ test("fn-985 finalizeEpic: fully-merged rib worktrees + branches are pruned alon
     },
     { nodeId: "fn-1-foo.2", branch: rib, worktreePath: ribPath },
   ];
-  const res = await createWorktreeDriver(fakeRun).finalizeEpic(info);
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    info,
+    async () => true,
+  );
   expect(res).toEqual({ ok: true });
   // Both the rib worktree AND the base worktree were torn down — nothing leaks.
   expect(cmds).toContain(`worktree remove ${ribPath}`);
@@ -6060,6 +6186,7 @@ test("fn-988 finalizeEpic teardown: an orphan rib NOT in laneOrder (live-git enu
   // laneOrder default is base-only (makeFinalizeInfo) — the rib is an orphan.
   const res = await createWorktreeDriver(fakeRun).finalizeEpic(
     makeFinalizeInfo(),
+    async () => true,
   );
   expect(res).toEqual({ ok: true });
   // The orphan rib's worktree AND branch were pruned, never `--contains`.
@@ -6120,7 +6247,10 @@ test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while t
     },
     { nodeId: "fn-1-foo.2", branch: rib, worktreePath: ribPath },
   ];
-  const res = await createWorktreeDriver(fakeRun).finalizeEpic(info);
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    info,
+    async () => true,
+  );
   expect(res).toEqual({ ok: true });
   // The unmerged rib survived (force-delete would lose work); the base still pruned.
   expect(cmds.some((c) => c === `branch -D ${rib}`)).toBe(false);
@@ -6132,9 +6262,11 @@ test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while t
 // dirty / off-branch / non-fast-forward SHARED main checkout, and is idempotent.
 // ---------------------------------------------------------------------------
 
-/** A finalize fakeRun past the branch-exists + done-state guards, parameterized on
- *  the main checkout's HEAD branch, `git status --porcelain`, and whether the
- *  cached origin ref is an ancestor of local (fast-forwardable). */
+/** A finalize fakeRun past the branch-exists guard with the lane base AHEAD of
+ *  default (so the shared merge routine reaches the readiness checks), parameterized
+ *  on the main checkout's HEAD branch, `git status --porcelain`, and whether the
+ *  cached origin ref is an ancestor of local (fast-forwardable). The projection-done
+ *  gate is the `isEpicDone` arg the caller passes, not a git read. */
 function makeFinalizeReadinessRun(opts: {
   head?: string; // rev-parse --abbrev-ref HEAD
   status?: string; // git status --porcelain stdout
@@ -6173,13 +6305,6 @@ function makeFinalizeReadinessRun(opts: {
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin ref exists
     }
-    if (args[0] === "show") {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
-        stderr: "",
-      };
-    }
     if (joined.startsWith("symbolic-ref")) {
       return { code: 0, stdout: "origin/main\n", stderr: "" };
     }
@@ -6198,8 +6323,13 @@ function makeFinalizeReadinessRun(opts: {
     if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
       return { code: opts.remoteAhead ? 1 : 0, stdout: "", stderr: "" };
     }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      // The lane base is AHEAD of default (not an ancestor) → the shared routine
+      // proceeds past the ahead-check into the readiness/precheck degrades.
+      return { code: 1, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 0, stdout: "", stderr: "" }; // base already-merged + prune gates
+      return { code: 0, stdout: "", stderr: "" }; // base vs HEAD: already-merged no-lock skip
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -6208,11 +6338,16 @@ function makeFinalizeReadinessRun(opts: {
 
 test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true), distinct reason, no merge/push/teardown", async () => {
   const { run, cmds } = makeFinalizeReadinessRun({ status: " M src/foo.ts\n" });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
     expect(res.reason).toContain("worktree-finalize-dirty-checkout");
+    // The finalize-side reason MUST NOT carry the recover prefix (else auto-cleared).
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
   // A clean skip — the human's WIP is never stomped, the lanes survive for a retry.
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
@@ -6222,22 +6357,30 @@ test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true)
 
 test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no working-tree probe past the branch", async () => {
   const { run, cmds } = makeFinalizeReadinessRun({ head: "feature-x" });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
     expect(res.reason).toContain("worktree-finalize-off-branch");
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
 test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and-retry, no merge/push/fetch", async () => {
   const { run, cmds } = makeFinalizeReadinessRun({ remoteAhead: true });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
     expect(res.reason).toContain("worktree-finalize-non-fast-forward");
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
   // Never an auto-fetch / rebase / force, and the base merge is skipped entirely.
   expect(cmds.some((c) => c.startsWith("fetch"))).toBe(false);
@@ -6247,7 +6390,10 @@ test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and
 
 test("fn-988 finalizeEpic: no origin remote (non-turn-key push) → distinct non-sticky skip-retry, no merge/push", async () => {
   const { run, cmds } = makeFinalizeReadinessRun({ noRemote: true });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true); // NON-sticky
@@ -6263,7 +6409,10 @@ test("fn-988 finalizeEpic: no origin remote (non-turn-key push) → distinct non
 
 test("fn-988 finalizeEpic: no @{push} target (non-turn-key push) → non-sticky skip-retry, no merge", async () => {
   const { run, cmds } = makeFinalizeReadinessRun({ noPushTarget: true });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
@@ -6278,7 +6427,10 @@ test("fn-988 finalizeEpic: push --dry-run rejected (would-prompt) → non-sticky
   const { run, cmds } = makeFinalizeReadinessRun({
     dryRunReject: "fatal: Authentication failed for 'https://host/repo.git'",
   });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
@@ -6295,7 +6447,10 @@ test("fn-988 finalizeEpic: a would-clobber untracked file (incoming ∩ main-unt
     untracked: "docs/new.md\nscratch.txt\n",
     incomingTracked: "src/a.ts\ndocs/new.md\n", // docs/new.md collides
   });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true); // NON-sticky
@@ -6314,7 +6469,10 @@ test("fn-988 finalizeEpic: a benign untracked-only tree (no incoming overlap) �
     untracked: ".env\neditor.tmp\n", // benign — no incoming path collides
     incomingTracked: "src/a.ts\ndocs/new.md\n",
   });
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res).toEqual({ ok: true });
   // The merge proceeded — a benign untracked file never blocks finalize.
   expect(cmds.some((c) => c.startsWith("merge-base --is-ancestor"))).toBe(true);
@@ -6361,7 +6519,10 @@ test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure
     }
     return { code: 0, stdout: "", stderr: "" };
   };
-  const res = await createWorktreeDriver(run).finalizeEpic(makeFinalizeInfo());
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
   expect(res).toEqual({ ok: true });
   // The merge was the idempotent no-op (already an ancestor → no `merge --no-edit`),
   // and teardown RESUMED: the lingering base worktree + branch were cleaned up.

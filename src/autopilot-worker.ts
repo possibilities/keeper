@@ -53,7 +53,11 @@ import {
   gitExec,
   type GitRunner as WorktreeGitRunner,
 } from "./commit-work/git-exec";
-import { describePushNotReady, remotePushTurnKey } from "./commit-work/push";
+import {
+  describePushNotReady,
+  type PushNotReadyReason,
+  remotePushTurnKey,
+} from "./commit-work/push";
 import {
   DEFAULT_MAX_CONCURRENT_JOBS,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
@@ -95,7 +99,6 @@ import {
   currentBranch as gitCurrentBranch,
   deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
-  epicBaseHasDoneState as gitEpicBaseHasDoneState,
   isAncestorOf as gitIsAncestorOf,
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
@@ -963,6 +966,15 @@ export interface ConfirmRunningDeps {
    */
   worktree?: WorktreeDriver;
   /**
+   * fn-990 — the MAIN-projection done-ness probe ({@link isEpicDoneById} bound to
+   * the reconciler's read-only connection), threaded into `worktree.finalizeEpic`
+   * so finalize merges a lane ONLY when its epic is done in the projection. The
+   * closer writes `done` to the PRIMARY repo, so the projection — not a lane-read —
+   * is the authority; this rejects a crashed closer that finished without `done`.
+   * Mirrors the same probe the recover glue passes into `worktree.recover`.
+   */
+  isEpicDone(epicId: string): Promise<boolean>;
+  /**
    * Tuning knobs — exposed as deps so tests can drive a 5ms / 50ms
    * cadence instead of seconds. Defaults applied in `runConfirmCycle`
    * when undefined.
@@ -994,6 +1006,13 @@ export interface WorktreeDriver {
    * resolved default branch (sequential pairwise, pushed once), then tear the lane
    * worktrees down. Returns `{ ok: true }` on a clean merge-and-teardown.
    *
+   * `isEpicDone` is the MAIN-projection done-ness probe ({@link isEpicDoneById}),
+   * threaded in the same way recover takes it: finalize merges ONLY when the epic
+   * is done in the projection (the closer wrote `done` to the PRIMARY repo, never
+   * the lane), which rejects a crashed closer that finished but never committed
+   * `done`. The lane-ahead half of the gate is the shared merge routine's
+   * `not-ahead` check.
+   *
    * A failure is one of two kinds, distinguished by `retry`:
    *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
    *    conflict, a dirty-LANE teardown refusal). The producer mints a STICKY
@@ -1006,6 +1025,7 @@ export interface WorktreeDriver {
    */
   finalizeEpic(
     info: WorktreeLaunchInfo,
+    isEpicDone: (epicId: string) => Promise<boolean>,
   ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
   /**
    * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
@@ -1341,22 +1361,21 @@ export function isEpicInFlight(
 /**
  * Has an epic's CLOSER worker RUN AND FINISHED — a `close::<epic_id>` job row
  * exists in the projection but no longer OCCUPIES its slot (not `working`, not a
- * live-`stopped` session)? The producer-observable half of the worktree finalize
- * trigger that DECOUPLES finalize from the main-worktree `epics` projection:
- * after task .2 the closer's `status:done` commit lands on the LANE, so the main
- * projection never folds the close-row to `completed` and the projection-gated
- * finalize would deadlock. This signal fires off the durable `jobs` projection
- * instead, and finalize then confirms the lane truly carries done via
- * `epicBaseHasDoneState` before merging.
+ * live-`stopped` session)? The producer-observable finalize trigger: it fires for
+ * ANY finished closer job off the durable `jobs` projection, BROADER than
+ * `completedRowIds` (which waits on the main `epics` projection folding the epic
+ * `done`). Finalize then confirms real completion via the MAIN projection
+ * (`isEpicDone` — the closer writes `done` to the PRIMARY repo, never the lane, so
+ * the projection is the authority) before it merges.
  *
  * Producer-only + re-fold-safe (jobs is a deterministic-replayed projection,
  * read here in the producer, never in a fold). Crash/restart-safe: the close job
  * row survives a daemon bounce, and after restart no panes are live so the
  * finished closer reads as non-occupying — the trigger re-fires. A crashed or
  * still-running closer is handled safely: a still-running one occupies (so this
- * is `false`); a crashed one that never committed done trips this but the git
- * confirm in `finalizeEpic` no-ops the merge until the lane carries done. Pure —
- * reads the snapshot fields only.
+ * is `false`); a crashed one that finished without committing `done` trips this
+ * but finalize's projection-done gate no-ops the merge until the done commit
+ * lands. Pure — reads the snapshot fields only.
  */
 export function closerJobFinished(
   jobs: Map<string, Job>,
@@ -1658,13 +1677,13 @@ export function reconcile(
   // paused autopilot must not do. Launches are already suppressed while paused, so
   // the geometry attach has nothing to decorate either.
   if (snapshot.worktreeMode && !state.paused) {
-    // fn-972 BUG 3 — the producer-observable finalize trigger. The close-row's
-    // `completed` verdict is gated on `epic.status==="done"` in the MAIN-worktree
-    // projection, which never folds the lane's close commit — so it deadlocks.
-    // Collect the epics whose CLOSER JOB finished (the durable jobs projection,
-    // re-fold-safe + restart-safe); `finalizeEpic` then confirms the lane base
-    // carries done via git before merging. Union'd with `completedRowIds` so the
-    // pre-worktree done-on-main path is unchanged.
+    // fn-990 — the producer-observable finalize trigger. Collect the epics whose
+    // CLOSER JOB finished (the durable jobs projection, re-fold-safe + restart-safe)
+    // — a BROADER trigger than `completedRowIds` (the close-row's `completed`
+    // verdict, gated on the main `epics` projection folding `done`). `finalizeEpic`
+    // then confirms real completion via the MAIN projection (`isEpicDone`) before
+    // merging — a finished-but-not-done crashed closer is rejected there. Union'd
+    // with `completedRowIds` so the pre-worktree done-on-main path is unchanged.
     const closerFinishedIds = new Set<string>();
     for (const epic of snapshot.epics) {
       if (
@@ -1870,11 +1889,11 @@ export function prepareWorktreeGeometry(
  *    synthetic {@link CLOSE_SINK_ID} sink (pinned to base).
  *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every `ok`
  *    epic that needs finalizing — its close-row id is in `completedRowIds` (the MAIN
- *    projection folded `status:done`) OR `closerFinishedIds` (fn-972 BUG 3: the
- *    closer JOB finished on the lane, the producer-observable signal that fires
- *    BEFORE the projection can ever see done, since the close commit is on the
- *    lane). The producer merges that base into the default branch + tears down,
- *    confirming the lane carries done via git first (`finalizeEpic`).
+ *    projection folded `status:done`) OR `closerFinishedIds` (the closer JOB
+ *    finished, the BROADER producer-observable signal off the durable `jobs`
+ *    projection). The producer merges that base into the default branch + tears
+ *    down, confirming real completion via the MAIN projection (`isEpicDone`) first
+ *    (`finalizeEpic`) — the closer writes `done` to the PRIMARY repo, not the lane.
  *
  * Pure: a total function of the epics + launches + id sets + the resolved geometry.
  */
@@ -2374,7 +2393,7 @@ export async function runReconcileCycle(
       if (signal.aborted) {
         return;
       }
-      const result = await deps.worktree.finalizeEpic(info);
+      const result = await deps.worktree.finalizeEpic(info, deps.isEpicDone);
       // A `retry` failure is a transient environment skip (dirty/off-branch/
       // non-ff main checkout): STOP this epic's finalize but mint NO sticky
       // DispatchFailed — the next cycle retries once the tree settles. Only a
@@ -2519,7 +2538,7 @@ export function createWorktreeDriver(
         };
       }
     },
-    async finalizeEpic(info) {
+    async finalizeEpic(info, isEpicDone) {
       const { repoDir, baseBranch, baseWorktreePath, laneOrder } = info;
       try {
         // A never-forked epic (a `done` epic that completed before worktree mode,
@@ -2531,114 +2550,79 @@ export function createWorktreeDriver(
         if (!(await gitBranchExists(repoDir, baseBranch, run))) {
           return { ok: true };
         }
-        // fn-972 BUG 3 — the git half of the producer-observable finalize trigger:
-        // only merge a lane that actually CARRIES the epic-done state. The
-        // closer-job-finished signal that flags this epic for finalize also trips
-        // for a CRASHED closer that never committed `status:done`; merging that
-        // lane would push incomplete work to the default branch. Confirm the lane
-        // base's `.keeper/epics/<id>.json` reads done first — decoupled from the
-        // main projection (it reads the LANE), crash-safe, idempotent. Not done →
-        // no-op cleanly; the readiness gate re-dispatches the closer and a later
-        // cycle retries once the done commit lands.
+        // fn-990 — the producer-observable finalize trigger (`closerFinishedIds`)
+        // flags this epic for ANY finished closer job, even a CRASHED one that
+        // committed code-but-not-`done`; merging that lane would push incomplete
+        // work to the default branch. Confirm the epic is DONE in the MAIN
+        // projection first: the closer writes `done` to the PRIMARY repo (plan
+        // state always = primary, never the lane), so the projection — not a
+        // lane-read — is the authority on real completion. Not done → no-op
+        // cleanly; the readiness gate re-dispatches the closer and a later cycle
+        // retries once the done commit lands. Mirrors recover pass-2's `isEpicDone`
+        // guard (the lane-ahead half is the shared routine's `not-ahead` check).
         const epicId = closeKeyEpicId(info);
-        if (!(await gitEpicBaseHasDoneState(repoDir, epicId, run))) {
+        if (!(await isEpicDone(epicId))) {
           return { ok: true };
         }
         const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
         // The base merge lands IN THE MAIN worktree (the repo dir is the human's
-        // shared checkout). Degrade — NEVER stomp WIP or fight an in-flight
-        // merge/rebase. A dirty / off-branch / mid-rebase checkout is a clean
-        // SKIP-AND-RETRY (a distinct, non-`worktree-recover*` reason so the
-        // recover auto-clear never touches it, AND no sticky DispatchFailed so it
-        // is never an un-clearable close); the next cycle retries once the tree
-        // settles. This converts ONLY the human's-WIP-blocks-the-merge case — a
-        // genuine divergent-content conflict still fails loud below.
-        const ready = await gitMergeReadiness(
+        // shared checkout) via the ONE shared {@link mergeLaneBaseIntoDefault}
+        // routine. It degrades — NEVER stomps WIP or fights an in-flight
+        // merge/rebase: a dirty / off-branch / would-clobber / non-ff / non-turn-key
+        // shared checkout is a clean SKIP-AND-RETRY (a DISTINCT, non-`worktree-recover*`
+        // reason so the recover auto-clear never touches it, AND `retry: true` so no
+        // sticky DispatchFailed — never an un-clearable close). A genuine
+        // divergent-content conflict or a push failure stays a loud sticky block.
+        // `not-ahead`/`merged` fall through to teardown (an already-merged base
+        // still tears its lanes down — the idempotent resume).
+        const merge = await mergeLaneBaseIntoDefault(
           repoDir,
+          baseBranch,
           defaultBranch,
           run,
-          baseBranch,
         );
-        if (ready.kind === "off-branch") {
-          return {
-            ok: false,
-            retry: true,
-            reason: `worktree-finalize-off-branch: ${repoDir} HEAD is ${ready.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
-          };
-        }
-        if (ready.kind === "dirty") {
-          return {
-            ok: false,
-            retry: true,
-            reason: `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${ready.detail}`,
-          };
-        }
-        // A would-clobber: merging the lane base would overwrite an untracked
-        // file the human left in the shared checkout — `git merge` hard-aborts on
-        // it. Degrade to a DISTINCT non-`worktree-recover*` skip-retry (so the
-        // recover auto-clear never touches it, and no sticky DispatchFailed), the
-        // same family as the dirty/off-branch finalize degrades. A benign
-        // untracked file that no incoming path collides with still reads `ready`.
-        if (ready.kind === "would-clobber") {
-          return {
-            ok: false,
-            retry: true,
-            reason: `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${ready.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
-          };
-        }
-        // Non-fast-forward precheck BEFORE the merge (so a diverged remote never
-        // advances local default into a stuck divergence): if the cached
-        // `origin/<default>` moved ahead, a push would be rejected — skip-and-retry,
-        // NEVER an auto-fetch / rebase / force on the shared checkout.
-        if (
-          !(await gitRemotePushFastForwardable(repoDir, defaultBranch, run))
-        ) {
-          return {
-            ok: false,
-            retry: true,
-            reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
-          };
-        }
-        // Turn-key-push precheck BEFORE the merge: confirm the eventual push is
-        // runnable non-interactively (remote + `@{push}` target + a clean
-        // `--dry-run`) so a non-turn-key push never advances local default into a
-        // merge-then-die state. A non-turn-key push degrades to a DISTINCT
-        // NON-STICKY skip-retry — `worktree-finalize-push-not-turn-key` is NOT
-        // `worktree-recover*`-prefixed (the recover auto-clear never touches it) and
-        // carries `retry: true` (no sticky DispatchFailed), so the next cycle
-        // retries once the push is turn-key.
-        const finalizePushReady = await remotePushTurnKey(repoDir, run);
-        if (!finalizePushReady.ready) {
-          return {
-            ok: false,
-            retry: true,
-            reason: `worktree-finalize-push-not-turn-key: ${describePushNotReady(finalizePushReady.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
-          };
-        }
-        // Pre-guarded by gitBranchExists above, so `missing-source` is unreachable
-        // here; any non-conflict result is an idempotently safe fall-through.
-        const merge: MergeResult = await gitMergeBranchInto(
-          repoDir,
-          baseBranch,
-          run,
-        );
-        if (merge.kind === "conflict") {
-          return {
-            ok: false,
-            reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
-          };
-        }
-        // Push the single merge-to-default. A push failure stops finalize (no
-        // teardown) so the lanes survive for a retry.
-        const push = await run(["push"], {
-          cwd: repoDir,
-          env: { GIT_TERMINAL_PROMPT: "0" },
-        });
-        if (push.code !== 0) {
-          return {
-            ok: false,
-            reason: `worktree-finalize-push-failed: ${(push.stdout + push.stderr).trim()}`,
-          };
+        switch (merge.kind) {
+          case "off-branch":
+            return {
+              ok: false,
+              retry: true,
+              reason: `worktree-finalize-off-branch: ${repoDir} HEAD is ${merge.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
+            };
+          case "dirty":
+            return {
+              ok: false,
+              retry: true,
+              reason: `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
+            };
+          case "would-clobber":
+            return {
+              ok: false,
+              retry: true,
+              reason: `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
+            };
+          case "non-ff":
+            return {
+              ok: false,
+              retry: true,
+              reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
+            };
+          case "not-turn-key":
+            return {
+              ok: false,
+              retry: true,
+              reason: `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
+            };
+          case "conflict":
+            return {
+              ok: false,
+              reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+            };
+          case "push-failed":
+            return {
+              ok: false,
+              reason: `worktree-finalize-push-failed: ${merge.detail}`,
+            };
+          // not-ahead (already merged) / merged → proceed to teardown.
         }
         // Enumerate EVERY rib of this epic — the snapshot's `laneOrder` ribs UNIONED
         // with EVERY live-git `keeper/epic/<id>--*` ref, so a rib forked in a cycle
@@ -2738,6 +2722,84 @@ export function createWorktreeDriver(
       return recoverWorktrees(repos, isEpicDone, run);
     },
   };
+}
+
+/**
+ * fn-990 — the structured result of {@link mergeLaneBaseIntoDefault}. A pure
+ * DISCRIMINANT carrying NO reason strings: each caller maps it to its own reason
+ * family ({@link finalizeEpic} → `worktree-finalize-*`, OUTSIDE the recover
+ * auto-clear prefix; {@link recoverWorktrees} pass-2 → `worktree-recover-*`,
+ * INSIDE it) so the {@link isWorktreeRecoverReason} boundary stays caller-owned.
+ */
+export type MergeLaneResult =
+  | { kind: "not-ahead" }
+  | { kind: "off-branch"; head: string }
+  | { kind: "dirty"; detail: string }
+  | { kind: "would-clobber"; paths: string[] }
+  | { kind: "non-ff" }
+  | { kind: "not-turn-key"; reason: PushNotReadyReason }
+  | { kind: "conflict"; stderr: string }
+  | { kind: "push-failed"; detail: string }
+  | { kind: "merged" };
+
+/**
+ * fn-990 — the ONE guarded lane-base→default merge sequence shared by
+ * {@link WorktreeDriver.finalizeEpic} and {@link recoverWorktrees} pass-2. Runs IN
+ * the main checkout (`repo`, already resolved to be on `defaultBranch`) and never
+ * stamps a reason string — it returns a {@link MergeLaneResult} discriminant the
+ * caller maps to its own reason family. Ordered ahead-check → mergeReadiness →
+ * non-ff precheck → turn-key-push precheck → merge → push:
+ *  - ahead-check: the base must carry real commits (NOT already an ancestor of
+ *    default) → `not-ahead` is the idempotent already-merged no-op.
+ *  - mergeReadiness degrades a dirty / off-branch / would-clobber shared checkout.
+ *  - the two push prechecks degrade a non-fast-forward / non-turn-key push BEFORE
+ *    the local merge, so a push that cannot land never advances local default into
+ *    a merge-then-die state.
+ * `acquireLock` is optional (recover passes the fast-tier-stubbable lock; finalize
+ * omits it for the default flock). Pure git side effects — never a fetch / rebase /
+ * force on the shared checkout.
+ */
+export async function mergeLaneBaseIntoDefault(
+  repo: string,
+  baseBranch: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+  acquireLock?: LockAcquirer,
+): Promise<MergeLaneResult> {
+  if (await gitIsAncestorOf(repo, baseBranch, defaultBranch, run)) {
+    return { kind: "not-ahead" };
+  }
+  const ready = await gitMergeReadiness(repo, defaultBranch, run, baseBranch);
+  if (ready.kind === "off-branch") {
+    return { kind: "off-branch", head: ready.head };
+  }
+  if (ready.kind === "dirty") {
+    return { kind: "dirty", detail: ready.detail };
+  }
+  if (ready.kind === "would-clobber") {
+    return { kind: "would-clobber", paths: ready.paths };
+  }
+  if (!(await gitRemotePushFastForwardable(repo, defaultBranch, run))) {
+    return { kind: "non-ff" };
+  }
+  const pushReady = await remotePushTurnKey(repo, run);
+  if (!pushReady.ready) {
+    return { kind: "not-turn-key", reason: pushReady.reason };
+  }
+  const merge: MergeResult = acquireLock
+    ? await gitMergeBranchInto(repo, baseBranch, run, acquireLock)
+    : await gitMergeBranchInto(repo, baseBranch, run);
+  if (merge.kind === "conflict") {
+    return { kind: "conflict", stderr: merge.stderr };
+  }
+  const push = await run(["push"], {
+    cwd: repo,
+    env: { GIT_TERMINAL_PROMPT: "0" },
+  });
+  if (push.code !== 0) {
+    return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
+  }
+  return { kind: "merged" };
 }
 
 /**
@@ -2862,101 +2924,75 @@ export async function recoverWorktrees(
         if (!(await isEpicDone(base.epicId))) {
           continue; // epic still open — its base is merged by `finalizeEpic`, not here
         }
-        // Idempotency guard: an already-merged base is an ancestor of default.
-        if (await gitIsAncestorOf(repo, base.branch, defaultBranch, run)) {
-          continue;
-        }
-        // The merge runs in the MAIN worktree (the repo dir). Degrade gracefully
-        // when the shared checkout is occupied: a dirty / off-branch / mid-rebase
-        // tree is a SKIP-AND-RETRY, never a stomp. The recover failures all carry
-        // the `worktree-recover*` prefix, so the level-triggered auto-clear lifts
-        // the block the moment the tree settles (no `retry_dispatch` needed) — the
-        // recover-side analogue of finalize's `retry` skip.
-        const ready = await gitMergeReadiness(
+        // fn-990 — the ONE shared {@link mergeLaneBaseIntoDefault} routine, the same
+        // finalize drives. The merge runs in the MAIN worktree (the repo dir).
+        // `not-ahead` is the idempotency skip (an already-merged base is an ancestor
+        // of default). Every degrade maps to a `worktree-recover-*` reason: the
+        // recover prefix keeps the level-triggered auto-clear scope, so the block
+        // lifts the moment the underlying git settles (no `retry_dispatch` needed) —
+        // the recover-side analogue of finalize's `retry` skip. The shared core
+        // stamps NO reason strings; recover owns the `worktree-recover-*` mapping
+        // exactly as finalize owns `worktree-finalize-*`.
+        const merge = await mergeLaneBaseIntoDefault(
           repo,
+          base.branch,
           defaultBranch,
           run,
-          base.branch,
+          acquireLock,
         );
-        if (ready.kind === "off-branch") {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-not-on-default: ${repo} HEAD is ${ready.head}, expected ${defaultBranch} to merge ${base.branch}`,
-            dir: repo,
-          });
-          continue;
-        }
-        if (ready.kind === "dirty") {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — skipping the merge of ${base.branch} until it is clean — ${ready.detail}`,
-            dir: repo,
-          });
-          continue;
-        }
-        // A would-clobber: merging this base would overwrite an untracked file in
-        // the shared checkout (`git merge` hard-aborts). Skip-and-retry, KEEPING
-        // the `worktree-recover*` prefix so the level-triggered auto-clear lifts
-        // the block the moment the path is cleared. A benign untracked file that
-        // no incoming path collides with still merges (no fn-987 regression).
-        if (ready.kind === "would-clobber") {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-would-clobber: merging ${base.branch} into ${defaultBranch} would overwrite untracked file(s) in ${repo} — ${ready.paths.join(", ")} — skipping until the path(s) are cleared`,
-            dir: repo,
-          });
-          continue;
-        }
-        // Non-fast-forward precheck BEFORE the merge: a cached `origin/<default>`
-        // ahead of local means a push would be rejected — skip-and-retry, never an
-        // auto-fetch / rebase / force on the shared checkout.
-        if (!(await gitRemotePushFastForwardable(repo, defaultBranch, run))) {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the merge of ${base.branch} (no fetch/rebase/force)`,
-            dir: repo,
-          });
-          continue;
-        }
-        // Turn-key-push precheck BEFORE the merge (recover-side analogue of
-        // finalize's): a non-turn-key push (no remote / no `@{push}` target /
-        // would-prompt dry-run) degrades to a skip-and-retry rather than merge-then-
-        // die. `worktree-recover-push-not-turn-key` KEEPS the `worktree-recover*`
-        // prefix so the level-triggered auto-clear lifts the block the moment the
-        // push becomes turn-key (no `retry_dispatch`).
-        const recoverPushReady = await remotePushTurnKey(repo, run);
-        if (!recoverPushReady.ready) {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-push-not-turn-key: ${describePushNotReady(recoverPushReady.reason)} — skipping the merge of ${base.branch} until the push is turn-key`,
-            dir: repo,
-          });
-          continue;
-        }
-        // Sources from a live branch, so `missing-source` is unreachable here;
-        // any non-conflict result is an idempotently safe fall-through.
-        const merge: MergeResult = acquireLock
-          ? await gitMergeBranchInto(repo, base.branch, run, acquireLock)
-          : await gitMergeBranchInto(repo, base.branch, run);
-        if (merge.kind === "conflict") {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
-            dir: repo,
-          });
-          continue;
-        }
-        // Push the recovered merge once (the per-lane pushes were skipped).
-        const push = await run(["push"], {
-          cwd: repo,
-          env: { GIT_TERMINAL_PROMPT: "0" },
-        });
-        if (push.code !== 0) {
-          failures.push({
-            epicId: base.epicId,
-            reason: `worktree-recover-push-failed: ${(push.stdout + push.stderr).trim()}`,
-            dir: repo,
-          });
+        switch (merge.kind) {
+          case "not-ahead":
+          case "merged":
+            break;
+          case "off-branch":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-not-on-default: ${repo} HEAD is ${merge.head}, expected ${defaultBranch} to merge ${base.branch}`,
+              dir: repo,
+            });
+            continue;
+          case "dirty":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — skipping the merge of ${base.branch} until it is clean — ${merge.detail}`,
+              dir: repo,
+            });
+            continue;
+          case "would-clobber":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-would-clobber: merging ${base.branch} into ${defaultBranch} would overwrite untracked file(s) in ${repo} — ${merge.paths.join(", ")} — skipping until the path(s) are cleared`,
+              dir: repo,
+            });
+            continue;
+          case "non-ff":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the merge of ${base.branch} (no fetch/rebase/force)`,
+              dir: repo,
+            });
+            continue;
+          case "not-turn-key":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the merge of ${base.branch} until the push is turn-key`,
+              dir: repo,
+            });
+            continue;
+          case "conflict":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+              dir: repo,
+            });
+            continue;
+          case "push-failed":
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-push-failed: ${merge.detail}`,
+              dir: repo,
+            });
+            continue;
         }
       } catch (err) {
         failures.push({
@@ -3775,6 +3811,10 @@ function main(): void {
     // guard hook does NOT fire here — this is the daemon producer shelling git
     // directly, not a plan-worker subagent's Bash.
     worktree: createWorktreeDriver(),
+    // fn-990 — the MAIN-projection done-ness probe finalize gates on (the closer
+    // writes `done` to the PRIMARY repo, so the projection is the authority). The
+    // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
+    isEpicDone: (epicId) => isEpicDoneById(db, epicId),
   };
 
   // Single-flight reconcile drive. `watchLoop` fires this on every

@@ -1,12 +1,16 @@
 // Real-git worktree-lane lifecycle — the slow-tier proof the pure suite cannot
 // give. Drives the full worktree-mode cycle on a real temp repo:
-//   provision -> claim-in-lane (the Task-1 runtime seam) -> commit -> merge ->
-//   teardown
-// and asserts the worker's commit lands on the LANE branch (never main), merges
-// cleanly to main, and teardown removes the worktree + branch. The claim-in-lane
-// step exercises resolveWorkerRepos (the one runtime seam claim routes through)
-// against a REAL lane dir, so realpath normalization runs on a path that exists —
-// coverage the fast tier (non-existent absolute paths) structurally skips.
+//   provision -> claim-in-lane (the Task-1 runtime seam) -> commit -> finalize
+// where the FINALIZE step is the production `createWorktreeDriver().finalizeEpic`
+// — the REAL close-sink merge + teardown, not a hand-rolled `git merge --no-ff`.
+// It drives the exact config the routing bug failed on: the epic is done in the
+// MAIN projection (isEpicDone true, simulating the closer's done-write to the
+// PRIMARY repo) while the lane carries real commits and NO done-state of its own.
+// Asserts the worker's commit lands on the LANE branch (never main), finalize
+// merges it cleanly to main + pushes, and teardown removes the worktree + branch.
+// The claim-in-lane step exercises resolveWorkerRepos (the one runtime seam claim
+// routes through) against a REAL lane dir, so realpath normalization runs on a
+// path that exists — coverage the fast tier (non-existent absolute paths) skips.
 //
 // CRITICAL: the commit step runs under an inherited main-pointed GIT_* env — the
 // exact pollution that made lane commits leak onto main. The real commit path
@@ -21,6 +25,10 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  createWorktreeDriver,
+  type WorktreeLaunchInfo,
+} from "../../../src/autopilot-worker.ts";
 import { autoCommitFromInvocation } from "../src/commit.ts";
 import { resolveWorkerRepos, worktreeOverride } from "../src/runtime_status.ts";
 import { SLOW_ENABLED } from "./harness.ts";
@@ -72,6 +80,7 @@ function setOrDeleteEnv(key: string, value: string | undefined): void {
 
 describe.skipIf(!SLOW_ENABLED)("worktree-lane lifecycle (real git)", () => {
   let main: string;
+  let origin: string;
 
   beforeEach(() => {
     main = mkdtempSync(join(tmpdir(), "planctl-wt-main-"));
@@ -82,15 +91,22 @@ describe.skipIf(!SLOW_ENABLED)("worktree-lane lifecycle (real git)", () => {
     writeFileSync(join(main, "README"), "seed\n");
     git(["add", "README"], main);
     git(["commit", "-q", "-m", "seed"], main);
+    // A bare origin so the real finalize push has a remote to fast-forward.
+    origin = mkdtempSync(join(tmpdir(), "planctl-wt-origin-"));
+    git(["init", "-q", "--bare", "-b", "main"], origin);
+    git(["remote", "add", "origin", origin], main);
+    git(["push", "-q", "-u", "origin", "main"], main);
   });
 
   afterEach(() => {
-    if (main) {
-      rmSync(main, { recursive: true, force: true });
+    for (const dir of [main, origin]) {
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 
-  test("provision -> claim-in-lane -> commit -> merge -> teardown", () => {
+  test("provision -> claim-in-lane -> commit -> finalize (real close-sink merge + teardown)", async () => {
     const seedSha = headSha(main);
 
     // PROVISION — a lane linked worktree on its own lane branch, forked off the
@@ -162,19 +178,47 @@ describe.skipIf(!SLOW_ENABLED)("worktree-lane lifecycle (real git)", () => {
       expect(git(["rev-parse", "refs/heads/main"], main).trim()).toBe(seedSha);
       expect(commitCount(main)).toBe(1); // seed only — no leak
 
-      // MERGE lane -> main — the cycle lands the lane work on the default branch.
-      git(["merge", "--no-ff", "-m", "merge lane into main", laneBranch], main);
-      expect(isAncestor(sha as string, "HEAD", main)).toBe(true);
-      // The merged file is present on main's HEAD tree + working copy.
-      git(["cat-file", "-e", `HEAD:${rel}`], main);
-      expect(commitCount(main)).toBe(3); // seed + lane work + merge
+      // FINALIZE — the REAL close-sink merge + teardown. The epic is done in the
+      // MAIN projection (isEpicDone → true, simulating the closer's done-write to
+      // the PRIMARY repo); the lane carries real commits and NO done-state of its
+      // own — the exact config the old lane-read gate failed on. finalizeEpic
+      // merges the lane base into main, pushes once, and tears the lane down.
+      const baseLane = realpathSync(lane);
+      const finalizeInfo: WorktreeLaunchInfo = {
+        assignment: {
+          nodeId: "__close__",
+          isCloseSink: true,
+          branch: laneBranch,
+          worktreePath: baseLane,
+          inherited: true,
+          preMerges: [],
+          assertBranch: laneBranch,
+        },
+        baseBranch: laneBranch,
+        baseWorktreePath: baseLane,
+        repoDir: main,
+        laneOrder: [
+          { nodeId: "__close__", branch: laneBranch, worktreePath: baseLane },
+        ],
+        parentBranch: laneBranch,
+      };
+      const res = await createWorktreeDriver().finalizeEpic(
+        finalizeInfo,
+        async () => true,
+      );
+      expect(res).toEqual({ ok: true });
 
-      // TEARDOWN — remove the worktree, then delete the (now fully merged) lane
-      // branch. Order matters: a branch checked out in a worktree can't be deleted.
-      git(["worktree", "remove", "--force", lane], main);
-      git(["branch", "-D", laneBranch], main);
+      // The lane work landed on main (merged), and the file is present on HEAD.
+      expect(isAncestor(sha as string, "HEAD", main)).toBe(true);
+      git(["cat-file", "-e", `HEAD:${rel}`], main);
+      // finalize pushed once — origin/main advanced to the merged HEAD.
+      expect(git(["rev-parse", "refs/remotes/origin/main"], main).trim()).toBe(
+        headSha(main),
+      );
+
+      // TEARDOWN completed — the lane worktree + branch are gone, nothing leaks.
       expect(
-        git(["worktree", "list", "--porcelain"], main).includes(lane),
+        git(["worktree", "list", "--porcelain"], main).includes(baseLane),
       ).toBe(false);
       expect(git(["branch", "--list", laneBranch], main).trim()).toBe("");
     } finally {

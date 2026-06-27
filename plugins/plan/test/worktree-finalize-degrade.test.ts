@@ -44,17 +44,19 @@ function headSha(cwd: string): string {
   return git(["rev-parse", "HEAD"], cwd).trim();
 }
 
-/** Commit the epic done-state (`.keeper/epics/<id>.json` status:done) onto the lane
- * checked out at `lane` — the git-observable finalize trigger epicBaseHasDoneState
- * reads. */
-function commitEpicDone(lane: string, epicId: string): void {
+/** Commit a real file onto the lane checked out at `lane` so its base branch is
+ * AHEAD of default — the merge has something to land. The finalize gate reads the
+ * epic done-state from the MAIN projection (`isEpicDone`, passed by the caller),
+ * never the lane, so this commit's content is irrelevant to the gate; it exists
+ * only to make the lane carry real commits. */
+function commitLaneAhead(lane: string, epicId: string): void {
   mkdirSync(join(lane, ".keeper", "epics"), { recursive: true });
   writeFileSync(
     join(lane, ".keeper", "epics", `${epicId}.json`),
     `${JSON.stringify({ id: epicId, status: "done" })}\n`,
   );
   git(["add", "."], lane);
-  git(["commit", "-q", "-m", `close: ${epicId} done`], lane);
+  git(["commit", "-q", "-m", `lane work: ${epicId}`], lane);
 }
 
 describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
@@ -131,7 +133,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     // The producer hands the driver a realpath-normalized lane path; match it so
     // teardown's worktree-list path comparison lands on macOS (/var ↔ /private/var).
     const baseLane = realpathSync(reserved);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
 
     // The human has uncommitted work in the shared main checkout. Stage it so
     // the readiness check (status --porcelain --untracked-files=no) sees it as
@@ -142,6 +144,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res.ok).toBe(false);
@@ -169,7 +172,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     const reserved = reserveLane();
     git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
     const baseLane = realpathSync(reserved);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
 
     // Drop the bare origin out from under the (still-configured) remote: the cached
     // origin/main tracking ref + `remote get-url` survive, but the push cannot reach it.
@@ -178,6 +181,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res.ok).toBe(false);
@@ -209,7 +213,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     writeFileSync(join(baseLane, "incoming.txt"), "from the lane\n");
     git(["add", "incoming.txt"], baseLane);
     git(["commit", "-q", "-m", "add incoming.txt"], baseLane);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
     // The human left an UNTRACKED file at the very path the merge would write.
     writeFileSync(
       join(main, "incoming.txt"),
@@ -219,6 +223,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res.ok).toBe(false);
@@ -250,12 +255,13 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     writeFileSync(join(baseLane, "incoming.txt"), "from the lane\n");
     git(["add", "incoming.txt"], baseLane);
     git(["commit", "-q", "-m", "add incoming.txt"], baseLane);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
     // A benign untracked file at a path the incoming tree never touches.
     writeFileSync(join(main, ".env"), "SECRET=1\n");
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res).toEqual({ ok: true });
@@ -277,7 +283,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     const reserved = reserveLane();
     git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
     const baseLane = realpathSync(reserved);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
     // Provision the orphan rib worktree at HEAD (an ancestor of default) — it is
     // NEVER added to finalizeInfo.laneOrder.
     const ribReserved = reserveLane();
@@ -286,6 +292,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res).toEqual({ ok: true });
@@ -303,7 +310,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     const reserved = reserveLane();
     git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
     const baseLane = realpathSync(reserved);
-    commitEpicDone(baseLane, epicId);
+    commitLaneAhead(baseLane, epicId);
 
     // SIMULATE the prior run: the base was merged into main + pushed, but the worker
     // crashed BEFORE teardown — so the lane worktree + branch still linger.
@@ -313,6 +320,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
 
     const res = await createWorktreeDriver().finalizeEpic(
       finalizeInfo(epicId, baseLane),
+      async () => true,
     );
 
     expect(res).toEqual({ ok: true });
