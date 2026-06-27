@@ -2100,6 +2100,10 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
       week_resets_at: "2026-06-01T20:00:00-04:00",
       sonnet_week_percent: 9.0,
       sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
+      codex_spark_session_percent: 27.0,
+      codex_spark_session_resets_at: "2026-05-30T23:59:00-04:00",
+      codex_spark_week_percent: 48.0,
+      codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
       status: "stale",
       subscription_active: false,
       error_type: "ClaudeUsageParseError",
@@ -2121,6 +2125,10 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
     week_resets_at: "2026-06-01T20:00:00-04:00",
     sonnet_week_percent: 9.0,
     sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
+    codex_spark_session_percent: 27.0,
+    codex_spark_session_resets_at: "2026-05-30T23:59:00-04:00",
+    codex_spark_week_percent: 48.0,
+    codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
     status: "stale",
     subscription_active: false,
     error_type: "ClaudeUsageParseError",
@@ -2158,6 +2166,10 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
         week_resets_at: null,
         sonnet_week_percent: null,
         sonnet_week_resets_at: null,
+        codex_spark_session_percent: null,
+        codex_spark_session_resets_at: null,
+        codex_spark_week_percent: null,
+        codex_spark_week_resets_at: null,
         status: "stale",
         subscription_active: false,
         error_type: "ClaudeUsageParseError",
@@ -2193,6 +2205,59 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
   db.close();
 });
 
+test("usage snapshot folds codex-spark quota columns end-to-end", () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
+    [
+      1500,
+      "codex",
+      serializeUsageSnapshot({
+        kind: "usage-snapshot",
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 33,
+        session_resets_at: "2026-06-26T22:57:00-04:00",
+        week_percent: 28,
+        week_resets_at: "2026-06-28T19:20:00-04:00",
+        sonnet_week_percent: null,
+        sonnet_week_resets_at: null,
+        codex_spark_session_percent: 27,
+        codex_spark_session_resets_at: "2026-06-26T23:59:00-04:00",
+        codex_spark_week_percent: 48,
+        codex_spark_week_resets_at: "2026-06-28T21:00:00-04:00",
+        status: "active",
+        subscription_active: null,
+        error_type: null,
+        error_message: null,
+        error_at: null,
+        lift_at: null,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  const row = db
+    .query(
+      `SELECT codex_spark_session_percent, codex_spark_session_resets_at,
+              codex_spark_week_percent, codex_spark_week_resets_at
+         FROM usage WHERE id = ?`,
+    )
+    .get("codex") as {
+    codex_spark_session_percent: number | null;
+    codex_spark_session_resets_at: string | null;
+    codex_spark_week_percent: number | null;
+    codex_spark_week_resets_at: string | null;
+  };
+  expect(row.codex_spark_session_percent).toBe(27);
+  expect(row.codex_spark_session_resets_at).toBe("2026-06-26T23:59:00-04:00");
+  expect(row.codex_spark_week_percent).toBe(48);
+  expect(row.codex_spark_week_resets_at).toBe("2026-06-28T21:00:00-04:00");
+  db.close();
+});
+
+
 test("fn-651: a no-subscription envelope folds subscription_active = 0 so the renderer redacts it", () => {
   // The `mc1` case from the epic spec: subscription_active=false on the
   // wire becomes 0 in the column, which is what `cli/usage.ts`'s
@@ -2215,6 +2280,10 @@ test("fn-651: a no-subscription envelope folds subscription_active = 0 so the re
         week_resets_at: null,
         sonnet_week_percent: null,
         sonnet_week_resets_at: null,
+        codex_spark_session_percent: null,
+        codex_spark_session_resets_at: null,
+        codex_spark_week_percent: null,
+        codex_spark_week_resets_at: null,
         status: "active",
         subscription_active: false,
         error_type: null,
@@ -2438,8 +2507,10 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // id the reaper could collateral-kill — a one-time version-guarded data-fix
   // UPDATE, NO cursor rewind: the pane column re-folds NULL for a terminal job
   // under the new terminal-clear fold arms and the generation column is live-only,
-  // so the existing rows simply converge to what a re-fold would produce).
-  expect(SCHEMA_VERSION).toBe(92);
+  // so the existing rows simply converge to what a re-fold would produce). And to
+  // 93 via nullable codex-spark usage columns (additive ALTER, NO cursor rewind:
+  // existing rows stay NULL until the next usage snapshot).
+  expect(SCHEMA_VERSION).toBe(93);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

@@ -9,7 +9,7 @@
  * sessions` log (bottom). Each is change-gated on its own raw-field hash, so a
  * relative-time tick or a fetch-only refresh never forges a frame. Each usage
  * row is a stacked block — a header chip plus one indented body line per quota
- * window (session, week, sonnet) and, when present, a `limited lifts in <rel>`
+ * window (session, week, sonnet, codex-spark) and, when present, a `limited lifts in <rel>`
  * line and a `stale Nm` line. The daemon-side usage worker folds synthetic
  * `UsageSnapshot` / `UsageDeleted` events into the `usage` collection; the
  * reducer's fan-out mirrors `last_rate_limit_at` onto the usage row in the same
@@ -74,7 +74,7 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
 
 Each profile renders as a stacked block — a header line with the id
 chip + target/multiplier chip, then one indented body line per quota
-window (session, week, and sonnet where present). Each body line
+window (session, week, sonnet where present, and codex-spark where present). Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
 the numeric pct and a bare relative reset countdown (\`5d 21h\` /
 \`1h 16m\` / \`5m\` / \`now\`; an elapsed-but-fresh reset reads \`now\`).
@@ -328,6 +328,14 @@ export function renderRowLines(
     // Empty string when no sonnet data; otherwise the rendered relative
     // time (or "" inside the rendered cell if sonnet_resets_at was null).
     swReset: string;
+    // null when this row's envelope carried no codex_spark_session sub-object.
+    cssBar: string | null;
+    cssPct: string | null;
+    cssReset: string;
+    // null when this row's envelope carried no codex_spark_week sub-object.
+    cswBar: string | null;
+    cswPct: string | null;
+    cswReset: string;
     // Empty when no `limited` line renders. Otherwise its tail: `lifts in
     // <rel>` while `rate_limit_lifts_at` is future, `lifts now` within the ±30s
     // gap. Gated on the future lift itself, not the fired-time
@@ -345,6 +353,8 @@ export function renderRowLines(
 
   const cells: RowCells[] = visible.map((row) => {
     const hasSonnet = row.sonnet_week_percent != null;
+    const hasCodexSparkSession = row.codex_spark_session_percent != null;
+    const hasCodexSparkWeek = row.codex_spark_week_percent != null;
     // codex has no rate-limit concept — suppress the line even if the
     // wire payload were to carry a non-null `last_rate_limit_at`.
     const isCodex = row.id === "codex" || row.target === "codex";
@@ -413,6 +423,16 @@ export function renderRowLines(
       swReset: hasSonnet
         ? resetCell(seg(row.sonnet_week_resets_at), nowMs, isStale)
         : "",
+      cssBar: hasCodexSparkSession ? bar(row.codex_spark_session_percent) : null,
+      cssPct: hasCodexSparkSession ? pct(row.codex_spark_session_percent) : null,
+      cssReset: hasCodexSparkSession
+        ? resetCell(seg(row.codex_spark_session_resets_at), nowMs, isStale)
+        : "",
+      cswBar: hasCodexSparkWeek ? bar(row.codex_spark_week_percent) : null,
+      cswPct: hasCodexSparkWeek ? pct(row.codex_spark_week_percent) : null,
+      cswReset: hasCodexSparkWeek
+        ? resetCell(seg(row.codex_spark_week_resets_at), nowMs, isStale)
+        : "",
       rlRel,
       staleRel,
       errContent,
@@ -433,6 +453,8 @@ export function renderRowLines(
     if (!c.weekDepleted) allPcts.push(c.sPct);
     allPcts.push(c.wPct);
     if (c.swPct != null) allPcts.push(c.swPct);
+    if (c.cssPct != null) allPcts.push(c.cssPct);
+    if (c.cswPct != null) allPcts.push(c.cswPct);
   }
   const wPct = widest(allPcts);
 
@@ -444,6 +466,8 @@ export function renderRowLines(
   if (cells.some((c) => !c.weekDepleted)) labels.push("session");
   labels.push("week");
   if (cells.some((c) => c.swPct != null)) labels.push("sonnet");
+  if (cells.some((c) => c.cssPct != null)) labels.push("spark-5h");
+  if (cells.some((c) => c.cswPct != null)) labels.push("spark-week");
   if (cells.some((c) => c.rlRel !== "")) labels.push("limited");
   if (cells.some((c) => c.staleRel !== "")) labels.push("stale");
   if (cells.some((c) => c.errContent !== "")) labels.push("error");
@@ -511,6 +535,12 @@ export function renderRowLines(
     lines.push(renderBody("week", c.wBar, c.wPct, c.wReset));
     if (c.swPct != null && c.swBar != null) {
       lines.push(renderBody("sonnet", c.swBar, c.swPct, c.swReset));
+    }
+    if (c.cssPct != null && c.cssBar != null) {
+      lines.push(renderBody("spark-5h", c.cssBar, c.cssPct, c.cssReset));
+    }
+    if (c.cswPct != null && c.cswBar != null) {
+      lines.push(renderBody("spark-week", c.cswBar, c.cswPct, c.cswReset));
     }
     if (c.rlRel !== "") {
       lines.push(renderLimited(c.rlRel));

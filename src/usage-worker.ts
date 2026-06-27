@@ -128,6 +128,14 @@ export interface UsageSnapshotMessage {
   sonnet_week_percent: number | null;
   /** Sonnet-specific weekly reset instant — ISO-8601 string when present, else null. */
   sonnet_week_resets_at: string | null;
+  /** Codex-Spark 5h quota percent used (0-100), codex-only. */
+  codex_spark_session_percent: number | null;
+  /** Codex-Spark 5h reset instant — ISO-8601 string when present, else null. */
+  codex_spark_session_resets_at: string | null;
+  /** Codex-Spark weekly quota percent used (0-100), codex-only. */
+  codex_spark_week_percent: number | null;
+  /** Codex-Spark weekly reset instant — ISO-8601 string when present, else null. */
+  codex_spark_week_resets_at: string | null;
   /**
    * Envelope freshness/liveness axis (fn-645): `"active" | "idle" | "stale"`.
    * Stamped at write time by agentusage, never derived. Null when the envelope
@@ -332,12 +340,18 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
   let weekResetsAt: string | null = null;
   let sonnetWeekPercent: number | null = null;
   let sonnetWeekResetsAt: string | null = null;
+  let codexSparkSessionPercent: number | null = null;
+  let codexSparkSessionResetsAt: string | null = null;
+  let codexSparkWeekPercent: number | null = null;
+  let codexSparkWeekResetsAt: string | null = null;
   const usageBlock = raw.usage;
   if (usageBlock != null && typeof usageBlock === "object") {
     const u = usageBlock as {
       session?: unknown;
       week?: unknown;
       sonnet_week?: unknown;
+      codex_spark_session?: unknown;
+      codex_spark_week?: unknown;
     };
     if (u.session != null && typeof u.session === "object") {
       const s = u.session as RawUsageWindow;
@@ -353,6 +367,19 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
       const sw = u.sonnet_week as RawUsageWindow;
       sonnetWeekPercent = asNumber(sw.percent_used);
       sonnetWeekResetsAt = asString(sw.resets_at);
+    }
+    if (
+      u.codex_spark_session != null &&
+      typeof u.codex_spark_session === "object"
+    ) {
+      const cs = u.codex_spark_session as RawUsageWindow;
+      codexSparkSessionPercent = asNumber(cs.percent_used);
+      codexSparkSessionResetsAt = asString(cs.resets_at);
+    }
+    if (u.codex_spark_week != null && typeof u.codex_spark_week === "object") {
+      const cw = u.codex_spark_week as RawUsageWindow;
+      codexSparkWeekPercent = asNumber(cw.percent_used);
+      codexSparkWeekResetsAt = asString(cw.resets_at);
     }
   }
   // fn-645: envelope freshness + plan + stale-error axes. `subscription_active`
@@ -383,6 +410,10 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     week_resets_at: weekResetsAt,
     sonnet_week_percent: sonnetWeekPercent,
     sonnet_week_resets_at: sonnetWeekResetsAt,
+    codex_spark_session_percent: codexSparkSessionPercent,
+    codex_spark_session_resets_at: codexSparkSessionResetsAt,
+    codex_spark_week_percent: codexSparkWeekPercent,
+    codex_spark_week_resets_at: codexSparkWeekResetsAt,
     status: asString(raw.status),
     subscription_active: subscriptionActive,
     error_type: errorType,
@@ -656,7 +687,9 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     .query(
       `SELECT id, target, multiplier, session_percent, session_resets_at,
               week_percent, week_resets_at, sonnet_week_percent,
-              sonnet_week_resets_at, status, subscription_active,
+              sonnet_week_resets_at, codex_spark_session_percent,
+              codex_spark_session_resets_at, codex_spark_week_percent,
+              codex_spark_week_resets_at, status, subscription_active,
               error_type, error_message, error_at, rate_limit_lifts_at
          FROM usage`,
     )
@@ -670,6 +703,10 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     week_resets_at: string | null;
     sonnet_week_percent: number | null;
     sonnet_week_resets_at: string | null;
+    codex_spark_session_percent: number | null;
+    codex_spark_session_resets_at: string | null;
+    codex_spark_week_percent: number | null;
+    codex_spark_week_resets_at: string | null;
     status: string | null;
     subscription_active: number | null;
     error_type: string | null;
@@ -694,6 +731,10 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       week_resets_at: r.week_resets_at,
       sonnet_week_percent: r.sonnet_week_percent,
       sonnet_week_resets_at: r.sonnet_week_resets_at,
+      codex_spark_session_percent: r.codex_spark_session_percent,
+      codex_spark_session_resets_at: r.codex_spark_session_resets_at,
+      codex_spark_week_percent: r.codex_spark_week_percent,
+      codex_spark_week_resets_at: r.codex_spark_week_resets_at,
       status: r.status,
       subscription_active: sub,
       error_type: r.error_type,

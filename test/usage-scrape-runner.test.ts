@@ -84,17 +84,23 @@ describe("parseScrapeStdout — ok/subscribed", () => {
     expect(r.usage.sonnet_week?.percent_used).toBe(5);
   });
 
-  test("codex subscribed → subscription_active null, no sonnet_week", () => {
+  test("codex subscribed → subscription_active null, optional spark buckets", () => {
     const json = JSON.stringify({
       schema_version: 1,
       status: "ok",
-      usage: { session: { percent_used: 0, resets_at: null } },
+      usage: {
+        session: { percent_used: 0, resets_at: null },
+        codex_spark_session: { percent_used: 27, resets_at: null },
+        codex_spark_week: { percent_used: 48, resets_at: null },
+      },
       subscription_active: null,
     });
     const r = parseScrapeStdout(json, "", 0);
     if (r.kind !== "ok" || r.no_subscription) throw new Error("wrong arm");
     expect(r.subscription_active).toBeNull();
     expect(r.usage.sonnet_week).toBeUndefined();
+    expect(r.usage.codex_spark_session?.percent_used).toBe(27);
+    expect(r.usage.codex_spark_week?.percent_used).toBe(48);
   });
 });
 

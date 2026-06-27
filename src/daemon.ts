@@ -903,6 +903,10 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     week_resets_at: msg.week_resets_at,
     sonnet_week_percent: msg.sonnet_week_percent,
     sonnet_week_resets_at: msg.sonnet_week_resets_at,
+    codex_spark_session_percent: msg.codex_spark_session_percent,
+    codex_spark_session_resets_at: msg.codex_spark_session_resets_at,
+    codex_spark_week_percent: msg.codex_spark_week_percent,
+    codex_spark_week_resets_at: msg.codex_spark_week_resets_at,
     // Envelope freshness / plan / stale-error axes — forwarded so the
     // reducer's UPSERT populates the columns instead of folding NULL.
     status: msg.status,

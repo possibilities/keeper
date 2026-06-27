@@ -321,6 +321,32 @@ test("sonnet body line appears only on rows with sonnet_week data", () => {
   expect(sonnetRow ?? "").toMatch(/ 5d$/);
 });
 
+test("codex-spark body lines appear when spark usage data exists", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 33,
+        session_resets_at: isoOffset(60),
+        week_percent: 28,
+        week_resets_at: isoOffset(3 * 24 * 60),
+        codex_spark_session_percent: 27,
+        codex_spark_session_resets_at: isoOffset(90),
+        codex_spark_week_percent: 48,
+        codex_spark_week_resets_at: isoOffset(3 * 24 * 60 + 2 * 60),
+      },
+    ],
+    NOW_MS,
+  );
+
+  expect(lines).toHaveLength(5);
+  expect(bodyLineExact(lines, "spark-5h") ?? "").toContain("27%");
+  expect(bodyLineExact(lines, "spark-week") ?? "").toContain("48%");
+});
+
+
 test("label padding widens to 'sonnet' only when sonnet rows exist", () => {
   // No sonnet → labels pool is {session, week} → widest = 7
   // ("session"). `week` padEnd(7) leaves 3 trailing spaces.

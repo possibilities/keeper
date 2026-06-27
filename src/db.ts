@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 92;
+export const SCHEMA_VERSION = 93;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -994,6 +994,10 @@ CREATE TABLE IF NOT EXISTS usage (
     week_resets_at TEXT,
     sonnet_week_percent REAL,
     sonnet_week_resets_at TEXT,
+    codex_spark_session_percent REAL,
+    codex_spark_session_resets_at TEXT,
+    codex_spark_week_percent REAL,
+    codex_spark_week_resets_at TEXT,
     last_rate_limit_at REAL,
     last_rate_limit_session_id TEXT,
     status TEXT,
@@ -5379,6 +5383,21 @@ function migrate(db: Database): void {
                    OR backend_exec_generation_id IS NOT NULL)`,
         );
       }
+
+      // v92→v93: add the nullable codex-spark quota bucket columns to `usage`.
+      // Codex `/status` can render a second GPT-5.3-Codex-Spark limit section
+      // with its own 5h + weekly windows. The agentusage envelope carries them
+      // as `usage.codex_spark_session` / `usage.codex_spark_week`, the worker
+      // flattens them here, and `keeper usage` renders them as additional body
+      // rows. APPEND-via-ALTER keeps existing rows NULL (zero-event shape) and
+      // a fresh scrape re-emits one UsageSnapshot to populate the columns; no
+      // cursor rewind is needed. Whitelist-only Python read (keeper-py does not
+      // inspect these columns) — this bump MUST add 93 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit.
+      addColumnIfMissing(db, "usage", "codex_spark_session_percent", "REAL");
+      addColumnIfMissing(db, "usage", "codex_spark_session_resets_at", "TEXT");
+      addColumnIfMissing(db, "usage", "codex_spark_week_percent", "REAL");
+      addColumnIfMissing(db, "usage", "codex_spark_week_resets_at", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

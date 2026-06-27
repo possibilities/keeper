@@ -375,6 +375,8 @@ from pathlib import Path
 # v91 (fn-959 task .1) adds the ``autopilot_state.worktree_mode`` config column —
 # the runtime-settable durable toggle for worktree-shaped autopilot dispatch.
 # keeper-py never reads this column, so only the version whitelist gains 91.
+# v93 adds codex-spark usage quota columns; keeper-py never reads them, so only
+# the version whitelist gains 93.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -439,6 +441,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         90,
         91,
         92,
+        93,
     }
 )
 

@@ -138,6 +138,10 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     // safe-value invariant. (codex envelopes never carry this sub-object.)
     sonnet_week_percent: null,
     sonnet_week_resets_at: null,
+    codex_spark_session_percent: null,
+    codex_spark_session_resets_at: null,
+    codex_spark_week_percent: null,
+    codex_spark_week_resets_at: null,
     // fn-645 fields: this envelope omits status/subscription/error → all null.
     status: null,
     subscription_active: null,
@@ -169,6 +173,30 @@ test("buildUsageMessage projects the optional sonnet_week sub-block when present
   });
   expect(msg?.sonnet_week_percent).toBe(2.0);
   expect(msg?.sonnet_week_resets_at).toBe("2026-06-01T20:00:00-04:00");
+});
+
+test("buildUsageMessage projects the optional codex-spark sub-blocks when present", () => {
+  const msg = buildUsageMessage({
+    id: "codex",
+    target: "codex",
+    multiplier: 1,
+    usage: {
+      session: { percent_used: 33, resets_at: "2026-06-26T22:57:00-04:00" },
+      week: { percent_used: 28, resets_at: "2026-06-28T19:20:00-04:00" },
+      codex_spark_session: {
+        percent_used: 27,
+        resets_at: "2026-06-26T23:59:00-04:00",
+      },
+      codex_spark_week: {
+        percent_used: 48,
+        resets_at: "2026-06-28T21:00:00-04:00",
+      },
+    },
+  });
+  expect(msg?.codex_spark_session_percent).toBe(27);
+  expect(msg?.codex_spark_session_resets_at).toBe("2026-06-26T23:59:00-04:00");
+  expect(msg?.codex_spark_week_percent).toBe(48);
+  expect(msg?.codex_spark_week_resets_at).toBe("2026-06-28T21:00:00-04:00");
 });
 
 test("buildUsageMessage returns null when id is missing or non-string", () => {
@@ -480,6 +508,10 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     week_resets_at: "2026-06-01T20:00:00-04:00",
     sonnet_week_percent: null,
     sonnet_week_resets_at: null,
+    codex_spark_session_percent: null,
+    codex_spark_session_resets_at: null,
+    codex_spark_week_percent: null,
+    codex_spark_week_resets_at: null,
     status: null,
     subscription_active: null,
     error_type: null,

@@ -63,11 +63,16 @@ export interface UsageWindow {
   resets_at: string | null;
 }
 
-/** The `usage` sub-object on the ok/subscribed arm. `sonnet_week` is claude-only. */
+/** The `usage` sub-object on the ok/subscribed arm. */
 export interface ScrapeUsage {
   session?: UsageWindow;
   week?: UsageWindow;
+  /** Claude-only Sonnet weekly bucket. */
   sonnet_week?: UsageWindow;
+  /** Codex-only GPT-5.3-Codex-Spark 5h bucket. */
+  codex_spark_session?: UsageWindow;
+  /** Codex-only GPT-5.3-Codex-Spark weekly bucket. */
+  codex_spark_week?: UsageWindow;
 }
 
 /**

@@ -2428,9 +2428,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `backend_exec_generation_id` on existing terminal (ended/killed) jobs so a
   // dead job stops holding a tmux-recyclable pane id the reaper could
   // collateral-kill, fn-977 task .2 (a one-time data-fix UPDATE, no column/shape
-  // change, version-guarded). The v62→v63 epics-shape migration this test
-  // exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(92);
+  // change, version-guarded). v93 appends nullable codex-spark usage columns
+  // (additive ALTER, no epics-shape change). The v62→v63 epics-shape migration
+  // this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(93);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -3587,6 +3588,12 @@ test("fresh openDb has the schema-v23 usage table for the agentusage read surfac
   expect(byName.get("session_resets_at")?.type).toBe("TEXT");
   expect(byName.get("week_percent")?.type).toBe("REAL");
   expect(byName.get("week_resets_at")?.type).toBe("TEXT");
+  expect(byName.get("sonnet_week_percent")?.type).toBe("REAL");
+  expect(byName.get("sonnet_week_resets_at")?.type).toBe("TEXT");
+  expect(byName.get("codex_spark_session_percent")?.type).toBe("REAL");
+  expect(byName.get("codex_spark_session_resets_at")?.type).toBe("TEXT");
+  expect(byName.get("codex_spark_week_percent")?.type).toBe("REAL");
+  expect(byName.get("codex_spark_week_resets_at")?.type).toBe("TEXT");
   expect(byName.get("last_event_id")?.type).toBe("INTEGER");
   expect(byName.get("updated_at")?.type).toBe("REAL");
   expect(byName.get("updated_at")?.notnull).toBe(1);

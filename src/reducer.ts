@@ -2836,6 +2836,10 @@ interface UsageSnapshotPayload {
   week_resets_at: string | null;
   sonnet_week_percent: number | null;
   sonnet_week_resets_at: string | null;
+  codex_spark_session_percent: number | null;
+  codex_spark_session_resets_at: string | null;
+  codex_spark_week_percent: number | null;
+  codex_spark_week_resets_at: string | null;
   // Envelope freshness / plan / stale-error axes.
   status: string | null;
   /**
@@ -2903,6 +2907,24 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
         typeof parsed.sonnet_week_resets_at === "string"
           ? parsed.sonnet_week_resets_at
           : null,
+      codex_spark_session_percent:
+        typeof parsed.codex_spark_session_percent === "number" &&
+        Number.isFinite(parsed.codex_spark_session_percent)
+          ? parsed.codex_spark_session_percent
+          : null,
+      codex_spark_session_resets_at:
+        typeof parsed.codex_spark_session_resets_at === "string"
+          ? parsed.codex_spark_session_resets_at
+          : null,
+      codex_spark_week_percent:
+        typeof parsed.codex_spark_week_percent === "number" &&
+        Number.isFinite(parsed.codex_spark_week_percent)
+          ? parsed.codex_spark_week_percent
+          : null,
+      codex_spark_week_resets_at:
+        typeof parsed.codex_spark_week_resets_at === "string"
+          ? parsed.codex_spark_week_resets_at
+          : null,
       status: typeof parsed.status === "string" ? parsed.status : null,
       subscription_active: subscriptionActive,
       error_type:
@@ -2960,18 +2982,22 @@ function projectUsageRow(db: Database, event: Event): void {
   const hasUsagePercents =
     snapshot.session_percent != null ||
     snapshot.week_percent != null ||
-    snapshot.sonnet_week_percent != null;
+    snapshot.sonnet_week_percent != null ||
+    snapshot.codex_spark_session_percent != null ||
+    snapshot.codex_spark_week_percent != null;
   const isSuccessfulFold = snapshot.status === "active" || hasUsagePercents;
   const lastUsageFoldAt: number | null = isSuccessfulFold ? event.ts : null;
   db.run(
     `INSERT INTO usage (
        id, target, multiplier, session_percent, session_resets_at,
        week_percent, week_resets_at, sonnet_week_percent,
-       sonnet_week_resets_at, status, subscription_active,
+       sonnet_week_resets_at, codex_spark_session_percent,
+       codex_spark_session_resets_at, codex_spark_week_percent,
+       codex_spark_week_resets_at, status, subscription_active,
        error_type, error_message, error_at,
        rate_limit_lifts_at, last_usage_fold_at,
        last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -2981,6 +3007,10 @@ function projectUsageRow(db: Database, event: Event): void {
        week_resets_at = excluded.week_resets_at,
        sonnet_week_percent = excluded.sonnet_week_percent,
        sonnet_week_resets_at = excluded.sonnet_week_resets_at,
+       codex_spark_session_percent = excluded.codex_spark_session_percent,
+       codex_spark_session_resets_at = excluded.codex_spark_session_resets_at,
+       codex_spark_week_percent = excluded.codex_spark_week_percent,
+       codex_spark_week_resets_at = excluded.codex_spark_week_resets_at,
        status = excluded.status,
        subscription_active = excluded.subscription_active,
        error_type = excluded.error_type,
@@ -3011,6 +3041,10 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.week_resets_at,
       snapshot.sonnet_week_percent,
       snapshot.sonnet_week_resets_at,
+      snapshot.codex_spark_session_percent,
+      snapshot.codex_spark_session_resets_at,
+      snapshot.codex_spark_week_percent,
+      snapshot.codex_spark_week_resets_at,
       snapshot.status,
       snapshot.subscription_active,
       snapshot.error_type,

@@ -178,6 +178,12 @@ test("getCollection resolves the usage collection (fn-615)", () => {
     "session_resets_at",
     "week_percent",
     "week_resets_at",
+    "sonnet_week_percent",
+    "sonnet_week_resets_at",
+    "codex_spark_session_percent",
+    "codex_spark_session_resets_at",
+    "codex_spark_week_percent",
+    "codex_spark_week_resets_at",
     // Schema v35 (fn-642): colocated rate-limit columns.
     "last_rate_limit_at",
     "last_rate_limit_session_id",
