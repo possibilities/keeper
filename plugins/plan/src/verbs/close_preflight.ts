@@ -126,8 +126,17 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
   );
   const touchedRepos = epicDef.touched_repos as string[] | null | undefined;
 
-  // Tasks, ordinal-sorted, with runtime state merged in.
-  const mergedTasks = loadTasksForEpic(ctx, epicId).sort(
+  // Route EVERY plan-state read through a primary-rooted context, never the
+  // cwd ctx. In worktree mode the close runs from the epic's lane, but plan
+  // STATE (the runtime status overlay + done summaries) lives ONLY in the
+  // primary repo (`.keeper/.gitignore` is `state/`) — the committed defs are
+  // identical lane vs primary, so a cwd-resolved ctx silently reads stale
+  // lane state and reports TASKS_NOT_DONE. When cwd==primary (non-worktree /
+  // --project), contextForRoot(primaryRepo) is identical to ctx (a no-op).
+  const stateCtx = contextForRoot(primaryRepo);
+
+  // Tasks, ordinal-sorted, with runtime state merged in (from primary).
+  const mergedTasks = loadTasksForEpic(stateCtx, epicId).sort(
     (a, b) =>
       taskSortKey((a.id as string) ?? "") - taskSortKey((b.id as string) ?? ""),
   );
@@ -189,7 +198,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       title: t.title,
       status: t.status,
       target_repo: t.target_repo,
-      done_summary: t.id ? doneSummary(ctx.dataDir, t.id) : "",
+      done_summary: t.id ? doneSummary(stateCtx.dataDir, t.id) : "",
     })),
   };
   const briefRef = writeBriefArtifact(primaryRepo, epicId, brief);

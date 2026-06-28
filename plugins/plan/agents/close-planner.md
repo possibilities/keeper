@@ -111,7 +111,7 @@ Invariants the verb enforces at emission — hold to them so you don't waste a s
 Pipe it via a quoted heredoc:
 
 ```bash
-keeper plan verdict submit <EPIC_ID> --file - <<'VERDICT_EOF'
+keeper plan verdict submit <EPIC_ID> --project "$PRIMARY_REPO" --file - <<'VERDICT_EOF'
 <verdict JSON verbatim>
 VERDICT_EOF
 ```
@@ -196,7 +196,7 @@ tasks:
 Pipe via a quoted heredoc:
 
 ```bash
-keeper plan followup submit <EPIC_ID> --file - <<'YAML_EOF'
+keeper plan followup submit <EPIC_ID> --project "$PRIMARY_REPO" --file - <<'YAML_EOF'
 <follow-up plan YAML verbatim>
 YAML_EOF
 ```

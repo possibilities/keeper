@@ -21,7 +21,13 @@
 // wired `bun run test:slow` (KEEPER_PLAN_RUN_SLOW=1) spawns the real `git`.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,9 +35,16 @@ import {
   createWorktreeDriver,
   type WorktreeLaunchInfo,
 } from "../../../src/autopilot-worker.ts";
+import { briefPath } from "../src/audit_artifacts.ts";
 import { autoCommitFromInvocation } from "../src/commit.ts";
 import { resolveWorkerRepos, worktreeOverride } from "../src/runtime_status.ts";
-import { SLOW_ENABLED } from "./harness.ts";
+import {
+  parseCliOutput,
+  runCli,
+  SLOW_ENABLED,
+  seedRuntime,
+  seedState,
+} from "./harness.ts";
 
 function git(args: string[], cwd: string): string {
   const proc = Bun.spawnSync(["git", ...args], { cwd });
@@ -229,3 +242,81 @@ describe.skipIf(!SLOW_ENABLED)("worktree-lane lifecycle (real git)", () => {
     }
   });
 });
+
+// The close-phase plan-state-to-primary fix, proven on a REAL worktree: the
+// gitignored state/ is genuinely absent from the lane checkout (not simulated by
+// an rm as the pure tier does), while the committed defs are present. The pure
+// analogue lives in worktree-close-state.test.ts.
+describe.skipIf(!SLOW_ENABLED)(
+  "close-preflight from a real lane worktree (real git)",
+  () => {
+    let main: string;
+    let home: string;
+
+    beforeEach(() => {
+      main = realpathSync(mkdtempSync(join(tmpdir(), "planctl-wt-cpf-main-")));
+      git(["init", "-q", "-b", "main"], main);
+      git(["config", "user.email", "test@planctl.local"], main);
+      git(["config", "user.name", "Planctl Test"], main);
+      git(["config", "commit.gpgsign", "false"], main);
+      home = realpathSync(mkdtempSync(join(tmpdir(), "planctl-wt-cpf-home-")));
+    });
+
+    afterEach(() => {
+      for (const dir of [main, home]) {
+        if (dir) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    test("a done epic whose state lives only in primary reads ready-to-close from the lane", () => {
+      const epicId = "fn-1-lane-close";
+      const [, taskIds] = seedState(main, {
+        epicId,
+        nTasks: 2,
+        primaryRepo: main,
+      });
+      for (const tid of taskIds) {
+        seedRuntime(main, tid, { status: "done" });
+      }
+
+      // Commit the defs with REAL git — the inner .keeper/.gitignore (`state/`)
+      // keeps the runtime overlay out of the index, so it stays primary-only.
+      git(["add", ".keeper"], main);
+      git(["commit", "-q", "-m", "seed defs"], main);
+
+      // A real lane worktree: it checks out the committed defs but NOT the
+      // gitignored state/ — the exact condition the routing fix addresses.
+      const lane = mkdtempSync(join(tmpdir(), "planctl-wt-cpf-lane-"));
+      rmSync(lane, { recursive: true, force: true });
+      git(
+        ["worktree", "add", "-q", "-b", "keeper/epic/lane", lane, "HEAD"],
+        main,
+      );
+
+      try {
+        const laneReal = realpathSync(lane);
+        // The lane has the committed defs but the gitignored state/ is absent.
+        expect(
+          existsSync(join(laneReal, ".keeper", "epics", `${epicId}.json`)),
+        ).toBe(true);
+        expect(existsSync(join(laneReal, ".keeper", "state"))).toBe(false);
+
+        const r = runCli(["close-preflight", epicId], { cwd: laneReal, home });
+        expect(r.code).toBe(0);
+        const env = parseCliOutput(r.output);
+        expect(env.all_done).toBe(true);
+        expect(env.primary_repo).toBe(main);
+
+        // The brief landed in primary, never the lane.
+        expect(existsSync(briefPath(main, epicId))).toBe(true);
+        expect(existsSync(briefPath(laneReal, epicId))).toBe(false);
+      } finally {
+        gitQuiet(["worktree", "remove", "--force", lane], main);
+        gitQuiet(["worktree", "prune"], main);
+        rmSync(lane, { recursive: true, force: true });
+      }
+    });
+  },
+);

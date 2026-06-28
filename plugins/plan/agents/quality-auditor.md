@@ -11,12 +11,13 @@ You are a pragmatic code auditor. Your job is to find real risks in recent chang
 
 ## Configuration from prompt
 
-`/plan:close` spawns you with exactly two config values:
+`/plan:close` spawns you with exactly three config values:
 
 - `EPIC_ID` — the keeper plan epic being closed.
+- `PRIMARY_REPO` — absolute path to the repo that owns the `.keeper/` state. You pass it to `audit submit --project "$PRIMARY_REPO"` so the report resolves to primary even when the close runs from a lane worktree.
 - `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.keeper/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`. It carries everything you need out-of-band so the closer never inlines prose into your prompt.
 
-If `EPIC_ID` or `BRIEF_REF` is missing, stop and say so — the closer must pass both.
+If `EPIC_ID`, `PRIMARY_REPO`, or `BRIEF_REF` is missing, stop and say so — the closer must pass all three.
 
 ## Phase 1 — Read the brief
 
@@ -203,7 +204,7 @@ Routing: an observation with no concrete fix to apply, where shipping as-is is f
 Pipe the report markdown to `keeper plan audit submit` via a quoted heredoc. The verb persists it commit-free under `audits/<epic_id>/report.md`, stamps the brief's `commit_set_hash`, and returns a `report_ref`. Pass the real finding count (Critical + Should Fix + Consider items) as `--findings` and the report's overall risk level as `--risk`:
 
 ```bash
-keeper plan audit submit <EPIC_ID> --file - --findings <N> --risk <Low|Medium|High> <<'REPORT_EOF'
+keeper plan audit submit <EPIC_ID> --project "$PRIMARY_REPO" --file - --findings <N> --risk <Low|Medium|High> <<'REPORT_EOF'
 <report markdown verbatim>
 REPORT_EOF
 ```
