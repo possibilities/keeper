@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-28T00:25:25.124000Z",
+  "depends_on": [
+    "fn-991-fix-worktree-base-teardown-guard-and.1"
+  ],
+  "epic": "fn-991-fix-worktree-base-teardown-guard-and",
+  "id": "fn-991-fix-worktree-base-teardown-guard-and.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "re-push stranded merge before base teardown",
+  "updated_at": "2026-06-28T00:25:25.124000Z"
+}
