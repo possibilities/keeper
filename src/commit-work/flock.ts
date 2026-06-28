@@ -53,6 +53,22 @@ const EWOULDBLOCK = 35; // == EAGAIN on darwin; flock(LOCK_NB) on a held lock
 
 const LE = true; // both supported targets are little-endian
 
+// Bounded-deadline poll schedule for {@link CommitWorkLock.acquireWithDeadline}.
+// A blocking `flock(LOCK_EX)` cannot be interrupted in-process (no timer/signal
+// reaches a blocked FFI syscall in Bun), so the deadline variant POLLS the
+// non-blocking `tryAcquire` with jittered exponential backoff instead.
+const LOCK_BACKOFF_START_MS = 20; // first wait between contention polls
+const LOCK_BACKOFF_CAP_MS = 500; // backoff never grows past this per-poll
+
+/**
+ * Default deadline (ms) for {@link CommitWorkLock.acquireWithDeadline}. Generous
+ * — a commit-work / base-merge window holds the lock only for the brief stage →
+ * commit/merge → push, so 45s tolerates a slow-but-progressing holder while
+ * still bounding the wait so a stuck holder degrades the worktree merge to a
+ * retry-skip rather than freezing the reconcile cycle.
+ */
+export const COMMIT_WORK_LOCK_DEADLINE_MS = 45_000;
+
 interface LibcSyms {
   // flock(int fd, int operation) -> int
   flock: (fd: number, operation: number) => number;
@@ -214,6 +230,41 @@ export class CommitWorkLock {
     }
 
     return new CommitWorkLock(fd, lib, syms);
+  }
+
+  /**
+   * Acquire `LOCK_EX` within `deadlineMs`, or return `null` on timeout. POLLS
+   * the non-blocking {@link tryAcquire} with jittered exponential backoff (start
+   * {@link LOCK_BACKOFF_START_MS}, cap {@link LOCK_BACKOFF_CAP_MS}) rather than a
+   * blocking `flock(LOCK_EX)`, because a blocked FFI syscall cannot be timed out
+   * in-process. The OPT-IN bounded acquirer for the autopilot worktree merge
+   * path: a stuck holder degrades that merge to a retry-skip instead of freezing
+   * the reconcile worker thread. PRODUCER-only — the bounded backoff-sleep is
+   * acceptable here (the test-tier "poll, don't sleep" rule governs tests). The
+   * default verb (`cli/commit-work.ts`) keeps the plain blocking {@link acquire}.
+   */
+  static async acquireWithDeadline(
+    lockPath: string,
+    deadlineMs: number = COMMIT_WORK_LOCK_DEADLINE_MS,
+  ): Promise<CommitWorkLock | null> {
+    const start = Date.now();
+    let backoff = LOCK_BACKOFF_START_MS;
+    for (;;) {
+      const lock = CommitWorkLock.tryAcquire(lockPath);
+      if (lock !== null) {
+        return lock;
+      }
+      const remaining = deadlineMs - (Date.now() - start);
+      if (remaining <= 0) {
+        return null;
+      }
+      // Jitter ±50% so concurrent waiters never lock-step their polls, and never
+      // sleep PAST the deadline (a tiny deadline still terminates promptly).
+      const jittered = backoff * (0.5 + Math.random());
+      const wait = Math.min(jittered, remaining);
+      await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      backoff = Math.min(backoff * 2, LOCK_BACKOFF_CAP_MS);
+    }
   }
 
   /**

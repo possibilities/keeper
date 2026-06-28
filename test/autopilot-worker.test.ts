@@ -4861,6 +4861,159 @@ test("fn-992 finalizeEpic: a stranded base (absent from origin) while HEAD is OF
   expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
 });
 
+test("fn-993 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → { kind: 'lock-timeout' }, NO merge, NO push (degrade, never freeze)", async () => {
+  // EDGE-2a: the bounded flock acquirer could not take the lock within its
+  // deadline (modeled by a null-returning acquirer). The shared core surfaces the
+  // raw `lock-timeout` discriminant — NO merge attempted, NO push, NO reason
+  // string (the caller maps it to its own `worktree-{finalize,recover}-*` family).
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // base AHEAD / not already merged
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    // Bounded acquirer that TIMED OUT → null. mergeBranchInto maps it to lock-timeout.
+    () => null,
+  );
+  expect(res).toEqual({ kind: "lock-timeout" });
+  // A raw discriminant carries no reason — it can never auto-clear a finalize block.
+  expect(isWorktreeRecoverReason((res as { kind: string }).kind)).toBe(false);
+  // The merge never ran (lock not held) and nothing was REALLY pushed (the
+  // turn-key `push --dry-run` probe is read-only and runs before the lock).
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-993 mergeLaneBaseIntoDefault: a local `merge --no-edit` TIMEOUT (124) → { kind: 'local-timeout' }, NOT conflict, NO push", async () => {
+  // EDGE-2b: a blocking git hook makes the local merge spawn exceed its timeout →
+  // the GNU-timeout sentinel. It must degrade to a TRANSIENT local-timeout, NEVER
+  // be mistaken for a content conflict (which would be a sticky operator block).
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // base AHEAD / not already merged
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "local-timeout" });
+  expect(res.kind).not.toBe("conflict");
+  // The timed-out merge never advances origin behind an un-landed merge (the
+  // read-only turn-key `push --dry-run` may run; the real `push origin` must not).
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-993 finalizeEpic: a local merge timeout → worktree-finalize-local-timeout retry-skip (NOT a recover reason), NO teardown", async () => {
+  // The finalize caller maps the shared core's local-timeout to a FINALIZE-side
+  // reason (OUTSIDE the recover auto-clear prefix) with `retry: true` — a clean
+  // skip-and-retry, never a teardown behind an un-landed merge. The real bounded
+  // FFI flock is taken on a free temp lock file (acquires immediately), so the
+  // merge is reached; only the merge spawn times out.
+  const lockDir = mkdtempSync(join(tmpdir(), "kw-finalize-locktimeout-"));
+  try {
+    const cmds: string[] = [];
+    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+      args,
+    ) => {
+      const joined = args.join(" ");
+      cmds.push(joined);
+      if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
+        return { code: 0, stdout: `${lockDir}\n`, stderr: "" }; // real, writable
+      }
+      if (joined === "rev-parse --abbrev-ref HEAD") {
+        return { code: 0, stdout: "main\n", stderr: "" }; // on default
+      }
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        return { code: 0, stdout: "abc\n", stderr: "" }; // base/origin refs exist
+      }
+      if (joined.startsWith("symbolic-ref")) {
+        return { code: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (joined.startsWith("status --porcelain")) {
+        return { code: 0, stdout: "", stderr: "" }; // clean checkout
+      }
+      if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+        return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
+      }
+      if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+        return { code: 0, stdout: "", stderr: "" }; // ff-able
+      }
+      if (joined.startsWith("merge-base --is-ancestor")) {
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      if (joined.startsWith("merge --no-edit")) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" }; // blocking hook
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+      makeFinalizeInfo(),
+      async () => true,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toMatch(/^worktree-finalize-local-timeout:/);
+      expect(res.retry).toBe(true);
+      // A finalize reason must NEVER satisfy the recover auto-clear prefix.
+      expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+    }
+    // No real push behind the un-landed merge, no teardown (the read-only
+    // turn-key `push --dry-run` probe may run; the real `push origin` must not).
+    expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+    expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+    expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+});
+
 test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (fake lock, no real flock)", async () => {
   // The shared merge routine both finalize and recover pass-2 drive. A lane base
   // that is NOT an ancestor of default carries real commits → it merges (under the
@@ -5823,6 +5976,7 @@ function makeRecoveryGit(state: {
   noPushTarget?: boolean; // `@{push}` does not resolve → not turn-key
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   mergeConflict?: boolean; // a real merge hits a conflict
+  mergeTimeout?: boolean; // the local `merge --no-edit` spawn times out (a blocking hook)
   pushFails?: boolean;
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
@@ -5964,6 +6118,9 @@ function makeRecoveryGit(state: {
         : { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("merge --no-edit")) {
+      if (state.mergeTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
       return state.mergeConflict
         ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
         : { code: 0, stdout: "", stderr: "" };
@@ -6215,6 +6372,74 @@ test("fn-990 recoverWorktrees pass-3: an UNMERGED orphan base is preserved (neve
     false,
   );
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-993 recoverWorktrees pass-2: a lock-timeout acquirer (null) → worktree-recover-lock-timeout (a recover reason), NO push, NO teardown", async () => {
+  // EDGE-2a recover side: a done-but-unmerged base whose bounded flock acquire
+  // times out degrades to a TRANSIENT defer INSIDE the `worktree-recover-*` prefix
+  // (the level-triggered auto-clear lifts it once the lock frees) — never a freeze,
+  // never a teardown behind an un-landed merge.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // base AHEAD → pass-2 attempts the merge
+    repoHead: "main",
+  });
+  // Epic DONE → pass-2 merges; the injected acquirer TIMES OUT (null).
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    () => null,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toMatch(/^worktree-recover-lock-timeout:/);
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  // The merge never ran (lock not held), nothing REALLY pushed (the turn-key
+  // `push --dry-run` probe is read-only), nothing torn down.
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  expect(calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
+});
+
+test("fn-993 recoverWorktrees pass-2: a local merge timeout (124) → worktree-recover-local-timeout (a recover reason), NOT conflict, NO push", async () => {
+  // EDGE-2b recover side: a blocking git hook times out the local merge spawn →
+  // a TRANSIENT recover defer, never mistaken for a content conflict.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // base AHEAD → pass-2 attempts the merge
+    repoHead: "main",
+    mergeTimeout: true, // the `merge --no-edit` spawn times out
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toMatch(/^worktree-recover-local-timeout:/);
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  expect(failures[0]?.reason).not.toContain("conflict");
+  // A timed-out merge never advances origin behind it (read-only `push --dry-run`
+  // may run; the real `push origin` must not).
+  expect(calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
 });
 
 test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failure and continues (never throws)", async () => {

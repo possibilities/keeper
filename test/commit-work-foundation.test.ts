@@ -313,4 +313,44 @@ describe("CommitWorkLock", () => {
     expect(third).not.toBeNull();
     third?.release();
   });
+
+  test("acquireWithDeadline TIMES OUT (→ null) while another holder owns the lock", async () => {
+    const lockPath = join(tmpDir, "keeper-commit-work.lock");
+    const held = CommitWorkLock.acquire(lockPath);
+    try {
+      // Real FFI in-process: the held lock forces the bounded poll to exhaust its
+      // (tiny) deadline and degrade to null — never a freeze on a blocking acquire.
+      const start = Date.now();
+      const timedOut = await CommitWorkLock.acquireWithDeadline(lockPath, 100);
+      const elapsed = Date.now() - start;
+      expect(timedOut).toBeNull();
+      // It actually WAITED out the deadline (poll-retried), and bounded it — not an
+      // instant null, not a runaway. Generous upper bound for CI scheduling jitter.
+      expect(elapsed).toBeGreaterThanOrEqual(90);
+      expect(elapsed).toBeLessThan(5_000);
+    } finally {
+      held.release();
+    }
+  });
+
+  test("acquireWithDeadline returns the lock once the holder releases", async () => {
+    const lockPath = join(tmpDir, "keeper-commit-work.lock");
+    const held = CommitWorkLock.acquire(lockPath);
+    // Release shortly; the bounded poll must then acquire well within its deadline.
+    setTimeout(() => held.release(), 30);
+    const lock = await CommitWorkLock.acquireWithDeadline(lockPath, 5_000);
+    expect(lock).not.toBeNull();
+    lock?.release();
+  });
+
+  test("acquireWithDeadline takes a free lock on the first poll", async () => {
+    const lockPath = join(tmpDir, "keeper-commit-work.lock");
+    const lock = await CommitWorkLock.acquireWithDeadline(lockPath, 5_000);
+    expect(lock).not.toBeNull();
+    lock?.release();
+    // And a fresh bounded acquire after release succeeds immediately too.
+    const again = await CommitWorkLock.acquireWithDeadline(lockPath, 5_000);
+    expect(again).not.toBeNull();
+    again?.release();
+  });
 });

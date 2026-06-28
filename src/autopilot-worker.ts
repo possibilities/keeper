@@ -2516,6 +2516,23 @@ export function createWorktreeDriver(
               reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
             };
           }
+          // A bounded-lock / local-op (blocking hook) timeout means the pre-merge
+          // did NOT land — surface it rather than fall through as if merged (which
+          // would launch the lane off an incomplete fan-in). Provision carries no
+          // retry flag, so this is a sticky `work::` block a human clears once the
+          // lock/hook frees; `worktree-merge-*` (NOT a recover/finalize reason).
+          if (merge.kind === "lock-timeout") {
+            return {
+              ok: false,
+              reason: `worktree-merge-lock-timeout: could not acquire the commit-work lock for ${worktreePath} within the deadline (a concurrent holder) merging ${source} into ${branch} — retry once the lock frees`,
+            };
+          }
+          if (merge.kind === "local-timeout") {
+            return {
+              ok: false,
+              reason: `worktree-merge-local-timeout: a local git op merging ${source} into ${branch} timed out (a blocking git hook) — retry once the hook clears`,
+            };
+          }
         }
         // Assert HEAD == derived branch AND the worktree is registered.
         const registered = await gitListWorktrees(repoDir, run);
@@ -2638,6 +2655,20 @@ export function createWorktreeDriver(
           case "push-unconfirmed":
             return retrySkip(
               `worktree-finalize-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${baseBranch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+            );
+          case "lock-timeout":
+            // The bounded commit-work flock could not be taken within its deadline
+            // (a concurrent holder). A TRANSIENT skip — retry next cycle, never a
+            // freeze, never a teardown on an un-merged base. `worktree-finalize-*`
+            // (OUTSIDE the recover auto-clear prefix), `retry: true` so no sticky.
+            return retrySkip(
+              `worktree-finalize-lock-timeout: could not acquire the commit-work lock for ${repoDir} within the deadline (a concurrent holder, no fetch/rebase/force) — deferring the base merge until the lock frees`,
+            );
+          case "local-timeout":
+            // A local merge git op timed out — almost always a blocking git hook.
+            // TRANSIENT skip-retry, NEVER mistaken for a content conflict.
+            return retrySkip(
+              `worktree-finalize-local-timeout: a local git op merging ${baseBranch} into ${defaultBranch} in ${repoDir} timed out (a blocking git hook, no fetch/rebase/force) — retrying the base merge next cycle`,
             );
           case "conflict":
             return {
@@ -2775,6 +2806,11 @@ export type MergeLaneResult =
   | { kind: "push-timeout" }
   | { kind: "push-failed"; detail: string }
   | { kind: "push-unconfirmed" }
+  // The bounded flock acquirer timed out / a local merge git op (a blocking hook)
+  // timed out — TRANSIENT retry-skips the caller maps to its own reason family
+  // (`worktree-finalize-*` / `worktree-recover-*`), never a freeze, never a sticky.
+  | { kind: "lock-timeout" }
+  | { kind: "local-timeout" }
   | { kind: "merged" };
 
 /**
@@ -2965,6 +3001,15 @@ export async function mergeLaneBaseIntoDefault(
     : await gitMergeBranchInto(repo, baseBranch, run);
   if (merge.kind === "conflict") {
     return { kind: "conflict", stderr: merge.stderr };
+  }
+  // A bounded-lock or local-op (blocking hook) timeout means NO merge landed —
+  // surface the transient degrade so the caller skip-retries; NEVER fall through
+  // to the push (which would advance origin past an un-merged base).
+  if (merge.kind === "lock-timeout") {
+    return { kind: "lock-timeout" };
+  }
+  if (merge.kind === "local-timeout") {
+    return { kind: "local-timeout" };
   }
   // Branch-explicit push, NOT a bare `push`: under `push.default=simple` a
   // no-refspec push targets the CURRENT HEAD's upstream, so off-default it would
@@ -3199,6 +3244,25 @@ export async function recoverWorktrees(
             failures.push({
               epicId: base.epicId,
               reason: `worktree-recover-push-failed: ${merge.detail}`,
+              dir: repo,
+            });
+            continue;
+          case "lock-timeout":
+            // The bounded commit-work flock could not be taken within its deadline.
+            // A TRANSIENT defer INSIDE the `worktree-recover-*` auto-clear prefix —
+            // the block lifts the moment the lock frees (no `retry_dispatch`).
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-lock-timeout: could not acquire the commit-work lock for ${repo} within the deadline (a concurrent holder) merging ${base.branch} — retrying next cycle`,
+              dir: repo,
+            });
+            continue;
+          case "local-timeout":
+            // A local merge git op timed out (a blocking hook) — a TRANSIENT defer,
+            // never a content conflict.
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-local-timeout: a local git op merging ${base.branch} into ${defaultBranch} in ${repo} timed out (a blocking git hook) — retrying next cycle`,
               dir: repo,
             });
             continue;

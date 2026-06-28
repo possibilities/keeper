@@ -58,6 +58,20 @@ export const GIT_SPAWN_TIMEOUT_CODE = 124;
 export const GIT_PUSH_TIMEOUT_MS = 120_000;
 
 /**
+ * Wall-clock bound (ms) for a LOCAL git op (merge / merge --abort / worktree
+ * remove / worktree prune / branch -D / rev-parse / merge-base) on the worktree
+ * merge + teardown path. SMALLER than {@link GIT_PUSH_TIMEOUT_MS}: a local op
+ * touches only the on-disk repo, so the only thing that makes one hang is a
+ * blocking git HOOK (a `merge`'s pre-merge-commit / post-merge running an
+ * interactive or wedged command). Generous enough that a legitimately slow hook
+ * (a linter) is never killed, while bounding a hung hook that would otherwise
+ * freeze the reconcile worker thread. A spawn that exceeds it reports
+ * {@link GIT_SPAWN_TIMEOUT_CODE}, which the worktree merge path degrades to a
+ * transient retry-skip (never a freeze, never a sticky conflict).
+ */
+export const GIT_LOCAL_TIMEOUT_MS = 60_000;
+
+/**
  * The function shape every commit-work git boundary depends on. Production uses
  * {@link spawnGitExec} (a real `git` subprocess); tests inject a fake recording
  * runner so the suite exercises keeper's DECISIONS (pathspec, subject, push

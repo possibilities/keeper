@@ -38,17 +38,29 @@
  */
 
 import { CommitWorkLock } from "./commit-work/flock";
-import { type GitRunner, gitExec } from "./commit-work/git-exec";
+import {
+  GIT_LOCAL_TIMEOUT_MS,
+  GIT_SPAWN_TIMEOUT_CODE,
+  type GitRunner,
+  gitExec,
+} from "./commit-work/git-exec";
 
 /**
- * Acquire the shared commit-work flock, returning a releasable handle. Injectable
- * so the fast tier can stub the lock (the real FFI flock is exercised by the
- * slow real-git test); production uses the blocking {@link CommitWorkLock.acquire}.
+ * Acquire the shared commit-work flock, returning a releasable handle — or `null`
+ * when a bounded acquirer times out. Injectable so the fast tier can stub the lock
+ * (the real FFI flock is exercised by the slow real-git test); production uses the
+ * DEADLINE-bounded {@link CommitWorkLock.acquireWithDeadline} so a stuck holder
+ * degrades the worktree merge to a retry-skip rather than freezing the reconcile
+ * cycle. The return is `MaybePromise`-shaped so a synchronous stub (`() => ({
+ * release(){} })`) and the async production acquirer both satisfy it; a `null`
+ * resolution is the timeout signal {@link mergeBranchInto} maps to `lock-timeout`.
  */
-export type LockAcquirer = (lockPath: string) => { release(): void };
+export type LockAcquirer = (
+  lockPath: string,
+) => { release(): void } | null | Promise<{ release(): void } | null>;
 
 const defaultLockAcquirer: LockAcquirer = (lockPath) =>
-  CommitWorkLock.acquire(lockPath);
+  CommitWorkLock.acquireWithDeadline(lockPath);
 
 /** The fallback default-branch chain, tried in order when origin/HEAD is unset. */
 export const DEFAULT_BRANCH_FALLBACKS = [
@@ -78,7 +90,24 @@ export type MergeResult =
    * `MERGE_HEAD` was present). The caller fails loud + stops; `stderr` carries
    * git's conflict output for the sticky DispatchFailed.
    */
-  | { kind: "conflict"; stderr: string };
+  | { kind: "conflict"; stderr: string }
+  /**
+   * The bounded {@link LockAcquirer} could not take the per-worktree commit-work
+   * flock within its deadline — another holder (a concurrent commit-work or a
+   * stuck process) owns it. A TRANSIENT degrade: the caller skip-retries the
+   * merge next cycle rather than freezing the reconcile thread on a blocking
+   * acquire. Never a content failure — no merge was attempted.
+   */
+  | { kind: "lock-timeout" }
+  /**
+   * A LOCAL git op on the merge path (the `merge --no-edit` itself, or the
+   * source-ref probe) exceeded {@link GIT_LOCAL_TIMEOUT_MS} and was SIGKILLed —
+   * almost always a blocking/wedged git hook. A TRANSIENT degrade like
+   * {@link lock-timeout}: the caller skip-retries, never a frozen cycle, and
+   * NEVER a sticky `conflict` (a timed-out merge's non-zero exit must not be
+   * mistaken for a content conflict).
+   */
+  | { kind: "local-timeout" };
 
 /** Outcome of a worktree removal attempt. */
 export type RemoveResult =
@@ -339,7 +368,10 @@ export async function deleteBranch(
   branch: string,
   run: GitRunner = gitExec,
 ): Promise<boolean> {
-  const r = await run(["branch", "-D", branch], { cwd });
+  const r = await run(["branch", "-D", branch], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
   return r.code === 0;
 }
 
@@ -387,7 +419,10 @@ export async function pruneWorktrees(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<void> {
-  await run(["worktree", "prune", "--expire", "now"], { cwd });
+  await run(["worktree", "prune", "--expire", "now"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
 }
 
 /**
@@ -440,6 +475,7 @@ export async function isAncestorOf(
 ): Promise<boolean> {
   const r = await run(["merge-base", "--is-ancestor", maybeAncestor, ref], {
     cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
   return r.code === 0;
 }
@@ -780,38 +816,62 @@ export async function mergeBranchInto(
       "--end-of-options",
       `refs/heads/${sourceBranch}^{commit}`,
     ],
-    { cwd: worktreePath },
+    { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
+  // A timed-out probe is a transient stall (a blocking hook is unusual on
+  // rev-parse, but bound it anyway) — degrade to a retry-skip rather than let a
+  // 124 masquerade as `missing-source` (a permanent lossless skip).
+  if (sourceExists.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "local-timeout" };
+  }
   if (sourceExists.code !== 0) {
     return { kind: "missing-source" };
   }
 
-  // Idempotent skip: already merged in (or fast-forward-equal).
+  // Idempotent skip: already merged in (or fast-forward-equal). A timed-out
+  // is-ancestor (124) falls through to the bounded lock+merge below, which
+  // re-derives the verdict (an already-merged source merges as "Already up to
+  // date" → `merged`) — so it needs no distinct timeout branch here.
   const isAncestor = await run(
     ["merge-base", "--is-ancestor", sourceBranch, "HEAD"],
-    { cwd: worktreePath },
+    { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
   if (isAncestor.code === 0) {
     return { kind: "already-merged" };
   }
 
   const lockPath = await commitWorkLockPath(worktreePath, run);
-  const lock = acquireLock(lockPath);
+  const lock = await acquireLock(lockPath);
+  // A bounded acquirer returns null when it cannot take the flock within its
+  // deadline — degrade to a retry-skip, NEVER block the reconcile thread.
+  if (lock === null) {
+    return { kind: "lock-timeout" };
+  }
   try {
     const merge = await run(["merge", "--no-edit", sourceBranch], {
       cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
     });
     if (merge.code === 0) {
       return { kind: "merged" };
+    }
+    // A SIGKILLed timeout (124) must NOT be read as a content conflict: a blocking
+    // merge hook is transient, so degrade to a retry-skip. Check it BEFORE the
+    // conflict/abort path (git's 1/128 conflict codes never collide with 124).
+    if (merge.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return { kind: "local-timeout" };
     }
     // Non-zero: a conflict (or other failure). Abort iff a MERGE_HEAD exists,
     // so a merge that never started is not spuriously "aborted".
     const mergeHead = await run(
       ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-      { cwd: worktreePath },
+      { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
     );
     if (mergeHead.code === 0) {
-      await run(["merge", "--abort"], { cwd: worktreePath });
+      await run(["merge", "--abort"], {
+        cwd: worktreePath,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
     }
     return {
       kind: "conflict",
@@ -837,7 +897,10 @@ export async function removeWorktree(
   if (!existing.some((e) => samePath(e.path, path))) {
     return { kind: "removed" }; // already gone
   }
-  const r = await run(["worktree", "remove", path], { cwd });
+  const r = await run(["worktree", "remove", path], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
   if (r.code === 0) {
     return { kind: "removed" };
   }
