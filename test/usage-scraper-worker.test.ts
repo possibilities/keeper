@@ -20,6 +20,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -95,6 +96,9 @@ function makeDeps(
       subscription_active: true,
     }),
     shutdownSignal: liveSignal,
+    // Default the in-cycle tier re-resolve at the sandbox home so a cycle test is
+    // deterministic on both CI and a dev box with a real `~/.claude-profiles`.
+    homeDir: tmpDir,
     ...overrides,
   };
 }
@@ -209,6 +213,8 @@ describe("AccountLoop success cycle", () => {
       multiplier: 5,
     };
     const clock = fixedClock("2026-06-24T12:00:00-04:00");
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Pre-seed a stale error sidecar to assert it is cleared on success.
     writeFileSync(join(tmpDir, "default.error.json"), "{}");
     const calls: ScrapeAccount[] = [];
@@ -378,6 +384,8 @@ describe("AccountLoop idle gate", () => {
       profile: "default",
       multiplier: 5,
     };
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Prior non-stale envelope so the gate engages (the gate only runs with a prior).
     writeFileSync(
       join(tmpDir, "default.json"),
@@ -480,6 +488,8 @@ describe("AccountLoop cooldown gate", () => {
       profile: "default",
       multiplier: 5,
     };
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Prior envelope with a future lift_at.
     writeFileSync(
       join(tmpDir, "default.json"),
@@ -576,6 +586,227 @@ describe("AccountLoop cooldown gate", () => {
   });
 });
 
+describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
+  // A prior envelope at `mult`, parked with a future lift_at so the cooldown gate
+  // would normally park the account until the lift.
+  function writeParkedPrior(mult: number, lift: string): void {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: mult,
+    };
+    writeFileSync(
+      join(tmpDir, "default.json"),
+      JSON.stringify(
+        buildEnvelope(acct, {
+          status: "active",
+          subscription_active: true,
+          usage: { session: { percent_used: 100, resets_at: lift } },
+          lift_at: lift,
+          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_skipped_fetch_at: null,
+          last_failed_fetch_at: null,
+          next_fetch_at: "2026-06-24T11:02:00-04:00",
+          error: null,
+        }),
+        null,
+        2,
+      ),
+    );
+  }
+
+  test("a parked cooldown wake re-resolves + rewrites the multiplier, caps the sleep, no scrape", async () => {
+    // In-memory acct is stale at 1x; the config + on-disk envelope both say 20x.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 1,
+    };
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_20x");
+    writeParkedPrior(20, "2026-06-25T00:00:00-04:00"); // a day out → parks
+    const calls: ScrapeAccount[] = [];
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      latestActivity: () =>
+        new Date("2026-06-24T12:00:00-04:00").getTime() / 1000,
+      runScrape: stubRunner(
+        {
+          kind: "ok",
+          no_subscription: false,
+          usage: {},
+          subscription_active: true,
+        },
+        calls,
+      ),
+    });
+    const sleepSec = await new AccountLoop(acct, deps).runCycleNoThrow();
+
+    expect(calls).toHaveLength(0); // parked → no network scrape
+    // The day-long cooldown sleep is capped to the ~60s poll window.
+    expect(sleepSec).toBeGreaterThan(0);
+    expect(sleepSec).toBe(60);
+    const env = readEnvelope(tmpDir, "default");
+    expect(env.status).toBe("idle");
+    expect(env.multiplier).toBe(20); // re-resolved 1 → 20 on a no-scrape wake
+  });
+
+  test("a multiplier change vs the on-disk prior bypasses both gates → full scrape", async () => {
+    // Boot already corrected acct to 20x (the 16MB fix); the on-disk envelope is
+    // FROZEN at 1x with a future lift AND the account is idle — both gates must yield.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 20,
+    };
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_20x");
+    writeParkedPrior(1, "2026-06-25T00:00:00-04:00");
+    const calls: ScrapeAccount[] = [];
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      latestActivity: () => 0, // idle too — must still be bypassed
+      runScrape: stubRunner(
+        {
+          kind: "ok",
+          no_subscription: false,
+          usage: {},
+          subscription_active: true,
+        },
+        calls,
+      ),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+
+    expect(calls).toHaveLength(1); // the change forced a scrape past both gates
+    const env = readEnvelope(tmpDir, "default");
+    expect(env.status).toBe("active");
+    expect(env.multiplier).toBe(20); // the corrected tier reached the envelope
+  });
+
+  test("a >interval no-scrape sleep is capped, but a post-scrape failure backoff is not", async () => {
+    // (1) No-scrape: a week-out cooldown lift is capped to the poll window.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
+    writeParkedPrior(5, "2026-07-01T00:00:00-04:00"); // a WEEK out
+    const noScrapeSleep = await new AccountLoop(
+      { id: "default", target: "claude", profile: "default", multiplier: 5 },
+      makeDeps({
+        stateDir: tmpDir,
+        clock: fixedClock("2026-06-24T12:00:00-04:00"),
+        latestActivity: () =>
+          new Date("2026-06-24T12:00:00-04:00").getTime() / 1000,
+      }),
+    ).runCycleNoThrow();
+    expect(noScrapeSleep).toBe(60); // capped — NOT the week-long lift
+
+    // (2) Post-scrape: the /usage rate-limit backoff stays at its full 15m, uncapped.
+    const failingDir = mkdtempSync(join(tmpdir(), "usage-scraper-cap-"));
+    try {
+      const failed = await new AccountLoop(
+        { id: "default", target: "claude", profile: "default", multiplier: 5 },
+        makeDeps({
+          stateDir: failingDir,
+          clock: fixedClock("2026-06-24T12:00:00-04:00"),
+          runScrape: stubRunner({
+            kind: "error",
+            error_type: "ClaudeUsageEndpointRateLimited",
+            message: "rate limited",
+            screen_excerpt: [],
+          }),
+        }),
+      ).runCycleNoThrow();
+      expect(failed).toBe(15 * 60); // far above the cap → not capped
+    } finally {
+      rmSync(failingDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a redundant parked wake (already idle, same multiplier) suppresses the re-write + event", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
+    // Prior is ALREADY an idle heartbeat at 5x with a future lift — a parked wake.
+    writeFileSync(
+      join(tmpDir, "default.json"),
+      JSON.stringify(
+        buildEnvelope(acct, {
+          status: "idle",
+          subscription_active: true,
+          usage: {
+            session: {
+              percent_used: 100,
+              resets_at: "2026-06-25T00:00:00-04:00",
+            },
+          },
+          lift_at: "2026-06-25T00:00:00-04:00",
+          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_skipped_fetch_at: "2026-06-24T11:30:00-04:00",
+          last_failed_fetch_at: null,
+          next_fetch_at: "2026-06-24T11:31:00-04:00",
+          error: null,
+        }),
+        null,
+        2,
+      ),
+    );
+    const before = readFileSync(join(tmpDir, "default.json"), "utf8");
+    const sleepSec = await new AccountLoop(
+      acct,
+      makeDeps({
+        stateDir: tmpDir,
+        clock: fixedClock("2026-06-24T12:00:00-04:00"),
+        latestActivity: () =>
+          new Date("2026-06-24T12:00:00-04:00").getTime() / 1000,
+      }),
+    ).runCycleNoThrow();
+
+    // Re-polls within the window, but the envelope is byte-identical (no churn) and
+    // no events line was appended — a multi-day park doesn't grow the log.
+    expect(readFileSync(join(tmpDir, "default.json"), "utf8")).toBe(before);
+    expect(existsSync(join(tmpDir, "events.jsonl"))).toBe(false);
+    expect(sleepSec).toBe(60);
+  });
+
+  test("resolveMultiplierOrNull skips the re-parse when size+mtime are unchanged", () => {
+    const dir = join(tmpDir, ".claude-profiles", "default");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, ".claude.json");
+    // Two payloads of IDENTICAL byte length so only mtime (not size) can differ:
+    // the 20x tier is one char longer than 5x, offset by a 1-char pad on the 5x.
+    const json20 = JSON.stringify({
+      oauthAccount: { organizationRateLimitTier: "default_claude_max_20x" },
+      pad: "",
+    });
+    const json5 = JSON.stringify({
+      oauthAccount: { organizationRateLimitTier: "default_claude_max_5x" },
+      pad: "x",
+    });
+    expect(json20.length).toBe(json5.length);
+
+    const pinned = new Date("2026-06-01T00:00:00Z");
+    writeFileSync(path, json20);
+    utimesSync(path, pinned, pinned);
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBe(20); // memoized
+
+    // Rewrite to 5x but PIN the same mtime → the memo short-circuits the re-parse.
+    writeFileSync(path, json5);
+    utimesSync(path, pinned, pinned);
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBe(20); // stale memo wins
+
+    // Bump the mtime → the memo invalidates and the new tier resolves.
+    const bumped = new Date("2026-06-02T00:00:00Z");
+    utimesSync(path, bumped, bumped);
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBe(5);
+  });
+});
+
 describe("AccountLoop restart-cheap initial delay", () => {
   test("sleeps out a prior future next_fetch_at; cold-boot jitter otherwise", () => {
     const acct: Account = {
@@ -588,13 +819,14 @@ describe("AccountLoop restart-cheap initial delay", () => {
     const deps = makeDeps({ stateDir: tmpDir, clock });
     // No prior file → cold-boot jitter (uniform stub returns lo=0).
     expect(new AccountLoop(acct, deps).initialDelaySeconds()).toBe(0);
-    // Prior with a future next_fetch_at (120s out) → sleep ~120s.
+    // Prior with a future next_fetch_at (120s out) → capped to the multiplier poll
+    // window so a restart re-resolves within ~60s, not after the full cooldown.
     writeFileSync(
       join(tmpDir, "default.json"),
       JSON.stringify({ next_fetch_at: "2026-06-24T12:02:00-04:00" }),
     );
     const remaining = new AccountLoop(acct, deps).initialDelaySeconds();
-    expect(remaining).toBeCloseTo(120, 0);
+    expect(remaining).toBeCloseTo(60, 0);
   });
 });
 
