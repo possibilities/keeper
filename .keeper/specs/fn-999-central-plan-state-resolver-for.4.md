@@ -45,5 +45,5 @@ audit/verdict/followup submit from a lane WITHOUT --project → find + write art
 - [ ] source-guard exempt-list empty of stateful verbs → guard fully strict; pure tier green
 
 ## Done summary
-
+Routed audit/verdict/followup submit STATE through the central resolvePlanStateContext seam so the close submits auto-route to primary from a lane without --project; emptied the source-guard exempt-list (fully strict), flipped the lane-without-project test to expect auto-routing, and reconciled docs to belt-and-suspenders --project.
 ## Evidence
