@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "route close-orchestrator verbs' plan-state to primary",
-  "updated_at": "2026-06-28T13:21:17.326000Z"
+  "updated_at": "2026-06-28T13:36:09.240000Z",
+  "worker_done_at": "2026-06-28T13:36:09.240000Z"
 }

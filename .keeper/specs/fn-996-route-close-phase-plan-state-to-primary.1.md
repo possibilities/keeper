@@ -78,5 +78,5 @@ Extend worktree-lifecycle.test.ts.
 - [ ] pure test: preflight-from-lane reads primary state; slow test: real lane worktree -> ready-to-close
 
 ## Done summary
-
+close-preflight now routes all plan-state reads (done-state merge + done summaries) through a primary-rooted context, and the three close-phase submits pass --project $PRIMARY_REPO (with PRIMARY_REPO threaded into the quality-auditor), so a close running from a worktree lane reads/writes plan-state in primary and reaches ready-to-close.
 ## Evidence
