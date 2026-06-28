@@ -42,5 +42,5 @@ Use monkeypatched `scrape()` and parser functions; do not spawn real Claude/Code
 - [ ] `cd /Users/mike/code/agentusage && uv run pytest` passes.
 
 ## Done summary
-
+Added a stable error_kind (scrape_failed/upstream_limited/format_changed/panel_missing) classified in agentusage.scrape_cli, gated on target panel evidence, shipped as an additive optional field under schema_version 1 with README contract docs; full pytest suite green.
 ## Evidence

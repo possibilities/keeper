@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/agentusage",
   "tier": "high",
   "title": "Emit scraper error kinds",
-  "updated_at": "2026-06-28T19:40:44.850000Z"
+  "updated_at": "2026-06-28T23:31:00.155000Z",
+  "worker_done_at": "2026-06-28T23:31:00.155000Z"
 }
