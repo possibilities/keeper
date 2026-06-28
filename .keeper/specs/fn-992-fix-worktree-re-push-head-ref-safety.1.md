@@ -72,5 +72,5 @@ off-default cases.
 - [ ] no finalize-side reason satisfies isWorktreeRecoverReason
 
 ## Done summary
-
+pushDefaultToOrigin now asserts HEAD==default (off-branch arm, no push) and pushes branch-explicit; a post-push origin-containment recheck gates teardown at both the finalize not-ahead short-circuit and recover pass-3 via a push-unconfirmed degrade, so a lane is torn down only once origin/<default> provably contains the merge.
 ## Evidence

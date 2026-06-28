@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "make pushDefaultToOrigin HEAD-safe + post-push recheck",
-  "updated_at": "2026-06-28T01:22:10.010000Z"
+  "updated_at": "2026-06-28T01:37:00.782000Z",
+  "worker_done_at": "2026-06-28T01:37:00.782000Z"
 }
