@@ -228,7 +228,13 @@ function runCaptured<T>(
  * hit. Mirrors _close_epic. */
 function closeEpic(ctx: ProjectContext, epicId: string): void {
   runCaptured(ctx.projectPath, () => {
-    runEpicClose({ epicId, force: false, reason: null, format: null });
+    runEpicClose({
+      epicId,
+      force: false,
+      reason: null,
+      project: null,
+      format: null,
+    });
   });
 }
 

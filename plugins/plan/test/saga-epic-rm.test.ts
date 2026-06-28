@@ -25,6 +25,7 @@ import { join } from "node:path";
 
 import {
   firstJsonPayload,
+  gitBaseline,
   gitFilesInHead,
   gitHeadMessage,
   gitInit,
@@ -33,6 +34,7 @@ import {
   parseCliOutput,
   runCli,
   scaffoldEpic,
+  seedRuntime,
   seedState,
   setRoots,
   withProject,
@@ -333,6 +335,79 @@ describe("epic rm dependents", () => {
     expect(
       (obj.warnings as string[]).some((w) => w.includes(dependent.epicId)),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lane routing: a destructive rm run from a worktree lane (no --project) targets
+// PRIMARY's artifacts via resolvePlanStateContext, never the lane's checked-out
+// defs (which would orphan primary's state). The lane is a sibling dir holding
+// ONLY the committed defs (state/ stripped) — what a worktree checkout sees.
+// ---------------------------------------------------------------------------
+
+describe("epic rm resolves the destructive op to primary from a lane", () => {
+  const created: string[] = [];
+  afterEach(() => {
+    for (const dir of created) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    created.length = 0;
+  });
+  function freshDir(prefix: string): string {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    created.push(dir);
+    return dir;
+  }
+
+  test("rm-from-lane deletes PRIMARY's artifacts, never the lane's defs", () => {
+    const primary = freshDir("planctl-erm-lane-primary-");
+    const lane = freshDir("planctl-erm-lane-lane-");
+    const home = freshDir("planctl-erm-lane-home-");
+    const epicId = "fn-1-demo";
+
+    const [, taskIds] = seedState(primary, {
+      epicId,
+      nTasks: 1,
+      primaryRepo: primary,
+    });
+    const taskId = taskIds[0] as string;
+    seedRuntime(primary, taskId, { status: "todo" });
+    // Adopt primary's committed defs as the baseline so the deletions register
+    // as a real commit (not an untracked-file no-op).
+    gitBaseline(primary);
+
+    // The lane carries the committed defs only — state/ is gitignored, absent.
+    seedState(lane, { epicId, nTasks: 1, primaryRepo: primary });
+    rmSync(join(lane, ".keeper", "state"), { recursive: true, force: true });
+    gitBaseline(lane);
+
+    const r = runCli(["epic", "rm", epicId], {
+      cwd: lane,
+      home,
+      env: { CLAUDE_CODE_SESSION_ID: "test-epic-rm-lane" },
+    });
+    expect(r.code).toBe(0);
+    expect(payload(r.output).success).toBe(true);
+
+    // PRIMARY's full artifact set is gone...
+    expect(
+      existsSync(join(primary, ".keeper", "epics", `${epicId}.json`)),
+    ).toBe(false);
+    expect(
+      existsSync(join(primary, ".keeper", "tasks", `${taskId}.json`)),
+    ).toBe(false);
+    expect(
+      existsSync(
+        join(primary, ".keeper", "state", "tasks", `${taskId}.state.json`),
+      ),
+    ).toBe(false);
+    // ...while the lane's checked-out defs were never touched.
+    expect(existsSync(join(lane, ".keeper", "epics", `${epicId}.json`))).toBe(
+      true,
+    );
+    expect(existsSync(join(lane, ".keeper", "tasks", `${taskId}.json`))).toBe(
+      true,
+    );
   });
 });
 

@@ -350,3 +350,59 @@ describe("close-finalize tallies + mints to primary from a lane", () => {
     expect(epicStatus(s.primary, s.epicId)).toBe("done");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The STANDALONE `epic close` verb routes its tally + irreversible close to
+// primary from a lane (no --project), same as the close-finalize delegation
+// path. A lane-resolved tally would read the lane's empty overlay and refuse
+// TASKS_NOT_DONE.
+// ---------------------------------------------------------------------------
+
+describe("epic close (standalone) resolves to primary from a lane", () => {
+  const ENV = { CLAUDE_CODE_SESSION_ID: "test-epic-close-lane" };
+
+  test("a done epic closes in primary, never stamping the lane's def", () => {
+    const s = makeLaneScenario("planctl-ecl-ok-", ["done", "done"]);
+
+    const r = runCli(["epic", "close", s.epicId], {
+      cwd: s.lane,
+      home: s.home,
+      env: ENV,
+    });
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.output);
+    expect(env.success).toBe(true);
+    expect(env.status).toBe("done");
+    expect(epicStatus(s.primary, s.epicId)).toBe("done");
+    expect(epicStatus(s.lane, s.epicId)).toBe("open");
+  });
+
+  test("force:false refusal is intact: primary's open task blocks the close", () => {
+    const s = makeLaneScenario("planctl-ecl-nd-", ["done", "todo"]);
+
+    const r = runCli(["epic", "close", s.epicId], {
+      cwd: s.lane,
+      home: s.home,
+      env: ENV,
+    });
+    expect(r.code).not.toBe(0);
+    const error = parseCliOutput(r.output).error as string;
+    expect(error).toContain("Cannot close");
+    expect(error).toContain("not done");
+    // Neither repo's def was stamped done.
+    expect(epicStatus(s.primary, s.epicId)).toBe("open");
+    expect(epicStatus(s.lane, s.epicId)).toBe("open");
+  });
+
+  test("--project stays authoritative from a lane", () => {
+    const s = makeLaneScenario("planctl-ecl-proj-", ["done"]);
+
+    const r = runCli(["epic", "close", s.epicId, "--project", s.primary], {
+      cwd: s.lane,
+      home: s.home,
+      env: ENV,
+    });
+    expect(r.code).toBe(0);
+    expect(epicStatus(s.primary, s.epicId)).toBe("done");
+  });
+});

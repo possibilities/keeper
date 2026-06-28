@@ -21,7 +21,7 @@ import { assembleBrief, writeBrief } from "../brief.ts";
 import { emitError, formatOutput, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolvePlanStateContext, resolveProject } from "../project.ts";
 import { resolveWorkerRepos } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { LocalFileStateStore, loadJsonSafe } from "../store.ts";
@@ -52,6 +52,10 @@ export function runWorkerResume(opts: {
     emitError(`Invalid task id: '${taskId}'`, format);
   }
 
+  // Committed DEFS (specs / tasks / epics) read from the locate ctx (cwd, so a
+  // lane reads its byte-identical checked-out defs). Plan STATE — the runtime
+  // overlay read + the regenerated brief write — routes through the central seam
+  // to the epic's PRIMARY repo, never the lane's gitignored (absent) state/.
   const ctx = resolveProject(format);
   const dataDir = ctx.dataDir;
 
@@ -61,6 +65,8 @@ export function runWorkerResume(opts: {
     emitError(`Task spec not found: ${taskId}`, format);
   }
 
+  const stateCtx = resolvePlanStateContext(taskId, null, format);
+
   // Read task status + tier. Under the commit-then-done contract, observing
   // `done` here means the source commit already landed.
   const taskPath = join(dataDir, "tasks", `${taskId}.json`);
@@ -69,7 +75,7 @@ export function runWorkerResume(opts: {
   let epicId = taskId.includes(".")
     ? taskId.slice(0, taskId.lastIndexOf("."))
     : taskId;
-  const stateStore = new LocalFileStateStore(ctx.stateDir);
+  const stateStore = new LocalFileStateStore(stateCtx.stateDir);
   let taskDef: Record<string, unknown> = {};
   if (existsSync(taskPath)) {
     const loaded = loadJsonSafe(taskPath);
@@ -114,7 +120,7 @@ export function runWorkerResume(opts: {
     dataDir,
   });
 
-  const briefsDir = join(ctx.stateDir, "briefs");
+  const briefsDir = join(stateCtx.stateDir, "briefs");
   let briefRef: string;
   try {
     mkdirSync(briefsDir, { recursive: true });

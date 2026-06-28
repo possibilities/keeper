@@ -10,10 +10,13 @@
 // delete loop leaves deletions out of the staged pathspec and silently never
 // commits them. We therefore recordTouched EVERY path BEFORE unlinking it.
 //
-// Resolution is cwd-then-global (resolveEpicGlobally) with a --project bypass.
-// epic.primary_repo is read BEFORE deleting the epic JSON so the commit routes
-// to the owning repo. NOT a restamp member — nothing to restamp once the epic
-// ceases to exist. No id-allocation lock (delete-only, no minting).
+// State resolution routes through the central resolvePlanStateContext seam: it
+// locates cwd-then-global (or honors --project) then PHYSICALLY roots the unlink
+// set + commit at the epic's primary_repo, so a lane-run deletes PRIMARY's
+// artifacts rather than the lane's checked-out defs. epic.primary_repo is also
+// read off the def BEFORE the unlink for the commit's state_repo trailer. NOT a
+// restamp member — nothing to restamp once the epic ceases to exist. No
+// id-allocation lock (delete-only, no minting).
 
 import {
   existsSync,
@@ -24,17 +27,12 @@ import {
 } from "node:fs";
 import { join, relative, resolve as resolvePath } from "node:path";
 
-import { resolveEpicGlobally } from "../discovery.ts";
 import { emitMutating, emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
-import { contextForRoot, type ProjectContext } from "../project.ts";
-import {
-  DATA_DIR_NAMES,
-  hasDataDir,
-  resolveDataDirOrDefault,
-} from "../state_path.ts";
+import { type ProjectContext, resolvePlanStateContext } from "../project.ts";
+import { DATA_DIR_NAMES } from "../state_path.ts";
 import { LocalFileStateStore, loadJsonSafe, recordTouched } from "../store.ts";
 
 // Traversal guard: only filename-safe characters before we glob/unlink. Any
@@ -72,62 +70,6 @@ function globSorted(dir: string, test: (name: string) => boolean): string[] {
     .filter(test)
     .sort()
     .map((name) => join(dir, name));
-}
-
-/** Resolve the project owning *epicId*, honoring --project. Fails closed
- * (emitError) when the project / epic isn't present, or when the id is
- * ambiguous across discovered roots. Mirrors _resolve_owning_project. */
-function resolveOwningProject(
-  epicId: string,
-  project: string | null,
-  format: OutputFormat | null,
-): ProjectContext {
-  if (project !== null) {
-    const projectRoot = expandResolve(project);
-    if (!hasDataDir(projectRoot)) {
-      emitError(
-        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
-        format,
-      );
-    }
-    const epicPath = join(
-      resolveDataDirOrDefault(projectRoot),
-      "epics",
-      `${epicId}.json`,
-    );
-    if (!existsSync(epicPath)) {
-      emitError(`Epic not found in ${projectRoot}: ${epicId}`, format);
-    }
-    return contextForRoot(projectRoot);
-  }
-
-  const result = resolveEpicGlobally(epicId);
-  if (result.ambiguous) {
-    const candidates = result.owners.join(", ");
-    emitError(
-      `Epic ${epicId} exists in multiple projects; pass --project <path>. ` +
-        `Candidates: ${candidates}`,
-      format,
-    );
-  }
-  if (!result.resolved) {
-    emitError(`Epic not found: ${epicId}`, format);
-  }
-  // resolved => projectPath is non-null.
-  return contextForRoot(result.projectPath as string);
-}
-
-/** Expand a leading ~ and resolve to an absolute path. --project paths come
- * from operators; mirror Path(project).expanduser().resolve(). */
-function expandResolve(p: string): string {
-  let expanded = p;
-  if (p === "~" || p.startsWith("~/")) {
-    const home = process.env.HOME;
-    if (home) {
-      expanded = home + p.slice(1);
-    }
-  }
-  return resolvePath(expanded);
 }
 
 /** Sorted list of every path belonging to *epicId*. Missing files/dirs are
@@ -273,7 +215,12 @@ export function runEpicRm(args: EpicRmArgs): void {
     emitError(`Invalid epic id: ${pyRepr(epicId)}`, format);
   }
 
-  const ctx = resolveOwningProject(epicId, project, format);
+  // Route through the central state seam: a lane-run resolves the destructive
+  // unlink set + commit to the epic's PRIMARY repo (never the lane's checked-out
+  // defs, which would orphan primary's artifacts). `--project` stays
+  // authoritative; a missing/stale primary fails loud rather than touching the
+  // lane.
+  const ctx = resolvePlanStateContext(epicId, project, format);
   const dataDir = ctx.dataDir;
 
   // Read epic.primary_repo BEFORE collecting/unlinking — the commit routes by

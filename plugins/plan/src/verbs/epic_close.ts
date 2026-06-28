@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolvePlanStateContext } from "../project.ts";
 import {
   atomicWriteJson,
   LocalFileStateStore,
@@ -30,13 +30,18 @@ export interface EpicCloseArgs {
   epicId: string;
   force: boolean;
   reason: string | null;
+  project: string | null;
   format: OutputFormat | null;
 }
 
 export function runEpicClose(args: EpicCloseArgs): void {
-  const { epicId, force, reason, format } = args;
+  const { epicId, force, reason, project, format } = args;
 
-  const ctx = resolveProject(format);
+  // Route the tally + the def write/commit through the central state seam so a
+  // close run from a worktree lane tallies PRIMARY's runtime overlay (never the
+  // lane's absent state, which would spuriously refuse TASKS_NOT_DONE) and lands
+  // the irreversible close in primary. `--project` stays authoritative.
+  const ctx = resolvePlanStateContext(epicId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

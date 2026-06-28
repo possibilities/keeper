@@ -347,13 +347,17 @@ const EPIC_GROUP: GroupSpec = {
           "close",
           "EPIC_ID",
           rest,
-          new Set(["--force", "--reason"]),
+          new Set(["--force", "--reason", "--project"]),
         );
-        const [epicId] = leafPositionals(rest, new Set(["--reason"]));
+        const [epicId] = leafPositionals(
+          rest,
+          new Set(["--reason", "--project"]),
+        );
         runEpicClose({
           epicId: epicId ?? "",
           force: leafFlag(rest, "--force"),
           reason: leafOption(rest, "--reason"),
+          project: leafOption(rest, "--project"),
           format,
         });
       },

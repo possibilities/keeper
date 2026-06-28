@@ -13,15 +13,26 @@
 // rather than injected. The only node that genuinely requires in-process
 // injection (a fabricated source-commit sha) is python_only and dropped.
 
-import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   gitHeadSha,
+  gitInit,
   gitLogCount,
   runCli,
   scaffoldEpic,
+  seedRuntime,
+  seedState,
   withProject,
   withTmpdir,
 } from "./harness.ts";
@@ -305,6 +316,62 @@ describe("worker resume", () => {
     expect("tier" in payload).toBe(true);
     expect(payload.tier).toBeNull();
     expect(payload.worker_agent).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Lane split: STATE (status read + brief write) resolves to PRIMARY; the
+  // git/source-commit probes + target_repo stay cwd-local. The lane is a sibling
+  // dir holding ONLY the committed defs (state/ stripped) — what a worktree
+  // checkout sees. The git-free lane-sim mirrors worktree-block-state.test.ts.
+  // -------------------------------------------------------------------------
+  describe("resume from a worktree lane", () => {
+    const created: string[] = [];
+    afterEach(() => {
+      for (const dir of created) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+      created.length = 0;
+    });
+    function freshDir(prefix: string): string {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+      created.push(dir);
+      return dir;
+    }
+
+    test("status read + brief write land in primary, never the lane", () => {
+      const primary = freshDir("planctl-resume-lane-primary-");
+      const lane = freshDir("planctl-resume-lane-lane-");
+      const home = freshDir("planctl-resume-lane-home-");
+      const epicId = "fn-1-demo";
+      gitInit(primary);
+      gitInit(lane);
+
+      const [, taskIds] = seedState(primary, {
+        epicId,
+        nTasks: 1,
+        primaryRepo: primary,
+      });
+      const taskId = taskIds[0] as string;
+      // Primary's overlay carries the live status; the lane has no overlay.
+      seedRuntime(primary, taskId, { status: "in_progress" });
+      seedState(lane, { epicId, nTasks: 1, primaryRepo: primary });
+      rmSync(join(lane, ".keeper", "state"), { recursive: true, force: true });
+
+      const r = runCli(["worker", "resume", taskId], { cwd: lane, home });
+      expect(r.code).toBe(0);
+      const payload = envelope(r.stdout);
+      // The status is read from PRIMARY's overlay (in_progress) — a lane read
+      // would see no overlay and report the def default (todo).
+      expect(payload.status).toBe("in_progress");
+      // primary_repo resolves to primary, never the lane cwd.
+      expect(payload.primary_repo).toBe(primary);
+
+      // The regenerated brief landed in PRIMARY's gitignored state, not the lane.
+      const ref = payload.brief_ref as string;
+      expect(ref).toBe(briefPath(primary, taskId));
+      expect(existsSync(briefPath(primary, taskId))).toBe(true);
+      expect(existsSync(briefPath(lane, taskId))).toBe(false);
+    });
   });
 
   test("blocked task: warns but state not flipped", () => {
