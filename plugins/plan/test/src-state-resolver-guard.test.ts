@@ -55,10 +55,6 @@ const DISPLAY_DEF_ALLOW = new Set([
 // state via the inline contextForRoot(primary_repo) precedent this seam lifts;
 // the rest await their convergence slice.
 const NOT_YET_MIGRATED = new Set([
-  "claim",
-  "done",
-  "reconcile",
-  "resolve_task",
   "worker_resume",
   "epic_close",
   "epic_rm",

@@ -1,8 +1,11 @@
 // Runtime-status overlay helpers for the TS dispatcher (the sole plan runtime).
-// resolveWorkerRepos is the ONE seam every runtime emitter (claim, resolve-task,
-// worker-resume, reconcile) routes through to get its {targetRepo, primaryRepo}
-// pair; it reads the KEEPER_PLAN_WORKTREE override via expectedWorkerCwd and so
-// is NOT pure. The remaining helpers are deterministic given their inputs.
+// resolveWorkerRepos is the CODE-routing seam: it resolves `targetRepo` (the
+// worker's lane in worktree mode) by reading the KEEPER_PLAN_WORKTREE override
+// via expectedWorkerCwd, and so is NOT pure. State verbs (claim, done, reconcile,
+// resolve-task) take their STATE-bearing primary_repo / state_repo from
+// resolvePlanStateContext (the primary-rooted ctx), consuming only `targetRepo`
+// here; `primaryRepo` is retained for worker-resume until it migrates. The
+// remaining helpers are deterministic given their inputs.
 
 import { realpathSync } from "node:fs";
 import { resolve as resolveAbs } from "node:path";
@@ -55,13 +58,15 @@ function expectedWorkerCwd(
   );
 }
 
-/** The canonical worker-repo resolver — the ONE seam every runtime emitter
- * (claim, resolve-task, worker-resume, reconcile) routes through. Returns the
+/** The canonical worker-repo resolver — the CODE-routing seam. Returns the
  * realpath-normalized pair:
  *   - targetRepo: override-aware (the worker's lane in worktree mode) via the
  *     three-level fallback in expectedWorkerCwd; the worker cds here for code.
+ *     This is the field state verbs consume.
  *   - primaryRepo: ALWAYS the primary repo (epic.primary_repo -> proj), NEVER
- *     the lane — plan STATE must never persist a lane path.
+ *     the lane. State verbs now take primary_repo / state_repo from the
+ *     primary-rooted resolvePlanStateContext ctx instead; this field is retained
+ *     for worker-resume until it migrates onto that seam.
  * Persistence/report verbs (scaffold, refine-apply, mv-repo,
  * task-set-target-repo, close-preflight, show) MUST NOT call this: routing them
  * through the lane override would write a lane path into plan state. */

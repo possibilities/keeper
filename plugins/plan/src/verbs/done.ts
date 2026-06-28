@@ -1,11 +1,12 @@
 // done verb — the port of planctl/run_done.py.
 //
-// The wave's committing verb. Resolves the OWNING project LANE-BLIND (roots
-// discovery, like claim), so a worker whose cwd is the task's target repo OR a
-// worktree lane still stamps the task on the board that owns it — the stamp +
-// gitignored runtime overlay land in the primary project's store and commit
-// there, never a lane that only carries committed defs. --project bypasses
-// discovery; a project outside any configured root falls back to cwd-then-global.
+// The wave's committing verb. Routes its STATE through the central
+// resolvePlanStateContext seam, so a worker whose cwd is the task's target repo
+// OR a worktree lane still stamps the task on the board that PHYSICALLY owns its
+// state (the epic's primary_repo) — the stamp + gitignored runtime overlay land
+// in the primary project's store and commit there, never a lane that only carries
+// committed defs (and never the lane even when primary is OUTSIDE the configured
+// roots). --project stays authoritative for locating.
 // Then under lockTask: re-read runtime, gate (already-done error; non-force
 // requires in_progress + assignee match), patch the spec's `## Done summary` and
 // `## Evidence` sections byte-stably, atomicWrite the spec, saveRuntime(done).
@@ -17,16 +18,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { findProjectsWithTask } from "../discovery.ts";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
-import {
-  contextForRoot,
-  type ProjectContext,
-  resolveOwningProjectForId,
-} from "../project.ts";
+import { resolvePlanStateContext } from "../project.ts";
 import { clearWorkMarker } from "../session_markers.ts";
 import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
 import {
@@ -53,35 +49,6 @@ interface Evidence {
   prs: unknown[];
 }
 
-/** Resolve done's owning project LANE-BLIND, like claim's roots discovery, so the
- * runtime overlay flips on the PRIMARY repo regardless of cwd. In worktree mode
- * the closer/worker cwd is the epic's lane (under `~/worktrees/`), whose COMMITTED
- * `.keeper/` defs would fool the shared cwd-first `resolveOwningProjectForId` into
- * writing state to the lane — where the gitignored runtime overlay never lives.
- * `findProjectsWithTask` scans IMMEDIATE children of the configured roots only, so
- * a lane is never discovered and resolution lands on primary.
- *
- * A `--project` override stays authoritative. When roots discovery yields exactly
- * one owner it wins; ZERO (a detached/throwaway project outside any configured
- * root) or MANY defers to the shared cwd-then-global resolver, which owns the
- * not-found / ambiguous error envelopes and keeps single-project non-worktree use
- * unaffected. Done-LOCAL on purpose — the shared resolver's cwd-first semantics are
- * load-bearing for cat/show/refine-context and must not change. */
-function resolveDoneProject(
-  taskId: string,
-  project: string | null,
-  format: OutputFormat | null,
-): ProjectContext {
-  if (project !== null) {
-    return resolveOwningProjectForId(taskId, project, format);
-  }
-  const matches = findProjectsWithTask(taskId);
-  if (matches.length === 1) {
-    return contextForRoot(matches[0] as string);
-  }
-  return resolveOwningProjectForId(taskId, null, format);
-}
-
 export function runDone(args: DoneArgs): void {
   const {
     taskId,
@@ -96,10 +63,12 @@ export function runDone(args: DoneArgs): void {
     emitError(`Invalid task ID: ${taskId}`, format);
   }
 
-  // Lane-blind owning-project resolution: the stamp + runtime overlay land in the
-  // board that owns the task (its PRIMARY repo), never a worktree lane whose
-  // committed defs would otherwise win cwd-first. --project stays authoritative.
-  const ctx = resolveDoneProject(taskId, project, format);
+  // STATE resolution through the central seam: the stamp + runtime overlay land
+  // in the repo that PHYSICALLY owns the task's state (the epic's primary_repo),
+  // never a worktree lane whose committed defs would otherwise win cwd-first, and
+  // never the lane even when primary is outside the configured roots. --project
+  // stays authoritative for locating.
+  const ctx = resolvePlanStateContext(taskId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

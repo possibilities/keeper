@@ -17,15 +17,18 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { join, resolve as resolveAbs } from "node:path";
 
-import { findProjectsWithTask } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, normalizeTask } from "../models.ts";
-import { contextForRoot, type ProjectContext } from "../project.ts";
+import {
+  type ProjectContext,
+  resolvePlanStateContext,
+  tryResolveOwningProjectForId,
+} from "../project.ts";
 import { resolveWorkerRepos } from "../runtime_status.ts";
-import { DATA_DIR_NAMES, hasDataDir } from "../state_path.ts";
+import { DATA_DIR_NAMES } from "../state_path.ts";
 import {
   LocalFileStateStore,
   loadJson,
@@ -75,47 +78,47 @@ function emitReconcileError(
   process.exit(1);
 }
 
-/** Resolve the owning project for `taskId` cwd-agnostically. Any same-id
- * collision surfaces as AMBIGUOUS_TASK_ID; --project is the escape hatch.
- * Mirrors _resolve_project_for_task. */
+/** Resolve the STATE-bearing context for `taskId`, PHYSICALLY rooted at the
+ * epic's primary_repo. LOCATE cwd-then-global (`--project` authoritative),
+ * mapping a locate failure to reconcile's typed envelope, then route STATE
+ * through the central `resolvePlanStateContext` seam so the overlay read + the
+ * committed-state probe target PRIMARY even from a worktree lane — and even when
+ * primary is OUTSIDE the configured roots (the lane's committed defs win the
+ * cwd-first locate, then the resolver re-roots to primary). The SOURCE-commit
+ * scan stays on `targetRepo`/cwd (the lane), resolved separately. */
 function resolveProjectForTask(
   taskId: string,
   project: string | null,
   format: OutputFormat | null,
 ): ProjectContext {
-  if (project !== null) {
-    const projectRoot = realpathOr(resolveAbs(expandUser(project)));
-    if (!hasDataDir(projectRoot)) {
-      emitReconcileError(
-        "NOT_A_PROJECT",
-        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
-        format,
-      );
+  const located = tryResolveOwningProjectForId(taskId, project);
+  if (!located.ok) {
+    switch (located.reason) {
+      case "no_project":
+        emitReconcileError(
+          "NOT_A_PROJECT",
+          `No plan project found at ${located.projectRoot}. Run 'keeper plan init' first.`,
+          format,
+        );
+        break;
+      case "not_found":
+        emitReconcileError(
+          "TASK_NOT_FOUND",
+          `Task not found: ${located.id}`,
+          format,
+        );
+        break;
+      case "ambiguous":
+        emitReconcileError(
+          "AMBIGUOUS_TASK_ID",
+          `Task ${located.id} exists in multiple projects; pass --project <path>.`,
+          format,
+          { candidates: located.owners },
+        );
+        break;
     }
-    const ctx = contextForRoot(projectRoot);
-    if (!existsSync(join(ctx.dataDir, "tasks", `${taskId}.json`))) {
-      emitReconcileError(
-        "TASK_NOT_FOUND",
-        `Task not found in ${projectRoot}: ${taskId}`,
-        format,
-      );
-    }
-    return ctx;
   }
-
-  const matches = findProjectsWithTask(taskId);
-  if (matches.length === 0) {
-    emitReconcileError("TASK_NOT_FOUND", `Task not found: ${taskId}`, format);
-  }
-  if (matches.length === 1) {
-    return contextForRoot(matches[0] as string);
-  }
-  emitReconcileError(
-    "AMBIGUOUS_TASK_ID",
-    `Task ${taskId} exists in multiple projects; pass --project <path>.`,
-    format,
-    { candidates: matches },
-  );
+  return resolvePlanStateContext(taskId, project, format);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,16 +290,14 @@ export function runReconcile(opts: {
 
   // 4. resolve repos. SOURCE scan runs against target_repo + touched_repos;
   //    state cat-file runs against state_repo — a DISTINCT cwd.
-  // target_repo follows the worker's lane (KEEPER_PLAN_WORKTREE override-aware);
-  // primary_repo / state_repo ALWAYS stay in the primary repo, never the lane —
-  // both via the one runtime seam.
+  // target_repo follows the worker's lane (KEEPER_PLAN_WORKTREE override-aware)
+  // via the runtime seam — CODE routing only. primary_repo / state_repo are the
+  // resolver's primary-rooted ctx, never the lane, so the committed-state probe
+  // runs against the PHYSICAL state site.
   const projPath = ctx.projectPath;
-  const { targetRepo, primaryRepo } = resolveWorkerRepos(
-    taskDef,
-    epicDef,
-    projPath,
-  );
+  const primaryRepo = projPath;
   const stateRepo = primaryRepo;
+  const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, projPath);
 
   // Source-scan repo set: target_repo, then every touched_repos entry, then
   // primary_repo — de-duplicated, order-preserving (realpath-normalized).

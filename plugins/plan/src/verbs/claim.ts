@@ -10,34 +10,33 @@
 // commits) carrying a brief_ref handle.
 //
 // The typed error envelope is the nested {success:false,error:{code,message,
-// details}} shape — distinct from the flat emitError. Resolution is
-// cwd-agnostic: roots discovery (findProjectsWithTask) or a --project override.
+// details}} shape — distinct from the flat emitError. STATE resolves through the
+// central resolvePlanStateContext seam (cwd-then-global locate, then re-rooted to
+// the epic's primary_repo); a same-id collision is disambiguated by claimability.
 
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { assembleBrief, writeBrief } from "../brief.ts";
-import { findProjectsWithTask } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
+import {
+  contextForRoot,
+  type ProjectContext,
+  resolvePlanStateContext,
+  tryResolveOwningProjectForId,
+} from "../project.ts";
 import { resolveWorkerRepos } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
-import { hasDataDir, resolveDataDirOrDefault } from "../state_path.ts";
 import {
   getActor,
   LocalFileStateStore,
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
-
-interface ProjectCtx {
-  dataDir: string;
-  stateDir: string;
-  projectPath: string;
-}
 
 /** Emit a typed claim error envelope {success:false,error:{code,message,
  * details?}} and exit 1. Routes through formatOutput so --format yaml renders
@@ -57,32 +56,11 @@ function emitClaimError(
   process.exit(1);
 }
 
-/** Build a ProjectCtx from a project root, resolving its `.keeper/` data dir. */
-function contextForRoot(projectRoot: string): ProjectCtx {
-  const dataDir = resolveDataDirOrDefault(projectRoot);
-  return {
-    dataDir,
-    stateDir: join(dataDir, "state"),
-    projectPath: projectRoot,
-  };
-}
-
-/** Expanduser-free resolve: absolutize + realpath (Python Path(p).resolve()).
- * The --project arg and the repo-fallback paths arrive absolute from callers /
- * config; a non-existent path falls back to its lexical absolute form. */
-function resolveExpand(p: string): string {
-  const abs = resolve(process.cwd(), p);
-  try {
-    return realpathSync(abs);
-  } catch {
-    return abs;
-  }
-}
-
-/** Whether `taskId` in `ctx` is a claimable candidate (open epic + todo/
- * in_progress task). Used to disambiguate same-id collisions. Fails closed on a
- * missing epic / unreadable state. Mirrors _is_claimable. */
-function isClaimable(ctx: ProjectCtx, taskId: string): boolean {
+/** Whether `taskId` in `projectRoot` is a claimable candidate (open epic +
+ * todo/in_progress task). Disambiguates a same-id collision across projects.
+ * Fails closed on a missing epic / unreadable state. Mirrors _is_claimable. */
+function isClaimable(projectRoot: string, taskId: string): boolean {
+  const ctx = contextForRoot(projectRoot);
   const taskPath = join(ctx.dataDir, "tasks", `${taskId}.json`);
   if (!existsSync(taskPath)) {
     return false;
@@ -110,54 +88,59 @@ function isClaimable(ctx: ProjectCtx, taskId: string): boolean {
   }
 }
 
-/** Resolve the owning project for `taskId`, cwd-agnostically. --project override
- * resolves directly (NOT_A_PROJECT / TASK_NOT_FOUND); zero-arg scans roots via
- * findProjectsWithTask (one match → use; many → filter to claimable; else
- * AMBIGUOUS_TASK_ID; zero → TASK_NOT_FOUND). Mirrors _resolve_project_for_task. */
+/** Resolve the STATE-bearing context for `taskId`, PHYSICALLY rooted at the
+ * epic's primary_repo. LOCATE cwd-then-global (`--project` authoritative),
+ * mapping a locate failure to claim's typed envelope, then route STATE through
+ * the central `resolvePlanStateContext` seam so the overlay + brief land in
+ * PRIMARY even from a worktree lane — and even when primary is OUTSIDE the
+ * configured roots (the lane's committed defs win the cwd-first locate, then the
+ * resolver re-roots to primary). A same-id collision across projects is
+ * disambiguated by claimability — exactly one claimable owner resolves silently;
+ * else AMBIGUOUS_TASK_ID. */
 function resolveProjectForTask(
   taskId: string,
   project: string | null,
   format: OutputFormat | null,
-): ProjectCtx {
-  if (project !== null) {
-    const projectRoot = resolveExpand(project);
-    if (!hasDataDir(projectRoot)) {
-      emitClaimError(
-        "NOT_A_PROJECT",
-        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
-        format,
-      );
+): ProjectContext {
+  const located = tryResolveOwningProjectForId(taskId, project);
+  if (!located.ok) {
+    switch (located.reason) {
+      case "no_project":
+        emitClaimError(
+          "NOT_A_PROJECT",
+          `No plan project found at ${located.projectRoot}. Run 'keeper plan init' first.`,
+          format,
+        );
+        break;
+      case "not_found":
+        emitClaimError(
+          "TASK_NOT_FOUND",
+          `Task not found: ${located.id}`,
+          format,
+        );
+        break;
+      case "ambiguous": {
+        const claimable = located.owners.filter((root) =>
+          isClaimable(root, taskId),
+        );
+        if (claimable.length === 1) {
+          return resolvePlanStateContext(
+            taskId,
+            claimable[0] as string,
+            format,
+          );
+        }
+        emitClaimError(
+          "AMBIGUOUS_TASK_ID",
+          `Task ${located.id} exists in multiple projects; pass --project <path>.`,
+          format,
+          { candidates: located.owners },
+        );
+        break;
+      }
     }
-    const ctx = contextForRoot(projectRoot);
-    if (!existsSync(join(ctx.dataDir, "tasks", `${taskId}.json`))) {
-      emitClaimError(
-        "TASK_NOT_FOUND",
-        `Task not found in ${projectRoot}: ${taskId}`,
-        format,
-      );
-    }
-    return ctx;
   }
-
-  const matches = findProjectsWithTask(taskId);
-  if (matches.length === 0) {
-    emitClaimError("TASK_NOT_FOUND", `Task not found: ${taskId}`, format);
-  }
-  if (matches.length === 1) {
-    return contextForRoot(matches[0] as string);
-  }
-
-  const contexts = matches.map((p) => contextForRoot(p));
-  const claimable = contexts.filter((c) => isClaimable(c, taskId));
-  if (claimable.length === 1) {
-    return claimable[0] as ProjectCtx;
-  }
-  emitClaimError(
-    "AMBIGUOUS_TASK_ID",
-    `Task ${taskId} exists in multiple projects; pass --project <path>.`,
-    format,
-    { candidates: contexts.map((c) => c.projectPath) },
-  );
+  return resolvePlanStateContext(taskId, project, format);
 }
 
 interface ClaimArgs {
@@ -189,18 +172,16 @@ export function runClaim(args: ClaimArgs): void {
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   const epicDef = existsSync(epicPath) ? (loadJsonSafe(epicPath) ?? {}) : {};
 
-  // 4. resolve target_repo / primary_repo (realpath-normalized) via the one
-  // runtime seam. target_repo follows the worker's lane (KEEPER_PLAN_WORKTREE
-  // override -> task.target_repo -> epic.primary_repo -> proj); the worker cds
-  // into it for code work, so a worktree-mode claim MUST return the lane — else
-  // the worker works in the shared main checkout and the lane stays empty. Plan
-  // STATE (primary_repo) ALWAYS resolves to the primary repo, never the lane.
+  // 4. resolve CODE routing via the runtime seam. target_repo follows the
+  // worker's lane (KEEPER_PLAN_WORKTREE override -> task.target_repo ->
+  // epic.primary_repo -> proj); the worker cds into it for code work, so a
+  // worktree-mode claim MUST return the lane — else the worker works in the
+  // shared main checkout and the lane stays empty. STATE (primary_repo /
+  // state_repo) comes from the resolver's primary-rooted ctx, so the reported
+  // value EQUALS the physical write site by construction.
   const projPath = ctx.projectPath;
-  const { targetRepo, primaryRepo } = resolveWorkerRepos(
-    taskDef,
-    epicDef,
-    projPath,
-  );
+  const primaryRepo = projPath;
+  const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, projPath);
 
   // 5. status / deps gate (pre-check, no lock — the CAS re-reads under the lock)
   const runtimePre = stateStore.loadRuntime(taskId);
