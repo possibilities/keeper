@@ -148,6 +148,7 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     error_type: null,
     error_message: null,
     error_at: null,
+    error_kind: null,
     // fn-651: envelope omits `lift_at` → null.
     lift_at: null,
   });
@@ -364,6 +365,116 @@ test("fn-651: buildUsageMessage projects top-level lift_at; absent/non-string �
   expect(bogus?.lift_at).toBeNull();
 });
 
+test("fn-1000: buildUsageMessage projects error.kind; absent/unknown → null", () => {
+  // The scraper worker stamps a stable classification on the stale envelope's
+  // `error.kind`; the consumer folds it onto `error_kind`. A classified
+  // envelope carries it...
+  const classified = buildUsageMessage({
+    id: "claude-default",
+    status: "stale",
+    error: {
+      type: "ClaudeUsageEndpointRateLimited",
+      message: "usage endpoint is rate limited",
+      at: "2026-05-29T11:42:17-07:00",
+      kind: "upstream_limited",
+    },
+  });
+  expect(classified?.error_kind).toBe("upstream_limited");
+
+  // ...a pre-classification envelope (error sub-object without `kind`) folds to
+  // null...
+  const legacy = buildUsageMessage({
+    id: "x",
+    status: "stale",
+    error: { type: "ClaudeUsageParseError", message: "drift", at: "T" },
+  });
+  expect(legacy?.error_kind).toBeNull();
+
+  // ...an unknown/garbage kind folds to null per the safe-value invariant...
+  const bogus = buildUsageMessage({
+    id: "x",
+    status: "stale",
+    error: { type: "X", message: "m", at: "T", kind: "not_a_kind" },
+  });
+  expect(bogus?.error_kind).toBeNull();
+
+  // ...and an active envelope (no error sub-object) → null.
+  const active = buildUsageMessage({ id: "x", status: "active", error: null });
+  expect(active?.error_kind).toBeNull();
+});
+
+test("ERROR_KIND IS GATED: a kind flip (error_type/message/at held) re-emits; error_at still excluded", () => {
+  // `error_kind` is PROJECTED and — unlike `error_at` — STAYS in the change
+  // gate, so a classification flip (e.g. format drift reclassified as a panel
+  // miss) emits a fresh snapshot even when error_type / message / at are
+  // unchanged. The error_at exclusion still holds: advancing ONLY error_at
+  // (kind held) suppresses.
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // error_type + message held constant across all three writes so the ONLY
+  // gate-moving field under test is `error_kind` (then `error_at`).
+  const constErr = {
+    type: "ClaudeUsageParseError",
+    message: "required label not found: 'Current session'",
+  };
+  const base = {
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    subscription_active: true,
+    usage: null,
+  };
+
+  const path = writeEnvelope("claude-default", {
+    ...base,
+    error: {
+      ...constErr,
+      at: "2026-05-29T11:42:17-07:00",
+      kind: "format_changed",
+    },
+  });
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  // Flip ONLY the kind (error_at held). error_kind is in the gate → re-emit.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-default",
+      ...base,
+      error: {
+        ...constErr,
+        at: "2026-05-29T11:42:17-07:00",
+        kind: "panel_missing",
+      },
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+  expect((emitted[1] as { error_kind: string | null }).error_kind).toBe(
+    "panel_missing",
+  );
+
+  // Advance ONLY error_at (kind held). error_at is excluded → suppressed.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-default",
+      ...base,
+      error: {
+        ...constErr,
+        at: "2026-05-29T11:50:00-07:00",
+        kind: "panel_missing",
+      },
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+});
+
 test("ERROR_AT GATE EXCLUSION: two envelopes differing ONLY in error.at produce ONE emit", () => {
   // fn-645 introduces the first PROJECTED-but-GATE-EXCLUDED field. `error.at`
   // advances on every failed scrape (~90s during an outage); without the
@@ -517,6 +628,7 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     error_type: null,
     error_message: null,
     error_at: null,
+    error_kind: null,
     // fn-651: envelope omits lift_at → null.
     lift_at: null,
   });

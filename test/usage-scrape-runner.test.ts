@@ -146,6 +146,47 @@ describe("parseScrapeStdout — error", () => {
     if (r.kind !== "error") throw new Error("wrong arm");
     expect(r.screen_excerpt).toEqual([]);
   });
+
+  test("v2 error arm carries a stable error_kind", () => {
+    const json = JSON.stringify({
+      schema_version: 1,
+      status: "error",
+      error_type: "ClaudeUsageParseError",
+      message: "panel never rendered",
+      screen_excerpt: [],
+      error_kind: "panel_missing",
+    });
+    const r = parseScrapeStdout(json, "", 1);
+    if (r.kind !== "error") throw new Error("wrong arm");
+    expect(r.error_kind).toBe("panel_missing");
+  });
+
+  test("v1 error arm (no error_kind) → error_kind null", () => {
+    const json = JSON.stringify({
+      schema_version: 1,
+      status: "error",
+      error_type: "ClaudeUsageParseError",
+      message: "drift",
+      screen_excerpt: [],
+    });
+    const r = parseScrapeStdout(json, "", 1);
+    if (r.kind !== "error") throw new Error("wrong arm");
+    expect(r.error_kind).toBeNull();
+  });
+
+  test("an unknown/garbage error_kind folds to null (forward-compat)", () => {
+    const json = JSON.stringify({
+      schema_version: 1,
+      status: "error",
+      error_type: "X",
+      message: "m",
+      screen_excerpt: [],
+      error_kind: "not_a_real_kind",
+    });
+    const r = parseScrapeStdout(json, "", 1);
+    if (r.kind !== "error") throw new Error("wrong arm");
+    expect(r.error_kind).toBeNull();
+  });
 });
 
 describe("parseScrapeStdout — runner_failure folds (no throw)", () => {

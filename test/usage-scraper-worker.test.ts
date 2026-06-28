@@ -297,9 +297,115 @@ describe("AccountLoop failure path (no-throw)", () => {
     const env = readEnvelope(tmpDir, "codex");
     expect(env.status).toBe("stale");
     expect(env.error?.type).toBe("runner_failure:timed_out");
+    // A runner_failure always classifies as `runner_failed` — on the stale
+    // envelope, the verbose sidecar, and the events.jsonl line.
+    expect(env.error?.kind).toBe("runner_failed");
     expect(existsSync(join(tmpDir, "codex.error.json"))).toBe(true);
+    const sidecar = JSON.parse(
+      readFileSync(join(tmpDir, "codex.error.json"), "utf8"),
+    );
+    expect(sidecar.error_kind).toBe("runner_failed");
     const events = readFileSync(join(tmpDir, "events.jsonl"), "utf8");
     expect(events).toContain('"event":"scrape_failed"');
+    expect(events).toContain('"error_kind":"runner_failed"');
+  });
+
+  test("v1 parse error (no error_kind) falls back to format_changed", async () => {
+    // A v1 `error` arm carries no error_kind; the parser exception family
+    // (`*ParseError`) classifies as format drift on the stale envelope.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({
+        kind: "error",
+        error_type: "ClaudeUsageParseError",
+        message: "required label not found: 'Current session'",
+        screen_excerpt: ["line1"],
+        error_kind: null,
+      }),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+    expect(readEnvelope(tmpDir, "default").error?.kind).toBe("format_changed");
+  });
+
+  test("v1 endpoint throttle (no error_kind) falls back to upstream_limited", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({
+        kind: "error",
+        error_type: "ClaudeUsageEndpointRateLimited",
+        message: "claude /usage endpoint is rate limited — retry later",
+        screen_excerpt: [],
+        error_kind: null,
+      }),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+    expect(readEnvelope(tmpDir, "default").error?.kind).toBe(
+      "upstream_limited",
+    );
+  });
+
+  test("an unclassified v1 crash falls back to scrape_failed", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({
+        kind: "error",
+        error_type: "RuntimeError",
+        message: "the TUI binary was not found",
+        screen_excerpt: [],
+        error_kind: null,
+      }),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+    expect(readEnvelope(tmpDir, "default").error?.kind).toBe("scrape_failed");
+  });
+
+  test("a v2 error arm's explicit error_kind reaches the stale envelope", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({
+        kind: "error",
+        error_type: "ClaudeUsageParseError",
+        message: "panel never rendered",
+        screen_excerpt: ["line1"],
+        error_kind: "panel_missing",
+      }),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+    const env = readEnvelope(tmpDir, "default");
+    // The v2 contract's own classification wins over any fallback derivation.
+    expect(env.error?.kind).toBe("panel_missing");
+    const sidecar = JSON.parse(
+      readFileSync(join(tmpDir, "default.error.json"), "utf8"),
+    );
+    expect(sidecar.error_kind).toBe("panel_missing");
   });
 
   test("Claude /usage endpoint throttle backs off for 15m", async () => {
@@ -317,6 +423,7 @@ describe("AccountLoop failure path (no-throw)", () => {
         error_type: "ClaudeUsageEndpointRateLimited",
         message: "claude /usage endpoint is rate limited — retry later",
         screen_excerpt: [],
+        error_kind: null,
       }),
     });
 
@@ -360,6 +467,7 @@ describe("AccountLoop failure path (no-throw)", () => {
         error_type: "ClaudeUsageParseError",
         message: "drift",
         screen_excerpt: ["line1", "line2"],
+        error_kind: null,
       }),
     });
     await new AccountLoop(acct, deps).runCycleNoThrow();
@@ -559,7 +667,12 @@ describe("AccountLoop cooldown gate", () => {
           last_skipped_fetch_at: null,
           last_failed_fetch_at: "2026-06-24T11:00:00-04:00",
           next_fetch_at: "2026-06-24T11:02:00-04:00",
-          error: { type: "X", message: "y", at: "2026-06-24T11:00:00-04:00" },
+          error: {
+            type: "X",
+            message: "y",
+            at: "2026-06-24T11:00:00-04:00",
+            kind: null,
+          },
         }),
         null,
         2,
@@ -715,6 +828,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
             error_type: "ClaudeUsageEndpointRateLimited",
             message: "rate limited",
             screen_excerpt: [],
+            error_kind: null,
           }),
         }),
       ).runCycleNoThrow();

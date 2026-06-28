@@ -76,13 +76,63 @@ export interface ScrapeUsage {
 }
 
 /**
+ * Stable keeper-side failure classification carried on a stale `usage` row's
+ * `error_kind` — separates WHAT kind of failure is blocking usage freshness so
+ * the renderer (and a human) can tell scraper/runner faults apart from target
+ * TUI format drift. Five stable values:
+ *  - `format_changed`  — the target TUI rendered but didn't match the expected
+ *                        shape (claude/codex parser drift).
+ *  - `panel_missing`   — the usage/status panel never rendered (no parseable
+ *                        content); distinct from format drift.
+ *  - `scrape_failed`   — the scrape itself crashed (binary missing, TUI spawn
+ *                        fault, unexpected crash before/while rendering).
+ *  - `upstream_limited`— the target reported its OWN usage endpoint is throttled
+ *                        (claude `/usage` endpoint rate limit); transient.
+ *  - `runner_failed`   — keeper's scrape SEAM could not obtain a contract at all
+ *                        (spawn/timeout/empty/non-JSON/schema-mismatch). Minted
+ *                        keeper-side, never by the util.
+ *
+ * The util (v2 contract) emits one of the first four on its `error` arm; keeper
+ * mints `runner_failed` on the runner_failure arm and falls back to a derived
+ * kind when an older (v1) util emits an `error` arm with no `error_kind`.
+ */
+export type UsageErrorKind =
+  | "format_changed"
+  | "panel_missing"
+  | "scrape_failed"
+  | "upstream_limited"
+  | "runner_failed";
+
+const USAGE_ERROR_KINDS: ReadonlySet<string> = new Set<UsageErrorKind>([
+  "format_changed",
+  "panel_missing",
+  "scrape_failed",
+  "upstream_limited",
+  "runner_failed",
+]);
+
+/**
+ * Coerce an unknown (a contract field, an envelope cell) to a {@link UsageErrorKind}
+ * or null. An unknown/absent value folds to null so a v1 contract (no
+ * `error_kind`) and any future/garbage value both stay safe — the worker's
+ * fallback classifier supplies the kind in that case.
+ */
+export function asUsageErrorKind(v: unknown): UsageErrorKind | null {
+  return typeof v === "string" && USAGE_ERROR_KINDS.has(v)
+    ? (v as UsageErrorKind)
+    : null;
+}
+
+/**
  * The util's discriminated JSON contract, parsed + validated. EXACTLY one of:
  *  - `ok` (subscribed): carries `usage` + `subscription_active` (true for claude,
  *    null for codex).
  *  - `ok` (no_subscription): the claude NoActiveSubscription SUCCESS arm — its
  *    `no_subscription:true` presence IS the signal; no `usage`.
  *  - `error`: parse drift / panel-never-rendered / scrape crash — carries
- *    `error_type`, `message`, `screen_excerpt` (head+tail-elided rendered lines).
+ *    `error_type`, `message`, `screen_excerpt` (head+tail-elided rendered lines),
+ *    and (v2) a stable `error_kind`. An older v1 util omits `error_kind`, which
+ *    parses to null and lets the worker derive a fallback kind.
  *  - `runner_failure`: the SEAM could not even obtain a valid contract (spawn
  *    failure, timeout/SIGKILL, empty stdout, non-JSON, schema mismatch). This arm
  *    is minted HERE, never by the util — it carries the captured stderr +
@@ -101,6 +151,8 @@ export type ScrapeResult =
       error_type: string;
       message: string;
       screen_excerpt: string[];
+      /** v2 contract classification; null when an older v1 util omitted it. */
+      error_kind: UsageErrorKind | null;
     }
   | {
       kind: "runner_failure";
@@ -246,6 +298,9 @@ export function parseScrapeStdout(
             (l): l is string => typeof l === "string",
           )
         : [],
+      // v2: a stable classification; absent on a v1 contract → null (the worker
+      // derives a fallback kind from error_type then).
+      error_kind: asUsageErrorKind(parsed.error_kind),
     };
   }
   return {

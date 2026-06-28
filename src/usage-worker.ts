@@ -69,6 +69,7 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
+import { asUsageErrorKind, type UsageErrorKind } from "./usage-scrape-runner";
 import type { ShutdownMessage } from "./wake-worker";
 
 /**
@@ -176,6 +177,15 @@ export interface UsageSnapshotMessage {
    * neither projected nor gated).
    */
   error_at: string | null;
+  /**
+   * Stable failure classification — one of {@link UsageErrorKind}. Carried on
+   * the envelope's stale `error.kind`; null when absent (active, or a
+   * pre-classification envelope). UNLIKE {@link error_at}, this field STAYS in
+   * the change-gate (see {@link usageGateKey}) so a kind flip — e.g. a
+   * `format_changed` drift turning into an `upstream_limited` throttle — emits a
+   * fresh snapshot.
+   */
+  error_kind: UsageErrorKind | null;
   /**
    * Rate-limit lift instant (fn-651) — ISO-8601 string carrying the soonest
    * `resets_at` among windows at >=100% usage (the effective unblock time
@@ -288,6 +298,9 @@ interface RawUsageError {
   type?: unknown;
   message?: unknown;
   at?: unknown;
+  // Stable failure classification stamped by the scraper worker; absent on a
+  // pre-classification envelope → null.
+  kind?: unknown;
 }
 
 /** Coerce a value to a non-empty string, else null. */
@@ -392,12 +405,14 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
   let errorType: string | null = null;
   let errorMessage: string | null = null;
   let errorAt: string | null = null;
+  let errorKind: UsageErrorKind | null = null;
   const errorBlock = raw.error;
   if (errorBlock != null && typeof errorBlock === "object") {
     const e = errorBlock as RawUsageError;
     errorType = asString(e.type);
     errorMessage = asString(e.message);
     errorAt = asString(e.at);
+    errorKind = asUsageErrorKind(e.kind);
   }
   return {
     kind: "usage-snapshot",
@@ -419,6 +434,7 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     error_type: errorType,
     error_message: errorMessage,
     error_at: errorAt,
+    error_kind: errorKind,
     // fn-651: rate-limit lift instant (the soonest `resets_at` among >=100%
     // windows on the agentusage side; null when not over any limit). Top-level
     // envelope field — mirrors `session_resets_at` shape.
@@ -690,7 +706,8 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
               sonnet_week_resets_at, codex_spark_session_percent,
               codex_spark_session_resets_at, codex_spark_week_percent,
               codex_spark_week_resets_at, status, subscription_active,
-              error_type, error_message, error_at, rate_limit_lifts_at
+              error_type, error_message, error_at, error_kind,
+              rate_limit_lifts_at
          FROM usage`,
     )
     .all() as {
@@ -712,6 +729,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     error_type: string | null;
     error_message: string | null;
     error_at: string | null;
+    error_kind: string | null;
     rate_limit_lifts_at: string | null;
   }[];
   for (const r of rows) {
@@ -740,6 +758,10 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       error_type: r.error_type,
       error_message: r.error_message,
       error_at: r.error_at,
+      // The projection only ever stores a validated kind (the producer coerces
+      // via `asUsageErrorKind` before minting the event), so the cast is safe
+      // and the seed key matches the live `buildUsageMessage` output.
+      error_kind: r.error_kind as UsageErrorKind | null,
       // fn-651: lift_at rides the gate so a re-scrape with the same lift
       // doesn't churn a synthetic event; a lift flip fires one emit.
       lift_at: r.rate_limit_lifts_at,

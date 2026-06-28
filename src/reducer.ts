@@ -2852,6 +2852,14 @@ interface UsageSnapshotPayload {
   error_message: string | null;
   error_at: string | null;
   /**
+   * Stable failure classification (one of the keeper-side `UsageErrorKind`
+   * values: `format_changed` / `panel_missing` / `scrape_failed` /
+   * `upstream_limited` / `runner_failed`). Stored opaque as TEXT; the producer
+   * (usage-worker) validates it before minting the event, so a malformed blob
+   * here folds to null. Older events that predate the field fold to null safely.
+   */
+  error_kind: string | null;
+  /**
    * Rate-limit lift instant — ISO-8601 string carrying the soonest `resets_at`
    * among windows at >=100% used; null when the profile is under every limit.
    * Stored opaque as TEXT. Folds into `usage.rate_limit_lifts_at` on the
@@ -2932,6 +2940,10 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
       error_message:
         typeof parsed.error_message === "string" ? parsed.error_message : null,
       error_at: typeof parsed.error_at === "string" ? parsed.error_at : null,
+      // Failure classification — null-safe string parse; older events that
+      // predate `error_kind` (and active/idle snapshots) fold to null safely.
+      error_kind:
+        typeof parsed.error_kind === "string" ? parsed.error_kind : null,
       // Rate-limit lift instant — null-safe string parse; older events that
       // predate `lift_at` fold to null safely.
       lift_at: typeof parsed.lift_at === "string" ? parsed.lift_at : null,
@@ -2994,10 +3006,10 @@ function projectUsageRow(db: Database, event: Event): void {
        sonnet_week_resets_at, codex_spark_session_percent,
        codex_spark_session_resets_at, codex_spark_week_percent,
        codex_spark_week_resets_at, status, subscription_active,
-       error_type, error_message, error_at,
+       error_type, error_message, error_at, error_kind,
        rate_limit_lifts_at, last_usage_fold_at,
        last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -3016,6 +3028,7 @@ function projectUsageRow(db: Database, event: Event): void {
        error_type = excluded.error_type,
        error_message = excluded.error_message,
        error_at = excluded.error_at,
+       error_kind = excluded.error_kind,
        -- fn-651: percentage path owns the lift instant; a re-snapshot
        -- rewrites it cleanly. The rate-limit fan-out (RateLimited /
        -- ApiError(kind='rate_limit')) carves this out of its UPDATE in
@@ -3050,6 +3063,7 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.error_type,
       snapshot.error_message,
       snapshot.error_at,
+      snapshot.error_kind,
       snapshot.lift_at,
       lastUsageFoldAt,
       event.id,

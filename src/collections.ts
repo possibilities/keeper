@@ -348,6 +348,8 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
  * read-and-discarded by the worker and absent from the projection. `error_at`
  * IS projected for "stale since" display but excluded from the worker
  * change-gate so a re-failed scrape with the same error produces zero events.
+ * `error_kind` (the stable failure classification) IS gated, so a kind flip
+ * emits a fresh snapshot.
  */
 export const USAGE_DESCRIPTOR: CollectionDescriptor = {
   name: "usage",
@@ -373,6 +375,7 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "error_type",
     "error_message",
     "error_at",
+    "error_kind",
     // Rate-limit lift instant + last-successful-fold freshness stamp, carved out
     // of the rate-limit fan-out so a RateLimited event cannot clobber them.
     "rate_limit_lifts_at",

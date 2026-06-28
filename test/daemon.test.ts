@@ -2109,6 +2109,7 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
       error_type: "ClaudeUsageParseError",
       error_message: "cli output unparseable",
       error_at: "2026-05-30T12:00:00-04:00",
+      error_kind: "format_changed",
       // fn-651 task .4: rate-limit lift instant. The companion
       // `last_usage_fold_at` is NOT a serialized field — the reducer
       // derives it from the event ts on a successful fold.
@@ -2134,6 +2135,7 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
     error_type: "ClaudeUsageParseError",
     error_message: "cli output unparseable",
     error_at: "2026-05-30T12:00:00-04:00",
+    error_kind: "format_changed",
     // fn-651 task .4: top-level envelope field, projected onto
     // `usage.rate_limit_lifts_at` by parseUsageSnapshot.
     lift_at: "2026-05-30T20:30:00-04:00",
@@ -2175,6 +2177,7 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
         error_type: "ClaudeUsageParseError",
         error_message: "boom",
         error_at: "2026-05-30T12:00:00-04:00",
+        error_kind: "format_changed",
         lift_at: null,
       }),
     ],
@@ -2183,7 +2186,7 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
   const row = db
     .query(
       `SELECT status, subscription_active, error_type, error_message, error_at,
-              sonnet_week_resets_at
+              error_kind, sonnet_week_resets_at
          FROM usage WHERE id = ?`,
     )
     .get("claude-mc1") as {
@@ -2192,6 +2195,7 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
     error_type: string | null;
     error_message: string | null;
     error_at: string | null;
+    error_kind: string | null;
     sonnet_week_resets_at: string | null;
   };
   expect(row.status).toBe("stale");
@@ -2200,6 +2204,8 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
   expect(row.error_type).toBe("ClaudeUsageParseError");
   expect(row.error_message).toBe("boom");
   expect(row.error_at).toBe("2026-05-30T12:00:00-04:00");
+  // fn-1000: the classification folds from the UsageSnapshot onto the column.
+  expect(row.error_kind).toBe("format_changed");
   // sonnet_week_resets_at was null in the message; folds to NULL safely.
   expect(row.sonnet_week_resets_at).toBeNull();
   db.close();
@@ -2233,6 +2239,7 @@ test("usage snapshot folds codex-spark quota columns end-to-end", () => {
         error_type: null,
         error_message: null,
         error_at: null,
+        error_kind: null,
         lift_at: null,
       }),
     ],
@@ -2288,6 +2295,7 @@ test("fn-651: a no-subscription envelope folds subscription_active = 0 so the re
         error_type: null,
         error_message: null,
         error_at: null,
+        error_kind: null,
         lift_at: null,
       }),
     ],
@@ -2512,8 +2520,11 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // task .1 (appending the nullable `events.worktree` + `jobs.worktree` durable
   // lane-branch marker — an additive ALTER, NO cursor rewind: a pre-v94 event
   // carries no worktree value, so a from-scratch re-fold leaves `jobs.worktree`
-  // NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(94);
+  // NULL byte-identical). And to 95 via fn-1000 task .1 (appending the nullable
+  // `usage.error_kind` failure-classification column — an additive ALTER, NO
+  // cursor rewind: a pre-v95 event carries no `error_kind`, so a from-scratch
+  // re-fold leaves the column NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(95);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

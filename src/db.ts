@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 94;
+export const SCHEMA_VERSION = 95;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1014,6 +1014,7 @@ CREATE TABLE IF NOT EXISTS usage (
     error_type TEXT,
     error_message TEXT,
     error_at TEXT,
+    error_kind TEXT,
     rate_limit_lifts_at TEXT,
     last_usage_fold_at REAL,
     last_event_id INTEGER,
@@ -5422,6 +5423,21 @@ function migrate(db: Database): void {
       // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "events", "worktree", "TEXT");
       addColumnIfMissing(db, "jobs", "worktree", "TEXT");
+
+      // v94→v95 (fn-1000.1): add the nullable `usage.error_kind` classification
+      // column. The usage-scraper worker now stamps a stable failure kind
+      // (`format_changed` / `panel_missing` / `scrape_failed` /
+      // `upstream_limited` / `runner_failed`) on a stale envelope's `error.kind`;
+      // the consumer folds it onto this column so `keeper usage` can label WHAT
+      // kind of failure is blocking freshness. APPEND-via-ALTER keeps existing
+      // rows NULL (the zero-event shape) and is re-fold-safe: a pre-v95 event
+      // carries no `error_kind`, so a from-scratch re-fold leaves the column NULL
+      // byte-identically. NO cursor rewind — do NOT add to the rewind-and-redrain
+      // DELETE list (mirrors the prior usage-column adds). Whitelist-only Python
+      // read (keeper-py never reads `usage`) — this bump MUST add 95 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "usage", "error_kind", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

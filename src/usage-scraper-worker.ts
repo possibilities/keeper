@@ -67,11 +67,13 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import { FileLock } from "./usage-flock";
 import {
+  asUsageErrorKind,
   runScrape,
   type ScrapeAccount,
   type ScrapeResult,
   type ScrapeRunner,
   type ScrapeUsage,
+  type UsageErrorKind,
 } from "./usage-scrape-runner";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -153,7 +155,13 @@ export interface Envelope {
   next_fetch_at: string;
   usage: ScrapeUsage | null;
   lift_at: string | null;
-  error: { type: string; message: string; at: string } | null;
+  error: {
+    type: string;
+    message: string;
+    at: string;
+    /** Stable failure classification — see {@link UsageErrorKind}. */
+    kind: UsageErrorKind | null;
+  } | null;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -664,7 +672,13 @@ function priorError(prior: Record<string, unknown>): Envelope["error"] {
     typeof e.message === "string" &&
     typeof e.at === "string"
   ) {
-    return { type: e.type, message: e.message, at: e.at };
+    // A pre-classification (older keeper) prior carries no `kind` → null.
+    return {
+      type: e.type,
+      message: e.message,
+      at: e.at,
+      kind: asUsageErrorKind(e.kind),
+    };
   }
   return null;
 }
@@ -1070,13 +1084,15 @@ export class AccountLoop {
     const delay = failureRetryDelaySeconds(result, clock);
     const nextFetch = new Date(failedAt.getTime() + delay * 1000);
 
-    const { errorType, message, screenExcerpt } = describeFailure(result);
+    const { errorType, message, screenExcerpt, errorKind } =
+      describeFailure(result);
 
     const errorEnvelope: Record<string, unknown> = {
       id: acct.id,
       target: acct.target,
       multiplier: acct.multiplier,
       failed_at: localIsoWithOffset(failedAt),
+      error_kind: errorKind,
       error_type: errorType,
       message,
     };
@@ -1105,6 +1121,7 @@ export class AccountLoop {
         type: errorType,
         message,
         at: localIsoWithOffset(failedAt),
+        kind: errorKind,
       },
     });
     this.writeState(envelope);
@@ -1113,6 +1130,7 @@ export class AccountLoop {
       id: acct.id,
       target: acct.target,
       event: "scrape_failed",
+      error_kind: errorKind,
       error_type: errorType,
       message,
       next_fetch_at: localIsoWithOffset(nextFetch),
@@ -1133,24 +1151,55 @@ export class AccountLoop {
   }
 }
 
-/** Normalize the two failure arms into `(errorType, message, screenExcerpt)`. */
+/**
+ * Normalize the two failure arms into `(errorType, message, screenExcerpt,
+ * errorKind)`. The kind PREFERS the v2 contract's own `error_kind`; a runner
+ * failure is always `runner_failed`; a v1 `error` arm (no `error_kind`) derives
+ * a fallback from the exception class via {@link fallbackErrorKind}.
+ */
 function describeFailure(result: Exclude<ScrapeResult, { kind: "ok" }>): {
   errorType: string;
   message: string;
   screenExcerpt: string[];
+  errorKind: UsageErrorKind;
 } {
   if (result.kind === "error") {
     return {
       errorType: result.error_type,
       message: result.message,
       screenExcerpt: result.screen_excerpt,
+      errorKind: result.error_kind ?? fallbackErrorKind(result.error_type),
     };
   }
   return {
     errorType: `runner_failure:${result.reason}`,
     message: result.message,
     screenExcerpt: [],
+    errorKind: "runner_failed",
   };
+}
+
+/**
+ * Derive an {@link UsageErrorKind} for a v1 `error` arm that carried no
+ * `error_kind`, from the parser exception class name:
+ *  - `ClaudeUsageEndpointRateLimited` → `upstream_limited` (the target's own
+ *    `/usage` endpoint is throttled).
+ *  - `*ParseError` (`ClaudeUsageParseError` / `CodexStatusParseError`) →
+ *    `format_changed` (the panel rendered but didn't match the expected shape).
+ *  - anything else (a scrape crash before/while rendering) → `scrape_failed`.
+ *
+ * `panel_missing` is NOT derivable from v1's collapsed exception family (the
+ * parsers raise the same `*ParseError` for a never-rendered panel as for format
+ * drift); only the v2 contract's explicit `error_kind` distinguishes it.
+ */
+function fallbackErrorKind(errorType: string): UsageErrorKind {
+  if (errorType === "ClaudeUsageEndpointRateLimited") {
+    return "upstream_limited";
+  }
+  if (errorType.endsWith("ParseError")) {
+    return "format_changed";
+  }
+  return "scrape_failed";
 }
 
 function failureRetryDelaySeconds(

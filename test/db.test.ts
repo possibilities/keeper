@@ -2431,9 +2431,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // change, version-guarded). v93 appends nullable codex-spark usage columns
   // (additive ALTER, no epics-shape change). v94 appends the nullable
   // `events.worktree` + `jobs.worktree` durable lane-branch marker (an additive
-  // ALTER, not an epics-shape change), fn-997 task .1. The v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(94);
+  // ALTER, not an epics-shape change), fn-997 task .1. v95 appends the nullable
+  // `usage.error_kind` failure-classification column (an additive ALTER, not an
+  // epics-shape change), fn-1000 task .1. The v62→v63 epics-shape migration this
+  // test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(95);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

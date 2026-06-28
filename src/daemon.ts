@@ -915,6 +915,7 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     error_type: msg.error_type,
     error_message: msg.error_message,
     error_at: msg.error_at,
+    error_kind: msg.error_kind,
     // Rate-limit lift instant — folded into `usage.rate_limit_lifts_at`. The
     // companion `last_usage_fold_at` freshness stamp is NOT serialized; the
     // reducer derives it from the event `ts` (never a wall-clock read in a fold).

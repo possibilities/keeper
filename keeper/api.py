@@ -380,6 +380,9 @@ from pathlib import Path
 # v94 (fn-997 task .1) adds the durable per-job ``events.worktree`` /
 # ``jobs.worktree`` lane-branch marker; keeper-py never reads them, so only the
 # version whitelist gains 94.
+# v95 (fn-1000 task .1) adds the nullable ``usage.error_kind`` failure
+# classification column; keeper-py never reads ``usage``, so only the version
+# whitelist gains 95.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -446,6 +449,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         92,
         93,
         94,
+        95,
     }
 )
 
