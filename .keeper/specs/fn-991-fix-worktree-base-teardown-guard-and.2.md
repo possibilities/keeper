@@ -15,5 +15,5 @@ the projection-done gate — remove the lane-spec narrative, do not append.
 - [ ] No reference to epicBaseHasDoneState or the lane-spec git-show mechanism remains
 
 ## Done summary
-
+Rewrote README worktree finalize paragraph to describe the isEpicDone main-projection done-gate, removing the deleted epicBaseHasDoneState lane-spec git-show narrative.
 ## Evidence
