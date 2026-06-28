@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-28T19:40:44.850000Z",
+  "depends_on": [
+    "fn-1000-classify-usage-scrape-failures.1",
+    "fn-1000-classify-usage-scrape-failures.2"
+  ],
+  "epic": "fn-1000-classify-usage-scrape-failures",
+  "id": "fn-1000-classify-usage-scrape-failures.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Render classified stale errors",
+  "updated_at": "2026-06-28T19:40:44.850000Z"
+}
