@@ -2626,6 +2626,10 @@ export function createWorktreeDriver(
             return retrySkip(
               `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying the push next cycle`,
             );
+          case "push-unconfirmed":
+            return retrySkip(
+              `worktree-finalize-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${baseBranch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+            );
           case "conflict":
             return {
               ok: false,
@@ -2761,6 +2765,7 @@ export type MergeLaneResult =
   | { kind: "conflict"; stderr: string }
   | { kind: "push-timeout" }
   | { kind: "push-failed"; detail: string }
+  | { kind: "push-unconfirmed" }
   | { kind: "merged" };
 
 /**
@@ -2772,6 +2777,7 @@ export type MergeLaneResult =
  */
 export type PushDefaultResult =
   | { kind: "pushed" }
+  | { kind: "off-branch"; head: string }
   | { kind: "not-turn-key"; reason: PushNotReadyReason }
   | { kind: "non-ff" }
   | { kind: "push-timeout" }
@@ -2807,6 +2813,17 @@ export async function pushDefaultToOrigin(
   defaultBranch: string,
   run: WorktreeGitRunner,
 ): Promise<PushDefaultResult> {
+  // HEAD-safety FIRST. Under `push.default=simple` a no-refspec push targets the
+  // CURRENT HEAD's upstream, not `defaultBranch`; off-default it would push the
+  // wrong ref (or "Everything up-to-date", exit 0) while `origin/<default>` never
+  // advances, then the caller tears down on a false `pushed` and strands the
+  // merge. Assert HEAD==default so the turn-key probe (`@{push}` of HEAD), the
+  // branch-explicit FF precheck (on `<default>`), and the push all resolve the
+  // SAME ref; off-default DEGRADE with NO push.
+  const head = await gitCurrentBranch(repo, run);
+  if (head !== defaultBranch) {
+    return { kind: "off-branch", head };
+  }
   // Authoritative turn-key probe FIRST — admits a legitimate first push to a
   // never-pushed default and carries the accurate not-ready reason.
   const pushReady = await remotePushTurnKey(repo, run);
@@ -2821,7 +2838,9 @@ export async function pushDefaultToOrigin(
   ) {
     return { kind: "non-ff" };
   }
-  const push = await run(["push"], {
+  // Branch-explicit refspec (belt-and-suspenders with the HEAD assertion): push
+  // `<default>` to origin regardless of `push.default`.
+  const push = await run(["push", "origin", defaultBranch], {
     cwd: repo,
     env: {
       GIT_TERMINAL_PROMPT: "0",
@@ -2887,7 +2906,25 @@ export async function mergeLaneBaseIntoDefault(
       return { kind: "not-ahead" };
     }
     const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
-    return pushed.kind === "pushed" ? { kind: "not-ahead" } : pushed;
+    if (pushed.kind !== "pushed") {
+      return pushed; // off-branch / non-ff / timeout / failed / not-turn-key → caller defers
+    }
+    // Post-push origin-containment recheck: a push can exit 0 yet leave
+    // origin/<default> un-advanced (e.g. "Everything up-to-date" on a stale ref).
+    // Signal teardown-safe (`not-ahead`) ONLY once origin PROVABLY contains the
+    // merge (cached remote-tracking ref, NO fetch); otherwise degrade transiently
+    // so the caller defers, never tears the base down off a false `pushed`.
+    if (
+      await gitIsAncestorOf(
+        repo,
+        baseBranch,
+        originDefaultRef(defaultBranch),
+        run,
+      )
+    ) {
+      return { kind: "not-ahead" };
+    }
+    return { kind: "push-unconfirmed" };
   }
   const ready = await gitMergeReadiness(repo, defaultBranch, run, baseBranch);
   if (ready.kind === "off-branch") {
@@ -3237,6 +3274,24 @@ export async function recoverWorktrees(
             });
             continue;
           }
+          // Post-push origin-containment recheck (the second teardown seam): a
+          // push can exit 0 yet leave origin/<default> un-advanced — tear down
+          // ONLY once origin PROVABLY contains the lane (cached ref, NO fetch).
+          if (
+            !(await gitIsAncestorOf(
+              repo,
+              lane.branch,
+              originDefaultRef(defaultBranch),
+              run,
+            ))
+          ) {
+            failures.push({
+              epicId: lane.epicId,
+              reason: `worktree-recover-${kind}-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${lane.branch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+              dir: repo,
+            });
+            continue;
+          }
         }
         const wt = wtByShortBranch.get(lane.branch);
         if (wt !== undefined) {
@@ -3283,6 +3338,8 @@ function pushDefaultRecoverReason(
   defaultBranch: string,
 ): string {
   switch (result.kind) {
+    case "off-branch":
+      return `worktree-recover-${laneKind}-off-branch: the main checkout HEAD is ${result.head}, expected ${defaultBranch} — deferring ${branch} teardown until the checkout returns to the default branch (no push off-default)`;
     case "not-turn-key":
       return `worktree-recover-${laneKind}-push-not-turn-key: ${describePushNotReady(result.reason)} — deferring ${branch} teardown until the ${defaultBranch} push to origin is turn-key (no fetch/rebase/force)`;
     case "non-ff":

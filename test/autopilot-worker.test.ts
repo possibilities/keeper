@@ -4814,6 +4814,53 @@ test("fn-990 finalizeEpic: done in the projection but the lane is NOT ahead of d
   expect(cmds.some((c) => c === "push")).toBe(false);
 });
 
+test("fn-992 finalizeEpic: a stranded base (absent from origin) while HEAD is OFF-default → worktree-finalize-off-branch retry-skip (NOT a recover reason), NO push, NO teardown", async () => {
+  // The not-ahead re-push seam reached with the shared checkout off the default
+  // branch: pushDefaultToOrigin's HEAD-safety arm degrades, finalize maps it to a
+  // FINALIZE-side reason (OUTSIDE the recover auto-clear prefix) and tears nothing
+  // down behind a wrong-ref push.
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      return { code: 0, stdout: "", stderr: "" }; // ancestor of LOCAL default
+    }
+    if (
+      joined ===
+      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // origin LACKS the merge → re-push seam
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "feature\n", stderr: "" }; // HEAD OFF the default branch
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toMatch(/^worktree-finalize-off-branch:/);
+    // A FINALIZE reason must stay OUTSIDE the recover auto-clear prefix, or the
+    // level-triggered clear would silently dismiss a legitimate finalize block.
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // No wrong-ref push, no teardown — the merge was never stranded behind it.
+  expect(cmds.some((c) => c === "push")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
+});
+
 test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (fake lock, no real flock)", async () => {
   // The shared merge routine both finalize and recover pass-2 drive. A lane base
   // that is NOT an ancestor of default carries real commits → it merges (under the
@@ -5042,6 +5089,7 @@ test("fn-991 mergeLaneBaseIntoDefault: a base merged into LOCAL default but ABSE
   // got it. Returning `not-ahead` straight to teardown would strand the merge.
   const base = "keeper/epic/fn-1-foo";
   const cmds: string[] = [];
+  let pushed = false;
   const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
     args,
   ) => {
@@ -5053,7 +5101,12 @@ test("fn-991 mergeLaneBaseIntoDefault: a base merged into LOCAL default but ABSE
     if (
       joined === `merge-base --is-ancestor ${base} refs/remotes/origin/main`
     ) {
-      return { code: 1, stdout: "", stderr: "" }; // origin LACKS the merge
+      // origin LACKS the merge until the re-push lands (the post-push recheck then
+      // sees it contained → teardown-safe `not-ahead`).
+      return { code: pushed ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" }; // HEAD on default → push allowed
     }
     if (joined === "remote get-url origin") {
       return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
@@ -5069,12 +5122,16 @@ test("fn-991 mergeLaneBaseIntoDefault: a base merged into LOCAL default but ABSE
     if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
       return { code: 0, stdout: "", stderr: "" }; // FF precheck: ff-able
     }
-    return { code: 0, stdout: "", stderr: "" }; // rev-parse --verify --quiet, push
+    if (joined === "push origin main") {
+      pushed = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" }; // rev-parse --verify --quiet
   };
   const res = await mergeLaneBaseIntoDefault("/repo", base, "main", fakeRun);
   expect(res).toEqual({ kind: "not-ahead" });
-  // The stranded merge was RE-PUSHED before signaling teardown-safe...
-  expect(cmds.some((c) => c === "push")).toBe(true);
+  // The stranded merge was RE-PUSHED (branch-explicit) before signaling teardown-safe...
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
   // ...with NO merge and NO mergeReadiness (a push touches refs, not the tree).
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("status --porcelain"))).toBe(false);
@@ -5094,6 +5151,9 @@ test("fn-991 mergeLaneBaseIntoDefault: a base absent from origin whose RE-PUSH t
     ) {
       return { code: 1, stdout: "", stderr: "" }; // origin lacks it
     }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" }; // HEAD on default → push allowed
+    }
     if (joined === "remote get-url origin") {
       return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
     }
@@ -5108,13 +5168,92 @@ test("fn-991 mergeLaneBaseIntoDefault: a base absent from origin whose RE-PUSH t
     if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "push") {
+    if (joined === "push origin main") {
       return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
   const res = await mergeLaneBaseIntoDefault("/repo", base, "main", fakeRun);
   expect(res).toEqual({ kind: "push-timeout" });
+});
+
+test("fn-992 mergeLaneBaseIntoDefault: a base absent from origin while HEAD is OFF-default → `off-branch`, NO push (a no-refspec push would target the wrong ref)", async () => {
+  // The push.default=simple footgun: a base merged into LOCAL default but absent
+  // from origin would trigger the not-ahead re-push — but if the shared checkout
+  // HEAD is off the default branch, a no-refspec push targets the WRONG upstream.
+  // The HEAD-safety arm degrades (off-branch, NO push) instead of stranding the
+  // merge behind a false `pushed`.
+  const base = "keeper/epic/fn-1-foo";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined === `merge-base --is-ancestor ${base} main`) {
+      return { code: 0, stdout: "", stderr: "" }; // ancestor of LOCAL default
+    }
+    if (
+      joined === `merge-base --is-ancestor ${base} refs/remotes/origin/main`
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // origin LACKS the merge
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "feature\n", stderr: "" }; // HEAD OFF the default branch
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault("/repo", base, "main", fakeRun);
+  expect(res).toEqual({ kind: "off-branch", head: "feature" });
+  // NO push of ANY form ran — not a bare push, not the wrong-ref push.
+  expect(cmds.some((c) => c === "push")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-992 mergeLaneBaseIntoDefault: a re-push that exits 0 but leaves origin un-advanced → `push-unconfirmed` (the caller defers, never tears down)", async () => {
+  // "Exit 0 but origin didn't move": the post-push origin-containment recheck must
+  // refuse to signal teardown-safe until origin PROVABLY carries the merge.
+  const base = "keeper/epic/fn-1-foo";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined === `merge-base --is-ancestor ${base} main`) {
+      return { code: 0, stdout: "", stderr: "" }; // ancestor of LOCAL default
+    }
+    if (
+      joined === `merge-base --is-ancestor ${base} refs/remotes/origin/main`
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // origin LACKS it — before AND after the push
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" }; // HEAD on default → push allowed
+    }
+    if (joined === "remote get-url origin") {
+      return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // FF ff-able
+    }
+    if (joined === "push origin main") {
+      return { code: 0, stdout: "Everything up-to-date\n", stderr: "" }; // exit 0, no advance
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault("/repo", base, "main", fakeRun);
+  expect(res).toEqual({ kind: "push-unconfirmed" });
+  // The push DID run (branch-explicit) but the recheck refused teardown-safe.
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
 test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
@@ -5597,6 +5736,7 @@ function makeRecoveryGit(state: {
   mergeConflict?: boolean; // a real merge hits a conflict
   pushFails?: boolean;
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
+  pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
@@ -5739,13 +5879,28 @@ function makeRecoveryGit(state: {
         ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
         : { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "push") {
+    if (args[0] === "push") {
+      // (`push --dry-run` is matched earlier.) Covers BOTH the bare merge-path
+      // push and the branch-explicit re-push (`push origin <default>`).
       if (state.pushTimeout) {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
       }
-      return state.pushFails
-        ? { code: 1, stdout: "", stderr: "remote rejected\n" }
-        : { code: 0, stdout: "", stderr: "" };
+      if (state.pushFails) {
+        return { code: 1, stdout: "", stderr: "remote rejected\n" };
+      }
+      // A successful push advances origin/<default> to local default — origin now
+      // contains every ancestor of local default — UNLESS the test models the
+      // "exit 0 but origin didn't move" pathology, which keeps origin stranded so
+      // the post-push containment recheck fires.
+      if (!state.pushUnconfirmed) {
+        state.originUnresolved = false;
+        const origin = state.originAncestors ?? new Set<string>();
+        for (const a of state.ancestors ?? []) {
+          origin.add(a);
+        }
+        state.originAncestors = origin;
+      }
+      return { code: 0, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -6091,8 +6246,10 @@ test("fn-991 recoverWorktrees pass-3: a base merged into LOCAL default but ABSEN
     async () => false, // epic absent → eligible to sweep
   );
   expect(failures).toEqual([]);
-  // Default re-pushed BEFORE teardown, then the lane reclaimed.
-  expect(calls.some((c) => c.cwd === "/repo" && c.args === "push")).toBe(true);
+  // Default re-pushed (branch-explicit) BEFORE teardown, then the lane reclaimed.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "push origin main"),
+  ).toBe(true);
   expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
     true,
   );
@@ -6161,7 +6318,9 @@ test("fn-991 recoverWorktrees pass-3: a never-pushed default (UNRESOLVED origin 
   );
   expect(failures).toEqual([]);
   // The "unknown" FF tri-state never minted a non-FF skip — the first push landed.
-  expect(calls.some((c) => c.cwd === "/repo" && c.args === "push")).toBe(true);
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "push origin main"),
+  ).toBe(true);
   expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
     true,
   );
@@ -6196,6 +6355,85 @@ test("fn-991 recoverWorktrees pass-3: a base absent from origin with NO push tar
   );
   expect(isWorktreeRecoverReason(failures[0]?.reason)).toBe(true);
   // DEFERRED — never torn down, and never a sticky teardown-on-failure.
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-992 recoverWorktrees pass-3: a base absent from origin while HEAD is OFF-default → DEFERRED (recover-side off-branch), NO push, base NOT torn down", async () => {
+  // The second teardown seam reached with the shared checkout off the default
+  // branch: pushDefaultToOrigin's HEAD-safety arm degrades to a recover-side
+  // off-branch defer (INSIDE the auto-clear prefix) rather than a wrong-ref push.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // ancestor of LOCAL default...
+    originAncestors: new Set(), // ...but origin LACKS it
+    repoHead: "feature", // the shared checkout HEAD is OFF the default branch
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toMatch(/^worktree-recover-base-off-branch:/);
+  expect(isWorktreeRecoverReason(failures[0]?.reason)).toBe(true);
+  // NO push of ANY form, and NEVER torn down behind a wrong-ref push.
+  expect(calls.some((c) => c.cwd === "/repo" && c.args === "push")).toBe(false);
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args.startsWith("push origin")),
+  ).toBe(false);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-992 recoverWorktrees pass-3: a re-push that exits 0 but leaves origin un-advanced → DEFERRED (push-unconfirmed), base NOT torn down", async () => {
+  // "Exit 0 but origin didn't move": the post-push containment recheck refuses
+  // teardown until origin PROVABLY carries the lane — a recover-side defer.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    originAncestors: new Set(), // origin lacks the merge before AND after the push
+    repoHead: "main",
+    pushUnconfirmed: true, // push exits 0 but origin/<default> never advances
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toMatch(
+    /^worktree-recover-base-push-unconfirmed:/,
+  );
+  expect(isWorktreeRecoverReason(failures[0]?.reason)).toBe(true);
+  // The push DID run (branch-explicit) but the recheck refused teardown.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "push origin main"),
+  ).toBe(true);
   expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
     false,
   );
