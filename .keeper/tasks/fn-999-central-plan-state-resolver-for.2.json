@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "converge done/claim/reconcile/resolve-task onto the resolver + fix primary-outside-roots",
-  "updated_at": "2026-06-28T19:02:48.182000Z"
+  "updated_at": "2026-06-28T22:06:13.711000Z",
+  "worker_done_at": "2026-06-28T22:06:13.711000Z"
 }

@@ -45,5 +45,5 @@ Registry behavioral test (B): parametrize done/claim/reconcile/resolve-task — 
 - [ ] these verbs removed from the source-guard exempt-list
 
 ## Done summary
-
+Converged done/claim/reconcile/resolve-task STATE onto the central resolvePlanStateContext seam: state re-roots to epic.primary_repo from a lane (and when primary is outside roots), CODE routing stays on resolveWorkerRepos().targetRepo, typed locate envelopes preserved, with a registry behavioral test over all four and the obsolete lane-commit test rewritten to the fail-loud backstop.
 ## Evidence
