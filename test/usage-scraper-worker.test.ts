@@ -95,6 +95,9 @@ function makeDeps(
       subscription_active: true,
     }),
     shutdownSignal: liveSignal,
+    // Default the in-cycle tier re-resolve at the sandbox home so a cycle test is
+    // deterministic on both CI and a dev box with a real `~/.claude-profiles`.
+    homeDir: tmpDir,
     ...overrides,
   };
 }
@@ -209,6 +212,8 @@ describe("AccountLoop success cycle", () => {
       multiplier: 5,
     };
     const clock = fixedClock("2026-06-24T12:00:00-04:00");
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Pre-seed a stale error sidecar to assert it is cleared on success.
     writeFileSync(join(tmpDir, "default.error.json"), "{}");
     const calls: ScrapeAccount[] = [];
@@ -378,6 +383,8 @@ describe("AccountLoop idle gate", () => {
       profile: "default",
       multiplier: 5,
     };
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Prior non-stale envelope so the gate engages (the gate only runs with a prior).
     writeFileSync(
       join(tmpDir, "default.json"),
@@ -480,6 +487,8 @@ describe("AccountLoop cooldown gate", () => {
       profile: "default",
       multiplier: 5,
     };
+    // Sandbox the in-cycle tier re-resolve so it deterministically keeps 5x.
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
     // Prior envelope with a future lift_at.
     writeFileSync(
       join(tmpDir, "default.json"),

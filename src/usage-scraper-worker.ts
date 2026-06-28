@@ -667,6 +667,8 @@ export interface AccountLoopDeps {
   shutdownSignal: AbortSignal;
   /** Latest agent activity (epoch seconds) — injectable so tests force idle/active. */
   latestActivity?: () => number;
+  /** Home dir the per-cycle tier re-resolve reads — injectable so tests sandbox it. */
+  homeDir?: string;
 }
 
 /**
@@ -753,7 +755,7 @@ export class AccountLoop {
     // the envelope within one window). KEEP THE PRIOR on a null read — the
     // mutable `acct.multiplier` is the carrier, so a Max account never downgrades.
     if (acct.target === "claude") {
-      reResolveMultiplier(acct);
+      reResolveMultiplier(acct, this.deps.homeDir);
     }
 
     // Idle / cooldown gates — only when a prior envelope exists AND it is not
