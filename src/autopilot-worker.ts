@@ -2764,6 +2764,81 @@ export type MergeLaneResult =
   | { kind: "merged" };
 
 /**
+ * The push-only analogue of {@link MergeLaneResult}: the verdict of
+ * {@link pushDefaultToOrigin}. Its non-`pushed` members are STRUCTURALLY the
+ * push-side {@link MergeLaneResult} arms, so a caller threading an already-merged
+ * (not-ahead) base through a re-push can return them straight as a
+ * {@link MergeLaneResult} without a remap.
+ */
+export type PushDefaultResult =
+  | { kind: "pushed" }
+  | { kind: "not-turn-key"; reason: PushNotReadyReason }
+  | { kind: "non-ff" }
+  | { kind: "push-timeout" }
+  | { kind: "push-failed"; detail: string };
+
+/**
+ * The CACHED remote-tracking ref for `origin/<defaultBranch>` — resolved from the
+ * local ref store ONLY (never a fetch), honoring the shared-checkout no-network
+ * invariant. An unresolved ref (a never-pushed default) makes
+ * {@link gitIsAncestorOf} return `false` ("origin lacks the lane"), which routes
+ * the lane through the turn-key first-push path rather than minting a false
+ * "already on origin" that would strand the merge.
+ */
+export function originDefaultRef(defaultBranch: string): string {
+  return `refs/remotes/origin/${defaultBranch}`;
+}
+
+/**
+ * Push local `defaultBranch` to `origin/<defaultBranch>` — a PUSH-ONLY path (no
+ * merge, so NO {@link mergeReadiness}: a push touches refs, not the working tree)
+ * that REUSES the fn-990 push gating rather than duplicating it: the authoritative
+ * {@link remotePushTurnKey} probe FIRST (it admits a legitimate first push to a
+ * never-pushed default via its dry-run), THEN the cached-ref non-ff precheck which
+ * blocks ONLY a PROVEN non-fast-forward — an `"unknown"` unresolved origin ref
+ * defers to the turn-key verdict, never a false permanent skip. Shared by the two
+ * teardown seams (the {@link mergeLaneBaseIntoDefault} not-ahead short-circuit and
+ * {@link recoverWorktrees} pass-3) so a base merged into LOCAL default whose push
+ * timed out is re-pushed before its lane is torn down (no silently-stranded
+ * merge). Pure git side effects — never a fetch / rebase / force.
+ */
+export async function pushDefaultToOrigin(
+  repo: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+): Promise<PushDefaultResult> {
+  // Authoritative turn-key probe FIRST — admits a legitimate first push to a
+  // never-pushed default and carries the accurate not-ready reason.
+  const pushReady = await remotePushTurnKey(repo, run);
+  if (!pushReady.ready) {
+    return { kind: "not-turn-key", reason: pushReady.reason };
+  }
+  // Cached-ref non-ff precheck second: block ONLY a PROVEN non-fast-forward; an
+  // `"unknown"` unresolved origin/<default> defers to the turn-key verdict above.
+  if (
+    (await gitRemotePushFastForwardable(repo, defaultBranch, run)) ===
+    "non-fast-forwardable"
+  ) {
+    return { kind: "non-ff" };
+  }
+  const push = await run(["push"], {
+    cwd: repo,
+    env: {
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
+    },
+    timeoutMs: GIT_PUSH_TIMEOUT_MS,
+  });
+  if (push.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "push-timeout" };
+  }
+  if (push.code !== 0) {
+    return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
+  }
+  return { kind: "pushed" };
+}
+
+/**
  * The ONE guarded lane-base→default merge sequence shared by
  * {@link WorktreeDriver.finalizeEpic} and {@link recoverWorktrees} pass-2. Runs IN
  * the main checkout (`repo`, already resolved to be on `defaultBranch`) and never
@@ -2793,7 +2868,26 @@ export async function mergeLaneBaseIntoDefault(
   acquireLock?: LockAcquirer,
 ): Promise<MergeLaneResult> {
   if (await gitIsAncestorOf(repo, baseBranch, defaultBranch, run)) {
-    return { kind: "not-ahead" };
+    // The base is already an ancestor of LOCAL default — but a base merged into
+    // local default whose push then TIMED OUT is, next cycle, exactly this: an
+    // ancestor of local default yet ABSENT from origin. Returning `not-ahead`
+    // straight to teardown would strand the merge (origin/<default> never
+    // advances). Verify origin contains it via the cached remote-tracking ref (NO
+    // fetch); if origin lacks it, RE-PUSH local default and signal teardown-safe
+    // (`not-ahead`) ONLY once the push lands. A push-side degrade returns its own
+    // discriminant so the caller defers (retry-skip), never tears down.
+    if (
+      await gitIsAncestorOf(
+        repo,
+        baseBranch,
+        originDefaultRef(defaultBranch),
+        run,
+      )
+    ) {
+      return { kind: "not-ahead" };
+    }
+    const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
+    return pushed.kind === "pushed" ? { kind: "not-ahead" } : pushed;
   }
   const ready = await gitMergeReadiness(repo, defaultBranch, run, baseBranch);
   if (ready.kind === "off-branch") {
@@ -3111,6 +3205,39 @@ export async function recoverWorktrees(
         if (!(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))) {
           continue; // unmerged lane — leave it for a human, never force-delete
         }
+        // Origin-containment guard — the SECOND teardown seam. Pass-3 sweeps
+        // WITHOUT mergeLaneBaseIntoDefault, so it runs its own check: a lane merged
+        // into LOCAL default whose push timed out is an ancestor of local default
+        // yet absent from origin, and deleting it strands the merge
+        // (origin/<default> never advances, yet autopilot reports the epic
+        // finalized). Verify origin contains it via the cached remote-tracking ref
+        // (NO fetch); if origin lacks it, RE-PUSH default (the shared push-only
+        // gating) and tear down ONLY after origin provably contains the lane. A
+        // push-side degrade DEFERS — a transient `worktree-recover-*` retry-skip
+        // INSIDE the auto-clear prefix (no sticky, no teardown), never a delete.
+        if (
+          !(await gitIsAncestorOf(
+            repo,
+            lane.branch,
+            originDefaultRef(defaultBranch),
+            run,
+          ))
+        ) {
+          const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
+          if (pushed.kind !== "pushed") {
+            failures.push({
+              epicId: lane.epicId,
+              reason: pushDefaultRecoverReason(
+                pushed,
+                kind,
+                lane.branch,
+                defaultBranch,
+              ),
+              dir: repo,
+            });
+            continue;
+          }
+        }
         const wt = wtByShortBranch.get(lane.branch);
         if (wt !== undefined) {
           const removed = await gitRemoveWorktree(repo, wt, run);
@@ -3140,6 +3267,31 @@ export async function recoverWorktrees(
 /** Compact an unknown thrown value to its message string. */
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Map a non-`pushed` {@link PushDefaultResult} to pass-3's recover-side reason for
+ * the origin-containment re-push degrade. Every variant carries the
+ * `worktree-recover-*` prefix so {@link isWorktreeRecoverReason} keeps it INSIDE
+ * the level-triggered auto-clear scope — a transient defer that lifts the moment
+ * origin settles, never a sticky jam, never a teardown-on-failure.
+ */
+function pushDefaultRecoverReason(
+  result: Exclude<PushDefaultResult, { kind: "pushed" }>,
+  laneKind: string,
+  branch: string,
+  defaultBranch: string,
+): string {
+  switch (result.kind) {
+    case "not-turn-key":
+      return `worktree-recover-${laneKind}-push-not-turn-key: ${describePushNotReady(result.reason)} — deferring ${branch} teardown until the ${defaultBranch} push to origin is turn-key (no fetch/rebase/force)`;
+    case "non-ff":
+      return `worktree-recover-${laneKind}-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — deferring ${branch} teardown until the checkout is updated (no fetch/rebase/force)`;
+    case "push-timeout":
+      return `worktree-recover-${laneKind}-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall) — deferring ${branch} teardown next cycle`;
+    case "push-failed":
+      return `worktree-recover-${laneKind}-push-failed: ${branch} — ${result.detail}`;
+  }
 }
 
 /**
