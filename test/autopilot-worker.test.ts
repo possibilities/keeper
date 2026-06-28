@@ -4156,6 +4156,79 @@ test("fn-978 reconcile: a required root resolving null → distinct sticky workt
   }
 });
 
+test("fn-1001 classifyWorktreeRepos: one toplevel but empty primary_repo → no-primary-repo (operator-required, NOT ok)", () => {
+  // The landmine: tasks all carry a target_repo (single toplevel) so the epic
+  // WOULD classify `ok`, but the epic has no primary_repo (project_dir) — so plan
+  // state would degrade to the lane checkout. Reject before any lane is keyed.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "", // no primary_repo
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos([epic], (r) =>
+    r === "/repo" ? "/repo" : null,
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("no-primary-repo");
+  expect(res?.kind === "no-primary-repo" && res.reason).toContain(
+    "worktree-no-primary-repo",
+  );
+  // Operator-required: OUTSIDE the worktree-recover auto-clear prefix.
+  expect(
+    res?.kind === "no-primary-repo" && isWorktreeRecoverReason(res.reason),
+  ).toBe(false);
+});
+
+test("fn-1001 classifyWorktreeRepos: one toplevel WITH primary_repo set → ok (byte-identical, even when base != primary_repo)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/created-here", // a non-empty primary_repo, distinct from the base
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos([epic], (r) =>
+    r === "/repo" ? "/repo" : r === "/created-here" ? "/created-here" : null,
+  ).get("fn-1-foo");
+  expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
+});
+
+test("fn-1001 reconcile: worktree ON, single-toplevel epic with empty primary_repo → every launch stamped worktree-no-primary-repo, no lane", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "", // no primary_repo
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) => (r === "/repo" ? "/repo" : null));
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    expect(l.worktreeReject?.reason).toContain("worktree-no-primary-repo");
+    expect(l.worktreeReject?.reason).not.toContain("worktree-multi-repo");
+    expect(l.worktreeReject?.reason).not.toContain("worktree-repo-unresolved");
+    // No lane geometry was attached — nothing was provisioned.
+    expect(l.worktree).toBeUndefined();
+  }
+});
+
+test("fn-1001 reconcile: worktree ON, single-toplevel epic WITH primary_repo set → provisions a lane unchanged (no reject)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo", // primary_repo present
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const snap = worktreeSnap([epic], (r) => (r === "/repo" ? "/repo" : null));
+  const decision = reconcile(snap, makeState(), 0);
+  const launch = decision.launches.find((l) => l.id === "fn-1-foo.1");
+  expect(launch?.worktreeReject).toBeUndefined();
+  expect(launch?.worktree?.repoDir).toBe("/repo");
+});
+
 test("fn-978 runReconcileCycle: an unresolved epic surfaces worktree-repo-unresolved AHEAD of cwd-missing (raw cwd never stat'd)", async () => {
   const { driver, log } = makeFakeWorktreeDriver();
   const { deps, log: depsLog } = makeFakeDeps({

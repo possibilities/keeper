@@ -644,11 +644,19 @@ export interface ReconcileSnapshot {
  *    transient git failure); the epic is rejected with a distinct sticky
  *    `worktree-repo-unresolved` reject (re-resolves next cycle via the per-cycle
  *    memo). The `reason` is a free-form `<prefix>: <detail>` literal.
+ *  - `no-primary-repo` — one toplevel resolved, but the epic carries no
+ *    `primary_repo` (mirrored onto `project_dir`). Provisioning a lane would let
+ *    the central plan-state resolver degrade state writes to the LANE checkout
+ *    (`done`/`claim`/close land on the lane branch, `isEpicDone` never flips,
+ *    `finalizeEpic` deadlocks). Rejected with a sticky `worktree-no-primary-repo`
+ *    — operator-required (OUTSIDE the `worktree-recover` auto-clear prefix; a
+ *    missing primary_repo is an epic-def fix, not a transient).
  */
 export type WorktreeRepoResolution =
   | { kind: "ok"; repoDir: string }
   | { kind: "multi-repo"; reason: string }
-  | { kind: "unresolved"; reason: string };
+  | { kind: "unresolved"; reason: string }
+  | { kind: "no-primary-repo"; reason: string };
 
 /**
  * In-memory reconciler state — the paused flag plus the set of
@@ -1796,6 +1804,20 @@ function classifyEpicRepo(
     return {
       kind: "unresolved",
       reason: `worktree-repo-unresolved: epic ${epic.epic_id} resolved no repo root`,
+    };
+  }
+  // One resolved toplevel is necessary but not sufficient. The central plan-state
+  // resolver roots `done`/`claim`/close state at `epic.primary_repo` (mirrored
+  // onto `project_dir`); a null/empty value degrades it to the locate dir — from a
+  // lane cwd that IS the lane — so state lands on the lane branch, `isEpicDone`
+  // never flips, and `finalizeEpic` defers forever (a silent worktree deadlock).
+  // Reject LOUD before any lane is provisioned, keyed OUTSIDE the
+  // `worktree-recover` auto-clear prefix (a missing primary_repo is an operator
+  // epic-def fix, not a transient).
+  if (projectDir === "") {
+    return {
+      kind: "no-primary-repo",
+      reason: `worktree-no-primary-repo: epic ${epic.epic_id} has no primary_repo — refusing to provision a lane (plan state would degrade to the lane checkout; set epic.primary_repo and retry)`,
     };
   }
   return { kind: "ok", repoDir };
