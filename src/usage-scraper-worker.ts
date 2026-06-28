@@ -38,7 +38,11 @@
  * multiplier resolution + account discovery (config profiles + codex) move TS-side
  * ({@link resolveMultiplierOrNull} / {@link buildAccounts}). A tier-read failure
  * KEEPS THE PRIOR multiplier (the mutable account record is the carrier) so a Max
- * account never silently downgrades to 1x.
+ * account never silently downgrades to 1x. The multiplier re-resolves on a ~60s
+ * sub-cadence INDEPENDENT of cooldown/idle parking: the no-scrape sleeps are capped
+ * at {@link MULTIPLIER_POLL_INTERVAL_S} (post-scrape backoffs are NOT), and a change
+ * vs the on-disk envelope breaks both gates early and forces a scrape. An mtime memo
+ * ({@link multiplierMemo}) keeps the multi-MB re-read free on an unchanged file.
  *
  * `isMainThread`-guarded body — a plain import (tests driving the pure helpers +
  * the {@link AccountLoop} with a stub runner + sandboxed root) is inert.
@@ -81,6 +85,21 @@ export const ENVELOPE_SCHEMA_VERSION = 1;
 
 /** Idle window: skip the scrape when no agent session log moved within this. */
 const IDLE_THRESHOLD_S = 15 * 60;
+
+/**
+ * Sub-cadence cap on the NO-SCRAPE sleeps (cooldown, idle, restart-delay): a
+ * parked account re-resolves its tier→multiplier within ~one poll instead of
+ * staying frozen until a multi-day cooldown lifts. ONLY the no-scrape sleeps are
+ * capped — a post-scrape backoff (esp. the /usage endpoint-rate-limit retry) must
+ * stay long so a throttled endpoint is not re-hammered every minute.
+ */
+const MULTIPLIER_POLL_INTERVAL_S = 60;
+
+/**
+ * Jitter added to the poll cap so per-account loops don't synchronize their parked
+ * wakes into a lockstep cohort. Jitters the CAP only, never the mtime stat.
+ */
+const MULTIPLIER_POLL_JITTER_S = 10;
 
 /** Min interval between profile launches — the global profile-gate cadence. */
 const MIN_PROFILE_USE_INTERVAL_S = 60.0;
@@ -182,23 +201,61 @@ export function loadProfileNames(): string[] {
 }
 
 /**
+ * Per-path {size, mtimeMs} → resolved-multiplier memo gating the readFileSync +
+ * JSON.parse in {@link resolveMultiplierOrNull}. `.claude.json` runs multi-MB and
+ * the parked sub-cadence re-resolves it every ~60s, so a byte-identical
+ * {size, mtimeMs} short-circuits to the cached multiplier (a cached `null`
+ * included). mtime is LOAD-BEARING: the claude CLI rewrites the file WHOLESALE
+ * (atomic rename), not appended, so size alone would false-skip a same-size tier
+ * flip — gate on both, and a ~60s cadence absorbs the atomic-rename mtime skew.
+ * `statSync` reads no file data, so the gate is free regardless of the 2-3 MB
+ * size. In-memory only — an empty memo after restart just costs one parse.
+ */
+const multiplierMemo = new Map<
+  string,
+  { size: number; mtimeMs: number; multiplier: number | null }
+>();
+
+/**
  * Resolve a profile's multiplier from its `.claude.json` tier string, or `null`
  * on EVERY failure path (oversize file, read/parse error, missing/unknown tier).
  * The `null` is load-bearing — the per-cycle re-resolve KEEPS the prior multiplier
  * on `null` so a transient blip never downgrades a Max account. Mirrors the
  * daemon's `_resolve_multiplier_or_none`. Pure-ish (reads the fs); never throws.
+ * An mtime memo ({@link multiplierMemo}) skips the parse on an unchanged file.
  */
 export function resolveMultiplierOrNull(
   profile: string,
   homeDir: string = homedir(),
 ): number | null {
   const path = join(homeDir, ".claude-profiles", profile, ".claude.json");
-  let data: unknown;
+  let size: number;
+  let mtimeMs: number;
   try {
     const st = statSync(path);
-    if (st.size > MAX_CLAUDE_JSON_BYTES) {
-      return null;
-    }
+    size = st.size;
+    mtimeMs = st.mtimeMs;
+  } catch {
+    // Missing/unreadable: drop any memo so a re-appeared file always re-resolves.
+    multiplierMemo.delete(path);
+    return null;
+  }
+  const memo = multiplierMemo.get(path);
+  if (memo && memo.size === size && memo.mtimeMs === mtimeMs) {
+    return memo.multiplier;
+  }
+  const multiplier = parseTierMultiplier(path, size);
+  multiplierMemo.set(path, { size, mtimeMs, multiplier });
+  return multiplier;
+}
+
+/** Read + parse the resolved tier multiplier (no memo); null on every failure. */
+function parseTierMultiplier(path: string, size: number): number | null {
+  if (size > MAX_CLAUDE_JSON_BYTES) {
+    return null;
+  }
+  let data: unknown;
+  try {
     data = JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null;
@@ -210,8 +267,7 @@ export function resolveMultiplierOrNull(
   if (typeof tier !== "string") {
     return null;
   }
-  const mult = TIER_MULTIPLIERS[tier];
-  return mult ?? null;
+  return TIER_MULTIPLIERS[tier] ?? null;
 }
 
 /** Boot-time multiplier with a 1x fallback (no prior to keep at boot). */
@@ -443,6 +499,19 @@ export const REAL_CLOCK: LoopClock = {
 };
 
 /**
+ * Cap a no-scrape sleep at the multiplier poll sub-cadence (+ a small jitter) so a
+ * parked account re-resolves its tier within ~one minute. Returns `sleepSec`
+ * unchanged when it is already under the cap (a cold-boot or short idle delay).
+ * NEVER applied to a post-scrape backoff — the /usage rate-limit retry must stay
+ * long so a throttled endpoint is not re-hammered every poll.
+ */
+function capNoScrapeSleepSeconds(sleepSec: number, clock: LoopClock): number {
+  const cap =
+    MULTIPLIER_POLL_INTERVAL_S + clock.uniform(0, MULTIPLIER_POLL_JITTER_S);
+  return Math.min(sleepSec, cap);
+}
+
+/**
  * Format a Date as local-time ISO 8601 with an explicit `±HH:MM` offset — the
  * SAME shape Python's `datetime.now().astimezone().isoformat()` writes (NOT
  * `toISOString()`'s `Z` form). The consumer + picker reject naive stamps, so the
@@ -569,6 +638,12 @@ function priorStr(prior: Record<string, unknown>, key: string): string | null {
   return typeof v === "string" ? v : null;
 }
 
+/** Read a finite numeric field off a prior envelope record, else null. */
+function priorNum(prior: Record<string, unknown>, key: string): number | null {
+  const v = prior[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 /** Read the prior `usage` sub-object, else null. */
 function priorUsage(prior: Record<string, unknown>): ScrapeUsage | null {
   return isRecord(prior.usage) ? (prior.usage as ScrapeUsage) : null;
@@ -592,6 +667,22 @@ function priorError(prior: Record<string, unknown>): Envelope["error"] {
     return { type: e.type, message: e.message, at: e.at };
   }
   return null;
+}
+
+/**
+ * True iff a parked re-write would carry no new information — the on-disk prior is
+ * already an `idle` heartbeat at the current multiplier. Suppressing the rewrite +
+ * event keeps a multi-day cooldown (re-polling every ~60s) from churning the
+ * envelope + growing the events log by ~1440 lines/day/account. A non-numeric or
+ * differing prior multiplier is NOT redundant (the rewrite refreshes it).
+ */
+function isRedundantParkedWake(
+  prior: Record<string, unknown>,
+  acct: Account,
+): boolean {
+  return (
+    prior.status === "idle" && priorNum(prior, "multiplier") === acct.multiplier
+  );
 }
 
 // ---------- profile gate ----------------------------------------------------
@@ -674,11 +765,16 @@ export interface AccountLoopDeps {
 /**
  * One account's scheduling loop — the ported `account_loop`. Runs CONTINUOUSLY
  * until `shutdownSignal` aborts. Each cycle: re-resolve the multiplier
- * (keep-prior on failure), run the cooldown + idle gates (writing an `idle`
- * envelope + an `events.jsonl` line on a skip), else scrape behind the per-target
- * mutex + profile gate, assemble + atomically write the envelope. The WHOLE cycle
- * is no-throw: a scrape/IO failure writes a `stale` envelope + `.error.json` + an
- * event and continues — it NEVER escapes to the worker's error path.
+ * (keep-prior on failure), then — UNLESS the resolved multiplier differs from the
+ * on-disk envelope (a change forces a scrape so the corrected tier lands at once) —
+ * run the cooldown + idle gates (writing an `idle` envelope + an `events.jsonl`
+ * line on a skip), else scrape behind the per-target mutex + profile gate, assemble
+ * + atomically write the envelope. The no-scrape sleeps (cooldown/idle/restart) are
+ * capped at {@link MULTIPLIER_POLL_INTERVAL_S} so a parked account re-resolves its
+ * multiplier within ~one minute; a redundant parked re-write (already idle at the
+ * same multiplier) is suppressed so a long park doesn't grow the log. The WHOLE
+ * cycle is no-throw: a scrape/IO failure writes a `stale` envelope + `.error.json` +
+ * an event and continues — it NEVER escapes to the worker's error path.
  *
  * Exported + dependency-injected so a test drives a full cycle with a stub
  * `runScrape`, a pinned clock, and a sandboxed `stateDir` — no real `uv`/PTY.
@@ -706,7 +802,11 @@ export class AccountLoop {
       return clock.uniform(0, 60);
     }
     const remaining = (next.getTime() - clock.now().getTime()) / 1000;
-    return remaining > 0 ? remaining : clock.uniform(0, 60);
+    // Cap a long prior next_fetch_at so a restart re-resolves the multiplier within
+    // the poll window instead of sleeping out a multi-day cooldown.
+    return remaining > 0
+      ? capNoScrapeSleepSeconds(remaining, clock)
+      : clock.uniform(0, 60);
   }
 
   /** Run forever (until shutdown). Each iteration is internally no-throw. */
@@ -759,10 +859,17 @@ export class AccountLoop {
     }
 
     // Idle / cooldown gates — only when a prior envelope exists AND it is not
-    // `stale` (a failing account must keep retrying through quiet periods).
+    // `stale` (a failing account must keep retrying through quiet periods). A
+    // multiplier change vs the ON-DISK prior (the frozen value) ALSO bypasses both
+    // gates and forces a scrape so the corrected tier reaches the envelope at once.
+    // Compare against the on-disk prior, NOT acct's pre-resolve value: boot already
+    // corrects `acct.multiplier`, so an in-memory before/after compare never fires.
     if (existsSync(path)) {
       const prior = loadEnvelope(path);
-      if (prior.status !== "stale") {
+      const priorMult = priorNum(prior, "multiplier");
+      const multiplierChanged =
+        priorMult !== null && priorMult !== acct.multiplier;
+      if (!multiplierChanged && prior.status !== "stale") {
         const cooldown = this.maybeCooldownSkip(prior, now);
         if (cooldown !== null) {
           return cooldown;
@@ -809,28 +916,34 @@ export class AccountLoop {
     const liftMs = new Date(prior.lift_at as string).getTime();
     const wakeupMs = liftMs + clock.uniform(0, 60) * 1000;
     const wakeup = new Date(wakeupMs);
-    const envelope = buildEnvelope(this.acct, {
-      status: "idle",
-      subscription_active: priorSubscription(prior),
-      usage: priorUsage(prior),
-      lift_at: priorStr(prior, "lift_at"),
-      last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
-      last_skipped_fetch_at: localIsoWithOffset(now),
-      last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
-      next_fetch_at: localIsoWithOffset(wakeup),
-      error: priorError(prior),
-    });
-    this.writeState(envelope);
-    appendEvent(this.deps.stateDir, {
-      ts: localIsoWithOffset(now),
-      id: this.acct.id,
-      target: this.acct.target,
-      event: "rate_limited_skipped",
-      lift_at: priorStr(prior, "lift_at"),
-      next_fetch_at: envelope.next_fetch_at,
-    });
+    // Suppress a redundant parked re-write so a multi-day cooldown re-polling every
+    // ~60s doesn't churn the envelope + grow the events log; still re-poll soon.
+    if (!isRedundantParkedWake(prior, this.acct)) {
+      const envelope = buildEnvelope(this.acct, {
+        status: "idle",
+        subscription_active: priorSubscription(prior),
+        usage: priorUsage(prior),
+        lift_at: priorStr(prior, "lift_at"),
+        last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
+        last_skipped_fetch_at: localIsoWithOffset(now),
+        last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
+        next_fetch_at: localIsoWithOffset(wakeup),
+        error: priorError(prior),
+      });
+      this.writeState(envelope);
+      appendEvent(this.deps.stateDir, {
+        ts: localIsoWithOffset(now),
+        id: this.acct.id,
+        target: this.acct.target,
+        event: "rate_limited_skipped",
+        lift_at: priorStr(prior, "lift_at"),
+        next_fetch_at: envelope.next_fetch_at,
+      });
+    }
+    // Cap the no-scrape sleep so the multiplier re-resolves within the poll window
+    // even while parked — NOT the post-scrape backoffs (those stay long).
     const sleepFor = (wakeupMs - clock.now().getTime()) / 1000;
-    return sleepFor > 0 ? sleepFor : 0;
+    return capNoScrapeSleepSeconds(Math.max(sleepFor, 0), clock);
   }
 
   /**
@@ -848,28 +961,33 @@ export class AccountLoop {
     if (idleFor <= IDLE_THRESHOLD_S) {
       return null;
     }
-    const delay = clock.uniform(60, 180);
-    const nextFetch = new Date(now.getTime() + delay * 1000);
-    const envelope = buildEnvelope(this.acct, {
-      status: "idle",
-      subscription_active: priorSubscription(prior),
-      usage: priorUsage(prior),
-      lift_at: priorStr(prior, "lift_at"),
-      last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
-      last_skipped_fetch_at: localIsoWithOffset(now),
-      last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
-      next_fetch_at: localIsoWithOffset(nextFetch),
-      error: priorError(prior),
-    });
-    this.writeState(envelope);
-    appendEvent(this.deps.stateDir, {
-      ts: localIsoWithOffset(now),
-      id: this.acct.id,
-      target: this.acct.target,
-      event: "idle_skipped",
-      idle_for_s: Math.round(idleFor * 10) / 10,
-      next_fetch_at: envelope.next_fetch_at,
-    });
+    // Cap the idle no-scrape sleep at the poll window so a re-resolved multiplier
+    // reaches the envelope within ~60s even during a long idle stretch.
+    const delay = capNoScrapeSleepSeconds(clock.uniform(60, 180), clock);
+    // Suppress a redundant idle re-write (already idle at the same multiplier).
+    if (!isRedundantParkedWake(prior, this.acct)) {
+      const nextFetch = new Date(now.getTime() + delay * 1000);
+      const envelope = buildEnvelope(this.acct, {
+        status: "idle",
+        subscription_active: priorSubscription(prior),
+        usage: priorUsage(prior),
+        lift_at: priorStr(prior, "lift_at"),
+        last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
+        last_skipped_fetch_at: localIsoWithOffset(now),
+        last_failed_fetch_at: priorStr(prior, "last_failed_fetch_at"),
+        next_fetch_at: localIsoWithOffset(nextFetch),
+        error: priorError(prior),
+      });
+      this.writeState(envelope);
+      appendEvent(this.deps.stateDir, {
+        ts: localIsoWithOffset(now),
+        id: this.acct.id,
+        target: this.acct.target,
+        event: "idle_skipped",
+        idle_for_s: Math.round(idleFor * 10) / 10,
+        next_fetch_at: envelope.next_fetch_at,
+      });
+    }
     return delay;
   }
 

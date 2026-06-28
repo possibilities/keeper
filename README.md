@@ -2876,8 +2876,9 @@ binary path (`usage_scraper_uv_path`) plus the agentusage project dir
 (`usage_scraper_project_dir`); an unresolved runtime leaves the worker un-spawned
 (a warning, never a `fatalExit`). When spawned it runs N concurrent per-account
 async loops sharing a global profile-gate (launches ≥60s apart) and a per-target
-mutex, on a 60–180s jitter cadence. Each cycle runs the idle/cooldown gates,
-resolves the account's tier→multiplier, then shells out via the scrape runner —
+mutex, on a 60–180s jitter cadence. Each cycle re-resolves the account's
+tier→multiplier and runs the idle/cooldown gates, then shells out via the scrape
+runner —
 `<uv> run --directory <agentusage> python -m agentusage.scrape_cli …` — to the
 stateless Python scrape util, which `pexpect`-spawns the real `claude`/`codex` TUI
 (direct, with `CLAUDE_CONFIG_DIR` set — no `keeper agent`, no hook, no job),
@@ -2887,7 +2888,15 @@ discriminated `{ok|error}` JSON object. The worker assembles the envelope
 and the fresh-derived `lift_at`) and atomically writes the `<id>.json` envelope (+
 `<id>.error.json` sidecar + `events.jsonl` audit line) the consumer above folds.
 The whole cycle is no-throw: a scrape/IO failure writes a `stale` envelope and an
-`.error.json`, never crash-loops. It writes ONLY this on-disk surface (its
+`.error.json`, never crash-loops. The tier→multiplier re-resolves on its own ~60s
+sub-cadence INDEPENDENT of cooldown/idle parking: the no-scrape sleeps
+(cooldown/idle/restart) are capped at that poll so a depleted account that parks
+for days still re-resolves its multiplier every minute (post-scrape backoffs —
+notably the /usage rate-limit retry — stay long, never capped), and a multiplier
+change vs the on-disk envelope breaks BOTH gates early to force a scrape. An mtime
+memo keeps the multi-MB `.claude.json` re-read free, and a redundant parked re-write
+(already idle at the same multiplier) is suppressed so a long park doesn't grow the
+log. It writes ONLY this on-disk surface (its
 read-only keeper.db handle is the worker-contract convention; main stays the sole
 event writer). A singleton `scraper.lock` FileLock on the state dir means two
 producers never race the same files, so the worker simply un-arms if a lock is
