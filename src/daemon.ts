@@ -2299,6 +2299,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       $backend_exec_type: null,
       $backend_exec_session_id: null,
       $backend_exec_pane_id: null,
+      $worktree: null,
     });
   }
 
@@ -2483,6 +2484,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               $backend_exec_type: null,
               $backend_exec_session_id: null,
               $backend_exec_pane_id: null,
+              $worktree: null,
             });
             wakePending = true;
             pumpWakes();
@@ -2551,6 +2553,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $backend_exec_type: null,
             $backend_exec_session_id: null,
             $backend_exec_pane_id: null,
+            $worktree: null,
           });
           wakePending = true;
           pumpWakes();
@@ -2623,6 +2626,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $backend_exec_type: null,
             $backend_exec_session_id: null,
             $backend_exec_pane_id: null,
+            $worktree: null,
           });
           wakePending = true;
           pumpWakes();
@@ -2699,6 +2703,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $backend_exec_type: null,
             $backend_exec_session_id: null,
             $backend_exec_pane_id: null,
+            $worktree: null,
           });
           wakePending = true;
           pumpWakes();
@@ -2855,6 +2860,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $backend_exec_type: null,
             $backend_exec_session_id: null,
             $backend_exec_pane_id: null,
+            $worktree: null,
           });
           wakePending = true;
           pumpWakes();
@@ -3058,6 +3064,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         // Our own INSERT bumps data_version — pump directly so the title folds
         // without a poll-cycle delay.
@@ -3102,6 +3109,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         wakePending = true;
         pumpWakes();
@@ -3145,6 +3153,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         wakePending = true;
         pumpWakes();
@@ -3191,6 +3200,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         wakePending = true;
         pumpWakes();
@@ -3334,6 +3344,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       // Our own INSERT bumps data_version, so the wake worker would re-drain
       // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
@@ -3470,6 +3481,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       // Our own INSERT bumps data_version — pump directly so the Killed fold
       // lands without a poll-cycle delay.
@@ -3601,6 +3613,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       // A `git-snapshot` or `commit` is the cross-worker "HEAD may have moved"
       // signal a plan-worker cannot observe on its own (a `git commit` leaves the
@@ -3709,6 +3722,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       // Nothing landed on a dropped mint — skip the wake so we don't spin a
       // no-op drain pass; the next re-emit / boot sweep carries the row.
@@ -3807,6 +3821,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       if (minted) {
         wakePending = true;
@@ -4178,6 +4193,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       ok = true;
     } catch (err) {
@@ -4256,6 +4272,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       wakePending = true;
       pumpWakes();
@@ -4337,6 +4354,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       wakePending = true;
       pumpWakes();
@@ -4424,6 +4442,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       // The ack promises INSERT durability ONLY — not the fold (idempotent on the
       // next drain). The committed INSERT is the whole contract.
@@ -4506,6 +4525,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       wakePending = true;
       pumpWakes();
@@ -4569,6 +4589,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       wakePending = true;
       pumpWakes();
@@ -5252,6 +5273,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_type: null,
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
+        $worktree: null,
       });
       wakePending = true;
       pumpWakes();
@@ -5429,6 +5451,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         wakePending = true;
         pumpWakes();
@@ -5478,6 +5501,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_type: null,
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
+          $worktree: null,
         });
         wakePending = true;
         pumpWakes();

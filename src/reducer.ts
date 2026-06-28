@@ -7384,10 +7384,14 @@ function projectJobsRow(db: Database, event: Event): void {
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
              config_dir = COALESCE(excluded.config_dir, jobs.config_dir),
-             -- Set-once durable worktree-lane marker: a resume sends NULL, so
-             -- COALESCE preserves the first-launch branch (mirrors config_dir).
-             -- MUST stay on THIS SessionStart arm (never the every-event
-             -- backend_exec arm) — there the resume's NULL would wipe it.
+             -- Set-once durable worktree-lane marker: a resume RE-INJECTS the
+             -- same lane branch env (resume-mode launch still carries
+             -- KEEPER_PLAN_WORKTREE_BRANCH), so excluded.worktree is that same
+             -- branch — COALESCE is set-once and idempotent either way (mirrors
+             -- config_dir). MUST stay on THIS SessionStart arm (never the
+             -- every-event backend_exec arm): only SessionStart captures the
+             -- lane env, so it is the sole arm whose excluded.worktree is ever
+             -- non-NULL.
              worktree = COALESCE(excluded.worktree, jobs.worktree),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so

@@ -1035,7 +1035,11 @@ event-log/reducer/hook touch. Run any of them with
   (`keeper/epic/fn-986` → `[⑂ fn-986]`, rib `keeper/epic/fn-986--fn-986.2` →
   `[⑂ fn-986--fn-986.2]`), via `worktreeLaneSeg`; a NULL / serial job drops it
   entirely (no empty bracket). Unlike the collapse-controlled pane pill it stays
-  on the head line — it's a stable launch-context identity, not live coordinates. When the row is
+  on the head line — it's a stable launch-context identity, not live coordinates.
+  There is NO backfill: jobs already running when v94 landed folded their
+  `SessionStart` before the `worktree` column existed, so they keep
+  `jobs.worktree=NULL` for life and show no pill — expected, not a bug (the marker
+  binds only on a fresh post-v94 `SessionStart`). When the row is
   expanded in insert mode, a per-job Monitors section (schema v51 /
   fn-682, enriched fn-718) lists the live background shells the
   session is running, parsed off the `jobs.monitors` JSON-array

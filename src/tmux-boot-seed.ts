@@ -208,6 +208,7 @@ function insertSyntheticTmuxTopology(
     $backend_exec_pane_id: null,
     $background_task_id: null,
     $mutation_path: null,
+    $worktree: null,
   });
 }
 

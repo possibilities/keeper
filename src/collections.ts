@@ -138,7 +138,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // read boundary for the board render. Sibling of `epic_links`.
     "handoff_links",
     // `worktree`: durable git lane BRANCH the job ran in (schema v94 / fn-997).
-    // Display-only — the renderer's `worktreeLaneSeg` lifts it into a `[⊟ …]`
+    // Display-only — the renderer's `worktreeLaneSeg` lifts it into a `[⑂ …]`
     // pill; never a `sortable` / `filters` / `jsonColumns` key.
     "worktree",
   ],
