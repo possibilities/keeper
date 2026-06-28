@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "bound the merge-path lock + local git ops",
-  "updated_at": "2026-06-28T02:12:51.472000Z"
+  "updated_at": "2026-06-28T02:44:05.508000Z",
+  "worker_done_at": "2026-06-28T02:44:05.508000Z"
 }

@@ -66,5 +66,5 @@ the default (non-worktree) commit-work path is unchanged.
 - [ ] the flock deadline variant is tested (real FFI in-process) + the MergeResult lock-timeout flow tested (fake-runner)
 
 ## Done summary
-
+Bounded the worktree merge-path flock (opt-in deadline acquirer via acquireWithDeadline) and the merge/teardown local git ops (GIT_LOCAL_TIMEOUT_MS); a lock-acquire or local-op timeout now degrades to a correctly-prefixed retry-skip (worktree-finalize-* / worktree-recover-* / worktree-merge-*) instead of freezing the reconcile cycle. Default commit-work acquire unchanged.
 ## Evidence
