@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-28T03:12:40.959000Z",
+  "depends_on_epics": [],
+  "id": "fn-995-close-worktree-canary-residual-edges",
+  "last_validated_at": "2026-06-28T03:12:41.068000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "close worktree canary residual edges",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-28T03:12:40.959000Z"
+}
