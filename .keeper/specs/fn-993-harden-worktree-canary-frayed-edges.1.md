@@ -61,5 +61,5 @@ emitDispatchFailed spy, like :4542), reason `worktree-finalize-*`. Update the
 - [ ] the bare-push test assertions are updated for the branch-explicit push + recheck
 
 ## Done summary
-
+Closed the merged-arm asymmetry (branch-explicit re-push + post-push origin-containment recheck via the shared mergeLaneBaseIntoDefault routine, reusing push-unconfirmed; teardown now reached only on proven origin-containment for both finalize and recover pass-2) and made the finalize non-ff/origin-ahead degrade an operator-visible sticky DispatchFailed (worktree-finalize-*, outside the recover auto-clear prefix).
 ## Evidence
