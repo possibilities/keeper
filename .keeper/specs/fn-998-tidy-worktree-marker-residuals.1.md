@@ -63,5 +63,5 @@ folds worktree=NULL (already implied by the existing fold tests).
 - [ ] `bun run test` green; no marker behavior change; no SCHEMA_VERSION bump
 
 ## Done summary
-
+Tidied the four non-behavioral fn-997 worktree-marker residuals: explicit $worktree:null bindings at every synthetic insertEvent site, consistent ⑂ pill glyph, corrected reducer resume COALESCE comment, and documented the in-flight-at-deploy no-backfill behavior. Full gate green, no marker behavior change.
 ## Evidence
