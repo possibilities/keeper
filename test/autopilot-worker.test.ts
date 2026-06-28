@@ -5988,6 +5988,13 @@ function makeRecoveryGit(state: {
 } {
   const calls: { cwd: string; args: string; env?: Record<string, string> }[] =
     [];
+  // Branches a successful pass-2 `merge --no-edit` landed into LOCAL default this
+  // run. A subsequent successful push advances origin to contain them (origin
+  // containment is distinct from the pre-merge local-ancestor `state.ancestors`),
+  // so the post-push recheck confirms `merged` rather than a false push-unconfirmed
+  // — while the LOCAL is-ancestor check (which pass-3 reads) stays `state.ancestors`
+  // only, so a just-merged base is not double-swept by pass-3 in the same cycle.
+  const mergedLocally = new Set<string>();
   // A no-op lock acquirer so the merge path never touches the real FFI flock
   // (the slow real-git test covers the actual flock-around-merge contract).
   const lock: NonNullable<Parameters<typeof recoverWorktrees>[3]> = () => ({
@@ -6121,9 +6128,14 @@ function makeRecoveryGit(state: {
       if (state.mergeTimeout) {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
       }
-      return state.mergeConflict
-        ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
+      if (state.mergeConflict) {
+        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+      }
+      const merged = args[2];
+      if (merged !== undefined) {
+        mergedLocally.add(merged); // now an ancestor of LOCAL default
+      }
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "push") {
       // (`push --dry-run` is matched earlier.) Covers BOTH the bare merge-path
@@ -6143,6 +6155,9 @@ function makeRecoveryGit(state: {
         const origin = state.originAncestors ?? new Set<string>();
         for (const a of state.ancestors ?? []) {
           origin.add(a);
+        }
+        for (const a of mergedLocally) {
+          origin.add(a); // a freshly-merged base the push just advanced onto origin
         }
         state.originAncestors = origin;
       }
@@ -6440,6 +6455,39 @@ test("fn-993 recoverWorktrees pass-2: a local merge timeout (124) → worktree-r
   // A timed-out merge never advances origin behind it (read-only `push --dry-run`
   // may run; the real `push origin` must not).
   expect(calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-995 recoverWorktrees pass-2: a done base whose push exits 0 but origin stays stranded → worktree-recover-push-unconfirmed (a recover reason), NO silent swallow, NO teardown", async () => {
+  // B1: pass-2's `switch (merge.kind)` had no `push-unconfirmed` case (the
+  // merged + not-ahead arms now return it) and no default — so a stranded
+  // post-push containment recheck fell through SILENTLY, recording no failure.
+  // It must surface as a recover-side (auto-clearable) retry-skip.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // base AHEAD → pass-2 merges + pushes
+    repoHead: "main",
+    pushUnconfirmed: true, // push exits 0 but origin/<default> never advances
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toMatch(/^worktree-recover-push-unconfirmed:/);
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // The base is NOT torn down on an unconfirmed push.
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
 });
 
 test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failure and continues (never throws)", async () => {

@@ -1016,13 +1016,14 @@ export interface WorktreeDriver {
    *
    * A failure is one of two kinds, distinguished by `retry`:
    *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
-   *    conflict, a dirty-LANE teardown refusal). The producer mints a STICKY
-   *    `close::<epic>` DispatchFailed a human clears with `retry_dispatch`.
+   *    conflict, a dirty-LANE teardown refusal, OR an origin-ahead non-fast-forward
+   *    needing an operator). The producer mints a STICKY `close::<epic>`
+   *    DispatchFailed a human clears with `retry_dispatch`.
    *  - `{ ok: false, retry: true, reason }` — a transient environment state on the
-   *    SHARED main checkout (dirty / off-branch / mid-rebase, or a non-fast-forward
-   *    push). The producer STOPS this epic's finalize but mints NO sticky failure;
-   *    the next cycle retries once the tree settles. NEVER an un-clearable close,
-   *    and NEVER the divergent-content case (that stays a loud sticky block).
+   *    SHARED main checkout (dirty / off-branch / mid-rebase). The producer STOPS
+   *    this epic's finalize but mints NO sticky failure; the next cycle retries
+   *    once the tree settles. NEVER an un-clearable close, and NEVER the
+   *    divergent-content or origin-ahead non-ff case (those stay loud sticky blocks).
    */
   finalizeEpic(
     info: WorktreeLaunchInfo,
@@ -2391,20 +2392,23 @@ export async function runReconcileCycle(
   // on `DONE_EPICS_REAP_WINDOW_SEC`. A GENUINE block (a content merge conflict /
   // dirty-LANE teardown refusal) mints a sticky `worktree-finalize` DispatchFailed
   // keyed on the close row (cleared by `retry_dispatch`) and STOPS that epic's
-  // finalize. A transient shared-checkout state (dirty/off-branch/non-ff main
-  // checkout) instead returns `retry` → STOP with NO sticky row, retried next
-  // cycle. Idempotent: `finalizeEpic` skips an already-merged base + resumes a
-  // partial teardown (already-gone worktrees no-op).
+  // finalize. A transient shared-checkout state (dirty/off-branch main checkout)
+  // instead returns `retry` → STOP with NO sticky row, retried next cycle — but a
+  // genuine origin-ahead non-ff is NOT a retry-skip: it mints a VISIBLE sticky
+  // `worktree-finalize-non-fast-forward` block needing an operator. Idempotent:
+  // `finalizeEpic` skips an already-merged base + resumes a partial teardown
+  // (already-gone worktrees no-op).
   if (deps.worktree !== undefined) {
     for (const info of decision.worktreeFinalize) {
       if (signal.aborted) {
         return;
       }
       const result = await deps.worktree.finalizeEpic(info, deps.isEpicDone);
-      // A `retry` failure is a transient environment skip (dirty/off-branch/
-      // non-ff main checkout): STOP this epic's finalize but mint NO sticky
-      // DispatchFailed — the next cycle retries once the tree settles. Only a
-      // GENUINE block (no `retry`) becomes the sticky `close::<epic>` row.
+      // A `retry` failure is a transient environment skip (dirty/off-branch main
+      // checkout): STOP this epic's finalize but mint NO sticky DispatchFailed —
+      // the next cycle retries once the tree settles. A GENUINE block (no `retry`)
+      // — a content conflict, a dirty-lane refusal, OR an origin-ahead non-ff —
+      // becomes the sticky `close::<epic>` row.
       if (!result.ok && result.retry !== true) {
         deps.emitDispatchFailed({
           verb: "close",
@@ -2605,11 +2609,12 @@ export function createWorktreeDriver(
         // The base merge lands IN THE MAIN worktree (the repo dir is the human's
         // shared checkout) via the ONE shared {@link mergeLaneBaseIntoDefault}
         // routine. It degrades — NEVER stomps WIP or fights an in-flight
-        // merge/rebase: a dirty / off-branch / would-clobber / non-ff / non-turn-key
+        // merge/rebase: a dirty / off-branch / would-clobber / non-turn-key
         // shared checkout is a clean SKIP-AND-RETRY (a DISTINCT, non-`worktree-recover*`
         // reason so the recover auto-clear never touches it, AND `retry: true` so no
         // sticky DispatchFailed — never an un-clearable close). A genuine
-        // divergent-content conflict or a push failure stays a loud sticky block.
+        // divergent-content conflict, a push failure, OR an origin-ahead non-ff
+        // stays a loud VISIBLE sticky block (an operator reconciles origin).
         // `not-ahead`/`merged` fall through to teardown (an already-merged base
         // still tears its lanes down — the idempotent resume).
         const merge = await mergeLaneBaseIntoDefault(
@@ -3266,6 +3271,32 @@ export async function recoverWorktrees(
               dir: repo,
             });
             continue;
+          case "push-unconfirmed":
+            // The base merge pushed but origin/<default> does not yet PROVABLY
+            // contain it (a settle lag) — a TRANSIENT defer INSIDE the
+            // `worktree-recover-*` auto-clear prefix; pass-3's post-push
+            // containment recheck re-confirms and tears down once origin settles
+            // (no fetch/rebase/force).
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${base.branch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+              dir: repo,
+            });
+            continue;
+          default: {
+            // Compile-time exhaustiveness guard so a future MergeLaneResult kind can
+            // never fall through pass-2 unhandled (the silent-swallow class). The
+            // runtime arm is unreachable while the union is fully handled; if a new
+            // kind ever reaches here it surfaces as a recover-side failure rather
+            // than vanishing.
+            const _exhaustive: never = merge;
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-unhandled-merge-kind: ${(_exhaustive as MergeLaneResult).kind} merging ${base.branch} into ${defaultBranch} in ${repo}`,
+              dir: repo,
+            });
+            continue;
+          }
         }
       } catch (err) {
         failures.push({
