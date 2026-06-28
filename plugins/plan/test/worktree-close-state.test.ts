@@ -30,6 +30,7 @@ import {
   briefPath,
   computeCommitSetHash,
   followupPath,
+  reportPath,
   verdictPath,
   writeArtifact,
   writeBriefArtifact,
@@ -160,10 +161,10 @@ describe("close-preflight resolves plan-state to primary from a lane", () => {
 
 describe("close-phase submits resolve artifacts to primary from a lane", () => {
   // resolveAuditContext is the shared brief-finding seam every submit verb
-  // (audit / verdict / followup) routes through, so `--project "$PRIMARY_REPO"`
-  // from a lane cwd makes all three find the brief in primary. Audit submit is
-  // the canonical lock; a verdict submit confirms the same seam from a second
-  // verb entry.
+  // (audit / verdict / followup) routes through resolvePlanStateContext, so a
+  // submit from a lane cwd — WITH or WITHOUT --project — roots state at the epic's
+  // primary_repo and finds the brief in primary. Audit submit is the canonical
+  // lock; a verdict submit confirms the same seam from a second verb entry.
 
   function seedBriefViaPreflight(s: LaneScenario): void {
     const pre = runCli(["close-preflight", s.epicId], {
@@ -196,20 +197,22 @@ describe("close-phase submits resolve artifacts to primary from a lane", () => {
     expect(parseCliOutput(ok.output).success).toBe(true);
   });
 
-  test("audit submit from a lane WITHOUT --project misses the brief (BRIEF_MISSING)", () => {
-    // The regression this fix's --project wiring exists to prevent: a lane-cwd
-    // submit with no --project cwd-walks into the lane, where no brief lives.
+  test("audit submit from a lane WITHOUT --project auto-routes to primary's brief", () => {
+    // The robustness the resolver buys: a lane-cwd submit with no --project
+    // locates the committed def in the lane, reads epic.primary_repo, and roots
+    // state at primary — finding the brief there and writing the report there.
     const s = makeLaneScenario("planctl-wcs-miss-", ["done"]);
     seedBriefViaPreflight(s);
 
-    const miss = runCli(
+    const ok = runCli(
       ["audit", "submit", s.epicId, "--file", "-", "--risk", "Low"],
       { cwd: s.lane, home: s.home, input: "# report\n" },
     );
-    expect(miss.code).toBe(1);
-    expect(
-      (parseCliOutput(miss.output).error as Record<string, unknown>).code,
-    ).toBe("BRIEF_MISSING");
+    expect(ok.code).toBe(0);
+    expect(parseCliOutput(ok.output).success).toBe(true);
+    // The report landed in PRIMARY, never the lane.
+    expect(existsSync(reportPath(s.primary, s.epicId))).toBe(true);
+    expect(existsSync(reportPath(s.lane, s.epicId))).toBe(false);
   });
 
   test("verdict submit from a lane with --project=primary clears brief resolution", () => {

@@ -1,16 +1,17 @@
 // Default-deny SOURCE guard for the central plan-state resolver. Scans
 // src/verbs/*.ts: any verb that touches runtime/audit STATE (constructs a
 // LocalFileStateStore, writes an audit artifact, or builds a path under
-// ctx.stateDir) MUST route that state through resolvePlanStateContext — UNLESS it
-// is on an explicit display/DEF allowlist (read-for-display / def-only writers,
-// which carry no primary-rooting concern) or on a SHRINKING temporary exempt-list
-// of stateful verbs not yet migrated to the resolver. Anything else is a
-// VIOLATION: a future verb added with a cwd-resolved state write fails here
-// instead of silently writing lane-adjacent state in worktree mode.
+// ctx.stateDir) MUST root that state at the epic's primary_repo through one of the
+// sanctioned seams — UNLESS it is on an explicit display/DEF allowlist
+// (read-for-display / def-only writers, which carry no primary-rooting concern).
+// Anything else is a VIOLATION: a future verb added with a cwd-resolved state
+// write fails here instead of silently writing lane-adjacent state in worktree
+// mode.
 //
-// As later slices migrate their verbs (route them through resolvePlanStateContext
-// OR the inline contextForRoot(primary_repo) precedent), each removes its entries
-// from NOT_YET_MIGRATED — the list shrinks toward empty.
+// The exempt-list is empty: every stateful verb is routed. A new stateful verb
+// either routes through the seam (or the documented inline precedent) or fails
+// here; a temporary exemption would be re-added to NOT_YET_MIGRATED only as a
+// deliberate, named stopgap.
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
@@ -26,8 +27,16 @@ const STATE_TOUCH = [
   /\bwriteBriefArtifact\(/,
 ];
 
-// The compliance signal: state routed through the central resolver.
-const RESOLVER = /resolvePlanStateContext/;
+// The compliance signals: state rooted at the epic's primary_repo through a
+// sanctioned seam — the central resolver directly (resolvePlanStateContext), the
+// submit verbs' shared brief-resolver (resolveAuditContext, itself routed through
+// the resolver), or the inline contextForRoot(primaryRepo) precedent the resolver
+// was lifted from (close-preflight / close-finalize thread it off the epic def).
+const COMPLIANT = [
+  /resolvePlanStateContext/,
+  /resolveAuditContext/,
+  /contextForRoot\(primaryRepo\)/,
+];
 
 // Display / DEF verbs: they read state for DISPLAY or write only committed defs,
 // so they carry no primary-rooting concern and are explicitly exempt.
@@ -50,16 +59,10 @@ const DISPLAY_DEF_ALLOW = new Set([
   "validate",
 ]);
 
-// SHRINKING temporary exempt-list: stateful verbs not yet routed through the
-// resolver (later slices migrate + remove them). close_preflight already routes
-// state via the inline contextForRoot(primary_repo) precedent this seam lifts;
-// the rest await their convergence slice.
-const NOT_YET_MIGRATED = new Set([
-  "audit_submit",
-  "verdict_submit",
-  "followup_submit",
-  "close_preflight",
-]);
+// Temporary exempt-list — EMPTY: every stateful verb is routed through a
+// sanctioned seam. Re-add a name here only as a deliberate, named stopgap for a
+// verb mid-migration; the guard is otherwise fully strict.
+const NOT_YET_MIGRATED = new Set<string>([]);
 
 type Verdict = "not-stateful" | "migrated" | "display" | "exempt" | "violation";
 
@@ -69,7 +72,7 @@ function classifyVerb(name: string, content: string): Verdict {
   if (!STATE_TOUCH.some((re) => re.test(content))) {
     return "not-stateful";
   }
-  if (RESOLVER.test(content)) {
+  if (COMPLIANT.some((re) => re.test(content))) {
     return "migrated";
   }
   if (DISPLAY_DEF_ALLOW.has(name)) {

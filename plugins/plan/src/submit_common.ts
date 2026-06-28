@@ -14,7 +14,7 @@
 // emitter. Each verb's own run module owns its payload validation + envelope.
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import {
   ArtifactSchemaTooNewError,
@@ -23,12 +23,7 @@ import {
 } from "./audit_artifacts.ts";
 import { formatOutput, type OutputFormat } from "./format.ts";
 import { isEpicId, isTaskId } from "./ids.ts";
-import {
-  contextForRoot,
-  type ProjectContext,
-  resolveProject,
-} from "./project.ts";
-import { hasDataDir } from "./state_path.ts";
+import { resolvePlanStateContext } from "./project.ts";
 import { readStdinBytes, stdinIsTTY } from "./stdin.ts";
 
 /** Same 1 MiB stdin cap scaffold uses against a YAML billion-laughs DoS. A real
@@ -130,16 +125,21 @@ export interface AuditContext {
   brief: Record<string, unknown>;
 }
 
-/** Resolve the project + load the on-disk brief for `epicId`.
+/** Resolve the state context + load the on-disk brief for `epicId`.
  *
  * Returns `{primaryRepo, brief}` where `primaryRepo` is the resolved absolute
  * state-repo path (from the brief, which close-preflight stamped) and `brief` is
  * the parsed `audits/<epic_id>/brief.json` dict.
  *
+ * State resolution routes through the central `resolvePlanStateContext` seam:
+ * `--project` (else cwd-then-global) LOCATES the owning def, then the context is
+ * physically rooted at the epic's `primary_repo`, so a submit run from a worktree
+ * lane WITHOUT `--project` finds + writes its artifacts in primary, never the
+ * lane. The resolver fails loud when the located primary lacks this epic's def.
+ *
  * Typed errors (thrown as SubmitError): BAD_EPIC_ID (garbage / task-shaped id),
- * NOT_A_PROJECT (`--project` path has no data dir), BRIEF_MISSING (no brief —
- * run close-preflight first), BRIEF_CORRUPT (unparseable JSON or a too-new
- * schema_version). Mirrors resolve_audit_context. */
+ * BRIEF_MISSING (no brief — run close-preflight first), BRIEF_CORRUPT
+ * (unparseable JSON or a too-new schema_version). Mirrors resolve_audit_context. */
 export function resolveAuditContext(
   epicId: string,
   project: string | null,
@@ -157,31 +157,11 @@ export function resolveAuditContext(
     throw new SubmitError("BAD_EPIC_ID", `Invalid epic ID: ${epicId}`);
   }
 
-  let ctx: ProjectContext;
-  if (project !== null) {
-    if (!isAbsolute(expandUser(project))) {
-      // Mirrors click.UsageError — surfaced via the same SubmitError channel
-      // (the CLI seam maps UsageError shape separately, but the spine flags it).
-      throw new SubmitError(
-        "BAD_PROJECT_PATH",
-        `--project requires an absolute path, got: ${project}`,
-      );
-    }
-    const projectRoot = resolveResolved(expandUser(project));
-    if (!hasDataDir(projectRoot)) {
-      throw new SubmitError(
-        "NOT_A_PROJECT",
-        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
-      );
-    }
-    ctx = contextForRoot(projectRoot);
-  } else {
-    ctx = resolveProject(format);
-  }
+  const ctx = resolvePlanStateContext(epicId, project, format);
 
   // The brief's primary_repo is the authoritative state repo (close-preflight
   // stamped it from epic.primary_repo). Resolve the brief path against the
-  // project's own path to FIND it, then trust the brief's value.
+  // resolver's primary-rooted path to FIND it, then trust the brief's value.
   const bp = briefPath(ctx.projectPath, epicId);
   if (!existsSync(bp)) {
     throw new SubmitError(
@@ -219,13 +199,6 @@ export function resolveAuditContext(
     typeof primaryRaw === "string" && primaryRaw ? primaryRaw : ctx.projectPath,
   );
   return { primaryRepo, brief };
-}
-
-function expandUser(pathArg: string): string {
-  if (pathArg === "~" || pathArg.startsWith("~/")) {
-    return (process.env.HOME ?? "") + pathArg.slice(1);
-  }
-  return pathArg;
 }
 
 function resolveResolved(path: string): string {

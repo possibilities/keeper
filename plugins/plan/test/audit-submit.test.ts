@@ -17,9 +17,16 @@ import {
   computeCommitSetHash,
   writeArtifact,
 } from "../src/audit_artifacts.ts";
-import { parseCliOutput, runCli, withProject } from "./harness.ts";
+import { parseCliOutput, runCli, seedState, withProject } from "./harness.ts";
 
 const EID = "fn-7-demo-epic";
+
+// Seed the owning epic def (+ one task) on disk. The central plan-state resolver
+// locates the committed def before the brief check, so the submit tests must
+// carry the def the real close flow always has (close-preflight ran first).
+function seedEpic(root: string, epicId: string): void {
+  seedState(root, { epicId, nTasks: 1, primaryRepo: root });
+}
 
 // Write an audits/<epic_id>/brief.json directly (skips close-preflight) so the
 // submit tests stay hermetic. Returns the stamped commit_set_hash. Port of
@@ -29,6 +36,7 @@ function seedBrief(
   epicId: string,
   commitSetHash?: string,
 ): string {
+  seedEpic(root, epicId);
   const hash =
     commitSetHash ?? computeCommitSetHash([{ repo: root, shas: ["abc123"] }]);
   const brief = {
@@ -132,6 +140,7 @@ describe("audit submit", () => {
   // test_audit_submit.py::test_missing_brief_rejects
   test("missing brief rejects with BRIEF_MISSING naming the real epic id", () => {
     const proj = getProj();
+    seedEpic(proj.root, EID);
     const { code, output } = submit(proj, EID, "x\n", ["--risk", "Low"]);
     expect(code).toBe(1);
     const env = parseCliOutput(output);

@@ -43,7 +43,7 @@ Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) v
 
 ## Phase 2 — Audit (spawn quality-auditor blind)
 
-Spawn the quality-auditor with a config-only prompt — `EPIC_ID`, `PRIMARY_REPO`, and `BRIEF_REF`, nothing else. The auditor reads the brief itself (commit groups, done summaries) and persists its report via `audit submit --project "$PRIMARY_REPO"` (so the report resolves to primary even when the close runs from a lane); the closer never inlines audit prose.
+Spawn the quality-auditor with a config-only prompt — `EPIC_ID`, `PRIMARY_REPO`, and `BRIEF_REF`, nothing else. The auditor reads the brief itself (commit groups, done summaries) and persists its report via `audit submit --project "$PRIMARY_REPO"` (the submit auto-routes state to the epic's primary repo through the central resolver; `--project` is an explicit belt-and-suspenders pin, not the mechanism); the closer never inlines audit prose.
 
 ```
 Task(
