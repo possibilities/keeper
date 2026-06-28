@@ -14,22 +14,23 @@ import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolvePlanStateContext } from "../project.ts";
 import { LocalFileStateStore, loadJsonSafe, nowIso } from "../store.ts";
 
 interface UnblockArgs {
   taskId: string;
+  project: string | null;
   format: OutputFormat | null;
 }
 
 export function runUnblock(args: UnblockArgs): void {
-  const { taskId, format } = args;
+  const { taskId, project, format } = args;
 
   if (!isTaskId(taskId)) {
     emitError(`Invalid task ID: ${taskId}`, format);
   }
 
-  const ctx = resolveProject(format);
+  const ctx = resolvePlanStateContext(taskId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

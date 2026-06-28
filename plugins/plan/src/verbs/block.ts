@@ -2,10 +2,12 @@
 //
 // Marks a task blocked under lockTask: re-read runtime, error if done, write the
 // blocked runtime state (status=blocked, blocked_reason), then clear the work
-// marker (only if it names this task). Resolves the project cwd-based via
-// resolveProject (unlike claim's discovery). Mutates only gitignored state/, so
-// it emits a readonly invocation (ZERO commits). The not-found / done gates use
-// the flat emitError shape (NOT claim's nested typed envelope).
+// marker (only if it names this task). Resolves the STATE-bearing context via
+// resolvePlanStateContext, so a block run from a worktree lane flips PRIMARY's
+// overlay (never the lane, where the gitignored overlay never lives). Mutates
+// only gitignored state/, so it emits a readonly invocation (ZERO commits). The
+// not-found / done gates use the flat emitError shape (NOT claim's nested typed
+// envelope).
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +17,7 @@ import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolvePlanStateContext } from "../project.ts";
 import { clearWorkMarker } from "../session_markers.ts";
 import { LocalFileStateStore, loadJsonSafe, nowIso } from "../store.ts";
 
@@ -23,17 +25,18 @@ interface BlockArgs {
   taskId: string;
   reason: string | null;
   reasonFile: string | null;
+  project: string | null;
   format: OutputFormat | null;
 }
 
 export function runBlock(args: BlockArgs): void {
-  const { taskId, reason, reasonFile, format } = args;
+  const { taskId, reason, reasonFile, project, format } = args;
 
   if (!isTaskId(taskId)) {
     emitError(`Invalid task ID: ${taskId}`, format);
   }
 
-  const ctx = resolveProject(format);
+  const ctx = resolvePlanStateContext(taskId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

@@ -467,10 +467,11 @@ const TASK_GROUP: GroupSpec = {
       name: "reset",
       shortHelp: "Reset a task to todo status.",
       run: (rest, format) => {
-        const [taskId] = leafPositionals(rest, new Set());
+        const [taskId] = leafPositionals(rest, new Set(["--project"]));
         runTaskReset({
           taskId: taskId ?? "",
           cascade: leafFlag(rest, "--cascade"),
+          project: leafOption(rest, "--project"),
           format,
         });
       },
@@ -848,12 +849,14 @@ function dispatch(parsed: ParsedArgs): number {
         taskId: readPositional(rest),
         reason: readOption(rest, "--reason"),
         reasonFile: readOption(rest, "--reason-file"),
+        project: readOption(rest, "--project"),
         format,
       });
       break;
     case "unblock":
       runUnblock({
         taskId: readPositional(rest),
+        project: readOption(rest, "--project"),
         format,
       });
       break;

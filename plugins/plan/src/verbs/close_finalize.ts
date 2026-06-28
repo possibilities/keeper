@@ -430,6 +430,14 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   );
   const touchedRepos = epicDef.touched_repos as string[] | null | undefined;
 
+  // The irreversible epic-close tally + the follow-up mint route STATE through a
+  // primary-rooted context, never the cwd ctx. In worktree mode the close runs
+  // from the epic's lane, but the runtime overlay (the tally reads task status
+  // from it) and a minted follow-up tree live ONLY in the primary repo — a
+  // cwd-resolved ctx would tally stale lane state and orphan the follow-up into
+  // the lane. When cwd==primary (non-worktree / --project), stateCtx == ctx.
+  const stateCtx = contextForRoot(primaryRepo);
+
   // 3. idempotent re-run: an already-done epic returns its prior terminal
   //    outcome WITHOUT calling close again.
   if (epicDef.status === "done") {
@@ -512,7 +520,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   // 7. zero surviving decisions → clean close.
   const expected = expectedClusterOrdinals(verdict);
   if (expected.size === 0) {
-    closeEpic(ctx, epicId);
+    closeEpic(stateCtx, epicId);
     emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format);
     return;
   }
@@ -523,7 +531,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   const existing = findFollowupEpic(ctx.dataDir, epicId);
   if (existing !== null) {
     if (existing.actualTasks === expectedCount) {
-      closeEpic(ctx, epicId);
+      closeEpic(stateCtx, epicId);
       emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
         newEpicId: existing.epicId,
       });
@@ -550,8 +558,8 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
       { expected: fp, expected_tasks: expectedCount },
     );
   }
-  const newEpicId = scaffoldFollowup(ctx, fp, epicId, format);
-  closeEpic(ctx, epicId);
+  const newEpicId = scaffoldFollowup(stateCtx, fp, epicId, format);
+  closeEpic(stateCtx, epicId);
   emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
     newEpicId,
   });

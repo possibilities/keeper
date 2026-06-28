@@ -17,6 +17,7 @@ import {
   resolveDataDir,
   resolveDataDirOrDefault,
 } from "./state_path.ts";
+import { loadJsonSafe } from "./store.ts";
 
 export interface ProjectContext {
   name: string;
@@ -200,6 +201,66 @@ export function resolveOwningProjectForId(
   }
   // emitError exits; this is unreachable but satisfies the return type.
   throw new Error("unreachable");
+}
+
+/** The ONE seam every runtime-overlay / close-audit WRITER routes its
+ * state-bearing context through, so no plan verb reads/writes runtime state from
+ * a worktree lane when the primary repo owns that state. Three phases:
+ *
+ *  1. LOCATE the owning def cwd-then-global (`resolveOwningProjectForId`;
+ *     `--project` bypasses discovery and fails loud on a bad path / missing id).
+ *     A non-null `project` is authoritative for BOTH locating and physical state
+ *     ownership — operator intent wins, so the locate ctx is returned outright.
+ *  2. Read the cwd-INDEPENDENT `epic.primary_repo` field off the located,
+ *     committed def; physical state lives at that repo (`contextForRoot`), never
+ *     the locate root. A worktree lane carries byte-identical committed defs but
+ *     no gitignored `state/`, so keying on the FIELD (not where defs sit, not
+ *     roots-discovery) keeps state on primary even when primary is OUTSIDE the
+ *     configured roots. A null `primary_repo` (single-repo board) degrades to the
+ *     locate root — a no-op.
+ *  3. FAIL LOUD when the resolved primary lacks its data dir OR this id's def — a
+ *     stale `primary_repo` (changed on main after the lane was cut) trips here
+ *     rather than silently writing lane-adjacent state.
+ *
+ * Code routing (where a worker edits/commits SOURCE) stays separate on cwd /
+ * `resolveWorkerRepos().targetRepo` — this seam owns STATE only. */
+export function resolvePlanStateContext(
+  id: string,
+  project: string | null,
+  format: OutputFormat | null,
+): ProjectContext {
+  const locate = resolveOwningProjectForId(id, project, format);
+  if (project !== null) {
+    return locate;
+  }
+
+  const isTask = isTaskId(id);
+  const epicId = isTask ? epicIdFromTask(id) : id;
+  const epicDef = loadJsonSafe(join(locate.dataDir, "epics", `${epicId}.json`));
+  const stateRoot = realpathOr(
+    (epicDef?.primary_repo as string | null | undefined) || locate.projectPath,
+  );
+
+  if (!hasDataDir(stateRoot) || !idExistsInProject(stateRoot, id, isTask)) {
+    emitError(
+      `plan state owner for ${id} is unusable: ${stateRoot} is missing its ` +
+        "data dir or definition (a stale epic.primary_repo?)",
+      format,
+    );
+  }
+
+  return contextForRoot(stateRoot);
+}
+
+/** Resolve `p` to an absolute path then through symlinks, falling back to the
+ * absolute form when it does not yet exist on disk. */
+function realpathOr(p: string): string {
+  const abs = resolvePath(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
 }
 
 /** True iff `id` (a task or epic id) has its definition JSON under `projectRoot`'s

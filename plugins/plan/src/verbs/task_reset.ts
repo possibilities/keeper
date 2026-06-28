@@ -12,7 +12,7 @@ import { findDependents } from "../deps.ts";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { epicIdFromTask } from "../ids.ts";
-import { resolveProject } from "../project.ts";
+import { resolvePlanStateContext } from "../project.ts";
 import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
 import {
   atomicWrite,
@@ -27,13 +27,14 @@ import { runSetter } from "../validation_restamp.ts";
 interface ResetArgs {
   taskId: string;
   cascade: boolean;
+  project: string | null;
   format: OutputFormat | null;
 }
 
 export function runTaskReset(args: ResetArgs): void {
-  const { taskId, cascade, format } = args;
+  const { taskId, cascade, project, format } = args;
 
-  const ctx = resolveProject(format);
+  const ctx = resolvePlanStateContext(taskId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

@@ -16,11 +16,24 @@
 // (slow tier).
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { briefPath } from "../src/audit_artifacts.ts";
+import {
+  briefPath,
+  computeCommitSetHash,
+  followupPath,
+  verdictPath,
+  writeArtifact,
+  writeBriefArtifact,
+} from "../src/audit_artifacts.ts";
 import {
   gitInit,
   parseCliOutput,
@@ -212,5 +225,128 @@ describe("close-phase submits resolve artifacts to primary from a lane", () => {
     expect(r.code).toBe(1);
     const error = parseCliOutput(r.output).error as Record<string, unknown>;
     expect(error.code).not.toBe("BRIEF_MISSING");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// close-finalize routes the IRREVERSIBLE epic-close tally + the follow-up mint
+// to primary from a lane (no --project). The tally lives inside runEpicClose
+// (force:false), which reads the runtime overlay; a lane-resolved close would
+// tally the lane's empty overlay (TASKS_NOT_DONE) and orphan any follow-up into
+// the lane. Threading contextForRoot(primaryRepo) into closeEpic + scaffoldFollowup
+// lands both in primary even from a lane.
+// ---------------------------------------------------------------------------
+
+/** The empty-set canonical hash the verb re-derives for an epic whose seeded
+ * tasks carry no `Task:` source-commit trailers. */
+function emptySetHash(): string {
+  return computeCommitSetHash([]);
+}
+
+/** Seed the close brief + verdict in PRIMARY's gitignored state (where they
+ * live). `decisions` drives the outcome: empty → closed_clean; one kept → needs
+ * a follow-up. */
+function seedCloseArtifacts(
+  s: LaneScenario,
+  decisions: Array<Record<string, unknown>>,
+): void {
+  const hash = emptySetHash();
+  writeBriefArtifact(s.primary, s.epicId, {
+    schema_version: 1,
+    epic_id: s.epicId,
+    primary_repo: s.primary,
+    commit_set_hash: hash,
+    commit_groups: [],
+    snippet_context: "",
+    tasks: [],
+  });
+  writeArtifact(
+    verdictPath(s.primary, s.epicId),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        commit_set_hash: hash,
+        fatal: false,
+        fatal_reason: "",
+        decisions,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+/** A valid scaffold-plan followup.yaml wiring back to the source epic. */
+function seedFollowupYaml(s: LaneScenario, nTasks: number): void {
+  const blocks: string[] = [];
+  for (let i = 1; i <= nTasks; i++) {
+    const spec =
+      "      ## Description\n      follow-up\n\n" +
+      "      ## Acceptance\n      - [ ] x\n\n" +
+      "      ## Done summary\n\n      ## Evidence\n";
+    blocks.push(
+      `  - title: Follow task ${i}\n    tier: medium\n    spec: |\n${spec}`,
+    );
+  }
+  const yaml =
+    `epic:\n  title: Follow-up of ${s.epicId}\n` +
+    `  depends_on_epics: [${s.epicId}]\n` +
+    "  spec: |\n    ## Overview\n    follow overview\n" +
+    `tasks:\n${blocks.join("\n")}\n`;
+  writeArtifact(followupPath(s.primary, s.epicId), yaml);
+}
+
+function epicStatus(root: string, epicId: string): string {
+  return (
+    JSON.parse(
+      readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
+    ) as Record<string, unknown>
+  ).status as string;
+}
+
+describe("close-finalize tallies + mints to primary from a lane", () => {
+  test("closed_clean: the irreversible close reads primary's done overlay", () => {
+    const s = makeLaneScenario("planctl-wcf-clean-", ["done", "done"]);
+    seedCloseArtifacts(s, []);
+
+    // No --project: a lane-resolved tally would see the lane's empty overlay and
+    // refuse TASKS_NOT_DONE. The fix tallies primary's done overlay and closes.
+    const r = runCli(["close-finalize", s.epicId], {
+      cwd: s.lane,
+      home: s.home,
+    });
+    expect(r.code).toBe(0);
+    expect(parseCliOutput(r.output).outcome).toBe("closed_clean");
+    // The epic closed in PRIMARY...
+    expect(epicStatus(s.primary, s.epicId)).toBe("done");
+    // ...and the lane's committed def was never stamped done.
+    expect(epicStatus(s.lane, s.epicId)).toBe("open");
+  });
+
+  test("closed_with_followup: the follow-up tree mints into PRIMARY, not the lane", () => {
+    const s = makeLaneScenario("planctl-wcf-followup-", ["done"]);
+    seedCloseArtifacts(s, [
+      { fid: "f1", action: "kept", task: 1, rationale: "real" },
+    ]);
+    seedFollowupYaml(s, 1);
+
+    const r = runCli(["close-finalize", s.epicId], {
+      cwd: s.lane,
+      home: s.home,
+    });
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.output);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(newEpicId).toBeTruthy();
+    expect(newEpicId).not.toBe(s.epicId);
+    // The minted follow-up landed in PRIMARY, never orphaned into the lane.
+    expect(
+      existsSync(join(s.primary, ".keeper", "epics", `${newEpicId}.json`)),
+    ).toBe(true);
+    expect(
+      existsSync(join(s.lane, ".keeper", "epics", `${newEpicId}.json`)),
+    ).toBe(false);
+    expect(epicStatus(s.primary, s.epicId)).toBe("done");
   });
 });
