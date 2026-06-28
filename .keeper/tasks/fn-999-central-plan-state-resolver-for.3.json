@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "split worker-resume state/code + route epic-close standalone + epic-rm",
-  "updated_at": "2026-06-28T19:02:48.182000Z"
+  "updated_at": "2026-06-28T22:18:30.477000Z",
+  "worker_done_at": "2026-06-28T22:18:30.477000Z"
 }

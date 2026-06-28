@@ -48,5 +48,5 @@ worker-resume from a lane: status read + brief write land in primary; git/source
 - [ ] these verbs removed from the source-guard exempt-list; pure tier green
 
 ## Done summary
-
+Converged worker-resume, epic-close, and epic-rm onto resolvePlanStateContext: STATE (runtime read, brief write, tally, destructive unlink) routes to the epic's primary repo from a lane while git/source probes + target_repo stay cwd-local; added --project to epic-close, dropped the trio from the source-guard exempt-list, and added lane-vs-primary tests.
 ## Evidence
