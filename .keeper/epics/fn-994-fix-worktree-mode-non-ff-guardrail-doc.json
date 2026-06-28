@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-28T02:48:08.451000Z",
+  "created_by_close_of": "fn-993-harden-worktree-canary-frayed-edges",
+  "depends_on_epics": [
+    "fn-993-harden-worktree-canary-frayed-edges"
+  ],
+  "id": "fn-994-fix-worktree-mode-non-ff-guardrail-doc",
+  "last_validated_at": "2026-06-28T02:48:08.467000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix worktree-mode non-ff guardrail doc",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-28T02:48:08.451000Z"
+}
