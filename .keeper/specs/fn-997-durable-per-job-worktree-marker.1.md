@@ -98,5 +98,5 @@ but SessionStart-gates + folds set-once like `config_dir`. Thread the branch end
 - [ ] Full `bun test` is green (exec-backend argv, events-writer lockstep, reducer fold, jobs pill, schema-version, refold-equivalence).
 
 ## Done summary
-
+Added a durable per-job worktree-lane BRANCH marker (schema v94): producer injects KEEPER_PLAN_WORKTREE_BRANCH, the hook captures it at SessionStart into events.worktree, the reducer folds it set-once onto jobs.worktree via COALESCE, and keeper jobs renders a [⑂ <lane>] pill. Stores the branch (survives worktree remove/move), never the dirhash-bearing path.
 ## Evidence
