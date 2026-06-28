@@ -18,5 +18,5 @@ non-sticky `retry` skips. Docs-only; do not touch the code path.
 - [ ] `bun scripts/lint-claude-md.ts` stays green
 
 ## Done summary
-
+Corrected the CLAUDE.md worktree-mode guardrail: non-ff now described as a visible worktree-finalize-non-fast-forward sticky needing an operator (outside the worktree-recover* auto-clear prefix), while dirty/off-branch + lock/local timeouts stay non-sticky retry skips.
 ## Evidence
