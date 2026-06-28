@@ -447,7 +447,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   // 3. idempotent re-run: an already-done epic returns its prior terminal
   //    outcome WITHOUT calling close again.
   if (epicDef.status === "done") {
-    const priorFollowup = findFollowupEpic(ctx.dataDir, epicId);
+    const priorFollowup = findFollowupEpic(stateCtx.dataDir, epicId);
     if (priorFollowup !== null) {
       emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
         newEpicId: priorFollowup.epicId,
@@ -479,7 +479,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   }
 
   // 5. re-derive commit_set_hash FRESH; mismatch → STALE_ARTIFACTS.
-  const taskIds = loadTasksForEpic(ctx, epicId)
+  const taskIds = loadTasksForEpic(stateCtx, epicId)
     .sort(
       (a, b) =>
         taskSortKey((a.id as string) ?? "") -
@@ -534,7 +534,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   // 8. surviving findings need a follow-up. Found+complete → adopt; found+
   //    partial → stop; absent → scaffold.
   const expectedCount = expected.size;
-  const existing = findFollowupEpic(ctx.dataDir, epicId);
+  const existing = findFollowupEpic(stateCtx.dataDir, epicId);
   if (existing !== null) {
     if (existing.actualTasks === expectedCount) {
       closeEpic(stateCtx, epicId);

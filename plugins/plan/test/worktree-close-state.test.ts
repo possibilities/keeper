@@ -326,6 +326,47 @@ describe("close-finalize tallies + mints to primary from a lane", () => {
     expect(epicStatus(s.lane, s.epicId)).toBe("open");
   });
 
+  test("followup-adoption read resolves to PRIMARY: an existing follow-up is adopted, not re-scaffolded", () => {
+    // The :537 followup-adoption check must read the SAME primary-rooted context
+    // as the close write. A follow-up epic already minted in PRIMARY (from a
+    // prior close) is invisible to a lane-cwd read — pre-fix the lane scan finds
+    // nothing and falls through to scaffold a duplicate; primary-rooted it finds
+    // and ADOPTS the existing follow-up.
+    const s = makeLaneScenario("planctl-wcf-adopt-", ["done"]);
+    seedCloseArtifacts(s, [
+      { fid: "f1", action: "kept", task: 1, rationale: "real" },
+    ]);
+
+    // Pre-seed the existing follow-up epic in PRIMARY only (never the lane):
+    // status open + created_by_close_of==source + one task → actualTasks matches
+    // the single surviving cluster, so the verb adopts it.
+    const followupId = "fn-9-existing-followup";
+    seedState(s.primary, {
+      epicId: followupId,
+      nTasks: 1,
+      primaryRepo: s.primary,
+    });
+    const fePath = join(s.primary, ".keeper", "epics", `${followupId}.json`);
+    const feDef = JSON.parse(readFileSync(fePath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    feDef.created_by_close_of = s.epicId;
+    writeArtifact(fePath, `${JSON.stringify(feDef, null, 2)}\n`);
+
+    const r = runCli(["close-finalize", s.epicId], {
+      cwd: s.lane,
+      home: s.home,
+    });
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.output);
+    expect(env.outcome).toBe("closed_with_followup");
+    // The EXISTING follow-up was adopted — not a freshly-scaffolded id.
+    expect(env.new_epic_id).toBe(followupId);
+    expect(epicStatus(s.primary, s.epicId)).toBe("done");
+    expect(epicStatus(s.lane, s.epicId)).toBe("open");
+  });
+
   test("closed_with_followup: the follow-up tree mints into PRIMARY, not the lane", () => {
     const s = makeLaneScenario("planctl-wcf-followup-", ["done"]);
     seedCloseArtifacts(s, [
