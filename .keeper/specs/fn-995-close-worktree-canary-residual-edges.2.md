@@ -45,5 +45,5 @@ Pure fake-runner: a local-timeout merge → a MERGE_HEAD-guarded `git merge --ab
 - [ ] no regression to the existing local-op timeout / conflict classification
 
 ## Done summary
-
+B2: the local-timeout (124) merge path now runs the same MERGE_HEAD-guarded git merge --abort the conflict path uses, leaving no merge residue (kind still local-timeout). B4: status/ls-files/ls-tree/rev-parse merge-path reads carry GIT_LOCAL_TIMEOUT_MS and a 124 timeout degrades safely to not-ready (dirty/off-branch), never a false clean.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "local-timeout merge abort + bound merge-path reads",
-  "updated_at": "2026-06-28T03:12:40.959000Z"
+  "updated_at": "2026-06-28T04:07:59.170000Z",
+  "worker_done_at": "2026-06-28T04:07:59.170000Z"
 }
