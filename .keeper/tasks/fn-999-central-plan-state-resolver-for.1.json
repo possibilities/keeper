@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "add resolvePlanStateContext + close block/unblock/task-reset + close-finalize tally + default-deny guard",
-  "updated_at": "2026-06-28T19:02:48.182000Z"
+  "updated_at": "2026-06-28T19:27:38.365000Z",
+  "worker_done_at": "2026-06-28T19:27:38.365000Z"
 }

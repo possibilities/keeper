@@ -77,5 +77,5 @@ Resolver unit (pure): from a lane cwd with epic.primary_repo=primary → ctx.pro
 - [ ] resolver unit tests incl. primary-outside-roots + fail-loud; pure tier green
 
 ## Done summary
-
+Added resolvePlanStateContext (locate cwd-then-global, root state at committed epic.primary_repo, fail-loud on missing primary def); routed block/unblock/task-reset through it with --project; threaded contextForRoot(primaryRepo) into close-finalize closeEpic+scaffoldFollowup; landed a default-deny source guard. Resolver unit + lane behavioral + guard tests; full pure tier green.
 ## Evidence
