@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "close-finalize reads use the primary-rooted stateCtx",
-  "updated_at": "2026-06-28T23:08:58.908000Z"
+  "updated_at": "2026-06-28T23:49:25.650000Z",
+  "worker_done_at": "2026-06-28T23:49:25.650000Z"
 }

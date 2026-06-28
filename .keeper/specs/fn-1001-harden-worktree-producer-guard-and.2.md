@@ -39,5 +39,5 @@ Pure tier: a finalize idempotency / followup-adoption check from a lane cwd with
 - [ ] pure test: finalize-from-lane-without-project reads primary; gate green
 
 ## Done summary
-
+Switched close-finalize's three idempotency/followup-adoption reads (findFollowupEpic x2, loadTasksForEpic) from cwd ctx to primary-rooted stateCtx, matching its writes and close-preflight; added a lane-cwd followup-adoption test.
 ## Evidence
