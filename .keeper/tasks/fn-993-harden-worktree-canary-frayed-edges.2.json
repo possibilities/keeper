@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-28T02:12:51.472000Z",
+  "depends_on": [
+    "fn-993-harden-worktree-canary-frayed-edges.1"
+  ],
+  "epic": "fn-993-harden-worktree-canary-frayed-edges",
+  "id": "fn-993-harden-worktree-canary-frayed-edges.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "bound the merge-path lock + local git ops",
+  "updated_at": "2026-06-28T02:12:51.472000Z"
+}
