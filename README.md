@@ -3189,14 +3189,13 @@ parent's committed tip, a fan-in task sequentially pairwise-merges its incoming
 lane branches (never octopus) before it dispatches, and a synthetic `__close__`
 sink pinned to the epic base makes the closer run where every lane has merged
 in; the base then merges into the default branch once the producer observes the
-closer JOB finished AND the lane base carries the epic-done commit. That
-finalize trigger is decoupled from the main-worktree `epics` projection: the
-closer commits `status:done` on the LANE, which the projection (folded from the
-MAIN worktree's `.keeper/` files) never sees until this very merge brings it
-over — so finalize keys off the durable `jobs` projection (`closerJobFinished`,
-re-fold-safe + restart-safe) plus a `git show` of the lane base's spec
-(`epicBaseHasDoneState`), never the projection's done-status. A crashed closer
-that never committed done leaves the lane base not-done, so finalize no-ops and
+closer JOB finished AND the MAIN `epics` projection reports the epic done. The
+closer writes `status:done` to the PRIMARY repo (plan state always = primary,
+never the lane), so finalize keys off the durable `jobs` projection
+(`closerJobFinished`, re-fold-safe + restart-safe) as the producer-observable
+trigger, then confirms real completion against the main `epics` projection
+(`isEpicDone`) — never a lane-read. A crashed closer that committed code but not
+`done` leaves the epic not-done in the main projection, so finalize no-ops and
 retries rather than pushing incomplete work to default.
 Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>--<task>`
 ribs — the FLAT `--` separator keeps a rib from being a path-prefix of the base
