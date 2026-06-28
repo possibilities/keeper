@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-28T19:02:48.182000Z",
+  "depends_on": [
+    "fn-999-central-plan-state-resolver-for.1"
+  ],
+  "epic": "fn-999-central-plan-state-resolver-for",
+  "id": "fn-999-central-plan-state-resolver-for.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "migrate close-phase submits off --project discipline + docs + test flip",
+  "updated_at": "2026-06-28T19:02:48.182000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-28T19:02:48.182000Z",
+  "depends_on_epics": [],
+  "id": "fn-999-central-plan-state-resolver-for",
+  "last_validated_at": "2026-06-28T19:02:48.201000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "central plan-state resolver for worktree mode",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-28T19:02:48.182000Z"
+}

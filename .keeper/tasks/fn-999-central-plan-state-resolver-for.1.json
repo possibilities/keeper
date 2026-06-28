@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-28T19:02:48.182000Z",
+  "depends_on": [],
+  "epic": "fn-999-central-plan-state-resolver-for",
+  "id": "fn-999-central-plan-state-resolver-for.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "add resolvePlanStateContext + close block/unblock/task-reset + close-finalize tally + default-deny guard",
+  "updated_at": "2026-06-28T19:02:48.182000Z"
+}
