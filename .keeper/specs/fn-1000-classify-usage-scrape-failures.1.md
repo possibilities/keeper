@@ -46,5 +46,5 @@ Cover both a v2 error arm with explicit `error_kind` and a v1 error arm without 
 - [ ] Targeted usage/schema tests pass.
 
 ## Done summary
-
+Added a stable usage error_kind classification: keeper parses error_kind off the v2 scrape contract (v1 falls back from the parser exception family), threads it through the scraper envelope/sidecar, the UsageSnapshot serializer/fold, the usage projection (schema v95 + keeper-py whitelist), and the subscription descriptor.
 ## Evidence
