@@ -516,6 +516,7 @@ function insertEvent(overrides: {
   plan_target?: string | null;
   plan_files?: string | null;
   spawn_name?: string | null;
+  worktree?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   const data = overrides.data ?? "{}";
@@ -544,8 +545,8 @@ function insertEvent(overrides: {
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
        subagent_agent_id, tool_use_id, agent_id, agent_type, plan_op,
-       plan_target, plan_files, spawn_name, mutation_path
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       plan_target, plan_files, spawn_name, mutation_path, worktree
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
@@ -564,6 +565,7 @@ function insertEvent(overrides: {
       overrides.plan_files ?? null,
       overrides.spawn_name ?? null,
       mutationPath,
+      overrides.worktree ?? null,
     ],
   );
   return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
@@ -1007,6 +1009,37 @@ test("autopilot_state: a fresh board with no AutopilotPaused history boots PAUSE
     .get() as { paused: number; max_concurrent_jobs: number };
   expect(row.paused).toBe(1);
   expect(row.max_concurrent_jobs).toBe(4);
+});
+
+// ---------------------------------------------------------------------------
+// `jobs.worktree` re-fold determinism (fn-997) — the durable per-job lane
+// marker is a DETERMINISTIC-replayed `jobs` column: a worktree SessionStart
+// folds the branch, a serial one folds NULL, and a from-scratch re-fold
+// reproduces both byte-identically (a pre-v94 event has no worktree → NULL).
+// ---------------------------------------------------------------------------
+
+test("jobs.worktree: a worktree branch and a NULL serial fold deterministically and re-fold byte-identically", () => {
+  // A worktree-mode SessionStart (rib lane) records the branch; a serial one
+  // leaves it NULL — exactly the two shapes the column carries in production.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: SESS_A,
+    worktree: "keeper/epic/fn-997--fn-997.1",
+  });
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_B });
+  drainAll();
+
+  const liveJobs = snapshotProjections().jobs as Array<Record<string, unknown>>;
+  const wtA = liveJobs.find((j) => j.job_id === SESS_A)?.worktree;
+  const wtB = liveJobs.find((j) => j.job_id === SESS_B)?.worktree;
+  expect(wtA).toBe("keeper/epic/fn-997--fn-997.1");
+  expect(wtB).toBeNull();
+
+  // Full from-scratch re-fold — the deterministic `jobs` column must reproduce
+  // both the recorded branch and the NULL byte-identically.
+  rewindAndWipeProjections();
+  drainAll();
+  expect(snapshotProjections().jobs).toEqual(liveJobs);
 });
 
 // ---------------------------------------------------------------------------

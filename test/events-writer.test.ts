@@ -30,6 +30,7 @@ import {
   parseLinuxStarttime,
   type SpawnInfo,
   splitArgsLstart,
+  worktreeBranchFromEnv,
 } from "../plugins/keeper/plugin/hooks/events-writer";
 import type { DeadLetterBindings } from "../src/dead-letter";
 import {
@@ -738,6 +739,37 @@ test("configDirFromEnv: a bare '/' value passes through unchanged", () => {
 });
 
 // ---------------------------------------------------------------------------
+// worktreeBranchFromEnv unit (v94 — KEEPER_PLAN_WORKTREE_BRANCH capture)
+// ---------------------------------------------------------------------------
+
+test("worktreeBranchFromEnv: a populated branch passes through verbatim (no normalization)", () => {
+  expect(
+    worktreeBranchFromEnv({
+      KEEPER_PLAN_WORKTREE_BRANCH: "keeper/epic/fn-986--fn-986.2",
+    }),
+  ).toBe("keeper/epic/fn-986--fn-986.2");
+});
+
+test("worktreeBranchFromEnv: undefined / empty / whitespace-only collapse to null", () => {
+  // The env is ALWAYS emitted (empty on serial launches), so the empty and
+  // whitespace shapes must collapse to the same absent value COALESCE treats
+  // uniformly — never an empty-bracket pill.
+  expect(worktreeBranchFromEnv({})).toBeNull();
+  expect(worktreeBranchFromEnv({ KEEPER_PLAN_WORKTREE_BRANCH: "" })).toBeNull();
+  expect(
+    worktreeBranchFromEnv({ KEEPER_PLAN_WORKTREE_BRANCH: "   " }),
+  ).toBeNull();
+});
+
+test("worktreeBranchFromEnv: a trailing slash is NOT stripped (canonical ref, recorded verbatim)", () => {
+  // Unlike config_dir, the branch is a canonical git ref — no slash trimming, so
+  // the fold reads back exactly what launch context froze (re-fold determinism).
+  expect(
+    worktreeBranchFromEnv({ KEEPER_PLAN_WORKTREE_BRANCH: "keeper/epic/fn-1/" }),
+  ).toBe("keeper/epic/fn-1/");
+});
+
+// ---------------------------------------------------------------------------
 // backendExecCoordsFromEnv unit (schema v48 / fn-668 — every-event capture)
 // ---------------------------------------------------------------------------
 
@@ -931,6 +963,34 @@ test("a non-SessionStart event leaves config_dir NULL even when the env is set",
     { env: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-c" } },
   );
   expect(b.config_dir).toBeNull();
+});
+
+test("SessionStart stamps worktree from KEEPER_PLAN_WORKTREE_BRANCH (verbatim)", () => {
+  const b = build(
+    { hook_event_name: "SessionStart", session_id: "sess-wt-set" },
+    { env: { KEEPER_PLAN_WORKTREE_BRANCH: "keeper/epic/fn-986--fn-986.2" } },
+  );
+  expect(b.worktree).toBe("keeper/epic/fn-986--fn-986.2");
+});
+
+test("a non-SessionStart event leaves worktree NULL even when the env is set", () => {
+  // SessionStart-gated, same as config_dir — a resume's later hook events never
+  // re-stamp the durable marker.
+  const b = build(
+    { hook_event_name: "UserPromptSubmit", session_id: "sess-wt-ups" },
+    { env: { KEEPER_PLAN_WORKTREE_BRANCH: "keeper/epic/fn-986" } },
+  );
+  expect(b.worktree).toBeNull();
+});
+
+test("SessionStart with an empty KEEPER_PLAN_WORKTREE_BRANCH (serial launch) folds worktree NULL", () => {
+  // The serial / OFF launch always emits the env EMPTY (the stale-leak guard) —
+  // it must collapse to NULL, identical to unset, so a serial job carries no marker.
+  const b = build(
+    { hook_event_name: "SessionStart", session_id: "sess-wt-serial" },
+    { env: { KEEPER_PLAN_WORKTREE_BRANCH: "" } },
+  );
+  expect(b.worktree).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

@@ -2508,8 +2508,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // under the new terminal-clear fold arms and the generation column is live-only,
   // so the existing rows simply converge to what a re-fold would produce). And to
   // 93 via nullable codex-spark usage columns (additive ALTER, NO cursor rewind:
-  // existing rows stay NULL until the next usage snapshot).
-  expect(SCHEMA_VERSION).toBe(93);
+  // existing rows stay NULL until the next usage snapshot). And to 94 via fn-997
+  // task .1 (appending the nullable `events.worktree` + `jobs.worktree` durable
+  // lane-branch marker — an additive ALTER, NO cursor rewind: a pre-v94 event
+  // carries no worktree value, so a from-scratch re-fold leaves `jobs.worktree`
+  // NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(94);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

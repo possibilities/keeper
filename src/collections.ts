@@ -137,6 +137,10 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // written by the `SessionStart` bind fold onto the callee. Decoded at the
     // read boundary for the board render. Sibling of `epic_links`.
     "handoff_links",
+    // `worktree`: durable git lane BRANCH the job ran in (schema v94 / fn-997).
+    // Display-only — the renderer's `worktreeLaneSeg` lifts it into a `[⊟ …]`
+    // pill; never a `sortable` / `filters` / `jsonColumns` key.
+    "worktree",
   ],
   pk: "job_id",
   version: "last_event_id",

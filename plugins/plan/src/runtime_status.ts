@@ -10,9 +10,11 @@ import { resolve as resolveAbs } from "node:path";
 /** The worktree-lane override: KEEPER_PLAN_WORKTREE. Empty/unset → undefined so
  * callers fall through to the ordinary fallback chain. Set producer-only at the
  * worker's child boundary (autopilot worktree mode), realpath-normalized so it
- * equals the worker's eventual process.cwd(); NEVER an event-log fold key, so
- * re-fold stays deterministic. Mirrors the clockOverride/getActor impure-helper
- * precedent in store.ts. */
+ * equals the worker's eventual process.cwd(); this PATH is NEVER an event-log
+ * fold key, so re-fold stays deterministic. (Its sibling KEEPER_PLAN_WORKTREE_BRANCH
+ * — the lane BRANCH, not consumed here — IS captured as the durable `jobs.worktree`
+ * marker; only the path dangles at finalize.) Mirrors the clockOverride/getActor
+ * impure-helper precedent in store.ts. */
 export function worktreeOverride(): string | undefined {
   const v = process.env.KEEPER_PLAN_WORKTREE;
   return v ? v : undefined;

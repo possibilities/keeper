@@ -61,7 +61,10 @@ Skill-tool invocation, e.g. `plan:plan` or `arthack:check`),
 `PostToolUse:Agent`), `events.config_dir` (the `CLAUDE_CONFIG_DIR` env
 value captured by the hook on `SessionStart` — the arthack-claude profile
 directory the session ran under, projected onto `jobs.config_dir` with
-latest-non-NULL-wins via `COALESCE` on resume), a five-column
+latest-non-NULL-wins via `COALESCE` on resume), `events.worktree` (schema v94 /
+fn-997 — the `KEEPER_PLAN_WORKTREE_BRANCH` lane branch the producer injects,
+captured the same SessionStart way and folded set-once onto `jobs.worktree` as
+the durable per-job worktree marker), a five-column
 plan-invocation envelope (`plan_op`, `plan_target`,
 `plan_epic_id`, `plan_task_id`, `plan_subject_present`) stamped
 on every `PostToolUse:Bash` row whose `data.tool_response.stdout` parses
@@ -1026,7 +1029,13 @@ event-log/reducer/hook touch. Run any of them with
   `--- <session> ---` heading). Plain text (no SGR baked in) so sidecars
   and non-TTY output stay clean; a missing pane drops the pill entirely,
   so rows with no backend coords show nothing at all (never `undefined`,
-  never a placeholder). There is no `<tab>` slot. When the row is
+  never a placeholder). There is no `<tab>` slot. The head line also carries
+  an always-visible `[⑂ <lane>]` worktree pill (schema v94 / fn-997) — the
+  durable `jobs.worktree` lane branch with the `keeper/epic/` prefix stripped
+  (`keeper/epic/fn-986` → `[⑂ fn-986]`, rib `keeper/epic/fn-986--fn-986.2` →
+  `[⑂ fn-986--fn-986.2]`), via `worktreeLaneSeg`; a NULL / serial job drops it
+  entirely (no empty bracket). Unlike the collapse-controlled pane pill it stays
+  on the head line — it's a stable launch-context identity, not live coordinates. When the row is
   expanded in insert mode, a per-job Monitors section (schema v51 /
   fn-682, enriched fn-718) lists the live background shells the
   session is running, parsed off the `jobs.monitors` JSON-array
@@ -2294,6 +2303,25 @@ surface.
 keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `48`
 (whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
 the `backend_exec_*` columns).
+As of schema v94 (fn-997), each job carries a durable `worktree` marker
+recording the git lane BRANCH it ran in (`keeper/epic/<id>` for a
+base/inheriting/closer lane, `keeper/epic/<id>--<task>` for a forked rib). The
+branch is captured exactly like `config_dir`: the producer injects it as the
+`KEEPER_PLAN_WORKTREE_BRANCH` launch env (a third always-emitted `--x-tmux-env`
+beside the path env `KEEPER_PLAN_WORKTREE`, so a serial launch reusing a tmux
+session overwrites any stale branch), the hook reads pure `process.env` at
+`SessionStart` into `events.worktree` (empty/whitespace/unset → NULL), and the
+reducer's SessionStart `INSERT … ON CONFLICT … COALESCE(excluded.worktree,
+jobs.worktree)` arm folds it set-once onto `jobs.worktree` — so a resume
+(emitting NULL) preserves the first-launch branch and a from-scratch re-fold
+reproduces byte-identical rows. The BRANCH is stored, not the lane PATH: the
+path `~/worktrees/<base>-<dirhash>--<slug>` embeds a provision-time dirhash and
+is torn down at finalize, while the branch is a stable joinable identity that
+survives `git worktree remove`/`move`. `jobs.worktree` is display-only on
+`JOBS_DESCRIPTOR`; the shared `projectJobRow` helper lifts it into a `[⑂ <branch
+minus keeper/epic/>]` lane pill (NULL → no pill). keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `94` (whitelist-only; keeper-py never
+reads the `worktree` column).
 As of schema v47 (fn-667), the autopilot pause/playing flag is event-sourced
 into a new singleton `autopilot_state` projection table (`id INTEGER PRIMARY
 KEY CHECK (id = 1)`, `paused INTEGER NOT NULL`, plus `last_event_id` /

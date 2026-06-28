@@ -273,6 +273,19 @@ export interface Event {
    * expression index + COALESCE dual-read stay until the `.3` attribution flip.
    */
   mutation_path: string | null;
+  /**
+   * Git lane BRANCH the job ran in (`keeper/epic/<id>` for a base/inheriting/
+   * closer lane, `keeper/epic/<id>--<task>` for a rib) captured by the hook at
+   * `SessionStart` from the producer-injected `KEEPER_PLAN_WORKTREE_BRANCH` env
+   * (`undefined`/empty/whitespace → NULL; no normalization — it is a canonical
+   * ref). NULL on every non-SessionStart row AND on every non-worktree launch.
+   * Folded into `jobs.worktree` set-once via COALESCE, so a resume SessionStart
+   * capturing NULL preserves the first-launch branch. Mirrors {@link config_dir}.
+   * Stores the BRANCH, never the lane PATH — the path embeds a provision-time
+   * dirhash and is torn down at finalize, while the branch survives
+   * `git worktree remove`/`move`.
+   */
+  worktree: string | null;
 }
 
 /**
@@ -404,6 +417,16 @@ export interface Job {
    * resume SessionStart capturing NULL preserves the prior value.
    */
   config_dir: string | null;
+  /**
+   * Durable git lane BRANCH the job ran in — the projection of
+   * {@link Event.worktree}, folded set-once on the SessionStart ON CONFLICT arm
+   * via `COALESCE(excluded.worktree, jobs.worktree)`. `keeper/epic/<id>` for a
+   * base/inheriting/closer lane, `keeper/epic/<id>--<task>` for a rib; NULL on a
+   * serial / non-worktree job. A stable, path-independent marker the `keeper
+   * jobs` TUI renders as a `[⑂ <branch minus keeper/epic/>]` pill. Display-only
+   * on `JOBS_DESCRIPTOR`.
+   */
+  worktree: string | null;
   /**
    * Per-job dirty-file count from the latest `GitSnapshot` whose `jobs[]`
    * enumerated this session. 0 on every never-enumerated job and after a

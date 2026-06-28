@@ -216,6 +216,25 @@ export function configDirFromEnv(env: NodeJS.ProcessEnv): string | null {
 }
 
 /**
+ * Capture the worktree-lane BRANCH from `KEEPER_PLAN_WORKTREE_BRANCH` — the
+ * durable per-job lane marker the producer injects (`keeper/epic/<id>[--<task>]`).
+ * SessionStart-gated by the caller, exactly like {@link configDirFromEnv}.
+ *
+ * Rules (locked):
+ * - `undefined` / empty / whitespace-only → `null` (the always-emitted `-e`
+ *   carries an EMPTY value on serial / OFF launches, which must collapse to the
+ *   same absent shape COALESCE treats uniformly — never an empty-bracket pill);
+ * - NO trailing-slash normalization — the value is a canonical git ref, recorded
+ *   verbatim so the fold reads back exactly what launch context froze (the
+ *   re-fold determinism guarantee).
+ *
+ * Stays pure (`process.env` read only) — no git, no fs, no `bun:sqlite`.
+ */
+export function worktreeBranchFromEnv(env: NodeJS.ProcessEnv): string | null {
+  return (env.KEEPER_PLAN_WORKTREE_BRANCH ?? "").trim() || null;
+}
+
+/**
  * Three-tuple of backend-exec coordinates captured on EVERY hook event
  * (not SessionStart-gated like {@link configDirFromEnv}). Each field is
  * an independent `string | null` so the reducer's COALESCE
@@ -567,6 +586,7 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "backend_exec_pane_id",
   "background_task_id",
   "mutation_path",
+  "worktree",
 ]);
 
 /**
@@ -726,6 +746,13 @@ export function buildEventBindings(
   // resume. `configDirFromEnv` normalizes.
   const configDir = hookEvent === "SessionStart" ? configDirFromEnv(env) : null;
 
+  // SessionStart only: capture the worktree-lane BRANCH from the producer-injected
+  // `KEEPER_PLAN_WORKTREE_BRANCH` env (the durable per-job marker). Set-once on the
+  // reducer's COALESCE arm, so a resume sends NULL → the first-launch branch holds.
+  // `worktreeBranchFromEnv` collapses empty/whitespace/unset → NULL.
+  const worktree =
+    hookEvent === "SessionStart" ? worktreeBranchFromEnv(env) : null;
+
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
@@ -793,6 +820,7 @@ export function buildEventBindings(
     backend_exec_pane_id: backendExecCoords.paneId,
     background_task_id: backgroundTaskId,
     mutation_path: mutationPath,
+    worktree,
   };
   return bindings;
 }

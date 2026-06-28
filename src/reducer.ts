@@ -7378,12 +7378,17 @@ function projectJobsRow(db: Database, event: Event): void {
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
              config_dir = COALESCE(excluded.config_dir, jobs.config_dir),
+             -- Set-once durable worktree-lane marker: a resume sends NULL, so
+             -- COALESCE preserves the first-launch branch (mirrors config_dir).
+             -- MUST stay on THIS SessionStart arm (never the every-event
+             -- backend_exec arm) — there the resume's NULL would wipe it.
+             worktree = COALESCE(excluded.worktree, jobs.worktree),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
@@ -7444,6 +7449,7 @@ function projectJobsRow(db: Database, event: Event): void {
             // own nullability under the resume COALESCE.
             event.config_dir == null ? null : projectBasename(event.config_dir),
             spawnNameHistory,
+            event.worktree,
           ],
         );
         // Seed a visible `profiles` row for this session's `config_dir` bucket.
@@ -8840,7 +8846,8 @@ export function drain(
               start_time, slash_command, skill_name,
               plan_op, plan_target, plan_epic_id, plan_task_id,
               plan_subject_present, tool_use_id, config_dir, plan_files,
-              backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+              backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+              worktree
          FROM events
         WHERE id > ?
         ORDER BY id ASC

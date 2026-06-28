@@ -240,6 +240,17 @@ test("JOBS_DESCRIPTOR serves window_index for the dash intra-band sort", () => {
   expect(JOBS_DESCRIPTOR.jsonColumns.has("window_index")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves worktree for the durable lane pill (v94)", () => {
+  // `worktree` (DB v94 / fn-997) is the durable git lane BRANCH the job ran in,
+  // folded set-once from `events.worktree`. Display-only — the renderer's
+  // `worktreeLaneSeg` lifts it into a `[⑂ …]` pill; out of sortable / filters /
+  // jsonColumns, same as the `backend_exec_*` cluster.
+  expect(JOBS_DESCRIPTOR.columns).toContain("worktree");
+  expect(JOBS_DESCRIPTOR.sortable.has("worktree")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.worktree).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("worktree")).toBe(false);
+});
+
 test("getCollection resolves the profiles collection (fn-639)", () => {
   expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
   expect(PROFILES_DESCRIPTOR.table).toBe("profiles");

@@ -103,6 +103,16 @@ export interface LaunchSpec {
    * producer-only runtime signal, NEVER a fold input / projection column.
    */
   readonly worktreePath?: string;
+  /**
+   * Worktree-mode lane BRANCH (`keeper/epic/<id>[--<task>]`). When set
+   * (non-empty), the launch emits a THIRD `--x-tmux-env
+   * KEEPER_PLAN_WORKTREE_BRANCH=<branch>` the hook captures at SessionStart as
+   * the DURABLE per-job `jobs.worktree` marker. Unlike {@link worktreePath}
+   * (a producer-only runtime path), the branch IS a captured fold value — it
+   * survives `git worktree remove`/`move` where the path dangles. Omitted for
+   * non-worktree / pair launches.
+   */
+  readonly worktreeBranch?: string;
 }
 
 /** One row of a `list-panes -a` sweep: the server-global pane id, its window
@@ -780,6 +790,14 @@ export interface AgentwrapLaunchOpts {
    * flag (last-wins per dup key). Omitted → argv is byte-identical to today.
    */
   readonly worktreePath?: string;
+  /**
+   * Worktree-mode lane BRANCH (`keeper/epic/<id>[--<task>]`). Emitted as a
+   * THIRD `--x-tmux-env KEEPER_PLAN_WORKTREE_BRANCH=<branch>` immediately after
+   * the path env — ALWAYS present (`?? ""`) so a serial / OFF launch reusing a
+   * tmux session OVERWRITES any stale branch a prior worktree launch left; an
+   * empty value resolves identically to unset (the hook collapses it to NULL).
+   */
+  readonly worktreeBranch?: string;
 }
 
 /**
@@ -791,7 +809,8 @@ export interface AgentwrapLaunchOpts {
  *   `<bun> <abs cli/keeper.ts> agent claude --x-tmux
  *     --x-tmux-detached --x-tmux-session <session>
  *     --x-tmux-env KEEPER_TMUX_SESSION=<session>
- *     [--x-tmux-env KEEPER_PLAN_WORKTREE=<lane>]
+ *     --x-tmux-env KEEPER_PLAN_WORKTREE=<lane>
+ *     --x-tmux-env KEEPER_PLAN_WORKTREE_BRANCH=<branch>
  *     [--model <m>] [--effort <e>] [--x-no-confirm]
  *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
  *
@@ -854,6 +873,14 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     // in a reused tmux session env; an empty value resolves identically to unset.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE=${opts.worktreePath ?? ""}`,
+    // Worktree-lane BRANCH carrier — ALWAYS a THIRD repeated `--x-tmux-env`
+    // (agentwrap last-wins per dup key): the lane branch in worktree mode, EMPTY
+    // in serial. Always present so the `-e` OVERWRITES any stale branch a prior
+    // worktree launch left in a reused tmux session env (the same reason the
+    // path env above is unconditional); an empty value collapses to NULL at the
+    // hook's SessionStart capture.
+    "--x-tmux-env",
+    `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
     ...flags,
     ...tail,
   ];
@@ -1046,6 +1073,9 @@ export async function agentwrapLaunch(
     ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
     ...(deps.spec.worktreePath !== undefined
       ? { worktreePath: deps.spec.worktreePath }
+      : {}),
+    ...(deps.spec.worktreeBranch !== undefined
+      ? { worktreeBranch: deps.spec.worktreeBranch }
       : {}),
     noConfirm: true,
   });

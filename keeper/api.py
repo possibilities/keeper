@@ -377,6 +377,9 @@ from pathlib import Path
 # keeper-py never reads this column, so only the version whitelist gains 91.
 # v93 adds codex-spark usage quota columns; keeper-py never reads them, so only
 # the version whitelist gains 93.
+# v94 (fn-997 task .1) adds the durable per-job ``events.worktree`` /
+# ``jobs.worktree`` lane-branch marker; keeper-py never reads them, so only the
+# version whitelist gains 94.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -442,6 +445,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         91,
         92,
         93,
+        94,
     }
 )
 

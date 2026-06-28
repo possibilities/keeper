@@ -364,7 +364,10 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
  * `buildLaunchArgv` shape even though agentwrap reads only this spec. A
  * non-empty `worktreePath` rides the spec as the `KEEPER_PLAN_WORKTREE` lane
  * env (worktree-mode launches only); absent/empty leaves it off so non-worktree
- * launches stay byte-identical. Pure — exported for tests.
+ * launches stay byte-identical. A non-empty `worktreeBranch` rides as the
+ * sibling `KEEPER_PLAN_WORKTREE_BRANCH` env — the durable per-job lane marker
+ * (the pure per-node branch, never derived from the path). Pure — exported for
+ * tests.
  */
 export function buildPlannedLaunchSpec(
   verb: Verb,
@@ -372,6 +375,7 @@ export function buildPlannedLaunchSpec(
   model: string = WORKER_MODEL,
   effort: string = WORKER_EFFORT,
   worktreePath?: string,
+  worktreeBranch?: string,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
@@ -380,6 +384,9 @@ export function buildPlannedLaunchSpec(
     effort,
     ...(worktreePath !== undefined && worktreePath !== ""
       ? { worktreePath }
+      : {}),
+    ...(worktreeBranch !== undefined && worktreeBranch !== ""
+      ? { worktreeBranch }
       : {}),
   };
 }
@@ -2271,6 +2278,10 @@ export async function runReconcileCycle(
     // geometry, just the on-default-branch assertion) leave it undefined so their
     // launch argv stays byte-identical to today.
     let worktreeLane: string | undefined;
+    // The pure per-node lane BRANCH (NOT derived from the realpath'd cwd) — the
+    // durable `jobs.worktree` marker the hook captures. Set alongside the lane
+    // path so a serial/OFF launch leaves it undefined and stays byte-identical.
+    let worktreeBranch: string | undefined;
     if (deps.worktree !== undefined) {
       const wt = await runWorktreeProducerStep(plan, launchCwd, deps.worktree);
       if (!wt.ok) {
@@ -2291,6 +2302,9 @@ export async function runReconcileCycle(
       // never a fold input.
       if (plan.worktree !== undefined) {
         worktreeLane = realpath(launchCwd);
+        // The pure per-node branch (base / inheriting / closer → base lane;
+        // rib → `<base>--<task>`), NOT anything derived from the realpath'd cwd.
+        worktreeBranch = plan.worktree.assignment.branch;
       }
     }
     state.inFlight.add(plan.key);
@@ -2326,6 +2340,7 @@ export async function runReconcileCycle(
       plan.model,
       plan.effort,
       worktreeLane,
+      worktreeBranch,
     );
     try {
       const outcome = await confirmRunning(

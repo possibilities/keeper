@@ -4330,6 +4330,12 @@ test("fn-976 runReconcileCycle: a worktree-mode launch carries the realpath-norm
       "/private/normalized/",
     ),
   );
+  // ...AND the durable lane BRANCH — the PURE per-node assignment branch (NOT
+  // derived from the realpath'd path), the value the hook captures as the
+  // durable `jobs.worktree` marker.
+  expect(depsLog.launches[0]?.spec?.worktreeBranch).toBe(
+    "keeper/epic/fn-1-foo",
+  );
 });
 
 test("fn-976 runReconcileCycle: a worktree-OFF launch carries NO lane on the LaunchSpec (byte-identical spec)", async () => {
@@ -4358,6 +4364,8 @@ test("fn-976 runReconcileCycle: a worktree-OFF launch carries NO lane on the Lau
 
   expect(depsLog.launches).toHaveLength(1);
   expect(depsLog.launches[0]?.spec?.worktreePath).toBeUndefined();
+  // A worktree-OFF launch carries NO branch either — the spec stays byte-identical.
+  expect(depsLog.launches[0]?.spec?.worktreeBranch).toBeUndefined();
 });
 
 test("fn-959 runReconcileCycle: worktree ON provision failure → sticky DispatchFailed, no launch", async () => {

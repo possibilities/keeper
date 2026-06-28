@@ -85,6 +85,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     backend_exec_pane_id: null,
     monitors: null,
     window_index: null,
+    worktree: null,
     ...overrides,
   };
 }

@@ -588,6 +588,9 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
     // session-env KEEPER_PLAN_WORKTREE can never be inherited.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=",
+    // ...and an empty branch entry (the durable-marker sibling), same reason.
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--model",
     "sonnet",
     "--effort",
@@ -618,6 +621,8 @@ test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confir
     "KEEPER_TMUX_SESSION=autopilot",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
     "do a thing",
   ]);
 });
@@ -642,6 +647,8 @@ test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trail
     "KEEPER_TMUX_SESSION=agentbus",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-no-confirm",
     "--resume",
     "planner-session",
@@ -670,6 +677,8 @@ test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode"
     "KEEPER_TMUX_SESSION=agentbus",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
     "fallback prompt",
   ]);
 });
@@ -684,6 +693,7 @@ test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env 
       model: "sonnet",
       effort: "max",
       worktreePath: "/private/var/wt/repo--keeper-epic-fn-1-x",
+      worktreeBranch: "keeper/epic/fn-1-x",
       noConfirm: true,
     }),
   ).toEqual([
@@ -699,6 +709,9 @@ test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env 
     // session entry and BEFORE the model/effort/name flags.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
+    // The 3rd repeated env entry — the durable lane-branch marker.
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
     "--model",
     "sonnet",
     "--effort",
@@ -720,6 +733,7 @@ test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WO
       prompt: "", // unused in resume mode
       resumeTarget: "work::fn-1-x.1",
       worktreePath: "/private/var/wt/repo--keeper-epic-fn-1-x",
+      worktreeBranch: "keeper/epic/fn-1-x--fn-1-x.2",
       noConfirm: true,
     }),
   ).toEqual([
@@ -733,6 +747,8 @@ test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WO
     "KEEPER_TMUX_SESSION=autopilot",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
     "--x-no-confirm",
     "--resume",
     "work::fn-1-x.1",
@@ -749,16 +765,23 @@ test("buildAgentwrapLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits 
     effort: "max",
     noConfirm: true,
   } as const;
-  // An explicit empty worktreePath is byte-identical to omitting it: both emit
-  // the single empty lane entry that OVERWRITES any stale `-e` session value.
+  // An explicit empty worktreePath / worktreeBranch is byte-identical to
+  // omitting it: both emit the single empty entry that OVERWRITES any stale
+  // `-e` session value.
   const absent = buildAgentwrapLaunchArgv(base);
-  expect(buildAgentwrapLaunchArgv({ ...base, worktreePath: "" })).toEqual(
-    absent,
-  );
+  expect(
+    buildAgentwrapLaunchArgv({ ...base, worktreePath: "", worktreeBranch: "" }),
+  ).toEqual(absent);
   const laneEntries = absent.filter((a) =>
     a.startsWith("KEEPER_PLAN_WORKTREE="),
   );
   expect(laneEntries).toEqual(["KEEPER_PLAN_WORKTREE="]);
+  // The branch sibling is ALSO always-emitted-empty in serial — the stale-leak
+  // guard applies to the durable marker exactly as it does to the lane path.
+  const branchEntries = absent.filter((a) =>
+    a.startsWith("KEEPER_PLAN_WORKTREE_BRANCH="),
+  );
+  expect(branchEntries).toEqual(["KEEPER_PLAN_WORKTREE_BRANCH="]);
 });
 
 // --- parseAgentwrapStdout ---

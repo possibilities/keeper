@@ -69,6 +69,9 @@ function insertEvent(
     // `tool_response.backgroundTaskId`. NULL on every other event;
     // monitors-projection tests pass this explicitly via overrides.
     background_task_id?: string | null;
+    // Schema v94 / fn-997: durable worktree-lane BRANCH captured at SessionStart.
+    // NULL on every non-worktree event; worktree-fold tests pass it via overrides.
+    worktree?: string | null;
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
@@ -136,6 +139,9 @@ function insertEvent(
             overrides.tool_name ?? null,
             overrides.data ?? "{}",
           ),
+    // Schema v94 / fn-997: durable worktree-lane BRANCH. NULL by default so a
+    // non-worktree SessionStart folds jobs.worktree NULL; worktree tests set it.
+    worktree: overrides.worktree ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -146,8 +152,8 @@ function insertEvent(
        plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path, worktree
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -182,6 +188,7 @@ function insertEvent(
       row.backend_exec_pane_id,
       row.background_task_id,
       row.mutation_path,
+      row.worktree,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -697,6 +704,75 @@ test("fn-816 a later real SessionStart hydrates a UPS-minted fork via ON CONFLIC
     .query("SELECT 1 AS one FROM pending_dispatches WHERE verb = ? AND id = ?")
     .get("work", "fn-99-x.1");
   expect(pending).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Schema v94 / fn-997 — durable per-job worktree-lane BRANCH marker. The
+// SessionStart ON CONFLICT arm folds `events.worktree` set-once onto
+// `jobs.worktree` via COALESCE (mirrors config_dir): a first launch records the
+// branch, a resume (emitting NULL) preserves it, a non-worktree launch is NULL.
+// ---------------------------------------------------------------------------
+
+const worktreeOf = (jobId: string): string | null =>
+  (
+    db.query("SELECT worktree FROM jobs WHERE job_id = ?").get(jobId) as {
+      worktree: string | null;
+    }
+  ).worktree;
+
+test("fn-997 a worktree-mode SessionStart folds jobs.worktree to the verbatim lane branch", () => {
+  // Base lane (closer / inheriting / root) → the bare `keeper/epic/<id>` branch.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-base",
+    spawn_name: "close::fn-986",
+    worktree: "keeper/epic/fn-986",
+  });
+  // Rib lane → the FLAT `keeper/epic/<id>--<task>` branch, recorded verbatim
+  // (no normalization — it is a canonical ref).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rib",
+    spawn_name: "work::fn-986.2",
+    worktree: "keeper/epic/fn-986--fn-986.2",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(worktreeOf("sess-base")).toBe("keeper/epic/fn-986");
+  expect(worktreeOf("sess-rib")).toBe("keeper/epic/fn-986--fn-986.2");
+});
+
+test("fn-997 a serial (non-worktree) SessionStart folds jobs.worktree NULL", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-serial",
+    spawn_name: "work::fn-1-x.1",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(worktreeOf("sess-serial")).toBeNull();
+});
+
+test("fn-997 a resume (empty branch → NULL) preserves the first-launch branch via set-once COALESCE", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-resume",
+    spawn_name: "work::fn-986.3",
+    worktree: "keeper/epic/fn-986--fn-986.3",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(worktreeOf("sess-resume")).toBe("keeper/epic/fn-986--fn-986.3");
+
+  // A resume SessionStart for the SAME session emits a NULL worktree (the
+  // always-emitted env carried empty). COALESCE(excluded.worktree, jobs.worktree)
+  // must PRESERVE the first-launch branch — the set-once invariant resume depends
+  // on (the every-event backend_exec arm would have wiped it; this arm must not).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-resume",
+    spawn_name: "work::fn-986.3",
+    worktree: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(worktreeOf("sess-resume")).toBe("keeper/epic/fn-986--fn-986.3");
 });
 
 // ---------------------------------------------------------------------------

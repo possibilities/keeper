@@ -179,7 +179,13 @@ export function projectJobRow(row: Record<string, unknown>): string {
     row.last_permission_prompt_at,
     row.last_permission_prompt_kind,
   );
-  const head = `${cwdSeg}${title}${roleSeg}${pillOrEmpty(row.state, "stopped")}${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+  // Durable worktree-lane pill — always-visible (a stable launch-context
+  // identity, NOT collapse-controlled like the backend pane pill). "" on a
+  // serial / non-worktree job. Self-delimited with a leading space so it slots
+  // between the role and state pills without a stray gap when absent.
+  const worktree = worktreeLaneSeg(row);
+  const worktreeSeg = worktree === "" ? "" : ` ${worktree}`;
+  const head = `${cwdSeg}${title}${roleSeg}${worktreeSeg}${pillOrEmpty(row.state, "stopped")}${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
   // Continuation lines under the head, at the 2-space depth shared with
   // sub-agent lines. Only the always-visible `awaiting` pills ride here;
   // the backend-coords pill moved out to `renderJobsBody`'s
@@ -221,6 +227,26 @@ export function backendCoordsSeg(row: Record<string, unknown>): string {
     return "";
   }
   return `[${paneSeg}]`;
+}
+
+/**
+ * Compose the durable worktree-lane PILL for one jobs row: `[⑂ <lane>]` where
+ * <lane> is the stored `jobs.worktree` branch with the `keeper/epic/` prefix
+ * stripped (base lane `keeper/epic/fn-986` → `⑂ fn-986`; rib
+ * `keeper/epic/fn-986--fn-986.2` → `⑂ fn-986--fn-986.2`). A NULL / empty
+ * `worktree` (serial / non-worktree job) → `""` so the pill drops entirely,
+ * never an empty bracket. Reuses `pill` so the bracket survives
+ * `colorizePillsInLine` (the `⑂ <lane>` token is themeless, rendering uncolored
+ * by design — same as the `[p<pane>]` coord pill). Exported for `test/jobs.test.ts`.
+ */
+export function worktreeLaneSeg(row: Record<string, unknown>): string {
+  const branch = row.worktree;
+  if (typeof branch !== "string" || branch === "") {
+    return "";
+  }
+  const PREFIX = "keeper/epic/";
+  const lane = branch.startsWith(PREFIX) ? branch.slice(PREFIX.length) : branch;
+  return pill(`⑂ ${lane}`);
 }
 
 // Nerd Font disclosure-triangle glyphs (the human's call): caret-right

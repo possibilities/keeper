@@ -2429,9 +2429,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // dead job stops holding a tmux-recyclable pane id the reaper could
   // collateral-kill, fn-977 task .2 (a one-time data-fix UPDATE, no column/shape
   // change, version-guarded). v93 appends nullable codex-spark usage columns
-  // (additive ALTER, no epics-shape change). The v62→v63 epics-shape migration
-  // this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(93);
+  // (additive ALTER, no epics-shape change). v94 appends the nullable
+  // `events.worktree` + `jobs.worktree` durable lane-branch marker (an additive
+  // ALTER, not an epics-shape change), fn-997 task .1. The v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(94);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 93;
+export const SCHEMA_VERSION = 94;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -708,7 +708,11 @@ CREATE TABLE IF NOT EXISTS events (
     -- recomputed for pre-deriver lines; NULL on every non-(PostToolUse, Write/Edit/
     -- MultiEdit/NotebookEdit) row. The expression index + COALESCE dual-read stay
     -- until .3 flips attribution onto this column.
-    mutation_path TEXT
+    mutation_path TEXT,
+    -- v93->v94 (fn-997.1): durable per-job worktree-lane BRANCH captured by the
+    -- hook at SessionStart from KEEPER_PLAN_WORKTREE_BRANCH (NULL on every
+    -- non-SessionStart / non-worktree row). Folded set-once onto jobs.worktree.
+    worktree TEXT
 )
 `;
 
@@ -928,6 +932,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     active_since REAL
 )
 `;
+// NOTE: every jobs column added after `active_since` (close_kind, window_index,
+// backend_exec_{generation,birth_session}_id, and v94 `worktree`) is
+// migration-ONLY via addColumnIfMissing — NOT in this CREATE literal — so the
+// fresh and migrated paths both append them in identical migration order and
+// PRAGMA table_info stays byte-identical (test/db.test.ts parity asserts).
 
 const CREATE_EPICS = `
 CREATE TABLE IF NOT EXISTS epics (
@@ -5399,6 +5408,21 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "usage", "codex_spark_week_percent", "REAL");
       addColumnIfMissing(db, "usage", "codex_spark_week_resets_at", "TEXT");
 
+      // v93→v94 (fn-997.1): add the durable per-job worktree-lane BRANCH marker
+      // to `events` (captured by the hook at SessionStart from
+      // `KEEPER_PLAN_WORKTREE_BRANCH`) and its `jobs` projection (folded set-once
+      // via COALESCE). Both nullable TEXT, NO default — a `DEFAULT ''` would
+      // poison the NULL=absent invariant the COALESCE fold + pill rely on.
+      // APPEND-via-ALTER keeps existing rows NULL (the zero-event shape) and is
+      // re-fold-safe: a pre-v94 event has no worktree value, so a from-scratch
+      // re-fold leaves `jobs.worktree` NULL byte-identically. NO cursor rewind —
+      // do NOT add to the rewind-and-redrain DELETE list (mirrors the prior
+      // usage-column add). Whitelist-only Python read (keeper-py never reads
+      // these columns) — this bump MUST add 94 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "events", "worktree", "TEXT");
+      addColumnIfMissing(db, "jobs", "worktree", "TEXT");
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -5439,7 +5463,7 @@ export function prepareStmts(db: Database): Stmts {
         plan_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-        background_task_id, mutation_path
+        background_task_id, mutation_path, worktree
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -5448,7 +5472,7 @@ export function prepareStmts(db: Database): Stmts {
         $plan_subject_present, $tool_use_id, $config_dir,
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
-        $background_task_id, $mutation_path
+        $background_task_id, $mutation_path, $worktree
       )
     `),
     selectWorldRev: db.prepare(

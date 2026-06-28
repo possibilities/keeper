@@ -21,6 +21,7 @@ import {
   projectJobRow,
   renderJobsBody,
   selectableJobIds,
+  worktreeLaneSeg,
 } from "../cli/jobs";
 import {
   colorizePillsInLine,
@@ -283,6 +284,67 @@ test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", 
   // unchanged because there's no PILL_COLORS bucket yet, but the
   // matcher doesn't crash on the input).
   expect(colorizePillsInLine(pill)).toBe(pill);
+});
+
+// ---------------------------------------------------------------------------
+// worktreeLaneSeg — the durable `[⑂ <lane>]` worktree pill (schema v94 /
+// fn-997). The stored `jobs.worktree` branch with the `keeper/epic/` prefix
+// stripped; NULL / empty → "" (no pill).
+// ---------------------------------------------------------------------------
+
+test("worktreeLaneSeg: base lane → '[⑂ <id>]' (keeper/epic/ stripped)", () => {
+  expect(worktreeLaneSeg({ worktree: "keeper/epic/fn-986" })).toBe(
+    "[⑂ fn-986]",
+  );
+});
+
+test("worktreeLaneSeg: rib lane → '[⑂ <id>--<task>]' (flat rib branch, prefix stripped)", () => {
+  expect(worktreeLaneSeg({ worktree: "keeper/epic/fn-986--fn-986.2" })).toBe(
+    "[⑂ fn-986--fn-986.2]",
+  );
+});
+
+test("worktreeLaneSeg: NULL / empty / missing worktree → '' (no pill)", () => {
+  expect(worktreeLaneSeg({ worktree: null })).toBe("");
+  expect(worktreeLaneSeg({ worktree: "" })).toBe("");
+  expect(worktreeLaneSeg({})).toBe("");
+});
+
+test("worktreeLaneSeg: a branch without the keeper/epic/ prefix renders verbatim", () => {
+  // Defensive: a non-conforming stored value is shown as-is rather than dropped
+  // or mangled — the strip is prefix-gated, never an unconditional slice.
+  expect(worktreeLaneSeg({ worktree: "main" })).toBe("[⑂ main]");
+});
+
+test("worktreeLaneSeg: pill is bracketed so colorizePillsInLine round-trips it", () => {
+  const out = worktreeLaneSeg({ worktree: "keeper/epic/fn-986" });
+  expect(out.startsWith("[")).toBe(true);
+  expect(out.endsWith("]")).toBe(true);
+  // Themeless token (no PILL_COLORS bucket) → unchanged, never crashes.
+  expect(colorizePillsInLine(out)).toBe(out);
+});
+
+test("projectJobRow: a worktree job carries the [⑂ <lane>] pill on the head line; a serial job shows none", () => {
+  const wt = projectJobRow({
+    cwd: "/repo/x",
+    title: "lane work",
+    plan_verb: "work",
+    state: "working",
+    worktree: "keeper/epic/fn-986--fn-986.2",
+  });
+  expect(wt).toBe(
+    `(x) lane work ${pill("worker")} [⑂ fn-986--fn-986.2] ${pill("working")}`,
+  );
+  // A serial / non-worktree job renders byte-identically to before — no pill,
+  // no stray gap.
+  const serial = projectJobRow({
+    cwd: "/repo/x",
+    title: "lane work",
+    plan_verb: "work",
+    state: "working",
+    worktree: null,
+  });
+  expect(serial).toBe(`(x) lane work ${pill("worker")} ${pill("working")}`);
 });
 
 // ---------------------------------------------------------------------------
