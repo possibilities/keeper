@@ -1299,7 +1299,14 @@ event-log/reducer/hook touch. Run any of them with
   dead. Driven only off that anchor, never `updated_at` (a rate-limit
   fold bumps that) and never agentusage's own `status` (which tracks its
   scrape failures rather than keeper's ingestion health) — so a wedged
-  usage worker becomes visible instead of silently frozen. Untracked
+  usage worker becomes visible instead of silently frozen. A stale row
+  carrying an `error_type` also renders an `error`-family line: the
+  projected `error_kind` becomes a short label — `format` (panel drift),
+  `panel` (panel missing), `scrape` (scrape crash), `upstream` (endpoint
+  throttle), `runner` (keeper-side runner fault) — while the body keeps the
+  full `<type>: <message>` and a ticking age. A null or unrecognized
+  `error_kind` degrades to the generic `error` label so the detail is never
+  hidden. Untracked
   profiles (rate-limited but with no agentusage usage row) do not render.
   Per-frame sidecars
   (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta

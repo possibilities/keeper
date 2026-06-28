@@ -1496,6 +1496,132 @@ test("label padding ignores 'error' when no row renders a stale error", () => {
   );
 });
 
+test("error_kind drives a kind-specific stale-error label, preserving type/message/age", () => {
+  // The projected `error_kind` becomes the line label while the body keeps the
+  // full `<type>: <message>` content and the rel-time stamp ticks as before.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        status: "stale",
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: "RunnerError",
+        error_message: "exit 1",
+        error_at: isoOffset(-4),
+        error_kind: "runner_failed",
+      },
+    ],
+    NOW_MS,
+  );
+  // No generic `error ` line; the kind-specific `runner ` label takes its place.
+  expect(lines.find((l) => l.trimStart().startsWith("error "))).toBeUndefined();
+  const runnerLine = lines.find((l) => l.trimStart().startsWith("runner "));
+  expect(runnerLine).toBeDefined();
+  expect(runnerLine).toContain("RunnerError: exit 1");
+  expect(runnerLine).toMatch(/ 4m ago$/);
+});
+
+test("each error_kind maps to its short label", () => {
+  const cases: [string, string][] = [
+    ["format_changed", "format"],
+    ["panel_missing", "panel"],
+    ["scrape_failed", "scrape"],
+    ["upstream_limited", "upstream"],
+    ["runner_failed", "runner"],
+  ];
+  for (const [kind, label] of cases) {
+    const lines = renderRowLines(
+      [
+        {
+          id: "p",
+          target: "claude",
+          multiplier: 5,
+          status: "stale",
+          subscription_active: 1,
+          session_percent: 10,
+          session_resets_at: isoOffset(60),
+          week_percent: 10,
+          week_resets_at: isoOffset(60),
+          error_type: "T",
+          error_message: "m",
+          error_at: isoOffset(-1),
+          error_kind: kind,
+        },
+      ],
+      NOW_MS,
+    );
+    expect(
+      lines.find((l) => l.trimStart().startsWith(`${label} `)),
+    ).toBeDefined();
+  }
+});
+
+test("null or unknown error_kind keeps the generic 'error' label", () => {
+  for (const kind of [null, "something_new"]) {
+    const lines = renderRowLines(
+      [
+        {
+          id: "p",
+          target: "claude",
+          multiplier: 5,
+          status: "stale",
+          subscription_active: 1,
+          session_percent: 10,
+          session_resets_at: isoOffset(60),
+          week_percent: 10,
+          week_resets_at: isoOffset(60),
+          error_type: "ParseError",
+          error_message: "label not found",
+          error_at: isoOffset(-2),
+          error_kind: kind,
+        },
+      ],
+      NOW_MS,
+    );
+    const errLine = lines.find((l) => l.trimStart().startsWith("error "));
+    expect(errLine).toBeDefined();
+    expect(errLine).toContain("ParseError: label not found");
+  }
+});
+
+test("current Codex weekly-line parse failure renders as 'format' and keeps CodexStatusParseError", () => {
+  // Fixture mirroring the live Codex `/status` weekly-line drift: the panel
+  // renders (format_changed, not panel_missing) but the parser rejects the
+  // weekly line. The label must read `format` while the body still surfaces the
+  // exact exception type so an operator can diagnose the drift.
+  const lines = renderRowLines(
+    [
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        status: "stale",
+        subscription_active: 1,
+        session_percent: 20,
+        session_resets_at: isoOffset(60),
+        week_percent: 20,
+        week_resets_at: isoOffset(60),
+        error_type: "CodexStatusParseError",
+        error_message: "weekly line not found",
+        error_at: isoOffset(-7),
+        error_kind: "format_changed",
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines.find((l) => l.trimStart().startsWith("error "))).toBeUndefined();
+  const fmtLine = lines.find((l) => l.trimStart().startsWith("format "));
+  expect(fmtLine).toBeDefined();
+  expect(fmtLine).toContain("CodexStatusParseError");
+  expect(fmtLine).toMatch(/ 7m ago$/);
+});
+
 // ---------------------------------------------------------------------------
 // fn-772 trailer-drift guard: usage is the open-coded outlier (no
 // `createViewShell`), so it threads snapshot mode inline while reusing the

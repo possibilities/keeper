@@ -106,6 +106,21 @@ function seg(v: unknown): string {
   return v == null ? "" : String(v);
 }
 
+// Short stale-error labels keyed by the projection's stable `error_kind`. A
+// null or unrecognized kind degrades to the generic `error` label so the
+// detailed `<type>: <message>` body is never hidden behind an unknown class.
+const ERROR_KIND_LABELS: Record<string, string> = {
+  format_changed: "format",
+  panel_missing: "panel",
+  scrape_failed: "scrape",
+  upstream_limited: "upstream",
+  runner_failed: "runner",
+};
+
+function errorKindLabel(kind: string): string {
+  return ERROR_KIND_LABELS[kind] ?? "error";
+}
+
 /**
  * Resolve an agentusage account id to its configured display alias (purely
  * cosmetic). An unmapped id passes through verbatim. The alias never touches
@@ -349,6 +364,10 @@ export function renderRowLines(
     // `<type>: <message>` content (the matching `errRel` is the rel-time cell).
     errContent: string;
     errRel: string;
+    // Stale-error line LABEL — empty when `error_type` is NULL, else the
+    // `error_kind`-derived short label (`format` / `panel` / `scrape` /
+    // `upstream` / `runner`), falling back to `error` for a null/unknown kind.
+    errLabel: string;
   }
 
   const cells: RowCells[] = visible.map((row) => {
@@ -405,6 +424,7 @@ export function renderRowLines(
     const errAtIso = seg(row.error_at);
     const errContent = errType === "" ? "" : `${errType}: ${errMsg}`;
     const errRel = errType === "" ? "" : relTime(errAtIso, nowMs);
+    const errLabel = errType === "" ? "" : errorKindLabel(seg(row.error_kind));
     return {
       id: `(${aliasOf(seg(row.id), aliases)})`,
       target: seg(row.target),
@@ -441,6 +461,7 @@ export function renderRowLines(
       staleRel,
       errContent,
       errRel,
+      errLabel,
     };
   });
 
@@ -474,7 +495,9 @@ export function renderRowLines(
   if (cells.some((c) => c.cswPct != null)) labels.push("spark-week");
   if (cells.some((c) => c.rlRel !== "")) labels.push("limited");
   if (cells.some((c) => c.staleRel !== "")) labels.push("stale");
-  if (cells.some((c) => c.errContent !== "")) labels.push("error");
+  for (const c of cells) {
+    if (c.errLabel !== "") labels.push(c.errLabel);
+  }
   const wLabel = widest(labels);
 
   const indent = " ".repeat(wId + 1);
@@ -506,14 +529,14 @@ export function renderRowLines(
   // Oversize content truncates with an ellipsis; under-width padEnds to keep
   // the rel-time column stable.
   const errCellWidth = BAR_WIDTH + 2 + 1 + wPct;
-  const renderError = (content: string, rel: string): string => {
+  const renderError = (label: string, content: string, rel: string): string => {
     let body: string;
     if (content.length > errCellWidth) {
       body = `${content.slice(0, Math.max(0, errCellWidth - 1))}…`;
     } else {
       body = content.padEnd(errCellWidth, " ");
     }
-    const head = `${indent}${"error".padEnd(wLabel, " ")} ${body}`;
+    const head = `${indent}${label.padEnd(wLabel, " ")} ${body}`;
     return rel === "" ? head : `${head} ${rel}`;
   };
 
@@ -553,7 +576,7 @@ export function renderRowLines(
       lines.push(renderStale(c.staleRel));
     }
     if (c.errContent !== "") {
-      lines.push(renderError(c.errContent, c.errRel));
+      lines.push(renderError(c.errLabel, c.errContent, c.errRel));
     }
   }
   return lines;
