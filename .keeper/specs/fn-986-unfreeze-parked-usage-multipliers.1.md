@@ -35,5 +35,5 @@ Existing cycle tests stay green after migration; add no new behavior assertions 
 - [ ] `bun test test/usage-scraper-worker.test.ts` green
 
 ## Done summary
-
+Inject optional homeDir seam into AccountLoopDeps; cycle() reResolveMultiplier uses injected seam; tests write sandbox .claude.json for deterministic in-cycle re-resolve
 ## Evidence
