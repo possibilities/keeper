@@ -62,5 +62,5 @@ that done's `--project` override still wins.
 - [ ] pure test: done-from-lane flips primary's runtime overlay (not the lane's)
 
 ## Done summary
-
+runDone resolves its owning project lane-blind (findProjectsWithTask, like claim), so a done run from a worktree lane flips the runtime overlay on the epic's primary repo, never the lane. --project stays authoritative; projects outside any root fall back to cwd-then-global. The shared resolveOwningProjectForId is untouched.
 ## Evidence
