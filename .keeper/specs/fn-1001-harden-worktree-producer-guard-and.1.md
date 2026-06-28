@@ -46,5 +46,5 @@ Pure fake-runner: worktree mode ON + an epic with single-toplevel tasks but `pri
 - [ ] fake-runner test covers both; gate green
 
 ## Done summary
-
+classifyEpicRepo now rejects a worktree-mode epic that resolves to one toplevel but has no primary_repo with a sticky operator-required worktree-no-primary-repo reject (outside the worktree-recover auto-clear prefix), before any lane is provisioned — closing the silent degrade-to-lane deadlock.
 ## Evidence
