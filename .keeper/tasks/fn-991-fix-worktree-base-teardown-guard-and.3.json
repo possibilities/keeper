@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "re-push stranded merge before base teardown",
-  "updated_at": "2026-06-28T00:25:25.124000Z"
+  "updated_at": "2026-06-28T00:51:39.916000Z",
+  "worker_done_at": "2026-06-28T00:51:39.916000Z"
 }

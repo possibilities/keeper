@@ -67,5 +67,5 @@ origin ref) → first push admitted via turn-key.
 - [ ] the push-default path reuses the turn-key + FF gating and does NOT run mergeReadiness
 
 ## Done summary
-
+Guard both lane-teardown seams (mergeLaneBaseIntoDefault not-ahead short-circuit + recover pass-3) on origin-containment: a base merged to LOCAL default but absent from origin is re-pushed via a shared push-only helper (turn-key + FF gating, no mergeReadiness) before teardown; a push degrade defers as a transient retry-skip, never sticky, never teardown-on-failure.
 ## Evidence
