@@ -38,5 +38,5 @@ Extend the pure renderer tests; no daemon, worker, PTY, or real `keeper usage` s
 - [ ] Targeted usage renderer tests pass.
 
 ## Done summary
-
+keeper usage now renders error_kind as a short stale-error label (format/panel/scrape/upstream/runner), falling back to error for null/unknown kinds while keeping the full type:message body and ticking age; README documents the labels and tests cover the Codex weekly-line format-drift fixture.
 ## Evidence
