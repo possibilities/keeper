@@ -2615,9 +2615,18 @@ export function createWorktreeDriver(
               `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
             );
           case "non-ff":
-            return retrySkip(
-              `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — skipping the base merge + push (no fetch/rebase/force); retrying once the checkout is updated`,
-            );
+            // Origin is AHEAD of local default (a genuine non-fast-forward) — the
+            // shared checkout cannot land the merge without a human reconciling
+            // origin (no fetch/rebase/force on the shared tree). UNLIKE the transient
+            // environment skips above, this needs operator attention, so mint a
+            // VISIBLE sticky DispatchFailed (no `retry: true`). The reason stays
+            // `worktree-finalize-*` (OUTSIDE the `worktree-recover` auto-clear prefix)
+            // so the level-triggered clear never silently dismisses an origin-ahead
+            // block.
+            return {
+              ok: false,
+              reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`,
+            };
           case "not-turn-key":
             return retrySkip(
               `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
@@ -2957,24 +2966,34 @@ export async function mergeLaneBaseIntoDefault(
   if (merge.kind === "conflict") {
     return { kind: "conflict", stderr: merge.stderr };
   }
-  // BatchMode + ConnectTimeout fail fast on a credential / connect stall;
-  // timeoutMs is the post-connect backstop. A timeout surfaces as the GNU-timeout
-  // sentinel code → a TRANSIENT retry, never the sticky push-failed.
-  const push = await run(["push"], {
-    cwd: repo,
-    env: {
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
-    },
-    timeoutMs: GIT_PUSH_TIMEOUT_MS,
-  });
-  if (push.code === GIT_SPAWN_TIMEOUT_CODE) {
-    return { kind: "push-timeout" };
+  // Branch-explicit push, NOT a bare `push`: under `push.default=simple` a
+  // no-refspec push targets the CURRENT HEAD's upstream, so off-default it would
+  // push the wrong ref (or "Everything up-to-date", exit 0) while origin/<default>
+  // never advances — then the caller tears down on a false `pushed` and strands the
+  // merge. pushDefaultToOrigin asserts HEAD==default, fails fast on a credential /
+  // connect stall (BatchMode + ConnectTimeout), and surfaces a timeout as the
+  // TRANSIENT push-timeout, never the sticky push-failed.
+  const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
+  if (pushed.kind !== "pushed") {
+    return pushed; // off-branch / non-ff / timeout / failed / not-turn-key → caller defers
   }
-  if (push.code !== 0) {
-    return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
+  // Post-push origin-containment recheck — the SAME guard the not-ahead arm runs: a
+  // push can exit 0 yet leave origin/<default> un-advanced (e.g. "Everything
+  // up-to-date" on a stale ref). Confirm `merged` (teardown-safe) ONLY once origin
+  // PROVABLY contains the just-merged base (cached remote-tracking ref, NO fetch);
+  // otherwise degrade to the EXISTING push-unconfirmed retry-skip so the caller
+  // defers teardown, never tears the base down off a false `pushed`.
+  if (
+    await gitIsAncestorOf(
+      repo,
+      baseBranch,
+      originDefaultRef(defaultBranch),
+      run,
+    )
+  ) {
+    return { kind: "merged" };
   }
-  return { kind: "merged" };
+  return { kind: "push-unconfirmed" };
 }
 
 /**

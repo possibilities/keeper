@@ -4886,6 +4886,13 @@ test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (
     if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
       return { code: 1, stdout: "", stderr: "" }; // base is AHEAD → merge it
     }
+    if (
+      joined ===
+      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
+    ) {
+      // Post-push origin recheck: origin PROVABLY contains the merge → teardown-safe.
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("merge-base --is-ancestor")) {
       return { code: 1, stdout: "", stderr: "" }; // not already-merged vs HEAD
     }
@@ -4906,7 +4913,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (
   expect(cmds.some((c) => c === "merge --no-edit keeper/epic/fn-1-foo")).toBe(
     true,
   );
-  expect(cmds.some((c) => c === "push")).toBe(true);
+  // The push is branch-explicit (`push origin <default>`), NOT a bare `push`.
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+  expect(cmds.some((c) => c === "push")).toBe(false);
 });
 
 test("fn-990 mergeLaneBaseIntoDefault: a real merge CONFLICT → { kind: 'conflict' }, no push (the shared core stamps no reason)", async () => {
@@ -4974,7 +4983,7 @@ test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: '
     if (joined.startsWith("merge --no-edit")) {
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "push") {
+    if (joined === "push origin main") {
       return { code: 1, stdout: "", stderr: "remote rejected" };
     }
     return { code: 0, stdout: "", stderr: "" };
@@ -5014,7 +5023,7 @@ test("fn-990 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) �
     if (joined.startsWith("merge --no-edit")) {
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "push") {
+    if (joined === "push origin main") {
       return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
@@ -5056,8 +5065,16 @@ test("fn-990 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF prechec
     if (joined.startsWith("status --porcelain")) {
       return { code: 0, stdout: "", stderr: "" };
     }
+    if (
+      joined ===
+      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
+    ) {
+      // Post-push origin recheck: the push landed (and refreshed the cached
+      // origin/<default> ref), so origin now PROVABLY contains the merge → merged.
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // base ahead of default
+      return { code: 1, stdout: "", stderr: "" }; // base ahead of default / not-yet-merged vs HEAD
     }
     if (joined.startsWith("merge --no-edit")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -5254,6 +5271,78 @@ test("fn-992 mergeLaneBaseIntoDefault: a re-push that exits 0 but leaves origin 
   expect(res).toEqual({ kind: "push-unconfirmed" });
   // The push DID run (branch-explicit) but the recheck refused teardown-safe.
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
+});
+
+test("fn-993 mergeLaneBaseIntoDefault: the MERGED arm re-pushes branch-explicit + rechecks origin — exit 0 but origin un-advanced → `push-unconfirmed`, never `merged`", async () => {
+  // EDGE-1: the merged arm (base NOT yet an ancestor of local default → a real
+  // merge runs) must mirror the not-ahead arm — a branch-explicit push THEN a
+  // post-push origin-containment recheck. A push that exits 0 yet leaves
+  // origin/<default> un-advanced degrades to `push-unconfirmed` (the existing
+  // retry-skip), so the caller defers teardown rather than stranding the merge.
+  const base = "keeper/epic/fn-1-foo";
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" }; // HEAD on default
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" }; // clean checkout
+    }
+    if (joined === `merge-base --is-ancestor ${base} main`) {
+      return { code: 1, stdout: "", stderr: "" }; // base AHEAD of LOCAL default → merge it
+    }
+    if (
+      joined === `merge-base --is-ancestor ${base} refs/remotes/origin/main`
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // origin LACKS it, even after the push
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able (not non-ff)
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      // base-vs-HEAD idempotent check → NOT already merged, so the real merge runs.
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined === "remote get-url origin") {
+      return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "push origin main") {
+      return { code: 0, stdout: "Everything up-to-date\n", stderr: "" }; // exit 0, no advance
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    base,
+    "main",
+    fakeRun,
+    () => ({
+      release() {},
+    }),
+  );
+  expect(res).toEqual({ kind: "push-unconfirmed" });
+  // The merge ran, and the push was branch-explicit — never a bare `push`.
+  expect(cmds.some((c) => c === `merge --no-edit ${base}`)).toBe(true);
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+  expect(cmds.some((c) => c === "push")).toBe(false);
 });
 
 test("worktreeRecoverDispatchId: slugs the dir so the recover key is retry-clearable", () => {
@@ -5987,10 +6076,13 @@ test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default +
         c.cwd === "/repo" && c.args === "merge --no-edit keeper/epic/fn-1-foo",
     ),
   ).toBe(true);
-  // The single recover push leg fails fast on a credential-needing origin —
-  // GIT_TERMINAL_PROMPT=0 keeps git from opening /dev/tty, and ssh BatchMode +
-  // ConnectTimeout keep an SSH stall from hanging the reconcile cycle.
-  const recoverPush = calls.find((c) => c.cwd === "/repo" && c.args === "push");
+  // The single recover push leg is branch-explicit (`push origin <default>`) and
+  // fails fast on a credential-needing origin — GIT_TERMINAL_PROMPT=0 keeps git
+  // from opening /dev/tty, and ssh BatchMode + ConnectTimeout keep an SSH stall
+  // from hanging the reconcile cycle.
+  const recoverPush = calls.find(
+    (c) => c.cwd === "/repo" && c.args === "push origin main",
+  );
   expect(recoverPush?.env).toEqual({
     GIT_TERMINAL_PROMPT: "0",
     GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
@@ -7175,7 +7267,13 @@ test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no wo
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
-test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and-retry, no merge/push/fetch", async () => {
+test("fn-993 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → operator-visible STICKY block (no retry), no merge/push/fetch", async () => {
+  // EDGE-3: an origin-ahead non-ff genuinely needs an operator to reconcile origin
+  // (no fetch/rebase/force on the shared checkout). UNLIKE the transient
+  // dirty/off-branch/not-turn-key skips, it mints a VISIBLE sticky DispatchFailed
+  // (retry !== true) so it is no longer silent. The reason stays
+  // `worktree-finalize-*` (outside the recover auto-clear prefix), so the
+  // level-triggered clear never dismisses a genuine origin-ahead block.
   const { run, cmds } = makeFinalizeReadinessRun({ remoteAhead: true });
   const res = await createWorktreeDriver(run).finalizeEpic(
     makeFinalizeInfo(),
@@ -7183,7 +7281,7 @@ test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and
   );
   expect(res.ok).toBe(false);
   if (!res.ok) {
-    expect(res.retry).toBe(true);
+    expect(res.retry).not.toBe(true); // STICKY — surfaces a close-row failure
     expect(res.reason).toContain("worktree-finalize-non-fast-forward");
     expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
@@ -7191,6 +7289,48 @@ test("fn-985 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → skip-and
   expect(cmds.some((c) => c.startsWith("fetch"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-993 runReconcileCycle: a non-ff finalize (origin ahead) mints an operator-visible sticky DispatchFailed end-to-end", async () => {
+  // EDGE-3 end-to-end: the real finalize routine hits the non-ff degrade and the
+  // producer seam turns its non-retry result into a VISIBLE close-row failure — an
+  // origin-ahead block is no longer silent. The reason stays worktree-finalize-*.
+  const { run } = makeFinalizeReadinessRun({ remoteAhead: true });
+  const { deps, log: depsLog } = makeFakeDeps({
+    worktree: createWorktreeDriver(run),
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({ verb: "close", id: "fn-1-foo" });
+  expect(depsLog.emissions[0]?.reason).toContain(
+    "worktree-finalize-non-fast-forward",
+  );
+  expect(isWorktreeRecoverReason(depsLog.emissions[0]?.reason ?? "")).toBe(
+    false,
+  );
 });
 
 test("fn-988 finalizeEpic: no origin remote (non-turn-key push) → distinct non-sticky skip-retry, no merge/push", async () => {
@@ -7298,10 +7438,10 @@ test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-fin
     if (joined.startsWith("merge-base --is-ancestor")) {
       // base-vs-HEAD: already-merged → the inner merge takes the no-lock skip
       // (the real FFI flock is the slow real-git test's contract), then the
-      // routine still runs the single push leg — which times out here.
+      // routine still runs the single branch-explicit push leg — which times out here.
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "push") {
+    if (joined === "push origin main") {
       return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
