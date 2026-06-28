@@ -83,5 +83,5 @@ an epic is OPEN leaves its base + ribs intact.
 - [ ] the misleading :5796 test is corrected to mean absent-or-done; open-base + open-rib preserve tests are added
 
 ## Done summary
-
+Pass-3 lane teardown is now tri-state on epic activity: a new epicPresentAndNotDone probe (cloning isEpicDoneById's pk-bypass frame) preserves a present-and-not-done epic's reflexive-ancestor base/rib, with is-ancestor kept as a secondary safety and the omitted probe defaulting to preserve.
 ## Evidence
