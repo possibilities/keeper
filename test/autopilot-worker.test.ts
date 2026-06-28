@@ -48,6 +48,7 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type DispatchKey,
+  epicPresentAndNotDone,
   FINALIZER_GUARD_S,
   type FoundJob,
   isEpicDoneById,
@@ -5761,7 +5762,14 @@ test("fn-988 recoverWorktrees pass-3: a merged orphan rib (worktree + branch) is
     ancestors: new Set([rib]), // the rib is fully merged → safe to prune
     repoHead: "main",
   });
-  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // The probe reports the rib's epic ABSENT (reaped) — eligible to sweep.
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
   expect(failures).toEqual([]);
   // The merge path is bases-only: a rib is NEVER merged to default.
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
@@ -5793,12 +5801,13 @@ test("fn-988 recoverWorktrees pass-3: an UNMERGED orphan rib is preserved (never
   expect(calls.some((c) => c.args === `branch -D ${rib}`)).toBe(false);
 });
 
-test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) is torn down, is-ancestor-gated", async () => {
-  // The orphan class found on disk this session: a done epic whose base merged
-  // into default but whose base worktree + `keeper/epic/<id>` branch were never
-  // swept (finalize no-op'd, recover pass-3 was ribs-only). Pass-3 now reclaims
-  // it once it is provably merged (an ancestor of default) — independent of
-  // whether THIS run did the merge.
+test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) of an absent-or-done epic is torn down, is-ancestor-gated", async () => {
+  // The orphan class found on disk this session: a done/reaped epic whose base
+  // merged into default but whose base worktree + `keeper/epic/<id>` branch were
+  // never swept (finalize no-op'd, recover pass-3 was ribs-only). Pass-3 reclaims
+  // it once its epic is inactive (the probe reports ABSENT-or-done) AND it is
+  // provably merged (an ancestor of default) — independent of whether THIS run
+  // did the merge.
   const base = "keeper/epic/fn-1-foo";
   const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
   const { run, calls } = makeRecoveryGit({
@@ -5811,9 +5820,15 @@ test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) i
     ancestors: new Set([base]), // already merged → no pass-2 merge, safe to sweep
     repoHead: "main",
   });
-  // isEpicDone false: the epic was reaped past the recent-done window, yet the
-  // is-ancestor gate still proves the orphan base merged → it is swept anyway.
-  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // The probe reports the epic ABSENT-or-done (reaped past the recent-done
+  // window, or EpicDeleted); the is-ancestor gate proves the base merged → swept.
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
   expect(failures).toEqual([]);
   // No pass-2 merge (already an ancestor), but the base worktree + branch ARE
   // torn down: worktree removed, then branch deleted, never `--contains`.
@@ -5861,7 +5876,14 @@ test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failur
     repoHead: "main",
     dirtyRemoveAt: new Set([basePath]), // but the base worktree refuses (dirty)
   });
-  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // Probe reports the epic absent-or-done → the merged base reaches teardown.
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
   // Recover ACCUMULATES — a base-keyed failure, OUTSIDE the merge-skip family,
   // and the branch is NEVER deleted while its worktree is dirty.
   expect(failures).toEqual([
@@ -5872,6 +5894,68 @@ test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failur
     },
   ]);
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-991 recoverWorktrees pass-3: an OPEN epic's reflexive-ancestor base is PRESERVED (born at the default tip, no commits)", async () => {
+  // A base is forked off the default tip and is-ancestor is reflexive, so an OPEN
+  // epic's base IS an ancestor of default. The ancestry-only sweep destroyed it
+  // mid-flight; the tri-state probe (epic present + not done) now preserves it.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // reflexive ancestor of default (born at the tip)
+    repoHead: "main",
+  });
+  // Probe reports the epic PRESENT and NOT done → its base is preserved despite
+  // being a reflexive ancestor.
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => true,
+  );
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("fn-991 recoverWorktrees pass-3: an OPEN epic's clean fresh RIB at the default tip is PRESERVED", async () => {
+  // The worker-boot window: a rib provisioned off the default tip before its first
+  // commit is a reflexive ancestor too. The tri-state probe preserves it (the
+  // accepted bounded leak — finalize reclaims it when the epic closes).
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${ribPath}\nHEAD z\nbranch refs/heads/${rib}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [rib],
+    defaultBranch: "main",
+    ancestors: new Set([rib]), // reflexive ancestor (no commits yet)
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => true, // epic present + not done
+  );
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === `worktree remove ${ribPath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${rib}`)).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: open (not-done) epic base → skipped, never merged", async () => {
@@ -6117,6 +6201,27 @@ test("fn-959.7 isEpicDoneById: pk-lookup resolves a DONE epic unbounded by the r
     // read, proving the pk-lookup is genuinely decoupled from the 1800s window.
     const snap = await loadReconcileSnapshot(db);
     expect(snap.epics.map((e) => e.epic_id)).not.toContain("fn-1-done");
+  });
+});
+
+test("fn-991 epicPresentAndNotDone: pk-lookup reads a live epic PRESENT (open → true, done → false, absent → false)", async () => {
+  await withSeededDb(async (db) => {
+    // The pk-bypass frame must read a live in_progress/blocked epic as PRESENT —
+    // NOT absent — so its base is never falsely swept. A done OR absent epic reads
+    // false (eligible to sweep). Stale `updated_at` past the recent-done window
+    // must not make a live epic read absent (the bypass is the whole point).
+    const nowSec = Math.floor(Date.now() / 1000);
+    seedEpicRow(db, "fn-1-open", { epic_number: 1, status: "in_progress" });
+    seedEpicRow(db, "fn-2-blocked", { epic_number: 2, status: "blocked" });
+    seedEpicRow(db, "fn-3-done", {
+      epic_number: 3,
+      status: "done",
+      updated_at: nowSec - DONE_EPICS_REAP_WINDOW_SEC - 10_000, // past the window
+    });
+    expect(await epicPresentAndNotDone(db, "fn-1-open")).toBe(true);
+    expect(await epicPresentAndNotDone(db, "fn-2-blocked")).toBe(true);
+    expect(await epicPresentAndNotDone(db, "fn-3-done")).toBe(false);
+    expect(await epicPresentAndNotDone(db, "fn-4-absent")).toBe(false);
   });
 });
 

@@ -1053,6 +1053,11 @@ export interface WorktreeDriver {
    *     push (idempotent: an already-merged base is skipped). DECOUPLED from
    *     `DONE_EPICS_REAP_WINDOW_SEC`.
    *
+   *  3. ORPHAN-LANE PRUNE: tear down each `keeper/epic/<id>` lane (base AND rib)
+   *     whose epic `epicPresentAndNotDone` reports inactive (ABSENT or done),
+   *     gated by a SECONDARY is-ancestor-of-default safety. A live epic's lanes
+   *     are PRESERVED (an omitted probe defaults to preserve — fail-safe).
+   *
    * Returns the failures (if any) for the caller to mint as sticky DispatchFailed;
    * a recovery failure NEVER throws past the driver (a producer git error must not
    * wedge the cycle).
@@ -1060,6 +1065,7 @@ export interface WorktreeDriver {
   recover(
     repos: readonly string[],
     isEpicDone: (epicId: string) => Promise<boolean>,
+    epicPresentAndNotDone: (epicId: string) => Promise<boolean>,
   ): Promise<WorktreeRecoveryFailure[]>;
 }
 
@@ -2726,8 +2732,14 @@ export function createWorktreeDriver(
         };
       }
     },
-    recover(repos, isEpicDone) {
-      return recoverWorktrees(repos, isEpicDone, run);
+    recover(repos, isEpicDone, epicPresentAndNotDone) {
+      return recoverWorktrees(
+        repos,
+        isEpicDone,
+        run,
+        undefined,
+        epicPresentAndNotDone,
+      );
     },
   };
 }
@@ -2853,6 +2865,12 @@ export async function mergeLaneBaseIntoDefault(
  * base is skipped via `merge-base --is-ancestor`. DECOUPLED from the 1800s
  * recent-done window — git is the authority for which bases still need merging.
  *
+ * Pass 3 (orphan-lane prune): tri-state on epic activity — every `keeper/epic/<id>`
+ * lane (base AND rib) whose epic is ABSENT (reaped / EpicDeleted) OR done, gated
+ * by a SECONDARY is-ancestor-of-default safety, is torn down. The injected
+ * `epicPresentAndNotDone` probe PRESERVES a live epic's lanes (an omitted probe
+ * defaults to preserve — fail-safe).
+ *
  * Every git error is caught and returned as a {@link WorktreeRecoveryFailure}; a
  * recovery error NEVER throws past here so a producer git failure can't wedge the
  * cycle.
@@ -2862,6 +2880,8 @@ export async function recoverWorktrees(
   isEpicDone: (epicId: string) => Promise<boolean>,
   run: WorktreeGitRunner = gitExec,
   acquireLock?: LockAcquirer,
+  epicPresentAndNotDone: (epicId: string) => Promise<boolean> = () =>
+    Promise.resolve(true),
 ): Promise<WorktreeRecoveryFailure[]> {
   const failures: WorktreeRecoveryFailure[] = [];
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
@@ -3042,18 +3062,21 @@ export async function recoverWorktrees(
       }
     }
 
-    // --- Pass 3: prune orphan lanes (`keeper/epic/<id>` bases AND ribs) merged
-    // into default. --- An INDEPENDENT is-ancestor-of-default sweep over BOTH a
-    // base and a rib: an ancestor of default is provably merged (its content is
-    // already on local default), so its worktree + branch are safe to remove —
-    // gated ONLY on the ancestry, NOT on whether THIS run did the merge, so a
-    // crash between the pass-2 base merge and teardown (OR a done epic reaped
-    // past the recent-done window, which `finalizeEpic` never swept) is reclaimed
-    // on the next cycle instead of leaking an orphan base branch + `~/worktrees`
-    // dir. is-ancestor-gated, prune-before-delete, NEVER `git branch --contains`
-    // (which force-deletes siblings). An UNMERGED lane is LEFT for a human. The
-    // candidate set is enumerated from LIVE git (no laneOrder snapshot — recover
-    // has none). Mirrors the finalize-teardown sweep for the crash/restart path.
+    // --- Pass 3: prune orphan lanes (`keeper/epic/<id>` bases AND ribs) whose
+    // epic is no longer active. --- TRI-STATE on epic activity: a lane is
+    // PRESERVED while its epic is PRESENT-in-projection AND NOT done, and SWEPT
+    // only once its epic is ABSENT (reaped / EpicDeleted) OR done. A lane is BORN
+    // at the default tip (provision forks off it) and is-ancestor is REFLEXIVE, so
+    // an OPEN epic's base — and a clean freshly-provisioned rib before its first
+    // commit — IS an ancestor of default; an ancestry-ONLY sweep destroyed it
+    // mid-flight. is-ancestor is KEPT as a SECONDARY safety BELOW the activity gate
+    // so an UNMERGED lane is never force-deleted (also covering a pass-2 open→done
+    // flip mid-cycle, and never deleting work whose merge hasn't landed). Teardown
+    // is prune-before-delete, NEVER `git branch --contains` (which force-deletes
+    // siblings). The candidate set is enumerated from LIVE git (no laneOrder
+    // snapshot — recover has none). Mirrors the finalize-teardown sweep for the
+    // crash/restart path; a done epic reaped past the recent-done window (which
+    // `finalizeEpic` never swept) is still reclaimed here on the next cycle.
     let laneBranches: { branch: string; epicId: string; isRib: boolean }[];
     try {
       laneBranches = await gitListEpicLaneBranches(repo, run);
@@ -3076,14 +3099,15 @@ export async function recoverWorktrees(
       wtByShortBranch.set(short, entry.path);
     }
     for (const lane of laneBranches) {
-      // Bases AND ribs share ONE sweep — both are torn down ONLY once they are an
-      // ancestor of default (a base via the pass-2/finalize merge, a rib via its
-      // fan-in). On a dirty teardown recover ACCUMULATES a failure and continues
-      // (never throws) — the recover contract; finalize's inline sweep returns a
-      // hard result instead. `kind` labels the reason so a base and a rib stay
-      // distinguishable in the failure feed.
+      // Bases AND ribs share ONE sweep. On a dirty teardown recover ACCUMULATES a
+      // failure and continues (never throws) — the recover contract; finalize's
+      // inline sweep returns a hard result instead. `kind` labels the reason so a
+      // base and a rib stay distinguishable in the failure feed.
       const kind = lane.isRib ? "rib" : "base";
       try {
+        if (await epicPresentAndNotDone(lane.epicId)) {
+          continue; // epic still active — preserve its lane (finalize reclaims it)
+        }
         if (!(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))) {
           continue; // unmerged lane — leave it for a human, never force-delete
         }
@@ -3182,6 +3206,35 @@ export function isEpicDoneById(
   const rows = res.type === "result" ? res.rows : [];
   const status = (rows[0] as { status?: unknown } | undefined)?.status;
   return Promise.resolve(status === "done");
+}
+
+/**
+ * The present-and-not-done probe pass-3 teardown threads in to PRESERVE an active
+ * epic's lanes. CLONES {@link isEpicDoneById}'s pk-bypass query frame (collection
+ * `epics`, `filter:{epic_id}`, `runQuery(db, 0, …)`) so it bypasses the default
+ * OPEN scope AND any recency floor in `resolveFilter` — a live in_progress/blocked
+ * epic resolves PRESENT here, never absent. That bypass is load-bearing: a scoped
+ * or `DONE_EPICS_REAP_WINDOW_SEC`-bounded read would read a live epic as ABSENT and
+ * FALSELY sweep its base mid-flight (the most dangerous misread). Returns `true`
+ * IFF the epic row exists AND `status !== "done"`; an ABSENT (reaped / EpicDeleted)
+ * OR a done epic → `false` (eligible to sweep). A read-time producer probe (never a
+ * fold).
+ */
+export function epicPresentAndNotDone(
+  db: Parameters<typeof runQuery>[0],
+  epicId: string,
+): Promise<boolean> {
+  const frame = {
+    type: "query" as const,
+    collection: "epics",
+    id: `autopilot-recover-epic-present-${epicId}`,
+    filter: { epic_id: epicId },
+    limit: 1,
+  };
+  const res = runQuery(db, 0, frame);
+  const rows = res.type === "result" ? res.rows : [];
+  const row = rows[0] as { status?: unknown } | undefined;
+  return Promise.resolve(row !== undefined && row.status !== "done");
 }
 
 /** Trailing-slash-tolerant path compare helper for worktree-path equality. */
@@ -3953,8 +4006,10 @@ function main(): void {
               snapshot.worktreeRepoByEpicId,
               snapshot.worktreeKnownRoots ?? [],
             );
-            const failures = await deps.worktree.recover(repos, (epicId) =>
-              isEpicDoneById(db, epicId),
+            const failures = await deps.worktree.recover(
+              repos,
+              (epicId) => isEpicDoneById(db, epicId),
+              (epicId) => epicPresentAndNotDone(db, epicId),
             );
             for (const f of failures) {
               deps.emitDispatchFailed({
