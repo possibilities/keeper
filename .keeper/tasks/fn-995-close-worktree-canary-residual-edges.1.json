@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "recover pass-2 exhaustiveness + non-ff comment prune",
-  "updated_at": "2026-06-28T03:12:40.959000Z"
+  "updated_at": "2026-06-28T03:44:34.348000Z",
+  "worker_done_at": "2026-06-28T03:44:34.348000Z"
 }

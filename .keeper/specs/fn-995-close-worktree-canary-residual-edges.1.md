@@ -49,5 +49,5 @@ Pure fake-runner: recover pass-2 returns push-unconfirmed → a worktree-recover
 - [ ] no inline comment still describes the finalize non-ff degrade as a retry-skip (corrected to the visible-sticky reality)
 
 ## Done summary
-
+Recover pass-2 now records a worktree-recover-push-unconfirmed retry-skip (was a silent fall-through) and has a default never-guard so a future MergeLaneResult kind cannot fall through unhandled; corrected the stale inline comments that grouped the finalize non-ff degrade with the transient retry-skips (it ships as a visible sticky).
 ## Evidence
