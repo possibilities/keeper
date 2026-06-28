@@ -7,7 +7,7 @@
     "fn-990-fix-worktree-finalize-merge-routing"
   ],
   "id": "fn-991-fix-worktree-base-teardown-guard-and",
-  "last_validated_at": "2026-06-27T23:43:15.126000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-27T23:43:15.110000Z"
+  "updated_at": "2026-06-28T00:09:09.481000Z"
 }
