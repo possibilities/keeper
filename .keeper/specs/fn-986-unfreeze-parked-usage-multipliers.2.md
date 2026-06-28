@@ -41,5 +41,5 @@ New tests (depend on `.1`'s home seam): (a) parked cooldown wake re-resolves + r
 - [ ] `bun test` green; biome + lint-claude-md clean
 
 ## Done summary
-
+Poll-cap the no-scrape sleeps (cooldown/idle/restart) at a ~60s window so a parked account re-resolves its tier multiplier every minute (post-scrape backoffs stay uncapped); a multiplier change vs the on-disk envelope bypasses both gates to force a scrape, an mtime memo skips the multi-MB .claude.json re-parse, and a redundant parked re-write is suppressed.
 ## Evidence
