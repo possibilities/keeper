@@ -337,7 +337,14 @@ export async function currentBranch(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<string> {
-  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+  // Bound the read (B4): an fsmonitor/FS stall must not wedge the cycle. On a
+  // 124 SIGKILL the stdout is empty → "" — a value that never equals a real
+  // expected branch, so every caller degrades SAFELY to a branch-mismatch /
+  // off-branch defer, never a false "on the right branch".
+  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
   return r.stdout.trim();
 }
 
@@ -512,8 +519,12 @@ export async function mergeReadiness(
   if (head !== expectedBranch) {
     return { kind: "off-branch", head };
   }
+  // Bound the read (B4). A 124 timeout (non-zero) folds through the existing
+  // `code !== 0` arm to `dirty` — a SAFE not-ready/retry-skip, never a false
+  // clean.
   const status = await run(["status", "--porcelain", "--untracked-files=no"], {
     cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
   const detail = (status.stdout + status.stderr).trim();
   if (status.code !== 0 || detail.length > 0) {
@@ -521,8 +532,13 @@ export async function mergeReadiness(
   }
   if (incomingBranch !== undefined && incomingBranch.length > 0) {
     const clobbered = await wouldClobberUntracked(cwd, incomingBranch, run);
-    if (clobbered.length > 0) {
-      return { kind: "would-clobber", paths: clobbered };
+    // A timed-out clobber probe degrades to a not-ready retry-skip (`dirty`),
+    // NEVER a false "no clobber" that could let a would-clobber merge through.
+    if (clobbered.kind === "timeout") {
+      return { kind: "dirty", detail: "would-clobber probe timed out" };
+    }
+    if (clobbered.paths.length > 0) {
+      return { kind: "would-clobber", paths: clobbered.paths };
     }
   }
   return { kind: "ready" };
@@ -533,20 +549,30 @@ export async function mergeReadiness(
  * `git ls-files --others --exclude-standard` (main's untracked, ignore-aware) ∩
  * `git ls-tree -r --name-only <incomingBranch>` (the incoming tracked tree). A
  * non-empty result is exactly the set `git merge` refuses to clobber and aborts
- * on. `git merge-tree` is NOT used — it never sees untracked files. Either probe
- * failing folds to an EMPTY result (no proven collision → let the merge run; its
- * own abort is the loud backstop), never a manufactured block. Pure git reads.
+ * on. `git merge-tree` is NOT used — it never sees untracked files. A non-timeout
+ * probe failure folds to an EMPTY result (no proven collision → let the merge
+ * run; its own abort is the loud backstop), never a manufactured block. Both
+ * reads are bounded by GIT_LOCAL_TIMEOUT_MS (B4); a 124 SIGKILL surfaces as
+ * `{ kind: "timeout" }` so the caller degrades to a not-ready retry-skip rather
+ * than a false "no clobber" — an fsmonitor/FS stall must never let a would-
+ * clobber merge through. Pure git reads.
  */
+type ClobberProbe = { kind: "ok"; paths: string[] } | { kind: "timeout" };
+
 async function wouldClobberUntracked(
   cwd: string,
   incomingBranch: string,
   run: GitRunner,
-): Promise<string[]> {
+): Promise<ClobberProbe> {
   const untrackedR = await run(["ls-files", "--others", "--exclude-standard"], {
     cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
+  if (untrackedR.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "timeout" };
+  }
   if (untrackedR.code !== 0) {
-    return [];
+    return { kind: "ok", paths: [] };
   }
   const untracked = new Set(
     untrackedR.stdout
@@ -555,14 +581,20 @@ async function wouldClobberUntracked(
       .filter((l) => l.length > 0),
   );
   if (untracked.size === 0) {
-    return [];
+    return { kind: "ok", paths: [] };
   }
   const incomingR = await run(
     ["ls-tree", "-r", "--name-only", incomingBranch],
-    { cwd },
+    {
+      cwd,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    },
   );
+  if (incomingR.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "timeout" };
+  }
   if (incomingR.code !== 0) {
-    return [];
+    return { kind: "ok", paths: [] };
   }
   const clobbered: string[] = [];
   for (const raw of incomingR.stdout.split("\n")) {
@@ -571,7 +603,7 @@ async function wouldClobberUntracked(
       clobbered.push(path);
     }
   }
-  return clobbered;
+  return { kind: "ok", paths: clobbered };
 }
 
 /**
@@ -779,6 +811,32 @@ export async function ensureWorktree(
 }
 
 /**
+ * MERGE_HEAD-guarded `git merge --abort`: aborts IFF a merge is actually in
+ * flight (a `MERGE_HEAD` exists), so a merge that never started is not
+ * spuriously "aborted". Run on BOTH the conflict and the local-timeout
+ * (SIGKILLed) exits of {@link mergeBranchInto} — a killed merge can leave
+ * MERGE_HEAD/partial state that would read as a spurious conflict next cycle.
+ * Best-effort + bounded by GIT_LOCAL_TIMEOUT_MS: a failed probe/abort leaves the
+ * common-case self-heal (next cycle's {@link mergeReadiness} sees a dirty tree
+ * and defers).
+ */
+async function abortMergeIfInProgress(
+  worktreePath: string,
+  run: GitRunner,
+): Promise<void> {
+  const mergeHead = await run(
+    ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+    { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (mergeHead.code === 0) {
+    await run(["merge", "--abort"], {
+      cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+  }
+}
+
+/**
  * Merge `sourceBranch` into the branch checked out at `worktreePath`, SEQUENTIAL
  * PAIRWISE — one source per call, NEVER octopus. Acquires the shared commit-work
  * flock for the merge window so it serializes against agent commits.
@@ -859,20 +917,18 @@ export async function mergeBranchInto(
     // merge hook is transient, so degrade to a retry-skip. Check it BEFORE the
     // conflict/abort path (git's 1/128 conflict codes never collide with 124).
     if (merge.code === GIT_SPAWN_TIMEOUT_CODE) {
+      // B2: a SIGKILLed merge can leave MERGE_HEAD/partial state behind, which
+      // next cycle would read as a spurious conflict. Run the same MERGE_HEAD-
+      // guarded abort here before returning so no residue is left. (The common
+      // case already self-heals — next cycle's mergeReadiness sees a dirty tree
+      // and defers — so this is belt-and-suspenders.) The returned kind stays
+      // `local-timeout` (a retry-skip), unchanged.
+      await abortMergeIfInProgress(worktreePath, run);
       return { kind: "local-timeout" };
     }
     // Non-zero: a conflict (or other failure). Abort iff a MERGE_HEAD exists,
     // so a merge that never started is not spuriously "aborted".
-    const mergeHead = await run(
-      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-      { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-    );
-    if (mergeHead.code === 0) {
-      await run(["merge", "--abort"], {
-        cwd: worktreePath,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      });
-    }
+    await abortMergeIfInProgress(worktreePath, run);
     return {
       kind: "conflict",
       stderr: (merge.stdout + merge.stderr).trim(),

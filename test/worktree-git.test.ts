@@ -10,9 +10,11 @@
  */
 
 import { expect, test } from "bun:test";
+import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import {
   branchExists,
   commitWorkLockPath,
+  currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
   isKeeperLaneEntry,
@@ -671,6 +673,74 @@ test("mergeBranchInto: phantom/unresolvable source → missing-source, no merge,
   expect(lock.events).toEqual([]); // no lock taken on the phantom path
 });
 
+// B2 — a SIGKILLed (124) merge must leave no MERGE_HEAD residue: run the same
+// MERGE_HEAD-guarded abort the conflict path uses, kind still local-timeout.
+const resolvedSourceRule: FakeGitRule = {
+  when: (a) =>
+    argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+    a.some((t) => t.endsWith("^{commit}")),
+  result: { exitCode: 0 },
+};
+const notAncestorRule: FakeGitRule = {
+  when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+  result: { exitCode: 1 },
+};
+const gitDirRule: FakeGitRule = {
+  when: (a) =>
+    argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+  result: { stdout: "/wt/.git\n" },
+};
+
+test("mergeBranchInto: a local-timeout (124) merge with MERGE_HEAD → guarded abort, still local-timeout, lock released", async () => {
+  const { run, calls } = fakeAsyncGit([
+    resolvedSourceRule,
+    notAncestorRule,
+    gitDirRule,
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE }, // SIGKILLed transient stall
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "mergehead\n" }, // MERGE_HEAD residue present
+    },
+  ]);
+  const lock = recordingLock();
+  const res = await mergeBranchInto("/wt", "src", run, lock.acquire);
+  // The classification stays local-timeout (a retry-skip) — the abort never
+  // re-shapes it into a conflict.
+  expect(res).toEqual({ kind: "local-timeout" });
+  // The residue is cleared so next cycle does not read a spurious conflict.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    true,
+  );
+  expect(lock.events).toEqual([
+    "acquire:/wt/.git/keeper-commit-work.lock",
+    "release",
+  ]);
+});
+
+test("mergeBranchInto: a local-timeout (124) merge with NO MERGE_HEAD → no spurious abort, still local-timeout", async () => {
+  const { run, calls } = fakeAsyncGit([
+    resolvedSourceRule,
+    notAncestorRule,
+    gitDirRule,
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 1 }, // no MERGE_HEAD — the kill landed before any merge state
+    },
+  ]);
+  const res = await mergeBranchInto("/wt", "src", run, recordingLock().acquire);
+  expect(res).toEqual({ kind: "local-timeout" });
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    false,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // removeWorktree — never blind-force; report a dirty refusal.
 // ---------------------------------------------------------------------------
@@ -868,6 +938,69 @@ test("mergeReadiness: a clean main checkout with NO untracked files → ready (n
   ).toEqual({ kind: "ready" });
   // An empty untracked set short-circuits BEFORE listing the incoming tree.
   expect(calls.some((c) => argvStartsWith(c.args, "ls-tree"))).toBe(false);
+});
+
+// B4 — the merge-path reads are bounded by GIT_LOCAL_TIMEOUT_MS and a 124
+// SIGKILL degrades SAFELY: never a false clean/ready that could let a
+// would-clobber merge through.
+test("currentBranch: a 124-timed-out rev-parse → empty head (caller degrades to off-branch)", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE }, // SIGKILLed → empty stdout
+    },
+  ]);
+  // "" never equals a real expected branch, so mergeReadiness reads off-branch.
+  expect(await currentBranch("/repo", run)).toBe("");
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({
+    kind: "off-branch",
+    head: "",
+  });
+});
+
+test("mergeReadiness: a 124-timed-out status read → dirty (safe not-ready, never false ready)", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule("", GIT_SPAWN_TIMEOUT_CODE),
+  ]);
+  expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
+});
+
+test("mergeReadiness: a 124-timed-out ls-files clobber probe → dirty, NOT a false no-clobber ready", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(""), // -uno → clean tree
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    "keeper/epic/fn-1-foo",
+  );
+  expect(res.kind).toBe("dirty");
+});
+
+test("mergeReadiness: a 124-timed-out ls-tree clobber probe → dirty, NOT a false no-clobber ready", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("main"),
+    statusRule(""),
+    lsFilesOthersRule("scratch.txt\n"), // some untracked → the ls-tree probe runs
+    {
+      when: (a) => argvStartsWith(a, "ls-tree", "-r", "--name-only"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    "keeper/epic/fn-1-foo",
+  );
+  expect(res.kind).toBe("dirty");
 });
 
 // ---------------------------------------------------------------------------
