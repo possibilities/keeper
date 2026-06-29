@@ -7,7 +7,7 @@
  * line plus exactly one terminal (`completed`/`failed`) line.
  *
  * The highest-value coverage is a failure path. We drive the launch-failure
- * branch by pointing `KEEPER_AGENTWRAP_PATH` at a nonexistent binary: the
+ * branch by pointing `KEEPER_AGENT_PATH` at a nonexistent binary: the
  * `agentwrap <cli>` launch spawn throws ENOENT, `runAgentwrap` returns null, and
  * `main()` takes the `fail(...)` path. No real tmux, no real git (read-only is
  * off so the git backstop is skipped), no daemon — a deterministic synchronous
@@ -17,7 +17,7 @@
  * (mirroring `test/keeper-cli.test.ts`'s `runMain`) we patch those globals around
  * the call: exit throws a tagged ExitError so the never-return `fail` branch
  * stops the function, and the streams are captured + restored in a finally. The
- * agentwrap-path + state env are sandboxed per the repo isolation rule and
+ * keeper-agent-path + state env are sandboxed per the repo isolation rule and
  * restored after each run.
  */
 
@@ -46,7 +46,7 @@ interface MainRun {
 let dir: string;
 /** Env keys this test mutates on process.env, captured for restore. */
 const TOUCHED_ENV_KEYS = [
-  "KEEPER_AGENTWRAP_PATH",
+  "KEEPER_AGENT_PATH",
   "KEEPER_DB",
   "KEEPER_DEAD_LETTER_DIR",
   "KEEPER_EVENTS_LOG",
@@ -75,7 +75,7 @@ beforeEach(() => {
     tmpDir: dir,
     dbPath: join(dir, "keeper.db"),
     extra: {
-      KEEPER_AGENTWRAP_PATH: join(dir, "no-such-agentwrap-binary"),
+      KEEPER_AGENT_PATH: join(dir, "no-such-keeper-agent-binary"),
       // Point the config resolver at a nonexistent file so `disable-autoclose`
       // resolves to its EMPTY default (the user's real config never bleeds in):
       // the codex reap path is then exercised against an autoclosing session.

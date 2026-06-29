@@ -1,7 +1,7 @@
 /**
- * Tests for `resolveConfig` in `src/db.ts` — focused on the `exec_backend`
- * key (autopilot backend selector) and its independence from the sibling
- * keys.
+ * Tests for `resolveConfig` in `src/db.ts` — each key resolves independently
+ * and a retired key (`exec_backend`, `agentwrap_path`, `max_concurrent_jobs`)
+ * is silently ignored without disturbing the siblings.
  *
  * Each test points `KEEPER_CONFIG` at a temp YAML file (the resolver's
  * documented test seam) and restores the prior env in afterEach. No
@@ -10,25 +10,21 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_AUTOCLOSE_GRACE_SECONDS,
   DEFAULT_MAX_CONCURRENT_JOBS,
-  resolveAgentwrapPath,
   resolveConfig,
 } from "../src/db";
 import { resolveDisableAutoclose } from "../src/pair-command";
 
 let dir: string;
 let prevEnv: string | undefined;
-let prevAgentwrapEnv: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "keeper-config-"));
   prevEnv = process.env.KEEPER_CONFIG;
-  prevAgentwrapEnv = process.env.KEEPER_AGENTWRAP_PATH;
-  delete process.env.KEEPER_AGENTWRAP_PATH;
 });
 
 afterEach(() => {
@@ -36,11 +32,6 @@ afterEach(() => {
     delete process.env.KEEPER_CONFIG;
   } else {
     process.env.KEEPER_CONFIG = prevEnv;
-  }
-  if (prevAgentwrapEnv === undefined) {
-    delete process.env.KEEPER_AGENTWRAP_PATH;
-  } else {
-    process.env.KEEPER_AGENTWRAP_PATH = prevAgentwrapEnv;
   }
   rmSync(dir, { recursive: true, force: true });
 });
@@ -62,55 +53,15 @@ test("a stale exec_backend: key boots clean (silently ignored, no field)", () =>
   expect(cfg.roots).toEqual(["~/code"]);
 });
 
-// ---------------------------------------------------------------------------
-// agentwrap_path / resolveAgentwrapPath — env override > config > default,
-// tilde-expanded at resolve time.
-// ---------------------------------------------------------------------------
-
-test("agentwrap_path parses onto agentwrapPath (non-empty string only)", () => {
-  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
-  expect(resolveConfig().agentwrapPath).toBe("/opt/bin/agentwrap");
-});
-
-test("agentwrapPath is undefined when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().agentwrapPath).toBeUndefined();
-});
-
-test("resolveAgentwrapPath defaults to ~/.bun/bin/agentwrap (tilde-expanded)", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveAgentwrapPath()).toBe(
-    join(homedir(), ".bun", "bin", "agentwrap"),
-  );
-});
-
-test("resolveAgentwrapPath uses the config value over the default", () => {
-  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
-  expect(resolveAgentwrapPath()).toBe("/opt/bin/agentwrap");
-});
-
-test("resolveAgentwrapPath expands a leading ~/ in the config value", () => {
-  writeConfig("agentwrap_path: ~/tools/agentwrap\n");
-  expect(resolveAgentwrapPath()).toBe(join(homedir(), "tools", "agentwrap"));
-});
-
-test("KEEPER_AGENTWRAP_PATH env override wins over the config value", () => {
-  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
-  process.env.KEEPER_AGENTWRAP_PATH = "/usr/local/bin/agentwrap";
-  expect(resolveAgentwrapPath()).toBe("/usr/local/bin/agentwrap");
-});
-
-test("KEEPER_AGENTWRAP_PATH env override expands a leading ~/", () => {
-  process.env.KEEPER_AGENTWRAP_PATH = "~/env/agentwrap";
-  expect(resolveAgentwrapPath()).toBe(join(homedir(), "env", "agentwrap"));
-});
-
-test("a non-string agentwrap_path leaves agentwrapPath undefined → default", () => {
-  writeConfig("agentwrap_path: 42\n");
-  expect(resolveConfig().agentwrapPath).toBeUndefined();
-  expect(resolveAgentwrapPath()).toBe(
-    join(homedir(), ".bun", "bin", "agentwrap"),
-  );
+test("a stale agentwrap_path: key boots clean (silently ignored, no field)", () => {
+  // The `agentwrap_path` config alias (and its `KEEPER_AGENTWRAP_PATH` env twin)
+  // is retired now the launcher folded into `keeper agent` — a stale key in a
+  // live config parses into the silent-ignore path: every kept key still
+  // resolves and there is no `agentwrapPath` field on the result.
+  writeConfig("agentwrap_path: /opt/bin/agentwrap\nroots:\n  - ~/code\n");
+  const cfg = resolveConfig();
+  expect(cfg).not.toHaveProperty("agentwrapPath");
+  expect(cfg.roots).toEqual(["~/code"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -127,10 +78,12 @@ test("KeeperConfig no longer carries maxConcurrentJobs (config-file support remo
   // A config file SETTING `max_concurrent_jobs` is now silently IGNORED — the
   // resolved config object has no such key (the cap rides the runtime RPC), and
   // a sibling key still resolves independently from the same document.
-  writeConfig("max_concurrent_jobs: 3\nagentwrap_path: /opt/bin/agentwrap\n");
+  writeConfig(
+    "max_concurrent_jobs: 3\nkeeper_agent_path: /opt/bin/keeper.ts\n",
+  );
   const cfg = resolveConfig();
   expect("maxConcurrentJobs" in cfg).toBe(false);
-  expect(cfg.agentwrapPath).toBe("/opt/bin/agentwrap");
+  expect(cfg.keeperAgentPath).toBe("/opt/bin/keeper.ts");
 });
 
 // ---------------------------------------------------------------------------

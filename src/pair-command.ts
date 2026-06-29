@@ -678,9 +678,8 @@ export function isSelfTranscriptCollision(
  * Resolve the absolute keeper CLI entry the pair path launches partners through
  * (`<bun> <this path> agent <cli> …`) — the folded `keeper agent` launcher.
  * db.ts-free (delegates to the shared {@link resolveKeeperAgentPathDepFree} leaf
- * so this surface never drags the DB graph): `KEEPER_AGENT_PATH` >
- * `KEEPER_AGENTWRAP_PATH` (deprecated alias) > the derived `cli/keeper.ts`
- * default. `env`/`home` injectable for tests.
+ * so this surface never drags the DB graph): `KEEPER_AGENT_PATH` > the derived
+ * `cli/keeper.ts` default. `env`/`home` injectable for tests.
  */
 export function resolvePairKeeperAgentPath(
   env: Record<string, string | undefined> = process.env,

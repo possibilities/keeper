@@ -74,25 +74,15 @@ describe("resolveKeeperAgentPathDepFree (cold-start / pair variant)", () => {
     ).toBe("/custom/keeper.ts");
   });
 
-  test("KEEPER_AGENTWRAP_PATH is read as a deprecated alias", () => {
+  test("a stray KEEPER_AGENTWRAP_PATH is now ignored (alias arm removed)", () => {
+    // The deprecated alias arm is gone — a lone KEEPER_AGENTWRAP_PATH no longer
+    // overrides; the resolver falls through to the derived default.
     expect(
       resolveKeeperAgentPathDepFree(
         { KEEPER_AGENTWRAP_PATH: "/old/agentwrap" },
         "/home/me",
       ),
-    ).toBe("/old/agentwrap");
-  });
-
-  test("KEEPER_AGENT_PATH wins over the deprecated KEEPER_AGENTWRAP_PATH alias", () => {
-    expect(
-      resolveKeeperAgentPathDepFree(
-        {
-          KEEPER_AGENT_PATH: "/new/keeper.ts",
-          KEEPER_AGENTWRAP_PATH: "/old/agentwrap",
-        },
-        "/home/me",
-      ),
-    ).toBe("/new/keeper.ts");
+    ).toBe(expectedDefault);
   });
 
   test("a tilde override expands at resolve time", () => {
@@ -113,11 +103,7 @@ describe("resolveKeeperAgentPath (config-aware, db.ts)", () => {
     overrides: Record<string, string | undefined>,
     fn: () => void,
   ): void {
-    const keys = [
-      "KEEPER_CONFIG",
-      "KEEPER_AGENT_PATH",
-      "KEEPER_AGENTWRAP_PATH",
-    ];
+    const keys = ["KEEPER_CONFIG", "KEEPER_AGENT_PATH"];
     const prev: Record<string, string | undefined> = {};
     for (const k of keys) prev[k] = process.env[k];
     try {
@@ -142,15 +128,6 @@ describe("resolveKeeperAgentPath (config-aware, db.ts)", () => {
       { KEEPER_CONFIG: noConfig, KEEPER_AGENT_PATH: "/custom/keeper.ts" },
       () => {
         expect(resolveKeeperAgentPath()).toBe("/custom/keeper.ts");
-      },
-    );
-  });
-
-  test("KEEPER_AGENTWRAP_PATH still read as a deprecated alias", () => {
-    withEnv(
-      { KEEPER_CONFIG: noConfig, KEEPER_AGENTWRAP_PATH: "/old/agentwrap" },
-      () => {
-        expect(resolveKeeperAgentPath()).toBe("/old/agentwrap");
       },
     );
   });

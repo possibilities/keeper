@@ -439,10 +439,9 @@ Keeper has no `install` verb. Wire it up manually:
      PATH. The launcher is an in-binary subcommand, not an external dependency:
      keeperd probes its launchability at boot (logging the resolved launcher argv;
      a prominent warning if `bun` + `cli/keeper.ts` are not launchable). The
-     `agentwrap_path` config key and `KEEPER_AGENTWRAP_PATH` env are still read as a
-     deprecated alias. The managed-session name is
-     hardcoded (`autopilot`), NOT configurable; each dispatch opens a new window
-     inside that shared background session. The window-reaper worker closes a
+     managed-session name is hardcoded (`autopilot`), NOT configurable; each
+     dispatch opens a new window inside that shared background session. The
+     window-reaper worker closes a
      keeper-created window by ONE rule: it has stopped cleanly and sat idle past
      the grace (see the autoclose deep-dive). A human-created window is never
      touched.

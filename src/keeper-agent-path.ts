@@ -15,9 +15,8 @@
  * ABSOLUTE and symlink-resolved — a relative or PATH-relative token would either
  * miss after the `cd` or PATH-inject.
  *
- * Precedence: `KEEPER_AGENT_PATH` env > `KEEPER_AGENTWRAP_PATH` env (deprecated
- * alias, kept readable for the migration) > the derived default (this module's
- * own location → `../cli/keeper.ts`, `realpath`'d). The env overrides are
+ * Precedence: `KEEPER_AGENT_PATH` env > the derived default (this module's own
+ * location → `../cli/keeper.ts`, `realpath`'d). The env override is
  * tilde-expanded AT RESOLVE TIME (`execvp`/the shell re-exec do not expand `~`).
  * No existence check — a bad path fails the launch loudly at spawn, not silently
  * here.
@@ -55,17 +54,16 @@ function expandTilde(entry: string, home: string): string {
 }
 
 /**
- * The `db.ts`-free resolver: env override > deprecated env alias > derived
- * default. `env`/`home` injectable for tests. Returns an absolute path
- * (tilde-expanded; an env override is taken as-given otherwise, so a caller that
- * needs it `realpath`'d should pass an already-resolved value — the DEFAULT is
- * always `realpath`'d).
+ * The `db.ts`-free resolver: env override > derived default. `env`/`home`
+ * injectable for tests. Returns an absolute path (tilde-expanded; an env
+ * override is taken as-given otherwise, so a caller that needs it `realpath`'d
+ * should pass an already-resolved value — the DEFAULT is always `realpath`'d).
  */
 export function resolveKeeperAgentPathDepFree(
   env: Record<string, string | undefined> = process.env,
   home: string = homedir(),
 ): string {
-  const override = env.KEEPER_AGENT_PATH ?? env.KEEPER_AGENTWRAP_PATH;
+  const override = env.KEEPER_AGENT_PATH;
   if (override && override.length > 0) {
     const expanded = expandTilde(override, home);
     return isAbsolute(expanded) ? expanded : resolve(expanded);
