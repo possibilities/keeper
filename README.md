@@ -1401,7 +1401,11 @@ event-log/reducer/hook touch. Run any of them with
   `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
   `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
   harness comes from the preset — and `keeper agent presets resolve <name>` emits
-  the resolved preset/panel JSON. Per-field resolution is `explicit flag > effort
+  the resolved preset/panel JSON. `keeper agent profiles check [--json]` is the
+  adjacent read-only diagnostic: it lists shadow/stray/auth-bearing
+  `~/.claude-profiles` + `~/.pi-profiles` dirs (a stable `id` + remediation per
+  finding; exit 0 clean / 9 findings / 1 tool error) and NEVER moves or deletes —
+  the operator re-homes a stranded login by hand. Per-field resolution is `explicit flag > effort
   env > preset > per-harness yaml > native default`, so a preset never overrides an
   explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
   `--x-preset` the launch is byte-identical to a no-preset run. The posture is

@@ -82,6 +82,11 @@ import {
 } from "./run";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
+  findShadowProfileDirs,
+  type ShadowProfileAgent,
+  type ShadowProfileFinding,
+} from "./shadow-profiles";
+import {
   ensureAgentwrapPiProfileDir,
   ensureAgentwrapProfileDir,
   ensureClaudeStateSharing,
@@ -156,6 +161,12 @@ export interface MainDeps {
     profileName: string,
     actionLog: string[] | null,
   ) => [string, boolean];
+  /**
+   * Read-only scan of `~/.claude-profiles` + `~/.pi-profiles` for shadow/stray
+   * dirs (the `profiles check` diagnostic). HOME-coupled, so injected: realDeps()
+   * binds the real `findShadowProfileDirs` against `homedir()`.
+   */
+  findShadowProfileDirsFn: () => ShadowProfileFinding[];
   startCodexSessionNameIndexerFn: (
     opts: CodexSessionNameIndexerOptions,
   ) => () => void;
@@ -210,6 +221,8 @@ export function realDeps(): MainDeps {
       ensurePiStateSharing(listProfilesFn, actionLog, homedir()),
     ensureAgentwrapPiProfileDirFn: (profileName, actionLog) =>
       ensureAgentwrapPiProfileDir(profileName, actionLog, homedir()),
+    findShadowProfileDirsFn: () =>
+      findShadowProfileDirs(listProfiles, homedir()),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     tmuxBin: resolveTmuxBin(process.env),
     launcherArgvPrefix: buildLauncherArgvPrefix(
@@ -833,6 +846,127 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   return deps.exit(0);
 }
 
+/** `profiles check` JSON contract version. Bump only on a breaking shape change. */
+const PROFILES_CHECK_SCHEMA_VERSION = 1;
+
+/** `profiles check` exit when one or more shadow/stray dirs are found. */
+const PROFILES_CHECK_FOUND_EXIT = 9;
+
+type ProfilesCheckFindingKind =
+  | "auth-bearing-reserved-shadow"
+  | "reserved-shadow"
+  | "stray-auth"
+  | "stray";
+
+/** Classify a finding into a stable category that drives its remediation. */
+function profilesCheckKind(f: ShadowProfileFinding): ProfilesCheckFindingKind {
+  if (f.isReservedShadow) {
+    return f.hasAuth ? "auth-bearing-reserved-shadow" : "reserved-shadow";
+  }
+  return f.hasAuth ? "stray-auth" : "stray";
+}
+
+function profilesRootDisplay(agent: ShadowProfileAgent): string {
+  return agent === "claude" ? "~/.claude-profiles" : "~/.pi-profiles";
+}
+
+function canonicalAccountDisplay(agent: ShadowProfileAgent): string {
+  return agent === "claude" ? "~/.claude" : "~/.pi";
+}
+
+/** Stable per-finding remediation prose — keeper NEVER performs the move/delete. */
+function profilesCheckRemediation(
+  f: ShadowProfileFinding,
+  kind: ProfilesCheckFindingKind,
+): string {
+  const account = canonicalAccountDisplay(f.agent);
+  switch (kind) {
+    case "auth-bearing-reserved-shadow":
+      return (
+        `Auth-bearing reserved shadow: the '${f.name}' account lives in ${account}, ` +
+        `so this dir strands a login nothing reads. Re-home it into ${account} by hand — ` +
+        "keeper never moves it for you."
+      );
+    case "reserved-shadow":
+      return (
+        `Reserved shadow with no auth. Remove the empty dir once confirmed — ` +
+        "keeper never deletes it."
+      );
+    case "stray-auth":
+      return (
+        `Untracked dir holding auth. Re-home into ${account} or add '${f.name}' to ` +
+        "agentusage config.yaml profiles; keeper never moves it for you."
+      );
+    case "stray":
+      return (
+        `Untracked profile dir. Remove it or add '${f.name}' to agentusage config.yaml ` +
+        "profiles; keeper never deletes it."
+      );
+  }
+}
+
+/**
+ * `profiles check [--json]`: the read-only shadow/stray profile-dir diagnostic.
+ * Scans `~/.claude-profiles` + `~/.pi-profiles` for reserved shadows
+ * (`default`/`auto`) and untracked strays, surfacing a stable `id` + remediation
+ * per finding so the JSON doubles as a runbook. Findings (data) go to stdout, the
+ * summary (prose) to stderr. NEVER mutates the filesystem. Exit 0 = clean, 9 =
+ * findings, 1 = tool error (the scan itself threw).
+ */
+function runProfilesCheck(deps: MainDeps, json: boolean): never {
+  let findings: ShadowProfileFinding[];
+  try {
+    findings = deps.findShadowProfileDirsFn();
+  } catch (exc) {
+    deps.writeErr(`Error: profiles check failed: ${(exc as Error).message}\n`);
+    return deps.exit(1);
+  }
+
+  const enriched = findings.map((f) => {
+    const kind = profilesCheckKind(f);
+    return {
+      id: `${f.agent}:${f.name}`,
+      agent: f.agent,
+      name: f.name,
+      path: `${profilesRootDisplay(f.agent)}/${f.name}`,
+      kind,
+      hasAuth: f.hasAuth,
+      isReservedShadow: f.isReservedShadow,
+      tracked: f.tracked,
+      remediation: profilesCheckRemediation(f, kind),
+    };
+  });
+  const authBearing = enriched.filter((f) => f.hasAuth).length;
+
+  if (json) {
+    deps.write(
+      `${JSON.stringify({
+        schema_version: PROFILES_CHECK_SCHEMA_VERSION,
+        findings: enriched,
+        summary: { total: enriched.length, authBearing },
+      })}\n`,
+    );
+    return deps.exit(enriched.length === 0 ? 0 : PROFILES_CHECK_FOUND_EXIT);
+  }
+
+  if (enriched.length === 0) {
+    deps.writeErr("profiles check: no shadow or stray profile dirs found.\n");
+    return deps.exit(0);
+  }
+
+  for (const f of enriched) {
+    deps.write(
+      `${f.path}  [${f.kind}]  hasAuth=${f.hasAuth} tracked=${f.tracked}\n`,
+    );
+    deps.write(`    ${f.remediation}\n`);
+  }
+  deps.writeErr(
+    `profiles check: ${enriched.length} finding(s) (${authBearing} auth-bearing). ` +
+      "Read-only — nothing was moved or deleted.\n",
+  );
+  return deps.exit(PROFILES_CHECK_FOUND_EXIT);
+}
+
 export async function main(deps: MainDeps): Promise<never> {
   const actionLog: string[] = [];
 
@@ -869,6 +1003,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "presets-list") {
     return runPresetsList(deps, dispatch.json);
+  }
+  if (dispatch.kind === "profiles-check") {
+    return runProfilesCheck(deps, dispatch.json);
   }
 
   // Resolve the leading-token harness. `run` carries it directly; the

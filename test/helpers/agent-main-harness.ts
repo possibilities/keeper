@@ -13,6 +13,7 @@ import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-sessi
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { MainDeps } from "../../src/agent/main";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
+import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -82,6 +83,8 @@ export interface HarnessOptions {
   presetCatalog?: PresetCatalog;
   /** Panel selections loadPanelSelectionsFn returns (default empty). */
   panelSelections?: PanelSelections;
+  /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
+  findShadowProfileDirs?: () => ShadowProfileFinding[];
   claudeStowDir?: string | null;
   spawn?: SpawnFn;
   nextCwdOrdinal?: (dirName: string) => number;
@@ -169,6 +172,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
     },
+    findShadowProfileDirsFn: opts.findShadowProfileDirs ?? (() => []),
     startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
       codexSessionNameIndexers.push(opts);
       return () => {};

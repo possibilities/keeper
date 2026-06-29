@@ -367,6 +367,18 @@ const PROFILE_DIR_NAME_PATTERN = /^[a-z0-9_-]+$/;
 const MAX_PROFILE_DIR_NAME_BYTES = 255;
 
 /**
+ * True iff `name` (trimmed + NFC-normalized) is a reserved profile-dir
+ * basename — `""`/`default`/`auto`, the set that collides with the native
+ * `~/.claude` / `~/.pi` account. The shared reserved-name knowledge the mkdir
+ * guard and the read-only shadow detector both key off (so a `default`/`auto`
+ * dir under a profiles root is ALWAYS a shadow).
+ */
+export function isReservedProfileDirName(name: string): boolean {
+  const candidate = name.trim().normalize("NFC");
+  return candidate === "" || RESERVED_PROFILE_DIR_NAMES.has(candidate);
+}
+
+/**
  * Fail-loud guard for every profile-dir `mkdir` site. Throws StateError (state
  * layer → exit 1, NOT ConfigError) for the reserved set (`""`/`default`/`auto`,
  * trimmed), path-escape (separator / `..` / NUL — checked atomically on the RAW
@@ -390,12 +402,12 @@ export function assertProfileDirNameAllowed(name: string): void {
       `Profile name exceeds ${MAX_PROFILE_DIR_NAME_BYTES} bytes.`,
     );
   }
-  const candidate = name.trim().normalize("NFC");
-  if (candidate === "" || RESERVED_PROFILE_DIR_NAMES.has(candidate)) {
+  if (isReservedProfileDirName(name)) {
     throw new StateError(
       `Profile name '${name.trim()}' is reserved and cannot be used.`,
     );
   }
+  const candidate = name.trim().normalize("NFC");
   if (!PROFILE_DIR_NAME_PATTERN.test(candidate)) {
     throw new StateError(
       `Profile name '${name.trim()}' must match [a-z0-9_-]+.`,
