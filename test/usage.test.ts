@@ -24,7 +24,12 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowLines, renderSessionLines } from "../cli/usage";
+import {
+  formatShadowAdvisory,
+  renderRowLines,
+  renderSessionLines,
+} from "../cli/usage";
+import type { ShadowProfileFinding } from "../src/agent/shadow-profiles";
 import {
   formatMetaLine,
   formatSnapshotOutput,
@@ -1844,4 +1849,72 @@ test("usage snapshot output: composed frame text, then the keeper-meta: line LAS
   expect(parsed.script).toBe("usage");
   expect(parsed.frame).toBe(1);
   expect(parsed.truncated).toBe(false);
+});
+
+// --- shadow-profile advisory banner (formatShadowAdvisory) -----------------
+
+function finding(over: Partial<ShadowProfileFinding>): ShadowProfileFinding {
+  return {
+    agent: "claude",
+    name: "default",
+    hasAuth: false,
+    isReservedShadow: false,
+    tracked: false,
+    ...over,
+  };
+}
+
+test("advisory fires for an auth-bearing reserved (default) shadow", () => {
+  const lines = formatShadowAdvisory([
+    finding({ name: "default", hasAuth: true, isReservedShadow: true }),
+  ]);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("keeper agent profiles check");
+  expect(lines[0]).toContain("claude default/");
+});
+
+test("advisory is silent without an auth-bearing reserved shadow", () => {
+  // No findings at all.
+  expect(formatShadowAdvisory([])).toEqual([]);
+  // Reserved shadow but signed out (no auth) — tracked-health territory, not
+  // this banner's job.
+  expect(
+    formatShadowAdvisory([
+      finding({ name: "default", hasAuth: false, isReservedShadow: true }),
+    ]),
+  ).toEqual([]);
+  // Auth-bearing stray that is NOT a reserved shadow — outside the predicate.
+  expect(
+    formatShadowAdvisory([
+      finding({ name: "leftover", hasAuth: true, isReservedShadow: false }),
+    ]),
+  ).toEqual([]);
+});
+
+test("advisory lists every qualifying shadow across agents on one line", () => {
+  const lines = formatShadowAdvisory([
+    finding({
+      agent: "claude",
+      name: "default",
+      hasAuth: true,
+      isReservedShadow: true,
+    }),
+    finding({
+      agent: "pi",
+      name: "auto",
+      hasAuth: true,
+      isReservedShadow: true,
+    }),
+    // Non-qualifying rows are filtered out.
+    finding({
+      agent: "claude",
+      name: "real",
+      hasAuth: true,
+      isReservedShadow: false,
+    }),
+  ]);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("claude default/");
+  expect(lines[0]).toContain("pi auto/");
+  expect(lines[0]).not.toContain("real");
 });
