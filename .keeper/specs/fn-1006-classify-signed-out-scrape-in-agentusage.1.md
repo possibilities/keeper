@@ -68,5 +68,5 @@ Keep the contract `schema_version` at 1.
 - [ ] Tests cover the signed_out arm, a wrap-split render, and the degrade-to-error path.
 
 ## Done summary
-
+Detect the Claude Code OAuth sign-in screen pre-send via a 2-of-3 sentinel quorum over the joined, alt-screen-gated pyte display and raise SignedOut before /usage is typed into the paste field; scrape_cli emits an additive ok+signed_out:true arm (exit 0, SCHEMA_VERSION stays 1) with a detector throw degrading to scrape_failed.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/agentusage",
   "tier": "xhigh",
   "title": "Classify signed-out scrape in agentusage",
-  "updated_at": "2026-06-29T14:36:07.339000Z"
+  "updated_at": "2026-06-29T14:47:06.914000Z",
+  "worker_done_at": "2026-06-29T14:47:06.914000Z"
 }
