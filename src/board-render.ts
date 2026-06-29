@@ -371,6 +371,29 @@ export function renderClosePills(
   return out;
 }
 
+/**
+ * Render the trailing `[failed:<kind>]` pill for a CLOSE ROW whose
+ * `close::<epic>` dispatch is parked STICKY in the `dispatch_failures`
+ * projection (the reconciler ATTEMPTED the close and it failed — e.g. a
+ * worktree merge conflict at `finalizeEpic`). `computeReadiness` is pure and
+ * never reads that projection, so the close row's readiness verdict still reads
+ * `ready`; without this pill the board would show a dispatchable close while
+ * autopilot is jammed on the sticky failure. The pill carries only the failure
+ * KIND — the reason's leading token, before the first `:` or whitespace — so a
+ * multi-line `reason` (the conflict dump) stays one scannable pill; the
+ * colorizer routes `failed:*` to the red `error` bucket.
+ *
+ * Returns `""` when there is no sticky close failure, else a `' '`-prefixed
+ * pill string.
+ */
+export function renderCloseFailurePill(reason: string | undefined): string {
+  if (reason === undefined || reason === "") {
+    return "";
+  }
+  const kind = reason.split(/[:\s]/, 1)[0] ?? reason;
+  return ` ${pill(`failed:${kind}`)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Pill colorization
 // ---------------------------------------------------------------------------

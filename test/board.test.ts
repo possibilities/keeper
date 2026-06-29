@@ -43,6 +43,7 @@ import {
   iconizePills,
   pill,
   pillOrEmpty,
+  renderCloseFailurePill,
   renderClosePills,
   renderTaskPills,
   startedPill,
@@ -1821,6 +1822,44 @@ test("renderClosePills: renders a non-open status value verbatim", () => {
   expect(renderClosePills({ status: "closed" }, READY)).toBe(
     ` ${pill("closed")}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// renderCloseFailurePill — the sticky close-row dispatch-failure pill. Carries
+// only the failure KIND (the reason's leading token) so a multi-line conflict
+// dump stays one scannable pill; the `failed:*` colorizer branch routes it red.
+// ---------------------------------------------------------------------------
+
+test("renderCloseFailurePill: empty / undefined reason renders nothing", () => {
+  expect(renderCloseFailurePill(undefined)).toBe("");
+  expect(renderCloseFailurePill("")).toBe("");
+});
+
+test("renderCloseFailurePill: a multi-line reason keeps only the leading kind token", () => {
+  // The live shape: `<kind>: <detail…>` where the detail is a multi-line merge
+  // conflict dump. Only `worktree-merge-conflict` survives into the pill.
+  const reason =
+    "worktree-merge-conflict: merging keeper/epic/fn-1005--…\nCONFLICT (content): README.md";
+  expect(renderCloseFailurePill(reason)).toBe(
+    ` ${pill("failed:worktree-merge-conflict")}`,
+  );
+});
+
+test("renderCloseFailurePill: a colon-free kind passes through whole", () => {
+  expect(renderCloseFailurePill("worktree-finalize-non-fast-forward")).toBe(
+    ` ${pill("failed:worktree-finalize-non-fast-forward")}`,
+  );
+});
+
+test("renderCloseFailurePill: the pill colorizes red via the failed:* branch", () => {
+  // The `failed:*` → error routing is pinned exhaustively above; here just
+  // confirm the helper's pill lands in that bucket (red SGR wraps the token).
+  const colored = colorizePillsInLine(
+    renderCloseFailurePill("worktree-merge-conflict: …").trimStart(),
+  );
+  expect(colored).toContain(ERROR);
+  expect(colored).toContain("failed:worktree-merge-conflict");
+  expect(colored).toContain(RESET);
 });
 
 // ---------------------------------------------------------------------------

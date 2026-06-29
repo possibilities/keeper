@@ -46,6 +46,7 @@ import {
   pill,
   pillOrEmpty,
   planVerbLabel,
+  renderCloseFailurePill,
   renderClosePills,
   renderTaskPills,
   startedPill,
@@ -465,6 +466,13 @@ export async function main(argv: string[]): Promise<void> {
   // Mutated in place (clear+re-add) on each edge so the closure identity the
   // renderer captured stays stable.
   const armedSet = new Set<string>();
+  // The live close-row sticky-failure set — epicId → failure `reason`, fed by a
+  // parallel `dispatch_failures` subscription below (the readiness composite is
+  // pure and never reads the sticky-failure projection). `renderEpicBlock` reads
+  // this to render the `[failed:<kind>]` pill on a jammed close row. Mutated in
+  // place (clear + re-add) on each edge so the closure identity the renderer
+  // captured stays stable.
+  const closeFailures = new Map<string, string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // Autopilot banner state — the metadata `keeper autopilot` pins at its top
@@ -661,8 +669,11 @@ export async function main(argv: string[]): Promise<void> {
       // The close-row `[status]` pill is dropped — the board filter pins it to
       // `[open]` (a custom-filtered view restores it; see `renderClosePills`).
       // The approval pill follows the same omit-default + verdict-aware
-      // suppression as the task line.
-      `  X. Quality audit and close${renderClosePills(row, closeVerdict)}`,
+      // suppression as the task line. A trailing `[failed:<kind>]` pill renders
+      // when this epic's `close::<epic>` is parked sticky in `dispatch_failures`
+      // — the one signal that distinguishes a dispatchable close row from one
+      // the reconciler already tried and that jammed (readiness can't see it).
+      `  X. Quality audit and close${renderClosePills(row, closeVerdict)}${renderCloseFailurePill(closeFailures.get(epicId))}`,
       ...closeIdLines,
       ...renderJobLines(subagentIndex, row.jobs),
     );
@@ -711,13 +722,14 @@ export async function main(argv: string[]): Promise<void> {
   const view = createViewShell<ReadinessClientSnapshot>({
     script: "board",
     title: "board",
-    // Board folds THREE streams — the readiness composite, the `armed_epics`
-    // presence table, and the `autopilot_state` singleton (the banner-metadata
-    // substrate) — so the snapshot latch holds until ALL THREE report (readiness
-    // via the auto-report in `view.emit`; armed_epics + autopilot_state via the
+    // Board folds FOUR streams — the readiness composite, the `armed_epics`
+    // presence table, the `autopilot_state` singleton (the banner-metadata
+    // substrate), and the `dispatch_failures` projection (the close-row
+    // sticky-failure pill) — so the snapshot latch holds until ALL FOUR report
+    // (readiness via the auto-report in `view.emit`; the other three via the
     // explicit `reportSnapshotStream` calls below).
     mode: mode === "snapshot" ? "snapshot" : "live",
-    streamCount: 3,
+    streamCount: 4,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     // The fixed banner row carries the autopilot metadata, mirroring the top of
     // `keeper autopilot`. Restored here after a copy-key flash expires.
@@ -837,17 +849,61 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
+  // A parallel `dispatch_failures` subscription — the readiness composite is
+  // pure and never reads the sticky-failure projection, so a `close::<epic>`
+  // dispatch that failed STICKY (e.g. a worktree merge conflict) renders as a
+  // dispatchable `[ready]` close row with no sign autopilot is jammed. On each
+  // edge we rebuild `closeFailures` in place from the `verb='close'` rows (keyed
+  // by the epic id; a `recoverWorktrees` failure is path-tied under a different
+  // id and is intentionally skipped) and re-emit so the `[failed:<kind>]` pill
+  // repaints live. Report to the snapshot latch exactly once; inert in live mode.
+  let closeFailStreamReported = false;
+  const closeFailHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "board",
+    collection: "dispatch_failures",
+    onRows: (rows) => {
+      closeFailures.clear();
+      for (const r of rows) {
+        if (seg(r.verb) !== "close") {
+          continue;
+        }
+        const id = seg(r.id);
+        if (id !== "") {
+          closeFailures.set(id, seg(r.reason));
+        }
+      }
+      // Re-emit BEFORE reporting the stream. `reportSnapshotStream` can resolve
+      // the snapshot latch SYNCHRONOUSLY (this is the 4th of four reports), and
+      // a resolve reads the captured frame and exits the process — so the
+      // capture must already reflect this edge's `closeFailures` mutation, or
+      // the snapshot prints the stale pill-less frame. Inert ordering in live
+      // mode (no latch). `lastSnap !== null` implies readiness already emitted,
+      // so this re-emit never double-reports the primary latch.
+      if (lastSnap !== null) {
+        emitFrame(lastSnap);
+      }
+      if (!closeFailStreamReported) {
+        closeFailStreamReported = true;
+        view.reportSnapshotStream();
+      }
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
   if (mode === "snapshot") {
     view.runSnapshot(() => {
       handle.dispose();
       armedHandle.dispose();
       autopilotHandle.dispose();
+      closeFailHandle.dispose();
     });
   } else {
     view.installSigintHandler(() => {
       handle.dispose();
       armedHandle.dispose();
       autopilotHandle.dispose();
+      closeFailHandle.dispose();
     });
   }
 }
