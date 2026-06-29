@@ -71,5 +71,5 @@ Add:
 - [ ] Stale doc comments updated (reducer JSDocs for `MAX_STOP_YIELD_GAP_SEC` + sweep + Stop/ApiError inline; readiness `subRunningByJobId` comment + the severed `SUBAGENT_STALENESS_SEC` "mirrors" claim; README ~201/~3756 open-turn clarification)
 
 ## Done summary
-
+Introduced one canonical open-turn predicate (duration_ms IS NULL AND status IN running|ok) via OPEN_TURN_STATUSES/isOpenTurnRow/findFreshInFlightSubagentAnchor in subagent-invocations.ts, and routed all five liveness sites through it: the Stop + ApiError reducer guards (now updated_at-anchored with same-name collapse, ApiError still stamps the pair unconditionally), the SessionEnd/Killed sweep, readiness predicate-6, and readiness-client collapse. Served duration_ms so readiness can distinguish an open ok (in flight) from a finished one; readiness stays deliberately unbounded. SILENT_STREAM_CUT untouched; full suite + lint + typecheck green.
 ## Evidence
