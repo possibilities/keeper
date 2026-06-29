@@ -2974,7 +2974,14 @@ lives), NOT a `~/.claude-profiles/default` shadow dir — every other profile re
 `~/.claude-profiles/<name>/.claude.json`. An mtime
 memo keeps the multi-MB `.claude.json` re-read free, and a redundant parked re-write
 (already idle at the same multiplier) is suppressed so a long park doesn't grow the
-log. It writes ONLY this on-disk surface (its
+log. A tier that never resolves at boot (authed but the `oauthAccount`
+metadata is absent — a `/login` restored the keychain but not that cache) keeps a
+RAW `null` multiplier in the envelope rather than collapsing to a silent `1x`: the
+column is `INTEGER|NULL`, the picker coerces `null → 1` for weighting at the math
+boundary, and `keeper usage` renders the chip as `?x` ("tier unknown"). The
+per-cycle re-resolve still keeps a prior known multiplier on a transient re-read
+failure, so `?x` surfaces only for a genuinely never-resolved tier, never a
+downgrade of a known-good account. It writes ONLY this on-disk surface (its
 read-only keeper.db handle is the worker-contract convention; main stays the sole
 event writer). A singleton `scraper.lock` FileLock on the state dir means two
 producers never race the same files, so the worker simply un-arms if a lock is

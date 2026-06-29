@@ -202,6 +202,32 @@ describe("buildEnvelope", () => {
     expect(env.multiplier).toBe(20);
     expect(env.schema_version).toBe(1);
   });
+
+  test("a null multiplier (boot-time unresolved tier) rides as the key with a null value", () => {
+    // The boot resolve returns null when the tier never resolved; the envelope
+    // must carry the key (the reducer/UPSERT tolerate null — no schema bump),
+    // value null, NOT a collapsed `1x` default and NOT a dropped key.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: null,
+    };
+    const env = buildEnvelope(acct, {
+      status: "active",
+      subscription_active: true,
+      account_state: null,
+      usage: null,
+      lift_at: null,
+      last_successful_fetch_at: "2026-06-24T12:00:00-04:00",
+      last_skipped_fetch_at: null,
+      last_failed_fetch_at: null,
+      next_fetch_at: "2026-06-24T12:02:00-04:00",
+      error: null,
+    });
+    expect(Object.keys(env)).toContain("multiplier");
+    expect(env.multiplier).toBeNull();
+  });
 });
 
 // ---------- AccountLoop cycle (stubbed runner, sandboxed root) ---------------
@@ -830,6 +856,42 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
     expect(env.multiplier).toBe(20); // the corrected tier reached the envelope
   });
 
+  test("a numeric→null change (tier went unresolvable) bypasses both gates → full scrape", async () => {
+    // The on-disk prior is a known 20x; on restart the tier no longer resolves
+    // (no `.claude.json`), so keep-prior leaves the carrier null. A 20→null
+    // downgrade-to-unknown is a genuine change and must force a scrape so the
+    // `?x` lands at once, NOT sit parked behind the idle/cooldown gates.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: null,
+    };
+    // NB: no writeProfileClaudeJson → the per-cycle re-resolve stays null.
+    writeParkedPrior(20, "2026-06-25T00:00:00-04:00");
+    const calls: ScrapeAccount[] = [];
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      latestActivity: () => 0, // idle too — must still be bypassed
+      runScrape: stubRunner(
+        {
+          kind: "ok",
+          no_subscription: false,
+          usage: {},
+          subscription_active: true,
+        },
+        calls,
+      ),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+
+    expect(calls).toHaveLength(1); // 20 → null forced a scrape past both gates
+    const env = readEnvelope(tmpDir, "default");
+    expect(env.status).toBe("active");
+    expect(env.multiplier).toBeNull(); // the unresolved tier reached the envelope
+  });
+
   test("a >interval no-scrape sleep is capped, but a post-scrape failure backoff is not", async () => {
     // (1) No-scrape: a week-out cooldown lift is capped to the poll window.
     writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
@@ -1119,5 +1181,31 @@ describe("reResolveMultiplier episode-throttled warning", () => {
     expect(acct.multiplier).toBe(5);
     expect(acct.tierResolveFailed).toBe(true);
     expect(logs.length).toBe(2);
+  });
+
+  test("a boot-null prior keeps null over a failed re-read and never logs the literal `nullx`", () => {
+    const logs: string[] = [];
+    const log = (msg: string) => logs.push(msg);
+    // Boot resolved to null (tier never resolved), so the carrier starts null.
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: null,
+    };
+    // No .claude.json → the re-read fails again; keep-prior keeps null, log once.
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBeNull();
+    expect(acct.tierResolveFailed).toBe(true);
+    expect(logs.length).toBe(1);
+    // The warning surfaces the unresolved sentinel, never the literal `nullx`.
+    expect(logs[0]).not.toContain("nullx");
+    expect(logs[0]).toContain("?x");
+
+    // A later recovery still adopts the resolved tier (keep-prior is not sticky).
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_20x");
+    reResolveMultiplier(acct, tmpDir, log);
+    expect(acct.multiplier).toBe(20);
+    expect(acct.tierResolveFailed).toBe(false);
   });
 });

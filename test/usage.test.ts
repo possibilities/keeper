@@ -1456,6 +1456,111 @@ test("missing/null status leaves the header without a status token", () => {
   expect(lines[0]).toMatch(/]$/);
 });
 
+test("a null multiplier on a subscription-active claude row renders `?x` (tier unknown), not `1x`", () => {
+  // A `/login` restored the keychain but not the `oauthAccount` tier cache, so
+  // the boot resolve returned null. A subscription-active row surfaces that
+  // honestly as `?x` rather than a confident-but-wrong `1x`.
+  const lines = renderRowLines(
+    [
+      {
+        id: "default",
+        target: "claude",
+        multiplier: null,
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[0]).toContain("[claude ?x]");
+  // Never the false `1x` default, never the old broken `[claude  x]`.
+  expect(lines[0]).not.toContain("1x");
+  expect(lines[0]).not.toMatch(/\[claude {2}x\]/);
+});
+
+test("codex keeps `[codex 1x]` (a real numeric multiplier is unaffected by `?x`)", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[0]).toContain("[codex 1x]");
+  expect(lines[0]).not.toContain("?x");
+});
+
+test("a signed_out / no_subscription row with a null multiplier DROPS the suffix (`[claude]`), never `?x`", () => {
+  // `?x` means "subscribed but tier unknown" — a no-plan / logged-out account
+  // must not claim a live-but-unknown tier. The suffix drops to a bare
+  // `[claude]`, which also fixes today's broken `[claude  x]`.
+  for (const state of ["signed_out", "no_subscription"]) {
+    const lines = renderRowLines(
+      [
+        {
+          id: "default",
+          target: "claude",
+          multiplier: null,
+          account_state: state,
+          subscription_active: 0,
+        },
+      ],
+      NOW_MS,
+    );
+    expect(lines[0]).toContain("[claude]");
+    expect(lines[0]).not.toContain("?x");
+    expect(lines[0]).not.toMatch(/\[claude {2}x\]/);
+  }
+});
+
+test("`?x` and `20x` right-align under the multiplier column", () => {
+  // The full token (incl. `x`) feeds `wMult`, so a mixed `?x` (2-char) /
+  // `20x` (3-char) frame pads the shorter token — both `]` close at the same
+  // column and the chip width is identical across rows.
+  const lines = renderRowLines(
+    [
+      {
+        id: "aaaaaa",
+        target: "claude",
+        multiplier: null,
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+      {
+        id: "bbbbbb",
+        target: "claude",
+        multiplier: 20,
+        subscription_active: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+      },
+    ],
+    NOW_MS,
+  );
+  // Equal-width ids → headers differ only in the id text + padded mult token.
+  const unknownHeader = lines.find((l) => l.includes("(aaaaaa)")) as string;
+  const knownHeader = lines.find((l) => l.includes("(bbbbbb)")) as string;
+  expect(unknownHeader).toContain("[claude  ?x]");
+  expect(knownHeader).toContain("[claude 20x]");
+  // Both chips close at the same column ⇒ the column aligns.
+  expect(unknownHeader.indexOf("]")).toBe(knownHeader.indexOf("]"));
+});
+
 test("stale error renders as an indented body line with type:message and ticking error_at", () => {
   // The error line mirrors renderLimited's idiom — body indent + label
   // padding matches the quota lines, with the relative-time stamp landing in

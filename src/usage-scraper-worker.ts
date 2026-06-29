@@ -137,8 +137,14 @@ export interface Account {
   target: "claude" | "codex";
   /** Profile name forwarded to the scrape util (claude); "" for codex. */
   profile: string;
-  /** Mutable multiplier — the keep-prior carrier across a failed tier re-resolve. */
-  multiplier: number;
+  /**
+   * Mutable multiplier — the keep-prior carrier across a failed tier re-resolve.
+   * `null` ≡ the tier never resolved at boot (renders `?x`, "tier unknown"). A
+   * transient per-cycle re-read failure KEEPS the prior value (see
+   * {@link reResolveMultiplier}), so `null` surfaces ONLY for a boot-time
+   * never-resolved tier — never a downgrade of a known-good account.
+   */
+  multiplier: number | null;
   /** Per-account episode flag: a tier resolve is currently failing (warning already fired). */
   tierResolveFailed?: boolean;
 }
@@ -148,7 +154,8 @@ export interface Envelope {
   schema_version: number;
   id: string;
   target: string;
-  multiplier: number;
+  /** `null` ≡ tier unresolved (renders `?x`); the column stays `INTEGER|NULL`. */
+  multiplier: number | null;
   status: "active" | "idle" | "stale";
   subscription_active: boolean | null;
   /**
@@ -293,11 +300,6 @@ function parseTierMultiplier(path: string, size: number): number | null {
   return TIER_MULTIPLIERS[tier] ?? null;
 }
 
-/** Boot-time multiplier with a 1x fallback (no prior to keep at boot). */
-function resolveMultiplier(profile: string): number {
-  return resolveMultiplierOrNull(profile) ?? 1;
-}
-
 /**
  * Per-cycle tier re-resolve with keep-prior + episode-throttled warning. On a
  * non-null result, adopt it and clear the failure flag (re-arming the warning).
@@ -318,8 +320,12 @@ export function reResolveMultiplier(
   }
   if (!acct.tierResolveFailed) {
     acct.tierResolveFailed = true;
+    // A boot-time never-resolved tier carries a null prior — render it as the
+    // unresolved sentinel rather than the literal `nullx`.
+    const prior =
+      acct.multiplier === null ? "unknown (?x)" : `${acct.multiplier}x`;
     log(
-      `[usage-scraper] tier resolve failed for ${JSON.stringify(acct.id)}; keeping prior multiplier ${acct.multiplier}x`,
+      `[usage-scraper] tier resolve failed for ${JSON.stringify(acct.id)}; keeping prior multiplier ${prior}`,
     );
   }
 }
@@ -350,7 +356,7 @@ export function buildAccounts(): Account[] {
       id: name,
       target: "claude",
       profile: name,
-      multiplier: resolveMultiplier(name),
+      multiplier: resolveMultiplierOrNull(name),
     });
   }
   if (!seen.has("codex")) {
@@ -709,10 +715,13 @@ function priorError(prior: Record<string, unknown>): Envelope["error"] {
 
 /**
  * True iff a parked re-write would carry no new information — the on-disk prior is
- * already an `idle` heartbeat at the current multiplier. Suppressing the rewrite +
+ * already an `idle` heartbeat at the SAME multiplier. Suppressing the rewrite +
  * event keeps a multi-day cooldown (re-polling every ~60s) from churning the
- * envelope + growing the events log by ~1440 lines/day/account. A non-numeric or
- * differing prior multiplier is NOT redundant (the rewrite refreshes it).
+ * envelope + growing the events log by ~1440 lines/day/account. Equality folds
+ * both unresolved sides together: a null `acct.multiplier` matching a non-numeric
+ * prior (`priorNum` → null) is a benign no-op suppress. A prior that DIFFERS —
+ * two distinct numbers, or numeric⇄unresolved — is NOT redundant (the rewrite
+ * refreshes it).
  */
 function isRedundantParkedWake(
   prior: Record<string, unknown>,
