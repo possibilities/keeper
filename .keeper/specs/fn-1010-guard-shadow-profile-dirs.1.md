@@ -56,5 +56,5 @@ omits the absolute path.
 - [ ] Tests cover claude + pi sites (pi greenfield), sandboxed tmp home.
 
 ## Done summary
-
+Added assertProfileDirNameAllowed (StateError->exit 1) guarding all four profile-dir mkdir sites (claude+pi, helper+loop) against the reserved set (""/default/auto), path-escape (separator/../NUL on raw input), off-allowlist, and >255-byte names; mkdir keeps the original non-NFC string. Tests cover claude+pi (pi greenfield) in a sandboxed tmp home; CLAUDE.md guardrail added.
 ## Evidence
