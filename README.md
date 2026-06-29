@@ -1309,9 +1309,17 @@ event-log/reducer/hook touch. Run any of them with
   throttle), `runner` (keeper-side runner fault) — while the body keeps the
   full `<type>: <message>` and a ticking age. A null or unrecognized
   `error_kind` degrades to the generic `error` label so the detail is never
-  hidden. Untracked
-  profiles (rate-limited but with no agentusage usage row) do not render.
-  Per-frame sidecars
+  hidden. A profile with no quota bars is no longer hidden: the renderer reads
+  the stable `account_state` column (schema v97) and emits a single annotation
+  line under the header — `auth · signed out` (`account_state="signed_out"`) or
+  `no active subscription` (`account_state="no_subscription"`, or the back-compat
+  `subscription_active=0` pre-v97 row whose `account_state` is still NULL).
+  Precedence is stale-error → account_state → bars, so a genuine scrape failure
+  keeps its `error`-family line. These two annotation phrases render no `stale` /
+  `limited` line (no usage to age) and intentionally stay OUT of the bar-label
+  width pool, so a no-bar row never shifts a healthy row's bar alignment.
+  Untracked profiles (rate-limited but with no agentusage usage row) still do
+  not render. Per-frame sidecars
   (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta
   sidecar) carry the row set so the JSON sidecar captures the full input
   to the rendered frame. SIGINT disposes the subscription handle and
@@ -2802,6 +2810,13 @@ fold stamp) is not misread as dead, and renders a `limited lifts in
 `<rel>`` countdown off `rate_limit_lifts_at` (`limited lifts now`
 within the ±30s gap; omitted when the lift is absent or already past —
 never a confusing "`<rel>` ago" countdown).
+As of schema v97 (fn-1007), the nullable `account_state TEXT` column carries the
+orthogonal account-state axis (`signed_out` / `no_subscription`; NULL ≡
+subscribed or unknown), distinct from the freshness `status`, the picker-gate
+`subscription_active`, and the stale-error `error_kind`. The renderer reads it to
+emit a one-line reason — `auth · signed out` / `no active subscription` — under a
+no-bar profile's header instead of hiding the row, precedence stale-error →
+account_state → bars.
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /

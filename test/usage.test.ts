@@ -1198,16 +1198,21 @@ test("change-gate insensitivity: rendered tail moves with the clock", () => {
 // fn-645: envelope status / subscription_active / stale-error rendering
 // ---------------------------------------------------------------------------
 //
-// `renderRowLines` consumes three new axes:
-//   - `subscription_active`: `0` hides the row entirely; `1` and NULL render.
+// `renderRowLines` consumes these axes:
+//   - `account_state` (schema v97): `signed_out` → `auth · signed out`,
+//     `no_subscription` (or back-compat `subscription_active === 0`) → `no
+//     active subscription`; rendered as a standalone annotation line under the
+//     header instead of bars. Precedence stale-error → account_state → bars.
+//   - `subscription_active`: `0` back-compat folds into `no active
+//     subscription`; `1` and NULL render bars (no longer a blanket hide).
 //   - `status`: trailing token on the header line ("active"/"idle"/"stale").
 //   - `error_type` + `error_message` + `error_at`: a stale-error body line
 //     `<type>: <message…>` truncated to the bar+pct column width with
 //     `error_at` ticking on the 30s clock via `relTime`.
 
-test("subscription_active=0 rows are hidden from the render entirely", () => {
-  // A no-subscription row would render empty `?` bars with no actionable
-  // signal — suppress it. Subscribed rows + unknown (null) rows still render.
+test("back-compat subscription_active=0 renders a no-subscription line, never hidden", () => {
+  // A pre-v97 no-sub row (account_state still NULL) keys off subscription_active
+  // === 0 onto the `no active subscription` annotation — no bars, no hide.
   const lines = renderRowLines(
     [
       {
@@ -1243,13 +1248,20 @@ test("subscription_active=0 rows are hidden from the render entirely", () => {
     ],
     NOW_MS,
   );
-  // Hidden row's id is absent; visible rows' ids are present.
-  expect(lines.join("\n")).not.toContain("no-sub");
+  // No-sub row now renders with its annotation; no quota bars.
+  expect(lines.join("\n")).toContain("no-sub");
+  expect(lines.join("\n")).toContain("no active subscription");
   expect(lines.join("\n")).toContain("subscribed");
   expect(lines.join("\n")).toContain("codex");
+  // The no-sub row carries no bar glyphs of its own — its block is header +
+  // annotation only.
+  const noSubBlock = lines.filter(
+    (l) => l.includes("no-sub") || l.includes("no active subscription"),
+  );
+  expect(noSubBlock.join("\n")).not.toMatch(/[█░]/);
 });
 
-test("an all-hidden input returns an empty array", () => {
+test("an all-no-subscription input renders one annotation per row (none hidden)", () => {
   const lines = renderRowLines(
     [
       {
@@ -1267,7 +1279,129 @@ test("an all-hidden input returns an empty array", () => {
     ],
     NOW_MS,
   );
-  expect(lines).toEqual([]);
+  // header + annotation per row = 4 lines; no bars anywhere.
+  expect(lines).toHaveLength(4);
+  expect(
+    lines.filter((l) => l.trimStart() === "no active subscription"),
+  ).toHaveLength(2);
+  expect(lines.join("\n")).not.toMatch(/[█░]/);
+});
+
+test("an empty input still returns an empty array", () => {
+  expect(renderRowLines([], NOW_MS)).toEqual([]);
+});
+
+test("account_state='signed_out' renders 'auth · signed out', no bars or stale line", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "default",
+        target: "claude",
+        multiplier: 5,
+        account_state: "signed_out",
+        subscription_active: 0,
+        status: "active",
+        session_percent: null,
+        week_percent: null,
+        // A stale fold stamp would normally drive a `stale` line — it must not
+        // for a stable state (no usage to age).
+        last_usage_fold_at: Math.floor((NOW_MS - 60 * 60_000) / 1000),
+      },
+    ],
+    NOW_MS,
+  );
+  // header + annotation = 2 lines.
+  expect(lines).toHaveLength(2);
+  expect(lines[1].trimStart()).toBe("auth · signed out");
+  expect(lines.join("\n")).not.toMatch(/[█░]/);
+  expect(lines.join("\n")).not.toContain("stale");
+  // signed_out outranks the back-compat no-sub arm despite subscription_active=0.
+  expect(lines.join("\n")).not.toContain("no active subscription");
+});
+
+test("account_state='no_subscription' renders 'no active subscription', no bars", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "default",
+        target: "claude",
+        multiplier: 5,
+        account_state: "no_subscription",
+        // account_state classifies even when subscription_active is null.
+        subscription_active: null,
+        session_percent: null,
+        week_percent: null,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines).toHaveLength(2);
+  expect(lines[1].trimStart()).toBe("no active subscription");
+  expect(lines.join("\n")).not.toMatch(/[█░]/);
+});
+
+test("a stale-error row outranks account_state: keeps bars + error line", () => {
+  // Precedence stale-error → account_state → bars: an error line present means
+  // the row renders its bars + error line, NOT the state annotation.
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        account_state: "no_subscription",
+        subscription_active: 0,
+        status: "stale",
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        error_type: "ParseError",
+        error_message: "label not found",
+        error_at: isoOffset(-3),
+        error_kind: "format_changed",
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines.join("\n")).not.toContain("no active subscription");
+  expect(lines.join("\n")).toContain("ParseError: label not found");
+  // Bars render for the quota windows.
+  expect(lines.join("\n")).toMatch(/[█░]/);
+});
+
+test("a state row does not shift a healthy row's bar column (phrase stays out of wLabel)", () => {
+  const healthyRow = {
+    id: "primary",
+    target: "opus",
+    multiplier: 2,
+    subscription_active: 1,
+    session_percent: 42,
+    session_resets_at: isoOffset(5),
+    week_percent: 17,
+    week_resets_at: isoOffset(185),
+  };
+  // Solo healthy frame — the baseline bar offset.
+  const solo = renderRowLines([healthyRow], NOW_MS);
+  const soloSession = bodyLine(solo, "session");
+  // Mixed frame: a no-sub state row (id no wider than the healthy id) alongside
+  // the same healthy row. The 22-char annotation phrase must NOT enter wLabel.
+  const mixed = renderRowLines(
+    [
+      {
+        id: "no-sub",
+        target: "claude",
+        multiplier: 5,
+        account_state: "no_subscription",
+        subscription_active: 0,
+      },
+      healthyRow,
+    ],
+    NOW_MS,
+  );
+  const mixedSession = bodyLine(mixed, "session");
+  // Byte-identical body line ⇒ the bar column did not move.
+  expect(mixedSession).toBe(soloSession);
 });
 
 test("status renders as a trailing token on the header line", () => {
