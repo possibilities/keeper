@@ -3317,14 +3317,40 @@ test("formatPill defaults to [blocked:unknown] for the unknown reason", () => {
 // Subagent_invocations status filter
 // ---------------------------------------------------------------------------
 
-test("subagent_invocations: matching job_id but status !== 'running' → ignored", () => {
+test("subagent_invocations: FINISHED ok (non-null duration_ms) → ignored", () => {
+  // fn-1008: predicate 6 now keys on the canonical open-turn predicate
+  // (`isOpenTurnRow`), so the discriminator is `duration_ms`, NOT a bare status
+  // check. A CLOSED `ok` sub (non-null `duration_ms`) is done — ignored — even
+  // though its status is `ok`. (The open-`ok` case is covered separately below.)
   const t = makeTask({
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t] });
-  const subs = [makeSub({ job_id: "worker-1", status: "ok" })];
+  const subs = [
+    makeSub({ job_id: "worker-1", status: "ok", duration_ms: 5000 }),
+  ];
   const snap = run([epic], new Map(), subs);
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
+});
+
+test("subagent_invocations: OPEN ok (NULL duration_ms) counts as in-flight, no time bound", () => {
+  // fn-1008: PostToolUse:Agent flips a still-open turn to `ok` BEFORE its
+  // SubagentStop lands, so an `ok` row with NULL `duration_ms` is a backgrounded
+  // sub still in flight — predicate 6 MUST fire (else readiness re-dispatches a
+  // live worker). No `now` is threaded: the readiness layer is deliberately
+  // UNBOUNDED, so even an ancient open `ok` (ts far in the past) still blocks.
+  const t = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [t] });
+  const subs = [
+    makeSub({ job_id: "worker-1", status: "ok", duration_ms: null, ts: 1 }),
+  ];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perTask.get(t.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
 });
 
 test("subagent_invocations: failed status → ignored", () => {

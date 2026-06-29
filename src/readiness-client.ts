@@ -74,6 +74,7 @@ import {
   type PendingDispatch,
   type ReadinessSnapshot,
 } from "./readiness";
+import { isOpenTurnRow } from "./subagent-invocations";
 import type {
   BlockEscalation,
   DeadLetter,
@@ -554,13 +555,15 @@ export function collapseSubagentsByName(
     existing.count += 1;
     if (row.turn_seq > existing.row.turn_seq) {
       // New row supersedes the old surviving. The demoted surviving
-      // becomes a stuck orphan iff it was still `running`.
-      if (existing.row.status === "running") {
+      // becomes a stuck orphan iff it is still in flight (open turn:
+      // NULL `duration_ms`, status running|ok) — a backgrounded `ok`
+      // orphan counts too, a finished `ok` does not.
+      if (isOpenTurnRow(existing.row)) {
         existing.stuck += 1;
       }
       existing.row = row;
-    } else if (row.status === "running") {
-      // Older-than-surviving row that's still `running` — stuck.
+    } else if (isOpenTurnRow(row)) {
+      // Older-than-surviving row that's still in flight — stuck.
       existing.stuck += 1;
     }
   }

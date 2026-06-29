@@ -42,8 +42,12 @@ import {
   DESCRIPTION_MAX_CHARS,
   extractTurnSeq,
   findBridgePreToolUse,
+  findFreshInFlightSubagentAnchor,
   findOpenTurnForStop,
   findPendingPreToolUseForStart,
+  isOpenTurnRow,
+  OPEN_TURN_STATUS_SQL,
+  OPEN_TURN_STATUSES,
   resolveBridgeAgentId,
   truncateDescription,
 } from "../src/subagent-invocations";
@@ -723,6 +727,250 @@ describe("findOpenTurnForStop", () => {
       ["sess-x", "agent_pbs", 0, 1.0, 0, "ok", null, 1, 1.0],
     );
     expect(findOpenTurnForStop(db, "sess-x", "agent_pbs")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1008: the canonical open-turn definition + its reducer-side anchor helper.
+// ---------------------------------------------------------------------------
+
+/** Insert one subagent_invocations row with explicit liveness-relevant fields. */
+function insertSub(over: {
+  agentId: string;
+  turnSeq: number;
+  status: string;
+  durationMs: number | null;
+  updatedAt: number;
+  subagentType?: string | null;
+  jobId?: string;
+}): void {
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      over.jobId ?? "sess-x",
+      over.agentId,
+      over.turnSeq,
+      over.updatedAt,
+      null,
+      over.subagentType ?? "Explore",
+      null,
+      0,
+      over.status,
+      over.durationMs,
+      1,
+      over.updatedAt,
+    ],
+  );
+}
+
+describe("isOpenTurnRow", () => {
+  test("NULL duration_ms + running|ok is in flight; everything else is not", () => {
+    expect(isOpenTurnRow({ status: "running", duration_ms: null })).toBe(true);
+    expect(isOpenTurnRow({ status: "ok", duration_ms: null })).toBe(true);
+    // Finished ok (non-null duration_ms) is NOT in flight.
+    expect(isOpenTurnRow({ status: "ok", duration_ms: 5000 })).toBe(false);
+    // Terminal statuses fail closed even with NULL duration_ms.
+    expect(isOpenTurnRow({ status: "failed", duration_ms: null })).toBe(false);
+    expect(isOpenTurnRow({ status: "unknown", duration_ms: null })).toBe(false);
+    expect(isOpenTurnRow({ status: "superseded", duration_ms: null })).toBe(
+      false,
+    );
+  });
+});
+
+describe("findFreshInFlightSubagentAnchor", () => {
+  test("no rows → no in-flight survivor (releases)", () => {
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_000)).toBe(
+      false,
+    );
+  });
+
+  test("fresh open running row blocks; an open `ok` row blocks too", () => {
+    insertSub({
+      agentId: "a-run",
+      turnSeq: 0,
+      status: "running",
+      durationMs: null,
+      updatedAt: 10_000,
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_060)).toBe(
+      true,
+    );
+    db.run("DELETE FROM subagent_invocations");
+    insertSub({
+      agentId: "a-ok",
+      turnSeq: 0,
+      status: "ok",
+      durationMs: null,
+      updatedAt: 10_000,
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_060)).toBe(
+      true,
+    );
+  });
+
+  test("a FINISHED `ok` row (non-null duration_ms) is not in flight (releases)", () => {
+    insertSub({
+      agentId: "a-done",
+      turnSeq: 0,
+      status: "ok",
+      durationMs: 5_000,
+      updatedAt: 10_000,
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_060)).toBe(
+      false,
+    );
+  });
+
+  test("releases only when the freshest survivor's age STRICTLY exceeds the bound", () => {
+    insertSub({
+      agentId: "a",
+      turnSeq: 0,
+      status: "running",
+      durationMs: null,
+      updatedAt: 10_000,
+    });
+    // age == bound → still blocks (strict >).
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_120)).toBe(
+      true,
+    );
+    // age == bound + 1 → releases.
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_121)).toBe(
+      false,
+    );
+  });
+
+  test("uncomputable updated_at (<= 0) keeps blocking", () => {
+    insertSub({
+      agentId: "a",
+      turnSeq: 0,
+      status: "running",
+      durationMs: null,
+      updatedAt: 0,
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 999_999)).toBe(
+      true,
+    );
+  });
+
+  test("negative age (event ts < updated_at) keeps blocking", () => {
+    insertSub({
+      agentId: "a",
+      turnSeq: 0,
+      status: "running",
+      durationMs: null,
+      updatedAt: 50_000,
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_000)).toBe(
+      true,
+    );
+  });
+
+  test("anchors on the freshest survivor by updated_at, not on a demoted same-name orphan", () => {
+    // turn_seq=0 is ancient (would release on its own) but is collapsed away by
+    // the later same-name turn_seq=1; the FRESH survivor anchors the bound.
+    insertSub({
+      agentId: "old",
+      turnSeq: 0,
+      status: "running",
+      durationMs: null,
+      updatedAt: 9_000,
+      subagentType: "Explore",
+    });
+    insertSub({
+      agentId: "new",
+      turnSeq: 1,
+      status: "running",
+      durationMs: null,
+      updatedAt: 10_050,
+      subagentType: "Explore",
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_060)).toBe(
+      true,
+    );
+  });
+
+  test("a same-name orphan masked by a later FINISHED row releases", () => {
+    // turn_seq=1 open running, turn_seq=2 finished `ok` (same name). The orphan
+    // is collapsed; the survivor is not in flight → release.
+    insertSub({
+      agentId: "orphan",
+      turnSeq: 1,
+      status: "running",
+      durationMs: null,
+      updatedAt: 1_000,
+      subagentType: "Explore",
+    });
+    insertSub({
+      agentId: "newer",
+      turnSeq: 2,
+      status: "ok",
+      durationMs: 5_000,
+      updatedAt: 2_000,
+      subagentType: "Explore",
+    });
+    expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 2_010)).toBe(
+      false,
+    );
+  });
+});
+
+describe("open-turn parity: SQL guards agree with the TS predicate for every status", () => {
+  const ALL_STATUSES = [
+    "running",
+    "ok",
+    "failed",
+    "unknown",
+    "superseded",
+  ] as const;
+
+  test("OPEN_TURN_STATUS_SQL is derived from OPEN_TURN_STATUSES", () => {
+    const expected = [...OPEN_TURN_STATUSES].map((s) => `'${s}'`).join(", ");
+    expect(OPEN_TURN_STATUS_SQL).toBe(expected);
+    expect(OPEN_TURN_STATUS_SQL).toBe("'running', 'ok'");
+  });
+
+  test("for each status, the SQL anchor blocks IFF the TS predicate says in-flight (NULL duration_ms)", () => {
+    for (const status of ALL_STATUSES) {
+      db.run("DELETE FROM subagent_invocations");
+      insertSub({
+        agentId: `a-${status}`,
+        turnSeq: 0,
+        status,
+        durationMs: null,
+        updatedAt: 10_000,
+      });
+      const sqlBlocks = findFreshInFlightSubagentAnchor(
+        db,
+        "sess-x",
+        120,
+        10_010,
+      );
+      const tsInFlight = isOpenTurnRow({ status, duration_ms: null });
+      expect(sqlBlocks).toBe(tsInFlight);
+      // And the whitelist matches exactly: only running|ok are members.
+      expect(tsInFlight).toBe(status === "running" || status === "ok");
+    }
+  });
+
+  test("a non-null duration_ms is never in-flight for any status (SQL and TS agree)", () => {
+    for (const status of ALL_STATUSES) {
+      db.run("DELETE FROM subagent_invocations");
+      insertSub({
+        agentId: `a-${status}`,
+        turnSeq: 0,
+        status,
+        durationMs: 5_000,
+        updatedAt: 10_000,
+      });
+      expect(findFreshInFlightSubagentAnchor(db, "sess-x", 120, 10_010)).toBe(
+        false,
+      );
+      expect(isOpenTurnRow({ status, duration_ms: 5_000 })).toBe(false);
+    }
   });
 });
 

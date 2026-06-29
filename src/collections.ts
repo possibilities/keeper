@@ -457,15 +457,19 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   table: "subagent_invocations",
   // Narrowed to the columns consumers actually read (wire render, readiness
   // predicate-6, the in-process autopilot read). `last_event_id` MUST stay —
-  // it's the `version` column the diff and result re-seed read. Halves the
-  // per-frame serialize cost of the large subagent set. NOT a row-filter or
-  // page (those break render's count/stuck + the byId diff).
+  // it's the `version` column the diff and result re-seed read. `duration_ms`
+  // MUST stay too: it is half the canonical open-turn predicate
+  // (`isOpenTurnRow`) — without it the readiness index + the render collapse
+  // can't tell a backgrounded `ok` sub (in flight, NULL `duration_ms`) from a
+  // finished one. NOT a row-filter or page (those break render's count/stuck +
+  // the byId diff).
   columns: [
     "job_id",
     "subagent_type",
     "turn_seq",
     "ts",
     "status",
+    "duration_ms",
     "description",
     "last_event_id",
   ],

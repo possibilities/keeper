@@ -207,14 +207,15 @@ test("collapseSubagentsByName: single row → one group, count=1, stuck=0", () =
 });
 
 test("collapseSubagentsByName: same name keeps max turn_seq, counts all rows", () => {
-  // Four rows, none stuck — `running:0 → ok:1 → ok:2 → ok:3` collapses to ok:3.
-  // count = 4, stuck = 0 because the only `running` row is non-surviving but
-  // there's NO later `running` survivor either, so the "stuck" definition
-  // ("non-surviving + status='running'") fires for turn_seq=0 only when a
-  // LATER row supersedes it AND that row's status isn't running. Trace:
-  // first row sets {row:0, count:1, stuck:0}. Next row (turn 1, ok)
-  // supersedes; turn_seq=0 was running → stuck += 1 → {row:1, count:2, stuck:1}.
-  // Then turn 2 ok → {row:2, count:3, stuck:1}. Then turn 3 ok → {row:3, count:4, stuck:1}.
+  // Four rows `running:0 → ok:1 → ok:2 → ok:3` collapse to ok:3. fn-1008: the
+  // "stuck" definition is now the canonical open-turn predicate (`isOpenTurnRow`:
+  // NULL `duration_ms` AND status running|ok). makeSub defaults `duration_ms` to
+  // NULL, so EVERY demoted row here is an OPEN turn — including the `ok` ones —
+  // and each counts as stuck. Trace: first row {row:0, count:1, stuck:0}. turn 1
+  // (ok) supersedes; demoted turn_seq=0 is open → stuck+1 → {row:1, count:2,
+  // stuck:1}. turn 2 (ok) supersedes; demoted turn_seq=1 open → {row:2, count:3,
+  // stuck:2}. turn 3 (ok) supersedes; demoted turn_seq=2 open → {row:3, count:4,
+  // stuck:3}.
   const rows = [
     makeSub({
       job_id: "j",
@@ -246,13 +247,15 @@ test("collapseSubagentsByName: same name keeps max turn_seq, counts all rows", (
   expect(out[0]?.row.turn_seq).toBe(3);
   expect(out[0]?.row.status).toBe("ok");
   expect(out[0]?.count).toBe(4);
-  expect(out[0]?.stuck).toBe(1);
+  expect(out[0]?.stuck).toBe(3);
 });
 
-test("collapseSubagentsByName: fn-593.3 shape — running orphan masked, stuck=1", () => {
+test("collapseSubagentsByName: fn-593.3 shape — running orphan masked, stuck=3", () => {
   // Exact shape from the wedged fn-593.3 session — ok:0, running:1 (orphan),
-  // ok:2, ok:3. The surviving row is ok:3; turn_seq=1's `running` is a
-  // non-surviving stuck orphan that gets counted but doesn't reach
+  // ok:2, ok:3. The surviving row is ok:3; the three demoted rows are all
+  // non-surviving stuck orphans (fn-1008: every demoted row here is an OPEN
+  // turn — makeSub defaults `duration_ms` NULL — so all three count as stuck,
+  // not just the bare `running:1`). They get counted but don't reach
   // computeReadiness via the subscribe loop.
   const rows = [
     makeSub({
@@ -284,12 +287,14 @@ test("collapseSubagentsByName: fn-593.3 shape — running orphan masked, stuck=1
   expect(group?.row.turn_seq).toBe(3);
   expect(group?.row.status).toBe("ok");
   expect(group?.count).toBe(4);
-  expect(group?.stuck).toBe(1);
+  expect(group?.stuck).toBe(3);
 });
 
 test("collapseSubagentsByName: surviving row running → not stuck (currently running)", () => {
-  // Two rows, `ok:0 → running:1`. The surviving row (turn 1) IS running,
-  // which is the normal "currently running" case — NOT stuck.
+  // Two rows, `ok:0 → running:1`. The surviving row (turn 1) IS running, the
+  // normal "currently running" case — never counted as stuck. fn-1008: the
+  // DEMOTED turn_seq=0 (`ok`, NULL `duration_ms`) is now itself an OPEN turn, so
+  // it counts as one stuck orphan (was 0 under the old bare-`running` rule).
   const rows = [
     makeSub({
       job_id: "j",
@@ -307,7 +312,7 @@ test("collapseSubagentsByName: surviving row running → not stuck (currently ru
   const [g] = collapseSubagentsByName(rows);
   expect(g?.row.status).toBe("running");
   expect(g?.count).toBe(2);
-  expect(g?.stuck).toBe(0);
+  expect(g?.stuck).toBe(1);
 });
 
 test("collapseSubagentsByName: different subagent_types don't collapse", () => {
@@ -368,7 +373,8 @@ test("collapseSubagentsByName: first-seen order preserved across groups", () => 
 test("collapseSubagentsByName: out-of-order input still keeps max turn_seq", () => {
   // Rows arrive in non-monotone turn_seq order (the wire stream is sorted
   // ascending today but the helper must not depend on that). Surviving
-  // row is still the max turn_seq.
+  // row is still the max turn_seq. fn-1008: both demoted rows (turn_seq 5 `ok`
+  // and 3 `running`, each NULL `duration_ms`) are OPEN turns, so stuck=2.
   const rows = [
     makeSub({ job_id: "j", subagent_type: "A", turn_seq: 5, status: "ok" }),
     makeSub({
@@ -382,19 +388,23 @@ test("collapseSubagentsByName: out-of-order input still keeps max turn_seq", () 
   const [g] = collapseSubagentsByName(rows);
   expect(g?.row.turn_seq).toBe(7);
   expect(g?.row.status).toBe("ok");
-  expect(g?.stuck).toBe(1);
+  expect(g?.stuck).toBe(2);
 });
 
-test("collapseSubagentsByName: fn-697.2 safe-7 narrowed wire shape collapses losslessly", () => {
-  // fn-697.2 narrowed SUBAGENT_INVOCATIONS_DESCRIPTOR.columns from 12 to the
-  // safe-7 {job_id, subagent_type, turn_seq, ts, status, description,
-  // last_event_id}. The wire decode no longer surfaces agent_id /
-  // tool_use_id / prompt_chars / duration_ms / updated_at — those cells
+test("collapseSubagentsByName: fn-697.2 safe-8 narrowed wire shape collapses losslessly", () => {
+  // fn-697.2 narrowed SUBAGENT_INVOCATIONS_DESCRIPTOR.columns; fn-1008 re-added
+  // `duration_ms` (load-bearing: it is half the canonical open-turn predicate),
+  // so the served set is now the safe-8 {job_id, subagent_type, turn_seq, ts,
+  // status, duration_ms, description, last_event_id}. The wire decode still does
+  // NOT surface agent_id / tool_use_id / prompt_chars / updated_at — those cells
   // arrive `undefined`. This asserts the renderer's collapse (the heaviest
   // consumer: ×N count + stuck-orphan detection + the surviving row's
-  // type/desc/status used by `subagentLinesFor`) is byte-identical when fed
-  // ONLY the safe-7, proving no dropped column is load-bearing.
-  const safe7 = (
+  // type/desc/status used by `subagentLinesFor`) is byte-identical when fed ONLY
+  // the safe-8, proving none of the 4 still-dropped columns is load-bearing.
+  // Row shapes mirror a real trace: turn_seq=0 is a FINISHED `ok` (non-null
+  // `duration_ms`), turn_seq=1 is the OPEN running orphan (NULL), turn_seq=2 is
+  // the surviving close. Only the open orphan counts as stuck.
+  const safe8 = (
     over: Pick<
       SubagentInvocation,
       | "job_id"
@@ -402,41 +412,45 @@ test("collapseSubagentsByName: fn-697.2 safe-7 narrowed wire shape collapses los
       | "turn_seq"
       | "ts"
       | "status"
+      | "duration_ms"
       | "description"
       | "last_event_id"
     >,
   ): SubagentInvocation =>
     ({
       // Exactly the columns the narrowed descriptor projects; the dropped
-      // five are absent (would be `undefined` off the wire), matching the
+      // four are absent (would be `undefined` off the wire), matching the
       // real narrowed frame rather than the full SQL row.
       ...over,
     }) as unknown as SubagentInvocation;
   const rows: SubagentInvocation[] = [
-    safe7({
+    safe8({
       job_id: "j",
       subagent_type: "plan:worker-high",
       turn_seq: 0,
       ts: 10,
       status: "ok",
+      duration_ms: 5_000,
       description: "first",
       last_event_id: 100,
     }),
-    safe7({
+    safe8({
       job_id: "j",
       subagent_type: "plan:worker-high",
       turn_seq: 1,
       ts: 11,
       status: "running",
+      duration_ms: null,
       description: "orphan",
       last_event_id: 101,
     }),
-    safe7({
+    safe8({
       job_id: "j",
       subagent_type: "plan:worker-high",
       turn_seq: 2,
       ts: 12,
       status: "ok",
+      duration_ms: 6_000,
       description: "surviving",
       last_event_id: 102,
     }),
@@ -444,7 +458,7 @@ test("collapseSubagentsByName: fn-697.2 safe-7 narrowed wire shape collapses los
   const out = collapseSubagentsByName(rows);
   expect(out).toHaveLength(1);
   // ×N count, stuck-orphan, surviving row's render fields all derive from the
-  // safe-7 alone — no dropped column touched.
+  // safe-8 alone — no dropped column touched.
   expect(out[0]?.count).toBe(3);
   expect(out[0]?.stuck).toBe(1);
   expect(out[0]?.row.turn_seq).toBe(2);
@@ -478,6 +492,9 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
   // Predicate 6 (own-progress-sub) no longer fires, so the readiness
   // verdict for the row's owning task isn't `running:sub-agent-running`.
   // This is the autopilot-unsticking effect of the client-side collapse.
+  // fn-1008: the surviving turn_seq=3 is a FINISHED `ok` (non-null
+  // `duration_ms`) — an OPEN `ok` survivor would itself be in-flight under the
+  // canonical open-turn predicate and keep predicate 6 firing.
   const task = makeTask({
     worker_phase: "open",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
@@ -489,6 +506,7 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
       subagent_type: "plan:worker-high",
       turn_seq: 0,
       status: "ok",
+      duration_ms: 4_000,
     }),
     makeSub({
       job_id: "worker-1",
@@ -501,12 +519,14 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
       subagent_type: "plan:worker-high",
       turn_seq: 2,
       status: "ok",
+      duration_ms: 5_000,
     }),
     makeSub({
       job_id: "worker-1",
       subagent_type: "plan:worker-high",
       turn_seq: 3,
       status: "ok",
+      duration_ms: 6_000,
     }),
   ];
   const collapsed = collapseSubagentsByName(subRows).map((g) => g.row);
