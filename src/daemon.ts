@@ -913,6 +913,7 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     // reducer's UPSERT populates the columns instead of folding NULL.
     status: msg.status,
     subscription_active: msg.subscription_active,
+    account_state: msg.account_state,
     error_type: msg.error_type,
     error_message: msg.error_message,
     error_at: msg.error_at,

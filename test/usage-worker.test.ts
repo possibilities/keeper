@@ -34,6 +34,7 @@ import {
   seedFromDb,
   type UsageMessage,
   UsageScanner,
+  usageGateKey,
 } from "../src/usage-worker";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -145,6 +146,8 @@ test("buildUsageMessage maps id/target/multiplier and the two-window usage sub-b
     // fn-645 fields: this envelope omits status/subscription/error → all null.
     status: null,
     subscription_active: null,
+    // fn-1007: envelope omits account_state → null.
+    account_state: null,
     error_type: null,
     error_message: null,
     error_at: null,
@@ -403,6 +406,57 @@ test("fn-1000: buildUsageMessage projects error.kind; absent/unknown → null", 
   expect(active?.error_kind).toBeNull();
 });
 
+test("fn-1007: buildUsageMessage projects account_state; absent/unknown → null", () => {
+  // The scraper worker derives an orthogonal account-state axis onto the
+  // envelope; the consumer folds it onto `account_state`. Both valid values
+  // round-trip...
+  const signedOut = buildUsageMessage({
+    id: "claude-default",
+    status: "active",
+    account_state: "signed_out",
+  });
+  expect(signedOut?.account_state).toBe("signed_out");
+  const noSub = buildUsageMessage({
+    id: "x",
+    status: "active",
+    account_state: "no_subscription",
+  });
+  expect(noSub?.account_state).toBe("no_subscription");
+
+  // ...an unknown/garbage value folds to null per the safe-value invariant...
+  const bogus = buildUsageMessage({ id: "x", account_state: "logged_in_ish" });
+  expect(bogus?.account_state).toBeNull();
+
+  // ...and an absent field (a subscribed / codex / pre-feature envelope) → null.
+  const absent = buildUsageMessage({ id: "x", status: "active" });
+  expect(absent?.account_state).toBeNull();
+});
+
+test("fn-1007: account_state STAYS in the change-gate key (a state flip re-emits)", () => {
+  // Unlike `error_at`, `account_state` rides the gate via the spread, so a flip
+  // (signed_out → no_subscription) moves the key and forces a fresh snapshot.
+  const signedOut = buildUsageMessage({
+    id: "claude-default",
+    status: "active",
+    account_state: "signed_out",
+  });
+  const noSub = buildUsageMessage({
+    id: "claude-default",
+    status: "active",
+    account_state: "no_subscription",
+  });
+  expect(signedOut).not.toBeNull();
+  expect(noSub).not.toBeNull();
+  // The field is present in the gate key (not stripped like error_at)...
+  expect(usageGateKey(signedOut as NonNullable<typeof signedOut>)).toContain(
+    "signed_out",
+  );
+  // ...and a flip changes the key, so the change-gate re-emits.
+  expect(usageGateKey(signedOut as NonNullable<typeof signedOut>)).not.toBe(
+    usageGateKey(noSub as NonNullable<typeof noSub>),
+  );
+});
+
 test("ERROR_KIND IS GATED: a kind flip (error_type/message/at held) re-emits; error_at still excluded", () => {
   // `error_kind` is PROJECTED and — unlike `error_at` — STAYS in the change
   // gate, so a classification flip (e.g. format drift reclassified as a panel
@@ -625,6 +679,8 @@ test("onChange emits a usage-snapshot for a real envelope, then change-gates an 
     codex_spark_week_resets_at: null,
     status: null,
     subscription_active: null,
+    // fn-1007: envelope omits account_state → null.
+    account_state: null,
     error_type: null,
     error_message: null,
     error_at: null,

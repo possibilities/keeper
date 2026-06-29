@@ -173,6 +173,7 @@ describe("buildEnvelope", () => {
     const env = buildEnvelope(acct, {
       status: "active",
       subscription_active: true,
+      account_state: null,
       usage: { session: { percent_used: 5, resets_at: null } },
       lift_at: null,
       last_successful_fetch_at: "2026-06-24T12:00:00-04:00",
@@ -188,6 +189,7 @@ describe("buildEnvelope", () => {
       "multiplier",
       "status",
       "subscription_active",
+      "account_state",
       "last_successful_fetch_at",
       "last_skipped_fetch_at",
       "last_failed_fetch_at",
@@ -269,6 +271,28 @@ describe("AccountLoop success cycle", () => {
     const env = readEnvelope(tmpDir, "default");
     expect(env.status).toBe("active");
     expect(env.subscription_active).toBe(false);
+    expect(env.account_state).toBe("no_subscription");
+    expect(env.usage).toBeNull();
+  });
+
+  test("signed_out success → subscription_active null, account_state signed_out, no usage (fn-1007)", async () => {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 1,
+    };
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      runScrape: stubRunner({ kind: "ok", signed_out: true }),
+    });
+    await new AccountLoop(acct, deps).runCycleNoThrow();
+    const env = readEnvelope(tmpDir, "default");
+    expect(env.status).toBe("active");
+    // Signed-out: no subscription signal is knowable (distinct from no-sub).
+    expect(env.subscription_active).toBeNull();
+    expect(env.account_state).toBe("signed_out");
     expect(env.usage).toBeNull();
   });
 });
@@ -450,6 +474,7 @@ describe("AccountLoop failure path (no-throw)", () => {
     const prior = buildEnvelope(acct, {
       status: "active",
       subscription_active: true,
+      account_state: null,
       usage: { session: { percent_used: 3, resets_at: null } },
       lift_at: null,
       last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
@@ -501,6 +526,7 @@ describe("AccountLoop idle gate", () => {
         buildEnvelope(acct, {
           status: "active",
           subscription_active: true,
+          account_state: null,
           usage: { session: { percent_used: 4, resets_at: null } },
           lift_at: null,
           last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
@@ -554,6 +580,7 @@ describe("AccountLoop idle gate", () => {
         buildEnvelope(acct, {
           status: "active",
           subscription_active: true,
+          account_state: null,
           usage: {},
           lift_at: null,
           last_successful_fetch_at: null,
@@ -605,6 +632,7 @@ describe("AccountLoop cooldown gate", () => {
         buildEnvelope(acct, {
           status: "active",
           subscription_active: true,
+          account_state: null,
           usage: {
             session: {
               percent_used: 100,
@@ -661,6 +689,7 @@ describe("AccountLoop cooldown gate", () => {
         buildEnvelope(acct, {
           status: "stale",
           subscription_active: true,
+          account_state: null,
           usage: {},
           lift_at: "2026-06-24T13:00:00-04:00",
           last_successful_fetch_at: null,
@@ -715,6 +744,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
         buildEnvelope(acct, {
           status: "active",
           subscription_active: true,
+          account_state: null,
           usage: { session: { percent_used: 100, resets_at: lift } },
           lift_at: lift,
           last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
@@ -853,6 +883,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
         buildEnvelope(acct, {
           status: "idle",
           subscription_active: true,
+          account_state: null,
           usage: {
             session: {
               percent_used: 100,

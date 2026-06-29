@@ -4803,6 +4803,46 @@ test("UsageSnapshot folds missing session/week to NULL (safe-value invariant)", 
   expect(row.week_resets_at).toBeNull();
 });
 
+test("UsageSnapshot folds account_state through the UPSERT; malformed/absent → NULL (fn-1007)", () => {
+  // A valid account_state persists through the UPSERT...
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "signed-out",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      status: "active",
+      account_state: "signed_out",
+    }),
+  });
+  // ...a malformed account_state folds to NULL (never throws — cursor advances)...
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "garbage",
+    data: JSON.stringify({
+      target: "claude",
+      multiplier: 5,
+      account_state: "not_a_state",
+    }),
+  });
+  // ...and a pre-v97 (field-absent) event folds to NULL.
+  insertEvent({
+    hook_event: "UsageSnapshot",
+    session_id: "legacy",
+    data: JSON.stringify({ target: "claude", multiplier: 5 }),
+  });
+  expect(drainAll()).toBe(3);
+  const rows = db
+    .query(
+      "SELECT id, account_state FROM usage WHERE id IN ('signed-out','garbage','legacy')",
+    )
+    .all() as { id: string; account_state: string | null }[];
+  const byId = Object.fromEntries(rows.map((r) => [r.id, r.account_state]));
+  expect(byId["signed-out"]).toBe("signed_out");
+  expect(byId.garbage).toBeNull();
+  expect(byId.legacy).toBeNull();
+});
+
 test("UsageSnapshot with empty pk (session_id) is a safe no-op", () => {
   const id = insertEvent({
     hook_event: "UsageSnapshot",

@@ -2106,6 +2106,7 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
       codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
       status: "stale",
       subscription_active: false,
+      account_state: null,
       error_type: "ClaudeUsageParseError",
       error_message: "cli output unparseable",
       error_at: "2026-05-30T12:00:00-04:00",
@@ -2132,6 +2133,7 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
     codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
     status: "stale",
     subscription_active: false,
+    account_state: null,
     error_type: "ClaudeUsageParseError",
     error_message: "cli output unparseable",
     error_at: "2026-05-30T12:00:00-04:00",
@@ -2174,6 +2176,7 @@ test("fn-651: serialized snapshot folds end-to-end — status / subscription_act
         codex_spark_week_resets_at: null,
         status: "stale",
         subscription_active: false,
+        account_state: null,
         error_type: "ClaudeUsageParseError",
         error_message: "boom",
         error_at: "2026-05-30T12:00:00-04:00",
@@ -2236,6 +2239,7 @@ test("usage snapshot folds codex-spark quota columns end-to-end", () => {
         codex_spark_week_resets_at: "2026-06-28T21:00:00-04:00",
         status: "active",
         subscription_active: null,
+        account_state: null,
         error_type: null,
         error_message: null,
         error_at: null,
@@ -2292,6 +2296,7 @@ test("fn-651: a no-subscription envelope folds subscription_active = 0 so the re
         codex_spark_week_resets_at: null,
         status: "active",
         subscription_active: false,
+        account_state: null,
         error_type: null,
         error_message: null,
         error_at: null,
@@ -2527,8 +2532,11 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // (appending the nullable `handoffs.target_dir` launch-directory column — an
   // additive ALTER, NO cursor rewind: a pre-v96 `HandoffRequested` event carries
   // no `target_dir`, so a from-scratch re-fold leaves the column NULL
-  // byte-identical).
-  expect(SCHEMA_VERSION).toBe(96);
+  // byte-identical). And to 97 via fn-1007 task .1 (appending the nullable
+  // `usage.account_state` account-axis column — an additive ALTER, NO cursor
+  // rewind: a pre-v97 `UsageSnapshot` carries no `account_state`, so a
+  // from-scratch re-fold leaves the column NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(97);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

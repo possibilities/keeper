@@ -1938,6 +1938,12 @@ required human-authored, host-global-unique slug (`handoff::<slug>`,
 reject-on-collision) and `handoffs` gains the nullable `target_dir` column
 (APPEND-via-ALTER) — the absolute directory the handoff-ee launches in (NULL ≡
 keeperd's cwd); a pre-v96 `HandoffRequested` event carries no `target_dir`, so a
+from-scratch re-fold leaves it NULL (re-fold-safe). As of schema v97 (fn-1007)
+the `usage` projection gains the nullable `account_state` column (APPEND-via-ALTER)
+— an orthogonal "why no quota bars" axis (`signed_out` / `no_subscription`, NULL ≡
+subscribed/codex) the usage-scraper derives onto the envelope and the consumer
+folds onto this column, distinct from `subscription_active` and the stale-error
+`error_kind`; a pre-v97 `UsageSnapshot` carries no `account_state`, so a
 from-scratch re-fold leaves it NULL (re-fold-safe). As of
 schema v31, the `git` collection is
 rebuilt around per-(session, file) attribution: `events` gains

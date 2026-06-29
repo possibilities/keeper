@@ -124,11 +124,44 @@ export function asUsageErrorKind(v: unknown): UsageErrorKind | null {
 }
 
 /**
+ * Orthogonal account-state axis — the stable "why are there no quota bars"
+ * reason that is independent of freshness (`status`) and scrape-failure class
+ * (`error_kind`). NULL ≡ a subscribed (or codex) account with nothing to flag.
+ *
+ *  - `signed_out`       — the profile is logged out; no subscription signal is
+ *                         knowable (distinct from a confirmed no-subscription).
+ *  - `no_subscription`  — logged in, but the account carries no active plan.
+ *
+ * Keeper-derived and written ONLY to the on-disk envelope (NOT a scrape_cli wire
+ * field), so `SCRAPE_CONTRACT_SCHEMA_VERSION` does not bump.
+ */
+export type AccountState = "signed_out" | "no_subscription";
+
+const USAGE_ACCOUNT_STATES: ReadonlySet<string> = new Set<AccountState>([
+  "signed_out",
+  "no_subscription",
+]);
+
+/**
+ * Coerce an unknown (a contract field, an envelope cell) to an {@link AccountState}
+ * or null. An unknown/absent/garbage value folds to null so a pre-feature envelope
+ * and any future value both stay safe — keeping the fold re-fold-deterministic.
+ */
+export function asAccountState(v: unknown): AccountState | null {
+  return typeof v === "string" && USAGE_ACCOUNT_STATES.has(v)
+    ? (v as AccountState)
+    : null;
+}
+
+/**
  * The util's discriminated JSON contract, parsed + validated. EXACTLY one of:
  *  - `ok` (subscribed): carries `usage` + `subscription_active` (true for claude,
  *    null for codex).
  *  - `ok` (no_subscription): the claude NoActiveSubscription SUCCESS arm — its
  *    `no_subscription:true` presence IS the signal; no `usage`.
+ *  - `ok` (signed_out): the claude logged-out SUCCESS arm — its `signed_out:true`
+ *    presence IS the signal; no `usage`, no subscription signal. Additive arm
+ *    (keeper parses it ahead of the agentusage emitter shipping it).
  *  - `error`: parse drift / panel-never-rendered / scrape crash — carries
  *    `error_type`, `message`, `screen_excerpt` (head+tail-elided rendered lines),
  *    and (v2) a stable `error_kind`. An older v1 util omits `error_kind`, which
@@ -146,6 +179,7 @@ export type ScrapeResult =
       subscription_active: boolean | null;
     }
   | { kind: "ok"; no_subscription: true }
+  | { kind: "ok"; signed_out: true }
   | {
       kind: "error";
       error_type: string;
@@ -267,6 +301,12 @@ export function parseScrapeStdout(
   }
   const status = parsed.status;
   if (status === "ok") {
+    // Check signed_out BEFORE no_subscription and the usage check: a logged-out
+    // profile carries no usage and no subscription signal, so it must not be
+    // mistaken for a no-subscription account or fall through to bad_shape.
+    if (parsed.signed_out === true) {
+      return { kind: "ok", signed_out: true };
+    }
     if (parsed.no_subscription === true) {
       return { kind: "ok", no_subscription: true };
     }
