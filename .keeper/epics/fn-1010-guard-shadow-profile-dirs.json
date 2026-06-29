@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-29T20:42:31.654000Z",
   "created_at": "2026-06-29T20:08:56.767000Z",
   "depends_on_epics": [],
   "id": "fn-1010-guard-shadow-profile-dirs",
   "last_validated_at": "2026-06-29T20:08:56.810000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Guard shadow profile dirs",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-29T20:08:56.767000Z"
+  "updated_at": "2026-06-29T20:42:31.654000Z"
 }
