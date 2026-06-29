@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-29T15:06:35.951000Z",
+  "depends_on": [],
+  "epic": "fn-1008-fix-subagent-open-turn-job-liveness",
+  "id": "fn-1008-fix-subagent-open-turn-job-liveness.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Unify subagent in-flight predicate",
+  "updated_at": "2026-06-29T15:06:35.951000Z"
+}
