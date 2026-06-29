@@ -64,5 +64,5 @@ shadow tally; `--json` has no duplicate id alongside a default shadow. Scope age
 - [ ] `bun test test/shadow-profiles.test.ts` (+ the emit test) green; no duplicate `--json` id with a default shadow.
 
 ## Done summary
-
+Added a tier-metadata-missing finding to keeper agent profiles check for the native ~/.claude being authed but tier-unresolvable (distinct kind, canonical path, distinct id, counted apart from the shadow tally), relocated the tier table/cap/predicate to a db-free claude-tier leaf shared with the scraper, and documented the oauthAccount re-home step + new finding class.
 ## Evidence
