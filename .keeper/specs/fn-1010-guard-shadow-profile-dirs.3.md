@@ -47,5 +47,5 @@ math; with no shadow → assert no banner. Keep it a pure-function test where po
 - [ ] `bun test test/usage.test.ts` green.
 
 ## Done summary
-
+keeper usage now surfaces a one-line, db-free advisory banner for an auth-bearing reserved profile shadow (isReservedShadow && hasAuth), computed once per frame, with a HELP hint pointing at keeper agent profiles check.
 ## Evidence
