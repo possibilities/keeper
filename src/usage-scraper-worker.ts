@@ -67,6 +67,8 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import { FileLock } from "./usage-flock";
 import {
+  type AccountState,
+  asAccountState,
   asUsageErrorKind,
   runScrape,
   type ScrapeAccount,
@@ -149,6 +151,13 @@ export interface Envelope {
   multiplier: number;
   status: "active" | "idle" | "stale";
   subscription_active: boolean | null;
+  /**
+   * Orthogonal account-state axis — see {@link AccountState}. NULL ≡ subscribed
+   * (or codex). Stable across a transient scrape failure (carried forward by
+   * {@link priorAccountState}) so a signed-out / no-subscription account does not
+   * flicker while a blip surfaces via the stale-error precedence.
+   */
+  account_state: AccountState | null;
   last_successful_fetch_at: string | null;
   last_skipped_fetch_at: string | null;
   last_failed_fetch_at: string | null;
@@ -614,6 +623,7 @@ export function buildEnvelope(
   fields: {
     status: "active" | "idle" | "stale";
     subscription_active: boolean | null;
+    account_state: AccountState | null;
     usage: ScrapeUsage | null;
     lift_at: string | null;
     last_successful_fetch_at: string | null;
@@ -630,6 +640,7 @@ export function buildEnvelope(
     multiplier: acct.multiplier,
     status: fields.status,
     subscription_active: fields.subscription_active,
+    account_state: fields.account_state,
     last_successful_fetch_at: fields.last_successful_fetch_at,
     last_skipped_fetch_at: fields.last_skipped_fetch_at,
     last_failed_fetch_at: fields.last_failed_fetch_at,
@@ -661,6 +672,13 @@ function priorUsage(prior: Record<string, unknown>): ScrapeUsage | null {
 function priorSubscription(prior: Record<string, unknown>): boolean | null {
   const v = prior.subscription_active;
   return v === true ? true : v === false ? false : null;
+}
+
+/** Read + validate the prior `account_state`, else null (garbage folds to null). */
+function priorAccountState(
+  prior: Record<string, unknown>,
+): AccountState | null {
+  return asAccountState(prior.account_state);
 }
 
 /** Read the prior `error` object, else null. */
@@ -936,6 +954,7 @@ export class AccountLoop {
       const envelope = buildEnvelope(this.acct, {
         status: "idle",
         subscription_active: priorSubscription(prior),
+        account_state: priorAccountState(prior),
         usage: priorUsage(prior),
         lift_at: priorStr(prior, "lift_at"),
         last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
@@ -984,6 +1003,7 @@ export class AccountLoop {
       const envelope = buildEnvelope(this.acct, {
         status: "idle",
         subscription_active: priorSubscription(prior),
+        account_state: priorAccountState(prior),
         usage: priorUsage(prior),
         lift_at: priorStr(prior, "lift_at"),
         last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),
@@ -1027,20 +1047,35 @@ export class AccountLoop {
     const nextFetch = new Date(fetchedAt.getTime() + delay * 1000);
     const prior = loadEnvelope(statePath(stateDir, acct.id));
 
-    const noSubscription = result.no_subscription;
-    const usage: ScrapeUsage | null = noSubscription ? null : result.usage;
+    // Three-way account axis: signed_out (logged out — no usage, no
+    // subscription signal), no_subscription (logged in, no active plan), or
+    // subscribed (account_state NULL). Codex only ever takes the subscribed
+    // arm, so it stays account_state=NULL.
+    let usage: ScrapeUsage | null;
     let subscriptionActive: boolean | null;
-    if (acct.target === "claude") {
-      subscriptionActive = !noSubscription;
+    let accountState: AccountState | null;
+    if ("signed_out" in result) {
+      usage = null;
+      subscriptionActive = null;
+      accountState = "signed_out";
+    } else if (result.no_subscription) {
+      usage = null;
+      subscriptionActive = false;
+      accountState = "no_subscription";
     } else {
-      // Codex has no subscription concept; carry whatever the contract said.
-      subscriptionActive = noSubscription ? null : result.subscription_active;
+      usage = result.usage;
+      // Claude subscribed → true; codex has no subscription concept so it
+      // carries whatever the contract said (null).
+      subscriptionActive =
+        acct.target === "claude" ? true : result.subscription_active;
+      accountState = null;
     }
     const liftAt = deriveLiftAt(usage);
 
     const envelope = buildEnvelope(acct, {
       status: "active",
       subscription_active: subscriptionActive,
+      account_state: accountState,
       usage,
       lift_at: liftAt,
       last_successful_fetch_at: localIsoWithOffset(fetchedAt),
@@ -1111,6 +1146,10 @@ export class AccountLoop {
     const envelope = buildEnvelope(acct, {
       status: "stale",
       subscription_active: priorSubscription(prior),
+      // Carry the stable account state forward so a transient scrape failure
+      // does not flicker a signed-out / no-subscription account; the blip still
+      // surfaces via the stale-error precedence.
+      account_state: priorAccountState(prior),
       usage: priorUsage(prior),
       lift_at: priorStr(prior, "lift_at"),
       last_successful_fetch_at: priorStr(prior, "last_successful_fetch_at"),

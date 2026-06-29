@@ -78,7 +78,8 @@ describe("parseScrapeStdout — ok/subscribed", () => {
   test("claude subscribed → ok with usage + subscription_active true", () => {
     const r = parseScrapeStdout(okSubscribed(), "", 0);
     expect(r.kind).toBe("ok");
-    if (r.kind !== "ok" || r.no_subscription) throw new Error("wrong arm");
+    if (r.kind !== "ok" || "signed_out" in r || r.no_subscription)
+      throw new Error("wrong arm");
     expect(r.subscription_active).toBe(true);
     expect(r.usage.session?.percent_used).toBe(12.5);
     expect(r.usage.sonnet_week?.percent_used).toBe(5);
@@ -96,7 +97,8 @@ describe("parseScrapeStdout — ok/subscribed", () => {
       subscription_active: null,
     });
     const r = parseScrapeStdout(json, "", 0);
-    if (r.kind !== "ok" || r.no_subscription) throw new Error("wrong arm");
+    if (r.kind !== "ok" || "signed_out" in r || r.no_subscription)
+      throw new Error("wrong arm");
     expect(r.subscription_active).toBeNull();
     expect(r.usage.sonnet_week).toBeUndefined();
     expect(r.usage.codex_spark_session?.percent_used).toBe(27);
@@ -113,8 +115,37 @@ describe("parseScrapeStdout — ok/no_subscription", () => {
     });
     const r = parseScrapeStdout(json, "", 0);
     expect(r.kind).toBe("ok");
-    if (r.kind !== "ok") throw new Error("wrong arm");
+    if (r.kind !== "ok" || "signed_out" in r) throw new Error("wrong arm");
     expect(r.no_subscription).toBe(true);
+  });
+});
+
+describe("parseScrapeStdout — ok/signed_out (fn-1007)", () => {
+  test("signed_out:true → the success signed-out arm, no usage", () => {
+    const json = JSON.stringify({
+      schema_version: 1,
+      status: "ok",
+      signed_out: true,
+    });
+    const r = parseScrapeStdout(json, "", 0);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok" || !("signed_out" in r)) throw new Error("wrong arm");
+    expect(r.signed_out).toBe(true);
+  });
+
+  test("signed_out is checked BEFORE no_subscription and the usage block", () => {
+    // A (degenerate) contract carrying both flags + usage must resolve to the
+    // signed-out arm — signed_out has precedence in the ok-block.
+    const json = JSON.stringify({
+      schema_version: 1,
+      status: "ok",
+      signed_out: true,
+      no_subscription: true,
+      usage: { session: { percent_used: 9, resets_at: null } },
+    });
+    const r = parseScrapeStdout(json, "", 0);
+    if (r.kind !== "ok") throw new Error("wrong arm");
+    expect("signed_out" in r).toBe(true);
   });
 });
 

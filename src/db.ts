@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 96;
+export const SCHEMA_VERSION = 97;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -956,6 +956,7 @@ CREATE TABLE IF NOT EXISTS usage (
     last_rate_limit_session_id TEXT,
     status TEXT,
     subscription_active INTEGER,
+    account_state TEXT,
     error_type TEXT,
     error_message TEXT,
     error_at TEXT,
@@ -5398,6 +5399,20 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "handoffs", "target_dir", "TEXT");
+
+      // v96→v97 (fn-1007.1): add the nullable `usage.account_state` axis. The
+      // usage-scraper worker now derives an orthogonal account-state reason
+      // (`signed_out` / `no_subscription`) onto the envelope; the consumer folds
+      // it onto this column so `keeper usage` can tell apart a logged-out profile
+      // from a confirmed no-subscription one (both distinct from a scrape error).
+      // APPEND-via-ALTER keeps existing rows NULL (the zero-event shape) and is
+      // re-fold-safe: a pre-v97 event carries no `account_state`, so a
+      // from-scratch re-fold leaves the column NULL byte-identically. NO cursor
+      // rewind — do NOT add to the rewind-and-redrain DELETE list (mirrors the
+      // prior usage-column adds). Whitelist-only Python read (keeper-py never
+      // reads `usage`) — this bump MUST add 97 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "usage", "account_state", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

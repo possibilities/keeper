@@ -92,8 +92,12 @@ the staleness threshold; anchoring to the lift keeps a depleted-but-quiet
 row (agentusage paused polling until its lift) FRESH while the lift is
 future. Driven only off that anchor, never \`updated_at\` and never
 agentusage's own \`status\` — surfacing a wedged ingestion path instead of
-silently frozen gauges, and labelling the \`—\` cells above it. Untracked profiles (a rate-limit with no agentusage usage
-row) do not render. Below the profile stacks, a \`recent sessions\` block logs the
+silently frozen gauges, and labelling the \`—\` cells above it. A profile with no
+quota bars renders a one-line reason on the stable \`account_state\` axis instead
+of vanishing: \`auth · signed out\` (logged out), \`no active subscription\` (no
+plan on this account), or — when a scrape genuinely failed — the existing
+\`<kind>\` stale-error line. Untracked profiles (a rate-limit with no agentusage
+usage row) still do not render. Below the profile stacks, a \`recent sessions\` block logs the
 last 20 jobs (any state) newest-first, each labeled with the profile
 it ran under (\`profile_name\`, schema v36) plus a short id, title,
 state, and age. The live frame re-renders every 30s so countdowns tick;
@@ -120,6 +124,16 @@ const ERROR_KIND_LABELS: Record<string, string> = {
 function errorKindLabel(kind: string): string {
   return ERROR_KIND_LABELS[kind] ?? "error";
 }
+
+// Standalone annotation phrases keyed by the stable `account_state` axis. A row
+// in one of these states renders ONE line under its header — no bars, no
+// stale/limited line, nothing to age. The phrase intentionally stays OUT of the
+// `wLabel` pool (it is 17 / 22 chars) so it never shoves a healthy row's bars
+// rightward; only the row's id/target/mult feed the width pools.
+const ACCOUNT_STATE_LABELS: Record<string, string> = {
+  signed_out: "auth · signed out",
+  no_subscription: "no active subscription",
+};
 
 /**
  * Resolve an agentusage account id to its configured display alias (purely
@@ -313,12 +327,10 @@ export function renderRowLines(
 ): string[] {
   if (rows.length === 0) return [];
 
-  // subscription_active gating: a row that confirmed no subscription
-  // (`subscription_active === 0`) renders empty `?` bars with no signal —
-  // suppress entirely. `null` (unknown) and `1` (true) stay visible. Filtered
-  // FIRST so width + label-pool math only see visible rows.
-  const visible = rows.filter((r) => r.subscription_active !== 0);
-  if (visible.length === 0) return [];
+  // Every tracked row now renders. A no-bar row is classified onto the stable
+  // `account_state` axis (see `stableState` below) and renders a single
+  // annotation line instead of empty `?` bars — no row is hidden, so the
+  // operator always sees why a profile has no quota stack.
 
   interface RowCells {
     id: string;
@@ -368,9 +380,16 @@ export function renderRowLines(
     // `error_kind`-derived short label (`format` / `panel` / `scrape` /
     // `upstream` / `runner`), falling back to `error` for a null/unknown kind.
     errLabel: string;
+    // Stable account-state axis. Non-null ⇒ this row renders a single
+    // standalone annotation line (`auth · signed out` / `no active
+    // subscription`) under its header INSTEAD of bars / limited / stale (no
+    // usage to age), and feeds nothing into the pct / label width pools. The
+    // stale-error line takes precedence: a row with an active error line keeps
+    // its bars + error line and is never reclassified.
+    stableState: "signed_out" | "no_subscription" | null;
   }
 
-  const cells: RowCells[] = visible.map((row) => {
+  const cells: RowCells[] = rows.map((row) => {
     const hasSonnet = row.sonnet_week_percent != null;
     const hasCodexSparkSession = row.codex_spark_session_percent != null;
     const hasCodexSparkWeek = row.codex_spark_week_percent != null;
@@ -425,6 +444,21 @@ export function renderRowLines(
     const errContent = errType === "" ? "" : `${errType}: ${errMsg}`;
     const errRel = errType === "" ? "" : relTime(errAtIso, nowMs);
     const errLabel = errType === "" ? "" : errorKindLabel(seg(row.error_kind));
+    // Stable account-state classification, precedence stale-error → account_state
+    // → bars. A row with an active error line keeps its bars + error line (never
+    // reclassified). `signed_out` outranks `no_subscription`; the
+    // `subscription_active === 0` arm is back-compat for a no-sub row scraped
+    // before v97 whose `account_state` is still NULL.
+    let stableState: "signed_out" | "no_subscription" | null = null;
+    if (errContent === "") {
+      const accountState = seg(row.account_state);
+      if (accountState === "signed_out") stableState = "signed_out";
+      else if (
+        accountState === "no_subscription" ||
+        row.subscription_active === 0
+      )
+        stableState = "no_subscription";
+    }
     return {
       id: `(${aliasOf(seg(row.id), aliases)})`,
       target: seg(row.target),
@@ -462,19 +496,27 @@ export function renderRowLines(
       errContent,
       errRel,
       errLabel,
+      stableState,
     };
   });
 
   const widest = (xs: string[]): number =>
     xs.reduce((acc, x) => Math.max(acc, x.length), 0);
 
+  // Id / target / mult pools span ALL cells — a stable-state row still renders a
+  // header chip, so its id/target/mult legitimately participate in column width.
   const wId = widest(cells.map((c) => c.id));
   const wTarget = widest(cells.map((c) => c.target));
   const wMult = widest(cells.map((c) => c.mult));
 
+  // Pct + label pools span ONLY bar-rendering rows. A stable-state row renders
+  // no body lines, so its (absent) bars/labels must never pad the column —
+  // crucially the annotation phrase never enters `wLabel`.
+  const barCells = cells.filter((c) => c.stableState === null);
+
   // Pct width across every body line that will render.
   const allPcts: string[] = [];
-  for (const c of cells) {
+  for (const c of barCells) {
     if (!c.weekDepleted) allPcts.push(c.sPct);
     allPcts.push(c.wPct);
     if (c.swPct != null) allPcts.push(c.swPct);
@@ -488,14 +530,14 @@ export function renderRowLines(
   // an absent label never pads the column. `session` likewise drops out of an
   // all-depleted frame (every row suppresses its session line).
   const labels: string[] = [];
-  if (cells.some((c) => !c.weekDepleted)) labels.push("session");
-  labels.push("week");
-  if (cells.some((c) => c.swPct != null)) labels.push("sonnet");
-  if (cells.some((c) => c.cssPct != null)) labels.push("spark-5h");
-  if (cells.some((c) => c.cswPct != null)) labels.push("spark-week");
-  if (cells.some((c) => c.rlRel !== "")) labels.push("limited");
-  if (cells.some((c) => c.staleRel !== "")) labels.push("stale");
-  for (const c of cells) {
+  if (barCells.some((c) => !c.weekDepleted)) labels.push("session");
+  if (barCells.length > 0) labels.push("week");
+  if (barCells.some((c) => c.swPct != null)) labels.push("sonnet");
+  if (barCells.some((c) => c.cssPct != null)) labels.push("spark-5h");
+  if (barCells.some((c) => c.cswPct != null)) labels.push("spark-week");
+  if (barCells.some((c) => c.rlRel !== "")) labels.push("limited");
+  if (barCells.some((c) => c.staleRel !== "")) labels.push("stale");
+  for (const c of barCells) {
     if (c.errLabel !== "") labels.push(c.errLabel);
   }
   const wLabel = widest(labels);
@@ -555,6 +597,13 @@ export function renderRowLines(
       return c.status === "" ? head : `${head}  ${c.status}`;
     })();
     lines.push(header);
+    // A stable account-state row renders ONE annotation line under its header
+    // and nothing else — no bars to draw, no usage to age. The phrase sits at
+    // the body indent but carries no `wLabel` padding (it is not a quota label).
+    if (c.stableState !== null) {
+      lines.push(`${indent}${ACCOUNT_STATE_LABELS[c.stableState]}`);
+      continue;
+    }
     // Suppress the session line on a weekly-depleted row — see RowCells.
     if (!c.weekDepleted) {
       lines.push(renderBody("session", c.sBar, c.sPct, c.sReset));
@@ -875,6 +924,10 @@ export async function main(argv: string[]): Promise<void> {
         // so the wire-side `error_at` only moves when gated fields move.
         r.status,
         r.subscription_active,
+        // Stable account-state axis — a flip (signed_out ⇄ no_subscription ⇄
+        // subscribed) changes which annotation line vs bars render, so the
+        // gate must repaint on it.
+        r.account_state,
         r.error_type,
         r.error_message,
         r.error_at,

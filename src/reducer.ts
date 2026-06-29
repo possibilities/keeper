@@ -66,6 +66,7 @@ import type {
   SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
+import { asAccountState } from "./usage-scrape-runner";
 
 /**
  * Default batch size for {@link drain}. Each event folds in its OWN
@@ -2848,6 +2849,13 @@ interface UsageSnapshotPayload {
    * boolean.
    */
   subscription_active: 1 | 0 | null;
+  /**
+   * Orthogonal account-state axis — one of the keeper-side `AccountState` values
+   * (`signed_out` / `no_subscription`), or null when subscribed / codex /
+   * pre-feature. Validated via `asAccountState` at extract time (garbage → null,
+   * never throws); NULL is the zero-event default. Stored opaque as TEXT.
+   */
+  account_state: string | null;
   error_type: string | null;
   error_message: string | null;
   error_at: string | null;
@@ -2935,6 +2943,10 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
           : null,
       status: typeof parsed.status === "string" ? parsed.status : null,
       subscription_active: subscriptionActive,
+      // Account-state axis — `asAccountState` coerces garbage/absent → null and
+      // never throws, so a pre-v97 (field-absent) or malformed event re-folds to
+      // NULL byte-identically.
+      account_state: asAccountState(parsed.account_state),
       error_type:
         typeof parsed.error_type === "string" ? parsed.error_type : null,
       error_message:
@@ -3006,10 +3018,10 @@ function projectUsageRow(db: Database, event: Event): void {
        sonnet_week_resets_at, codex_spark_session_percent,
        codex_spark_session_resets_at, codex_spark_week_percent,
        codex_spark_week_resets_at, status, subscription_active,
-       error_type, error_message, error_at, error_kind,
+       account_state, error_type, error_message, error_at, error_kind,
        rate_limit_lifts_at, last_usage_fold_at,
        last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        target = excluded.target,
        multiplier = excluded.multiplier,
@@ -3025,6 +3037,7 @@ function projectUsageRow(db: Database, event: Event): void {
        codex_spark_week_resets_at = excluded.codex_spark_week_resets_at,
        status = excluded.status,
        subscription_active = excluded.subscription_active,
+       account_state = excluded.account_state,
        error_type = excluded.error_type,
        error_message = excluded.error_message,
        error_at = excluded.error_at,
@@ -3060,6 +3073,7 @@ function projectUsageRow(db: Database, event: Event): void {
       snapshot.codex_spark_week_resets_at,
       snapshot.status,
       snapshot.subscription_active,
+      snapshot.account_state,
       snapshot.error_type,
       snapshot.error_message,
       snapshot.error_at,

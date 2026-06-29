@@ -69,7 +69,12 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { AsyncSubscription } from "@parcel/watcher";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
-import { asUsageErrorKind, type UsageErrorKind } from "./usage-scrape-runner";
+import {
+  type AccountState,
+  asAccountState,
+  asUsageErrorKind,
+  type UsageErrorKind,
+} from "./usage-scrape-runner";
 import type { ShutdownMessage } from "./wake-worker";
 
 /**
@@ -149,6 +154,14 @@ export interface UsageSnapshotMessage {
    * boolean here; the reducer coerces to 1/0/NULL on the SQLite column.
    */
   subscription_active: boolean | null;
+  /**
+   * Orthogonal account-state axis — one of {@link AccountState} (`signed_out` /
+   * `no_subscription`), or null when subscribed / codex / a pre-feature
+   * envelope. Distinct from {@link subscription_active}: it tells a logged-out
+   * profile apart from a confirmed no-subscription one. STAYS in the change-gate
+   * (rides {@link usageGateKey}'s spread) so a state flip emits a fresh snapshot.
+   */
+  account_state: AccountState | null;
   /**
    * Stale-only error type (fn-645) — the agentusage-side exception class name,
    * e.g. `"ClaudeUsageParseError"`. Present only when `status == "stale"`;
@@ -273,6 +286,8 @@ interface RawUsage {
   // fn-645: envelope freshness/plan/error axes — projected.
   status?: unknown;
   subscription_active?: unknown;
+  // Orthogonal account-state axis — validated via `asAccountState`, projected.
+  account_state?: unknown;
   error?: unknown;
   // fn-651: rate-limit lift instant — top-level on the envelope, projected
   // onto `usage.rate_limit_lifts_at`. ISO-8601 string when present, null when
@@ -431,6 +446,8 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     codex_spark_week_resets_at: codexSparkWeekResetsAt,
     status: asString(raw.status),
     subscription_active: subscriptionActive,
+    // Validated account-state axis; garbage/absent → null (safe-value invariant).
+    account_state: asAccountState(raw.account_state),
     error_type: errorType,
     error_message: errorMessage,
     error_at: errorAt,
@@ -706,7 +723,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
               sonnet_week_resets_at, codex_spark_session_percent,
               codex_spark_session_resets_at, codex_spark_week_percent,
               codex_spark_week_resets_at, status, subscription_active,
-              error_type, error_message, error_at, error_kind,
+              account_state, error_type, error_message, error_at, error_kind,
               rate_limit_lifts_at
          FROM usage`,
     )
@@ -726,6 +743,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     codex_spark_week_resets_at: string | null;
     status: string | null;
     subscription_active: number | null;
+    account_state: string | null;
     error_type: string | null;
     error_message: string | null;
     error_at: string | null;
@@ -755,6 +773,10 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       codex_spark_week_resets_at: r.codex_spark_week_resets_at,
       status: r.status,
       subscription_active: sub,
+      // The projection only ever stores a validated account_state (the producer
+      // coerces via `asAccountState` before minting), so the cast is safe and
+      // the seed key matches the live `buildUsageMessage` output.
+      account_state: r.account_state as AccountState | null,
       error_type: r.error_type,
       error_message: r.error_message,
       error_at: r.error_at,
