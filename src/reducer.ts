@@ -47,9 +47,11 @@ import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import {
   extractTurnSeq,
   findBridgePreToolUse,
+  findFreshInFlightSubagentAnchor,
   findOpenRunningInGroup,
   findOpenTurnForStop,
   findPendingPreToolUseForStart,
+  OPEN_TURN_STATUS_SQL,
   resolveBridgeAgentId,
 } from "./subagent-invocations";
 import type {
@@ -101,19 +103,26 @@ const ENDED = "ended";
 const KILLED = "killed";
 
 /**
- * Recency bound (unix-SECONDS) for the Stop fold's sub-agent guard. Without it,
- * a one-shot orphan sub-agent that never emits `SubagentStop` would pin its
- * parent at `state='working'` forever (the guard keeps finding the surviving
- * running row) and hold the autopilot mutex open. If the newest surviving
- * `running` sub-agent's `ts` is older than this many seconds relative to the
- * Stop event's `ts`, the guard releases and the Stop fold writes `stopped`.
+ * Recency bound (unix-SECONDS) for the Stop + ApiError sub-agent guards (both
+ * route through {@link findFreshInFlightSubagentAnchor}). Without it, a one-shot
+ * orphan sub-agent that never emits `SubagentStop` would pin its parent at
+ * `state='working'` forever (the guard keeps finding the surviving open-turn row)
+ * and hold the autopilot mutex open. If the freshest surviving in-flight
+ * sub-agent's last-activity `updated_at` is older than this many seconds relative
+ * to the guard event's `ts`, the guard releases and the fold writes its terminal
+ * state.
  *
- * UNIT TRAP: both `events.ts` and `subagent_invocations.ts` are unix-SECONDS;
- * the comparison `event.ts - row.ts` is in seconds — multiplying by 1000 is a
- * 1000x bug. Pure (compile-time constant, no clock/config/meta read), so
- * re-fold determinism holds. Tradeoff: too large pins a stuck sub-agent's mutex
- * longer; too small flashes a slow in-flight sub-agent to `stopped` and clears
- * readiness predicate 5 for a tick.
+ * Anchored on `updated_at` (last activity — re-stamped by every SubagentTurn /
+ * PostToolUse:Agent / SubagentStop), NOT the frozen SubagentStart spawn `ts`, so
+ * a slow-but-alive sub re-arms its window on each activity instead of aging out
+ * mid-run.
+ *
+ * UNIT TRAP: both `events.ts` and `subagent_invocations.updated_at` are
+ * unix-SECONDS; the comparison `event.ts - row.updated_at` is in seconds —
+ * multiplying by 1000 is a 1000x bug. Pure (compile-time constant, no
+ * clock/config/meta read), so re-fold determinism holds. Tradeoff: too large
+ * pins a stuck sub-agent's mutex longer; too small flashes a slow in-flight
+ * sub-agent to `stopped` and clears readiness predicate 5 for a tick.
  */
 const MAX_STOP_YIELD_GAP_SEC = 120;
 
@@ -4853,15 +4862,20 @@ function foldHandoffLaunchFailed(db: Database, event: Event): void {
 }
 
 /**
- * Sweep open `status='running'` subagent_invocations rows for a job to
- * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
- * Killed arms of {@link projectJobsRow} on the proven write path (after the
- * jobs UPDATE landed), inside the same `BEGIN IMMEDIATE` transaction as the
- * lifecycle write + cursor advance — exactly-once-per-event holds across both
- * projections.
+ * Sweep open (in-flight) subagent_invocations rows for a job to
+ * `status='unknown'` in a single bulk UPDATE. "In-flight" is the canonical
+ * open-turn predicate (`duration_ms IS NULL AND status IN (...)`), so a
+ * backgrounded `ok` orphan (NULL `duration_ms`) is swept too — NOT a bare
+ * `status='running'`. The `duration_ms IS NULL` clause is load-bearing: without
+ * it a FINISHED `ok` row (non-null `duration_ms`) on a now-terminal job would be
+ * clobbered to `unknown`, corrupting a legitimately-closed turn. Called from the
+ * SessionEnd and Killed arms of {@link projectJobsRow} on the proven write path
+ * (after the jobs UPDATE landed), inside the same `BEGIN IMMEDIATE` transaction
+ * as the lifecycle write + cursor advance — exactly-once-per-event holds across
+ * both projections.
  *
  * Closes the lifecycle gap for orphaned subagents whose parent session died
- * before the matching SubagentStop landed: a `running` row whose job is now
+ * before the matching SubagentStop landed: an open-turn row whose job is now
  * `'ended'` / `'killed'` will never close on its own, so flip its status to the
  * indeterminate sentinel `'unknown'` (`duration_ms` stays NULL). The
  * terminal-status guard in the SubagentStop / PostToolUse arms carves out
@@ -4879,7 +4893,9 @@ function sweepRunningSubagentsToUnknown(
     `UPDATE subagent_invocations
         SET status = 'unknown',
             last_event_id = ?, updated_at = ?
-      WHERE job_id = ? AND status = 'running'`,
+      WHERE job_id = ?
+        AND duration_ms IS NULL
+        AND status IN (${OPEN_TURN_STATUS_SQL})`,
     [eventId, ts, jobId],
   );
 }
@@ -7708,46 +7724,21 @@ function projectJobsRow(db: Database, event: Event): void {
       // yields to the sub-agent (which shares the parent session_id), but the
       // session is conceptually still working. Honoring the mid-yield Stop would
       // clear readiness predicate 5 prematurely and dup-fire predicate 7's
-      // approval-notify. So skip the state flip while any subagent_invocations
-      // row is still `running`. Same-name collapse: a `running` row is ignored if
-      // a LATER same-`(job_id, subagent_type)` row exists — "same name, higher
-      // turn_seq" means the older row is an orphan whose SubagentStop never
-      // landed; this matches the client's `collapseSubagentsByName`.
-      // `subagent_type IS …` is null-safe equality. Pure over the event log.
-      //
-      // Recency bound: anchor the staleness check on the SURVIVING running row
-      // (max `turn_seq` per name group), measured against its `ts` — ORDER BY ts
-      // DESC so multiple in-flight subs pick the newest start (the guard only
-      // releases once even the freshest survivor crosses the bound).
-      const subRunning = db
-        .query(
-          `SELECT s1.ts AS ts FROM subagent_invocations s1
-            WHERE s1.job_id = ?
-              AND s1.status = 'running'
-              AND NOT EXISTS (
-                SELECT 1 FROM subagent_invocations s2
-                 WHERE s2.job_id = s1.job_id
-                   AND s2.subagent_type IS s1.subagent_type
-                   AND s2.turn_seq > s1.turn_seq
-              )
-            ORDER BY s1.ts DESC
-            LIMIT 1`,
+      // approval-notify. So skip the state flip while a fresh in-flight subagent
+      // survives — `findFreshInFlightSubagentAnchor` applies the canonical
+      // open-turn predicate (so a backgrounded `ok` sub still blocks), the
+      // same-name collapse (a higher-turn_seq sibling masks an orphan), and the
+      // `MAX_STOP_YIELD_GAP_SEC` freshness bound anchored on last-activity
+      // `updated_at`. Pure over the event log (re-fold deterministic).
+      if (
+        findFreshInFlightSubagentAnchor(
+          db,
+          jobId,
+          MAX_STOP_YIELD_GAP_SEC,
+          event.ts,
         )
-        .get(jobId) as { ts: number | null } | null;
-      if (subRunning != null) {
-        // Keep swallowing on a NULL/non-positive `ts` (age uncomputable) or a
-        // non-positive age (clock skew / same-second); the bound only releases
-        // once age STRICTLY exceeds `MAX_STOP_YIELD_GAP_SEC`.
-        const rowTs = subRunning.ts;
-        if (rowTs == null || rowTs <= 0) {
-          break;
-        }
-        const age = event.ts - rowTs;
-        if (age <= MAX_STOP_YIELD_GAP_SEC) {
-          break;
-        }
-        // Fall through: the newest surviving sub-agent is older than the bound —
-        // an orphan whose SubagentStop never landed; release the Stop gate.
+      ) {
+        break;
       }
       const res = db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
@@ -7872,19 +7863,24 @@ function projectJobsRow(db: Database, event: Event): void {
         event.hook_event === "RateLimited"
           ? "rate_limit"
           : extractApiErrorKind(event);
-      // Sub-agent guard (mirrors Stop): suppress the state flip while any
-      // subagent row is `running` (the parent isn't making API calls while it
-      // waits on a sub), but stamp the annotation pair UNCONDITIONALLY — that's
-      // the honest reading — via the CASE keeping state at its pre-event value.
+      // Sub-agent guard (mirrors Stop): suppress the state FLIP while a fresh
+      // in-flight subagent survives (the parent isn't making API calls while it
+      // waits on a sub) — but stamp the (last_api_error_at, last_api_error_kind)
+      // pair UNCONDITIONALLY, which is the honest reading. The liveness decision
+      // is lifted to `findFreshInFlightSubagentAnchor` (open-turn predicate +
+      // same-name collapse + `updated_at` freshness bound — both of which the
+      // old inline `EXISTS(status='running')` CASE lacked); only the `state =`
+      // clause is gated on it. The interpolated fragment is a fixed string chosen
+      // by a fold-time-pure boolean (re-fold deterministic).
+      const subBlocks = findFreshInFlightSubagentAnchor(
+        db,
+        jobId,
+        MAX_STOP_YIELD_GAP_SEC,
+        event.ts,
+      );
+      const stateClause = subBlocks ? "state" : "'stopped'";
       const res = db.run(
-        `UPDATE jobs SET state = CASE
-                           WHEN EXISTS (
-                             SELECT 1 FROM subagent_invocations
-                              WHERE job_id = jobs.job_id
-                                AND status = 'running'
-                           ) THEN state
-                           ELSE 'stopped'
-                         END,
+        `UPDATE jobs SET state = ${stateClause},
                          last_api_error_at = ?,
                          last_api_error_kind = ?,
                          last_event_id = ?,

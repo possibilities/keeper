@@ -158,6 +158,124 @@ export function findOpenTurnForStop(
 }
 
 /**
+ * The CANONICAL "open turn" status set — the single source of truth for subagent
+ * liveness. A `subagent_invocations` row is IN FLIGHT (its turn has not closed)
+ * iff `duration_ms IS NULL` AND its status is in this set. Every liveness site —
+ * the reducer's Stop + ApiError guards (via {@link findFreshInFlightSubagentAnchor}),
+ * the SessionEnd/Killed sweep, the readiness predicate-6 index, and the
+ * readiness-client collapse — routes through this ONE definition (the SQL sites
+ * via {@link OPEN_TURN_STATUS_SQL}, the TS sites via {@link isOpenTurnRow}) so
+ * they can never drift; drift between consumers is the exact bug class this
+ * fixes, and a parity test pins the agreement.
+ *
+ * `'ok'` is a member because PostToolUse:Agent flips a still-open turn to `'ok'`
+ * BEFORE its SubagentStop lands (Anthropic-confirmed). An `'ok'` row with a NULL
+ * `duration_ms` is a backgrounded sub still in flight, NOT a finished one — and
+ * `duration_ms IS NULL` is precisely what separates the two, since SubagentStop
+ * stamps a non-NULL `duration_ms` on close. The supersession scan
+ * ({@link findOpenRunningInGroup}) is NOT a liveness site and deliberately stays
+ * on a bare `status='running'`.
+ *
+ * Whitelist, not blacklist, by design: `'failed'` / `'unknown'` / `'superseded'`
+ * are terminal and excluded, and an unknown future status fails CLOSED (it never
+ * silently passes a liveness guard the way a blacklist would).
+ */
+export const OPEN_TURN_STATUSES: ReadonlySet<string> = new Set([
+  "running",
+  "ok",
+]);
+
+/**
+ * The SQL `IN (...)` value list for {@link OPEN_TURN_STATUSES}, DERIVED from the
+ * same set so the SQL-side liveness guards and the TS-side ones cannot diverge.
+ * The values are compile-time string constants (no user input), safe to
+ * interpolate into a query the same way the reducer interpolates `ENDED` /
+ * `KILLED`. A parity test asserts this fragment matches the set membership.
+ */
+export const OPEN_TURN_STATUS_SQL: string = [...OPEN_TURN_STATUSES]
+  .map((s) => `'${s}'`)
+  .join(", ");
+
+/**
+ * The TS-side mirror of the open-turn SQL predicate. A row is in flight iff its
+ * `duration_ms` is NULL and its status is an {@link OPEN_TURN_STATUSES} member.
+ * Used by the two NON-SQL liveness sites (readiness predicate-6 index +
+ * readiness-client collapse) so they agree byte-for-byte with the reducer's SQL
+ * guards. Accepts the minimal `{ status, duration_ms }` shape so any row
+ * projection satisfies it.
+ */
+export function isOpenTurnRow(row: {
+  status: string;
+  duration_ms: number | null;
+}): boolean {
+  return row.duration_ms == null && OPEN_TURN_STATUSES.has(row.status);
+}
+
+/**
+ * Liveness decision for the reducer's Stop + ApiError/RateLimited guards: should
+ * the parent job's state flip be SUPPRESSED because a fresh in-flight subagent is
+ * still surviving? Returns `true` to BLOCK the flip (a fresh, or age-uncomputable,
+ * open-turn survivor exists), `false` to RELEASE it (no in-flight survivor, or
+ * even the freshest survivor's age strictly exceeds `maxGapSec`).
+ *
+ * "Survivor" applies the same same-name collapse the client's
+ * `collapseSubagentsByName` does: an open-turn row is ignored when a LATER
+ * same-`(job_id, subagent_type)` `turn_seq` row exists ("same name, higher
+ * turn_seq" → the older row is an orphan whose SubagentStop never landed). The
+ * `subagent_type IS …` join is null-safe equality.
+ *
+ * Anchor + freshness (mirrors {@link findOpenTurnForStop}'s re-fold-determinism
+ * rationale — a pure read over persisted-state-at-fold-time, never a clock read):
+ * - In-flight membership is the canonical open-turn predicate
+ *   (`duration_ms IS NULL AND status IN (...)`), NOT a bare `status='running'`,
+ *   so a backgrounded `ok` sub (NULL `duration_ms`) still blocks.
+ * - The freshness anchor is last-activity `updated_at` (re-stamped by every
+ *   SubagentTurn / PostToolUse:Agent / SubagentStop), NOT the frozen SubagentStart
+ *   spawn `ts` — so a slow-but-alive sub re-arms its window on each activity. The
+ *   pick is the FRESHEST survivor: `ORDER BY updated_at DESC` PLUS a deterministic
+ *   secondary sort (`turn_seq DESC, agent_id ASC`) so `updated_at` ties (the
+ *   sweep/bulk folds stamp identical `updated_at`, so ties are likelier than on
+ *   `ts`) never make the anchor non-deterministic — re-fold determinism would
+ *   break otherwise.
+ * - `updated_at IS NULL` or `updated_at <= 0` is UNCOMPUTABLE → conservatively
+ *   BLOCKS (never release on an age we cannot trust). Release only when the age
+ *   `eventTs - updated_at` STRICTLY exceeds `maxGapSec`; at/under the bound, and
+ *   a negative age from clock skew, both stay blocking.
+ */
+export function findFreshInFlightSubagentAnchor(
+  db: Database,
+  jobId: string,
+  maxGapSec: number,
+  eventTs: number,
+): boolean {
+  const anchor = db
+    .prepare(
+      `SELECT s1.updated_at AS updated_at
+         FROM subagent_invocations s1
+        WHERE s1.job_id = ?
+          AND s1.duration_ms IS NULL
+          AND s1.status IN (${OPEN_TURN_STATUS_SQL})
+          AND NOT EXISTS (
+            SELECT 1 FROM subagent_invocations s2
+             WHERE s2.job_id = s1.job_id
+               AND s2.subagent_type IS s1.subagent_type
+               AND s2.turn_seq > s1.turn_seq
+          )
+        ORDER BY s1.updated_at DESC, s1.turn_seq DESC, s1.agent_id ASC
+        LIMIT 1`,
+    )
+    .get(jobId) as { updated_at: number | null } | null;
+  if (anchor == null) {
+    return false; // no in-flight survivor — release.
+  }
+  const updatedAt = anchor.updated_at;
+  if (updatedAt == null || updatedAt <= 0) {
+    return true; // age uncomputable — conservatively keep blocking.
+  }
+  return eventTs - updatedAt <= maxGapSec;
+}
+
+/**
  * One element in the `findOpenRunningInGroup` result set. Returned by the
  * supersession scan fired from the PostToolUse:Agent arm of the reducer once
  * the bridged row's authoritative `subagent_type` is known — every earlier

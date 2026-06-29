@@ -5958,7 +5958,13 @@ test("Stop guard ignores `running` orphan when a later same-name row exists (fn-
       null,
       0,
       "ok",
-      null,
+      // fn-1008: the surviving turn_seq=2 row is FINISHED (non-NULL
+      // duration_ms), not an open `ok`. Under the canonical open-turn predicate
+      // (`duration_ms IS NULL AND status IN running|ok`) a NULL here would make
+      // this survivor a fresh in-flight anchor and block the Stop — so the
+      // wedged-trace intent (orphan turn_seq=1 collapsed away, parent closes) is
+      // preserved by marking the survivor closed.
+      5_000,
       0,
       2_000,
     ],
@@ -6166,13 +6172,14 @@ test("bounded Stop guard: boundary exactly at MAX_STOP_YIELD_GAP_SEC keeps swall
 });
 
 test("bounded Stop guard: NULL ts on a running row keeps swallowing (safe branch)", () => {
-  // Legacy/malformed `subagent_invocations` row with NULL ts — the bound
-  // cannot honestly compute an age, so the guard conservatively keeps
-  // swallowing (treat as not-stuck, never throw). Spec edge case.
-  // bun:sqlite rejects a literal NULL on a `NOT NULL REAL` column, so we
-  // instead simulate the "we can't trust this ts" branch with a 0 sentinel
-  // — the reducer's `rowTs == null || rowTs <= 0` guard treats both the
-  // same way.
+  // Legacy/malformed `subagent_invocations` row with an untrustworthy
+  // last-activity timestamp — the bound cannot honestly compute an age, so the
+  // guard conservatively keeps swallowing (treat as not-stuck, never throw).
+  // Spec edge case. fn-1008: the guard now anchors on `updated_at` (last
+  // activity), NOT spawn `ts`, so the uncomputable sentinel lives on
+  // `updated_at`. bun:sqlite rejects a literal NULL on the `NOT NULL REAL`
+  // column, so we simulate "we can't trust this" with a 0 sentinel — the
+  // helper's `updatedAt == null || updatedAt <= 0` guard treats both the same.
   insertEvent({ hook_event: "SessionStart", ts: 10_000 });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
   db.run(
@@ -6184,7 +6191,7 @@ test("bounded Stop guard: NULL ts on a running row keeps swallowing (safe branch
       "sess-a",
       "agent-zero-ts",
       0,
-      0, // sentinel: cannot honestly age this row
+      1_000,
       null,
       "plan:worker-high",
       null,
@@ -6192,7 +6199,7 @@ test("bounded Stop guard: NULL ts on a running row keeps swallowing (safe branch
       "running",
       null,
       0,
-      1_000,
+      0, // updated_at sentinel: cannot honestly age this row
     ],
   );
   // Stop arrives at a normal far-future ts — without the safe-branch
@@ -6317,6 +6324,297 @@ test("bounded Stop guard: from-scratch re-fold of a bounded release is byte-dete
   drainAll();
   const reJob = getJob();
   expect(reJob?.state).toBe("stopped");
+  expect(reJob?.last_event_id).toBe(firstJob?.last_event_id);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1008: canonical open-turn liveness — the `updated_at` activity re-base,
+// the open-`ok` background-hold, the ApiError guard's new freshness + collapse,
+// and the sweep widening.
+// ---------------------------------------------------------------------------
+
+test("Stop guard: sub-agent activity (SubagentTurn) refreshes updated_at and re-arms the window", () => {
+  // The whole point of anchoring on `updated_at` instead of spawn `ts`: a
+  // long-lived sub that keeps emitting activity re-arms its 120s window. The
+  // SubagentTurn lands 98s after spawn (a `ts`-anchored guard would already be
+  // 98s into its 120s budget); the Stop lands 148s after SPAWN but only 50s
+  // after the last ACTIVITY, so the `updated_at`-anchored guard still swallows.
+  insertEvent({ hook_event: "SessionStart", ts: 10_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 10_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-act",
+    agent_type: "Explore",
+    ts: 10_002,
+  });
+  // `clean` disposition — never triggers SILENT_STREAM_CUT; it only re-stamps
+  // updated_at to 10_100.
+  insertEvent({
+    hook_event: "SubagentTurn",
+    agent_id: "sub-act",
+    ts: 10_100,
+    data: JSON.stringify({ disposition: "clean" }),
+  });
+  // 148s past spawn, 50s past last activity → within bound on `updated_at`.
+  insertEvent({ hook_event: "Stop", ts: 10_150 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+});
+
+test("Stop guard: open-`ok` background sub holds the parent `working`, then SubagentStop releases it", () => {
+  // PostToolUse:Agent flips the turn to `ok` BEFORE its SubagentStop lands — a
+  // backgrounded sub still in flight (NULL `duration_ms`). The canonical
+  // open-turn predicate keeps the parent `working` across a Stop; once
+  // SubagentStop stamps `duration_ms`, the row is finished and the next Stop
+  // closes the job.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-bg",
+    agent_type: "Explore",
+  });
+  // Bridge fold flips turn-0 to `ok` (duration_ms stays NULL).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_bg",
+    subagent_agent_id: "sub-bg",
+    data: JSON.stringify({
+      tool_use_id: "toolu_bg",
+      tool_response: { agentId: "sub-bg" },
+    }),
+  });
+  // Mid-yield Stop while the open-`ok` sub is in flight — swallowed.
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  const openRow = db
+    .query(
+      "SELECT status, duration_ms FROM subagent_invocations WHERE agent_id = 'sub-bg'",
+    )
+    .get() as { status: string; duration_ms: number | null };
+  expect(openRow.status).toBe("ok");
+  expect(openRow.duration_ms).toBeNull();
+  // SubagentStop closes the open turn (duration_ms IS NULL gate finds the `ok`
+  // row), then the parent's real Stop applies.
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-bg" });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+});
+
+test("ApiError guard: a STALE (>120s) in-flight sub no longer suppresses the state flip", () => {
+  // The pre-fn-1008 ApiError guard had NO freshness bound — an orphan
+  // SubagentStart would suppress the flip forever. Now it routes through the
+  // same `updated_at` bound as Stop: 500s past spawn with no activity → release.
+  insertEvent({ hook_event: "SessionStart", ts: 30_000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 30_001 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-stale",
+    agent_type: "Explore",
+    ts: 30_002,
+  });
+  insertEvent({
+    hook_event: "ApiError",
+    data: JSON.stringify({ kind: "rate_limit" }),
+    ts: 30_502,
+  });
+  drainAll();
+  const job = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  // Stale → the state flips to `stopped` (the guard released)...
+  expect(job.state).toBe("stopped");
+  // ...and the annotation pair stamps unconditionally regardless.
+  expect(job.last_api_error_at).not.toBeNull();
+  expect(job.last_api_error_kind).toBe("rate_limit");
+});
+
+test("ApiError guard: a collapse-masked running orphan does NOT suppress the flip", () => {
+  // The pre-fn-1008 ApiError guard had NO same-name collapse either — a bare
+  // EXISTS(status='running') would have found the orphan turn_seq=1 and
+  // suppressed. Now the helper masks it behind the later same-name finished
+  // turn_seq=2, so the flip lands while the pair still stamps.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit" });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "orphan",
+      1,
+      1_000,
+      null,
+      "Explore",
+      null,
+      0,
+      "running",
+      null,
+      0,
+      1_000,
+    ],
+  );
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "newer",
+      2,
+      2_000,
+      null,
+      "Explore",
+      null,
+      0,
+      "ok",
+      5_000,
+      0,
+      2_000,
+    ],
+  );
+  insertEvent({
+    hook_event: "ApiError",
+    data: JSON.stringify({ kind: "rate_limit" }),
+  });
+  drainAll();
+  const job = db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-a") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(job.state).toBe("stopped");
+  expect(job.last_api_error_at).not.toBeNull();
+  expect(job.last_api_error_kind).toBe("rate_limit");
+});
+
+test("sweep: SessionEnd closes a backgrounded open-`ok` orphan to `unknown` but never clobbers a finished `ok`", () => {
+  // The sweep widened from a bare `status='running'` to the full open-turn
+  // predicate, so a backgrounded `ok` orphan (NULL `duration_ms`) is now closed
+  // to `unknown` on a terminal job. The `duration_ms IS NULL` clause is
+  // load-bearing: a FINISHED `ok` (non-null `duration_ms`) must NOT be clobbered.
+  insertEvent({ hook_event: "SessionStart" });
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-open",
+      0,
+      1_000,
+      null,
+      "Explore",
+      null,
+      0,
+      "ok",
+      null,
+      0,
+      1_000,
+    ],
+  );
+  db.run(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, tool_use_id, subagent_type,
+        description, prompt_chars, status, duration_ms, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "sess-a",
+      "agent-done",
+      0,
+      1_000,
+      null,
+      "Build",
+      null,
+      0,
+      "ok",
+      5_000,
+      0,
+      1_000,
+    ],
+  );
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  const openRow = db
+    .query(
+      "SELECT status, duration_ms FROM subagent_invocations WHERE agent_id = 'agent-open'",
+    )
+    .get() as { status: string; duration_ms: number | null };
+  const doneRow = db
+    .query(
+      "SELECT status, duration_ms FROM subagent_invocations WHERE agent_id = 'agent-done'",
+    )
+    .get() as { status: string; duration_ms: number | null };
+  expect(openRow.status).toBe("unknown");
+  expect(openRow.duration_ms).toBeNull();
+  expect(doneRow.status).toBe("ok"); // finished — never clobbered
+  expect(doneRow.duration_ms).toBe(5_000);
+});
+
+test("fn-1008: from-scratch re-fold of an open-`ok` sweep is byte-deterministic", () => {
+  // The new open-turn guard + sweep are pure reads over folded-state-at-fold-
+  // time (event.ts, never wall-clock), so a from-scratch re-fold reproduces the
+  // same final projection. Exercises the open-`ok` → swept-`unknown` path.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-rf-ok",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu_rf",
+    subagent_agent_id: "sub-rf-ok",
+    data: JSON.stringify({
+      tool_use_id: "toolu_rf",
+      tool_response: { agentId: "sub-rf-ok" },
+    }),
+  });
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  const firstStatus = (
+    db
+      .query(
+        "SELECT status FROM subagent_invocations WHERE agent_id = 'sub-rf-ok'",
+      )
+      .get() as { status: string }
+  ).status;
+  const firstJob = getJob();
+  expect(firstStatus).toBe("unknown");
+  expect(firstJob?.state).toBe("ended");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM subagent_invocations");
+  drainAll();
+  const reStatus = (
+    db
+      .query(
+        "SELECT status FROM subagent_invocations WHERE agent_id = 'sub-rf-ok'",
+      )
+      .get() as { status: string }
+  ).status;
+  const reJob = getJob();
+  expect(reStatus).toBe(firstStatus);
+  expect(reJob?.state).toBe(firstJob?.state);
   expect(reJob?.last_event_id).toBe(firstJob?.last_event_id);
 });
 

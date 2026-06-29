@@ -3373,7 +3373,12 @@ test("subagent_invocations re-fold is byte-identical with new arms (failed/unkno
       tool_response: { agentId: "agent-supY" },
     }),
   });
-  // Lifecycle sweep — open subagent + SessionEnd → 'unknown'.
+  // Lifecycle sweep — open subagents + SessionEnd → 'unknown'. fn-1008: the
+  // sweep now matches the full open-turn predicate, so BOTH the bare `running`
+  // orphan (agent-swp) AND the open-`ok` survivor whose SubagentStop never
+  // landed (agent-supY, flipped to `ok` with NULL duration_ms by its
+  // PostToolUse:Agent) are closed to `unknown`. The `superseded` peer
+  // (agent-supX) is terminal and never swept.
   insertEvent({
     hook_event: "SubagentStart",
     agent_id: "agent-swp",
@@ -3405,10 +3410,11 @@ test("subagent_invocations re-fold is byte-identical with new arms (failed/unkno
       r.status,
     ]),
   );
-  expect(byAgent["agent-cln"]).toBe("ok");
+  expect(byAgent["agent-cln"]).toBe("ok"); // closed via SubagentStop (finished)
   expect(byAgent["agent-fld"]).toBe("failed");
   expect(byAgent["agent-supX"]).toBe("superseded");
-  expect(byAgent["agent-supY"]).toBe("ok");
+  // fn-1008: open-`ok` orphan (no SubagentStop) swept to `unknown` on SessionEnd.
+  expect(byAgent["agent-supY"]).toBe("unknown");
   expect(byAgent["agent-swp"]).toBe("unknown");
 });
 

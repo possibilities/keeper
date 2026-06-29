@@ -199,8 +199,11 @@ collection), `subagent_invocations` (the per-job timeline of Task-tool
 subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
-on close (NULL on rows that never observed a SubagentStop — `superseded`
-peers + lifecycle-swept `unknown` orphans)), `git` (per-watched-worktree
+on close (NULL while the turn is still OPEN — including an `ok` row whose
+PostToolUse:Agent flipped its status before its SubagentStop landed, i.e. a
+backgrounded sub still in flight — and on `superseded` peers + lifecycle-swept
+`unknown` orphans; the canonical in-flight test is NULL `duration_ms` AND status
+in running|ok)), `git` (per-watched-worktree
 git status — watch gate is `.keeper present || dirty || ahead of upstream > 0`,
 recomputed each reconcile (epic fn-690); branch, ahead/behind, and a file-centric `dirty_files` list where
 each entry carries a per-file `attributions[]` array with `source` badges
@@ -3753,7 +3756,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id FROM events WHERE plan_op IS NOT NULL AND plan_epic_id = 'fn-628-contention-review-tier-2-index-pack' UNION SELECT session_id FROM events WHERE plan_op IS NOT NULL AND plan_target = 'fn-628-contention-review-tier-2-index-pack'"
 
-# Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|failed|unknown|superseded, duration_ms populated on SubagentStop (NULL on rows never closed — superseded peers + lifecycle-swept unknown orphans):
+# Recent per-job Task-tool subagent timeline — one row per PreToolUse:Agent paired with its PostToolUse:Agent (and lifecycle Start/Stop), status running|ok|failed|unknown|superseded, duration_ms populated on SubagentStop (NULL while the turn is still OPEN — including an `ok` row whose PostToolUse:Agent landed before its SubagentStop, a backgrounded sub still in flight — plus superseded peers + lifecycle-swept unknown orphans; canonical in-flight test = NULL duration_ms AND status in running|ok):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, turn_seq, subagent_type, status, duration_ms, prompt_chars, tool_use_id FROM subagent_invocations ORDER BY job_id ASC, turn_seq ASC LIMIT 20"
 

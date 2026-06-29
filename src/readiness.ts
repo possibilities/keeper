@@ -54,6 +54,7 @@ import {
   resolveEpicDep as resolveEpicDepLeaf,
 } from "./epic-deps";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
+import { isOpenTurnRow } from "./subagent-invocations";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 
 // Re-export so existing import sites keep working. The canonical home is
@@ -286,13 +287,13 @@ export type BlockReason =
  * session in motion, distinct from a `blocked` verdict (stuck waiting on a
  * dependency, repo state, or mutex).
  *
- * `sub-agent-stale` is the visibility affordance for a still-`running`
- * sub-agent whose age exceeds `SUBAGENT_STALENESS_SEC`. It SUPPLEMENTS the
- * reducer's bounded Stop guard: the reducer releases the worker's `working`
- * state once Stop's `ts` is past the same window, clearing predicate 5; a
- * sub-agent that survives because Stop never fired keeps predicate 6 firing
- * indefinitely, so this variant surfaces the possibly-stuck row on the board
- * instead of a silently-wedged autopilot.
+ * `sub-agent-stale` is a PURE visibility affordance for an open-turn sub-agent
+ * whose age exceeds `SUBAGENT_STALENESS_SEC`. Predicate 6 itself is deliberately
+ * UNBOUNDED (an open sub keeps it firing no matter how old) so a slow-but-alive
+ * sub is never re-dispatched; this variant only re-colors the board pill so a
+ * human can see WHICH row is holding the gate. It no longer tracks the reducer's
+ * release window — the reducer's Stop/ApiError guards now release on last-activity
+ * `updated_at`, while this pill ages on the frozen spawn `ts`.
  */
 export type RunningReason =
   | { kind: "job-running" }
@@ -302,13 +303,14 @@ export type RunningReason =
   | { kind: "monitor-stale" };
 
 /**
- * Staleness threshold for the `sub-agent-stale` variant. A still-`running`
- * sub-agent whose `ts` is older than the injected `now` by strictly more than
- * this renders as `sub-agent-stale`. Value mirrors `MAX_STOP_YIELD_GAP_SEC`
- * in `src/reducer.ts` (the bounded Stop guard window) so the board pill and
- * the autopilot release-window agree on the same row population; held as a
- * local constant (not imported) to keep readiness leaf-ish — drifting one
- * surfaces in `test/reducer.test.ts` + `test/readiness.test.ts` together.
+ * Staleness threshold for the `sub-agent-stale` board pill (a pure visibility
+ * affordance — see {@link RunningReason}). An open-turn sub-agent whose spawn
+ * `ts` is older than the injected `now` by strictly more than this re-colors to
+ * `sub-agent-stale`. This is NOT a release window: predicate 6 stays in-flight
+ * regardless, and the reducer's Stop/ApiError guards release on last-activity
+ * `updated_at`, not on this `ts`-anchored pill — so the two no longer track the
+ * same population. The 120s value is kept only as a reasonable "looks stuck"
+ * cutoff. Held as a local constant (not imported) to keep readiness leaf-ish.
  *
  * Determinism: `now - inv.ts > SUBAGENT_STALENESS_SEC` reads the injected
  * `now`, NOT `Date.now()`. This is a CLIENT computation over the live
@@ -543,11 +545,16 @@ export function computeReadiness(
   const matchedPendingKeys = new Set<string>();
 
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
-  // Filtered to `status === "running"` at index time — the only status that
-  // can block; ok/error rows pass silently.
+  // Filtered to the canonical open-turn predicate (`isOpenTurnRow`: NULL
+  // `duration_ms` AND status running|ok) at index time — a backgrounded `ok` sub
+  // (NULL `duration_ms`) is still in flight and must block, while a FINISHED `ok`
+  // (non-null `duration_ms`) and the terminal statuses pass silently. NO time /
+  // staleness bound here (deliberate asymmetry vs. the reducer's bounded guards):
+  // a long Bash/build freezes `updated_at` by emitting no SubagentTurn, so a
+  // readiness bound would re-dispatch a slow-but-alive sub.
   const subRunningByJobId = new Map<string, SubagentInvocation[]>();
   for (const inv of subagentInvocations) {
-    if (inv.status !== "running") {
+    if (!isOpenTurnRow(inv)) {
       continue;
     }
     const arr = subRunningByJobId.get(inv.job_id);

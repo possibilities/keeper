@@ -720,8 +720,9 @@ export function renderTmuxFocusPill(
  * comma-joined block that
  * appears only when there's something to say:
  *   - `×N` when the group folded more than one row
- *   - `N stuck` when one or more non-surviving rows are still
- *     `status='running'` (orphans whose `SubagentStop` never landed)
+ *   - `N stuck` when one or more non-surviving rows are still in flight
+ *     (open turn: NULL `duration_ms`, status running|ok — orphans whose
+ *     `SubagentStop` never landed)
  * A clean group of one row renders with no parenthesized block.
  * `indent` is supplied per caller: embedded jobs (already three-
  * space indented inside an epic block) get six spaces; bottom-
