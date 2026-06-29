@@ -168,6 +168,7 @@ import type {
   WakeMessage,
   WakeWorkerData,
 } from "./wake-worker";
+import { worktreePathFor } from "./worktree-plan";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
 const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
@@ -832,6 +833,281 @@ export async function runBlockEscalationSweep(
       result = { outcome: "send_failed", detail: "notify threw" };
     }
     deps.mintAttempted(row.epic_id, row.task_id, result.outcome);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// fn-1009 — daemon worktree-merge-conflict close-escalation producer
+// ---------------------------------------------------------------------------
+
+/**
+ * The EXACT leading reason token a stuck worktree fan-in close mints (the close-sink
+ * provision pre-merge content conflict — `worktree-merge-conflict: merging <source>
+ * into <base> — <stderr>`). The escalation gate matches the leading token (the text
+ * up to the first `:`) against this EXACTLY — never a `worktree-merge` prefix — so
+ * the excluded `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
+ * `worktree-finalize-non-fast-forward` / `worktree-recover*` siblings never escalate.
+ */
+export const MERGE_ESCALATION_REASON_TOKEN = "worktree-merge-conflict";
+
+/**
+ * A sticky `worktree-merge-conflict` close failure row — the merge-escalation
+ * sweep's current-state working set, read straight off `dispatch_failures`
+ * (bounded by the number of concurrently-stuck closes, never a history scan). The
+ * `id` is the close-row key (the epic id; `verb` is always `close`).
+ */
+export interface PendingMergeEscalation {
+  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
+  id: string;
+  /** The close failure reason — the `worktree-merge-conflict: …` string to parse. */
+  reason: string;
+  /** The close row's `dir` — the repo root, for {@link worktreePathFor}. */
+  dir: string | null;
+}
+
+/** The outcome the producer records on the `MergeEscalationAttempted` event. A
+ *  TERMINAL `sent` / `queued_for_wake` stamps the `merge_escalated_at` once-marker
+ *  (task .1's fold); `send_failed` is NON-terminal — the row stays re-sweepable. */
+export type MergeEscalationOutcome = "sent" | "queued_for_wake" | "send_failed";
+
+/** The result of the shared `planner@<epic>` bus-notify core — the send + (on the
+ *  offline-creator path) wake. Fail-open by contract: every error degrades to
+ *  `send_failed`, never throws into a sweep. Shared by the block + merge producers. */
+export interface PlannerNotifyResult {
+  outcome: MergeEscalationOutcome;
+  detail: string;
+}
+
+/**
+ * Select every sticky `worktree-merge-conflict` close failure that has NOT yet been
+ * escalated. Reads `dispatch_failures` on the passed connection — production passes
+ * MAIN's writable connection so the read is sequenced inside the same writer that
+ * mints. The token filter is the SQL twin of {@link shouldEscalateMergeConflict}:
+ * the leading token (text up to the FIRST `:`) must be EXACTLY
+ * {@link MERGE_ESCALATION_REASON_TOKEN}, so a `worktree-merge-lock-timeout` /
+ * `worktree-merge-local-timeout` / `worktree-finalize-non-fast-forward` /
+ * `worktree-recover*` row never matches. `merge_escalated_at IS NULL` is the
+ * escalate-once gate — a stamped row (task .1's terminal fold) drops out.
+ */
+export function selectPendingMergeEscalations(
+  db: Database,
+): PendingMergeEscalation[] {
+  return db
+    .query(
+      `SELECT id, reason, dir FROM dispatch_failures
+         WHERE verb = 'close'
+           AND merge_escalated_at IS NULL
+           AND reason IS NOT NULL
+           AND instr(reason, ':') > 0
+           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
+    )
+    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
+}
+
+/**
+ * The escalation gate: escalate IFF the reason's leading token (the text up to the
+ * first `:`) is EXACTLY {@link MERGE_ESCALATION_REASON_TOKEN}. Defense-in-depth over
+ * {@link selectPendingMergeEscalations}'s SQL filter (re-applied per row in the
+ * sweep). Pure; never throws; null/colon-less reason → false. The exact-token match
+ * is what keeps the `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
+ * `worktree-finalize-non-fast-forward` / `worktree-recover*` siblings OUT.
+ */
+export function shouldEscalateMergeConflict(reason: string | null): boolean {
+  if (reason == null) return false;
+  const colon = reason.indexOf(":");
+  if (colon < 0) return false;
+  return reason.slice(0, colon).trim() === MERGE_ESCALATION_REASON_TOKEN;
+}
+
+/**
+ * Parse the `<source>` + `<base>` branches out of a
+ * `worktree-merge-conflict: merging <source> into <base> — <stderr>` reason. Splits
+ * on the FIRST ` — ` em-dash (so a stderr that happens to contain one can't poison
+ * the branch parse), then lifts `<source>` / `<base>` from the head via
+ * `merging … into …`. Returns null on any structural miss — the body builder
+ * degrades a parse-miss to a human-actionable brief rather than throwing the sweep.
+ * Pure.
+ */
+function parseMergeConflictReason(
+  reason: string,
+): { source: string; base: string } | null {
+  const dash = reason.indexOf(" — ");
+  const head = dash >= 0 ? reason.slice(0, dash) : reason;
+  const m = head.match(
+    /^\s*worktree-merge-conflict:\s*merging\s+(\S.*?)\s+into\s+(\S.*?)\s*$/,
+  );
+  if (m == null) return null;
+  return { source: m[1], base: m[2] };
+}
+
+/**
+ * Build the resolve+unstick brief the merge-escalation producer sends to
+ * `planner@<epic>`. Parses the source/base branches out of the reason and derives
+ * the base worktree path via {@link worktreePathFor} (`row.dir` is the repo root).
+ * The recipe: `cd <worktree>` → `git merge --no-ff <source>` (NEVER `--squash` /
+ * rebase — a single-parent commit re-conflicts on the next fan-in) → resolve merging
+ * BOTH intents (never pick a side) → run the epic's tests/build → commit the merge
+ * commit → `keeper autopilot retry close::<epic>`, plus the escalate-to-human
+ * guardrail for a semantically-dense conflict. A parse-miss (or a missing repo dir)
+ * DEGRADES to a still-human-actionable manual body — the sweep never throws on a
+ * reason it can't parse. The free-text reason rides as a body line, never a shell
+ * arg (the notify helper passes the whole body via stdin). Pure.
+ */
+export function buildMergeEscalationBody(args: {
+  epicId: string;
+  reason: string;
+  repoDir: string | null;
+}): string {
+  const epic = args.epicId;
+  const parsed = parseMergeConflictReason(args.reason);
+  const hasRepo = args.repoDir != null && args.repoDir !== "";
+  if (parsed == null || !hasRepo) {
+    // Parse-miss / no repo dir → a human-actionable manual body, never a throw.
+    return [
+      `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict and needs you.`,
+      ``,
+      `The autopilot will NOT auto-retry this close — only you can resolve it, then`,
+      `unstick the board.`,
+      ``,
+      `Resolve \`close::${epic}\` by hand: open the epic's base worktree, RE-RUN the`,
+      `failed \`git merge --no-ff <source>\` (NOT \`--squash\` or rebase — a`,
+      `single-parent commit re-conflicts on the next fan-in), resolve the conflict by`,
+      `merging BOTH sides (never pick one side and drop the other), run the epic's`,
+      `tests/build, commit the merge commit, then unstick the board:`,
+      `\`keeper autopilot retry close::${epic}\`.`,
+      ``,
+      `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
+      `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
+      `A confident-but-wrong merge is worse than a stuck close.`,
+      ``,
+      `Failure reason:`,
+      args.reason.trim(),
+    ].join("\n");
+  }
+  const worktree = worktreePathFor(args.repoDir as string, parsed.base);
+  return [
+    `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict and needs you.`,
+    ``,
+    `The autopilot will NOT auto-retry this close — only you can resolve it, then`,
+    `unstick the board.`,
+    ``,
+    `Resolve it:`,
+    `  1. cd ${worktree}`,
+    `  2. git merge --no-ff ${parsed.source}`,
+    `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the`,
+    `     next fan-in; \`--no-ff\` makes ${parsed.source} an ancestor so the retry`,
+    `     merge no-ops. The base worktree is left CLEAN after the abort, so RE-RUN`,
+    `     the merge to recreate the conflict markers.)`,
+    `  3. Resolve the conflict by merging BOTH intents — never pick one side and`,
+    `     drop the other.`,
+    `  4. Run the epic's tests/build; passing tests are necessary, not sufficient.`,
+    `  5. Commit the merge commit.`,
+    `  6. keeper autopilot retry close::${epic}`,
+    ``,
+    `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
+    `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
+    `A confident-but-wrong merge is worse than a stuck close.`,
+    ``,
+    `Failure reason:`,
+    args.reason.trim(),
+  ].join("\n");
+}
+
+/** Injectable dependency surface for {@link runMergeEscalationSweep}. Mirrors
+ *  {@link BlockEscalationSweepDeps}'s fail-open injectable-deps discipline so the
+ *  producer is testable with synthetic rows + an injected notify, and never throws
+ *  into the daemon loop. */
+export interface MergeEscalationSweepDeps {
+  /** The current-state pending working set (DELEGATES to
+   *  {@link selectPendingMergeEscalations} in production). */
+  readonly selectPending: () => PendingMergeEscalation[];
+  /** Re-read that the sticky close row for `id` is STILL present with
+   *  `merge_escalated_at IS NULL` — checked immediately before the send to narrow
+   *  the clear-mid-sweep window (a `retry_dispatch` between select and send drops
+   *  the row). Reads the live projection on the writable connection in production. */
+  readonly stillPending: (id: string) => boolean;
+  /** Notify `planner@<epic>` with the prebuilt body (and wake on the offline-creator
+   *  path). Async + fail-open. */
+  readonly notifyPlanner: (
+    target: string,
+    body: string,
+  ) => Promise<PlannerNotifyResult>;
+  /** Mint a `MergeEscalationAttempted{outcome}` synthetic event. Task .1's fold
+   *  stamps `merge_escalated_at` ONLY on a terminal outcome; it NEVER clears the
+   *  sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
+  readonly mintAttempted: (id: string, outcome: MergeEscalationOutcome) => void;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one daemon merge-escalation sweep — the producer half of the escalate-once
+ * loop for a stuck worktree fan-in close. Walk the sticky `worktree-merge-conflict`
+ * close rows, gate each by {@link shouldEscalateMergeConflict} (defense-in-depth over
+ * the selector's SQL filter), re-read that the row is STILL pending immediately
+ * before the send (narrowing the clear-mid-sweep window), notify `planner@<epic>`
+ * with the resolve+unstick brief, then mint `MergeEscalationAttempted{outcome}`.
+ *
+ * NOTIFIES ONLY — the sweep NEVER mints `DispatchCleared` and never clears the
+ * sticky row; only `retry_dispatch` does. A TERMINAL `sent` / `queued_for_wake`
+ * stamps the once-marker (task .1's fold), so the next sweep's selector drops the
+ * row; a `send_failed` leaves the marker NULL so the row stays re-sweepable. Each
+ * close failure keys on its own epic (`close::<epic>`), so there is one row per epic
+ * and no coalescing is needed. NEVER throws — every helper edge degrades to a
+ * recorded outcome (mirrors {@link runBlockEscalationSweep}). The spawn lives ONLY
+ * here in the producer, never reachable from `applyEvent`, so a re-fold never
+ * re-fires a send.
+ */
+export async function runMergeEscalationSweep(
+  deps: MergeEscalationSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let pending: PendingMergeEscalation[];
+  try {
+    pending = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: merge-escalation sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (pending.length === 0) return;
+
+  for (const row of pending) {
+    // Defense-in-depth gate: the selector already filters by the exact token, but
+    // re-apply the pure gate so an injected/loosened selector can never fan out a
+    // non-escalatable reason.
+    if (!shouldEscalateMergeConflict(row.reason)) continue;
+    // Re-read immediately before the send: a `retry_dispatch` that cleared the row
+    // (or task .1's fold that stamped the marker) between select and send means
+    // there is nothing left to escalate — skip without minting.
+    if (!deps.stillPending(row.id)) continue;
+
+    const target = `planner@${row.id}`;
+    const body = buildMergeEscalationBody({
+      epicId: row.id,
+      reason: row.reason,
+      repoDir: row.dir,
+    });
+    let result: PlannerNotifyResult;
+    try {
+      result = await deps.notifyPlanner(target, body);
+    } catch (err) {
+      // The helper is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a terminal outcome and never aborts the sweep.
+      note(
+        `# warn: merge-escalation notify threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      result = { outcome: "send_failed", detail: "notify threw" };
+    }
+    // Mint the attempt regardless of outcome: task .1's fold stamps the once-marker
+    // ONLY on a terminal `sent` / `queued_for_wake`, so a `send_failed` folds to a
+    // no-op and the row stays re-sweepable next tick.
+    deps.mintAttempted(row.id, result.outcome);
   }
 }
 
@@ -4621,6 +4897,66 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
+   * Mint one synthetic `MergeEscalationAttempted` event onto the writable
+   * connection — the merge-escalation producer's only write path into the
+   * `dispatch_failures.merge_escalated_at` once-marker (it never UPDATEs the
+   * projection directly; task .1's reducer fold owns that, stamping the marker ONLY
+   * on a terminal outcome and NEVER clearing the sticky row). The close-row `id`
+   * rides the entity-key overload on `session_id` so a re-fold correlates the row
+   * WITHOUT re-parsing `data`; the full `{ id, outcome }` payload also rides `data`
+   * for the strict fold parser. NON-FATAL on insert failure — the next heartbeat
+   * sweep re-attempts (the marker stays NULL on a non-terminal/failed mint).
+   */
+  function mintMergeEscalationEvent(
+    id: string,
+    outcome: MergeEscalationOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "MergeEscalationAttempted",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] MergeEscalationAttempted mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Read the task's `blocked_reason` from its plan state file
    * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`). Producer-side fs
    * read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
@@ -4653,30 +4989,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Notify one `planner@<epic>` over the bus that a plan task is blocked, then
-   * wake the planner ONLY when the send returns `queued_for_wake` (the
-   * known-but-offline creator path). Both legs spawn the `keeper` CLI ASYNC
-   * (`Bun.spawn`, NEVER `Bun.spawnSync` — a sync spawn would block the daemon main
-   * loop). The body goes in via STDIN (`keeper bus chat send <target> -`) so the
-   * free-text `blocked_reason` is NEVER interpolated into a shell arg. Mirrors
-   * `runWake`'s fail-open discipline — every error degrades to `send_failed`,
-   * never throws into the sweep.
+   * Notify one `planner@<epic>` over the bus with a prebuilt body, then wake the
+   * planner ONLY when the send returns `queued_for_wake` (the known-but-offline
+   * creator path). Both legs spawn the `keeper` CLI ASYNC (`Bun.spawn`, NEVER
+   * `Bun.spawnSync` — a sync spawn would block the daemon main loop). The body goes
+   * in via STDIN (`keeper bus chat send <target> -`) so free-text body lines are
+   * NEVER interpolated into a shell arg. Mirrors `runWake`'s fail-open discipline —
+   * every error degrades to `send_failed`, never throws into a sweep. SHARED by the
+   * block + merge escalation producers (body assembly + target derivation live in
+   * each producer's wrapper).
    */
-  async function notifyPlannerOfBlock(args: {
-    epicId: string;
-    taskId: string;
-    category: string;
-    blockedReason: string;
-    repo: string;
-  }): Promise<BlockEscalationSendResult> {
-    const target = `planner@${args.epicId}`;
-    const body = buildBlockEscalationBody({
-      epicId: args.epicId,
-      taskId: args.taskId,
-      category: args.category,
-      blockedReason: args.blockedReason,
-      repo: args.repo,
-    });
+  async function notifyPlanner(
+    target: string,
+    body: string,
+  ): Promise<PlannerNotifyResult> {
     // `[bun, cli/keeper.ts]` — the same resolved transport the autopilot launcher
     // uses, minus the `agent` suffix, so the bus subcommand rides directly.
     const cliPrefix = [process.execPath, resolveKeeperAgentPath()];
@@ -4706,7 +5032,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       };
     } catch (err) {
       console.error(
-        `[keeperd] block-escalation bus send spawn threw for ${target} (non-fatal): ${
+        `[keeperd] planner bus send spawn threw for ${target} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -4738,7 +5064,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       await wakeProc.exited;
     } catch (err) {
       console.error(
-        `[keeperd] block-escalation bus wake spawn threw for ${target} (non-fatal): ${
+        `[keeperd] planner bus wake spawn threw for ${target} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -4747,6 +5073,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       outcome: "queued_for_wake",
       detail: `queued_for_wake for ${target}`,
     };
+  }
+
+  /**
+   * Notify one `planner@<epic>` that a plan task is BLOCKED — derives the target +
+   * assembles the block-specific body, then delegates the send/wake core to the
+   * shared {@link notifyPlanner}. Fail-open by contract.
+   */
+  async function notifyPlannerOfBlock(args: {
+    epicId: string;
+    taskId: string;
+    category: string;
+    blockedReason: string;
+    repo: string;
+  }): Promise<BlockEscalationSendResult> {
+    const target = `planner@${args.epicId}`;
+    const body = buildBlockEscalationBody({
+      epicId: args.epicId,
+      taskId: args.taskId,
+      category: args.category,
+      blockedReason: args.blockedReason,
+      repo: args.repo,
+    });
+    return notifyPlanner(target, body);
   }
 
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
@@ -4877,6 +5226,55 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     void runBlockEscalationSweepTick().catch((err) => {
       console.error(
         `[keeperd] block-escalation sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS);
+
+  // Producer-side merge-escalation sweep (fn-1009), sibling to the block-escalation
+  // sweep. Each heartbeat tick walks the sticky `worktree-merge-conflict` close
+  // rows (a fan-in content conflict the autopilot deliberately never auto-retries),
+  // sends `planner@<epic>` the resolve+unstick brief over the bus, and mints
+  // `MergeEscalationAttempted{outcome}`. NOTIFIES ONLY — it never clears the sticky
+  // row; only `retry_dispatch` does. A terminal `sent` / `queued_for_wake` stamps
+  // the `merge_escalated_at` once-marker (task .1's fold), so a daemon escalates a
+  // given stuck close ONCE. All wall-clock + spawn lives HERE in the producer, never
+  // in a fold; the spawn lives only here, so a re-fold never re-fires a notify.
+  //
+  // Rides the SAME 60s heartbeat as the block tick (a stuck close is not
+  // latency-sensitive on the order of seconds). `void` + `.catch` for the same
+  // reason as the block tick: the async notify must not block the heartbeat, and
+  // the sweep is fail-open by contract.
+  async function runMergeEscalationSweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    await runMergeEscalationSweep({
+      selectPending: () => selectPendingMergeEscalations(db),
+      stillPending: (id) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NULL LIMIT 1",
+              )
+              .get(id) != null
+          );
+        } catch {
+          // A point-read failure (unexpected) conservatively skips THIS tick's send
+          // for the row — the selector already succeeded, the marker stays NULL, and
+          // the next heartbeat re-sweeps. Never a false escalation.
+          return false;
+        }
+      },
+      notifyPlanner: (target, body) => notifyPlanner(target, body),
+      mintAttempted: (id, outcome) => mintMergeEscalationEvent(id, outcome),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const mergeEscalationSweepTimer = setInterval(() => {
+    void runMergeEscalationSweepTick().catch((err) => {
+      console.error(
+        `[keeperd] merge-escalation sweep tick threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -5637,6 +6035,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
     clearInterval(blockEscalationSweepTimer);
+    clearInterval(mergeEscalationSweepTimer);
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(retentionTimer);
     clearInterval(mutationPathBackfillTimer);
