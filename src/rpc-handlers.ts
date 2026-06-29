@@ -42,6 +42,7 @@
  * any future SQL-mutating RPC.
  */
 
+import { isAbsolute } from "node:path";
 import {
   parseDispatchKey as parseDispatchKeyResult,
   type RetryDispatchVerb,
@@ -539,6 +540,12 @@ export interface RequestHandoffParams {
   title: string | null;
   /** The resolved target tmux session the handoff-ee launches into. */
   target_session: string;
+  /** The resolved ABSOLUTE directory the handoff-ee launches in (the CLI expands
+   *  `~` + resolves relatives against the caller's cwd, defaulting to it). The
+   *  daemon re-guards the absolute-path shape (the socket is the trust boundary).
+   *  Nullable for a hand-crafted RPC / pre-feature replay; a null/empty value
+   *  coalesces to keeperd's cwd at launch. */
+  target_dir: string | null;
   /** Raw initiator coords — always carried even when the pane isn't yet folded. */
   initiator_session: string | null;
   initiator_pane: string | null;
@@ -589,6 +596,16 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
     return v;
   };
   const title = optStr(obj.title, "title");
+  // The daemon-side absolute-path guard: the CLI always resolves `--dir` to an
+  // absolute path, so a non-empty relative value at the trust boundary is a
+  // hand-crafted/buggy RPC. Reject it rather than launch into an ambiguous
+  // (keeperd-relative) directory. A null/empty value is tolerated (→ keeperd cwd).
+  const target_dir = optStr(obj.target_dir, "target_dir");
+  if (target_dir !== null && target_dir !== "" && !isAbsolute(target_dir)) {
+    throw new BadParamsError(
+      "request_handoff: `target_dir` must be an absolute path",
+    );
+  }
   const initiator_session = optStr(obj.initiator_session, "initiator_session");
   const initiator_pane = optStr(obj.initiator_pane, "initiator_pane");
   return {
@@ -596,6 +613,7 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
     doc_path: obj.doc_path,
     title,
     target_session: obj.target_session,
+    target_dir,
     initiator_session,
     initiator_pane,
   };

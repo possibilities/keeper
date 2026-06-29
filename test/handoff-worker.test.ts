@@ -35,6 +35,7 @@ function row(over: Partial<HandoffDispatchRow>): HandoffDispatchRow {
     status: "requested",
     doc: "brief",
     target_session: "work",
+    target_dir: null,
     claimed_at: null,
     never_bound_count: 0,
     ...over,
@@ -135,7 +136,7 @@ test("buildHandoffPrompt with no prefix is just the pointer", () => {
 
 interface Recorder {
   dispatching: number;
-  launches: Array<{ session: string; spec: LaunchSpec }>;
+  launches: Array<{ session: string; cwd: string; spec: LaunchSpec }>;
   failed: HandoffLaunchFailedPayload[];
 }
 
@@ -153,8 +154,8 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
       rec.dispatching++;
       return { ok: true };
     },
-    launch: async (session, _cwd, spec): Promise<LaunchResult> => {
-      rec.launches.push({ session, spec });
+    launch: async (session, cwd, spec): Promise<LaunchResult> => {
+      rec.launches.push({ session, cwd, spec });
       return { ok: true };
     },
     emitLaunchFailed: (p): void => {
@@ -201,6 +202,35 @@ test("dispatchOneHandoff launches into the row's target_session", async () => {
     deps,
   );
   expect(rec.launches[0]?.session).toBe("my-session");
+});
+
+test("dispatchOneHandoff uses the row's target_dir as the launch cwd (per-row wins over the global)", async () => {
+  const { deps, rec } = makeDeps({});
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-dir", target_dir: "/Users/dev/code/other" }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.cwd).toBe("/Users/dev/code/other");
+});
+
+test("dispatchOneHandoff falls back to the global cwd when target_dir is null or empty", async () => {
+  const { deps, rec } = makeDeps({});
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-null", target_dir: null }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-empty", target_dir: "" }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.cwd).toBe("/keeperd-cwd");
+  expect(rec.launches[1]?.cwd).toBe("/keeperd-cwd");
 });
 
 test("an ack {ok:false} aborts WITHOUT launching (no double-dispatch window)", async () => {

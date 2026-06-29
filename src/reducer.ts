@@ -4580,6 +4580,9 @@ interface HandoffRequestedPayload {
   doc: string;
   title: string | null;
   target_session: string | null;
+  /** Resolved ABSOLUTE launch directory (null = pre-feature event / no `--dir`
+   *  → the dispatcher coalesces to keeperd's cwd). */
+  target_dir: string | null;
   initiator_session: string | null;
   initiator_pane: string | null;
   initiator_job_id: string | null;
@@ -4615,6 +4618,7 @@ function extractHandoffRequestedPayload(
       doc: parsed.doc,
       title: str(parsed.title),
       target_session: str(parsed.target_session),
+      target_dir: str(parsed.target_dir),
       initiator_session: str(parsed.initiator_session),
       initiator_pane: str(parsed.initiator_pane),
       initiator_job_id: str(parsed.initiator_job_id),
@@ -4655,14 +4659,15 @@ function foldHandoffRequested(db: Database, event: Event): void {
   }
   db.run(
     `INSERT INTO handoffs (
-       handoff_id, status, doc, title, target_session,
+       handoff_id, status, doc, title, target_session, target_dir,
        initiator_session, initiator_pane, initiator_job_id,
        callee_job_id, claimed_at, never_bound_count, last_event_id
-     ) VALUES (?, 'requested', ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+     ) VALUES (?, 'requested', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
      ON CONFLICT(handoff_id) DO UPDATE SET
        doc = excluded.doc,
        title = excluded.title,
        target_session = excluded.target_session,
+       target_dir = excluded.target_dir,
        initiator_session = excluded.initiator_session,
        initiator_pane = excluded.initiator_pane,
        initiator_job_id = excluded.initiator_job_id,
@@ -4672,6 +4677,7 @@ function foldHandoffRequested(db: Database, event: Event): void {
       payload.doc,
       payload.title,
       payload.target_session,
+      payload.target_dir,
       payload.initiator_session,
       payload.initiator_pane,
       payload.initiator_job_id,

@@ -303,6 +303,8 @@ export interface RequestHandoffRequestMessage {
   doc_path: string;
   title: string | null;
   target_session: string;
+  /** Resolved ABSOLUTE launch directory (or null → keeperd cwd at launch). */
+  target_dir: string | null;
   initiator_session: string | null;
   initiator_pane: string | null;
 }
@@ -1498,6 +1500,7 @@ export interface ReplayBridge {
     doc_path: string;
     title: string | null;
     target_session: string;
+    target_dir: string | null;
     initiator_session: string | null;
     initiator_pane: string | null;
   }): Promise<{
@@ -3514,6 +3517,7 @@ function main(): void {
           doc_path: req.doc_path,
           title: req.title,
           target_session: req.target_session,
+          target_dir: req.target_dir,
           initiator_session: req.initiator_session,
           initiator_pane: req.initiator_pane,
         } satisfies RequestHandoffRequestMessage);

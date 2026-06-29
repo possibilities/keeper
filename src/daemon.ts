@@ -2858,6 +2858,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               doc,
               title: msg.title,
               target_session: msg.target_session,
+              target_dir: msg.target_dir,
               initiator_session: msg.initiator_session,
               initiator_pane: msg.initiator_pane,
               initiator_job_id: initiatorJobId,

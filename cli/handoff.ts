@@ -19,14 +19,27 @@
  * collection and prints the stored `doc` body so the brief can be inspected.
  *
  * Two forms mirror `keeper dispatch`'s free-form half: `--prompt "<doc>"` or
- * `--prompt-file <path>`, plus `--slug`, `--title`, and `--session`.
+ * `--prompt-file <path>`, plus `--slug`, `--title`, `--session`, and `--dir`.
+ *
+ * `--dir <path>` is the directory the handoff-ee launches in — defaults to the
+ * caller's own cwd. The CLI expands `~`, resolves a relative path against
+ * `process.cwd()` to an ABSOLUTE path, and validates it exists + is a directory
+ * (exit 2 on a miss) before sending; the dispatcher worker launches the
+ * handoff-ee with that path as its cwd.
  *
  * Exit codes: 0 success, 1 daemon-unreachable / generic failure, 2 arg fault
- * (missing/empty `--slug`, over-cap brief), 3 slug already in use (pick another).
+ * (missing/empty `--slug`, over-cap brief, bad `--dir`), 3 slug already in use.
  */
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
 import { slugifyHandoffSlug } from "../src/handoff-slug";
@@ -49,6 +62,9 @@ Enqueue flags:
   --prompt-file <path>  Read the brief from a file instead of --prompt
   --title <t>           Optional human title for the handoff
   --session <s>         Target tmux session (default: KEEPER_TMUX_SESSION > current > work)
+  --dir <path>          Directory the handoff-ee launches in (default: this
+                        caller's cwd). Expands ~, resolves a relative path to an
+                        absolute one; a non-existent / non-directory path → exit 2.
   --sock <path>         Override the daemon socket path
 
   show <slug>           Print the stored doc body for a handoff (inspection)
@@ -58,6 +74,59 @@ truncated, because it rides inline in the event log and a fold reads it back.
 
 Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault, 3 slug already in use.
 `;
+
+/** Discriminated result of {@link resolveTargetDir}. */
+export type ResolveTargetDirResult =
+  | { ok: true; dir: string }
+  | { ok: false; error: string };
+
+/**
+ * Resolve the handoff-ee's launch directory from the raw `--dir` flag, against
+ * the caller's `cwd`. Absent/empty `--dir` defaults to `cwd` (the caller's own
+ * dir). Otherwise expand a leading `~` against the home dir, resolve a relative
+ * path against `cwd` to an ABSOLUTE path, then validate it exists + is a
+ * directory (a symlinked dir is valid — `statSync` follows). A miss is CLI
+ * misuse → the caller exits 2.
+ *
+ * TOCTOU is unavoidable (the dir can vanish between here and the launch); this
+ * upfront probe is the primary guard, and the worker also catches a spawn-time
+ * cwd error. Pure-with-injected-stat — `statDir` is the on-disk probe (defaults
+ * to `statSync`), injected so a test drives the miss/non-dir branches without a
+ * real path.
+ */
+export function resolveTargetDir(
+  rawDir: string | undefined,
+  cwd: string,
+  statDir: (path: string) => { isDirectory(): boolean } = statSync,
+): ResolveTargetDirResult {
+  // Default = the caller's own cwd (always absolute — `process.cwd()`).
+  if (rawDir === undefined || rawDir === "") {
+    return { ok: true, dir: cwd };
+  }
+  // Expand a leading `~` / `~/...` against the home dir.
+  const expanded =
+    rawDir === "~" || rawDir.startsWith("~/")
+      ? join(homedir(), rawDir.slice(1))
+      : rawDir;
+  // Resolve a relative path against the caller's cwd to an ABSOLUTE path.
+  const abs = isAbsolute(expanded) ? expanded : resolvePath(cwd, expanded);
+  let st: { isDirectory(): boolean };
+  try {
+    st = statDir(abs);
+  } catch {
+    return {
+      ok: false,
+      error: `--dir '${rawDir}' does not exist (resolved to ${abs})`,
+    };
+  }
+  if (!st.isDirectory()) {
+    return {
+      ok: false,
+      error: `--dir '${rawDir}' is not a directory (resolved to ${abs})`,
+    };
+  }
+  return { ok: true, dir: abs };
+}
 
 /** Doc-body cap (bytes, UTF-8). The brief rides inline in `events.data` forever
  *  (the canonical fold source), so an uncapped body is a re-fold time-bomb. This
@@ -107,6 +176,7 @@ export function buildRequestHandoffFrame(
     doc_path: string;
     title: string | null;
     target_session: string;
+    target_dir: string;
     initiator_session: string | null;
     initiator_pane: string | null;
   },
@@ -164,6 +234,7 @@ export async function main(argv: string[]): Promise<void> {
       "prompt-file": { type: "string" },
       title: { type: "string" },
       session: { type: "string" },
+      dir: { type: "string" },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -254,6 +325,17 @@ export async function main(argv: string[]): Promise<void> {
   // precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX`-current > `work`.
   const { session } = resolveSession({ sessionFlag: parsed.values.session });
 
+  // Resolve the launch directory for the handoff-ee. `--dir` defaults to THIS
+  // caller's cwd; a relative path / `~` is resolved here (the daemon only sees
+  // the absolute result) and validated to exist + be a directory — exit 2 on a
+  // miss, mirroring dispatch's cwd-existence guard. Always send an absolute
+  // `target_dir` so the dispatcher never falls back to keeperd's own cwd.
+  const dirResult = resolveTargetDir(parsed.values.dir, process.cwd());
+  if (!dirResult.ok) {
+    argFault(dirResult.error);
+  }
+  const targetDir = dirResult.dir;
+
   // Raw initiator coordinates — always carried so the from-edge anchors even
   // when main can't resolve the pane to a folded job. `TMUX_PANE` is the live
   // pane id; `KEEPER_TMUX_SESSION` the initiator's session.
@@ -287,6 +369,7 @@ export async function main(argv: string[]): Promise<void> {
         doc_path: docPath,
         title,
         target_session: session,
+        target_dir: targetDir,
         initiator_session: initiatorSession,
         initiator_pane: initiatorPane,
       }),

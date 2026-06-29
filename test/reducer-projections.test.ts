@@ -5892,6 +5892,7 @@ function handoffRequestedEvent(opts: {
   doc: string;
   title?: string | null;
   target_session?: string | null;
+  target_dir?: string | null;
   initiator_session?: string | null;
   initiator_pane?: string | null;
   initiator_job_id?: string | null;
@@ -5905,6 +5906,7 @@ function handoffRequestedEvent(opts: {
       doc: opts.doc,
       title: opts.title ?? null,
       target_session: opts.target_session ?? null,
+      target_dir: opts.target_dir ?? null,
       initiator_session: opts.initiator_session ?? null,
       initiator_pane: opts.initiator_pane ?? null,
       initiator_job_id: opts.initiator_job_id ?? null,
@@ -5926,6 +5928,7 @@ function getHandoffs() {
     doc: string;
     title: string | null;
     target_session: string | null;
+    target_dir: string | null;
     initiator_session: string | null;
     initiator_pane: string | null;
     initiator_job_id: string | null;
@@ -5949,6 +5952,7 @@ test("HandoffRequested folds into a handoffs row status=requested + advances the
     doc: "investigate X; context: ...",
     title: "explore X",
     target_session: "work",
+    target_dir: "/Users/dev/code/other",
     initiator_session: "dash",
     initiator_pane: "%7",
   });
@@ -5961,6 +5965,7 @@ test("HandoffRequested folds into a handoffs row status=requested + advances the
     doc: "investigate X; context: ...",
     title: "explore X",
     target_session: "work",
+    target_dir: "/Users/dev/code/other",
     initiator_session: "dash",
     initiator_pane: "%7",
     initiator_job_id: null,
@@ -5970,6 +5975,29 @@ test("HandoffRequested folds into a handoffs row status=requested + advances the
     last_event_id: eventId,
   });
   expect(getCursor()).toBe(eventId);
+});
+
+test("HandoffRequested without a target_dir folds to NULL (pre-v96 re-fold safety) (fn-1003)", () => {
+  // A pre-feature event's data carries NO `target_dir` key — the fold must land
+  // the column NULL byte-identically (re-fold determinism for old log entries).
+  insertEvent({
+    hook_event: "HandoffRequested",
+    event_type: "handoffs",
+    session_id: "h-nodir",
+    data: JSON.stringify({
+      handoff_id: "h-nodir",
+      doc: "legacy handoff with no target_dir",
+      title: null,
+      target_session: "work",
+      initiator_session: null,
+      initiator_pane: null,
+      initiator_job_id: null,
+    }),
+  });
+  drainAll();
+  const rows = getHandoffs();
+  expect(rows.length).toBe(1);
+  expect(rows[0]?.target_dir).toBeNull();
 });
 
 test("HandoffRequested writes the handoff-from link onto the initiator job (fn-946)", () => {

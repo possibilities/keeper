@@ -212,6 +212,7 @@ function autopilotStubBridge(opts: {
       doc_path: string;
       title: string | null;
       target_session: string;
+      target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
     }>;
@@ -232,6 +233,7 @@ function autopilotStubBridge(opts: {
       doc_path: string;
       title: string | null;
       target_session: string;
+      target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
     }>,
@@ -670,6 +672,7 @@ test("request_handoff forwards the validated request to the bridge and returns o
       doc_path: "/state/handoff/rpc-1.txt",
       title: "explore X",
       target_session: "work",
+      target_dir: "/Users/dev/code/other",
       initiator_session: "dash",
       initiator_pane: "%3",
     },
@@ -682,6 +685,7 @@ test("request_handoff forwards the validated request to the bridge and returns o
       doc_path: "/state/handoff/rpc-1.txt",
       title: "explore X",
       target_session: "work",
+      target_dir: "/Users/dev/code/other",
       initiator_session: "dash",
       initiator_pane: "%3",
     },
@@ -705,10 +709,43 @@ test("request_handoff coerces absent optional coords to null", async () => {
       doc_path: "/state/handoff/rpc-2.txt",
       title: null,
       target_session: "work",
+      target_dir: null,
       initiator_session: null,
       initiator_pane: null,
     },
   ]);
+});
+
+test("request_handoff rejects a non-absolute target_dir at the trust boundary (daemon-side guard)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  expect(
+    requestHandoffHandler(
+      {
+        desired_slug: "rel-dir",
+        doc_path: "/p",
+        target_session: "work",
+        target_dir: "relative/path",
+      },
+      bridge,
+    ),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(state.requestHandoffCalls).toEqual([]);
+});
+
+test("request_handoff forwards an absolute target_dir verbatim", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  await requestHandoffHandler(
+    {
+      desired_slug: "abs-dir",
+      doc_path: "/p",
+      target_session: "work",
+      target_dir: "/Users/dev/code/other",
+    },
+    bridge,
+  );
+  expect(state.requestHandoffCalls[0]?.target_dir).toBe(
+    "/Users/dev/code/other",
+  );
 });
 
 test("request_handoff throws BadParamsError on non-object params", async () => {

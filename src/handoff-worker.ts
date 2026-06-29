@@ -99,6 +99,9 @@ export interface HandoffDispatchRow {
   status: string;
   doc: string;
   target_session: string | null;
+  /** Resolved ABSOLUTE launch directory, or null/empty → keeperd's cwd. The
+   *  per-row launch cwd (`dispatchOneHandoff` coalesces it against the global). */
+  target_dir: string | null;
   /** Unix-seconds the dispatcher stamped on its last `HandoffDispatching`. */
   claimed_at: number | null;
   never_bound_count: number;
@@ -271,7 +274,14 @@ export async function dispatchOneHandoff(
     prompt: deps.buildPrompt(row.handoff_id),
     claudeName: `handoff::${row.handoff_id}`,
   };
-  const result = await deps.launch(session, cwd, spec).catch(
+  // PER-ROW launch cwd: the handoff's resolved `--dir` (an absolute path the CLI
+  // validated) wins; a NULL/empty value coalesces to the worker-global `cwd`
+  // (`data.cwd ?? process.cwd()` = keeperd's cwd) BEFORE the spawn — exec-backend
+  // treats `""` as undefined and would otherwise drop to keeperd's cwd anyway,
+  // but coalescing here keeps the intent explicit.
+  const launchCwd =
+    row.target_dir != null && row.target_dir.length > 0 ? row.target_dir : cwd;
+  const result = await deps.launch(session, launchCwd, spec).catch(
     (err): LaunchResult => ({
       ok: false,
       error: `launch threw: ${err instanceof Error ? err.message : String(err)}`,
@@ -329,7 +339,7 @@ export function buildHandoffPrompt(
 export function selectActionableHandoffs(db: Database): HandoffDispatchRow[] {
   return db
     .query(
-      `SELECT handoff_id, status, doc, target_session, claimed_at, never_bound_count
+      `SELECT handoff_id, status, doc, target_session, target_dir, claimed_at, never_bound_count
          FROM handoffs
         WHERE status IN ('requested', 'dispatching')
         ORDER BY handoff_id ASC`,

@@ -763,6 +763,7 @@ export const HANDOFFS_DESCRIPTOR: CollectionDescriptor = {
     "doc",
     "title",
     "target_session",
+    "target_dir",
     "initiator_session",
     "initiator_pane",
     "initiator_job_id",
