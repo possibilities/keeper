@@ -40,5 +40,5 @@ Add table-driven parser fixtures covering all four combinations that matter: 5h 
 - [ ] After deploy, the live Codex row in `keeper usage` leaves `format`/`stale` on the next successful scrape.
 
 ## Done summary
-
+Shared the Codex reset-suffix parser so 5h and Weekly rows each accept resets HH:MM (today/tomorrow) or resets HH:MM on DD Mon (this/next year); added table-driven combo fixtures and a live-drift regression panel.
 ## Evidence

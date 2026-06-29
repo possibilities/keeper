@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/agentusage",
   "tier": "high",
   "title": "Accept dated Codex resets",
-  "updated_at": "2026-06-29T00:25:50.475000Z"
+  "updated_at": "2026-06-29T00:31:42.641000Z",
+  "worker_done_at": "2026-06-29T00:31:42.641000Z"
 }
