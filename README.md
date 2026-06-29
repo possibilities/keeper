@@ -2955,7 +2955,10 @@ sub-cadence INDEPENDENT of cooldown/idle parking: the no-scrape sleeps
 (cooldown/idle/restart) are capped at that poll so a depleted account that parks
 for days still re-resolves its multiplier every minute (post-scrape backoffs —
 notably the /usage rate-limit retry — stay long, never capped), and a multiplier
-change vs the on-disk envelope breaks BOTH gates early to force a scrape. An mtime
+change vs the on-disk envelope breaks BOTH gates early to force a scrape. The `default`
+account's tier is read from `~/.claude/.claude.json` (where the canonical login
+lives), NOT a `~/.claude-profiles/default` shadow dir — every other profile reads
+`~/.claude-profiles/<name>/.claude.json`. An mtime
 memo keeps the multi-MB `.claude.json` re-read free, and a redundant parked re-write
 (already idle at the same multiplier) is suppressed so a long park doesn't grow the
 log. It writes ONLY this on-disk surface (its
@@ -3855,6 +3858,30 @@ launchctl start <keeperd label>
 Because the entire system folds deterministically from the immutable `events`
 table, a restored DB re-derives byte-identical projections; no projection state
 is lost that the event log doesn't already carry.
+
+### Re-homing a stranded account
+
+An auth login can land in `~/.claude-profiles/default/` — a SHADOW dir nothing
+reads, because the `default` profile canonically resolves to `~/.claude`. The
+account is real but invisible: usage scraping and tier resolution both look at
+`~/.claude`, so a `default/` shadow leaves `keeper usage` showing default as
+signed-out/1x while the subscription sits idle in the shadow. **keeper never
+moves or deletes a profile dir** — re-homing is a manual operator step, and the
+shadow must NOT be deleted before the canonical login is verified, or the only
+copy of that login is lost.
+
+1. **Recognise it.** Run `keeper agent profiles check` (`--json` for a
+   machine-readable per-finding `id` + `remediation`). An auth-bearing
+   `~/.claude-profiles/default/` is reported as a shadow finding.
+2. **Re-home the login.** Sign `~/.claude` into the stranded account (the normal
+   `claude` login flow against the default config dir — `CLAUDE_CONFIG_DIR`
+   unset / `~/.claude`).
+3. **Verify the canonical login.** Run `keeper usage` and confirm `default`
+   now shows healthy (subscription active, correct tier multiplier) — the tier
+   read comes from `~/.claude/.claude.json`, so a healthy line proves the
+   re-home took.
+4. **Only then remove the shadow.** With the canonical login verified, delete
+   `~/.claude-profiles/default/` by hand. Never delete it before step 3 passes.
 
 ### `keeper reclaim` — offline size-reclaim (fn-847)
 
