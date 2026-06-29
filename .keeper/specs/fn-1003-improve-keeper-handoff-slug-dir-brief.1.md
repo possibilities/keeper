@@ -67,5 +67,5 @@ spill before the daemon reads it.
 - [ ] `bun test` green.
 
 ## Done summary
-
+Replaced the handoff uuid with an agent-authored, host-global-unique --slug: new src/handoff-slug.ts (slugify + format re-validation + a pure events-log uniqueness probe), main probes synchronously before insertEvent and rejects a collision via a distinct slug_conflict frame mapped to CLI exit 3, spill keyed on a throwaway rpc id.
 ## Evidence
