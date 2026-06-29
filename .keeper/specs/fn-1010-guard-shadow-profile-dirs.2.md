@@ -60,5 +60,5 @@ Assert `--json` shape (id + remediation per finding). Cover pi (`~/.pi-profiles`
 - [ ] AGENTWRAP_HELP + USAGE_HELP + README presets block document the subcommand.
 
 ## Done summary
-
+Add db-free findShadowProfileDirs (scans ~/.claude-profiles + ~/.pi-profiles for reserved shadows + untracked strays, read-only, ENOENT/parse-robust, covers claude + pi) and wire keeper agent profiles check [--json] with id+remediation per finding and exit 0/9/1.
 ## Evidence
