@@ -40,5 +40,5 @@ No automated test covers prose. Verify by re-grepping `disable_autoclose|autoclo
 - [ ] `keeper commit-work` lands the repo doc changes; the personal-config edit is noted as a non-committed operator step.
 
 ## Done summary
-
+Scrubbed all tmux window-autoclose prose: README worker tour (removed window-reaper paragraph, renumbered to thirteen workers), config-key docs, and autoclose deep-dive; pair + panel SKILL.md now state windows stay open for inspection. Also removed the disable_autoclose block from the operator's ~/.config/keeper/config.yaml (outside-repo, non-committed operator step).
 ## Evidence
