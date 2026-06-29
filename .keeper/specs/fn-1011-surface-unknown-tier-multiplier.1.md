@@ -61,5 +61,5 @@ across restart fires change-detection.
 - [ ] `bun test test/usage.test.ts test/usage-scraper-worker.test.ts` green (incl. null-multiplier envelope + `?x` render cases).
 
 ## Done summary
-
+Propagate the raw nullable multiplier end-to-end: drop the boot ?? 1 (resolveMultiplierOrNull direct), widen Account/Envelope.multiplier to number|null, and render ?x ('tier unknown') at the display boundary via a named formatMultiplier. Keep-prior re-resolve stays intact (?x only for a boot-never-resolved tier); signed_out/no_subscription null-mult rows drop the suffix; codex keeps 1x. No schema change.
 ## Evidence
