@@ -88,6 +88,7 @@ import type {
   GitWorkerData,
   GitWorkerMessage,
 } from "./git-worker";
+import { handoffSlugExists } from "./handoff-slug";
 import type {
   HandoffDispatchingAckMessage,
   HandoffDispatchingMessage,
@@ -2820,11 +2821,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               .get(msg.initiator_pane) as { job_id: string } | null;
             initiatorJobId = jobRow?.job_id ?? null;
           }
+          // Host-global uniqueness: probe the events log for the slug and, on a
+          // hit, REJECT (never suffix — the slug is user-authored). The probe and
+          // the append below are ONE synchronous unit with NO `await` between
+          // them, so the single-writer lock makes the check race-free (the only
+          // race vector). `conflict:true` routes the CLI to exit 3. The probe is
+          // producer-only — it NEVER enters the fold (the resolved slug is frozen
+          // in `events.data`; replay never re-checks uniqueness).
+          if (handoffSlugExists(msg.desired_slug, db)) {
+            sw.postMessage({
+              type: "request-handoff-result",
+              id,
+              ok: false,
+              conflict: true,
+              error: `handoff slug \`${msg.desired_slug}\` is already in use on this host — pick a new slug`,
+            });
+            return;
+          }
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
-            // The handoff_id rides as the entity-key overload so a re-fold can
-            // correlate the event to its `handoffs` row.
-            $session_id: msg.handoff_id,
+            // The resolved slug is frozen as the entity-key overload so a re-fold
+            // correlates the event to its `handoffs` row (never re-slugified).
+            $session_id: msg.desired_slug,
             $pid: null,
             $hook_event: "HandoffRequested",
             $event_type: "handoffs",
@@ -2836,7 +2854,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $agent_type: null,
             $stop_hook_active: null,
             $data: JSON.stringify({
-              handoff_id: msg.handoff_id,
+              handoff_id: msg.desired_slug,
               doc,
               title: msg.title,
               target_session: msg.target_session,

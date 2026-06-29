@@ -1,29 +1,35 @@
 /**
  * `keeper handoff` — enqueue a contextful document + instructions for a fresh
  * fire-and-forget claude worker, dispatched by a keeperd worker into the
- * INITIATOR's tmux session. The enqueue is event-sourced: this CLI mints a
- * stable `handoff_id` and stores the brief RAW (the dispatcher worker, not this
- * CLI, applies the `handoff_prompt_prefix` to the launch prompt — so the brief
- * rides `keeper handoff show` unprefixed and is read back as the handoff-ee's
- * `/hack` request, not as a second slash-command). It caps the doc at 64KB
- * (REJECT over cap — never truncate, since the body rides inline in
- * `events.data` forever and a fold reads it back), and sends a `request_handoff`
- * RPC (the SIXTH mutating RPC) → main APPENDs a `HandoffRequested` event → the
- * durable `handoffs` projection (status=`requested`). The dispatcher worker
- * (task .3) picks the row up and launches the handoff-ee.
+ * INITIATOR's tmux session. The enqueue is event-sourced: the agent authors a
+ * REQUIRED, globally-unique `--slug` (the handoff id — the worker launches as
+ * `handoff::<slug>`), the CLI slugifies it to `[a-z0-9-]+`, and the brief is
+ * stored RAW (the dispatcher worker, not this CLI, applies the
+ * `handoff_prompt_prefix` to the launch prompt — so the brief rides
+ * `keeper handoff show` unprefixed and is read back as the handoff-ee's `/hack`
+ * request, not as a second slash-command). It caps the doc at 64KB (REJECT over
+ * cap — never truncate, since the body rides inline in `events.data` forever and
+ * a fold reads it back), and sends a `request_handoff` RPC (the SIXTH mutating
+ * RPC) → main probes the events log for a host-global slug collision (rejecting a
+ * duplicate with exit 3), then APPENDs a `HandoffRequested` event → the durable
+ * `handoffs` projection (status=`requested`). The dispatcher worker picks the row
+ * up and launches the handoff-ee.
  *
- * `keeper handoff show <handoff_id>` is the read verb — the dispatched worker's
- * FIRST call: it queries the `handoffs` collection and prints the stored `doc`
- * body so the handoff-ee can load its brief.
+ * `keeper handoff show <slug>` is the read verb: it queries the `handoffs`
+ * collection and prints the stored `doc` body so the brief can be inspected.
  *
  * Two forms mirror `keeper dispatch`'s free-form half: `--prompt "<doc>"` or
- * `--prompt-file <path>`, plus `--title` and `--session`.
+ * `--prompt-file <path>`, plus `--slug`, `--title`, and `--session`.
+ *
+ * Exit codes: 0 success, 1 daemon-unreachable / generic failure, 2 arg fault
+ * (missing/empty `--slug`, over-cap brief), 3 slug already in use (pick another).
  */
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
+import { slugifyHandoffSlug } from "../src/handoff-slug";
 import type { ClientFrame, ServerFrame } from "../src/protocol";
 import { queryCollection, roundTrip } from "./control-rpc";
 import { resolveSession } from "./dispatch";
@@ -31,22 +37,26 @@ import { resolveSession } from "./dispatch";
 const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
 
 Usage:
-  keeper handoff --prompt "<doc>" [--title "<t>"] [--session <s>]
-  keeper handoff --prompt-file <path> [--title "<t>"] [--session <s>]
-  keeper handoff show <handoff_id>
+  keeper handoff --slug <slug> --prompt "<doc>" [--title "<t>"] [--session <s>]
+  keeper handoff --slug <slug> --prompt-file <path> [--title "<t>"] [--session <s>]
+  keeper handoff show <slug>
 
 Enqueue flags:
+  --slug <slug>         REQUIRED. Human-meaningful, globally-unique id for the
+                        handoff; slugified to [a-z0-9-]+. The worker launches as
+                        handoff::<slug>. A slug already in use is REJECTED (exit 3).
   --prompt <doc>        The contextful brief + instructions (inline)
   --prompt-file <path>  Read the brief from a file instead of --prompt
   --title <t>           Optional human title for the handoff
   --session <s>         Target tmux session (default: KEEPER_TMUX_SESSION > current > work)
   --sock <path>         Override the daemon socket path
 
-  show <handoff_id>     Print the stored doc body for a handoff (the dispatched
-                        worker's first call)
+  show <slug>           Print the stored doc body for a handoff (inspection)
 
 The brief is capped at 64KB — an over-cap brief is REJECTED (exit 2), never
 truncated, because it rides inline in the event log and a fold reads it back.
+
+Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault, 3 slug already in use.
 `;
 
 /** Doc-body cap (bytes, UTF-8). The brief rides inline in `events.data` forever
@@ -93,7 +103,7 @@ export function validateHandoffDoc(doc: string): ValidateDocResult {
 export function buildRequestHandoffFrame(
   id: string,
   req: {
-    handoff_id: string;
+    desired_slug: string;
     doc_path: string;
     title: string | null;
     target_session: string;
@@ -114,12 +124,15 @@ export function buildRequestHandoffFrame(
  * spill dir and return its absolute path. The daemon reads it back to inline the
  * doc into the `HandoffRequested` event, so durability is unchanged — the spill is
  * a transport detail, not the system of record (the CLI removes it on a successful
- * ack; age-out is the backstop). Pure-ish — exported for the round-trip test.
+ * ack; age-out is the backstop). Keyed on a THROWAWAY transport id (the rpc id),
+ * NEVER the slug — two concurrent same-slug enqueues would otherwise clobber each
+ * other's spill before the daemon reads it (the loser then inlines the wrong
+ * brief). Pure-ish — exported for the round-trip test.
  */
-export function spillHandoffDoc(handoffId: string, doc: string): string {
+export function spillHandoffDoc(spillKey: string, doc: string): string {
   const dir = resolveHandoffSpillDir();
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${handoffId}.txt`);
+  const path = join(dir, `${spillKey}.txt`);
   writeFileSync(path, doc, "utf8");
   return path;
 }
@@ -134,10 +147,19 @@ function argFault(message: string): never {
   process.exit(2);
 }
 
+/** Exit 3 — a duplicate slug. DISTINCT from exit 1 (daemon-unreachable / generic)
+ *  and exit 2 (arg fault) so a caller can machine-distinguish "pick a new slug"
+ *  from "the daemon is down". */
+function slugTaken(message: string): never {
+  process.stderr.write(`keeper handoff: ${message}\n`);
+  process.exit(3);
+}
+
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
     options: {
+      slug: { type: "string" },
       prompt: { type: "string" },
       "prompt-file": { type: "string" },
       title: { type: "string" },
@@ -156,25 +178,23 @@ export async function main(argv: string[]): Promise<void> {
   const sockPath = parsed.values.sock ?? resolveSockPath();
   const [subcommand, ...rest] = parsed.positionals;
 
-  // ---- read verb: `keeper handoff show <id>` ----
+  // ---- read verb: `keeper handoff show <slug>` ----
   if (subcommand === "show") {
     if (rest.length !== 1 || rest[0] === undefined || rest[0] === "") {
-      die(
-        "'show' takes exactly one positional <handoff_id>; pass --help for usage.",
-      );
+      die("'show' takes exactly one positional <slug>; pass --help for usage.");
     }
-    const handoffId = rest[0];
+    const slug = rest[0];
     let rows: Awaited<ReturnType<typeof queryCollection>> = [];
     try {
       rows = await queryCollection(sockPath, "handoffs", {
-        handoff_id: handoffId,
+        handoff_id: slug,
       });
     } catch (err) {
       die((err as Error).message);
     }
     const row = rows[0];
     if (row === undefined) {
-      die(`no handoff with id '${handoffId}'`);
+      die(`no handoff with slug '${slug}'`);
     }
     // Print the raw stored brief verbatim (the dispatched worker reads it back).
     process.stdout.write(`${String(row.doc ?? "")}\n`);
@@ -187,7 +207,20 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
-  // ---- enqueue: `keeper handoff --prompt ... ` ----
+  // ---- enqueue: `keeper handoff --slug <slug> --prompt ... ` ----
+  // The slug is REQUIRED and is the handoff's globally-unique id (the worker
+  // launches as `handoff::<slug>`). Slugify to `[a-z0-9-]+`; an empty result
+  // (all non-ASCII / punctuation-only) is misuse → exit 2.
+  if (parsed.values.slug === undefined) {
+    argFault("--slug is required (a human-meaningful, globally-unique id)");
+  }
+  const slug = slugifyHandoffSlug(parsed.values.slug);
+  if (slug === null) {
+    argFault(
+      `--slug '${parsed.values.slug}' slugifies to nothing — use [a-z0-9-]`,
+    );
+  }
+
   const hasPrompt = parsed.values.prompt !== undefined;
   const hasPromptFile = parsed.values["prompt-file"] !== undefined;
   if (hasPrompt === hasPromptFile) {
@@ -228,7 +261,9 @@ export async function main(argv: string[]): Promise<void> {
   const initiatorPane = process.env.TMUX_PANE ?? null;
 
   const title = parsed.values.title ?? null;
-  const handoffId = crypto.randomUUID();
+  // The slug is the handoff id (resolved daemon-side on uniqueness). The spill is
+  // keyed on the THROWAWAY rpc id, NOT the slug, so two concurrent same-slug
+  // enqueues never clobber each other's spill before the daemon reads it.
   const rpcId = crypto.randomUUID();
 
   // Spill the doc to a file and send only its PATH over the wire. The inline doc
@@ -238,7 +273,7 @@ export async function main(argv: string[]): Promise<void> {
   // is transient — removed on a successful ack, aged out as a backstop.
   let docPath: string;
   try {
-    docPath = spillHandoffDoc(handoffId, doc);
+    docPath = spillHandoffDoc(rpcId, doc);
   } catch (err) {
     die(`cannot write the handoff spill file: ${(err as Error).message}`);
   }
@@ -248,7 +283,7 @@ export async function main(argv: string[]): Promise<void> {
     response = await roundTrip(
       sockPath,
       buildRequestHandoffFrame(rpcId, {
-        handoff_id: handoffId,
+        desired_slug: slug,
         doc_path: docPath,
         title,
         target_session: session,
@@ -275,6 +310,10 @@ export async function main(argv: string[]): Promise<void> {
     process.exit(0);
   }
   if (response.type === "error") {
+    // A taken slug is machine-distinguishable: exit 3, not the generic exit 1.
+    if (response.code === "slug_conflict") {
+      slugTaken(response.message);
+    }
     die(`server error ${response.code}: ${response.message}`);
   }
   die(`unexpected frame type: ${response.type}`);

@@ -46,10 +46,12 @@ import {
   parseDispatchKey as parseDispatchKeyResult,
   type RetryDispatchVerb,
 } from "./dispatch-command";
+import { validateHandoffSlug } from "./handoff-slug";
 import {
   BadParamsError,
   type ReplayBridge,
   registerAsyncRpc,
+  SlugConflictError,
 } from "./server-worker";
 
 // Re-export the verb type for downstream importers that read it off this
@@ -524,8 +526,11 @@ export async function setAutopilotConfigHandler(
 
 /** `request_handoff` wire params. */
 export interface RequestHandoffParams {
-  /** Stably-minted idempotency key (CLI-minted, the `handoffs` row PK). */
-  handoff_id: string;
+  /** Agent-authored, slugified key — the daemon re-validates its format (the
+   *  socket is the trust boundary; a hand-crafted RPC bypasses CLI slugify),
+   *  probes the events log for a host-global collision, then freezes it as the
+   *  `handoff_id` (the `handoffs` row PK). */
+  desired_slug: string;
   /** Path to the CLI's spill file holding the brief. Main reads it back and
    *  inlines the doc into the event — the large blob rides the filesystem, not
    *  the wire (the inline doc overflowed the UDS send buffer and hung). */
@@ -539,7 +544,8 @@ export interface RequestHandoffParams {
   initiator_pane: string | null;
 }
 
-/** Successful return shape for `request_handoff`. */
+/** Successful return shape for `request_handoff`. `handoff_id` carries the
+ *  resolved (frozen) slug. */
 export interface RequestHandoffResult {
   ok: true;
   handoff_id: string;
@@ -548,14 +554,16 @@ export interface RequestHandoffResult {
 function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
   if (params === null || typeof params !== "object" || Array.isArray(params)) {
     throw new BadParamsError(
-      "request_handoff: params must be an object with `handoff_id: string, doc_path: string, target_session: string`",
+      "request_handoff: params must be an object with `desired_slug: string, doc_path: string, target_session: string`",
     );
   }
   const obj = params as Record<string, unknown>;
-  if (typeof obj.handoff_id !== "string" || obj.handoff_id.length === 0) {
-    throw new BadParamsError(
-      "request_handoff: `handoff_id` must be a non-empty string",
-    );
+  // Re-validate the slug format at the socket trust boundary — a hand-crafted
+  // RPC bypasses CLI slugify, so empty / oversized / `.` / `..` / non-`[a-z0-9-]`
+  // / all-hyphen slugs are rejected here independent of the CLI.
+  const slugCheck = validateHandoffSlug(obj.desired_slug);
+  if (!slugCheck.ok) {
+    throw new BadParamsError(`request_handoff: ${slugCheck.error}`);
   }
   if (typeof obj.doc_path !== "string" || obj.doc_path.length === 0) {
     throw new BadParamsError(
@@ -584,7 +592,7 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
   const initiator_session = optStr(obj.initiator_session, "initiator_session");
   const initiator_pane = optStr(obj.initiator_pane, "initiator_pane");
   return {
-    handoff_id: obj.handoff_id,
+    desired_slug: obj.desired_slug as string,
     doc_path: obj.doc_path,
     title,
     target_session: obj.target_session,
@@ -595,11 +603,14 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
 
 /**
  * `request_handoff` handler — the SIXTH mutating RPC. Validates the
- * `{ handoff_id, doc_path, target_session, ... }` shape and bridges to main, which
- * reads the brief back from `doc_path`, resolves `initiator_job_id` best-effort by
- * pane, then APPENDS a `HandoffRequested` synthetic event (with the doc inlined)
- * onto the writable connection and pumps a wake (no relay — the dispatcher worker
- * re-reads the requested set each cycle).
+ * `{ desired_slug, doc_path, target_session, ... }` shape (re-validating the slug
+ * format at the trust boundary) and bridges to main, which reads the brief back
+ * from `doc_path`, probes the events log for a host-global slug collision,
+ * resolves `initiator_job_id` best-effort by pane, then APPENDS a
+ * `HandoffRequested` synthetic event (with the doc inlined + the slug frozen as
+ * `handoff_id`) onto the writable connection and pumps a wake (no relay — the
+ * dispatcher worker re-reads the requested set each cycle). A taken slug rejects
+ * via {@link SlugConflictError} → the `slug_conflict` wire code.
  *
  * The brief rides through the filesystem (`doc_path`), not inline in the frame —
  * a 64KB inline doc overflowed the UDS send buffer and silently hung. The 64KB
@@ -615,9 +626,16 @@ export async function requestHandoffHandler(
   const req = validateRequestHandoffParams(params);
   const result = await bridge.requestHandoff(req);
   if (!result.ok) {
+    // A slug collision is a DISTINCT condition — throw the typed error so the
+    // dispatcher frames `slug_conflict` (→ CLI exit 3), not `rpc_failed`.
+    if (result.conflict) {
+      throw new SlugConflictError(
+        result.error ?? "request_handoff: slug already in use",
+      );
+    }
     throw new Error(result.error ?? "request_handoff: main reported failure");
   }
-  return { ok: true, handoff_id: req.handoff_id };
+  return { ok: true, handoff_id: req.desired_slug };
 }
 
 // ---------------------------------------------------------------------------

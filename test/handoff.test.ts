@@ -56,10 +56,10 @@ test("validateHandoffDoc: counts UTF-8 bytes, not code points (multibyte over th
   expect(validateHandoffDoc(doc).ok).toBe(false);
 });
 
-test("buildRequestHandoffFrame: carries doc_path, not the inline doc (small wire frame)", () => {
+test("buildRequestHandoffFrame: carries desired_slug + doc_path, not the inline doc (small wire frame)", () => {
   const frame = buildRequestHandoffFrame("rpc-1", {
-    handoff_id: "h-1",
-    doc_path: "/state/handoff/h-1.txt",
+    desired_slug: "investigate-foo",
+    doc_path: "/state/handoff/rpc-1.txt",
     title: "t",
     target_session: "work",
     initiator_session: "dash",
@@ -70,8 +70,8 @@ test("buildRequestHandoffFrame: carries doc_path, not the inline doc (small wire
     id: "rpc-1",
     method: "request_handoff",
     params: {
-      handoff_id: "h-1",
-      doc_path: "/state/handoff/h-1.txt",
+      desired_slug: "investigate-foo",
+      doc_path: "/state/handoff/rpc-1.txt",
       title: "t",
       target_session: "work",
       initiator_session: "dash",
@@ -85,8 +85,8 @@ test("buildRequestHandoffFrame: stays small even for a 64KB doc (the doc rides a
   // frame overflowed the ~8 KiB UDS send buffer and hung. With doc_path the
   // encoded frame is well under MAX_CONTROL_FRAME_BYTES regardless of doc size.
   const frame = buildRequestHandoffFrame("rpc-1", {
-    handoff_id: "h-1",
-    doc_path: "/state/handoff/h-1.txt",
+    desired_slug: "investigate-foo",
+    doc_path: "/state/handoff/rpc-1.txt",
     title: null,
     target_session: "work",
     initiator_session: null,

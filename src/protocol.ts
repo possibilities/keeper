@@ -323,6 +323,10 @@ export interface RpcResultFrame {
  *   (e.g. the recovery transaction itself crashed). The thrown / posted-back
  *   message is carried in `message`; the connection stays open. Carries the
  *   request `id`.
+ * - `"slug_conflict"` — a `request_handoff` named a slug already taken on this
+ *   host (the host-global uniqueness probe rejected it). DISTINCT from
+ *   `rpc_failed` so the CLI maps a duplicate to exit 3, not exit 1. Carries the
+ *   request `id`; the connection stays open (retry with a new slug).
  * - `"server_booting"` — a MUTATING rpc was rejected because the daemon has not
  *   yet reached the post-drain spawn point (drain-reaches-head + git-seed +
  *   ephemeral-truncate). Reads are served throughout the boot; only state-changing
