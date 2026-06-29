@@ -77,5 +77,5 @@ payload folds to a safe no-op (never throws, cursor advances). Use
 - [ ] The fold never throws on a malformed payload (folds to a safe no-op; cursor still advances).
 
 ## Done summary
-
+Added the nullable dispatch_failures.merge_escalated_at escalate-once marker (schema v97->v98) folded by a new MergeEscalationAttempted synthetic event: a terminal outcome (sent/queued_for_wake) stamps it = event.ts, send_failed/unknown leaves NULL (re-sweepable), foldDispatchFailed preserves it across the UPSERT, DispatchCleared drops it. Re-fold byte-equivalence and the schema-version whitelist stay green.
 ## Evidence
