@@ -50,7 +50,8 @@ Usage:
                                     Launch the preset's harness (harnessless).
   agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
   agentwrap presets list [--json]   List configured presets + panels.
-  agentwrap profiles check [--json] Report shadow/stray profile dirs (read-only).
+  agentwrap profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
+                                    tier metadata is missing (read-only).
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   agentwrap show-last-message <h>   Print a detached run's final message.
@@ -111,10 +112,13 @@ Preset resolution:
 
 Profile diagnostics:
   agentwrap profiles check [--json] List shadow/stray/auth-bearing
-                                    ~/.claude-profiles + ~/.pi-profiles dirs
-                                    read-only — NEVER moves or deletes. Each
-                                    finding carries a stable id + remediation.
-                                    Exit 0 clean / 9 findings / 1 tool error.
+                                    ~/.claude-profiles + ~/.pi-profiles dirs,
+                                    plus a ~/.claude that is authed but whose
+                                    tier metadata is missing (renders ?x in
+                                    usage) — read-only, NEVER moves or deletes.
+                                    Each finding carries a stable id +
+                                    remediation. Exit 0 clean / 9 findings /
+                                    1 tool error.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.

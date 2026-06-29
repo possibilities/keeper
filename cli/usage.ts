@@ -80,7 +80,11 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
 
 Each profile renders as a stacked block — a header line with the id
 chip + target/multiplier chip, then one indented body line per quota
-window (session, week, sonnet where present, and codex-spark where present). Each body line
+window (session, week, sonnet where present, and codex-spark where present). The
+multiplier reads \`?x\` ("tier unknown") when the account is authed but its tier
+metadata is absent (a \`/login\` restored the keychain but not the
+\`oauthAccount\` tier cache) — never a confident-but-wrong \`1x\`; a
+signed-out / no-subscription row drops the suffix entirely. Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
 the numeric pct and a bare relative reset countdown (\`5d 21h\` /
 \`1h 16m\` / \`5m\` / \`now\`; an elapsed-but-fresh reset reads \`now\`).
@@ -118,6 +122,19 @@ stacks; run \`keeper agent profiles check\` to inspect and reconcile it.
 
 function seg(v: unknown): string {
   return v == null ? "" : String(v);
+}
+
+/**
+ * Format a raw nullable multiplier into its chip token. A resolved tier renders
+ * `<N>x` (`20x`, `1x`); an UNRESOLVED tier (`null` — a `/login` restored the
+ * keychain but not the `~/.claude/.claude.json` `oauthAccount` tier cache)
+ * renders `?x` ("tier unknown") rather than a confident-but-wrong `1x`. The
+ * full token carries the trailing `x`, so it feeds the `wMult` width pool
+ * directly and `?x` / `20x` right-align in the chip. The display boundary is the
+ * ONLY place the null collapses — the column + envelope stay `INTEGER|NULL`.
+ */
+function formatMultiplier(raw: number | null): string {
+  return raw == null ? "?x" : `${raw}x`;
 }
 
 // Short stale-error labels keyed by the projection's stable `error_kind`. A
@@ -469,10 +486,18 @@ export function renderRowLines(
       )
         stableState = "no_subscription";
     }
+    // Multiplier chip token. A resolved tier renders `<N>x`; an unresolved tier
+    // (null) renders `?x` on a subscription-active row, but a signed_out /
+    // no_subscription row DROPS the suffix entirely (`[claude]`) — surfacing
+    // `?x` there would imply a live-but-unknown tier on an account that has no
+    // active plan, and it also fixes today's broken `[claude  x]`.
+    const rawMult = typeof row.multiplier === "number" ? row.multiplier : null;
+    const mult =
+      rawMult === null && stableState !== null ? "" : formatMultiplier(rawMult);
     return {
       id: `(${aliasOf(seg(row.id), aliases)})`,
       target: seg(row.target),
-      mult: seg(row.multiplier),
+      mult,
       status: seg(row.status),
       sBar: bar(row.session_percent),
       sPct: pct(row.session_percent),
@@ -595,10 +620,16 @@ export function renderRowLines(
   const lines: string[] = [];
   for (const c of cells) {
     const id = c.id.padStart(wId, " ");
+    // The `x` rides inside the formatted token (`20x` / `?x`), so the chip just
+    // padStarts the token under `wMult`. An empty token with a present target is
+    // a dropped multiplier suffix (an unresolved tier on a signed_out /
+    // no_subscription row) → the bare `[target]`, never the broken `[claude  x]`.
     const targetChip =
       c.target === "" && c.mult === ""
         ? ""
-        : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}x]`;
+        : c.mult === ""
+          ? `[${c.target.padEnd(wTarget, " ")}]`
+          : `[${c.target.padEnd(wTarget, " ")} ${c.mult.padStart(wMult, " ")}]`;
     // Status token as a trailing header chip, rendered for any non-empty
     // status. Two-space separator distances it from the chip; when the chip is
     // absent it tags directly after the id.

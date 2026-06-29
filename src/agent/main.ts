@@ -856,10 +856,14 @@ type ProfilesCheckFindingKind =
   | "auth-bearing-reserved-shadow"
   | "reserved-shadow"
   | "stray-auth"
-  | "stray";
+  | "stray"
+  | "tier-metadata-missing";
 
 /** Classify a finding into a stable category that drives its remediation. */
 function profilesCheckKind(f: ShadowProfileFinding): ProfilesCheckFindingKind {
+  if (f.tierUnresolved) {
+    return "tier-metadata-missing";
+  }
   if (f.isReservedShadow) {
     return f.hasAuth ? "auth-bearing-reserved-shadow" : "reserved-shadow";
   }
@@ -902,6 +906,14 @@ function profilesCheckRemediation(
         `Untracked profile dir. Remove it or add '${f.name}' to agentusage config.yaml ` +
         "profiles; keeper never deletes it."
       );
+    case "tier-metadata-missing":
+      return (
+        `Authed but the tier is unresolvable: ${account}'s oauthAccount carries no ` +
+        "resolvable organizationRateLimitTier, so usage renders '?x' instead of the real " +
+        "multiplier. A /login restores the keychain but not the oauthAccount tier cache — " +
+        `re-home that metadata into ${account} (see the re-homing runbook); a persistent ` +
+        "'?x' means the step is still pending. keeper never edits it for you."
+      );
   }
 }
 
@@ -924,11 +936,17 @@ function runProfilesCheck(deps: MainDeps, json: boolean): never {
 
   const enriched = findings.map((f) => {
     const kind = profilesCheckKind(f);
+    // The tier-metadata finding is the native ~/.claude account, not a
+    // profiles-root dir: render the canonical path + a DISTINCT id so it never
+    // collides with a `claude:default` ~/.claude-profiles/default shadow.
+    const canonical = canonicalAccountDisplay(f.agent);
     return {
-      id: `${f.agent}:${f.name}`,
+      id: f.tierUnresolved ? `${f.agent}:${canonical}` : `${f.agent}:${f.name}`,
       agent: f.agent,
       name: f.name,
-      path: `${profilesRootDisplay(f.agent)}/${f.name}`,
+      path: f.tierUnresolved
+        ? canonical
+        : `${profilesRootDisplay(f.agent)}/${f.name}`,
       kind,
       hasAuth: f.hasAuth,
       isReservedShadow: f.isReservedShadow,
@@ -936,14 +954,22 @@ function runProfilesCheck(deps: MainDeps, json: boolean): never {
       remediation: profilesCheckRemediation(f, kind),
     };
   });
-  const authBearing = enriched.filter((f) => f.hasAuth).length;
+  // Count tier-metadata findings SEPARATELY from the auth-bearing-shadow tally:
+  // their prose differs ("re-home incomplete", not "a login nothing reads"),
+  // and a tier finding is authed but is not a stranded shadow.
+  const tierMissing = enriched.filter(
+    (f) => f.kind === "tier-metadata-missing",
+  ).length;
+  const authBearing = enriched.filter(
+    (f) => f.hasAuth && f.kind !== "tier-metadata-missing",
+  ).length;
 
   if (json) {
     deps.write(
       `${JSON.stringify({
         schema_version: PROFILES_CHECK_SCHEMA_VERSION,
         findings: enriched,
-        summary: { total: enriched.length, authBearing },
+        summary: { total: enriched.length, authBearing, tierMissing },
       })}\n`,
     );
     return deps.exit(enriched.length === 0 ? 0 : PROFILES_CHECK_FOUND_EXIT);
@@ -960,8 +986,10 @@ function runProfilesCheck(deps: MainDeps, json: boolean): never {
     );
     deps.write(`    ${f.remediation}\n`);
   }
+  const tierNote =
+    tierMissing > 0 ? `, ${tierMissing} tier-metadata-missing` : "";
   deps.writeErr(
-    `profiles check: ${enriched.length} finding(s) (${authBearing} auth-bearing). ` +
+    `profiles check: ${enriched.length} finding(s) (${authBearing} auth-bearing${tierNote}). ` +
       "Read-only — nothing was moved or deleted.\n",
   );
   return deps.exit(PROFILES_CHECK_FOUND_EXIT);
