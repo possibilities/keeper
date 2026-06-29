@@ -66,5 +66,5 @@ column offset is unchanged. Confirm `renderRowLines([], NOW_MS)` still returns `
 - [ ] `bun test test/usage.test.ts` green incl. the mixed-frame alignment test.
 
 ## Done summary
-
+renderRowLines now classifies no-bar rows onto the stable account_state axis (signed_out -> 'auth · signed out', no_subscription / back-compat subscription_active=0 -> 'no active subscription'; precedence stale-error -> account_state -> bars), un-hides no-sub rows without shifting healthy bar columns, adds account_state to usageRowsHashKey, and refreshes HELP + README docs.
 ## Evidence
