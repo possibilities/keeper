@@ -58,5 +58,5 @@ currently passes one worker-global cwd for all rows.
 - [ ] `bun test` green (incl. schema-version + the new column tests).
 
 ## Done summary
-
+Added keeper handoff --dir to launch the handoff-ee in a chosen directory (default: caller's cwd), resolved+validated CLI-side and threaded event->fold->nullable handoffs.target_dir (schema v95->v96)->collection->per-row worker launch cwd.
 ## Evidence

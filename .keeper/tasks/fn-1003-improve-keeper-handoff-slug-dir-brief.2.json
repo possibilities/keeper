@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Launch handoff into a target directory",
-  "updated_at": "2026-06-29T00:37:56.897000Z"
+  "updated_at": "2026-06-29T01:19:12.580000Z",
+  "worker_done_at": "2026-06-29T01:19:12.580000Z"
 }
