@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-29T00:37:56.897000Z",
+  "depends_on": [],
+  "epic": "fn-1003-improve-keeper-handoff-slug-dir-brief",
+  "id": "fn-1003-improve-keeper-handoff-slug-dir-brief.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Handoff slug identity and global uniqueness",
+  "updated_at": "2026-06-29T00:37:56.897000Z"
+}
