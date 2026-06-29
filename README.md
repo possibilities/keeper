@@ -1407,9 +1407,12 @@ event-log/reducer/hook touch. Run any of them with
   harness comes from the preset — and `keeper agent presets resolve <name>` emits
   the resolved preset/panel JSON. `keeper agent profiles check [--json]` is the
   adjacent read-only diagnostic: it lists shadow/stray/auth-bearing
-  `~/.claude-profiles` + `~/.pi-profiles` dirs (a stable `id` + remediation per
-  finding; exit 0 clean / 9 findings / 1 tool error) and NEVER moves or deletes —
-  the operator re-homes a stranded login by hand. Per-field resolution is `explicit flag > effort
+  `~/.claude-profiles` + `~/.pi-profiles` dirs AND flags the native `~/.claude`
+  when it is authed but its tier is unresolvable (a `tier-metadata-missing`
+  finding — the re-home-incomplete state that renders `?x` in `keeper usage`),
+  each with a stable `id` + remediation (exit 0 clean / 9 findings / 1 tool
+  error). It NEVER moves, deletes, or edits anything — the operator re-homes a
+  stranded login (or restores the missing tier metadata) by hand. Per-field resolution is `explicit flag > effort
   env > preset > per-harness yaml > native default`, so a preset never overrides an
   explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
   `--x-preset` the launch is byte-identical to a no-preset run. The posture is
@@ -3921,12 +3924,20 @@ copy of that login is lost.
 2. **Re-home the login.** Sign `~/.claude` into the stranded account (the normal
    `claude` login flow against the default config dir — `CLAUDE_CONFIG_DIR`
    unset / `~/.claude`).
-3. **Verify the canonical login.** Run `keeper usage` and confirm `default`
-   now shows healthy (subscription active, correct tier multiplier) — the tier
-   read comes from `~/.claude/.claude.json`, so a healthy line proves the
-   re-home took.
-4. **Only then remove the shadow.** With the canonical login verified, delete
-   `~/.claude-profiles/default/` by hand. Never delete it before step 3 passes.
+3. **Restore the tier metadata.** A `/login` restores the keychain (the usage
+   bars) but not always the `oauthAccount.organizationRateLimitTier` cache in
+   `~/.claude/.claude.json` that holds the plan tier — so `keeper usage` can show
+   `default` as `?x` (tier unknown) even while signed in, and `profiles check`
+   reports a `tier-metadata-missing` finding for `~/.claude`. Bring that field
+   across (re-launch `claude` against `~/.claude` so it refreshes the cached
+   `oauthAccount`, or copy `oauthAccount.organizationRateLimitTier` over from the
+   shadow's `.claude.json`). A persistent `?x` means this step is still pending.
+4. **Verify the canonical login.** Run `keeper usage` and confirm `default`
+   now shows healthy (subscription active, the correct tier multiplier — not
+   `?x`) — the tier read comes from `~/.claude/.claude.json`, so a healthy line
+   proves both the re-home and the tier metadata took.
+5. **Only then remove the shadow.** With the canonical login verified, delete
+   `~/.claude-profiles/default/` by hand. Never delete it before step 4 passes.
 
 ### `keeper reclaim` — offline size-reclaim (fn-847)
 

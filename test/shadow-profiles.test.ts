@@ -66,6 +66,18 @@ function piProfile(name: string, files: Record<string, string> = {}): string {
   return dir;
 }
 
+/** Seed the native `~/.claude/.claude.json` with `content` (the tier source). */
+function claudeHome(content: string): void {
+  const dir = join(home, ".claude");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, ".claude.json"), content);
+}
+
+/** A `.claude.json` whose oauthAccount carries a KNOWN (resolvable) tier. */
+const RESOLVED_TIER_JSON = JSON.stringify({
+  oauthAccount: { organizationRateLimitTier: "default_claude_max_20x" },
+});
+
 const OAUTH_JSON = JSON.stringify({
   oauthAccount: { organizationRateLimitTier: "max_20x" },
 });
@@ -232,6 +244,77 @@ describe("findShadowProfileDirs", () => {
   });
 });
 
+describe("canonical ~/.claude tier detection", () => {
+  const TIER_FINDING: ShadowProfileFinding = {
+    agent: "claude",
+    name: ".claude",
+    hasAuth: true,
+    isReservedShadow: false,
+    tracked: false,
+    tierUnresolved: true,
+  };
+
+  test("authed but tier absent → a distinct tier-unresolved finding", () => {
+    claudeHome(JSON.stringify({ oauthAccount: { foo: "bar" } }));
+    const f = findingFor(
+      findShadowProfileDirs(() => [], home),
+      "claude",
+      ".claude",
+    );
+    expect(f).toEqual(TIER_FINDING);
+  });
+
+  test("authed but the tier is an UNKNOWN key → tier-unresolved", () => {
+    // "max_20x" is not a TIER_MULTIPLIERS key (the keys are `default_claude_*`).
+    claudeHome(OAUTH_JSON);
+    const f = findingFor(
+      findShadowProfileDirs(() => [], home),
+      "claude",
+      ".claude",
+    );
+    expect(f?.tierUnresolved).toBe(true);
+  });
+
+  test("authed but the tier is non-string → tier-unresolved", () => {
+    claudeHome(
+      JSON.stringify({ oauthAccount: { organizationRateLimitTier: 20 } }),
+    );
+    const f = findingFor(
+      findShadowProfileDirs(() => [], home),
+      "claude",
+      ".claude",
+    );
+    expect(f?.tierUnresolved).toBe(true);
+  });
+
+  test("authed with a KNOWN tier → no finding", () => {
+    claudeHome(RESOLVED_TIER_JSON);
+    const findings = findShadowProfileDirs(() => [], home);
+    expect(findingFor(findings, "claude", ".claude")).toBeUndefined();
+  });
+
+  test("no oauthAccount (not authed here) → NOT a tier finding", () => {
+    // Keychain-only / no oauthAccount object is a different state, not re-home-incomplete.
+    claudeHome(JSON.stringify({ somethingElse: true }));
+    const findings = findShadowProfileDirs(() => [], home);
+    expect(findingFor(findings, "claude", ".claude")).toBeUndefined();
+  });
+
+  test("a missing ~/.claude/.claude.json yields no tier finding", () => {
+    const findings = findShadowProfileDirs(() => [], home);
+    expect(findingFor(findings, "claude", ".claude")).toBeUndefined();
+  });
+
+  test("an unparseable ~/.claude/.claude.json → no tier finding, no crash", () => {
+    claudeHome("{not json");
+    let findings: ShadowProfileFinding[] = [];
+    expect(() => {
+      findings = findShadowProfileDirs(() => [], home);
+    }).not.toThrow();
+    expect(findingFor(findings, "claude", ".claude")).toBeUndefined();
+  });
+});
+
 // ── `keeper agent profiles check` subcommand through main() ──────────────────
 
 function profilesHarness(argv: string[], shadow: () => ShadowProfileFinding[]) {
@@ -258,6 +341,16 @@ const SAMPLE_FINDINGS: ShadowProfileFinding[] = [
     tracked: false,
   },
 ];
+
+/** The native ~/.claude authed-but-tier-unresolvable finding. */
+const TIER_FINDING: ShadowProfileFinding = {
+  agent: "claude",
+  name: ".claude",
+  hasAuth: true,
+  isReservedShadow: false,
+  tracked: false,
+  tierUnresolved: true,
+};
 
 describe("profiles check subcommand", () => {
   test("clean board exits 0, prose to stderr, no stdout, no launch", async () => {
@@ -295,10 +388,14 @@ describe("profiles check subcommand", () => {
     const parsed = JSON.parse(h.out.join("")) as {
       schema_version: number;
       findings: Array<Record<string, unknown>>;
-      summary: { total: number; authBearing: number };
+      summary: { total: number; authBearing: number; tierMissing: number };
     };
     expect(parsed.schema_version).toBe(1);
-    expect(parsed.summary).toEqual({ total: 2, authBearing: 1 });
+    expect(parsed.summary).toEqual({
+      total: 2,
+      authBearing: 1,
+      tierMissing: 0,
+    });
     expect(parsed.findings[0]).toMatchObject({
       id: "claude:default",
       agent: "claude",
@@ -335,5 +432,50 @@ describe("profiles check subcommand", () => {
     expect(h.out.join("")).toBe("");
     expect(h.err.join("")).toContain("Error:");
     expect(h.spawned.length).toBe(0);
+  });
+
+  test("tier-metadata-missing: canonical path + distinct id, counted apart", async () => {
+    // A `claude:default` shadow AND the ~/.claude tier finding coexist — the
+    // tier finding MUST NOT collide on `claude:default`.
+    const h = profilesHarness(["profiles", "check", "--json"], () => [
+      SAMPLE_FINDINGS[0] as ShadowProfileFinding,
+      TIER_FINDING,
+    ]);
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(9);
+    const parsed = JSON.parse(h.out.join("")) as {
+      findings: Array<Record<string, unknown>>;
+      summary: { total: number; authBearing: number; tierMissing: number };
+    };
+    const ids = parsed.findings.map((f) => f.id as string);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicate id
+    expect(ids).toContain("claude:default");
+    expect(ids).toContain("claude:~/.claude");
+    const tier = parsed.findings.find((f) => f.id === "claude:~/.claude");
+    expect(tier).toMatchObject({
+      kind: "tier-metadata-missing",
+      path: "~/.claude",
+      agent: "claude",
+      name: ".claude",
+      hasAuth: true,
+    });
+    expect(tier?.remediation as string).toContain("?x");
+    // Counted SEPARATELY: the tier finding is not in the auth-bearing tally.
+    expect(parsed.summary).toEqual({
+      total: 2,
+      authBearing: 1,
+      tierMissing: 1,
+    });
+  });
+
+  test("tier-metadata-missing flips exit to 9 and notes it in the summary", async () => {
+    const h = profilesHarness(["profiles", "check"], () => [TIER_FINDING]);
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(9);
+    expect(h.out.join("")).toContain("~/.claude  [tier-metadata-missing]");
+    const err = h.err.join("");
+    expect(err).toContain("1 finding(s)");
+    expect(err).toContain("0 auth-bearing");
+    expect(err).toContain("1 tier-metadata-missing");
   });
 });
