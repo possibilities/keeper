@@ -62,5 +62,5 @@ Remove the deprecated agentwrap alias scaffolding left after the launcher folded
 - [ ] `bun run test` full suite green; committed via `keeper commit-work`.
 
 ## Done summary
-
+Removed all deprecated agentwrap path-alias scaffolding (resolveAgentwrapPath, DEFAULT_AGENTWRAP_PATH, KEEPER_AGENTWRAP_PATH/agentwrap_path arms) from the three live keeper-agent-path resolvers + config parse, repointed/deleted the alias tests, added an agentwrap_path silent-ignore regression guard, and dropped the stale README sentence. Full suite green.
 ## Evidence
