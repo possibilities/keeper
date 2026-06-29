@@ -30,9 +30,13 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
+  assertProfileDirNameAllowed,
+  ensureAgentwrapPiProfileDir,
   ensureAgentwrapProfileDir,
   ensureClaudeStateSharing,
+  ensurePiStateSharing,
   ensureProfileClaudeJson,
+  StateError,
 } from "../src/agent/state-sharing";
 import {
   flagValues,
@@ -371,6 +375,101 @@ describe("ensureClaudeStateSharing", () => {
         join(canonicalDir, "session-env", "profile-session"),
       ).isDirectory(),
     ).toBe(true);
+  });
+});
+
+// ── assertProfileDirNameAllowed reserved/path-escape guard ──────────────────
+
+describe("assertProfileDirNameAllowed", () => {
+  test("accepts a normal profile name", () => {
+    expect(() => assertProfileDirNameAllowed("multi-claude-1")).not.toThrow();
+    expect(() => assertProfileDirNameAllowed("a_b-2")).not.toThrow();
+  });
+
+  test("rejects the reserved set (trimmed)", () => {
+    for (const name of ["", "default", " default ", "auto", "  "]) {
+      expect(() => assertProfileDirNameAllowed(name)).toThrow(StateError);
+    }
+  });
+
+  test("rejects path-escape: separators, '..', and NUL", () => {
+    for (const name of ["a/b", "a\\b", "../x", "x/..", "a\0b"]) {
+      expect(() => assertProfileDirNameAllowed(name)).toThrow(StateError);
+    }
+  });
+
+  test("rejects an over-255-byte name", () => {
+    expect(() => assertProfileDirNameAllowed("a".repeat(256))).toThrow(
+      StateError,
+    );
+    expect(() => assertProfileDirNameAllowed("a".repeat(255))).not.toThrow();
+  });
+
+  test("rejects off-allowlist characters", () => {
+    for (const name of ["Default", "a b", "café", "x.y"]) {
+      expect(() => assertProfileDirNameAllowed(name)).toThrow(StateError);
+    }
+  });
+
+  test("error message carries the name + reason, never an absolute path", () => {
+    for (const name of ["default", "a/b", "../x"]) {
+      let message = "";
+      try {
+        assertProfileDirNameAllowed(name);
+      } catch (exc) {
+        message = (exc as Error).message;
+      }
+      expect(message).not.toContain("/Users");
+      expect(message).not.toContain(home);
+      expect(message).not.toContain(".claude-profiles");
+    }
+  });
+});
+
+// ── the four mkdir sites refuse a reserved/escaping profile name ─────────────
+
+describe("profile-dir mkdir sites reject reserved/escaping names", () => {
+  test("ensureAgentwrapProfileDir (claude) throws for a reserved name", () => {
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    writeFileSync(join(home, ".claude", "settings.json"), "{}\n");
+    expect(() =>
+      ensureAgentwrapProfileDir("default", null, null, home),
+    ).toThrow(StateError);
+    expect(() =>
+      ensureAgentwrapProfileDir("../escape", null, null, home),
+    ).toThrow(StateError);
+  });
+
+  test("ensureAgentwrapPiProfileDir (pi) throws for a reserved name", () => {
+    expect(() => ensureAgentwrapPiProfileDir("default", null, home)).toThrow(
+      StateError,
+    );
+    expect(() => ensureAgentwrapPiProfileDir("a/b", null, home)).toThrow(
+      StateError,
+    );
+  });
+
+  test("ensureAgentwrapPiProfileDir (pi) creates a valid profile dir", () => {
+    const [profileDir, changed] = ensureAgentwrapPiProfileDir(
+      "multi-claude-1",
+      null,
+      home,
+    );
+    expect(changed).toBe(true);
+    expect(profileDir).toBe(join(home, ".pi-profiles", "multi-claude-1"));
+    expect(lstatSync(profileDir).isDirectory()).toBe(true);
+  });
+
+  test("ensureClaudeStateSharing loop throws for an escaping profile name", () => {
+    expect(() => ensureClaudeStateSharing(() => ["a/b"], null, home)).toThrow(
+      StateError,
+    );
+  });
+
+  test("ensurePiStateSharing loop throws for an escaping profile name", () => {
+    expect(() => ensurePiStateSharing(() => ["../x"], null, home)).toThrow(
+      StateError,
+    );
   });
 });
 

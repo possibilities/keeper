@@ -70,6 +70,8 @@ imperative guardrails only.
   hook-sourced `events` rows; main writes all synthetic events + `dead_letters` + the replay path,
   workers feed via main. The codex pre-launch trust-seed (`src/codex-trust.ts`) is the ONLY keeper
   surface writing codex's own config dir, fail-open.
+- **Profile-dir names are guarded — never hand-create `~/.claude-profiles/default`.**
+  `assertProfileDirNameAllowed` fail-loud rejects (StateError→exit 1) the reserved set (`""`/`default`/`auto`, trimmed) + path-escape (separator/`..`/NUL, checked on RAW input) at every `mkdir` site.
 
 ## Process & DB-watch invariants
 
