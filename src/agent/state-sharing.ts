@@ -350,6 +350,72 @@ export function ensureProfileClaudeJson(
 }
 
 /**
+ * Profile-dir basenames a launch may NEVER `mkdir` under `~/.claude-profiles`
+ * / `~/.pi-profiles`. `""`/`default` collide with the native `~/.claude`
+ * account — a `default` silo strands auth nothing reads; `auto` is the routing
+ * sentinel. Mirror of RESERVED_PRESET_NAMES (config.ts), but profile-shaped.
+ */
+const RESERVED_PROFILE_DIR_NAMES: ReadonlySet<string> = new Set([
+  "default",
+  "auto",
+]);
+
+/** Allowlist for a profile-dir basename — aligned with PRESET_NAME_PATTERN. */
+const PROFILE_DIR_NAME_PATTERN = /^[a-z0-9_-]+$/;
+
+/** Max bytes for a single path component on the supported filesystems. */
+const MAX_PROFILE_DIR_NAME_BYTES = 255;
+
+/**
+ * True iff `name` (trimmed + NFC-normalized) is a reserved profile-dir
+ * basename — `""`/`default`/`auto`, the set that collides with the native
+ * `~/.claude` / `~/.pi` account. The shared reserved-name knowledge the mkdir
+ * guard and the read-only shadow detector both key off (so a `default`/`auto`
+ * dir under a profiles root is ALWAYS a shadow).
+ */
+export function isReservedProfileDirName(name: string): boolean {
+  const candidate = name.trim().normalize("NFC");
+  return candidate === "" || RESERVED_PROFILE_DIR_NAMES.has(candidate);
+}
+
+/**
+ * Fail-loud guard for every profile-dir `mkdir` site. Throws StateError (state
+ * layer → exit 1, NOT ConfigError) for the reserved set (`""`/`default`/`auto`,
+ * trimmed), path-escape (separator / `..` / NUL — checked atomically on the RAW
+ * input BEFORE any normalization, since `path.normalize` silently collapses
+ * `foo/../bar`→`bar`), an off-allowlist name, or an over-255-byte name. NFC is
+ * for validation/comparison ONLY — the caller still mkdirs the ORIGINAL string
+ * (macOS stores NFD; writing a normalized name then readdir mismatches). The
+ * message carries the name + reason only — never the resolved absolute path.
+ */
+export function assertProfileDirNameAllowed(name: string): void {
+  if (name.includes("\0")) {
+    throw new StateError("Profile name must not contain a NUL byte.");
+  }
+  if (name.includes("/") || name.includes("\\") || name.includes("..")) {
+    throw new StateError(
+      `Profile name '${name}' must not contain path separators or '..'.`,
+    );
+  }
+  if (Buffer.byteLength(name, "utf8") > MAX_PROFILE_DIR_NAME_BYTES) {
+    throw new StateError(
+      `Profile name exceeds ${MAX_PROFILE_DIR_NAME_BYTES} bytes.`,
+    );
+  }
+  if (isReservedProfileDirName(name)) {
+    throw new StateError(
+      `Profile name '${name.trim()}' is reserved and cannot be used.`,
+    );
+  }
+  const candidate = name.trim().normalize("NFC");
+  if (!PROFILE_DIR_NAME_PATTERN.test(candidate)) {
+    throw new StateError(
+      `Profile name '${name.trim()}' must match [a-z0-9_-]+.`,
+    );
+  }
+}
+
+/**
  * Create a named Claude config dir and link its `settings.json`/`CLAUDE.md` to
  * the canonical `~/.claude/` copies (stow-owned). Returns `[profileDir,
  * changed]`. `~/.claude/settings.json` MUST exist (fail-loud); `~/.claude/
@@ -361,6 +427,7 @@ export function ensureAgentwrapProfileDir(
   actionLog: string[] | null,
   homeDir: string = homedir(),
 ): [string, boolean] {
+  assertProfileDirNameAllowed(profileName);
   const sharedConfigDir = join(homeDir, ".claude");
   const sharedSettings = join(sharedConfigDir, "settings.json");
   const sharedClaudeMd = join(sharedConfigDir, "CLAUDE.md");
@@ -433,6 +500,7 @@ export function ensureAgentwrapPiProfileDir(
   actionLog: string[] | null,
   homeDir: string = homedir(),
 ): [string, boolean] {
+  assertProfileDirNameAllowed(profileName);
   const canonicalDir = join(homeDir, ".pi", "agent");
   const profileDir = join(homeDir, ".pi-profiles", profileName);
   let changed = false;
@@ -767,6 +835,7 @@ export function ensureClaudeStateSharing(
 
   mkdirSync(profilesRoot, { recursive: true });
   for (const profileName of profileNames) {
+    assertProfileDirNameAllowed(profileName);
     const profileDir = join(profilesRoot, profileName);
     if (
       (pathExists(profileDir) || isSymlink(profileDir)) &&
@@ -800,6 +869,7 @@ export function ensurePiStateSharing(
   const profilesRoot = join(homeDir, ".pi-profiles");
   mkdirSync(profilesRoot, { recursive: true });
   for (const profileName of profileNames) {
+    assertProfileDirNameAllowed(profileName);
     const profileDir = join(profilesRoot, profileName);
     if (
       (pathExists(profileDir) || isSymlink(profileDir)) &&

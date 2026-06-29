@@ -24,6 +24,7 @@ export type Dispatch =
   | { kind: "run-preset"; presetName: string; rest: string[] }
   | { kind: "presets-resolve"; presetName: string }
   | { kind: "presets-list"; json: boolean }
+  | { kind: "profiles-check"; json: boolean }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
@@ -49,6 +50,7 @@ Usage:
                                     Launch the preset's harness (harnessless).
   agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
   agentwrap presets list [--json]   List configured presets + panels.
+  agentwrap profiles check [--json] Report shadow/stray profile dirs (read-only).
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   agentwrap show-last-message <h>   Print a detached run's final message.
@@ -106,6 +108,13 @@ Preset resolution:
                                     {name,harness} members).
   agentwrap presets list [--json]   List the configured catalog presets
                                     (name + harness/model/effort) and panels.
+
+Profile diagnostics:
+  agentwrap profiles check [--json] List shadow/stray/auth-bearing
+                                    ~/.claude-profiles + ~/.pi-profiles dirs
+                                    read-only — NEVER moves or deletes. Each
+                                    finding carries a stable id + remediation.
+                                    Exit 0 clean / 9 findings / 1 tool error.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.
@@ -178,6 +187,12 @@ export function splitSubcommand(argv: string[]): Dispatch {
       return { kind: "presets-list", json: argv.slice(2).includes("--json") };
     }
     return { kind: "usage", unknown: `presets ${argv[1] ?? ""}`.trim() };
+  }
+  if (head === "profiles") {
+    if (argv[1] === "check") {
+      return { kind: "profiles-check", json: argv.slice(2).includes("--json") };
+    }
+    return { kind: "usage", unknown: `profiles ${argv[1] ?? ""}`.trim() };
   }
   if (head === "--x-preset" || head.startsWith("--x-preset=")) {
     // Harnessless launch: harness comes from the named preset. Keep the WHOLE

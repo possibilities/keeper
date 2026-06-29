@@ -163,6 +163,34 @@ describe("splitSubcommand", () => {
     });
   });
 
+  test("profiles check classifies (bare → human-readable)", () => {
+    expect(splitSubcommand(["profiles", "check"])).toEqual({
+      kind: "profiles-check",
+      json: false,
+    });
+  });
+
+  test("profiles check --json classifies", () => {
+    expect(splitSubcommand(["profiles", "check", "--json"])).toEqual({
+      kind: "profiles-check",
+      json: true,
+    });
+  });
+
+  test("profiles with an unknown verb is usage", () => {
+    expect(splitSubcommand(["profiles", "frobnicate"])).toEqual({
+      kind: "usage",
+      unknown: "profiles frobnicate",
+    });
+  });
+
+  test("bare profiles is usage", () => {
+    expect(splitSubcommand(["profiles"])).toEqual({
+      kind: "usage",
+      unknown: "profiles",
+    });
+  });
+
   test("empty argv is bare usage (no unknown)", () => {
     expect(splitSubcommand([])).toEqual({ kind: "usage" });
   });

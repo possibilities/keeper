@@ -30,7 +30,12 @@
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { parseArgs } from "node:util";
+import {
+  findShadowProfileDirs,
+  type ShadowProfileFinding,
+} from "../src/agent/shadow-profiles";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveConfig, resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
@@ -47,6 +52,7 @@ import {
   type SnapshotMeta,
   type SnapshotStatus,
 } from "../src/snapshot";
+import { listProfiles } from "../src/usage-picker";
 import { armViewerExitTriggers } from "../src/view-shell";
 
 const COLLECTION = "usage";
@@ -104,6 +110,10 @@ state, and age. The live frame re-renders every 30s so countdowns tick;
 historical scroll-back stays frozen at each frame's capture time.
 Per-frame sidecars under /tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*
 with an indexed meta sidecar; session paths print on SIGINT.
+
+An auth-bearing reserved profile-shadow dir (e.g. a login stranded in
+\`~/.claude-profiles/default\`) surfaces a one-line advisory banner above the
+stacks; run \`keeper agent profiles check\` to inspect and reconcile it.
 `;
 
 function seg(v: unknown): string {
@@ -715,6 +725,31 @@ export function renderSessionLines(
   return lines;
 }
 
+/**
+ * One-line, non-fatal advisory for an AUTH-BEARING reserved profile shadow
+ * (`isReservedShadow && hasAuth`) — a signed-in account stranded in a dir
+ * (e.g. `~/.claude-profiles/default`) that nothing reads, the collision this
+ * plank guards against. Returns a single banner line pointing at the read-only
+ * `keeper agent profiles check` doctor, or `[]` when no such shadow exists.
+ *
+ * Pure over its findings input; the caller computes findings ONCE per frame (a
+ * live fs read via `findShadowProfileDirs`, never a daemon round-trip), so the
+ * usage render path stays db-free and the 30s redraw tick never re-reads dirs.
+ * Stays NARROW: tracked-profile health (signed-out / no-subscription) is the
+ * account-row's job, not this banner's — so it keys strictly off the
+ * auth-bearing reserved-shadow predicate.
+ */
+export function formatShadowAdvisory(
+  findings: ShadowProfileFinding[],
+): string[] {
+  const stranded = findings.filter((f) => f.isReservedShadow && f.hasAuth);
+  if (stranded.length === 0) return [];
+  const where = stranded.map((f) => `${f.agent} ${f.name}/`).join(", ");
+  return [
+    `! a signed-in account is stranded in a reserved profile shadow (${where}) — run \`keeper agent profiles check\` to reconcile`,
+  ];
+}
+
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -777,6 +812,15 @@ export async function main(argv: string[]): Promise<void> {
   // live stream, so a restart picks up edits (consistent with the daemon's
   // own config read).
   const accountAliases = resolveConfig().accountAliases;
+  // Read-only detection of an auth-bearing reserved profile shadow (a login
+  // stranded in `~/.claude-profiles/default` and friends). Computed ONCE here —
+  // a live fs read, NEVER a daemon round-trip — and cached for the process'
+  // lifetime so the 30s redraw tick never re-reads the dirs (no IO churn /
+  // flicker). Db-free: `findShadowProfileDirs` + `listProfiles` import only
+  // node:* + dep-free leaves, so the usage render path stays off `src/db.ts`.
+  const shadowAdvisory = formatShadowAdvisory(
+    findShadowProfileDirs(listProfiles, homedir()),
+  );
   // Forward-reference slot for the `c`-key copy handler — wired further
   // down once sidecar paths and the last frame text are in scope.
   let onKey: ((key: string) => void) | undefined;
@@ -962,11 +1006,13 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   /**
-   * Compose the full frame body against `nowMs`: the per-profile usage stacks
-   * on top, then — when at least one job is present — a blank-line-separated
-   * `recent sessions` block. Both streams render against the SAME clock so a
-   * single 30s tick keeps every relative-time cell (quota resets, rate-limit
-   * annotations, AND session ages) fresh together.
+   * Compose the full frame body against `nowMs`: an optional shadow-profile
+   * advisory banner on top (when an auth-bearing reserved shadow exists), then
+   * the per-profile usage stacks, then — when at least one job is present — a
+   * blank-line-separated `recent sessions` block. Both streams render against
+   * the SAME clock so a single 30s tick keeps every relative-time cell (quota
+   * resets, rate-limit annotations, AND session ages) fresh together; the
+   * advisory is frame-static (computed once at startup, not per redraw).
    */
   function composeBody(nowMs: number): string[] {
     const usageLines = renderRowLines(lastUsageRows, nowMs, accountAliases);
@@ -975,11 +1021,21 @@ export async function main(argv: string[]): Promise<void> {
       nowMs,
       accountAliases,
     );
-    if (sessionLines.length === 0) return usageLines;
-    if (usageLines.length === 0) {
-      return ["recent sessions", ...sessionLines];
+    let body: string[];
+    if (sessionLines.length === 0) {
+      body = usageLines;
+    } else if (usageLines.length === 0) {
+      body = ["recent sessions", ...sessionLines];
+    } else {
+      body = [...usageLines, "", "recent sessions", ...sessionLines];
     }
-    return [...usageLines, "", "recent sessions", ...sessionLines];
+    // Prepend the shadow advisory as a top banner separated by a blank line.
+    // It sits ABOVE the stacks on its own lines, so it never feeds the
+    // account-row width pools (renderRowLines derives column widths from rows
+    // alone) and can't shift the table alignment.
+    if (shadowAdvisory.length === 0) return body;
+    if (body.length === 0) return [...shadowAdvisory];
+    return [...shadowAdvisory, "", ...body];
   }
 
   /**
