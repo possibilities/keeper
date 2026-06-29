@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-29T14:47:49.899000Z",
   "created_at": "2026-06-29T14:36:07.339000Z",
   "depends_on_epics": [],
   "id": "fn-1006-classify-signed-out-scrape-in-agentusage",
   "last_validated_at": "2026-06-29T14:36:14.343000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Classify signed-out scrape in agentusage",
   "touched_repos": [
     "/Users/mike/code/agentusage"
   ],
-  "updated_at": "2026-06-29T14:36:14.320000Z"
+  "updated_at": "2026-06-29T14:47:49.899000Z"
 }
