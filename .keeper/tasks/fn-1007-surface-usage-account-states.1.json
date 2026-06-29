@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Thread account_state through keeper",
-  "updated_at": "2026-06-29T14:37:22.470000Z"
+  "updated_at": "2026-06-29T15:02:56.635000Z",
+  "worker_done_at": "2026-06-29T15:02:56.635000Z"
 }

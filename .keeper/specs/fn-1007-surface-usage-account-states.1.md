@@ -86,5 +86,5 @@ Worker / subprocess — pure in-process per the suite contract.
 - [ ] `bun test` green (fold round-trip, schema-version, usage-worker gate).
 
 ## Done summary
-
+Threaded the orthogonal account_state axis (signed_out/no_subscription, NULL=subscribed/codex) end-to-end: parse the additive ok+signed_out scrape arm, three-way handleSuccess branch carried forward on transient failure, fold through serialize/extract/UPSERT, and land usage.account_state via schema v96->v97 (+SUPPORTED_SCHEMA_VERSIONS 97). Re-fold deterministic (asAccountState garbage->NULL).
 ## Evidence
