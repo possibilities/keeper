@@ -53,5 +53,5 @@ still reads `~/.claude-profiles/<name>`. Assert a signed-out `~/.claude` (no oau
 - [ ] `bun test test/usage-scraper-worker.test.ts` green.
 
 ## Done summary
-
+Fixed the default-tier split-brain: resolveMultiplierOrNull now reads default's tier from ~/.claude/.claude.json (not the ~/.claude-profiles/default shadow), inherited by both boot and per-cycle re-resolve. Updated test fixtures, added split-brain + signed-out pins, and README producer note + Re-homing runbook.
 ## Evidence
