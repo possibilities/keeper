@@ -3,14 +3,14 @@
  * enter the hook import graph through `reducer.ts`'s `bashTargetMatches`
  * (mirrors the `src/derivers.ts` / `src/dead-letter.ts` dep-free precedent: a
  * stray `src/` import here breaks the hook's "no third-party / no DB graph"
- * rule). Two consumers share ONE glob implementation: the reducer's deletion-
- * attribution path and the pair/reaper autoclose opt-out matcher.
+ * rule). Consumed by the reducer's deletion-attribution path
+ * (`bashTargetMatches`).
  *
  * Module-scope cache of token → compiled RegExp. A caller may probe the same
- * token many times (the deletion-attribution path across dirty files; the
- * boot-frozen reaper matcher across sessions); cache so re-compilation stays
- * O(distinct tokens). Cleared only on process restart — re-fold determinism is
- * unaffected because the cache value is a pure function of the key.
+ * token many times (the deletion-attribution path across dirty files); cache so
+ * re-compilation stays O(distinct tokens). Cleared only on process restart —
+ * re-fold determinism is unaffected because the cache value is a pure function
+ * of the key.
  */
 const FNMATCH_CACHE = new Map<string, RegExp>();
 

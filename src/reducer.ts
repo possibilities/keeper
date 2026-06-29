@@ -7773,7 +7773,7 @@ function projectJobsRow(db: Database, event: Event): void {
       // proven-dead evidence and outranks). Clears `monitors='[]'` in the same
       // UPDATE (terminal jobs have no live monitors). NULLs the backend-exec
       // pane + generation coords too: tmux recycles `%N`, so a dead job that
-      // keeps its pane id lets the window-reaper collateral-kill the live window
+      // keeps its pane id would be mis-attributed as owning the live window
       // that later inherits it (the post-switch COALESCE arm carries a matching
       // terminal guard so a late hook event can't re-stamp the pane). Matches
       // zero rows for a terminal event with no prior SessionStart — a correct
@@ -7847,8 +7847,8 @@ function projectJobsRow(db: Database, event: Event): void {
         }
         // NULL the backend-exec pane + generation coords on the terminal flip
         // (same recycle-guard rationale as SessionEnd): a dead job must not keep
-        // a tmux pane id `%N` that a fresh window can inherit, or the reaper
-        // collateral-kills the live window.
+        // a tmux pane id `%N` that a fresh window can inherit, or it gets
+        // mis-attributed as owning that live window.
         db.run(
           `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?,
                            backend_exec_pane_id = NULL,
@@ -8139,7 +8139,7 @@ function projectJobsRow(db: Database, event: Event): void {
   //
   // TERMINAL GUARD: skip a job already folded to ended/killed. The terminal
   // arms NULL `backend_exec_pane_id` (tmux recycles `%N`, so a dead job holding
-  // a live-recyclable pane id lets the reaper collateral-kill a fresh window);
+  // a live-recyclable pane id would be mis-attributed as owning a fresh window);
   // without this guard a late hook event carrying the stale env pane id would
   // COALESCE it straight back onto the dead row, undoing the clear in the very
   // same event. Mirrors the `TmuxTopologySnapshot` fold's live-state filter.

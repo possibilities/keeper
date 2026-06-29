@@ -3915,8 +3915,8 @@ test("TmuxTopologySnapshot with malformed / no-generation payload folds to a no-
 // ---------------------------------------------------------------------------
 // Terminal-state pane/generation clear (fn-977 task .2). A job folding to
 // ended/killed must drop its `backend_exec_pane_id` + `backend_exec_generation_id`:
-// tmux recycles a pane id `%N`, so a dead job that keeps its stale pane id lets
-// the window-reaper collateral-kill the fresh window that later inherits it. The
+// tmux recycles a pane id `%N`, so a dead job that keeps its stale pane id could
+// be mis-attributed as owning the fresh window that later inherits it. The
 // post-switch COALESCE arm carries a matching terminal guard so a late hook
 // event can't re-stamp the pane in the same (or a later) event.
 // ---------------------------------------------------------------------------

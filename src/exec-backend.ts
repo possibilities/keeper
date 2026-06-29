@@ -6,7 +6,7 @@
  * restore (all in resume mode for the latter two). tmux is used DIRECTLY only for
  * the surviving pane-ops seam — the session-agnostic pane ops
  * ({@link createTmuxPaneOps}: focus / list / rename / kill, consumed by the
- * reaper / renamer / jobs CLI / autopilot liveness probe). No `ExecBackend`
+ * renamer / jobs CLI / autopilot liveness probe). No `ExecBackend`
  * interface, no backend toggle: the launch transport is agentwrap, the pane ops
  * are the only remaining direct tmux surface.
  *
@@ -147,13 +147,13 @@ export const MANAGED_EXEC_SESSION = "autopilot" as const;
 /** The dedicated managed-session name `keeper bus wake` resumes an offline
  *  planner@<epic> creator into. Hardcoded, distinct from {@link
  *  MANAGED_EXEC_SESSION} so woken planners never share a window list with
- *  autopilot dispatch. The reaper autocloses its stopped windows via the single
- *  unified rule; this constant only names the spawn target. */
+ *  autopilot dispatch. This constant only names the spawn target. */
 export const AGENTBUS_EXEC_SESSION = "agentbus" as const;
 
 /** Default tmux session name `keeper pair` partners land in (mirrors
  *  `DEFAULT_PAIR_SESSION` in `src/pair-command.ts` — duplicated here so the
- *  reaper allow-list stays in `exec-backend.ts` without dragging the pair leaf). */
+ *  managed session-name constants stay colocated in `exec-backend.ts` without
+ *  dragging the pair leaf). */
 export const PAIR_EXEC_SESSION = "pair" as const;
 
 /** tmux session name `/plan:panel` legs land in. */
@@ -688,7 +688,7 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
       // this removes exactly the worker's window). Killing the last window
       // kills the managed session — fine, the next dispatch re-mints it via
       // get-or-create. A nonzero "can't find window" is the expected TOCTOU
-      // no-op (the window already closed between the reaper's snapshot and the
+      // no-op (the window already closed between a caller's snapshot and the
       // kill) — returned { ok: false } with no noteLine so a self-healing race
       // never spams the sidecar. The exit-watcher's synthetic Killed mint, not
       // this op's return, is the only truth of the row's death.

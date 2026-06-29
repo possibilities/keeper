@@ -2427,9 +2427,9 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `autopilot_state.worktree_mode` config column (an additive ALTER, not an
   // epics-shape change), fn-959 task .1. v92 NULLs `backend_exec_pane_id` +
   // `backend_exec_generation_id` on existing terminal (ended/killed) jobs so a
-  // dead job stops holding a tmux-recyclable pane id the reaper could
-  // collateral-kill, fn-977 task .2 (a one-time data-fix UPDATE, no column/shape
-  // change, version-guarded). v93 appends nullable codex-spark usage columns
+  // dead job stops holding a tmux-recyclable pane id that could be
+  // mis-attributed to a fresh window, fn-977 task .2 (a one-time data-fix
+  // UPDATE, no column/shape change, version-guarded). v93 appends nullable codex-spark usage columns
   // (additive ALTER, no epics-shape change). v94 appends the nullable
   // `events.worktree` + `jobs.worktree` durable lane-branch marker (an additive
   // ALTER, not an epics-shape change), fn-997 task .1. v95 appends the nullable

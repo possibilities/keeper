@@ -55,7 +55,6 @@ import {
   resolvePreset,
 } from "../src/agent/config";
 import { ensureCodexDirTrust } from "../src/codex-trust";
-import { resolveConfig } from "../src/db";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import { runPanel } from "../src/pair/panel";
 import {
@@ -74,7 +73,6 @@ import {
   parseGitPorcelain,
   parsePairLaunchJson,
   parseShowLastMessageJson,
-  resolveDisableAutoclose,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
   stripClaudeEnv,
@@ -184,21 +182,6 @@ function runAgentwrap(
     };
   } catch {
     return null;
-  }
-}
-
-/** Best-effort tmux window reap by pane id. Never throws. */
-function killWindow(paneId: string | null): void {
-  if (paneId === null || paneId === "") {
-    return;
-  }
-  try {
-    Bun.spawnSync(["tmux", "kill-window", "-t", paneId], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-  } catch {
-    // Best-effort — the window may already be gone.
   }
 }
 
@@ -354,37 +337,18 @@ export async function main(argv: string[]): Promise<void> {
     resolvePairKeeperAgentPath(),
   );
 
-  // Partner tmux session + autoclose policy. The window-kill is split by CLI:
-  //   - claude launches as a tracked interactive TUI job (the `KEEPER_TMUX_SESSION`
-  //     carrier), so the DAEMON reaper's managed-session arm (task .2) owns its
-  //     autoclose past the idle grace. The CLI NEVER synchronously reaps a claude
-  //     window — doing so would race the answer-capture against the kill.
-  //   - codex/pi fire no keeper hooks → they never become tracked jobs → the
-  //     daemon cannot reap them, so the CLI keeps the synchronous reap here.
-  // Either way a session listed in `disable-autoclose` (the ONE knob, shared with
-  // the daemon arm via `resolveConfig().disableAutoclose`; default EMPTY) is left
-  // open + interactive for inspection — attach with `tmux attach -t <session>`.
-  // agentwrap's race-safe launch lets concurrent partners share a named session
-  // without a create race, so a stable name is safe.
+  // Partner tmux session. Partners land in a stable named session (`pair` by
+  // default, `panels` for panel legs) and the window STAYS OPEN after the partner
+  // stops — keeper closes no windows; the operator garbage-collects them by hand
+  // (attach with `tmux attach -t <session>`). agentwrap's race-safe launch lets
+  // concurrent partners share a named session without a create race, so a stable
+  // name is safe.
   const sessionName = v.session ?? DEFAULT_PAIR_SESSION;
-  const isAutocloseDisabled = resolveDisableAutoclose(
-    resolveConfig().disableAutoclose,
-  );
-  const shouldReap = pairCli !== "claude" && !isAutocloseDisabled(sessionName);
 
   // SIGTERM handler: a Monitor kills the process when its timeout_ms expires. We
-  // MUST still emit a terminal line (so the orchestrating agent never hangs) AND
-  // reap the partner's tmux window when `shouldReap` holds (codex/pi only — a
-  // claude window is the daemon reaper's to autoclose). The pane id is captured
-  // into `reapPaneId` the moment the launch JSON is parsed.
-  let reapPaneId: string | null = null;
-  const reap = (): void => {
-    if (shouldReap) {
-      killWindow(reapPaneId);
-    }
-  };
+  // MUST still emit a terminal line (so the orchestrating agent never hangs); the
+  // partner's tmux window is left open for inspection.
   process.on("SIGTERM", () => {
-    reap();
     if (!startedEmitted) {
       emitEvent("started", { cli, role, output, preset: presetName });
     }
@@ -491,7 +455,6 @@ export async function main(argv: string[]): Promise<void> {
     return fail(launchParse.error);
   }
   const handle = launchParse.handle.id;
-  reapPaneId = launchParse.handle.paneId;
 
   // ---- 2. wait for the partner to stop ----
   // keeper's `--timeout` drives `--stop-timeout-ms` (agentwrap's stop-wait budget,
@@ -505,7 +468,6 @@ export async function main(argv: string[]): Promise<void> {
     stopTimeoutMs + PATH_CEILING_MS + SLOP_MS,
   );
   if (waitRes === null || waitRes.exitCode !== 0) {
-    reap();
     const detail =
       waitRes === null
         ? "spawn failed / killed"
@@ -520,7 +482,6 @@ export async function main(argv: string[]): Promise<void> {
     cwd,
   );
   if (showRes === null || showRes.exitCode !== 0) {
-    reap();
     const detail =
       showRes === null
         ? "spawn failed / killed"
@@ -529,15 +490,8 @@ export async function main(argv: string[]): Promise<void> {
   }
   const showParse = parseShowLastMessageJson(showRes.stdout);
   if (!showParse.ok) {
-    reap();
     return fail(showParse.error);
   }
-
-  // The partner has stopped and we have the message; autoclose its window now
-  // for the codex/pi path (for a claude partner `reap` is a no-op — the daemon
-  // reaper owns its autoclose — and a `disable-autoclose` session likewise stays
-  // open + interactive for inspection).
-  reap();
 
   // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
   // if the resolver fell back to newest-by-mtime and won the DRIVER's own

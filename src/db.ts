@@ -163,18 +163,6 @@ export interface KeeperConfig {
   // undefined here); `resolveKeeperAgentPath()` supplies the derived default +
   // the `KEEPER_AGENT_PATH` env override + tilde-expansion.
   keeperAgentPath?: string;
-  // Keeper-created session tokens (exact names or globs like `panels:*`) whose
-  // stopped tracked windows the reaper leaves OPEN instead of autoclosing — the
-  // debug opt-out. Tested against BOTH the live and birth session; gates EVERY
-  // keeper session, `autopilot` included. Default EMPTY (every keeper session
-  // autocloses). Folded from the `disable_autoclose` YAML list; non-string/empty
-  // entries are dropped.
-  disableAutoclose: string[];
-  // Idle grace (SECONDS) a cleanly-stopped keeper window must sit past before it
-  // autocloses. Folded from the `autoclose_grace_seconds` YAML key; a
-  // non-number / negative / garbage value falls back to
-  // {@link DEFAULT_AUTOCLOSE_GRACE_SECONDS}.
-  autocloseGraceSeconds: number;
   // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
@@ -203,15 +191,6 @@ export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
  * board. The reconciler/board resolve `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT`.
  */
 export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
-
-/**
- * Default idle grace (SECONDS) the reaper waits after a keeper window stops
- * cleanly before autoclosing it. Tight — the clean-stop signal plus the
- * immediate pre-kill re-check carry the safety; this grace only keeps a
- * just-stopped window alive long enough that a human glancing at it isn't racing
- * the reaper. Overridable via the `autoclose_grace_seconds` config key.
- */
-export const DEFAULT_AUTOCLOSE_GRACE_SECONDS = 3;
 
 /** `KEEPER_CONFIG` env wins; else `~/.config/keeper/config.yaml`. Pure. */
 export function resolveConfigPath(): string {
@@ -247,8 +226,6 @@ export function resolveConfig(): KeeperConfig {
   // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
-  let disableAutoclose: string[] = [];
-  let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
   let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
@@ -256,8 +233,6 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentusageRoot,
-        disableAutoclose,
-        autocloseGraceSeconds,
         accountAliases,
       };
     }
@@ -324,23 +299,6 @@ export function resolveConfig(): KeeperConfig {
       if (typeof kap === "string" && kap.length > 0) {
         keeperAgentPath = kap;
       }
-      // Best-effort string list — keep only non-empty trimmed strings; a
-      // non-array/absent value leaves the default (empty → autoclose every
-      // managed session).
-      const dac = (raw as { disable_autoclose?: unknown }).disable_autoclose;
-      if (Array.isArray(dac)) {
-        disableAutoclose = dac
-          .filter((s): s is string => typeof s === "string")
-          .map((s) => s.trim())
-          .filter((s) => s !== "");
-      }
-      // Best-effort number — a finite non-negative value wins; a non-number /
-      // negative / NaN leaves the default grace.
-      const ags = (raw as { autoclose_grace_seconds?: unknown })
-        .autoclose_grace_seconds;
-      if (typeof ags === "number" && Number.isFinite(ags) && ags >= 0) {
-        autocloseGraceSeconds = ags;
-      }
       // Keep only string→non-empty-string entries; drop the rest.
       const aliases = (raw as { account_aliases?: unknown }).account_aliases;
       if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
@@ -362,8 +320,6 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
-      disableAutoclose: [],
-      autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
       accountAliases: {},
     };
   }
@@ -377,8 +333,6 @@ export function resolveConfig(): KeeperConfig {
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
-    disableAutoclose,
-    autocloseGraceSeconds,
     accountAliases,
   };
 }
@@ -5311,11 +5265,11 @@ function migrate(db: Database): void {
       // v91→v92 (fn-977 task .2): NULL `backend_exec_pane_id` +
       // `backend_exec_generation_id` on EXISTING terminal (ended/killed) jobs.
       // tmux recycles a pane id `%N`, so a long-dead job that keeps its stale
-      // pane id lets the window-reaper collateral-kill the fresh window that
-      // later inherits it. The reducer's terminal fold arms now clear these
-      // coords going forward; this one-time pass brings the ~113 already-terminal
-      // rows (pane ids spanning %0-%519) in line so the reaper's recycle-guard
-      // (fn-977 task .1) has no stale pane → job mapping to trip over.
+      // pane id could be mis-attributed as owning the fresh window that later
+      // inherits it. The reducer's terminal fold arms now clear these coords
+      // going forward; this one-time pass brings the ~113 already-terminal rows
+      // (pane ids spanning %0-%519) in line so the recycle-guard (fn-977 task .1)
+      // has no stale pane → job mapping to trip over.
       //
       // VERSION-GUARDED (`preMigrateStoredVersion < 92`): the clear is a data
       // fix, not a column add. It is also naturally idempotent (the WHERE matches

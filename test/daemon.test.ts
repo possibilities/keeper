@@ -2516,7 +2516,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // never reads it, so a pre-feature log re-folds byte-identical). And to 92 via
   // fn-977 task .2 (NULLing `backend_exec_pane_id` + `backend_exec_generation_id`
   // on existing terminal jobs so a dead job stops holding a tmux-recyclable pane
-  // id the reaper could collateral-kill — a one-time version-guarded data-fix
+  // id that could be mis-attributed to a fresh window — a one-time version-guarded data-fix
   // UPDATE, NO cursor rewind: the pane column re-folds NULL for a terminal job
   // under the new terminal-clear fold arms and the generation column is live-only,
   // so the existing rows simply converge to what a re-fold would produce). And to
@@ -3351,7 +3351,6 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "maintenance-worker.ts": "maintenance",
   "restore-worker.ts": "restore",
   "renamer-worker.ts": "renamer",
-  "reaper-worker.ts": "reaper",
   "bus-worker.ts": "bus",
   "tmux-control-worker.ts": "tmuxControl",
 };
@@ -3373,7 +3372,6 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
  */
 function spawnedWorkerNames(opts?: {
   workers?: readonly WorkerName[];
-  enableReaper?: boolean;
 }): WorkerName[] {
   const captured: WorkerName[] = [];
 
@@ -3424,21 +3422,11 @@ function spawnedWorkerNames(opts?: {
   };
   const prior: Record<string, string | undefined> = {};
   for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
-  // The reaper is an OPT-IN feature gate (default OFF in prod). Pin it ON for the
-  // full-set worker contract — mirroring the builds/usageScraper gate pins above —
-  // so the no-selector boot deterministically spawns every ALL_WORKERS member; pass
-  // {enableReaper:false} to exercise the production default. Managed explicitly here
-  // (outside `sandbox`, which only ever SETS keys) so an inherited launchctl value
-  // can't leak into the boot.
-  const priorReaper = process.env.KEEPER_ENABLE_REAPER;
-  const reaperOn = opts?.enableReaper !== false;
 
   let handle: DaemonHandle | null = null;
   try {
     (globalThis as { Worker: unknown }).Worker = WorkerSpy;
     for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
-    if (reaperOn) process.env.KEEPER_ENABLE_REAPER = "1";
-    else delete process.env.KEEPER_ENABLE_REAPER;
     // Boot is fully synchronous up to the returned handle (every `new Worker`
     // fires here, under the spy).
     handle = startDaemon({ workers: opts?.workers });
@@ -3449,21 +3437,18 @@ function spawnedWorkerNames(opts?: {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    if (priorReaper === undefined) delete process.env.KEEPER_ENABLE_REAPER;
-    else process.env.KEEPER_ENABLE_REAPER = priorReaper;
   }
   void handle;
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
   // added `builds` (the first outbound-HTTP worker, gated on a configured
   // `buildbot_url` — `spawnedWorkerNames` pins one so the boot is deterministic);
   // fn-801 added `renamer` (the tmux window-namer; no watcher, no message minter);
-  // fn-802 added `reaper` (the autopilot window-reaper; no watcher, no message minter);
   // fn-875 added `bus` (the Agent Bus UDS relay; no watcher, no message minter —
   // owns its own bus.db + bus.sock, reads keeper.db read-only); fn-930 added
   // `usageScraper` (the in-process agentusage producer, gated on a resolvable `uv`
@@ -3476,7 +3461,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
   // the spy boot's default `disableNativeWatcher:false` but never in-process).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(19);
+  expect(spawned).toHaveLength(18);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -3496,7 +3481,6 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
     "maintenance",
     "restore",
     "renamer",
-    "reaper",
     "bus",
     "tmuxControl",
   ]);
@@ -3507,22 +3491,6 @@ test("fn-749: passing the full ALL_WORKERS set is identical to passing no select
   expect(spawnedWorkerNames({ workers: ALL_WORKERS })).toEqual([
     ...ALL_WORKERS,
   ]);
-});
-
-test("reaper: opt-in — absent from the default boot, present only with KEEPER_ENABLE_REAPER=1", () => {
-  // The autopilot window-reaper is OFF BY DEFAULT (a deliberate operator toggle, not
-  // a resource gate): a fresh production boot must NOT spawn it, so no session silently
-  // runs with reaping/autoclose on. KEEPER_ENABLE_REAPER=1 opts back in. (The full-set
-  // tests above pin it ON via the helper default; here we exercise both edges.)
-  const off = spawnedWorkerNames({ enableReaper: false });
-  expect(off).not.toContain("reaper");
-  expect(off).toEqual([...ALL_WORKERS].filter((w) => w !== "reaper"));
-  expect(off).toHaveLength(18);
-
-  const on = spawnedWorkerNames({ enableReaper: true });
-  expect(on).toContain("reaper");
-  expect(on).toEqual([...ALL_WORKERS]);
-  expect(on).toHaveLength(19);
 });
 
 test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worker)", () => {

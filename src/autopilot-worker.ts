@@ -1238,10 +1238,10 @@ export const DISPATCHED_ACK_TIMEOUT_MS = 10_000;
  * Worker shell wrapping. Mirrors the CLI autopilot's launch body so the
  * argv shape is identical: `[$SHELL, "-l", "-i", "-c", <body>]` where
  * `<body>` is `<workerCommand> ; exec $SHELL -l -i`. The trailing exec
- * leaves a usable login+interactive shell after `claude` exits (vim
- * fallback for the rare auto-close miss). The argv shape is the safe
- * quoting seam at the OS argv boundary — tmux forwards it verbatim
- * after `--`.
+ * leaves a usable login+interactive shell after `claude` exits so the
+ * window stays open for inspection until it is closed by hand. The argv
+ * shape is the safe quoting seam at the OS argv boundary — tmux forwards
+ * it verbatim after `--`.
  *
  * `shell` is injected (the worker resolves `process.env.SHELL` once
  * with a safe default fallback at boot; the pure function never reads
@@ -3632,10 +3632,10 @@ export interface AutopilotWorkerData {
   launcherArgvPrefix?: string[];
   /**
    * Worker-role discriminator. The bottom-of-file entrypoint runs `main()`
-   * ONLY when this is `"autopilot"`. The reaper worker imports this module
-   * for its `loadReconcileSnapshot` export and runs as `!isMainThread`
+   * ONLY when this is `"autopilot"`. Any other worker module that imports this
+   * module for its `loadReconcileSnapshot` export runs as `!isMainThread`
    * itself — the gate stops that import from booting a stowaway reconciler
-   * (racing dispatch decisions against the real one) inside the reaper
+   * (racing dispatch decisions against the real one) in that worker's
    * thread.
    */
   role?: "autopilot";
@@ -4473,7 +4473,7 @@ function main(): void {
 
 // Only run inside a real Worker spawned AS the autopilot (`role: "autopilot"`).
 // A plain import on the main thread is inert; an import from ANOTHER worker
-// module (the reaper pulls `loadReconcileSnapshot` from here) must NOT boot a
+// module that pulls `loadReconcileSnapshot` from here must NOT boot a
 // stowaway reconciler in that thread — the role gate enforces that.
 if (
   !isMainThread &&

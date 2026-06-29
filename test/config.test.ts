@@ -12,12 +12,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-  DEFAULT_MAX_CONCURRENT_JOBS,
-  resolveConfig,
-} from "../src/db";
-import { resolveDisableAutoclose } from "../src/pair-command";
+import { DEFAULT_MAX_CONCURRENT_JOBS, resolveConfig } from "../src/db";
 
 let dir: string;
 let prevEnv: string | undefined;
@@ -214,103 +209,5 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
   writeConfig("roots: not-a-list\nhandoff_prompt_prefix: /hack\n");
   const cfg = resolveConfig();
   expect(cfg.handoffPromptPrefix).toBe("/hack");
-  expect(cfg.roots.length).toBeGreaterThan(0);
-});
-
-// ---------------------------------------------------------------------------
-// disable_autoclose — the reaper opt-out; default empty (every keeper session
-// autocloses, autopilot included), best-effort string list, glob-aware.
-// ---------------------------------------------------------------------------
-
-test("disableAutoclose defaults to [] when the file is absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().disableAutoclose).toEqual([]);
-});
-
-test("disableAutoclose defaults to [] when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().disableAutoclose).toEqual([]);
-});
-
-test("disable_autoclose parses a session-name list", () => {
-  writeConfig("disable_autoclose:\n  - pair\n  - panels\n");
-  expect(resolveConfig().disableAutoclose).toEqual(["pair", "panels"]);
-});
-
-test("disable_autoclose trims and drops empty / non-string entries", () => {
-  writeConfig(
-    "disable_autoclose:\n" +
-      '  - "  pair  "\n' +
-      '  - ""\n' +
-      "  - 7\n" +
-      "  - null\n" +
-      "  - panels\n",
-  );
-  expect(resolveConfig().disableAutoclose).toEqual(["pair", "panels"]);
-});
-
-test("a non-array disable_autoclose falls back to [] (a list is required)", () => {
-  writeConfig("disable_autoclose: pair\n");
-  expect(resolveConfig().disableAutoclose).toEqual([]);
-});
-
-test("disable_autoclose resolves independently of a malformed sibling key", () => {
-  writeConfig("roots: not-a-list\ndisable_autoclose:\n  - pair\n");
-  const cfg = resolveConfig();
-  expect(cfg.disableAutoclose).toEqual(["pair"]);
-  expect(cfg.roots.length).toBeGreaterThan(0);
-});
-
-test("a disable_autoclose glob pattern parses and resolves through the matcher", () => {
-  writeConfig("disable_autoclose:\n  - 'panels:*'\n  - pair\n");
-  const isDisabled = resolveDisableAutoclose(resolveConfig().disableAutoclose);
-  // The glob arm matches any `panels:<id>` session; the bare arm matches exactly.
-  expect(isDisabled("panels:fn-1")).toBe(true);
-  expect(isDisabled("pair")).toBe(true);
-  expect(isDisabled("autopilot")).toBe(false);
-});
-
-// ---------------------------------------------------------------------------
-// autoclose_grace_seconds — the single reaper idle grace; default 3, best-effort
-// number (garbage / negative falls back to the default).
-// ---------------------------------------------------------------------------
-
-test("autocloseGraceSeconds defaults when the file is absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().autocloseGraceSeconds).toBe(
-    DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-  );
-});
-
-test("autocloseGraceSeconds defaults when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().autocloseGraceSeconds).toBe(
-    DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-  );
-});
-
-test("autoclose_grace_seconds parses a positive number override", () => {
-  writeConfig("autoclose_grace_seconds: 15\n");
-  expect(resolveConfig().autocloseGraceSeconds).toBe(15);
-});
-
-test("autoclose_grace_seconds accepts 0", () => {
-  writeConfig("autoclose_grace_seconds: 0\n");
-  expect(resolveConfig().autocloseGraceSeconds).toBe(0);
-});
-
-test("a garbage / negative autoclose_grace_seconds falls back to the default", () => {
-  for (const bad of ["not-a-number", "-5", "[]"]) {
-    writeConfig(`autoclose_grace_seconds: ${bad}\n`);
-    expect(resolveConfig().autocloseGraceSeconds).toBe(
-      DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-    );
-  }
-});
-
-test("autoclose_grace_seconds resolves independently of a malformed sibling key", () => {
-  writeConfig("roots: not-a-list\nautoclose_grace_seconds: 9\n");
-  const cfg = resolveConfig();
-  expect(cfg.autocloseGraceSeconds).toBe(9);
   expect(cfg.roots.length).toBeGreaterThan(0);
 });
