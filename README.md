@@ -440,9 +440,9 @@ Keeper has no `install` verb. Wire it up manually:
      keeperd probes its launchability at boot (logging the resolved launcher argv;
      a prominent warning if `bun` + `cli/keeper.ts` are not launchable). The
      managed-session name is hardcoded (`autopilot`), NOT configurable; each
-     dispatch opens a new window inside that shared background session. A
-     keeper-created window stays open after its work stops — keeper closes no
-     windows; the operator garbage-collects completed windows by hand.
+     dispatch opens a new window inside that shared background session. keeper
+     never auto-closes a managed window — every keeper-created window stays open
+     until the operator garbage-collects it by hand.
    - `dispatch_prompt_prefix` — a global prompt prefix for `keeper dispatch`
      FREE-FORM dispatches (`--prompt`/`--prompt-file`). When set (e.g. `/hack`),
      a free-form prompt launches as `<prefix> <prompt>` (single space) — handy
@@ -2649,8 +2649,8 @@ a test) emits `DispatchExpired` only if the bind truly never lands. On
 launch-window surfaces by intersecting `list-panes -a -j` with OPEN
 `pending_dispatches` rows — a discharged row = live worker, never reaped — and
 the reap never threw (no-self-heal). That broad pause/boot reap is gone; keeper
-closes no managed windows automatically — the operator garbage-collects
-completed windows by hand.
+does not auto-close any managed window — the operator garbage-collects completed
+windows by hand.
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -3143,9 +3143,8 @@ dispatch and the manual `keeper dispatch` re-exec the `keeper agent
 <claude|codex|pi>` subcommand (which owns the tmux window) — the in-binary
 launcher is the sole launch path (keeperd probes its launchability at boot). tmux
 is used DIRECTLY only for the pane ops
-(`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer);
-keeper closes no managed windows automatically, so there is no sweep-close
-path. Crash-recovery restore (`restore-agents.ts`) and bus wake both ride the
+(`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer;
+there is no general sweep-close path, and keeper never auto-closes a window). Crash-recovery restore (`restore-agents.ts`) and bus wake both ride the
 SAME in-binary launcher in resume mode (`agentwrapLaunch` with a `resumeTarget` —
 agentwrap get-or-creates the recorded session and re-attaches via
 `--resume <target>`), so there is ONE launch transport, not a second
@@ -3180,10 +3179,13 @@ per-run `-na` (`--no-approve`) flag, which ignores the cwd's project-local `.pi/
 resources and so never triggers the prompt. pi's `trust.json` is a shared profile
 path (state-sharing), so a seeder would collide there — `-na` replaces it.
 
-keeper closes no managed windows automatically: a keeper-created window stays
-open after its work stops — the operator garbage-collects completed windows by
-hand. The pending-dispatch row discharges on `SessionStart` or the 120s TTL
-sweep (above). The close-row
+keeper does NOT auto-close any managed window — every keeper-created window stays
+open until the operator garbage-collects it by hand, and a `killed` window stays
+open for forensics too. keeper also does NOT reap runaway raw OS processes
+(a leaked `bun test` tree or busy-loop shell is fixed at its source, not
+SIGKILLed by the daemon). The
+pending-dispatch row still discharges on `SessionStart` or the 120s TTL sweep
+(above). The close-row
 readiness verdict still rides the fn-764 wind-down read: the default epics read
 scopes to `status='open'`, so a SECOND bounded read (`filter:{status:"done"}`,
 sorted `updated_at` DESC, limited to a small window — never O(all done history),
@@ -3491,9 +3493,8 @@ resume mode (the same seam crash-restore uses): agentwrap builds the
 mints/owns the window, and holds the pane open after claude exits — so there is
 ONE launch transport, not a separate shell-wrapper. Single-flighted per session,
 liveness- and cooldown-gated, fail-open. The relay itself NEVER spawns — wake is entirely the
-CLI verb — and the resumed `agentbus` window stays OPEN after the planner stops,
-like every keeper-created window: keeper closes no windows automatically, so the
-operator garbage-collects it by hand. Liveness is socket-close, NOT a heartbeat: a peer's
+CLI verb — and a stopped tracked `agentbus` window stays open for manual GC,
+like every keeper-created window. Liveness is socket-close, NOT a heartbeat: a peer's
 death closes its fd → kernel FIN → the relay drops the channel, with no periodic
 liveness timer; boot rehydration still drops dead pids. `keeper bus list` is
 informational only, never a send precondition (there is no `resolve` subcommand —

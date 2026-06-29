@@ -60,9 +60,8 @@ This is the whole flow. Do it from the orchestrating (main) session:
    stream on stdout: `[keeper-pair] started …` immediately, then one terminal
    line — `[keeper-pair] completed …` (exit 0) or `[keeper-pair] failed …`
    (exit non-zero). The contract holds on EVERY path, including a Monitor
-   timeout/SIGTERM. The partner's tmux window stays open after it stops — keeper
-   closes no windows; attach with `tmux attach -t pair` to inspect it and close
-   it by hand when done.
+   timeout/SIGTERM. keeper never auto-closes the partner's tmux window — it stays
+   open for inspection (`tmux attach -t pair`) until you close it by hand.
 4. **Wait in silence.** Do NOT poll, do NOT spin, do NOT tail the output file.
    Hand back to the human or do other work until the Monitor notification
    arrives. The partner's turn can take minutes; that is normal.
@@ -123,8 +122,8 @@ expected path.
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with `--cli claude` is an arg fault). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner`. Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
-| `--session <s>` | Target tmux session for the partner window. Defaults to `pair` (panel legs use `panels`). The partner's window stays **open + interactive** after it stops, for inspection (`tmux attach -t pair`); keeper closes no windows, so close it by hand when done. Usually omit. |
-| `--timeout <s>` | Wait timeout in seconds (default 1800). It is authoritative for the partner stop wait: keeper forwards it to `keeper agent wait-for-stop … --stop-timeout-ms <ms>` (overriding the subcommand's 600s default) and widens the subprocess-kill margin to sit strictly above the launcher's worst-case clean return, so a 10–30 min turn no longer dies at 10 min. On timeout the run emits `failed` and the partner's window is left open for inspection. |
+| `--session <s>` | Target tmux session for the partner window. Defaults to `pair` (panel legs use `panels`). keeper never auto-closes the window: the CLI captures the answer synchronously and leaves the window **open + interactive** for inspection (`tmux attach -t pair`) until you close it by hand. Usually omit. |
+| `--timeout <s>` | Wait timeout in seconds (default 1800). It is authoritative for the partner stop wait: keeper forwards it to `keeper agent wait-for-stop … --stop-timeout-ms <ms>` (overriding the subcommand's 600s default) and widens the subprocess-kill margin to sit strictly above the launcher's worst-case clean return, so a 10–30 min turn no longer dies at 10 min. On timeout the run emits `failed`; the partner window stays open for inspection. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a
 sensible default (a cross-vendor partner, `default` role) and say what you
