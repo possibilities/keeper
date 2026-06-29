@@ -57,5 +57,5 @@ narration). All docs forward-facing only (no provenance/history).
 - [ ] `bun test` green.
 
 ## Done summary
-
+Inlined the handoff brief as the launch prompt (<prefix> <framing> <doc>, no keeper handoff show round-trip) with a coupled-cap test pinning prefix+framing+64KB doc under PROMPT_MAX_BYTES; swept SKILL.md/CLI/reducer/README docs to the inline model, the create-a-handoff trigger, --slug/--dir flags, and exit-3.
 ## Evidence
