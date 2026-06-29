@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-29T14:37:22.470000Z",
+  "depends_on": [
+    "fn-1007-surface-usage-account-states.1"
+  ],
+  "epic": "fn-1007-surface-usage-account-states",
+  "id": "fn-1007-surface-usage-account-states.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Render the three no-bar states",
+  "updated_at": "2026-06-29T14:37:22.470000Z"
+}
