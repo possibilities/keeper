@@ -1348,6 +1348,94 @@ test("block_escalations re-folds byte-identically from a from-scratch replay (es
 });
 
 // ---------------------------------------------------------------------------
+// `dispatch_failures.merge_escalated_at` once-marker (fn-1009) — the daemon
+// merge-escalation sweep's escalate-once gate folded by `MergeEscalationAttempted`
+// onto the sticky close row. A DETERMINISTIC-replayed column on a
+// deterministic-replayed table: a from-scratch re-fold MUST reproduce the stamp
+// (and the NULL non-terminal arm) byte-identically, or the escalate-once
+// guarantee is unsound. This is the load-bearing risk the early-proof-point task
+// retires before the producer (task .2) is built.
+// ---------------------------------------------------------------------------
+
+test("dispatch_failures.merge_escalated_at: a {DispatchFailed(close), MergeEscalationAttempted} stream re-folds byte-identically (fn-1009)", () => {
+  // A TERMINAL escalation stamps the marker = event.ts; a send_failed escalation
+  // on a second close row stays NULL (re-sweepable). Both arms must reproduce
+  // byte-identically from a from-scratch replay — the fold reads ONLY event.ts +
+  // the persisted row, no wall-clock/fs/liveness.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1009-mc",
+      reason: "worktree-merge-conflict",
+      dir: "/repo",
+      ts: 1700,
+    }),
+  });
+  insertEvent({
+    hook_event: "MergeEscalationAttempted",
+    session_id: "reconciler",
+    ts: 1750,
+    data: JSON.stringify({ id: "fn-1009-mc", outcome: "sent" }),
+  });
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1009-mc-sf",
+      reason: "worktree-merge-conflict",
+      dir: "/repo",
+      ts: 1760,
+    }),
+  });
+  insertEvent({
+    hook_event: "MergeEscalationAttempted",
+    session_id: "reconciler",
+    ts: 1770,
+    data: JSON.stringify({ id: "fn-1009-mc-sf", outcome: "send_failed" }),
+  });
+  // A re-failure of the stamped row AFTER it escalated must preserve the marker
+  // through the UPSERT — fold this into the re-folded stream so the preservation
+  // is part of the determinism proof, not just the unit test.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1009-mc",
+      reason: "worktree-merge-conflict",
+      dir: "/repo2",
+      ts: 1800,
+    }),
+  });
+  drainAll();
+
+  const live = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  const stamped = live.find((r) => r.id === "fn-1009-mc");
+  const unstamped = live.find((r) => r.id === "fn-1009-mc-sf");
+  // Terminal stamp survives the later re-failure UPSERT; non-terminal stays NULL.
+  expect(stamped?.merge_escalated_at).toBe(1750);
+  expect(unstamped?.merge_escalated_at).toBeNull();
+
+  // Full from-scratch re-fold: rewind + wipe (dispatch_failures rides the
+  // canonical DELETE list but rewindAndWipeProjections omits it, mirroring the
+  // resurrection regression test above), then re-drain from id 0.
+  rewindAndWipeProjections();
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+
+  const refolded = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  // Byte-identical — the escalate-once marker is re-fold-deterministic.
+  expect(refolded).toEqual(live);
+});
+
+// ---------------------------------------------------------------------------
 // Layer 1 — aggregate counts over the live-shaped corpus
 // ---------------------------------------------------------------------------
 

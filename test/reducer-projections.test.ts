@@ -1068,6 +1068,191 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
   expect(after).toEqual(before);
 });
 
+// ---------------------------------------------------------------------------
+// Schema v98 (fn-1009.1) — `MergeEscalationAttempted` folds the escalate-once
+// `dispatch_failures.merge_escalated_at` once-marker on a sticky
+// `worktree-merge-conflict` CLOSE row. A TERMINAL outcome (`sent` /
+// `queued_for_wake`) stamps `merge_escalated_at = event.ts` (gated IS NULL); a
+// `send_failed` / unknown outcome leaves it NULL (re-sweepable). The marker
+// PERSISTS across a `DispatchFailed` re-UPSERT of an uncleared row and is dropped
+// with the row on `DispatchCleared`. Pure fold (event.ts + persisted row only).
+// ---------------------------------------------------------------------------
+
+function mergeEscalationEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "MergeEscalationAttempted",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome }),
+  });
+}
+
+function getMergeEscalatedAt(verb: string, id: string): number | null {
+  const row = db
+    .query(
+      "SELECT merge_escalated_at FROM dispatch_failures WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { merge_escalated_at: number | null } | null;
+  return row?.merge_escalated_at ?? null;
+}
+
+test("MergeEscalationAttempted stamps merge_escalated_at = event.ts on a terminal outcome (sent / queued_for_wake)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-1",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-1")).toBeNull();
+
+  const sentId = mergeEscalationEvent("fn-mc-1", "sent", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getMergeEscalatedAt("close", "fn-mc-1")).toBe(1750);
+  expect(getCursor()).toBe(sentId);
+
+  // `queued_for_wake` (no live subscriber, parked for wake) is also terminal.
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-2",
+    "worktree-merge-conflict",
+    "/r",
+    1760,
+  );
+  mergeEscalationEvent("fn-mc-2", "queued_for_wake", 1770);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-2")).toBe(1770);
+});
+
+test("MergeEscalationAttempted with a send_failed / unknown outcome leaves merge_escalated_at NULL (re-sweepable)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-sf",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeEscalationEvent("fn-mc-sf", "send_failed", 1750);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-sf")).toBeNull();
+
+  // An unknown / unexpected outcome is non-terminal too (terminal is a strict
+  // allow-list: only a CONFIRMED delivery stamps the once-marker).
+  mergeEscalationEvent("fn-mc-sf", "weird_outcome", 1760);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-sf")).toBeNull();
+
+  // A later terminal retry over the same still-uncleared row stamps it.
+  mergeEscalationEvent("fn-mc-sf", "sent", 1770);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-sf")).toBe(1770);
+});
+
+test("MergeEscalationAttempted on a missing close row is a safe no-op (cursor still advances)", () => {
+  const id = mergeEscalationEvent("fn-mc-gone", "sent", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getDispatchFailure("close", "fn-mc-gone")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("MergeEscalationAttempted only stamps a CLOSE-verb row (a same-id work failure is untouched)", () => {
+  // The fold is verb-scoped to `close` — a non-close failure sharing the id must
+  // never be marked, so the marker can't bleed across verbs.
+  dispatchFailedEvent("work", "fn-mc-verb", "launch_failed", "/r", 1700);
+  mergeEscalationEvent("fn-mc-verb", "sent", 1750);
+  drainAll();
+  expect(getMergeEscalatedAt("work", "fn-mc-verb")).toBeNull();
+});
+
+test("a DispatchFailed re-UPSERT of an uncleared close row preserves merge_escalated_at (escalate-once)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-pres",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeEscalationEvent("fn-mc-pres", "sent", 1750);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-pres")).toBe(1750);
+
+  // A re-failure of the SAME uncleared close row (later ts, different dir) must
+  // NOT reset the escalate-once marker — else the sweep would re-notify.
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-pres",
+    "worktree-merge-conflict",
+    "/r2",
+    1800,
+  );
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-pres")).toBe(1750);
+});
+
+test("DispatchCleared drops merge_escalated_at with the close row so a fresh conflict re-arms at NULL", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeEscalationEvent("fn-mc-clr", "sent", 1750);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-clr")).toBe(1750);
+
+  dispatchClearedEvent("close", "fn-mc-clr");
+  drainAll();
+  expect(getDispatchFailure("close", "fn-mc-clr")).toBeNull();
+
+  // A fresh conflict on the same key re-arms the marker at the column default.
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1800,
+  );
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-clr")).toBeNull();
+});
+
+test("MergeEscalationAttempted with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-mal",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ outcome: "sent" }), // missing id
+    JSON.stringify({ id: "", outcome: "sent" }), // empty id
+    JSON.stringify({ id: "fn-mc-mal" }), // missing outcome
+    JSON.stringify({ id: "fn-mc-mal", outcome: "" }), // empty outcome
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "MergeEscalationAttempted",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  // No malformed event stamped the marker — it stays NULL.
+  expect(getMergeEscalatedAt("close", "fn-mc-mal")).toBeNull();
+});
+
 test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {
   const count = (
     db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {

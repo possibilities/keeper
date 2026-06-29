@@ -586,6 +586,7 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
     "created_at",
     "updated_at",
+    "merge_escalated_at",
   ],
   pk: "verb",
   version: "last_event_id",

@@ -2535,8 +2535,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // byte-identical). And to 97 via fn-1007 task .1 (appending the nullable
   // `usage.account_state` account-axis column — an additive ALTER, NO cursor
   // rewind: a pre-v97 `UsageSnapshot` carries no `account_state`, so a
-  // from-scratch re-fold leaves the column NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(97);
+  // from-scratch re-fold leaves the column NULL byte-identical). And to 98 via
+  // fn-1009 task .1 (appending the nullable `dispatch_failures.merge_escalated_at`
+  // escalate-once marker for the daemon merge-escalation sweep — an additive
+  // ALTER, NO cursor rewind: a pre-v98 stream carries no `MergeEscalationAttempted`
+  // event, so a from-scratch re-fold leaves the column NULL byte-identical, and
+  // `foldDispatchFailed` preserves it across the UPSERT).
+  expect(SCHEMA_VERSION).toBe(98);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

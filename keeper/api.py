@@ -386,6 +386,9 @@ from pathlib import Path
 # v96 (fn-1003 task .2) adds the nullable ``handoffs.target_dir`` column — the
 # resolved absolute directory a ``keeper handoff --dir`` launches the handoff-ee
 # in; keeper-py never reads ``handoffs``, so only the version whitelist gains 96.
+# v98 (fn-1009 task .1) adds the nullable ``dispatch_failures.merge_escalated_at``
+# once-marker for the daemon merge-escalation sweep; keeper-py never reads
+# ``dispatch_failures``, so only the version whitelist gains 98.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -455,6 +458,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         95,
         96,
         97,
+        98,
     }
 )
 

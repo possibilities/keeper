@@ -2438,9 +2438,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `handoffs.target_dir` launch-directory column (an additive ALTER, not an
   // epics-shape change), fn-1003 task .2. v97 appends the nullable
   // `usage.account_state` account-axis column (an additive ALTER, not an
-  // epics-shape change), fn-1007 task .1. The v62→v63 epics-shape migration this
-  // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(97);
+  // epics-shape change), fn-1007 task .1. v98 appends the nullable
+  // `dispatch_failures.merge_escalated_at` escalate-once marker for the daemon
+  // merge-escalation sweep (an additive ALTER, not an epics-shape change),
+  // fn-1009 task .1. The v62→v63 epics-shape migration this test exercises is
+  // unchanged.
+  expect(SCHEMA_VERSION).toBe(98);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
