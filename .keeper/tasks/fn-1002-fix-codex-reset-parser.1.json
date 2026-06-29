@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-29T00:25:50.475000Z",
+  "depends_on": [],
+  "epic": "fn-1002-fix-codex-reset-parser",
+  "id": "fn-1002-fix-codex-reset-parser.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/agentusage",
+  "tier": "high",
+  "title": "Accept dated Codex resets",
+  "updated_at": "2026-06-29T00:25:50.475000Z"
+}
