@@ -64,6 +64,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { MAX_CLAUDE_JSON_BYTES, resolveTierMultiplier } from "./claude-tier";
 import { openDb } from "./db";
 import { FileLock } from "./usage-flock";
 import {
@@ -111,24 +112,6 @@ const MIN_PROFILE_USE_INTERVAL_S = 60.0;
 /** Backoff for Claude's transient `/usage` endpoint throttle. */
 const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MIN_S = 15 * 60;
 const USAGE_ENDPOINT_RATE_LIMIT_RETRY_MAX_S = 30 * 60;
-
-/**
- * Cap a `.claude.json` read so a runaway file never balloons boot memory. Real
- * configs run 1.7-2.4 MB and grow with history, so the cap only fences off a
- * pathological file — set well above the live range with headroom to spare.
- */
-const MAX_CLAUDE_JSON_BYTES = 16 * 1024 * 1024;
-
-/**
- * Plan-tier string → multiplier. Source of truth:
- * `~/.claude-profiles/<p>/.claude.json:oauthAccount.organizationRateLimitTier`.
- * Pro (1x), Max-5x, Max-20x. Codex has no tier — treated as 1x.
- */
-const TIER_MULTIPLIERS: Record<string, number> = {
-  default_claude_ai: 1,
-  default_claude_max_5x: 5,
-  default_claude_max_20x: 20,
-};
 
 /** One account the worker scrapes: a stable id + the TUI target + its multiplier. */
 export interface Account {
@@ -293,11 +276,7 @@ function parseTierMultiplier(path: string, size: number): number | null {
   if (!isRecord(data) || !isRecord(data.oauthAccount)) {
     return null;
   }
-  const tier = data.oauthAccount.organizationRateLimitTier;
-  if (typeof tier !== "string") {
-    return null;
-  }
-  return TIER_MULTIPLIERS[tier] ?? null;
+  return resolveTierMultiplier(data.oauthAccount.organizationRateLimitTier);
 }
 
 /**
