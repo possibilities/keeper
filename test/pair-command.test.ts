@@ -689,18 +689,18 @@ test("isSelfTranscriptCollision: null/empty inputs never collide", () => {
 // keeper-agent launcher path resolution
 // ---------------------------------------------------------------------------
 
-test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; deprecated alias next; tilde expands", () => {
-  // The new env override wins.
+test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; tilde expands; else derived default", () => {
+  // The env override wins.
   expect(
     resolvePairKeeperAgentPath(
       { KEEPER_AGENT_PATH: "/custom/keeper.ts" },
       "/home/u",
     ),
   ).toBe("/custom/keeper.ts");
-  // The deprecated agentwrap alias still resolves (migration readability).
+  // A leading ~/ in the override expands at resolve time.
   expect(
     resolvePairKeeperAgentPath(
-      { KEEPER_AGENTWRAP_PATH: "~/bin/keeper.ts" },
+      { KEEPER_AGENT_PATH: "~/bin/keeper.ts" },
       "/home/u",
     ),
   ).toBe("/home/u/bin/keeper.ts");

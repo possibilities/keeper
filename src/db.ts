@@ -121,10 +121,6 @@ const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
 const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
 
-/** Default absolute agentwrap binary used when `agentwrap_path` /
- *  `KEEPER_AGENTWRAP_PATH` are unset. Tilde-expanded at resolve time. */
-const DEFAULT_AGENTWRAP_PATH = "~/.bun/bin/agentwrap";
-
 /**
  * Parsed keeper daemon config. Keys are INDEPENDENT — a malformed/missing one
  * never disturbs the others. Unknown keys are ignored.
@@ -161,19 +157,11 @@ export interface KeeperConfig {
   // default: absent/empty/garbage → undefined → no prefix applied. Mirrors
   // `dispatchPromptPrefix`.
   handoffPromptPrefix?: string;
-  // Absolute path to the agentwrap binary keeper launches workers through.
-  // Independent best-effort key with NO default at the parse layer (absent →
-  // undefined here); `resolveAgentwrapPath()` supplies the `~/.bun/bin/agentwrap`
-  // default + the `KEEPER_AGENTWRAP_PATH` env override + tilde-expansion.
-  // DEPRECATED alias of `keeperAgentPath` since the agentwrap launcher folded
-  // into `keeper agent` — still read so an existing config keeps working.
-  agentwrapPath?: string;
   // Absolute path to the keeper CLI entry the detached tmux pane re-execs to
   // reach the folded launcher (`<bun> <keeperAgentPath> agent <agent> …`).
   // Independent best-effort key with NO default at the parse layer (absent →
   // undefined here); `resolveKeeperAgentPath()` supplies the derived default +
-  // the `KEEPER_AGENT_PATH` env override + tilde-expansion. Supersedes
-  // `agentwrapPath` (read as a deprecated alias).
+  // the `KEEPER_AGENT_PATH` env override + tilde-expansion.
   keeperAgentPath?: string;
   // Keeper-created session tokens (exact names or globs like `panels:*`) whose
   // stopped tracked windows the reaper leaves OPEN instead of autoclosing — the
@@ -256,9 +244,6 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `handoffPromptPrefix` undefined so no prefix is
   // applied to `keeper handoff` dispatches.
   let handoffPromptPrefix: string | undefined;
-  // No default at the parse layer — absent leaves `agentwrapPath` undefined so
-  // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
-  let agentwrapPath: string | undefined;
   // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
@@ -332,17 +317,9 @@ export function resolveConfig(): KeeperConfig {
         handoffPromptPrefix = hpp;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
-      // leaves `agentwrapPath` undefined and `resolveAgentwrapPath()` falls
-      // back to the default. NOT tilde-expanded here — resolution happens in
-      // `resolveAgentwrapPath()`.
-      const awp = (raw as { agentwrap_path?: unknown }).agentwrap_path;
-      if (typeof awp === "string" && awp.length > 0) {
-        agentwrapPath = awp;
-      }
-      // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `keeperAgentPath` undefined and `resolveKeeperAgentPath()` falls
-      // back to `agentwrap_path` (deprecated alias) then the derived default.
-      // NOT tilde-expanded here — resolution happens in `resolveKeeperAgentPath()`.
+      // back to the derived default. NOT tilde-expanded here — resolution
+      // happens in `resolveKeeperAgentPath()`.
       const kap = (raw as { keeper_agent_path?: unknown }).keeper_agent_path;
       if (typeof kap === "string" && kap.length > 0) {
         keeperAgentPath = kap;
@@ -399,37 +376,11 @@ export function resolveConfig(): KeeperConfig {
     usageScraperProjectDir,
     dispatchPromptPrefix,
     handoffPromptPrefix,
-    agentwrapPath,
     keeperAgentPath,
     disableAutoclose,
     autocloseGraceSeconds,
     accountAliases,
   };
-}
-
-/**
- * Resolve the absolute agentwrap binary path for the `agentwrap` exec backend.
- * `KEEPER_AGENTWRAP_PATH` env wins; else the `agentwrap_path` config key; else
- * `~/.bun/bin/agentwrap`. A leading `~` is expanded via `homedir()` AT RESOLVE
- * TIME — `execvp` does not expand `~`, so a tilde must be gone before spawn.
- * Mirrors {@link resolveDbPath}'s env-override + {@link resolvePlanRoots}'s
- * tilde-expansion precedents. No existence check here — a missing/bad path
- * fails the launch loudly at spawn time, not silently at resolve time.
- */
-export function resolveAgentwrapPath(): string {
-  const override = process.env.KEEPER_AGENTWRAP_PATH;
-  const entry =
-    override && override.length > 0
-      ? override
-      : (resolveConfig().agentwrapPath ?? DEFAULT_AGENTWRAP_PATH);
-  const home = homedir();
-  if (entry === "~") {
-    return home;
-  }
-  if (entry.startsWith("~/")) {
-    return join(home, entry.slice(2));
-  }
-  return entry;
 }
 
 /**
@@ -439,22 +390,16 @@ export function resolveAgentwrapPath(): string {
  * `src/keeper-agent-path.ts`): it folds the `keeper_agent_path` config key on top
  * of the same env-override + derived default.
  *
- * Precedence: `KEEPER_AGENT_PATH` env > `keeper_agent_path` config >
- * `KEEPER_AGENTWRAP_PATH` env (deprecated alias) > `agentwrap_path` config
- * (deprecated alias) > the derived `cli/keeper.ts` default. A leading `~` on a
- * config/env value is expanded via `homedir()` AT RESOLVE TIME (`execvp`/the
- * shell re-exec do not expand `~`). The DERIVED default is already absolute +
- * `realpath`'d. No existence check — a bad path fails the launch loudly at spawn.
+ * Precedence: `KEEPER_AGENT_PATH` env > `keeper_agent_path` config > the derived
+ * `cli/keeper.ts` default. A leading `~` on a config/env value is expanded via
+ * `homedir()` AT RESOLVE TIME (`execvp`/the shell re-exec do not expand `~`). The
+ * DERIVED default is already absolute + `realpath`'d. No existence check — a bad
+ * path fails the launch loudly at spawn.
  */
 export function resolveKeeperAgentPath(): string {
   const cfg = resolveConfig();
   const entry =
-    firstNonEmpty(
-      process.env.KEEPER_AGENT_PATH,
-      cfg.keeperAgentPath,
-      process.env.KEEPER_AGENTWRAP_PATH,
-      cfg.agentwrapPath,
-    ) ?? null;
+    firstNonEmpty(process.env.KEEPER_AGENT_PATH, cfg.keeperAgentPath) ?? null;
   if (entry === null) {
     return defaultKeeperAgentPath();
   }
