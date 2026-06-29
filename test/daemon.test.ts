@@ -33,6 +33,7 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildBlockEscalationBody,
+  buildMergeEscalationBody,
   buildPendingDispatchSweepRecords,
   checkKeeperAgentPresence,
   type DaemonHandle,
@@ -43,18 +44,26 @@ import {
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
   isTransientBusyError,
+  MERGE_ESCALATION_REASON_TOKEN,
+  type MergeEscalationOutcome,
+  type MergeEscalationSweepDeps,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
+  type PendingMergeEscalation,
+  type PlannerNotifyResult,
   parseBlockedCategory,
   prewarmWatcherAddon,
   recoverOneDeadLetter,
   runBlockEscalationSweep,
+  runMergeEscalationSweep,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
+  selectPendingMergeEscalations,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
+  shouldEscalateMergeConflict,
   startDaemon,
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
@@ -65,6 +74,7 @@ import { serializeDeadLetterRecord } from "../src/dead-letter";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
+import { worktreePathFor } from "../src/worktree-plan";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -2535,8 +2545,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // byte-identical). And to 97 via fn-1007 task .1 (appending the nullable
   // `usage.account_state` account-axis column — an additive ALTER, NO cursor
   // rewind: a pre-v97 `UsageSnapshot` carries no `account_state`, so a
-  // from-scratch re-fold leaves the column NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(97);
+  // from-scratch re-fold leaves the column NULL byte-identical). And to 98 via
+  // fn-1009 task .1 (appending the nullable `dispatch_failures.merge_escalated_at`
+  // escalate-once marker for the daemon merge-escalation sweep — an additive
+  // ALTER, NO cursor rewind: a pre-v98 stream carries no `MergeEscalationAttempted`
+  // event, so a from-scratch re-fold leaves the column NULL byte-identical, and
+  // `foldDispatchFailed` preserves it across the UPSERT).
+  expect(SCHEMA_VERSION).toBe(98);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -3269,6 +3284,364 @@ test("runBlockEscalationSweep: a queued_for_wake helper result rides through as 
     taskId: "fn-1-foo.1",
     outcome: "queued_for_wake",
   });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1009 task .2 — daemon worktree-merge-conflict close-escalation producer
+// ---------------------------------------------------------------------------
+
+// The EXACT ` — ` separator the autopilot mints (src/autopilot-worker.ts) — a
+// space + U+2014 em-dash + space. Pin it: the reason parser splits on this exact
+// sequence, so a drift in the producer string must break this test, not silently
+// degrade every escalation body to a parse-miss.
+const EM_DASH = "—";
+function mergeConflictReason(
+  source: string,
+  base: string,
+  stderr = "CONFLICT (content): Merge conflict in src/foo.ts",
+): string {
+  return `worktree-merge-conflict: merging ${source} into ${base} ${EM_DASH} ${stderr}`;
+}
+
+test("MERGE_ESCALATION_REASON_TOKEN is the exact worktree-merge-conflict leading token", () => {
+  expect(MERGE_ESCALATION_REASON_TOKEN).toBe("worktree-merge-conflict");
+});
+
+test("shouldEscalateMergeConflict: exact leading-token gate — only worktree-merge-conflict escalates", () => {
+  expect(
+    shouldEscalateMergeConflict(
+      mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
+    ),
+  ).toBe(true);
+  // The excluded siblings — a `worktree-merge` PREFIX must NOT match.
+  expect(
+    shouldEscalateMergeConflict(
+      "worktree-merge-lock-timeout: could not acquire the lock",
+    ),
+  ).toBe(false);
+  expect(
+    shouldEscalateMergeConflict(
+      "worktree-merge-local-timeout: a local git op timed out",
+    ),
+  ).toBe(false);
+  expect(
+    shouldEscalateMergeConflict(
+      "worktree-finalize-non-fast-forward: origin is ahead",
+    ),
+  ).toBe(false);
+  expect(
+    shouldEscalateMergeConflict(
+      "worktree-recover-dirty: lane has uncommitted work",
+    ),
+  ).toBe(false);
+  // A longer token that merely STARTS with the token string is not an exact match.
+  expect(
+    shouldEscalateMergeConflict("worktree-merge-conflict-extra: nope"),
+  ).toBe(false);
+  // No colon / empty / null → false.
+  expect(shouldEscalateMergeConflict("worktree-merge-conflict")).toBe(false);
+  expect(shouldEscalateMergeConflict("")).toBe(false);
+  expect(shouldEscalateMergeConflict(null)).toBe(false);
+});
+
+// ---- selectPendingMergeEscalations (the current-state working-set read) -----
+
+function seedMergeFailureRow(
+  db: ReturnType<typeof openDb>["db"],
+  args: {
+    verb: string;
+    id: string;
+    reason: string;
+    dir?: string | null;
+    mergeEscalatedAt?: number | null;
+  },
+): void {
+  db.run(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at)
+       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?)`,
+    [
+      args.verb,
+      args.id,
+      args.reason,
+      args.dir ?? null,
+      args.mergeEscalatedAt ?? null,
+    ],
+  );
+}
+
+test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token and a NULL marker", () => {
+  const { db } = freshMemDb();
+  // Escalatable: a sticky close merge conflict, not yet escalated.
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-1-foo",
+    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+    dir: "/repo/root",
+  });
+  // Already escalated (marker set) → dropped.
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-2-bar",
+    reason: mergeConflictReason("fn-2-bar.1", "keeper/epic/fn-2-bar"),
+    dir: "/repo/root",
+    mergeEscalatedAt: 12345,
+  });
+  // Excluded reasons on a close row — a `worktree-merge` prefix must NOT match.
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-3-lock",
+    reason: "worktree-merge-lock-timeout: could not acquire the lock",
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-4-local",
+    reason: "worktree-merge-local-timeout: a local git op timed out",
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-5-nonff",
+    reason: "worktree-finalize-non-fast-forward: origin is ahead",
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-6-recover",
+    reason: "worktree-recover-dirty: lane has uncommitted work",
+  });
+  // A WORK row carrying the same reason token — wrong verb, dropped.
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-7-foo.1",
+    reason: mergeConflictReason("fn-7-foo.1", "keeper/epic/fn-7-foo"),
+  });
+
+  const rows = selectPendingMergeEscalations(db);
+  expect(rows).toEqual([
+    {
+      id: "fn-1-foo",
+      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+      dir: "/repo/root",
+    },
+  ]);
+  db.close();
+});
+
+test("selectPendingMergeEscalations: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingMergeEscalations(db)).toEqual([]);
+  db.close();
+});
+
+// ---- buildMergeEscalationBody (pure body assembly + parse-miss degrade) ------
+
+test("buildMergeEscalationBody: parses source/base, derives the worktree path, carries the --no-ff recipe + guardrails", () => {
+  const repoDir = "/Users/me/code/foo";
+  const base = "keeper/epic/fn-9-foo";
+  const source = "fn-9-foo.2";
+  const body = buildMergeEscalationBody({
+    epicId: "fn-9-foo",
+    reason: mergeConflictReason(source, base),
+    repoDir,
+  });
+  // The exact base worktree path, derived from row.dir + the parsed base branch.
+  expect(body).toContain(worktreePathFor(repoDir, base));
+  // The merge-commit mechanic: --no-ff against the parsed source, never squash/rebase.
+  expect(body).toContain(`git merge --no-ff ${source}`);
+  expect(body).toContain("--squash");
+  expect(body).toContain("rebase");
+  // The guardrails: run the tests before retry, merge BOTH intents, escalate a
+  // semantically-dense conflict to a human.
+  expect(body).toContain("tests");
+  expect(body).toContain("BOTH");
+  expect(body).toContain("state machine");
+  expect(body).toContain("ping the human");
+  // The unstick command keyed on the epic's close.
+  expect(body).toContain("keeper autopilot retry close::fn-9-foo");
+  // The free-text reason rides as a body line.
+  expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
+});
+
+test("buildMergeEscalationBody: a parse-miss degrades to a human-actionable manual body (never throws)", () => {
+  // A reason that does not match the `merging … into …` shape.
+  const body = buildMergeEscalationBody({
+    epicId: "fn-9-foo",
+    reason: "worktree-merge-conflict: something unparseable happened",
+    repoDir: "/Users/me/code/foo",
+  });
+  expect(body).toContain("close::fn-9-foo");
+  expect(body).toContain("--no-ff");
+  expect(body).toContain("ping the human");
+  // No source branch to interpolate, but still a manual recipe — and no throw.
+  expect(body).toContain("keeper autopilot retry close::fn-9-foo");
+});
+
+test("buildMergeEscalationBody: a null/empty repoDir degrades to the manual body (never throws)", () => {
+  const body = buildMergeEscalationBody({
+    epicId: "fn-9-foo",
+    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
+    repoDir: null,
+  });
+  expect(body).toContain("close::fn-9-foo");
+  expect(body).toContain("--no-ff");
+});
+
+// ---- runMergeEscalationSweep (orchestration core, injected deps) ------------
+
+interface MergeMintCall {
+  id: string;
+  outcome: MergeEscalationOutcome;
+}
+
+function fakeMergeSweepDeps(opts: {
+  pending: PendingMergeEscalation[];
+  stillPending?: (id: string) => boolean;
+  notify?: (target: string, body: string) => Promise<PlannerNotifyResult>;
+  selectThrows?: boolean;
+}): {
+  deps: MergeEscalationSweepDeps;
+  mints: MergeMintCall[];
+  notifies: { target: string; body: string }[];
+} {
+  const mints: MergeMintCall[] = [];
+  const notifies: { target: string; body: string }[] = [];
+  const deps: MergeEscalationSweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    notifyPlanner: async (target, body) => {
+      notifies.push({ target, body });
+      return (
+        (await opts.notify?.(target, body)) ?? {
+          outcome: "sent",
+          detail: "sent",
+        }
+      );
+    },
+    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
+  };
+  return { deps, mints, notifies };
+}
+
+test("runMergeEscalationSweep: an escalatable close sends the recipe to planner@<epic> once and mints attempted{sent}", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+  });
+  await runMergeEscalationSweep(deps);
+
+  expect(notifies.length).toBe(1);
+  expect(notifies[0]?.target).toBe("planner@fn-1-foo");
+  // The brief carried through the sweep includes the --no-ff recipe.
+  expect(notifies[0]?.body).toContain("git merge --no-ff fn-1-foo.2");
+  // Mints the attempt with the terminal outcome — and NEVER a DispatchCleared (the
+  // deps surface has no clear path; the sticky row is cleared only by retry_dispatch).
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "sent" }]);
+});
+
+test("runMergeEscalationSweep: a non-token reason in the pending set is NOT escalated (defense-in-depth gate)", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: "worktree-merge-lock-timeout: could not acquire the lock",
+        dir: "/repo/root",
+      },
+    ],
+  });
+  await runMergeEscalationSweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runMergeEscalationSweep: a send_failed outcome is recorded and leaves the marker unset (re-sweepable)", async () => {
+  const { deps, mints } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    notify: async () => ({ outcome: "send_failed", detail: "not_connected" }),
+  });
+  await runMergeEscalationSweep(deps);
+  // send_failed mints attempted{send_failed} — task .1's fold no-ops on it, so the
+  // marker stays NULL and the next sweep retries.
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "send_failed" }]);
+});
+
+test("runMergeEscalationSweep: a queued_for_wake outcome escalates exactly once", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    notify: async () => ({ outcome: "queued_for_wake", detail: "queued" }),
+  });
+  await runMergeEscalationSweep(deps);
+  expect(notifies.length).toBe(1);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "queued_for_wake" }]);
+});
+
+test("runMergeEscalationSweep: a THROWING notify never aborts the sweep (records send_failed)", async () => {
+  const { deps, mints } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    notify: async () => {
+      throw new Error("boom");
+    },
+  });
+  await runMergeEscalationSweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "send_failed" }]);
+});
+
+test("runMergeEscalationSweep: a row cleared mid-sweep (stillPending false) is skipped — no send, no mint", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    stillPending: () => false,
+  });
+  await runMergeEscalationSweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runMergeEscalationSweep: an empty pending set is a no-op", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({ pending: [] });
+  await runMergeEscalationSweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
+});
+
+test("runMergeEscalationSweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [],
+    selectThrows: true,
+  });
+  // MUST resolve (never throw) and do nothing.
+  await runMergeEscalationSweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
 });
 
 // fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is

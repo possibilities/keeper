@@ -983,3 +983,24 @@ export interface BlockEscalationAttemptedPayload {
   /** Producer-recorded helper outcome, recorded onto the latch `outcome` column. */
   outcome: string;
 }
+
+/**
+ * Pre-flattened `MergeEscalationAttempted` synthetic event payload — the daemon
+ * merge-escalation sweep mints it after the one-way `planner@<epic>` bus-send
+ * helper resolves, stamping the `dispatch_failures.merge_escalated_at` once-marker
+ * so the notify fires exactly once per sticky `worktree-merge-conflict` close
+ * failure. Keyed by the close-row `id` (verb is always `close`). A TERMINAL
+ * `outcome` (`sent` / `queued_for_wake`) stamps `merge_escalated_at = event.ts`;
+ * the non-terminal `send_failed` outcome folds to a no-op, leaving the marker NULL
+ * so the row stays re-sweepable (mirrors `BlockEscalationAttempted`'s
+ * `send_failed`-is-non-terminal rule). The fold reads ONLY the payload + the
+ * persisted row, so re-fold stays byte-deterministic. The marker NEVER clears the
+ * sticky row — only `retry_dispatch` does. KEEP-SET inline forever (never added to
+ * the retention shed predicate).
+ */
+export interface MergeEscalationAttemptedPayload {
+  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
+  id: string;
+  /** Producer-recorded helper outcome; only a terminal outcome stamps the marker. */
+  outcome: string;
+}

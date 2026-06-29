@@ -63,6 +63,7 @@ import type {
   HandoffLinkEntry,
   InputRequestKind,
   JobLinkEntry,
+  MergeEscalationAttemptedPayload,
   PermissionPromptKind,
   ResolvedEpicDep,
   SubagentDisposition,
@@ -3739,8 +3740,9 @@ function foldDispatchFailed(db: Database, event: Event): void {
   }
   db.run(
     `INSERT INTO dispatch_failures (
-       verb, id, reason, dir, ts, last_event_id, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+       merge_escalated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
@@ -3748,6 +3750,11 @@ function foldDispatchFailed(db: Database, event: Event): void {
        last_event_id = excluded.last_event_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
        -- view is the FIRST observation of this failure, never the latest.
+       -- merge_escalated_at preserved through UPSERT (excluded from the SET
+       -- clause, same as created_at): a re-failure of an uncleared row must
+       -- NOT reset the escalate-once marker, or the daemon merge-escalation
+       -- sweep would re-notify the planner. The marker re-arms only on a
+       -- DispatchCleared (retry_dispatch) DELETE dropping the row entirely.
        updated_at = excluded.updated_at`,
     [
       payload.verb,
@@ -4153,6 +4160,68 @@ function foldBlockEscalationAttempted(db: Database, event: Event): void {
         SET status = ?, outcome = ?, last_event_id = ?
       WHERE epic_id = ? AND task_id = ?`,
     [status, payload.outcome, event.id, payload.epic_id, payload.task_id],
+  );
+}
+
+/**
+ * Parse a `MergeEscalationAttempted` event payload. Returns null on any
+ * structural miss ({@link foldMergeEscalationAttempted} folds null to a safe
+ * no-op); NEVER throws. Strict: `id` / `outcome` non-empty strings.
+ */
+function extractMergeEscalationAttemptedPayload(
+  event: Event,
+): MergeEscalationAttemptedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<MergeEscalationAttemptedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse MergeEscalationAttempted payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `MergeEscalationAttempted` event. For a TERMINAL outcome
+ * (`sent` / `queued_for_wake` — a confirmed delivery) it stamps the once-marker
+ * `merge_escalated_at = event.ts` on the sticky `worktree-merge-conflict` close
+ * row, gated `merge_escalated_at IS NULL` so the first observation wins and a
+ * re-fold reproduces it byte-identically. Every other outcome (`send_failed` /
+ * undelivered / unknown) is NON-TERMINAL and folds to a no-op, leaving the marker
+ * NULL so the sweep re-attempts on the next tick — mirroring
+ * `foldBlockEscalationAttempted`'s `send_failed`-is-non-terminal rule. The branch
+ * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
+ * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
+ * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
+ * (`retry_dispatch`) does. Malformed/missing payload → safe no-op.
+ */
+function foldMergeEscalationAttempted(db: Database, event: Event): void {
+  const payload = extractMergeEscalationAttemptedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  const terminal =
+    payload.outcome === "sent" || payload.outcome === "queued_for_wake";
+  if (!terminal) {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET merge_escalated_at = ?
+      WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NULL`,
+    [event.ts, payload.id],
   );
 }
 
@@ -8565,6 +8634,8 @@ export function applyEvent(
       foldBlockEscalationRequested(db, event);
     } else if (event.hook_event === "BlockEscalationAttempted") {
       foldBlockEscalationAttempted(db, event);
+    } else if (event.hook_event === "MergeEscalationAttempted") {
+      foldMergeEscalationAttempted(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {

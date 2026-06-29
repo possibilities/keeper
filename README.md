@@ -1123,7 +1123,11 @@ event-log/reducer/hook touch. Run any of them with
     dispatch is sticky and visible in the `--- failed ---` section until a
     human runs `retry`. `verb` is one of `work|close|approve`: `approve` is
     accepted SOLELY to clear a resurrected/phantom `approve` pending (the
-    reconciler never dispatches `approve` itself — fn-870).
+    reconciler never dispatches `approve` itself — fn-870). A
+    `worktree-merge-conflict` `close::<epic>` is special: `retry` only re-arms
+    dispatch, so the operator MUST resolve the fan-in conflict FIRST (the
+    merge-escalation brief's `git merge --no-ff` recipe) — a bare `retry` on an
+    unresolved conflict simply re-conflicts and re-sticks the row.
   - `keeper autopilot mode <yolo|armed>` — set the autopilot mode via
     `set_autopilot_mode` (fn-751, schema v62). **yolo** (the default) works
     every ready epic; **armed** works ONLY explicitly-armed epics plus their
@@ -2683,7 +2687,16 @@ precheck refusal. No auto-retry; the only way to
 clear a row is the `retry_dispatch` RPC (human-driven), which routes through
 the server-worker → main → `DispatchCleared` mint. A from-scratch re-fold
 reproduces the table byte-identically (no fold-time wall clock; the event's
-own `ts` lands in `failed_at`). The `keeper autopilot` CLI is a thin viewer
+own `ts` lands in `failed_at`). As of schema v98 (fn-1009) the row also carries a
+nullable `merge_escalated_at` REAL once-marker: the daemon merge-escalation sweep
+stamps it (via a `MergeEscalationAttempted` event folded onto the existing row)
+the first time it notifies `planner@<epic>` about a sticky `worktree-merge-conflict`
+close, so the notify fires exactly once. The gate is a COLUMN on the sticky row,
+never a sibling latch table — it is PRESERVED across a re-failure UPSERT (excluded
+from the SET clause, same as `created_at`) and re-armed only when `retry_dispatch`
+DELETEs the row. The sweep is READ-ONLY wrt the sticky row: it NOTIFIES only and
+never mints `DispatchCleared` — only `retry_dispatch` clears the failure.
+The `keeper autopilot` CLI is a thin viewer
 plus the `play` / `pause` / `retry` controls; the reconcile loop runs
 server-side in the daemon. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `42`
@@ -3152,7 +3165,34 @@ worker subagent in-context. FALLBACK: a miss on that send (`not_connected`/
 `unknown_target`) means the orchestrator session is gone, so the board-unblock lets
 the autopilot cold-re-dispatch a fresh worker — gated against double-dispatch by
 the live-pane occupancy gate (`isOccupyingJob`), which suppresses re-dispatch while
-the worker pane lives. The reconciler boots PAUSED (the in-memory
+the worker pane lives. A THIRD main-thread heartbeat producer rides the same
+gate-armed shape: the **merge-escalation producer** (`runMergeEscalationSweep`, the
+same `BLOCK_ESCALATION_SWEEP_INTERVAL_MS` 60s heartbeat, fn-1009). When a worktree
+fan-in close hits a content conflict (the close-sink provision pre-merge fails) the
+autopilot mints a sticky `worktree-merge-conflict` `dispatch_failures` row keyed
+`close::<epic>` it deliberately never auto-retries — so the board silently stalls
+until an operator notices. Each sweep selects those rows
+(`selectPendingMergeEscalations`: `verb='close'`, an EXACT `worktree-merge-conflict`
+leading token, `merge_escalated_at IS NULL`), re-reads the row is still present
+immediately before the send (clear-mid-sweep narrowing), and sends `planner@<epic>`
+a resolve+unstick brief over the bus via the SHARED `notifyPlanner` send/wake core
+(factored out of the block producer, which stays byte-identical) — the recipe `cd
+<base worktree>` (derived `worktreePathFor(row.dir, <base>)`) → `git merge --no-ff
+<source>` (NEVER `--squash`/rebase — a single-parent commit re-conflicts on the next
+fan-in) → resolve merging BOTH intents → run the epic's tests → commit → `keeper
+autopilot retry close::<epic>`, plus the escalate-to-human guardrail for a
+semantically-dense conflict (state machine / schema / security / transaction
+boundary). After the send it mints `MergeEscalationAttempted{outcome}`; the fold
+stamps the `merge_escalated_at` once-marker ONLY on a terminal `sent`/
+`queued_for_wake`, so a `send_failed` stays re-sweepable and the notify fires
+exactly once otherwise. The sweep NOTIFIES ONLY — it never clears the sticky row;
+only `retry_dispatch` does. The excluded reasons never match the exact token, so
+they never escalate: the transient `worktree-merge-lock-timeout` /
+`worktree-merge-local-timeout` skips, the origin-ahead
+`worktree-finalize-non-fast-forward` sticky, and the level-triggered
+`worktree-recover*` rows. Like the block producer it is fail-open per `runWake`'s
+injectable-deps discipline, and the spawn lives ONLY in the producer so a re-fold
+never re-fires a send. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection
@@ -3267,7 +3307,12 @@ is a lossless `missing-source` no-op: nothing to merge, so the pre-merge is
 skipped and the close still proceeds (probed before any lock/merge-base, so a
 real merge/is-ancestor failure is never masked). A genuine content conflict still
 aborts (`git merge --abort`) + fails loud + stops (no merge-to-default, no
-teardown).
+teardown), minting a sticky `worktree-merge-conflict` `close::<epic>`
+`DispatchFailed` (`merging <source> into <base> — <stderr>`) the autopilot
+deliberately never auto-retries — the row the daemon merge-escalation sweep
+notifies `planner@<epic>` about (below). The `--abort` leaves the base worktree
+CLEAN, so the resolve recipe RE-RUNS the merge to recreate the markers rather than
+expecting them to survive.
 The merge-to-default + push at close run in the shared MAIN checkout, so finalize
 DEGRADES GRACEFULLY rather than stomping it: before the merge it probes the
 checkout (`mergeReadiness` — `git status --porcelain` + the current branch, which
