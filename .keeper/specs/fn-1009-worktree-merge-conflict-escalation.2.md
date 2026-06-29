@@ -94,5 +94,5 @@ green.
 - [ ] CLAUDE.md's worktree guardrail is extended with the gate-is-a-column-not-a-table + sweep-is-read-only-wrt-the-sticky-row rule; README escalation/schema paragraphs updated per the epic Docs gaps.
 
 ## Done summary
-
+Added the daemon merge-escalation producer: selectPendingMergeEscalations + shouldEscalateMergeConflict gate + buildMergeEscalationBody (the git merge --no-ff resolve+unstick brief) + runMergeEscalationSweep on the 60s heartbeat, factoring the bus send/wake core into a shared notifyPlanner (block path byte-identical). Notifies planner@<epic> once via MergeEscalationAttempted; never clears the sticky row. Docs updated.
 ## Evidence
