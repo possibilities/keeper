@@ -245,7 +245,13 @@ export function resolveMultiplierOrNull(
   profile: string,
   homeDir: string = homedir(),
 ): number | null {
-  const path = join(homeDir, ".claude-profiles", profile, ".claude.json");
+  // `default` canonically lives in `~/.claude`, not a `~/.claude-profiles/default`
+  // shadow (which nothing else reads). Mirror the scraper's default special-case
+  // here so BOTH the boot path and the per-cycle re-resolve read the right tier.
+  const path =
+    profile === "default"
+      ? join(homeDir, ".claude", ".claude.json")
+      : join(homeDir, ".claude-profiles", profile, ".claude.json");
   let size: number;
   let mtimeMs: number;
   try {

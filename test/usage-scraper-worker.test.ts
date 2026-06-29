@@ -920,7 +920,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
   });
 
   test("resolveMultiplierOrNull skips the re-parse when size+mtime are unchanged", () => {
-    const dir = join(tmpDir, ".claude-profiles", "default");
+    const dir = profileClaudeJsonDir(tmpDir, "default");
     mkdirSync(dir, { recursive: true });
     const path = join(dir, ".claude.json");
     // Two payloads of IDENTICAL byte length so only mtime (not size) can differ:
@@ -1002,15 +1002,23 @@ describe("ProfileGate / TargetMutex serialization", () => {
   });
 });
 
-// Write `<tmpHome>/.claude-profiles/<profile>/.claude.json` with the given tier,
-// padded past `padBytes` so the size guard is exercised against a realistic file.
+// Directory holding a profile's `.claude.json`. Mirrors production: `default`
+// lives in `~/.claude`, every other profile in `~/.claude-profiles/<profile>`.
+function profileClaudeJsonDir(home: string, profile: string): string {
+  return profile === "default"
+    ? join(home, ".claude")
+    : join(home, ".claude-profiles", profile);
+}
+
+// Write the profile's `.claude.json` with the given tier, padded past `padBytes`
+// so the size guard is exercised against a realistic file.
 function writeProfileClaudeJson(
   home: string,
   profile: string,
   tier: string | null,
   padBytes = 0,
 ): void {
-  const dir = join(home, ".claude-profiles", profile);
+  const dir = profileClaudeJsonDir(home, profile);
   mkdirSync(dir, { recursive: true });
   const body: Record<string, unknown> = {
     oauthAccount: tier === null ? {} : { organizationRateLimitTier: tier },
@@ -1027,7 +1035,7 @@ describe("resolveMultiplierOrNull (injected home seam)", () => {
       "default_claude_max_20x",
       2 * 1024 * 1024,
     );
-    const path = join(tmpDir, ".claude-profiles", "default", ".claude.json");
+    const path = join(profileClaudeJsonDir(tmpDir, "default"), ".claude.json");
     // The file is genuinely past the old 1 MB cap that froze multipliers at 1x.
     expect(readFileSync(path, "utf8").length).toBeGreaterThan(1024 * 1024);
     expect(resolveMultiplierOrNull("default", tmpDir)).toBe(20);
@@ -1039,6 +1047,35 @@ describe("resolveMultiplierOrNull (injected home seam)", () => {
     writeProfileClaudeJson(tmpDir, "mystery", "default_claude_ultra_99x");
     expect(resolveMultiplierOrNull("mystery", tmpDir)).toBeNull();
     expect(resolveMultiplierOrNull("absent", tmpDir)).toBeNull();
+  });
+
+  test("`default` reads ~/.claude, NOT the ~/.claude-profiles/default shadow", () => {
+    // The shadow dir holds 20x; the canonical ~/.claude holds 5x. The split-brain
+    // bug read the shadow — the fix must read ~/.claude.
+    mkdirSync(join(tmpDir, ".claude-profiles", "default"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, ".claude-profiles", "default", ".claude.json"),
+      JSON.stringify({
+        oauthAccount: { organizationRateLimitTier: "default_claude_max_20x" },
+      }),
+    );
+    mkdirSync(join(tmpDir, ".claude"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, ".claude", ".claude.json"),
+      JSON.stringify({
+        oauthAccount: { organizationRateLimitTier: "default_claude_max_5x" },
+      }),
+    );
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBe(5);
+  });
+
+  test("a signed-out ~/.claude (no oauthAccount) resolves `default` to null", () => {
+    mkdirSync(join(tmpDir, ".claude"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, ".claude", ".claude.json"),
+      JSON.stringify({ someOtherKey: true }),
+    );
+    expect(resolveMultiplierOrNull("default", tmpDir)).toBeNull();
   });
 });
 
@@ -1074,7 +1111,7 @@ describe("reResolveMultiplier episode-throttled warning", () => {
     expect(logs.length).toBe(1);
 
     // A subsequent failure logs again (the episode re-opened).
-    rmSync(join(tmpDir, ".claude-profiles", "default"), {
+    rmSync(profileClaudeJsonDir(tmpDir, "default"), {
       recursive: true,
       force: true,
     });
