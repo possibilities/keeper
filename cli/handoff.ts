@@ -4,10 +4,10 @@
  * INITIATOR's tmux session. The enqueue is event-sourced: the agent authors a
  * REQUIRED, globally-unique `--slug` (the handoff id — the worker launches as
  * `handoff::<slug>`), the CLI slugifies it to `[a-z0-9-]+`, and the brief is
- * stored RAW (the dispatcher worker, not this CLI, applies the
- * `handoff_prompt_prefix` to the launch prompt — so the brief rides
- * `keeper handoff show` unprefixed and is read back as the handoff-ee's `/hack`
- * request, not as a second slash-command). It caps the doc at 64KB (REJECT over
+ * stored RAW (the dispatcher worker, not this CLI, composes the launch prompt as
+ * `handoff_prompt_prefix` + framing + the brief INLINE — so the stored doc stays
+ * unprefixed, and `keeper handoff show <slug>` prints it verbatim for
+ * inspection). It caps the doc at 64KB (REJECT over
  * cap — never truncate, since the body rides inline in `events.data` forever and
  * a fold reads it back), and sends a `request_handoff` RPC (the SIXTH mutating
  * RPC) → main probes the events log for a host-global slug collision (rejecting a
@@ -267,7 +267,8 @@ export async function main(argv: string[]): Promise<void> {
     if (row === undefined) {
       die(`no handoff with slug '${slug}'`);
     }
-    // Print the raw stored brief verbatim (the dispatched worker reads it back).
+    // Print the raw stored brief verbatim (inspection only — the handoff-ee gets
+    // the brief inline in its launch prompt, not via this verb).
     process.stdout.write(`${String(row.doc ?? "")}\n`);
     process.exit(0);
   }
@@ -310,11 +311,11 @@ export async function main(argv: string[]): Promise<void> {
     doc = parsed.values.prompt as string;
   }
 
-  // The brief is stored RAW — the dispatcher worker applies the configured
-  // `handoff_prompt_prefix` to the small launch prompt (a pointer at
-  // `keeper handoff show <id>`), never to the doc body. Prefixing here would
-  // embed a stray `/hack` in the brief that the handoff-ee reads back as bash
-  // output (inert noise), so the prefix lives at exactly one site: the launcher.
+  // The brief is stored RAW — the dispatcher worker composes the launch prompt
+  // (`handoff_prompt_prefix` + framing + the brief inline), never mutating the
+  // stored doc body. Prefixing here would embed a stray `/hack` in the brief that
+  // the handoff-ee reads back as inert noise, so the prefix lives at exactly one
+  // site: the launcher.
   const docCheck = validateHandoffDoc(doc);
   if (!docCheck.ok) {
     // Over-cap / NUL / empty brief is CLI misuse — exit 2.

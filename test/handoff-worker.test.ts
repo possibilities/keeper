@@ -14,6 +14,8 @@
  */
 
 import { expect, test } from "bun:test";
+import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
+import { PROMPT_MAX_BYTES } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import {
   buildHandoffPrompt,
@@ -113,23 +115,37 @@ test("an unknown status is inert", () => {
 
 // ── prompt composition ────────────────────────────────────────────────────
 
-test("buildHandoffPrompt prepends the configured prefix + the brief pointer", () => {
-  const p = buildHandoffPrompt("abc-123", "/hack");
+test("buildHandoffPrompt prepends the configured prefix + the framing + the inline brief", () => {
+  const p = buildHandoffPrompt("investigate the flaky reaper", "/hack");
   expect(p.startsWith("/hack ")).toBe(true);
-  expect(p).toContain("keeper handoff show abc-123");
-  // The pointer frames the brief as the session's REQUEST, never an execute
+  // The brief rides INLINE — no `keeper handoff show` pointer round-trip.
+  expect(p).toContain("investigate the flaky reaper");
+  expect(p).not.toContain("keeper handoff show");
+  // The framing frames the brief as the session's REQUEST, never an execute
   // order — an order would override `/hack`'s confirm-before-acting beat, which
   // is the whole behavior a handoff-ee must run. Regression guard.
   expect(p).not.toContain("carry it out");
   expect(p.toLowerCase()).toContain("request");
 });
 
-test("buildHandoffPrompt with no prefix is just the pointer", () => {
-  const p = buildHandoffPrompt("abc-123", undefined);
+test("buildHandoffPrompt with no prefix is just the framing + the inline brief", () => {
+  const p = buildHandoffPrompt("investigate the flaky reaper", undefined);
   expect(p.startsWith("/")).toBe(false);
-  expect(p).toContain("keeper handoff show abc-123");
+  expect(p).toContain("investigate the flaky reaper");
+  expect(p).not.toContain("keeper handoff show");
   // An empty-string prefix is treated as absent.
-  expect(buildHandoffPrompt("abc-123", "")).toBe(p);
+  expect(buildHandoffPrompt("investigate the flaky reaper", "")).toBe(p);
+});
+
+test("the coupled cap holds: prefix + framing + a max-size 64KB brief fits under PROMPT_MAX_BYTES", () => {
+  // The doc cap (64KB) and the argv cap (96KB) are now COUPLED — the inline
+  // brief rides the launch argv, so `prefix + framing + doc` must stay under the
+  // per-arg E2BIG ceiling. Pinned against a worst-case max-size ASCII brief.
+  const maxDoc = "x".repeat(HANDOFF_DOC_MAX_BYTES);
+  const prompt = buildHandoffPrompt(maxDoc, "/hack");
+  expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(
+    PROMPT_MAX_BYTES,
+  );
 });
 
 // ── dispatchOneHandoff confirm path ─────────────────────────────────────────
@@ -161,7 +177,7 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
     emitLaunchFailed: (p): void => {
       rec.failed.push(p);
     },
-    buildPrompt: (id) => `/hack show ${id}`,
+    buildPrompt: (doc) => `/hack ${doc}`,
     ...over,
   };
   return { deps, rec };

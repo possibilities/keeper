@@ -205,8 +205,8 @@ export interface HandoffDispatchDeps {
   launch(session: string, cwd: string, spec: LaunchSpec): Promise<LaunchResult>;
   /** Mint a terminal `HandoffLaunchFailed` event + a dead-letter (permanent). */
   emitLaunchFailed(payload: HandoffLaunchFailedPayload): void;
-  /** The launch prompt = `handoffPromptPrefix` + the short brief pointer. */
-  buildPrompt(handoffId: string): string;
+  /** The launch prompt = `handoffPromptPrefix` + the framing + the inline brief. */
+  buildPrompt(doc: string): string;
 }
 
 /** Outcome of {@link dispatchOneHandoff}, for the cycle log + tests. */
@@ -268,10 +268,10 @@ export async function dispatchOneHandoff(
     return "aborted-shutdown";
   }
   // Launch — ONLY after the durable `HandoffDispatching` ack. agentwrap owns the
-  // tmux window; the prompt boots the handoff-ee into the prefix skill then
-  // points it at `keeper handoff show <id>`.
+  // tmux window; the prompt boots the handoff-ee into the prefix skill with the
+  // brief inline (the framing + `row.doc`), no `keeper handoff show` round-trip.
   const spec: LaunchSpec = {
-    prompt: deps.buildPrompt(row.handoff_id),
+    prompt: deps.buildPrompt(row.doc),
     claudeName: `handoff::${row.handoff_id}`,
   };
   // PER-ROW launch cwd: the handoff's resolved `--dir` (an absolute path the CLI
@@ -308,26 +308,37 @@ export async function dispatchOneHandoff(
 }
 
 /**
+ * The investigate-then-confirm framing prepended to the inline brief. It frames
+ * the brief as the session's REQUEST — handled under the handoff-ee's normal
+ * `/hack` workflow (investigate, then confirm before any code lands), NOT a
+ * pre-approved order to execute blind. It carries NO execute verb on purpose: an
+ * execute order would override `/hack`'s confirm-before-acting beat, which is
+ * exactly the behavior a handoff-ee must run. Exported so the coupled-cap test
+ * can size `prefix + framing + doc` against `PROMPT_MAX_BYTES`.
+ */
+export const HANDOFF_PROMPT_FRAMING =
+  "The text below is your brief for this session — your REQUEST, NOT a pre-approved order to execute. Handle it under your normal workflow: investigate first, then confirm before any code lands.";
+
+/**
  * Compose the launch prompt: the configured `handoff_prompt_prefix` (e.g.
- * `/hack`, so the handoff-ee boots into the skill) followed by a short pointer
- * that frames the brief as the session's REQUEST — handled under the skill's
- * normal workflow (investigate, then confirm before any code lands), NOT a
- * pre-approved order to execute blind. The pointer carries no execute verb on
- * purpose: an execute order would override `/hack`'s confirm-before-acting beat,
- * which is exactly what a handoff-ee must run. The full contextful doc lives in
- * `handoffs.doc` and is read back via `keeper handoff show <id>` — the prompt
- * stays small (it rides the launch argv, capped by agentwrap, NOT the 64KB doc
- * cap). Pure; exported for tests.
+ * `/hack`, so the handoff-ee boots into the skill), the investigate-then-confirm
+ * {@link HANDOFF_PROMPT_FRAMING}, and the full brief INLINE — the handoff-ee gets
+ * its whole world directly in the launch prompt, no `keeper handoff show` pointer
+ * round-trip. The doc is capped CLI-side at 64KB and the framing+prefix are a
+ * small constant, so `prefix + framing + doc` stays under the 96KB argv cap
+ * (`PROMPT_MAX_BYTES`) — the two caps are now COUPLED (a coupled-cap test pins
+ * it). `keeper handoff show <slug>` remains an inspection-only verb. Pure;
+ * exported for tests.
  */
 export function buildHandoffPrompt(
-  handoffId: string,
+  doc: string,
   promptPrefix: string | undefined,
 ): string {
-  const pointer = `First run \`keeper handoff show ${handoffId}\` to load your brief — its contents are your request for this session, NOT a pre-approved order to execute. Handle it under your normal workflow.`;
+  const body = `${HANDOFF_PROMPT_FRAMING}\n\n${doc}`;
   if (promptPrefix !== undefined && promptPrefix !== "") {
-    return `${promptPrefix} ${pointer}`;
+    return `${promptPrefix} ${body}`;
   }
-  return pointer;
+  return body;
 }
 
 /**
@@ -533,7 +544,7 @@ function main(): void {
         payload,
       } satisfies HandoffLaunchFailedMessage);
     },
-    buildPrompt: (handoffId) => buildHandoffPrompt(handoffId, promptPrefix),
+    buildPrompt: (doc) => buildHandoffPrompt(doc, promptPrefix),
   };
 
   // Single-flight cycle drive — coalesce a wake burst into one trailing re-run.

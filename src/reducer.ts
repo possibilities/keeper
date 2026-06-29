@@ -4569,11 +4569,13 @@ function foldEpicArmed(db: Database, event: Event): void {
 
 /**
  * `HandoffRequested` synthetic-event payload — the durable record of a
- * `keeper handoff` enqueue, minted main-side. `handoff_id` is the stably-minted
- * idempotency key; `doc` is the contextful brief (capped at WRITE time, never
- * here); the raw `initiator_*` coords always ride even when `initiator_job_id`
- * resolved null (initiator pane not yet folded). `target_session` is the
- * resolved tmux session the dispatcher launches the handoff-ee into.
+ * `keeper handoff` enqueue, minted main-side. `handoff_id` is the human-authored
+ * slug (host-global-unique, frozen at request time — never re-slugified at
+ * replay), serving as the idempotency key; `doc` is the contextful brief (capped
+ * at WRITE time, never here); the raw `initiator_*` coords always ride even when
+ * `initiator_job_id` resolved null (initiator pane not yet folded).
+ * `target_session` is the resolved tmux session the dispatcher launches the
+ * handoff-ee into.
  */
 interface HandoffRequestedPayload {
   handoff_id: string;

@@ -22,8 +22,9 @@ already-bound pair, but a row that was minted with a NULL pair (an
 out-of-order `UserPromptSubmit` fork-seed landing before the session's
 SessionStart) COALESCE-heals to the spawn name's pair when the SessionStart
 folds, so a worker binds to its task regardless of fold order. A
-`handoff::<id>` spawn name (fn-946) is a SEPARATE spawn-name class, NOT a
-plan_verb: it is matched by its own anchored regex and binds the `handoffs`
+`handoff::<slug>` spawn name (fn-946) is a SEPARATE spawn-name class, NOT a
+plan_verb: the `<slug>` is the handoff's human-authored, host-global-unique id,
+matched by its own anchored `[a-z0-9-]+` regex, and binds the `handoffs`
 job→job edge — it MUST NOT populate `(plan_verb, plan_ref)` and never widens
 the `{plan, work, close}` whitelist. Two paired stoppage annotations ride alongside
 the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
@@ -454,13 +455,16 @@ Keeper has no `install` verb. Wire it up manually:
      it for one invocation.
    - `handoff_prompt_prefix` — the sibling prefix for `keeper handoff`
      dispatches (fn-946). When set (e.g. `/hack`), the dispatcher boots each
-     handoff-ee with `<prefix> <pointer>` — the pointer sends it to
-     `keeper handoff show <id>` to load the stored (raw, unprefixed) brief as its
-     REQUEST, so the handoff-ee runs the FULL `/hack` workflow (investigate, then
-     park at the confirm beat) instead of executing the brief blind. The prefix
-     is applied at this ONE site, the launch prompt — never to the doc body.
-     A non-empty string only; absent/empty leaves it unset (the launch prompt is
-     the bare pointer, no skill boot).
+     handoff-ee with `<prefix> <framing> <brief>` — the stored (raw, unprefixed)
+     brief INLINE as the launch prompt, framed as the session's REQUEST, so the
+     handoff-ee runs the FULL `/hack` workflow (investigate, then park at the
+     confirm beat) instead of executing the brief blind. The doc's 64KB cap and
+     the 96KB argv cap (`PROMPT_MAX_BYTES`) are COUPLED — framing + prefix are a
+     small constant, so the inline prompt always fits. The prefix is applied at
+     this ONE site, the launch prompt — never to the stored doc body. A non-empty
+     string only; absent/empty leaves it unset (the launch prompt is the bare
+     framing + brief, no skill boot). `keeper handoff show <slug>` prints the
+     stored brief for inspection only — the handoff-ee no longer reads it back.
    - `disable_autoclose` — a list of keeper-created session tokens (exact names
      like `pair`, or globs like `panels:*`) whose stopped tracked windows the
      reaper leaves OPEN instead of autoclosing — the debug opt-out. Tested against
@@ -1930,7 +1934,12 @@ the `jobs.handoff_links` column (APPEND-via-ALTER, default `'[]'`), the per-job
 home for the rendered job→job handoff edge (`handoff-from` written by the
 `HandoffRequested` fold onto the initiator, `handoff-to` by the callee's
 `handoff::<id>` `SessionStart` bind fold). Both re-fold byte-identically from a
-pre-feature log (empty / `'[]'`). As of
+pre-feature log (empty / `'[]'`). As of schema v96 (fn-1003) the handoff id is a
+required human-authored, host-global-unique slug (`handoff::<slug>`,
+reject-on-collision) and `handoffs` gains the nullable `target_dir` column
+(APPEND-via-ALTER) — the absolute directory the handoff-ee launches in (NULL ≡
+keeperd's cwd); a pre-v96 `HandoffRequested` event carries no `target_dir`, so a
+from-scratch re-fold leaves it NULL (re-fold-safe). As of
 schema v31, the `git` collection is
 rebuilt around per-(session, file) attribution: `events` gains
 `bash_mutation_kind` + `bash_mutation_targets` (hook-side derived columns
@@ -3576,8 +3585,9 @@ presence is the `bus.db` registry, not the hook-fed projection.
 A **fourteenth** Worker thread is the handoff dispatcher (epic fn-946):
 level-triggered on `PRAGMA data_version`, it picks an actionable
 `requested`/stale-`dispatching` `handoffs` row (selection is
-`handoff_id`-lexicographic over a random UUID, not temporal — there is no
-created-at column to order on), mints a durable `HandoffDispatching` marker via main (the
+`handoff_id`-lexicographic — the `handoff_id` is the human-authored slug, so the
+order is slug-alphabetical, not temporal; there is no created-at column to order
+on), mints a durable `HandoffDispatching` marker via main (the
 mint-before-launch transactional outbox — a `handoff-dispatching-request`
 relayed for the synthetic-event write, ACK-correlated) BEFORE it spawns the
 fire-and-forget handoff-ee worker into the initiator's tmux session, so a
