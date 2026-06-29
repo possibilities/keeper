@@ -297,10 +297,14 @@ export interface SetEpicArmedResultMessage {
 export interface RequestHandoffRequestMessage {
   kind: "request-handoff-request";
   id: string;
-  handoff_id: string;
+  /** Agent-authored slug — main re-validates its format, probes the events log
+   *  for a host-global collision, and freezes it as the `handoff_id` on success. */
+  desired_slug: string;
   doc_path: string;
   title: string | null;
   target_session: string;
+  /** Resolved ABSOLUTE launch directory (or null → keeperd cwd at launch). */
+  target_dir: string | null;
   initiator_session: string | null;
   initiator_pane: string | null;
 }
@@ -311,6 +315,10 @@ export interface RequestHandoffResultMessage {
   id: string;
   ok: boolean;
   error?: string;
+  /** Set when `ok:false` is a slug collision (vs an ordinary failure), so the
+   *  handler throws {@link SlugConflictError} → the distinct `slug_conflict`
+   *  wire code → CLI exit 3. */
+  conflict?: boolean;
 }
 
 /**
@@ -1488,15 +1496,18 @@ export interface ReplayBridge {
    * worker reads the requested set each cycle.
    */
   requestHandoff(req: {
-    handoff_id: string;
+    desired_slug: string;
     doc_path: string;
     title: string | null;
     target_session: string;
+    target_dir: string | null;
     initiator_session: string | null;
     initiator_pane: string | null;
   }): Promise<{
     ok: boolean;
     error?: string;
+    /** Set when the failure is a slug collision (vs an ordinary failure). */
+    conflict?: boolean;
   }>;
 }
 
@@ -1532,6 +1543,21 @@ export class BadParamsError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "BadParamsError";
+  }
+}
+
+/**
+ * A typed error a handler may throw when a user-authored unique key already
+ * exists (today: a `request_handoff` slug collision). The dispatcher frames an
+ * `error` with the DISTINCT code `slug_conflict`, so the CLI can map a duplicate
+ * to a machine-distinguishable exit 3 (not `rpc_failed`/exit 1 "we crashed").
+ * Reject-not-suffix: the slug is user-chosen, so the loud rejection tells the
+ * agent to pick a new one rather than silently mutating their key.
+ */
+export class SlugConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SlugConflictError";
   }
 }
 
@@ -1867,6 +1893,9 @@ function dispatchRpc(
       if (err instanceof BadParamsError) {
         return [errorFrame(db, "bad_params", err.message, id)];
       }
+      if (err instanceof SlugConflictError) {
+        return [errorFrame(db, "slug_conflict", err.message, id)];
+      }
       const message = err instanceof Error ? err.message : String(err);
       return [errorFrame(db, "rpc_failed", message, id)];
     }
@@ -1932,6 +1961,12 @@ function runAsyncRpc(
     } catch (err) {
       if (err instanceof BadParamsError) {
         asyncCtx.onAsyncResult([errorFrame(db, "bad_params", err.message, id)]);
+        return;
+      }
+      if (err instanceof SlugConflictError) {
+        asyncCtx.onAsyncResult([
+          errorFrame(db, "slug_conflict", err.message, id),
+        ]);
         return;
       }
       const message = err instanceof Error ? err.message : String(err);
@@ -3256,10 +3291,12 @@ function main(): void {
     error?: string;
   };
   /** Reply shape for the non-replay bridge calls — the replay `{ok, error?}`
-   *  union minus the dead-letter-specific `recovered_dl_id`. */
+   *  union minus the dead-letter-specific `recovered_dl_id`. `conflict` rides
+   *  only on the `request_handoff` slug-collision reject. */
   type SimpleResolution = {
     ok: boolean;
     error?: string;
+    conflict?: boolean;
   };
   const pendingReplays = new Map<
     string,
@@ -3476,10 +3513,11 @@ function main(): void {
         parentPort?.postMessage({
           kind: "request-handoff-request",
           id: reqId,
-          handoff_id: req.handoff_id,
+          desired_slug: req.desired_slug,
           doc_path: req.doc_path,
           title: req.title,
           target_session: req.target_session,
+          target_dir: req.target_dir,
           initiator_session: req.initiator_session,
           initiator_pane: req.initiator_pane,
         } satisfies RequestHandoffRequestMessage);
@@ -3664,7 +3702,7 @@ function main(): void {
         if (!entry) return;
         pendingRequestHandoff.delete(r.id);
         clearTimeout(entry.timer);
-        entry.resolve({ ok: r.ok, error: r.error });
+        entry.resolve({ ok: r.ok, error: r.error, conflict: r.conflict });
         return;
       }
     },

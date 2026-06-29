@@ -14,6 +14,8 @@
  */
 
 import { expect, test } from "bun:test";
+import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
+import { PROMPT_MAX_BYTES } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import {
   buildHandoffPrompt,
@@ -35,6 +37,7 @@ function row(over: Partial<HandoffDispatchRow>): HandoffDispatchRow {
     status: "requested",
     doc: "brief",
     target_session: "work",
+    target_dir: null,
     claimed_at: null,
     never_bound_count: 0,
     ...over,
@@ -112,30 +115,44 @@ test("an unknown status is inert", () => {
 
 // ── prompt composition ────────────────────────────────────────────────────
 
-test("buildHandoffPrompt prepends the configured prefix + the brief pointer", () => {
-  const p = buildHandoffPrompt("abc-123", "/hack");
+test("buildHandoffPrompt prepends the configured prefix + the framing + the inline brief", () => {
+  const p = buildHandoffPrompt("investigate the flaky reaper", "/hack");
   expect(p.startsWith("/hack ")).toBe(true);
-  expect(p).toContain("keeper handoff show abc-123");
-  // The pointer frames the brief as the session's REQUEST, never an execute
+  // The brief rides INLINE — no `keeper handoff show` pointer round-trip.
+  expect(p).toContain("investigate the flaky reaper");
+  expect(p).not.toContain("keeper handoff show");
+  // The framing frames the brief as the session's REQUEST, never an execute
   // order — an order would override `/hack`'s confirm-before-acting beat, which
   // is the whole behavior a handoff-ee must run. Regression guard.
   expect(p).not.toContain("carry it out");
   expect(p.toLowerCase()).toContain("request");
 });
 
-test("buildHandoffPrompt with no prefix is just the pointer", () => {
-  const p = buildHandoffPrompt("abc-123", undefined);
+test("buildHandoffPrompt with no prefix is just the framing + the inline brief", () => {
+  const p = buildHandoffPrompt("investigate the flaky reaper", undefined);
   expect(p.startsWith("/")).toBe(false);
-  expect(p).toContain("keeper handoff show abc-123");
+  expect(p).toContain("investigate the flaky reaper");
+  expect(p).not.toContain("keeper handoff show");
   // An empty-string prefix is treated as absent.
-  expect(buildHandoffPrompt("abc-123", "")).toBe(p);
+  expect(buildHandoffPrompt("investigate the flaky reaper", "")).toBe(p);
+});
+
+test("the coupled cap holds: prefix + framing + a max-size 64KB brief fits under PROMPT_MAX_BYTES", () => {
+  // The doc cap (64KB) and the argv cap (96KB) are now COUPLED — the inline
+  // brief rides the launch argv, so `prefix + framing + doc` must stay under the
+  // per-arg E2BIG ceiling. Pinned against a worst-case max-size ASCII brief.
+  const maxDoc = "x".repeat(HANDOFF_DOC_MAX_BYTES);
+  const prompt = buildHandoffPrompt(maxDoc, "/hack");
+  expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(
+    PROMPT_MAX_BYTES,
+  );
 });
 
 // ── dispatchOneHandoff confirm path ─────────────────────────────────────────
 
 interface Recorder {
   dispatching: number;
-  launches: Array<{ session: string; spec: LaunchSpec }>;
+  launches: Array<{ session: string; cwd: string; spec: LaunchSpec }>;
   failed: HandoffLaunchFailedPayload[];
 }
 
@@ -153,14 +170,14 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
       rec.dispatching++;
       return { ok: true };
     },
-    launch: async (session, _cwd, spec): Promise<LaunchResult> => {
-      rec.launches.push({ session, spec });
+    launch: async (session, cwd, spec): Promise<LaunchResult> => {
+      rec.launches.push({ session, cwd, spec });
       return { ok: true };
     },
     emitLaunchFailed: (p): void => {
       rec.failed.push(p);
     },
-    buildPrompt: (id) => `/hack show ${id}`,
+    buildPrompt: (doc) => `/hack ${doc}`,
     ...over,
   };
   return { deps, rec };
@@ -201,6 +218,35 @@ test("dispatchOneHandoff launches into the row's target_session", async () => {
     deps,
   );
   expect(rec.launches[0]?.session).toBe("my-session");
+});
+
+test("dispatchOneHandoff uses the row's target_dir as the launch cwd (per-row wins over the global)", async () => {
+  const { deps, rec } = makeDeps({});
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-dir", target_dir: "/Users/dev/code/other" }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.cwd).toBe("/Users/dev/code/other");
+});
+
+test("dispatchOneHandoff falls back to the global cwd when target_dir is null or empty", async () => {
+  const { deps, rec } = makeDeps({});
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-null", target_dir: null }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-empty", target_dir: "" }),
+    "/keeperd-cwd",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.cwd).toBe("/keeperd-cwd");
+  expect(rec.launches[1]?.cwd).toBe("/keeperd-cwd");
 });
 
 test("an ack {ok:false} aborts WITHOUT launching (no double-dispatch window)", async () => {

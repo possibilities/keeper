@@ -383,6 +383,9 @@ from pathlib import Path
 # v95 (fn-1000 task .1) adds the nullable ``usage.error_kind`` failure
 # classification column; keeper-py never reads ``usage``, so only the version
 # whitelist gains 95.
+# v96 (fn-1003 task .2) adds the nullable ``handoffs.target_dir`` column — the
+# resolved absolute directory a ``keeper handoff --dir`` launches the handoff-ee
+# in; keeper-py never reads ``handoffs``, so only the version whitelist gains 96.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -450,6 +453,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         93,
         94,
         95,
+        96,
     }
 )
 

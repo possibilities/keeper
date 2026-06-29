@@ -34,15 +34,16 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 const SPAWN_VERB_REF_RE = /^(plan|work|close)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
 
 /**
- * Anchored `handoff::<handoff_id>` spawn-name match — the SEPARATE spawn-name
- * class for `keeper handoff` dispatch. DELIBERATELY its own regex, never folded
- * into {@link SPAWN_VERB_REF_RE}: a `handoff::` name must NOT populate
+ * Anchored `handoff::<slug>` spawn-name match — the SEPARATE spawn-name class for
+ * `keeper handoff` dispatch. DELIBERATELY its own regex, never folded into
+ * {@link SPAWN_VERB_REF_RE}: a `handoff::` name must NOT populate
  * `plan_verb`/`plan_ref` (it carries no plan ref and would pollute readiness +
  * the autopilot dispatch correlator), so the plan-verb parser returns
- * `(null, null)` for it. The id is a `crypto.randomUUID()` (lowercase hex +
- * hyphens) the CLI mints, so the body class is kebab/hex (`[a-z0-9-]`); the `$`
- * anchor rejects any trailing `::` segment so a typo rejects rather than
- * binding wrong. Sibling of `SPAWN_VERB_REF_RE` — kept narrow on purpose.
+ * `(null, null)` for it. The id is the agent-authored, slugified handoff slug
+ * (`[a-z0-9-]+`, globally unique on this host), so the body class is kebab
+ * (`[a-z0-9-]`); the `$` anchor rejects any trailing `::` segment so a typo
+ * rejects rather than binding wrong. Sibling of `SPAWN_VERB_REF_RE` — kept narrow
+ * on purpose.
  */
 const HANDOFF_SPAWN_RE = /^handoff::([a-z0-9-]+)$/;
 

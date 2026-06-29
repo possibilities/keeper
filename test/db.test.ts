@@ -150,6 +150,7 @@ test("openDb creates the handoffs table with the documented columns (fn-946)", (
     "doc",
     "title",
     "target_session",
+    "target_dir",
     "initiator_session",
     "initiator_pane",
     "initiator_job_id",
@@ -2433,9 +2434,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `events.worktree` + `jobs.worktree` durable lane-branch marker (an additive
   // ALTER, not an epics-shape change), fn-997 task .1. v95 appends the nullable
   // `usage.error_kind` failure-classification column (an additive ALTER, not an
-  // epics-shape change), fn-1000 task .1. The v62→v63 epics-shape migration this
+  // epics-shape change), fn-1000 task .1. v96 appends the nullable
+  // `handoffs.target_dir` launch-directory column (an additive ALTER, not an
+  // epics-shape change), fn-1003 task .2. The v62→v63 epics-shape migration this
   // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(95);
+  expect(SCHEMA_VERSION).toBe(96);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

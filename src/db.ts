@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 95;
+export const SCHEMA_VERSION = 96;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1272,6 +1272,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
     doc TEXT NOT NULL,
     title TEXT,
     target_session TEXT,
+    target_dir TEXT,
     initiator_session TEXT,
     initiator_pane TEXT,
     initiator_job_id TEXT,
@@ -5438,6 +5439,20 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "usage", "error_kind", "TEXT");
+
+      // v95→v96 (fn-1003.2): add the nullable `handoffs.target_dir` column — the
+      // resolved ABSOLUTE directory a `keeper handoff --dir <path>` launches the
+      // handoff-ee in (default = the caller's cwd, resolved CLI-side). The
+      // dispatcher reads it per-row as the launch cwd, coalescing NULL/empty to
+      // keeperd's cwd. APPEND-via-ALTER keeps existing rows NULL (the zero-event
+      // shape) and is re-fold-safe: a pre-v96 `HandoffRequested` event carries no
+      // `target_dir`, so a from-scratch re-fold leaves the column NULL
+      // byte-identically. NO cursor rewind — do NOT add to the rewind-and-redrain
+      // DELETE list (mirrors the prior column adds). Whitelist-only Python read
+      // (keeper-py never reads `handoffs`) — this bump MUST add 96 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "handoffs", "target_dir", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

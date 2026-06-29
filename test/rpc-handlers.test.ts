@@ -34,7 +34,11 @@ import {
   setAutopilotPausedHandler,
   setEpicArmedHandler,
 } from "../src/rpc-handlers";
-import { BadParamsError, type ReplayBridge } from "../src/server-worker";
+import {
+  BadParamsError,
+  type ReplayBridge,
+  SlugConflictError,
+} from "../src/server-worker";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -190,7 +194,7 @@ function autopilotStubBridge(opts: {
   setMode?: { ok: boolean; error?: string };
   setConfig?: { ok: boolean; error?: string };
   setArmed?: { ok: boolean; error?: string };
-  requestHandoff?: { ok: boolean; error?: string };
+  requestHandoff?: { ok: boolean; error?: string; conflict?: boolean };
 }): {
   bridge: ReplayBridge;
   state: {
@@ -204,10 +208,11 @@ function autopilotStubBridge(opts: {
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
-      handoff_id: string;
+      desired_slug: string;
       doc_path: string;
       title: string | null;
       target_session: string;
+      target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
     }>;
@@ -224,10 +229,11 @@ function autopilotStubBridge(opts: {
     }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
-      handoff_id: string;
+      desired_slug: string;
       doc_path: string;
       title: string | null;
       target_session: string;
+      target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
     }>,
@@ -658,26 +664,28 @@ test("set_epic_armed throws rpc_failed when the bridge reports ok:false", async 
 // fn-946 task .2 — `request_handoff`
 // ---------------------------------------------------------------------------
 
-test("request_handoff forwards the validated request to the bridge and returns ok+handoff_id", async () => {
+test("request_handoff forwards the validated request to the bridge and returns ok+handoff_id (the resolved slug)", async () => {
   const { bridge, state } = autopilotStubBridge({});
   const result = await requestHandoffHandler(
     {
-      handoff_id: "h-1",
-      doc_path: "/state/handoff/h-1.txt",
+      desired_slug: "investigate-foo",
+      doc_path: "/state/handoff/rpc-1.txt",
       title: "explore X",
       target_session: "work",
+      target_dir: "/Users/dev/code/other",
       initiator_session: "dash",
       initiator_pane: "%3",
     },
     bridge,
   );
-  expect(result).toEqual({ ok: true, handoff_id: "h-1" });
+  expect(result).toEqual({ ok: true, handoff_id: "investigate-foo" });
   expect(state.requestHandoffCalls).toEqual([
     {
-      handoff_id: "h-1",
-      doc_path: "/state/handoff/h-1.txt",
+      desired_slug: "investigate-foo",
+      doc_path: "/state/handoff/rpc-1.txt",
       title: "explore X",
       target_session: "work",
+      target_dir: "/Users/dev/code/other",
       initiator_session: "dash",
       initiator_pane: "%3",
     },
@@ -688,23 +696,56 @@ test("request_handoff coerces absent optional coords to null", async () => {
   const { bridge, state } = autopilotStubBridge({});
   const result = await requestHandoffHandler(
     {
-      handoff_id: "h-2",
-      doc_path: "/state/handoff/h-2.txt",
+      desired_slug: "clean-x",
+      doc_path: "/state/handoff/rpc-2.txt",
       target_session: "work",
     },
     bridge,
   );
-  expect(result).toEqual({ ok: true, handoff_id: "h-2" });
+  expect(result).toEqual({ ok: true, handoff_id: "clean-x" });
   expect(state.requestHandoffCalls).toEqual([
     {
-      handoff_id: "h-2",
-      doc_path: "/state/handoff/h-2.txt",
+      desired_slug: "clean-x",
+      doc_path: "/state/handoff/rpc-2.txt",
       title: null,
       target_session: "work",
+      target_dir: null,
       initiator_session: null,
       initiator_pane: null,
     },
   ]);
+});
+
+test("request_handoff rejects a non-absolute target_dir at the trust boundary (daemon-side guard)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  expect(
+    requestHandoffHandler(
+      {
+        desired_slug: "rel-dir",
+        doc_path: "/p",
+        target_session: "work",
+        target_dir: "relative/path",
+      },
+      bridge,
+    ),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(state.requestHandoffCalls).toEqual([]);
+});
+
+test("request_handoff forwards an absolute target_dir verbatim", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  await requestHandoffHandler(
+    {
+      desired_slug: "abs-dir",
+      doc_path: "/p",
+      target_session: "work",
+      target_dir: "/Users/dev/code/other",
+    },
+    bridge,
+  );
+  expect(state.requestHandoffCalls[0]?.target_dir).toBe(
+    "/Users/dev/code/other",
+  );
 });
 
 test("request_handoff throws BadParamsError on non-object params", async () => {
@@ -719,16 +760,16 @@ test("request_handoff throws BadParamsError on non-object params", async () => {
 test("request_handoff throws BadParamsError on a bad-shape payload", async () => {
   const { bridge, state } = autopilotStubBridge({});
   for (const bad of [
-    {}, // no handoff_id/doc_path/target_session
-    { doc_path: "/p", target_session: "work" }, // missing handoff_id
-    { handoff_id: "", doc_path: "/p", target_session: "work" }, // empty handoff_id
-    { handoff_id: "h", target_session: "work" }, // missing doc_path
-    { handoff_id: "h", doc_path: "", target_session: "work" }, // empty doc_path
-    { handoff_id: "h", doc_path: "/p" }, // missing target_session
-    { handoff_id: "h", doc_path: "/p", target_session: "" }, // empty target_session
-    { handoff_id: "h", doc_path: "/p", target_session: "work", title: 1 }, // non-string title
+    {}, // no desired_slug/doc_path/target_session
+    { doc_path: "/p", target_session: "work" }, // missing desired_slug
+    { desired_slug: "", doc_path: "/p", target_session: "work" }, // empty slug
+    { desired_slug: "h", target_session: "work" }, // missing doc_path
+    { desired_slug: "h", doc_path: "", target_session: "work" }, // empty doc_path
+    { desired_slug: "h", doc_path: "/p" }, // missing target_session
+    { desired_slug: "h", doc_path: "/p", target_session: "" }, // empty target_session
+    { desired_slug: "h", doc_path: "/p", target_session: "work", title: 1 }, // non-string title
     {
-      handoff_id: "h",
+      desired_slug: "h",
       doc_path: "/p",
       target_session: "work",
       initiator_pane: 1,
@@ -741,16 +782,61 @@ test("request_handoff throws BadParamsError on a bad-shape payload", async () =>
   expect(state.requestHandoffCalls).toEqual([]);
 });
 
+test("request_handoff re-validates slug FORMAT at the trust boundary (hand-crafted RPC bypass)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  // A hand-crafted RPC skips CLI slugify — the daemon rejects a malformed slug.
+  for (const badSlug of [
+    "Has-Caps",
+    "has_underscore",
+    "has space",
+    "has.dot",
+    ".",
+    "..",
+    "---",
+    "a".repeat(65),
+  ]) {
+    expect(
+      requestHandoffHandler(
+        { desired_slug: badSlug, doc_path: "/p", target_session: "work" },
+        bridge,
+      ),
+    ).rejects.toBeInstanceOf(BadParamsError);
+  }
+  expect(state.requestHandoffCalls).toEqual([]);
+});
+
 test("request_handoff throws rpc_failed when the bridge reports ok:false", async () => {
   const { bridge } = autopilotStubBridge({
     requestHandoff: { ok: false, error: "writer lock contention" },
   });
   expect(
     requestHandoffHandler(
-      { handoff_id: "h", doc_path: "/p", target_session: "work" },
+      {
+        desired_slug: "investigate-foo",
+        doc_path: "/p",
+        target_session: "work",
+      },
       bridge,
     ),
   ).rejects.toThrow(/writer lock contention/);
+});
+
+test("request_handoff throws SlugConflictError when the bridge reports a collision", async () => {
+  const { bridge } = autopilotStubBridge({
+    requestHandoff: {
+      ok: false,
+      conflict: true,
+      error: "handoff slug `investigate-foo` is already in use on this host",
+    },
+  });
+  // A collision is DISTINCT from a generic failure — the typed error routes the
+  // dispatcher to the `slug_conflict` wire code (→ CLI exit 3).
+  const p = requestHandoffHandler(
+    { desired_slug: "investigate-foo", doc_path: "/p", target_session: "work" },
+    bridge,
+  );
+  expect(p).rejects.toBeInstanceOf(SlugConflictError);
+  expect(p).rejects.toThrow(/already in use/);
 });
 
 // ---------------------------------------------------------------------------
