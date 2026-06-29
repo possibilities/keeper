@@ -50,5 +50,5 @@ Run the full `bun test` suite — the worker-fleet count assertion in `test/daem
 - [ ] `bun test` green; `keeper commit-work` lands one commit.
 
 ## Done summary
-
+Removed the tmux window-autoclose reaper end to end: deleted src/reaper-worker.ts + its test, pruned the daemon worker-fleet 4-link chain (ALL_WORKERS now eighteen), the disable_autoclose/autoclose_grace_seconds config surface, resolveDisableAutoclose, and the CLI-side pair reap; scrubbed window-reaper rationale from the immutable fn-977/migration-v92 sites, README, and pair/panel skills. Full bun test suite green.
 ## Evidence
