@@ -76,9 +76,8 @@ beforeEach(() => {
     dbPath: join(dir, "keeper.db"),
     extra: {
       KEEPER_AGENT_PATH: join(dir, "no-such-keeper-agent-binary"),
-      // Point the config resolver at a nonexistent file so `disable-autoclose`
-      // resolves to its EMPTY default (the user's real config never bleeds in):
-      // the codex reap path is then exercised against an autoclosing session.
+      // Point the config resolver at a nonexistent file so the run uses keeper's
+      // built-in defaults and the user's real config never bleeds in.
       KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
       // Sandbox the preset catalog dir under the tmpdir so the user's real
       // presets never bleed in (a bare `keeper pair` with no --preset reads no

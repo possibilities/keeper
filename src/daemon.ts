@@ -110,7 +110,6 @@ import type {
   PlanWorkerOutbound,
   RecheckPendingMessage,
 } from "./plan-worker";
-import type { ReaperWorkerData } from "./reaper-worker";
 import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
@@ -863,7 +862,7 @@ export async function runBlockEscalationSweep(
  * the WAL (when it succeeds) still means a worker's first `openDb` reads the main
  * file with no WAL frames to scan and no `-shm` recovery path to walk. Steady-state
  * checkpoints stay PASSIVE — the hook no longer writes the DB (since fn-736) but
- * live workers and the reaper run concurrently there, and PASSIVE skips them
+ * live workers run concurrently there, and PASSIVE skips them
  * without blocking.
  */
 export function withBootDrainCheckpointTuning(
@@ -1794,7 +1793,6 @@ export type WorkerName =
   | "maintenance"
   | "restore"
   | "renamer"
-  | "reaper"
   | "bus"
   | "tmuxControl";
 
@@ -1820,7 +1818,6 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "maintenance",
   "restore",
   "renamer",
-  "reaper",
   "bus",
   "tmuxControl",
 ] as const;
@@ -5332,45 +5329,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Gated on the selector — `null` when unselected. The reaper reads its
-  // `disable_autoclose` opt-out + `autoclose_grace_seconds` from the resolved
-  // config and threads them through workerData (frozen for the worker's
-  // lifetime; a config change takes effect on the next bounce, same as the other
-  // tunables).
-  const reaperConfig = resolveConfig();
-  // The reaper worker is OFF BY DEFAULT (deliberate operator default): a fresh
-  // boot does NOT spawn it, so no launch silently runs with reaping/autoclose on.
-  // Set KEEPER_ENABLE_REAPER=1 to opt back in. Revisit once the reaper's
-  // recycled-pane retry loop no longer interrupts live resumed panes.
-  const reaperEnabled = process.env.KEEPER_ENABLE_REAPER === "1";
-  const reaperWorker =
-    want("reaper") && reaperEnabled
-      ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
-          workerData: {
-            dbPath,
-            disableAutoclose: reaperConfig.disableAutoclose,
-            autocloseGraceSeconds: reaperConfig.autocloseGraceSeconds,
-          } satisfies ReaperWorkerData,
-        } as WorkerOptions & { workerData: unknown })
-      : null;
-
-  if (reaperWorker) {
-    const rpw = reaperWorker;
-    // NO onmessage handler: the reaper is a pure external actuator (reads the
-    // jobs/epics projections read-only, kills via tmux kill-window). It writes
-    // NOTHING to the DB — row terminalization flows through the existing
-    // exit-watcher → synthetic Killed mint, NOT a message from here. Only the
-    // lifecycle onerror + close guards escalate to the single recovery path.
-    rpw.onerror = (err: ErrorEvent): void => {
-      console.error("[keeperd] reaper worker error:", err.message ?? err);
-      if (!shuttingDown) fatalExit();
-    };
-
-    rpw.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  }
-
   // Gated on the selector — `null` when unselected. The Agent Bus relay
   // (epic fn-875): opens keeper.db READ-ONLY for jobs identity reads and owns
   // its OWN writable bus.db + dedicated bus.sock (paths default to
@@ -5705,7 +5663,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       maintenanceWorker,
       restoreWorker,
       renamerWorker,
-      reaperWorker,
       busWorker,
       tmuxControlWorker,
     ].filter((w): w is Worker => w !== null);

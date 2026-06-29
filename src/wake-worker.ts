@@ -43,8 +43,8 @@ export interface WakeWorkerData {
   pollMs?: number;
   /**
    * Worker-role discriminator. The bottom-of-file entrypoint runs `main()`
-   * ONLY when this is `"wake"`. Consumer worker modules (autopilot / reaper /
-   * renamer / restore) import this module for its `watchLoop` export and run
+   * ONLY when this is `"wake"`. Consumer worker modules (autopilot / renamer /
+   * restore) import this module for its `watchLoop` export and run
    * as `!isMainThread` themselves — the gate stops their import from booting
    * a stowaway wake loop (its own DB connection + an ignored `{kind:"wake"}`
    * stream) inside their threads.
@@ -183,7 +183,7 @@ function main(): void {
 
 // Only run inside a real Worker spawned AS the wake worker (`role: "wake"`).
 // A plain import on the main thread is inert; an import from ANOTHER worker
-// module (autopilot / reaper / renamer / restore pull `watchLoop` from here)
+// module (autopilot / renamer / restore pull `watchLoop` from here)
 // must NOT boot a stowaway wake loop in that thread — the role gate enforces
 // that.
 if (
