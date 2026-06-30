@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T03:05:41.733000Z",
+  "depends_on": [
+    "fn-1015-agent-watch-and-orient-surface.1"
+  ],
+  "epic": "fn-1015-agent-watch-and-orient-surface",
+  "id": "fn-1015-agent-watch-and-orient-surface.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "tighten await complete to done-and-idle",
+  "updated_at": "2026-06-30T03:05:41.733000Z"
+}
