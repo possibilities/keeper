@@ -34,5 +34,5 @@ Pure-builder assertions: import the builder, call with fixed inputs, `toEqual` t
 - [ ] `bun test` green; no test in this task launches a real subprocess/tmux/git.
 
 ## Done summary
-
+Added golden characterization pins (test/agent-run-capture-golden.test.ts) for the pure pair/agent builders and extended test/agent-byte-pin.test.ts with negative posture assertions. Test-only; no production change.
 ## Evidence
