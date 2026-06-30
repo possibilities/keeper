@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T00:48:31.041000Z",
+  "depends_on": [
+    "fn-1013-worktree-eligibility-heuristic.2"
+  ],
+  "epic": "fn-1013-worktree-eligibility-heuristic",
+  "id": "fn-1013-worktree-eligibility-heuristic.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "grandfather in-flight worktree epics",
+  "updated_at": "2026-06-30T00:48:31.041000Z"
+}
