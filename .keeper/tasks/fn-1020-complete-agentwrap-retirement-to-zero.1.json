@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T21:24:25.180000Z",
+  "depends_on": [],
+  "epic": "fn-1020-complete-agentwrap-retirement-to-zero",
+  "id": "fn-1020-complete-agentwrap-retirement-to-zero.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "high",
+  "title": "Cut arthack statusline to KEEPER_AGENT_CLAUDE_PROFILE",
+  "updated_at": "2026-06-30T21:24:25.180000Z"
+}
