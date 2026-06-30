@@ -54,5 +54,5 @@ Keep `bun scripts/lint-claude-md.ts` green.
 - [ ] If fn-1013 doc changes have landed, the two non-error-deferral notes are consolidated, not duplicated
 
 ## Done summary
-
+Docs for the cross-epic upstream-merge gate were largely shipped by task .1's commit; added the missing armed-eligibility architectural-slot parenthetical pointer to the README gate section. CLAUDE.md sub-clause and cli/autopilot.ts deferral help already present; lint-claude-md green.
 ## Evidence
