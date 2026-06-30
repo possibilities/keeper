@@ -52,5 +52,5 @@ skill. Both files are hand-authored static (no `.tmpl`, no
 - [ ] all edited/added prose is forward-facing (no provenance, dates, or fn-ids)
 
 ## Done summary
-
+Reworded handoff and defer skill frontmatter descriptions plus handoff body so imperative 'handoff'/'send a handoff'/cross-repo --dir routes to keeper:handoff with reciprocal plan:defer negative clauses; defer scope unchanged, markdown-doc carve-out preserved.
 ## Evidence
