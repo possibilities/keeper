@@ -4,7 +4,9 @@ description: >-
   Capture the conversation's currently actionable work as a single
   normal-priority plan epic (no queue jump). Use when the human says
   "defer", "save for later", "put on the list", or wants a small follow-up
-  tracked without interrupting current work.
+  tracked without interrupting current work. NOT for "send a handoff" /
+  "handoff to <repo>" or otherwise dispatching live work to a separate worker —
+  that is `keeper:handoff` (defer only scaffolds a board epic, spawns no worker).
 argument-hint: "[subject]"
 allowed-tools: Bash(keeper plan:*), Bash(keeper:*), Read, Glob, Task
 ---
