@@ -27,8 +27,9 @@
  *  4. `backend.listPanes()` — `null` (degraded/missing tmux) → skip the cycle.
  *  5. Pure {@link computeRenames}: join candidates to panes by pane id, group
  *     by window id, winner = max `created_at` (tie → higher `job_id`), target
- *     = winner's `title` verbatim; emit a rename ONLY where the swept
- *     `windowName !== target`. Every `rename-window` permanently SUPPRESSES
+ *     = winner's `title` with `::` rewritten to `/` (so a spawn-name title
+ *     like `work::fn-1019.2` tabs as `work/fn-1019.2`); emit a rename ONLY
+ *     where the swept `windowName !== target`. Every `rename-window` SUPPRESSES
  *     that window's automatic-rename, so a matching name must not re-rename;
  *     the suppression is deliberately left in place (tmux fighting back on
  *     every activity tick is worse than a stale name on a dead window).
@@ -166,9 +167,12 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
  * window id, pick the winner per window (max `created_at`; tie → higher
  * `job_id` — a deterministic tiebreak so equal-aged sessions don't flicker
  * the window name every pulse), and emit a `{windowId, name}` ONLY where the
- * sweep's current `windowName` differs from the winner's title. A matching
- * name is NOT re-emitted — every `rename-window` permanently suppresses that
- * window's automatic-rename, so re-issuing a no-op rename is pure churn.
+ * sweep's current `windowName` differs from the target. The target is the
+ * winner's title with `::` rewritten to `/`, so a spawn-name title like
+ * `work::fn-1019.2` tabs as `work/fn-1019.2`; the comparison uses that same
+ * formatted target, so a window already wearing it is NOT re-emitted — every
+ * `rename-window` permanently suppresses that window's automatic-rename, so
+ * re-issuing a no-op rename is pure churn.
  *
  * Returned in ascending `windowId` order for stable test assertions and a
  * deterministic fire order. Pure relative to its inputs.
@@ -212,8 +216,9 @@ export function computeRenames(
 
   const renames: WindowRename[] = [];
   for (const [windowId, { windowName, winner }] of winners) {
-    if (windowName !== winner.title) {
-      renames.push({ windowId, name: winner.title });
+    const target = winner.title.replaceAll("::", "/");
+    if (windowName !== target) {
+      renames.push({ windowId, name: target });
     }
   }
   renames.sort((a, b) =>
