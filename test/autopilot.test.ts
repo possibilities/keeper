@@ -162,6 +162,13 @@ function buildSnap(
     // escalated-but-paused await softening.
     blockEscalations: [],
     autopilotPaused: false,
+    // fn-1015: the un-dropped autopilot mode / caps / worktree. Safe-side
+    // defaults (yolo · unlimited jobs · per-root 1 · worktree off); this
+    // CLI-path fixture doesn't exercise the orient surface built on them.
+    autopilotMode: "yolo" as const,
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+    worktreeMode: false,
     readiness,
   };
 }

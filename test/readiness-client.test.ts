@@ -2867,3 +2867,193 @@ test("absent jobsLimit leaves the jobs query unbounded (limit 0)", () => {
   expect(jobsQuery(sock.takeOutbound()).limit).toBe(0);
   handle.dispose();
 });
+
+// ---------------------------------------------------------------------------
+// fn-1015 — the snapshot un-drops the autopilot mode / caps / worktree / armed
+//           eligibility the readiness pass already computes, so every downstream
+//           reader orients off ONE snapshot. Pure — driven by the mock socket.
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed eligibility (fn-1015)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-ap",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Stamp the boot-status header carrying N=3 on the epics frame; the readiness
+  // pass latches it and the snapshot reports the LATCHED value (NOT the
+  // autopilot_state column re-read) on the same emit.
+  sock.deliver([
+    {
+      type: "result",
+      id: "test-ap-epics",
+      collection: "epics",
+      rev: 1,
+      total: 0,
+      rows: [],
+      boot: {
+        rev: 1,
+        head_event_id: 1,
+        catching_up: false,
+        git_seed_required: false,
+        max_concurrent_per_root: 3,
+      },
+    },
+  ]);
+  for (const c of [
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "scheduled_tasks",
+    "block_escalations",
+    "tmux_client_focus",
+  ]) {
+    sock.deliver([emptyResult(c, `test-ap-${c.replace(/_/g, "-")}`)]);
+  }
+  // A populated autopilot_state singleton: playing, armed mode, jobs cap 8,
+  // worktree on; its per-root column (99) is intentionally NOT the latch value.
+  sock.deliver([
+    rowsResult("autopilot_state", "test-ap-autopilot-state", [
+      {
+        id: 1,
+        paused: 0,
+        mode: "armed",
+        max_concurrent_jobs: 8,
+        max_concurrent_per_root: 99,
+        worktree_mode: 1,
+      },
+    ]),
+  ]);
+  // Two armed epics, out of sorted order on the wire, so the eligible set proves
+  // the stable sort. armed mode computes the closure — an armed id is seeded by
+  // its own membership even with no epic rows folded.
+  sock.deliver([
+    rowsResult("armed_epics", "test-ap-armed-epics", [
+      { epic_id: "fn-2-bar" },
+      { epic_id: "fn-1-foo" },
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  const snap = snapshots[0];
+  expect(snap?.autopilotPaused).toBe(false);
+  expect(snap?.autopilotMode).toBe("armed");
+  expect(snap?.maxConcurrentJobs).toBe(8);
+  // The boot-header LATCH (3) wins over the autopilot_state column (99): the
+  // snapshot reports the per-root value the readiness pass actually used.
+  expect(snap?.maxConcurrentPerRoot).toBe(3);
+  expect(snap?.worktreeMode).toBe(true);
+  expect(snap?.autopilotEligibleEpicIds).toEqual(["fn-1-foo", "fn-2-bar"]);
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: empty autopilot_state defaults the autopilot fields to the safe side (fn-1015)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-ap-default",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Every collection empty, no boot header — the common pre-edge steady state.
+  for (const c of [
+    "epics",
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "autopilot_state",
+    "armed_epics",
+    "scheduled_tasks",
+    "block_escalations",
+    "tmux_client_focus",
+  ]) {
+    sock.deliver([emptyResult(c, `test-ap-default-${c.replace(/_/g, "-")}`)]);
+  }
+  expect(snapshots).toHaveLength(1);
+  const snap = snapshots[0];
+  // Safe side: paused, yolo, unlimited jobs (null), per-root default (1, the
+  // latch default with no boot header), worktree off, and no eligibility filter
+  // (undefined — yolo computes none).
+  expect(snap?.autopilotPaused).toBe(true);
+  expect(snap?.autopilotMode).toBe("yolo");
+  expect(snap?.maxConcurrentJobs).toBeNull();
+  expect(snap?.maxConcurrentPerRoot).toBe(1);
+  expect(snap?.worktreeMode).toBe(false);
+  expect(snap?.autopilotEligibleEpicIds).toBeUndefined();
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: a malformed autopilot_state row falls back to the safe defaults (fn-1015)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-ap-bad",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  for (const c of [
+    "epics",
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "armed_epics",
+    "scheduled_tasks",
+    "block_escalations",
+    "tmux_client_focus",
+  ]) {
+    sock.deliver([emptyResult(c, `test-ap-bad-${c.replace(/_/g, "-")}`)]);
+  }
+  // A present-but-garbage singleton: every column an illegal value.
+  sock.deliver([
+    rowsResult("autopilot_state", "test-ap-bad-autopilot-state", [
+      {
+        id: 1,
+        paused: "nope",
+        mode: "bananas",
+        max_concurrent_jobs: -4,
+        max_concurrent_per_root: 0,
+        worktree_mode: 7,
+      },
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  const snap = snapshots[0];
+  expect(snap?.autopilotPaused).toBe(true); // non-number paused → paused
+  expect(snap?.autopilotMode).toBe("yolo"); // unknown mode → yolo
+  expect(snap?.maxConcurrentJobs).toBeNull(); // non-positive → unlimited
+  expect(snap?.maxConcurrentPerRoot).toBe(1); // no boot header → latch default
+  expect(snap?.worktreeMode).toBe(false); // worktree_mode !== 1 → off
+  expect(snap?.autopilotEligibleEpicIds).toBeUndefined(); // yolo computes none
+
+  handle.dispose();
+});

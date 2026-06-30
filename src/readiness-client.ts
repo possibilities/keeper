@@ -57,6 +57,10 @@
  *   - SIGINT remains the CALLER's concern.
  */
 
+import {
+  projectMaxConcurrentJobs,
+  projectWorktreeMode,
+} from "../cli/autopilot";
 import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
 import { DEFAULT_MAX_CONCURRENT_PER_ROOT } from "./db";
@@ -184,6 +188,28 @@ export interface ReadinessClientSnapshot {
   // to PAUSED, mirroring `cli/autopilot.ts`'s coercion). Pairs with
   // `blockEscalations` for the escalated-but-paused await softening.
   readonly autopilotPaused: boolean;
+  // fn-1015: the autopilot mode / caps / worktree the readiness pass already
+  // computes to mirror the daemon's armed-mode dispatch but otherwise dropped.
+  // ADDITIVE — these touch neither the `states` array, the first-paint gate, nor
+  // the readiness verdict; un-dropped here so every downstream reader (board,
+  // dash, await, the new `keeper status`/`watch`) orients off ONE snapshot.
+  // `autopilotMode` reuses the local that feeds `computeReadiness`'s armed-mode
+  // eligibility (`'yolo'` on a missing/malformed row). `maxConcurrentPerRoot` is
+  // the boot-header-LATCHED value the readiness pass actually used — NOT a re-read
+  // of the `autopilot_state` column — defaulting to the safe
+  // `DEFAULT_MAX_CONCURRENT_PER_ROOT` until the header lands. `maxConcurrentJobs`
+  // (`null` = unlimited) and `worktreeMode` come off the `autopilot_state`
+  // singleton via the shared `cli/autopilot.ts` projectors (never re-coerced
+  // inline); an empty/malformed singleton defaults to unlimited / off.
+  readonly autopilotMode: "yolo" | "armed";
+  // The armed ∪ transitive-upstream eligibility closure (sorted, stable) the
+  // reconciler dispatches against in `armed` mode. `undefined` in `yolo` mode —
+  // no eligibility filter, matching the `eligibleEpicIds` local handed to
+  // `computeReadiness`.
+  readonly autopilotEligibleEpicIds?: readonly string[];
+  readonly maxConcurrentJobs: number | null;
+  readonly maxConcurrentPerRoot: number;
+  readonly worktreeMode: boolean;
   // fn-952: the `tmux_client_focus` singleton row (`id = 1`) — the persistent
   // control worker's view of the current real client's focused
   // session/window/pane. `undefined` when the singleton is empty (no-tmux env or
@@ -1722,6 +1748,18 @@ export function subscribeReadiness(
     const tmuxFocus = tmuxClientFocus.byId.get(
       tmuxClientFocus.order[0] ?? "",
     ) as TmuxClientFocus | undefined;
+    // fn-1015: un-drop the autopilot caps/worktree onto the snapshot. `mode` and
+    // the boot-header-latched `maxConcurrentPerRoot` reuse the locals that already
+    // feed `computeReadiness` (so the reported per-root cap matches what the pass
+    // used, never a stale column re-read). `max_concurrent_jobs` / `worktree_mode`
+    // come off the `autopilot_state` singleton via the shared projectors — never
+    // re-coerced inline. The eligibility set is the armed-mode closure, sorted for
+    // a stable render and absent in yolo (no filter).
+    const autopilotRows = projectRows<Record<string, unknown>>(autopilotState);
+    const maxConcurrentJobs = projectMaxConcurrentJobs(autopilotRows);
+    const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
+    const eligibleEpicIdsSorted =
+      eligibleEpicIds === undefined ? undefined : [...eligibleEpicIds].sort();
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1734,6 +1772,13 @@ export function subscribeReadiness(
       scheduledTasks: scheduledTasksTyped,
       blockEscalations: blockEscalationsTyped,
       autopilotPaused,
+      autopilotMode: mode,
+      ...(eligibleEpicIdsSorted === undefined
+        ? {}
+        : { autopilotEligibleEpicIds: eligibleEpicIdsSorted }),
+      maxConcurrentJobs,
+      maxConcurrentPerRoot,
+      worktreeMode,
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });
