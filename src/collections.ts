@@ -887,6 +887,41 @@ export function getCollection(name: string): CollectionDescriptor | undefined {
 }
 
 /**
+ * Read-allowlist for `keeper query <collection>` — the curated set of
+ * collection names an agent may one-shot read off the daemon. A DELIBERATE gate
+ * distinct from the full {@link REGISTRY}: an off-allowlist name is rejected at
+ * the CLI's parse time (exit 1 usage) BEFORE any daemon round-trip, so adding a
+ * registry collection never auto-exposes it to the query CLI. There is no
+ * `safe-to-expose` flag on the descriptor, so the allowlist is authored here as
+ * its own constant. Every entry MUST also be a `REGISTRY` key — asserted in
+ * `test/status.test.ts` so a typo here fails loudly rather than always-rejecting.
+ */
+export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
+  "epics",
+  "jobs",
+  "git",
+  "subagent_invocations",
+  "scheduled_tasks",
+  "dead_letters",
+  "dispatch_failures",
+  "autopilot_state",
+  "pending_dispatches",
+  "armed_epics",
+  "builds",
+  "block_escalations",
+  "handoffs",
+  "tmux_client_focus",
+  "worktree_repo_status",
+  "profiles",
+  "usage",
+]);
+
+/** Whether `name` is on the {@link QUERY_READ_ALLOWLIST} for `keeper query`. */
+export function isQueryAllowed(name: string): boolean {
+  return QUERY_READ_ALLOWLIST.has(name);
+}
+
+/**
  * Read a set of rows by primary key. Empty-set short-circuits to `[]` (a bare
  * `IN ()` is a SQL syntax error); over `MAX_IN_PARAMS` throws ("chunk the
  * caller"). Returns rows in SQLite's emission order (NOT input order). Trusted

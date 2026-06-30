@@ -1,0 +1,443 @@
+/**
+ * Pure-shaping tests for `keeper status` + `keeper query`. The JSON-builder
+ * (`buildStatusEnvelope`) and the arg parsers are pure / socket-free, so a
+ * fixture snapshot pins the envelope shape, the drained/jammed split, and the
+ * count tallies without booting a daemon. The `keeper query` runner is exercised
+ * through injected transport deps (no socket).
+ */
+
+import { describe, expect, test } from "bun:test";
+import {
+  parseQueryArgs,
+  QUERY_SCHEMA_VERSION,
+  runQueryCommand,
+} from "../cli/query";
+import {
+  buildStatusEnvelope,
+  buildStatusErrorEnvelope,
+  DEFAULT_CONNECT_DEADLINE_MS,
+  parseStatusArgs,
+  STATUS_SCHEMA_VERSION,
+  type StatusBootInfo,
+} from "../cli/status";
+import { QUERY_READ_ALLOWLIST, REGISTRY } from "../src/collections";
+import type { FilterValue, Row } from "../src/protocol";
+import type { Verdict } from "../src/readiness";
+import type { ReadinessClientSnapshot } from "../src/readiness-client";
+
+class ExitError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super(`exit ${code}`);
+    this.code = code;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture builders — minimal casts (production likewise casts wire rows).
+// ---------------------------------------------------------------------------
+
+interface FixtureTask {
+  task_id: string;
+}
+interface FixtureEpic {
+  epic_id: string;
+  status: string | null;
+  tasks: FixtureTask[];
+}
+
+interface SnapOverrides {
+  epics?: FixtureEpic[];
+  jobsByState?: string[];
+  pendingDispatches?: number;
+  deadLetters?: number;
+  blockEscalations?: number;
+  perEpic?: Record<string, Verdict>;
+  perTask?: Record<string, Verdict>;
+  perCloseRow?: Record<string, Verdict>;
+  autopilotPaused?: boolean;
+  autopilotMode?: "yolo" | "armed";
+  autopilotEligibleEpicIds?: string[];
+  maxConcurrentJobs?: number | null;
+  maxConcurrentPerRoot?: number;
+  worktreeMode?: boolean;
+}
+
+function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
+  const jobs = new Map<string, { state: string }>();
+  (o.jobsByState ?? []).forEach((state, i) => {
+    jobs.set(`job-${i}`, { state });
+  });
+  const toMap = (
+    rec: Record<string, Verdict> | undefined,
+  ): Map<string, Verdict> => new Map(Object.entries(rec ?? {}));
+  return {
+    epics: (o.epics ?? []) as unknown as ReadinessClientSnapshot["epics"],
+    jobs: jobs as unknown as ReadinessClientSnapshot["jobs"],
+    subagentInvocations: [],
+    scheduledTasks: [],
+    gitStatus: [],
+    deadLetters: Array.from(
+      { length: o.deadLetters ?? 0 },
+      () => ({}),
+    ) as unknown as ReadinessClientSnapshot["deadLetters"],
+    pendingDispatches: Array.from(
+      { length: o.pendingDispatches ?? 0 },
+      () => ({}),
+    ) as unknown as ReadinessClientSnapshot["pendingDispatches"],
+    blockEscalations: Array.from(
+      { length: o.blockEscalations ?? 0 },
+      () => ({}),
+    ) as unknown as ReadinessClientSnapshot["blockEscalations"],
+    autopilotPaused: o.autopilotPaused ?? false,
+    autopilotMode: o.autopilotMode ?? "yolo",
+    ...(o.autopilotEligibleEpicIds === undefined
+      ? {}
+      : { autopilotEligibleEpicIds: o.autopilotEligibleEpicIds }),
+    maxConcurrentJobs:
+      o.maxConcurrentJobs === undefined ? null : o.maxConcurrentJobs,
+    maxConcurrentPerRoot: o.maxConcurrentPerRoot ?? 1,
+    worktreeMode: o.worktreeMode ?? false,
+    readiness: {
+      perTask: toMap(o.perTask),
+      perCloseRow: toMap(o.perCloseRow),
+      perEpic: toMap(o.perEpic),
+      diagnostics: [],
+    },
+  } as unknown as ReadinessClientSnapshot;
+}
+
+const BOOT: StatusBootInfo = { rev: 4242, catching_up: false };
+
+// ---------------------------------------------------------------------------
+// buildStatusEnvelope — envelope shape + field presence
+// ---------------------------------------------------------------------------
+
+describe("buildStatusEnvelope shape", () => {
+  test("envelope carries every documented field", () => {
+    const snap = makeSnap({
+      epics: [
+        { epic_id: "fn-1-a", status: "open", tasks: [{ task_id: "fn-1-a.1" }] },
+      ],
+      perEpic: { "fn-1-a": { tag: "ready" } },
+      perTask: { "fn-1-a.1": { tag: "ready" } },
+      perCloseRow: {
+        "fn-1-a": {
+          tag: "blocked",
+          reason: { kind: "dep-on-task", upstream: "fn-1-a.1" },
+        } as unknown as Verdict,
+      },
+      autopilotMode: "armed",
+      autopilotEligibleEpicIds: ["fn-1-a"],
+      maxConcurrentJobs: 3,
+      maxConcurrentPerRoot: 2,
+      worktreeMode: true,
+    });
+    const env = buildStatusEnvelope(snap, BOOT, []);
+    expect(env.schema_version).toBe(STATUS_SCHEMA_VERSION);
+    expect(env.ok).toBe(true);
+    expect(env.error).toBeNull();
+    const d = env.data;
+    expect(d).not.toBeNull();
+    if (d === null) return;
+    // autopilot block
+    expect(d.autopilot).toEqual({
+      paused: false,
+      mode: "armed",
+      worktree_mode: true,
+      armed: ["fn-1-a"],
+      max_concurrent_jobs: 3,
+      max_concurrent_per_root: 2,
+    });
+    // board: epic + task + close verdict views
+    expect(d.board.epics).toHaveLength(1);
+    const epic = d.board.epics[0];
+    expect(epic?.epic_id).toBe("fn-1-a");
+    expect(epic?.status).toBe("open");
+    expect(epic?.verdict).toBe("ready");
+    expect(epic?.pill).toBe("[ready]");
+    expect(epic?.tasks).toEqual([
+      { task_id: "fn-1-a.1", verdict: "ready", pill: "[ready]" },
+    ]);
+    expect(epic?.close?.verdict).toBe("blocked");
+    expect(epic?.close?.pill).toContain("dep-on-task");
+    // boot header passthrough
+    expect(d.rev).toBe(4242);
+    expect(d.catching_up).toBe(false);
+    // count + flag + in_flight + needs_human blocks present
+    expect(d.counts.epics.total).toBe(1);
+    expect(d.counts.tasks.ready).toBe(1);
+    expect(typeof d.drained).toBe("boolean");
+    expect(typeof d.jammed).toBe("boolean");
+    expect(d.in_flight).toEqual({
+      pending_dispatches: 0,
+      running_jobs: 0,
+      total: 0,
+    });
+    expect(d.needs_human.total).toBe(0);
+  });
+
+  test("a verdict-map miss renders the inert [blocked:unknown] view", () => {
+    const snap = makeSnap({
+      epics: [
+        { epic_id: "fn-2-b", status: null, tasks: [{ task_id: "fn-2-b.1" }] },
+      ],
+      // no perEpic/perTask entries at all
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.board.epics[0]?.verdict).toBe("unknown");
+    expect(d?.board.epics[0]?.pill).toBe("[blocked:unknown]");
+    expect(d?.board.epics[0]?.tasks[0]?.pill).toBe("[blocked:unknown]");
+    expect(d?.board.epics[0]?.close).toBeNull();
+  });
+
+  test("yolo mode reports an empty armed set", () => {
+    const d = buildStatusEnvelope(
+      makeSnap({ autopilotMode: "yolo" }),
+      BOOT,
+      [],
+    ).data;
+    expect(d?.autopilot.mode).toBe("yolo");
+    expect(d?.autopilot.armed).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drained / jammed split + in-flight + needs-human
+// ---------------------------------------------------------------------------
+
+describe("buildStatusEnvelope drained/jammed", () => {
+  test("at rest with no human-blocking signal → drained, not jammed", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "done", tasks: [] }],
+      perEpic: { "fn-1-a": { tag: "completed" } },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.drained).toBe(true);
+    expect(d?.jammed).toBe(false);
+  });
+
+  test("a ready epic is NOT drained (dispatchable work remains)", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", tasks: [] }],
+      perEpic: { "fn-1-a": { tag: "ready" } },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.drained).toBe(false);
+    expect(d?.jammed).toBe(false);
+  });
+
+  test("at rest with a sticky dispatch_failure → jammed, not drained", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", tasks: [] }],
+      perEpic: {
+        "fn-1-a": {
+          tag: "blocked",
+          reason: { kind: "unknown" },
+        } as unknown as Verdict,
+      },
+    });
+    const failures: Row[] = [
+      { verb: "close", id: "fn-1-a", reason: "worktree-merge-conflict" },
+    ];
+    const d = buildStatusEnvelope(snap, BOOT, failures).data;
+    expect(d?.jammed).toBe(true);
+    expect(d?.drained).toBe(false);
+    expect(d?.needs_human.stuck_dispatches).toBe(1);
+    expect(d?.needs_human.total).toBe(1);
+  });
+
+  test("dead_letters / block_escalations feed needs-human and force jammed at rest", () => {
+    const snap = makeSnap({ deadLetters: 2, blockEscalations: 1 });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.needs_human.dead_letters).toBe(2);
+    expect(d?.needs_human.block_escalations).toBe(1);
+    expect(d?.needs_human.total).toBe(3);
+    expect(d?.jammed).toBe(true);
+  });
+
+  test("finalize_non_ff is counted as a subset of stuck_dispatches, not double-added", () => {
+    const failures: Row[] = [
+      {
+        verb: "close",
+        id: "fn-1-a",
+        reason: "worktree-finalize-non-fast-forward",
+      },
+      { verb: "close", id: "fn-2-b", reason: "worktree-merge-conflict" },
+    ];
+    const d = buildStatusEnvelope(makeSnap(), BOOT, failures).data;
+    expect(d?.needs_human.stuck_dispatches).toBe(2);
+    expect(d?.needs_human.finalize_non_ff).toBe(1);
+    expect(d?.needs_human.total).toBe(2);
+  });
+
+  test("in-flight counts pending dispatches + working jobs", () => {
+    const snap = makeSnap({
+      pendingDispatches: 2,
+      jobsByState: ["working", "stopped", "working"],
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.in_flight.pending_dispatches).toBe(2);
+    expect(d?.in_flight.running_jobs).toBe(2);
+    expect(d?.in_flight.total).toBe(4);
+    // in-flight work → not at rest → neither drained nor jammed
+    expect(d?.drained).toBe(false);
+    expect(d?.jammed).toBe(false);
+  });
+});
+
+describe("buildStatusErrorEnvelope", () => {
+  test("transport failure envelope is parseable JSON with ok:false", () => {
+    const env = buildStatusErrorEnvelope("unreachable: down");
+    expect(env).toEqual({
+      schema_version: STATUS_SCHEMA_VERSION,
+      ok: false,
+      error: "unreachable: down",
+      data: null,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseStatusArgs
+// ---------------------------------------------------------------------------
+
+describe("parseStatusArgs", () => {
+  test("defaults the connect deadline to ~10s", () => {
+    const r = parseStatusArgs([]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.args.connectTimeoutMs).toBe(DEFAULT_CONNECT_DEADLINE_MS);
+  });
+
+  test("--connect-timeout parses a duration", () => {
+    const r = parseStatusArgs(["--connect-timeout", "5s"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.args.connectTimeoutMs).toBe(5000);
+  });
+
+  test("a bad --connect-timeout is a usage error", () => {
+    const r = parseStatusArgs(["--connect-timeout", "soon"]);
+    expect(r.ok).toBe(false);
+  });
+
+  test("--help is surfaced as the __help__ sentinel", () => {
+    const r = parseStatusArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toBe("__help__");
+  });
+
+  test("an unknown flag is a usage error", () => {
+    const r = parseStatusArgs(["--bogus"]);
+    expect(r.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// keeper query — allowlist gate, filter parsing, transport
+// ---------------------------------------------------------------------------
+
+describe("QUERY_READ_ALLOWLIST", () => {
+  test("every allowlisted name is a real registry collection", () => {
+    for (const name of QUERY_READ_ALLOWLIST) {
+      expect(REGISTRY.has(name)).toBe(true);
+    }
+  });
+});
+
+describe("parseQueryArgs", () => {
+  test("an allowlisted collection parses", () => {
+    const r = parseQueryArgs(["epics"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.collection).toBe("epics");
+      expect(r.args.filter).toEqual({});
+    }
+  });
+
+  test("an off-allowlist collection is rejected at parse time", () => {
+    const r = parseQueryArgs(["secrets"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("not readable");
+  });
+
+  test("a missing collection is a usage error", () => {
+    const r = parseQueryArgs([]);
+    expect(r.ok).toBe(false);
+  });
+
+  test("--filter k=v builds the exact-match filter map", () => {
+    const r = parseQueryArgs(["jobs", "--filter", "state=working"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.args.filter).toEqual({ state: "working" });
+  });
+
+  test("a malformed --filter (no =) is a usage error", () => {
+    const r = parseQueryArgs(["jobs", "--filter", "state"]);
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe("runQueryCommand", () => {
+  type QueryFn = (
+    sock: string,
+    collection: string,
+    filter?: Record<string, FilterValue>,
+  ) => Promise<Record<string, unknown>[]>;
+
+  function harness(query: QueryFn) {
+    const out: string[] = [];
+    const err: string[] = [];
+    let code: number | null = null;
+    return {
+      out,
+      err,
+      get code() {
+        return code;
+      },
+      deps: {
+        query,
+        writeStdout: (s: string) => out.push(s),
+        writeStderr: (s: string) => err.push(s),
+        exit: (c: number): never => {
+          code = c;
+          throw new ExitError(c);
+        },
+      },
+    };
+  }
+
+  async function run(h: ReturnType<typeof harness>): Promise<void> {
+    try {
+      await runQueryCommand(
+        { collection: "epics", filter: {}, sock: "/tmp/s" },
+        h.deps,
+      );
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    }
+  }
+
+  test("success prints a JSON envelope with the rows and exits 0", async () => {
+    const rows = [{ epic_id: "fn-1-a" }, { epic_id: "fn-2-b" }];
+    const h = harness(() => Promise.resolve(rows));
+    await run(h);
+    expect(h.code).toBe(0);
+    const env = JSON.parse(h.out.join(""));
+    expect(env.schema_version).toBe(QUERY_SCHEMA_VERSION);
+    expect(env.ok).toBe(true);
+    expect(env.data).toEqual(rows);
+    expect(h.err).toEqual([]);
+  });
+
+  test("a transport throw maps to a clean exit-1 stderr message, empty stdout", async () => {
+    const h = harness(() =>
+      Promise.reject(
+        new Error("daemon error querying 'epics': bad_frame: nope"),
+      ),
+    );
+    await run(h);
+    expect(h.code).toBe(1);
+    expect(h.out).toEqual([]);
+    expect(h.err.join("")).toContain("bad_frame");
+  });
+});

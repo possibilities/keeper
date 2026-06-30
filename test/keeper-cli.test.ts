@@ -72,6 +72,8 @@ function makeHarness(): Harness {
       autopilot: mkHandler("autopilot"),
       builds: mkHandler("builds"),
       dash: mkHandler("dash"),
+      status: mkHandler("status"),
+      query: mkHandler("query"),
       await: mkHandler("await"),
       "commit-work": mkHandler("commit-work"),
       "setup-tmux": mkHandler("setup-tmux"),
@@ -206,6 +208,8 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
+    expect(isSubcommand("status")).toBe(true);
+    expect(isSubcommand("query")).toBe(true);
     expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("commit-work")).toBe(true);
     expect(isSubcommand("setup-tmux")).toBe(true);

@@ -27,6 +27,8 @@ export const SUBCOMMANDS = [
   "autopilot",
   "builds",
   "dash",
+  "status",
+  "query",
   "await",
   "commit-work",
   "setup-tmux",
@@ -60,6 +62,8 @@ Subcommands:
   autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
   builds              Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)
   dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
+  status              One-shot unified board + autopilot JSON read (orient in one call)
+  query               One-shot read of an allowlisted daemon collection (JSON)
   await               Block until a plan/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
   setup-tmux          Provision the tmux control plane (dash + work sessions)
@@ -166,6 +170,8 @@ export async function main(): Promise<void> {
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
     builds: async (argv) => (await import("./builds")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
+    status: async (argv) => (await import("./status")).main(argv),
+    query: async (argv) => (await import("./query")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
