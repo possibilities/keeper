@@ -3414,7 +3414,10 @@ has merged into default — so B builds on a pre-A tree. The gate defers cutting
 lane until every SATISFIED (done) SAME-RESOLVED-REPO upstream is contained in the
 LOCAL default branch. It is EPHEMERAL + producer-only: probed ONCE per cycle in
 `loadReconcileSnapshot` (`computeDeferredEpicIds` → a `deferredEpicIds` set the pure
-`reconcile` reads as plain data, shelling git NOWHERE), gated on worktree mode (an
+`reconcile` reads as plain data, shelling git NOWHERE — the same
+snapshot-probe-feeds-pure-`reconcile` architectural slot as the armed-eligibility
+`computeEligibleEpics` gate above, but worktree-specific and git-probed rather than
+projection-read), gated on worktree mode (an
 OFF cycle adds zero git spawns), and minting NO `dispatch_failures` row — a deferred
 epic re-evaluates every cycle and provisions the one AFTER A's finalize merge lands.
 Two no-sticky `continue` arms (one on the work row, one on the close row, both ABOVE
