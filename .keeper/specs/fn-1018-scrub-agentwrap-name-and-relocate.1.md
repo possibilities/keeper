@@ -35,5 +35,5 @@ Extend the existing fn-889 frozen-allowlist + guard to cover the `agentwrap` sur
 - [ ] `bun test` green; no production code renamed in this task
 
 ## Done summary
-
+Extended the fn-889 frozen-allowlist with anchor records for every agentwrap survivor (AGENTWRAP_* env-var family + prefix filter, ~/.local/state/agentwrap state dir, legacyAgentwrapPresetsPath detector + path, retired-alias test guards) plus a fixture test asserting an agentwrap anchor clobber exits 1. Guard exits 0 on the current tree.
 ## Evidence
