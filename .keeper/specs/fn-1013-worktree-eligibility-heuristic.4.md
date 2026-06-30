@@ -47,5 +47,5 @@ Surface WHY a repo's worktrees are disabled as a NON-error operator view on `kee
 - [ ] no `dispatch_failures` / sticky reject involvement
 
 ## Done summary
-
+Added the LIVE-ONLY worktree_repo_status projection (fed worker→main→fold like git_status, no new RPC) so keeper autopilot renders a neutral --- worktree --- section of worktree-disabled epics + reasons, distinct from the red dispatch-failures block.
 ## Evidence
