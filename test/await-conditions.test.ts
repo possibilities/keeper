@@ -29,10 +29,16 @@ import { expect, test } from "bun:test";
 import {
   type AwaitState,
   agentsIdleState,
+  changedSignature,
   classifyTargetId,
+  drainedState,
+  epicAddedMet,
+  epicRemovedMet,
   evaluateAwaitCondition,
   gitCleanState,
+  isJamReason,
   monitorRunningState,
+  verdictKey,
   workable,
 } from "../src/await-conditions";
 import { computeReadiness, type Verdict } from "../src/readiness";
@@ -1487,4 +1493,209 @@ test("monitor-running: ownSessionId null → met (no own row, vacuously done)", 
   expect(monitorRunningState(null, { command: "watch.sh" }, jobs).kind).toBe(
     "met",
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 board predicates: drained / isJamReason
+// ---------------------------------------------------------------------------
+
+const READY: Verdict = { tag: "ready" };
+const DONE: Verdict = { tag: "completed" };
+
+test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", () => {
+  expect(isJamReason("worktree-finalize-non-fast-forward")).toBe(true);
+  expect(
+    isJamReason("worktree-merge-conflict: merging X into Y — conflict"),
+  ).toBe(true);
+  // The auto-clear prefix is excluded even though it shares the namespace.
+  expect(isJamReason("worktree-recover-conflict")).toBe(false);
+  expect(isJamReason("worktree-recover-push-failed")).toBe(false);
+  // Unrelated reasons never count.
+  expect(isJamReason("job-rejected")).toBe(false);
+  expect(isJamReason("worktree-merge-local-timeout")).toBe(false);
+});
+
+test("drained: empty open board → met", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: all verdicts completed → met", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", DONE]]),
+    perCloseRow: new Map([["fn-1-a", DONE]]),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: a ready (deferred-style) verdict → waiting (not drained)", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", READY]]),
+    perCloseRow: new Map(),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: a running job → waiting", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", DONE]]),
+    perCloseRow: new Map(),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 1,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: a pending dispatch → waiting", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 1,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: catching_up → waiting even when otherwise drained", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: true,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: jam sticky + --fail-on-stuck → stuck", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-finalize-non-fast-forward"],
+    failOnStuck: true,
+  });
+  expect(r.kind).toBe("stuck");
+});
+
+test("drained: recover* sticky + --fail-on-stuck → NOT stuck (met when at rest)", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-recover-conflict"],
+    failOnStuck: true,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: jam sticky WITHOUT --fail-on-stuck → not escalated (met at rest)", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-merge-conflict: x"],
+    failOnStuck: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 edge predicates: epic-added / epic-removed
+// ---------------------------------------------------------------------------
+
+test("epicAddedMet: baseline === current → false (never on first paint)", () => {
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a"])).toBe(false);
+});
+
+test("epicAddedMet: a new id appears → true; narrowed by target", () => {
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"])).toBe(true);
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"], "fn-2-b")).toBe(true);
+  // a different new id does not satisfy a specific target
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-3-c"], "fn-2-b")).toBe(false);
+  // bare-id target matches the full id
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"], "fn-2")).toBe(true);
+});
+
+test("epicRemovedMet: present-then-absent → true; absent-at-baseline → false", () => {
+  expect(epicRemovedMet(["fn-1-a", "fn-2-b"], ["fn-1-a"], "fn-2-b")).toBe(true);
+  expect(epicRemovedMet(["fn-1-a", "fn-2-b"], ["fn-1-a"], "fn-2")).toBe(true);
+  // never saw it → can't observe removal
+  expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-9-z")).toBe(false);
+  // still present → waiting
+  expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-1-a")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 changed signature
+// ---------------------------------------------------------------------------
+
+test("verdictKey: stable per tag + reason", () => {
+  expect(verdictKey({ tag: "ready" })).toBe("ready");
+  expect(verdictKey({ tag: "completed" })).toBe("completed");
+  expect(verdictKey({ tag: "blocked", reason: { kind: "job-rejected" } })).toBe(
+    "blocked:job-rejected",
+  );
+});
+
+test("changedSignature: identical boards hash identically; a verdict move differs", () => {
+  const base = {
+    epics: [{ epic_id: "fn-1-a", status: "open" as string | null }],
+    perTask: new Map<string, Verdict>([["fn-1-a.1", READY]]),
+    perCloseRow: new Map<string, Verdict>(),
+    perEpic: new Map<string, Verdict>([["fn-1-a", READY]]),
+    autopilot: {
+      mode: "yolo",
+      paused: false,
+      worktreeMode: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+    },
+  };
+  const same = changedSignature(base);
+  expect(changedSignature(base)).toBe(same);
+  // map-iteration-order churn does not perturb the signature
+  const reordered = {
+    ...base,
+    perTask: new Map<string, Verdict>([["fn-1-a.1", READY]]),
+  };
+  expect(changedSignature(reordered)).toBe(same);
+  // a verdict change moves the hash
+  const moved = {
+    ...base,
+    perTask: new Map<string, Verdict>([["fn-1-a.1", DONE]]),
+  };
+  expect(changedSignature(moved)).not.toBe(same);
+  // an autopilot pause toggle moves the hash
+  const paused = { ...base, autopilot: { ...base.autopilot, paused: true } };
+  expect(changedSignature(paused)).not.toBe(same);
 });

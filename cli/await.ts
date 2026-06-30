@@ -56,7 +56,12 @@ import {
   type AwaitState,
   type AwaitTarget,
   agentsIdleState,
+  type BoardSignatureInput,
+  changedSignature,
   classifyTargetId,
+  drainedState,
+  epicAddedMet,
+  epicRemovedMet,
   evaluateAwaitCondition,
   gitCleanState,
   type MonitorSelector,
@@ -97,6 +102,15 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      a background monitor in YOUR session is still running.
                      Selector (exact match): cmd:<command>, kind:<monitor|
                      bash-bg|ambient>, or a bare token (= cmd:<token>).
+  drained            the board is fully at rest — no in-flight launch, no
+                     running job, every row completed, not catching up (no id).
+                     --fail-on-stuck → exit 5 on an operator jam sticky
+  epic-added [id]    an epic appears on the board (optionally a specific id).
+                     Edge-triggered: never satisfied on first paint
+  epic-removed <id>  the named epic leaves the board (done or deleted).
+                     Edge-triggered: never satisfied on first paint
+  changed [since:R]  the board's epics/verdicts/autopilot move. Edge-triggered;
+                     since:<hash> anchors against a prior 'changed' baseline
 
 Flags:
   --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3
@@ -197,7 +211,13 @@ export type ConditionSegment =
   | { condition: "git-clean" }
   | { condition: "agents-idle" }
   | { condition: "server-up" }
-  | { condition: "monitor-running"; selector: MonitorSelector; raw: string };
+  | { condition: "monitor-running"; selector: MonitorSelector; raw: string }
+  // fn-1015 board-level conditions (read the whole board off the readiness
+  // snapshot; no plan target presence semantics).
+  | { condition: "drained" }
+  | { condition: "changed"; since?: string }
+  | { condition: "epic-added"; target?: string }
+  | { condition: "epic-removed"; target: string };
 
 export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
@@ -463,10 +483,103 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
         selector,
         raw: rawSelector,
       });
+    } else if (condRaw === "drained") {
+      if (rest.length !== 0) {
+        return {
+          ok: false,
+          message: `condition 'drained' takes no id (got ${rest.length} extra arg(s))`,
+        };
+      }
+      if (seen.has("drained")) {
+        return { ok: false, message: "duplicate condition 'drained'" };
+      }
+      seen.add("drained");
+      segments.push({ condition: "drained" });
+    } else if (condRaw === "changed") {
+      if (rest.length > 1) {
+        return {
+          ok: false,
+          message: `condition 'changed' takes at most one since:<hash> token (got ${rest.length})`,
+        };
+      }
+      let since: string | undefined;
+      if (rest.length === 1) {
+        const tok = rest[0] ?? "";
+        if (!tok.startsWith("since:")) {
+          return {
+            ok: false,
+            message: `invalid arg '${tok}' for 'changed' (expected since:<hash>)`,
+          };
+        }
+        since = tok.slice("since:".length);
+        if (since.length === 0) {
+          return {
+            ok: false,
+            message:
+              "condition 'changed' since:<hash> requires a non-empty hash",
+          };
+        }
+      }
+      const dupKey = since === undefined ? "changed" : `changed:${since}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: "changed",
+        ...(since === undefined ? {} : { since }),
+      });
+    } else if (condRaw === "epic-added") {
+      if (rest.length > 1) {
+        return {
+          ok: false,
+          message: `condition 'epic-added' takes at most one id (got ${rest.length})`,
+        };
+      }
+      let target: string | undefined;
+      if (rest.length === 1) {
+        target = rest[0] ?? "";
+        if (classifyTargetId(target) !== "epic") {
+          return {
+            ok: false,
+            message: `condition 'epic-added' id '${target}' must be an epic id (fn-N or fn-N-slug)`,
+          };
+        }
+      }
+      const dupKey =
+        target === undefined ? "epic-added" : `epic-added:${target}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: "epic-added",
+        ...(target === undefined ? {} : { target }),
+      });
+    } else if (condRaw === "epic-removed") {
+      if (rest.length !== 1) {
+        return {
+          ok: false,
+          message: `condition 'epic-removed' takes exactly one id (got ${rest.length})`,
+        };
+      }
+      const target = rest[0] ?? "";
+      if (classifyTargetId(target) !== "epic") {
+        return {
+          ok: false,
+          message: `condition 'epic-removed' id '${target}' must be an epic id (fn-N or fn-N-slug)`,
+        };
+      }
+      const dupKey = `epic-removed:${target}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({ condition: "epic-removed", target });
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed)`,
       };
     }
   }
@@ -683,11 +796,41 @@ interface ServerUpSlotState {
   lastVerdictPhrase: string | null;
 }
 
+/**
+ * Per-board-slot mutable state (fn-1015) — `drained` / `changed` /
+ * `epic-added` / `epic-removed`. Reads the whole board off the readiness
+ * snapshot (plus the boot-status `catching_up` and, for `drained
+ * --fail-on-stuck`, the live `dispatch_failures` rows). No `deleted`/`stuck`
+ * re-query (a board condition has no plan-target presence); `drained` reaches
+ * `stuck` purely through its pure predicate, never a re-query.
+ *
+ * The edge-triggered conditions (`changed`/`epic-added`/`epic-removed`) capture
+ * a FIRST-PAINT baseline (`baselineEpicIds` / `baselineSignature`) once
+ * (`baselineCaptured` latches and is NEVER reset on reconnect — the anchor is
+ * last-known content, not connection lifecycle), then fire `met` on the first
+ * qualifying delta against it. `drained` is level-triggered and ignores the
+ * baseline.
+ */
+interface BoardSlotState {
+  readonly kind: "drained" | "changed" | "epic-added" | "epic-removed";
+  /** epic id for `epic-added` (optional) / `epic-removed` (required). */
+  readonly target?: string;
+  /** `changed since:<hash>` anchor — overrides the first-paint baseline. */
+  readonly since?: string;
+  met: boolean;
+  lastEval: AwaitState | null;
+  lastVerdictPhrase: string | null;
+  baselineCaptured: boolean;
+  baselineEpicIds: string[];
+  baselineSignature: string | null;
+}
+
 type SlotState =
   | PlanSlotState
   | GitJobSlotState
   | MonitorSlotState
-  | ServerUpSlotState;
+  | ServerUpSlotState
+  | BoardSlotState;
 
 interface RunnerState {
   terminating: boolean;
@@ -745,17 +888,30 @@ export async function runAwait(
   // bounded deadline for the give-up-eligible streams but is rejected with
   // server-up at parse time.)
   const hasServerUp = args.segments.some((s) => s.condition === "server-up");
+  // fn-1015 board conditions all read off the readiness snapshot. `drained`
+  // additionally needs the boot-status `catching_up` flag (latched via
+  // `onBootStatus`) and, under `--fail-on-stuck`, the live `dispatch_failures`
+  // rows (a dedicated collection subscribe — there's no readiness equivalent).
+  const hasDrained = args.segments.some((s) => s.condition === "drained");
+  const hasBoard = args.segments.some(
+    (s) =>
+      s.condition === "drained" ||
+      s.condition === "changed" ||
+      s.condition === "epic-added" ||
+      s.condition === "epic-removed",
+  );
+  const openDispatchFailures = hasDrained && args.failOnStuck;
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
   // NO git root (unlike `agents-idle`, which scopes by cwd containment).
   const needsRoot = hasGitClean || hasAgentsIdle;
   // Both `agents-idle` and `monitor-running` read the jobs collection.
   const needsJobs = hasAgentsIdle || hasMonitorRunning;
-  // Open the readiness stream when any plan segment is present; it
+  // Open the readiness stream when any plan OR board segment is present; it
   // already folds git + jobs so those families ride it. Otherwise open a
   // dedicated git / jobs collection stream per family used.
-  const openReadiness = hasPlan;
-  const openGitCollection = hasGitClean && !hasPlan;
-  const openJobsCollection = needsJobs && !hasPlan;
+  const openReadiness = hasPlan || hasBoard;
+  const openGitCollection = hasGitClean && !openReadiness;
+  const openJobsCollection = needsJobs && !openReadiness;
   // `server-up` gets its OWN minimal readiness subscribe (always
   // give-up-exempt) — NOT bolted onto `openReadiness`, which would drag in
   // the plan re-query machinery.
@@ -788,6 +944,28 @@ export async function runAwait(
         lastVerdictPhrase: null,
       };
     }
+    if (
+      seg.condition === "drained" ||
+      seg.condition === "changed" ||
+      seg.condition === "epic-added" ||
+      seg.condition === "epic-removed"
+    ) {
+      return {
+        kind: seg.condition,
+        ...("target" in seg && seg.target !== undefined
+          ? { target: seg.target }
+          : {}),
+        ...("since" in seg && seg.since !== undefined
+          ? { since: seg.since }
+          : {}),
+        met: false,
+        lastEval: null,
+        lastVerdictPhrase: null,
+        baselineCaptured: false,
+        baselineEpicIds: [],
+        baselineSignature: null,
+      };
+    }
     return {
       kind: seg.condition,
       met: false,
@@ -806,6 +984,15 @@ export async function runAwait(
   // until it seeds. Defaults `false` (steady state / a server that stamps no
   // header → treat as seeded).
   let latestGitSeedRequired = false;
+  // fn-1015: latest boot-status `catching_up` (latched off the same header). The
+  // `drained` predicate refuses to report drained while the reducer is still
+  // draining toward head. Defaults `false` (steady state / a server stamping no
+  // header → treat as caught up).
+  let latestCatchingUp = false;
+  // fn-1015: latest `dispatch_failures.reason` strings, latched off the
+  // dedicated collection stream opened only for `drained --fail-on-stuck`. Null
+  // until first-painted; the drained jam check reads it.
+  let latestDispatchFailureReasons: readonly string[] | null = null;
   // Latest readiness snapshot (null until first paint); plan + (when
   // riding readiness) git/jobs read off it.
   let latestReadiness: ReadinessClientSnapshot | null = null;
@@ -822,12 +1009,17 @@ export async function runAwait(
     // `allPainted()` AND so `server-up`'s single slot only `met`s once the
     // daemon is actually serving.
     serverUp: !openServerUp,
+    // fn-1015: the dedicated `dispatch_failures` stream for `drained
+    // --fail-on-stuck`. Folded into the gate so a board condition doesn't
+    // glitch-evaluate before the jam rows have first-painted.
+    dispatchFailures: !openDispatchFailures,
   };
   const allPainted = (): boolean =>
     paintGate.readiness &&
     paintGate.git &&
     paintGate.jobs &&
-    paintGate.serverUp;
+    paintGate.serverUp &&
+    paintGate.dispatchFailures;
 
   const state: RunnerState = {
     terminating: false,
@@ -845,11 +1037,13 @@ export async function runAwait(
     git: true,
     jobs: true,
     serverUp: true,
+    dispatchFailures: true,
   };
 
   let readinessHandle: ReadinessClientHandle | null = null;
   let gitHandle: ReadinessClientHandle | null = null;
   let jobsHandle: ReadinessClientHandle | null = null;
+  let dispatchFailuresHandle: ReadinessClientHandle | null = null;
   let deadlineHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
 
@@ -858,7 +1052,12 @@ export async function runAwait(
       deps.clearTimer(deadlineHandle);
       deadlineHandle = null;
     }
-    for (const h of [readinessHandle, gitHandle, jobsHandle]) {
+    for (const h of [
+      readinessHandle,
+      gitHandle,
+      jobsHandle,
+      dispatchFailuresHandle,
+    ]) {
       if (h !== null) {
         try {
           h.dispose();
@@ -870,6 +1069,7 @@ export async function runAwait(
     readinessHandle = null;
     gitHandle = null;
     jobsHandle = null;
+    dispatchFailuresHandle = null;
     if (unregisterSignals !== null) {
       try {
         unregisterSignals();
@@ -911,6 +1111,12 @@ export async function runAwait(
     if (slot.kind === "monitor-running") {
       return `monitor-running ${slot.raw}`;
     }
+    if (
+      (slot.kind === "epic-added" || slot.kind === "epic-removed") &&
+      slot.target !== undefined
+    ) {
+      return `${slot.kind} ${slot.target}`;
+    }
     return slot.kind;
   };
 
@@ -937,6 +1143,22 @@ export async function runAwait(
       fields = {
         condition: "monitor-running",
         selector: slots[0].raw,
+        state: initial.detail ?? initial.kind,
+      };
+    } else if (
+      single &&
+      slots[0] !== undefined &&
+      (slots[0].kind === "drained" ||
+        slots[0].kind === "changed" ||
+        slots[0].kind === "epic-added" ||
+        slots[0].kind === "epic-removed")
+    ) {
+      // fn-1015 single board condition: bare condition (+ target) + state.
+      const slot = slots[0];
+      const initial = initials[0] ?? { kind: "waiting" as const };
+      fields = {
+        condition: slot.kind,
+        ...(slot.target !== undefined ? { target: slot.target } : {}),
         state: initial.detail ?? initial.kind,
       };
     } else if (single) {
@@ -979,6 +1201,22 @@ export async function runAwait(
         condition: "monitor-running",
         selector: slots[0].raw,
         detail: slots[0].lastEval?.detail ?? "",
+      });
+      return;
+    }
+    if (
+      single &&
+      slots[0] !== undefined &&
+      (slots[0].kind === "drained" ||
+        slots[0].kind === "changed" ||
+        slots[0].kind === "epic-added" ||
+        slots[0].kind === "epic-removed")
+    ) {
+      const slot = slots[0];
+      emitTerminal("met", 0, {
+        condition: slot.kind,
+        ...(slot.target !== undefined ? { target: slot.target } : {}),
+        detail: slot.lastEval?.detail ?? "",
       });
       return;
     }
@@ -1038,6 +1276,28 @@ export async function runAwait(
       base.from = slotLabel(slot);
     }
     emitTerminal("failed", 1, base);
+  };
+
+  // fn-1015: a board slot reached a terminal failure (today only `drained
+  // --fail-on-stuck` → `stuck` exit 5 on an operator jam). Single-segment names
+  // the bare condition; an aggregate additionally carries `from`.
+  const emitBoardFailure = (
+    slot: BoardSlotState,
+    reason: "stuck",
+    code: number,
+    detail: string | undefined,
+  ): void => {
+    const base: Record<string, string> = { reason, condition: slot.kind };
+    if (slot.target !== undefined) {
+      base.target = slot.target;
+    }
+    if (detail !== undefined && detail.length > 0) {
+      base.detail = detail;
+    }
+    if (!single) {
+      base.from = slotLabel(slot);
+    }
+    emitTerminal("failed", code, base);
   };
 
   // Best-effort scope-exempt re-query for the deleted-vs-complete
@@ -1246,6 +1506,85 @@ export async function runAwait(
       ? reQueryHitTask(slot.target.id)
       : reQueryHit(slot.target.id);
 
+  // Build the `changedSignature` input from a readiness snapshot — the coarse
+  // orient surface (epics + verdicts + autopilot), git/subagent/job churn
+  // excluded so `changed` fires on a real board move.
+  const boardSignatureInputOf = (
+    snap: ReadinessClientSnapshot,
+  ): BoardSignatureInput => ({
+    epics: snap.epics.map((e) => ({ epic_id: e.epic_id, status: e.status })),
+    perTask: snap.readiness.perTask,
+    perCloseRow: snap.readiness.perCloseRow,
+    perEpic: snap.readiness.perEpic,
+    autopilot: {
+      mode: snap.autopilotMode,
+      paused: snap.autopilotPaused,
+      worktreeMode: snap.worktreeMode,
+      maxConcurrentJobs: snap.maxConcurrentJobs,
+      maxConcurrentPerRoot: snap.maxConcurrentPerRoot,
+    },
+  });
+
+  /**
+   * Evaluate one board slot (fn-1015) off the latest readiness snapshot plus
+   * the latched `catching_up` / `dispatch_failures`. Captures the first-paint
+   * baseline ONCE for the edge-triggered families (never reset on reconnect, so
+   * a re-paint of an unchanged board is a null-diff). `drained` is
+   * level-triggered and ignores the baseline. Pure wrt its inputs — all I/O is
+   * the caller's.
+   */
+  const evalBoardSlot = (
+    slot: BoardSlotState,
+    snap: ReadinessClientSnapshot,
+  ): AwaitState => {
+    if (!slot.baselineCaptured) {
+      slot.baselineEpicIds = snap.epics.map((e) => e.epic_id);
+      slot.baselineSignature =
+        slot.since ?? changedSignature(boardSignatureInputOf(snap));
+      slot.baselineCaptured = true;
+    }
+    if (slot.kind === "drained") {
+      let runningJobs = 0;
+      for (const job of snap.jobs.values()) {
+        if (job.state === "working") {
+          runningJobs += 1;
+        }
+      }
+      return drainedState({
+        perTask: snap.readiness.perTask,
+        perCloseRow: snap.readiness.perCloseRow,
+        openEpicCount: snap.epics.length,
+        pendingDispatchCount: snap.pendingDispatches.length,
+        runningJobCount: runningJobs,
+        catchingUp: latestCatchingUp,
+        ...(latestDispatchFailureReasons === null
+          ? {}
+          : { dispatchFailureReasons: latestDispatchFailureReasons }),
+        failOnStuck: args.failOnStuck,
+      });
+    }
+    const currentEpicIds = snap.epics.map((e) => e.epic_id);
+    if (slot.kind === "epic-added") {
+      return epicAddedMet(slot.baselineEpicIds, currentEpicIds, slot.target)
+        ? {
+            kind: "met",
+            detail: slot.target ? `epic ${slot.target} added` : "epic added",
+          }
+        : { kind: "waiting", detail: "no qualifying epic added yet" };
+    }
+    if (slot.kind === "epic-removed") {
+      const target = slot.target ?? "";
+      return epicRemovedMet(slot.baselineEpicIds, currentEpicIds, target)
+        ? { kind: "met", detail: `epic ${target} removed` }
+        : { kind: "waiting", detail: `waiting for epic ${target} to leave` };
+    }
+    // changed
+    const sig = changedSignature(boardSignatureInputOf(snap));
+    return sig !== slot.baselineSignature
+      ? { kind: "met", detail: "board changed" }
+      : { kind: "waiting", detail: "board unchanged" };
+  };
+
   // Per-slot stderr progress throttle (verdict-change only, never per
   // poll). `slot.lastVerdictPhrase` carries the throttle key.
   const logProgress = (
@@ -1391,6 +1730,23 @@ export async function runAwait(
         logProgress(slot, result);
         slot.met = true;
         evals[i] = result;
+      } else if (
+        slot.kind === "drained" ||
+        slot.kind === "changed" ||
+        slot.kind === "epic-added" ||
+        slot.kind === "epic-removed"
+      ) {
+        // fn-1015 board slots: all read off the readiness snapshot. Hold
+        // `waiting` until it paints.
+        if (latestReadiness === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = evalBoardSlot(slot, latestReadiness);
+        slot.lastEval = result;
+        logProgress(slot, result);
+        slot.met = result.kind === "met";
+        evals[i] = result;
       }
     }
 
@@ -1499,6 +1855,30 @@ export async function runAwait(
       }
     }
 
+    // fn-1015: short-circuit on a board slot's `stuck` (drained jam) under
+    // `--fail-on-stuck` → exit 5, mirroring the plan stuck path.
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const ev = evals[i];
+      if (
+        slot === undefined ||
+        ev === undefined ||
+        ev === null ||
+        !(
+          slot.kind === "drained" ||
+          slot.kind === "changed" ||
+          slot.kind === "epic-added" ||
+          slot.kind === "epic-removed"
+        )
+      ) {
+        continue;
+      }
+      if (ev.kind === "stuck" && args.failOnStuck) {
+        emitBoardFailure(slot, "stuck", 5, ev.detail);
+        return;
+      }
+    }
+
     // Aggregate met: every slot latched met.
     if (slots.every((s) => s.met)) {
       emitAggregateMet();
@@ -1531,13 +1911,28 @@ export async function runAwait(
   // every served frame during catch-up). Threaded into BOTH the readiness and
   // dedicated-git subscribes so `git-clean` never reports "clean" off an unseeded
   // surface, regardless of which stream feeds the git rows.
-  const onBootStatus = (boot: { git_seed_required: boolean }): void => {
+  // fn-1015: also latch `catching_up` off the same header so the `drained`
+  // predicate never reports drained mid-catch-up.
+  const onBootStatus = (boot: {
+    git_seed_required: boolean;
+    catching_up: boolean;
+  }): void => {
     latestGitSeedRequired = boot.git_seed_required;
+    latestCatchingUp = boot.catching_up;
   };
 
   const onJobRows = (rows: Record<string, unknown>[]): void => {
     latestJobRows = rows as unknown as Job[];
     paintGate.jobs = true;
+    void evaluate();
+  };
+
+  // fn-1015: dedicated `dispatch_failures` rows for `drained --fail-on-stuck`.
+  const onDispatchFailureRows = (rows: Record<string, unknown>[]): void => {
+    latestDispatchFailureReasons = rows.map((r) =>
+      typeof r.reason === "string" ? r.reason : "",
+    );
+    paintGate.dispatchFailures = true;
     void evaluate();
   };
 
@@ -1551,7 +1946,7 @@ export async function runAwait(
   };
 
   const onLifecycle =
-    (stream: "readiness" | "git" | "jobs" | "serverUp") =>
+    (stream: "readiness" | "git" | "jobs" | "serverUp" | "dispatchFailures") =>
     (event: string): void => {
       if (event === "disconnected") {
         reconnectStable[stream] = false;
@@ -1669,8 +2064,9 @@ export async function runAwait(
       onSnapshot: onReadinessSnapshot,
       onLifecycle: onLifecycle("readiness"),
       onFatal,
-      // fn-897 B1: capture the git-seed state when this stream feeds git rows.
-      ...(hasGitClean ? { onBootStatus } : {}),
+      // fn-897 B1 / fn-1015: capture the boot-status header when this stream
+      // feeds git rows (git-seed) OR a board condition needs `catching_up`.
+      ...(hasGitClean || hasBoard ? { onBootStatus } : {}),
       // fn-1015: merge the recently-done epics so an epic `complete` await reads
       // the close-row `completed` verdict on the present branch.
       ...(hasComplete ? { includeRecentDoneEpics: true } : {}),
@@ -1699,6 +2095,21 @@ export async function runAwait(
       collection: "jobs",
       onRows: onJobRows,
       onLifecycle: onLifecycle("jobs"),
+      onFatal,
+      ...(giveUpExtras ?? {}),
+      ...(deps.connect === undefined ? {} : { connect: deps.connect }),
+    });
+  }
+  // fn-1015: the `dispatch_failures` stream for `drained --fail-on-stuck`'s jam
+  // check — there's no readiness equivalent, so it rides its own dedicated
+  // collection subscribe regardless of whether readiness is open.
+  if (openDispatchFailures) {
+    dispatchFailuresHandle = subscribeCollection({
+      sockPath: args.sock,
+      idPrefix: `await-${process.pid}`,
+      collection: "dispatch_failures",
+      onRows: onDispatchFailureRows,
+      onLifecycle: onLifecycle("dispatchFailures"),
       onFatal,
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
