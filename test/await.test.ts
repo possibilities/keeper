@@ -155,6 +155,9 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     // condition). An unmatched id is harmlessly ignored when the stream didn't
     // opt in (unblocked/started/server-up), so it's safe to deliver uniformly.
     resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
+    // fn-1016: the opt-in merge-landed observable, gated on the SAME flag — deliver
+    // uniformly (harmlessly ignored when not opted in).
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
   ]);
 }
 
@@ -181,6 +184,8 @@ function deliverFiveWithEpic(
     // fn-1015: opt-in recent-done window — empty here, so an epic that drops off
     // `epics` is absent from BOTH scopes and rides the existing re-query path.
     resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
+    // fn-1016: opt-in merge-landed observable (empty here).
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
   ]);
 }
 
@@ -223,6 +228,8 @@ function deliverFiveWith(
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, [], rev),
     // fn-1015: opt-in recent-done window (empty unless a test opts otherwise).
     resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [], rev),
+    // fn-1016: opt-in merge-landed observable (empty unless a test opts otherwise).
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, [], rev),
   ]);
 }
 
@@ -1573,12 +1580,13 @@ test("fn-1015 epic complete: done epic in recent-done window + idle close-row �
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // The complete-condition subscribe opts in the recent-done window — twelve
-  // queries, not eleven.
+  // The complete-condition subscribe opts in the recent-done window AND the
+  // fn-1016 merge-landed observable — thirteen queries, not eleven.
   const collections = (sock.takeOutbound() as Array<{ collection?: string }>)
     .map((f) => f.collection)
     .filter((c): c is string => c !== undefined);
   expect(collections).toContain("epics_recent_done");
+  expect(collections).toContain("lane_merged");
 
   // First paint: the epic is ABSENT from open `epics` but PRESENT (status done,
   // idle close-row) in the recent-done window. The merge surfaces it; its
@@ -1602,6 +1610,7 @@ test("fn-1015 epic complete: done epic in recent-done window + idle close-row �
     resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [
       doneEpic,
     ]),
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
   ]);
 
   const lines = h.stdout.join("");
@@ -2542,8 +2551,8 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   // (fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
   // `armed_epics`; fn-813 added `scheduled_tasks`; fn-941 added
   // `block_escalations`; fn-952 added `tmux_client_focus`; fn-1015 adds the
-  // opt-in `epics_recent_done` window because a `complete` segment is present),
-  // NOT a separate dedicated git sub.
+  // opt-in `epics_recent_done` window AND fn-1016 the `lane_merged` observable
+  // because a `complete` segment is present), NOT a separate dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
   expect(cols).toEqual([
@@ -2555,6 +2564,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "epics_recent_done",
     "git",
     "jobs",
+    "lane_merged",
     "pending_dispatches",
     "scheduled_tasks",
     "subagent_invocations",

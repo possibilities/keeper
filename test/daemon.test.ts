@@ -2550,8 +2550,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // escalate-once marker for the daemon merge-escalation sweep — an additive
   // ALTER, NO cursor rewind: a pre-v98 stream carries no `MergeEscalationAttempted`
   // event, so a from-scratch re-fold leaves the column NULL byte-identical, and
-  // `foldDispatchFailed` preserves it across the UPSERT).
-  expect(SCHEMA_VERSION).toBe(98);
+  // `foldDispatchFailed` preserves it across the UPSERT). And to 99 via fn-1016
+  // task .1 (the LIVE-ONLY `lane_merged` merge-landed observable — a CREATE-only
+  // table registered in LIVE_ONLY_PROJECTIONS, NO cursor rewind: the merged verdict
+  // is git-derived and re-emitted each cycle, so an empty log leaves the table
+  // empty and the surface is excluded from the byte-identical re-fold charter).
+  expect(SCHEMA_VERSION).toBe(99);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

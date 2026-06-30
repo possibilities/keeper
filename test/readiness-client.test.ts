@@ -49,6 +49,7 @@ import { expect, test } from "bun:test";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
   type ConnectFactory,
+  computeLandedEpicIds,
   type FatalError,
   type GiveUpPolicy,
   type ReadinessClientSnapshot,
@@ -58,6 +59,7 @@ import {
   subscribeReadiness,
   TRANSIENT_SERVER_CODES,
 } from "../src/readiness-client";
+import type { Epic } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Mock socket / connect factory
@@ -381,9 +383,9 @@ test("subscribeReadiness: includeRecentDoneEpics OFF does not subscribe epics_re
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  const collections = (sock.takeOutbound() as Array<{ collection: string }>).map(
-    (f) => f.collection,
-  );
+  const collections = (
+    sock.takeOutbound() as Array<{ collection: string }>
+  ).map((f) => f.collection);
   expect(collections).not.toContain("epics_recent_done");
   expect(collections).toHaveLength(11);
   handle.dispose();
@@ -405,24 +407,23 @@ test("subscribeReadiness: includeRecentDoneEpics ON subscribes the window, gates
     throw new Error("mock socket never installed");
   }
 
-  // Twelve queries now — the opt-in window is the 12th subscription.
+  // Thirteen queries now — the opt-in adds BOTH the recent-done window (12th) and
+  // the fn-1016 merge-landed observable (13th), gated on the same flag.
   const initial = sock.takeOutbound() as Array<{ collection: string }>;
-  expect(initial).toHaveLength(12);
+  expect(initial).toHaveLength(13);
   expect(initial.map((f) => f.collection)).toContain("epics_recent_done");
+  expect(initial.map((f) => f.collection)).toContain("lane_merged");
 
   // Deliver the eleven base collections (open `epics` carries an open epic and a
-  // dup that ALSO appears done). The gate must HOLD until the recent-done window
-  // paints — proving it's load-bearing when opted in.
+  // dup that ALSO appears done). The gate must HOLD until BOTH opt-in collections
+  // paint — proving they're load-bearing when opted in.
   sock.deliver([
     rowsResult("epics", `${idPrefix}-epics`, [
       epicRow("fn-1-open", "open"),
       epicRow("fn-3-dup", "open"),
     ]),
     emptyResult("jobs", `${idPrefix}-jobs`),
-    emptyResult(
-      "subagent_invocations",
-      `${idPrefix}-subagent-invocations`,
-    ),
+    emptyResult("subagent_invocations", `${idPrefix}-subagent-invocations`),
     emptyResult("git", `${idPrefix}-git`),
     emptyResult("dead_letters", `${idPrefix}-dead-letters`),
     emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
@@ -435,12 +436,22 @@ test("subscribeReadiness: includeRecentDoneEpics ON subscribes the window, gates
   expect(snapshots).toHaveLength(0);
 
   // The recent-done window paints: one fresh done epic + a dup of an open one.
-  // Gate clears; the merge is open-wins (the dup keeps its OPEN row, appears
-  // once) and the fresh done epic joins the set.
+  // The gate STILL holds — `lane_merged` has not painted yet.
   sock.deliver([
     rowsResult("epics_recent_done", `${idPrefix}-epics-recent-done`, [
       epicRow("fn-2-done", "done"),
       epicRow("fn-3-dup", "done"),
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // The merge-landed observable paints (carrying a bogus row to prove it is
+  // IGNORED in worktree mode OFF — autopilot_state is empty here, so `worktreeMode`
+  // defaults false and `landed` degrades to DONE). Gate clears; the epics merge is
+  // open-wins (the dup keeps its OPEN row, appears once).
+  sock.deliver([
+    rowsResult("lane_merged", `${idPrefix}-lane-merged`, [
+      { epic_id: "fn-9-bogus", repo_dir: "/r" },
     ]),
   ]);
   expect(snapshots).toHaveLength(1);
@@ -452,8 +463,54 @@ test("subscribeReadiness: includeRecentDoneEpics ON subscribes the window, gates
   ]);
   // Open-wins: the dup kept its `open` status, not the done row's.
   expect(epics.find((e) => e.epic_id === "fn-3-dup")?.status).toBe("open");
+  // fn-1016: worktree mode OFF → `landed` degrades to DONE epics (merged ⇔ done),
+  // IGNORING the `lane_merged` projection row (which only applies in worktree mode).
+  expect(snapshots[0]?.landedEpicIds).toEqual(["fn-2-done"]);
 
   handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1016 — `computeLandedEpicIds` pure degradation (worktree ON → the
+// `lane_merged` projection; OFF → done epics, merged ⇔ done). Sorted + stable.
+// ---------------------------------------------------------------------------
+
+/** Minimal `Epic` shaped object — `computeLandedEpicIds` reads only id + status. */
+function landedEpic(epicId: string, status: string): Epic {
+  return { epic_id: epicId, status } as unknown as Epic;
+}
+
+test("fn-1016 computeLandedEpicIds: worktree mode ON returns the lane_merged projection ids (sorted)", () => {
+  const epics = [
+    landedEpic("fn-2-done", "done"),
+    landedEpic("fn-1-open", "open"),
+  ];
+  // ON: the projection set is authoritative — done-ness is irrelevant.
+  expect(computeLandedEpicIds(true, ["fn-2-b", "fn-1-a"], epics)).toEqual([
+    "fn-1-a",
+    "fn-2-b",
+  ]);
+});
+
+test("fn-1016 computeLandedEpicIds: worktree mode OFF degrades to DONE epics, ignoring the projection (merged ⇔ done)", () => {
+  const epics = [
+    landedEpic("fn-1-open", "open"),
+    landedEpic("fn-3-done", "done"),
+    landedEpic("fn-2-done", "done"),
+  ];
+  // OFF: the `lane_merged` rows (worktree-mode-only) are IGNORED; only done epics
+  // count, sorted.
+  expect(computeLandedEpicIds(false, ["fn-9-bogus"], epics)).toEqual([
+    "fn-2-done",
+    "fn-3-done",
+  ]);
+});
+
+test("fn-1016 computeLandedEpicIds: an unmerged-but-done epic is NOT landed in worktree mode ON", () => {
+  // The done epic's lane is NOT in the projection (still outstanding) → NOT landed,
+  // even though it is done. This is the worktree-mode distinction `complete` lacks.
+  const epics = [landedEpic("fn-1-a", "done")];
+  expect(computeLandedEpicIds(true, [], epics)).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

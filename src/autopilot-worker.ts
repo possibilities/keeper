@@ -93,7 +93,7 @@ import {
   projectGitStatusByProjectDir,
   projectPendingDispatches,
 } from "./readiness-client";
-import type { WorktreeRepoStatusEntry } from "./reducer";
+import type { LaneMergedEntry, WorktreeRepoStatusEntry } from "./reducer";
 import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
@@ -655,6 +655,18 @@ export interface ReconcileSnapshot {
    * may omit it (defaults to no deferral).
    */
   deferredEpicIds?: ReadonlySet<string>;
+  /**
+   * The durable MERGE-LANDED set (fn-1016) — every `ok`-classified epic whose lane
+   * `keeper/epic/<id>` is merged into LOCAL default (ancestor-of-default, or
+   * torn-down after the merge). Probed ONCE per cycle in
+   * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}) via
+   * {@link computeMergedLaneEntries}, then emitted as a synthetic `LaneMerged`
+   * event main folds into the LIVE-ONLY `lane_merged` projection. NEVER a fold
+   * input, NEVER read by the pure `reconcile` (purely observational — it drives no
+   * dispatch arm). EMPTY whenever worktree mode is OFF (no lanes exist; the
+   * consumer degrades `landed` to `done`). Optional so a test snapshot may omit it.
+   */
+  landedLaneEntries?: readonly LaneMergedEntry[];
 }
 
 /**
@@ -939,6 +951,16 @@ export interface ConfirmRunningDeps {
    * dispatch path is byte-identical without it.
    */
   emitWorktreeRepoStatus?(entries: WorktreeRepoStatusEntry[]): void;
+  /**
+   * Emit the FULL current merge-landed set to main (fn-1016) for the LIVE-ONLY
+   * `lane_merged` observable. Main is the sole writer of the synthetic `LaneMerged`
+   * event. Called once per cycle with the complete set; the impl dedupes by a
+   * stable serialization so a stable board mints no event (mirrors
+   * {@link emitWorktreeRepoStatus}). OPTIONAL — a no-op when absent (a fake-deps
+   * test never needs the observable), so the dispatch path is byte-identical
+   * without it.
+   */
+  emitLaneMerged?(entries: readonly LaneMergedEntry[]): void;
   /**
    * Emit a synthetic `Dispatched` event (via main — workers never write the DB)
    * AND AWAIT a durable ack. Outbox-ordered intent: the reconciler mints this
@@ -2041,6 +2063,121 @@ export async function computeDeferredEpicIds(
     }
   }
   return deferred;
+}
+
+/**
+ * Compute the durable MERGE-LANDED set (fn-1016): every `ok`-classified epic whose
+ * worktree lane branch (`keeper/epic/<id>`) is provably merged into the LOCAL
+ * default branch. Producer-side + git-touching — probed ONCE per cycle in
+ * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}), then emitted as a
+ * synthetic `LaneMerged` event main folds into the LIVE-ONLY `lane_merged`
+ * projection. NEVER a fold input; mints no `dispatch_failures` row. Returns the
+ * entries sorted by `epic_id` for a stable serialization so the change-gate
+ * (semantic dedupe) never fires on map-iteration-order churn. Exported for tests.
+ *
+ * The per-epic merge verdict mirrors {@link computeDeferredEpicIds}'s per-upstream
+ * probe, applied to the epic's OWN lane — UNION-free (one lane per epic):
+ *  - lane `keeper/epic/<id>` PRESENT ∧ an ancestor of LOCAL default → MERGED;
+ *  - DEFINITIVELY ABSENT (a SUCCESSFUL enumeration that omits it) → merged-and-
+ *    torn-down (keeper deletes a base only once it is an ancestor of default) →
+ *    MERGED;
+ *  - PRESENT ∧ NOT an ancestor (or the ancestry probe errored/timed out — both
+ *    collapse to `isAncestorOf`→`false`) → NOT merged;
+ *  - enumeration FAILED/timed out → NOT merged (conservative: never CLAIM merged
+ *    off an inconclusive probe — the inverse degrade of the merge-gate, which
+ *    defers off inconclusive; here the safe default is to UNDER-report, so a
+ *    `landed` waiter blocks one more cycle rather than fire early).
+ *
+ * Only an `ok` epic cuts a lane; a `disabled` (serial, no lane) / multi-repo /
+ * unresolved epic is skipped here — the no-lane "merged ⇔ done" degradation lives
+ * in the consumer (the snapshot's `landedEpicIds`, and worktree mode OFF). A
+ * throwing git probe degrades that epic to NOT merged; the function NEVER throws
+ * out of the snapshot build. The per-repo default-branch + lane-enumeration probes
+ * are memoized so N epics sharing one repo spawn git once.
+ */
+export async function computeMergedLaneEntries(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+): Promise<LaneMergedEntry[]> {
+  // Per-repo memos so N same-repo epics resolve the default branch + enumerate
+  // lanes ONCE. A throwing probe degrades to the conservative value (null default
+  // / `{ ok: false }` enumeration → NOT merged), never out of the snapshot build.
+  const defaultBranchByRepo = new Map<string, string | null>();
+  const resolveLocalDefault = async (
+    repoDir: string,
+  ): Promise<string | null> => {
+    const hit = defaultBranchByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: string | null;
+    try {
+      value = await gitResolveDefaultBranch(repoDir, run);
+    } catch {
+      value = null; // unresolvable default → NOT merged (never claim off an unknown base)
+    }
+    defaultBranchByRepo.set(repoDir, value);
+    return value;
+  };
+  const laneSetByRepo = new Map<string, EpicLaneBranchSet>();
+  const enumerateLanes = async (
+    repoDir: string,
+  ): Promise<EpicLaneBranchSet> => {
+    const hit = laneSetByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: EpicLaneBranchSet;
+    try {
+      value = await gitEnumerateEpicLaneBranches(repoDir, run);
+    } catch {
+      value = { ok: false }; // enumeration error → NOT merged for this repo's epics
+    }
+    laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  const out: LaneMergedEntry[] = [];
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    // Only an `ok` epic cuts a lane forked off its `repoDir`; everything else has
+    // no lane to probe (the no-lane degradation is the consumer's concern).
+    if (resolution === undefined || resolution.kind !== "ok") {
+      continue;
+    }
+    const repoDir = resolution.repoDir;
+    try {
+      const lanes = await enumerateLanes(repoDir);
+      if (!lanes.ok) {
+        continue; // enumeration inconclusive → NOT merged (never claim off a failed probe)
+      }
+      const laneBranch = baseBranchFor(epic.epic_id);
+      if (!lanes.branches.has(laneBranch)) {
+        // DEFINITIVELY absent → merged-and-torn-down → MERGED (no ancestry probe).
+        out.push({ epic_id: epic.epic_id, repo_dir: repoDir });
+        continue;
+      }
+      // Present: merged IFF an ancestor of LOCAL default. `gitIsAncestorOf`→`false`
+      // covers BOTH not-ancestor AND an errored/timed-out probe → NOT merged.
+      const localDefault = await resolveLocalDefault(repoDir);
+      if (localDefault === null) {
+        continue; // unresolvable default → NOT merged
+      }
+      if (await gitIsAncestorOf(repoDir, laneBranch, localDefault, run)) {
+        out.push({ epic_id: epic.epic_id, repo_dir: repoDir });
+      }
+    } catch (err) {
+      // A git probe threw — treat this epic as NOT merged (conservative: never
+      // claim merged off an inconclusive probe). The snapshot build never sees it.
+      console.error(
+        `[autopilot-worker] merge-landed: skipping ${epic.epic_id} — probe threw:`,
+        err,
+      );
+    }
+  }
+  out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
+  return out;
 }
 
 /** Classify ONE epic's repos — see {@link classifyWorktreeRepos}. */
@@ -4096,6 +4233,18 @@ export interface WorktreeRepoStatusMessage {
   entries: WorktreeRepoStatusEntry[];
 }
 
+/**
+ * Worker → main: LaneMerged mint request (fn-1016). Main is the sole writer of the
+ * synthetic event; the worker describes the FULL current merged-lane set (one entry
+ * per `ok` epic whose lane is merged into LOCAL default). Posted only when the set
+ * CHANGES (the worker dedupes by a stable serialization), mirroring
+ * {@link WorktreeRepoStatusMessage} so a stable board never floods the event log.
+ */
+export interface LaneMergedMessage {
+  kind: "lane-merged";
+  entries: readonly LaneMergedEntry[];
+}
+
 type IncomingMessage =
   | SetPausedMessage
   | ShutdownMessage
@@ -4370,6 +4519,16 @@ export async function loadReconcileSnapshot(
     ? await computeDeferredEpicIds(epics, worktreeRepoByEpicId)
     : new Set<string>();
 
+  // The durable MERGE-LANDED set (fn-1016) — purely observational (drives no
+  // dispatch arm), probed here so the worker can emit the `lane_merged` projection
+  // each cycle. Reuses `worktreeRepoByEpicId`'s already-resolved toplevels (no extra
+  // toplevel spawns — only per-repo lane-enumeration + ancestry reads, memoized
+  // inside). Gated on `worktreeMode` so an OFF cycle adds ZERO git spawns + emits an
+  // empty set (the consumer degrades `landed` → `done`). NEVER throws.
+  const landedLaneEntries = worktreeMode
+    ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
+    : [];
+
   return {
     epics,
     jobs,
@@ -4391,6 +4550,7 @@ export async function loadReconcileSnapshot(
     worktreeRepoByEpicId,
     worktreeKnownRoots,
     deferredEpicIds,
+    landedLaneEntries,
   };
 }
 
@@ -4477,6 +4637,11 @@ function main(): void {
   // post-(re)boot cycle; thereafter a stable set mints no `WorktreeRepoStatus`
   // event. In-worker memory only — persists across cycles in this closure.
   let lastWorktreeStatusKey: string | null = null;
+  // fn-1016 change-gate for the LIVE-ONLY merge-landed observable: the serialized
+  // last-emitted merged-lane set. `null` re-emits once on the first post-(re)boot
+  // cycle; thereafter a stable set mints no `LaneMerged` event. In-worker memory
+  // only — persists across cycles in this closure. Twin of `lastWorktreeStatusKey`.
+  let lastLaneMergedKey: string | null = null;
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -4636,6 +4801,21 @@ function main(): void {
         entries,
       } satisfies WorktreeRepoStatusMessage);
     },
+    // fn-1016 — semantic-dedupe emit of the merge-landed set (mirrors
+    // `emitWorktreeRepoStatus`): only post when the merged-lane set changes, so a
+    // stable board mints zero `LaneMerged` events. `null` seed re-emits once on the
+    // first cycle after each (re)boot. In-worker memory only.
+    emitLaneMerged: (entries) => {
+      const key = JSON.stringify(entries);
+      if (key === lastLaneMergedKey) {
+        return;
+      }
+      lastLaneMergedKey = key;
+      parentPort?.postMessage({
+        kind: "lane-merged",
+        entries,
+      } satisfies LaneMergedMessage);
+    },
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
         // Post an id-correlated request and AWAIT main's durable insert ack.
@@ -4749,6 +4929,20 @@ function main(): void {
         } catch (err) {
           console.error(
             "[autopilot-worker] worktree-status emit threw (non-fatal):",
+            err,
+          );
+        }
+        // fn-1016 — surface the FULL current merge-landed set to the LIVE-ONLY
+        // `lane_merged` observable. Once per cycle, regardless of paused/playing
+        // (the verdict is observational, not a dispatch action); the dep dedupes so
+        // a stable set mints no event, and an empty set (worktree mode OFF, or no
+        // merged lanes) clears the table. Wrapped — a post failure must not wedge
+        // the wake loop.
+        try {
+          deps.emitLaneMerged?.(snapshot.landedLaneEntries ?? []);
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] lane-merged emit threw (non-fatal):",
             err,
           );
         }

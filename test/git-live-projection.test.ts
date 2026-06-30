@@ -110,12 +110,13 @@ function gitStatusRow(projectDir: string): { dirty_count: number } | null {
 // Registry
 // ---------------------------------------------------------------------------
 
-test("registry: LIVE_ONLY_PROJECTIONS names exactly git_status + file_attributions + tmux_client_focus + worktree_repo_status, and the 5 live-only jobs columns (3 git counters + 2 tmux location)", () => {
+test("registry: LIVE_ONLY_PROJECTIONS names exactly git_status + file_attributions + tmux_client_focus + worktree_repo_status + lane_merged, and the 5 live-only jobs columns (3 git counters + 2 tmux location)", () => {
   expect([...LIVE_ONLY_PROJECTIONS]).toEqual([
     "git_status",
     "file_attributions",
     "tmux_client_focus",
     "worktree_repo_status",
+    "lane_merged",
   ]);
   expect([...LIVE_ONLY_JOBS_COLUMNS]).toEqual([
     "git_dirty_count",
