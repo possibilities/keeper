@@ -1,13 +1,17 @@
 # Frozen-string allowlist for the retired "planctl" AND "agentwrap" names.
 #
-# The fn-889 epic retires "planctl" → "keeper plan" / ".keeper" / "plan" across
-# the repo. The fn-1018 epic likewise retires "agentwrap" → "keeper agent",
-# relocating the launcher config dir from ~/.config/agentwrap/ to
-# ~/.config/keeper/. Each retirement freezes a set of literals that must survive
-# every code sweep verbatim. This file is the single source of truth the guard
-# (scripts/lint-retired-name.sh) reads to tell a frozen literal from a renamable
-# symbol. Every code-sweep task (planctl: .6/.7/.8, migration/docs .2/.3/.4/.5;
-# agentwrap: the .2 sweep) leans on it.
+# "planctl" (fn-889) retired to "keeper plan" / ".keeper" / "plan", with two
+# narrow classes of literal PERMANENTLY frozen (git-history trailers + src/db.ts
+# schema-history) — a PROGRESSIVE guard that pins only those.
+#
+# "agentwrap" (fn-1018 + fn-1020) retired to ZERO: env vars -> KEEPER_AGENT_*,
+# config dir -> ~/.config/keeper, runtime state dir -> ~/.local/state/keeper-agent.
+# scripts/lint-retired-name.sh Check C enforces zero "agentwrap" repo-wide; the
+# ONLY records this file still carries for it are the count-pins on the two
+# state-dir relocation files that must name their pre-relocation path forever.
+#
+# This file is the single source of truth the guard (scripts/lint-retired-name.sh)
+# reads to tell a frozen literal from a renamable symbol.
 #
 # Format: pipe-delimited records, one per line. Blank lines and `#` comments are
 # ignored. Three record kinds:
@@ -18,11 +22,12 @@
 #       The substring is matched as a fixed string (grep -F), so regex/quoting
 #       metacharacters are literal.
 #
-#   count|<relpath>|<n>
-#       A PURE-frozen file: every case-insensitive "planctl" token in it is a
-#       frozen literal (schema-history or trailer). The guard fails if the live
-#       count != <n> — catching both an accidental clobber (count drops) and a
-#       planted retired-name edit (count rises).
+#   count|<relpath>|<n>[|<token>]
+#       A PURE-frozen file: every case-insensitive <token> occurrence in it is a
+#       frozen literal (schema-history, trailer, or a permanent relocation path).
+#       <token> defaults to "planctl" when the 4th field is omitted. The guard
+#       fails if the live count != <n> — catching both an accidental clobber
+#       (count drops) and a planted retired-name edit (count rises).
 #
 #   exempt|<relpath>
 #       A file that legitimately still carries un-renamed "planctl" references
@@ -94,38 +99,20 @@ exempt|src/derivers.ts
 exempt|src/reducer.ts
 
 # =========================================================================
-# fn-1018 — agentwrap survivors (frozen FOREVER: cross-process contract +
-# leftover detectors + retired-alias test guards)
+# agentwrap — RETIRED to zero (fn-1018 + fn-1020). Permanent relocation residue.
 # =========================================================================
-# The fn-1018 sweep renames "agentwrap" → "keeper agent" across code, comments,
-# docs, and user-visible strings. A deliberate frozen set survives untouched
-# because each literal is a cross-process contract a rename would break:
+# "agentwrap" is fully retired; scripts/lint-retired-name.sh Check C enforces zero
+# occurrences repo-wide. The fn-1018 frozen scaffolding (the legacyAgentwrap*
+# leftover detectors, the per-harness ~/.config/agentwrap/ read-old fallback, and
+# the retired-alias config-key test guards) is GONE — fn-1020 deleted the symbols
+# and tests outright.
 #
-#   * legacyAgentwrapPresetsPath is the leftover detector for the pre-relocation
-#     ~/.config/agentwrap/presets.yaml — its whole job is to name the old path.
-#   * The retired-alias test guards assert a stale agentwrap_path config key
-#     (and its KEEPER_AGENTWRAP_PATH env twin / agentwrapPath field) boots clean;
-#     the literals ARE the retired aliases under test.
-#
-# The .3 task appends the per-file ~/.config/agentwrap/ fallback anchors once it
-# creates them; this task anchors ONLY the enumerated frozen survivors.
-# (The ~/.local/state/agentwrap runtime state-dir literal was retired once the
-# dir relocated to ~/.local/state/keeper-agent via an inode-preserving rename.)
-
-# legacyAgentwrapPresetsPath leftover detector — name + the ~/.config/agentwrap/
-# presets.yaml path literal it returns.
-anchor|src/agent/config.ts|legacyAgentwrapPresetsPath
-anchor|src/agent/config.ts|".config", "agentwrap", "presets.yaml"
-
-# Retired-alias test guards — the literals under test in test/config.test.ts.
-anchor|test/config.test.ts|agentwrap_path
-anchor|test/config.test.ts|KEEPER_AGENTWRAP_PATH
-anchor|test/config.test.ts|agentwrapPath
-
-# Per-harness read-old fallback (fn-1018 .3) — the transitional resolver reads
-# the pre-relocation ~/.config/agentwrap/{claude,codex,pi,plugins}.yaml when the
-# new ~/.config/keeper/ path is absent (warned once), so a stale config still
-# boots until the move (.4) populates the new location + the restow lands. Frozen
-# so a future sweep can't delete the fallback before that cutover completes.
-anchor|src/agent/config.ts|legacyAgentwrapConfigPath
-anchor|src/agent/config.ts|".config", "agentwrap", basename(configPath)
+# The ONLY live code that still names "agentwrap" is the inode-preserving state-dir
+# relocation: a one-time rename(2) from the pre-relocation ~/.local/state/agentwrap
+# dir to ~/.local/state/keeper-agent (preserving the flock-guarded cwd-ordinals
+# counter's inode). It MUST name its old path to find and move it. Check C excludes
+# these two files; pinning their exact "agentwrap" line count here keeps Check B as
+# the guard — the migration survives verbatim, but a NEW agentwrap token in either
+# file (count rises) FAILs.
+count|src/agent/cwd-ordinal.ts|4|agentwrap
+count|test/agent-cwd-ordinal.test.ts|7|agentwrap

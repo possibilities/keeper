@@ -1,7 +1,7 @@
 /**
  * Tests for `resolveConfig` in `src/db.ts` — each key resolves independently
- * and a retired key (`exec_backend`, `agentwrap_path`, `max_concurrent_jobs`)
- * is silently ignored without disturbing the siblings.
+ * and a retired key (`exec_backend`, `max_concurrent_jobs`) is silently ignored
+ * without disturbing the siblings.
  *
  * Each test points `KEEPER_CONFIG` at a temp YAML file (the resolver's
  * documented test seam) and restores the prior env in afterEach. No
@@ -42,20 +42,9 @@ test("a stale exec_backend: key boots clean (silently ignored, no field)", () =>
   // launch transport. A stale key in a live config must parse cleanly into the
   // existing silent-ignore path: every kept key still resolves, and there is no
   // `execBackend` field on the result.
-  writeConfig("exec_backend: agentwrap\nroots:\n  - ~/code\n");
+  writeConfig("exec_backend: direct\nroots:\n  - ~/code\n");
   const cfg = resolveConfig();
   expect(cfg).not.toHaveProperty("execBackend");
-  expect(cfg.roots).toEqual(["~/code"]);
-});
-
-test("a stale agentwrap_path: key boots clean (silently ignored, no field)", () => {
-  // The `agentwrap_path` config alias (and its `KEEPER_AGENTWRAP_PATH` env twin)
-  // is retired now the launcher folded into `keeper agent` — a stale key in a
-  // live config parses into the silent-ignore path: every kept key still
-  // resolves and there is no `agentwrapPath` field on the result.
-  writeConfig("agentwrap_path: /opt/bin/agentwrap\nroots:\n  - ~/code\n");
-  const cfg = resolveConfig();
-  expect(cfg).not.toHaveProperty("agentwrapPath");
   expect(cfg.roots).toEqual(["~/code"]);
 });
 

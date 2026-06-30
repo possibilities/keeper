@@ -1,10 +1,12 @@
 /**
  * Fixture tests for the retired-name guard (scripts/lint-retired-name.sh).
  *
- * The guard is the fn-889 safety harness: it enforces ONLY the frozen-literal
- * surface enumerated in scripts/frozen-allowlist.txt (git-history trailers +
- * src/db.ts schema-history), so a code sweep that clobbers a frozen literal
- * fails loud while un-renamed renamable references stay green.
+ * The guard covers two retired names: "planctl" (PROGRESSIVE — enforces only the
+ * frozen-literal surface in scripts/frozen-allowlist.txt: anchors via Check A,
+ * count-pins via Check B) and "agentwrap" (ZERO-TOLERANCE — Check C fails on any
+ * occurrence repo-wide outside a defined exclusion set). A count-pin's token
+ * defaults to "planctl" but a 4th `|<token>` field overrides it (the agentwrap
+ * relocation files are pinned that way).
  *
  * These drive the script via a sandboxed fixture tree (the guard honors
  * KEEPER_RETIRED_NAME_REPO_ROOT), so no git repo or real source is mutated.
@@ -86,18 +88,55 @@ test("fails when a frozen trailer anchor is clobbered (renamed away)", () => {
   expect(stderr).toContain("CLOBBERED frozen literal in src/emit.ts");
 });
 
-test("fails when a frozen keeper agent survivor anchor is clobbered", () => {
-  // The fn-1018 sweep must not rename a frozen AGENTWRAP_* env-var name string;
-  // the guard catches a clobber the same way it does a planctl trailer.
-  put(
-    "scripts/frozen-allowlist.txt",
-    'anchor|src/agent/main.ts|"AGENTWRAP_CLAUDE_PROFILE"\n',
-  );
-  put("src/agent/main.ts", 'return "KEEPER_AGENT_CLAUDE_PROFILE";\n');
+test("agentwrap zero-tolerance: a planted agentwrap token fails repo-wide", () => {
+  // Check C greps the whole tree: a stray "agentwrap" in any non-excluded file
+  // fails, even with an otherwise-empty allowlist (the retired name can never
+  // return).
+  put("scripts/frozen-allowlist.txt", "");
+  put("src/agent/foo.ts", "const dir = oldAgentwrapDir();\n");
 
   const { code, stderr } = runGuard();
   expect(code).toBe(1);
-  expect(stderr).toContain("CLOBBERED frozen literal in src/agent/main.ts");
+  expect(stderr).toContain("AGENTWRAP zero-tolerance");
+  expect(stderr).toContain("src/agent/foo.ts");
+});
+
+test("agentwrap zero-tolerance: agentwrap only in excluded files passes", () => {
+  // The allowlist itself and the retirement docs legitimately name the retired
+  // token; the exclusion set keeps Check C from flagging them.
+  put(
+    "scripts/frozen-allowlist.txt",
+    "# agentwrap is named in this allowlist\n",
+  );
+  put("docs/plan-name-retirement.md", "The agentwrap name is fully retired.\n");
+
+  expect(runGuard().code).toBe(0);
+});
+
+test("a count-pin with an explicit token pins a non-planctl name", () => {
+  // The state-dir relocation files are Check-C-excluded by basename but pinned
+  // via a `count|...|<n>|agentwrap` record, so a NEW agentwrap token there still
+  // FAILs (count drift).
+  put(
+    "scripts/frozen-allowlist.txt",
+    "count|src/agent/cwd-ordinal.ts|2|agentwrap\n",
+  );
+  put(
+    "src/agent/cwd-ordinal.ts",
+    'const old = "agentwrap";\nconst dir = "agentwrap";\n',
+  );
+  expect(runGuard().code).toBe(0);
+
+  // A third agentwrap line drifts the pin → fail (and the file stays Check-C
+  // excluded, so the failure is the count check, not the grep-clean).
+  put(
+    "src/agent/cwd-ordinal.ts",
+    'const old = "agentwrap";\nconst dir = "agentwrap";\n// agentwrap planted\n',
+  );
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("cwd-ordinal.ts drifted");
+  expect(stderr).toContain('"agentwrap"');
 });
 
 test("anchor payload may itself contain pipe characters (regex alternation)", () => {
@@ -122,7 +161,10 @@ test("fails when the allowlist is missing", () => {
   expect(stderr).toContain("frozen allowlist not found");
 });
 
-test("the real repo tree passes the guard (frozen surface intact)", () => {
+test("the real repo tree passes the guard (planctl frozen surface intact + agentwrap at zero)", () => {
+  // Proves both postures against live source: the planctl anchors/count-pins hold
+  // AND Check C finds zero "agentwrap" outside the exclusion set (the only residue
+  // is the count-pinned state-dir relocation).
   const res = Bun.spawnSync(["bash", GUARD], {
     cwd: join(import.meta.dir, ".."),
   });

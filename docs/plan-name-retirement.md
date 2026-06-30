@@ -1,12 +1,19 @@
-# plan name retirement — closed note
+# name retirements — closed note
+
+Two names are retired across keeper: **planctl** and **agentwrap**. This note
+records the **end reality** of each — what was renamed, and the narrow residue
+that is permanently grandfathered. Both are guarded by
+`scripts/lint-retired-name.sh` (reading `scripts/frozen-allowlist.txt`, covered by
+`test/lint-retired-name.test.ts`); this doc is itself in the guard's exclusion set,
+so it may name the retired tokens freely.
+
+## planctl
 
 The "planctl" name is retired across keeper. The live surfaces are `keeper plan`
 (the command), `.keeper/` (the data directory), and `plan` (columns, the event
-envelope, the source badge, code symbols, wire kinds). This note records the
-**end reality**: what was renamed, and the two narrow classes that are
-permanently grandfathered.
+envelope, the source badge, code symbols, wire kinds).
 
-## Permanently frozen — never rename these
+### Permanently frozen — never rename these
 
 Exactly two classes of literal survive forever. They are pinned by
 `scripts/frozen-allowlist.txt` and enforced by `scripts/lint-retired-name.sh`.
@@ -26,7 +33,7 @@ Exactly two classes of literal survive forever. They are pinned by
    exactly as written (version-guarded so a post-rename boot never resurrects a
    zombie column). The whole file is count-pinned by the allowlist.
 
-## What was retired
+### What was retired
 
 Everything else became `plan`:
 
@@ -48,9 +55,42 @@ Everything else became `plan`:
 - **The `PLANCTL_*` env fallbacks**, the vestigial `planctl-bun` build artifact,
   incidental code symbols, comments, docs, and test descriptions.
 
-## Lint guard
+### Lint guard (planctl)
 
-`scripts/lint-retired-name.sh` (covered by `test/lint-retired-name.test.ts`) reads
-`scripts/frozen-allowlist.txt` and fails if a frozen literal is clobbered or a
-count-pinned file drifts. The epic's final state is a repo-wide grep for "planctl"
-returning only the ratified frozen allowlist.
+`scripts/lint-retired-name.sh` reads `scripts/frozen-allowlist.txt` and fails if a
+frozen "planctl" literal is clobbered (Check A: anchors) or a count-pinned file
+drifts (Check B). Enforcement is PROGRESSIVE — only the ratified frozen surface is
+pinned. The end state is a repo-wide grep for "planctl" returning only that surface.
+
+## agentwrap
+
+The "agentwrap" name (the former launcher) is retired to **zero**. The live
+surfaces are `keeper agent` (the command), `KEEPER_AGENT_*` (the env-var family,
+e.g. `KEEPER_AGENT_PATH` / `KEEPER_AGENT_CLAUDE_PROFILE`), `~/.config/keeper/` (the
+launcher config dir), and `~/.local/state/keeper-agent/` (the runtime state dir).
+
+### What was retired
+
+- **The launcher name + command.** `agentwrap` is gone; `keeper agent` is the
+  in-process launcher.
+- **The env-var family.** `AGENTWRAP_*` → `KEEPER_AGENT_*` across producer,
+  consumer, and the pane-forward filter (`KEEPER_AGENT_PATH` is excluded from the
+  forward filter). arthack's statusline reads `KEEPER_AGENT_CLAUDE_PROFILE`.
+- **The config dir.** `~/.config/agentwrap/` → `~/.config/keeper/`, split into the
+  per-harness `{claude,codex,pi,plugins}.yaml` defaults + `{presets,panel}.yaml`
+  launch-config. The transitional read-old fallback and its `legacyAgentwrap*`
+  detectors are gone — no back-compat shim remains.
+- **The runtime state dir.** `~/.local/state/agentwrap/` → `~/.local/state/keeper-agent/`
+  via a one-time inode-preserving `rename(2)` that preserves the flock-guarded
+  cwd-ordinals counter. This relocation is the ONLY live code that still names the
+  old path (it must, to find and move it).
+- **The retired config aliases**, the `~/.config/agentwrap/presets.yaml` migration
+  hint, incidental symbols, comments, docs, and test descriptions.
+
+### Lint guard (agentwrap — zero-tolerance)
+
+`scripts/lint-retired-name.sh` Check C greps the whole tree and fails on ANY
+"agentwrap" occurrence outside a defined exclusion set: the guard's own files, the
+retirement docs (this file), `.keeper/` history, the guard's fixture test, and the
+state-dir relocation source (`src/agent/cwd-ordinal.ts` + `test/agent-cwd-ordinal.test.ts`,
+themselves count-pinned so a NEW token there still fails). The name can never return.

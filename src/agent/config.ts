@@ -19,7 +19,7 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -98,64 +98,6 @@ export function panelConfigPath(): string {
   return join(keeperConfigDir(), "panel.yaml");
 }
 
-/** The pre-relocation single-file location, named only in migration hints. */
-export function legacyAgentwrapPresetsPath(): string {
-  return join(homedir(), ".config", "agentwrap", "presets.yaml");
-}
-
-/**
- * The pre-relocation `~/.config/agentwrap/` twin of a per-harness keeper-config
- * path — the read-old fallback target. Derives the legacy file from the new
- * path's basename so claude/codex/pi/plugins each map to their OWN old file (the
- * codex reader reuses {@link loadLauncherDefaults} with the codex path, so a
- * fixed legacy default would mis-route it).
- */
-function legacyAgentwrapConfigPath(configPath: string): string {
-  return join(homedir(), ".config", "agentwrap", basename(configPath));
-}
-
-const warnedLegacyConfigPaths = new Set<string>();
-
-/**
- * Emit ONE stderr line the first time a per-harness reader actually falls back
- * to a pre-relocation `~/.config/agentwrap/` file, naming the stale path. Deduped
- * per path (the two claude.yaml readers — defaults + stow dir — warn once), and
- * self-silencing: once the file moves under `~/.config/keeper/` the resolver
- * returns the new path and never reaches here.
- */
-function warnLegacyConfigRead(legacyPath: string): void {
-  if (warnedLegacyConfigPaths.has(legacyPath)) {
-    return;
-  }
-  warnedLegacyConfigPaths.add(legacyPath);
-  process.stderr.write(
-    "keeper agent: reading launcher config from the pre-relocation path " +
-      `${legacyPath}; move it under ${keeperConfigDir()}/ to silence this.\n`,
-  );
-}
-
-/**
- * Resolve a per-harness launcher config path with a transitional read-old
- * fallback: the new `~/.config/keeper/` path when it exists, else the
- * pre-relocation `~/.config/agentwrap/` path when THAT exists (warned once),
- * else the new path. Returning the new path when NEITHER exists is what keeps
- * each reader's own absence posture intact — a fail-open reader still returns
- * its null defaults, `loadPluginSources` still throws fail-loud on the new path.
- */
-export function resolveHarnessConfigPath(
-  newPath: string,
-  legacyPath: string,
-): string {
-  if (isFile(newPath)) {
-    return newPath;
-  }
-  if (isFile(legacyPath)) {
-    warnLegacyConfigRead(legacyPath);
-    return legacyPath;
-  }
-  return newPath;
-}
-
 export interface LauncherDefaults {
   model: string | null;
   effort: string | null;
@@ -186,13 +128,11 @@ function readMapping(configPath: string): Record<string, unknown> {
  */
 export function loadLauncherDefaults(
   configPath: string = launcherConfigPath(),
-  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): LauncherDefaults {
-  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
-  if (!isFile(resolved)) {
+  if (!isFile(configPath)) {
     return { model: null, effort: null };
   }
-  const raw = readMapping(resolved);
+  const raw = readMapping(configPath);
 
   const value = (key: string): string | null => {
     const v = raw[key];
@@ -201,7 +141,7 @@ export function loadLauncherDefaults(
     }
     if (typeof v !== "string" || !v.trim()) {
       throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${resolved}`,
+        `Expected ${key} to be a non-empty string in ${configPath}`,
       );
     }
     return v.trim();
@@ -218,13 +158,11 @@ export function loadLauncherDefaults(
  */
 export function loadPiLauncherDefaults(
   configPath: string = piLauncherConfigPath(),
-  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): PiLauncherDefaults {
-  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
-  if (!isFile(resolved)) {
+  if (!isFile(configPath)) {
     return { model: null, thinking: null };
   }
-  const raw = readMapping(resolved);
+  const raw = readMapping(configPath);
 
   const value = (key: string): string | null => {
     const v = raw[key];
@@ -233,7 +171,7 @@ export function loadPiLauncherDefaults(
     }
     if (typeof v !== "string" || !v.trim()) {
       throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${resolved}`,
+        `Expected ${key} to be a non-empty string in ${configPath}`,
       );
     }
     return v.trim();
@@ -244,20 +182,18 @@ export function loadPiLauncherDefaults(
 
 export function loadClaudeStowDir(
   configPath: string = launcherConfigPath(),
-  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): string | null {
-  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
-  if (!isFile(resolved)) {
+  if (!isFile(configPath)) {
     return null;
   }
-  const raw = readMapping(resolved);
+  const raw = readMapping(configPath);
   const v = raw.claude_stow_dir;
   if (v === null || v === undefined) {
     return null;
   }
   if (typeof v !== "string" || !v.trim()) {
     throw new ConfigError(
-      `Expected claude_stow_dir to be a non-empty string in ${resolved}`,
+      `Expected claude_stow_dir to be a non-empty string in ${configPath}`,
     );
   }
   return resolvePath(expandUser(v.trim()));
@@ -279,28 +215,26 @@ export interface PluginSources {
  */
 export function loadPluginSources(
   configPath: string = pluginConfigPath(),
-  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): PluginSources {
-  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
-  if (!isFile(resolved)) {
+  if (!isFile(configPath)) {
     throw new ConfigError(
-      `Launcher plugin config missing at ${resolved}. ` +
+      `Launcher plugin config missing at ${configPath}. ` +
         "It ships via the `arthack` stow package — run scripts/install.sh " +
         "(or restore the file) before launching.",
     );
   }
-  const raw = readMapping(resolved);
+  const raw = readMapping(configPath);
 
   const paths = (key: string): string[] => {
     const values = raw[key] ?? [];
     if (!Array.isArray(values)) {
-      throw new ConfigError(`Expected ${key} to be a list in ${resolved}`);
+      throw new ConfigError(`Expected ${key} to be a list in ${configPath}`);
     }
     const out: string[] = [];
     for (const item of values) {
       if (typeof item !== "string" || !item.trim()) {
         throw new ConfigError(
-          `Expected non-empty string entries in ${key} of ${resolved}`,
+          `Expected non-empty string entries in ${key} of ${configPath}`,
         );
       }
       out.push(resolvePath(expandUser(item.trim())));
@@ -459,23 +393,6 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set(["presets"]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
 
-/**
- * Suffix appended to a missing-file `ConfigError` when the pre-relocation
- * single-file config is still sitting at the old agentwrap path — names the old
- * path and the new two-file layout so the cutover is self-explaining (no
- * back-compat shim). Empty string when no leftover exists.
- */
-function migrationHint(legacyPath: string): string {
-  if (!isFile(legacyPath)) {
-    return "";
-  }
-  return (
-    ` A legacy launch-config remains at ${legacyPath}; the agent launch-config ` +
-    `moved to ${presetsCatalogPath()} (preset catalog) + ${panelConfigPath()} ` +
-    "(panel selections) — split the old file across those two."
-  );
-}
-
 /** Reject any unknown top-level key in a config mapping (no silent typos). */
 function rejectUnknownKeys(
   raw: Record<string, unknown>,
@@ -493,20 +410,17 @@ function rejectUnknownKeys(
 
 /**
  * Read the preset catalog from `presets.yaml`. REQUIRED + validated: a missing
- * file is fail-LOUD (ConfigError, with a migration hint when the legacy agentwrap
- * file lingers) — the reversal of the old fail-open posture. An empty `presets:`
- * mapping is still valid (the worker tolerates a catalog with no presets). Also
- * fail-loud on malformed YAML, an unknown top-level key, or any invalid entry: a
- * bad harness, cross-harness effort+thinking, or a reserved / non-matching name.
+ * file is fail-LOUD (ConfigError) — the reversal of the old fail-open posture. An
+ * empty `presets:` mapping is still valid (the worker tolerates a catalog with no
+ * presets). Also fail-loud on malformed YAML, an unknown top-level key, or any
+ * invalid entry: a bad harness, cross-harness effort+thinking, or a reserved /
+ * non-matching name.
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
-  legacyPath: string = legacyAgentwrapPresetsPath(),
 ): PresetCatalog {
   if (!isFile(configPath)) {
-    throw new ConfigError(
-      `Preset catalog missing at ${configPath}.${migrationHint(legacyPath)}`,
-    );
+    throw new ConfigError(`Preset catalog missing at ${configPath}.`);
   }
   const raw = readMapping(configPath);
   rejectUnknownKeys(raw, ALLOWED_CATALOG_KEYS, configPath);
@@ -526,22 +440,19 @@ export function loadPresetCatalog(
 /**
  * Read the panel selections from `panel.yaml`, resolved against an already-parsed
  * {@link PresetCatalog}. REQUIRED + validated: a missing file is fail-LOUD
- * (ConfigError, with a migration hint when the legacy agentwrap file lingers).
- * Each panel member must name a catalog preset whose harness is panel-launchable
- * (claude|codex — pi is rejected AT LOAD). The optional top-level `default` key
- * (a structural key, exempt from `validatePresetName` though `default` is a
- * reserved preset name) must name a defined panel. Fail-loud on malformed YAML,
- * an unknown top-level key, an empty panel list, or any of the above.
+ * (ConfigError). Each panel member must name a catalog preset whose harness is
+ * panel-launchable (claude|codex — pi is rejected AT LOAD). The optional top-level
+ * `default` key (a structural key, exempt from `validatePresetName` though
+ * `default` is a reserved preset name) must name a defined panel. Fail-loud on
+ * malformed YAML, an unknown top-level key, an empty panel list, or any of the
+ * above.
  */
 export function loadPanelSelections(
   catalog: PresetCatalog,
   configPath: string = panelConfigPath(),
-  legacyPath: string = legacyAgentwrapPresetsPath(),
 ): PanelSelections {
   if (!isFile(configPath)) {
-    throw new ConfigError(
-      `Panel selections missing at ${configPath}.${migrationHint(legacyPath)}`,
-    );
+    throw new ConfigError(`Panel selections missing at ${configPath}.`);
   }
   const raw = readMapping(configPath);
   rejectUnknownKeys(raw, ALLOWED_PANEL_KEYS, configPath);

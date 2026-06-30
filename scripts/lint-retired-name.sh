@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
-# Guard against clobbering a FROZEN "planctl" literal during the fn-889
-# name-retirement sweep.
-#
-# Enforcement is PROGRESSIVE, not repo-wide-hard. While the code sweeps
-# (.6/.7/.8) and the migration/docs tasks (.2/.3/.4/.5) still hold un-renamed
-# references, this guard enforces ONLY the frozen surface enumerated in
+# Guard for two retired names with DIFFERENT enforcement postures, both keyed off
 # scripts/frozen-allowlist.txt:
 #
-#   * Check A (anti-clobber): every frozen literal `anchor` record must still
-#     appear verbatim in its file. A sweep that renames a frozen literal (e.g.
-#     `Planctl-Op:` -> `Plan-Op:` in the trailer emit, or a `planctl_*`
-#     schema-history column in src/db.ts) drops the anchor -> FAIL.
+#   "planctl" (fn-889) — PROGRESSIVE frozen guard. Only the enumerated frozen
+#   surface is enforced; un-renamed renamable references stay green.
 #
-#   * Check B (pure-frozen file lock): a `count` record pins the exact
-#     case-insensitive "planctl" occurrence count of a file whose every token
-#     is frozen (src/db.ts). A clobber (count drops) OR a planted retired-name
-#     edit (count rises) -> FAIL.
+#     * Check A (anti-clobber): every frozen literal `anchor` record must still
+#       appear verbatim in its file. A sweep that renames a frozen literal (e.g.
+#       `Planctl-Op:` -> `Plan-Op:` in the trailer emit, or a `planctl_*`
+#       schema-history column in src/db.ts) drops the anchor -> FAIL.
 #
-# The repo-wide grep-clean (only the frozen allowlist remains) is the EPIC's
-# final state after every task lands; this guard does NOT gate an individual
-# sweep on it.
+#     * Check B (pure-frozen file lock): a `count` record pins the exact
+#       case-insensitive occurrence count of a file whose every token of the
+#       named retired name is frozen (e.g. src/db.ts for "planctl"). A clobber
+#       (count drops) OR a planted retired-name edit (count rises) -> FAIL. The
+#       counted token defaults to "planctl"; a 4th `|<token>` field overrides it
+#       (the "agentwrap" relocation files are pinned this way — see below).
 #
-# Exit 0 = clean, 1 = a frozen literal was clobbered or a pure-frozen file
-# drifted.
+#   "agentwrap" (fn-1018 + fn-1020) — ZERO-TOLERANCE. The name is fully retired
+#   (env vars -> KEEPER_AGENT_*, config dir -> ~/.config/keeper, runtime state dir
+#   -> ~/.local/state/keeper-agent).
+#
+#     * Check C (repo-wide grep-clean): NO "agentwrap" anywhere except a DEFINED
+#       exclusion set — this script, the allowlist, the retirement docs
+#       (docs/*retirement*.md), .keeper/ plan history, this guard's own fixture
+#       test (test/lint-retired-name.test.ts), and the inode-preserving state-dir
+#       relocation that MUST name its old path to find and move it
+#       (src/agent/cwd-ordinal.ts + test/agent-cwd-ordinal.test.ts, themselves
+#       count-pinned via Check B so a NEW agentwrap token there still FAILs).
+#
+# Exit 0 = clean, 1 = a frozen literal was clobbered, a pinned file drifted, or
+# the retired "agentwrap" name resurfaced outside the exclusion set.
 set -euo pipefail
 
 # KEEPER_RETIRED_NAME_REPO_ROOT overrides the repo root for tests (point it at a
@@ -70,10 +78,16 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 violations+=("MISSING FILE for count pin: ${relpath}")
                 continue
             fi
-            expected="$payload"
-            actual="$(grep -icE 'planctl' "$file" || true)"
+            # Payload is `<n>` (token defaults to planctl) or `<n>|<token>`.
+            expected="${payload%%|*}"
+            if [[ "$payload" == *"|"* ]]; then
+                token="${payload#*|}"
+            else
+                token="planctl"
+            fi
+            actual="$(grep -icE "$token" "$file" || true)"
             if [[ "$actual" != "$expected" ]]; then
-                violations+=("PURE-FROZEN file ${relpath} drifted: expected ${expected} \"planctl\" lines, found ${actual} (a clobber or a planted retired-name edit)")
+                violations+=("PURE-FROZEN file ${relpath} drifted: expected ${expected} \"${token}\" lines, found ${actual} (a clobber or a planted retired-name edit)")
             fi
             ;;
         exempt)
@@ -86,15 +100,44 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     esac
 done < "$allowlist"
 
+# Check C — "agentwrap" zero-tolerance (repo-wide grep-clean). The fn-1018 +
+# fn-1020 retirement drove the name to zero; this asserts it can never return. A
+# DEFINED exclusion set carries the only legitimate residue: the guard's own
+# files, the retirement docs, .keeper/ plan history, this guard's fixture test,
+# and the two state-dir relocation files that MUST name their pre-relocation path
+# (count-pinned above, so a NEW agentwrap token there still trips Check B). Uses
+# plain recursive grep (not git grep) so the fixture-tree tests run git-free.
+agentwrap_hits="$(
+    grep -rIilE 'agentwrap' "$repo_root" \
+        --exclude-dir=.git \
+        --exclude-dir=node_modules \
+        --exclude-dir=.keeper \
+        --exclude='lint-retired-name.sh' \
+        --exclude='frozen-allowlist.txt' \
+        --exclude='lint-retired-name.test.ts' \
+        --exclude='*retirement*.md' \
+        --exclude='cwd-ordinal.ts' \
+        --exclude='agent-cwd-ordinal.test.ts' \
+        2>/dev/null || true
+)"
+if [[ -n "$agentwrap_hits" ]]; then
+    while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        violations+=("AGENTWRAP zero-tolerance: retired name present in ${hit#"${repo_root}"/}")
+    done <<< "$agentwrap_hits"
+fi
+
 if [[ ${#violations[@]} -gt 0 ]]; then
-    echo "ERROR: retired-name guard found ${#violations[@]} frozen-literal violation(s):" >&2
+    echo "ERROR: retired-name guard found ${#violations[@]} violation(s):" >&2
     for v in "${violations[@]}"; do
         echo "  - ${v}" >&2
     done
     echo >&2
-    echo "These are PERMANENTLY FROZEN literals (git-history trailers + src/db.ts" >&2
-    echo "schema-history). If a sweep legitimately changed the frozen surface, update" >&2
-    echo "scripts/frozen-allowlist.txt to re-ratify it. Otherwise revert the clobber." >&2
+    echo "A CLOBBERED/DRIFTED \"planctl\" literal is a PERMANENTLY FROZEN surface" >&2
+    echo "(git-history trailers + src/db.ts schema-history); if a sweep legitimately" >&2
+    echo "changed it, re-ratify in scripts/frozen-allowlist.txt, else revert the clobber." >&2
+    echo "An AGENTWRAP hit means the fully-retired name resurfaced — rename it to the" >&2
+    echo "KEEPER_AGENT_* / keeper-agent equivalent (the name can never return)." >&2
     exit 1
 fi
 

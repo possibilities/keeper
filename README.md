@@ -1433,8 +1433,7 @@ event-log/reducer/hook touch. Run any of them with
   REQUIRED + validated: any preset referenced by name (`keeper pair --preset`,
   `keeper dispatch --preset`, `keeper agent --x-preset`) and EVERY panel op
   hard-fail (exit 2) on a missing or invalid `presets.yaml`/`panel.yaml`, with a
-  message naming the file, the bad name, and the sorted available names (and a
-  migration hint naming any leftover `~/.config/agentwrap/presets.yaml`). Panel
+  message naming the file, the bad name, and the sorted available names. Panel
   members are claude|codex only (pi is rejected at load). Presets are producer-side
   launch config, never a fold input — no RPC writes one and both files are
   re-parsed per dispatch (no watcher), so an edit lands without a daemon bounce.

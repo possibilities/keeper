@@ -25,7 +25,6 @@ import {
   piLauncherConfigPath,
   pluginConfigPath,
   presetsCatalogPath,
-  resolveHarnessConfigPath,
   resolvePreset,
 } from "../src/agent/config";
 
@@ -164,13 +163,9 @@ function catalogFixture(): PresetCatalog {
 
 describe("loadPresetCatalog", () => {
   test("a missing file is fail-loud (the required-catalog reversal)", () => {
-    // No legacy file at the supplied (nonexistent) legacy path → no hint.
-    expect(() =>
-      loadPresetCatalog(
-        join(tmpDir, "nope.yaml"),
-        join(tmpDir, "no-legacy.yaml"),
-      ),
-    ).toThrow(ConfigError);
+    expect(() => loadPresetCatalog(join(tmpDir, "nope.yaml"))).toThrow(
+      ConfigError,
+    );
   });
 
   test("an empty presets mapping is valid (worker tolerance)", () => {
@@ -288,28 +283,22 @@ describe("loadPresetCatalog", () => {
     expect(() => loadPresetCatalog(p)).toThrow(/\[a-z0-9_-\]/);
   });
 
-  test("a missing-file error names the leftover legacy path + new layout", () => {
-    const legacy = writeYaml("legacy-presets.yaml", "presets: {}\n");
+  test("a missing-file error names the absent path", () => {
     let msg = "";
     try {
-      loadPresetCatalog(join(tmpDir, "absent.yaml"), legacy);
+      loadPresetCatalog(join(tmpDir, "absent.yaml"));
     } catch (e) {
       msg = e instanceof Error ? e.message : String(e);
     }
-    expect(msg).toContain(legacy);
-    expect(msg).toContain("presets.yaml");
-    expect(msg).toContain("panel.yaml");
+    expect(msg).toContain("absent.yaml");
+    expect(msg).toContain("missing");
   });
 });
 
 describe("loadPanelSelections", () => {
   test("a missing file is fail-loud (the required-panel reversal)", () => {
     expect(() =>
-      loadPanelSelections(
-        catalogFixture(),
-        join(tmpDir, "nope.yaml"),
-        join(tmpDir, "no-legacy.yaml"),
-      ),
+      loadPanelSelections(catalogFixture(), join(tmpDir, "nope.yaml")),
     ).toThrow(ConfigError);
   });
 
@@ -427,24 +416,14 @@ describe("KEEPER_CONFIG_DIR single seam", () => {
   });
 });
 
-describe("per-harness config relocation + read-old fallback", () => {
+describe("per-harness config readers (KEEPER_CONFIG_DIR seam)", () => {
   let savedConfigDir: string | undefined;
-  let origWrite: typeof process.stderr.write;
-  const stderr: string[] = [];
 
   beforeEach(() => {
     savedConfigDir = process.env.KEEPER_CONFIG_DIR;
     delete process.env.KEEPER_CONFIG_DIR;
-    stderr.length = 0;
-    origWrite = process.stderr.write.bind(process.stderr);
-    // Capture the fallback warning rather than pollute the test output.
-    process.stderr.write = ((chunk: unknown) => {
-      stderr.push(String(chunk));
-      return true;
-    }) as typeof process.stderr.write;
   });
   afterEach(() => {
-    process.stderr.write = origWrite;
     if (savedConfigDir === undefined) delete process.env.KEEPER_CONFIG_DIR;
     else process.env.KEEPER_CONFIG_DIR = savedConfigDir;
   });
@@ -455,93 +434,6 @@ describe("per-harness config relocation + read-old fallback", () => {
     expect(codexConfigPath()).toBe("/cfg/keeper/codex.yaml");
     expect(piLauncherConfigPath()).toBe("/cfg/keeper/pi.yaml");
     expect(pluginConfigPath()).toBe("/cfg/keeper/plugins.yaml");
-  });
-
-  test("resolver: the new path present wins (no fallback, no warning)", () => {
-    const newP = writeYaml("claude.yaml", "model: opus\n");
-    const oldP = writeYaml("old-claude.yaml", "model: sonnet\n");
-    expect(resolveHarnessConfigPath(newP, oldP)).toBe(newP);
-    expect(stderr.join("")).toBe("");
-  });
-
-  test("resolver: new absent + old present falls back and warns once", () => {
-    const newP = join(tmpDir, "claude.yaml"); // absent
-    const oldP = writeYaml("old-claude.yaml", "model: sonnet\n");
-    expect(resolveHarnessConfigPath(newP, oldP)).toBe(oldP);
-    expect(resolveHarnessConfigPath(newP, oldP)).toBe(oldP); // 2nd call deduped
-    expect(stderr.length).toBe(1);
-    expect(stderr[0]).toContain(oldP);
-  });
-
-  test("resolver: both absent returns the new path (posture preserved)", () => {
-    const newP = join(tmpDir, "claude.yaml");
-    const oldP = join(tmpDir, "old-claude.yaml");
-    expect(resolveHarnessConfigPath(newP, oldP)).toBe(newP);
-    expect(stderr.join("")).toBe("");
-  });
-
-  test("loadLauncherDefaults prefers the new path over the old", () => {
-    const newP = writeYaml("claude.yaml", "model: opus\n");
-    const oldP = writeYaml("old-claude.yaml", "model: sonnet\neffort: low\n");
-    expect(loadLauncherDefaults(newP, oldP)).toEqual({
-      model: "opus",
-      effort: null,
-    });
-    expect(stderr.join("")).toBe("");
-  });
-
-  test("loadLauncherDefaults falls back to the old path (fail-open)", () => {
-    const newP = join(tmpDir, "claude.yaml");
-    const oldP = writeYaml("old-claude.yaml", "model: sonnet\neffort: low\n");
-    expect(loadLauncherDefaults(newP, oldP)).toEqual({
-      model: "sonnet",
-      effort: "low",
-    });
-  });
-
-  test("loadLauncherDefaults both-absent yields null defaults (fail-open)", () => {
-    expect(
-      loadLauncherDefaults(
-        join(tmpDir, "claude.yaml"),
-        join(tmpDir, "old-claude.yaml"),
-      ),
-    ).toEqual({ model: null, effort: null });
-  });
-
-  test("loadPiLauncherDefaults falls back to the old path (fail-open)", () => {
-    const newP = join(tmpDir, "pi.yaml");
-    const oldP = writeYaml("old-pi.yaml", "model: opus\nthinking: high\n");
-    expect(loadPiLauncherDefaults(newP, oldP)).toEqual({
-      model: "opus",
-      thinking: "high",
-    });
-  });
-
-  test("loadClaudeStowDir falls back to the old path (fail-open)", () => {
-    const newP = join(tmpDir, "claude.yaml");
-    const oldP = writeYaml(
-      "old-claude.yaml",
-      "claude_stow_dir: /opt/stow/.claude\n",
-    );
-    expect(loadClaudeStowDir(newP, oldP)).toBe("/opt/stow/.claude");
-  });
-
-  test("loadPluginSources reads the old path when the new is absent", () => {
-    const newP = join(tmpDir, "plugins.yaml");
-    const oldP = writeYaml("old-plugins.yaml", "{}\n");
-    expect(loadPluginSources(newP, oldP)).toEqual({
-      pluginDirs: [],
-      pluginScanDirs: [],
-    });
-  });
-
-  test("loadPluginSources both-absent stays fail-loud", () => {
-    expect(() =>
-      loadPluginSources(
-        join(tmpDir, "plugins.yaml"),
-        join(tmpDir, "old-plugins.yaml"),
-      ),
-    ).toThrow(ConfigError);
   });
 
   test("KEEPER_CONFIG_DIR seam drives all 4 no-arg readers to the new dir", () => {
@@ -560,8 +452,6 @@ describe("per-harness config relocation + read-old fallback", () => {
       thinking: "deep",
     });
     expect(loadPluginSources()).toEqual({ pluginDirs: [], pluginScanDirs: [] });
-    // New paths present → no fallback warning.
-    expect(stderr.join("")).toBe("");
   });
 });
 

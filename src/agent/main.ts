@@ -198,9 +198,9 @@ export interface MainDeps {
 
 /** Production deps — the real collaborators. */
 export function realDeps(): MainDeps {
-  // Relocate the legacy ~/.local/state/agentwrap dir before the launcher's
-  // tmux-runs/ mkdir reads launcherStateDir (a launch with an explicit --name
-  // never hits the cwd-ordinal chokepoint, so this surface must migrate too).
+  // Relocate the legacy launcher state dir before the launcher's tmux-runs/
+  // mkdir reads launcherStateDir (a launch with an explicit --name never hits
+  // the cwd-ordinal chokepoint, so this surface must migrate too).
   migrateLegacyAgentStateDir();
   return {
     argv: process.argv.slice(2),

@@ -74,17 +74,6 @@ describe("resolveKeeperAgentPathDepFree (cold-start / pair variant)", () => {
     ).toBe("/custom/keeper.ts");
   });
 
-  test("a stray KEEPER_AGENTWRAP_PATH is now ignored (alias arm removed)", () => {
-    // The deprecated alias arm is gone — a lone KEEPER_AGENTWRAP_PATH no longer
-    // overrides; the resolver falls through to the derived default.
-    expect(
-      resolveKeeperAgentPathDepFree(
-        { KEEPER_AGENTWRAP_PATH: "/old/agentwrap" },
-        "/home/me",
-      ),
-    ).toBe(expectedDefault);
-  });
-
   test("a tilde override expands at resolve time", () => {
     expect(
       resolveKeeperAgentPathDepFree(
