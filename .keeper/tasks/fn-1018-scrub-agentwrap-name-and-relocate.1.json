@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T19:46:05.424000Z",
+  "depends_on": [],
+  "epic": "fn-1018-scrub-agentwrap-name-and-relocate",
+  "id": "fn-1018-scrub-agentwrap-name-and-relocate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Frozen-anchor guard for agentwrap survivors",
+  "updated_at": "2026-06-30T19:46:05.424000Z"
+}
