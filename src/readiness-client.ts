@@ -1420,6 +1420,18 @@ export interface SubscribeOptions {
   /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). Fires
    *  independently of `onSnapshot` whenever a `result` frame carries a header. */
   readonly onBootStatus?: (boot: BootStatus) => void;
+  /**
+   * fn-1015 OPT-IN: also subscribe the `epics_recent_done` window
+   * (`status='done'`, time-bounded to the last `DONE_EPICS_REAP_WINDOW_SEC` by
+   * the descriptor's `recencyBound`) and MERGE it open-wins into the epic set
+   * fed to BOTH `computeReadiness` and the snapshot's `epics` field — so a done
+   * epic's close-row `completed` verdict stays reachable through its wind-down.
+   * Mirrors the reconciler's `loadReconcileSnapshot` merge. Set ONLY by the
+   * await-complete path (and `keeper status`); board/dash leave it OFF, keeping
+   * their `computeReadiness` inputs, the `states`/first-paint gate, and the
+   * snapshot's `epics` field BYTE-IDENTICAL. Default `false`.
+   */
+  readonly includeRecentDoneEpics?: boolean;
 }
 
 /**
@@ -1598,6 +1610,22 @@ export function subscribeReadiness(
       limit: TMUX_CLIENT_FOCUS_PAGE_LIMIT,
     },
   );
+  // fn-1015 OPT-IN: the recently-done epics window. Created, gated, and merged
+  // ONLY when `includeRecentDoneEpics` is set (the await-complete / `keeper
+  // status` paths). When off it is `null` — never added to `states`, never
+  // gated, never merged — so board/dash first-paint and compute inputs stay
+  // byte-identical. Reuses `EPICS_PAGE_LIMIT` (unbounded; the descriptor's
+  // `recencyBound` is the real bound).
+  const epicsRecentDoneSubId = `${idPrefix}-epics-recent-done`;
+  const epicsRecentDone =
+    opts.includeRecentDoneEpics === true
+      ? makeState("epics_recent_done", epicsRecentDoneSubId, "epic_id", {
+          type: "query",
+          collection: "epics_recent_done",
+          id: epicsRecentDoneSubId,
+          limit: EPICS_PAGE_LIMIT,
+        })
+      : null;
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1611,6 +1639,9 @@ export function subscribeReadiness(
     blockEscalations,
     tmuxClientFocus,
   ];
+  if (epicsRecentDone !== null) {
+    states.push(epicsRecentDone);
+  }
 
   function emitSnapshotIfReady(): void {
     if (
@@ -1637,15 +1668,52 @@ export function subscribeReadiness(
       // (no-tmux env) produces a `result` with `rows: []` and still clears the
       // gate. Gating on it keeps the focus pill from painting on a pre-paint
       // blank.
-      !tmuxClientFocus.gotResult
+      !tmuxClientFocus.gotResult ||
+      // fn-1015 OPT-IN: gate on the recent-done window ONLY when it was opted in
+      // (`null` otherwise — board/dash never wait on it, so their gate stays
+      // unchanged). Empty produces a `result` with `rows: []`, so it clears.
+      (epicsRecentDone !== null && !epicsRecentDone.gotResult)
     ) {
       return;
     }
     // Cast: the wire delivers each row as `Record<string, unknown>`; the
     // descriptors guarantee the shape matches the typed projection.
-    const epicsTyped = epics.order.map(
+    const openEpicsTyped = epics.order.map(
       (id) => (epics.byId.get(id) ?? { [epics.pk]: id }) as unknown as Epic,
     );
+    // fn-1015 OPT-IN: merge the recently-done epics open-wins (the live open row
+    // wins a collision; a done row only joins for an epic NOT in the open set),
+    // mirroring the reconciler's `loadReconcileSnapshot` dedup. When the window
+    // was not opted in this is exactly `openEpicsTyped` — byte-identical to the
+    // pre-fn-1015 board/dash path. The merged set feeds BOTH `computeReadiness`
+    // (so a done epic's close-row gets a `completed` verdict) AND the snapshot's
+    // `epics` field (so the await presence lookup sees it).
+    let epicsTyped = openEpicsTyped;
+    if (epicsRecentDone !== null) {
+      const doneEpicsTyped = epicsRecentDone.order.map(
+        (id) =>
+          (epicsRecentDone.byId.get(id) ?? {
+            [epicsRecentDone.pk]: id,
+          }) as unknown as Epic,
+      );
+      const seenEpicIds = new Set<string>();
+      const merged: Epic[] = [];
+      for (const epic of openEpicsTyped) {
+        if (seenEpicIds.has(epic.epic_id)) {
+          continue;
+        }
+        seenEpicIds.add(epic.epic_id);
+        merged.push(epic);
+      }
+      for (const epic of doneEpicsTyped) {
+        if (seenEpicIds.has(epic.epic_id)) {
+          continue;
+        }
+        seenEpicIds.add(epic.epic_id);
+        merged.push(epic);
+      }
+      epicsTyped = merged;
+    }
     const jobsTyped = new Map<string, Job>();
     for (const [id, row] of jobs.byId) {
       jobsTyped.set(id, row as unknown as Job);
