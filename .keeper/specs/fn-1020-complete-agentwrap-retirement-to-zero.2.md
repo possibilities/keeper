@@ -36,5 +36,5 @@ Rename the `AGENTWRAP_*` env-var family → `KEEPER_AGENT_*` (matches the existi
 - [ ] `KEEPER_TMUX_SESSION` untouched; `bun test` green
 
 ## Done summary
-
+Renamed the AGENTWRAP_* launcher env-var family to KEEPER_AGENT_* (profile, carrier, skip-guard, shell) with the TMUX_SESSION_ID carrier moved in lockstep, excluded KEEPER_AGENT_PATH from the pane-forward filter (regression-tested), and removed the env anchors from the frozen-allowlist.
 ## Evidence
