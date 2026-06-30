@@ -219,7 +219,7 @@ describe("launch script embeds the launcherArgvPrefix (not argv[1])", () => {
     );
     const script = readFileSync(launchScript, "utf8");
     expect(script).toContain(
-      `"$AGENTWRAP_SHELL" '/abs/bun' '/install/keeper/cli/keeper.ts' 'agent' 'codex' 'hello'`,
+      `"$KEEPER_AGENT_SHELL" '/abs/bun' '/install/keeper/cli/keeper.ts' 'agent' 'codex' 'hello'`,
     );
     // Negative: the pane must NOT re-exec daemon.ts (argv[1] under keeperd).
     expect(script).not.toContain("daemon.ts");

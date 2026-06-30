@@ -76,8 +76,8 @@ describe("Codex command assembly", () => {
       threadName: "proj-001",
       expectedCwd: "/fake-home/code/proj",
     });
-    expect(h.deps.env.AGENTWRAP_CODEX_PROFILE).toBe("default");
-    expect(h.deps.env.AGENTWRAP_CLAUDE_PROFILE).toBeUndefined();
+    expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("default");
+    expect(h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE).toBeUndefined();
   });
 
   test("slug-shaped prompts feed the Codex session indexer", async () => {
@@ -103,7 +103,7 @@ describe("Codex command assembly", () => {
       "work",
       "hello",
     ]);
-    expect(h.deps.env.AGENTWRAP_CODEX_PROFILE).toBe("work");
+    expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("work");
   });
 
   test("native Codex --profile suppresses wrapper profile injection", async () => {
@@ -127,7 +127,7 @@ describe("Codex command assembly", () => {
 
   test("env profile maps to Codex --profile", async () => {
     const h = codexHarness(["--x-no-confirm", "hello"], {
-      env: { AGENTWRAP_PROFILE: "work" },
+      env: { KEEPER_AGENT_PROFILE: "work" },
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([

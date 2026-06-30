@@ -477,7 +477,7 @@ describe("profile-dir mkdir sites reject reserved/escaping names", () => {
 
 /** The env var the launcher exports for the resolved profile. */
 function profileEnv(h: ReturnType<typeof makeHarness>): string | undefined {
-  return h.deps.env.AGENTWRAP_CLAUDE_PROFILE as string | undefined;
+  return h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE as string | undefined;
 }
 
 describe("main() passthrough commands", () => {
@@ -661,12 +661,14 @@ describe("main() explicit + env profile precedence", () => {
     expect(profileEnv(h)).toBe("multi-claude-1");
   });
 
-  test("AGENTWRAP_PROFILE env bypasses the router", async () => {
+  test("KEEPER_AGENT_PROFILE env bypasses the router", async () => {
     const h = makeHarness({
       argv: ["--print"],
-      env: { AGENTWRAP_PROFILE: "multi-claude-2" },
+      env: { KEEPER_AGENT_PROFILE: "multi-claude-2" },
       pickProfile: () => {
-        throw new Error("router should not run when AGENTWRAP_PROFILE is set");
+        throw new Error(
+          "router should not run when KEEPER_AGENT_PROFILE is set",
+        );
       },
       profileDir: join(home, ".claude-profiles", "multi-claude-2"),
     });
@@ -678,7 +680,7 @@ describe("main() explicit + env profile precedence", () => {
   test("a CLI profile wins over the env profile", async () => {
     const h = makeHarness({
       argv: ["--x-profile", "multi-claude-1", "--print"],
-      env: { AGENTWRAP_PROFILE: "multi-claude-2" },
+      env: { KEEPER_AGENT_PROFILE: "multi-claude-2" },
       profileDir: join(home, ".claude-profiles", "multi-claude-1"),
     });
     await runAndCapture(h, main);
@@ -686,10 +688,10 @@ describe("main() explicit + env profile precedence", () => {
     expect(profileEnv(h)).toBe("multi-claude-1");
   });
 
-  test("AGENTWRAP_PROFILE=auto keeps the router", async () => {
+  test("KEEPER_AGENT_PROFILE=auto keeps the router", async () => {
     const h = makeHarness({
       argv: ["--print"],
-      env: { AGENTWRAP_PROFILE: "auto" },
+      env: { KEEPER_AGENT_PROFILE: "auto" },
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "multi-claude-1",
       profileDir: join(home, ".claude-profiles", "multi-claude-1"),
@@ -699,12 +701,14 @@ describe("main() explicit + env profile precedence", () => {
     expect(profileEnv(h)).toBe("multi-claude-1");
   });
 
-  test("AGENTWRAP_PROFILE=default uses the native account (no router, no config dir)", async () => {
+  test("KEEPER_AGENT_PROFILE=default uses the native account (no router, no config dir)", async () => {
     const h = makeHarness({
       argv: ["--print"],
-      env: { AGENTWRAP_PROFILE: "default" },
+      env: { KEEPER_AGENT_PROFILE: "default" },
       pickProfile: () => {
-        throw new Error("router should not run when AGENTWRAP_PROFILE=default");
+        throw new Error(
+          "router should not run when KEEPER_AGENT_PROFILE=default",
+        );
       },
     });
     await runAndCapture(h, main);

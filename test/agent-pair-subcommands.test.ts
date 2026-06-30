@@ -700,13 +700,13 @@ describe("runWaitForStop forwards --stop-timeout-ms", () => {
 describe("inner --session-id pin", () => {
   test("the inner claude re-exec pushes --session-id from the pane carrier", async () => {
     // Simulate the pane env the outer launch forwards: the inner re-exec reads
-    // AGENTWRAP_TMUX_SESSION_ID and must push it as --session-id, matching the
+    // KEEPER_AGENT_TMUX_SESSION_ID and must push it as --session-id, matching the
     // id the outer recorded in run.json transcriptSessionId.
     const sessionId = "66666666-6666-6666-6666-666666666666";
     const h = makeHarness({
       argv: ["claude", "--x-no-confirm", "hi"],
       rawArgv: true,
-      env: { AGENTWRAP_TMUX_SESSION_ID: sessionId },
+      env: { KEEPER_AGENT_TMUX_SESSION_ID: sessionId },
     });
 
     const cmd = await (async () => {
@@ -747,6 +747,6 @@ describe("inner --session-id pin", () => {
     // carrier so the inner re-exec mints the SAME uuid.
     const newWindow = h.tmuxCommands.find((cmd) => cmd.includes("new-window"));
     expect(newWindow).toBeDefined();
-    expect(newWindow).toContain(`AGENTWRAP_TMUX_SESSION_ID=${sessionId}`);
+    expect(newWindow).toContain(`KEEPER_AGENT_TMUX_SESSION_ID=${sessionId}`);
   });
 });

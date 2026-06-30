@@ -216,7 +216,7 @@ describe("ensureCanonicalStowLinks", () => {
     const msg = (thrown as Error).message;
     expect(msg).toContain("diff -u");
     expect(msg).toContain("stow --restow");
-    expect(msg).toContain("AGENTWRAP_SKIP_LINK_GUARD=1");
+    expect(msg).toContain("KEEPER_AGENT_SKIP_LINK_GUARD=1");
     // The divergent file must be left untouched (not relinked).
     expect(lstatSync(settingsLink()).isSymbolicLink()).toBe(false);
   });
@@ -244,14 +244,16 @@ describe("ensureCanonicalStowLinks", () => {
     expect(lstatSync(claudeMdLink()).isSymbolicLink()).toBe(true);
   });
 
-  test("AGENTWRAP_SKIP_LINK_GUARD bypasses the guard with a loud warning", () => {
+  test("KEEPER_AGENT_SKIP_LINK_GUARD bypasses the guard with a loud warning", () => {
     writeFileSync(settingsLink(), '{"a": 999}');
     const log: string[] = [];
     // Divergent clobber that WOULD throw — but the bypass skips it entirely.
     ensureCanonicalStowLinks(stowDir, homeDir, log, {
-      AGENTWRAP_SKIP_LINK_GUARD: "1",
+      KEEPER_AGENT_SKIP_LINK_GUARD: "1",
     });
     expect(lstatSync(settingsLink()).isSymbolicLink()).toBe(false);
-    expect(log.some((l) => l.includes("AGENTWRAP_SKIP_LINK_GUARD"))).toBe(true);
+    expect(log.some((l) => l.includes("KEEPER_AGENT_SKIP_LINK_GUARD"))).toBe(
+      true,
+    );
   });
 });

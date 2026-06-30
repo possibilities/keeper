@@ -62,7 +62,7 @@ export interface ParsedArgs {
 
 /**
  * Parse the launcher's own flags out of `args`, returning the residual argv plus
- * the launch-mode signals. Does NOT apply the AGENTWRAP_PROFILE env override or
+ * the launch-mode signals. Does NOT apply the KEEPER_AGENT_PROFILE env override or
  * the "default"-normalization — those happen in main() after parsing, logged as
  * separate action-log entries.
  */

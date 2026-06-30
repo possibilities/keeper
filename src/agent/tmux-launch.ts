@@ -675,8 +675,8 @@ function withTranscriptSessionCarrier(
     return env;
   }
   return [
-    ...env.filter(([key]) => key !== "AGENTWRAP_TMUX_SESSION_ID"),
-    ["AGENTWRAP_TMUX_SESSION_ID", transcriptSessionId],
+    ...env.filter(([key]) => key !== "KEEPER_AGENT_TMUX_SESSION_ID"),
+    ["KEEPER_AGENT_TMUX_SESSION_ID", transcriptSessionId],
   ];
 }
 
@@ -824,8 +824,8 @@ function buildLaunchScript(req: TmuxLaunchRequest): string {
     lines.push(envExports);
   }
   lines.push(
-    'AGENTWRAP_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
-    `exec "$AGENTWRAP_SHELL" -l -i -c '${tmuxShellBody()}' "$AGENTWRAP_SHELL" ${[
+    'KEEPER_AGENT_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
+    `exec "$KEEPER_AGENT_SHELL" -l -i -c '${tmuxShellBody()}' "$KEEPER_AGENT_SHELL" ${[
       ...req.launcherArgvPrefix,
       ...argv,
     ]
@@ -840,11 +840,15 @@ function launchScriptEnv(env: NodeJS.ProcessEnv): [string, string][] {
     "PATH",
     "SHELL",
     "BUN_INSTALL",
-    "AGENTWRAP_PROFILE",
+    "KEEPER_AGENT_PROFILE",
     "CODEX_HOME",
   ]);
   for (const key of Object.keys(env)) {
-    if (key.startsWith("AGENTWRAP_")) {
+    // KEEPER_AGENT_PATH is the launcher's OWN re-exec resolution env (read by
+    // resolveKeeperAgentPathDepFree), not a pane-bound carrier — it shares the
+    // family prefix but must never cross into the pane, or a pane would inherit
+    // the parent's launcher path. Every other KEEPER_AGENT_* var forwards.
+    if (key.startsWith("KEEPER_AGENT_") && key !== "KEEPER_AGENT_PATH") {
       keys.add(key);
     }
   }

@@ -345,12 +345,12 @@ function displayAgent(agent: AgentKind): string {
 
 function agentProfileEnvName(agent: AgentKind): string {
   if (agent === "claude") {
-    return "AGENTWRAP_CLAUDE_PROFILE";
+    return "KEEPER_AGENT_CLAUDE_PROFILE";
   }
   if (agent === "codex") {
-    return "AGENTWRAP_CODEX_PROFILE";
+    return "KEEPER_AGENT_CODEX_PROFILE";
   }
-  return "AGENTWRAP_PI_PROFILE";
+  return "KEEPER_AGENT_PI_PROFILE";
 }
 
 function findPassthroughForAgent(
@@ -524,7 +524,7 @@ function existingSessionId(args: string[]): string | null {
  * `--session-id`, else a freshly minted uuid for a new claude/pi session. Null
  * for codex (no id pin) and for a continue/resume launch (keeps the persisted
  * session). This one id is recorded in run.json `transcriptSessionId`, forwarded
- * into the pane via the `-e AGENTWRAP_TMUX_SESSION_ID` carrier, and consumed by
+ * into the pane via the `-e KEEPER_AGENT_TMUX_SESSION_ID` carrier, and consumed by
  * the inner re-exec's `--session-id` push — one source of truth, no divergence.
  */
 function tmuxTranscriptSessionId(
@@ -1383,12 +1383,12 @@ export async function main(deps: MainDeps): Promise<never> {
   }
 
   if (!explicitLauncherProfile) {
-    const envProfile = (deps.env.AGENTWRAP_PROFILE ?? "").trim();
+    const envProfile = (deps.env.KEEPER_AGENT_PROFILE ?? "").trim();
     if (envProfile && envProfile !== "auto") {
       launcherProfile = envProfile;
       explicitLauncherProfile = true;
       actionLog.push(
-        `Forced profile from AGENTWRAP_PROFILE env: ${envProfile}`,
+        `Forced profile from KEEPER_AGENT_PROFILE env: ${envProfile}`,
       );
     }
   }
@@ -1813,7 +1813,7 @@ export async function main(deps: MainDeps): Promise<never> {
   // Generate session ID and name for new Claude/Pi sessions.
   let sessionUuid: string | null = null;
   const tmuxSessionUuid =
-    (deps.env.AGENTWRAP_TMUX_SESSION_ID ?? "").trim() || null;
+    (deps.env.KEEPER_AGENT_TMUX_SESSION_ID ?? "").trim() || null;
   if (!hasContinueOrResume && !hasFlagToken(remainingArgs, "--session-id")) {
     sessionUuid = tmuxSessionUuid ?? deps.randomUuid();
     runCmd.push("--session-id", sessionUuid);
@@ -1824,7 +1824,7 @@ export async function main(deps: MainDeps): Promise<never> {
     );
   }
   if (tmuxSessionUuid !== null) {
-    delete deps.env.AGENTWRAP_TMUX_SESSION_ID;
+    delete deps.env.KEEPER_AGENT_TMUX_SESSION_ID;
   }
   // A fresh launch OR a fork needs a fresh --name (a fork mints a new session
   // id; plain --resume/--continue keeps its persisted title and is excluded).

@@ -101,9 +101,6 @@ exempt|src/reducer.ts
 # docs, and user-visible strings. A deliberate frozen set survives untouched
 # because each literal is a cross-process contract a rename would break:
 #
-#   * The AGENTWRAP_* env-var name strings are read across process boundaries
-#     (the tmux launch script, child harnesses, the profile plumbing). Renaming
-#     a name string silently severs every consumer still exporting the old name.
 #   * The ~/.local/state/agentwrap runtime state dir is a stable on-disk path
 #     other tooling reads; relocating it would orphan existing state.
 #   * legacyAgentwrapPresetsPath is the leftover detector for the pre-relocation
@@ -114,18 +111,6 @@ exempt|src/reducer.ts
 #
 # The .3 task appends the per-file ~/.config/agentwrap/ fallback anchors once it
 # creates them; this task anchors ONLY the enumerated frozen survivors.
-
-# AGENTWRAP_* env-var name strings — defining sites.
-anchor|src/agent/main.ts|"AGENTWRAP_CLAUDE_PROFILE"
-anchor|src/agent/main.ts|"AGENTWRAP_CODEX_PROFILE"
-anchor|src/agent/main.ts|"AGENTWRAP_PI_PROFILE"
-anchor|src/agent/tmux-launch.ts|"AGENTWRAP_PROFILE"
-anchor|src/agent/tmux-launch.ts|AGENTWRAP_TMUX_SESSION_ID
-anchor|src/agent/tmux-launch.ts|AGENTWRAP_SHELL
-anchor|src/agent/state-sharing.ts|AGENTWRAP_SKIP_LINK_GUARD
-
-# The AGENTWRAP_ prefix filter (passes every AGENTWRAP_* var into the launch env).
-anchor|src/agent/tmux-launch.ts|startsWith("AGENTWRAP_")
 
 # The ~/.local/state/agentwrap runtime state-dir path literal.
 anchor|src/agent/tmux-launch.ts|".local", "state", "agentwrap"

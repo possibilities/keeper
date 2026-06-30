@@ -657,7 +657,7 @@ function divergentClobberMessage(
     `  cp ${linkPath} ${target} && rm ${linkPath} && ln -snf ${relTarget} ${linkPath}`,
     "",
     "Rip-cord — bypass this guard entirely for one launch (last resort):",
-    "  AGENTWRAP_SKIP_LINK_GUARD=1 <your keeper agent command>",
+    "  KEEPER_AGENT_SKIP_LINK_GUARD=1 <your keeper agent command>",
   ].join("\n");
 }
 
@@ -676,7 +676,7 @@ function divergentClobberMessage(
  *   - link absent but source present → create the relative link
  *   - source file missing → skip + warn (nothing to enforce against)
  *
- * `AGENTWRAP_SKIP_LINK_GUARD` set → skip the whole guard with a loud warning.
+ * `KEEPER_AGENT_SKIP_LINK_GUARD` set → skip the whole guard with a loud warning.
  * Throws a typed StateError on divergence; main() owns the exit.
  */
 export function ensureCanonicalStowLinks(
@@ -685,9 +685,9 @@ export function ensureCanonicalStowLinks(
   actionLog: string[] | null = null,
   env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (env.AGENTWRAP_SKIP_LINK_GUARD) {
+  if (env.KEEPER_AGENT_SKIP_LINK_GUARD) {
     actionLog?.push(
-      "WARNING: AGENTWRAP_SKIP_LINK_GUARD set — skipping the canonical stow " +
+      "WARNING: KEEPER_AGENT_SKIP_LINK_GUARD set — skipping the canonical stow " +
         "link guard; ~/.claude/{settings.json,CLAUDE.md} are NOT re-asserted",
     );
     return;

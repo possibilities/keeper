@@ -66,8 +66,8 @@ describe("Pi command assembly", () => {
     ]);
     expect(cmd).not.toContain("--strict-mcp-config");
     expect(cmd).not.toContain("--teammate-mode");
-    expect(h.deps.env.AGENTWRAP_PI_PROFILE).toBe("default");
-    expect(h.deps.env.AGENTWRAP_CLAUDE_PROFILE).toBeUndefined();
+    expect(h.deps.env.KEEPER_AGENT_PI_PROFILE).toBe("default");
+    expect(h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE).toBeUndefined();
   });
 
   test("configured model and thinking are injected for Pi", async () => {
@@ -103,7 +103,7 @@ describe("Pi command assembly", () => {
     expect(h.bootstrappedProfiles).toEqual(["work"]);
     expect(h.deps.env.PI_CODING_AGENT_DIR).toBe("/fake-home/.pi-profiles/work");
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
-    expect(h.deps.env.AGENTWRAP_PI_PROFILE).toBe("work");
+    expect(h.deps.env.KEEPER_AGENT_PI_PROFILE).toBe("work");
   });
 
   test("--fork gets a fresh display name but not a wrapper session id", async () => {

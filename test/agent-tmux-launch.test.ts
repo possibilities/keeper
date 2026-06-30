@@ -168,10 +168,10 @@ describe("--x-tmux", () => {
     expect(script).toContain("cd -- '/fake-home/code/proj'");
     expect(script).toContain("export PATH='/fake/bin'");
     expect(script).toContain(
-      'AGENTWRAP_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
+      'KEEPER_AGENT_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
@@ -187,6 +187,53 @@ describe("--x-tmux", () => {
       stop: null,
       tmux: { session: "dash", windowId: "@9", paneId: "%10" },
     });
+  });
+
+  test("the KEEPER_AGENT_* family forwards into the pane env, but KEEPER_AGENT_PATH is excluded", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    writeCodexTranscript(home, cwd);
+    const h = makeHarness({
+      argv: ["codex", "--x-tmux", "hello"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      env: {
+        TMUX: "/tmp/tmux-501/default,1,0",
+        PATH: "/fake/bin",
+        // A family var that ONLY the prefix branch forwards (not in the static
+        // key set) — proves the KEEPER_AGENT_* family still crosses.
+        KEEPER_AGENT_CLAUDE_PROFILE: "work",
+        // The launcher's own re-exec resolution env: shares the family prefix
+        // but must NOT cross into the pane.
+        KEEPER_AGENT_PATH: "/custom/keeper.ts",
+      },
+      cwd,
+      randomUuid: () => "55555555-5555-5555-5555-555555555555",
+      tmuxCommand: (cmd) => {
+        if (cmd.includes("display-message")) {
+          return { exitCode: 0, stdout: "dash\n", stderr: "" };
+        }
+        if (cmd.includes("new-window")) {
+          return { exitCode: 0, stdout: "dash\x01@9\x01%10\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    const launchScript = join(
+      stateDir,
+      "tmux-runs",
+      "tmux-55555555-5555-5555-5555-555555555555",
+      "launch.sh",
+    );
+    const script = readFileSync(launchScript, "utf8");
+    expect(script).toContain("export KEEPER_AGENT_CLAUDE_PROFILE='work'");
+    expect(script).not.toContain("KEEPER_AGENT_PATH");
   });
 
   test("outside tmux, creates the default session and returns metadata without attaching", async () => {
@@ -351,7 +398,7 @@ describe("--x-tmux", () => {
       // The pinned transcript session-id carrier is forwarded into the pane so
       // the inner re-exec mints the SAME uuid recorded in run.json.
       "-e",
-      `AGENTWRAP_TMUX_SESSION_ID=${sessionId}`,
+      `KEEPER_AGENT_TMUX_SESSION_ID=${sessionId}`,
       "-c",
     ]);
     expect(parseJsonOutput(h.out)).toMatchObject({
@@ -373,7 +420,7 @@ describe("--x-tmux", () => {
     );
     const script = readFileSync(launchScript, "utf8");
     expect(script).toContain(
-      `exec "$AGENTWRAP_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$AGENTWRAP_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux-L");
   });
