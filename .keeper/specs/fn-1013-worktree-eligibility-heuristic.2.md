@@ -48,5 +48,5 @@ THE load-bearing invariant: an all-disabled cycle MUST populate `laneKeyById` (t
 - [ ] the fast tier injects a synthetic `assessRepo`; no real fs/git
 
 ## Done summary
-
+Threaded the non-error disabled outcome end-to-end through autopilot dispatch: classifyEpicRepo downgrades a would-be-ok epic via an injected per-cycle assessRepo probe, prepareWorktreeGeometry keys every task + close row on the bare toplevel for the cap-1 mutex, and attachWorktreeGeometry no-ops so disabled epics dispatch sequentially on the shared checkout with no worktreeReject/dispatch_failure.
 ## Evidence
