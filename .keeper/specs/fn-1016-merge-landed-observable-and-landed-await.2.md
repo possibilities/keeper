@@ -47,5 +47,5 @@ Pure fixtures: `landed` met when merged signal present; waiting when done-but-un
 - [ ] Pure fixture tests; `bun test` green.
 
 ## Done summary
-
+Added the 'landed <epic>' await condition: a pure landedState predicate reading the snapshot merge-landed set (worktree ON/OFF degradation baked in by task 1), wired as an epic-only board-family condition in cli/await.ts. Repointed the planning daisy-chain gate in the plan/hack skills from complete to landed and documented landed in the await skill table + README.
 ## Evidence
