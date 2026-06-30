@@ -291,6 +291,40 @@ test("fn-756 task-complete: done + (ignored) rejected → met (approval no longe
   expect(state.kind).toBe("met");
 });
 
+test("fn-1015 task-complete: done AND idle (no live work) → met (completed verdict)", () => {
+  // A bare done task with no embedded jobs / sub-agents / monitors folds to the
+  // readiness `completed` verdict — the done-AND-idle moment.
+  const task = makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 task-complete: done BUT embedded job still working → waiting (not idle)", () => {
+  // `worker_phase==="done"` raced ahead of the session winding down — an
+  // embedded job is still `working`, so readiness holds the verdict at
+  // `running:*`, NOT `completed`. `complete` must report `waiting` (the fn-1015
+  // done-AND-idle change) instead of the old raw-`worker_phase` `met`.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
 // ---------------------------------------------------------------------------
 // Task-started: the monotonic "work has begun at least once" milestone.
 // True via any of {jobs non-empty, runtime_status in {in_progress, done},
@@ -504,6 +538,89 @@ test("epic-complete: bare fn-N form looks up by epic_number", () => {
   // Epic is on the board → waiting (same present-branch rule as the
   // full-id version above).
   expect(state.kind).toBe("waiting");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 epic-complete: the present-branch close-row verdict state machine.
+// present+open → waiting; present+done+idle-close-row → met; present+done+
+// closer-live → waiting. The await-complete recent-done merge keeps a done epic
+// present here; aged-out / deleted fall through to the absent branch (above).
+// ---------------------------------------------------------------------------
+
+test("fn-1015 epic-complete: present + open → waiting (close-row not completed)", () => {
+  const epic = makeEpic({
+    status: "open",
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("fn-1015 epic-complete: present + done + idle close-row → met (completed verdict)", () => {
+  // A done epic with no live close-scope work (no working epic job, no running
+  // sub-agent, no held monitor) folds to the close-row `completed` verdict. With
+  // the recent-done merge this epic stays present, so `complete` reads `met`
+  // directly off `perCloseRow` — no board pop-off / re-query needed.
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "completed" });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 epic-complete: present + done + closer still live → waiting (close-row not idle)", () => {
+  // `status==="done"` raced ahead of the closer — an epic-level `close` job is
+  // still `working`, so the close-row holds at `running:*`, NOT `completed`.
+  // `complete` must hold `waiting` until the closer winds down (the mutex stays
+  // held), even though the epic is administratively done.
+  const epic = makeEpic({
+    status: "done",
+    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "working" })],
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("fn-1015 epic-complete: aged out of recent-done window → absent → re-query hit → met", () => {
+  // After the 1800s window a completion ages out: the epic drops from BOTH the
+  // open AND recent-done scopes, so it lands on the absent branch. The
+  // scope-exempt re-query still hits (the row lives on in the projection) → the
+  // existing machinery resolves `met`. An agent arming long after completion
+  // gets the right answer.
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true, reQueryHit: true },
+    { id: "fn-1-foo", kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 epic-complete: truly deleted → absent → re-query miss → deleted", () => {
+  // Absent from both scopes AND the scope-exempt re-query misses → genuine
+  // deletion, NOT completion. The TRUE-deletion path is retained unchanged.
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true, reQueryHit: false },
+    { id: "fn-1-foo", kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("deleted");
 });
 
 // ---------------------------------------------------------------------------

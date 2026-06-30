@@ -723,6 +723,12 @@ export async function runAwait(
       s.condition === "unblocked" ||
       s.condition === "started",
   );
+  // fn-1015: a `complete` condition reads the done-AND-idle verdict, which for
+  // an epic lives on the close-row that only stays observable when the recently-
+  // done epics are merged into the readiness scope. Opt the readiness stream
+  // into that merge ONLY when a `complete` segment is present — `unblocked` /
+  // `started` keep the byte-identical board/dash scope.
+  const hasComplete = args.segments.some((s) => s.condition === "complete");
   const hasGitClean = args.segments.some((s) => s.condition === "git-clean");
   const hasAgentsIdle = args.segments.some(
     (s) => s.condition === "agents-idle",
@@ -1665,6 +1671,9 @@ export async function runAwait(
       onFatal,
       // fn-897 B1: capture the git-seed state when this stream feeds git rows.
       ...(hasGitClean ? { onBootStatus } : {}),
+      // fn-1015: merge the recently-done epics so an epic `complete` await reads
+      // the close-row `completed` verdict on the present branch.
+      ...(hasComplete ? { includeRecentDoneEpics: true } : {}),
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });

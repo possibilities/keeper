@@ -70,11 +70,15 @@
  *                    recoverable reason kind. Command exits 5 only under
  *                    `--fail-on-stuck` (otherwise treated as `waiting`).
  *
- * `met` for `complete` is presence-driven on epics (the spec's "pops off
- * the board" semantics) — the epic disappearing from the default-visible
- * scope is the signal, NOT an explicit `status` value. For tasks `met`
- * reads the raw field directly: `worker_phase === "done"` (fn-756 — the
- * approval enum no longer gates completion).
+ * `met` for `complete` reads the readiness `completed` verdict (fn-1015) —
+ * done-AND-idle, not the administrative pop-off signal that can fire before the
+ * worker winds down. A task is complete when `perTask[id].tag === "completed"`
+ * (`worker_phase === "done"` AND the session idle); an epic is complete when its
+ * close-row `perCloseRow[epic_id].tag === "completed"` (`status === "done"` AND
+ * the closer idle), reachable on the present branch because the await-complete
+ * path opts the recently-done epics into the observed scope. An epic that has
+ * aged past that window (or was deleted) lands on the absent branch, where the
+ * command's scope-exempt re-query splits complete (re-query hit) from deleted.
  */
 
 import type { MonitorEntry } from "./derivers";
@@ -472,10 +476,13 @@ function epicStarted(epic: Epic): boolean {
  * something is implicit. Every field is a pure value — no live handles,
  * no functions.
  *
- *   - `epics`          — the board-scoped epic list as observed by the
- *                        subscribe stream (`default_visible = status='open'
- *                        OR approval!='approved'`). Drives presence
- *                        lookups for both kinds.
+ *   - `epics`          — the epic list as observed by the subscribe stream.
+ *                        Normally the board-scoped default-visible set
+ *                        (`status='open' OR approval!='approved'`); the
+ *                        await-complete path additionally merges the
+ *                        recently-done epics (open-wins) so a done epic's
+ *                        close-row verdict is reachable on the present branch.
+ *                        Drives presence lookups for both kinds.
  *   - `snapshot`       — the post-mutex `ReadinessSnapshot` from the same
  *                        subscribe tick.
  *   - `priorPresence`  — true iff the target was observed at least once
@@ -543,12 +550,15 @@ export interface AwaitInputs {
  *       scope-exempt re-query disambiguates that from a real deletion.)
  *
  *   - Target present in `inputs.epics`:
- *       condition='complete'  → read the raw field:
- *           task: `worker_phase==='done'` (fn-756 — no approval gate)
- *           epic: never `met` on the present branch (an epic that's
- *                 truly complete has popped off the board scope — see
- *                 absent branch above). If the epic is still on the
- *                 board, it isn't complete yet; return `waiting`.
+ *       condition='complete'  → read the readiness `completed` verdict:
+ *           task: `perTask[id].tag==='completed'` (done AND idle) → `met`; a
+ *                 present task with no verdict, or any non-`completed` verdict
+ *                 (e.g. `running:sub-agent-stale`), → `waiting`.
+ *           epic: `perCloseRow[epic_id].tag==='completed'` (status done AND the
+ *                 closer idle) → `met`; present+open or present+done+closer-live
+ *                 → `waiting`. A done epic stays present via the await-complete
+ *                 recent-done merge; one aged past the window / deleted lands on
+ *                 the absent branch.
  *       condition='started'  → read the raw fields (met / waiting only,
  *           evaluated BEFORE any stuck branch so a blocked-but-ran row
  *           reads `met`):
@@ -583,15 +593,27 @@ function evaluateTaskAwait(
     return absentBranch(inputs, target);
   }
   if (target.condition === "complete") {
-    const { task } = hit;
-    // fn-756: completion is the worker-done signal alone; the approval enum
-    // no longer gates.
-    if (task.worker_phase === "done") {
-      return { kind: "met", detail: "task complete (worker done)" };
+    // fn-1015: completion is the readiness `completed` verdict — `worker_phase
+    // === "done"` AND the session idle (no embedded job working, no running
+    // sub-agent, no held monitor lease) — NOT the raw `worker_phase` pop-off
+    // that can race ahead of the worker winding down. A done-but-live task reads
+    // `running:*` and stays `waiting` here (a done task whose sub-agent died
+    // without SubagentStop is `running:sub-agent-stale` by design, so `complete`
+    // holds `waiting` until an operator clears it). Undefined-guard mirrors the
+    // unblocked path: a present task with no verdict reads `waiting`.
+    const v = inputs.snapshot.perTask.get(target.id);
+    if (v === undefined) {
+      return {
+        kind: "waiting",
+        detail: "task present but no verdict in snapshot",
+      };
+    }
+    if (v.tag === "completed") {
+      return { kind: "met", detail: "task complete (done and idle)" };
     }
     return {
       kind: "waiting",
-      detail: `task not complete (worker_phase=${task.worker_phase ?? "null"})`,
+      detail: `task not complete (${verdictPhrase(v)})`,
     };
   }
   if (target.condition === "started") {
@@ -645,13 +667,29 @@ function evaluateEpicAwait(
     return absentBranch(inputs, target);
   }
   if (target.condition === "complete") {
-    // An epic that's truly complete (status != 'open' per the
-    // EPICS_DESCRIPTOR's default filter) has popped off the board scope,
-    // so it lands on the absent branch above. If we see it here, it's
-    // still on the board — not yet complete.
+    // fn-1015: with the await-complete opt-in recent-done merge feeding this
+    // input set, a done epic stays observable through its close-row wind-down,
+    // so completion is the close-row `completed` verdict (status==='done' AND
+    // the closer idle — no embedded close job working, no running sub-agent, no
+    // held monitor lease) read off `perCloseRow`, NOT the epic merely popping
+    // off the board. State machine: present+open → waiting; present+done+
+    // idle-close-row → met; present+done+closer-live → waiting. A truly-deleted
+    // epic (absent from BOTH the open AND recent-done scopes) lands on the
+    // absent branch above, where the scope-exempt re-query disambiguates
+    // re-query-hit → met (aged past the 1800s window but still in the
+    // projection) from re-query-miss → deleted.
+    const closeV = inputs.snapshot.perCloseRow.get(epic.epic_id);
+    if (closeV !== undefined && closeV.tag === "completed") {
+      return {
+        kind: "met",
+        detail: "epic complete (done and close-row idle)",
+      };
+    }
     return {
       kind: "waiting",
-      detail: `epic still on board (status=${epic.status ?? "null"})`,
+      detail: `epic not complete (status=${epic.status ?? "null"}${
+        closeV === undefined ? "" : `, ${verdictPhrase(closeV)}`
+      })`,
     };
   }
   if (target.condition === "started") {
