@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T19:55:05.829000Z",
+  "depends_on": [],
+  "epic": "fn-1019-agent-run-capture-primitive",
+  "id": "fn-1019-agent-run-capture-primitive.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Behavior-lock golden + byte-pin tests",
+  "updated_at": "2026-06-30T19:55:05.829000Z"
+}

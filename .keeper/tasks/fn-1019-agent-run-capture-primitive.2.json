@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T19:55:05.829000Z",
+  "depends_on": [
+    "fn-1019-agent-run-capture-primitive.1"
+  ],
+  "epic": "fn-1019-agent-run-capture-primitive",
+  "id": "fn-1019-agent-run-capture-primitive.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "agent run + agent wait run-capture primitive",
+  "updated_at": "2026-06-30T19:55:05.829000Z"
+}
