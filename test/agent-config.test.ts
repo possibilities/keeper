@@ -11,7 +11,9 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
+  codexConfigPath,
   keeperConfigDir,
+  launcherConfigPath,
   loadClaudeStowDir,
   loadLauncherDefaults,
   loadPanelSelections,
@@ -20,14 +22,17 @@ import {
   loadPresetCatalog,
   type PresetCatalog,
   panelConfigPath,
+  piLauncherConfigPath,
+  pluginConfigPath,
   presetsCatalogPath,
+  resolveHarnessConfigPath,
   resolvePreset,
 } from "../src/agent/config";
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "agentwrap-config-"));
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-config-"));
 });
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
@@ -419,6 +424,144 @@ describe("KEEPER_CONFIG_DIR single seam", () => {
     expect(keeperConfigDir()).toBe("/cfg/keeper");
     expect(presetsCatalogPath()).toBe("/cfg/keeper/presets.yaml");
     expect(panelConfigPath()).toBe("/cfg/keeper/panel.yaml");
+  });
+});
+
+describe("per-harness config relocation + read-old fallback", () => {
+  let savedConfigDir: string | undefined;
+  let origWrite: typeof process.stderr.write;
+  const stderr: string[] = [];
+
+  beforeEach(() => {
+    savedConfigDir = process.env.KEEPER_CONFIG_DIR;
+    delete process.env.KEEPER_CONFIG_DIR;
+    stderr.length = 0;
+    origWrite = process.stderr.write.bind(process.stderr);
+    // Capture the fallback warning rather than pollute the test output.
+    process.stderr.write = ((chunk: unknown) => {
+      stderr.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+  });
+  afterEach(() => {
+    process.stderr.write = origWrite;
+    if (savedConfigDir === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = savedConfigDir;
+  });
+
+  test("KEEPER_CONFIG_DIR drives all 4 per-harness path fns to ~/.config/keeper", () => {
+    process.env.KEEPER_CONFIG_DIR = "/cfg/keeper";
+    expect(launcherConfigPath()).toBe("/cfg/keeper/claude.yaml");
+    expect(codexConfigPath()).toBe("/cfg/keeper/codex.yaml");
+    expect(piLauncherConfigPath()).toBe("/cfg/keeper/pi.yaml");
+    expect(pluginConfigPath()).toBe("/cfg/keeper/plugins.yaml");
+  });
+
+  test("resolver: the new path present wins (no fallback, no warning)", () => {
+    const newP = writeYaml("claude.yaml", "model: opus\n");
+    const oldP = writeYaml("old-claude.yaml", "model: sonnet\n");
+    expect(resolveHarnessConfigPath(newP, oldP)).toBe(newP);
+    expect(stderr.join("")).toBe("");
+  });
+
+  test("resolver: new absent + old present falls back and warns once", () => {
+    const newP = join(tmpDir, "claude.yaml"); // absent
+    const oldP = writeYaml("old-claude.yaml", "model: sonnet\n");
+    expect(resolveHarnessConfigPath(newP, oldP)).toBe(oldP);
+    expect(resolveHarnessConfigPath(newP, oldP)).toBe(oldP); // 2nd call deduped
+    expect(stderr.length).toBe(1);
+    expect(stderr[0]).toContain(oldP);
+  });
+
+  test("resolver: both absent returns the new path (posture preserved)", () => {
+    const newP = join(tmpDir, "claude.yaml");
+    const oldP = join(tmpDir, "old-claude.yaml");
+    expect(resolveHarnessConfigPath(newP, oldP)).toBe(newP);
+    expect(stderr.join("")).toBe("");
+  });
+
+  test("loadLauncherDefaults prefers the new path over the old", () => {
+    const newP = writeYaml("claude.yaml", "model: opus\n");
+    const oldP = writeYaml("old-claude.yaml", "model: sonnet\neffort: low\n");
+    expect(loadLauncherDefaults(newP, oldP)).toEqual({
+      model: "opus",
+      effort: null,
+    });
+    expect(stderr.join("")).toBe("");
+  });
+
+  test("loadLauncherDefaults falls back to the old path (fail-open)", () => {
+    const newP = join(tmpDir, "claude.yaml");
+    const oldP = writeYaml("old-claude.yaml", "model: sonnet\neffort: low\n");
+    expect(loadLauncherDefaults(newP, oldP)).toEqual({
+      model: "sonnet",
+      effort: "low",
+    });
+  });
+
+  test("loadLauncherDefaults both-absent yields null defaults (fail-open)", () => {
+    expect(
+      loadLauncherDefaults(
+        join(tmpDir, "claude.yaml"),
+        join(tmpDir, "old-claude.yaml"),
+      ),
+    ).toEqual({ model: null, effort: null });
+  });
+
+  test("loadPiLauncherDefaults falls back to the old path (fail-open)", () => {
+    const newP = join(tmpDir, "pi.yaml");
+    const oldP = writeYaml("old-pi.yaml", "model: opus\nthinking: high\n");
+    expect(loadPiLauncherDefaults(newP, oldP)).toEqual({
+      model: "opus",
+      thinking: "high",
+    });
+  });
+
+  test("loadClaudeStowDir falls back to the old path (fail-open)", () => {
+    const newP = join(tmpDir, "claude.yaml");
+    const oldP = writeYaml(
+      "old-claude.yaml",
+      "claude_stow_dir: /opt/stow/.claude\n",
+    );
+    expect(loadClaudeStowDir(newP, oldP)).toBe("/opt/stow/.claude");
+  });
+
+  test("loadPluginSources reads the old path when the new is absent", () => {
+    const newP = join(tmpDir, "plugins.yaml");
+    const oldP = writeYaml("old-plugins.yaml", "{}\n");
+    expect(loadPluginSources(newP, oldP)).toEqual({
+      pluginDirs: [],
+      pluginScanDirs: [],
+    });
+  });
+
+  test("loadPluginSources both-absent stays fail-loud", () => {
+    expect(() =>
+      loadPluginSources(
+        join(tmpDir, "plugins.yaml"),
+        join(tmpDir, "old-plugins.yaml"),
+      ),
+    ).toThrow(ConfigError);
+  });
+
+  test("KEEPER_CONFIG_DIR seam drives all 4 no-arg readers to the new dir", () => {
+    process.env.KEEPER_CONFIG_DIR = tmpDir;
+    writeFileSync(join(tmpDir, "claude.yaml"), "model: opus\neffort: high\n");
+    writeFileSync(join(tmpDir, "codex.yaml"), "model: gpt\neffort: low\n");
+    writeFileSync(join(tmpDir, "pi.yaml"), "model: pi-1\nthinking: deep\n");
+    writeFileSync(join(tmpDir, "plugins.yaml"), "{}\n");
+    expect(loadLauncherDefaults()).toEqual({ model: "opus", effort: "high" });
+    expect(loadLauncherDefaults(codexConfigPath())).toEqual({
+      model: "gpt",
+      effort: "low",
+    });
+    expect(loadPiLauncherDefaults()).toEqual({
+      model: "pi-1",
+      thinking: "deep",
+    });
+    expect(loadPluginSources()).toEqual({ pluginDirs: [], pluginScanDirs: [] });
+    // New paths present → no fallback warning.
+    expect(stderr.join("")).toBe("");
   });
 });
 

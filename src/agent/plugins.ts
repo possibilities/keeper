@@ -3,7 +3,7 @@
  *
  *  1. The cwd `--plugin-dir .` detection: if any of commands/agents/skills/hooks
  *     is a directory in cwd, the repo itself is a plugin. STAYS in code.
- *  2. Config-driven entries from `~/.config/agentwrap/plugins.yaml`:
+ *  2. Config-driven entries from `~/.config/keeper/plugins.yaml`:
  *       - `plugin_dirs`      — each entry IS a plugin; a missing manifest is
  *                              FAIL-LOUD (hard dependency).
  *       - `plugin_scan_dirs` — each entry is a parent whose immediate children
@@ -81,7 +81,7 @@ export function discoverPlugins(
       throw new PluginError(
         `Error: configured plugin manifest missing at ${manifest}. ` +
           `It is listed under plugin_dirs in ${pluginConfigPathStr} and ` +
-          "is a hard dependency of agentwrap — restore the checkout " +
+          "is a hard dependency of keeper agent — restore the checkout " +
           "or remove the entry before launching.",
       );
     }

@@ -139,3 +139,11 @@ anchor|src/agent/config.ts|".config", "agentwrap", "presets.yaml"
 anchor|test/config.test.ts|agentwrap_path
 anchor|test/config.test.ts|KEEPER_AGENTWRAP_PATH
 anchor|test/config.test.ts|agentwrapPath
+
+# Per-harness read-old fallback (fn-1018 .3) — the transitional resolver reads
+# the pre-relocation ~/.config/agentwrap/{claude,codex,pi,plugins}.yaml when the
+# new ~/.config/keeper/ path is absent (warned once), so a stale config still
+# boots until the move (.4) populates the new location + the restow lands. Frozen
+# so a future sweep can't delete the fallback before that cutover completes.
+anchor|src/agent/config.ts|legacyAgentwrapConfigPath
+anchor|src/agent/config.ts|".config", "agentwrap", basename(configPath)

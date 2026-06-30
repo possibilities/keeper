@@ -1,6 +1,6 @@
 /**
  * Launcher config adapters — the dep-free island that reads both the
- * `~/.config/agentwrap/{claude,codex,pi,plugins}.yaml` launcher defaults and the
+ * `~/.config/keeper/{claude,codex,pi,plugins}.yaml` launcher defaults and the
  * `~/.config/keeper/{presets.yaml,panel.yaml}` agent launch-config. YAML parsing
  * is isolated behind one adapter (`parseYaml`) so a js-yaml swap stays a one-line
  * change. Bun.YAML targets YAML 1.2 (no `yes/no/on/off` booleans); the config
@@ -19,7 +19,7 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -58,19 +58,19 @@ export function expandUser(p: string): string {
 }
 
 export function launcherConfigPath(): string {
-  return join(homedir(), ".config", "agentwrap", "claude.yaml");
+  return join(keeperConfigDir(), "claude.yaml");
 }
 
 export function codexConfigPath(): string {
-  return join(homedir(), ".config", "agentwrap", "codex.yaml");
+  return join(keeperConfigDir(), "codex.yaml");
 }
 
 export function piLauncherConfigPath(): string {
-  return join(homedir(), ".config", "agentwrap", "pi.yaml");
+  return join(keeperConfigDir(), "pi.yaml");
 }
 
 export function pluginConfigPath(): string {
-  return join(homedir(), ".config", "agentwrap", "plugins.yaml");
+  return join(keeperConfigDir(), "plugins.yaml");
 }
 
 /**
@@ -103,6 +103,59 @@ export function legacyAgentwrapPresetsPath(): string {
   return join(homedir(), ".config", "agentwrap", "presets.yaml");
 }
 
+/**
+ * The pre-relocation `~/.config/agentwrap/` twin of a per-harness keeper-config
+ * path — the read-old fallback target. Derives the legacy file from the new
+ * path's basename so claude/codex/pi/plugins each map to their OWN old file (the
+ * codex reader reuses {@link loadLauncherDefaults} with the codex path, so a
+ * fixed legacy default would mis-route it).
+ */
+function legacyAgentwrapConfigPath(configPath: string): string {
+  return join(homedir(), ".config", "agentwrap", basename(configPath));
+}
+
+const warnedLegacyConfigPaths = new Set<string>();
+
+/**
+ * Emit ONE stderr line the first time a per-harness reader actually falls back
+ * to a pre-relocation `~/.config/agentwrap/` file, naming the stale path. Deduped
+ * per path (the two claude.yaml readers — defaults + stow dir — warn once), and
+ * self-silencing: once the file moves under `~/.config/keeper/` the resolver
+ * returns the new path and never reaches here.
+ */
+function warnLegacyConfigRead(legacyPath: string): void {
+  if (warnedLegacyConfigPaths.has(legacyPath)) {
+    return;
+  }
+  warnedLegacyConfigPaths.add(legacyPath);
+  process.stderr.write(
+    "keeper agent: reading launcher config from the pre-relocation path " +
+      `${legacyPath}; move it under ${keeperConfigDir()}/ to silence this.\n`,
+  );
+}
+
+/**
+ * Resolve a per-harness launcher config path with a transitional read-old
+ * fallback: the new `~/.config/keeper/` path when it exists, else the
+ * pre-relocation `~/.config/agentwrap/` path when THAT exists (warned once),
+ * else the new path. Returning the new path when NEITHER exists is what keeps
+ * each reader's own absence posture intact — a fail-open reader still returns
+ * its null defaults, `loadPluginSources` still throws fail-loud on the new path.
+ */
+export function resolveHarnessConfigPath(
+  newPath: string,
+  legacyPath: string,
+): string {
+  if (isFile(newPath)) {
+    return newPath;
+  }
+  if (isFile(legacyPath)) {
+    warnLegacyConfigRead(legacyPath);
+    return legacyPath;
+  }
+  return newPath;
+}
+
 export interface LauncherDefaults {
   model: string | null;
   effort: string | null;
@@ -133,11 +186,13 @@ function readMapping(configPath: string): Record<string, unknown> {
  */
 export function loadLauncherDefaults(
   configPath: string = launcherConfigPath(),
+  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): LauncherDefaults {
-  if (!isFile(configPath)) {
+  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
+  if (!isFile(resolved)) {
     return { model: null, effort: null };
   }
-  const raw = readMapping(configPath);
+  const raw = readMapping(resolved);
 
   const value = (key: string): string | null => {
     const v = raw[key];
@@ -146,7 +201,7 @@ export function loadLauncherDefaults(
     }
     if (typeof v !== "string" || !v.trim()) {
       throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${configPath}`,
+        `Expected ${key} to be a non-empty string in ${resolved}`,
       );
     }
     return v.trim();
@@ -163,11 +218,13 @@ export function loadLauncherDefaults(
  */
 export function loadPiLauncherDefaults(
   configPath: string = piLauncherConfigPath(),
+  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): PiLauncherDefaults {
-  if (!isFile(configPath)) {
+  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
+  if (!isFile(resolved)) {
     return { model: null, thinking: null };
   }
-  const raw = readMapping(configPath);
+  const raw = readMapping(resolved);
 
   const value = (key: string): string | null => {
     const v = raw[key];
@@ -176,7 +233,7 @@ export function loadPiLauncherDefaults(
     }
     if (typeof v !== "string" || !v.trim()) {
       throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${configPath}`,
+        `Expected ${key} to be a non-empty string in ${resolved}`,
       );
     }
     return v.trim();
@@ -187,18 +244,20 @@ export function loadPiLauncherDefaults(
 
 export function loadClaudeStowDir(
   configPath: string = launcherConfigPath(),
+  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): string | null {
-  if (!isFile(configPath)) {
+  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
+  if (!isFile(resolved)) {
     return null;
   }
-  const raw = readMapping(configPath);
+  const raw = readMapping(resolved);
   const v = raw.claude_stow_dir;
   if (v === null || v === undefined) {
     return null;
   }
   if (typeof v !== "string" || !v.trim()) {
     throw new ConfigError(
-      `Expected claude_stow_dir to be a non-empty string in ${configPath}`,
+      `Expected claude_stow_dir to be a non-empty string in ${resolved}`,
     );
   }
   return resolvePath(expandUser(v.trim()));
@@ -220,26 +279,28 @@ export interface PluginSources {
  */
 export function loadPluginSources(
   configPath: string = pluginConfigPath(),
+  legacyPath: string = legacyAgentwrapConfigPath(configPath),
 ): PluginSources {
-  if (!isFile(configPath)) {
+  const resolved = resolveHarnessConfigPath(configPath, legacyPath);
+  if (!isFile(resolved)) {
     throw new ConfigError(
-      `Launcher plugin config missing at ${configPath}. ` +
+      `Launcher plugin config missing at ${resolved}. ` +
         "It ships via the `arthack` stow package — run scripts/install.sh " +
         "(or restore the file) before launching.",
     );
   }
-  const raw = readMapping(configPath);
+  const raw = readMapping(resolved);
 
   const paths = (key: string): string[] => {
     const values = raw[key] ?? [];
     if (!Array.isArray(values)) {
-      throw new ConfigError(`Expected ${key} to be a list in ${configPath}`);
+      throw new ConfigError(`Expected ${key} to be a list in ${resolved}`);
     }
     const out: string[] = [];
     for (const item of values) {
       if (typeof item !== "string" || !item.trim()) {
         throw new ConfigError(
-          `Expected non-empty string entries in ${key} of ${configPath}`,
+          `Expected non-empty string entries in ${key} of ${resolved}`,
         );
       }
       out.push(resolvePath(expandUser(item.trim())));
