@@ -19,7 +19,7 @@ import type { AgentKind } from "./dispatch";
 import { CODEX_OPTIONS_WITH_REQUIRED_VALUE } from "./passthrough";
 
 /** Normalize a CLI-visible profile alias onto internal routing. */
-export function normalizeAgentwrapProfileArg(profileName: string): string {
+export function normalizeKeeperAgentProfileArg(profileName: string): string {
   const normalized = profileName.trim();
   if (normalized === "default") {
     return "";
@@ -37,27 +37,27 @@ export interface ParsedArgs {
   /** Agent-native headless mode was seen. */
   hasPrint: boolean;
   /** `--x-verbose` seen — print one line per startup section. */
-  agentwrapVerbose: boolean;
+  launcherVerbose: boolean;
   /**
    * `--x-very-verbose` seen — section lines plus the full action log and
    * composed claude command. Implies `--x-verbose`.
    */
-  agentwrapVeryVerbose: boolean;
+  launcherVeryVerbose: boolean;
   /** `--x-no-confirm` seen — suppress the cwd-confirm prompt. */
-  agentwrapNoConfirm: boolean;
+  launcherNoConfirm: boolean;
   /** Resolved profile selector: `"auto"`, `""` (default account), or a name. */
-  agentwrapProfile: string;
+  launcherProfile: string;
   /** True when a profile was specified on the CLI (vs. defaulted to "auto"). */
-  explicitAgentwrapProfile: boolean;
+  explicitLauncherProfile: boolean;
   /** Synthetic Codex session name to index once the live session id is known. */
-  agentwrapCodexSessionName: string | null;
+  launcherCodexSessionName: string | null;
   /**
    * `--x-preset <name>` — a named launch-config preset resolved from
    * `presets.yaml` that supplies harness/model/effort defaults BELOW any
    * explicit flag or effort env. `null` when unset (no "auto"); the preset
    * never overrides an explicit `--model`/`--effort`.
    */
-  agentwrapPreset: string | null;
+  launcherPreset: string | null;
 }
 
 /**
@@ -84,55 +84,55 @@ export function parseArgsForAgent(
   let hasContinueOrResume = false;
   let hasForkSession = false;
   let hasPrint = false;
-  let agentwrapVerbose = false;
-  let agentwrapVeryVerbose = false;
-  let agentwrapNoConfirm = false;
-  let agentwrapProfile = "auto";
-  let agentwrapCodexSessionName: string | null = null;
-  let agentwrapPreset: string | null = null;
-  let explicitAgentwrapProfile = false;
-  let parsingAgentwrapProfile = false;
-  let parsingAgentwrapCodexSessionName = false;
-  let parsingAgentwrapPreset = false;
+  let launcherVerbose = false;
+  let launcherVeryVerbose = false;
+  let launcherNoConfirm = false;
+  let launcherProfile = "auto";
+  let launcherCodexSessionName: string | null = null;
+  let launcherPreset: string | null = null;
+  let explicitLauncherProfile = false;
+  let parsingLauncherProfile = false;
+  let parsingLauncherCodexSessionName = false;
+  let parsingLauncherPreset = false;
 
   for (const arg of args) {
-    if (parsingAgentwrapProfile) {
-      agentwrapProfile = arg;
-      explicitAgentwrapProfile = true;
-      parsingAgentwrapProfile = false;
+    if (parsingLauncherProfile) {
+      launcherProfile = arg;
+      explicitLauncherProfile = true;
+      parsingLauncherProfile = false;
       continue;
     }
-    if (parsingAgentwrapCodexSessionName) {
-      agentwrapCodexSessionName = arg.trim() || null;
-      parsingAgentwrapCodexSessionName = false;
+    if (parsingLauncherCodexSessionName) {
+      launcherCodexSessionName = arg.trim() || null;
+      parsingLauncherCodexSessionName = false;
       continue;
     }
-    if (parsingAgentwrapPreset) {
-      agentwrapPreset = arg.trim() || null;
-      parsingAgentwrapPreset = false;
+    if (parsingLauncherPreset) {
+      launcherPreset = arg.trim() || null;
+      parsingLauncherPreset = false;
       continue;
     }
     if (arg === "--x-verbose") {
-      agentwrapVerbose = true;
+      launcherVerbose = true;
     } else if (arg === "--x-very-verbose") {
-      agentwrapVeryVerbose = true;
+      launcherVeryVerbose = true;
     } else if (arg === "--x-no-confirm") {
-      agentwrapNoConfirm = true;
+      launcherNoConfirm = true;
     } else if (arg === "--x-profile") {
-      parsingAgentwrapProfile = true;
-      explicitAgentwrapProfile = true;
+      parsingLauncherProfile = true;
+      explicitLauncherProfile = true;
     } else if (arg.startsWith("--x-profile=")) {
-      agentwrapProfile = arg.slice("--x-profile=".length);
-      explicitAgentwrapProfile = true;
+      launcherProfile = arg.slice("--x-profile=".length);
+      explicitLauncherProfile = true;
     } else if (arg === "--x-codex-session-name") {
-      parsingAgentwrapCodexSessionName = true;
+      parsingLauncherCodexSessionName = true;
     } else if (arg.startsWith("--x-codex-session-name=")) {
-      agentwrapCodexSessionName =
+      launcherCodexSessionName =
         arg.slice("--x-codex-session-name=".length).trim() || null;
     } else if (arg === "--x-preset") {
-      parsingAgentwrapPreset = true;
+      parsingLauncherPreset = true;
     } else if (arg.startsWith("--x-preset=")) {
-      agentwrapPreset = arg.slice("--x-preset=".length).trim() || null;
+      launcherPreset = arg.slice("--x-preset=".length).trim() || null;
     } else {
       remainingArgs.push(arg);
       if (agent !== "codex" && isContinueOrResumeArg(arg, agent)) {
@@ -161,13 +161,13 @@ export function parseArgsForAgent(
     hasContinueOrResume,
     hasForkSession,
     hasPrint,
-    agentwrapVerbose,
-    agentwrapVeryVerbose,
-    agentwrapNoConfirm,
-    agentwrapProfile,
-    explicitAgentwrapProfile,
-    agentwrapCodexSessionName,
-    agentwrapPreset,
+    launcherVerbose,
+    launcherVeryVerbose,
+    launcherNoConfirm,
+    launcherProfile,
+    explicitLauncherProfile,
+    launcherCodexSessionName,
+    launcherPreset,
   };
 }
 

@@ -86,7 +86,7 @@ test("fails when a frozen trailer anchor is clobbered (renamed away)", () => {
   expect(stderr).toContain("CLOBBERED frozen literal in src/emit.ts");
 });
 
-test("fails when a frozen agentwrap survivor anchor is clobbered", () => {
+test("fails when a frozen keeper agent survivor anchor is clobbered", () => {
   // The fn-1018 sweep must not rename a frozen AGENTWRAP_* env-var name string;
   // the guard catches a clobber the same way it does a planctl trailer.
   put(

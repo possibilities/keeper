@@ -30,7 +30,7 @@ import {
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "agentwrap-state-"));
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-state-"));
 });
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });

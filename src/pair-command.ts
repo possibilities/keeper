@@ -1,28 +1,28 @@
 /**
  * Pure, dep-free plumbing for `keeper pair` — the pairing helper that fans a
- * task out to another model CLI (claude / codex) via agentwrap as the spawn
+ * task out to another model CLI (claude / codex) via keeper agent as the spawn
  * transport, driven from the orchestrating session's Monitor tool. Owns the
  * pairing ergonomics — role prompts, read-only posture, output normalization,
  * the Monitor two-line stdout contract — and delegates the tmux transport +
- * model/effort selection to agentwrap.
+ * model/effort selection to keeper agent.
  *
  * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module holds
- * the pure builders only — role loading, prompt assembly, the per-CLI agentwrap
+ * the pure builders only — role loading, prompt assembly, the per-CLI keeper agent
  * argv builders, the git changed-files diff, the env strip, and the output-YAML
  * assembly. It imports `js-yaml` (a serialization dep, not the DB graph) and
  * `node:fs`/`node:path`/`node:os` for asset reads; it MUST NOT pull `bun:sqlite`
  * or `./db`. The orchestration (subprocess compose, SIGTERM handler, atomic
  * write) lives in the thin `cli/pair.ts` entry.
  *
- * Compose flow keeper drives, mirroring the agentwrap subcommand contract
+ * Compose flow keeper drives, mirroring the keeper agent subcommand contract
  * (task .1):
- *   1. `agentwrap <cli> --x-tmux --x-tmux-detached
+ *   1. `keeper agent <cli> --x-tmux --x-tmux-detached
  *      --x-no-confirm <native flags> <prompt>` → one launch-JSON line
  *      carrying the `id` handle.
- *   2. `agentwrap wait-for-stop <id> --stop-timeout-ms <ms>` → blocks until the
+ *   2. `keeper agent wait-for-stop <id> --stop-timeout-ms <ms>` → blocks until the
  *      partner's next stop; the ms budget forwards keeper's `--timeout` so
- *      agentwrap's stop-wait honors it instead of its own 600s default.
- *   3. `agentwrap show-last-message <id>` → the partner's final assistant
+ *      keeper agent's stop-wait honors it instead of its own 600s default.
+ *   3. `keeper agent show-last-message <id>` → the partner's final assistant
  *      message on stdout + a JSON metadata line.
  */
 
@@ -37,7 +37,7 @@ import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
 // CLIs, roles, read-only directive
 // ---------------------------------------------------------------------------
 
-/** The partner CLIs `keeper pair` can fan out to — agentwrap's full agent-kind
+/** The partner CLIs `keeper pair` can fan out to — keeper agent's full agent-kind
  *  set. pi pairs read-only and read-write like claude/codex; its read-only
  *  posture is the directive + git backstop, reinforced by `--exclude-tools
  *  edit,write` (pi has no native sandbox of its own). */
@@ -147,7 +147,7 @@ export function assemblePrompt(args: {
 }
 
 // ---------------------------------------------------------------------------
-// agentwrap argv builders — per-CLI flag sets
+// keeper agent argv builders — per-CLI flag sets
 // ---------------------------------------------------------------------------
 
 /** Inputs to {@link buildPairLaunchArgv}. */
@@ -168,7 +168,7 @@ export interface PairLaunchOpts {
   effort?: string;
   /** Read-only posture: claude strips edit tools; codex keeps web search. */
   readOnly: boolean;
-  /** Target tmux session agentwrap mints/targets. Omitted = agentwrap default. */
+  /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
   session?: string;
   /** A named launch-config preset forwarded as `--x-preset <name>` so the
    *  launcher owns model/effort resolution — pair never re-derives them. Omitted
@@ -194,7 +194,7 @@ export interface PairLaunchOpts {
  * stealing focus, so the orchestrating session keeps control.
  *
  * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
- * CLAUDE path only (mirroring `buildAgentwrapLaunchArgv` in
+ * CLAUDE path only (mirroring `buildKeeperAgentLaunchArgv` in
  * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
  * the `jobs` projection as a tracked job — the launcher injects it into the pane
  * env via tmux `-e`, so the SessionStart hook stamps the session name as the
@@ -241,7 +241,7 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
 /**
  * Native claude flags for a one-turn pairing partner launched as an INTERACTIVE
  * TUI (not headless `--print`). The interactive shape is what registers the
- * partner as a tracked `jobs` row — agentwrap binds the pane via the
+ * partner as a tracked `jobs` row — keeper agent binds the pane via the
  * `KEEPER_TMUX_SESSION` env carrier {@link buildPairLaunchArgv} injects, and the
  * SessionStart hook stamps the birth session onto the row. The read-only posture
  * strips the edit tools via `--disallowed-tools` (the directive is the primary
@@ -370,13 +370,13 @@ export function buildShowLastMessageArgv(
 }
 
 // ---------------------------------------------------------------------------
-// agentwrap launch-JSON parsing (the handle contract)
+// keeper agent launch-JSON parsing (the handle contract)
 // ---------------------------------------------------------------------------
 
-/** The agentwrap tmux-launch JSON schema `keeper pair` consumes. A drift here
+/** The keeper agent tmux-launch JSON schema `keeper pair` consumes. A drift here
  *  fails loud (never a silent mismatch). Mirrors keeper's
- *  `AGENTWRAP_SCHEMA_VERSION` and agentwrap's `TMUX_SCHEMA_VERSION`. */
-export const PAIR_AGENTWRAP_SCHEMA_VERSION = 1;
+ *  `KEEPER_AGENT_SCHEMA_VERSION` and keeper agent's `TMUX_SCHEMA_VERSION`. */
+export const PAIR_KEEPER_AGENT_SCHEMA_VERSION = 1;
 
 /** The fields `keeper pair` reads off the launch JSON: the `id` handle (passed
  *  to wait/show) and the `paneId` (passed to tmux kill-window for reaping). */
@@ -391,7 +391,7 @@ export type ParseLaunchResult =
   | { ok: false; error: string };
 
 /**
- * Parse agentwrap's launch stdout DEFENSIVELY: scan line-by-line, take the first
+ * Parse keeper agent's launch stdout DEFENSIVELY: scan line-by-line, take the first
  * line that `JSON.parse`es to an object carrying a matching `schema_version`,
  * and pull the `id` handle + `paneId`. A schema drift, a missing `id`, or no
  * parseable line each fail loud. Pure — exported for tests.
@@ -418,17 +418,17 @@ export function parsePairLaunchJson(stdout: string): ParseLaunchResult {
       sawObjectWithoutSchema = true;
       continue;
     }
-    if (sv !== PAIR_AGENTWRAP_SCHEMA_VERSION) {
+    if (sv !== PAIR_KEEPER_AGENT_SCHEMA_VERSION) {
       return {
         ok: false,
-        error: `agentwrap launch JSON schema_version ${JSON.stringify(sv)} != ${PAIR_AGENTWRAP_SCHEMA_VERSION} (cross-repo contract drift)`,
+        error: `keeper agent launch JSON schema_version ${JSON.stringify(sv)} != ${PAIR_KEEPER_AGENT_SCHEMA_VERSION} (cross-repo contract drift)`,
       };
     }
     const id = obj.id;
     if (typeof id !== "string" || id === "") {
       return {
         ok: false,
-        error: "agentwrap launch JSON carried no run id handle",
+        error: "keeper agent launch JSON carried no run id handle",
       };
     }
     const paneId =
@@ -438,14 +438,14 @@ export function parsePairLaunchJson(stdout: string): ParseLaunchResult {
   return {
     ok: false,
     error: sawObjectWithoutSchema
-      ? "agentwrap launch JSON carried no schema_version field"
-      : "agentwrap emitted no parseable launch JSON line",
+      ? "keeper agent launch JSON carried no schema_version field"
+      : "keeper agent emitted no parseable launch JSON line",
   };
 }
 
 /**
- * Parse agentwrap's `show-last-message` stdout into the partner's final message
- * + drill-down keys. agentwrap prints the bare message text first, then a JSON
+ * Parse keeper agent's `show-last-message` stdout into the partner's final message
+ * + drill-down keys. keeper agent prints the bare message text first, then a JSON
  * metadata line (`{schema_version, agent, transcriptPath, found, message}`). We
  * read the message from the JSON `message` field (authoritative — it carries the
  * `null` empty-turn signal); `transcriptPath` is the drill-down pointer. Returns
@@ -482,7 +482,7 @@ export function parseShowLastMessageJson(stdout: string): ParseShowResult {
       continue;
     }
     const obj = parsed as Record<string, unknown>;
-    if (obj.schema_version !== PAIR_AGENTWRAP_SCHEMA_VERSION) {
+    if (obj.schema_version !== PAIR_KEEPER_AGENT_SCHEMA_VERSION) {
       continue;
     }
     if (!("found" in obj) && !("message" in obj)) {
@@ -498,7 +498,8 @@ export function parseShowLastMessageJson(stdout: string): ParseShowResult {
   if (last === null) {
     return {
       ok: false,
-      error: "agentwrap show-last-message emitted no parseable metadata line",
+      error:
+        "keeper agent show-last-message emitted no parseable metadata line",
     };
   }
   return { ok: true, result: last };
@@ -590,9 +591,9 @@ export interface PairOutputOpts {
   /** Files the tree showed as changed around the wait (read-only violation when
    *  non-empty and `readOnly`). */
   changedFiles: string[];
-  /** agentwrap transcript path drill-down pointer. */
+  /** keeper agent transcript path drill-down pointer. */
   transcriptPath: string | null;
-  /** agentwrap run id handle (the session drill-down key). */
+  /** keeper agent run id handle (the session drill-down key). */
   handle: string;
   /** Elapsed wall seconds. */
   elapsedSeconds?: number;
@@ -693,5 +694,5 @@ export function resolvePairKeeperAgentPath(
 
 /** Default tmux session for `keeper pair` partners when `--session` is absent.
  *  A stable named session (not a per-launch unique name) so partners are easy to
- *  find/attach; agentwrap's race-safe launch lets concurrent partners share it. */
+ *  find/attach; keeper agent's race-safe launch lets concurrent partners share it. */
 export const DEFAULT_PAIR_SESSION = "pair";

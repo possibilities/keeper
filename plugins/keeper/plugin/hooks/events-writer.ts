@@ -260,7 +260,7 @@ export interface BackendExecCoords {
  *    tmux session carries no `KEEPER_TMUX_SESSION`, so the session stays NULL
  *    and the snapshot poller fills it later.
  *  - native `TMUX` absent but the carrier `KEEPER_TMUX_PANE` present → the
- *    fallback arm stamps coord-identical tmux rows from the carrier. agentwrap
+ *    fallback arm stamps coord-identical tmux rows from the carrier. keeper agent
  *    strips `TMUX`/`TMUX_PANE` (so Claude emits truecolor) after copying the
  *    pane id into the carrier; this arm keeps window renaming alive across the
  *    strip. The carrier is a hint, not proof of a live pane: an empty/absent
@@ -293,7 +293,7 @@ export function backendExecCoordsFromEnv(
       paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
     };
   }
-  // Fallback arm: native `TMUX` is absent (agentwrap strips it so Claude emits
+  // Fallback arm: native `TMUX` is absent (keeper agent strips it so Claude emits
   // truecolor), but the keeper-owned carrier `KEEPER_TMUX_PANE` rides through
   // and holds the pane id. Stamp coord-identical tmux rows from it so window
   // renaming survives the strip. Same empty→NULL collapse the native arm uses,

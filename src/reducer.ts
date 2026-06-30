@@ -5083,7 +5083,7 @@ function foldHandoffDispatching(db: Database, event: Event): void {
 
 /**
  * `HandoffLaunchFailed` synthetic-event payload — a PERMANENT launch failure
- * (agentwrap exit 1/2/3, a thrown launch) the dispatcher surfaces. Distinct from
+ * (keeper agent exit 1/2/3, a thrown launch) the dispatcher surfaces. Distinct from
  * the never-bound breaker (which trips off `never_bound_count`). `reason` is the
  * surfaced launch error (carried for the operator view; the fold only needs the
  * id to flip status).

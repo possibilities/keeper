@@ -6,7 +6,7 @@
  *  - `inCooldown` — the failed-wake circuit-breaker window.
  *  - `pickCreatorJob` — the newest-creator pick over >1 edges.
  *  - `runWake` — resolve → liveness-skip → single-flight-skip → cooldown-skip →
- *    launch (the unified `agentwrapLaunch` resume transport, resume target carried
+ *    launch (the unified `keeperAgentLaunch` resume transport, resume target carried
  *    through the seam) → launch_failed bumps cooldown.
  */
 
@@ -302,7 +302,7 @@ test("runWake: launched resumes into agentbus via the resume seam, clears cooldo
   expect(res.outcome).toBe("launched");
   expect(res.sessionId).toBe("s1");
   // Launched into the dedicated agentbus session, carrying the RESUME TARGET
-  // (the creator's current name) and cwd — NOT a pre-wrapped argv. agentwrapLaunch
+  // (the creator's current name) and cwd — NOT a pre-wrapped argv. keeperAgentLaunch
   // builds the `--resume <target>` invocation and owns the window.
   expect(launchArgs).toEqual([
     { session: "agentbus", target: "planner", cwd: "/abs/repo" },

@@ -60,7 +60,7 @@ export const TMUX_EXIT = {
  * secondary count-cap keeps at most N most-recent dirs, deleting oldest-first
  * subject to the same liveness gate.
  *
- * Pid caveat: agentwrap exits immediately on a detached launch, so its OWN pid
+ * Pid caveat: the launcher exits immediately on a detached launch, so its OWN pid
  * dies at once — liveness is NOT keyed on it. run.json records the surviving
  * tmux pane's client pid when knowable; when it is not, the age-only fallback
  * with a generous TTL governs.
@@ -193,7 +193,7 @@ const ENV_KEY_RE = /^[A-Z_][A-Z0-9_]*$/;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control chars from injected values is the intent.
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/g;
 
-export function parseAgentwrapTmuxArgs(args: string[]): ParsedTmuxLaunch {
+export function parseKeeperAgentTmuxArgs(args: string[]): ParsedTmuxLaunch {
   const remainingArgs: string[] = [];
   const options: TmuxLaunchOptions = {
     session: null,
@@ -357,7 +357,7 @@ function addTmuxEnv(options: TmuxLaunchOptions, raw: string): string | null {
   return null;
 }
 
-export function defaultAgentwrapStateDir(env: NodeJS.ProcessEnv): string {
+export function defaultKeeperAgentStateDir(env: NodeJS.ProcessEnv): string {
   const xdgStateHome = (env.XDG_STATE_HOME ?? "").trim();
   if (xdgStateHome !== "") {
     return join(xdgStateHome, "agentwrap");
@@ -465,7 +465,7 @@ function bufferToString(value: unknown): string {
   return "";
 }
 
-export function launchAgentwrapInTmux(
+export function launchKeeperAgentInTmux(
   req: TmuxLaunchRequest,
 ): TmuxLaunchResult {
   const tmuxBase = buildTmuxBase(req.tmuxBin, req.options);
@@ -718,7 +718,7 @@ export function resolveTmuxBin(env: NodeJS.ProcessEnv): string {
  * (`resolveKeeperAgentPath`), since `process.argv[1]` under keeper is
  * `daemon.ts`/`cli/keeper.ts`, neither carrying the `agent` token.
  */
-export function resolveAgentwrapBin(
+export function resolveKeeperAgentBin(
   bin: string,
   invocationCwd: string,
 ): string {
@@ -764,7 +764,7 @@ function resolveSession(
     }
   }
 
-  return "agentwrap";
+  return "keeper-agent";
 }
 
 function runTmux(req: TmuxLaunchRequest, cmd: string[]): TmuxCommandResult {
@@ -1043,7 +1043,7 @@ function writeRunMetadata(
     agent: req.agent,
     cwd: req.cwd,
     transcriptSessionId: req.transcriptSessionId,
-    command: ["agentwrap", req.agent, ...req.innerArgs],
+    command: ["keeper", "agent", req.agent, ...req.innerArgs],
     tmux: {
       command: meta.tmuxBase,
       session: meta.session,
@@ -1095,7 +1095,7 @@ function startedMessage(
   tmuxBase: string[],
 ): string {
   return (
-    `Started agentwrap in tmux window ${windowId} (session ${session}).\n` +
+    `Started keeper agent in tmux window ${windowId} (session ${session}).\n` +
     `Attach with: ${formatCommand([...tmuxBase, "attach-session", "-t", session])}\n`
   );
 }

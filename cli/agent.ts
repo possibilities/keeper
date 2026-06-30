@@ -1,7 +1,6 @@
 /**
- * `keeper agent` — the folded agentwrap launcher. This is the in-binary launch
- * surface that supersedes the external `agentwrap` binary: `keeper agent
- * <claude|codex|pi> [args...]` launches a supported agent CLI with agentwrap
+ * `keeper agent` — the in-binary agent-launch surface: `keeper agent
+ * <claude|codex|pi> [args...]` launches a supported agent CLI with keeper agent
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
  * The blocking run-and-capture verbs compose those primitives into the uniform
@@ -18,8 +17,8 @@
  * preset/panel JSON. A preset supplies defaults BELOW any explicit
  * `--model`/`--effort` or effort env, so with no preset behavior is unchanged.
  *
- * Mirrors the thin `bin/agentwrap.ts` process boundary: build the production
- * deps and hand off to `main()`, whose subcommand-dispatch pre-pass
+ * The thin process boundary: build the production deps and hand off to
+ * `main()`, whose subcommand-dispatch pre-pass
  * (`src/agent/dispatch.ts` `splitSubcommand`) strips the leading agent token so
  * the composed agent argv stays byte-identical to what the bare launcher
  * produced. Policy lives in `src/agent/`; this file is the argv → main → exit

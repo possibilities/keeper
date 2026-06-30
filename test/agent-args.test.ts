@@ -8,62 +8,62 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  normalizeAgentwrapProfileArg,
+  normalizeKeeperAgentProfileArg,
   parseArgs,
   parseArgsForAgent,
 } from "../src/agent/args";
 
-describe("normalizeAgentwrapProfileArg", () => {
+describe("normalizeKeeperAgentProfileArg", () => {
   test("'default' maps to empty (native account)", () => {
-    expect(normalizeAgentwrapProfileArg("default")).toBe("");
+    expect(normalizeKeeperAgentProfileArg("default")).toBe("");
   });
   test("whitespace is trimmed", () => {
-    expect(normalizeAgentwrapProfileArg("  work  ")).toBe("work");
+    expect(normalizeKeeperAgentProfileArg("  work  ")).toBe("work");
   });
   test("a named profile passes through", () => {
-    expect(normalizeAgentwrapProfileArg("work")).toBe("work");
+    expect(normalizeKeeperAgentProfileArg("work")).toBe("work");
   });
 });
 
 describe("parseArgs", () => {
-  test("strips agentwrap flags, keeps the rest in order", () => {
+  test("strips keeper agent flags, keeps the rest in order", () => {
     const p = parseArgs(["--x-verbose", "--resume", "--x-no-confirm", "hello"]);
-    expect(p.agentwrapVerbose).toBe(true);
-    expect(p.agentwrapNoConfirm).toBe(true);
+    expect(p.launcherVerbose).toBe(true);
+    expect(p.launcherNoConfirm).toBe(true);
     expect(p.remainingArgs).toEqual(["--resume", "hello"]);
   });
 
   test("--x-very-verbose is a bare bool, stripped", () => {
     const p = parseArgs(["--x-very-verbose", "hi"]);
-    expect(p.agentwrapVeryVerbose).toBe(true);
-    expect(p.agentwrapVerbose).toBe(false);
+    expect(p.launcherVeryVerbose).toBe(true);
+    expect(p.launcherVerbose).toBe(false);
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
   test("verbose flags default to false", () => {
     const p = parseArgs(["hi"]);
-    expect(p.agentwrapVerbose).toBe(false);
-    expect(p.agentwrapVeryVerbose).toBe(false);
+    expect(p.launcherVerbose).toBe(false);
+    expect(p.launcherVeryVerbose).toBe(false);
   });
 
   test("--x-profile split form", () => {
     const p = parseArgs(["--x-profile", "work", "hi"]);
-    expect(p.agentwrapProfile).toBe("work");
-    expect(p.explicitAgentwrapProfile).toBe(true);
+    expect(p.launcherProfile).toBe("work");
+    expect(p.explicitLauncherProfile).toBe(true);
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
   test("--x-profile=joined form", () => {
     const p = parseArgs(["--x-profile=work", "hi"]);
-    expect(p.agentwrapProfile).toBe("work");
-    expect(p.explicitAgentwrapProfile).toBe(true);
+    expect(p.launcherProfile).toBe("work");
+    expect(p.explicitLauncherProfile).toBe(true);
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
   test("default profile is 'auto' when unset", () => {
     const p = parseArgs(["hi"]);
-    expect(p.agentwrapProfile).toBe("auto");
-    expect(p.explicitAgentwrapProfile).toBe(false);
+    expect(p.launcherProfile).toBe("auto");
+    expect(p.explicitLauncherProfile).toBe(false);
   });
 
   test("--continue / -c / -r / --resume set continuation", () => {
@@ -98,24 +98,24 @@ describe("parseArgs", () => {
     // The token after a bare --x-profile is the value even if flag-shaped
     // is NOT special-cased — the very next token is consumed verbatim.
     const p = parseArgs(["--x-profile", "work"]);
-    expect(p.agentwrapProfile).toBe("work");
+    expect(p.launcherProfile).toBe("work");
     expect(p.remainingArgs).toEqual([]);
   });
 
   test("--x-preset split form is consumed and stripped", () => {
     const p = parseArgs(["--x-preset", "claude-opus-xhigh", "hi"]);
-    expect(p.agentwrapPreset).toBe("claude-opus-xhigh");
+    expect(p.launcherPreset).toBe("claude-opus-xhigh");
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
   test("--x-preset=joined form is consumed and stripped", () => {
     const p = parseArgs(["--x-preset=codex-gpt55-high", "hi"]);
-    expect(p.agentwrapPreset).toBe("codex-gpt55-high");
+    expect(p.launcherPreset).toBe("codex-gpt55-high");
     expect(p.remainingArgs).toEqual(["hi"]);
   });
 
   test("--x-preset defaults to null (no auto)", () => {
-    expect(parseArgs(["hi"]).agentwrapPreset).toBeNull();
+    expect(parseArgs(["hi"]).launcherPreset).toBeNull();
   });
 
   test("--x-help is dispatch-owned, not a parser-consumed flag", () => {
@@ -123,8 +123,8 @@ describe("parseArgs", () => {
     // parser sets no launch-mode signal for it and treats it like any unknown
     // token (forwarded verbatim), so it can never silently rewrite the argv.
     const p = parseArgs(["--x-help"]);
-    expect(p.agentwrapVerbose).toBe(false);
-    expect(p.agentwrapNoConfirm).toBe(false);
+    expect(p.launcherVerbose).toBe(false);
+    expect(p.launcherNoConfirm).toBe(false);
     expect(p.remainingArgs).toEqual(["--x-help"]);
   });
 });
@@ -141,10 +141,10 @@ describe("parseArgs retired --arthack-* flags fall through", () => {
       "hello",
     ]);
     // None of the launch-mode signals fired — the launcher ignores these.
-    expect(p.agentwrapVerbose).toBe(false);
-    expect(p.agentwrapNoConfirm).toBe(false);
-    expect(p.explicitAgentwrapProfile).toBe(false);
-    expect(p.agentwrapProfile).toBe("auto");
+    expect(p.launcherVerbose).toBe(false);
+    expect(p.launcherNoConfirm).toBe(false);
+    expect(p.explicitLauncherProfile).toBe(false);
+    expect(p.launcherProfile).toBe("auto");
     // Every token (flag + would-be value) lands in the claude argv unchanged.
     expect(p.remainingArgs).toEqual([
       "--arthack-verbose",

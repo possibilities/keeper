@@ -2392,8 +2392,8 @@ test("confirmRunning BAD: launch returns {ok:false} → failed immediately with 
   expect(log.findJobCalls.length).toBe(0);
 });
 
-test("confirmRunning TRANSIENT (agentwrap): launch {ok:false, retryable:true} → indoubt, NO DispatchFailed, pending row kept", async () => {
-  // The agentwrap exit-4 / timeout-kill / bad-path class. A transient launch
+test("confirmRunning TRANSIENT (keeper agent): launch {ok:false, retryable:true} → indoubt, NO DispatchFailed, pending row kept", async () => {
+  // The keeper agent exit-4 / timeout-kill / bad-path class. A transient launch
   // fail must NOT mint a sticky DispatchFailed (that writes off a recoverable
   // launch) and must NOT route as "failed" (which would clear the cooldown +
   // never feed the TTL→DispatchExpired→never-bound machinery). It routes EXACTLY
@@ -2401,7 +2401,7 @@ test("confirmRunning TRANSIENT (agentwrap): launch {ok:false, retryable:true} �
   const { deps, log } = makeFakeDeps({
     launch: async () => ({
       ok: false,
-      error: "agentwrap launch transient (exit 4 RETRYABLE)",
+      error: "keeper agent launch transient (exit 4 RETRYABLE)",
       retryable: true,
     }),
   });

@@ -38,7 +38,7 @@ function writeConfig(yaml: string): void {
 }
 
 test("a stale exec_backend: key boots clean (silently ignored, no field)", () => {
-  // The `exec_backend` toggle is retired — agentwrap is keeper's sole, direct
+  // The `exec_backend` toggle is retired — keeper agent is keeper's sole, direct
   // launch transport. A stale key in a live config must parse cleanly into the
   // existing silent-ignore path: every kept key still resolves, and there is no
   // `execBackend` field on the result.

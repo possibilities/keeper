@@ -22,7 +22,7 @@
  *     prompt launches as `<prefix> <prompt>` (unless `--no-prefix`); plan form
  *     is never prefixed.
  *
- * Launch is purely CLIENT-SIDE via a direct `agentwrapLaunch(...)` (keeper's
+ * Launch is purely CLIENT-SIDE via a direct `keeperAgentLaunch(...)` (keeper's
  * sole launch transport) — no daemon RPC, no synthetic event, no
  * reducer/migration touch — so re-fold determinism and the five-surface
  * RPC-write invariant hold by construction.
@@ -61,7 +61,7 @@ import {
   validatePromptBytes,
 } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
-import { agentwrapLaunch } from "../src/exec-backend";
+import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
@@ -80,10 +80,10 @@ export type QueryFn = (
 /**
  * The launch seam. Injected into {@link main} so a launch-path test runs against
  * a fake launch (asserting the success / `result.ok === false` branches) without
- * spawning a real tmux window. Defaults to a direct {@link agentwrapLaunch} into
+ * spawning a real tmux window. Defaults to a direct {@link keeperAgentLaunch} into
  * the resolved session.
  *
- * agentwrap is the sole launch transport: it builds its invocation from `spec`
+ * keeper agent is the sole launch transport: it builds its invocation from `spec`
  * (the structured prompt + claude flags) and owns the tmux window, IGNORING the
  * pre-wrapped `argv`. `argv`/`name` are retained at the seam so the dry-run line
  * keeps printing the shell-wrapped argv shape; the launch impl reads `spec`.
@@ -102,7 +102,7 @@ export interface MainDeps {
   /** The collection-read transport. Defaults to a real `queryCollection`
    *  against the resolved socket. */
   readonly query?: QueryFn;
-  /** The launch transport. Defaults to a direct `agentwrapLaunch(...)`. */
+  /** The launch transport. Defaults to a direct `keeperAgentLaunch(...)`. */
   readonly launch?: LaunchFn;
   /** The configured global prompt prefix for FREE-FORM dispatches. Defaults to
    *  `resolveConfig().dispatchPromptPrefix`. Injected so tests drive the
@@ -446,7 +446,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   const launch: LaunchFn =
     deps.launch ??
     ((session, _argv, cwd, name, spec) =>
-      agentwrapLaunch({
+      keeperAgentLaunch({
         noteLine: (line: string) => process.stderr.write(`${line}\n`),
         launcherArgvPrefix,
         session,
@@ -562,7 +562,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     process.exit(0);
   }
 
-  // Structured spec agentwrap builds its unwrapped invocation from (it ignores
+  // Structured spec keeper agent builds its unwrapped invocation from (it ignores
   // the pre-wrapped `launchArgv`). Mirrors the flags already baked into
   // `launchArgv` — that parity keeps the dry-run argv line honest.
   const spec: LaunchSpec = {

@@ -44,7 +44,7 @@ export interface Harness {
   out: string[];
   /** stderr sink. */
   err: string[];
-  /** Profile names ensureAgentwrapProfileDirFn was called with, in order. */
+  /** Profile names ensureKeeperAgentProfileDirFn was called with, in order. */
   bootstrappedProfiles: string[];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
@@ -71,7 +71,7 @@ export interface HarnessOptions {
   piBin?: string;
   pickProfile?: () => string;
   listProfiles?: () => string[];
-  /** Profile dir ensureAgentwrapProfileDirFn returns (default deterministic). */
+  /** Profile dir ensureKeeperAgentProfileDirFn returns (default deterministic). */
   profileDir?: string;
   launcherModel?: string | null;
   launcherEffort?: string | null;
@@ -93,7 +93,7 @@ export interface HarnessOptions {
   now?: () => number;
   tmuxBin?: string;
   launcherArgvPrefix?: string[];
-  agentwrapStateDir?: string;
+  launcherStateDir?: string;
   transcriptHomeDir?: string;
   tmuxCommand?: (cmd: string[]) => TmuxCommandResult;
 }
@@ -147,7 +147,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     claudeBin: homeBin,
     codexBin,
     piBin,
-    pluginConfigPath: "/fake-home/.config/agentwrap/plugins.yaml",
+    pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
     loadLauncherDefaultsFn: () => ({
       model: opts.launcherModel ?? null,
       effort: opts.launcherEffort ?? null,
@@ -166,12 +166,12 @@ export function makeHarness(opts: HarnessOptions): Harness {
     loadPanelSelectionsFn: () =>
       opts.panelSelections ?? { panels: {}, default: null },
     ensureClaudeStateSharingFn: () => {},
-    ensureAgentwrapProfileDirFn: (profileName: string) => {
+    ensureKeeperAgentProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
     },
     ensurePiStateSharingFn: () => {},
-    ensureAgentwrapPiProfileDirFn: (profileName: string) => {
+    ensureKeeperAgentPiProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
     },
@@ -186,7 +186,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
       "/fake-home/code/keeper/cli/keeper.ts",
       "agent",
     ],
-    agentwrapStateDir: opts.agentwrapStateDir ?? "/tmp/agentwrap-test-state",
+    launcherStateDir: opts.launcherStateDir ?? "/tmp/keeper-agent-test-state",
     transcriptHomeDir: opts.transcriptHomeDir ?? "/fake-home",
     runTmuxCommandFn: (cmd: string[]): TmuxCommandResult => {
       tmuxCommands.push(cmd);

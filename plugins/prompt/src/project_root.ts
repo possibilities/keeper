@@ -3,7 +3,7 @@
 // resolves it the way the Python promptctl did — walk up from cwd to the nearest
 // `.git` root, falling back to `~/code/arthack` when cwd is not inside a repo.
 //
-// The fallback mirrors the claudectl AGENTWRAP default home: an agent running a
+// The fallback mirrors the claudectl default home: an agent running a
 // `keeper prompt render` from any worktree still finds the corpus.
 
 import { existsSync } from "node:fs";

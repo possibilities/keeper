@@ -69,8 +69,8 @@ import {
 } from "./db";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
-  agentwrapLaunch,
   createTmuxPaneOps,
+  keeperAgentLaunch,
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
   type PaneInfo,
@@ -369,10 +369,10 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
 
 /**
  * Build the structured {@link LaunchSpec} for a planned launch — the unwrapped
- * inputs {@link agentwrapLaunch} builds its invocation from. Mirrors
+ * inputs {@link keeperAgentLaunch} builds its invocation from. Mirrors
  * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/
  * prompt) — that parity is a drift guard kept alongside the shell-wrapped
- * `buildLaunchArgv` shape even though agentwrap reads only this spec. A
+ * `buildLaunchArgv` shape even though keeper agent reads only this spec. A
  * non-empty `worktreePath` rides the spec as the `KEEPER_PLAN_WORKTREE` lane
  * env (worktree-mode launches only); absent/empty leaves it off so non-worktree
  * launches stay byte-identical. A non-empty `worktreeBranch` rides as the
@@ -913,7 +913,7 @@ export interface ReconcileDecision {
  * — no real worker spawn).
  */
 export interface ConfirmRunningDeps {
-  /** Spawn the worker in a managed window keyed by `name`. agentwrap is the sole
+  /** Spawn the worker in a managed window keyed by `name`. keeper agent is the sole
    *  launch transport: it builds its invocation from `spec` (the unwrapped
    *  structured launch) and owns the tmux window, IGNORING the pre-wrapped
    *  `argv`. `name` feeds the warn/log lines and is the autopilot dedup key only.
@@ -1165,7 +1165,7 @@ export interface WorktreeRecoveryFailure {
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
- *  failure routes a TRANSIENT launch fail (agentwrap exit 4 / timeout-kill /
+ *  failure routes a TRANSIENT launch fail (keeper agent exit 4 / timeout-kill /
  *  bad-path) to `"indoubt"` (keep the pending row → TTL→`DispatchExpired`
  *  re-dispatch) instead of a sticky `"failed"` — kept byte-identical to
  *  `exec-backend.ts`'s `LaunchResult`. */
@@ -2636,7 +2636,7 @@ export async function confirmRunning(
     return "aborted-prelaunch";
   }
   // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`. `spec` is the
-  // structured input agentwrap (keeper's sole launch transport) builds its
+  // structured input keeper agent (keeper's sole launch transport) builds its
   // invocation from; the pre-wrapped `argv` is ignored by the launch impl.
   const launchResult: LaunchResult = await deps
     .launch(argv, key, cwd, spec)
@@ -2647,7 +2647,7 @@ export async function confirmRunning(
     }));
   if (launchResult.ok === false) {
     if (launchResult.retryable === true) {
-      // TRANSIENT launch fail (agentwrap exit 4 / timeout-kill / bad-path). Do
+      // TRANSIENT launch fail (keeper agent exit 4 / timeout-kill / bad-path). Do
       // NOT mint a sticky `DispatchFailed` — KEEP the `pending_dispatches` row
       // so the TTL sweep mints `DispatchExpired` and the normal expire path
       // re-dispatches. This routes EXACTLY like the ceiling `"indoubt"` outcome:
@@ -2656,7 +2656,7 @@ export async function confirmRunning(
       deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: 0 });
       return "indoubt";
     }
-    // PERMANENT launch fail (agentwrap exit 3/1/2, a tmux backend failure, or a
+    // PERMANENT launch fail (keeper agent exit 3/1/2, a tmux backend failure, or a
     // thrown launch): a sticky `DispatchFailed`, cleared only by a human
     // `retry_dispatch`. Must NOT feed the never-bound counter as a transient
     // would.
@@ -2854,7 +2854,7 @@ export async function runReconcileCycle(
       state.finalizerGuard.set(plan.id, deps.now());
     }
     // Rebuild the shell command body when worktree mode re-pointed the cwd, so the
-    // drift-guarded `cd <path>` prefix matches the actual launch cwd. (agentwrap
+    // drift-guarded `cd <path>` prefix matches the actual launch cwd. (keeper agent
     // reads `spec` + the `cwd` arg, not this string — but keeping them consistent
     // preserves the parity the builders intend.)
     const workerCommand =
@@ -4765,7 +4765,7 @@ function main(): void {
     // `argv` is ignored — the launcher builds its invocation from the structured
     // `spec` and owns the tmux window; `name` is the warn/log label + dedup key.
     launch: (_argv, name, cwd, spec) =>
-      agentwrapLaunch({
+      keeperAgentLaunch({
         noteLine,
         launcherArgvPrefix,
         session: MANAGED_EXEC_SESSION,

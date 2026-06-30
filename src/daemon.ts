@@ -2151,7 +2151,7 @@ export interface DaemonHandle {
 }
 
 /** Minimal `Bun.spawnSync`-shaped result the keeper-agent boot self-check reads. */
-export interface AgentwrapProbeResult {
+export interface KeeperAgentProbeResult {
   readonly success: boolean;
   readonly exitCode: number;
 }
@@ -2159,7 +2159,7 @@ export interface AgentwrapProbeResult {
 /** Injectable `Bun.spawnSync`-shaped probe for {@link checkKeeperAgentPresence};
  *  takes the full launcher argv (`[<bun>, <keeper.ts>, "agent", "--version"]`); a
  *  throw models an unlaunchable launcher (ENOENT bun / missing keeper.ts). */
-export type AgentwrapProbeFn = (argv: string[]) => AgentwrapProbeResult;
+export type KeeperAgentProbeFn = (argv: string[]) => KeeperAgentProbeResult;
 
 /**
  * Fail-fast keeper-agent launcher SELF-check, run at boot ONLY where launch is
@@ -2183,12 +2183,12 @@ export type AgentwrapProbeFn = (argv: string[]) => AgentwrapProbeResult;
 export function checkKeeperAgentPresence(
   launcherArgvPrefix: string[],
   deps: {
-    spawn?: AgentwrapProbeFn;
+    spawn?: KeeperAgentProbeFn;
     log?: (msg: string) => void;
   } = {},
 ): boolean {
   const log = deps.log ?? ((msg: string) => console.error(msg));
-  const probe: AgentwrapProbeFn =
+  const probe: KeeperAgentProbeFn =
     deps.spawn ??
     ((argv: string[]) => {
       const res = Bun.spawnSync(argv, {
@@ -4296,7 +4296,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // The autopilot reconciler worker runs the level-triggered dispatch loop
   // server-side: data_version wake → desired-vs-observed verdict → launch via
-  // agentwrap → confirm → mint on ceiling (bridged through main). The pure
+  // keeper agent → confirm → mint on ceiling (bridged through main). The pure
   // decision logic lives in `src/autopilot-worker.ts`; this spawn is the glue.
   // Boots from the `paused: autopilotPaused` workerData — `autopilotPaused` was
   // seeded from the durable `autopilot_state.paused` column after the boot drain,
@@ -4404,7 +4404,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // double-dispatch guard). Gated on the selector — `null` when unselected. The
   // worker reads keeper.db read-only; every mutation round-trips through main as
   // a synthetic `HandoffDispatching` / `HandoffLaunchFailed` event. `cwd` is
-  // keeperd's own cwd (a handoff-ee carries no plan ref; agentwrap reads its own
+  // keeperd's own cwd (a handoff-ee carries no plan ref; keeper agent reads its own
   // process.cwd for the launch-script `cd`).
   const handoffWorkerInstance = want("handoff")
     ? new Worker(new URL("./handoff-worker.ts", import.meta.url).href, {
@@ -4531,7 +4531,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   /**
    * Mint a synthetic `HandoffLaunchFailed` event (flips the `handoffs` row to
    * terminal `failed`) AND write a `dead_letters` row — a PERMANENT launch
-   * failure (agentwrap exit 1/2/3 / a thrown launch). The dead-letter is a
+   * failure (keeper agent exit 1/2/3 / a thrown launch). The dead-letter is a
    * DIRECT operational-table write (NOT an event fold), mirroring
    * {@link scanDeadLetterDir}'s INSERT shape, keyed on a fresh `dl_id`. NON-FATAL
    * on either write — the row stays `dispatching` and the never-bound breaker

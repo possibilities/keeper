@@ -21,7 +21,7 @@ import {
 } from "../keeper-agent-path";
 import { buildPairLaunchArgv } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
-import { normalizeAgentwrapProfileArg, parseArgsForAgent } from "./args";
+import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
   type CodexSessionNameIndexerOptions,
   startCodexSessionNameIndexer,
@@ -49,9 +49,9 @@ import {
 import { checkCwdInProjectRoot } from "./cwd-confirm";
 import { nextCwdOrdinal } from "./cwd-ordinal";
 import {
-  AGENTWRAP_HELP,
   type AgentKind,
-  hasAgentwrapHelpFlag,
+  hasKeeperAgentHelpFlag,
+  KEEPER_AGENT_HELP,
   type SubcommandKind,
   splitSubcommand,
   USAGE,
@@ -98,17 +98,17 @@ import {
   type ShadowProfileFinding,
 } from "./shadow-profiles";
 import {
-  ensureAgentwrapPiProfileDir,
-  ensureAgentwrapProfileDir,
   ensureClaudeStateSharing,
+  ensureKeeperAgentPiProfileDir,
+  ensureKeeperAgentProfileDir,
   ensurePiStateSharing,
   StateError,
 } from "./state-sharing";
 import {
-  defaultAgentwrapStateDir,
+  defaultKeeperAgentStateDir,
   defaultTmuxCommandRunner,
-  launchAgentwrapInTmux,
-  parseAgentwrapTmuxArgs,
+  launchKeeperAgentInTmux,
+  parseKeeperAgentTmuxArgs,
   resolveTmuxBin,
   TMUX_EXIT,
   type TmuxCommandRunner,
@@ -161,7 +161,7 @@ export interface MainDeps {
     actionLog: string[],
     claudeStowDir: string | null,
   ) => void;
-  ensureAgentwrapProfileDirFn: (
+  ensureKeeperAgentProfileDirFn: (
     profileName: string,
     trustPaths: string[] | null,
     actionLog: string[] | null,
@@ -170,7 +170,7 @@ export interface MainDeps {
     listProfilesFn: () => string[],
     actionLog: string[],
   ) => void;
-  ensureAgentwrapPiProfileDirFn: (
+  ensureKeeperAgentPiProfileDirFn: (
     profileName: string,
     actionLog: string[] | null,
   ) => [string, boolean];
@@ -191,7 +191,7 @@ export interface MainDeps {
    * daemon dependency), NOT from `process.argv[1]`.
    */
   launcherArgvPrefix: string[];
-  agentwrapStateDir: string;
+  launcherStateDir: string;
   transcriptHomeDir: string;
   runTmuxCommandFn: TmuxCommandRunner;
 }
@@ -230,11 +230,11 @@ export function realDeps(): MainDeps {
         homedir(),
         claudeStowDir,
       ),
-    ensureAgentwrapProfileDirFn: ensureAgentwrapProfileDir,
+    ensureKeeperAgentProfileDirFn: ensureKeeperAgentProfileDir,
     ensurePiStateSharingFn: (listProfilesFn, actionLog) =>
       ensurePiStateSharing(listProfilesFn, actionLog, homedir()),
-    ensureAgentwrapPiProfileDirFn: (profileName, actionLog) =>
-      ensureAgentwrapPiProfileDir(profileName, actionLog, homedir()),
+    ensureKeeperAgentPiProfileDirFn: (profileName, actionLog) =>
+      ensureKeeperAgentPiProfileDir(profileName, actionLog, homedir()),
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
@@ -243,7 +243,7 @@ export function realDeps(): MainDeps {
       process.execPath,
       resolveKeeperAgentPathDepFree(),
     ),
-    agentwrapStateDir: defaultAgentwrapStateDir(process.env),
+    launcherStateDir: defaultKeeperAgentStateDir(process.env),
     transcriptHomeDir: homedir(),
     runTmuxCommandFn: defaultTmuxCommandRunner,
   };
@@ -643,10 +643,10 @@ async function runTranscriptSubcommand(
   const resolution = resolveHandle({
     rest,
     cwd: deps.cwd,
-    stateDir: deps.agentwrapStateDir,
+    stateDir: deps.launcherStateDir,
   });
   if (!resolution.ok) {
-    deps.writeErr(`agentwrap: ${resolution.error}\n`);
+    deps.writeErr(`keeper agent: ${resolution.error}\n`);
     deps.write(tmuxErrorJson(TMUX_EXIT.BAD_ARGS, resolution.error));
     return deps.exit(TMUX_EXIT.BAD_ARGS);
   }
@@ -739,7 +739,7 @@ function firstHandleToken(rest: string[]): string | null {
 /**
  * The `agent run` launch seam: assemble the per-CLI detached launch argv (reusing
  * the pair builder for the native posture flags), strip the prefix + cli token,
- * and drive `launchAgentwrapInTmux` DIRECTLY — no subprocess re-exec. The pinned
+ * and drive `launchKeeperAgentInTmux` DIRECTLY — no subprocess re-exec. The pinned
  * handle returned here is held LOCALLY by the compose (no run.json re-resolution,
  * no cross-process kill margin, no self-transcript-collision exposure). A
  * parse/launch failure maps to `launch_failed`; diagnostics go to stderr.
@@ -756,7 +756,7 @@ function launchForRunCapture(
     prompt,
     readOnly: false,
   });
-  const tmuxLaunch = parseAgentwrapTmuxArgs(launchArgv.slice(1));
+  const tmuxLaunch = parseKeeperAgentTmuxArgs(launchArgv.slice(1));
   if (tmuxLaunch.error !== null) {
     deps.writeErr(`agent: ${tmuxLaunch.error}\n`);
     return { ok: false, error: tmuxLaunch.error };
@@ -768,7 +768,7 @@ function launchForRunCapture(
     deps.randomUuid,
   );
   try {
-    const result = launchAgentwrapInTmux({
+    const result = launchKeeperAgentInTmux({
       agent,
       innerArgs: tmuxLaunch.remainingArgs,
       options: tmuxLaunch.options,
@@ -776,7 +776,7 @@ function launchForRunCapture(
       cwd: deps.cwd,
       transcriptSessionId,
       startedAtMs,
-      stateDir: deps.agentwrapStateDir,
+      stateDir: deps.launcherStateDir,
       tmuxBin: deps.tmuxBin,
       launcherArgvPrefix: deps.launcherArgvPrefix,
       randomUuid: deps.randomUuid,
@@ -844,7 +844,7 @@ async function runWaitCaptureSubcommand(
   const resolution = resolveHandle({
     rest,
     cwd: deps.cwd,
-    stateDir: deps.agentwrapStateDir,
+    stateDir: deps.launcherStateDir,
   });
   if (!resolution.ok) {
     deps.writeErr(`agent: ${resolution.error}\n`);
@@ -1194,7 +1194,7 @@ export async function main(deps: MainDeps): Promise<never> {
     return deps.exit(0);
   }
   if (dispatch.kind === "help-wrapper") {
-    deps.write(AGENTWRAP_HELP);
+    deps.write(KEEPER_AGENT_HELP);
     return deps.exit(0);
   }
   if (dispatch.kind === "version") {
@@ -1203,7 +1203,7 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "usage") {
     if (dispatch.unknown !== undefined) {
-      deps.writeErr(`agentwrap: unknown subcommand '${dispatch.unknown}'\n`);
+      deps.writeErr(`keeper agent: unknown subcommand '${dispatch.unknown}'\n`);
     }
     deps.writeErr(USAGE);
     return deps.exit(2);
@@ -1262,17 +1262,17 @@ export async function main(deps: MainDeps): Promise<never> {
   const agentLabel = displayAgent(agent);
 
   // Wrapper-owned help short-circuits before the tmux pre-pass, passthrough
-  // detection, and launch — `agentwrap <agent> --x-help` prints the
+  // detection, and launch — `keeper agent <agent> --x-help` prints the
   // overlay help and exits without reaching the native agent. Native `--help`
   // carries no `--x-help` token, so it still passes through unchanged.
-  if (hasAgentwrapHelpFlag(argv)) {
-    deps.write(AGENTWRAP_HELP);
+  if (hasKeeperAgentHelpFlag(argv)) {
+    deps.write(KEEPER_AGENT_HELP);
     return deps.exit(0);
   }
 
-  const tmuxLaunch = parseAgentwrapTmuxArgs(argv);
+  const tmuxLaunch = parseKeeperAgentTmuxArgs(argv);
   if (tmuxLaunch.error !== null) {
-    deps.writeErr(`agentwrap: ${tmuxLaunch.error}\n`);
+    deps.writeErr(`keeper agent: ${tmuxLaunch.error}\n`);
     deps.write(tmuxErrorJson(TMUX_EXIT.BAD_ARGS, tmuxLaunch.error));
     return deps.exit(TMUX_EXIT.BAD_ARGS);
   }
@@ -1284,7 +1284,7 @@ export async function main(deps: MainDeps): Promise<never> {
         tmuxLaunch.remainingArgs,
         deps.randomUuid,
       );
-      const result = launchAgentwrapInTmux({
+      const result = launchKeeperAgentInTmux({
         agent,
         innerArgs: tmuxLaunch.remainingArgs,
         options: tmuxLaunch.options,
@@ -1292,7 +1292,7 @@ export async function main(deps: MainDeps): Promise<never> {
         cwd: deps.cwd,
         transcriptSessionId,
         startedAtMs,
-        stateDir: deps.agentwrapStateDir,
+        stateDir: deps.launcherStateDir,
         tmuxBin: deps.tmuxBin,
         launcherArgvPrefix: deps.launcherArgvPrefix,
         randomUuid: deps.randomUuid,
@@ -1334,16 +1334,16 @@ export async function main(deps: MainDeps): Promise<never> {
   const parsed = parseArgsForAgent(argv, agent);
   const { remainingArgs, hasContinueOrResume, hasForkSession, hasPrint } =
     parsed;
-  const { agentwrapVerbose, agentwrapVeryVerbose, agentwrapNoConfirm } = parsed;
-  const { agentwrapCodexSessionName } = parsed;
-  let { agentwrapProfile, explicitAgentwrapProfile } = parsed;
+  const { launcherVerbose, launcherVeryVerbose, launcherNoConfirm } = parsed;
+  const { launcherCodexSessionName } = parsed;
+  let { launcherProfile, explicitLauncherProfile } = parsed;
 
   // Named preset resolution: the `--x-preset` flag (or the harnessless
-  // head, already mirrored onto parsed.agentwrapPreset). Resolve it once here so
+  // head, already mirrored onto parsed.launcherPreset). Resolve it once here so
   // its model/effort/thinking can layer into the resolver default slots BELOW
   // the explicit-flag / effort-env precedence. A head agent disagreeing with the
   // preset's harness is fail-loud — never silently re-route the launch.
-  const presetName = parsed.agentwrapPreset ?? dispatchPresetName;
+  const presetName = parsed.launcherPreset ?? dispatchPresetName;
   let resolvedPreset: Preset | null = null;
   if (presetName !== null) {
     try {
@@ -1373,36 +1373,36 @@ export async function main(deps: MainDeps): Promise<never> {
   if (hasPrint) {
     actionLog.push(`Detected ${agentLabel} headless mode`);
   }
-  if (agentwrapNoConfirm) {
+  if (launcherNoConfirm) {
     actionLog.push("Parsed --x-no-confirm: cwd confirmation suppressed");
   }
-  if (agentwrapCodexSessionName !== null) {
+  if (launcherCodexSessionName !== null) {
     actionLog.push(
-      `Parsed --x-codex-session-name: ${agentwrapCodexSessionName}`,
+      `Parsed --x-codex-session-name: ${launcherCodexSessionName}`,
     );
   }
 
-  if (!explicitAgentwrapProfile) {
+  if (!explicitLauncherProfile) {
     const envProfile = (deps.env.AGENTWRAP_PROFILE ?? "").trim();
     if (envProfile && envProfile !== "auto") {
-      agentwrapProfile = envProfile;
-      explicitAgentwrapProfile = true;
+      launcherProfile = envProfile;
+      explicitLauncherProfile = true;
       actionLog.push(
         `Forced profile from AGENTWRAP_PROFILE env: ${envProfile}`,
       );
     }
   }
 
-  if (explicitAgentwrapProfile && agentwrapProfile) {
-    actionLog.push(`Parsed --x-profile: ${agentwrapProfile}`);
-    if (agentwrapProfile !== "auto") {
-      const normalized = normalizeAgentwrapProfileArg(agentwrapProfile);
-      if (normalized !== agentwrapProfile) {
+  if (explicitLauncherProfile && launcherProfile) {
+    actionLog.push(`Parsed --x-profile: ${launcherProfile}`);
+    if (launcherProfile !== "auto") {
+      const normalized = normalizeKeeperAgentProfileArg(launcherProfile);
+      if (normalized !== launcherProfile) {
         actionLog.push(
           `Normalized --x-profile default to native ${agentLabel} account`,
         );
       }
-      agentwrapProfile = normalized;
+      launcherProfile = normalized;
     }
   }
 
@@ -1427,10 +1427,10 @@ export async function main(deps: MainDeps): Promise<never> {
   // (--x-very-verbose, which implies level 1) adds per-phase timing plus
   // the full action log and composed command. --print/passthrough force clean
   // stdout, so section lines never appear there regardless of level.
-  const verbose = agentwrapVerbose || agentwrapVeryVerbose;
+  const verbose = launcherVerbose || launcherVeryVerbose;
   const chattyQuiet = hasPrint || shouldPassthrough;
   const sectionsOn = verbose && !chattyQuiet;
-  const phase = makePhaser(!sectionsOn, deps.write, agentwrapVeryVerbose);
+  const phase = makePhaser(!sectionsOn, deps.write, launcherVeryVerbose);
   const note = (msg: string): void => {
     if (sectionsOn) {
       deps.write(`~ ${msg}\n`);
@@ -1442,7 +1442,7 @@ export async function main(deps: MainDeps): Promise<never> {
     configuredProfiles = safeList(deps.listProfilesFn);
   }
 
-  if (!shouldPassthrough && !hasPrint && !agentwrapNoConfirm) {
+  if (!shouldPassthrough && !hasPrint && !launcherNoConfirm) {
     phase("check cwd is a project dir", () => {
       checkCwdInProjectRoot(
         actionLog,
@@ -1452,7 +1452,7 @@ export async function main(deps: MainDeps): Promise<never> {
         deps.env,
       );
     });
-  } else if (agentwrapNoConfirm && !shouldPassthrough && !hasPrint) {
+  } else if (launcherNoConfirm && !shouldPassthrough && !hasPrint) {
     actionLog.push(
       "Skipped cwd confirmation (--x-no-confirm): " +
         `${deps.env.PWD || deps.cwd}`,
@@ -1490,8 +1490,8 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  if (shouldPassthrough && agentwrapProfile === "auto") {
-    agentwrapProfile = "";
+  if (shouldPassthrough && launcherProfile === "auto") {
+    launcherProfile = "";
     actionLog.push("Skipped auto profile routing for passthrough invocation");
   }
 
@@ -1507,18 +1507,18 @@ export async function main(deps: MainDeps): Promise<never> {
         actionLog.push("Added Codex live-search default");
       }
     }
-    if (agent === "codex" && agentwrapProfile) {
+    if (agent === "codex" && launcherProfile) {
       if (!hasExplicitCodexProfileArg(remainingArgs)) {
-        ptCmd.push("--profile", agentwrapProfile);
+        ptCmd.push("--profile", launcherProfile);
         actionLog.push(
-          `Added Codex profile override: --profile ${agentwrapProfile}`,
+          `Added Codex profile override: --profile ${launcherProfile}`,
         );
       }
-    } else if (agent === "pi" && agentwrapProfile) {
+    } else if (agent === "pi" && launcherProfile) {
       let profileDir: string;
       try {
-        const [dir, bootstrapped] = deps.ensureAgentwrapPiProfileDirFn(
-          agentwrapProfile,
+        const [dir, bootstrapped] = deps.ensureKeeperAgentPiProfileDirFn(
+          launcherProfile,
           actionLog,
         );
         profileDir = dir;
@@ -1534,12 +1534,12 @@ export async function main(deps: MainDeps): Promise<never> {
       }
       deps.env.PI_CODING_AGENT_DIR = profileDir;
       actionLog.push(`Set PI_CODING_AGENT_DIR=${profileDir}`);
-    } else if (agent === "claude" && agentwrapProfile) {
+    } else if (agent === "claude" && launcherProfile) {
       let profileDir: string;
       try {
         const trustPaths = [deps.cwd];
-        const [dir, bootstrapped] = deps.ensureAgentwrapProfileDirFn(
-          agentwrapProfile,
+        const [dir, bootstrapped] = deps.ensureKeeperAgentProfileDirFn(
+          launcherProfile,
           trustPaths,
           actionLog,
         );
@@ -1559,15 +1559,15 @@ export async function main(deps: MainDeps): Promise<never> {
     }
 
     ptCmd.push(...remainingArgs);
-    if (agentwrapVeryVerbose) {
+    if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, ptCmd.join(" "));
     }
     return runPassthrough(ptCmd, deps.spawn, deps.exit);
   }
 
   if (agent === "codex") {
-    if (agentwrapProfile === "auto") {
-      agentwrapProfile = "";
+    if (launcherProfile === "auto") {
+      launcherProfile = "";
       actionLog.push("Using native Codex profile");
     }
 
@@ -1581,10 +1581,10 @@ export async function main(deps: MainDeps): Promise<never> {
       actionLog.push("Added Codex live-search default");
     }
 
-    if (agentwrapProfile && !hasExplicitCodexProfileArg(remainingArgs)) {
-      runCmd.push("--profile", agentwrapProfile);
+    if (launcherProfile && !hasExplicitCodexProfileArg(remainingArgs)) {
+      runCmd.push("--profile", launcherProfile);
       actionLog.push(
-        `Added Codex profile override: --profile ${agentwrapProfile}`,
+        `Added Codex profile override: --profile ${launcherProfile}`,
       );
     }
 
@@ -1616,12 +1616,12 @@ export async function main(deps: MainDeps): Promise<never> {
 
     runCmd.push(...remainingArgs);
     const codexSessionName =
-      agentwrapCodexSessionName ??
+      launcherCodexSessionName ??
       resolveLaunchSessionName(remainingArgs, deps.cwd, deps.nextCwdOrdinalFn)
         .sessionName;
-    note(`profile: ${agentwrapProfile || "default"}`);
+    note(`profile: ${launcherProfile || "default"}`);
     note(`session: ${codexSessionName}`);
-    if (agentwrapCodexSessionName === null) {
+    if (launcherCodexSessionName === null) {
       actionLog.push(
         `Derived Codex synthetic session-name: ${codexSessionName}`,
       );
@@ -1630,11 +1630,11 @@ export async function main(deps: MainDeps): Promise<never> {
       `Started Codex synthetic session-name indexer: ${codexSessionName}`,
     );
 
-    if (agentwrapVeryVerbose) {
+    if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, formatCommand(runCmd));
     }
 
-    deps.env[agentProfileEnvName(agent)] = agentwrapProfile || "default";
+    deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
 
     if (sectionsOn) {
       deps.write("~ launching codex\n");
@@ -1678,10 +1678,10 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  if (agentwrapProfile === "auto" && configuredProfiles.length === 1) {
+  if (launcherProfile === "auto" && configuredProfiles.length === 1) {
     const forced = configuredProfiles[0] as string;
-    const normalizedForced = normalizeAgentwrapProfileArg(forced);
-    agentwrapProfile = normalizedForced;
+    const normalizedForced = normalizeKeeperAgentProfileArg(forced);
+    launcherProfile = normalizedForced;
     actionLog.push(
       `Forced profile from config list: ${forced}` +
         (normalizedForced !== forced
@@ -1690,7 +1690,7 @@ export async function main(deps: MainDeps): Promise<never> {
     );
   }
 
-  if (agentwrapProfile === "auto") {
+  if (launcherProfile === "auto") {
     const selected = phase(`auto-select ${agentLabel} profile`, () => {
       try {
         return deps.pickProfileFn();
@@ -1698,10 +1698,10 @@ export async function main(deps: MainDeps): Promise<never> {
         return DEFAULT_PROFILE;
       }
     });
-    agentwrapProfile = normalizeAgentwrapProfileArg(selected);
+    launcherProfile = normalizeKeeperAgentProfileArg(selected);
     actionLog.push(
       `Auto-selected ${agentLabel} profile: ${selected}` +
-        (agentwrapProfile !== selected
+        (launcherProfile !== selected
           ? ` (normalized to default ${agentLabel} account)`
           : ""),
     );
@@ -1710,13 +1710,13 @@ export async function main(deps: MainDeps): Promise<never> {
   const profileDir = phase(
     "link shared settings + profile dir",
     (): string | null => {
-      if (!agentwrapProfile) {
+      if (!launcherProfile) {
         return null;
       }
       try {
         if (agent === "pi") {
-          const [dir, bootstrapped] = deps.ensureAgentwrapPiProfileDirFn(
-            agentwrapProfile,
+          const [dir, bootstrapped] = deps.ensureKeeperAgentPiProfileDirFn(
+            launcherProfile,
             actionLog,
           );
           if (bootstrapped) {
@@ -1725,8 +1725,8 @@ export async function main(deps: MainDeps): Promise<never> {
           return dir;
         }
         const trustPaths = [deps.cwd];
-        const [dir, bootstrapped] = deps.ensureAgentwrapProfileDirFn(
-          agentwrapProfile,
+        const [dir, bootstrapped] = deps.ensureKeeperAgentProfileDirFn(
+          launcherProfile,
           trustPaths,
           actionLog,
         );
@@ -1743,7 +1743,7 @@ export async function main(deps: MainDeps): Promise<never> {
       }
     },
   );
-  note(`profile: ${agentwrapProfile || "default"}`);
+  note(`profile: ${launcherProfile || "default"}`);
 
   // Build agent command.
   const runCmd = [bin, ...remainingArgs];
@@ -1908,7 +1908,7 @@ export async function main(deps: MainDeps): Promise<never> {
     scrubInheritedClaudeSessionEnv(deps.env, actionLog);
   }
 
-  if (agentwrapVeryVerbose) {
+  if (launcherVeryVerbose) {
     printVerbose(deps, actionLog, formatCommand(runCmd));
   }
 
@@ -1922,7 +1922,7 @@ export async function main(deps: MainDeps): Promise<never> {
       actionLog.push(`Set CLAUDE_CONFIG_DIR=${profileDir}`);
     }
   }
-  deps.env[agentProfileEnvName(agent)] = agentwrapProfile || "default";
+  deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
   if (agent === "claude") {
     deps.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }

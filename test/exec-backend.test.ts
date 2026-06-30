@@ -9,11 +9,11 @@
  *  - `createTmuxPaneOps` — the direct session-agnostic pane ops: `focusPane`
  *    id-based select-window+select-pane, `listPanes` tab-safe sweep + null
  *    degrade, `renameWindow`/`killWindow` `@N`/`%N` targets + TOCTOU no-op.
- *  - The agentwrap launch (keeper's sole launch transport) —
- *    `buildAgentwrapLaunchArgv` (byte-pinned contract invocation),
- *    `parseAgentwrapStdout` (line-scan, schema_version check,
- *    empty/non-JSON/missing-field), `mapAgentwrapExit` (the central
- *    0/1/2/3/4 + timeout exit-map), and `agentwrapLaunch`
+ *  - The keeper agent launch (keeper's sole launch transport) —
+ *    `buildKeeperAgentLaunchArgv` (byte-pinned contract invocation),
+ *    `parseKeeperAgentStdout` (line-scan, schema_version check,
+ *    empty/non-JSON/missing-field), `mapKeeperAgentExit` (the central
+ *    0/1/2/3/4 + timeout exit-map), and `keeperAgentLaunch`
  *    (launch→parse→exit-map→outcome, worker-cwd-on-spawn, per-call session).
  *  - `execBackendEnvMeta` returns the tmux env-var names, including the
  *    fall-through for unknown backends.
@@ -25,10 +25,7 @@
 import { expect, test } from "bun:test";
 import {
   AGENTBUS_EXEC_SESSION,
-  AGENTWRAP_SCHEMA_VERSION,
-  AGENTWRAP_TMUX_EXIT,
-  agentwrapLaunch,
-  buildAgentwrapLaunchArgv,
+  buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
   buildTmuxListPanesArgs,
@@ -41,11 +38,14 @@ import {
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
+  KEEPER_AGENT_SCHEMA_VERSION,
+  KEEPER_AGENT_TMUX_EXIT,
+  keeperAgentLaunch,
   type LaunchResult,
   localeDefaultedEnv,
   MANAGED_EXEC_SESSION,
-  mapAgentwrapExit,
-  parseAgentwrapStdout,
+  mapKeeperAgentExit,
+  parseKeeperAgentStdout,
   type SpawnFn,
   type SyncProbeFn,
 } from "../src/exec-backend";
@@ -496,18 +496,18 @@ test("createTmuxPaneOps.killWindow: ENOENT (binary missing) → { ok: false }, n
 });
 
 // ---------------------------------------------------------------------------
-// agentwrap launch (keeper's sole launch transport) — buildAgentwrapLaunchArgv
-// (byte-pinned), parse, exit-map, and the agentwrapLaunch
+// keeper agent launch (keeper's sole launch transport) — buildKeeperAgentLaunchArgv
+// (byte-pinned), parse, exit-map, and the keeperAgentLaunch
 // launch→parse→exit-map→outcome path.
 // ---------------------------------------------------------------------------
 
 /**
- * A canned `schema_version:1` agentwrap success line — the cross-repo contract
+ * A canned `schema_version:1` keeper agent success line — the cross-repo contract
  * keeper parses. Byte-pinned (with `\n`) so the JSON-parse path is exercised on
- * the real one-line shape agentwrap emits, not a hand-trimmed approximation.
+ * the real one-line shape keeper agent emits, not a hand-trimmed approximation.
  * Task .4 adds the cross-repo fixture pin; this is the in-test canned form.
  */
-const AGENTWRAP_OK_LINE = `${JSON.stringify({
+const KEEPER_AGENT_OK_LINE = `${JSON.stringify({
   schema_version: 1,
   id: "fn-1-x.1",
   agent: "claude",
@@ -534,7 +534,7 @@ const AGENTWRAP_OK_LINE = `${JSON.stringify({
  * argv + options (cwd) so the test can assert the invocation shape and the
  * worker-cwd-on-spawn behavior. tmux ops fall through to a zero-exit default.
  */
-function makeAgentwrapSpawnStub(
+function makeKeeperAgentSpawnStub(
   launcherArgvPrefix: readonly string[],
   launch: { stdout?: string; stderr?: string; exitCode?: number },
   records: Array<{ cmd: string[]; cwd?: string }>,
@@ -560,13 +560,13 @@ function makeAgentwrapSpawnStub(
 }
 
 // The folded-launcher argv prefix the dispatch path spawns: `[bun, cli/keeper.ts,
-// "agent"]`. Supersedes the standalone `agentwrap` binary path — the launcher
+// "agent"]`. Supersedes the standalone `keeper agent` binary path — the launcher
 // folded into `keeper agent`.
 const LAP = ["/abs/bin/bun", "/abs/cli/keeper.ts", "agent"] as const;
 
-test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)", () => {
+test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)", () => {
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "/plan:work fn-1-x.1",
@@ -602,9 +602,9 @@ test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)",
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confirm flag", () => {
+test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-confirm flag", () => {
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "do a thing",
@@ -627,9 +627,9 @@ test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confir
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trailing prompt (byte-pinned)", () => {
+test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO trailing prompt (byte-pinned)", () => {
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "agentbus",
       prompt: "", // unused in resume mode
@@ -655,11 +655,11 @@ test("buildAgentwrapLaunchArgv: resume mode emits --resume <target> and NO trail
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode", () => {
+test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mode", () => {
   // A degenerate empty target must NOT emit `--resume ""` (a quoting/UX hazard);
   // it falls through to the trailing prompt positional.
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "agentbus",
       prompt: "fallback prompt",
@@ -683,9 +683,9 @@ test("buildAgentwrapLaunchArgv: an empty resumeTarget falls back to prompt mode"
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
+test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "/plan:work fn-1-x.1",
@@ -723,11 +723,11 @@ test("buildAgentwrapLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env 
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WORKTREE before --resume (byte-pinned)", () => {
+test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WORKTREE before --resume (byte-pinned)", () => {
   // A resumed worktree worker must NOT re-resolve to the main checkout, so the
   // lane env rides resume mode too — emitted before the `--resume` tail.
   expect(
-    buildAgentwrapLaunchArgv({
+    buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       session: "autopilot",
       prompt: "", // unused in resume mode
@@ -755,7 +755,7 @@ test("buildAgentwrapLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_WO
   ]);
 });
 
-test("buildAgentwrapLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits one empty KEEPER_PLAN_WORKTREE entry — so a stale tmux session-env lane can never leak in", () => {
+test("buildKeeperAgentLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits one empty KEEPER_PLAN_WORKTREE entry — so a stale tmux session-env lane can never leak in", () => {
   const base = {
     launcherArgvPrefix: LAP,
     session: "autopilot",
@@ -768,9 +768,13 @@ test("buildAgentwrapLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits 
   // An explicit empty worktreePath / worktreeBranch is byte-identical to
   // omitting it: both emit the single empty entry that OVERWRITES any stale
   // `-e` session value.
-  const absent = buildAgentwrapLaunchArgv(base);
+  const absent = buildKeeperAgentLaunchArgv(base);
   expect(
-    buildAgentwrapLaunchArgv({ ...base, worktreePath: "", worktreeBranch: "" }),
+    buildKeeperAgentLaunchArgv({
+      ...base,
+      worktreePath: "",
+      worktreeBranch: "",
+    }),
   ).toEqual(absent);
   const laneEntries = absent.filter((a) =>
     a.startsWith("KEEPER_PLAN_WORKTREE="),
@@ -784,79 +788,81 @@ test("buildAgentwrapLaunchArgv: serial (empty/absent worktreePath) ALWAYS emits 
   expect(branchEntries).toEqual(["KEEPER_PLAN_WORKTREE_BRANCH="]);
 });
 
-// --- parseAgentwrapStdout ---
+// --- parseKeeperAgentStdout ---
 
-test("parseAgentwrapStdout: a schema_version:1 line → ok", () => {
-  expect(parseAgentwrapStdout(AGENTWRAP_OK_LINE)).toEqual({ ok: true });
+test("parseKeeperAgentStdout: a schema_version:1 line → ok", () => {
+  expect(parseKeeperAgentStdout(KEEPER_AGENT_OK_LINE)).toEqual({ ok: true });
 });
 
-test("parseAgentwrapStdout: tolerates a banner line before the JSON line", () => {
+test("parseKeeperAgentStdout: tolerates a banner line before the JSON line", () => {
   expect(
-    parseAgentwrapStdout(`some startup banner\n${AGENTWRAP_OK_LINE}`),
+    parseKeeperAgentStdout(`some startup banner\n${KEEPER_AGENT_OK_LINE}`),
   ).toEqual({ ok: true });
 });
 
-test("parseAgentwrapStdout: schema_version:2 → permanent fail (contract drift)", () => {
+test("parseKeeperAgentStdout: schema_version:2 → permanent fail (contract drift)", () => {
   const line = `${JSON.stringify({ schema_version: 2, session: "autopilot" })}\n`;
-  const res = parseAgentwrapStdout(line);
+  const res = parseKeeperAgentStdout(line);
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.error).toContain("schema_version");
   }
 });
 
-test("parseAgentwrapStdout: empty stdout → INTERNAL fail", () => {
-  const res = parseAgentwrapStdout("");
+test("parseKeeperAgentStdout: empty stdout → INTERNAL fail", () => {
+  const res = parseKeeperAgentStdout("");
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.error).toContain("no parseable schema_version");
   }
 });
 
-test("parseAgentwrapStdout: non-JSON noise only → INTERNAL fail", () => {
-  const res = parseAgentwrapStdout("not json\nstill not json\n");
+test("parseKeeperAgentStdout: non-JSON noise only → INTERNAL fail", () => {
+  const res = parseKeeperAgentStdout("not json\nstill not json\n");
   expect(res.ok).toBe(false);
 });
 
-test("parseAgentwrapStdout: a JSON object without schema_version → INTERNAL fail naming the missing field", () => {
-  const res = parseAgentwrapStdout(`${JSON.stringify({ session: "x" })}\n`);
+test("parseKeeperAgentStdout: a JSON object without schema_version → INTERNAL fail naming the missing field", () => {
+  const res = parseKeeperAgentStdout(`${JSON.stringify({ session: "x" })}\n`);
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.error).toContain("no schema_version");
   }
 });
 
-test("AGENTWRAP_SCHEMA_VERSION is pinned at 1 (cross-repo contract)", () => {
-  expect(AGENTWRAP_SCHEMA_VERSION).toBe(1);
+test("KEEPER_AGENT_SCHEMA_VERSION is pinned at 1 (cross-repo contract)", () => {
+  expect(KEEPER_AGENT_SCHEMA_VERSION).toBe(1);
 });
 
-// --- cross-repo drift guard: byte-pinned agentwrap stdout fixture ---
+// --- cross-repo drift guard: byte-pinned keeper agent stdout fixture ---
 
 /**
  * The JSON shape + exit-code taxonomy is a cross-repo contract with NO shared
- * module (agentwrap `src/main.ts` `tmuxMetadata` / `tmux-launch.ts` `TMUX_EXIT`
- * on one side, keeper `parseAgentwrapStdout` / `AGENTWRAP_TMUX_EXIT` on the
- * other). `test/fixtures/agentwrap-launch-stdout.json` is ONE line of real
- * `agentwrap claude --x-tmux --x-tmux-detached …` stdout
+ * module (keeper agent `src/main.ts` `tmuxMetadata` / `tmux-launch.ts` `TMUX_EXIT`
+ * on one side, keeper `parseKeeperAgentStdout` / `KEEPER_AGENT_TMUX_EXIT` on the
+ * other). `test/fixtures/keeper-agent-launch-stdout.json` is ONE line of real
+ * `keeper agent claude --x-tmux --x-tmux-detached …` stdout
  * (captured from the binary, not hand-authored), so these tests fail loudly the
- * moment agentwrap's emitted shape or keeper's parser drifts apart. Recapture
+ * moment keeper agent's emitted shape or keeper's parser drifts apart. Recapture
  * the fixture from real output when the contract is intentionally bumped.
  */
-const AGENTWRAP_FIXTURE_STDOUT = await Bun.file(
-  new URL("./fixtures/agentwrap-launch-stdout.jsonl", import.meta.url),
+const KEEPER_AGENT_FIXTURE_STDOUT = await Bun.file(
+  new URL("./fixtures/keeper-agent-launch-stdout.jsonl", import.meta.url),
 ).text();
 
-test("fixture: keeper's parser consumes agentwrap's real launch stdout → ok", () => {
-  expect(parseAgentwrapStdout(AGENTWRAP_FIXTURE_STDOUT)).toEqual({ ok: true });
+test("fixture: keeper's parser consumes keeper agent's real launch stdout → ok", () => {
+  expect(parseKeeperAgentStdout(KEEPER_AGENT_FIXTURE_STDOUT)).toEqual({
+    ok: true,
+  });
 });
 
-test("fixture: the real line carries schema_version === AGENTWRAP_SCHEMA_VERSION and the top-level bind points", () => {
-  const obj = JSON.parse(AGENTWRAP_FIXTURE_STDOUT.trim()) as Record<
+test("fixture: the real line carries schema_version === KEEPER_AGENT_SCHEMA_VERSION and the top-level bind points", () => {
+  const obj = JSON.parse(KEEPER_AGENT_FIXTURE_STDOUT.trim()) as Record<
     string,
     unknown
   >;
   // The version keeper validates against.
-  expect(obj.schema_version).toBe(AGENTWRAP_SCHEMA_VERSION);
+  expect(obj.schema_version).toBe(KEEPER_AGENT_SCHEMA_VERSION);
   // The stable top-level bind points keeper documents (discarded at runtime —
   // binding is hook-based — but their PRESENCE is the contract).
   expect(typeof obj.session).toBe("string");
@@ -864,14 +870,14 @@ test("fixture: the real line carries schema_version === AGENTWRAP_SCHEMA_VERSION
   expect(typeof obj.paneId).toBe("string");
 });
 
-test("fixture-fed agentwrapLaunch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
+test("fixture-fed keeperAgentLaunch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
+  const spawn = makeKeeperAgentSpawnStub(
     LAP,
-    { stdout: AGENTWRAP_FIXTURE_STDOUT, exitCode: 0 },
+    { stdout: KEEPER_AGENT_FIXTURE_STDOUT, exitCode: 0 },
     records,
   );
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -883,26 +889,28 @@ test("fixture-fed agentwrapLaunch: exit 0 + real stdout → ok (full launch→pa
   expect(res).toEqual({ ok: true });
 });
 
-test("AGENTWRAP_TMUX_EXIT mirrors agentwrap's landed TMUX_EXIT taxonomy (1/2/3/4) and maps to the right outcome class", () => {
-  // The exit-code numbers MUST match agentwrap's `TMUX_EXIT`
+test("KEEPER_AGENT_TMUX_EXIT mirrors keeper agent's landed TMUX_EXIT taxonomy (1/2/3/4) and maps to the right outcome class", () => {
+  // The exit-code numbers MUST match keeper agent's `TMUX_EXIT`
   // (src/tmux-launch.ts): INTERNAL=1, BAD_ARGS=2, NOOP=3, RETRYABLE=4.
-  expect(AGENTWRAP_TMUX_EXIT.INTERNAL).toBe(1);
-  expect(AGENTWRAP_TMUX_EXIT.BAD_ARGS).toBe(2);
-  expect(AGENTWRAP_TMUX_EXIT.NOOP).toBe(3);
-  expect(AGENTWRAP_TMUX_EXIT.RETRYABLE).toBe(4);
+  expect(KEEPER_AGENT_TMUX_EXIT.INTERNAL).toBe(1);
+  expect(KEEPER_AGENT_TMUX_EXIT.BAD_ARGS).toBe(2);
+  expect(KEEPER_AGENT_TMUX_EXIT.NOOP).toBe(3);
+  expect(KEEPER_AGENT_TMUX_EXIT.RETRYABLE).toBe(4);
   // …and the central map routes each to its outcome class: only RETRYABLE(4)
   // is transient; INTERNAL/BAD_ARGS/NOOP are permanent (no retryable).
   const ok: LaunchResult = { ok: true };
-  expect(mapAgentwrapExit(AGENTWRAP_TMUX_EXIT.RETRYABLE, ok)).toMatchObject({
+  expect(
+    mapKeeperAgentExit(KEEPER_AGENT_TMUX_EXIT.RETRYABLE, ok),
+  ).toMatchObject({
     ok: false,
     retryable: true,
   });
   for (const code of [
-    AGENTWRAP_TMUX_EXIT.INTERNAL,
-    AGENTWRAP_TMUX_EXIT.BAD_ARGS,
-    AGENTWRAP_TMUX_EXIT.NOOP,
+    KEEPER_AGENT_TMUX_EXIT.INTERNAL,
+    KEEPER_AGENT_TMUX_EXIT.BAD_ARGS,
+    KEEPER_AGENT_TMUX_EXIT.NOOP,
   ]) {
-    const res = mapAgentwrapExit(code, ok);
+    const res = mapKeeperAgentExit(code, ok);
     expect(res.ok).toBe(false);
     if (res.ok === false) {
       expect(res.retryable).toBeUndefined();
@@ -910,28 +918,28 @@ test("AGENTWRAP_TMUX_EXIT mirrors agentwrap's landed TMUX_EXIT taxonomy (1/2/3/4
   }
 });
 
-// --- mapAgentwrapExit (the ONE central exit map, table-driven) ---
+// --- mapKeeperAgentExit (the ONE central exit map, table-driven) ---
 
-test("mapAgentwrapExit: 0 + valid parse → ok", () => {
-  expect(mapAgentwrapExit(0, { ok: true })).toEqual({ ok: true });
+test("mapKeeperAgentExit: 0 + valid parse → ok", () => {
+  expect(mapKeeperAgentExit(0, { ok: true })).toEqual({ ok: true });
 });
 
-test("mapAgentwrapExit: 0 + bad parse → PERMANENT (unconfirmed launch, never retry)", () => {
-  const res = mapAgentwrapExit(0, { ok: false, error: "no json" });
+test("mapKeeperAgentExit: 0 + bad parse → PERMANENT (unconfirmed launch, never retry)", () => {
+  const res = mapKeeperAgentExit(0, { ok: false, error: "no json" });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.retryable).toBeUndefined();
   }
 });
 
-test("mapAgentwrapExit: exit-code → outcome class table (1/2/3 permanent, 4 transient, unknown permanent)", () => {
+test("mapKeeperAgentExit: exit-code → outcome class table (1/2/3 permanent, 4 transient, unknown permanent)", () => {
   const ok: LaunchResult = { ok: true };
   // 4 RETRYABLE → transient.
-  const four = mapAgentwrapExit(4, ok);
+  const four = mapKeeperAgentExit(4, ok);
   expect(four).toMatchObject({ ok: false, retryable: true });
   // 3 NOOP, 1 INTERNAL, 2 BAD_ARGS, and an unknown code → permanent (no retryable).
   for (const code of [1, 2, 3, 99]) {
-    const res = mapAgentwrapExit(code, ok);
+    const res = mapKeeperAgentExit(code, ok);
     expect(res.ok).toBe(false);
     if (res.ok === false) {
       expect(res.retryable).toBeUndefined();
@@ -939,16 +947,16 @@ test("mapAgentwrapExit: exit-code → outcome class table (1/2/3 permanent, 4 tr
   }
 });
 
-// --- agentwrapLaunch (launch→parse→exit-map→outcome) ---
+// --- keeperAgentLaunch (launch→parse→exit-map→outcome) ---
 
-test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv with worker cwd on the spawn", async () => {
+test("keeperAgentLaunch: exit 0 + valid JSON → ok; spawns the keeper agent argv with worker cwd on the spawn", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
+  const spawn = makeKeeperAgentSpawnStub(
     LAP,
-    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    { stdout: KEEPER_AGENT_OK_LINE, exitCode: 0 },
     records,
   );
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -972,10 +980,10 @@ test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv wit
   expect(records[0]?.cwd).toBe("/repo");
 });
 
-test("agentwrapLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
+test("keeperAgentLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 4 }, records);
-  const res = await agentwrapLaunch({
+  const spawn = makeKeeperAgentSpawnStub(LAP, { exitCode: 4 }, records);
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -987,10 +995,10 @@ test("agentwrapLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:tru
   expect(res).toMatchObject({ ok: false, retryable: true });
 });
 
-test("agentwrapLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
+test("keeperAgentLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 3 }, records);
-  const res = await agentwrapLaunch({
+  const spawn = makeKeeperAgentSpawnStub(LAP, { exitCode: 3 }, records);
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -1005,10 +1013,10 @@ test("agentwrapLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
   }
 });
 
-test("agentwrapLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
+test("keeperAgentLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(LAP, { exitCode: 2 }, records);
-  const res = await agentwrapLaunch({
+  const spawn = makeKeeperAgentSpawnStub(LAP, { exitCode: 2 }, records);
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -1023,14 +1031,14 @@ test("agentwrapLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)",
   }
 });
 
-test("agentwrapLaunch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
+test("keeperAgentLaunch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
+  const spawn = makeKeeperAgentSpawnStub(
     LAP,
     { stdout: `${JSON.stringify({ schema_version: 2 })}\n`, exitCode: 0 },
     records,
   );
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -1045,14 +1053,14 @@ test("agentwrapLaunch: exit 0 but schema_version:2 stdout → permanent (unconfi
   }
 });
 
-test("agentwrapLaunch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
+test("keeperAgentLaunch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
+  const spawn = makeKeeperAgentSpawnStub(
     LAP,
     { stdout: "", exitCode: 0 },
     records,
   );
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -1067,7 +1075,7 @@ test("agentwrapLaunch: exit 0 but empty stdout → permanent (INTERNAL, unconfir
   }
 });
 
-test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () => {
+test("keeperAgentLaunch: timeout-kill (runCapture null) → transient", async () => {
   // A spawn whose `exited` never resolves forces the kill-timeout path; a tiny
   // captureTimeoutMs pins it without a real wait.
   const spawn: SpawnFn = (_cmd, _options) => ({
@@ -1076,7 +1084,7 @@ test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () =
     stderr: new Response("").body,
     kill: () => {},
   });
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: MANAGED_EXEC_SESSION,
@@ -1089,13 +1097,13 @@ test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () =
   expect(res).toMatchObject({ ok: false, retryable: true });
 });
 
-test("agentwrapLaunch: ENOENT (bad launcher) → transient, loud (noteLine warned)", async () => {
+test("keeperAgentLaunch: ENOENT (bad launcher) → transient, loud (noteLine warned)", async () => {
   const warnings: string[] = [];
   // A spawn that throws models ENOENT (missing bun / keeper.ts).
   const spawn: SpawnFn = () => {
     throw new Error("ENOENT");
   };
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: (l) => warnings.push(l),
     launcherArgvPrefix: ["/nope/bun", "/nope/keeper.ts", "agent"],
     session: MANAGED_EXEC_SESSION,
@@ -1109,16 +1117,16 @@ test("agentwrapLaunch: ENOENT (bad launcher) → transient, loud (noteLine warne
   expect(warnings.some((w) => w.includes("/nope/keeper.ts"))).toBe(true);
 });
 
-test("agentwrapLaunch: a per-call session targets that session, not the managed default", async () => {
+test("keeperAgentLaunch: a per-call session targets that session, not the managed default", async () => {
   // Manual `keeper dispatch` passes a per-call session (the resolved foreground /
   // current session) rather than the hardcoded managed one.
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
+  const spawn = makeKeeperAgentSpawnStub(
     LAP,
-    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    { stdout: KEEPER_AGENT_OK_LINE, exitCode: 0 },
     records,
   );
-  const res = await agentwrapLaunch({
+  const res = await keeperAgentLaunch({
     noteLine: () => {},
     launcherArgvPrefix: LAP,
     session: "work",

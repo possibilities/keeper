@@ -13,7 +13,7 @@
  * `tierForJobFromEpics` — live in the shared `src/resume-descriptor.ts`
  * module. That module exposes ONE DISPLAY form (`buildResumeCommand`, the bare
  * `claude --resume` string THIS script prints); the launch surfaces
- * (`keeper bus wake` + `scripts/restore-agents.ts`) resume via `agentwrapLaunch`
+ * (`keeper bus wake` + `scripts/restore-agents.ts`) resume via `keeperAgentLaunch`
  * in resume mode (`src/exec-backend.ts`), which builds the `--resume` argv
  * itself. This script is the DISPLAY producer. It keeps the lazy per-epic UDS fetch loop (one
  * round-trip per distinct work-job epic, memoized) because it's read-on-

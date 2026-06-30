@@ -10,7 +10,7 @@ import {
 const SESSION_ID = "019eec30-d7eb-7142-9363-5c1535537ee6";
 
 function codexHome(): string {
-  return mkdtempSync(join(tmpdir(), "agentwrap-codex-index-"));
+  return mkdtempSync(join(tmpdir(), "keeper-agent-codex-index-"));
 }
 
 function sessionDir(home: string, date: Date): string {
@@ -64,7 +64,7 @@ describe("Codex session index helpers", () => {
     writeRollout(
       home,
       "019eec31-01f1-7163-afa1-7facaaf72122",
-      "/fake-home/code/agentwrap",
+      "/fake-home/code/keeper",
       startedAtMs,
     );
 
@@ -72,7 +72,7 @@ describe("Codex session index helpers", () => {
       findCodexSessionId({
         codexHome: home,
         threadName: "synthetic name",
-        expectedCwd: "/fake-home/code/agentwrap",
+        expectedCwd: "/fake-home/code/keeper",
         startedAtMs,
       }),
     ).toBe("019eec31-01f1-7163-afa1-7facaaf72122");
@@ -84,7 +84,7 @@ describe("Codex session index helpers", () => {
     writeRollout(
       home,
       SESSION_ID,
-      "/fake-home/code/agentwrap",
+      "/fake-home/code/keeper",
       startedAtMs - 60_000,
     );
 
@@ -92,7 +92,7 @@ describe("Codex session index helpers", () => {
       findCodexSessionId({
         codexHome: home,
         threadName: "synthetic name",
-        expectedCwd: "/fake-home/code/agentwrap",
+        expectedCwd: "/fake-home/code/keeper",
         startedAtMs,
       }),
     ).toBeNull();

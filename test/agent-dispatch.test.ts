@@ -253,11 +253,11 @@ describe("main() dispatch routing", () => {
     expect(cmd[0]).toBe(h.deps.claudeBin);
   });
 
-  test("bare agentwrap → usage on stderr + exit 2", async () => {
+  test("bare keeper agent → usage on stderr + exit 2", async () => {
     const h = harness([]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
-    expect(h.err.join("")).toContain("agentwrap");
+    expect(h.err.join("")).toContain("keeper agent");
     expect(h.out.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });
@@ -283,7 +283,7 @@ describe("main() dispatch routing", () => {
     const h = harness(["--version"]);
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
-    expect(h.out.join("")).toContain("agentwrap ");
+    expect(h.out.join("")).toContain("keeper agent ");
     expect(h.spawned.length).toBe(0);
   });
 

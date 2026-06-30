@@ -1,5 +1,5 @@
 /**
- * Pi launcher pins: `agentwrap pi` maps wrapper features onto Pi-native CLI
+ * Pi launcher pins: `keeper agent pi` maps wrapper features onto Pi-native CLI
  * contracts. Profile routing uses PI_CODING_AGENT_DIR, model/thinking defaults
  * become `--model`/`--thinking`, session naming uses Pi's `--session-id` and
  * `--name`, and package/metadata commands pass through cleanly.
@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgsForAgent } from "../src/agent/args";
 import { main } from "../src/agent/main";
-import { ensureAgentwrapPiProfileDir } from "../src/agent/state-sharing";
+import { ensureKeeperAgentPiProfileDir } from "../src/agent/state-sharing";
 import {
   flagValues,
   makeHarness,
@@ -173,7 +173,7 @@ let tmpDir: string;
 let home: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "agentwrap-pi-profile-"));
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-pi-profile-"));
   home = join(tmpDir, "home");
   mkdirSync(home, { recursive: true });
 });
@@ -182,7 +182,7 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("ensureAgentwrapPiProfileDir", () => {
+describe("ensureKeeperAgentPiProfileDir", () => {
   test("links shared Pi state while leaving auth profile-local", () => {
     const canonicalDir = join(home, ".pi", "agent");
     mkdirSync(join(canonicalDir, "sessions"), { recursive: true });
@@ -194,7 +194,7 @@ describe("ensureAgentwrapPiProfileDir", () => {
     writeFileSync(join(profileDir, "auth.json"), '{"profile":true}\n');
 
     const log: string[] = [];
-    const [dir, changed] = ensureAgentwrapPiProfileDir("work", log, home);
+    const [dir, changed] = ensureKeeperAgentPiProfileDir("work", log, home);
 
     expect(changed).toBe(true);
     expect(dir).toBe(profileDir);

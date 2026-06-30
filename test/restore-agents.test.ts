@@ -15,7 +15,7 @@
  *    no socket); a candidate resumes by its latest name, read live from the DB.
  *
  * The util's `main()` exit path (Bun.argv parsing, real openDb, real
- * `agentwrapLaunch`) is NOT spawned — the same shape every other one-shot CLI
+ * `keeperAgentLaunch`) is NOT spawned — the same shape every other one-shot CLI
  * test uses. The fixture DB is a `freshDbFile` clone (no subprocess, no daemon).
  */
 
@@ -195,7 +195,7 @@ const RESTORE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
 // renderSnapshotScript — the --snapshot-current revive script
 // ---------------------------------------------------------------------------
 
-test("renderSnapshotScript emits a get-or-create guard + paced BARE agentwrap resume argv", () => {
+test("renderSnapshotScript emits a get-or-create guard + paced BARE keeper agent resume argv", () => {
   const candidates = [
     fakeCandidate({
       job_id: "j1",
@@ -225,9 +225,9 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE agentwrap re
   // Get-or-create the session up front (every argv token single-quoted).
   expect(script).toContain("'tmux' 'has-session' '-t' '=work'");
   expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'work'");
-  // Each candidate is the BARE agentwrap resume argv — agentwrap owns the
+  // Each candidate is the BARE keeper agent resume argv — keeper agent owns the
   // session+window, so there is NO `tmux new-window` wrapper around it. cwd is
-  // applied via a `cd <cwd> &&` prefix (agentwrap reads its own process.cwd()).
+  // applied via a `cd <cwd> &&` prefix (keeper agent reads its own process.cwd()).
   expect(script).not.toContain("'tmux' 'new-window'");
   expect(script).toContain("cd '/repo/a' && '/abs/bun' '/abs/cli/keeper.ts'");
   expect(script).toContain(
@@ -247,11 +247,11 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE agentwrap re
   expect(script).toContain("# summary: snapshot-current sessions=1 windows=2");
 });
 
-test("renderSnapshotScript is byte-aligned with what --apply spawns (bare agentwrap argv, no shell wrapper)", () => {
-  // The inner per-candidate line must equal the argv agentwrapLaunch spawns on
+test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper agent argv, no shell wrapper)", () => {
+  // The inner per-candidate line must equal the argv keeperAgentLaunch spawns on
   // --apply, so the manual snapshot revives identically to the crash path. No
-  // login-shell `-c` hold-open wrapper (agentwrap's tmuxShellBody holds the pane
-  // open) and no `tmux new-window` (agentwrap mints its own window).
+  // login-shell `-c` hold-open wrapper (keeper agent's tmuxShellBody holds the pane
+  // open) and no `tmux new-window` (keeper agent mints its own window).
   const script = renderSnapshotScript(
     [
       fakeCandidate({
@@ -404,7 +404,7 @@ test("applyRestore launches each would-restore via ensureLaunched, carrying the 
   expect(out.map((o) => o.kind)).toEqual(["restored", "restored"]);
   expect(calls).toHaveLength(2);
   // The candidate's recorded session, latest-name resume target, and cwd flow
-  // straight to the agentwrapLaunch seam — agentwrap builds the --resume argv.
+  // straight to the keeperAgentLaunch seam — keeper agent builds the --resume argv.
   expect(calls[0]).toEqual({
     session: "work",
     resumeTarget: "a-name",
@@ -422,14 +422,14 @@ test("applyRestore continues past a single agent's launch failure", async () => 
     plan,
     async (_session, resumeTarget) =>
       resumeTarget === "fail"
-        ? { ok: false, error: "agentwrap launch no-op (exit 3 NOOP)" }
+        ? { ok: false, error: "keeper agent launch no-op (exit 3 NOOP)" }
         : { ok: true },
     async () => {},
   );
   expect(out).toHaveLength(2);
   expect(out[0].kind).toBe("failed");
   expect((out[0] as { error: string }).error).toBe(
-    "agentwrap launch no-op (exit 3 NOOP)",
+    "keeper agent launch no-op (exit 3 NOOP)",
   );
   expect(out[1].kind).toBe("restored");
 });
@@ -678,7 +678,7 @@ test("loadRestoreSet end-to-end: the apply path relaunches each derived candidat
   expect(out.map((o) => o.kind)).toEqual(["restored", "restored"]);
   expect(calls.map((c) => c.session)).toEqual(["work", "work"]);
   // The candidate's latest-name resume target (the UUID here, no title) + cwd
-  // flow straight to the agentwrapLaunch seam.
+  // flow straight to the keeperAgentLaunch seam.
   expect(calls[0].resumeTarget).toBe("uuid-a");
   expect(calls[0].cwd).toBe("/repo/a");
   expect(calls[1].resumeTarget).toBe("uuid-b");

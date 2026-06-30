@@ -7,7 +7,7 @@
  *    Byte-unchanged, alias-shaped (a bare `claude` token a human pastes).
  *
  * There is NO separate LAUNCH form here: `keeper bus wake` and crash-restore
- * both resume via keeper's sole launch transport (`agentwrapLaunch` in resume
+ * both resume via keeper's sole launch transport (`keeperAgentLaunch` in resume
  * mode, `src/exec-backend.ts`), which builds the `--resume <target>` invocation
  * itself. {@link resumeTarget} is the shared key both paths resolve.
  *
@@ -50,7 +50,7 @@ export function resumeTarget(job: Pick<Job, "title" | "job_id">): string {
  * This is the DISPLAY form — the bare `claude --resume` string a human pastes
  * (`scripts/resume.ts`). The launch surfaces (`keeper bus wake`, crash-restore)
  * do NOT use it (a bare `claude` relies on the `claude → keeper agent claude`
- * alias, which is shell-specific); they resume via `agentwrapLaunch` in resume
+ * alias, which is shell-specific); they resume via `keeperAgentLaunch` in resume
  * mode (`src/exec-backend.ts`), which builds the `--resume <target>` argv off an
  * absolute launcher prefix.
  *

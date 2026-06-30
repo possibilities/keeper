@@ -1,6 +1,6 @@
 /**
  * Unit tests for the dep-free `src/pair-command.ts` leaf module: the per-CLI
- * agentwrap argv builders (byte-pinned, read-only flag sets), prompt assembly
+ * keeper agent argv builders (byte-pinned, read-only flag sets), prompt assembly
  * (directive + role + message ordering), the launch/show-last-message JSON
  * parsers (schema-drift + handle extraction), the git changed-files diff, the
  * CLAUDE* env strip, and the output-YAML assembly (read_only_violation flag).
@@ -21,7 +21,7 @@ import {
   nativeClaudeArgs,
   nativeCodexArgs,
   nativePiArgs,
-  PAIR_AGENTWRAP_SCHEMA_VERSION,
+  PAIR_KEEPER_AGENT_SCHEMA_VERSION,
   PAIR_ROLES,
   parseGitPorcelain,
   parsePairLaunchJson,
@@ -33,7 +33,7 @@ import {
 } from "../src/pair-command";
 
 // The folded-launcher argv prefix the pair path spawns: `[bun, cli/keeper.ts,
-// "agent"]`. Supersedes the standalone `agentwrap` binary path.
+// "agent"]`. Supersedes the standalone `keeper agent` binary path.
 const LAP = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
 
 // Subprocess-kill margin over the stop budget, mirrored from cli/pair.ts
@@ -296,7 +296,7 @@ test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION b
     session: "panels",
   });
   // The carrier is what binds the partner into `jobs` as a tracked job, mirroring
-  // buildAgentwrapLaunchArgv. Its value names the same session as the window.
+  // buildKeeperAgentLaunchArgv. Its value names the same session as the window.
   const envIdx = argv.indexOf("--x-tmux-env");
   expect(envIdx).toBeGreaterThanOrEqual(0);
   expect(argv[envIdx + 1]).toBe("KEEPER_TMUX_SESSION=panels");
@@ -511,7 +511,7 @@ test("parseShowLastMessageJson: reads message + transcriptPath from metadata lin
     found: true,
     message: "the final answer",
   });
-  // agentwrap prints the bare message first, then the JSON metadata.
+  // keeper agent prints the bare message first, then the JSON metadata.
   const res = parseShowLastMessageJson(`the final answer\n${meta}\n`);
   expect(res.ok).toBe(true);
   if (res.ok) {
@@ -710,7 +710,7 @@ test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; tilde expands; else de
 });
 
 test("schema version constant is pinned at 1 (cross-repo contract)", () => {
-  expect(PAIR_AGENTWRAP_SCHEMA_VERSION).toBe(1);
+  expect(PAIR_KEEPER_AGENT_SCHEMA_VERSION).toBe(1);
 });
 
 test("DEFAULT_PAIR_SESSION is the stable 'pair' session name", () => {

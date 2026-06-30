@@ -72,7 +72,7 @@ describe("FileLock", () => {
 
 describe("raw libc exports (external-consumer fd locking)", () => {
   test("setCloexec + flockFd lock a fd the consumer opened non-truncating", () => {
-    // agentwrap's ordinal counter locks the DATA file directly with a
+    // keeper agent's ordinal counter locks the DATA file directly with a
     // non-truncating open. Prove the raw symbols lock such a fd and that a
     // second non-blocking flock on a fresh fd reports contention.
     const dataPath = join(tmpDir, "counter.dat");

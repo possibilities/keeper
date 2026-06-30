@@ -273,7 +273,7 @@ test("a PERMANENT launch failure mints HandoffLaunchFailed", async () => {
   const { deps, rec } = makeDeps({
     launch: async (): Promise<LaunchResult> => ({
       ok: false,
-      error: "agentwrap exit 3",
+      error: "keeper agent exit 3",
     }),
   });
   const out = await dispatchOneHandoff(
@@ -284,7 +284,7 @@ test("a PERMANENT launch failure mints HandoffLaunchFailed", async () => {
   );
   expect(out).toBe("failed");
   expect(rec.failed).toEqual([
-    { handoff_id: "h-11", reason: "agentwrap exit 3" },
+    { handoff_id: "h-11", reason: "keeper agent exit 3" },
   ]);
 });
 

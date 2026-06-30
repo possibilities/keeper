@@ -14,7 +14,7 @@ import { discoverPlugins, PluginError } from "../src/agent/plugins";
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "agentwrap-plugins-"));
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-plugins-"));
 });
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });

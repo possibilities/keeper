@@ -288,10 +288,10 @@ describe("golden: [keeper-pair] Monitor event lines", () => {
       formatEvent("failed", {
         cli: "claude",
         output: "/out.yaml",
-        error: "agentwrap wait-for-stop failed (spawn failed / killed)",
+        error: "keeper agent wait-for-stop failed (spawn failed / killed)",
       }),
     ).toBe(
-      "[keeper-pair] failed cli=claude output=/out.yaml error=agentwrap wait-for-stop failed (spawn failed / killed)",
+      "[keeper-pair] failed cli=claude output=/out.yaml error=keeper agent wait-for-stop failed (spawn failed / killed)",
     );
   });
 });

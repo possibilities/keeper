@@ -396,7 +396,7 @@ test("wait: mixed verdict (one failed log) → exit 0, ok:false, reason populate
   writeFileSync(join(dir, "opus.yaml"), "message: hi\n");
   writeFileSync(
     join(dir, "codex.log"),
-    "[keeper-pair] started cli=codex\n[keeper-pair] failed cli=codex output=/x error=agentwrap launch exited 1: boom\n",
+    "[keeper-pair] started cli=codex\n[keeper-pair] failed cli=codex output=/x error=keeper agent launch exited 1: boom\n",
   );
 
   const { deps, stdout } = makeDeps({});
@@ -410,7 +410,7 @@ test("wait: mixed verdict (one failed log) → exit 0, ok:false, reason populate
     status: "fail",
     yaml: null,
   });
-  expect(v.members[1]?.reason).toBe("agentwrap launch exited 1: boom");
+  expect(v.members[1]?.reason).toBe("keeper agent launch exited 1: boom");
 });
 
 test("wait: content-blind — a panelist answer in .yaml never reaches the verdict", async () => {

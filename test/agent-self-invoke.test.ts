@@ -185,7 +185,7 @@ describe("launch script embeds the launcherArgvPrefix (not argv[1])", () => {
     const h = makeHarness({
       argv: ["codex", "--x-tmux", "hello"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       env: { TMUX: "/tmp/tmux-501/default,1,0", PATH: "/fake/bin" },
       cwd,
@@ -221,8 +221,7 @@ describe("launch script embeds the launcherArgvPrefix (not argv[1])", () => {
     expect(script).toContain(
       `"$AGENTWRAP_SHELL" '/abs/bun' '/install/keeper/cli/keeper.ts' 'agent' 'codex' 'hello'`,
     );
-    // Negative: the pane must NOT re-exec daemon.ts or an external agentwrap bin.
+    // Negative: the pane must NOT re-exec daemon.ts (argv[1] under keeperd).
     expect(script).not.toContain("daemon.ts");
-    expect(script).not.toContain("agentwrap.ts");
   });
 });

@@ -5605,7 +5605,7 @@ test("resolveConfig: malformed YAML and missing roots key fall back to default",
 });
 
 // ---------------------------------------------------------------------------
-// fn-896: the `exec_backend` toggle is retired — agentwrap is keeper's sole,
+// fn-896: the `exec_backend` toggle is retired — keeper agent is keeper's sole,
 // direct launch transport. A stale key falls into the silent-ignore path.
 // ---------------------------------------------------------------------------
 
@@ -5613,7 +5613,10 @@ test("resolveConfig: a stale exec_backend key is silently ignored (no field, sib
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    writeFileSync(cfg, "roots:\n  - /tmp/projects\nexec_backend: agentwrap\n");
+    writeFileSync(
+      cfg,
+      "roots:\n  - /tmp/projects\nexec_backend: keeper agent\n",
+    );
     process.env.KEEPER_CONFIG = cfg;
     const got = resolveConfig();
     expect(got).not.toHaveProperty("execBackend");

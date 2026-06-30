@@ -4,7 +4,7 @@
  * profile-routing drives (explicit / env / auto / single-list-force /
  * fail-open). Two groups:
  *
- *  - Leaf helpers run against a real tmp filesystem. ensureAgentwrapProfileDir /
+ *  - Leaf helpers run against a real tmp filesystem. ensureKeeperAgentProfileDir /
  *    ensureClaudeStateSharing derive ~/.claude-profiles from homedir(); since
  *    os.homedir() ignores process.env.HOME, they take an injected homeDir seam so
  *    a tmp home isolates them.
@@ -31,9 +31,9 @@ import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
   assertProfileDirNameAllowed,
-  ensureAgentwrapPiProfileDir,
-  ensureAgentwrapProfileDir,
   ensureClaudeStateSharing,
+  ensureKeeperAgentPiProfileDir,
+  ensureKeeperAgentProfileDir,
   ensurePiStateSharing,
   ensureProfileClaudeJson,
   StateError,
@@ -50,7 +50,7 @@ let home: string;
 
 beforeEach(() => {
   savedEnv = process.env;
-  tmpDir = mkdtempSync(join(tmpdir(), "agentwrap-bootstrap-"));
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-bootstrap-"));
   home = join(tmpDir, "home");
   mkdirSync(home, { recursive: true });
 });
@@ -65,7 +65,7 @@ function readJson(path: string): Record<string, unknown> {
 
 // ── Leaf helpers: profile-dir bootstrap against a tmp home ──────────────────
 
-describe("ensureAgentwrapProfileDir", () => {
+describe("ensureKeeperAgentProfileDir", () => {
   test("creates the profile dir + shared symlinks", () => {
     const settings = join(home, ".claude", "settings.json");
     mkdirSync(join(home, ".claude"), { recursive: true });
@@ -74,7 +74,7 @@ describe("ensureAgentwrapProfileDir", () => {
     writeFileSync(claudeMd, "# Default Claude\n");
 
     const log: string[] = [];
-    const [profileDir, changed] = ensureAgentwrapProfileDir(
+    const [profileDir, changed] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       log,
@@ -108,13 +108,13 @@ describe("ensureAgentwrapProfileDir", () => {
     const claudeMd = join(home, ".claude", "CLAUDE.md");
     writeFileSync(claudeMd, "# Default Claude\n");
 
-    const [firstDir, firstChanged] = ensureAgentwrapProfileDir(
+    const [firstDir, firstChanged] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
       home,
     );
-    const [secondDir, secondChanged] = ensureAgentwrapProfileDir(
+    const [secondDir, secondChanged] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
@@ -137,7 +137,7 @@ describe("ensureAgentwrapProfileDir", () => {
     mkdirSync(profileDir, { recursive: true });
     writeFileSync(join(profileDir, "settings.json"), '{"theme":"wrong"}\n');
 
-    const [, changed] = ensureAgentwrapProfileDir(
+    const [, changed] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
@@ -163,7 +163,7 @@ describe("ensureAgentwrapProfileDir", () => {
     const claudeMd = join(home, ".claude", "CLAUDE.md");
     writeFileSync(claudeMd, "# Default Claude\n");
 
-    const [profileDir, firstChanged] = ensureAgentwrapProfileDir(
+    const [profileDir, firstChanged] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
@@ -174,7 +174,7 @@ describe("ensureAgentwrapProfileDir", () => {
     unlinkSync(join(profileDir, "settings.json"));
     symlinkSync(wrong, join(profileDir, "settings.json"));
 
-    const [repairedDir, repairedChanged] = ensureAgentwrapProfileDir(
+    const [repairedDir, repairedChanged] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
@@ -204,7 +204,7 @@ describe("ensureAgentwrapProfileDir", () => {
       recursive: true,
     });
 
-    const [, changed] = ensureAgentwrapProfileDir(
+    const [, changed] = ensureKeeperAgentProfileDir(
       "multi-claude-1",
       null,
       null,
@@ -429,28 +429,28 @@ describe("assertProfileDirNameAllowed", () => {
 // ── the four mkdir sites refuse a reserved/escaping profile name ─────────────
 
 describe("profile-dir mkdir sites reject reserved/escaping names", () => {
-  test("ensureAgentwrapProfileDir (claude) throws for a reserved name", () => {
+  test("ensureKeeperAgentProfileDir (claude) throws for a reserved name", () => {
     mkdirSync(join(home, ".claude"), { recursive: true });
     writeFileSync(join(home, ".claude", "settings.json"), "{}\n");
     expect(() =>
-      ensureAgentwrapProfileDir("default", null, null, home),
+      ensureKeeperAgentProfileDir("default", null, null, home),
     ).toThrow(StateError);
     expect(() =>
-      ensureAgentwrapProfileDir("../escape", null, null, home),
+      ensureKeeperAgentProfileDir("../escape", null, null, home),
     ).toThrow(StateError);
   });
 
-  test("ensureAgentwrapPiProfileDir (pi) throws for a reserved name", () => {
-    expect(() => ensureAgentwrapPiProfileDir("default", null, home)).toThrow(
+  test("ensureKeeperAgentPiProfileDir (pi) throws for a reserved name", () => {
+    expect(() => ensureKeeperAgentPiProfileDir("default", null, home)).toThrow(
       StateError,
     );
-    expect(() => ensureAgentwrapPiProfileDir("a/b", null, home)).toThrow(
+    expect(() => ensureKeeperAgentPiProfileDir("a/b", null, home)).toThrow(
       StateError,
     );
   });
 
-  test("ensureAgentwrapPiProfileDir (pi) creates a valid profile dir", () => {
-    const [profileDir, changed] = ensureAgentwrapPiProfileDir(
+  test("ensureKeeperAgentPiProfileDir (pi) creates a valid profile dir", () => {
+    const [profileDir, changed] = ensureKeeperAgentPiProfileDir(
       "multi-claude-1",
       null,
       home,

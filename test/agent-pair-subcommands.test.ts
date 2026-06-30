@@ -26,7 +26,7 @@ import {
 } from "./helpers/agent-main-harness";
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), "agentwrap-pair-test-"));
+  return mkdtempSync(join(tmpdir(), "keeper-agent-pair-test-"));
 }
 
 /** Write a run.json under the state dir so a run-id handle resolves. */
@@ -307,7 +307,7 @@ describe("findLastMessage", () => {
   });
 });
 
-describe("agentwrap wait-for-stop", () => {
+describe("keeper agent wait-for-stop", () => {
   test("codex: resolves the handle and returns the stop event", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -325,7 +325,7 @@ describe("agentwrap wait-for-stop", () => {
     const h = makeHarness({
       argv: ["wait-for-stop", "tmux-c1"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -346,7 +346,7 @@ describe("agentwrap wait-for-stop", () => {
     const h = makeHarness({
       argv: ["wait-for-stop"],
       rawArgv: true,
-      agentwrapStateDir: tempDir(),
+      launcherStateDir: tempDir(),
     });
 
     const code = await expectExit(main(h.deps));
@@ -373,7 +373,7 @@ describe("agentwrap wait-for-stop", () => {
     const h = makeHarness({
       argv: ["wait-for-stop", "tmux-bad1", "--stop-timeout-ms", "abc"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -390,7 +390,7 @@ describe("agentwrap wait-for-stop", () => {
   });
 });
 
-describe("agentwrap show-last-message", () => {
+describe("keeper agent show-last-message", () => {
   test("claude: prints the final message then a JSON metadata line", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -408,7 +408,7 @@ describe("agentwrap show-last-message", () => {
     const h = makeHarness({
       argv: ["show-last-message", "tmux-cl1"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -535,7 +535,7 @@ describe("pinned transcript resolution (decoy collision)", () => {
     const h = makeHarness({
       argv: ["show-last-message", "tmux-p1"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -564,7 +564,7 @@ describe("pinned transcript resolution (decoy collision)", () => {
     const h = makeHarness({
       argv: ["wait-for-stop", "tmux-p2"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -725,7 +725,7 @@ describe("inner --session-id pin", () => {
     const h = makeHarness({
       argv: ["claude", "--x-tmux-session=work", "--x-tmux-detached", "hi"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
       randomUuid: () => sessionId,

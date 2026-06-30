@@ -8,7 +8,7 @@
  *
  * The highest-value coverage is a failure path. We drive the launch-failure
  * branch by pointing `KEEPER_AGENT_PATH` at a nonexistent binary: the
- * `agentwrap <cli>` launch spawn throws ENOENT, `runAgentwrap` returns null, and
+ * `keeper agent <cli>` launch spawn throws ENOENT, `runKeeperAgent` returns null, and
  * `main()` takes the `fail(...)` path. No real tmux, no real git (read-only is
  * off so the git backstop is skipped), no daemon — a deterministic synchronous
  * failure.
@@ -161,9 +161,9 @@ test("launch-failure path emits exactly one started + one failed line (two-line 
   expect(countEvent(r.stdout, "completed")).toBe(0);
 
   // The terminal line carries the launch-failure cause: bun runs the bad launcher
-  // module and exits non-zero, surfaced as an "agentwrap launch exited" error.
+  // module and exits non-zero, surfaced as an "keeper agent launch exited" error.
   expect(r.stdout).toContain("[keeper-pair] failed");
-  expect(r.stdout).toContain("error=agentwrap launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch exited");
 });
 
 test("started precedes failed on the failure path", async () => {
@@ -213,7 +213,7 @@ test("--preset alone is valid: harness comes from the preset, started carries pr
   expect(r.stdout).toContain("[keeper-pair] started cli=claude");
   expect(r.stdout).toContain("preset=reviewer");
   // It reached the launch, not an arg-fault exit-2.
-  expect(r.stdout).toContain("error=agentwrap launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch exited");
 });
 
 test("--preset + agreeing --cli is accepted", async () => {
@@ -233,7 +233,7 @@ test("--preset + agreeing --cli is accepted", async () => {
   ]);
   expect(r.code).toBe(1);
   expect(countEvent(r.stdout, "started")).toBe(1);
-  expect(r.stdout).toContain("error=agentwrap launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch exited");
 });
 
 test("--preset disagreeing with --cli fails loud (exit 2, no started line)", async () => {
@@ -281,7 +281,7 @@ test("a pi preset is accepted: reaches launch (exit 1, started cli=pi)", async (
   expect(countEvent(r.stdout, "failed")).toBe(1);
   expect(r.stdout).toContain("[keeper-pair] started cli=pi");
   expect(r.stdout).toContain("preset=thinker");
-  expect(r.stdout).toContain("error=agentwrap launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch exited");
 });
 
 test("--cli pi is accepted: reaches launch (exit 1)", async () => {
@@ -300,7 +300,7 @@ test("--cli pi is accepted: reaches launch (exit 1)", async () => {
   expect(countEvent(r.stdout, "started")).toBe(1);
   expect(countEvent(r.stdout, "failed")).toBe(1);
   expect(r.stdout).toContain("[keeper-pair] started cli=pi");
-  expect(r.stdout).toContain("error=agentwrap launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch exited");
 });
 
 test("a missing preset name fails loud naming the available presets (exit 2)", async () => {

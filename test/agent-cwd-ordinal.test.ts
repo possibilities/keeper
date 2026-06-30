@@ -23,7 +23,7 @@ const counterPath = join(
 const touchedKeys: string[] = [];
 
 function uniqueKey(): string {
-  const k = `agentwrap-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const k = `keeper-agent-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
   touchedKeys.push(k);
   return k;
 }

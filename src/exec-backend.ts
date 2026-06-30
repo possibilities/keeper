@@ -1,20 +1,20 @@
 /**
  * The terminal-surface launch + pane seams keeper dispatches workers through.
- * agentwrap is the SOLE launch transport: {@link agentwrapLaunch} invokes the
- * patched agentwrap CLI (which OWNS the tmux window — session-create + handoff)
+ * keeper agent is the SOLE launch transport: {@link keeperAgentLaunch} invokes the
+ * patched keeper agent CLI (which OWNS the tmux window — session-create + handoff)
  * for autopilot dispatch, manual `keeper dispatch`, bus wake, AND crash-recovery
  * restore (all in resume mode for the latter two). tmux is used DIRECTLY only for
  * the surviving pane-ops seam — the session-agnostic pane ops
  * ({@link createTmuxPaneOps}: focus / list / rename / kill, consumed by the
  * renamer / jobs CLI / autopilot liveness probe). No `ExecBackend`
- * interface, no backend toggle: the launch transport is agentwrap, the pane ops
+ * interface, no backend toggle: the launch transport is keeper agent, the pane ops
  * are the only remaining direct tmux surface.
  *
  * Every function is pure / side-effect-free at module scope; tests inject a fake
  * `spawn` to assert argv without launching real processes.
  *
  * The reconciler correlates a launch back to keeperd via the `--name verb::id`
- * baked into the agentwrap invocation → SessionStart hook event → `jobs`
+ * baked into the keeper agent invocation → SessionStart hook event → `jobs`
  * projection, never via a surface ref; tmux is stateless from autopilot's side.
  */
 
@@ -34,8 +34,8 @@ export type SpawnFn = (
     /**
      * Child working directory. The tmux backend sets the worker cwd via tmux's
      * own `-c <cwd>` inside the argv (so it is omitted on those spawns); the
-     * agentwrap backend has no such flag, so it sets the worker cwd HERE —
-     * agentwrap reads its `process.cwd()` for the launch-script `cd`, and
+     * keeper agent backend has no such flag, so it sets the worker cwd HERE —
+     * keeper agent reads its `process.cwd()` for the launch-script `cd`, and
      * keeperd's own cwd is not the worker's target repo.
      */
     cwd?: string;
@@ -60,7 +60,7 @@ export type SpawnFn = (
  *     backend failure is this class, so the existing tmux routing is unchanged.
  *   - `retryable: true` → TRANSIENT: NO `DispatchFailed`; the `pending_dispatches`
  *     row is KEPT so the normal TTL→`DispatchExpired` path re-dispatches. The
- *     agentwrap backend stamps this for an agentwrap `RETRYABLE`(4) exit and a
+ *     keeper agent backend stamps this for a keeper agent `RETRYABLE`(4) exit and a
  *     timeout-kill — a recoverable launch must NOT be written off as sticky, and
  *     must NOT feed the K=3 never-bound counter as a permanent fail would.
  */
@@ -69,8 +69,8 @@ export type LaunchResult =
   | { ok: false; error: string; retryable?: boolean };
 
 /**
- * Structured launch inputs {@link agentwrapLaunch} builds its unwrapped
- * agentwrap invocation from (agentwrap owns its own tmux window, so the keeper
+ * Structured launch inputs {@link keeperAgentLaunch} builds its unwrapped
+ * keeper agent invocation from (keeper agent owns its own tmux window, so the keeper
  * shell-wrap shape does not apply). Both call sites already hold these pieces —
  * the autopilot reconciler from `(verb, id)`, the CLI from its parsed flags — so
  * threading the spec costs nothing at the seam.
@@ -135,7 +135,7 @@ const RUN_CAPTURE_TIMEOUT_MS = 5000;
 
 /** The persisted `backend_exec_type` schema tag (restore-worker.ts stamps it;
  *  the hook's {@link execBackendEnvMeta} returns it). NOT a launch toggle —
- *  agentwrap is the sole launch transport; this is the historical tag the env
+ *  keeper agent is the sole launch transport; this is the historical tag the env
  *  metadata + the persisted snapshot carry. The one source of truth for the
  *  lockstep `db.ts` site and tests. */
 export const DEFAULT_EXEC_BACKEND = "tmux" as const;
@@ -188,8 +188,8 @@ export type CaptureResult = {
  * ENOENT (binary missing) also degrades to `null`. NEVER throws.
  *
  * `noteLine` carries the timeout warn; `kind` labels the killed subprocess in
- * that warn (`"tmux"` / `"agentwrap"`). Factored to module scope so the
- * agentwrap backend reuses the EXACT same bounded-capture semantics the tmux
+ * that warn (`"tmux"` / `"keeper agent"`). Factored to module scope so the
+ * keeper agent backend reuses the EXACT same bounded-capture semantics the tmux
  * backend relies on (stderr drained separately, timeout-kill → null).
  */
 function makeRunCapture(deps: {
@@ -255,7 +255,7 @@ export interface ExecBackendEnvMeta {
   readonly paneIdEnvVar: string;
   /**
    * Keeper-owned carrier the hook reads for the pane id when the native
-   * `TMUX`/`TMUX_PANE` env has been stripped (agentwrap deletes them so Claude
+   * `TMUX`/`TMUX_PANE` env has been stripped (keeper agent deletes them so Claude
    * emits truecolor, copying the pane id here first). The fallback read in
    * `backendExecCoordsFromEnv` keys off this name.
    */
@@ -276,11 +276,11 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
     sessionIdEnvVar: "KEEPER_TMUX_SESSION",
     paneIdEnvVar: "TMUX_PANE",
     // Drift guard: this literal MUST stay byte-identical to the carrier string
-    // agentwrap writes in ~/code/agentwrap/src/main.ts. There is no shared
-    // module across the two repos; matching comments on both sides are the
-    // agreed drift guard. agentwrap copies `$TMUX_PANE` here before deleting
-    // `TMUX`/`TMUX_PANE` (so Claude emits truecolor), and the hook's fallback
-    // arm reads it to keep stamping the pane id for window renaming.
+    // the launcher writes in `src/agent/main.ts`. There is no shared module
+    // across the launcher and this consumer; matching comments on both sides are
+    // the agreed drift guard. The launcher copies `$TMUX_PANE` here before
+    // deleting `TMUX`/`TMUX_PANE` (so Claude emits truecolor), and the hook's
+    // fallback arm reads it to keep stamping the pane id for window renaming.
     paneIdCarrierEnvVar: "KEEPER_TMUX_PANE",
   };
 }
@@ -572,7 +572,7 @@ export interface TmuxPaneOps {
  * Direct factory for the session-agnostic tmux pane ops — focus / sweep /
  * rename / kill. These are the surviving tmux seam alongside the restore replay:
  * every op targets a server-global tmux id the hook stamps, so they apply
- * identically regardless of who minted the window (agentwrap-launched or
+ * identically regardless of who minted the window (keeper-agent-launched or
  * hand-created). Reuses the same pure argv builders + bounded `makeRunCapture` +
  * locale default the restore-replay path uses. NEVER throws — every failure
  * degrades to a `noteLine` warn / a best-effort no-op `{ ok: false }`.
@@ -713,36 +713,36 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
 }
 
 // ===========================================================================
-// agentwrap launch — keeper's sole launch transport
+// keeper agent launch — keeper's sole launch transport
 //
-// keeper invokes the patched agentwrap CLI — which OWNS the tmux window
-// (session-create + handoff) — for both autopilot dispatch and manual
+// keeper invokes the in-binary keeper agent launcher — which OWNS the tmux
+// window (session-create + handoff) — for both autopilot dispatch and manual
 // `keeper dispatch`. The binding/lease/kill/list/rename/focus machinery is the
 // DIRECT tmux pane-ops seam ({@link createTmuxPaneOps}): every later op targets
-// the server-global tmux pane id the hook stamps, not anything agentwrap
-// returns. agentwrap's one-line JSON + exit code are consumed ONLY to confirm
+// the server-global tmux pane id the hook stamps, not anything the launcher
+// returns. The launcher's one-line JSON + exit code are consumed ONLY to confirm
 // the launch and classify retry.
 //
-// Cross-repo contract (NO shared module — matching comments are the drift
+// Launcher contract (NO shared module — matching comments are the drift
 // guard, byte-pinned by a fixture in test/exec-backend.test.ts):
 //   - CLI flags: `claude --x-tmux --x-tmux-detached
 //     --x-tmux-session <s> --x-tmux-env KEEPER_TMUX_SESSION=<s>`.
 //   - stdout: exactly one line of `schema_version:1` JSON (`session`/`windowId`/
 //     `paneId` at top level). keeper DISCARDS `paneId` — binding is hook-based.
-//   - exit codes (agentwrap `TMUX_EXIT`): 0=launched, 1=INTERNAL, 2=BAD_ARGS,
+//   - exit codes (the launcher's `TMUX_EXIT`): 0=launched, 1=INTERNAL, 2=BAD_ARGS,
 //     3=NOOP, 4=RETRYABLE.
 // ===========================================================================
 
-/** The agentwrap tmux-launch JSON schema keeper consumes. Bumping this on the
- *  agentwrap side without a keeper update lands a PERMANENT fail (loud), never a
- *  silent mismatch. */
-export const AGENTWRAP_SCHEMA_VERSION = 1;
+/** The keeper agent tmux-launch JSON schema keeper consumes. Bumping this on the
+ *  launcher side without a keeper-consumer update lands a PERMANENT fail (loud),
+ *  never a silent mismatch. */
+export const KEEPER_AGENT_SCHEMA_VERSION = 1;
 
 /**
- * agentwrap's `TMUX_EXIT` taxonomy (cross-repo contract — mirrors
- * `~/code/agentwrap/src/tmux-launch.ts`). Pinned here so the central exit map
+ * The launcher's `TMUX_EXIT` taxonomy (mirrors
+ * `src/agent/tmux-launch.ts`). Pinned here so the central exit map
  * reads off named constants, never bare magic numbers.
- *   - `INTERNAL`(1): agentwrap parse/logic failure — hard fail, never retry.
+ *   - `INTERNAL`(1): launcher parse/logic failure — hard fail, never retry.
  *   - `BAD_ARGS`(2): malformed invocation — a keeper-built-bad-argv BUG, loud,
  *     never retry.
  *   - `NOOP`(3): a prereq the caller can't retry into (tmux missing, session
@@ -750,24 +750,24 @@ export const AGENTWRAP_SCHEMA_VERSION = 1;
  *   - `RETRYABLE`(4): transient (timeout / lock contention) — TRANSIENT, worth a
  *     bounded retry via the normal expire path.
  */
-export const AGENTWRAP_TMUX_EXIT = {
+export const KEEPER_AGENT_TMUX_EXIT = {
   INTERNAL: 1,
   BAD_ARGS: 2,
   NOOP: 3,
   RETRYABLE: 4,
 } as const;
 
-/** Inputs to {@link buildAgentwrapLaunchArgv}. Structured (DB-free) so the argv
+/** Inputs to {@link buildKeeperAgentLaunchArgv}. Structured (DB-free) so the argv
  *  is byte-pin testable. */
-export interface AgentwrapLaunchOpts {
+export interface KeeperAgentLaunchOpts {
   /** The launcher argv PREFIX the spawn execs to reach the folded launcher:
    *  `[<abs bun>, <abs cli/keeper.ts>, "agent"]` (built by
    *  `buildLauncherArgvPrefix` over `process.execPath` + `resolveKeeperAgentPath`).
    *  The agent token + flags are appended, yielding
-   *  `<bun> <keeper.ts> agent claude …`. Supersedes the standalone agentwrap
+   *  `<bun> <keeper.ts> agent claude …`. Supersedes the standalone keeper agent
    *  binary path — the launcher folded into `keeper agent`. */
   readonly launcherArgvPrefix: readonly string[];
-  /** Managed tmux session agentwrap mints/targets via `--x-tmux-session`. */
+  /** Managed tmux session keeper agent mints/targets via `--x-tmux-session`. */
   readonly session: string;
   /** The initial interactive prompt — the FINAL positional argv element. Dropped
    *  in resume mode ({@link resumeTarget} set). */
@@ -786,7 +786,7 @@ export interface AgentwrapLaunchOpts {
   /**
    * Worktree-mode lane path (realpath-normalized by the producer). When set
    * (non-empty), emit a SECOND `--x-tmux-env KEEPER_PLAN_WORKTREE=<path>`
-   * right after the `KEEPER_TMUX_SESSION` entry — agentwrap accepts the repeated
+   * right after the `KEEPER_TMUX_SESSION` entry — keeper agent accepts the repeated
    * flag (last-wins per dup key). Omitted → argv is byte-identical to today.
    */
   readonly worktreePath?: string;
@@ -815,7 +815,7 @@ export interface AgentwrapLaunchOpts {
  *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
  *
  * The tail is the ONLY conditional: prompt mode (the default) ends with the
- * `prompt` positional; resume mode ({@link AgentwrapLaunchOpts.resumeTarget} set)
+ * `prompt` positional; resume mode ({@link KeeperAgentLaunchOpts.resumeTarget} set)
  * ends with `--resume <target>` and NO prompt — the `keeper bus wake` / crash-
  * restore re-attach. The prompt-mode argv is byte-identical to before the resume
  * branch was added.
@@ -830,14 +830,16 @@ export interface AgentwrapLaunchOpts {
  * as the tmux backend's own `-e` does. The `--name` adjacency is load-bearing for
  * reap/classify parsing. EVERY launch emits a SECOND `--x-tmux-env
  * KEEPER_PLAN_WORKTREE=<lane-or-empty>` immediately after — the lane when {@link
- * AgentwrapLaunchOpts.worktreePath} is set, EMPTY otherwise. tmux persists `-e`
+ * KeeperAgentLaunchOpts.worktreePath} is set, EMPTY otherwise. tmux persists `-e`
  * into the session env, so an always-present entry OVERWRITES any stale lane a
  * prior worktree launch left in a reused session (an empty value resolves
  * identically to unset, so serial resolution is unchanged). It rides BOTH prompt
  * and resume launches (a resumed worktree worker must not re-resolve to the main
  * checkout). Pure — exported for byte-pin tests.
  */
-export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
+export function buildKeeperAgentLaunchArgv(
+  opts: KeeperAgentLaunchOpts,
+): string[] {
   const flags: string[] = [];
   if (opts.model !== undefined) {
     flags.push("--model", opts.model);
@@ -867,14 +869,14 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
     opts.session,
     "--x-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
-    // Worktree-lane carrier — ALWAYS a SECOND repeated `--x-tmux-env` (agentwrap
+    // Worktree-lane carrier — ALWAYS a SECOND repeated `--x-tmux-env` (keeper agent
     // last-wins per dup key): the lane in worktree mode, EMPTY in serial. Always
     // present so the `-e` OVERWRITES any stale lane a prior worktree launch left
     // in a reused tmux session env; an empty value resolves identically to unset.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE=${opts.worktreePath ?? ""}`,
     // Worktree-lane BRANCH carrier — ALWAYS a THIRD repeated `--x-tmux-env`
-    // (agentwrap last-wins per dup key): the lane branch in worktree mode, EMPTY
+    // (keeper agent last-wins per dup key): the lane branch in worktree mode, EMPTY
     // in serial. Always present so the `-e` OVERWRITES any stale branch a prior
     // worktree launch left in a reused tmux session env (the same reason the
     // path env above is unconditional); an empty value collapses to NULL at the
@@ -886,20 +888,22 @@ export function buildAgentwrapLaunchArgv(opts: AgentwrapLaunchOpts): string[] {
   ];
 }
 
-/** Outcome of parsing agentwrap stdout (the JSON-shape verdict, separate from
+/** Outcome of parsing keeper agent stdout (the JSON-shape verdict, separate from
  *  the exit-code verdict). `ok` confirms a `schema_version:1` line was found;
  *  the parsed `paneId` is DISCARDED by keeper (binding is hook-based) but
  *  returned for completeness / logging. */
-export type AgentwrapParseResult = { ok: true } | { ok: false; error: string };
+export type KeeperAgentParseResult =
+  | { ok: true }
+  | { ok: false; error: string };
 
 /**
- * Parse agentwrap's stdout DEFENSIVELY: scan LINE-BY-LINE (never `JSON.parse` a
+ * Parse keeper agent's stdout DEFENSIVELY: scan LINE-BY-LINE (never `JSON.parse` a
  * raw multi-line chunk), take the first line that `JSON.parse`es to an object
- * carrying `schema_version`, and validate the version. agentwrap emits exactly
+ * carrying `schema_version`, and validate the version. keeper agent emits exactly
  * one JSON line, but the line scan tolerates a stray banner/log line ahead of
  * it. Every parse is wrapped in try/catch.
  *
- *   - a `schema_version === AGENTWRAP_SCHEMA_VERSION` object → `{ ok: true }`.
+ *   - a `schema_version === KEEPER_AGENT_SCHEMA_VERSION` object → `{ ok: true }`.
  *   - a JSON object with a DIFFERENT `schema_version` → PERMANENT fail (the
  *     cross-repo contract drifted; do not retry into a mismatch).
  *   - no parseable `schema_version` line (empty / non-JSON / malformed) →
@@ -907,7 +911,7 @@ export type AgentwrapParseResult = { ok: true } | { ok: false; error: string };
  *
  * Pure — exported for tests.
  */
-export function parseAgentwrapStdout(stdout: string): AgentwrapParseResult {
+export function parseKeeperAgentStdout(stdout: string): KeeperAgentParseResult {
   let sawObjectWithoutSchema = false;
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
@@ -931,10 +935,10 @@ export function parseAgentwrapStdout(stdout: string): AgentwrapParseResult {
       sawObjectWithoutSchema = true;
       continue;
     }
-    if (sv !== AGENTWRAP_SCHEMA_VERSION) {
+    if (sv !== KEEPER_AGENT_SCHEMA_VERSION) {
       return {
         ok: false,
-        error: `agentwrap JSON schema_version ${JSON.stringify(sv)} != ${AGENTWRAP_SCHEMA_VERSION} (cross-repo contract drift)`,
+        error: `keeper agent JSON schema_version ${JSON.stringify(sv)} != ${KEEPER_AGENT_SCHEMA_VERSION} (cross-repo contract drift)`,
       };
     }
     return { ok: true };
@@ -942,13 +946,13 @@ export function parseAgentwrapStdout(stdout: string): AgentwrapParseResult {
   return {
     ok: false,
     error: sawObjectWithoutSchema
-      ? "agentwrap JSON carried no schema_version field"
-      : "agentwrap emitted no parseable schema_version JSON line",
+      ? "keeper agent JSON carried no schema_version field"
+      : "keeper agent emitted no parseable schema_version JSON line",
   };
 }
 
 /**
- * The ONE central agentwrap exit-code → launch outcome map. Keeping it a single
+ * The ONE central keeper agent exit-code → launch outcome map. Keeping it a single
  * function (never scattered `if exitCode===3`) is load-bearing: the 3-vs-4
  * split is the fork that decides sticky-fail vs transient-retry, and a miscode
  * either trips the K=3 never-bound breaker wrongly (a permanent folded as
@@ -967,9 +971,9 @@ export function parseAgentwrapStdout(stdout: string): AgentwrapParseResult {
  * stdout did NOT carry a valid contract line is treated as INTERNAL-permanent
  * (we cannot confirm the window was created). Pure — exported for tests.
  */
-export function mapAgentwrapExit(
+export function mapKeeperAgentExit(
   exitCode: number,
-  parse: AgentwrapParseResult,
+  parse: KeeperAgentParseResult,
 ): LaunchResult {
   if (exitCode === 0) {
     if (parse.ok) {
@@ -977,54 +981,60 @@ export function mapAgentwrapExit(
     }
     // Clean exit but unconfirmable launch — permanent (do not retry into a
     // contract we can't read).
-    return { ok: false, error: `agentwrap launch unconfirmed: ${parse.error}` };
-  }
-  if (exitCode === AGENTWRAP_TMUX_EXIT.RETRYABLE) {
     return {
       ok: false,
-      error: "agentwrap launch transient (exit 4 RETRYABLE)",
+      error: `keeper agent launch unconfirmed: ${parse.error}`,
+    };
+  }
+  if (exitCode === KEEPER_AGENT_TMUX_EXIT.RETRYABLE) {
+    return {
+      ok: false,
+      error: "keeper agent launch transient (exit 4 RETRYABLE)",
       retryable: true,
     };
   }
-  if (exitCode === AGENTWRAP_TMUX_EXIT.NOOP) {
-    return { ok: false, error: "agentwrap launch no-op (exit 3 NOOP)" };
+  if (exitCode === KEEPER_AGENT_TMUX_EXIT.NOOP) {
+    return { ok: false, error: "keeper agent launch no-op (exit 3 NOOP)" };
   }
-  if (exitCode === AGENTWRAP_TMUX_EXIT.INTERNAL) {
-    return { ok: false, error: "agentwrap internal failure (exit 1 INTERNAL)" };
+  if (exitCode === KEEPER_AGENT_TMUX_EXIT.INTERNAL) {
+    return {
+      ok: false,
+      error: "keeper agent internal failure (exit 1 INTERNAL)",
+    };
   }
-  if (exitCode === AGENTWRAP_TMUX_EXIT.BAD_ARGS) {
+  if (exitCode === KEEPER_AGENT_TMUX_EXIT.BAD_ARGS) {
     return {
       ok: false,
       error:
-        "agentwrap bad argv (exit 2 BAD_ARGS — keeper built a bad invocation)",
+        "keeper agent bad argv (exit 2 BAD_ARGS — keeper built a bad invocation)",
     };
   }
-  return { ok: false, error: `agentwrap launch failed (exit ${exitCode})` };
+  return { ok: false, error: `keeper agent launch failed (exit ${exitCode})` };
 }
 
 /**
- * Upper bound on a single agentwrap-launch `runCapture` await. Larger than the
- * pane-ops 5s default because agentwrap mints the session AND hands off to
+ * Upper bound on a single keeper-agent-launch `runCapture` await. Larger than the
+ * pane-ops 5s default because keeper agent mints the session AND hands off to
  * claude in the same invocation, so a 5s cap would spuriously timeout-kill a
  * legitimately-slow launch. On expiry the child is force-killed and the launch
  * degrades to a TRANSIENT fail (the normal expire path re-dispatches), never a
  * sticky one. Unit: MILLISECONDS.
  */
-export const AGENTWRAP_CAPTURE_TIMEOUT_MS = 30_000;
+export const KEEPER_AGENT_CAPTURE_TIMEOUT_MS = 30_000;
 
-/** Inputs to {@link agentwrapLaunch}. `session` is the tmux session agentwrap
+/** Inputs to {@link keeperAgentLaunch}. `session` is the tmux session keeper agent
  *  mints/targets (the hardcoded {@link MANAGED_EXEC_SESSION} for autopilot
  *  dispatch, a per-call session for manual `keeper dispatch`); `cwd` is the
- *  worker's target repo, set on the spawn (agentwrap has no cwd flag). `label`
- *  feeds the warn/log lines only. `spec` is the structured launch agentwrap
+ *  worker's target repo, set on the spawn (keeper agent has no cwd flag). `label`
+ *  feeds the warn/log lines only. `spec` is the structured launch keeper agent
  *  builds its invocation from. `spawn`/`captureTimeoutMs` are injectable for
  *  tests. */
-export interface AgentwrapLaunchDeps {
+export interface KeeperAgentLaunchDeps {
   readonly noteLine: (line: string) => void;
   /** The launcher argv PREFIX (`[<bun>, <abs cli/keeper.ts>, "agent"]`) the spawn
    *  execs to reach the folded `keeper agent` launcher. Resolved by the caller
    *  (`buildLauncherArgvPrefix` over `process.execPath` + `resolveKeeperAgentPath`),
-   *  frozen in here. Supersedes the standalone agentwrap binary path. */
+   *  frozen in here. Supersedes the standalone keeper agent binary path. */
   readonly launcherArgvPrefix: readonly string[];
   readonly session: string;
   readonly cwd: string;
@@ -1035,31 +1045,31 @@ export interface AgentwrapLaunchDeps {
 }
 
 /**
- * keeper's sole launch transport. Builds the unwrapped agentwrap invocation from
- * the structured {@link LaunchSpec} (agentwrap owns its own tmux window, so the
+ * keeper's sole launch transport. Builds the unwrapped keeper agent invocation from
+ * the structured {@link LaunchSpec} (keeper agent owns its own tmux window, so the
  * keeper shell-wrap shape does not apply), runs it via the shared bounded
- * `runCapture` with the worker `cwd` on the spawn (agentwrap has no cwd flag and
+ * `runCapture` with the worker `cwd` on the spawn (keeper agent has no cwd flag and
  * reads its own `process.cwd()` for the launch-script `cd`; keeperd's cwd is NOT
  * the worker's target repo), parses the one-line JSON defensively, and maps the
- * exit code through the central {@link mapAgentwrapExit}. Session-create is
- * DELEGATED to agentwrap (`--x-tmux-session`, minting with
+ * exit code through the central {@link mapKeeperAgentExit}. Session-create is
+ * DELEGATED to keeper agent (`--x-tmux-session`, minting with
  * C.UTF-8 + TERM/COLORTERM) — keeper runs no tmux session-ensure on this path.
  * Drives BOTH autopilot dispatch (the managed session) and manual `keeper
  * dispatch` (a per-call session). NEVER throws.
  */
-export async function agentwrapLaunch(
-  deps: AgentwrapLaunchDeps,
+export async function keeperAgentLaunch(
+  deps: KeeperAgentLaunchDeps,
 ): Promise<LaunchResult> {
   const spawn = deps.spawn ?? defaultSpawn;
   const captureTimeoutMs =
-    deps.captureTimeoutMs ?? AGENTWRAP_CAPTURE_TIMEOUT_MS;
+    deps.captureTimeoutMs ?? KEEPER_AGENT_CAPTURE_TIMEOUT_MS;
   const runCapture = makeRunCapture({
     spawn,
     captureTimeoutMs,
     noteLine: deps.noteLine,
-    kind: "agentwrap",
+    kind: "keeper agent",
   });
-  const launchArgv = buildAgentwrapLaunchArgv({
+  const launchArgv = buildKeeperAgentLaunchArgv({
     launcherArgvPrefix: deps.launcherArgvPrefix,
     session: deps.session,
     prompt: deps.spec.prompt,
@@ -1079,7 +1089,7 @@ export async function agentwrapLaunch(
       : {}),
     noConfirm: true,
   });
-  // agentwrap has no cwd flag — it reads its own `process.cwd()` for the
+  // keeper agent has no cwd flag — it reads its own `process.cwd()` for the
   // launch-script `cd`, so set the worker cwd on the spawn.
   const res = await runCapture(
     launchArgv,
@@ -1091,15 +1101,15 @@ export async function agentwrapLaunch(
     // wedged-but-recoverable launch (the timeout-kill case) re-dispatches; a
     // genuinely-missing binary keeps failing each cycle and surfaces in the
     // warn log, tripping the K=3 never-bound breaker after bounded retries.
-    const error = `agentwrap launch for ${deps.label} produced no result (bad prefix '${deps.launcherArgvPrefix.join(" ")}'? or timeout-kill)`;
+    const error = `keeper agent launch for ${deps.label} produced no result (bad prefix '${deps.launcherArgvPrefix.join(" ")}'? or timeout-kill)`;
     deps.noteLine(`# warn: ${error}`);
     return { ok: false, error, retryable: true };
   }
   if (res.stderr.trim().length > 0) {
     deps.noteLine(`# launch stderr (${deps.label}): ${res.stderr.trim()}`);
   }
-  const parse = parseAgentwrapStdout(res.stdout);
-  const outcome = mapAgentwrapExit(res.exitCode, parse);
+  const parse = parseKeeperAgentStdout(res.stdout);
+  const outcome = mapKeeperAgentExit(res.exitCode, parse);
   if (outcome.ok === false) {
     deps.noteLine(
       `# warn: ${outcome.error}${outcome.retryable === true ? " (transient)" : ""}; raw stdout: ${JSON.stringify(res.stdout)}`,

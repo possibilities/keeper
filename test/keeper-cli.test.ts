@@ -506,7 +506,7 @@ async function runMain(
   return { code, stdout: out.join(""), stderr: err.join("") };
 }
 
-/** A LaunchFn recording its call (including the structured `spec` the agentwrap
+/** A LaunchFn recording its call (including the structured `spec` the keeper agent
  *  backend consumes) and returning a canned result. */
 function fakeLaunch(result: LaunchResult): {
   fn: LaunchFn;
@@ -782,8 +782,8 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     expect(r.stdout).toContain("prompt-from: plan");
   });
 
-  test("threads a structured spec to the launch seam (agentwrap backend consumes it)", async () => {
-    // The agentwrap backend ignores the pre-wrapped argv and builds its own
+  test("threads a structured spec to the launch seam (keeper agent backend consumes it)", async () => {
+    // The keeper agent backend ignores the pre-wrapped argv and builds its own
     // invocation from `spec`; manual dispatch MUST pass it. Free form: prompt +
     // the forwarded model/effort, no claudeName.
     const launch = fakeLaunch({ ok: true });
@@ -933,7 +933,7 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
     const s = setupBackendSandbox();
     try {
       const r = await runWithBackendEnv(
-        ["--prompt", "hello agentwrap", "--session", "scratch"],
+        ["--prompt", "hello keeper agent", "--session", "scratch"],
         s,
       );
       // The stub exited 0 → launched; dispatch reports success.
@@ -945,7 +945,7 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
       expect(recorded).toContain("--x-tmux-session scratch");
       expect(recorded).toContain("--x-tmux-env KEEPER_TMUX_SESSION=scratch");
       // The structured prompt rides as the final positional.
-      expect(recorded).toContain("hello agentwrap");
+      expect(recorded).toContain("hello keeper agent");
     } finally {
       s.cleanup();
     }
@@ -956,7 +956,7 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
     const s = setupBackendSandbox("tmux");
     try {
       const r = await runWithBackendEnv(
-        ["--prompt", "hello agentwrap", "--session", "scratch"],
+        ["--prompt", "hello keeper agent", "--session", "scratch"],
         s,
       );
       expect(r.code).toBeUndefined();

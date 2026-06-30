@@ -1,9 +1,9 @@
 /**
  * Subcommand dispatch — the pre-pass that runs before any wrapper logic.
- * `agentwrap` is a subcommand dispatcher. `splitSubcommand` strips exactly ONE
+ * `keeper agent` is a subcommand dispatcher. `splitSubcommand` strips exactly ONE
  * leading agent token and hands the rest to the launcher flow, so the composed
  * agent argv stays byte-identical to what the bare launcher produced.
- * `agentwrap claude claude` keeps the second `claude` as a prompt arg; the same
+ * `keeper agent claude claude` keeps the second `claude` as a prompt arg; the same
  * contract applies to `codex` and `pi`.
  *
  * Informational flags (`-h`/`--help`, `-v`/`--version`) and the bare/unknown
@@ -38,63 +38,63 @@ export type Dispatch =
   | { kind: "usage"; unknown?: string };
 
 /** The wrapper-owned help flag, consumed before passthrough and launch. */
-export const AGENTWRAP_HELP_FLAG = "--x-help";
+export const KEEPER_AGENT_HELP_FLAG = "--x-help";
 
 /** True when argv contains the wrapper-owned `--x-help` flag. */
-export function hasAgentwrapHelpFlag(argv: string[]): boolean {
-  return argv.includes(AGENTWRAP_HELP_FLAG);
+export function hasKeeperAgentHelpFlag(argv: string[]): boolean {
+  return argv.includes(KEEPER_AGENT_HELP_FLAG);
 }
 
 /** Top-level help/usage text. */
-export const USAGE = `agentwrap — launch agent CLIs with agentwrap routing and startup defaults.
+export const USAGE = `keeper agent — launch agent CLIs with keeper agent routing and startup defaults.
 
 Usage:
-  agentwrap claude [args...]        Launch Claude Code.
-  agentwrap codex [args...]         Launch Codex CLI.
-  agentwrap pi [args...]            Launch pi.
-  agentwrap --x-preset <name> [args...]
+  keeper agent claude [args...]        Launch Claude Code.
+  keeper agent codex [args...]         Launch Codex CLI.
+  keeper agent pi [args...]            Launch pi.
+  keeper agent --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
-  agentwrap presets resolve <name>  Emit the resolved preset/panel JSON.
-  agentwrap presets list [--json]   List configured presets + panels.
-  agentwrap profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
+  keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
+  keeper agent presets list [--json]   List configured presets + panels.
+  keeper agent profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
                                     tier metadata is missing (read-only).
-  agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
-  agentwrap show-last-message <h>   Print a detached run's final message.
-  agentwrap run <cli> <prompt> [--stop-timeout-ms <ms>]
+  keeper agent show-last-message <h>   Print a detached run's final message.
+  keeper agent run <cli> <prompt> [--stop-timeout-ms <ms>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
-  agentwrap wait <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
-  agentwrap --help                  Show this help.
-  agentwrap --version               Show the version.
+  keeper agent --help                  Show this help.
+  keeper agent --version               Show the version.
 
-Agentwrap transport flags such as --x-tmux are consumed by the wrapper;
+keeper agent transport flags such as --x-tmux are consumed by the wrapper;
 all other args after the agent subcommand pass through to that launcher unchanged.
 A detached launch (--x-tmux --x-tmux-detached) prints a JSON
 handle; pass its "id" (or a transcript path) to wait-for-stop / show-last-message.
 `;
 
 /** Version string, sourced from package.json. */
-export const VERSION = `agentwrap ${(pkg as { version: string }).version}\n`;
+export const VERSION = `keeper agent ${(pkg as { version: string }).version}\n`;
 
 /**
  * Wrapper-owned overlay help. Documents only the `--x-*` surface the
  * wrapper consumes — common flags, the tmux transport flags, and the
  * agent-specific wrapper flag. Native agent flags are NOT listed here; reach a
- * launcher's own help with `agentwrap <agent> --help`.
+ * launcher's own help with `keeper agent <agent> --help`.
  */
-export const AGENTWRAP_HELP = `agentwrap — launch agent CLIs with agentwrap routing and startup defaults.
+export const KEEPER_AGENT_HELP = `keeper agent — launch agent CLIs with keeper agent routing and startup defaults.
 
 Usage:
-  agentwrap claude [args...]   Launch Claude Code.
-  agentwrap codex [args...]    Launch Codex CLI.
-  agentwrap pi [args...]       Launch pi.
+  keeper agent claude [args...]   Launch Claude Code.
+  keeper agent codex [args...]    Launch Codex CLI.
+  keeper agent pi [args...]       Launch pi.
 
 The flags below are consumed by the wrapper; every other arg after the agent
 subcommand passes through to that launcher unchanged. For a launcher's own
-options, run \`agentwrap <agent> --help\`.
+options, run \`keeper agent <agent> --help\`.
 
 Wrapper flags:
   --x-help                  Show this wrapper help and exit.
@@ -111,19 +111,19 @@ Wrapper flags:
                                     explicit --model/--effort or effort env).
                                     With no agent token the harness comes from
                                     the preset; with one, a disagreeing harness
-                                    is rejected. Run \`agentwrap presets list\`
+                                    is rejected. Run \`keeper agent presets list\`
                                     to see the configured names.
 
 Preset resolution:
-  agentwrap presets resolve <name>  Emit the resolved JSON for a single preset
+  keeper agent presets resolve <name>  Emit the resolved JSON for a single preset
                                     ({name,harness,model,effort|thinking,role})
                                     or a panel (an ordered array of
                                     {name,harness} members).
-  agentwrap presets list [--json]   List the configured catalog presets
+  keeper agent presets list [--json]   List the configured catalog presets
                                     (name + harness/model/effort) and panels.
 
 Profile diagnostics:
-  agentwrap profiles check [--json] List shadow/stray/auth-bearing
+  keeper agent profiles check [--json] List shadow/stray/auth-bearing
                                     ~/.claude-profiles + ~/.pi-profiles dirs,
                                     plus a ~/.claude that is authed but whose
                                     tier metadata is missing (renders ?x in
@@ -145,16 +145,16 @@ tmux transport flags (any one implies tmux mode):
                                     trail; JSON result carries runDir:null.
 
 Post-launch transcript subcommands (composable with a detached launch):
-  agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                         Block until the run's next stop event.
                                         --stop-timeout-ms overrides the 600s
                                         stop-wait ceiling (positive integer ms).
-  agentwrap show-last-message <handle>  Print the run's final assistant message.
+  keeper agent show-last-message <handle>  Print the run's final assistant message.
                                         <handle> is the launch JSON's id (or a
                                         transcript path with --agent <kind>).
 
 Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
-  agentwrap run <cli> <prompt> [--stop-timeout-ms <ms>]
+  keeper agent run <cli> <prompt> [--stop-timeout-ms <ms>]
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
                                         process. Emits the uniform envelope
@@ -164,7 +164,7 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         outcome ∈ completed|no_message (exit 0) /
                                         timed_out|no_transcript (4) / launch_failed
                                         (1) / bad_args (2).
-  agentwrap wait <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with
                                         --agent <kind>); same uniform envelope.
@@ -186,7 +186,7 @@ Top-level flags:
 
 /**
  * Classify the leading argv token. `claude`/`codex`/`pi` → run with the remaining
- * args (even when empty, so a bare `agentwrap claude`, `agentwrap codex`, or `agentwrap pi`
+ * args (even when empty, so a bare `keeper agent claude`, `keeper agent codex`, or `keeper agent pi`
  * still launches interactively); a leading `--x-preset <name>` (no head
  * agent token) → the harnessless run-preset form whose harness comes from the
  * preset (the whole argv stays in `rest` so parseArgs strips the flag);
@@ -249,7 +249,7 @@ export function splitSubcommand(argv: string[]): Dispatch {
   if (head === "wait") {
     return { kind: "wait-capture", rest: argv.slice(1) };
   }
-  if (head === AGENTWRAP_HELP_FLAG) {
+  if (head === KEEPER_AGENT_HELP_FLAG) {
     return { kind: "help-wrapper" };
   }
   if (head === "-h" || head === "--help") {

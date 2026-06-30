@@ -10,8 +10,8 @@
  * (a read-only `keeper.db` connection, no socket round-trip).
  *
  * Each surviving candidate is replayed back into its original backend session
- * via keeper's SOLE launch transport — `agentwrapLaunch` in resume mode (the
- * same transport `keeper dispatch` and `keeper bus wake` use). agentwrap owns
+ * via keeper's SOLE launch transport — `keeperAgentLaunch` in resume mode (the
+ * same transport `keeper dispatch` and `keeper bus wake` use). keeper agent owns
  * the tmux window (session get-or-create + handoff), re-attaches via
  * `--resume <target>`, and holds the pane open after claude exits;
  * `scripts/resume.ts` keeps the human-facing DISPLAY form
@@ -23,7 +23,7 @@
  * The candidate set already excludes any `job_id` still occupying a live
  * backend (`restore-set.ts`'s UUID-liveness dedup, computed from the same DB
  * read) — so there is no UDS round-trip and no separate skip-set probe. Every
- * candidate routes through the one `agentwrapLaunch` resume seam.
+ * candidate routes through the one `keeperAgentLaunch` resume seam.
  *
  * Across every mode, restored windows come back in their ORIGINAL visual
  * (left-to-right) tmux order: `restore-set.ts` sorts candidates by the captured
@@ -67,8 +67,8 @@
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
 import {
-  agentwrapLaunch,
-  buildAgentwrapLaunchArgv,
+  keeperAgentLaunch,
+  buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
   localeDefaultedEnv,
@@ -118,7 +118,7 @@ recent crash burst when no generation boundary is recorded yet).
 --snapshot-current is the manual safety net: it reads the CURRENT live set
 (every working/stopped session) and emits a runnable bash script that revives
 each via the bare 'keeper agent claude --x-tmux … --resume' argv
-(agentwrap owns the session+window), byte-aligned with what --apply spawns. Pipe
+(keeper agent owns the session+window), byte-aligned with what --apply spawns. Pipe
 it to a file and run it later — a dump you can trust independent of the
 automatic crash path.
 
@@ -153,7 +153,7 @@ interface ParsedArgs {
  * dry-run path) the per-agent label lines. PURE shape — no I/O leaks out. The
  * candidate carries everything the launch needs: `resume_target` (the latest-name
  * resume key), `backend_exec_session_id` (the tmux session to relaunch into), and
- * `cwd` (the directory the resumed window opens in, set on the `agentwrapLaunch`
+ * `cwd` (the directory the resumed window opens in, set on the `keeperAgentLaunch`
  * spawn). `tier` is irrelevant — fn-10 inverted tier routing dropped the
  * `--plugin-dir` flag, so a resume command never carries a tier.
  */
@@ -221,9 +221,9 @@ export function planRestore(
 
 /**
  * The launch shape the action loop uses. Real binding in `main()` routes through
- * `agentwrapLaunch` in resume mode (keeper's sole launch transport); tests inject
+ * `keeperAgentLaunch` in resume mode (keeper's sole launch transport); tests inject
  * a capturing fake so `--apply` can be asserted without spawning a real
- * multiplexer. Carries the RESUME TARGET (not a pre-wrapped argv) — agentwrap
+ * multiplexer. Carries the RESUME TARGET (not a pre-wrapped argv) — keeper agent
  * builds the `--resume <target>` invocation and owns the tmux window, mirroring
  * the `keeper bus wake` seam.
  */
@@ -368,15 +368,15 @@ export function shellQuote(arg: string): string {
 
 /**
  * Pure renderer: turn the CURRENT live candidate set into a RUNNABLE bash script
- * that revives each session via the SAME `agentwrapLaunch` transport `--apply`
- * uses. Each candidate emits the BARE `buildAgentwrapLaunchArgv` resume argv
+ * that revives each session via the SAME `keeperAgentLaunch` transport `--apply`
+ * uses. Each candidate emits the BARE `buildKeeperAgentLaunchArgv` resume argv
  * (`keeper agent claude --x-tmux … --resume <target>`) shell-quoted —
  * byte-aligned with what `--apply` spawns, with NO `tmux new-window` wrapper
- * (agentwrap creates its OWN session+window; a `new-window` wrapper would
- * DOUBLE-create). A `cd <cwd> &&` prefix sets the directory agentwrap reads from
+ * (keeper agent creates its OWN session+window; a `new-window` wrapper would
+ * DOUBLE-create). A `cd <cwd> &&` prefix sets the directory keeper agent reads from
  * `process.cwd()` (the `--apply` path sets it on the spawn). Each session is
  * still preceded by a redundant-but-explicit `has-session || new-session`
- * get-or-create guard so the script reads self-contained even though agentwrap
+ * get-or-create guard so the script reads self-contained even though keeper agent
  * mints the session itself.
  *
  * Sessions emit in alpha order; candidates within a session in the visual window
@@ -398,7 +398,7 @@ export function renderSnapshotScript(
     "#!/usr/bin/env bash",
     "# restore-agents --snapshot-current — runnable snapshot of the CURRENT live set.",
     `# Source: ${sourcePath}. Pipe to a file and run to revive these tabs.`,
-    "# Each window relaunches via agentwrap claude --resume by its LATEST name; the session is get-or-created.",
+    "# Each window relaunches via keeper agent claude --resume by its LATEST name; the session is get-or-created.",
     "set -euo pipefail",
   ];
   // Group candidates by backend session, preserving the incoming visual order
@@ -431,7 +431,7 @@ export function renderSnapshotScript(
     const n = bucket.length;
     lines.push("");
     lines.push(`# session: ${sessionName} (${n} window${n === 1 ? "" : "s"})`);
-    // Get-or-create the session up front. agentwrap also mints it, so this is
+    // Get-or-create the session up front. keeper agent also mints it, so this is
     // redundant — kept so the script reads self-contained. `|| ` keeps `set -e`
     // from tripping when has-session exits non-zero (session absent).
     lines.push(
@@ -440,9 +440,9 @@ export function renderSnapshotScript(
     );
     for (const candidate of bucket) {
       const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
-      // The BARE agentwrap resume argv — byte-aligned with what --apply spawns.
-      // agentwrap owns the session+window, so NO `tmux new-window` wrapper.
-      const launchArgv = buildAgentwrapLaunchArgv({
+      // The BARE keeper agent resume argv — byte-aligned with what --apply spawns.
+      // keeper agent owns the session+window, so NO `tmux new-window` wrapper.
+      const launchArgv = buildKeeperAgentLaunchArgv({
         launcherArgvPrefix: prefix,
         session: sessionName,
         prompt: "",
@@ -453,7 +453,7 @@ export function renderSnapshotScript(
         lines.push("sleep 0.5");
       }
       lines.push(`# ${candidate.label}`);
-      // `cd <cwd> &&` sets agentwrap's process.cwd() (the directory it reads for
+      // `cd <cwd> &&` sets keeper agent's process.cwd() (the directory it reads for
       // the launch-script `cd`); the --apply path sets it on the spawn instead.
       const cdPrefix = cwd === "" ? "" : `cd ${shellQuote(cwd)} && `;
       lines.push(`${cdPrefix}${quoteArgv(launchArgv)}`);
@@ -651,7 +651,7 @@ async function main(): Promise<void> {
 
   const dbPath = args.db ?? resolveDbPath();
   // The absolute `keeper agent` launcher prefix — PATH-independent, so a
-  // restored tab never depends on the `claude` alias. `agentwrapLaunch` builds
+  // restored tab never depends on the `claude` alias. `keeperAgentLaunch` builds
   // the `claude --x-tmux … --resume <target>` invocation off it.
   const launcherPrefix = buildLauncherArgvPrefix(
     process.execPath,
@@ -737,15 +737,15 @@ async function main(): Promise<void> {
   }
 
   // --apply path. Route every candidate through keeper's sole launch transport —
-  // `agentwrapLaunch` in resume mode (the same seam `keeper bus wake` uses).
-  // agentwrap mints/owns the recorded `backend_exec_session_id` and re-attaches
-  // via `--resume <target>`; cwd is set on the spawn (agentwrap has no cwd flag).
+  // `keeperAgentLaunch` in resume mode (the same seam `keeper bus wake` uses).
+  // keeper agent mints/owns the recorded `backend_exec_session_id` and re-attaches
+  // via `--resume <target>`; cwd is set on the spawn (keeper agent has no cwd flag).
   // Per-candidate failure isolation rides on the returned LaunchResult verdict.
   const noteLine = (line: string): void => {
     process.stderr.write(`${line}\n`);
   };
   const ensureLaunched: EnsureLaunchedFn = (session, resumeTarget, cwd) =>
-    agentwrapLaunch({
+    keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix: launcherPrefix,
       session,

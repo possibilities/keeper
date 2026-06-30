@@ -1,5 +1,5 @@
 /**
- * Codex launcher pins: `agentwrap codex` uses Codex-native CLI contracts
+ * Codex launcher pins: `keeper agent codex` uses Codex-native CLI contracts
  * instead of forwarding Claude-only flags. Explicit/env profiles map to Codex
  * `--profile`; `model`/`effort` defaults become `--model` and
  * `-c model_reasoning_effort="..."`; admin subcommands pass through.
@@ -53,7 +53,7 @@ describe("Codex parse signals", () => {
       ["--x-codex-session-name", "work item", "hello"],
       "codex",
     );
-    expect(p.agentwrapCodexSessionName).toBe("work item");
+    expect(p.launcherCodexSessionName).toBe("work item");
     expect(p.remainingArgs).toEqual(["hello"]);
   });
 });
@@ -202,7 +202,7 @@ describe("Codex command assembly", () => {
       ["--x-no-confirm", "--x-codex-session-name=work item", "hello"],
       {
         env: { CODEX_HOME: "/fake-home/.codex" },
-        cwd: "/fake-home/code/agentwrap",
+        cwd: "/fake-home/code/keeper",
       },
     );
     const cmd = await runAndCapture(h, main);
@@ -212,7 +212,7 @@ describe("Codex command assembly", () => {
     expect(h.codexSessionNameIndexers[0]).toMatchObject({
       codexHome: "/fake-home/.codex",
       threadName: "work item",
-      expectedCwd: "/fake-home/code/agentwrap",
+      expectedCwd: "/fake-home/code/keeper",
     });
   });
 });

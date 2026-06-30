@@ -421,7 +421,7 @@ export function assertProfileDirNameAllowed(name: string): void {
  * changed]`. `~/.claude/settings.json` MUST exist (fail-loud); `~/.claude/
  * CLAUDE.md` is linked only when it exists.
  */
-export function ensureAgentwrapProfileDir(
+export function ensureKeeperAgentProfileDir(
   profileName: string,
   trustPaths: string[] | null,
   actionLog: string[] | null,
@@ -495,7 +495,7 @@ export function ensureAgentwrapProfileDir(
  * settings, package resources, trust, and sessions link through to the native
  * Pi account so profile routing does not fragment history or installed tools.
  */
-export function ensureAgentwrapPiProfileDir(
+export function ensureKeeperAgentPiProfileDir(
   profileName: string,
   actionLog: string[] | null,
   homeDir: string = homedir(),
@@ -643,7 +643,7 @@ function divergentClobberMessage(
     `contents differ from the stow source ${target}.`,
     "",
     "Claude Code's atomic-rename settings write clobbered the stow symlink and",
-    "the live file has since diverged from the repo. agentwrap will not pick a",
+    "the live file has since diverged from the repo. keeper agent will not pick a",
     "winner for you. Resolve it one of these ways:",
     "",
     `  # 1. Inspect the difference`,
@@ -657,7 +657,7 @@ function divergentClobberMessage(
     `  cp ${linkPath} ${target} && rm ${linkPath} && ln -snf ${relTarget} ${linkPath}`,
     "",
     "Rip-cord — bypass this guard entirely for one launch (last resort):",
-    "  AGENTWRAP_SKIP_LINK_GUARD=1 <your agentwrap command>",
+    "  AGENTWRAP_SKIP_LINK_GUARD=1 <your keeper agent command>",
   ].join("\n");
 }
 
@@ -852,7 +852,7 @@ export function ensureClaudeStateSharing(
   }
 }
 
-/** Prepare Pi profile dirs for every configured non-default agentwrap profile. */
+/** Prepare Pi profile dirs for every configured non-default keeper agent profile. */
 export function ensurePiStateSharing(
   listProfilesFn: () => string[],
   actionLog: string[] | null = null,

@@ -14,8 +14,8 @@
  * cooldown file — are injected as deps by {@link runWake}, so the resolve →
  * liveness-recheck → single-flight → cooldown → launch pipeline unit-tests with an
  * injected `launch`/`now`/`fs` and no real tmux/daemon/process. The launch is
- * keeper's sole transport — {@link agentwrapLaunch} in resume mode — so the woken
- * window is agentwrap-owned and managed-reaped like every other keeper launch.
+ * keeper's sole transport — {@link keeperAgentLaunch} in resume mode — so the woken
+ * window is keeper-agent-owned and managed-reaped like every other keeper launch.
  *
  * Security: the resume TARGET is trusted plan data — the epic's `job_links`
  * creator edge from keeper.db — never a sender's claim. The resolved `job_id` is
@@ -26,7 +26,7 @@
 
 import {
   AGENTBUS_EXEC_SESSION,
-  agentwrapLaunch,
+  keeperAgentLaunch,
   type LaunchResult,
 } from "./exec-backend";
 import { resumeTarget } from "./resume-descriptor";
@@ -35,8 +35,8 @@ import { resumeTarget } from "./resume-descriptor";
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
  * import("./types").Job} so the resolve/liveness/launch pipeline unit-tests with a
  * tiny synthetic row. `title`/`job_id` feed {@link resumeTarget}; `cwd` is the
- * directory the resumed window opens in (set on the `agentwrapLaunch` spawn —
- * agentwrap reads its own `process.cwd()`, not interpolated into the launch body);
+ * directory the resumed window opens in (set on the `keeperAgentLaunch` spawn —
+ * keeper agent reads its own `process.cwd()`, not interpolated into the launch body);
  * `state` is the running-liveness signal; `backend_exec_pane_id` is
  * the live-pane liveness signal (a `stopped` row whose pane is still listed is
  * live); `updated_at` is the newest-creator tiebreaker. Field names + types match
@@ -74,7 +74,7 @@ export interface WakeCooldownRecord {
  *  - `in_flight`       — another wake of this session holds the single-flight lock.
  *  - `cooldown`        — a recent failed wake is still inside {@link WAKE_COOLDOWN_MS}.
  *  - `unknown_creator` — the role address resolved to no usable `jobs` row.
- *  - `launch_failed`   — `agentwrapLaunch` returned `{ ok: false }` (fail-open).
+ *  - `launch_failed`   — `keeperAgentLaunch` returned `{ ok: false }` (fail-open).
  */
 export type WakeOutcome =
   | "launched"
@@ -199,7 +199,7 @@ export interface WakeDeps {
    *  (`[<bun>, <abs cli/keeper.ts>, "agent"]` from `buildLauncherArgvPrefix`),
    *  resolved by the caller (impure: reads `process.execPath` +
    *  `resolveKeeperAgentPathDepFree`) and INJECTED so {@link runWake} stays pure.
-   *  Threaded to {@link agentwrapLaunch} as the launch-argv prefix. */
+   *  Threaded to {@link keeperAgentLaunch} as the launch-argv prefix. */
   readonly launcherPrefix: string[];
   /** Resolve the creator `jobs` rows for `(role=creator, epic)`. Returns the rows
    *  (already decoded), or `[]` on a miss. */
@@ -222,9 +222,9 @@ export interface WakeDeps {
    *  handle, or null when another wake of this session holds it. */
   readonly tryLock: (sessionId: string) => { release: () => void } | null;
   /** The resume launch transport. Carries the RESUME TARGET (not a pre-wrapped
-   *  argv) — `agentwrapLaunch` builds the `--resume <target>` invocation and owns
+   *  argv) — `keeperAgentLaunch` builds the `--resume <target>` invocation and owns
    *  the tmux window. Defaults to {@link defaultWakeLaunch} (the real
-   *  `agentwrapLaunch` path); injected by tests. */
+   *  `keeperAgentLaunch` path); injected by tests. */
   readonly launch?: (
     session: string,
     resumeTarget: string,
@@ -249,10 +249,10 @@ export interface WakeDeps {
  *     alone is racy).
  *  4. Cooldown ({@link inCooldown}): a recent failed wake still inside the window →
  *     `cooldown`, SKIP.
- *  5. Launch via {@link agentwrapLaunch} in resume mode into `agentbus`
- *     (agentwrap mints + owns the window, re-attaches via `--resume <target>`);
+ *  5. Launch via {@link keeperAgentLaunch} in resume mode into `agentbus`
+ *     (keeper agent mints + owns the window, re-attaches via `--resume <target>`);
  *     fail-open on `{ ok: false }` → `launch_failed`, bump the cooldown record. On
- *     success, clear the cooldown record (no marker stamp — agentwrap owns + reaps
+ *     success, clear the cooldown record (no marker stamp — keeper agent owns + reaps
  *     its own window).
  *
  * NEVER throws — every edge degrades to a verdict. The lock is always released.
@@ -320,7 +320,7 @@ export async function runWake(
     }
 
     // Success — clear any prior cooldown so a recovered creator isn't gated.
-    // agentwrap owns + reaps the window it minted; no marker stamp.
+    // keeper agent owns + reaps the window it minted; no marker stamp.
     deps.writeCooldown(sessionId, null);
     return {
       outcome: "launched",
@@ -334,7 +334,7 @@ export async function runWake(
 
 /**
  * The default wake launch transport for {@link runWake} — keeper's sole launch
- * transport {@link agentwrapLaunch} in resume mode. agentwrap mints/owns the
+ * transport {@link keeperAgentLaunch} in resume mode. keeper agent mints/owns the
  * `agentbus` tmux window and re-attaches the session via `--resume <target>`; its
  * `tmuxShellBody` holds the pane open after claude exits (byte-identical to the
  * old hand-rolled hold-open), and the window is managed-reaped via the
@@ -350,7 +350,7 @@ function defaultWakeLaunch(
   cwd: string,
 ) => Promise<LaunchResult> {
   return (session, target, cwd) =>
-    agentwrapLaunch({
+    keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix: launcherPrefix,
       session,

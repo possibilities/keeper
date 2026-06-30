@@ -79,8 +79,8 @@ Subcommands:
   prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
   dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
   handoff             Enqueue a fire-and-forget claude worker with a contextful brief (\`keeper handoff show <id>\` reads it)
-  pair                Fan a task to another model CLI (claude/codex) via agentwrap (\`keeper pair send\`)
-  agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded agentwrap launcher)
+  pair                Fan a task to another model CLI (claude/codex) via keeper agent (\`keeper pair send\`)
+  agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded keeper agent launcher)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
   bus                 Agent Bus: \`keeper bus <list|resolve|chat send|watch>\`
 

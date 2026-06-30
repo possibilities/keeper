@@ -117,12 +117,12 @@ Options:
 
 const DEFAULT_TIMEOUT_SECONDS = 1800;
 
-// Subprocess-kill margin over the stop-wait budget. agentwrap runs its ≤30s
+// Subprocess-kill margin over the stop-wait budget. keeper agent runs its ≤30s
 // path-discovery wait SEQUENTIALLY before the stop-wait clock starts, so its
 // worst-case clean (retryable exit-4) return is ~`stopTimeoutMs + 30s`. The kill
-// MUST sit strictly above that, or a slow start SIGKILLs agentwrap mid-wait —
+// MUST sit strictly above that, or a slow start SIGKILLs keeper agent mid-wait —
 // yielding a raw `waitRes === null` "killed" instead of the clean retryable exit.
-// PATH_CEILING_MS mirrors agentwrap's `DEFAULT_PATH_TIMEOUT_MS` (loose coupling,
+// PATH_CEILING_MS mirrors keeper agent's `DEFAULT_PATH_TIMEOUT_MS` (loose coupling,
 // NOT a cross-repo import): a future bump there prompts a glance here.
 const PATH_CEILING_MS = 30_000;
 const SLOP_MS = 5_000;
@@ -158,10 +158,10 @@ function gitSnapshot(cwd: string): Set<string> | null {
   }
 }
 
-/** Run an agentwrap subcommand, returning the captured stdout + exit code, or
+/** Run a keeper agent subcommand, returning the captured stdout + exit code, or
  *  null on a spawn failure (ENOENT / kill). Env is the CLAUDE-stripped partner
  *  env; cwd is the partner's target repo. */
-function runAgentwrap(
+function runKeeperAgent(
   argv: string[],
   env: Record<string, string>,
   cwd: string,
@@ -340,7 +340,7 @@ export async function main(argv: string[]): Promise<void> {
   // Partner tmux session. Partners land in a stable named session (`pair` by
   // default, `panels` for panel legs) and the window STAYS OPEN after the partner
   // stops — keeper closes no windows; the operator garbage-collects them by hand
-  // (attach with `tmux attach -t <session>`). agentwrap's race-safe launch lets
+  // (attach with `tmux attach -t <session>`). keeper agent's race-safe launch lets
   // concurrent partners share a named session without a create race, so a stable
   // name is safe.
   const sessionName = v.session ?? DEFAULT_PAIR_SESSION;
@@ -392,7 +392,7 @@ export async function main(argv: string[]): Promise<void> {
 
   // Partner env. The CLAUDE path launches as an INTERACTIVE TUI bound into the
   // `jobs` projection (the `KEEPER_TMUX_SESSION` carrier in the launch argv): it
-  // KEEPS the inherited env so agentwrap's own `--session-id` pin — not an env
+  // KEEPS the inherited env so keeper agent's own `--session-id` pin — not an env
   // scrub — is what keeps the partner transcript distinct from the driver's; the
   // self-collision guard below still backstops the resolver. codex fires no
   // keeper hooks and stays headless, so it keeps the CLAUDE* env strip that
@@ -433,21 +433,21 @@ export async function main(argv: string[]): Promise<void> {
     ...(v.model !== undefined ? { model: v.model } : {}),
     ...(v.effort !== undefined ? { effort: v.effort } : {}),
     // Partners land in a stable named session (`pair` by default, `panels` for
-    // panel legs). Concurrent launches sharing the name are safe: agentwrap's
+    // panel legs). Concurrent launches sharing the name are safe: keeper agent's
     // launch recovers from the new-session "duplicate session" TOCTOU by adding a
     // window to the now-existing session.
     session: sessionName,
   });
   const startMs = Date.now();
-  const launchRes = runAgentwrap(launchArgv, env, cwd);
+  const launchRes = runKeeperAgent(launchArgv, env, cwd);
   if (launchRes === null) {
     return fail(
-      `agentwrap launch produced no result (bad launcher '${launcherArgvPrefix.join(" ")}'?)`,
+      `keeper agent launch produced no result (bad launcher '${launcherArgvPrefix.join(" ")}'?)`,
     );
   }
   if (launchRes.exitCode !== 0) {
     return fail(
-      `agentwrap launch exited ${launchRes.exitCode}: ${launchRes.stderr.trim()}`,
+      `keeper agent launch exited ${launchRes.exitCode}: ${launchRes.stderr.trim()}`,
     );
   }
   const launchParse = parsePairLaunchJson(launchRes.stdout);
@@ -457,11 +457,11 @@ export async function main(argv: string[]): Promise<void> {
   const handle = launchParse.handle.id;
 
   // ---- 2. wait for the partner to stop ----
-  // keeper's `--timeout` drives `--stop-timeout-ms` (agentwrap's stop-wait budget,
+  // keeper's `--timeout` drives `--stop-timeout-ms` (keeper agent's stop-wait budget,
   // overriding its 600s default) AND a widened subprocess-kill margin sitting
-  // strictly above agentwrap's worst-case clean return (stop budget + ≤30s path
-  // discovery + slop) so a slow agentwrap start never gets SIGKILLed mid-wait.
-  const waitRes = runAgentwrap(
+  // strictly above keeper agent's worst-case clean return (stop budget + ≤30s path
+  // discovery + slop) so a slow keeper agent start never gets SIGKILLed mid-wait.
+  const waitRes = runKeeperAgent(
     buildWaitForStopArgv(launcherArgvPrefix, handle, stopTimeoutMs),
     env,
     cwd,
@@ -472,11 +472,11 @@ export async function main(argv: string[]): Promise<void> {
       waitRes === null
         ? "spawn failed / killed"
         : `exit ${waitRes.exitCode}: ${waitRes.stderr.trim()}`;
-    return fail(`agentwrap wait-for-stop failed (${detail})`);
+    return fail(`keeper agent wait-for-stop failed (${detail})`);
   }
 
   // ---- 3. read the partner's final message ----
-  const showRes = runAgentwrap(
+  const showRes = runKeeperAgent(
     buildShowLastMessageArgv(launcherArgvPrefix, handle),
     env,
     cwd,
@@ -486,14 +486,14 @@ export async function main(argv: string[]): Promise<void> {
       showRes === null
         ? "spawn failed / killed"
         : `exit ${showRes.exitCode}: ${showRes.stderr.trim()}`;
-    return fail(`agentwrap show-last-message failed (${detail})`);
+    return fail(`keeper agent show-last-message failed (${detail})`);
   }
   const showParse = parseShowLastMessageJson(showRes.stdout);
   if (!showParse.ok) {
     return fail(showParse.error);
   }
 
-  // Self-collision guard (defense-in-depth behind the agentwrap session-id pin):
+  // Self-collision guard (defense-in-depth behind the keeper agent session-id pin):
   // if the resolver fell back to newest-by-mtime and won the DRIVER's own
   // concurrently-written transcript, never surface that as a `completed` carrying
   // a bogus answer — fail loud. The driver's session id is read straight off the

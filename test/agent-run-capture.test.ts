@@ -493,7 +493,7 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     const h = makeHarness({
       argv: ["run", "claude", "say hi"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
       randomUuid: () => sessionId,
@@ -502,7 +502,11 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
           return { exitCode: 1, stdout: "", stderr: "no session" };
         }
         // new-session and new-window both report the created target.
-        return { exitCode: 0, stdout: "agentwrap\x01@1\x01%1\n", stderr: "" };
+        return {
+          exitCode: 0,
+          stdout: "keeper agent\x01@1\x01%1\n",
+          stderr: "",
+        };
       },
     });
 
@@ -564,7 +568,7 @@ describe("main() — agent wait", () => {
     const h = makeHarness({
       argv: ["wait", "tmux-w1"],
       rawArgv: true,
-      agentwrapStateDir: stateDir,
+      launcherStateDir: stateDir,
       transcriptHomeDir: home,
       cwd,
     });
@@ -589,7 +593,7 @@ describe("main() — agent wait", () => {
     const h = makeHarness({
       argv: ["wait", "tmux-nope"],
       rawArgv: true,
-      agentwrapStateDir: tempDir(),
+      launcherStateDir: tempDir(),
     });
 
     const code = await expectExit(main(h.deps));

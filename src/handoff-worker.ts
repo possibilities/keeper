@@ -4,7 +4,7 @@
  * `request_handoff` RPC → the `handoffs` projection). It runs the level-triggered
  * dispatch loop server-side: a `data_version` pulse wakes a cycle, each cycle
  * selects actionable `handoffs` rows and launches a fresh handoff-ee worker into
- * the INITIATOR's tmux session via agentwrap (keeper's sole launch transport),
+ * the INITIATOR's tmux session via keeper agent (keeper's sole launch transport),
  * borrowing the autopilot's mint-before-launch protocol (capture the events
  * watermark, mint a durable `HandoffDispatching` marker, AWAIT the ack, THEN
  * launch). The fold is the pure decider; this worker is the only thing that
@@ -29,7 +29,7 @@
  * `never_bound_count` (fold-side, from the event); K=3 consecutive dispatches
  * without an intervening bind flips the row to sticky `failed` (mirrors the
  * autopilot's `NEVER_BOUND_EXPIRE_THRESHOLD`). A permanent launch failure
- * (agentwrap exit 1/2/3, a thrown launch) takes a DIFFERENT path: it mints a
+ * (keeper agent exit 1/2/3, a thrown launch) takes a DIFFERENT path: it mints a
  * terminal `HandoffLaunchFailed` event + a dead-letter immediately.
  *
  * Worker contract: `isMainThread`-guarded body (a plain import is inert + the
@@ -45,7 +45,7 @@ import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import {
-  agentwrapLaunch,
+  keeperAgentLaunch,
   type LaunchResult,
   type LaunchSpec,
 } from "./exec-backend";
@@ -62,7 +62,7 @@ const DEFAULT_POLL_MS = 1000;
  * The `claimed_at` lease window (ms). A `dispatching` row whose `claimed_at` is
  * OLDER than this AND that has no bind is re-dispatchable — the prior launch is
  * presumed lost (a crash between the ack and a successful bind). Set generously
- * above the launch+boot round-trip (agentwrap mint + `claude` cold start +
+ * above the launch+boot round-trip (keeper agent mint + `claude` cold start +
  * SessionStart fold) so a merely-slow boot is NEVER re-dispatched while it is
  * still coming up; the bind check is the authoritative "already up" gate, the
  * lease is only the floor for "presumed lost". Unit: MILLISECONDS — `claimed_at`
@@ -201,7 +201,7 @@ export interface HandoffDispatchDeps {
   emitDispatching(
     payload: HandoffDispatchingPayload,
   ): Promise<HandoffDispatchingAck>;
-  /** Launch the handoff-ee into `session` via agentwrap. */
+  /** Launch the handoff-ee into `session` via keeper agent. */
   launch(session: string, cwd: string, spec: LaunchSpec): Promise<LaunchResult>;
   /** Mint a terminal `HandoffLaunchFailed` event + a dead-letter (permanent). */
   emitLaunchFailed(payload: HandoffLaunchFailedPayload): void;
@@ -267,7 +267,7 @@ export async function dispatchOneHandoff(
   if (signal.aborted) {
     return "aborted-shutdown";
   }
-  // Launch — ONLY after the durable `HandoffDispatching` ack. agentwrap owns the
+  // Launch — ONLY after the durable `HandoffDispatching` ack. keeper agent owns the
   // tmux window; the prompt boots the handoff-ee into the prefix skill with the
   // brief inline (the framing + `row.doc`), no `keeper handoff show` round-trip.
   const spec: LaunchSpec = {
@@ -289,7 +289,7 @@ export async function dispatchOneHandoff(
   );
   if (result.ok === false) {
     if (result.retryable === true) {
-      // TRANSIENT launch fail (agentwrap exit 4 / timeout-kill). Leave the
+      // TRANSIENT launch fail (keeper agent exit 4 / timeout-kill). Leave the
       // `dispatching` row in place — the lease re-dispatches it, and the
       // never-bound breaker bounds the retries before going sticky. NO terminal
       // mint here (that would write off a recoverable launch).
@@ -440,7 +440,7 @@ function main(): void {
   const port = parentPort;
   const launcherArgvPrefix = data.launcherArgvPrefix ?? [];
   const promptPrefix = data.handoffPromptPrefix;
-  // keeperd's cwd is NOT a worker repo, but agentwrap reads its own
+  // keeperd's cwd is NOT a worker repo, but keeper agent reads its own
   // `process.cwd()` for the launch-script `cd`; a handoff-ee carries no plan ref,
   // so the launch dir is just "somewhere valid". Default to keeperd's cwd.
   const cwd = data.cwd ?? process.cwd();
@@ -530,7 +530,7 @@ function main(): void {
         } satisfies HandoffDispatchingMessage);
       }),
     launch: (session, launchCwd, spec) =>
-      agentwrapLaunch({
+      keeperAgentLaunch({
         noteLine,
         launcherArgvPrefix,
         session,

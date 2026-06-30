@@ -6522,7 +6522,7 @@ test("HandoffLaunchFailed flips the row to terminal failed (fn-946)", () => {
   });
   handoffDispatchingEvent("f-1");
   drainAll();
-  handoffLaunchFailedEvent("f-1", "agentwrap exit 3");
+  handoffLaunchFailedEvent("f-1", "keeper agent exit 3");
   drainAll();
   expect(getHandoffs().find((r) => r.handoff_id === "f-1")?.status).toBe(
     "failed",
