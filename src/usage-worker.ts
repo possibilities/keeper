@@ -53,13 +53,25 @@
  * refresh on every ~90s fetch cycle even when no real content has moved.
  * Including ANY of them in the change-gate hash (or in the projection schema)
  * would force a synthetic `UsageSnapshot` event every cycle and churn the
- * downstream wire collection. The change-gate here hashes ONLY the
+ * downstream wire collection. The CONTENT change-gate here hashes ONLY the
  * projection-meaningful fields produced by {@link buildUsageMessage}, which
  * never carry the four freshness fields. A future contributor adding a
  * "freshness" column would have to route through both `buildUsageMessage`'s
  * field list AND the projection schema in `src/db.ts`; the freshness-
  * exclusion test in `test/usage-worker.test.ts` is the tripwire that fails
  * loudly if either changes.
+ *
+ * **Bounded liveness heartbeat (the ONE sanctioned freshness read).** Pure
+ * zero-churn suppression starves `usage.last_usage_fold_at` for a stable
+ * account (e.g. claude-0) whose quota values never move, making a healthy
+ * producer look wedged-stale. So a SEPARATE coarse gate sits beside the
+ * content gate: when content is unchanged but a healthy `active` scrape's
+ * successful-fetch freshness advances into a new 10-minute bucket, the worker
+ * emits one ordinary `usage-snapshot` heartbeat (re-stamping the fold), capped
+ * at one per bucket. Freshness still never enters the MESSAGE, the content
+ * gate, or the projection schema — only the coarse bucket index does, and only
+ * inside {@link UsageScanner}'s in-memory gate. Stale/idle envelopes never
+ * heartbeat, so a moving `error.at` or fetch retry can't churn an event.
  */
 
 import type { Database } from "bun:sqlite";
@@ -488,6 +500,42 @@ export function usageGateKey(msg: UsageSnapshotMessage): string {
   return JSON.stringify(gated);
 }
 
+/** Width of the coarse usage liveness-heartbeat bucket, in milliseconds. */
+const HEARTBEAT_BUCKET_MS = 10 * 60 * 1000;
+
+/**
+ * Coarse 10-minute bucket index for a millisecond instant — the granularity of
+ * the usage liveness heartbeat. Pure.
+ */
+function heartbeatBucket(ms: number): number {
+  return Math.floor(ms / HEARTBEAT_BUCKET_MS);
+}
+
+/**
+ * Bucket for an UNCHANGED healthy scrape's liveness heartbeat, or null when the
+ * envelope must NOT heartbeat. Restricted to `status === "active"` envelopes —
+ * stale/idle never heartbeat, so a moving `error.at` or a fetch retry can't
+ * churn an event — and to a parseable successful-scrape freshness instant:
+ * `last_successful_fetch_at`, with `fetched_at` only as a legacy fallback for
+ * envelopes predating the dedicated field. Pure: reads only the envelope's own
+ * timestamps, never wall-clock.
+ */
+function activeHeartbeatBucket(
+  msg: UsageSnapshotMessage,
+  raw: RawUsage,
+): number | null {
+  if (msg.status !== "active") {
+    return null;
+  }
+  const freshIso =
+    asString(raw.last_successful_fetch_at) ?? asString(raw.fetched_at);
+  if (freshIso === null) {
+    return null;
+  }
+  const ms = Date.parse(freshIso);
+  return Number.isNaN(ms) ? null : heartbeatBucket(ms);
+}
+
 /**
  * Pure, exported usage-file scanner — the deterministic core, drivable in
  * tests with no Worker or watcher. Mirrors {@link import("./plan-worker").PlanScanner}:
@@ -510,8 +558,14 @@ export function usageGateKey(msg: UsageSnapshotMessage): string {
  * synthetic event per profile every boot.
  */
 export class UsageScanner {
-  /** id → last-emitted serialized snapshot (the change-gate). */
+  /** id → last-emitted serialized snapshot (the content change-gate). */
   private readonly lastEmitted = new Map<string, string>();
+  /**
+   * id → last-emitted heartbeat bucket (the coarse freshness liveness gate,
+   * SEPARATE from {@link lastEmitted}). Caps an unchanged healthy `active`
+   * scrape to one heartbeat per 10-minute successful-fetch bucket.
+   */
+  private readonly lastHeartbeatBucket = new Map<string, number>();
   /** path → id, so a delete can drop the right change-gate entry. */
   private readonly pathToId = new Map<string, string>();
   /**
@@ -535,6 +589,16 @@ export class UsageScanner {
    */
   seed(id: string, serialized: string): void {
     this.lastEmitted.set(id, serialized);
+  }
+
+  /**
+   * Seed the coarse heartbeat bucket for one entity from the persisted
+   * `last_usage_fold_at` stamp so a daemon restart does not re-emit a
+   * same-bucket liveness heartbeat. A fresher on-disk active scrape (a newer
+   * bucket) still self-heals an old stamp by emitting exactly one heartbeat.
+   */
+  seedHeartbeat(id: string, bucket: number): void {
+    this.lastHeartbeatBucket.set(id, bucket);
   }
 
   /**
@@ -607,7 +671,8 @@ export class UsageScanner {
       return;
     }
 
-    const msg = buildUsageMessage(parsed as RawUsage);
+    const raw = parsed as RawUsage;
+    const msg = buildUsageMessage(raw);
     if (msg === null) {
       // No usable id — can't key the projection.
       this.log(`[usage-worker] ${path} has no usable id; skipping`);
@@ -620,10 +685,32 @@ export class UsageScanner {
     // `onSnapshot` still posts the FULL message (carrying `error_at`) so the
     // projection can show "stale since <first occurrence>".
     const gateKey = usageGateKey(msg);
+    const bucket = activeHeartbeatBucket(msg, raw);
     if (this.lastEmitted.get(msg.id) === gateKey) {
-      return; // change-gate: unchanged snapshot, suppress.
+      // Content unchanged. A healthy `active` scrape still emits at most ONE
+      // coarse liveness heartbeat per 10-minute successful-fetch bucket so
+      // `usage.last_usage_fold_at` keeps tracking producer liveness for a
+      // stable account (e.g. claude-0) whose quota values never move. A
+      // stale/idle envelope or one with no parseable freshness stamp
+      // (bucket === null) stays fully suppressed.
+      if (bucket === null) {
+        return;
+      }
+      const prevBucket = this.lastHeartbeatBucket.get(msg.id);
+      if (prevBucket !== undefined && bucket <= prevBucket) {
+        return; // same-or-older bucket — suppress the redundant heartbeat.
+      }
+      this.lastHeartbeatBucket.set(msg.id, bucket);
+      this.onSnapshot(msg);
+      return;
     }
     this.lastEmitted.set(msg.id, gateKey);
+    // Re-baseline the heartbeat bucket on a real content emit (which itself
+    // re-stamps `last_usage_fold_at`) so the same scrape can't immediately
+    // re-heartbeat inside its own bucket.
+    if (bucket !== null) {
+      this.lastHeartbeatBucket.set(msg.id, bucket);
+    }
     this.onSnapshot(msg);
   }
 
@@ -641,6 +728,7 @@ export class UsageScanner {
     this.onSnapshot({ kind: "usage-deleted", id });
     this.pathToId.delete(path);
     this.lastEmitted.delete(id);
+    this.lastHeartbeatBucket.delete(id);
   }
 
   /**
@@ -666,6 +754,7 @@ export class UsageScanner {
       }
       this.onSnapshot({ kind: "usage-deleted", id: row.id });
       this.lastEmitted.delete(row.id);
+      this.lastHeartbeatBucket.delete(row.id);
     }
   }
 }
@@ -726,7 +815,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
               codex_spark_session_resets_at, codex_spark_week_percent,
               codex_spark_week_resets_at, status, subscription_active,
               account_state, error_type, error_message, error_at, error_kind,
-              rate_limit_lifts_at
+              rate_limit_lifts_at, last_usage_fold_at
          FROM usage`,
     )
     .all() as {
@@ -751,6 +840,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
     error_at: string | null;
     error_kind: string | null;
     rate_limit_lifts_at: string | null;
+    last_usage_fold_at: number | null;
   }[];
   for (const r of rows) {
     // SQLite stores `subscription_active` as 1/0/NULL — reconstruct the
@@ -791,6 +881,12 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
       lift_at: r.rate_limit_lifts_at,
     };
     scanner.seed(r.id, usageGateKey(msg));
+    // Seed the coarse heartbeat bucket from the last successful fold stamp
+    // (REAL unix-SECONDS) so a restart's boot scan suppresses a same-bucket
+    // re-emit; a newer on-disk active scrape still self-heals an old stamp.
+    if (r.last_usage_fold_at !== null) {
+      scanner.seedHeartbeat(r.id, heartbeatBucket(r.last_usage_fold_at * 1000));
+    }
   }
 }
 
