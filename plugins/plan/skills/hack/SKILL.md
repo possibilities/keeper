@@ -51,43 +51,35 @@ Mode-specific moves:
 
 <!-- Canonical source: keeper prompt render engineering/keeper-history-forensics -->
 
-Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Query it with `sqlite3 -readonly` only — the keeper daemon is the sole writer. Large `data` payloads may live in the `event_blobs` side table, so read payloads as `COALESCE(e.data, b.data)` via `LEFT JOIN event_blobs b ON b.event_id = e.id`.
+Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Reach for the read-only `keeper` JSON subcommands below first — they emit a parseable envelope and stay stable across schema shifts; drop to `sqlite3 -readonly` only for an ad-hoc column they don't surface (the daemon is the sole writer — never open the DB read-write).
 
 **Who last touched a file** — then replay that session:
 
 ```bash
-sqlite3 -readonly ~/.local/state/keeper/keeper.db \
-  "SELECT session_id, datetime(last_mutation_at,'unixepoch','localtime') AS at, op, source
-   FROM file_attributions WHERE file_path LIKE '%<name>%'
-   ORDER BY last_mutation_at DESC LIMIT 10"
+keeper find-file-history <path-fragment>   # session_id, mutation time, op, source, project_dir (most-recent-first)
 ```
 
-Feed the `session_id` to `claudectl show-session <id>` to see what that session actually did and why.
+Feed a `session_id` to `keeper show-session-events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
 
-**Search past prompts** — "when did we discuss X / decide Y" (full scan; takes a few seconds):
+**Search past prompts** — "when did we discuss X / decide Y":
 
 ```bash
-sqlite3 -readonly ~/.local/state/keeper/keeper.db \
-  "SELECT datetime(e.ts,'unixepoch','localtime') AS at, e.session_id,
-          substr(json_extract(COALESCE(e.data,b.data),'$.prompt'),1,200) AS prompt
-   FROM events e LEFT JOIN event_blobs b ON b.event_id=e.id
-   WHERE e.hook_event='UserPromptSubmit' AND COALESCE(e.data,b.data) LIKE '%<term>%'
-   ORDER BY e.ts DESC LIMIT 20"
+keeper search-history <term>   # ts, session_id, prompt snippet for every matching UserPromptSubmit row
 ```
 
-**What a session did** — the tool-call spine without transcript bulk:
+**What a session did** — the prompt/tool-call spine without transcript bulk:
 
 ```bash
-sqlite3 -readonly ~/.local/state/keeper/keeper.db \
-  "SELECT datetime(ts,'unixepoch','localtime') AS at, hook_event, tool_name,
-          COALESCE(slash_command, skill_name, plan_op, '') AS verb
-   FROM events WHERE session_id='<id>' AND hook_event IN ('UserPromptSubmit','PreToolUse')
-   ORDER BY ts LIMIT 300"
+keeper show-session-events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
 ```
 
-**Failed-worker forensics** — `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; join `events` on `agent_id` for its tool stream. `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay.
+**One job's metadata / failed-worker forensics**:
 
-`events` columns worth filtering on: `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd`. The schema shifts across keeper versions — when a query errors, check `.schema events` rather than guessing.
+```bash
+keeper show-job --session <title>   # the full jobs-projection row (auto-detects your own job with no selector)
+```
+
+`subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.
 
 ## Prefer the panel for any non-tiny inquiry
 

@@ -86,6 +86,19 @@ Optional flags (both forms unless noted):
 If the user gives a slug-less reference ("dispatch the OAuth task") and you
 can't resolve it to an exact id, ask. Do not invent ids.
 
+## Orient first
+
+<!-- Canonical source: keeper prompt render engineering/orient -->
+
+Before firing a worker, read the board in one call: `keeper status --json`
+prints autopilot config (`{paused, mode, …}`), per-row readiness verdicts,
+counts, `drained`/`jammed`, in-flight launches, and needs-human in a single
+envelope (exit 0 on any board state). The `data.autopilot.paused` flag tells
+you up front whether the race-guard refusal in Step 3 is coming (an unpaused
+autopilot may dispatch the key itself), and the readiness verdict confirms the
+target is workable. For the full orient step run `keeper prompt render
+engineering/orient`. Then verify the specific id in Step 1.
+
 ## Step 1 — Pre-check the plan target (plan form only)
 
 For a plan-form launch, verify the id is on-board and workable BEFORE

@@ -53,13 +53,17 @@ the literal `and` token.
 
 | Condition | How to derive | `keeper await` form |
 |---|---|---|
-| `complete <id>` | Default for a keeper plan id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
+| `complete <id>` | Default for a keeper plan id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). Fires on the readiness `completed` verdict — **done AND idle** (every owning subagent has gone idle), the moment autopilot actually unblocks downstream work. See the done-AND-idle note below. | `complete fn-…` |
 | `started <id>` | A keeper plan id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
 | `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). A `runtime-blocked` task the daemon has escalated to the planner reports `waiting` (escalation in flight), not `stuck`, while the autopilot is paused — see the escalated-but-paused note under *Defaults and overrides*. | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
-| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot — i.e. the moment the READ socket opens, which (since fn-897) is right after `migrate()` while the reducer may still be CATCHING UP. So `server-up` means "the control plane is reachable", NOT "the board has fully caught up"; an early board read may be provisional (its frames carry a `catching_up` boot-status header until the drain reaches head + the git surface is seeded). Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
+| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot — i.e. the moment the READ socket opens, right after `migrate()` while the reducer may still be CATCHING UP. So `server-up` means "the control plane is reachable", NOT "the board has fully caught up"; an early board read may be provisional (its frames carry a `catching_up` boot-status header until the drain reaches head + the git surface is seeded). Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
 | `monitor-running <selector>` | Any "wait until my dev server / script / background task / build watcher finishes" phrasing. Scoped to THIS session's own monitors. **Takes one selector token:** `cmd:<full command>`, `kind:<monitor\|bash-bg\|ambient>`, or a bare token (= `cmd:<token>`). Exact match, never substring. | `monitor-running cmd:bun run dev` |
+| `drained` | Any "wait until the whole board is done / at rest / there's nothing left to run" phrasing. **No id.** Holds until no in-flight launch, no running job, every row completed, and not catching up. Distinguishes a JAM (a sticky `dispatch_failures` row) from true drain — add `--fail-on-stuck` to exit 5 on an operator jam instead of waiting. | `drained` |
+| `epic-added [id]` | "ping me when a new epic shows up" (bare) or "when fn-X appears on the board" (a specific id). **Edge-triggered:** never satisfied on first paint, so it always waits for a real appearance. | `epic-added` / `epic-added fn-…` |
+| `epic-removed <id>` | "when fn-X leaves the board / is done or deleted." **One id, edge-triggered.** | `epic-removed fn-…` |
+| `changed [since:R]` | "ping me when anything on the board moves" — an epic appears/leaves, a verdict flips, or autopilot config changes. **Edge-triggered;** optional `since:<hash>` anchors against a prior `changed` baseline so you can detect movement since a known point. | `changed` / `changed since:<hash>` |
 
 | Field | How to derive | Example |
 |---|---|---|
@@ -78,15 +82,31 @@ on (e.g. "wait for one of these"), ask. An explicit AND of distinct
 conditions ("wait for fn-X and the repo to be clean") is a single
 invocation, not an ambiguity.
 
+## Orient / discover the board
+
+<!-- Canonical source: keeper prompt render engineering/orient -->
+
+When the user's reference is to "the board" rather than a known id — "ping me
+when a new epic shows up", "when anything moves", "when it's all done" — orient
+first with one read: `keeper status --json` prints autopilot config, per-row
+readiness verdicts, counts, `drained`/`jammed`, in-flight, and needs-human in a
+single envelope (exit 0 on any board state). Use it to discover which epics
+exist, whether the board is already drained, and which condition fits. For the
+full orient step run `keeper prompt render engineering/orient`. The Step 1
+`keeper plan show` pre-check below only verifies a KNOWN id; `keeper status`
+is how you discover the board before picking a condition.
+
 ## Step 1 — Pre-check plan targets are on-board (plan conditions only)
 
-This pre-check applies **only to `complete` / `started` / `unblocked`**. The
-`git-clean`, `agents-idle`, `server-up`, and `monitor-running` conditions
-have **no `keeper plan show` pre-check** — they read live keeper projections (or,
-for `server-up`, just wait for the daemon to serve), so there is nothing to
-refuse upfront here; skip straight to step 2 for them. `server-up` in
-particular deliberately blocks while keeperd is down, so a "is it on board?"
-check would be self-defeating.
+This pre-check applies **only to `complete` / `started` / `unblocked`** (and
+optionally `epic-removed`, whose id you can verify exists today). The other
+conditions — `git-clean`, `agents-idle`, `server-up`, `monitor-running`,
+`drained`, `epic-added`, `changed` — have **no `keeper plan show` pre-check**:
+they read live keeper projections (or, for `server-up`, just wait for the daemon
+to serve), so there is nothing to refuse upfront; skip straight to step 2 for
+them. `server-up` in particular deliberately blocks while keeperd is down, and
+`epic-added` deliberately waits for an epic that does not exist yet — so an
+"is it on board?" check would be self-defeating for both.
 
 **`monitor-running` self-refuses at arm time.** If the selector matches no
 running monitor in this session, `keeper await` emits `failed
@@ -136,6 +156,18 @@ If the target is on-board and the condition isn't already met, continue
 to step 2. (For `condition=unblocked` you may skip the
 already-unblocked check — `keeper await unblocked` with an already-
 workable target fires `met` immediately, which is the correct behavior.)
+
+> **`complete` is done-AND-idle, not done-alone.** `complete` fires on the
+> readiness `completed` verdict, which requires the row to be done AND every
+> owning subagent to have gone idle — the same moment autopilot treats the work
+> as truly finished and unblocks downstream tasks. A row whose worker reports
+> done while a subagent is still winding down (a stale subagent) reads
+> `runtime_status: done` in the plan-show pre-check above, but `await complete`
+> deliberately HOLDS until that subagent goes idle rather than firing on the
+> worker-done signal alone. The pre-check's `runtime_status == "done"` /
+> `epic.status == "done"` test stays the right "already popped off the board"
+> shortcut; just know the live wait is gated on idle, so it can hold a beat
+> past plan-done while a subagent settles.
 
 > **`started <id> --require-transition` warns.** `started` is a monotonic
 > latch — it fires once and has NO second edge. Pairing it with
@@ -207,6 +239,11 @@ aggregate:
 # single monitor-running condition (carries the selector)
 [keeper-await] armed condition=monitor-running selector=<…> state=<…>
 [keeper-await] met condition=monitor-running selector=<…> detail=<…>
+
+# single board condition (drained / changed / epic-added / epic-removed;
+# target=<id> rides only the id-bearing forms)
+[keeper-await] armed condition=<drained|changed|epic-added|epic-removed> [target=<id>] state=<…>
+[keeper-await] met condition=<…> [target=<id>] detail=<…>
 
 # AND aggregate (two or more conditions)
 [keeper-await] armed conditions=<c1 and c2 …> count=<N>
@@ -328,6 +365,18 @@ it WITHOUT `--connect-timeout` so it waits forever.
 3. On `[keeper-await] met condition=monitor-running …` → ping the user. On
    `failed reason=no-match` → the selector matched nothing; re-check the
    command string against `keeper jobs`.
+
+### Wait until the whole board drains (drained)
+
+> User: "Let me know when the autopilot's worked through everything."
+
+1. No `keeper plan show` pre-check — `drained` is a board-level predicate.
+   Optionally `keeper status --json` first to confirm it isn't already at rest.
+2. `Monitor({ command: "keeper await drained", description: "wait for the
+   board to drain then ping", persistent: true })`.
+3. On `[keeper-await] met condition=drained …` → ping the user. To surrender on
+   an operator jam instead of waiting, add `--fail-on-stuck` (a sticky
+   `dispatch_failures` row then exits 5).
 
 ### Combination (AND)
 
