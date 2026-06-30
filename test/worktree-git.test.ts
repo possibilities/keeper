@@ -17,6 +17,7 @@ import {
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
+  enumerateEpicLaneBranches,
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
@@ -1037,6 +1038,75 @@ test("listEpicLaneBranches: enumerates bases AND ribs, each tagged + epicId reco
     },
     { branch: "keeper/epic/fn-2-bar", epicId: "fn-2-bar", isRib: false },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1014 — enumerateEpicLaneBranches (the code-surfacing present/absent/
+// inconclusive enumeration the cross-epic merge-gate's absent-implies-merged arm
+// needs; closes the `[]`-collapse + no-timeout gap of listEpicLaneBranches).
+// ---------------------------------------------------------------------------
+
+test("enumerateEpicLaneBranches: success → { ok:true } carrying the full keeper/epic short-name set (bases AND ribs)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "for-each-ref"),
+      result: {
+        exitCode: 0,
+        stdout: [
+          "keeper/epic/fn-1-foo",
+          "keeper/epic/fn-1-foo--fn-1-foo.2",
+          "keeper/epic/fn-2-bar",
+          "refs/heads/not-a-lane", // ignored (no prefix)
+        ].join("\n"),
+      },
+    },
+  ]);
+  const res = await enumerateEpicLaneBranches("/repo", run);
+  expect(res).toEqual({
+    ok: true,
+    branches: new Set([
+      "keeper/epic/fn-1-foo",
+      "keeper/epic/fn-1-foo--fn-1-foo.2",
+      "keeper/epic/fn-2-bar",
+    ]),
+  });
+  // The read is TIME-BOUND (unlike listEpicLaneBranches) so an fsmonitor stall
+  // can't wedge the cycle.
+  expect(calls.some((c) => argvStartsWith(c.args, "for-each-ref"))).toBe(true);
+});
+
+test("enumerateEpicLaneBranches: a lane-less repo → { ok:true, branches: ∅ } — a DEFINITIVE absence, NOT a failure", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "for-each-ref"),
+      result: { exitCode: 0, stdout: "" },
+    },
+  ]);
+  const res = await enumerateEpicLaneBranches("/repo", run);
+  expect(res.ok).toBe(true);
+  if (res.ok) {
+    expect(res.branches.size).toBe(0);
+  }
+});
+
+test("enumerateEpicLaneBranches: a non-zero for-each-ref exit → { ok:false } (NEVER collapsed to an empty set)", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "for-each-ref"),
+      result: { exitCode: 1 },
+    },
+  ]);
+  expect(await enumerateEpicLaneBranches("/repo", run)).toEqual({ ok: false });
+});
+
+test("enumerateEpicLaneBranches: a 124 SIGKILL timeout → { ok:false } (the caller DEFERS, never reads a stalled probe as absent)", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "for-each-ref"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  expect(await enumerateEpicLaneBranches("/repo", run)).toEqual({ ok: false });
 });
 
 // ---------------------------------------------------------------------------
