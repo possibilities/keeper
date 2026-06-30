@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Bound usage freshness heartbeat",
-  "updated_at": "2026-06-30T06:56:53.472000Z"
+  "updated_at": "2026-06-30T07:11:15.724000Z",
+  "worker_done_at": "2026-06-30T07:11:15.724000Z"
 }

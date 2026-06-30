@@ -38,5 +38,5 @@ Add pure `UsageScanner` tests for same-bucket suppression, next-bucket heartbeat
 - [ ] Focused tests pass with `bun test test/usage-worker.test.ts test/usage.test.ts`.
 
 ## Done summary
-
+UsageScanner now emits one liveness heartbeat per 10-minute successful-fetch bucket for unchanged active scrapes, keyed off last_successful_fetch_at and seeded from last_usage_fold_at, so stable accounts (e.g. claude-0) no longer flap false-stale. Freshness stays out of the message, content gate, and projection.
 ## Evidence
