@@ -1,18 +1,18 @@
 ---
 name: handoff
 description: >-
-  Hand a piece of work off to a fresh fire-and-forget claude worker — gather a
-  contextful brief + instructions, then enqueue it with `keeper handoff` ONCE.
-  A keeperd worker dispatches the brief into a new worker in your tmux session,
-  preloaded with the doc inline. Use when the human says "hand this off", "hand
-  off this work", "create a handoff", "create handoffs", "spawn someone to
-  investigate X", or otherwise wants to pass a contextful task to a separate
-  worker and walk away — even when they never say "keeper" or "handoff". This is
-  passing LIVE work to a worker; it is NOT authoring a markdown handoff DOCUMENT
-  (a `.md` write-up) — when the human wants a written doc, just write the file.
-  NOT for launching a worker on a plan id (that is `keeper:dispatch` —
-  `work::fn-N.M` / `close::fn-N`), NOT for messaging an already-running agent
-  (that is `keeper:bus`), and NOT for planning work (`/plan:plan`).
+  Hand a piece of work off to a fresh fire-and-forget claude worker via `keeper
+  handoff` (one call; a keeperd worker boots it inline in your tmux session). Use
+  whenever the human imperatively says "handoff" — "hand this off", "send a
+  handoff", "handoff to/in the <repo> project" (cross-repo is just `--dir`, still
+  a handoff), "create handoffs", "spawn someone to investigate X" — or otherwise
+  wants to pass a contextful task to a separate worker and walk away, even when
+  they never say "keeper". This passes LIVE work to a worker; it is NOT authoring
+  a markdown handoff DOCUMENT (a `.md` write-up) — for a written doc, just write
+  the file. NOT for capturing/queuing a follow-up to track on the board (that is
+  `plan:defer` — scaffolds an epic, dispatches no worker), NOT a plan-id launch
+  (`keeper:dispatch` — `work::fn-N.M` / `close::fn-N`), NOT messaging a running
+  agent (`keeper:bus`), NOT planning (`/plan:plan`).
 allowed-tools: Bash
 argument-hint: --slug <slug> --prompt "<brief>" [--dir <path>] [--title "<t>"]
 ---
@@ -43,6 +43,7 @@ move on:
 - *"Hand this off."* / *"Hand off this work to a fresh worker."*
 - *"Create a handoff."* / *"Create handoffs for X and Y."*
 - *"Spawn someone to investigate X."* / *"Kick off a worker to dig into Y; here's the context."*
+- *"Send a handoff in the arthack project to work on it."* — a handoff launched in another repo via `--dir`; a cross-repo target is not a reason to defer.
 
 Each distinct handoff is ONE `keeper handoff` call — the one-call rule is
 per-handoff, so "create handoffs for X and Y" is two calls (different `--slug`
@@ -58,6 +59,10 @@ each), not one.
   free-text brief, never a plan id/verb.
 - *"Tell <agent> X"* / *"message the planner"* → that is `keeper:bus`, a
   message to an already-running agent.
+- *"Defer this"* / *"put X on the list"* → that is `plan:defer`, which scaffolds
+  a board epic and dispatches no worker. A temporal "when done…" or cross-repo
+  framing does NOT downgrade a handoff to a defer — when the human says "handoff"
+  or wants a worker to actually work on it, it is THIS skill.
 - *"Plan a feature"* / *"make a plan"* → `/plan:plan`.
 
 ## Step 1 — Gather the brief
