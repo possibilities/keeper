@@ -3915,15 +3915,17 @@ test("fn-959 reconcile: worktree ON multi-repo epic → every launch stamped wor
 // synthetic resolver (no real git in the fast tier).
 // ---------------------------------------------------------------------------
 
-/** A worktree-ON snapshot whose repo classification uses a synthetic resolver. */
+/** A worktree-ON snapshot whose repo classification uses a synthetic resolver
+ *  (and an optional synthetic eligibility probe — defaults to always-eligible). */
 function worktreeSnap(
   epics: Epic[],
   resolve: (root: string) => string | null,
+  assessRepo?: (toplevel: string) => { eligible: boolean; reason: string },
 ): ReconcileSnapshot {
   return makeSnapshot({
     epics,
     worktreeMode: true,
-    worktreeRepoByEpicId: classifyWorktreeRepos(epics, resolve),
+    worktreeRepoByEpicId: classifyWorktreeRepos(epics, resolve, assessRepo),
   });
 }
 
@@ -4295,6 +4297,165 @@ test("fn-978 prepareWorktreeGeometry: gate laneKeyById ↔ dispatch byEpicId der
   }
   // The close row (epic id) keys on the base lane.
   expect(prepared.laneKeyById.get("fn-1-foo")).toBe(geom.plan.baseWorktreePath);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1013 — the per-repo worktree-eligibility downgrade. A would-be-`ok` epic
+// whose RESOLVED toplevel is NOT worktree-friendly (the injected `assessRepo`
+// probe returns ineligible) becomes `disabled`: a NORMAL, NON-error sequential-
+// on-shared-checkout fallback (one task per toplevel, cap-1) — never a sticky
+// reject. The fast tier injects a synthetic `assessRepo`; no real fs/git.
+// ---------------------------------------------------------------------------
+
+test("fn-1013 classifyWorktreeRepos: an injected ineligible assessRepo downgrades a would-be-ok epic → disabled (repoDir + reason)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    (top) => ({
+      eligible: false,
+      reason: `worktree-disabled:workspace-marker:turbo (${top})`,
+    }),
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("disabled");
+  expect(res?.kind === "disabled" && res.repoDir).toBe("/repo");
+  expect(res?.kind === "disabled" && res.reason).toContain(
+    "workspace-marker:turbo",
+  );
+  // The probe saw the RESOLVED toplevel, not a raw subdir.
+  expect(res?.kind === "disabled" && res.reason).toContain("/repo");
+});
+
+test("fn-1013 classifyWorktreeRepos: assessRepo only downgrades a would-be-ok epic — a reject (multi-repo / no-primary-repo) is NEVER probed", () => {
+  let probed = 0;
+  const assess = (top: string) => {
+    probed++;
+    return {
+      eligible: false,
+      reason: `worktree-disabled:no-manifest (${top})`,
+    };
+  };
+  // multi-repo: two distinct toplevels — reject returns BEFORE eligibility.
+  const multi = makeEpic({
+    epic_id: "fn-1-multi",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-multi.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-multi.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  // no-primary-repo: single toplevel but empty project_dir — reject returns first.
+  const noPrimary = makeEpic({
+    epic_id: "fn-1-noprimary",
+    project_dir: "",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-noprimary.1",
+        task_number: 1,
+        target_repo: "/repo",
+      }),
+    ],
+  });
+  const map = classifyWorktreeRepos(
+    [multi, noPrimary],
+    (r) =>
+      r.startsWith("/repo-a")
+        ? "/repo-a"
+        : r.startsWith("/repo-b")
+          ? "/repo-b"
+          : r === "/repo"
+            ? "/repo"
+            : null,
+    assess,
+  );
+  expect(map.get("fn-1-multi")?.kind).toBe("multi-repo");
+  expect(map.get("fn-1-noprimary")?.kind).toBe("no-primary-repo");
+  // Neither reject consulted the eligibility probe.
+  expect(probed).toBe(0);
+});
+
+test("fn-1013 classifyWorktreeRepos: default assessRepo (no 3rd arg) keeps a single-toplevel epic ok — existing callers byte-identical", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  expect(
+    classifyWorktreeRepos([epic], (r) => (r === "/repo" ? "/repo" : null)).get(
+      "fn-1-foo",
+    ),
+  ).toEqual({ kind: "ok", repoDir: "/repo" });
+});
+
+test("fn-1013 prepareWorktreeGeometry: a disabled epic → every task id + epic id key the BARE toplevel, byEpicId disabled, NO reject", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "P", task_number: 1 }),
+      makeTask({ task_id: "A", task_number: 2, depends_on: ["P"] }),
+      makeTask({ task_id: "B", task_number: 3, depends_on: ["P"] }),
+    ],
+  });
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    (r) => (r.startsWith("/repo") ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:submodules" }),
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  const geom = prepared.byEpicId.get("fn-1-foo");
+  expect(geom?.kind).toBe("disabled");
+  expect(geom?.kind === "disabled" && geom.repoDir).toBe("/repo");
+  expect(geom?.kind === "disabled" && geom.reason).toContain("submodules");
+  // Every task id AND the epic id (close row) key the BARE toplevel — never a
+  // per-lane worktree path. 3 tasks + 1 epic id = 4 keys, all the toplevel.
+  for (const id of ["P", "A", "B", "fn-1-foo"]) {
+    expect(prepared.laneKeyById.get(id)).toBe("/repo");
+  }
+  expect(prepared.laneKeyById.size).toBe(4);
+});
+
+test("fn-1013 reconcile: worktree ON, a disabled epic → launches dispatch on the SHARED checkout (no worktree, no worktreeReject)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const snap = worktreeSnap(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({
+      eligible: false,
+      reason: "worktree-disabled:no-manifest",
+    }),
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    // No lane geometry, no sticky reject — byte-identical to worktree-mode-OFF.
+    expect(l.worktree).toBeUndefined();
+    expect(l.worktreeReject).toBeUndefined();
+    // The launch cwd is the shared checkout (the resolved toplevel), unmodified.
+    expect(l.cwd).toBe("/repo");
+  }
 });
 
 test("fn-978 cyclic-DAG asymmetry: the gate skips (no key, no throw); reconcile (dispatch) re-throws", () => {

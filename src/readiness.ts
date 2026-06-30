@@ -1897,6 +1897,15 @@ function effectiveRoot(
  * close row (whose lane is always the epic BASE). The gate (`computeReadiness`)
  * and the dispatch-side resolver build this map off the SAME `deriveWorktreePlan`,
  * so they never diverge.
+ *
+ * A worktree-DISABLED epic (see `WorktreeRepoResolution.disabled`) is a third
+ * shape: the producer maps EVERY task id + the epic id to the BARE resolved
+ * toplevel (one shared key, NOT per-lane paths), so all its rows collapse to ONE
+ * cap-1 mutex key and serialize on the shared checkout. A non-empty `laneKeyById`
+ * is exactly what routes {@link applyPerRootRoundRobinAllocator} through the cap-1
+ * mutex (bypassing the `max_concurrent_per_root>1` round-robin), so same-toplevel
+ * rows of a disabled repo can NEVER parallelize into one shared checkout. The keys
+ * are opaque strings; this function needs no special case for them.
  */
 function rootKeyForRow(
   rowId: string,
