@@ -46,5 +46,5 @@ Migrate `test/pair-cli.test.ts` launch-failure coverage to the injected tmux sea
 - [ ] Launch-failure tests re-targeted via the injected tmux seam; in-process compose tests cover each outcome; `bun test` green.
 
 ## Done summary
-
+Repointed pair send's launch->wait->show onto the in-process composeRunCapture/launchToResolvedHandle helpers on a locally-held pinned handle; dropped the subprocess kill margin + isSelfTranscriptCollision guard and the dead wait/show argv + launch/show JSON-parse builders; outcome maps to pair's 0/1/2 contract at one never-checked boundary. Posture + the --output YAML + two Monitor lines byte-identical (golden test green).
 ## Evidence
