@@ -68,5 +68,5 @@ Prose/docs task — verify by rendering the orient snippet (`keeper prompt rende
 - [ ] Forward-facing prose only; `bun scripts/lint-claude-md.ts` green.
 
 ## Done summary
-
+Authored the shared engineering/orient snippet (arthack corpus) and cited it from await/autopilot/dispatch/handoff (referenced, not inlined); repointed autopilot/dispatch state reads to keeper status --json with the extended autopilot shape; documented await's drained/epic-added/epic-removed/changed conditions, the done-AND-idle complete, and board-discovery; surfaced keeper autopilot config; pointed hack forensics at the JSON subcommands; and updated README Example clients with status/query/watch + the revised await/subscribeReadiness prose.
 ## Evidence
