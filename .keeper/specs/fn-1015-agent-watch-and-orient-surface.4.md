@@ -54,5 +54,5 @@ Pure fixtures: drained empty/all-completed→met; running present→waiting; cat
 - [ ] Pure fixture/diff tests cover the predicates and the delta function; `bun test` green.
 
 ## Done summary
-
+Add board-level await conditions (drained/changed/epic-added/epic-removed) as pure snapshot predicates plus the non-exiting keeper watch NDJSON delta tail; drained --fail-on-stuck jam allowlist excludes worktree-recover*.
 ## Evidence
