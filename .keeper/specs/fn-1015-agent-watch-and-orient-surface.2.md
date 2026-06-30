@@ -71,5 +71,5 @@ Routing tests in test/keeper-cli.test.ts (stub handlers). A pure shaping test (t
 - [ ] `bun test` green.
 
 ## Done summary
-
+Added keeper status (unified board+autopilot JSON envelope via bare subscribeReadiness first-paint + dispatch_failures read; ~10s give-up, exit 0 on any board state) and keeper query (allowlisted collection read via queryCollection, off-allowlist rejected at parse time). drained/jammed/needs-human computed inline pending task-4's canonical predicate (TODO at call site).
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "keeper status and query read commands",
-  "updated_at": "2026-06-30T03:05:41.733000Z"
+  "updated_at": "2026-06-30T03:33:31.309000Z",
+  "worker_done_at": "2026-06-30T03:33:31.309000Z"
 }
