@@ -101,5 +101,5 @@ and assert finalize merges via `git merge --no-edit` (true merge) so a future sw
 - [ ] `bun test` green
 
 ## Done summary
-
+Added an ephemeral, producer-only cross-epic merge-gate: in worktree mode a dependent epic's lane is deferred (no work/close launch, no sticky row) until every satisfied same-resolved-repo upstream is an ancestor of LOCAL default — probed once per cycle in loadReconcileSnapshot (computeDeferredEpicIds + new enumerateEpicLaneBranches), read as plain deferredEpicIds data by pure reconcile, every inconclusive probe DEFERS.
 ## Evidence
