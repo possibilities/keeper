@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T03:06:49.446000Z",
+  "depends_on": [
+    "fn-1016-merge-landed-observable-and-landed-await.1"
+  ],
+  "epic": "fn-1016-merge-landed-observable-and-landed-await",
+  "id": "fn-1016-merge-landed-observable-and-landed-await.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "landed await condition and daisy-chain repoint",
+  "updated_at": "2026-06-30T03:06:49.446000Z"
+}
