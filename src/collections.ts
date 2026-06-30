@@ -859,6 +859,29 @@ export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `lane_merged` descriptor (fn-1016) — the LIVE-ONLY merge-landed observable.
+ * One row per epic whose worktree lane branch (`keeper/epic/<id>`) the autopilot
+ * reconciler probed as merged into the LOCAL default branch (ancestor-of-default,
+ * or torn-down after the merge), folded from a synthetic `LaneMerged` event the
+ * worker posts when the merged set changes. Registering it here is what makes the
+ * table subscribable over the UDS socket so `keeper await landed` and `keeper
+ * status` can read the durable signal; an empty / pre-first-cycle table returns
+ * `rows: []`. `version: 'last_event_id'` so the diff fires on every fold. Mirrors
+ * {@link WORKTREE_REPO_STATUS_DESCRIPTOR}.
+ */
+export const LANE_MERGED_DESCRIPTOR: CollectionDescriptor = {
+  name: "lane_merged",
+  table: "lane_merged",
+  columns: ["epic_id", "repo_dir", "last_event_id", "updated_at"],
+  pk: "epic_id",
+  version: "last_event_id",
+  sortable: new Set(["epic_id", "repo_dir", "last_event_id", "updated_at"]),
+  defaultSort: { column: "epic_id", dir: "asc" },
+  filters: { epic_id: "epic_id" },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -879,6 +902,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
   [TMUX_CLIENT_FOCUS_DESCRIPTOR.name, TMUX_CLIENT_FOCUS_DESCRIPTOR],
   [WORKTREE_REPO_STATUS_DESCRIPTOR.name, WORKTREE_REPO_STATUS_DESCRIPTOR],
+  [LANE_MERGED_DESCRIPTOR.name, LANE_MERGED_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */
@@ -912,6 +936,7 @@ export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
   "handoffs",
   "tmux_client_focus",
   "worktree_repo_status",
+  "lane_merged",
   "profiles",
   "usage",
 ]);

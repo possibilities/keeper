@@ -1468,7 +1468,7 @@ event-log/reducer/hook touch. Run any of them with
   is `cmd:<full command>`, `kind:<monitor|bash-bg|ambient>`, or a bare
   token (= `cmd:<token>`), exact-matched against the v51 `jobs.monitors`
   projection (a no-match at arm time refuses with `reason=no-match` exit 1
-  rather than firing an instant `met`). The four board-level conditions are pure
+  rather than firing an instant `met`). The five board-level conditions are pure
   predicates over the readiness snapshot, reusing the same exit taxonomy:
   `drained` blocks until the board is fully at rest (no in-flight launch, no
   running job, every row completed, not catching up) and distinguishes a JAM (a
@@ -1477,8 +1477,14 @@ event-log/reducer/hook touch. Run any of them with
   id); `epic-removed <id>` fires when the named epic leaves the board (done or
   deleted); `changed [since:R]` fires when the board's epics / verdicts /
   autopilot config move, with an optional `since:<hash>` anchoring against a
-  prior `changed` baseline — all four are edge-triggered (never satisfied on
-  first paint). `git-clean` / `agents-idle` take no
+  prior `changed` baseline; `landed <epic>` fires when the named epic's lane is
+  merged to the default branch — a membership read over the durable
+  merge-landed observable that **degrades to `complete` semantics (merged ⇔
+  done) when worktree mode is off**, the gate a planning daisy-chain wants
+  ("author B against A's MERGED files") since under worktree mode a dependent
+  lane is cut before the upstream finalize merge. `epic-added` / `epic-removed`
+  / `changed` are edge-triggered (never satisfied on first paint); `drained` /
+  `landed` are level-triggered. `git-clean` / `agents-idle` take no
   id and are project-scoped to the cwd's repo; `monitor-running` takes one
   selector and needs no git root. Multiple conditions joined by the
   literal `and` token block until ALL hold simultaneously (level-
@@ -1504,6 +1510,7 @@ event-log/reducer/hook touch. Run any of them with
 
   ```sh
   keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
+  keeper await landed fn-646-keeper-cli-opentui-port       # epic lane merged to default
   keeper await started fn-646-keeper-cli-opentui-port.1    # task begun
   keeper await git-clean                                   # repo clean
   keeper await server-up                                   # daemon serving

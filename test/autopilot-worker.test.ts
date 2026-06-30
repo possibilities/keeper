@@ -42,6 +42,7 @@ import {
   classifyWorktreeRepos,
   closerJobFinished,
   computeDeferredEpicIds,
+  computeMergedLaneEntries,
   confirmRunning,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
@@ -8557,6 +8558,115 @@ test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked u
   const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
   const deferred = await computeDeferredEpicIds(epics, map, run);
   expect(deferred.has("fn-2-b")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1016 — the durable merge-landed observable (computeMergedLaneEntries). An
+// `ok` epic's OWN lane probed merged-into-default → an entry; reuses the SAME
+// per-repo lane-enumeration + ancestry probes as the merge-gate.
+// ---------------------------------------------------------------------------
+
+test("fn-1016 computeMergedLaneEntries: a lane PRESENT ∧ ancestor of local default → MERGED", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [a];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestors: ["keeper/epic/fn-1-a"], // merged into local default
+  });
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
+});
+
+test("fn-1016 computeMergedLaneEntries: a lane PRESENT ∧ NOT an ancestor → NOT merged (an unmerged-but-done epic)", async () => {
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    status: "done",
+  });
+  const epics = [a];
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([]);
+});
+
+test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration ok) → MERGED-and-torn-down, no ancestry probe", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [a];
+  const { run, calls } = gateGit({ lanes: [] }); // enumeration ok, A's lane gone
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
+  // A definitively-absent lane short-circuits to merged WITHOUT an ancestry probe.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1016 computeMergedLaneEntries: an enumeration FAILURE → NOT merged (never claim merged off an inconclusive probe)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [a];
+  const { run } = gateGit({ enumError: true });
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([]);
+});
+
+test("fn-1016 computeMergedLaneEntries: an ancestry probe TIMEOUT → NOT merged (collapses to not-ancestor)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [a];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestryTimeout: true,
+  });
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([]);
+});
+
+test("fn-1016 computeMergedLaneEntries: a DISABLED / non-`ok` epic has no lane → skipped, never probed", async () => {
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    status: "done",
+  });
+  const epics = [a];
+  const map = classifyIdentity(epics);
+  map.set("fn-1-a", { kind: "disabled", repoDir: "/repo", reason: "serial" });
+  const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
+  const entries = await computeMergedLaneEntries(epics, map, run);
+  expect(entries).toEqual([]);
+  expect(calls.length).toBe(0); // a non-`ok` epic is skipped before any git
+});
+
+test("fn-1016 computeMergedLaneEntries: entries are sorted by epic_id (stable serialization for the change-gate)", async () => {
+  const b = makeEpic({ epic_id: "fn-2-b", project_dir: "/repo" });
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [b, a]; // unsorted input
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+  });
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries.map((e) => e.epic_id)).toEqual(["fn-1-a", "fn-2-b"]);
 });
 
 test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {

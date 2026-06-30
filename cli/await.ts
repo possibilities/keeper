@@ -64,6 +64,7 @@ import {
   epicRemovedMet,
   evaluateAwaitCondition,
   gitCleanState,
+  landedState,
   type MonitorSelector,
   monitorRunningState,
   type PlanCondition,
@@ -217,7 +218,12 @@ export type ConditionSegment =
   | { condition: "drained" }
   | { condition: "changed"; since?: string }
   | { condition: "epic-added"; target?: string }
-  | { condition: "epic-removed"; target: string };
+  | { condition: "epic-removed"; target: string }
+  // fn-1016: `landed <epic>` — the lane-merged-to-default milestone. A
+  // board-family condition (reads the whole-board `landedEpicIds` set off the
+  // readiness snapshot), but carrying a required epic target like
+  // `epic-removed`.
+  | { condition: "landed"; target: string };
 
 export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
@@ -576,10 +582,32 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       }
       seen.add(dupKey);
       segments.push({ condition: "epic-removed", target });
+    } else if (condRaw === "landed") {
+      // fn-1016: `landed <epic>` — lanes are per-epic, so a task id is a usage
+      // error (mirrors `epic-removed`'s epic-only guard).
+      if (rest.length !== 1) {
+        return {
+          ok: false,
+          message: `condition 'landed' takes exactly one id (got ${rest.length})`,
+        };
+      }
+      const target = rest[0] ?? "";
+      if (classifyTargetId(target) !== "epic") {
+        return {
+          ok: false,
+          message: `condition 'landed' id '${target}' must be an epic id (fn-N or fn-N-slug)`,
+        };
+      }
+      const dupKey = `landed:${target}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({ condition: "landed", target });
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed, landed)`,
       };
     }
   }
@@ -812,8 +840,16 @@ interface ServerUpSlotState {
  * baseline.
  */
 interface BoardSlotState {
-  readonly kind: "drained" | "changed" | "epic-added" | "epic-removed";
-  /** epic id for `epic-added` (optional) / `epic-removed` (required). */
+  readonly kind:
+    | "drained"
+    | "changed"
+    | "epic-added"
+    | "epic-removed"
+    | "landed";
+  /**
+   * epic id for `epic-added` (optional) / `epic-removed` (required) /
+   * `landed` (required, fn-1016).
+   */
   readonly target?: string;
   /** `changed since:<hash>` anchor — overrides the first-paint baseline. */
   readonly since?: string;
@@ -893,12 +929,19 @@ export async function runAwait(
   // `onBootStatus`) and, under `--fail-on-stuck`, the live `dispatch_failures`
   // rows (a dedicated collection subscribe — there's no readiness equivalent).
   const hasDrained = args.segments.some((s) => s.condition === "drained");
+  // fn-1016: `landed` reads the whole-board `landedEpicIds` set, so it rides
+  // the readiness stream like the other board conditions — BUT that set is only
+  // populated under the `includeRecentDoneEpics` opt-in (task-1's
+  // `computeLandedEpicIds` gates on it for the OFF degradation), so it shares
+  // `complete`'s recent-done opt-in below.
+  const hasLanded = args.segments.some((s) => s.condition === "landed");
   const hasBoard = args.segments.some(
     (s) =>
       s.condition === "drained" ||
       s.condition === "changed" ||
       s.condition === "epic-added" ||
-      s.condition === "epic-removed",
+      s.condition === "epic-removed" ||
+      s.condition === "landed",
   );
   const openDispatchFailures = hasDrained && args.failOnStuck;
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
@@ -948,7 +991,8 @@ export async function runAwait(
       seg.condition === "drained" ||
       seg.condition === "changed" ||
       seg.condition === "epic-added" ||
-      seg.condition === "epic-removed"
+      seg.condition === "epic-removed" ||
+      seg.condition === "landed"
     ) {
       return {
         kind: seg.condition,
@@ -1112,7 +1156,9 @@ export async function runAwait(
       return `monitor-running ${slot.raw}`;
     }
     if (
-      (slot.kind === "epic-added" || slot.kind === "epic-removed") &&
+      (slot.kind === "epic-added" ||
+        slot.kind === "epic-removed" ||
+        slot.kind === "landed") &&
       slot.target !== undefined
     ) {
       return `${slot.kind} ${slot.target}`;
@@ -1151,9 +1197,10 @@ export async function runAwait(
       (slots[0].kind === "drained" ||
         slots[0].kind === "changed" ||
         slots[0].kind === "epic-added" ||
-        slots[0].kind === "epic-removed")
+        slots[0].kind === "epic-removed" ||
+        slots[0].kind === "landed")
     ) {
-      // fn-1015 single board condition: bare condition (+ target) + state.
+      // fn-1015/fn-1016 single board condition: bare condition (+ target) + state.
       const slot = slots[0];
       const initial = initials[0] ?? { kind: "waiting" as const };
       fields = {
@@ -1210,7 +1257,8 @@ export async function runAwait(
       (slots[0].kind === "drained" ||
         slots[0].kind === "changed" ||
         slots[0].kind === "epic-added" ||
-        slots[0].kind === "epic-removed")
+        slots[0].kind === "epic-removed" ||
+        slots[0].kind === "landed")
     ) {
       const slot = slots[0];
       emitTerminal("met", 0, {
@@ -1537,6 +1585,12 @@ export async function runAwait(
     slot: BoardSlotState,
     snap: ReadinessClientSnapshot,
   ): AwaitState => {
+    if (slot.kind === "landed") {
+      // fn-1016: level-triggered membership read off the merge-landed set — no
+      // baseline (a positive milestone, like `drained`). The worktree ON/OFF
+      // degradation is already baked into `landedEpicIds` (task-1).
+      return landedState(slot.target ?? "", snap.landedEpicIds);
+    }
     if (!slot.baselineCaptured) {
       slot.baselineEpicIds = snap.epics.map((e) => e.epic_id);
       slot.baselineSignature =
@@ -1734,9 +1788,10 @@ export async function runAwait(
         slot.kind === "drained" ||
         slot.kind === "changed" ||
         slot.kind === "epic-added" ||
-        slot.kind === "epic-removed"
+        slot.kind === "epic-removed" ||
+        slot.kind === "landed"
       ) {
-        // fn-1015 board slots: all read off the readiness snapshot. Hold
+        // fn-1015/fn-1016 board slots: all read off the readiness snapshot. Hold
         // `waiting` until it paints.
         if (latestReadiness === null) {
           evals[i] = { kind: "waiting" };
@@ -2068,8 +2123,10 @@ export async function runAwait(
       // feeds git rows (git-seed) OR a board condition needs `catching_up`.
       ...(hasGitClean || hasBoard ? { onBootStatus } : {}),
       // fn-1015: merge the recently-done epics so an epic `complete` await reads
-      // the close-row `completed` verdict on the present branch.
-      ...(hasComplete ? { includeRecentDoneEpics: true } : {}),
+      // the close-row `completed` verdict on the present branch. fn-1016: `landed`
+      // shares the opt-in — the `landedEpicIds` set is only populated under it (its
+      // worktree-OFF degradation reads done epics, which ride this same merge).
+      ...(hasComplete || hasLanded ? { includeRecentDoneEpics: true } : {}),
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });

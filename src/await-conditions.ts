@@ -1184,6 +1184,41 @@ export function epicRemovedMet(
   return false;
 }
 
+/**
+ * `landed` predicate (fn-1016) — "this epic's lane is merged to the default
+ * branch." A thin membership read over the durable MERGE-LANDED set
+ * (`ReadinessClientSnapshot.landedEpicIds`, computed by task-1's
+ * `computeLandedEpicIds`), so the worktree ON/OFF degradation is ALREADY baked
+ * into the input: ON → the `lane_merged` projection ids, OFF → done epics
+ * (no lanes, so merged ⇔ done). This consumer just asks "is `target` in the
+ * set?" — it never re-derives the degradation.
+ *
+ * `target` is a full `fn-N-slug` epic id or a bare `fn-N`; matched against the
+ * set via {@link epicIdMatchesTarget} (bare → numeric prefix, full → exact).
+ *
+ * `landedEpicIds === undefined` means the merge-landed observable wasn't opted
+ * into (the snapshot omits it for board/dash scopes) or hasn't first-painted —
+ * UNKNOWN, so `waiting` (never a false `met`). Membership is authoritative
+ * regardless of board presence: a merged epic that has aged off the open board
+ * still reads `met` as long as it rides the set, so there is no
+ * `not-found`/`deleted` semantic — `landed` is a positive milestone like
+ * `started`/`drained`, MET or `waiting` only. Pure: no I/O, no `Date.now()`.
+ */
+export function landedState(
+  target: string,
+  landedEpicIds: readonly string[] | undefined,
+): AwaitState {
+  if (landedEpicIds === undefined) {
+    return { kind: "waiting", detail: "merge-landed signal not yet available" };
+  }
+  for (const id of landedEpicIds) {
+    if (epicIdMatchesTarget(id, target)) {
+      return { kind: "met", detail: `lane merged to default (${id})` };
+    }
+  }
+  return { kind: "waiting", detail: "lane not yet merged to default" };
+}
+
 /** Stable string key for a verdict (tag + reason kind). Exported so the
  *  `keeper watch` coarse diff shares ONE verdict vocabulary with `changed`. */
 export function verdictKey(v: Verdict): string {

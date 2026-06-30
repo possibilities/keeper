@@ -3552,6 +3552,102 @@ function foldWorktreeRepoStatus(db: Database, event: Event): void {
 }
 
 /**
+ * One entry of a synthetic `LaneMerged` event (fn-1016) — ONE epic whose worktree
+ * lane branch (`keeper/epic/<id>`) the autopilot reconciler probed as merged into
+ * the LOCAL default branch (an ancestor of default, OR torn-down after a merge —
+ * keeper deletes a base only once it is an ancestor of default). The durable
+ * "merge-landed" observable the planning daisy-chain needs ("author B against A's
+ * MERGED reality"), which `complete` (done-AND-idle) does not guarantee in
+ * worktree mode (a dependent lane is cut before the upstream's finalize merge
+ * lands). The event's `data` carries the FULL current merged set as
+ * `{ entries: LaneMergedEntry[] }`; the fold replaces the whole table with it (a
+ * cheap full-set replace bounded by board size). Defined here so the producer
+ * (autopilot worker) and this fold share one contract.
+ */
+export interface LaneMergedEntry {
+  epic_id: string;
+  repo_dir: string;
+}
+
+/**
+ * Null-safe decode of a `LaneMerged` event's `data` blob into the validated entry
+ * array. Returns `[]` on a missing / empty / malformed blob OR a non-array
+ * `entries` (the fold then clears the table — the merged set is empty); NEVER
+ * throws. Each entry is type-narrowed independently: a non-string field
+ * normalizes to `""`, and an entry with no `epic_id` is dropped (the PK must be
+ * present). Reads ONLY `event.data` — no probe, no env, no wall-clock — keeping
+ * the fold a pure function of the event payload. Mirrors
+ * {@link extractWorktreeRepoStatus}.
+ */
+function extractLaneMerged(event: Event): LaneMergedEntry[] {
+  if (event.data == null || event.data.length === 0) {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.data);
+  } catch {
+    return [];
+  }
+  if (parsed == null || typeof parsed !== "object") {
+    return [];
+  }
+  const rawEntries = (parsed as Record<string, unknown>).entries;
+  if (!Array.isArray(rawEntries)) {
+    return [];
+  }
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const out: LaneMergedEntry[] = [];
+  for (const raw of rawEntries) {
+    if (raw == null || typeof raw !== "object") {
+      continue;
+    }
+    const r = raw as Record<string, unknown>;
+    const epic_id = str(r.epic_id);
+    if (epic_id === "") {
+      continue;
+    }
+    out.push({ epic_id, repo_dir: str(r.repo_dir) });
+  }
+  return out;
+}
+
+/**
+ * Fold one synthetic `LaneMerged` event (fn-1016) into the LIVE-ONLY
+ * `lane_merged` projection — a full-set REPLACE: wipe the table, then INSERT one
+ * row per merged-lane epic carried in the event. The autopilot worker posts the
+ * FULL current merged set whenever it changes, so the table always reflects the
+ * latest emitted set; an empty set (worktree mode OFF, or no merged lanes) clears
+ * it.
+ *
+ * Cheap full replace bounded by board size (NOT O(history)), so no floor/seed of
+ * its own — the wipe + re-INSERT runs unconditionally and a re-fold's last
+ * `LaneMerged` event wins; the table is LIVE-ONLY (in `LIVE_ONLY_PROJECTIONS`) so
+ * it is excluded from the byte-identical re-fold charter regardless (the merged
+ * verdict is git-derived — a per-cycle ancestry probe — so it must NOT be
+ * deterministic-replayed). `ON CONFLICT DO UPDATE` keeps the fold total even if
+ * the producer ever posts a duplicate epic_id. Pure: reads ONLY the event payload
+ * + `event.id` / `event.ts` — NEVER throws (a malformed payload clears the
+ * table). Mirrors {@link foldWorktreeRepoStatus}.
+ */
+function foldLaneMerged(db: Database, event: Event): void {
+  const entries = extractLaneMerged(event);
+  db.run("DELETE FROM lane_merged");
+  for (const e of entries) {
+    db.run(
+      `INSERT INTO lane_merged (
+         epic_id, repo_dir, last_event_id, updated_at
+       ) VALUES (?, ?, ?, ?)
+       ON CONFLICT(epic_id) DO UPDATE SET
+         repo_dir = excluded.repo_dir,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [e.epic_id, e.repo_dir, event.id, event.ts],
+    );
+  }
+}
+
+/**
  * Wire payload for a synthetic `BuildSnapshot` event — the projection-meaningful
  * fields of one buildbot builder's latest build. The pk (the builder NAME) does
  * NOT ride here; it travels in `event.session_id` (the generic entity-key
@@ -8785,6 +8881,16 @@ export function applyEvent(
       // (in `LIVE_ONLY_PROJECTIONS`) — excluded from the byte-identical re-fold
       // charter. A malformed payload clears the table; the fold never throws.
       foldWorktreeRepoStatus(db, event);
+    } else if (event.hook_event === "LaneMerged") {
+      // fn-1016 — the LIVE-ONLY merge-landed observable (sole owner of
+      // `lane_merged`). Full-set REPLACE from the autopilot worker's current
+      // merged-lane set (posted only when it changes). NO floor/seed: the verdict
+      // is git-derived (a per-cycle ancestry probe) and re-emitted each cycle, so
+      // the fold runs unconditionally and a re-fold's last event wins; the table
+      // is LIVE-ONLY (in `LIVE_ONLY_PROJECTIONS`) — excluded from the
+      // byte-identical re-fold charter. A malformed payload clears the table; the
+      // fold never throws.
+      foldLaneMerged(db, event);
     } else if (event.hook_event === "TmuxPaneSnapshot") {
       // retired fn-907 — the fill-only session resolver (epic fn-789) is
       // superseded by the `TmuxTopologySnapshot` live-location fold above. Fold

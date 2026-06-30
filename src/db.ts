@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 98;
+export const SCHEMA_VERSION = 99;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -886,6 +886,33 @@ CREATE TABLE IF NOT EXISTS worktree_repo_status (
 )
 `;
 
+/**
+ * `lane_merged` projection table — the LIVE-ONLY "merge-landed observable"
+ * (fn-1016). One row per epic whose worktree lane branch (`keeper/epic/<id>`) the
+ * autopilot reconciler probed as merged into the LOCAL default branch (an ancestor
+ * of default, OR torn-down after the merge), folded from a synthetic `LaneMerged`
+ * event the worker posts when the merged set changes. The durable signal the
+ * planning daisy-chain needs ("author B against A's MERGED reality"), which
+ * `complete` (done-AND-idle) does not guarantee in worktree mode — a dependent
+ * lane is cut before the upstream's finalize merge lands.
+ *
+ * LIVE-ONLY by construction (in {@link LIVE_ONLY_PROJECTIONS}): the verdict is
+ * git-derived (a per-cycle ancestry probe), so it is DELIBERATELY excluded from
+ * the deterministic-replayed byte-identical re-fold charter and wiped by
+ * {@link rewindLiveProjection}; the reconciler re-emits it each cycle, so a wipe
+ * is repopulated by the live producer (no boot-seed / skip-floor of its own — the
+ * fold is a cheap full-set replace bounded by board size, never O(history)).
+ * Mirrors {@link CREATE_WORKTREE_REPO_STATUS}.
+ */
+const CREATE_LANE_MERGED = `
+CREATE TABLE IF NOT EXISTS lane_merged (
+    epic_id TEXT PRIMARY KEY,
+    repo_dir TEXT NOT NULL DEFAULT '',
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
 const CREATE_GIT_STATUS = `
 CREATE TABLE IF NOT EXISTS git_status (
     project_dir TEXT PRIMARY KEY,
@@ -1564,6 +1591,12 @@ export const LIVE_ONLY_PROJECTIONS = [
   // `rewindLiveProjection` wipe (no floor/seed of its own) is repopulated by the
   // live producer — the same shape as `tmux_client_focus`.
   "worktree_repo_status",
+  // fn-1016 — the merge-landed observable. The verdict is git-derived (a per-cycle
+  // lane-is-ancestor-of-default probe), so it must NOT be deterministic-replayed;
+  // the reconciler re-emits it each cycle, so the bare `rewindLiveProjection` wipe
+  // (no floor/seed of its own) is repopulated by the live producer — the same
+  // shape as `worktree_repo_status`.
+  "lane_merged",
 ] as const;
 
 /**
@@ -2253,6 +2286,7 @@ function migrate(db: Database): void {
       db.run(CREATE_EPICS);
       db.run(CREATE_GIT_STATUS);
       db.run(CREATE_WORKTREE_REPO_STATUS);
+      db.run(CREATE_LANE_MERGED);
       db.run(CREATE_USAGE);
       db.run(CREATE_REDUCER_STATE);
       db.run(CREATE_GIT_PROJECTION_STATE);
@@ -5420,6 +5454,16 @@ function migrate(db: Database): void {
       // `dispatch_failures`) — this bump MUST add 98 to `SUPPORTED_SCHEMA_VERSIONS` in
       // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "dispatch_failures", "merge_escalated_at", "REAL");
+
+      // v98→v99 (fn-1016.1): add the LIVE-ONLY `lane_merged` projection table — the
+      // durable merge-landed observable. CREATEd idempotently in the always-run base
+      // schema block above (`CREATE_LANE_MERGED`, `IF NOT EXISTS`), so an existing DB
+      // gains the empty table on this boot and the live producer repopulates it; no
+      // ALTER / backfill / cursor rewind (a LIVE-ONLY table is excluded from the
+      // re-fold charter and rewound by `rewindLiveProjection`, never a bare DELETE).
+      // This bump MUST add 99 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the
+      // SAME commit (keeper-py never reads `lane_merged`, but the whitelist is a hard
+      // membership set); test/schema-version.test.ts enforces it.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

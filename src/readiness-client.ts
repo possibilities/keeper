@@ -116,6 +116,9 @@ const BLOCK_ESCALATIONS_PAGE_LIMIT = 0;
 // The `tmux_client_focus` singleton (fn-952) — at most one row (`id = 1`), so
 // unbounded (0) like the other singleton collections.
 const TMUX_CLIENT_FOCUS_PAGE_LIMIT = 0;
+// The `lane_merged` observable (fn-1016) — one row per merged-lane epic, bounded
+// by board size, so unbounded (0) like the other epic-keyed collections.
+const LANE_MERGED_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -210,6 +213,15 @@ export interface ReadinessClientSnapshot {
   readonly maxConcurrentJobs: number | null;
   readonly maxConcurrentPerRoot: number;
   readonly worktreeMode: boolean;
+  // fn-1016: the durable MERGE-LANDED set — epic ids whose work is provably on the
+  // default branch, for `keeper await landed` and `keeper status`. Sorted, stable.
+  // Present ONLY under the `includeRecentDoneEpics` opt-in (the OFF degradation
+  // reads done epics, which only join `epics` then) — `undefined` for board/dash so
+  // their first-paint stays byte-identical (mirrors `autopilotEligibleEpicIds`).
+  // Worktree mode ON: the `lane_merged` projection (an `ok` epic's lane merged into
+  // default, or torn-down). Worktree mode OFF: degrades cleanly to DONE epics (no
+  // lanes exist; merged ⇔ done) — see {@link computeLandedEpicIds}.
+  readonly landedEpicIds?: readonly string[];
   // fn-952: the `tmux_client_focus` singleton row (`id = 1`) — the persistent
   // control worker's view of the current real client's focused
   // session/window/pane. `undefined` when the singleton is empty (no-tmux env or
@@ -445,6 +457,34 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
   // permissive input type lets the regression test hand in a `{ rows: T[] }`
   // literal without an upcast.
   return state.rows as unknown as T[];
+}
+
+/**
+ * Compute the durable MERGE-LANDED set (fn-1016) — the epic ids whose work is
+ * provably on the default branch — degrading cleanly across worktree mode. PURE
+ * (no socket, no clock), so the snapshot path and tests share one source of truth.
+ *
+ *  - Worktree mode ON: the `lane_merged` projection ids (an `ok` epic's lane merged
+ *    into LOCAL default, or torn-down after the merge). The producer probes git;
+ *    this consumer just reads the durable projection.
+ *  - Worktree mode OFF: there are no lanes, so "merged" degrades to DONE — the work
+ *    landed straight on the default branch when the epic finished. Reads each
+ *    epic's `status` (the done epics ride `epics` only under the
+ *    `includeRecentDoneEpics` opt-in, which is also what gates this whole signal).
+ *
+ * Returns a fresh sorted array (stable tick-to-tick so a membership-only consumer
+ * never sees spurious churn).
+ */
+export function computeLandedEpicIds(
+  worktreeMode: boolean,
+  mergedLaneEpicIds: readonly string[],
+  epics: readonly Epic[],
+): string[] {
+  const ids = worktreeMode
+    ? [...mergedLaneEpicIds]
+    : epics.filter((e) => e.status === "done").map((e) => e.epic_id);
+  ids.sort();
+  return ids;
 }
 
 /**
@@ -1626,6 +1666,21 @@ export function subscribeReadiness(
           limit: EPICS_PAGE_LIMIT,
         })
       : null;
+  // fn-1016 OPT-IN: the merge-landed observable, gated on the SAME
+  // `includeRecentDoneEpics` flag as the recent-done window — the OFF-mode
+  // degradation (`landed` ⇔ `done`) reads done epics, which only join `epics` under
+  // that opt-in, so the two are intrinsically coupled. When off it is `null` (never
+  // subscribed/gated) so board/dash first-paint stays byte-identical.
+  const laneMergedSubId = `${idPrefix}-lane-merged`;
+  const laneMerged =
+    opts.includeRecentDoneEpics === true
+      ? makeState("lane_merged", laneMergedSubId, "epic_id", {
+          type: "query",
+          collection: "lane_merged",
+          id: laneMergedSubId,
+          limit: LANE_MERGED_PAGE_LIMIT,
+        })
+      : null;
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1641,6 +1696,9 @@ export function subscribeReadiness(
   ];
   if (epicsRecentDone !== null) {
     states.push(epicsRecentDone);
+  }
+  if (laneMerged !== null) {
+    states.push(laneMerged);
   }
 
   function emitSnapshotIfReady(): void {
@@ -1672,7 +1730,11 @@ export function subscribeReadiness(
       // fn-1015 OPT-IN: gate on the recent-done window ONLY when it was opted in
       // (`null` otherwise — board/dash never wait on it, so their gate stays
       // unchanged). Empty produces a `result` with `rows: []`, so it clears.
-      (epicsRecentDone !== null && !epicsRecentDone.gotResult)
+      (epicsRecentDone !== null && !epicsRecentDone.gotResult) ||
+      // fn-1016 OPT-IN: gate on the merge-landed observable ONLY when opted in
+      // (`null` otherwise). The table exists from migration, so empty produces a
+      // `result` with `rows: []` and still clears the gate.
+      (laneMerged !== null && !laneMerged.gotResult)
     ) {
       return;
     }
@@ -1828,6 +1890,15 @@ export function subscribeReadiness(
     const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
     const eligibleEpicIdsSorted =
       eligibleEpicIds === undefined ? undefined : [...eligibleEpicIds].sort();
+    // fn-1016: the merge-landed set, computed ONLY under the `includeRecentDoneEpics`
+    // opt-in (the `laneMerged` state is `null` otherwise). Worktree mode ON → the
+    // `lane_merged` projection ids; OFF → degrades to DONE epics (read off the merged
+    // `epicsTyped`, which carries recent-done under this same opt-in). `undefined` for
+    // board/dash so their snapshot stays byte-identical.
+    const landedEpicIds =
+      laneMerged === null
+        ? undefined
+        : computeLandedEpicIds(worktreeMode, laneMerged.order, epicsTyped);
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1847,6 +1918,7 @@ export function subscribeReadiness(
       maxConcurrentJobs,
       maxConcurrentPerRoot,
       worktreeMode,
+      ...(landedEpicIds === undefined ? {} : { landedEpicIds }),
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });
