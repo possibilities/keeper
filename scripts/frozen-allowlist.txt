@@ -1,11 +1,13 @@
-# Frozen-string allowlist for the retired "planctl" name.
+# Frozen-string allowlist for the retired "planctl" AND "agentwrap" names.
 #
 # The fn-889 epic retires "planctl" → "keeper plan" / ".keeper" / "plan" across
-# the repo. Two classes of literal are PERMANENTLY FROZEN and must survive every
-# code sweep verbatim. This file is the single source of truth the guard
+# the repo. The fn-1018 epic likewise retires "agentwrap" → "keeper agent",
+# relocating the launcher config dir from ~/.config/agentwrap/ to
+# ~/.config/keeper/. Each retirement freezes a set of literals that must survive
+# every code sweep verbatim. This file is the single source of truth the guard
 # (scripts/lint-retired-name.sh) reads to tell a frozen literal from a renamable
-# symbol. Every code-sweep task (.6/.7/.8) and the migration/docs tasks
-# (.2/.3/.4/.5) lean on it.
+# symbol. Every code-sweep task (planctl: .6/.7/.8, migration/docs .2/.3/.4/.5;
+# agentwrap: the .2 sweep) leans on it.
 #
 # Format: pipe-delimited records, one per line. Blank lines and `#` comments are
 # ignored. Three record kinds:
@@ -90,3 +92,50 @@ exempt|plugins/plan/src/commit.ts
 exempt|src/git-worker.ts
 exempt|src/derivers.ts
 exempt|src/reducer.ts
+
+# =========================================================================
+# fn-1018 — agentwrap survivors (frozen FOREVER: cross-process contract +
+# leftover detectors + retired-alias test guards)
+# =========================================================================
+# The fn-1018 sweep renames "agentwrap" → "keeper agent" across code, comments,
+# docs, and user-visible strings. A deliberate frozen set survives untouched
+# because each literal is a cross-process contract a rename would break:
+#
+#   * The AGENTWRAP_* env-var name strings are read across process boundaries
+#     (the tmux launch script, child harnesses, the profile plumbing). Renaming
+#     a name string silently severs every consumer still exporting the old name.
+#   * The ~/.local/state/agentwrap runtime state dir is a stable on-disk path
+#     other tooling reads; relocating it would orphan existing state.
+#   * legacyAgentwrapPresetsPath is the leftover detector for the pre-relocation
+#     ~/.config/agentwrap/presets.yaml — its whole job is to name the old path.
+#   * The retired-alias test guards assert a stale agentwrap_path config key
+#     (and its KEEPER_AGENTWRAP_PATH env twin / agentwrapPath field) boots clean;
+#     the literals ARE the retired aliases under test.
+#
+# The .3 task appends the per-file ~/.config/agentwrap/ fallback anchors once it
+# creates them; this task anchors ONLY the enumerated frozen survivors.
+
+# AGENTWRAP_* env-var name strings — defining sites.
+anchor|src/agent/main.ts|"AGENTWRAP_CLAUDE_PROFILE"
+anchor|src/agent/main.ts|"AGENTWRAP_CODEX_PROFILE"
+anchor|src/agent/main.ts|"AGENTWRAP_PI_PROFILE"
+anchor|src/agent/tmux-launch.ts|"AGENTWRAP_PROFILE"
+anchor|src/agent/tmux-launch.ts|AGENTWRAP_TMUX_SESSION_ID
+anchor|src/agent/tmux-launch.ts|AGENTWRAP_SHELL
+anchor|src/agent/state-sharing.ts|AGENTWRAP_SKIP_LINK_GUARD
+
+# The AGENTWRAP_ prefix filter (passes every AGENTWRAP_* var into the launch env).
+anchor|src/agent/tmux-launch.ts|startsWith("AGENTWRAP_")
+
+# The ~/.local/state/agentwrap runtime state-dir path literal.
+anchor|src/agent/tmux-launch.ts|".local", "state", "agentwrap"
+
+# legacyAgentwrapPresetsPath leftover detector — name + the ~/.config/agentwrap/
+# presets.yaml path literal it returns.
+anchor|src/agent/config.ts|legacyAgentwrapPresetsPath
+anchor|src/agent/config.ts|".config", "agentwrap", "presets.yaml"
+
+# Retired-alias test guards — the literals under test in test/config.test.ts.
+anchor|test/config.test.ts|agentwrap_path
+anchor|test/config.test.ts|KEEPER_AGENTWRAP_PATH
+anchor|test/config.test.ts|agentwrapPath

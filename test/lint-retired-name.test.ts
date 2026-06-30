@@ -86,6 +86,20 @@ test("fails when a frozen trailer anchor is clobbered (renamed away)", () => {
   expect(stderr).toContain("CLOBBERED frozen literal in src/emit.ts");
 });
 
+test("fails when a frozen agentwrap survivor anchor is clobbered", () => {
+  // The fn-1018 sweep must not rename a frozen AGENTWRAP_* env-var name string;
+  // the guard catches a clobber the same way it does a planctl trailer.
+  put(
+    "scripts/frozen-allowlist.txt",
+    'anchor|src/agent/main.ts|"AGENTWRAP_CLAUDE_PROFILE"\n',
+  );
+  put("src/agent/main.ts", 'return "KEEPER_AGENT_CLAUDE_PROFILE";\n');
+
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("CLOBBERED frozen literal in src/agent/main.ts");
+});
+
 test("anchor payload may itself contain pipe characters (regex alternation)", () => {
   // The FORBIDDEN_TRAILER_RE alternation carries `|`; the guard must split on
   // the first two record `|` only and match the rest as a fixed substring.
