@@ -29,5 +29,5 @@ The updated test asserts `KEEPER_AGENT_CLAUDE_PROFILE` is read (+ `ARTHACK_` fal
 - [ ] zero agentwrap in arthack (outside `.keeper` history)
 
 ## Done summary
-
+Renamed the arthack statusline profile read from AGENTWRAP_CLAUDE_PROFILE to KEEPER_AGENT_CLAUDE_PROFILE (hard cut, ARTHACK_CLAUDE_PROFILE fallback kept), updated the monkeypatch tests, and pruned the retired agentwrap vocabulary keyword. git grep -i agentwrap is now empty in arthack.
 ## Evidence
