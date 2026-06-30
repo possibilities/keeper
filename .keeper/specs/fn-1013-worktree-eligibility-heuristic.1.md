@@ -48,5 +48,5 @@ Exhaustively unit-test the PURE `classifyWorktreeEligibility` with synthetic `Re
 - [ ] the fast test tier adds no real git/daemon/subprocess
 
 ## Done summary
-
+New dep-light src/worktree-eligibility.ts: pure classifyWorktreeEligibility + fail-closed assessRepo producer + per-cycle memoizedAssessRepo, with exhaustive unit tests reproducing the approved ~/code oracle (keeper=eligible, arthack/zellijsub=disabled).
 ## Evidence
