@@ -38,5 +38,5 @@ Unit-test the extracted helper via an injected `runTmuxCommand` (force launch su
 - [ ] `bun test` green.
 
 ## Done summary
-
+Extracted a shared db-free launch→ResolvedHandle helper (src/agent/launch-handle.ts: launchToResolvedHandle + co-extracted tmuxTranscriptSessionId), parameterized by posture opts + explicit launch deps; repointed agent run's runRunCaptureSubcommand onto it byte-stable. Unit + depgraph tests added.
 ## Evidence
