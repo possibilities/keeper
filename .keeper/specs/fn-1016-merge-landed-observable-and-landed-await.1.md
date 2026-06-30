@@ -54,5 +54,5 @@ Pure fixtures over the chosen projection/fold (no real git): assert the merged s
 - [ ] Pure fixture tests (incl. re-fold determinism if event-sourced); `bun test` green.
 
 ## Done summary
-
+Built the durable LIVE-ONLY lane_merged merge-landed observable (shape b: producer-minted LaneMerged synthetic event, full-set-replace fold reading only event payload — no git/wall-clock/fs in any fold, registered in LIVE_ONLY_PROJECTIONS, rewound by rewindLiveProjection). computeMergedLaneEntries probes each ok epic's lane (ancestor-of-default or torn-down) per cycle. Surfaced on ReadinessClientSnapshot.landedEpicIds (opt-in): worktree ON reads the projection, OFF degrades cleanly to done epics (merged <=> done). bun test green (4970+76).
 ## Evidence
