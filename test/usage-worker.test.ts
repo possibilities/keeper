@@ -256,16 +256,17 @@ test("buildUsageMessage drops every freshness field — they NEVER enter the mes
 });
 
 // ---------------------------------------------------------------------------
-// (a) FRESHNESS-EXCLUSION TRIPWIRE — load-bearing discipline test
+// (a) FRESHNESS-EXCLUSION TRIPWIRE + bounded liveness heartbeat
 // ---------------------------------------------------------------------------
 
-test("FRESHNESS EXCLUSION: two envelopes differing ONLY in fetch timestamps produce ZERO emits past the first", () => {
+test("FRESHNESS EXCLUSION: a NON-active envelope never heartbeats — freshness movement across a bucket produces ZERO emits past the first", () => {
   // The point of this test: a future contributor adding `fetched_at` (or any
-  // of the four freshness fields) to the change-gate hash would force a
-  // synthetic event on every ~90s agentusage fetch cycle, churning the
-  // projection. The change-gate compares JSON.stringify byte-for-byte, so
-  // omitting the field from `buildUsageMessage`'s output is the discipline
-  // — and this test asserts that discipline holds.
+  // of the four freshness fields) to the CONTENT change-gate hash would force
+  // a synthetic event on every ~90s agentusage fetch cycle, churning the
+  // projection. The content gate compares JSON.stringify byte-for-byte, so
+  // omitting the field from `buildUsageMessage`'s output is the discipline.
+  // envelopeBody() carries NO `status` (status null), so the coarse heartbeat
+  // gate stays inert too — even a bucket-crossing freshness move emits nothing.
   const emitted: UsageMessage[] = [];
   const scanner = new UsageScanner(
     (m) => emitted.push(m),
@@ -277,8 +278,9 @@ test("FRESHNESS EXCLUSION: two envelopes differing ONLY in fetch timestamps prod
   scanner.onChange(path);
   expect(emitted.length).toBe(1);
 
-  // Rewrite with ONLY the four freshness fields advanced. The session/week
-  // numbers + resets_at + target + multiplier all stay byte-identical.
+  // Rewrite with ONLY the four freshness fields advanced — across a 10-minute
+  // bucket boundary (15:49 → 16:00). The session/week numbers + resets_at +
+  // target + multiplier all stay byte-identical, and status stays null.
   writeFileSync(
     path,
     JSON.stringify({
@@ -292,10 +294,143 @@ test("FRESHNESS EXCLUSION: two envelopes differing ONLY in fetch timestamps prod
     }),
   );
   scanner.onChange(path);
-  // ZERO additional emits — the freshness-only diff is suppressed by the
-  // change-gate. If this assertion fails, a freshness field has leaked into
-  // buildUsageMessage's output (or into the schema-derived seed). FIX BY
-  // REMOVING THE LEAK — do NOT relax this test.
+  // ZERO additional emits — the freshness-only diff is suppressed. If this
+  // assertion fails, a freshness field has leaked into buildUsageMessage's
+  // output, OR a non-active envelope wrongly heartbeats. FIX THE LEAK — do
+  // NOT relax this test.
+  expect(emitted.length).toBe(1);
+});
+
+test("HEARTBEAT: an unchanged active envelope inside the same 10-minute bucket stays suppressed", () => {
+  // Same quota content, status active, freshness advancing but still inside
+  // the [15:40, 15:50) bucket → the content gate AND the heartbeat gate both
+  // suppress. This is also a freshness-no-leak tripwire for the active path:
+  // last_successful_fetch_at moved but content did not re-emit.
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  const path = writeEnvelope(
+    "claude-0",
+    envelopeBody({
+      status: "active",
+      last_successful_fetch_at: "2026-05-26T15:40:00-04:00",
+      fetched_at: "2026-05-26T15:40:00-04:00",
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-0",
+      ...envelopeBody({
+        status: "active",
+        last_successful_fetch_at: "2026-05-26T15:49:30-04:00",
+        fetched_at: "2026-05-26T15:49:30-04:00",
+      }),
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+});
+
+test("HEARTBEAT: an unchanged active envelope advancing into a new 10-minute bucket emits exactly one heartbeat", () => {
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // First scan at the [15:40, 15:50) bucket — a normal content emit.
+  const path = writeEnvelope(
+    "claude-0",
+    envelopeBody({
+      status: "active",
+      last_successful_fetch_at: "2026-05-26T15:40:00-04:00",
+      fetched_at: "2026-05-26T15:40:00-04:00",
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  // Same quota content, freshness now in the next bucket [15:50, 16:00) → one
+  // liveness heartbeat (an ordinary usage-snapshot re-stamping the fold).
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-0",
+      ...envelopeBody({
+        status: "active",
+        last_successful_fetch_at: "2026-05-26T15:50:00-04:00",
+        fetched_at: "2026-05-26T15:50:00-04:00",
+      }),
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+  expect(emitted[1]?.kind).toBe("usage-snapshot");
+
+  // A second freshness move WITHIN that same [15:50, 16:00) bucket → capped at
+  // one heartbeat per bucket, so no further emit.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-0",
+      ...envelopeBody({
+        status: "active",
+        last_successful_fetch_at: "2026-05-26T15:59:00-04:00",
+        fetched_at: "2026-05-26T15:59:00-04:00",
+      }),
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+});
+
+test("HEARTBEAT: stale/error envelopes never heartbeat on error.at or freshness movement (even across a bucket)", () => {
+  // A stale envelope re-failing: only `error.at` (gate-excluded) AND the
+  // freshness fields advance — across a 10-minute boundary. status is "stale",
+  // so the heartbeat gate is inert. Net: exactly one emit (the first), proving
+  // the heartbeat source is restricted to healthy active scrapes.
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  const staleBody = (at: string, fresh: string): Record<string, unknown> => ({
+    target: "claude",
+    multiplier: 5,
+    status: "stale",
+    subscription_active: true,
+    last_successful_fetch_at: fresh,
+    fetched_at: fresh,
+    error: {
+      type: "ClaudeUsageParseError",
+      message: "required label not found",
+      at,
+    },
+    usage: {
+      session: { percent_used: 12.0, resets_at: "2026-05-26T18:30:00-04:00" },
+      week: { percent_used: 8.0, resets_at: "2026-06-01T20:00:00-04:00" },
+    },
+  });
+  const path = writeEnvelope(
+    "claude-0",
+    staleBody("2026-05-26T15:42:00-04:00", "2026-05-26T15:42:00-04:00"),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "claude-0",
+      ...staleBody("2026-05-26T16:05:00-04:00", "2026-05-26T16:05:00-04:00"),
+    }),
+  );
+  scanner.onChange(path);
   expect(emitted.length).toBe(1);
 });
 
@@ -1046,6 +1181,101 @@ test("seedFromDb handles subscription_active=0 (false) round-trip", () => {
   });
   scanner.onChange(join(stateDir, "no-sub.json"));
   expect(emitted).toEqual([]);
+  db.close();
+});
+
+test("seedFromDb seeds the heartbeat bucket from last_usage_fold_at and suppresses a same-bucket boot scan", () => {
+  // A daemon restart must not re-emit a liveness heartbeat for an account whose
+  // on-disk active scrape sits in the SAME 10-minute bucket as the persisted
+  // `last_usage_fold_at` stamp. The seed primes both gates; the boot scan's
+  // onChange then suppresses on both content (unchanged) and bucket (same).
+  const { db } = freshMemDb();
+  // `last_usage_fold_at` is REAL unix-SECONDS; place it in the [15:40, 15:50)
+  // bucket so the on-disk 15:49 scrape lands in the same bucket.
+  const foldAtSec = Date.parse("2026-05-26T15:45:00-04:00") / 1000;
+  db.run(
+    `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
+                        week_percent, week_resets_at, status,
+                        last_usage_fold_at, last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "claude-0",
+      "claude",
+      5,
+      12.0,
+      "2026-05-26T18:30:00-04:00",
+      8.0,
+      "2026-06-01T20:00:00-04:00",
+      "active",
+      foldAtSec,
+      1,
+      100,
+    ],
+  );
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  writeEnvelope(
+    "claude-0",
+    envelopeBody({
+      status: "active",
+      last_successful_fetch_at: "2026-05-26T15:49:00-04:00",
+      fetched_at: "2026-05-26T15:49:00-04:00",
+    }),
+  );
+  scanner.onChange(join(stateDir, "claude-0.json"));
+  expect(emitted).toEqual([]);
+  db.close();
+});
+
+test("seedFromDb heartbeat seed self-heals: a newer-bucket on-disk active scrape emits exactly one heartbeat", () => {
+  // The mirror of the same-bucket case: when the on-disk active scrape is in a
+  // NEWER bucket than the seeded `last_usage_fold_at`, an old stamp self-heals
+  // — content is unchanged, but the advanced freshness bucket fires exactly one
+  // heartbeat so `last_usage_fold_at` catches up.
+  const { db } = freshMemDb();
+  const foldAtSec = Date.parse("2026-05-26T15:45:00-04:00") / 1000;
+  db.run(
+    `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
+                        week_percent, week_resets_at, status,
+                        last_usage_fold_at, last_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "claude-0",
+      "claude",
+      5,
+      12.0,
+      "2026-05-26T18:30:00-04:00",
+      8.0,
+      "2026-06-01T20:00:00-04:00",
+      "active",
+      foldAtSec,
+      1,
+      100,
+    ],
+  );
+  const emitted: UsageMessage[] = [];
+  const scanner = new UsageScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  writeEnvelope(
+    "claude-0",
+    envelopeBody({
+      status: "active",
+      last_successful_fetch_at: "2026-05-26T15:55:00-04:00",
+      fetched_at: "2026-05-26T15:55:00-04:00",
+    }),
+  );
+  scanner.onChange(join(stateDir, "claude-0.json"));
+  expect(emitted.length).toBe(1);
+  expect(emitted[0]?.kind).toBe("usage-snapshot");
   db.close();
 });
 
