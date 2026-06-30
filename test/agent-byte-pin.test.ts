@@ -14,6 +14,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { main } from "../src/agent/main";
+import { buildAgentwrapLaunchArgv } from "../src/exec-backend";
 import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
 
 const CLAUDE_BIN = "/fake-home/.local/bin/claude";
@@ -92,5 +93,76 @@ describe("keeper agent byte-pin — pi native argv", () => {
       "--name",
       "proj-001",
     ]);
+  });
+});
+
+/**
+ * Negative byte-pin: the bare `agent <cli>` launch and the managed
+ * `buildAgentwrapLaunchArgv` worker/dispatch launch must carry NO read-only
+ * posture and NO extra `CLAUDE*` env strip. Posture (`--read-only`,
+ * `--exclude-tools`, `--disallowed-tools`) belongs only on a future posture-bearing
+ * path; this is the byte-stability anchor that keeps later increments from leaking
+ * it onto the managed launch surface.
+ */
+const POSTURE_FLAGS = [
+  "--read-only",
+  "--exclude-tools",
+  "--disallowed-tools",
+] as const;
+
+describe("keeper agent byte-pin — bare launch carries no posture", () => {
+  for (const cli of ["claude", "codex", "pi"] as const) {
+    test(`bare ${cli} launch emits no posture flags or CLAUDE env delete`, async () => {
+      const h = makeHarness({
+        argv: [cli, "hello"],
+        rawArgv: true,
+        randomUuid: () => UUID,
+      });
+      const cmd = await runAndCapture(h, main);
+      for (const flag of POSTURE_FLAGS) {
+        expect(cmd).not.toContain(flag);
+      }
+      // No CLAUDE-prefixed env carrier/delete leaks into the composed argv.
+      expect(cmd.join(" ")).not.toContain("CLAUDE");
+    });
+  }
+});
+
+describe("keeper agent byte-pin — managed launch carries no posture", () => {
+  test("buildAgentwrapLaunchArgv (prompt mode) emits no posture flags", () => {
+    const cmd = buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: [
+        "/fake-home/.bun/bin/bun",
+        "/fake-home/code/keeper/cli/keeper.ts",
+        "agent",
+      ],
+      session: "work",
+      prompt: "do it",
+      claudeName: "proj-001",
+      noConfirm: true,
+    });
+    for (const flag of POSTURE_FLAGS) {
+      expect(cmd).not.toContain(flag);
+    }
+    // The only env carriers are KEEPER_*; no CLAUDE-prefixed env delete leaks.
+    expect(cmd.join(" ")).not.toContain("CLAUDE");
+  });
+
+  test("buildAgentwrapLaunchArgv (resume mode) emits no posture flags", () => {
+    const cmd = buildAgentwrapLaunchArgv({
+      launcherArgvPrefix: [
+        "/fake-home/.bun/bin/bun",
+        "/fake-home/code/keeper/cli/keeper.ts",
+        "agent",
+      ],
+      session: "work",
+      prompt: "ignored",
+      resumeTarget: "sess-xyz",
+      noConfirm: true,
+    });
+    for (const flag of POSTURE_FLAGS) {
+      expect(cmd).not.toContain(flag);
+    }
+    expect(cmd.join(" ")).not.toContain("CLAUDE");
   });
 });

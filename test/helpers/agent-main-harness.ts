@@ -89,6 +89,8 @@ export interface HarnessOptions {
   spawn?: SpawnFn;
   nextCwdOrdinal?: (dirName: string) => number;
   randomUuid?: () => string;
+  /** Wall-clock seam (ms); default returns 0 for deterministic elapsed. */
+  now?: () => number;
   tmuxBin?: string;
   launcherArgvPrefix?: string[];
   agentwrapStateDir?: string;
@@ -138,6 +140,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     nextCwdOrdinalFn: opts.nextCwdOrdinal ?? (() => 1),
     randomUuid:
       opts.randomUuid ?? (() => "00000000-0000-0000-0000-000000000000"),
+    now: opts.now ?? (() => 0),
     write: (s) => out.push(s),
     writeErr: (s) => err.push(s),
     exit: throwingExit,

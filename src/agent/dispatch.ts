@@ -26,6 +26,12 @@ export type Dispatch =
   | { kind: "presets-list"; json: boolean }
   | { kind: "profiles-check"; json: boolean }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
+  // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
+  // in one process; `wait-capture` runs wait→show on an already-launched handle.
+  // Both emit the uniform run-capture envelope. Named distinctly from the `run`
+  // kind (the agent-launch) — the leading token is `run` / `wait`.
+  | { kind: "run-capture"; rest: string[] }
+  | { kind: "wait-capture"; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
   | { kind: "version" }
@@ -55,6 +61,12 @@ Usage:
   agentwrap wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   agentwrap show-last-message <h>   Print a detached run's final message.
+  agentwrap run <cli> <prompt> [--stop-timeout-ms <ms>]
+                                    Launch, wait, and capture in one process;
+                                    emit the uniform run-capture JSON envelope.
+  agentwrap wait <handle> [--stop-timeout-ms <ms>]
+                                    Wait + capture on an existing handle; emit
+                                    the same uniform envelope.
   agentwrap --help                  Show this help.
   agentwrap --version               Show the version.
 
@@ -141,6 +153,22 @@ Post-launch transcript subcommands (composable with a detached launch):
                                         <handle> is the launch JSON's id (or a
                                         transcript path with --agent <kind>).
 
+Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
+  agentwrap run <cli> <prompt> [--stop-timeout-ms <ms>]
+                                        Launch <cli> detached, wait for its stop,
+                                        and capture the final message — all in one
+                                        process. Emits the uniform envelope
+                                        {schema_version, agent, handle,
+                                        transcript_path, resume_target, message,
+                                        message_found, elapsed_seconds, outcome};
+                                        outcome ∈ completed|no_message (exit 0) /
+                                        timed_out|no_transcript (4) / launch_failed
+                                        (1) / bad_args (2).
+  agentwrap wait <handle> [--stop-timeout-ms <ms>]
+                                        Wait + capture on an already-launched
+                                        handle (a run id or a transcript path with
+                                        --agent <kind>); same uniform envelope.
+
 tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit):
   0  success                        2  bad args
   1  internal/parse failure         3  prerequisite missing (tmux/session not found)
@@ -164,7 +192,9 @@ Top-level flags:
  * preset (the whole argv stays in `rest` so parseArgs strips the flag);
  * `presets resolve <name>` → emit the resolved preset/panel JSON;
  * `wait-for-stop`/`show-last-message` → the
- * post-launch transcript verbs with the remaining args (the handle); `--x-help`
+ * post-launch transcript verbs with the remaining args (the handle); `run`/`wait`
+ * → the blocking run-and-capture verbs (launch→wait→show in one process, and
+ * wait→show on an existing handle) emitting the uniform envelope; `--x-help`
  * → wrapper help; `-h`/`--help` → short usage; `-v`/`--version` → version; an empty
  * argv or any other leading token → usage (carrying the unknown subcommand name when
  * present). Strips exactly one token so a repeated agent name preserves the second.
@@ -212,6 +242,12 @@ export function splitSubcommand(argv: string[]): Dispatch {
   }
   if (head === "wait-for-stop" || head === "show-last-message") {
     return { kind: "subcommand", verb: head, rest: argv.slice(1) };
+  }
+  if (head === "run") {
+    return { kind: "run-capture", rest: argv.slice(1) };
+  }
+  if (head === "wait") {
+    return { kind: "wait-capture", rest: argv.slice(1) };
   }
   if (head === AGENTWRAP_HELP_FLAG) {
     return { kind: "help-wrapper" };

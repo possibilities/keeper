@@ -19,6 +19,7 @@ import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
+import { buildPairLaunchArgv } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeAgentwrapProfileArg, parseArgsForAgent } from "./args";
 import {
@@ -57,6 +58,7 @@ import {
   VERSION,
 } from "./dispatch";
 import {
+  type ResolvedHandle,
   resolveHandle,
   runShowLastMessage,
   runWaitForStop,
@@ -80,6 +82,15 @@ import {
   runWithJobControl,
   type SpawnFn,
 } from "./run";
+import {
+  buildRunCaptureEnvelope,
+  captureFromHandle,
+  composeRunCapture,
+  parseRunArgs,
+  type RunCaptureDeps,
+  type RunCaptureResult,
+  type RunLaunchResult,
+} from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
   findShadowProfileDirs,
@@ -116,6 +127,8 @@ export interface MainDeps {
   pickProfileFn: () => string;
   nextCwdOrdinalFn: (dirName: string) => number;
   randomUuid: () => string;
+  /** Wall clock (ms), seam for deterministic run-capture `elapsed_seconds`. */
+  now: () => number;
   write: (s: string) => void;
   writeErr: (s: string) => void;
   exit: (code: number) => never;
@@ -195,6 +208,7 @@ export function realDeps(): MainDeps {
     pickProfileFn: pickProfile,
     nextCwdOrdinalFn: nextCwdOrdinal,
     randomUuid: () => crypto.randomUUID(),
+    now: () => Date.now(),
     write: (s) => process.stdout.write(s),
     writeErr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
@@ -681,6 +695,174 @@ async function runTranscriptSubcommand(
   return deps.exit(0);
 }
 
+/** The wait/show/clock seams the run-capture compose drives, bound to the
+ *  production primitives + the injected clock. */
+function runCaptureSeams(deps: MainDeps): RunCaptureDeps {
+  return {
+    waitForStop: runWaitForStop,
+    showLastMessage: runShowLastMessage,
+    now: deps.now,
+  };
+}
+
+/**
+ * Emit the run-capture envelope as exactly ONE JSON line on stdout, then exit
+ * with the outcome's code. JSON-ONLY on stdout (no bare-text prelude like
+ * show-last-message) — every diagnostic already went to stderr, so a programmatic
+ * caller parses stdout cleanly.
+ */
+function emitRunCapture(deps: MainDeps, result: RunCaptureResult): never {
+  deps.write(`${JSON.stringify(result.envelope)}\n`);
+  return deps.exit(result.exitCode);
+}
+
+/**
+ * The first positional (run id or transcript path) of an `agent wait` argv —
+ * echoed into the envelope's `handle`. Mirrors `resolveHandle`'s positional
+ * detection (skip `--agent`/`--stop-timeout-ms` values and any other `--flag`).
+ */
+function firstHandleToken(rest: string[]): string | null {
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i] as string;
+    if (arg === "--agent" || arg === "--stop-timeout-ms") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      continue;
+    }
+    return arg;
+  }
+  return null;
+}
+
+/**
+ * The `agent run` launch seam: assemble the per-CLI detached launch argv (reusing
+ * the pair builder for the native posture flags), strip the prefix + cli token,
+ * and drive `launchAgentwrapInTmux` DIRECTLY — no subprocess re-exec. The pinned
+ * handle returned here is held LOCALLY by the compose (no run.json re-resolution,
+ * no cross-process kill margin, no self-transcript-collision exposure). A
+ * parse/launch failure maps to `launch_failed`; diagnostics go to stderr.
+ */
+function launchForRunCapture(
+  deps: MainDeps,
+  agent: AgentKind,
+  prompt: string,
+  stopTimeoutMs: number | null,
+): RunLaunchResult {
+  const launchArgv = buildPairLaunchArgv({
+    launcherArgvPrefix: [],
+    cli: agent,
+    prompt,
+    readOnly: false,
+  });
+  const tmuxLaunch = parseAgentwrapTmuxArgs(launchArgv.slice(1));
+  if (tmuxLaunch.error !== null) {
+    deps.writeErr(`agent: ${tmuxLaunch.error}\n`);
+    return { ok: false, error: tmuxLaunch.error };
+  }
+  const startedAtMs = deps.now();
+  const transcriptSessionId = tmuxTranscriptSessionId(
+    agent,
+    tmuxLaunch.remainingArgs,
+    deps.randomUuid,
+  );
+  try {
+    const result = launchAgentwrapInTmux({
+      agent,
+      innerArgs: tmuxLaunch.remainingArgs,
+      options: tmuxLaunch.options,
+      env: deps.env,
+      cwd: deps.cwd,
+      transcriptSessionId,
+      startedAtMs,
+      stateDir: deps.agentwrapStateDir,
+      tmuxBin: deps.tmuxBin,
+      launcherArgvPrefix: deps.launcherArgvPrefix,
+      randomUuid: deps.randomUuid,
+      runTmuxCommand: deps.runTmuxCommandFn,
+    });
+    const handle: ResolvedHandle = {
+      agent,
+      cwd: deps.cwd,
+      sessionId: transcriptSessionId,
+      startedAtMs,
+      transcriptPath: null,
+      stopTimeoutMs,
+    };
+    return { ok: true, handle, runId: result.id };
+  } catch (exc) {
+    if (exc instanceof TmuxLaunchError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return { ok: false, error: exc.message };
+    }
+    throw exc;
+  }
+}
+
+/**
+ * `agent run <cli> <prompt>`: compose launch→wait→show in one process, emitting
+ * the uniform run-capture envelope. A bad invocation short-circuits to bad_args
+ * with the same envelope (nulls elsewhere) — never a separate error shape.
+ */
+async function runRunCaptureSubcommand(
+  deps: MainDeps,
+  rest: string[],
+): Promise<never> {
+  const parsed = parseRunArgs(rest);
+  if (!parsed.ok) {
+    deps.writeErr(`agent: ${parsed.error}\n`);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+    );
+  }
+  const agent = parsed.cli;
+  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const result = await composeRunCapture(
+    {
+      ...runCaptureSeams(deps),
+      launch: () =>
+        launchForRunCapture(deps, agent, parsed.prompt, parsed.stopTimeoutMs),
+    },
+    verbDeps,
+    agent,
+  );
+  return emitRunCapture(deps, result);
+}
+
+/**
+ * `agent wait <handle>`: resolve the handle (run id or transcript path), then
+ * wait→show and emit the SAME uniform envelope. An unresolvable handle is
+ * bad_args.
+ */
+async function runWaitCaptureSubcommand(
+  deps: MainDeps,
+  rest: string[],
+): Promise<never> {
+  const startMs = deps.now();
+  const resolution = resolveHandle({
+    rest,
+    cwd: deps.cwd,
+    stateDir: deps.agentwrapStateDir,
+  });
+  if (!resolution.ok) {
+    deps.writeErr(`agent: ${resolution.error}\n`);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+    );
+  }
+  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const result = await captureFromHandle(runCaptureSeams(deps), verbDeps, {
+    handle: resolution.handle,
+    handleId: firstHandleToken(rest),
+    agent: resolution.handle.agent,
+    startMs,
+  });
+  return emitRunCapture(deps, result);
+}
+
 /**
  * `presets resolve <name>`: emit the resolved launch-config JSON to stdout. A
  * name matching a single preset emits `{kind:"preset", name, harness, model,
@@ -1001,8 +1183,11 @@ export async function main(deps: MainDeps): Promise<never> {
   // Subcommand dispatch pre-pass: classify the leading argv token before any
   // wrapper logic. This MUST precede parseArgs and passthrough detection — an
   // unstripped leading agent name would fall through the passthrough scan and
-  // become a prompt arg. `run` continues the launcher flow with the remaining
-  // args; help/version/usage print + exit through the deps seams.
+  // become a prompt arg. A leading agent token continues the launcher flow with
+  // the remaining args; the composable verbs (`wait-for-stop`/`show-last-message`
+  // read a detached run's transcript, `run`/`wait` block-capture into the uniform
+  // envelope) route to their handlers; help/version/usage print + exit through
+  // the deps seams.
   const dispatch = splitSubcommand(deps.argv);
   if (dispatch.kind === "help") {
     deps.write(USAGE);
@@ -1025,6 +1210,12 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "subcommand") {
     return runTranscriptSubcommand(deps, dispatch.verb, dispatch.rest);
+  }
+  if (dispatch.kind === "run-capture") {
+    return runRunCaptureSubcommand(deps, dispatch.rest);
+  }
+  if (dispatch.kind === "wait-capture") {
+    return runWaitCaptureSubcommand(deps, dispatch.rest);
   }
   if (dispatch.kind === "presets-resolve") {
     return runPresetsResolve(deps, dispatch.presetName);
