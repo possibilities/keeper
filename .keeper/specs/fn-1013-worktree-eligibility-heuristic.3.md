@@ -43,5 +43,5 @@ Protect an epic that ALREADY has live worktree lanes from being flipped to `disa
 - [ ] the fast tier injects synthetic grandfather + `assessRepo`; no real fs/git
 
 ## Done summary
-
+Grandfather in-flight worktree epics against a mid-flight disabled flip: a per-epic predicate (base worktree dir OR keeper/epic/<id> branch exists) gathered producer-side and injected into classifyWorktreeRepos keeps a would-be-disabled epic 'ok' so its live lanes finalize. Added a sync localBranchExists to git-toplevel.
 ## Evidence
