@@ -57,5 +57,5 @@ Unit-test the compose helper + envelope builder with injected spawn/wait/show/`n
 - [ ] Existing behavior unchanged (bare agent launch, `wait-for-stop`, `show-last-message` byte-identical); `bun test` green; no test launches a real subprocess.
 
 ## Done summary
-
+Add additive 'agent run <cli> <prompt>' / 'agent wait <handle>' verbs composing detached launch + wait-for-stop + show-last-message in one process, emitting one uniform schema-versioned JSON envelope (9 keys; outcome closed set mapped to exit codes). New db-free src/agent/run-capture.ts holds the seam-injected compose + envelope builder; run-id held locally (no cross-process kill margin). Docs (USAGE/help/cli header/README) + golden/dep-graph/compose tests added; full suite green, no behavior change to existing paths.
 ## Evidence

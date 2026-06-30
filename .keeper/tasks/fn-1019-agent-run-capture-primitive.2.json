@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "agent run + agent wait run-capture primitive",
-  "updated_at": "2026-06-30T19:55:05.829000Z"
+  "updated_at": "2026-06-30T20:21:18.388000Z",
+  "worker_done_at": "2026-06-30T20:21:18.388000Z"
 }
