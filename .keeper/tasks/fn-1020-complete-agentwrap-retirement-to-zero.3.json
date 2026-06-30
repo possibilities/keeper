@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Relocate state dir via atomic inode-preserving rename",
-  "updated_at": "2026-06-30T21:24:25.180000Z"
+  "updated_at": "2026-06-30T22:18:59.363000Z",
+  "worker_done_at": "2026-06-30T22:18:59.363000Z"
 }

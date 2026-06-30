@@ -38,5 +38,5 @@ Tests cover: rename migrates old→new preserving the counter value; new-present
 - [ ] Fixture content path updated; state-dir anchor removed; `bun test` + lint green
 
 ## Done summary
-
+Unified the two state-dir resolvers onto one XDG-honoring keeper-agent source and relocated ~/.local/state/agentwrap via a guarded inode-preserving rename at a single pre-mkdir chokepoint; the flock-bound cwd-ordinals counter survives (test-proven). Fixture path updated, state-dir frozen-allowlist anchor removed, lint + suite green.
 ## Evidence
