@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Relocate launcher config dir to keeper (keeper side)",
-  "updated_at": "2026-06-30T19:46:05.424000Z"
+  "updated_at": "2026-06-30T21:45:37.998000Z",
+  "worker_done_at": "2026-06-30T21:45:37.998000Z"
 }

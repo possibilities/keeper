@@ -40,5 +40,5 @@ New tests cover: new-path-present wins; new-absent/old-present falls back (fail-
 - [ ] New agent-config.test.ts tests cover env-seam + fallback for all 4 readers; dep-free import-graph guard green; `bun test` green
 
 ## Done summary
-
+Relocated the 4 per-harness launcher configs to ~/.config/keeper via keeperConfigDir(), adding a per-file read-old fallback to the pre-relocation ~/.config/agentwrap/ twin (warned once) that preserves each reader's fail-open/fail-loud posture; frozen-anchored the fallback literals and added env-seam + fallback tests.
 ## Evidence
