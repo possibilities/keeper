@@ -65,6 +65,12 @@ each), not one.
   or wants a worker to actually work on it, it is THIS skill.
 - *"Plan a feature"* / *"make a plan"* → `/plan:plan`.
 
+## Orient first (optional)
+
+<!-- Canonical source: keeper prompt render engineering/orient -->
+
+When the brief depends on the current board — "hand off whatever's stuck", "spawn someone on the failing epic" — read it in one call first: `keeper status --json` prints autopilot config, per-row readiness verdicts, counts, `drained`/`jammed`, in-flight, and needs-human in a single envelope (exit 0 on any board state). For the full orient step run `keeper prompt render engineering/orient`. A self-contained brief needs no orient — skip to Step 1.
+
 ## Step 1 — Gather the brief
 
 Assemble these from the conversation:
@@ -129,8 +135,9 @@ Surface to the human:
 
 - The `handoff_id`. (The CLI does not report the target session; it dispatches
   into your current/`--session` tmux session per the precedence above.)
-- How to inspect: `keeper board` (the handoff-from → handoff-to relationship
-  renders on your row and the handoff-ee's once it binds), and
+- How to inspect: `keeper status --json` for a one-shot board read (the
+  handoff-ee surfaces as a job once it binds), `keeper board` for the live
+  handoff-from → handoff-to relationship on your row and the handoff-ee's, and
   `keeper handoff show <slug>` (prints the stored brief — inspection only; the
   handoff-ee already has the brief inline and does not call it).
 

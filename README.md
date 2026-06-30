@@ -794,7 +794,13 @@ subscribe clients share helpers in `src/readiness-client.ts` —
 autopilot) and `subscribeCollection` owns the single-collection
 lifecycle (git, usage); both feed `computeReadiness` / row-list
 callbacks (the pure verdict pipeline lives in `src/readiness.ts` as
-library code, not a runnable script). All six snapshot-capable viewers (`board`, `jobs`,
+library code, not a runnable script). The `ReadinessClientSnapshot` it
+delivers carries the full autopilot singleton it already computes —
+`mode`, the `armed` set, the `max_concurrent_jobs` / `max_concurrent_per_root`
+caps, and `worktree_mode` alongside `paused` — so a consumer reads the whole
+autopilot config off one snapshot (the `keeper status` / `keeper watch` orient
+surface depends on this); board and dash render the additive fields without
+change. All six snapshot-capable viewers (`board`, `jobs`,
 `git`, `autopilot`, `usage`, `builds`) resolve their output mode through a
 three-way TTY gate (fn-772, shared `src/snapshot.ts` / `src/view-shell.ts`
 seam); `keeper dash` is a TTY-ONLY exception outside this gate (no snapshot
@@ -1438,7 +1444,10 @@ event-log/reducer/hook touch. Run any of them with
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
   `[keeper-await] failed …` line — and exits when its condition holds.
-  Seven conditions: `complete <id>` (epic/task pops off the board),
+  Eleven conditions: `complete <id>` (the readiness `completed` verdict —
+  done AND idle, every owning subagent gone idle, the moment autopilot unblocks
+  downstream work; a row whose worker is done while a subagent is still winding
+  down reads `runtime_status: done` but `complete` HOLDS until idle),
   `started <id>` (work has begun at least once — a monotonic milestone
   keyed on job-presence OR `runtime_status` in {in_progress, done} OR
   `worker_phase=done`, NOT the flapping liveness `running` verdict; a
@@ -1459,7 +1468,17 @@ event-log/reducer/hook touch. Run any of them with
   is `cmd:<full command>`, `kind:<monitor|bash-bg|ambient>`, or a bare
   token (= `cmd:<token>`), exact-matched against the v51 `jobs.monitors`
   projection (a no-match at arm time refuses with `reason=no-match` exit 1
-  rather than firing an instant `met`). `git-clean` / `agents-idle` take no
+  rather than firing an instant `met`). The four board-level conditions are pure
+  predicates over the readiness snapshot, reusing the same exit taxonomy:
+  `drained` blocks until the board is fully at rest (no in-flight launch, no
+  running job, every row completed, not catching up) and distinguishes a JAM (a
+  sticky `dispatch_failures` row → exit 5 only under `--fail-on-stuck`) from
+  true drain; `epic-added [id]` fires when an epic appears (optionally a named
+  id); `epic-removed <id>` fires when the named epic leaves the board (done or
+  deleted); `changed [since:R]` fires when the board's epics / verdicts /
+  autopilot config move, with an optional `since:<hash>` anchoring against a
+  prior `changed` baseline — all four are edge-triggered (never satisfied on
+  first paint). `git-clean` / `agents-idle` take no
   id and are project-scoped to the cwd's repo; `monitor-running` takes one
   selector and needs no git root. Multiple conditions joined by the
   literal `and` token block until ALL hold simultaneously (level-
@@ -1491,6 +1510,61 @@ event-log/reducer/hook touch. Run any of them with
   keeper await monitor-running cmd:bun run dev             # my dev server done
   keeper await git-clean and agents-idle                   # both, ANDed
   keeper await complete fn-1-foo --connect-timeout 30s     # opt-in give-up
+  ```
+
+The next three subcommands are the agent-facing JSON read surface — orient in
+one call, read one collection, or tail board deltas — all read-only, none
+routing through the write path.
+
+- `status.ts` — a one-shot unified board + autopilot JSON read: ONE
+  `{schema_version, ok, error, data}` envelope carrying autopilot config
+  (`{paused, mode, armed, worktree_mode, max_concurrent_jobs,
+  max_concurrent_per_root}`), the per-epic/-task/-close-row readiness verdicts,
+  aggregate `counts`, `drained`/`jammed` booleans, `in_flight` launches,
+  `needs_human` signals, and `{rev, catching_up}`. Transport mirrors
+  `keeper await server-up` (a bare `subscribeReadiness` whose first snapshot is
+  a complete composite, then dispose + exit) but with a bounded ~10s default
+  connect deadline so a down daemon gives up rather than reconnecting forever.
+  Exit 0 on ANY board state (a bad board is DATA), exit 1 only on transport
+  (`unreachable`/`connect`) or usage; the jammed / needs-human signals come from
+  a best-effort one-shot `queryCollection` of `dispatch_failures` — NEVER
+  `sendControlRpc`. The agent "orient in one read" surface.
+
+  ```sh
+  keeper status --json | jq .data.autopilot
+  keeper status --json | jq '.data.drained, .data.jammed'
+  ```
+
+- `query.ts` — a thin one-shot read of an allowlisted daemon collection over
+  `queryCollection` (one `query` frame, decoded rows, close — never
+  `sendControlRpc`). The collection name is validated against
+  `QUERY_READ_ALLOWLIST` (`src/collections.ts`) at PARSE time, so an
+  off-allowlist name is a usage error (exit 1) that never opens a socket;
+  `--filter k=v` (repeatable) builds a server-resolved exact-match filter map
+  (keys resolve against the collection's declared filters, values are bound — no
+  free-form eval, no injection surface). Output is one `{schema_version, ok,
+  error, data}` envelope whose `data` is the row array.
+
+  ```sh
+  keeper query epics --json | jq '.data[].epic_id'
+  keeper query jobs --filter state=working
+  ```
+
+- `watch.ts` — a NON-EXITING NDJSON tail of coarse board deltas over
+  `subscribeReadiness`. Emits a baseline full-snapshot line, then one
+  `{schema_version, sequence, type, data}` line per real change (epic
+  added/removed, verdict change, job-state change, autopilot change). Coarse,
+  NOT a firehose: successive snapshots are projected to a coarse board and
+  diffed client-side, so a null-diff (a byte-identical reconnect re-paint) emits
+  NOTHING; bursts coalesce over a short window; an idle keepalive carries the
+  current `sequence` so a consumer detects gaps. `--filter <type>` is a
+  named-type allowlist (off-allowlist value → exit 1 at parse time); the
+  `baseline` line is always emitted. Reconnects FOREVER (a daemon bounce must
+  not end the tail) — pair it with the one-shot `keeper status` orient.
+
+  ```sh
+  keeper watch --json
+  keeper watch --filter verdict-change --filter epic-removed
   ```
 
 The next four subcommands are keeper's git-coordination verbs (epic
@@ -3727,8 +3801,8 @@ without paying its cost today.
 
 The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
 the package.json `bin`) that fans into every subcommand — `board`,
-`autopilot`, `git`, `usage`, `builds`, `await` — so all example clients
-ship as one binary instead of N standalone scripts.
+`autopilot`, `git`, `usage`, `builds`, `await`, `status`, `query`, `watch` —
+so all example clients ship as one binary instead of N standalone scripts.
 
 The sitter scanners (performance, builds, helptailing) — read-only out-of-process observers of `keeper.db` and buildbot state — now live in their own repo at `~/code/sitter`. They import nothing from keeper and observe purely through durable contracts (read-only SQLite at a whitelisted schema version, NDJSON telemetry, their own private state tree). See `~/code/sitter` for the daemon set, its launchd jobs, and its architecture.
 

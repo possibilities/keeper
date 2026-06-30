@@ -70,11 +70,15 @@
  *                    recoverable reason kind. Command exits 5 only under
  *                    `--fail-on-stuck` (otherwise treated as `waiting`).
  *
- * `met` for `complete` is presence-driven on epics (the spec's "pops off
- * the board" semantics) — the epic disappearing from the default-visible
- * scope is the signal, NOT an explicit `status` value. For tasks `met`
- * reads the raw field directly: `worker_phase === "done"` (fn-756 — the
- * approval enum no longer gates completion).
+ * `met` for `complete` reads the readiness `completed` verdict (fn-1015) —
+ * done-AND-idle, not the administrative pop-off signal that can fire before the
+ * worker winds down. A task is complete when `perTask[id].tag === "completed"`
+ * (`worker_phase === "done"` AND the session idle); an epic is complete when its
+ * close-row `perCloseRow[epic_id].tag === "completed"` (`status === "done"` AND
+ * the closer idle), reachable on the present branch because the await-complete
+ * path opts the recently-done epics into the observed scope. An epic that has
+ * aged past that window (or was deleted) lands on the absent branch, where the
+ * command's scope-exempt re-query splits complete (re-query hit) from deleted.
  */
 
 import type { MonitorEntry } from "./derivers";
@@ -472,10 +476,13 @@ function epicStarted(epic: Epic): boolean {
  * something is implicit. Every field is a pure value — no live handles,
  * no functions.
  *
- *   - `epics`          — the board-scoped epic list as observed by the
- *                        subscribe stream (`default_visible = status='open'
- *                        OR approval!='approved'`). Drives presence
- *                        lookups for both kinds.
+ *   - `epics`          — the epic list as observed by the subscribe stream.
+ *                        Normally the board-scoped default-visible set
+ *                        (`status='open' OR approval!='approved'`); the
+ *                        await-complete path additionally merges the
+ *                        recently-done epics (open-wins) so a done epic's
+ *                        close-row verdict is reachable on the present branch.
+ *                        Drives presence lookups for both kinds.
  *   - `snapshot`       — the post-mutex `ReadinessSnapshot` from the same
  *                        subscribe tick.
  *   - `priorPresence`  — true iff the target was observed at least once
@@ -543,12 +550,15 @@ export interface AwaitInputs {
  *       scope-exempt re-query disambiguates that from a real deletion.)
  *
  *   - Target present in `inputs.epics`:
- *       condition='complete'  → read the raw field:
- *           task: `worker_phase==='done'` (fn-756 — no approval gate)
- *           epic: never `met` on the present branch (an epic that's
- *                 truly complete has popped off the board scope — see
- *                 absent branch above). If the epic is still on the
- *                 board, it isn't complete yet; return `waiting`.
+ *       condition='complete'  → read the readiness `completed` verdict:
+ *           task: `perTask[id].tag==='completed'` (done AND idle) → `met`; a
+ *                 present task with no verdict, or any non-`completed` verdict
+ *                 (e.g. `running:sub-agent-stale`), → `waiting`.
+ *           epic: `perCloseRow[epic_id].tag==='completed'` (status done AND the
+ *                 closer idle) → `met`; present+open or present+done+closer-live
+ *                 → `waiting`. A done epic stays present via the await-complete
+ *                 recent-done merge; one aged past the window / deleted lands on
+ *                 the absent branch.
  *       condition='started'  → read the raw fields (met / waiting only,
  *           evaluated BEFORE any stuck branch so a blocked-but-ran row
  *           reads `met`):
@@ -583,15 +593,27 @@ function evaluateTaskAwait(
     return absentBranch(inputs, target);
   }
   if (target.condition === "complete") {
-    const { task } = hit;
-    // fn-756: completion is the worker-done signal alone; the approval enum
-    // no longer gates.
-    if (task.worker_phase === "done") {
-      return { kind: "met", detail: "task complete (worker done)" };
+    // fn-1015: completion is the readiness `completed` verdict — `worker_phase
+    // === "done"` AND the session idle (no embedded job working, no running
+    // sub-agent, no held monitor lease) — NOT the raw `worker_phase` pop-off
+    // that can race ahead of the worker winding down. A done-but-live task reads
+    // `running:*` and stays `waiting` here (a done task whose sub-agent died
+    // without SubagentStop is `running:sub-agent-stale` by design, so `complete`
+    // holds `waiting` until an operator clears it). Undefined-guard mirrors the
+    // unblocked path: a present task with no verdict reads `waiting`.
+    const v = inputs.snapshot.perTask.get(target.id);
+    if (v === undefined) {
+      return {
+        kind: "waiting",
+        detail: "task present but no verdict in snapshot",
+      };
+    }
+    if (v.tag === "completed") {
+      return { kind: "met", detail: "task complete (done and idle)" };
     }
     return {
       kind: "waiting",
-      detail: `task not complete (worker_phase=${task.worker_phase ?? "null"})`,
+      detail: `task not complete (${verdictPhrase(v)})`,
     };
   }
   if (target.condition === "started") {
@@ -645,13 +667,29 @@ function evaluateEpicAwait(
     return absentBranch(inputs, target);
   }
   if (target.condition === "complete") {
-    // An epic that's truly complete (status != 'open' per the
-    // EPICS_DESCRIPTOR's default filter) has popped off the board scope,
-    // so it lands on the absent branch above. If we see it here, it's
-    // still on the board — not yet complete.
+    // fn-1015: with the await-complete opt-in recent-done merge feeding this
+    // input set, a done epic stays observable through its close-row wind-down,
+    // so completion is the close-row `completed` verdict (status==='done' AND
+    // the closer idle — no embedded close job working, no running sub-agent, no
+    // held monitor lease) read off `perCloseRow`, NOT the epic merely popping
+    // off the board. State machine: present+open → waiting; present+done+
+    // idle-close-row → met; present+done+closer-live → waiting. A truly-deleted
+    // epic (absent from BOTH the open AND recent-done scopes) lands on the
+    // absent branch above, where the scope-exempt re-query disambiguates
+    // re-query-hit → met (aged past the 1800s window but still in the
+    // projection) from re-query-miss → deleted.
+    const closeV = inputs.snapshot.perCloseRow.get(epic.epic_id);
+    if (closeV !== undefined && closeV.tag === "completed") {
+      return {
+        kind: "met",
+        detail: "epic complete (done and close-row idle)",
+      };
+    }
     return {
       kind: "waiting",
-      detail: `epic still on board (status=${epic.status ?? "null"})`,
+      detail: `epic not complete (status=${epic.status ?? "null"}${
+        closeV === undefined ? "" : `, ${verdictPhrase(closeV)}`
+      })`,
     };
   }
   if (target.condition === "started") {
@@ -963,4 +1001,240 @@ export function monitorRunningState(
     kind: "waiting",
     detail: `${matches} matching monitor(s) still running`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Board-level await predicates (fn-1015): drained / changed / epic-added /
+// epic-removed. These read the WHOLE board, not one plan target, so they reuse
+// the `met`/`waiting`/`stuck` arms of {@link AwaitState} but never
+// `not-found`/`deleted` — a board condition has no target presence. All pure:
+// no I/O, no `Date.now()`; the command captures the first-paint baseline and
+// threads the live rows in.
+// ---------------------------------------------------------------------------
+
+/**
+ * The two `dispatch_failures.reason` families that mean a human MUST act before
+ * the board can drain — the jam allowlist for `await drained --fail-on-stuck`.
+ * `worktree-finalize-non-fast-forward` is an origin-ahead non-ff needing an
+ * operator to reconcile origin; `worktree-merge-conflict` is a close-sink
+ * content conflict. The `worktree-recover*` auto-clear prefix is EXCLUDED — a
+ * recover-originated row self-clears level-triggered once its git resolves, so
+ * it is never an operator jam. Held as local constants (the source of truth is
+ * `daemon.ts`'s `MERGE_ESCALATION_REASON_TOKEN` + `autopilot-worker.ts`'s
+ * `WORKTREE_RECOVER_REASON_PREFIX`; `test/await-conditions.test.ts` pins the
+ * equality so they never drift) to keep this module an import leaf.
+ */
+const JAM_FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
+const JAM_MERGE_CONFLICT_PREFIX = "worktree-merge-conflict";
+const WORKTREE_RECOVER_PREFIX = "worktree-recover";
+
+/**
+ * Is this `dispatch_failures.reason` an operator jam (an open-board sticky that
+ * will NOT self-resolve)? The `worktree-recover*` auto-clear prefix is excluded
+ * FIRST so a `worktree-recover-conflict` never counts despite sharing the
+ * `worktree-` namespace. Exported for the `drained` jam check + its test.
+ */
+export function isJamReason(reason: string): boolean {
+  if (reason.startsWith(WORKTREE_RECOVER_PREFIX)) {
+    return false;
+  }
+  return (
+    reason === JAM_FINALIZE_NON_FF_REASON ||
+    reason.startsWith(JAM_MERGE_CONFLICT_PREFIX)
+  );
+}
+
+export interface DrainedInputs {
+  /** Per-task readiness verdicts (post-mutex). */
+  perTask: ReadonlyMap<string, Verdict>;
+  /** Per-close-row readiness verdicts. */
+  perCloseRow: ReadonlyMap<string, Verdict>;
+  /** Count of OPEN epics on the default-visible board; `0` ⇒ board empty. */
+  openEpicCount: number;
+  /** In-flight launch-window occupants (`pending_dispatches`). */
+  pendingDispatchCount: number;
+  /** Jobs in the `working` state. */
+  runningJobCount: number;
+  /** Reducer still draining toward head — NEVER report drained mid-catch-up. */
+  catchingUp: boolean;
+  /** The live `dispatch_failures.reason` strings (for the jam check). */
+  dispatchFailureReasons?: readonly string[];
+  /** Whether `--fail-on-stuck` armed the jam→stuck escalation. */
+  failOnStuck?: boolean;
+}
+
+/**
+ * `drained` predicate (fn-1015). MET when the board is fully at rest:
+ * `catching_up===false` AND no in-flight launch AND no running job AND (the
+ * open board is empty OR every per-task / per-close-row verdict is
+ * `completed`). A deferred-on-upstream-merge epic (the reconciler's
+ * `computeDeferredEpicIds` set) always carries a non-`completed` verdict (a
+ * ready task / ready close-row held back from cutting its lane), so it reads
+ * `waiting` here automatically — the self-resolving carve-out needs no
+ * producer-side probe on the client.
+ *
+ * Under `--fail-on-stuck` a jam-reason sticky ({@link isJamReason}) escalates
+ * to `stuck` (exit 5): the board will not drain without an operator, so an
+ * armed await must bail rather than block forever. Checked right after the
+ * catch-up guard — a jam never self-clears, so siblings still in flight don't
+ * make it any less terminal.
+ *
+ * Level-triggered (no baseline): fires `met` immediately if the board is
+ * already at rest at first paint.
+ */
+export function drainedState(inputs: DrainedInputs): AwaitState {
+  if (inputs.catchingUp) {
+    return { kind: "waiting", detail: "catching up (reducer draining)" };
+  }
+  if (inputs.failOnStuck === true) {
+    const jams = (inputs.dispatchFailureReasons ?? []).filter(isJamReason);
+    if (jams.length > 0) {
+      return {
+        kind: "stuck",
+        detail: `board jammed (${jams.length} sticky: ${jams[0]})`,
+      };
+    }
+  }
+  if (inputs.pendingDispatchCount > 0 || inputs.runningJobCount > 0) {
+    return {
+      kind: "waiting",
+      detail: `in-flight (pending=${inputs.pendingDispatchCount} running=${inputs.runningJobCount})`,
+    };
+  }
+  if (inputs.openEpicCount === 0) {
+    return { kind: "met", detail: "board empty (drained)" };
+  }
+  for (const v of inputs.perTask.values()) {
+    if (v.tag !== "completed") {
+      return {
+        kind: "waiting",
+        detail: `task ${verdictPhrase(v)} (not drained)`,
+      };
+    }
+  }
+  for (const v of inputs.perCloseRow.values()) {
+    if (v.tag !== "completed") {
+      return {
+        kind: "waiting",
+        detail: `close-row ${verdictPhrase(v)} (not drained)`,
+      };
+    }
+  }
+  return { kind: "met", detail: "all rows completed (drained)" };
+}
+
+/**
+ * Does `target` (a full `fn-N-slug` epic id or a bare `fn-N`) name `epicId`?
+ * The bare form matches the `fn-<number>` numeric prefix; the full form is
+ * exact equality. Mirrors {@link findEpicByIdOrBare}'s bare-vs-full split.
+ */
+function epicIdMatchesTarget(epicId: string, target: string): boolean {
+  if (epicId === target) {
+    return true;
+  }
+  const bare = /^fn-(\d+)$/.exec(target);
+  if (bare === null) {
+    return false;
+  }
+  const m = /^fn-(\d+)(?:-|$)/.exec(epicId);
+  return m !== null && m[1] === bare[1];
+}
+
+/**
+ * `epic-added` edge predicate (fn-1015). MET when an epic id present in
+ * `current` was absent from the first-paint `baseline` — optionally narrowed to
+ * `target` (full or bare). Edge-triggered: on the baseline tick `current` ===
+ * `baseline`, so it can NEVER fire on first paint (no prior tick to diff).
+ */
+export function epicAddedMet(
+  baseline: readonly string[],
+  current: readonly string[],
+  target?: string,
+): boolean {
+  const base = new Set(baseline);
+  for (const id of current) {
+    if (base.has(id)) {
+      continue;
+    }
+    if (target === undefined || epicIdMatchesTarget(id, target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * `epic-removed` edge predicate (fn-1015). MET when an epic id matching
+ * `target` (full or bare) was present in the first-paint `baseline` but is now
+ * absent from `current`. Edge-triggered: never fires on first paint. A target
+ * absent from the baseline can never satisfy it (we never saw it present to see
+ * it leave) — the command holds `waiting`.
+ */
+export function epicRemovedMet(
+  baseline: readonly string[],
+  current: readonly string[],
+  target: string,
+): boolean {
+  const cur = new Set(current);
+  for (const id of baseline) {
+    if (epicIdMatchesTarget(id, target) && !cur.has(id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Stable string key for a verdict (tag + reason kind). Exported so the
+ *  `keeper watch` coarse diff shares ONE verdict vocabulary with `changed`. */
+export function verdictKey(v: Verdict): string {
+  switch (v.tag) {
+    case "ready":
+      return "ready";
+    case "completed":
+      return "completed";
+    case "blocked":
+      return `blocked:${v.reason.kind}`;
+    case "running":
+      return `running:${v.reason.kind}`;
+  }
+}
+
+export interface BoardSignatureInput {
+  epics: readonly { epic_id: string; status: string | null }[];
+  perTask: ReadonlyMap<string, Verdict>;
+  perCloseRow: ReadonlyMap<string, Verdict>;
+  perEpic: ReadonlyMap<string, Verdict>;
+  autopilot: {
+    mode: string;
+    paused: boolean;
+    worktreeMode: boolean;
+    maxConcurrentJobs: number | null;
+    maxConcurrentPerRoot: number;
+  };
+}
+
+/**
+ * Coarse content signature for `await changed` (fn-1015). Covers ONLY the
+ * orient-relevant surface — epic id+status, the three per-row verdict maps, and
+ * autopilot mode/pause/worktree/caps — and deliberately EXCLUDES noisy
+ * git_status / subagent / job churn so a `changed` await fires on a real board
+ * move, not heartbeat noise. Sorted keys ⇒ map-iteration-order churn never
+ * perturbs the signature, so a reconnect re-paint of an unchanged board hashes
+ * identically (no spurious edge).
+ */
+export function changedSignature(input: BoardSignatureInput): string {
+  const epics = [...input.epics]
+    .map((e) => [e.epic_id, e.status ?? null] as const)
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  const mapSig = (m: ReadonlyMap<string, Verdict>): [string, string][] =>
+    [...m.entries()]
+      .map(([k, v]) => [k, verdictKey(v)] as [string, string])
+      .sort((a, b) => a[0].localeCompare(b[0]));
+  return JSON.stringify({
+    epics,
+    perTask: mapSig(input.perTask),
+    perCloseRow: mapSig(input.perCloseRow),
+    perEpic: mapSig(input.perEpic),
+    autopilot: input.autopilot,
+  });
 }

@@ -4,7 +4,7 @@ description: >-
   Drive the server-side autopilot reconciler by hand — pause / play, switch
   mode (yolo vs armed), arm / disarm an epic, retry a stuck dispatch, or read
   what it is doing. Also the temporary take-over window: capture the current
-  {paused, mode, armed, worktree_mode} state, change it for a bit, then restore it when the
+  {paused, mode, armed, worktree_mode, caps} state, change it for a bit, then restore it when the
   human says done. Use when the user asks to pause or steer the autopilot —
   pause/play, mode, arm, retry, or inspect it ("pause it", "let it rip",
   "only work fn-X", "approve fn-Y", "what's autopilot doing") — even when they
@@ -67,9 +67,10 @@ flags." Every control op below is a bare one-shot Bash call:
 | Arm an epic | "arm fn-X", "only work fn-X and its deps" — an epic id `fn-N-slug` | `keeper autopilot arm fn-N-slug` |
 | Disarm an epic | "disarm fn-X", "stop arming fn-X" | `keeper autopilot disarm fn-N-slug` |
 | Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
+| Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
-| Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper autopilot --snapshot \| tail -1` (read) |
+| Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper status --json \| jq .data.autopilot` (read) |
 
 `yolo` works EVERY ready epic; `armed` works ONLY explicitly-armed epics plus
 their transitive upstream dep-closure. `arm` / `disarm` only matter in `armed`
@@ -80,29 +81,32 @@ resolve it to an exact id, ask. Do not invent ids. Gate any ambiguous
 control-plane intent ("change the mode" without naming which) with ONE
 clarifying question — fail loud on ambiguity, never guess a global-state mutation.
 
-## Reading autopilot state
+## Orient — reading autopilot state
 
-Read state with the snapshot, NEVER the live stream:
+<!-- Canonical source: keeper prompt render engineering/orient -->
+
+Read state with `keeper status --json`, NEVER the live stream:
 
 ```bash
-keeper autopilot --snapshot | tail -1
+keeper status --json | jq .data.autopilot
 ```
 
-The last stdout line is the machine-parseable `keeper-meta:` trailer (a single
-JSON object). Its `state` field is a PATH to a per-frame sidecar JSON carrying
-the captured singleton plus the body sections:
+It prints ONE `{schema_version, ok, error, data}` envelope and exits — no TUI
+snapshot dance, no reconnect loop. `data.autopilot` IS the global singleton:
 
 ```json
-{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "current": [], "dependencies": [], "failed": [] }
+{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "max_concurrent_jobs": null, "max_concurrent_per_root": 1 }
 ```
 
-The `{paused, mode, armed, worktree_mode}` set IS the autopilot's global singleton — read
-those to answer "what's it doing" and to capture before a take-over. For a
-human-readable frame instead of the trailer, drop `| tail -1` and read the whole
-snapshot block (banner pill `[playing] · yolo · max ∞`, plus the current /
-stopped / failed / armed / dependencies sections). `status: "ok"` with `frame:
-1` in the trailer means a real frame was captured; `truncated: true` means the
-snapshot timed out with a partial composite — re-run before trusting it.
+Read those six fields to answer "what's it doing" and to capture before a
+take-over. The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
+(pending + running launches), and `data.needs_human` (dead-letters, escalations,
+stuck dispatches) cover what it's CURRENTLY doing — so one read covers both the
+config and the activity. Exit 0 on any board state; exit 1 only on
+transport/usage. For the full orient step run `keeper prompt render
+engineering/orient`. (The dispatch-log TUI `keeper autopilot --snapshot` still
+exists for a human-readable frame; for a machine read prefer the status envelope,
+and NEVER `--watch` — it hangs.)
 
 ## Single control op — just run it
 
@@ -123,16 +127,17 @@ ONLY when the human says some version of "take over for a bit, then put it
 back." This is the one place capture/restore applies — a bare "pause it" must
 NEVER capture/restore (that would auto-undo a deliberate pause).
 
-**1 — Capture BEFORE mutating.** Read the full singleton and pin all three
-fields in your working context for the whole window:
+**1 — Capture BEFORE mutating.** Read the full singleton and pin every field
+you might change in your working context for the whole window:
 
 ```bash
-keeper autopilot --snapshot | tail -1   # read the `state` sidecar → {paused, mode, armed}
+keeper status --json | jq .data.autopilot   # → {paused, mode, armed, worktree_mode, max_concurrent_jobs, max_concurrent_per_root}
 ```
 
-Capture `{paused, mode, armed_epics, worktree_mode}` — capturing fewer than all
-four produces a wrong GLOBAL state on restore. Pin them; do not re-derive from
-memory later.
+Capture `{paused, mode, armed, worktree_mode, max_concurrent_jobs,
+max_concurrent_per_root}` — capturing fewer than the fields your take-over
+touches produces a wrong GLOBAL state on restore. Pin them; do not re-derive
+from memory later.
 
 **2 — Drive.** Run the control ops the take-over needs (pause, mode, arm, …).
 Wire the restore plan PER MUTATING PHASE as you go — track exactly which fields
@@ -147,7 +152,7 @@ take-over spans turns.
 may have drifted during the window, so re-read current state before restoring:
 
 ```bash
-keeper autopilot --snapshot | tail -1   # re-read CURRENT state
+keeper status --json | jq .data.autopilot   # re-read CURRENT state
 ```
 
 Restore ONLY the fields your take-over changed, back to the captured values
@@ -156,7 +161,7 @@ Restore ONLY the fields your take-over changed, back to the captured values
 
 **5 — Surface a restore failure DISTINCTLY.** If any restore op exits non-zero,
 do NOT swallow it. Surface a distinct error: **"autopilot state unknown — verify
-with `keeper autopilot --snapshot`."** Name the **partial-mutation** case
+with `keeper status --json`."** Name the **partial-mutation** case
 explicitly when it happens (e.g. mode restored but a disarm failed) so the human
 knows exactly which field is still off and can finish the restore by hand.
 
@@ -210,33 +215,33 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 
 > User: "What's the autopilot up to?"
 
-1. `keeper autopilot --snapshot | tail -1` → parse the `keeper-meta:` JSON;
-   read its `state` sidecar for `{paused, mode, armed}` plus the current /
-   failed sections.
-2. Report paused/playing, mode, armed epics, and any in-flight or failed
-   dispatches. NEVER `--watch` (it hangs).
+1. `keeper status --json | jq .data.autopilot` → read `{paused, mode, armed,
+   worktree_mode, …}`; the same envelope's `data.in_flight` / `data.needs_human`
+   cover in-flight launches and anything needing an operator.
+2. Report paused/playing, mode, armed epics, and any in-flight or stuck
+   dispatches. NEVER `keeper autopilot --watch` (it hangs).
 
 ### Take over for a bit, then put it back
 
 > User: "Pause it and switch to armed while I poke at fn-871, then restore it."
 
-1. **Capture:** `keeper autopilot --snapshot | tail -1` → pin `{paused:false,
+1. **Capture:** `keeper status --json | jq .data.autopilot` → pin `{paused:false,
    mode:"yolo", armed:[], worktree_mode:false}`.
 2. **Drive:** `keeper autopilot pause`; `keeper autopilot mode armed`. Track:
    changed `paused` and `mode` (not `armed`).
 3. Window stays open across turns until the human says "restore it / done."
-4. **On close — re-read:** `keeper autopilot --snapshot | tail -1` (the
+4. **On close — re-read:** `keeper status --json | jq .data.autopilot` (the
    reconciler may have drifted).
 5. **Restore only what changed:** `keeper autopilot play` (→ `paused:false`);
    `keeper autopilot mode yolo`. If `mode yolo` succeeds but `play` fails →
-   surface "autopilot state unknown — verify with `keeper autopilot --snapshot`;
+   surface "autopilot state unknown — verify with `keeper status --json`;
    mode restored to yolo but unpause FAILED (still paused)."
 
 ## What NOT to do
 
 - Do not run `keeper autopilot --watch` — it forces the live subscribe stream
-  and HANGS the agent's tool call forever. Reads are always `--snapshot | tail
-  -1` (or the bare snapshot block).
+  and HANGS the agent's tool call forever. Read state with `keeper status --json`
+  (or the bare `keeper autopilot --snapshot` block for a human-readable frame).
 - Do not capture/restore around a BARE control op — capture/restore is
   take-over-window-only. Auto-restoring after "pause it" would silently undo a
   deliberate pause.
@@ -245,10 +250,11 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 - Do not restore without RE-READING current state first — the level-triggered
   reconciler may have drifted, and restoring a stale capture sets a wrong global
   state.
-- Do not capture fewer than {paused, mode, armed_epics, worktree_mode} — a
-  partial capture restores a wrong global state.
+- Do not capture fewer than the singleton fields your take-over touches
+  ({paused, mode, armed, worktree_mode, max_concurrent_jobs,
+  max_concurrent_per_root}) — a partial capture restores a wrong global state.
 - Do not swallow a restore failure — surface "autopilot state unknown — verify
-  with `keeper autopilot --snapshot`" distinctly, and name the partial-mutation
+  with `keeper status --json`" distinctly, and name the partial-mutation
   field that's still off.
 - Do not treat "prioritize this" / "do this next" as arm/mode — plan state has
   no board-priority knob. Only an explicit autopilot/armed reference triggers

@@ -151,6 +151,10 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    // fn-1015: the opt-in recent-done window (gated only on a `complete`
+    // condition). An unmatched id is harmlessly ignored when the stream didn't
+    // opt in (unblocked/started/server-up), so it's safe to deliver uniformly.
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
   ]);
 }
 
@@ -174,6 +178,9 @@ function deliverFiveWithEpic(
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    // fn-1015: opt-in recent-done window — empty here, so an epic that drops off
+    // `epics` is absent from BOTH scopes and rides the existing re-query path.
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
   ]);
 }
 
@@ -214,6 +221,8 @@ function deliverFiveWith(
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, [], rev),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, [], rev),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, [], rev),
+    // fn-1015: opt-in recent-done window (empty unless a test opts otherwise).
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [], rev),
   ]);
 }
 
@@ -1548,6 +1557,60 @@ test("epic complete: present-then-drop + re-query hit → met (exit 0)", async (
 });
 
 // ---------------------------------------------------------------------------
+// fn-1015: epic complete via the opt-in recent-done merge — a done epic served
+// in the `epics_recent_done` window with an idle close-row fires `met` directly
+// on the present branch, no board pop-off / re-query needed.
+// ---------------------------------------------------------------------------
+
+test("fn-1015 epic complete: done epic in recent-done window + idle close-row → met (no drop)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // The complete-condition subscribe opts in the recent-done window — twelve
+  // queries, not eleven.
+  const collections = (sock.takeOutbound() as Array<{ collection?: string }>)
+    .map((f) => f.collection)
+    .filter((c): c is string => c !== undefined);
+  expect(collections).toContain("epics_recent_done");
+
+  // First paint: the epic is ABSENT from open `epics` but PRESENT (status done,
+  // idle close-row) in the recent-done window. The merge surfaces it; its
+  // close-row folds to `completed` → met on the present branch.
+  const doneEpic = makeEpicRow({
+    status: "done",
+    tasks: [makeTaskRow({ worker_phase: "done" })],
+  });
+  sock.deliver([
+    resultFrame("epics", `${idPrefix}-epics`, []),
+    resultFrame("jobs", `${idPrefix}-jobs`, []),
+    resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
+    resultFrame("git", `${idPrefix}-git`, []),
+    resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
+    resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, []),
+    resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
+    resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [
+      doneEpic,
+    ]),
+  ]);
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] armed");
+  expect(lines).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // Drop + re-query miss → deleted exit 4.
 // ---------------------------------------------------------------------------
 
@@ -2475,11 +2538,12 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A plan-bearing combo rides subscribeReadiness only — its eleven
-  // collections (fn-721 added `pending_dispatches`; fn-770 added
-  // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`; fn-941
-  // added `block_escalations`; fn-952 added `tmux_client_focus`), NOT a
-  // separate dedicated git sub.
+  // A plan-bearing combo rides subscribeReadiness only — its collections
+  // (fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
+  // `armed_epics`; fn-813 added `scheduled_tasks`; fn-941 added
+  // `block_escalations`; fn-952 added `tmux_client_focus`; fn-1015 adds the
+  // opt-in `epics_recent_done` window because a `complete` segment is present),
+  // NOT a separate dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
   expect(cols).toEqual([
@@ -2488,6 +2552,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "block_escalations",
     "dead_letters",
     "epics",
+    "epics_recent_done",
     "git",
     "jobs",
     "pending_dispatches",
@@ -2594,4 +2659,278 @@ test("AND aggregate: SIGTERM → failed reason=timeout exit 3, one terminal line
   expect(failed).toHaveLength(1);
   expect(failed[0]).toContain("reason=timeout");
   expect(h.exitCode).toBe(3);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 board conditions — parse
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: drained takes no id", () => {
+  const r = parseAwaitArgs(["drained"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.segments[0]?.condition).toBe("drained");
+});
+
+test("parseAwaitArgs: drained with a stray id → usage error", () => {
+  expect(parseAwaitArgs(["drained", "fn-1-foo"]).ok).toBe(false);
+});
+
+test("parseAwaitArgs: changed parses bare + since:<hash>", () => {
+  const bare = parseAwaitArgs(["changed"]);
+  if (!bare.ok) {
+    throw new Error(`expected ok, got ${bare.message}`);
+  }
+  expect(bare.args.segments[0]?.condition).toBe("changed");
+  const since = parseAwaitArgs(["changed", "since:abc123"]);
+  if (!since.ok) {
+    throw new Error(`expected ok, got ${since.message}`);
+  }
+  const seg = since.args.segments[0];
+  if (seg?.condition !== "changed") {
+    throw new Error("expected changed segment");
+  }
+  expect(seg.since).toBe("abc123");
+});
+
+test("parseAwaitArgs: changed with a non-since token → usage error", () => {
+  expect(parseAwaitArgs(["changed", "fn-1-foo"]).ok).toBe(false);
+});
+
+test("parseAwaitArgs: epic-added parses bare + optional epic id", () => {
+  const bare = parseAwaitArgs(["epic-added"]);
+  if (!bare.ok) {
+    throw new Error(`expected ok, got ${bare.message}`);
+  }
+  expect(bare.args.segments[0]?.condition).toBe("epic-added");
+  const withId = parseAwaitArgs(["epic-added", "fn-2-bar"]);
+  if (!withId.ok) {
+    throw new Error(`expected ok, got ${withId.message}`);
+  }
+  const seg = withId.args.segments[0];
+  if (seg?.condition !== "epic-added") {
+    throw new Error("expected epic-added segment");
+  }
+  expect(seg.target).toBe("fn-2-bar");
+});
+
+test("parseAwaitArgs: epic-added with a task id → usage error", () => {
+  expect(parseAwaitArgs(["epic-added", "fn-1-foo.1"]).ok).toBe(false);
+});
+
+test("parseAwaitArgs: epic-removed requires an epic id", () => {
+  expect(parseAwaitArgs(["epic-removed"]).ok).toBe(false);
+  const ok = parseAwaitArgs(["epic-removed", "fn-1-foo"]);
+  if (!ok.ok) {
+    throw new Error(`expected ok, got ${ok.message}`);
+  }
+  const seg = ok.args.segments[0];
+  if (seg?.condition !== "epic-removed") {
+    throw new Error("expected epic-removed segment");
+  }
+  expect(seg.target).toBe("fn-1-foo");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 board conditions — runner
+// ---------------------------------------------------------------------------
+
+test("await drained: empty board → armed + met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "drained" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveEmpty(sock, idPrefix);
+  // Empty board, no in-flight, not catching up → drained met on first paint.
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await drained: a working job holds waiting, then drains → met", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "drained" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: a working job → waiting (armed only, no met).
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [jobRow({ job_id: "j-1", state: "working" })],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // Job goes away → drained met.
+  sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
+  const { factory, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { failOnStuck: true }),
+    h.deps,
+  );
+  // Two sockets open: readiness + the dedicated dispatch_failures stream.
+  const dfSock = findSockForCollection(socketsAll.sockets, "dispatch_failures");
+  const readinessSock = findSockForCollection(socketsAll.sockets, "epics");
+  if (!dfSock || !readinessSock) {
+    throw new Error("readiness + dispatch_failures sockets not both opened");
+  }
+
+  // A jam-reason sticky present, board otherwise at rest → stuck exit 5.
+  dfSock.deliver([
+    resultFrame("dispatch_failures", `${idPrefix}-dispatch_failures`, [
+      { reason: "worktree-finalize-non-fast-forward" },
+    ]),
+  ]);
+  deliverFiveEmpty(readinessSock, idPrefix);
+
+  const failed = h.stdout.filter((l) => l.includes("[keeper-await] failed"));
+  expect(failed.length).toBeGreaterThanOrEqual(1);
+  expect(failed[0]).toContain("reason=stuck");
+  expect(h.exitCode).toBe(5);
+});
+
+test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", async () => {
+  const { factory, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { failOnStuck: true }),
+    h.deps,
+  );
+  const dfSock = findSockForCollection(socketsAll.sockets, "dispatch_failures");
+  const readinessSock = findSockForCollection(socketsAll.sockets, "epics");
+  if (!dfSock || !readinessSock) {
+    throw new Error("readiness + dispatch_failures sockets not both opened");
+  }
+
+  dfSock.deliver([
+    resultFrame("dispatch_failures", `${idPrefix}-dispatch_failures`, [
+      { reason: "worktree-recover-conflict" },
+    ]),
+  ]);
+  deliverFiveEmpty(readinessSock, idPrefix);
+
+  // recover* is auto-clearing, never an operator jam → drained met, not stuck.
+  expect(h.exitCode).toBe(0);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+});
+
+test("await epic-added: new epic across two frames → met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "epic-added" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Baseline: one epic. Edge-triggered → armed, never met on first paint.
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ epic_id: "fn-1-foo" }));
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // A new epic appears → met.
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [
+        makeEpicRow({ epic_id: "fn-1-foo" }),
+        makeEpicRow({ epic_id: "fn-2-bar", epic_number: 2 }),
+      ],
+      2,
+    ),
+  ]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await epic-removed: present-then-absent → met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "epic-removed", target: "fn-1-foo" }]),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Baseline carries fn-1-foo.
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ epic_id: "fn-1-foo" }));
+  expect(h.exitCode).toBeNull();
+
+  // fn-1-foo leaves the board → met.
+  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await changed: an epic status move fires met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "changed" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Baseline.
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ epic_id: "fn-1-foo", status: "open" }),
+  );
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // Same board re-painted → null-diff, still waiting.
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ epic_id: "fn-1-foo", status: "open" })],
+      2,
+    ),
+  ]);
+  expect(h.exitCode).toBeNull();
+
+  // Status moves → changed met.
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ epic_id: "fn-1-foo", status: "done" })],
+      3,
+    ),
+  ]);
+  expect(h.exitCode).toBe(0);
 });

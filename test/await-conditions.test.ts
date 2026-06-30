@@ -29,10 +29,16 @@ import { expect, test } from "bun:test";
 import {
   type AwaitState,
   agentsIdleState,
+  changedSignature,
   classifyTargetId,
+  drainedState,
+  epicAddedMet,
+  epicRemovedMet,
   evaluateAwaitCondition,
   gitCleanState,
+  isJamReason,
   monitorRunningState,
+  verdictKey,
   workable,
 } from "../src/await-conditions";
 import { computeReadiness, type Verdict } from "../src/readiness";
@@ -291,6 +297,40 @@ test("fn-756 task-complete: done + (ignored) rejected → met (approval no longe
   expect(state.kind).toBe("met");
 });
 
+test("fn-1015 task-complete: done AND idle (no live work) → met (completed verdict)", () => {
+  // A bare done task with no embedded jobs / sub-agents / monitors folds to the
+  // readiness `completed` verdict — the done-AND-idle moment.
+  const task = makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 task-complete: done BUT embedded job still working → waiting (not idle)", () => {
+  // `worker_phase==="done"` raced ahead of the session winding down — an
+  // embedded job is still `working`, so readiness holds the verdict at
+  // `running:*`, NOT `completed`. `complete` must report `waiting` (the fn-1015
+  // done-AND-idle change) instead of the old raw-`worker_phase` `met`.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
 // ---------------------------------------------------------------------------
 // Task-started: the monotonic "work has begun at least once" milestone.
 // True via any of {jobs non-empty, runtime_status in {in_progress, done},
@@ -504,6 +544,89 @@ test("epic-complete: bare fn-N form looks up by epic_number", () => {
   // Epic is on the board → waiting (same present-branch rule as the
   // full-id version above).
   expect(state.kind).toBe("waiting");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 epic-complete: the present-branch close-row verdict state machine.
+// present+open → waiting; present+done+idle-close-row → met; present+done+
+// closer-live → waiting. The await-complete recent-done merge keeps a done epic
+// present here; aged-out / deleted fall through to the absent branch (above).
+// ---------------------------------------------------------------------------
+
+test("fn-1015 epic-complete: present + open → waiting (close-row not completed)", () => {
+  const epic = makeEpic({
+    status: "open",
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("fn-1015 epic-complete: present + done + idle close-row → met (completed verdict)", () => {
+  // A done epic with no live close-scope work (no working epic job, no running
+  // sub-agent, no held monitor) folds to the close-row `completed` verdict. With
+  // the recent-done merge this epic stays present, so `complete` reads `met`
+  // directly off `perCloseRow` — no board pop-off / re-query needed.
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "completed" });
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 epic-complete: present + done + closer still live → waiting (close-row not idle)", () => {
+  // `status==="done"` raced ahead of the closer — an epic-level `close` job is
+  // still `working`, so the close-row holds at `running:*`, NOT `completed`.
+  // `complete` must hold `waiting` until the closer winds down (the mutex stays
+  // held), even though the epic is administratively done.
+  const epic = makeEpic({
+    status: "done",
+    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "working" })],
+    tasks: [makeTask({ worker_phase: "done" })],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)?.tag).not.toBe("completed");
+  const state = evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("waiting");
+});
+
+test("fn-1015 epic-complete: aged out of recent-done window → absent → re-query hit → met", () => {
+  // After the 1800s window a completion ages out: the epic drops from BOTH the
+  // open AND recent-done scopes, so it lands on the absent branch. The
+  // scope-exempt re-query still hits (the row lives on in the projection) → the
+  // existing machinery resolves `met`. An agent arming long after completion
+  // gets the right answer.
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true, reQueryHit: true },
+    { id: "fn-1-foo", kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("fn-1015 epic-complete: truly deleted → absent → re-query miss → deleted", () => {
+  // Absent from both scopes AND the scope-exempt re-query misses → genuine
+  // deletion, NOT completion. The TRUE-deletion path is retained unchanged.
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true, reQueryHit: false },
+    { id: "fn-1-foo", kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("deleted");
 });
 
 // ---------------------------------------------------------------------------
@@ -1370,4 +1493,209 @@ test("monitor-running: ownSessionId null → met (no own row, vacuously done)", 
   expect(monitorRunningState(null, { command: "watch.sh" }, jobs).kind).toBe(
     "met",
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 board predicates: drained / isJamReason
+// ---------------------------------------------------------------------------
+
+const READY: Verdict = { tag: "ready" };
+const DONE: Verdict = { tag: "completed" };
+
+test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", () => {
+  expect(isJamReason("worktree-finalize-non-fast-forward")).toBe(true);
+  expect(
+    isJamReason("worktree-merge-conflict: merging X into Y — conflict"),
+  ).toBe(true);
+  // The auto-clear prefix is excluded even though it shares the namespace.
+  expect(isJamReason("worktree-recover-conflict")).toBe(false);
+  expect(isJamReason("worktree-recover-push-failed")).toBe(false);
+  // Unrelated reasons never count.
+  expect(isJamReason("job-rejected")).toBe(false);
+  expect(isJamReason("worktree-merge-local-timeout")).toBe(false);
+});
+
+test("drained: empty open board → met", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: all verdicts completed → met", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", DONE]]),
+    perCloseRow: new Map([["fn-1-a", DONE]]),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: a ready (deferred-style) verdict → waiting (not drained)", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", READY]]),
+    perCloseRow: new Map(),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: a running job → waiting", () => {
+  const r = drainedState({
+    perTask: new Map([["fn-1-a.1", DONE]]),
+    perCloseRow: new Map(),
+    openEpicCount: 1,
+    pendingDispatchCount: 0,
+    runningJobCount: 1,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: a pending dispatch → waiting", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 1,
+    runningJobCount: 0,
+    catchingUp: false,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: catching_up → waiting even when otherwise drained", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: true,
+  });
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained: jam sticky + --fail-on-stuck → stuck", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-finalize-non-fast-forward"],
+    failOnStuck: true,
+  });
+  expect(r.kind).toBe("stuck");
+});
+
+test("drained: recover* sticky + --fail-on-stuck → NOT stuck (met when at rest)", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-recover-conflict"],
+    failOnStuck: true,
+  });
+  expect(r.kind).toBe("met");
+});
+
+test("drained: jam sticky WITHOUT --fail-on-stuck → not escalated (met at rest)", () => {
+  const r = drainedState({
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatchCount: 0,
+    runningJobCount: 0,
+    catchingUp: false,
+    dispatchFailureReasons: ["worktree-merge-conflict: x"],
+    failOnStuck: false,
+  });
+  expect(r.kind).toBe("met");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 edge predicates: epic-added / epic-removed
+// ---------------------------------------------------------------------------
+
+test("epicAddedMet: baseline === current → false (never on first paint)", () => {
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a"])).toBe(false);
+});
+
+test("epicAddedMet: a new id appears → true; narrowed by target", () => {
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"])).toBe(true);
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"], "fn-2-b")).toBe(true);
+  // a different new id does not satisfy a specific target
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-3-c"], "fn-2-b")).toBe(false);
+  // bare-id target matches the full id
+  expect(epicAddedMet(["fn-1-a"], ["fn-1-a", "fn-2-b"], "fn-2")).toBe(true);
+});
+
+test("epicRemovedMet: present-then-absent → true; absent-at-baseline → false", () => {
+  expect(epicRemovedMet(["fn-1-a", "fn-2-b"], ["fn-1-a"], "fn-2-b")).toBe(true);
+  expect(epicRemovedMet(["fn-1-a", "fn-2-b"], ["fn-1-a"], "fn-2")).toBe(true);
+  // never saw it → can't observe removal
+  expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-9-z")).toBe(false);
+  // still present → waiting
+  expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-1-a")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1015 changed signature
+// ---------------------------------------------------------------------------
+
+test("verdictKey: stable per tag + reason", () => {
+  expect(verdictKey({ tag: "ready" })).toBe("ready");
+  expect(verdictKey({ tag: "completed" })).toBe("completed");
+  expect(verdictKey({ tag: "blocked", reason: { kind: "job-rejected" } })).toBe(
+    "blocked:job-rejected",
+  );
+});
+
+test("changedSignature: identical boards hash identically; a verdict move differs", () => {
+  const base = {
+    epics: [{ epic_id: "fn-1-a", status: "open" as string | null }],
+    perTask: new Map<string, Verdict>([["fn-1-a.1", READY]]),
+    perCloseRow: new Map<string, Verdict>(),
+    perEpic: new Map<string, Verdict>([["fn-1-a", READY]]),
+    autopilot: {
+      mode: "yolo",
+      paused: false,
+      worktreeMode: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+    },
+  };
+  const same = changedSignature(base);
+  expect(changedSignature(base)).toBe(same);
+  // map-iteration-order churn does not perturb the signature
+  const reordered = {
+    ...base,
+    perTask: new Map<string, Verdict>([["fn-1-a.1", READY]]),
+  };
+  expect(changedSignature(reordered)).toBe(same);
+  // a verdict change moves the hash
+  const moved = {
+    ...base,
+    perTask: new Map<string, Verdict>([["fn-1-a.1", DONE]]),
+  };
+  expect(changedSignature(moved)).not.toBe(same);
+  // an autopilot pause toggle moves the hash
+  const paused = { ...base, autopilot: { ...base.autopilot, paused: true } };
+  expect(changedSignature(paused)).not.toBe(same);
 });
