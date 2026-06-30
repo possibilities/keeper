@@ -856,6 +856,36 @@ CREATE TABLE IF NOT EXISTS epics (
 )
 `;
 
+/**
+ * `worktree_repo_status` projection table — the LIVE-ONLY operator surface for
+ * the per-epic worktree-eligibility verdict (fn-1013). One row per epic the
+ * autopilot reconciler marked `disabled` (a worktree-friendliness heuristic
+ * downgrade → sequential shared-checkout dispatch), folded from a synthetic
+ * `WorktreeRepoStatus` event the autopilot worker posts when the disabled set
+ * changes.
+ *
+ * LIVE-ONLY by construction (in {@link LIVE_ONLY_PROJECTIONS}): the verdict is
+ * fs-derived (a per-cycle filesystem probe), so it is DELIBERATELY excluded from
+ * the deterministic-replayed byte-identical re-fold charter and wiped by
+ * {@link rewindLiveProjection}; the reconciler re-emits it each cycle, so a wipe
+ * is repopulated by the live producer (no boot-seed / skip-floor of its own — the
+ * fold is a cheap full-set replace bounded by board size, never O(history)).
+ *
+ * `mode` is the dispatch shape (`serial` for a disabled repo); `reason` names the
+ * disabling signal (a `worktree-disabled:*` string). The row carries NO
+ * `dispatch_failures` involvement — `disabled` is a neutral, NON-error fallback.
+ */
+const CREATE_WORKTREE_REPO_STATUS = `
+CREATE TABLE IF NOT EXISTS worktree_repo_status (
+    epic_id TEXT PRIMARY KEY,
+    repo_dir TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'serial',
+    reason TEXT NOT NULL DEFAULT '',
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
 const CREATE_GIT_STATUS = `
 CREATE TABLE IF NOT EXISTS git_status (
     project_dir TEXT PRIMARY KEY,
@@ -1528,6 +1558,12 @@ export const LIVE_ONLY_PROJECTIONS = [
   // `rewindLiveProjection` loop's `DELETE FROM`) leaving the table empty is the
   // correct rewind — no floor to reset, no seed flag to raise.
   "tmux_client_focus",
+  // fn-1013 — the per-epic worktree-eligibility operator surface. The verdict is
+  // fs-derived (a per-cycle filesystem probe), so it must NOT be deterministic-
+  // replayed; the autopilot reconciler re-emits it each cycle, so the bare
+  // `rewindLiveProjection` wipe (no floor/seed of its own) is repopulated by the
+  // live producer — the same shape as `tmux_client_focus`.
+  "worktree_repo_status",
 ] as const;
 
 /**
@@ -2216,6 +2252,7 @@ function migrate(db: Database): void {
       db.run(CREATE_JOBS);
       db.run(CREATE_EPICS);
       db.run(CREATE_GIT_STATUS);
+      db.run(CREATE_WORKTREE_REPO_STATUS);
       db.run(CREATE_USAGE);
       db.run(CREATE_REDUCER_STATE);
       db.run(CREATE_GIT_PROJECTION_STATE);

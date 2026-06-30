@@ -3370,14 +3370,33 @@ snapshot-build (`classifyWorktreeRepos` + the nullable `memoizedNullableGitTople
 a fresh per-cycle memo) before the lane geometry compares + places lanes, so the
 gate and dispatch never re-derive from raw strings — a single-repo epic whose raw
 roots differ only by subdir/symlink/trailing-slash is NO LONGER falsely rejected.
-Two distinct sticky rejects survive: `worktree-multi-repo` (the tasks resolve to >1
+Two error-class sticky rejects survive: `worktree-multi-repo` (the tasks resolve to >1
 distinct toplevel — genuinely unsupported for v1) and `worktree-repo-unresolved` (a
 required root resolved null; re-resolves next cycle via the per-cycle memo). Those,
 plus toggling the mode while a STARTED open epic is in flight (`isEpicStarted`), are
 rejected loud in worktree mode (both reject kinds cleared by `retry_dispatch`); a
 drained / unstarted-open / zero-epic board toggles freely, so the operator's own
 interactive session no longer trips the guard (`keeper autopilot worktree on`
-has a `--force` escape hatch for the started-epic guard). `commit-work` pins every
+has a `--force` escape hatch for the started-epic guard).
+
+Separately from those error-class rejects, a `disabled` category is a NEUTRAL,
+non-error fallback (`src/worktree-eligibility.ts`): even with worktree mode ON, only
+a worktree-FRIENDLY repo gets parallel lanes — a git toplevel with >=1 root language
+manifest, NO workspace-orchestration marker (`pnpm-workspace`/`turbo`/`nx`/`lerna`/
+`rush`/`go.work`/`package.json "workspaces"`/Cargo `[workspace]`/`[tool.uv.workspace]`),
+and NO `.gitmodules`. Anything else (a monorepo, a no-manifest repo, a submodule
+repo, or any read/parse error — fail CLOSED) is `disabled`: its epics dispatch
+SEQUENTIALLY on the shared checkout, one task per root (the cap-1 lane mutex), with
+NO `dispatch_failures` row and NO sticky reject. The verdict is a fresh per-cycle,
+injectable, fail-closed filesystem probe (`memoizedAssessRepo`, mirroring
+`memoizedNullableGitToplevel`), so a transient probe error re-probes next cycle
+rather than permanently darkening a repo; an IN-FLIGHT worktree epic is
+GRANDFATHERED (`worktreeEpicGrandfathered`) so a mid-flight marker change or a
+transient probe error never flips it to `disabled` mid-epic. The disabled set
+surfaces to the operator via the LIVE-ONLY `worktree_repo_status` projection (fed by
+the reconciler exactly as `git_status` is, NEVER deterministic-replayed) and renders
+as a neutral `--- worktree ---` section on `keeper autopilot`, DISTINCT from the red
+failed / dispatch-failures block. `commit-work` pins every
 git op to the resolved worktree root (`git rev-parse --show-toplevel`, `cwd:` on
 every spawn) and strips `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`
 from each spawn's env, so a concurrent producer prune/add can never make a lane

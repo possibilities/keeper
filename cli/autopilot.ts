@@ -89,7 +89,10 @@ Subcommands:
            half-migrates an in-progress epic); a drained / unstarted-open /
            zero-epic board toggles freely. Pass --force to override. Turning it
            off also pins max_concurrent_per_root back to 1 (worktree-off workers
-           share the main checkout).
+           share the main checkout). Even with it ON, a not-worktree-friendly repo
+           (a workspace/monorepo marker, no language manifest, or submodules) falls
+           back to sequential shared-checkout dispatch — a NEUTRAL state shown in
+           the viewer's --- worktree --- section, never a failure.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3). verb is
            one of work|close|approve; approve clears a resurrected/phantom
@@ -227,6 +230,45 @@ export interface FailedRow {
   reason: string;
   dir: string;
   ts: string;
+}
+
+/**
+ * One row of the LIVE-ONLY `worktree_repo_status` collection (fn-1013) shipped to
+ * the viewer — a neutral worktree-disabled verdict, rendered DISTINCT from the
+ * red failed / dispatch-failures block.
+ */
+export interface WorktreeStatusRow {
+  epicId: string;
+  dir: string;
+  mode: string;
+  reason: string;
+}
+
+/**
+ * Project `worktree_repo_status` wire rows to typed {@link WorktreeStatusRow}s,
+ * sorted by `epic_id` ASC for a stable render. Each row is a worktree-disabled
+ * epic (serial shared-checkout dispatch); the `repo_dir` renders as its basename.
+ * Pure transform — exported for tests.
+ */
+export function projectWorktreeStatusRows(
+  rows: Record<string, unknown>[],
+): WorktreeStatusRow[] {
+  const out: WorktreeStatusRow[] = [];
+  for (const r of rows) {
+    const epicId = seg(r.epic_id);
+    if (epicId === "") {
+      continue;
+    }
+    const dir = seg(r.repo_dir);
+    out.push({
+      epicId,
+      dir: dir === "" ? "" : basename(dir),
+      mode: seg(r.mode) || "serial",
+      reason: seg(r.reason),
+    });
+  }
+  out.sort((a, b) => a.epicId.localeCompare(b.epicId));
+  return out;
 }
 
 /**
@@ -413,6 +455,10 @@ export interface RenderInput {
    * empty/absent array renders nothing — the "nothing armed" callout lives on
    * the banner, not the body. */
   armed?: string[];
+  /** The worktree-disabled epics (fn-1013) listed by the neutral
+   * `--- worktree ---` section. An empty/absent array renders nothing — distinct
+   * from the red `--- failed ---` block. */
+  worktree?: WorktreeStatusRow[];
 }
 
 /**
@@ -468,6 +514,18 @@ export function renderBody(input: RenderInput): string[] {
     out.push("--- armed ---");
     for (const epicId of armed) {
       out.push(epicId);
+    }
+  }
+
+  // Worktree-disabled epics (fn-1013) — a NEUTRAL section: these dispatch
+  // sequentially on the shared checkout (a not-worktree-friendly repo), NOT an
+  // error. DISTINCT from `--- failed ---`. Empty set renders nothing.
+  const worktree = input.worktree ?? [];
+  if (worktree.length > 0) {
+    out.push("--- worktree ---");
+    for (const r of worktree) {
+      const dirSeg = r.dir === "" ? "" : `(${r.dir}) `;
+      out.push(`${dirSeg}${r.epicId} — ${r.mode} (${r.reason})`);
     }
   }
 
@@ -595,6 +653,9 @@ interface ViewerState {
   // The explicitly-armed epic ids, sourced from the `armed_epics` presence
   // table.
   armedEpics: string[];
+  // The worktree-disabled epics (fn-1013), sourced from the LIVE-ONLY
+  // `worktree_repo_status` collection — the neutral `--- worktree ---` section.
+  worktreeStatus: WorktreeStatusRow[];
 }
 
 /**
@@ -661,18 +722,21 @@ async function runViewer(
     worktreeMode: false,
     // Seed empty until the `armed_epics` subscribe edge lands.
     armedEpics: [],
+    // Seed empty until the `worktree_repo_status` subscribe edge lands (or stays
+    // empty when no epic is worktree-disabled).
+    worktreeStatus: [],
   };
 
   const view = createViewShell<ViewerState>({
     script: "autopilot",
     title: "autopilot",
-    // Snapshot: autopilot folds FOUR streams — readiness, dispatch_failures,
-    // autopilot_state (paused/mode/cap), and armed_epics. The latch holds the
-    // snapshot until ALL FOUR report (readiness auto-reports via `view.emit`,
-    // the other three via `reportSnapshotStream` below) so the captured frame
-    // reflects the FOLDED state rather than the seed values.
+    // Snapshot: autopilot folds FIVE streams — readiness, dispatch_failures,
+    // autopilot_state (paused/mode/cap), armed_epics, and worktree_repo_status.
+    // The latch holds the snapshot until ALL FIVE report (readiness auto-reports
+    // via `view.emit`, the other four via `reportSnapshotStream` below) so the
+    // captured frame reflects the FOLDED state rather than the seed values.
     mode: mode === "snapshot" ? "snapshot" : "live",
-    streamCount: 4,
+    streamCount: 5,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     persistentBannerPill: () =>
       autopilotBannerLabel({
@@ -695,6 +759,7 @@ async function runViewer(
           failed: snap.failed,
           paused: snap.paused,
           armed: snap.armedEpics,
+          worktree: snap.worktreeStatus,
         }),
         stateJson: {
           paused: snap.paused,
@@ -704,6 +769,7 @@ async function runViewer(
           current,
           dependencies,
           failed: snap.failed,
+          worktree: snap.worktreeStatus,
         },
       };
     },
@@ -738,6 +804,7 @@ async function runViewer(
   let failuresStreamReported = false;
   let pausedStreamReported = false;
   let armedStreamReported = false;
+  let worktreeStreamReported = false;
 
   const readinessHandle = subscribeReadiness({
     sockPath,
@@ -819,14 +886,33 @@ async function runViewer(
     onLifecycle: view.emitLifecycle,
   });
 
-  // Dispose ALL FOUR subscription handles before exit — disposing only the
-  // primary leaks the other three sockets. The same fan-out feeds both the
+  // Subscribe the LIVE-ONLY `worktree_repo_status` collection (fn-1013) so the
+  // neutral `--- worktree ---` section reflects the live worktree-disabled set. An
+  // empty / pre-first-cycle collection leaves `worktreeStatus` empty (no section).
+  const worktreeHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "autopilot",
+    collection: "worktree_repo_status",
+    onRows: (rows) => {
+      state.worktreeStatus = projectWorktreeStatusRows(rows);
+      if (!worktreeStreamReported) {
+        worktreeStreamReported = true;
+        view.reportSnapshotStream();
+      }
+      view.emit(state);
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
+  // Dispose ALL FIVE subscription handles before exit — disposing only the
+  // primary leaks the other four sockets. The same fan-out feeds both the
   // live SIGINT teardown and the snapshot exit path.
   const disposeAll = (): void => {
     readinessHandle.dispose();
     failuresHandle.dispose();
     pausedHandle.dispose();
     armedHandle.dispose();
+    worktreeHandle.dispose();
   };
 
   if (mode === "snapshot") {

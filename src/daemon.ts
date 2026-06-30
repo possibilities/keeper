@@ -30,6 +30,7 @@ import type {
   DispatchedMessage,
   DispatchFailedMessage,
   Verb,
+  WorktreeRepoStatusMessage,
 } from "./autopilot-worker";
 import {
   backfillMutationPath,
@@ -4360,6 +4361,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | DispatchClearedMessage
         | DispatchedMessage
         | DispatchExpiredMessage
+        | WorktreeRepoStatusMessage
         | BackstopMessage
         | undefined
       >,
@@ -4374,6 +4376,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       if (msg.kind === "dispatch-failed") {
         handleDispatchFailedMint(msg.payload);
+      } else if (msg.kind === "worktree-repo-status") {
+        handleWorktreeRepoStatusMint(msg.entries);
       } else if (msg.kind === "dispatch-cleared") {
         handleDispatchClearedMint(msg.payload);
       } else if (msg.kind === "dispatched-request") {
@@ -4658,6 +4662,64 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // an extra retry round-trip, not a correctness hazard).
       console.error(
         `[keeperd] DispatchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint a synthetic `WorktreeRepoStatus` event (fn-1013) carrying the FULL
+   * current worktree-disabled set, folded into the LIVE-ONLY
+   * `worktree_repo_status` operator projection. Workers never write the DB; the
+   * worker dedupes (posts only when the set changes), so this fires at most once
+   * per set-change. The disabled set rides `data` as `{ entries }`; the fold does
+   * a full-set replace. NON-FATAL on insert failure — the next set-change re-emits
+   * (a missed emit just leaves a stale operator view for one cycle, never a
+   * correctness hazard). Mirrors {@link handleDispatchFailedMint}.
+   */
+  function handleWorktreeRepoStatusMint(
+    entries: WorktreeRepoStatusMessage["entries"],
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: "reconciler",
+        $pid: null,
+        $hook_event: "WorktreeRepoStatus",
+        $event_type: "worktree_repo_status",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ entries }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] WorktreeRepoStatus mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

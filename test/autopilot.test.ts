@@ -42,6 +42,7 @@ import {
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
   projectWorktreeMode,
+  projectWorktreeStatusRows,
   renderBody,
   renderDependencyGraph,
 } from "../cli/autopilot";
@@ -337,8 +338,63 @@ test("projectFailedRows — empty wire array yields empty output", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderBody — four sections, each only emitted when non-empty, in priority
-// order: current → stopped → failed → dependencies.
+// projectWorktreeStatusRows — typed projection of the worktree_repo_status
+// (fn-1013) wire rows (the neutral worktree-disabled operator surface).
+// ---------------------------------------------------------------------------
+
+test("projectWorktreeStatusRows — projects + sorts wire rows, basenaming repo_dir", () => {
+  const wire = [
+    {
+      epic_id: "fn-3-cargo",
+      repo_dir: "/code/zellijsub",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:cargo-workspace",
+      last_event_id: 9,
+      updated_at: 2,
+    },
+    {
+      epic_id: "fn-2-mono",
+      repo_dir: "/code/arthack",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:pnpm-workspace",
+      last_event_id: 8,
+      updated_at: 1,
+    },
+  ];
+  // Sorted by epic_id ASC; repo_dir → basename.
+  expect(projectWorktreeStatusRows(wire)).toEqual([
+    {
+      epicId: "fn-2-mono",
+      dir: "arthack",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:pnpm-workspace",
+    },
+    {
+      epicId: "fn-3-cargo",
+      dir: "zellijsub",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:cargo-workspace",
+    },
+  ]);
+});
+
+test("projectWorktreeStatusRows — a row missing epic_id is dropped; empty dir stays empty; mode defaults to serial", () => {
+  const wire = [
+    { repo_dir: "/r", reason: "no-pk" },
+    { epic_id: "fn-9-x", repo_dir: "", reason: "no-manifest" },
+  ];
+  expect(projectWorktreeStatusRows(wire)).toEqual([
+    { epicId: "fn-9-x", dir: "", mode: "serial", reason: "no-manifest" },
+  ]);
+});
+
+test("projectWorktreeStatusRows — empty wire array yields empty output", () => {
+  expect(projectWorktreeStatusRows([])).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// renderBody — five sections, each only emitted when non-empty, in priority
+// order: current → stopped → failed → armed → worktree → dependencies.
 // ---------------------------------------------------------------------------
 
 test("renderBody — empty input renders no lines", () => {
@@ -508,6 +564,68 @@ test("renderBody — armed section sits between failed and dependencies (fn-751)
     "(/repo) work::fn-1-foo.3 — confirm timeout",
     "--- armed ---",
     "fn-7-armed",
+    "--- dependencies ---",
+    "legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)",
+    "fn-1-foo",
+    "  ▸ .1",
+  ]);
+});
+
+test("renderBody — worktree section lists disabled epics as a neutral mode (reason) line (fn-1013)", () => {
+  const lines = renderBody({
+    current: [],
+    failed: [],
+    paused: false,
+    worktree: [
+      {
+        epicId: "fn-2-mono",
+        dir: "arthack",
+        mode: "serial",
+        reason: "worktree-disabled:workspace-marker:pnpm-workspace",
+      },
+      { epicId: "fn-9-bare", dir: "", mode: "serial", reason: "no-manifest" },
+    ],
+  });
+  expect(lines).toEqual([
+    "--- worktree ---",
+    "(arthack) fn-2-mono — serial (worktree-disabled:workspace-marker:pnpm-workspace)",
+    "fn-9-bare — serial (no-manifest)",
+  ]);
+});
+
+test("renderBody — empty/absent worktree set renders no worktree section (fn-1013)", () => {
+  expect(
+    renderBody({ current: [], failed: [], paused: false, worktree: [] }),
+  ).toEqual([]);
+  expect(renderBody({ current: [], failed: [], paused: false })).toEqual([]);
+});
+
+test("renderBody — worktree section sits between armed and dependencies, distinct from failed (fn-1013)", () => {
+  const lines = renderBody({
+    current: [],
+    failed: [
+      {
+        verb: "close",
+        id: "fn-1-foo",
+        reason: "worktree-multi-repo",
+        dir: "/repo",
+        ts: "2026-05-31T12:00:00Z",
+      },
+    ],
+    armed: ["fn-7-armed"],
+    worktree: [
+      { epicId: "fn-2-mono", dir: "arthack", mode: "serial", reason: "r" },
+    ],
+    dependencies: ["fn-1-foo", "  ▸ .1"],
+    paused: false,
+  });
+  expect(lines).toEqual([
+    "--- failed ---",
+    "(/repo) close::fn-1-foo — worktree-multi-repo",
+    "--- armed ---",
+    "fn-7-armed",
+    "--- worktree ---",
+    "(arthack) fn-2-mono — serial (r)",
     "--- dependencies ---",
     "legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)",
     "fn-1-foo",

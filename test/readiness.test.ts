@@ -2211,6 +2211,78 @@ test("fn-959 distinct sibling lanes both cap-1 at N=5 (parallel, not stacked)", 
   expect(snap.perTask.get("R2")).toEqual({ tag: "ready" });
 });
 
+// ---------------------------------------------------------------------------
+// fn-1013 — worktree-DISABLED repos. The producer keys EVERY task id + the epic
+// id to the BARE resolved toplevel (one shared key, NOT per-lane paths), so an
+// all-disabled cycle serializes one worker per repo on the shared checkout. This
+// is THE load-bearing safety invariant: an empty laneKeyById would fall through
+// to the N>1 round-robin and run multiple workers in ONE shared checkout.
+// ---------------------------------------------------------------------------
+
+test("fn-1013 all-disabled cycle: two ready tasks keyed on the BARE toplevel → cap-1 per repo even at max_concurrent_per_root=5", () => {
+  // The disabled-repo geometry: both tasks (and the epic/close id) map to the
+  // SAME bare toplevel. At N=5 the lane-keyed cap-1 mutex MUST keep only ONE
+  // ready — never the N>1 round-robin (two workers in one shared checkout).
+  const t1 = makeTask({ task_id: "fn-1-foo.1", task_number: 1 });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1, t2],
+  });
+  const laneKeyById = new Map<string, string>([
+    ["fn-1-foo.1", "/repo"],
+    ["fn-1-foo.2", "/repo"],
+    ["fn-1-foo", "/repo"], // the close row keys on the toplevel too
+  ]);
+  const snap = runWithLanes([epic], 5, laneKeyById);
+  const ready = ["fn-1-foo.1", "fn-1-foo.2"].filter(
+    (id) => snap.perTask.get(id)?.tag === "ready",
+  );
+  expect(ready.length).toBe(1);
+});
+
+test("fn-1013 all-disabled cycle: two DIFFERING raw roots resolving to ONE toplevel collapse to a single cap-1 key (never parallelized)", () => {
+  // Two tasks with DISTINCT raw effective roots that the disabled geometry keys
+  // to the same toplevel. Without lane keys the differing raw roots are distinct
+  // effectiveRoots → at N=5 the round-robin would let BOTH dispatch (the
+  // corruption path). The bare-toplevel lane key collapses them to ONE cap-1 key.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    target_repo: "/repo/a",
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    target_repo: "/repo/b",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks: [t1, t2],
+  });
+  // Sanity: WITHOUT lane keys, the differing raw roots parallelize at N=5.
+  const off = runWithN([epic], 5);
+  const offReady = ["fn-1-foo.1", "fn-1-foo.2"].filter(
+    (id) => off.perTask.get(id)?.tag === "ready",
+  );
+  expect(offReady.length).toBe(2);
+  // With the bare-toplevel lane key, the two raw roots collapse to ONE cap-1 key.
+  const laneKeyById = new Map<string, string>([
+    ["fn-1-foo.1", "/repo"],
+    ["fn-1-foo.2", "/repo"],
+    ["fn-1-foo", "/repo"],
+  ]);
+  const snap = runWithLanes([epic], 5, laneKeyById);
+  const ready = ["fn-1-foo.1", "fn-1-foo.2"].filter(
+    (id) => snap.perTask.get(id)?.tag === "ready",
+  );
+  expect(ready.length).toBe(1);
+});
+
 test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {
   // updated_at=1000, now=1700 → age=700 > MONITOR_STALENESS_SEC(600), and
   // 700 < MONITOR_RELEASE_SEC(1800). Surfaces `monitor-stale` for human

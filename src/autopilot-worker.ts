@@ -77,6 +77,7 @@ import {
 } from "./exec-backend";
 import { unseededGatedRoots } from "./gated-roots";
 import {
+  localBranchExists,
   memoizedGitToplevel,
   memoizedNullableGitToplevel,
 } from "./git-toplevel";
@@ -92,9 +93,15 @@ import {
   projectGitStatusByProjectDir,
   projectPendingDispatches,
 } from "./readiness-client";
+import type { WorktreeRepoStatusEntry } from "./reducer";
 import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
+import {
+  ELIGIBLE_REASON,
+  memoizedAssessRepo,
+  type WorktreeEligibility,
+} from "./worktree-eligibility";
 import {
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
@@ -117,11 +124,13 @@ import {
   type WorktreeEntry,
 } from "./worktree-git";
 import {
+  baseBranchFor,
   CLOSE_SINK_ID,
   deriveWorktreePlan,
   type WorktreeAssignment,
   WorktreeCycleError,
   type WorktreePlan,
+  worktreePathFor,
 } from "./worktree-plan";
 
 /**
@@ -651,9 +660,18 @@ export interface ReconcileSnapshot {
  *    `finalizeEpic` deadlocks). Rejected with a sticky `worktree-no-primary-repo`
  *    — operator-required (OUTSIDE the `worktree-recover` auto-clear prefix; a
  *    missing primary_repo is an epic-def fix, not a transient).
+ *  - `disabled` — a would-be-`ok` epic whose RESOLVED toplevel is not
+ *    worktree-friendly (a workspace-orchestration marker, a submodule repo, no
+ *    root language manifest, or a probe error — see `worktree-eligibility.ts`).
+ *    A NORMAL, NON-error fallback: the epic dispatches SEQUENTIALLY on the shared
+ *    checkout (one task per root, cap-1) — NEVER a sticky `DispatchFailed`. Carries
+ *    the resolved `repoDir` (like `ok`) so the geometry can key every lane on the
+ *    bare toplevel. Only ever downgrades a would-be-`ok` epic (after the
+ *    multi-repo / unresolved / no-primary-repo rejects).
  */
 export type WorktreeRepoResolution =
   | { kind: "ok"; repoDir: string }
+  | { kind: "disabled"; repoDir: string; reason: string }
   | { kind: "multi-repo"; reason: string }
   | { kind: "unresolved"; reason: string }
   | { kind: "no-primary-repo"; reason: string };
@@ -895,6 +913,16 @@ export interface ConfirmRunningDeps {
    * underlying git is resolved, so no operator `retry_dispatch` is needed.
    */
   emitDispatchCleared(payload: DispatchClearedPayload): void;
+  /**
+   * Emit the FULL current worktree-disabled set to main (fn-1013) for the
+   * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
+   * the synthetic `WorktreeRepoStatus` event. Called once per cycle with the
+   * complete set; the impl dedupes by a stable serialization so a stable board
+   * mints no event (mirrors `git_status`'s semantic-dedupe emit). OPTIONAL — a
+   * no-op when absent (a fake-deps test never needs the operator surface), so the
+   * dispatch path is byte-identical without it.
+   */
+  emitWorktreeRepoStatus?(entries: WorktreeRepoStatusEntry[]): void;
   /**
    * Emit a synthetic `Dispatched` event (via main — workers never write the DB)
    * AND AWAIT a durable ack. Outbox-ordered intent: the reconciler mints this
@@ -1740,17 +1768,67 @@ export function reconcile(
  * an epic with no tasks falls back to its own `project_dir`). An empty root, or a
  * root the resolver maps to `null`, makes the epic `unresolved` (every required
  * root must resolve). Otherwise the distinct resolved toplevels decide: >1 →
- * `multi-repo`; exactly 1 → `ok` with that toplevel as the lane base. The resolver
- * MAY shell git, so this is NEVER called from a fold.
+ * `multi-repo`; exactly 1 → a single base toplevel, which the second injected
+ * probe {@link assessRepo} either keeps `ok` or downgrades to `disabled` (a
+ * not-worktree-friendly repo dispatches sequentially on the shared checkout — a
+ * non-error fallback, never a sticky reject). `assessRepo` defaults to
+ * always-eligible so a caller that passes only `resolve` is byte-identical to the
+ * pre-heuristic behavior. The resolver / probe MAY touch git/fs, so this is NEVER
+ * called from a fold.
+ *
+ * `isGrandfathered` is a SEPARATE per-epic input (`assessRepo` is memoized by
+ * toplevel and never sees the epic id, so grandfather CANNOT live inside it):
+ * an epic that ALREADY has a live worktree lane stays `ok` even when its toplevel
+ * assesses `disabled` — so a mid-flight marker change OR (the likelier trigger) a
+ * TRANSIENT probe error does NOT strand its `~/worktrees` lanes or lose the
+ * merge-to-default finalize. Producer-only (fs/git); defaults to never-grandfather
+ * so a pre-grandfather caller is byte-identical.
  */
 export function classifyWorktreeRepos(
   epics: readonly Epic[],
   resolve: (root: string) => string | null,
+  assessRepo: (toplevel: string) => WorktreeEligibility = () => ({
+    eligible: true,
+    reason: ELIGIBLE_REASON,
+  }),
+  isGrandfathered: (epicId: string, repoDir: string) => boolean = () => false,
 ): Map<string, WorktreeRepoResolution> {
   const out = new Map<string, WorktreeRepoResolution>();
   for (const epic of epics) {
-    out.set(epic.epic_id, classifyEpicRepo(epic, resolve));
+    out.set(
+      epic.epic_id,
+      classifyEpicRepo(epic, resolve, assessRepo, isGrandfathered),
+    );
   }
+  return out;
+}
+
+/**
+ * PURE projection of the per-cycle {@link WorktreeRepoResolution} map to the
+ * operator-surface entry set (fn-1013) — one entry per epic the heuristic marked
+ * `disabled` (a not-worktree-friendly repo → serial shared-checkout dispatch).
+ * Only `disabled` resolutions surface: `ok` epics get worktree lanes (the normal
+ * path), and the `multi-repo` / `unresolved` / `no-primary-repo` rejects already
+ * show in the red `dispatch_failures` block — the neutral worktree surface is
+ * DISTINCT from that. Sorted by `epic_id` for a stable serialization so the
+ * change-gate (semantic dedupe) never fires on map-iteration-order churn.
+ * Exported for tests.
+ */
+export function buildWorktreeStatusEntries(
+  byEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+): WorktreeRepoStatusEntry[] {
+  const out: WorktreeRepoStatusEntry[] = [];
+  for (const [epicId, resolution] of byEpicId) {
+    if (resolution.kind === "disabled") {
+      out.push({
+        epic_id: epicId,
+        repo_dir: resolution.repoDir,
+        mode: "serial",
+        reason: resolution.reason,
+      });
+    }
+  }
+  out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
   return out;
 }
 
@@ -1758,6 +1836,8 @@ export function classifyWorktreeRepos(
 function classifyEpicRepo(
   epic: Epic,
   resolve: (root: string) => string | null,
+  assessRepo: (toplevel: string) => WorktreeEligibility,
+  isGrandfathered: (epicId: string, repoDir: string) => boolean,
 ): WorktreeRepoResolution {
   const projectDir = epic.project_dir ?? "";
   // The required RAW roots: each task's effective root (`target_repo` when set,
@@ -1820,13 +1900,59 @@ function classifyEpicRepo(
       reason: `worktree-no-primary-repo: epic ${epic.epic_id} has no primary_repo — refusing to provision a lane (plan state would degrade to the lane checkout; set epic.primary_repo and retry)`,
     };
   }
+  // A would-be-`ok` epic resolving to ONE primary-backed toplevel: the LAST gate
+  // is repo eligibility. A not-worktree-friendly toplevel (workspace marker /
+  // submodule / no manifest / probe error) downgrades to `disabled` — a NORMAL,
+  // NON-error sequential-on-shared-checkout fallback, never a sticky reject. Only
+  // ever downgrades `ok`; the loud rejects above already returned.
+  const eligibility = assessRepo(repoDir);
+  if (!eligibility.eligible) {
+    // GRANDFATHER: an epic that ALREADY has live worktree lanes keeps `ok` even on
+    // a `disabled` verdict — flipping it mid-flight would strand work on its
+    // `~/worktrees` lanes while new tasks dispatch on the shared checkout AND lose
+    // the merge-to-default finalize (`attachWorktreeGeometry` builds
+    // `worktreeFinalize` only for `ok`). The likelier flip is a TRANSIENT probe
+    // error (fail-closed) on a healthy in-flight epic, not a marker appearing
+    // mid-epic. The predicate is producer-side fs/git (base worktree dir OR
+    // `keeper/epic/<id>` branch exists) — never read here in the pure layer.
+    if (isGrandfathered(epic.epic_id, repoDir)) {
+      return { kind: "ok", repoDir };
+    }
+    return { kind: "disabled", repoDir, reason: eligibility.reason };
+  }
   return { kind: "ok", repoDir };
+}
+
+/**
+ * PRODUCER: the per-epic grandfather predicate threaded into
+ * {@link classifyWorktreeRepos} — true IFF epic `epicId` ALREADY has a live
+ * worktree lane on `repoDir`, so a `disabled` verdict must NOT flip it (see the
+ * grandfather note in {@link classifyEpicRepo}). Two robust signals OR'd, so the
+ * costly false NEGATIVE (an in-flight epic missed → split-brain / lost work) needs
+ * BOTH to miss:
+ *  - the deterministic base worktree dir exists (`existsSync` — pure fs), or
+ *  - the `keeper/epic/<id>` base branch exists (a fail-closed `git` ref peek;
+ *    only spawned when the cheap dir check misses).
+ * Both mirror the recover scan's notion of a live lane. A stale leftover dir/branch
+ * is a BOUNDED false POSITIVE — it keeps ONE now-disabled epic on worktree mode
+ * until the recover sweep reaps its dead lane; acceptable. Producer-only (fs+git),
+ * NEVER read inside the pure classify layer or a fold.
+ */
+function worktreeEpicGrandfathered(epicId: string, repoDir: string): boolean {
+  const baseBranch = baseBranchFor(epicId);
+  return (
+    existsSync(worktreePathFor(repoDir, baseBranch)) ||
+    localBranchExists(repoDir, baseBranch)
+  );
 }
 
 /**
  * The per-epic worktree geometry {@link prepareWorktreeGeometry} resolves
  * to, consumed by the dispatch-side {@link attachWorktreeGeometry}:
  *  - `ok` — the derived plan + the RESOLVED repo dir (the lane base).
+ *  - `disabled` — a not-worktree-friendly repo: dispatch sequentially on the shared
+ *    checkout (one task per `repoDir`, cap-1), provisioning NO lane and minting NO
+ *    sticky. A NORMAL, NON-error fallback — distinct from `reject`.
  *  - `reject` — a loud multi-repo / unresolved epic; the `reason` is minted as a
  *    sticky `DispatchFailed`. No lane was provisioned, so the epic never finalizes.
  *  - `cycle` — a cyclic `depends_on` DAG; the gate already skipped lane-keying, and
@@ -1834,6 +1960,7 @@ function classifyEpicRepo(
  */
 type EpicWorktreeGeometry =
   | { kind: "ok"; plan: WorktreePlan; repoDir: string }
+  | { kind: "disabled"; reason: string; repoDir: string }
   | { kind: "reject"; reason: string }
   | { kind: "cycle"; error: WorktreeCycleError };
 
@@ -1853,6 +1980,11 @@ interface PreparedWorktreeGeometry {
  * {@link WorktreeRepoResolution} classification:
  *  - `ok` → derive the deterministic {@link WorktreePlan} off the RESOLVED toplevel;
  *    emit lane keys (task → its lane path, epic id → the base lane) + an `ok` geometry.
+ *  - `disabled` → key EVERY task id AND the epic id (close row) to the bare RESOLVED
+ *    `repoDir` (NOT a per-lane path) + a `disabled` geometry. The shared toplevel key
+ *    is what forces the allocator's cap-1 mutex so an all-`disabled` cycle serializes
+ *    one worker per repo on the shared checkout. NEVER the `reject` branch (mints no
+ *    sticky); the dispatch pass no-ops, so launches run worktree-less on the toplevel.
  *  - `multi-repo` / `unresolved` → a `reject` geometry carrying the sticky reason
  *    and NO lane keys (the gate keys those rows on `effectiveRoot`; the dispatch
  *    pass stamps the reject).
@@ -1873,6 +2005,25 @@ export function prepareWorktreeGeometry(
   const byEpicId = new Map<string, EpicWorktreeGeometry>();
   for (const epic of epics) {
     const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution !== undefined && resolution.kind === "disabled") {
+      // A worktree-DISABLED repo: dispatch SEQUENTIALLY on the shared checkout,
+      // never a lane. Key EVERY task id AND the epic id (close row) to the bare
+      // resolved toplevel (NOT a per-lane path) so the allocator's lane-keyed cap-1
+      // mutex serializes one worker per repo — the load-bearing safety invariant
+      // (a non-empty `laneKeyById` is what forces cap-1 even under
+      // `max_concurrent_per_root>1`). Record the `disabled` geometry, NOT a reject.
+      const repoDir = resolution.repoDir;
+      byEpicId.set(epic.epic_id, {
+        kind: "disabled",
+        reason: resolution.reason,
+        repoDir,
+      });
+      laneKeyById.set(epic.epic_id, repoDir);
+      for (const t of epic.tasks) {
+        laneKeyById.set(t.task_id, repoDir);
+      }
+      continue;
+    }
     if (resolution === undefined || resolution.kind !== "ok") {
       // Unclassified (a producer bug — every epic IS classified when worktree mode
       // is ON) or a loud reject: stamp a `reject` geometry, NO lane keys. Never fall
@@ -1914,6 +2065,11 @@ export function prepareWorktreeGeometry(
  * launches, consuming the SAME {@link prepareWorktreeGeometry} `byEpicId` the gate
  * keyed off (so dispatch never re-derives from raw `target_repo`/`project_dir`).
  * For each epic with launches or a pending finalize (when worktree mode is ON):
+ *  - `disabled` → NO-OP: leave every launch worktree-less (no `worktree`, no
+ *    `worktreeReject`) and collect no finalize. `plan.worktree === undefined` routes
+ *    the producer through `assertOnDefaultBranch` on the shared checkout — byte-
+ *    identical to worktree-mode-OFF. The gate already serialized these launches via
+ *    the shared-toplevel lane key. NEVER a sticky reject.
  *  - `reject` (multi-repo / unresolved) → stamp `worktreeReject` on every launch so
  *    the producer mints the sticky `worktree-multi-repo` / `worktree-repo-unresolved`
  *    DispatchFailed and runs no git. No lane was provisioned, so no finalize.
@@ -1979,6 +2135,14 @@ function attachWorktreeGeometry(
     if (geom.kind === "cycle") {
       // A cyclic DAG — re-throw to `driveCycle`'s backstop; no launch is emitted.
       throw geom.error;
+    }
+    if (geom.kind === "disabled") {
+      // A worktree-DISABLED epic: dispatch on the SHARED checkout, exactly like
+      // worktree-mode-OFF. NO `worktree` geometry (so runWorktreeProducerStep takes
+      // the `assertOnDefaultBranch` branch, unmodified cwd), NO `worktreeReject`
+      // (mints no sticky), NO finalize (no lane was ever provisioned). The gate
+      // already serialized these launches via the shared-toplevel lane key.
+      continue;
     }
 
     const { plan, repoDir } = geom;
@@ -3708,6 +3872,19 @@ export interface DispatchExpiredMessage {
   payload: DispatchExpiredPayload;
 }
 
+/**
+ * Worker → main: WorktreeRepoStatus mint request (fn-1013). Main is the sole
+ * writer of the synthetic event; the worker describes the FULL current disabled
+ * set (one entry per epic whose repo the eligibility heuristic downgraded to
+ * `disabled` → serial shared-checkout dispatch). Posted only when the set CHANGES
+ * (the worker dedupes by a stable serialization), mirroring `git_status`'s
+ * semantic-dedupe emit so a stable board never floods the event log.
+ */
+export interface WorktreeRepoStatusMessage {
+  kind: "worktree-repo-status";
+  entries: WorktreeRepoStatusEntry[];
+}
+
 type IncomingMessage =
   | SetPausedMessage
   | ShutdownMessage
@@ -3939,10 +4116,22 @@ export async function loadReconcileSnapshot(
   // rather than permanently darkening an epic. The pure `reconcile` layer then
   // compares + places lanes by the RESOLVED toplevel and never shells git.
   // ONE resolver (shared memo) for BOTH the per-epic classification and the
-  // known-roots resolution below, so a root resolved once is never re-spawned.
+  // known-roots resolution below, so a root resolved once is never re-spawned. A
+  // SECOND per-cycle memo {@link memoizedAssessRepo} probes each RESOLVED toplevel's
+  // worktree-eligibility (fail-closed fs/path peek), so a not-worktree-friendly repo
+  // downgrades `ok` → `disabled` (sequential shared-checkout dispatch). Both memos
+  // are FRESH per cycle (GC'd at cycle end), so a transient probe failure re-probes
+  // next cycle rather than permanently darkening a repo. Gated on `worktreeMode`, so
+  // an OFF cycle adds ZERO probes.
   const toplevelResolver = memoizedNullableGitToplevel();
+  const assessResolver = memoizedAssessRepo();
   const worktreeRepoByEpicId = worktreeMode
-    ? classifyWorktreeRepos(epics, toplevelResolver)
+    ? classifyWorktreeRepos(
+        epics,
+        toplevelResolver,
+        assessResolver,
+        worktreeEpicGrandfathered,
+      )
     : new Map<string, WorktreeRepoResolution>();
   // The recover sweep's KNOWN-ROOTS set — every git-tracked project dir
   // (from the git-status projection) RESOLVED to its toplevel, so a repo carrying
@@ -4061,6 +4250,11 @@ function main(): void {
     number,
     { resolve: (ack: DispatchedAck) => void; reject: (err: Error) => void }
   >();
+  // fn-1013 change-gate for the LIVE-ONLY worktree-disabled operator surface:
+  // the serialized last-emitted disabled set. `null` re-emits once on the first
+  // post-(re)boot cycle; thereafter a stable set mints no `WorktreeRepoStatus`
+  // event. In-worker memory only — persists across cycles in this closure.
+  let lastWorktreeStatusKey: string | null = null;
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -4204,6 +4398,22 @@ function main(): void {
         payload,
       } satisfies DispatchClearedMessage);
     },
+    // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
+    // changes, so a stable board mints zero `WorktreeRepoStatus` events. The
+    // serialized key is the change-gate; `null` seed re-emits once on the first
+    // cycle after each (re)boot. In-worker memory only — `lastWorktreeStatusKey`
+    // persists across cycles in this `main()` closure.
+    emitWorktreeRepoStatus: (entries) => {
+      const key = JSON.stringify(entries);
+      if (key === lastWorktreeStatusKey) {
+        return;
+      }
+      lastWorktreeStatusKey = key;
+      parentPort?.postMessage({
+        kind: "worktree-repo-status",
+        entries,
+      } satisfies WorktreeRepoStatusMessage);
+    },
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
         // Post an id-correlated request and AWAIT main's durable insert ack.
@@ -4304,6 +4514,22 @@ function main(): void {
         const snapshot = await loadReconcileSnapshot(db, () =>
           paneOps.listPanes(),
         );
+        // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
+        // operator projection. Once per cycle, regardless of paused/playing (the
+        // verdict is observational, not a dispatch action); the dep dedupes so a
+        // stable set mints no event, and an empty set (worktree mode OFF, or no
+        // disabled epics) clears the table. Wrapped — a post failure must not wedge
+        // the wake loop.
+        try {
+          deps.emitWorktreeRepoStatus?.(
+            buildWorktreeStatusEntries(snapshot.worktreeRepoByEpicId),
+          );
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] worktree-status emit threw (non-fatal):",
+            err,
+          );
+        }
         // Prune expired cooldown entries each cycle, BEFORE `reconcile` reads the
         // Map so a just-expired key is re-dispatchable this cycle. Wrapped
         // (no-self-heal: a sweep throw must not crash the worker).

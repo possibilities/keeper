@@ -106,3 +106,39 @@ export function memoizedNullableGitToplevel(): (root: string) => string | null {
     return resolved;
   };
 }
+
+/**
+ * True IFF local branch `branch` exists in the repo at `repoDir`
+ * (`git rev-parse --verify --quiet refs/heads/<branch>`). The SYNCHRONOUS producer
+ * peek mirrored on {@link resolveGitToplevel}: env-stripped (an inherited `GIT_DIR`
+ * would resolve the ref against the pointed-at worktree, not `repoDir`),
+ * `--no-optional-locks` (a pure observer), time-bound + fail-CLOSED (`false` on
+ * empty input / timeout / error / non-repo). Used by the worktree grandfather
+ * predicate as the branch-side OR signal; NEVER call from a fold.
+ */
+export function localBranchExists(repoDir: string, branch: string): boolean {
+  if (repoDir === "" || branch === "") return false;
+  try {
+    const res = Bun.spawnSync(
+      [
+        "git",
+        "--no-optional-locks",
+        "-C",
+        repoDir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${branch}`,
+      ],
+      {
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: GIT_TOPLEVEL_TIMEOUT_MS,
+        env: gitResolveEnv(),
+      },
+    );
+    return res.success && res.exitCode === 0;
+  } catch {
+    return false;
+  }
+}

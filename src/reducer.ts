@@ -3453,6 +3453,105 @@ function foldTmuxClientFocusSnapshot(db: Database, event: Event): void {
 }
 
 /**
+ * One entry of a synthetic `WorktreeRepoStatus` event (fn-1013) — the
+ * worktree-eligibility verdict for ONE epic the autopilot reconciler marked
+ * `disabled` (a not-worktree-friendly repo → serial shared-checkout dispatch).
+ * `mode` is the dispatch shape (`serial`); `reason` names the disabling signal (a
+ * `worktree-disabled:*` string). The event's `data` carries the FULL current
+ * disabled set as `{ entries: WorktreeRepoStatusEntry[] }`; the fold replaces the
+ * whole table with it (a cheap full-set replace bounded by board size). Defined
+ * here so the producer (autopilot worker) and this fold share one contract.
+ */
+export interface WorktreeRepoStatusEntry {
+  epic_id: string;
+  repo_dir: string;
+  mode: string;
+  reason: string;
+}
+
+/**
+ * Null-safe decode of a `WorktreeRepoStatus` event's `data` blob into the
+ * validated entry array. Returns `[]` on a missing / empty / malformed blob OR a
+ * non-array `entries` (the fold then clears the table — the disabled set is
+ * empty); NEVER throws. Each entry is type-narrowed independently: a non-string
+ * field normalizes to `""`, and an entry with no `epic_id` is dropped (the PK
+ * must be present). Reads ONLY `event.data` — no probe, no env, no wall-clock —
+ * keeping the fold a pure function of the event payload.
+ */
+function extractWorktreeRepoStatus(event: Event): WorktreeRepoStatusEntry[] {
+  if (event.data == null || event.data.length === 0) {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.data);
+  } catch {
+    return [];
+  }
+  if (parsed == null || typeof parsed !== "object") {
+    return [];
+  }
+  const rawEntries = (parsed as Record<string, unknown>).entries;
+  if (!Array.isArray(rawEntries)) {
+    return [];
+  }
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const out: WorktreeRepoStatusEntry[] = [];
+  for (const raw of rawEntries) {
+    if (raw == null || typeof raw !== "object") {
+      continue;
+    }
+    const r = raw as Record<string, unknown>;
+    const epic_id = str(r.epic_id);
+    if (epic_id === "") {
+      continue;
+    }
+    out.push({
+      epic_id,
+      repo_dir: str(r.repo_dir),
+      mode: str(r.mode) || "serial",
+      reason: str(r.reason),
+    });
+  }
+  return out;
+}
+
+/**
+ * Fold one synthetic `WorktreeRepoStatus` event (fn-1013) into the LIVE-ONLY
+ * `worktree_repo_status` projection — a full-set REPLACE: wipe the table, then
+ * INSERT one row per disabled epic carried in the event. The autopilot worker
+ * posts the FULL current disabled set whenever it changes, so the table always
+ * reflects the latest emitted set; an empty set (e.g. worktree mode flipped OFF,
+ * or no disabled epics) clears it.
+ *
+ * Cheap full replace bounded by board size (NOT O(history)), so no floor/seed of
+ * its own — the wipe + re-INSERT runs unconditionally and a re-fold's last
+ * `WorktreeRepoStatus` event wins; the table is LIVE-ONLY (in
+ * `LIVE_ONLY_PROJECTIONS`) so it is excluded from the byte-identical re-fold
+ * charter regardless. `ON CONFLICT DO UPDATE` keeps the fold total even if the
+ * producer ever posts a duplicate epic_id. Pure: reads ONLY the event payload +
+ * `event.id` / `event.ts` — NEVER throws (a malformed payload clears the table).
+ */
+function foldWorktreeRepoStatus(db: Database, event: Event): void {
+  const entries = extractWorktreeRepoStatus(event);
+  db.run("DELETE FROM worktree_repo_status");
+  for (const e of entries) {
+    db.run(
+      `INSERT INTO worktree_repo_status (
+         epic_id, repo_dir, mode, reason, last_event_id, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(epic_id) DO UPDATE SET
+         repo_dir = excluded.repo_dir,
+         mode = excluded.mode,
+         reason = excluded.reason,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [e.epic_id, e.repo_dir, e.mode, e.reason, event.id, event.ts],
+    );
+  }
+}
+
+/**
  * Wire payload for a synthetic `BuildSnapshot` event — the projection-meaningful
  * fields of one buildbot builder's latest build. The pk (the builder NAME) does
  * NOT ride here; it travels in `event.session_id` (the generic entity-key
@@ -8677,6 +8776,15 @@ export function applyEvent(
       // byte-identical re-fold charter. A malformed payload no-ops; the cursor
       // still advances here.
       foldTmuxClientFocusSnapshot(db, event);
+    } else if (event.hook_event === "WorktreeRepoStatus") {
+      // fn-1013 — the LIVE-ONLY worktree-eligibility operator surface (sole owner
+      // of `worktree_repo_status`). Full-set REPLACE from the autopilot worker's
+      // current disabled set (posted only when it changes). NO floor/seed: the
+      // verdict is fs-derived and re-emitted each cycle, so the fold runs
+      // unconditionally and a re-fold's last event wins; the table is LIVE-ONLY
+      // (in `LIVE_ONLY_PROJECTIONS`) — excluded from the byte-identical re-fold
+      // charter. A malformed payload clears the table; the fold never throws.
+      foldWorktreeRepoStatus(db, event);
     } else if (event.hook_event === "TmuxPaneSnapshot") {
       // retired fn-907 — the fill-only session resolver (epic fn-789) is
       // superseded by the `TmuxTopologySnapshot` live-location fold above. Fold
