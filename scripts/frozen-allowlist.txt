@@ -101,8 +101,6 @@ exempt|src/reducer.ts
 # docs, and user-visible strings. A deliberate frozen set survives untouched
 # because each literal is a cross-process contract a rename would break:
 #
-#   * The ~/.local/state/agentwrap runtime state dir is a stable on-disk path
-#     other tooling reads; relocating it would orphan existing state.
 #   * legacyAgentwrapPresetsPath is the leftover detector for the pre-relocation
 #     ~/.config/agentwrap/presets.yaml — its whole job is to name the old path.
 #   * The retired-alias test guards assert a stale agentwrap_path config key
@@ -111,9 +109,8 @@ exempt|src/reducer.ts
 #
 # The .3 task appends the per-file ~/.config/agentwrap/ fallback anchors once it
 # creates them; this task anchors ONLY the enumerated frozen survivors.
-
-# The ~/.local/state/agentwrap runtime state-dir path literal.
-anchor|src/agent/tmux-launch.ts|".local", "state", "agentwrap"
+# (The ~/.local/state/agentwrap runtime state-dir literal was retired once the
+# dir relocated to ~/.local/state/keeper-agent via an inode-preserving rename.)
 
 # legacyAgentwrapPresetsPath leftover detector — name + the ~/.config/agentwrap/
 # presets.yaml path literal it returns.

@@ -360,9 +360,9 @@ function addTmuxEnv(options: TmuxLaunchOptions, raw: string): string | null {
 export function defaultKeeperAgentStateDir(env: NodeJS.ProcessEnv): string {
   const xdgStateHome = (env.XDG_STATE_HOME ?? "").trim();
   if (xdgStateHome !== "") {
-    return join(xdgStateHome, "agentwrap");
+    return join(xdgStateHome, "keeper-agent");
   }
-  return join(homedir(), ".local", "state", "agentwrap");
+  return join(homedir(), ".local", "state", "keeper-agent");
 }
 
 export const defaultTmuxCommandRunner: TmuxCommandRunner = (
