@@ -19,7 +19,6 @@ import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
-import { buildPairLaunchArgv } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
@@ -58,7 +57,11 @@ import {
   VERSION,
 } from "./dispatch";
 import {
-  type ResolvedHandle,
+  type LaunchHandleDeps,
+  launchToResolvedHandle,
+  tmuxTranscriptSessionId,
+} from "./launch-handle";
+import {
   resolveHandle,
   runShowLastMessage,
   runWaitForStop,
@@ -89,7 +92,6 @@ import {
   parseRunArgs,
   type RunCaptureDeps,
   type RunCaptureResult,
-  type RunLaunchResult,
 } from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
@@ -510,47 +512,6 @@ function codexWrapperDefaults(args: string[]): string[] {
   return defaults;
 }
 
-function existingSessionId(args: string[]): string | null {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === "--session-id") {
-      return args[i + 1] ?? null;
-    }
-    if (arg.startsWith("--session-id=")) {
-      return arg.slice("--session-id=".length) || null;
-    }
-  }
-  return null;
-}
-
-/**
- * The pinned transcript session id for a tmux launch: an explicit user
- * `--session-id`, else a freshly minted uuid for a new claude/pi session. Null
- * for codex (no id pin) and for a continue/resume launch (keeps the persisted
- * session). This one id is recorded in run.json `transcriptSessionId`, forwarded
- * into the pane via the `-e KEEPER_AGENT_TMUX_SESSION_ID` carrier, and consumed by
- * the inner re-exec's `--session-id` push — one source of truth, no divergence.
- */
-function tmuxTranscriptSessionId(
-  agent: AgentKind,
-  args: string[],
-  randomUuid: () => string,
-): string | null {
-  if (agent === "codex") {
-    return null;
-  }
-
-  const parsed = parseArgsForAgent(args, agent);
-  const explicit = existingSessionId(parsed.remainingArgs);
-  if (explicit !== null) {
-    return explicit;
-  }
-  if (parsed.hasContinueOrResume) {
-    return null;
-  }
-  return randomUuid();
-}
-
 /**
  * tmux-mode JSON contract version. One stable schema serves the launch result,
  * the `wait-for-stop` / `show-last-message` subcommand results, and the error
@@ -709,6 +670,22 @@ function runCaptureSeams(deps: MainDeps): RunCaptureDeps {
   };
 }
 
+/** The launch-seam effect deps the shared launch→handle helper drives, bound to
+ *  the production launcher collaborators. */
+function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
+  return {
+    env: deps.env,
+    cwd: deps.cwd,
+    tmuxBin: deps.tmuxBin,
+    launcherStateDir: deps.launcherStateDir,
+    launcherArgvPrefix: deps.launcherArgvPrefix,
+    randomUuid: deps.randomUuid,
+    runTmuxCommand: deps.runTmuxCommandFn,
+    now: deps.now,
+    writeErr: deps.writeErr,
+  };
+}
+
 /**
  * Emit the run-capture envelope as exactly ONE JSON line on stdout, then exit
  * with the outcome's code. JSON-ONLY on stdout (no bare-text prelude like
@@ -741,70 +718,6 @@ function firstHandleToken(rest: string[]): string | null {
 }
 
 /**
- * The `agent run` launch seam: assemble the per-CLI detached launch argv (reusing
- * the pair builder for the native posture flags), strip the prefix + cli token,
- * and drive `launchKeeperAgentInTmux` DIRECTLY — no subprocess re-exec. The pinned
- * handle returned here is held LOCALLY by the compose (no run.json re-resolution,
- * no cross-process kill margin, no self-transcript-collision exposure). A
- * parse/launch failure maps to `launch_failed`; diagnostics go to stderr.
- */
-function launchForRunCapture(
-  deps: MainDeps,
-  agent: AgentKind,
-  prompt: string,
-  stopTimeoutMs: number | null,
-): RunLaunchResult {
-  const launchArgv = buildPairLaunchArgv({
-    launcherArgvPrefix: [],
-    cli: agent,
-    prompt,
-    readOnly: false,
-  });
-  const tmuxLaunch = parseKeeperAgentTmuxArgs(launchArgv.slice(1));
-  if (tmuxLaunch.error !== null) {
-    deps.writeErr(`agent: ${tmuxLaunch.error}\n`);
-    return { ok: false, error: tmuxLaunch.error };
-  }
-  const startedAtMs = deps.now();
-  const transcriptSessionId = tmuxTranscriptSessionId(
-    agent,
-    tmuxLaunch.remainingArgs,
-    deps.randomUuid,
-  );
-  try {
-    const result = launchKeeperAgentInTmux({
-      agent,
-      innerArgs: tmuxLaunch.remainingArgs,
-      options: tmuxLaunch.options,
-      env: deps.env,
-      cwd: deps.cwd,
-      transcriptSessionId,
-      startedAtMs,
-      stateDir: deps.launcherStateDir,
-      tmuxBin: deps.tmuxBin,
-      launcherArgvPrefix: deps.launcherArgvPrefix,
-      randomUuid: deps.randomUuid,
-      runTmuxCommand: deps.runTmuxCommandFn,
-    });
-    const handle: ResolvedHandle = {
-      agent,
-      cwd: deps.cwd,
-      sessionId: transcriptSessionId,
-      startedAtMs,
-      transcriptPath: null,
-      stopTimeoutMs,
-    };
-    return { ok: true, handle, runId: result.id };
-  } catch (exc) {
-    if (exc instanceof TmuxLaunchError) {
-      deps.writeErr(`Error: ${exc.message}\n`);
-      return { ok: false, error: exc.message };
-    }
-    throw exc;
-  }
-}
-
-/**
  * `agent run <cli> <prompt>`: compose launch→wait→show in one process, emitting
  * the uniform run-capture envelope. A bad invocation short-circuits to bad_args
  * with the same envelope (nulls elsewhere) — never a separate error shape.
@@ -827,7 +740,13 @@ async function runRunCaptureSubcommand(
     {
       ...runCaptureSeams(deps),
       launch: () =>
-        launchForRunCapture(deps, agent, parsed.prompt, parsed.stopTimeoutMs),
+        launchToResolvedHandle({
+          deps: launchHandleDeps(deps),
+          agent,
+          prompt: parsed.prompt,
+          posture: { readOnly: false },
+          stopTimeoutMs: parsed.stopTimeoutMs,
+        }),
     },
     verbDeps,
     agent,
