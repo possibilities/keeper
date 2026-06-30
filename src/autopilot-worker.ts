@@ -93,6 +93,7 @@ import {
   projectGitStatusByProjectDir,
   projectPendingDispatches,
 } from "./readiness-client";
+import type { WorktreeRepoStatusEntry } from "./reducer";
 import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation, Task } from "./types";
 import { watchLoop } from "./wake-worker";
@@ -912,6 +913,16 @@ export interface ConfirmRunningDeps {
    * underlying git is resolved, so no operator `retry_dispatch` is needed.
    */
   emitDispatchCleared(payload: DispatchClearedPayload): void;
+  /**
+   * Emit the FULL current worktree-disabled set to main (fn-1013) for the
+   * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
+   * the synthetic `WorktreeRepoStatus` event. Called once per cycle with the
+   * complete set; the impl dedupes by a stable serialization so a stable board
+   * mints no event (mirrors `git_status`'s semantic-dedupe emit). OPTIONAL — a
+   * no-op when absent (a fake-deps test never needs the operator surface), so the
+   * dispatch path is byte-identical without it.
+   */
+  emitWorktreeRepoStatus?(entries: WorktreeRepoStatusEntry[]): void;
   /**
    * Emit a synthetic `Dispatched` event (via main — workers never write the DB)
    * AND AWAIT a durable ack. Outbox-ordered intent: the reconciler mints this
@@ -1789,6 +1800,35 @@ export function classifyWorktreeRepos(
       classifyEpicRepo(epic, resolve, assessRepo, isGrandfathered),
     );
   }
+  return out;
+}
+
+/**
+ * PURE projection of the per-cycle {@link WorktreeRepoResolution} map to the
+ * operator-surface entry set (fn-1013) — one entry per epic the heuristic marked
+ * `disabled` (a not-worktree-friendly repo → serial shared-checkout dispatch).
+ * Only `disabled` resolutions surface: `ok` epics get worktree lanes (the normal
+ * path), and the `multi-repo` / `unresolved` / `no-primary-repo` rejects already
+ * show in the red `dispatch_failures` block — the neutral worktree surface is
+ * DISTINCT from that. Sorted by `epic_id` for a stable serialization so the
+ * change-gate (semantic dedupe) never fires on map-iteration-order churn.
+ * Exported for tests.
+ */
+export function buildWorktreeStatusEntries(
+  byEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+): WorktreeRepoStatusEntry[] {
+  const out: WorktreeRepoStatusEntry[] = [];
+  for (const [epicId, resolution] of byEpicId) {
+    if (resolution.kind === "disabled") {
+      out.push({
+        epic_id: epicId,
+        repo_dir: resolution.repoDir,
+        mode: "serial",
+        reason: resolution.reason,
+      });
+    }
+  }
+  out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
   return out;
 }
 
@@ -3832,6 +3872,19 @@ export interface DispatchExpiredMessage {
   payload: DispatchExpiredPayload;
 }
 
+/**
+ * Worker → main: WorktreeRepoStatus mint request (fn-1013). Main is the sole
+ * writer of the synthetic event; the worker describes the FULL current disabled
+ * set (one entry per epic whose repo the eligibility heuristic downgraded to
+ * `disabled` → serial shared-checkout dispatch). Posted only when the set CHANGES
+ * (the worker dedupes by a stable serialization), mirroring `git_status`'s
+ * semantic-dedupe emit so a stable board never floods the event log.
+ */
+export interface WorktreeRepoStatusMessage {
+  kind: "worktree-repo-status";
+  entries: WorktreeRepoStatusEntry[];
+}
+
 type IncomingMessage =
   | SetPausedMessage
   | ShutdownMessage
@@ -4197,6 +4250,11 @@ function main(): void {
     number,
     { resolve: (ack: DispatchedAck) => void; reject: (err: Error) => void }
   >();
+  // fn-1013 change-gate for the LIVE-ONLY worktree-disabled operator surface:
+  // the serialized last-emitted disabled set. `null` re-emits once on the first
+  // post-(re)boot cycle; thereafter a stable set mints no `WorktreeRepoStatus`
+  // event. In-worker memory only — persists across cycles in this closure.
+  let lastWorktreeStatusKey: string | null = null;
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -4340,6 +4398,22 @@ function main(): void {
         payload,
       } satisfies DispatchClearedMessage);
     },
+    // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
+    // changes, so a stable board mints zero `WorktreeRepoStatus` events. The
+    // serialized key is the change-gate; `null` seed re-emits once on the first
+    // cycle after each (re)boot. In-worker memory only — `lastWorktreeStatusKey`
+    // persists across cycles in this `main()` closure.
+    emitWorktreeRepoStatus: (entries) => {
+      const key = JSON.stringify(entries);
+      if (key === lastWorktreeStatusKey) {
+        return;
+      }
+      lastWorktreeStatusKey = key;
+      parentPort?.postMessage({
+        kind: "worktree-repo-status",
+        entries,
+      } satisfies WorktreeRepoStatusMessage);
+    },
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
         // Post an id-correlated request and AWAIT main's durable insert ack.
@@ -4440,6 +4514,22 @@ function main(): void {
         const snapshot = await loadReconcileSnapshot(db, () =>
           paneOps.listPanes(),
         );
+        // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
+        // operator projection. Once per cycle, regardless of paused/playing (the
+        // verdict is observational, not a dispatch action); the dep dedupes so a
+        // stable set mints no event, and an empty set (worktree mode OFF, or no
+        // disabled epics) clears the table. Wrapped — a post failure must not wedge
+        // the wake loop.
+        try {
+          deps.emitWorktreeRepoStatus?.(
+            buildWorktreeStatusEntries(snapshot.worktreeRepoByEpicId),
+          );
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] worktree-status emit threw (non-fatal):",
+            err,
+          );
+        }
         // Prune expired cooldown entries each cycle, BEFORE `reconcile` reads the
         // Map so a just-expired key is re-dispatchable this cycle. Wrapped
         // (no-self-heal: a sweep throw must not crash the worker).

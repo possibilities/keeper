@@ -37,6 +37,7 @@ import {
   buildLaunchArgv,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
+  buildWorktreeStatusEntries,
   type ConfirmRunningDeps,
   classifyWorktreeRepos,
   closerJobFinished,
@@ -4013,6 +4014,72 @@ test("fn-978 classifyWorktreeRepos: a required root resolving null → unresolve
   expect(res?.kind === "unresolved" && res.reason).toContain(
     "worktree-repo-unresolved",
   );
+});
+
+test("fn-1013 buildWorktreeStatusEntries: only `disabled` resolutions surface, sorted by epic_id with repo_dir + reason", () => {
+  const map = classifyWorktreeRepos(
+    [
+      // ok → worktree lane (NOT surfaced).
+      makeEpic({
+        epic_id: "fn-1-ok",
+        project_dir: "/code/keeper",
+        tasks: [makeTask({ task_id: "fn-1-ok.1", task_number: 1 })],
+      }),
+      // disabled (a workspace marker) → serial (surfaced).
+      makeEpic({
+        epic_id: "fn-3-mono",
+        project_dir: "/code/arthack",
+        tasks: [makeTask({ task_id: "fn-3-mono.1", task_number: 1 })],
+      }),
+      makeEpic({
+        epic_id: "fn-2-cargo",
+        project_dir: "/code/zellijsub",
+        tasks: [makeTask({ task_id: "fn-2-cargo.1", task_number: 1 })],
+      }),
+    ],
+    (r) => r, // identity resolver — each project_dir IS its toplevel
+    (toplevel) =>
+      toplevel === "/code/keeper"
+        ? { eligible: true, reason: "worktree-eligible" }
+        : {
+            eligible: false,
+            reason: `worktree-disabled:workspace-marker:${
+              toplevel === "/code/arthack"
+                ? "pnpm-workspace"
+                : "cargo-workspace"
+            }`,
+          },
+  );
+
+  expect(buildWorktreeStatusEntries(map)).toEqual([
+    {
+      epic_id: "fn-2-cargo",
+      repo_dir: "/code/zellijsub",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:cargo-workspace",
+    },
+    {
+      epic_id: "fn-3-mono",
+      repo_dir: "/code/arthack",
+      mode: "serial",
+      reason: "worktree-disabled:workspace-marker:pnpm-workspace",
+    },
+  ]);
+});
+
+test("fn-1013 buildWorktreeStatusEntries: an all-eligible board surfaces NO entries (empty set clears the projection)", () => {
+  const map = classifyWorktreeRepos(
+    [
+      makeEpic({
+        epic_id: "fn-1-ok",
+        project_dir: "/code/keeper",
+        tasks: [makeTask({ task_id: "fn-1-ok.1", task_number: 1 })],
+      }),
+    ],
+    (r) => r,
+    () => ({ eligible: true, reason: "worktree-eligible" }),
+  );
+  expect(buildWorktreeStatusEntries(map)).toEqual([]);
 });
 
 test("fn-978 classifyWorktreeRepos: an empty root → unresolved WITHOUT calling the resolver", () => {

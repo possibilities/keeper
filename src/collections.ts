@@ -824,6 +824,41 @@ export const TMUX_CLIENT_FOCUS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `worktree_repo_status` descriptor (fn-1013) — the LIVE-ONLY operator
+ * surface for the per-epic worktree-eligibility verdict. One row per epic the
+ * autopilot reconciler marked `disabled` (a not-worktree-friendly repo → serial
+ * shared-checkout dispatch), folded from a synthetic `WorktreeRepoStatus` event.
+ * `keeper autopilot` subscribes over the socket and renders a neutral
+ * `--- worktree ---` section DISTINCT from the red failed / dispatch-failures
+ * block; an empty / pre-first-cycle table returns `rows: []` so the section
+ * renders nothing. `version: 'last_event_id'` so the diff fires on every fold.
+ */
+export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
+  name: "worktree_repo_status",
+  table: "worktree_repo_status",
+  columns: [
+    "epic_id",
+    "repo_dir",
+    "mode",
+    "reason",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "epic_id",
+  version: "last_event_id",
+  sortable: new Set([
+    "epic_id",
+    "repo_dir",
+    "mode",
+    "last_event_id",
+    "updated_at",
+  ]),
+  defaultSort: { column: "epic_id", dir: "asc" },
+  filters: { epic_id: "epic_id", mode: "mode" },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -843,6 +878,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
   [TMUX_CLIENT_FOCUS_DESCRIPTOR.name, TMUX_CLIENT_FOCUS_DESCRIPTOR],
+  [WORKTREE_REPO_STATUS_DESCRIPTOR.name, WORKTREE_REPO_STATUS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */
