@@ -77,6 +77,7 @@ import {
 } from "./exec-backend";
 import { unseededGatedRoots } from "./gated-roots";
 import {
+  localBranchExists,
   memoizedGitToplevel,
   memoizedNullableGitToplevel,
 } from "./git-toplevel";
@@ -122,11 +123,13 @@ import {
   type WorktreeEntry,
 } from "./worktree-git";
 import {
+  baseBranchFor,
   CLOSE_SINK_ID,
   deriveWorktreePlan,
   type WorktreeAssignment,
   WorktreeCycleError,
   type WorktreePlan,
+  worktreePathFor,
 } from "./worktree-plan";
 
 /**
@@ -1761,6 +1764,14 @@ export function reconcile(
  * always-eligible so a caller that passes only `resolve` is byte-identical to the
  * pre-heuristic behavior. The resolver / probe MAY touch git/fs, so this is NEVER
  * called from a fold.
+ *
+ * `isGrandfathered` is a SEPARATE per-epic input (`assessRepo` is memoized by
+ * toplevel and never sees the epic id, so grandfather CANNOT live inside it):
+ * an epic that ALREADY has a live worktree lane stays `ok` even when its toplevel
+ * assesses `disabled` — so a mid-flight marker change OR (the likelier trigger) a
+ * TRANSIENT probe error does NOT strand its `~/worktrees` lanes or lose the
+ * merge-to-default finalize. Producer-only (fs/git); defaults to never-grandfather
+ * so a pre-grandfather caller is byte-identical.
  */
 export function classifyWorktreeRepos(
   epics: readonly Epic[],
@@ -1769,10 +1780,14 @@ export function classifyWorktreeRepos(
     eligible: true,
     reason: ELIGIBLE_REASON,
   }),
+  isGrandfathered: (epicId: string, repoDir: string) => boolean = () => false,
 ): Map<string, WorktreeRepoResolution> {
   const out = new Map<string, WorktreeRepoResolution>();
   for (const epic of epics) {
-    out.set(epic.epic_id, classifyEpicRepo(epic, resolve, assessRepo));
+    out.set(
+      epic.epic_id,
+      classifyEpicRepo(epic, resolve, assessRepo, isGrandfathered),
+    );
   }
   return out;
 }
@@ -1782,6 +1797,7 @@ function classifyEpicRepo(
   epic: Epic,
   resolve: (root: string) => string | null,
   assessRepo: (toplevel: string) => WorktreeEligibility,
+  isGrandfathered: (epicId: string, repoDir: string) => boolean,
 ): WorktreeRepoResolution {
   const projectDir = epic.project_dir ?? "";
   // The required RAW roots: each task's effective root (`target_repo` when set,
@@ -1851,9 +1867,43 @@ function classifyEpicRepo(
   // ever downgrades `ok`; the loud rejects above already returned.
   const eligibility = assessRepo(repoDir);
   if (!eligibility.eligible) {
+    // GRANDFATHER: an epic that ALREADY has live worktree lanes keeps `ok` even on
+    // a `disabled` verdict — flipping it mid-flight would strand work on its
+    // `~/worktrees` lanes while new tasks dispatch on the shared checkout AND lose
+    // the merge-to-default finalize (`attachWorktreeGeometry` builds
+    // `worktreeFinalize` only for `ok`). The likelier flip is a TRANSIENT probe
+    // error (fail-closed) on a healthy in-flight epic, not a marker appearing
+    // mid-epic. The predicate is producer-side fs/git (base worktree dir OR
+    // `keeper/epic/<id>` branch exists) — never read here in the pure layer.
+    if (isGrandfathered(epic.epic_id, repoDir)) {
+      return { kind: "ok", repoDir };
+    }
     return { kind: "disabled", repoDir, reason: eligibility.reason };
   }
   return { kind: "ok", repoDir };
+}
+
+/**
+ * PRODUCER: the per-epic grandfather predicate threaded into
+ * {@link classifyWorktreeRepos} — true IFF epic `epicId` ALREADY has a live
+ * worktree lane on `repoDir`, so a `disabled` verdict must NOT flip it (see the
+ * grandfather note in {@link classifyEpicRepo}). Two robust signals OR'd, so the
+ * costly false NEGATIVE (an in-flight epic missed → split-brain / lost work) needs
+ * BOTH to miss:
+ *  - the deterministic base worktree dir exists (`existsSync` — pure fs), or
+ *  - the `keeper/epic/<id>` base branch exists (a fail-closed `git` ref peek;
+ *    only spawned when the cheap dir check misses).
+ * Both mirror the recover scan's notion of a live lane. A stale leftover dir/branch
+ * is a BOUNDED false POSITIVE — it keeps ONE now-disabled epic on worktree mode
+ * until the recover sweep reaps its dead lane; acceptable. Producer-only (fs+git),
+ * NEVER read inside the pure classify layer or a fold.
+ */
+function worktreeEpicGrandfathered(epicId: string, repoDir: string): boolean {
+  const baseBranch = baseBranchFor(epicId);
+  return (
+    existsSync(worktreePathFor(repoDir, baseBranch)) ||
+    localBranchExists(repoDir, baseBranch)
+  );
 }
 
 /**
@@ -4023,7 +4073,12 @@ export async function loadReconcileSnapshot(
   const toplevelResolver = memoizedNullableGitToplevel();
   const assessResolver = memoizedAssessRepo();
   const worktreeRepoByEpicId = worktreeMode
-    ? classifyWorktreeRepos(epics, toplevelResolver, assessResolver)
+    ? classifyWorktreeRepos(
+        epics,
+        toplevelResolver,
+        assessResolver,
+        worktreeEpicGrandfathered,
+      )
     : new Map<string, WorktreeRepoResolution>();
   // The recover sweep's KNOWN-ROOTS set — every git-tracked project dir
   // (from the git-status projection) RESOLVED to its toplevel, so a repo carrying

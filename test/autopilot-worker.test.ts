@@ -3916,16 +3916,23 @@ test("fn-959 reconcile: worktree ON multi-repo epic → every launch stamped wor
 // ---------------------------------------------------------------------------
 
 /** A worktree-ON snapshot whose repo classification uses a synthetic resolver
- *  (and an optional synthetic eligibility probe — defaults to always-eligible). */
+ *  (and an optional synthetic eligibility probe — defaults to always-eligible —
+ *  plus an optional synthetic grandfather predicate, defaults to never). */
 function worktreeSnap(
   epics: Epic[],
   resolve: (root: string) => string | null,
   assessRepo?: (toplevel: string) => { eligible: boolean; reason: string },
+  isGrandfathered?: (epicId: string, repoDir: string) => boolean,
 ): ReconcileSnapshot {
   return makeSnapshot({
     epics,
     worktreeMode: true,
-    worktreeRepoByEpicId: classifyWorktreeRepos(epics, resolve, assessRepo),
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      epics,
+      resolve,
+      assessRepo,
+      isGrandfathered,
+    ),
   });
 }
 
@@ -4455,6 +4462,180 @@ test("fn-1013 reconcile: worktree ON, a disabled epic → launches dispatch on t
     expect(l.worktreeReject).toBeUndefined();
     // The launch cwd is the shared checkout (the resolved toplevel), unmodified.
     expect(l.cwd).toBe("/repo");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// fn-1013.3 — GRANDFATHER: an epic with live worktree evidence (base worktree dir
+// OR `keeper/epic/<id>` branch) keeps `ok` even when its toplevel assesses
+// `disabled` (INCLUDING on a transient probe error) — so its `~/worktrees` lanes
+// finalize normally rather than stranding mid-flight. The predicate is a SEPARATE
+// per-epic producer input (never inside the toplevel-memoized `assessRepo` nor a
+// fold); the fast tier injects a synthetic predicate (no real fs/git).
+// ---------------------------------------------------------------------------
+
+test("fn-1013.3 classifyWorktreeRepos: assessRepo=disabled + grandfather TRUE → ok (lanes preserved, finalize intact)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const seen: Array<[string, string]> = [];
+  const res = classifyWorktreeRepos(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:workspace-marker" }),
+    (epicId, repoDir) => {
+      seen.push([epicId, repoDir]);
+      return true; // a live lane exists for this epic
+    },
+  ).get("fn-1-foo");
+  expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
+  // The predicate is consulted with the EPIC id + the RESOLVED toplevel.
+  expect(seen).toEqual([["fn-1-foo", "/repo"]]);
+});
+
+test("fn-1013.3 classifyWorktreeRepos: a TRANSIENT probe error on a grandfathered epic → still ok (no split-brain)", () => {
+  // A fail-closed probe error is the LIKELIER mid-flight flip — the predicate does
+  // not care WHY the toplevel assessed disabled, only that a live lane exists.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:probe-error" }),
+    () => true,
+  ).get("fn-1-foo");
+  expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
+});
+
+test("fn-1013.3 classifyWorktreeRepos: assessRepo=disabled + grandfather FALSE → disabled (stays serial)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:no-manifest" }),
+    () => false, // no live lane
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("disabled");
+  expect(res?.kind === "disabled" && res.repoDir).toBe("/repo");
+  expect(res?.kind === "disabled" && res.reason).toContain("no-manifest");
+});
+
+test("fn-1013.3 classifyWorktreeRepos: grandfather is consulted ONLY on a would-be-disabled epic — never on an eligible one, never on a reject", () => {
+  let consulted = 0;
+  const grandfather = (): boolean => {
+    consulted++;
+    return true;
+  };
+  // (a) eligible epic — grandfather is irrelevant, never consulted.
+  const eligible = makeEpic({
+    epic_id: "fn-1-ok",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-ok.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  // (b) multi-repo reject — returns BEFORE the eligibility/grandfather gate.
+  const multi = makeEpic({
+    epic_id: "fn-1-multi",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-multi.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-multi.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const map = classifyWorktreeRepos(
+    [eligible, multi],
+    (r) =>
+      r.startsWith("/repo-a")
+        ? "/repo-a"
+        : r.startsWith("/repo-b")
+          ? "/repo-b"
+          : r === "/repo"
+            ? "/repo"
+            : null,
+    (top) => ({ eligible: top === "/repo", reason: "x" }),
+    grandfather,
+  );
+  expect(map.get("fn-1-ok")).toEqual({ kind: "ok", repoDir: "/repo" });
+  expect(map.get("fn-1-multi")?.kind).toBe("multi-repo");
+  expect(consulted).toBe(0);
+});
+
+test("fn-1013.3 classifyWorktreeRepos: default grandfather (no 4th arg) leaves a disabled epic disabled — existing callers byte-identical", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:no-manifest" }),
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("disabled");
+});
+
+test("fn-1013.3 reposForRecovery: a grandfathered (ok) epic IS swept; a disabled sibling contributes NO lane", () => {
+  const grand = makeEpic({ epic_id: "fn-1-grand", project_dir: "/repo-grand" });
+  const disabled = makeEpic({ epic_id: "fn-2-dis", project_dir: "/repo-dis" });
+  const repoMap = classifyWorktreeRepos(
+    [grand, disabled],
+    (r) => r,
+    (top) => ({ eligible: false, reason: `worktree-disabled (${top})` }),
+    (epicId) => epicId === "fn-1-grand", // only the grandfathered epic has a lane
+  );
+  // The grandfathered epic stayed `ok` → swept; the disabled epic provisioned no
+  // lane → skipped (nothing to recover).
+  expect(repoMap.get("fn-1-grand")?.kind).toBe("ok");
+  expect(repoMap.get("fn-2-dis")?.kind).toBe("disabled");
+  expect(reposForRecovery([grand, disabled], repoMap)).toEqual(["/repo-grand"]);
+});
+
+test("fn-1013.3 reconcile: a grandfathered disabled-toplevel epic dispatches IN A LANE (worktree geometry), not the shared checkout", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    ],
+  });
+  const snap = worktreeSnap(
+    [epic],
+    (r) => (r === "/repo" ? "/repo" : null),
+    () => ({ eligible: false, reason: "worktree-disabled:no-manifest" }),
+    () => true, // live lane → grandfathered → stays ok
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.length).toBeGreaterThan(0);
+  for (const l of decision.launches) {
+    // Grandfathered → `ok` geometry → a worktree lane, NOT the bare shared checkout.
+    expect(l.worktree).toBeDefined();
+    expect(l.worktreeReject).toBeUndefined();
   }
 });
 
