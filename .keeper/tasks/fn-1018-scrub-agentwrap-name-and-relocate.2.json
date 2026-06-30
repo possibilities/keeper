@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Scrub agentwrap identifiers, prose, and CLI strings",
-  "updated_at": "2026-06-30T19:46:05.424000Z"
+  "updated_at": "2026-06-30T21:33:04.210000Z",
+  "worker_done_at": "2026-06-30T21:33:04.210000Z"
 }

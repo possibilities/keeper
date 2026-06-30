@@ -45,5 +45,5 @@ FREEZE — never touch: the `AGENTWRAP_*` env-var NAME strings + the `startsWith
 - [ ] src/agent/config.ts, src/agent/plugins.ts, test/agent-config.test.ts untouched (owned by .3)
 
 ## Done summary
-
+Atomic agentwrap->keeper agent name sweep: renamed launch-transport symbols to keeperAgent*/KEEPER_AGENT_* and launcher flag fields to launcher*, renamed the launch-stdout fixture, scrubbed all prose/help/error/README strings to keeper agent/the launcher, and fixed the --agentwrap-preset doc bug to --x-preset. Preserved the frozen AGENTWRAP_* env family, state dir, legacy detector, and retired-alias tests. Frozen-anchor lint green; full suite 5034 pass/0 fail.
 ## Evidence
