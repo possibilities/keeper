@@ -35,5 +35,5 @@ After restow: `ls -la ~/.config/keeper/{claude,plugins}.yaml` shows live symlink
 - [ ] Launcher boots reading `~/.config/keeper/` (fallback now dormant)
 
 ## Done summary
-
+Relocated keeper agent launcher config (claude.yaml, plugins.yaml) from the agentwrap stow subdir to ~/.config/keeper/ via git mv + restow; old ~/.config/agentwrap/ symlinks removed, new ones live and the launcher boots reading the new path. Scrubbed retired agentwrap launcher name from CLAUDE.md, install.sh, and claude-matrix.zsh forward-facing; statusline AGENTWRAP_CLAUDE_PROFILE env var left untouched.
 ## Evidence

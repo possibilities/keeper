@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Relocate arthack stow config dir to keeper",
-  "updated_at": "2026-06-30T19:46:05.424000Z"
+  "updated_at": "2026-06-30T21:52:51.723000Z",
+  "worker_done_at": "2026-06-30T21:52:51.723000Z"
 }
