@@ -37,5 +37,5 @@ PRECONDITION: re-grep the tree (post fn-1018) and confirm the ONLY residual agen
 - [ ] retirement documented forward-facing; `git grep agentwrap` (minus exclusion set) empty in keeper + arthack; `bun test` + lint green
 
 ## Done summary
-
+Removed fn-1018's transitional ~/.config/agentwrap/ config fallback + legacyAgentwrap detectors/migrationHint (config.ts stays dep-free), deleted the retired-alias tests, and flipped scripts/lint-retired-name.sh to agentwrap zero-tolerance (Check C grep-clean + parameterized count-pins on the permanent state-dir relocation files). Documented the zero-survivor end-state; bun test surface green and lint exit 0.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Remove fallback, delete alias tests, flip lint to zero",
-  "updated_at": "2026-06-30T21:24:25.180000Z"
+  "updated_at": "2026-06-30T22:39:58.949000Z",
+  "worker_done_at": "2026-06-30T22:39:58.949000Z"
 }
