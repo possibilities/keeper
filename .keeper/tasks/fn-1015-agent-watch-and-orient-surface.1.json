@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "extend readiness snapshot with autopilot state",
-  "updated_at": "2026-06-30T03:05:41.733000Z"
+  "updated_at": "2026-06-30T03:17:35.012000Z",
+  "worker_done_at": "2026-06-30T03:17:35.012000Z"
 }

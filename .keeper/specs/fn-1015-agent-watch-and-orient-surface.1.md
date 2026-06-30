@@ -55,5 +55,5 @@ Extend test/readiness-client.test.ts: assert the new fields are populated from a
 - [ ] `bun test` green.
 
 ## Done summary
-
+Extended ReadinessClientSnapshot with autopilotMode, the armed/eligible epic-id closure, maxConcurrentJobs, the boot-header-latched maxConcurrentPerRoot, and worktreeMode — additive only, reusing the shared cli/autopilot projectors and the locals that feed computeReadiness so board/dash render byte-identically.
 ## Evidence
