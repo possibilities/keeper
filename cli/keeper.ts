@@ -29,6 +29,7 @@ export const SUBCOMMANDS = [
   "dash",
   "status",
   "query",
+  "watch",
   "await",
   "commit-work",
   "setup-tmux",
@@ -64,6 +65,7 @@ Subcommands:
   dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
   status              One-shot unified board + autopilot JSON read (orient in one call)
   query               One-shot read of an allowlisted daemon collection (JSON)
+  watch               NDJSON tail of coarse board deltas (never exits)
   await               Block until a plan/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
   setup-tmux          Provision the tmux control plane (dash + work sessions)
@@ -172,6 +174,7 @@ export async function main(): Promise<void> {
     dash: async (argv) => (await import("./dash")).main(argv),
     status: async (argv) => (await import("./status")).main(argv),
     query: async (argv) => (await import("./query")).main(argv),
+    watch: async (argv) => (await import("./watch")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),

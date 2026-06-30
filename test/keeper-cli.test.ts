@@ -74,6 +74,7 @@ function makeHarness(): Harness {
       dash: mkHandler("dash"),
       status: mkHandler("status"),
       query: mkHandler("query"),
+      watch: mkHandler("watch"),
       await: mkHandler("await"),
       "commit-work": mkHandler("commit-work"),
       "setup-tmux": mkHandler("setup-tmux"),
