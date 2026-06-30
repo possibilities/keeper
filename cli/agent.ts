@@ -4,6 +4,10 @@
  * <claude|codex|pi> [args...]` launches a supported agent CLI with agentwrap
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
+ * The blocking run-and-capture verbs compose those primitives into the uniform
+ * schema-versioned JSON envelope: `keeper agent run <cli> <prompt>` launches,
+ * waits, and captures in one process, and `keeper agent wait <handle>` does the
+ * wait + capture on an already-launched handle.
  *
  * Named launch-config presets (harness/model/effort) live in the catalog
  * `~/.config/keeper/presets.yaml` (panel selections in `panel.yaml`): `keeper

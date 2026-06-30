@@ -1418,7 +1418,15 @@ event-log/reducer/hook touch. Run any of them with
   finding — the re-home-incomplete state that renders `?x` in `keeper usage`),
   each with a stable `id` + remediation (exit 0 clean / 9 findings / 1 tool
   error). It NEVER moves, deletes, or edits anything — the operator re-homes a
-  stranded login (or restores the missing tier metadata) by hand. Per-field resolution is `explicit flag > effort
+  stranded login (or restores the missing tier metadata) by hand. The blocking
+  run-and-capture verbs compose the detached launch + transcript reads into one
+  process: `keeper agent run <cli> <prompt>` launches, waits for the run's stop,
+  and captures the final message; `keeper agent wait <handle>` does the wait +
+  capture on an already-launched handle. Both emit ONE uniform schema-versioned
+  JSON envelope (`{schema_version, agent, handle, transcript_path, resume_target,
+  message, message_found, elapsed_seconds, outcome}`) for every terminal state,
+  the `outcome` mapping to the exit code (completed/no_message 0, timed_out/
+  no_transcript 4, launch_failed 1, bad_args 2). Per-field resolution is `explicit flag > effort
   env > preset > per-harness yaml > native default`, so a preset never overrides an
   explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
   `--x-preset` the launch is byte-identical to a no-preset run. The posture is
