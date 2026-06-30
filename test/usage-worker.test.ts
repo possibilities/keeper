@@ -93,7 +93,8 @@ test("isUsageFilename accepts <id>.json (lowercase, digit, hyphen); rejects ever
   expect(isUsageFilename("a.json")).toBe(true);
   // Reject extra dot segment (future agentusage error envelope).
   expect(isUsageFilename("claude-default.error.json")).toBe(false);
-  // Reject non-.json files (agentusage log surfaces).
+  // Reject non-usage JSON files and log surfaces.
+  expect(isUsageFilename("picker.json")).toBe(false);
   expect(isUsageFilename("server.stdout")).toBe(false);
   expect(isUsageFilename("server.stderr")).toBe(false);
   expect(isUsageFilename("events.jsonl")).toBe(false);

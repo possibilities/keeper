@@ -259,8 +259,10 @@ const MAX_USAGE_FILE_BYTES = 1024 * 1024;
  *
  * Pure. Exported for unit reach.
  */
+const NON_USAGE_JSON_FILES = new Set(["picker.json"]);
+
 export function isUsageFilename(name: string): boolean {
-  return /^[a-z0-9-]+\.json$/.test(name);
+  return !NON_USAGE_JSON_FILES.has(name) && /^[a-z0-9-]+\.json$/.test(name);
 }
 
 /**
