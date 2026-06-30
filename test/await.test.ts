@@ -151,6 +151,10 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    // fn-1015: the opt-in recent-done window (gated only on a `complete`
+    // condition). An unmatched id is harmlessly ignored when the stream didn't
+    // opt in (unblocked/started/server-up), so it's safe to deliver uniformly.
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
   ]);
 }
 
@@ -174,6 +178,9 @@ function deliverFiveWithEpic(
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    // fn-1015: opt-in recent-done window — empty here, so an epic that drops off
+    // `epics` is absent from BOTH scopes and rides the existing re-query path.
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
   ]);
 }
 
@@ -214,6 +221,8 @@ function deliverFiveWith(
     resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, [], rev),
     resultFrame("block_escalations", `${idPrefix}-block-escalations`, [], rev),
     resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, [], rev),
+    // fn-1015: opt-in recent-done window (empty unless a test opts otherwise).
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [], rev),
   ]);
 }
 
@@ -1548,6 +1557,60 @@ test("epic complete: present-then-drop + re-query hit → met (exit 0)", async (
 });
 
 // ---------------------------------------------------------------------------
+// fn-1015: epic complete via the opt-in recent-done merge — a done epic served
+// in the `epics_recent_done` window with an idle close-row fires `met` directly
+// on the present branch, no board pop-off / re-query needed.
+// ---------------------------------------------------------------------------
+
+test("fn-1015 epic complete: done epic in recent-done window + idle close-row → met (no drop)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // The complete-condition subscribe opts in the recent-done window — twelve
+  // queries, not eleven.
+  const collections = (sock.takeOutbound() as Array<{ collection?: string }>)
+    .map((f) => f.collection)
+    .filter((c): c is string => c !== undefined);
+  expect(collections).toContain("epics_recent_done");
+
+  // First paint: the epic is ABSENT from open `epics` but PRESENT (status done,
+  // idle close-row) in the recent-done window. The merge surfaces it; its
+  // close-row folds to `completed` → met on the present branch.
+  const doneEpic = makeEpicRow({
+    status: "done",
+    tasks: [makeTaskRow({ worker_phase: "done" })],
+  });
+  sock.deliver([
+    resultFrame("epics", `${idPrefix}-epics`, []),
+    resultFrame("jobs", `${idPrefix}-jobs`, []),
+    resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
+    resultFrame("git", `${idPrefix}-git`, []),
+    resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
+    resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, []),
+    resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
+    resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [
+      doneEpic,
+    ]),
+  ]);
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] armed");
+  expect(lines).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // Drop + re-query miss → deleted exit 4.
 // ---------------------------------------------------------------------------
 
@@ -2475,11 +2538,12 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A plan-bearing combo rides subscribeReadiness only — its eleven
-  // collections (fn-721 added `pending_dispatches`; fn-770 added
-  // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`; fn-941
-  // added `block_escalations`; fn-952 added `tmux_client_focus`), NOT a
-  // separate dedicated git sub.
+  // A plan-bearing combo rides subscribeReadiness only — its collections
+  // (fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
+  // `armed_epics`; fn-813 added `scheduled_tasks`; fn-941 added
+  // `block_escalations`; fn-952 added `tmux_client_focus`; fn-1015 adds the
+  // opt-in `epics_recent_done` window because a `complete` segment is present),
+  // NOT a separate dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
   expect(cols).toEqual([
@@ -2488,6 +2552,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "block_escalations",
     "dead_letters",
     "epics",
+    "epics_recent_done",
     "git",
     "jobs",
     "pending_dispatches",

@@ -339,6 +339,124 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all collec
 });
 
 // ---------------------------------------------------------------------------
+// (a.1a) fn-1015 — the opt-in `epics_recent_done` merge. The window is
+//        subscribed, gated, and merged ONLY when `includeRecentDoneEpics` is
+//        set; default-off keeps the 11-collection subscribe + open-only `epics`
+//        byte-identical (the first-paint-gate test above is the off-path proof).
+// ---------------------------------------------------------------------------
+
+/** A minimal well-formed epic row the readiness pass can fold without throwing. */
+function epicRow(
+  epicId: string,
+  status: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    epic_id: epicId,
+    epic_number: Number.parseInt(epicId.replace(/\D+/g, ""), 10) || 0,
+    title: epicId,
+    project_dir: "/repo",
+    status,
+    last_event_id: 0,
+    updated_at: 0,
+    depends_on_epics: [],
+    tasks: [],
+    jobs: [],
+    job_links: [],
+    resolved_epic_deps: null,
+    last_validated_at: "2026-05-24T00:00:00Z",
+    ...overrides,
+  };
+}
+
+test("subscribeReadiness: includeRecentDoneEpics OFF does not subscribe epics_recent_done", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-no-recent-done",
+    onSnapshot: () => {},
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const collections = (sock.takeOutbound() as Array<{ collection: string }>).map(
+    (f) => f.collection,
+  );
+  expect(collections).not.toContain("epics_recent_done");
+  expect(collections).toHaveLength(11);
+  handle.dispose();
+});
+
+test("subscribeReadiness: includeRecentDoneEpics ON subscribes the window, gates on it, and merges open-wins", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const idPrefix = "test-recent-done";
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    onSnapshot: (snap) => snapshots.push(snap),
+    includeRecentDoneEpics: true,
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Twelve queries now — the opt-in window is the 12th subscription.
+  const initial = sock.takeOutbound() as Array<{ collection: string }>;
+  expect(initial).toHaveLength(12);
+  expect(initial.map((f) => f.collection)).toContain("epics_recent_done");
+
+  // Deliver the eleven base collections (open `epics` carries an open epic and a
+  // dup that ALSO appears done). The gate must HOLD until the recent-done window
+  // paints — proving it's load-bearing when opted in.
+  sock.deliver([
+    rowsResult("epics", `${idPrefix}-epics`, [
+      epicRow("fn-1-open", "open"),
+      epicRow("fn-3-dup", "open"),
+    ]),
+    emptyResult("jobs", `${idPrefix}-jobs`),
+    emptyResult(
+      "subagent_invocations",
+      `${idPrefix}-subagent-invocations`,
+    ),
+    emptyResult("git", `${idPrefix}-git`),
+    emptyResult("dead_letters", `${idPrefix}-dead-letters`),
+    emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
+    emptyResult("autopilot_state", `${idPrefix}-autopilot-state`),
+    emptyResult("armed_epics", `${idPrefix}-armed-epics`),
+    emptyResult("scheduled_tasks", `${idPrefix}-scheduled-tasks`),
+    emptyResult("block_escalations", `${idPrefix}-block-escalations`),
+    emptyResult("tmux_client_focus", `${idPrefix}-tmux-client-focus`),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // The recent-done window paints: one fresh done epic + a dup of an open one.
+  // Gate clears; the merge is open-wins (the dup keeps its OPEN row, appears
+  // once) and the fresh done epic joins the set.
+  sock.deliver([
+    rowsResult("epics_recent_done", `${idPrefix}-epics-recent-done`, [
+      epicRow("fn-2-done", "done"),
+      epicRow("fn-3-dup", "done"),
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  const epics = snapshots[0]?.epics ?? [];
+  expect(epics.map((e) => e.epic_id)).toEqual([
+    "fn-1-open",
+    "fn-3-dup",
+    "fn-2-done",
+  ]);
+  // Open-wins: the dup kept its `open` status, not the done row's.
+  expect(epics.find((e) => e.epic_id === "fn-3-dup")?.status).toBe("open");
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // (a.1b) fn-905 — the boot-status header on a `result` frame fires
 //        `onBootStatus` AND latches `git_unseeded_roots`, forcing the next
 //        snapshot's readiness to UNKNOWN ONLY for rows whose `effectiveRoot` is
