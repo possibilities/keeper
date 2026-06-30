@@ -26,9 +26,9 @@ import type {
 } from "./pair-subcommands";
 
 /**
- * Run-capture envelope contract version. Mirrors `TMUX_SCHEMA_VERSION` /
- * `PAIR_KEEPER_AGENT_SCHEMA_VERSION` (integer, snake_case keys). Bump ONLY on a
- * breaking shape change — the full-key-set snapshot test fails a silent drift.
+ * Run-capture envelope contract version. Mirrors `TMUX_SCHEMA_VERSION` (integer,
+ * snake_case keys). Bump ONLY on a breaking shape change — the full-key-set
+ * snapshot test fails a silent drift.
  */
 export const RUN_CAPTURE_SCHEMA_VERSION = 1;
 

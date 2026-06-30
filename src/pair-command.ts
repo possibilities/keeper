@@ -1,29 +1,19 @@
 /**
  * Pure, dep-free plumbing for `keeper pair` — the pairing helper that fans a
- * task out to another model CLI (claude / codex) via keeper agent as the spawn
- * transport, driven from the orchestrating session's Monitor tool. Owns the
- * pairing ergonomics — role prompts, read-only posture, output normalization,
- * the Monitor two-line stdout contract — and delegates the tmux transport +
- * model/effort selection to keeper agent.
+ * task out to another model CLI (claude / codex / pi) via `keeper agent` as the
+ * launch transport, driven from the orchestrating session's Monitor tool. Owns
+ * the pairing ergonomics — role prompts, read-only posture, output
+ * normalization, the Monitor two-line stdout contract — and delegates the tmux
+ * transport + model/effort selection to `keeper agent`.
  *
  * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module holds
- * the pure builders only — role loading, prompt assembly, the per-CLI keeper agent
- * argv builders, the git changed-files diff, the env strip, and the output-YAML
+ * the pure builders only — role loading, prompt assembly, the per-CLI launch
+ * argv builder, the git changed-files diff, the env strip, and the output-YAML
  * assembly. It imports `js-yaml` (a serialization dep, not the DB graph) and
  * `node:fs`/`node:path`/`node:os` for asset reads; it MUST NOT pull `bun:sqlite`
- * or `./db`. The orchestration (subprocess compose, SIGTERM handler, atomic
- * write) lives in the thin `cli/pair.ts` entry.
- *
- * Compose flow keeper drives, mirroring the keeper agent subcommand contract
- * (task .1):
- *   1. `keeper agent <cli> --x-tmux --x-tmux-detached
- *      --x-no-confirm <native flags> <prompt>` → one launch-JSON line
- *      carrying the `id` handle.
- *   2. `keeper agent wait-for-stop <id> --stop-timeout-ms <ms>` → blocks until the
- *      partner's next stop; the ms budget forwards keeper's `--timeout` so
- *      keeper agent's stop-wait honors it instead of its own 600s default.
- *   3. `keeper agent show-last-message <id>` → the partner's final assistant
- *      message on stdout + a JSON metadata line.
+ * or `./db`. The orchestration — the in-process launch→wait→show compose (via
+ * the shared `src/agent` run-capture primitives), the SIGTERM handler, the
+ * atomic write — lives in the thin `cli/pair.ts` entry.
  */
 
 import { readFileSync } from "node:fs";
@@ -332,177 +322,12 @@ export function nativePiArgs(opts: PairLaunchOpts): string[] {
   return args;
 }
 
-/** keeper's `--timeout` (seconds) → the stop-wait budget in ms, the single value
- *  driving BOTH the emitted `--stop-timeout-ms` flag and the subprocess-kill
- *  margin. A fractional `--timeout` rounds UP to ms granularity so the partner is
- *  never short-changed. Pure — exported for tests + the kill-margin calc. */
+/** keeper's `--timeout` (seconds) → the stop-wait budget in ms, threaded onto the
+ *  pinned handle's `stopTimeoutMs` so the in-process wait honors it instead of the
+ *  launcher's 600s default. A fractional `--timeout` rounds UP to ms granularity
+ *  so the partner is never short-changed. Pure — exported for tests. */
 export function stopTimeoutMsFromSeconds(timeoutSeconds: number): number {
   return Math.ceil(timeoutSeconds * 1000);
-}
-
-/** Build the `keeper agent wait-for-stop <handle> --stop-timeout-ms <ms>` argv.
- *  `launcherArgvPrefix` is `[<bun>, <keeper.ts>, "agent"]`. The `stopTimeoutMs`
- *  forwards keeper's resolved `--timeout` budget so the launcher's stop-wait
- *  honors it instead of its own 600s default — keeper is authoritative. Pure —
- *  exported for tests. */
-export function buildWaitForStopArgv(
-  launcherArgvPrefix: readonly string[],
-  handle: string,
-  stopTimeoutMs: number,
-): string[] {
-  return [
-    ...launcherArgvPrefix,
-    "wait-for-stop",
-    handle,
-    "--stop-timeout-ms",
-    String(stopTimeoutMs),
-  ];
-}
-
-/** Build the `keeper agent show-last-message <handle>` argv.
- *  `launcherArgvPrefix` is `[<bun>, <keeper.ts>, "agent"]`. Pure — exported for
- *  tests. */
-export function buildShowLastMessageArgv(
-  launcherArgvPrefix: readonly string[],
-  handle: string,
-): string[] {
-  return [...launcherArgvPrefix, "show-last-message", handle];
-}
-
-// ---------------------------------------------------------------------------
-// keeper agent launch-JSON parsing (the handle contract)
-// ---------------------------------------------------------------------------
-
-/** The keeper agent tmux-launch JSON schema `keeper pair` consumes. A drift here
- *  fails loud (never a silent mismatch). Mirrors keeper's
- *  `KEEPER_AGENT_SCHEMA_VERSION` and keeper agent's `TMUX_SCHEMA_VERSION`. */
-export const PAIR_KEEPER_AGENT_SCHEMA_VERSION = 1;
-
-/** The fields `keeper pair` reads off the launch JSON: the `id` handle (passed
- *  to wait/show) and the `paneId` (passed to tmux kill-window for reaping). */
-export interface PairLaunchHandle {
-  id: string;
-  paneId: string | null;
-}
-
-/** Discriminated result of {@link parsePairLaunchJson}. */
-export type ParseLaunchResult =
-  | { ok: true; handle: PairLaunchHandle }
-  | { ok: false; error: string };
-
-/**
- * Parse keeper agent's launch stdout DEFENSIVELY: scan line-by-line, take the first
- * line that `JSON.parse`es to an object carrying a matching `schema_version`,
- * and pull the `id` handle + `paneId`. A schema drift, a missing `id`, or no
- * parseable line each fail loud. Pure — exported for tests.
- */
-export function parsePairLaunchJson(stdout: string): ParseLaunchResult {
-  let sawObjectWithoutSchema = false;
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") {
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (parsed == null || typeof parsed !== "object") {
-      continue;
-    }
-    const obj = parsed as Record<string, unknown>;
-    const sv = obj.schema_version;
-    if (sv === undefined) {
-      sawObjectWithoutSchema = true;
-      continue;
-    }
-    if (sv !== PAIR_KEEPER_AGENT_SCHEMA_VERSION) {
-      return {
-        ok: false,
-        error: `keeper agent launch JSON schema_version ${JSON.stringify(sv)} != ${PAIR_KEEPER_AGENT_SCHEMA_VERSION} (cross-repo contract drift)`,
-      };
-    }
-    const id = obj.id;
-    if (typeof id !== "string" || id === "") {
-      return {
-        ok: false,
-        error: "keeper agent launch JSON carried no run id handle",
-      };
-    }
-    const paneId =
-      typeof obj.paneId === "string" && obj.paneId !== "" ? obj.paneId : null;
-    return { ok: true, handle: { id, paneId } };
-  }
-  return {
-    ok: false,
-    error: sawObjectWithoutSchema
-      ? "keeper agent launch JSON carried no schema_version field"
-      : "keeper agent emitted no parseable launch JSON line",
-  };
-}
-
-/**
- * Parse keeper agent's `show-last-message` stdout into the partner's final message
- * + drill-down keys. keeper agent prints the bare message text first, then a JSON
- * metadata line (`{schema_version, agent, transcriptPath, found, message}`). We
- * read the message from the JSON `message` field (authoritative — it carries the
- * `null` empty-turn signal); `transcriptPath` is the drill-down pointer. Returns
- * the parsed final message (or `null` for a tool-only/refusal turn) + transcript
- * path. Pure — exported for tests.
- */
-export interface ShowLastMessageParsed {
-  message: string | null;
-  found: boolean;
-  transcriptPath: string | null;
-}
-
-export type ParseShowResult =
-  | { ok: true; result: ShowLastMessageParsed }
-  | { ok: false; error: string };
-
-export function parseShowLastMessageJson(stdout: string): ParseShowResult {
-  // The JSON metadata line is the LAST parseable schema_version object — the
-  // bare message text precedes it and may itself contain `{`-leading lines, so
-  // scan all lines and keep the last valid contract object.
-  let last: ShowLastMessageParsed | null = null;
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "" || !trimmed.startsWith("{")) {
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (parsed == null || typeof parsed !== "object") {
-      continue;
-    }
-    const obj = parsed as Record<string, unknown>;
-    if (obj.schema_version !== PAIR_KEEPER_AGENT_SCHEMA_VERSION) {
-      continue;
-    }
-    if (!("found" in obj) && !("message" in obj)) {
-      continue;
-    }
-    last = {
-      message: typeof obj.message === "string" ? obj.message : null,
-      found: obj.found === true,
-      transcriptPath:
-        typeof obj.transcriptPath === "string" ? obj.transcriptPath : null,
-    };
-  }
-  if (last === null) {
-    return {
-      ok: false,
-      error:
-        "keeper agent show-last-message emitted no parseable metadata line",
-    };
-  }
-  return { ok: true, result: last };
 }
 
 // ---------------------------------------------------------------------------
@@ -639,35 +464,6 @@ export function buildPairOutput(opts: PairOutputOpts): Record<string, unknown> {
  *  tests share one serializer. */
 export function pairOutputYaml(output: Record<string, unknown>): string {
   return yaml.dump(output, { lineWidth: -1 });
-}
-
-/**
- * Self-collision guard: true when the partner's resolved transcript belongs to
- * the DRIVER, not the spawned partner. claude-code transcripts are
- * `<session-uuid>.jsonl`; when the resolver falls back to newest-by-mtime it can
- * win the driver's concurrently-written transcript, so its basename (minus the
- * `.jsonl` suffix) equals the driver's `CLAUDE_CODE_SESSION_ID`. On a match the
- * caller must emit `failed` (`error=self-transcript-collision`) rather than a
- * bogus `completed` carrying the driver's own answer. `null`/empty inputs never
- * collide. Pure — exported for tests.
- */
-export function isSelfTranscriptCollision(
-  transcriptPath: string | null,
-  driverSessionId: string | null | undefined,
-): boolean {
-  if (
-    transcriptPath == null ||
-    transcriptPath === "" ||
-    driverSessionId == null ||
-    driverSessionId === ""
-  ) {
-    return false;
-  }
-  const base = transcriptPath.slice(transcriptPath.lastIndexOf("/") + 1);
-  const sessionId = base.endsWith(".jsonl")
-    ? base.slice(0, -".jsonl".length)
-    : base;
-  return sessionId === driverSessionId;
 }
 
 // ---------------------------------------------------------------------------

@@ -18,16 +18,16 @@
  * ONLY the event stream. The two-line contract holds on EVERY path, including
  * SIGTERM/timeout (a Monitor kill) and early validation errors.
  *
- * Compose flow (the `keeper agent` subcommand contract):
- *   1. `keeper agent <cli> --x-tmux --x-tmux-detached
- *      --x-no-confirm <native flags> <prompt>` → launch JSON `id`.
- *   2. `keeper agent wait-for-stop <id> --stop-timeout-ms <ms>` → block until the
- *      partner stops; keeper's `--timeout` drives the ms budget (overriding
- *      the subcommand's 600s default) and the widened subprocess-kill margin.
- *   3. `keeper agent show-last-message <id>` → the partner's final message.
- * The partner's final answer is written to `--output` (YAML) via
- * write-temp-then-rename, and `completed` is emitted only AFTER the rename so
- * the Monitor event never points at a half-written file.
+ * Compose flow (in-process, via the shared `src/agent` run-capture primitives):
+ *   1. launch the partner detached through the shared launch→handle helper
+ *      (`launchToResolvedHandle`), holding the pinned `ResolvedHandle` locally.
+ *   2. `composeRunCapture` drives `runWaitForStop` → `runShowLastMessage` on that
+ *      handle IN-PROCESS — no `keeper agent` subprocess re-exec, so no
+ *      cross-process kill margin and no self-transcript-collision exposure.
+ *   3. map the run-capture outcome to pair's contract: `completed`/`no_message`
+ *      write the partner's answer to `--output` (YAML) via write-temp-then-rename
+ *      and emit `completed` only AFTER the rename (the Monitor event never points
+ *      at a half-written file); every failure outcome emits `failed` + exits 1.
  *
  * Read-only posture is layered: the directive (primary) + the per-CLI tool strip
  * (claude `--disallowed-tools`; codex keeps web search) + a git changed-files
@@ -38,6 +38,7 @@
  * timeout); 2 = arg fault (bad flags, missing prompt file).
  */
 
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   readFileSync,
@@ -45,7 +46,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -54,25 +55,38 @@ import {
   type Preset,
   resolvePreset,
 } from "../src/agent/config";
+import {
+  type LaunchHandleDeps,
+  type LaunchPosture,
+  launchToResolvedHandle,
+} from "../src/agent/launch-handle";
+import {
+  runShowLastMessage,
+  runWaitForStop,
+} from "../src/agent/pair-subcommands";
+import {
+  composeRunCapture,
+  type RunCaptureDeps,
+} from "../src/agent/run-capture";
+import {
+  defaultKeeperAgentStateDir,
+  defaultTmuxCommandRunner,
+  resolveTmuxBin,
+  type TmuxCommandRunner,
+} from "../src/agent/tmux-launch";
 import { ensureCodexDirTrust } from "../src/codex-trust";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import { runPanel } from "../src/pair/panel";
 import {
   assemblePrompt,
-  buildPairLaunchArgv,
   buildPairOutput,
-  buildShowLastMessageArgv,
-  buildWaitForStopArgv,
   DEFAULT_PAIR_SESSION,
   diffGitSnapshots,
-  isSelfTranscriptCollision,
   loadRolePrompt,
   PAIR_CLIS,
   type PairCli,
   pairOutputYaml,
   parseGitPorcelain,
-  parsePairLaunchJson,
-  parseShowLastMessageJson,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
   stripClaudeEnv,
@@ -117,15 +131,40 @@ Options:
 
 const DEFAULT_TIMEOUT_SECONDS = 1800;
 
-// Subprocess-kill margin over the stop-wait budget. keeper agent runs its ≤30s
-// path-discovery wait SEQUENTIALLY before the stop-wait clock starts, so its
-// worst-case clean (retryable exit-4) return is ~`stopTimeoutMs + 30s`. The kill
-// MUST sit strictly above that, or a slow start SIGKILLs keeper agent mid-wait —
-// yielding a raw `waitRes === null` "killed" instead of the clean retryable exit.
-// PATH_CEILING_MS mirrors keeper agent's `DEFAULT_PATH_TIMEOUT_MS` (loose coupling,
-// NOT a cross-repo import): a future bump there prompts a glance here.
-const PATH_CEILING_MS = 30_000;
-const SLOP_MS = 5_000;
+/**
+ * The process-level seams the in-process compose drives, injected so a test can
+ * force a tmux launch failure (a canned `runTmuxCommand`) or canned wait/show
+ * outcomes without a real subprocess/tmux. The partner env (CLAUDE-stripped per
+ * CLI) is derived inside `main` — it depends on the resolved partner CLI — so it
+ * is NOT a seam here.
+ */
+export interface PairSendSeams {
+  cwd: string;
+  /** Transcript-resolution home (`homedir()`); the wait/show seams read it. */
+  homeDir: string;
+  tmuxBin: string;
+  launcherStateDir: string;
+  randomUuid: () => string;
+  runTmuxCommand: TmuxCommandRunner;
+  now: () => number;
+  waitForStop: RunCaptureDeps["waitForStop"];
+  showLastMessage: RunCaptureDeps["showLastMessage"];
+}
+
+/** The production seam bindings — the real launcher collaborators + wall clock. */
+function productionPairSendSeams(): PairSendSeams {
+  return {
+    cwd: process.cwd(),
+    homeDir: homedir(),
+    tmuxBin: resolveTmuxBin(process.env),
+    launcherStateDir: defaultKeeperAgentStateDir(process.env),
+    randomUuid: () => randomUUID(),
+    runTmuxCommand: defaultTmuxCommandRunner,
+    now: () => Date.now(),
+    waitForStop: runWaitForStop,
+    showLastMessage: runShowLastMessage,
+  };
+}
 
 /** Emit one Monitor event line. The event name + key=value fields render in a
  *  stable order so a Monitor regex never has to tolerate reordering. */
@@ -158,34 +197,10 @@ function gitSnapshot(cwd: string): Set<string> | null {
   }
 }
 
-/** Run a keeper agent subcommand, returning the captured stdout + exit code, or
- *  null on a spawn failure (ENOENT / kill). Env is the CLAUDE-stripped partner
- *  env; cwd is the partner's target repo. */
-function runKeeperAgent(
+export async function main(
   argv: string[],
-  env: Record<string, string>,
-  cwd: string,
-  timeoutMs?: number,
-): { exitCode: number; stdout: string; stderr: string } | null {
-  try {
-    const res = Bun.spawnSync(argv, {
-      env,
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
-    });
-    return {
-      exitCode: res.exitCode,
-      stdout: res.stdout.toString(),
-      stderr: res.stderr.toString(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-export async function main(argv: string[]): Promise<void> {
+  seamsOverride: Partial<PairSendSeams> = {},
+): Promise<void> {
   // Sub-verb routing: `send` (fan one task to a partner) and `panel` (fan a
   // question to a panel of detached legs + chunked-wait verdict).
   const sub = argv[0];
@@ -203,6 +218,13 @@ export async function main(argv: string[]): Promise<void> {
     );
     process.exit(2);
   }
+
+  // Production seams unless a caller (tests) overrides them. Resolved only on the
+  // `send` path so `panel` / `--help` never touch the filesystem probes.
+  const seams: PairSendSeams = {
+    ...productionPairSendSeams(),
+    ...seamsOverride,
+  };
 
   const parsed = parseArgs({
     args: argv.slice(1),
@@ -329,7 +351,7 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const pairCli = cli as PairCli;
-  const cwd = process.cwd();
+  const cwd = seams.cwd;
   // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the partner is
   // launched + waited-on + read through — the folded `keeper agent` launcher.
   const launcherArgvPrefix = buildLauncherArgvPrefix(
@@ -421,96 +443,93 @@ export async function main(argv: string[]): Promise<void> {
     ensureCodexDirTrust({ cwd, env: process.env });
   }
 
-  // ---- 1. launch the partner detached ----
-  const launchArgv = buildPairLaunchArgv({
-    launcherArgvPrefix,
-    cli: pairCli,
-    prompt,
+  // ---- launch → wait-for-stop → show-last-message, IN-PROCESS ----
+  // The launch + capture run in ONE process on a pinned `ResolvedHandle` held
+  // locally for the whole turn (`launchToResolvedHandle` drives the tmux launcher
+  // directly; `composeRunCapture` then drives the wait/show seams on that handle).
+  // Two guards the old cross-process subprocess compose needed are now
+  // structurally unnecessary and intentionally dropped:
+  //   - the PATH_CEILING_MS+SLOP_MS subprocess-kill margin: there is no `keeper
+  //     agent` subprocess to SIGKILL mid-wait — the wait is an in-process await
+  //     bounded by `ResolvedHandle.stopTimeoutMs`, so a slow start cannot race it.
+  //   - the self-transcript-collision guard: the launch PINS the partner's
+  //     transcript session id and the handle is held locally, so the resolver
+  //     never falls back to newest-by-mtime onto the driver's own transcript.
+  const posture: LaunchPosture = {
     readOnly,
-    ...(presetName !== undefined && presetName !== ""
-      ? { preset: presetName }
-      : {}),
-    ...(v.model !== undefined ? { model: v.model } : {}),
-    ...(v.effort !== undefined ? { effort: v.effort } : {}),
+    model: v.model,
+    effort: v.effort,
     // Partners land in a stable named session (`pair` by default, `panels` for
-    // panel legs). Concurrent launches sharing the name are safe: keeper agent's
-    // launch recovers from the new-session "duplicate session" TOCTOU by adding a
-    // window to the now-existing session.
+    // panel legs). Concurrent launches sharing the name are safe: the launcher
+    // recovers from the new-session "duplicate session" TOCTOU by adding a window.
     session: sessionName,
-  });
-  const startMs = Date.now();
-  const launchRes = runKeeperAgent(launchArgv, env, cwd);
-  if (launchRes === null) {
-    return fail(
-      `keeper agent launch produced no result (bad launcher '${launcherArgvPrefix.join(" ")}'?)`,
-    );
-  }
-  if (launchRes.exitCode !== 0) {
-    return fail(
-      `keeper agent launch exited ${launchRes.exitCode}: ${launchRes.stderr.trim()}`,
-    );
-  }
-  const launchParse = parsePairLaunchJson(launchRes.stdout);
-  if (!launchParse.ok) {
-    return fail(launchParse.error);
-  }
-  const handle = launchParse.handle.id;
-
-  // ---- 2. wait for the partner to stop ----
-  // keeper's `--timeout` drives `--stop-timeout-ms` (keeper agent's stop-wait budget,
-  // overriding its 600s default) AND a widened subprocess-kill margin sitting
-  // strictly above keeper agent's worst-case clean return (stop budget + ≤30s path
-  // discovery + slop) so a slow keeper agent start never gets SIGKILLed mid-wait.
-  const waitRes = runKeeperAgent(
-    buildWaitForStopArgv(launcherArgvPrefix, handle, stopTimeoutMs),
+    preset: presetName,
+  };
+  const launchDeps: LaunchHandleDeps = {
     env,
     cwd,
-    stopTimeoutMs + PATH_CEILING_MS + SLOP_MS,
+    tmuxBin: seams.tmuxBin,
+    launcherStateDir: seams.launcherStateDir,
+    launcherArgvPrefix,
+    randomUuid: seams.randomUuid,
+    runTmuxCommand: seams.runTmuxCommand,
+    now: seams.now,
+    writeErr: (s) => {
+      process.stderr.write(s);
+    },
+  };
+  const result = await composeRunCapture(
+    {
+      waitForStop: seams.waitForStop,
+      showLastMessage: seams.showLastMessage,
+      now: seams.now,
+      launch: () =>
+        launchToResolvedHandle({
+          deps: launchDeps,
+          agent: pairCli,
+          prompt,
+          posture,
+          // keeper's `--timeout` is authoritative for the partner stop wait; it
+          // rides onto the handle so the in-process wait honors it over the 600s
+          // launcher default.
+          stopTimeoutMs,
+        }),
+    },
+    { env, homeDir: seams.homeDir },
+    pairCli,
   );
-  if (waitRes === null || waitRes.exitCode !== 0) {
-    const detail =
-      waitRes === null
-        ? "spawn failed / killed"
-        : `exit ${waitRes.exitCode}: ${waitRes.stderr.trim()}`;
-    return fail(`keeper agent wait-for-stop failed (${detail})`);
+
+  // ---- map run-capture's outcome → pair's 0/1/2 contract (ONE exhaustive,
+  //      `never`-checked boundary; never leak run-capture's 0/4/2 codes) ----
+  // completed/no_message run the success tail (exit 0); no_message is a tool-only
+  // final turn that old pair always succeeded on. timed_out/no_transcript/
+  // launch_failed `fail()` (exit 1) BEFORE any --output file is written, dropping
+  // any partial message. bad_args is defensive — pair validates args pre-compose
+  // (exit 2 already happened above) — and the `never` default both exit 1.
+  const outcome = result.envelope.outcome;
+  switch (outcome) {
+    case "completed":
+    case "no_message":
+      break;
+    case "timed_out":
+      return fail("partner timed out before stopping");
+    case "no_transcript":
+      return fail("partner produced no transcript");
+    case "launch_failed":
+      return fail("keeper agent launch failed");
+    case "bad_args":
+      return fail("keeper agent rejected the launch arguments");
+    default: {
+      const unreachable: never = outcome;
+      return fail(`unexpected run-capture outcome: ${String(unreachable)}`);
+    }
   }
 
-  // ---- 3. read the partner's final message ----
-  const showRes = runKeeperAgent(
-    buildShowLastMessageArgv(launcherArgvPrefix, handle),
-    env,
-    cwd,
-  );
-  if (showRes === null || showRes.exitCode !== 0) {
-    const detail =
-      showRes === null
-        ? "spawn failed / killed"
-        : `exit ${showRes.exitCode}: ${showRes.stderr.trim()}`;
-    return fail(`keeper agent show-last-message failed (${detail})`);
-  }
-  const showParse = parseShowLastMessageJson(showRes.stdout);
-  if (!showParse.ok) {
-    return fail(showParse.error);
-  }
-
-  // Self-collision guard (defense-in-depth behind the keeper agent session-id pin):
-  // if the resolver fell back to newest-by-mtime and won the DRIVER's own
-  // concurrently-written transcript, never surface that as a `completed` carrying
-  // a bogus answer — fail loud. The driver's session id is read straight off the
-  // orchestrator's OWN process env (always present here, independent of whatever
-  // env the partner pane inherited).
-  if (
-    isSelfTranscriptCollision(
-      showParse.result.transcriptPath,
-      process.env.CLAUDE_CODE_SESSION_ID,
-    )
-  ) {
-    return fail("self-transcript-collision");
-  }
-
+  // ---- success tail (UNCHANGED): after-snapshot → buildPairOutput → YAML →
+  //      atomic temp-write+rename → completed AFTER the rename → exit 0 ----
   const afterSnapshot = readOnly ? gitSnapshot(cwd) : null;
   const changedFiles = diffGitSnapshots(beforeSnapshot, afterSnapshot);
-  const elapsedSeconds = (Date.now() - startMs) / 1000;
+  const elapsedSeconds = result.envelope.elapsed_seconds ?? 0;
 
   if (readOnly && changedFiles.length > 0) {
     process.stderr.write(
@@ -522,11 +541,11 @@ export async function main(argv: string[]): Promise<void> {
   const outputObj = buildPairOutput({
     cli: pairCli,
     role,
-    message: showParse.result.message,
+    message: result.envelope.message,
     readOnly,
     changedFiles,
-    transcriptPath: showParse.result.transcriptPath,
-    handle,
+    transcriptPath: result.envelope.transcript_path,
+    handle: result.envelope.handle ?? "",
     elapsedSeconds,
   });
   const yamlText = pairOutputYaml(outputObj);

@@ -1,8 +1,7 @@
 /**
  * Unit tests for the dep-free `src/pair-command.ts` leaf module: the per-CLI
- * keeper agent argv builders (byte-pinned, read-only flag sets), prompt assembly
- * (directive + role + message ordering), the launch/show-last-message JSON
- * parsers (schema-drift + handle extraction), the git changed-files diff, the
+ * launch argv builder (byte-pinned, read-only flag sets), prompt assembly
+ * (directive + role + message ordering), the git changed-files diff, the
  * CLAUDE* env strip, and the output-YAML assembly (read_only_violation flag).
  */
 
@@ -11,21 +10,15 @@ import {
   assemblePrompt,
   buildPairLaunchArgv,
   buildPairOutput,
-  buildShowLastMessageArgv,
-  buildWaitForStopArgv,
   DEFAULT_PAIR_SESSION,
   diffGitSnapshots,
   isPairRole,
-  isSelfTranscriptCollision,
   loadRolePrompt,
   nativeClaudeArgs,
   nativeCodexArgs,
   nativePiArgs,
-  PAIR_KEEPER_AGENT_SCHEMA_VERSION,
   PAIR_ROLES,
   parseGitPorcelain,
-  parsePairLaunchJson,
-  parseShowLastMessageJson,
   READ_ONLY_DIRECTIVE,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
@@ -35,11 +28,6 @@ import {
 // The folded-launcher argv prefix the pair path spawns: `[bun, cli/keeper.ts,
 // "agent"]`. Supersedes the standalone `keeper agent` binary path.
 const LAP = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
-
-// Subprocess-kill margin over the stop budget, mirrored from cli/pair.ts
-// (PATH_CEILING_MS 30s + SLOP_MS 5s). Asserted here so the kill-margin invariant
-// is pinned alongside the flag-emission seam.
-const KILL_MARGIN_MS = 35_000;
 
 // ---------------------------------------------------------------------------
 // roles
@@ -411,21 +399,6 @@ test("buildPairLaunchArgv: no preset → no --x-preset flag (zero behavior chang
   expect(argv).not.toContain("--x-preset");
 });
 
-test("buildWaitForStopArgv / buildShowLastMessageArgv: handle composition", () => {
-  expect(buildWaitForStopArgv(LAP, "tmux-abc", 1_800_000)).toEqual([
-    ...LAP,
-    "wait-for-stop",
-    "tmux-abc",
-    "--stop-timeout-ms",
-    "1800000",
-  ]);
-  expect(buildShowLastMessageArgv(LAP, "tmux-abc")).toEqual([
-    ...LAP,
-    "show-last-message",
-    "tmux-abc",
-  ]);
-});
-
 test("stopTimeoutMsFromSeconds: integer seconds → exact ms", () => {
   expect(stopTimeoutMsFromSeconds(1800)).toBe(1_800_000);
   expect(stopTimeoutMsFromSeconds(1)).toBe(1000);
@@ -435,111 +408,6 @@ test("stopTimeoutMsFromSeconds: fractional seconds round UP to ms", () => {
   expect(stopTimeoutMsFromSeconds(0.5)).toBe(500);
   expect(stopTimeoutMsFromSeconds(1.0009)).toBe(1001);
   expect(stopTimeoutMsFromSeconds(599.9999)).toBe(600_000);
-});
-
-test("buildWaitForStopArgv emits --stop-timeout-ms <Math.ceil(secs*1000)>", () => {
-  // A fractional --timeout still emits an integer-ms flag (the same one tested
-  // seam the kill margin uses) — never a fractional ms.
-  const argv = buildWaitForStopArgv(LAP, "h", stopTimeoutMsFromSeconds(1.0009));
-  const idx = argv.indexOf("--stop-timeout-ms");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(argv[idx + 1]).toBe("1001");
-});
-
-test("kill margin = stopTimeoutMs + 35_000, strictly above the stop budget", () => {
-  for (const secs of [1, 600, 1800, 0.5]) {
-    const stopMs = stopTimeoutMsFromSeconds(secs);
-    const killMs = stopMs + KILL_MARGIN_MS;
-    expect(killMs).toBe(stopMs + 35_000);
-    expect(killMs).toBeGreaterThan(stopMs);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// launch JSON parsing
-// ---------------------------------------------------------------------------
-
-test("parsePairLaunchJson: extracts id + paneId from the schema-1 line", () => {
-  const line = JSON.stringify({
-    schema_version: 1,
-    id: "tmux-xyz",
-    agent: "claude",
-    paneId: "%7",
-  });
-  const res = parsePairLaunchJson(`some banner\n${line}\n`);
-  expect(res.ok).toBe(true);
-  if (res.ok) {
-    expect(res.handle).toEqual({ id: "tmux-xyz", paneId: "%7" });
-  }
-});
-
-test("parsePairLaunchJson: schema drift fails loud", () => {
-  const line = JSON.stringify({ schema_version: 99, id: "x" });
-  const res = parsePairLaunchJson(line);
-  expect(res.ok).toBe(false);
-  if (!res.ok) {
-    expect(res.error).toContain("schema_version");
-  }
-});
-
-test("parsePairLaunchJson: missing id fails loud; null paneId tolerated", () => {
-  const noId = parsePairLaunchJson(JSON.stringify({ schema_version: 1 }));
-  expect(noId.ok).toBe(false);
-  const nullPane = parsePairLaunchJson(
-    JSON.stringify({ schema_version: 1, id: "h", paneId: null }),
-  );
-  expect(nullPane.ok).toBe(true);
-  if (nullPane.ok) {
-    expect(nullPane.handle.paneId).toBeNull();
-  }
-});
-
-test("parsePairLaunchJson: no JSON line at all fails", () => {
-  const res = parsePairLaunchJson("plain text, no json\n");
-  expect(res.ok).toBe(false);
-});
-
-// ---------------------------------------------------------------------------
-// show-last-message JSON parsing
-// ---------------------------------------------------------------------------
-
-test("parseShowLastMessageJson: reads message + transcriptPath from metadata line", () => {
-  const meta = JSON.stringify({
-    schema_version: 1,
-    agent: "claude",
-    transcriptPath: "/t/x.jsonl",
-    found: true,
-    message: "the final answer",
-  });
-  // keeper agent prints the bare message first, then the JSON metadata.
-  const res = parseShowLastMessageJson(`the final answer\n${meta}\n`);
-  expect(res.ok).toBe(true);
-  if (res.ok) {
-    expect(res.result.message).toBe("the final answer");
-    expect(res.result.found).toBe(true);
-    expect(res.result.transcriptPath).toBe("/t/x.jsonl");
-  }
-});
-
-test("parseShowLastMessageJson: tool-only turn — found true, message null", () => {
-  const meta = JSON.stringify({
-    schema_version: 1,
-    agent: "codex",
-    transcriptPath: "/t/y.jsonl",
-    found: true,
-    message: null,
-  });
-  const res = parseShowLastMessageJson(meta);
-  expect(res.ok).toBe(true);
-  if (res.ok) {
-    expect(res.result.message).toBeNull();
-    expect(res.result.found).toBe(true);
-  }
-});
-
-test("parseShowLastMessageJson: no metadata line fails", () => {
-  const res = parseShowLastMessageJson("just a message body, no json\n");
-  expect(res.ok).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -654,37 +522,6 @@ test("buildPairOutput: null message serializes to an empty string message", () =
 });
 
 // ---------------------------------------------------------------------------
-// self-transcript-collision guard
-// ---------------------------------------------------------------------------
-
-test("isSelfTranscriptCollision: basename == driver session id collides", () => {
-  const sid = "abc123-uuid";
-  expect(
-    isSelfTranscriptCollision(
-      `/home/u/.claude/projects/encoded-cwd/${sid}.jsonl`,
-      sid,
-    ),
-  ).toBe(true);
-});
-
-test("isSelfTranscriptCollision: partner transcript (different uuid) does not collide", () => {
-  expect(
-    isSelfTranscriptCollision(
-      "/home/u/.claude/projects/encoded-cwd/partner-uuid.jsonl",
-      "driver-uuid",
-    ),
-  ).toBe(false);
-});
-
-test("isSelfTranscriptCollision: null/empty inputs never collide", () => {
-  expect(isSelfTranscriptCollision(null, "driver")).toBe(false);
-  expect(isSelfTranscriptCollision("/p/driver.jsonl", null)).toBe(false);
-  expect(isSelfTranscriptCollision("/p/driver.jsonl", undefined)).toBe(false);
-  expect(isSelfTranscriptCollision("", "driver")).toBe(false);
-  expect(isSelfTranscriptCollision("/p/driver.jsonl", "")).toBe(false);
-});
-
-// ---------------------------------------------------------------------------
 // keeper-agent launcher path resolution
 // ---------------------------------------------------------------------------
 
@@ -707,10 +544,6 @@ test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; tilde expands; else de
   const derived = resolvePairKeeperAgentPath({}, "/home/u");
   expect(derived.startsWith("/")).toBe(true);
   expect(derived.endsWith("/cli/keeper.ts")).toBe(true);
-});
-
-test("schema version constant is pinned at 1 (cross-repo contract)", () => {
-  expect(PAIR_KEEPER_AGENT_SCHEMA_VERSION).toBe(1);
 });
 
 test("DEFAULT_PAIR_SESSION is the stable 'pair' session name", () => {

@@ -6,26 +6,36 @@
  * event channel and EVERY exit path must emit exactly one `[keeper-pair] started`
  * line plus exactly one terminal (`completed`/`failed`) line.
  *
- * The highest-value coverage is a failure path. We drive the launch-failure
- * branch by pointing `KEEPER_AGENT_PATH` at a nonexistent binary: the
- * `keeper agent <cli>` launch spawn throws ENOENT, `runKeeperAgent` returns null, and
- * `main()` takes the `fail(...)` path. No real tmux, no real git (read-only is
- * off so the git backstop is skipped), no daemon — a deterministic synchronous
- * failure.
+ * pair now composes the partner launch IN-PROCESS via the shared `src/agent`
+ * run-capture primitives, so the launch + wait/show are driven through INJECTED
+ * seams (a canned tmux command runner that forces a `TmuxLaunchError`, and canned
+ * wait/show outcomes) — no real tmux, no real git (read-only is off so the git
+ * backstop is skipped), no daemon, no subprocess. Each `RunCaptureOutcome` is
+ * exercised for its mapping onto pair's 0/1/2 contract.
  *
  * `main()` writes to process.stdout/stderr and calls process.exit() directly, so
  * (mirroring `test/keeper-cli.test.ts`'s `runMain`) we patch those globals around
  * the call: exit throws a tagged ExitError so the never-return `fail` branch
  * stops the function, and the streams are captured + restored in a finally. The
- * keeper-agent-path + state env are sandboxed per the repo isolation rule and
- * restored after each run.
+ * launcher state dir is redirected into the per-test tmpdir via the injected
+ * seam, and the keeper state env is sandboxed per the repo isolation rule.
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main as pairMain } from "../cli/pair";
+import { type PairSendSeams, main as pairMain } from "../cli/pair";
+import type {
+  ShowLastMessageResult,
+  WaitForStopResult,
+} from "../src/agent/pair-subcommands";
 import { sandboxEnv } from "./helpers/sandbox-env";
 
 class ExitError extends Error {
@@ -68,9 +78,8 @@ beforeEach(() => {
   for (const k of TOUCHED_ENV_KEYS) savedEnv[k] = process.env[k];
 
   // Sandbox every keeper state path under the per-test tmpdir (the isolation
-  // rule) and point the keeper-agent launcher path at a nonexistent module so the
-  // launch spawn (`bun <bad-path> agent claude …`) deterministically fails — bun
-  // runs but cannot load the bad module and exits non-zero.
+  // rule). The launcher state dir + tmux transport are injected per-run via the
+  // seam bag, so no real tmux/subprocess ever fires.
   const env = sandboxEnv({
     tmpDir: dir,
     dbPath: join(dir, "keeper.db"),
@@ -99,8 +108,55 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** Drive `pairMain(argv)` with process.{exit,stdout,stderr} captured. */
-async function runMain(argv: string[]): Promise<MainRun> {
+/** A canned tmux runner that fails window creation → `TmuxLaunchError` →
+ *  `launch_failed`, with no real tmux. */
+const FAILING_TMUX: PairSendSeams["runTmuxCommand"] = () => ({
+  exitCode: 1,
+  stdout: "",
+  stderr: "tmux unavailable",
+});
+
+/** A canned tmux runner that reports no existing session then a created target
+ *  (`session\x01@window\x01%pane`), so the launch succeeds with no real tmux. */
+const LAUNCHING_TMUX: PairSendSeams["runTmuxCommand"] = (cmd) => {
+  if (cmd.includes("has-session")) {
+    return { exitCode: 1, stdout: "", stderr: "no session" };
+  }
+  return { exitCode: 0, stdout: "pair\x01@1\x01%1\n", stderr: "" };
+};
+
+const STOP = {
+  agent: "claude" as const,
+  eventType: "assistant",
+  reason: "end_turn",
+  timestamp: null,
+  message: "the answer",
+};
+
+/** Seam overrides for a launch that fails at the tmux step. */
+function launchFailureSeams(): Partial<PairSendSeams> {
+  return { runTmuxCommand: FAILING_TMUX, launcherStateDir: dir };
+}
+
+/** Seam overrides for a successful launch with canned wait/show outcomes. */
+function composeSeams(
+  wait: WaitForStopResult,
+  show: ShowLastMessageResult,
+): Partial<PairSendSeams> {
+  return {
+    runTmuxCommand: LAUNCHING_TMUX,
+    launcherStateDir: dir,
+    waitForStop: async () => wait,
+    showLastMessage: async () => show,
+    now: () => 0,
+  };
+}
+
+/** Drive `pairMain(argv, seams)` with process.{exit,stdout,stderr} captured. */
+async function runMain(
+  argv: string[],
+  seams: Partial<PairSendSeams> = {},
+): Promise<MainRun> {
   const out: string[] = [];
   const err: string[] = [];
   const realOut = process.stdout.write.bind(process.stdout);
@@ -120,7 +176,7 @@ async function runMain(argv: string[]): Promise<MainRun> {
     throw new ExitError(code);
   }) as typeof process.exit;
   try {
-    await pairMain(argv);
+    await pairMain(argv, seams);
   } catch (e) {
     if (!(e instanceof ExitError)) throw e;
   } finally {
@@ -142,14 +198,17 @@ test("launch-failure path emits exactly one started + one failed line (two-line 
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "audit this");
 
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--cli",
-    "claude",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  const r = await runMain(
+    [
+      "send",
+      promptFile,
+      "--cli",
+      "claude",
+      "--output",
+      join(dir, "result.yaml"),
+    ],
+    launchFailureSeams(),
+  );
 
   // Failure path exits 1 (the launch/wait/show error taxonomy).
   expect(r.code).toBe(1);
@@ -160,24 +219,29 @@ test("launch-failure path emits exactly one started + one failed line (two-line 
   // …and no completed line leaked onto the failure path.
   expect(countEvent(r.stdout, "completed")).toBe(0);
 
-  // The terminal line carries the launch-failure cause: bun runs the bad launcher
-  // module and exits non-zero, surfaced as an "keeper agent launch exited" error.
+  // The terminal line carries the launch-failure cause (the injected tmux seam
+  // forced a TmuxLaunchError → launch_failed).
   expect(r.stdout).toContain("[keeper-pair] failed");
-  expect(r.stdout).toContain("error=keeper agent launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch failed");
+  // No --output file is written on the failure path.
+  expect(existsSync(join(dir, "result.yaml"))).toBe(false);
 });
 
 test("started precedes failed on the failure path", async () => {
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "audit this");
 
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--cli",
-    "codex",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  const r = await runMain(
+    [
+      "send",
+      promptFile,
+      "--cli",
+      "claude",
+      "--output",
+      join(dir, "result.yaml"),
+    ],
+    launchFailureSeams(),
+  );
 
   expect(r.code).toBe(1);
   const startedIdx = r.stdout.indexOf("[keeper-pair] started");
@@ -185,6 +249,116 @@ test("started precedes failed on the failure path", async () => {
   expect(startedIdx).toBeGreaterThanOrEqual(0);
   expect(failedIdx).toBeGreaterThan(startedIdx);
 });
+
+// ---------------------------------------------------------------------------
+// in-process compose: RunCaptureOutcome → pair's 0/1/2 contract
+// ---------------------------------------------------------------------------
+
+test("completed outcome → success tail writes YAML, completed line, exit 0", async () => {
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "audit this");
+  const outPath = join(dir, "result.yaml");
+
+  const r = await runMain(
+    ["send", promptFile, "--cli", "claude", "--output", outPath],
+    composeSeams(
+      { ok: true, transcriptPath: "/t.jsonl", stop: STOP },
+      {
+        ok: true,
+        transcriptPath: "/t.jsonl",
+        text: "partner answer",
+        found: true,
+      },
+    ),
+  );
+
+  expect(r.code).toBe(0);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(countEvent(r.stdout, "completed")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(0);
+  // The atomic write landed the partner's answer + the cli/role echo.
+  const yaml = readFileSync(outPath, "utf8");
+  expect(yaml).toContain("message: partner answer");
+  expect(yaml).toContain("cli: claude");
+});
+
+test("no_message outcome (tool-only final turn) → completed, empty message, exit 0", async () => {
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "audit this");
+  const outPath = join(dir, "result.yaml");
+
+  const r = await runMain(
+    ["send", promptFile, "--cli", "claude", "--output", outPath],
+    composeSeams(
+      {
+        ok: true,
+        transcriptPath: "/t.jsonl",
+        stop: { ...STOP, message: null },
+      },
+      { ok: true, transcriptPath: "/t.jsonl", text: null, found: false },
+    ),
+  );
+
+  // Old pair always SUCCEEDED on a tool-only final turn — no_message is exit 0.
+  expect(r.code).toBe(0);
+  expect(countEvent(r.stdout, "completed")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(0);
+  const yaml = readFileSync(outPath, "utf8");
+  expect(yaml).toContain("message: ''");
+});
+
+test("timed_out outcome → failed, exit 1, drops the partial message, no output file", async () => {
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "audit this");
+  const outPath = join(dir, "result.yaml");
+
+  const r = await runMain(
+    ["send", promptFile, "--cli", "claude", "--output", outPath],
+    composeSeams(
+      {
+        ok: false,
+        error: "timed out waiting for transcript stop after 50ms (caller)",
+      },
+      {
+        ok: true,
+        transcriptPath: "/t.jsonl",
+        text: "partial so far",
+        found: true,
+      },
+    ),
+  );
+
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "started")).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(1);
+  expect(countEvent(r.stdout, "completed")).toBe(0);
+  expect(r.stdout).toContain("error=partner timed out before stopping");
+  // The partial message is dropped — no output file is written on the fail arm.
+  expect(existsSync(outPath)).toBe(false);
+});
+
+test("no_transcript outcome → failed, exit 1, no output file", async () => {
+  const promptFile = join(dir, "prompt.txt");
+  writeFileSync(promptFile, "audit this");
+  const outPath = join(dir, "result.yaml");
+
+  const r = await runMain(
+    ["send", promptFile, "--cli", "claude", "--output", outPath],
+    composeSeams(
+      { ok: false, error: "timed out waiting for transcript path" },
+      { ok: false, error: "timed out waiting for transcript path" },
+    ),
+  );
+
+  expect(r.code).toBe(1);
+  expect(countEvent(r.stdout, "failed")).toBe(1);
+  expect(r.stdout).toContain("error=partner produced no transcript");
+  expect(existsSync(outPath)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// preset resolution + arg validation (unchanged, pre-compose)
+// ---------------------------------------------------------------------------
 
 /** Write the sandboxed `presets.yaml` (KEEPER_CONFIG_DIR/presets.yaml). */
 function writePresets(body: string): void {
@@ -196,16 +370,19 @@ test("--preset alone is valid: harness comes from the preset, started carries pr
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "review this");
 
-  // --preset (no --cli) reaches the LAUNCH (fails there on the bad launcher path),
-  // proving the cli===undefined hard-fail was relaxed for the preset case.
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--preset",
-    "reviewer",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  // --preset (no --cli) reaches the LAUNCH (failing there on the injected tmux
+  // seam), proving the cli===undefined hard-fail was relaxed for the preset case.
+  const r = await runMain(
+    [
+      "send",
+      promptFile,
+      "--preset",
+      "reviewer",
+      "--output",
+      join(dir, "result.yaml"),
+    ],
+    launchFailureSeams(),
+  );
   expect(r.code).toBe(1);
   expect(countEvent(r.stdout, "started")).toBe(1);
   expect(countEvent(r.stdout, "failed")).toBe(1);
@@ -213,7 +390,7 @@ test("--preset alone is valid: harness comes from the preset, started carries pr
   expect(r.stdout).toContain("[keeper-pair] started cli=claude");
   expect(r.stdout).toContain("preset=reviewer");
   // It reached the launch, not an arg-fault exit-2.
-  expect(r.stdout).toContain("error=keeper agent launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch failed");
 });
 
 test("--preset + agreeing --cli is accepted", async () => {
@@ -221,19 +398,22 @@ test("--preset + agreeing --cli is accepted", async () => {
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "review this");
 
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--preset",
-    "reviewer",
-    "--cli",
-    "claude",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  const r = await runMain(
+    [
+      "send",
+      promptFile,
+      "--preset",
+      "reviewer",
+      "--cli",
+      "claude",
+      "--output",
+      join(dir, "result.yaml"),
+    ],
+    launchFailureSeams(),
+  );
   expect(r.code).toBe(1);
   expect(countEvent(r.stdout, "started")).toBe(1);
-  expect(r.stdout).toContain("error=keeper agent launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch failed");
 });
 
 test("--preset disagreeing with --cli fails loud (exit 2, no started line)", async () => {
@@ -266,41 +446,40 @@ test("a pi preset is accepted: reaches launch (exit 1, started cli=pi)", async (
   writeFileSync(promptFile, "think");
 
   // pi is a first-class pair partner now: --preset thinker reaches the LAUNCH
-  // (failing there on the sandboxed bad-launcher path) like the claude preset,
-  // instead of the old exit-2 reject — no accept/reject inconsistency remains.
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--preset",
-    "thinker",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  // (failing there on the injected tmux seam) like the claude preset, instead of
+  // the old exit-2 reject — no accept/reject inconsistency remains.
+  const r = await runMain(
+    [
+      "send",
+      promptFile,
+      "--preset",
+      "thinker",
+      "--output",
+      join(dir, "result.yaml"),
+    ],
+    launchFailureSeams(),
+  );
   expect(r.code).toBe(1);
   expect(countEvent(r.stdout, "started")).toBe(1);
   expect(countEvent(r.stdout, "failed")).toBe(1);
   expect(r.stdout).toContain("[keeper-pair] started cli=pi");
   expect(r.stdout).toContain("preset=thinker");
-  expect(r.stdout).toContain("error=keeper agent launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch failed");
 });
 
 test("--cli pi is accepted: reaches launch (exit 1)", async () => {
   const promptFile = join(dir, "prompt.txt");
   writeFileSync(promptFile, "explore this");
 
-  const r = await runMain([
-    "send",
-    promptFile,
-    "--cli",
-    "pi",
-    "--output",
-    join(dir, "result.yaml"),
-  ]);
+  const r = await runMain(
+    ["send", promptFile, "--cli", "pi", "--output", join(dir, "result.yaml")],
+    launchFailureSeams(),
+  );
   expect(r.code).toBe(1);
   expect(countEvent(r.stdout, "started")).toBe(1);
   expect(countEvent(r.stdout, "failed")).toBe(1);
   expect(r.stdout).toContain("[keeper-pair] started cli=pi");
-  expect(r.stdout).toContain("error=keeper agent launch exited");
+  expect(r.stdout).toContain("error=keeper agent launch failed");
 });
 
 test("a missing preset name fails loud naming the available presets (exit 2)", async () => {
