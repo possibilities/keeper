@@ -2742,6 +2742,22 @@ test("parseAwaitArgs: epic-removed requires an epic id", () => {
   expect(seg.target).toBe("fn-1-foo");
 });
 
+test("parseAwaitArgs: landed requires an epic id (full or bare); rejects task id", () => {
+  expect(parseAwaitArgs(["landed"]).ok).toBe(false);
+  expect(parseAwaitArgs(["landed", "fn-1-foo.1"]).ok).toBe(false);
+  const ok = parseAwaitArgs(["landed", "fn-1-foo"]);
+  if (!ok.ok) {
+    throw new Error(`expected ok, got ${ok.message}`);
+  }
+  const seg = ok.args.segments[0];
+  if (seg?.condition !== "landed") {
+    throw new Error("expected landed segment");
+  }
+  expect(seg.target).toBe("fn-1-foo");
+  // bare id is accepted
+  expect(parseAwaitArgs(["landed", "fn-42"]).ok).toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // fn-1015 board conditions — runner
 // ---------------------------------------------------------------------------
@@ -2898,6 +2914,99 @@ test("await epic-removed: present-then-absent → met (exit 0)", async () => {
 
   // fn-1-foo leaves the board → met.
   sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await landed (worktree ON): lane absent → waiting, then lane_merged → met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "landed", target: "fn-1-foo" }]),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // `landed` opts into the merge-landed observable (and the recent-done window
+  // it is gated with) — the lane_merged query is subscribed.
+  const collections = (sock.takeOutbound() as Array<{ collection?: string }>)
+    .map((f) => f.collection)
+    .filter((c): c is string => c !== undefined);
+  expect(collections).toContain("lane_merged");
+
+  // First paint: worktree mode ON (autopilot_state row), but the lane hasn't
+  // merged yet (empty lane_merged) → armed + waiting.
+  sock.deliver([
+    resultFrame("epics", `${idPrefix}-epics`, []),
+    resultFrame("jobs", `${idPrefix}-jobs`, []),
+    resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
+    resultFrame("git", `${idPrefix}-git`, []),
+    resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
+    resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, [
+      { id: 1, worktree_mode: 1 },
+    ]),
+    resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
+    resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, []),
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
+  ]);
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // The lane merges to default → the projection carries fn-1-foo → met.
+  sock.deliver([
+    resultFrame(
+      "lane_merged",
+      `${idPrefix}-lane-merged`,
+      [{ epic_id: "fn-1-foo" }],
+      2,
+    ),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await landed (worktree OFF): degrades to done — a done epic fires met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "landed", target: "fn-1-foo" }]),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Worktree mode OFF (empty autopilot_state) → no lanes; `landed` degrades to
+  // `done`. The done epic rides the recent-done window; `lane_merged` is empty.
+  sock.deliver([
+    resultFrame("epics", `${idPrefix}-epics`, []),
+    resultFrame("jobs", `${idPrefix}-jobs`, []),
+    resultFrame("subagent_invocations", `${idPrefix}-subagent-invocations`, []),
+    resultFrame("git", `${idPrefix}-git`, []),
+    resultFrame("dead_letters", `${idPrefix}-dead-letters`, []),
+    resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
+    resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, []),
+    resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
+    resultFrame("block_escalations", `${idPrefix}-block-escalations`, []),
+    resultFrame("tmux_client_focus", `${idPrefix}-tmux-client-focus`, []),
+    resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [
+      makeEpicRow({ epic_id: "fn-1-foo", status: "done" }),
+    ]),
+    resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
+  ]);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
   expect(h.exitCode).toBe(0);
 });
 

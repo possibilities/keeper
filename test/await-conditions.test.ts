@@ -37,11 +37,13 @@ import {
   evaluateAwaitCondition,
   gitCleanState,
   isJamReason,
+  landedState,
   monitorRunningState,
   verdictKey,
   workable,
 } from "../src/await-conditions";
 import { computeReadiness, type Verdict } from "../src/readiness";
+import { computeLandedEpicIds } from "../src/readiness-client";
 import type {
   EmbeddedJob,
   Epic,
@@ -1653,6 +1655,52 @@ test("epicRemovedMet: present-then-absent → true; absent-at-baseline → false
   expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-9-z")).toBe(false);
   // still present → waiting
   expect(epicRemovedMet(["fn-1-a"], ["fn-1-a"], "fn-1-a")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1016 landed (merge-landed milestone)
+// ---------------------------------------------------------------------------
+
+test("landedState: met when the epic is in the merge-landed set (full + bare)", () => {
+  expect(landedState("fn-2-b", ["fn-1-a", "fn-2-b"])).toEqual({
+    kind: "met",
+    detail: "lane merged to default (fn-2-b)",
+  });
+  // bare-id target resolves against the full id in the set
+  expect(landedState("fn-2", ["fn-1-a", "fn-2-b"]).kind).toBe("met");
+});
+
+test("landedState: waiting when done-but-unmerged (not yet in the set)", () => {
+  // worktree mode ON: the epic finished (done) but its lane hasn't merged to
+  // default, so it is absent from `landedEpicIds` → waiting, not met.
+  expect(landedState("fn-2-b", ["fn-1-a"])).toEqual({
+    kind: "waiting",
+    detail: "lane not yet merged to default",
+  });
+  expect(landedState("fn-2-b", []).kind).toBe("waiting");
+});
+
+test("landedState: undefined set (not opted in / unpainted) → waiting, never met", () => {
+  expect(landedState("fn-2-b", undefined)).toEqual({
+    kind: "waiting",
+    detail: "merge-landed signal not yet available",
+  });
+});
+
+test("landedState: degrades to complete semantics when worktree mode is OFF", () => {
+  // OFF → no lanes; `computeLandedEpicIds` bakes merged ⇔ done into the set,
+  // so a done epic reads `met` and an open one stays `waiting`.
+  const epics = [
+    makeEpic({ epic_id: "fn-2-b", epic_number: 2, status: "done" }),
+    makeEpic({ epic_id: "fn-3-c", epic_number: 3, status: "open" }),
+  ];
+  const landedOff = computeLandedEpicIds(false, [], epics);
+  expect(landedState("fn-2-b", landedOff).kind).toBe("met");
+  expect(landedState("fn-3-c", landedOff).kind).toBe("waiting");
+  // worktree ON ignores `status`, reading only the projection ids.
+  const landedOn = computeLandedEpicIds(true, ["fn-3-c"], epics);
+  expect(landedState("fn-3-c", landedOn).kind).toBe("met");
+  expect(landedState("fn-2-b", landedOn).kind).toBe("waiting");
 });
 
 // ---------------------------------------------------------------------------

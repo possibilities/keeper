@@ -54,6 +54,7 @@ the literal `and` token.
 | Condition | How to derive | `keeper await` form |
 |---|---|---|
 | `complete <id>` | Default for a keeper plan id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). Fires on the readiness `completed` verdict — **done AND idle** (every owning subagent has gone idle), the moment autopilot actually unblocks downstream work. See the done-AND-idle note below. | `complete fn-…` |
+| `landed <epic>` | A keeper plan EPIC where the user needs its work MERGED to the default branch — "once fn-X's lane lands / is merged", or the planning premise "author B against A's merged files". **Epic only** (a task id is a usage error). Fires when the epic's lane is merged to default; **degrades to `complete` semantics when worktree mode is off** (no lanes → merged ⇔ done). Prefer over `complete` for a planning daisy-chain: under worktree mode a dependent lane is cut before the upstream's finalize merge, so `complete` can fire while the files aren't on the default branch yet. | `landed fn-…` |
 | `started <id>` | A keeper plan id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
 | `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). A `runtime-blocked` task the daemon has escalated to the planner reports `waiting` (escalation in flight), not `stuck`, while the autopilot is paused — see the escalated-but-paused note under *Defaults and overrides*. | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
@@ -99,7 +100,8 @@ is how you discover the board before picking a condition.
 ## Step 1 — Pre-check plan targets are on-board (plan conditions only)
 
 This pre-check applies **only to `complete` / `started` / `unblocked`** (and
-optionally `epic-removed`, whose id you can verify exists today). The other
+optionally `epic-removed` / `landed`, whose epic id you can verify exists
+today). The other
 conditions — `git-clean`, `agents-idle`, `server-up`, `monitor-running`,
 `drained`, `epic-added`, `changed` — have **no `keeper plan show` pre-check**:
 they read live keeper projections (or, for `server-up`, just wait for the daemon
@@ -240,9 +242,9 @@ aggregate:
 [keeper-await] armed condition=monitor-running selector=<…> state=<…>
 [keeper-await] met condition=monitor-running selector=<…> detail=<…>
 
-# single board condition (drained / changed / epic-added / epic-removed;
+# single board condition (drained / changed / epic-added / epic-removed / landed;
 # target=<id> rides only the id-bearing forms)
-[keeper-await] armed condition=<drained|changed|epic-added|epic-removed> [target=<id>] state=<…>
+[keeper-await] armed condition=<drained|changed|epic-added|epic-removed|landed> [target=<id>] state=<…>
 [keeper-await] met condition=<…> [target=<id>] detail=<…>
 
 # AND aggregate (two or more conditions)
