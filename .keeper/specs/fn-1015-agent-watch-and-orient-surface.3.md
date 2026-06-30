@@ -62,5 +62,5 @@ Pure fixtures in test/await-conditions.test.ts: task done-AND-idle → met; done
 - [ ] Pure fixture tests cover every state-machine branch; `bun test` green.
 
 ## Done summary
-
+await complete now fires on the readiness done-AND-idle verdict: task reads perTask completed, epic reads the close-row completed verdict via an OPT-IN recent-done merge in subscribeReadiness (board/dash stay byte-identical when the flag is off). BEHAVIOR CHANGE: a task whose worker_phase=done but whose sub-agent died without SubagentStop stays running:sub-agent-stale by design, so complete now reports waiting (was met) until an operator clears it; task 5 documents this in the await skill.
 ## Evidence

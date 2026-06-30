@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "tighten await complete to done-and-idle",
-  "updated_at": "2026-06-30T03:05:41.733000Z"
+  "updated_at": "2026-06-30T03:36:32.956000Z",
+  "worker_done_at": "2026-06-30T03:36:32.956000Z"
 }
