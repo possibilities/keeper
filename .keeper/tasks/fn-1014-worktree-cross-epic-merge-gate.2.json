@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-30T02:07:28.129000Z",
+  "depends_on": [
+    "fn-1014-worktree-cross-epic-merge-gate.1"
+  ],
+  "epic": "fn-1014-worktree-cross-epic-merge-gate",
+  "id": "fn-1014-worktree-cross-epic-merge-gate.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "document the cross-epic merge gate",
+  "updated_at": "2026-06-30T02:07:28.129000Z"
+}
