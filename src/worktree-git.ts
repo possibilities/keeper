@@ -748,6 +748,56 @@ export async function listEpicLaneBranches(
 }
 
 /**
+ * The discriminated result of {@link enumerateEpicLaneBranches}: the FULL set of
+ * `keeper/epic/<...>` lane short-names present as local refs (`ok`), or a
+ * code-surfaced enumeration FAILURE (`ok:false`) — a non-zero `for-each-ref` exit
+ * OR a {@link GIT_LOCAL_TIMEOUT_MS} SIGKILL. The discriminant is the whole point:
+ * unlike {@link listEpicLaneBranches} (which collapses an error to `[]`, making a
+ * lane-less repo and a failed enumeration indistinguishable) and
+ * {@link branchExists} (error→`false`), a caller MUST be able to tell "this branch
+ * is DEFINITIVELY absent" (a SUCCESSFUL enumeration that omits it) from "I could
+ * not enumerate" (defer). The cross-epic merge-gate's absent-implies-merged arm is
+ * sound ONLY on the former.
+ */
+export type EpicLaneBranchSet =
+  | { ok: true; branches: Set<string> }
+  | { ok: false };
+
+/**
+ * Enumerate EVERY `keeper/epic/<...>` lane short-name (bases AND ribs) present as
+ * a local ref, as a code-surfacing discriminated result bounded by
+ * {@link GIT_LOCAL_TIMEOUT_MS}. On a non-zero `for-each-ref` exit OR a 124 SIGKILL
+ * timeout → `{ ok: false }` (the caller DEFERS — never reads a failed enumeration
+ * as "the branch is absent"); on success → `{ ok: true; branches }` carrying the
+ * full short-name set (e.g. `keeper/epic/fn-1-foo`), which MAY be empty (a repo
+ * with no live lanes — a DEFINITIVE absence, distinct from a failure). The
+ * absent-implies-merged half of the cross-epic merge-gate (keeper deletes a base
+ * only once it is an ancestor of default) needs exactly this present/absent/
+ * inconclusive distinction, which {@link listEpicLaneBranches} (error→`[]`, no
+ * timeout) cannot provide.
+ */
+export async function enumerateEpicLaneBranches(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<EpicLaneBranchSet> {
+  const r = await run(
+    ["for-each-ref", "--format=%(refname:short)", "refs/heads/keeper/epic"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (r.code !== 0) {
+    return { ok: false };
+  }
+  const branches = new Set<string>();
+  for (const raw of r.stdout.split("\n")) {
+    const branch = raw.trim();
+    if (branch.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) {
+      branches.add(branch);
+    }
+  }
+  return { ok: true, branches };
+}
+
+/**
  * Ensure a worktree exists at `path` on `branch`, forked off `commitish` (the
  * parent lane's committed tip, or the base branch for a root). Idempotent + crash-
  * recoverable:

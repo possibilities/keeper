@@ -103,11 +103,13 @@ import {
   type WorktreeEligibility,
 } from "./worktree-eligibility";
 import {
+  type EpicLaneBranchSet,
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
   currentBranch as gitCurrentBranch,
   deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
+  enumerateEpicLaneBranches as gitEnumerateEpicLaneBranches,
   isAncestorOf as gitIsAncestorOf,
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
@@ -639,6 +641,20 @@ export interface ReconcileSnapshot {
    * Optional so a test snapshot may omit it (defaults to no extra roots).
    */
   worktreeKnownRoots?: readonly string[];
+  /**
+   * The EPHEMERAL cross-epic merge-gate defer set — every epic whose lane MUST NOT
+   * be cut this cycle because a SATISFIED, SAME-RESOLVED-REPO upstream is not yet
+   * contained in the LOCAL default branch (cutting the lane would fork it off a
+   * stale base, inverting merge order). Probed ONCE per cycle in
+   * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}) via
+   * {@link computeDeferredEpicIds}, then read back here as PLAIN DATA by the pure
+   * `reconcile` — which shells git nowhere. NEVER a fold input; mints NO sticky /
+   * `dispatch_failures` row (a deferred epic re-evaluates every cycle and provisions
+   * the cycle after its upstream's finalize merge lands). EMPTY whenever worktree
+   * mode is OFF (a byte-identical no-op for OFF / yolo). Optional so a test snapshot
+   * may omit it (defaults to no deferral).
+   */
+  deferredEpicIds?: ReadonlySet<string>;
 }
 
 /**
@@ -1443,6 +1459,10 @@ export function closerJobFinished(
   return sawCloseJob && !isOccupyingJob(jobs, "close", epicId, livePaneIds);
 }
 
+/** Shared empty defer set — the `snapshot.deferredEpicIds ?? …` fallback so the
+ * inert (OFF / nothing-deferred) reconcile path allocates no per-cycle Set. */
+const EMPTY_DEFERRED_EPIC_IDS: ReadonlySet<string> = new Set<string>();
+
 /**
  * The pure reconcile decision. Walks every epic / task / close-row, computes the
  * verb each verdict wants, and emits a `PlannedLaunch` IFF no suppression rule
@@ -1458,6 +1478,13 @@ export function reconcile(
   now: number,
 ): ReconcileDecision {
   const launches: PlannedLaunch[] = [];
+
+  // The EPHEMERAL cross-epic merge-gate defer set, probed git-side ONCE per cycle in
+  // `loadReconcileSnapshot` and read here as PLAIN DATA (the pure layer shells git
+  // nowhere). EMPTY whenever worktree mode is OFF / nothing is deferred — then both
+  // gate arms below are inert and dispatch stays byte-identical. Read once.
+  const deferredEpicIds: ReadonlySet<string> =
+    snapshot.deferredEpicIds ?? EMPTY_DEFERRED_EPIC_IDS;
 
   // The armed-mode eligibility set: in `armed` mode `work` is dispatched ONLY
   // for armed epics PLUS their transitive upstream dep-closure. Computed ONCE
@@ -1587,6 +1614,15 @@ export function reconcile(
       if (armedMode && verb === "work" && !eligible?.has(epic.epic_id)) {
         continue;
       }
+      // Cross-epic merge-gate (worktree mode): suppress a `work` launch for an epic
+      // whose lane must NOT be cut yet — a satisfied same-repo upstream is not yet
+      // contained in local default, so forking the lane now would build on a stale
+      // base (merge-order inversion). EPHEMERAL + producer-probed; mints NO sticky
+      // row and re-evaluates every cycle. ABOVE the budget gate so a deferred epic
+      // consumes no global budget. Inert (empty set) in OFF / yolo.
+      if (deferredEpicIds.has(epic.epic_id)) {
+        continue;
+      }
       if (state.inFlight.has(key)) {
         continue;
       }
@@ -1687,6 +1723,11 @@ export function reconcile(
             snapshot.livePaneIds,
           )
         ) &&
+        // Cross-epic merge-gate: suppress the close launch for a deferred epic too
+        // (no merge-order inversion — its lane was never cut). EPHEMERAL, no sticky;
+        // ABOVE the budget gate (the `budget > 0` term below is last). Inert (empty
+        // set) in OFF / yolo.
+        !deferredEpicIds.has(epicId) &&
         // Cap — the close-row push shares the SAME decrementing budget as the
         // task push, so a closer can't blow the cap.
         budget > 0;
@@ -1830,6 +1871,176 @@ export function buildWorktreeStatusEntries(
   }
   out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
   return out;
+}
+
+/**
+ * Compute the EPHEMERAL cross-epic merge-gate defer set: every epic whose lane
+ * MUST NOT be cut this cycle because a SATISFIED same-resolved-repo upstream is not
+ * yet contained in the LOCAL default branch (so cutting B's lane would fork it off a
+ * stale base, inverting merge order). Producer-side + git-touching — probed ONCE per
+ * cycle in {@link loadReconcileSnapshot}, read back by the pure `reconcile` as plain
+ * {@link ReconcileSnapshot.deferredEpicIds} data. NEVER a fold input; mints NO
+ * sticky / `dispatch_failures` row — a deferred epic re-evaluates every cycle and
+ * provisions the cycle after its upstream's finalize merge lands.
+ *
+ * For each epic B classified `ok` (a single resolved toplevel = its lane base) walk
+ * its DIRECT {@link Epic.resolved_epic_deps} ONLY — never the transitive closure:
+ * coverage is INDUCTIVE (an unmerged grand-upstream defers the upstream, which
+ * defers B). For each `satisfied` dep whose resolved upstream A is ALSO classified
+ * `ok` with the SAME `repoDir` (same-resolved-repo is decided by the RESOLVED git
+ * toplevel from {@link classifyWorktreeRepos} — the shared per-cycle memo — NEVER
+ * `dep.cross_project`: two epics can share a repo across project basenames), probe
+ * A's merge state in that repo. UNION semantics — B defers if ANY such upstream is
+ * unmerged OR its probe is inconclusive:
+ *  - lane `keeper/epic/A` PRESENT ∧ an ancestor of LOCAL default → merged;
+ *  - PRESENT ∧ NOT an ancestor (or the ancestry probe errored/timed out — both
+ *    collapse to `isAncestorOf`→`false`) → DEFER;
+ *  - DEFINITIVELY ABSENT (a SUCCESSFUL enumeration that omits it) → merged-and-
+ *    torn-down (keeper deletes a base only once it is an ancestor of default), so
+ *    satisfied;
+ *  - enumeration FAILED/timed out → DEFER every dependent in that repo (a failed
+ *    enumeration is NEVER read as absent → no false-satisfied stale fork).
+ *
+ * Conservative-degrade: in this level-triggered reconciler an inconclusive VCS probe
+ * DEFERS (self-heals next cycle) — a stale fork would be permanent. A dangling /
+ * null / cross-repo / non-`ok` / reaped upstream folds to "skip this upstream"
+ * (not-gating), mirroring {@link computeEligibleEpics}; the probe NEVER throws out of
+ * the snapshot build (a thrown git probe degrades that epic to DEFER). The LOCAL
+ * default is the same {@link gitResolveDefaultBranch} the provision fork-source uses
+ * (NOT `origin/<default>`) so the ancestry ref matches the base a lane is cut from.
+ * A `disabled` upstream is intentionally NOT gated on: it never cut a lane (its work
+ * landed straight on the shared-checkout default), so a satisfied one is already
+ * contained. The per-repo default-branch + lane-enumeration probes are memoized so N
+ * upstreams sharing one repo spawn git once; A's toplevel reuses the classification
+ * map (already resolved via the shared memo), so no toplevel is re-resolved here.
+ */
+export async function computeDeferredEpicIds(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+): Promise<Set<string>> {
+  const deferred = new Set<string>();
+
+  // Per-repo memos so N same-repo upstreams resolve the default branch + enumerate
+  // lanes ONCE. A throwing probe degrades to the conservative value (null default /
+  // `{ ok: false }` enumeration → DEFER), never out of the snapshot build.
+  const defaultBranchByRepo = new Map<string, string | null>();
+  const resolveLocalDefault = async (
+    repoDir: string,
+  ): Promise<string | null> => {
+    const hit = defaultBranchByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: string | null;
+    try {
+      value = await gitResolveDefaultBranch(repoDir, run);
+    } catch {
+      value = null; // unresolvable default → DEFER (never proceed off an unknown base)
+    }
+    defaultBranchByRepo.set(repoDir, value);
+    return value;
+  };
+  const laneSetByRepo = new Map<string, EpicLaneBranchSet>();
+  const enumerateLanes = async (
+    repoDir: string,
+  ): Promise<EpicLaneBranchSet> => {
+    const hit = laneSetByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: EpicLaneBranchSet;
+    try {
+      value = await gitEnumerateEpicLaneBranches(repoDir, run);
+    } catch {
+      value = { ok: false }; // enumeration error → DEFER every dependent in this repo
+    }
+    laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    // Only an `ok` epic actually cuts a lane forked off its `repoDir`; a multi-repo
+    // / unresolved / no-primary-repo reject (or a serial `disabled` epic) has no
+    // single base to fork and is handled elsewhere — skip it here.
+    if (resolution === undefined || resolution.kind !== "ok") {
+      continue;
+    }
+    const repoDir = resolution.repoDir;
+    const deps = epic.resolved_epic_deps;
+    if (deps === null) {
+      continue;
+    }
+    try {
+      for (const dep of deps) {
+        // Only a SATISFIED (done) upstream can already carry a lane to merge; a
+        // blocked-incomplete / dangling dep blocks B through the normal readiness
+        // gate, never here.
+        if (dep.state !== "satisfied") {
+          continue;
+        }
+        const upstreamId = dep.resolved_epic_id;
+        if (upstreamId === null) {
+          continue; // dangling/ambiguous — not-gating (mirrors computeEligibleEpics)
+        }
+        const upstreamRes = worktreeRepoByEpicId.get(upstreamId);
+        // Same-resolved-repo gate: the upstream must ALSO be `ok` (cut a lane) AND
+        // resolve to B's exact toplevel. A reaped (absent), non-`ok`, or cross-repo
+        // upstream never gates B (cross-repo finalize is independent per repo).
+        if (
+          upstreamRes === undefined ||
+          upstreamRes.kind !== "ok" ||
+          upstreamRes.repoDir !== repoDir
+        ) {
+          continue;
+        }
+        // UNION: one unmerged/inconclusive same-repo upstream defers B. Enumerate
+        // first (cheaper than ancestry) — a definitively-absent lane is satisfied
+        // without an ancestry probe.
+        const lanes = await enumerateLanes(repoDir);
+        if (!lanes.ok) {
+          console.error(
+            `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id} — could not enumerate ${repoDir} lane branches (probe inconclusive)`,
+          );
+          deferred.add(epic.epic_id);
+          break;
+        }
+        const laneBranch = baseBranchFor(upstreamId);
+        if (!lanes.branches.has(laneBranch)) {
+          continue; // DEFINITIVELY absent → merged-and-torn-down → satisfied
+        }
+        // Present: merged IFF an ancestor of LOCAL default. `gitIsAncestorOf`→`false`
+        // covers BOTH not-ancestor AND an errored/timed-out probe → DEFER (the
+        // three-way exit-0/exit-1/timeout distinction matters only for diagnostics:
+        // not-ancestor and inconclusive both defer; only exit 0 proceeds).
+        const localDefault = await resolveLocalDefault(repoDir);
+        if (localDefault === null) {
+          console.error(
+            `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id} — could not resolve ${repoDir} default branch (probe inconclusive)`,
+          );
+          deferred.add(epic.epic_id);
+          break;
+        }
+        if (!(await gitIsAncestorOf(repoDir, laneBranch, localDefault, run))) {
+          console.error(
+            `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id} — upstream ${upstreamId} (${laneBranch}) not yet merged into ${localDefault}`,
+          );
+          deferred.add(epic.epic_id);
+          break;
+        }
+      }
+    } catch (err) {
+      // A git probe threw — DEFER B conservatively (an inconclusive probe must never
+      // proceed: a stale fork is permanent). The snapshot build never sees the throw.
+      console.error(
+        `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id} — probe threw:`,
+        err,
+      );
+      deferred.add(epic.epic_id);
+    }
+  }
+  return deferred;
 }
 
 /** Classify ONE epic's repos — see {@link classifyWorktreeRepos}. */
@@ -4149,6 +4360,16 @@ export async function loadReconcileSnapshot(
       )
     : [];
 
+  // The EPHEMERAL cross-epic merge-gate defer set — the ONE place this git pass is
+  // probed (it reuses `worktreeRepoByEpicId`'s already-resolved toplevels, so it
+  // adds NO extra toplevel spawns — only per-repo lane-enumeration + default-branch
+  // reads, memoized inside). Gated on `worktreeMode` so an OFF cycle adds ZERO git
+  // spawns (empty set = a byte-identical no-op). NEVER throws (every probe degrades
+  // to DEFER), so the snapshot build stays crash-free.
+  const deferredEpicIds = worktreeMode
+    ? await computeDeferredEpicIds(epics, worktreeRepoByEpicId)
+    : new Set<string>();
+
   return {
     epics,
     jobs,
@@ -4169,6 +4390,7 @@ export async function loadReconcileSnapshot(
     worktreeMode,
     worktreeRepoByEpicId,
     worktreeKnownRoots,
+    deferredEpicIds,
   };
 }
 

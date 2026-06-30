@@ -3407,6 +3407,45 @@ merge-to-default — and, defense-in-depth, re-checks linkage + HEAD immediately
 before the push and aborts loudly rather than push the default/protected branch
 from a linked worktree.
 
+A cross-epic **merge-gate** keeps a dependent epic from forking its lane off a
+STALE base. In worktree mode a dependent epic B (`depends_on_epics:[A]`) would
+otherwise have its lane cut from the default-branch HEAD before upstream A's lane
+has merged into default — so B builds on a pre-A tree. The gate defers cutting B's
+lane until every SATISFIED (done) SAME-RESOLVED-REPO upstream is contained in the
+LOCAL default branch. It is EPHEMERAL + producer-only: probed ONCE per cycle in
+`loadReconcileSnapshot` (`computeDeferredEpicIds` → a `deferredEpicIds` set the pure
+`reconcile` reads as plain data, shelling git NOWHERE — the same
+snapshot-probe-feeds-pure-`reconcile` architectural slot as the armed-eligibility
+`computeEligibleEpics` gate above, but worktree-specific and git-probed rather than
+projection-read), gated on worktree mode (an
+OFF cycle adds zero git spawns), and minting NO `dispatch_failures` row — a deferred
+epic re-evaluates every cycle and provisions the one AFTER A's finalize merge lands.
+Two no-sticky `continue` arms (one on the work row, one on the close row, both ABOVE
+the budget gate so a deferred epic consumes no budget) suppress both launches, so the
+merge order is never inverted. Same-resolved-repo is decided by the upstream's
+RESOLVED git toplevel (`worktreeRepoByEpicId`, the shared per-cycle memo — never
+`dep.cross_project`, since two epics can share a repo across project basenames), and
+only DIRECT `resolved_epic_deps` are walked (coverage is inductive: an unmerged
+grand-upstream defers the upstream, which defers B). Per same-repo upstream A, keyed
+off the LOCAL default branch (the same `gitResolveDefaultBranch` the provision
+fork-source uses, NOT `origin/<default>`): the base `keeper/epic/A` PRESENT ∧ an
+ancestor of local default → merged; PRESENT ∧ not-an-ancestor (or the ancestry probe
+errors/times out) → DEFER; DEFINITIVELY ABSENT (a SUCCESSFUL, timeout-bounded
+`enumerateEpicLaneBranches` that omits it — a code-surfacing `{ ok }` discriminant,
+NOT `listEpicLaneBranches`'s error→`[]` collapse) → merged-and-torn-down; an
+enumeration error/timeout → DEFER every dependent in that repo. Multi-upstream is a
+UNION (any unmerged upstream defers). Every inconclusive VCS probe DEFERS in this
+level-triggered reconciler (it self-heals next cycle; a stale fork would be
+permanent), and the probe NEVER throws out of the snapshot build (a malformed/null
+dep folds to "skip this upstream"). The absent-implies-merged arm is sound ONLY
+because keeper's teardown deletes a base via a TRUE `git merge --no-edit` once it is
+an ancestor of default (a `--squash` would invalidate `--is-ancestor`, so a
+regression test locks the non-squash merge + the is-ancestor-gated delete). An
+operator force-deleting an unmerged `keeper/epic/A`, a squash-merge, or an orphan /
+stuck-non-ff upstream is a DOCUMENTED stuck-state (B parks until reconciled) — the
+durable, subscribable merge signal this gate deliberately does NOT mint is owned by a
+parked downstream observability plan.
+
 The crash-restore set is derived RETROSPECTIVELY from `keeper.db` at READ TIME
 (`src/restore-set.ts`, epic fn-817) — there is no frozen snapshot to read and no
 daemon round-trip, which is exactly the disaster-recovery moment restore exists

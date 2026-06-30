@@ -92,7 +92,11 @@ Subcommands:
            share the main checkout). Even with it ON, a not-worktree-friendly repo
            (a workspace/monorepo marker, no language manifest, or submodules) falls
            back to sequential shared-checkout dispatch — a NEUTRAL state shown in
-           the viewer's --- worktree --- section, never a failure.
+           the viewer's --- worktree --- section, never a failure. Also with it ON, a
+           dependent epic whose satisfied same-repo upstream is not yet merged into
+           the local default branch is SILENTLY deferred (its lane is not cut) for
+           that cycle and provisions once the upstream's finalize merge lands — an
+           ephemeral per-cycle wait, never a sticky failure.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3). verb is
            one of work|close|approve; approve clears a resurrected/phantom

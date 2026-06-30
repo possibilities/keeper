@@ -41,6 +41,7 @@ import {
   type ConfirmRunningDeps,
   classifyWorktreeRepos,
   closerJobFinished,
+  computeDeferredEpicIds,
   confirmRunning,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
@@ -82,6 +83,7 @@ import {
   type WorktreeDriver,
   type WorktreeLaunchInfo,
   type WorktreeRecoveryFailure,
+  type WorktreeRepoResolution,
   worktreeRecoverDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
@@ -106,6 +108,12 @@ import type {
   Task,
 } from "../src/types";
 import { worktreePathFor } from "../src/worktree-plan";
+import {
+  argvHas,
+  argvStartsWith,
+  type FakeGitRule,
+  fakeAsyncGit,
+} from "./helpers/fake-git";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
@@ -8291,4 +8299,454 @@ test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure
     "worktree remove /repo.worktrees/keeper-epic-fn-1-foo",
   );
   expect(cmds).toContain("branch -D keeper/epic/fn-1-foo");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1014 — the EPHEMERAL cross-epic merge-gate (computeDeferredEpicIds + the
+// reconcile continue-arms). A dependent epic B's lane MUST NOT be cut until every
+// satisfied same-resolved-repo upstream is contained in LOCAL default.
+// ---------------------------------------------------------------------------
+
+/** A satisfied (done) resolved-dep on `upstreamId`. */
+function satisfiedEpicDep(upstreamId: string): ResolvedEpicDep {
+  return {
+    dep_token: upstreamId,
+    resolved_epic_id: upstreamId,
+    epic_number: null,
+    project_basename: null,
+    cross_project: false,
+    state: "satisfied",
+  };
+}
+
+/** Identity-resolved classification (raw root == toplevel) — same as makeSnapshot. */
+function classifyIdentity(epics: Epic[]): Map<string, WorktreeRepoResolution> {
+  return classifyWorktreeRepos(epics, (r) => r);
+}
+
+/**
+ * A rule-driven git runner for the merge-gate probe. `lanes` are the present
+ * `keeper/epic/*` short-names (the enumeration); `enumError` fails the enumeration;
+ * `ancestors` are the lane branches that are ancestors of LOCAL default (merged);
+ * `ancestryTimeout` makes EVERY ancestry probe surface the 124 SIGKILL sentinel.
+ */
+function gateGit(opts: {
+  lanes?: string[];
+  enumError?: boolean;
+  ancestors?: string[];
+  ancestryTimeout?: boolean;
+  defaultBranch?: string;
+}): ReturnType<typeof fakeAsyncGit> {
+  const def = opts.defaultBranch ?? "main";
+  const rules: FakeGitRule[] = [];
+  // Lane enumeration — MUST precede the resolveDefaultBranch `refs/heads` fallback.
+  rules.push({
+    when: (a) =>
+      argvStartsWith(a, "for-each-ref") && argvHas(a, "refs/heads/keeper/epic"),
+    result: opts.enumError
+      ? { exitCode: 1 }
+      : { exitCode: 0, stdout: (opts.lanes ?? []).join("\n") },
+  });
+  // Default-branch resolve via origin/HEAD symbolic-ref → origin/<def>.
+  rules.push({
+    when: (a) => argvStartsWith(a, "symbolic-ref"),
+    result: { exitCode: 0, stdout: `origin/${def}\n` },
+  });
+  // Per-lane ancestry: exit 0 (merged) for a branch in `ancestors`, else exit 1
+  // (or the timeout sentinel) — both of the latter DEFER.
+  for (const lane of opts.ancestors ?? []) {
+    rules.push({
+      when: (a) =>
+        argvStartsWith(a, "merge-base", "--is-ancestor") && a[2] === lane,
+      result: { exitCode: 0 },
+    });
+  }
+  rules.push({
+    when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+    result: opts.ancestryTimeout
+      ? { exitCode: GIT_SPAWN_TIMEOUT_CODE }
+      : { exitCode: 1 },
+  });
+  return fakeAsyncGit(rules);
+}
+
+test("fn-1014 computeDeferredEpicIds: a same-repo upstream PRESENT ∧ ancestor of local default → NOT deferred", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestors: ["keeper/epic/fn-1-a"], // merged into local default
+  });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(false);
+});
+
+test("fn-1014 computeDeferredEpicIds: a same-repo upstream PRESENT ∧ NOT an ancestor → DEFERRED (unmerged)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(true);
+});
+
+test("fn-1014 computeDeferredEpicIds: a DEFINITIVELY ABSENT lane (enumeration ok) → NOT deferred (merged-and-torn-down), no ancestry probe", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({ lanes: [] }); // enumeration ok, A's lane gone
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(false);
+  // A definitively-absent lane short-circuits to satisfied WITHOUT an ancestry probe.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1014 computeDeferredEpicIds: an enumeration FAILURE → DEFERRED (never read as absent)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ enumError: true });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(true);
+});
+
+test("fn-1014 computeDeferredEpicIds: an ancestry TIMEOUT (124) on a present lane → DEFERRED (inconclusive ≠ merged)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestryTimeout: true,
+  });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(true);
+});
+
+test("fn-1014 computeDeferredEpicIds: multi-upstream UNION — one unmerged same-repo upstream defers B", async () => {
+  const a1 = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const a2 = makeEpic({ epic_id: "fn-1-c", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [
+      satisfiedEpicDep("fn-1-a"),
+      satisfiedEpicDep("fn-1-c"),
+    ],
+  });
+  const epics = [a1, a2, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-1-c"],
+    ancestors: ["keeper/epic/fn-1-a"], // a1 merged, a2 NOT → union defers
+  });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(true);
+});
+
+test("fn-1014 computeDeferredEpicIds: a CROSS-REPO upstream never gates (no enumeration, decided by resolved toplevel not cross_project)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/other" }); // a DIFFERENT toplevel
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    // cross_project FALSE on purpose — the gate must decide on the RESOLVED repo,
+    // never this flag (two epics can share a repo across project basenames).
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestors: [],
+  });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(false);
+  // The same-repo gate short-circuits BEFORE any per-repo enumeration.
+  expect(
+    calls.some(
+      (c) =>
+        argvStartsWith(c.args, "for-each-ref") &&
+        argvHas(c.args, "refs/heads/keeper/epic"),
+    ),
+  ).toBe(false);
+});
+
+test("fn-1014 computeDeferredEpicIds: B's OWN repo unresolved → skipped (never deferred, never probed)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const map = classifyIdentity(epics);
+  map.set("fn-2-b", { kind: "unresolved", reason: "test: B unresolved" });
+  const { run, calls } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestors: [],
+  });
+  const deferred = await computeDeferredEpicIds(epics, map, run);
+  expect(deferred.has("fn-2-b")).toBe(false);
+  expect(calls.length).toBe(0); // a non-`ok` B is skipped before any git
+});
+
+test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked upstream never gates (folds to skip)", async () => {
+  // A `disabled` upstream cut no lane (its work landed straight on shared-checkout
+  // default → already contained); a reaped (absent) one, a dangling (null) edge, and
+  // a still-incomplete dep all fold to "skip this upstream" (not-gating).
+  const aDisabled = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [
+      satisfiedEpicDep("fn-1-a"), // resolved to a `disabled` upstream below
+      { ...satisfiedEpicDep("fn-1-gone"), resolved_epic_id: null }, // dangling
+      { ...satisfiedEpicDep("fn-1-reaped") }, // absent from the classification map
+      { ...satisfiedEpicDep("fn-1-wip"), state: "blocked-incomplete" }, // not satisfied
+    ],
+  });
+  const epics = [aDisabled, b];
+  const map = classifyIdentity(epics);
+  map.set("fn-1-a", { kind: "disabled", repoDir: "/repo", reason: "serial" });
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
+  const deferred = await computeDeferredEpicIds(epics, map, run);
+  expect(deferred.has("fn-2-b")).toBe(false);
+});
+
+test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {
+  // Distinct roots so each epic owns its own cap-1 lane (no per-root contention
+  // masking the gate). bWork would work-launch; cClose would close-launch.
+  const bWork = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const cClose = makeEpic({
+    epic_id: "fn-3-c",
+    project_dir: "/repo-c",
+    tasks: [
+      makeTask({
+        task_id: "fn-3-c.1",
+        epic_id: "fn-3-c",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const control = makeEpic({
+    epic_id: "fn-4-d",
+    project_dir: "/repo-d",
+    tasks: [makeTask({ task_id: "fn-4-d.1", epic_id: "fn-4-d" })],
+  });
+  const snap = makeSnapshot({
+    epics: [bWork, cClose, control],
+    deferredEpicIds: new Set(["fn-2-b", "fn-3-c"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  // The deferred epics launch NOTHING — neither the work row nor the close row.
+  expect(decision.launches.some((p) => p.id === "fn-2-b.1")).toBe(false);
+  expect(
+    decision.launches.some((p) => p.verb === "close" && p.id === "fn-3-c"),
+  ).toBe(false);
+  // The non-deferred sibling still launches — the gate is targeted, not global.
+  expect(
+    decision.launches.some((p) => p.verb === "work" && p.id === "fn-4-d.1"),
+  ).toBe(true);
+  // A pure `continue` — no failure surface is touched (reconcile mints no sticky).
+  expect(decision.worktreeFinalize).toEqual([]);
+});
+
+test("fn-1014 reconcile: an empty deferredEpicIds is a byte-identical no-op (every gate arm inert)", () => {
+  const bWork = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const cClose = makeEpic({
+    epic_id: "fn-3-c",
+    project_dir: "/repo-c",
+    tasks: [
+      makeTask({
+        task_id: "fn-3-c.1",
+        epic_id: "fn-3-c",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [bWork, cClose],
+    deferredEpicIds: new Set<string>(),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  // With nothing deferred, BOTH the work row and the close row launch normally.
+  expect(
+    decision.launches.some((p) => p.verb === "work" && p.id === "fn-2-b.1"),
+  ).toBe(true);
+  expect(
+    decision.launches.some((p) => p.verb === "close" && p.id === "fn-3-c"),
+  ).toBe(true);
+});
+
+test("fn-1014 regression: a lane base AHEAD of default merges via a TRUE `git merge --no-edit` (never --squash) — the absent-implies-merged premise", async () => {
+  // Locks the merge half of the gate premise: keeper places a base into default via
+  // a TRUE merge (so `merge-base --is-ancestor` stays valid afterward). A future
+  // switch to `--squash` (which INVALIDATES `--is-ancestor`, so an absent lane could
+  // be unmerged) must fail this test. Drives the shared routine both finalize and
+  // recover use, with the fast-tier fake lock (never the FFI flock).
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+    args,
+  ) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs resolve
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" }; // clean shared checkout
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    }
+    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+      return { code: 1, stdout: "", stderr: "" }; // base is AHEAD → merge it
+    }
+    if (
+      joined ===
+      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
+    ) {
+      return { code: 0, stdout: "", stderr: "" }; // post-push origin contains it
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // not already-merged vs HEAD
+    }
+    if (joined.startsWith("merge --no-edit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    fakeRun,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merged" });
+  // A TRUE merge ran — and NEVER a squash (which would break the gate's absent arm).
+  expect(cmds).toContain("merge --no-edit keeper/epic/fn-1-foo");
+  expect(cmds.some((c) => c.includes("--squash"))).toBe(false);
+});
+
+test("fn-1014 regression: a MERGED keeper/epic base (an ancestor of default) IS deleted, is-ancestor-gated — so a later 'lane absent' reading is provably merged", async () => {
+  // The other half of the premise: a base that IS an ancestor of (origin/)default is
+  // torn down, so a subsequent cycle's enumeration sees it ABSENT — which the gate
+  // treats as merged. This is what makes absent-implies-merged sound.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // already an ancestor of default → provably merged
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(failures).toEqual([]);
+  // Torn down (worktree removed, then branch deleted), never `git branch --contains`.
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    true,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
+  expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+test("fn-1014 regression: an UNMERGED keeper/epic base (NOT an ancestor of default) is NEVER deleted — the absent-implies-merged premise holds", async () => {
+  // The recover teardown delete gate: a base that is NOT an ancestor of default is
+  // unmerged work and MUST be preserved, never force-deleted. This is what makes a
+  // LATER "lane absent" reading safe to treat as "merged" by the cross-epic gate.
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // NOT an ancestor of default → unmerged work
+    repoHead: "main",
+  });
+  // The epic is absent/done (eligible to sweep) — yet the is-ancestor gate refuses.
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+  expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
+    false,
+  );
 });
