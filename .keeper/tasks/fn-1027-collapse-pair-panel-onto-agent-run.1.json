@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T04:09:58.829000Z",
+  "depends_on": [],
+  "epic": "fn-1027-collapse-pair-panel-onto-agent-run",
+  "id": "fn-1027-collapse-pair-panel-onto-agent-run.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Add agent run preset/session/output",
+  "updated_at": "2026-07-01T04:09:58.829000Z"
+}

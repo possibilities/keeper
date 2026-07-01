@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-01T04:09:58.829000Z",
+  "depends_on_epics": [],
+  "id": "fn-1027-collapse-pair-panel-onto-agent-run",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Collapse pair panel onto agent run",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-01T04:09:58.829000Z"
+}

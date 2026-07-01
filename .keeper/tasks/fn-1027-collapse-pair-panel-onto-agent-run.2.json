@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T04:09:58.829000Z",
+  "depends_on": [
+    "fn-1027-collapse-pair-panel-onto-agent-run.1"
+  ],
+  "epic": "fn-1027-collapse-pair-panel-onto-agent-run",
+  "id": "fn-1027-collapse-pair-panel-onto-agent-run.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Collapse panel legs onto agent run",
+  "updated_at": "2026-07-01T04:09:58.829000Z"
+}
