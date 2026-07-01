@@ -10,9 +10,10 @@
 //
 // Fail open is absolute: any internal error, unparseable stdin, null/typed-error
 // reconcile envelope, or `tooling_error` verdict allows the stop. The close
-// branch is deliberately lenient — it errs toward allowing the close skill's own
-// legitimate halt states (QUESTION, BLOCKED, typed errors, fatal/partial
-// reports) rather than fighting them.
+// branch is deliberately lenient — it allows on either of two zero-subprocess
+// gates: a sanctioned typed-stop message (QUESTION, BLOCKED, typed errors,
+// fatal/partial reports), or an in-flight subagent it spawned and is awaiting —
+// and blocks only a bare mid-saga stop that matches neither.
 
 import {
   emitBlock,
@@ -23,8 +24,9 @@ import {
   unlinkMarker,
 } from "./lib.ts";
 
-/** Typed-stop surfaces the close skill legitimately ends a turn on. A marker is
- * present only because close-finalize never cleared it (it clears on all four
+/** Typed-stop surfaces the close skill legitimately ends a turn on — the
+ * message-pattern allow gate (the in-flight-subagent gate is the other). A marker
+ * is present only because close-finalize never cleared it (it clears on all four
  * outcomes), so any of these in the last message means the closer stopped on a
  * sanctioned halt, not a mid-saga drop — allow. Patterns are derived verbatim
  * from skills/close/SKILL.md:
@@ -47,6 +49,27 @@ export function closeStopAllowed(message: unknown): boolean {
   return CLOSE_ALLOW_PATTERNS.some((pattern) => pattern.test(message));
 }
 
+/** True when the close session's Stop payload carries an in-flight subagent it
+ * spawned and is awaiting (the quality-auditor or close-planner) — the harness
+ * resumes the session on the child's completion notification, so this stop is a
+ * legitimate await, not a mid-saga drop. Reads the TOP-LEVEL `background_tasks`
+ * array the Stop payload attaches; a parked child appears as
+ * `{type:"subagent", status:"running", agent_type:"plan:…"}`. Gates on subagent
+ * PRESENCE, never array length — a bus-subscribed close session always carries a
+ * shell `keeper bus watch` entry, so the array is never empty. Non-throwing: any
+ * shape mismatch degrades to `false` (fall through to the message gate, then
+ * block), never an abort. */
+export function closeChildInFlight(bg: unknown): boolean {
+  if (!Array.isArray(bg)) return false;
+  return bg.some(
+    (t) =>
+      t !== null &&
+      typeof t === "object" &&
+      (t as Record<string, unknown>).type === "subagent" &&
+      (t as Record<string, unknown>).status === "running",
+  );
+}
+
 /** The work-branch resume checklist — delivered to the blocked orchestrator as
  * its next instruction. Names the verdict so a deliberate human interrupt can
  * read why it was caught and simply stop again (stop_hook_active passes the
@@ -61,15 +84,20 @@ export function workBlockReason(taskId: string, verdict: string): string {
   );
 }
 
-/** The close-branch mid-saga block reason — close-finalize never returned
- * success (the marker would be gone otherwise), and the last message carried no
- * sanctioned typed stop. */
+/** The close-branch block reason — reached only when neither allow gate fired:
+ * close-finalize never returned success (the marker would be gone otherwise), the
+ * last message carried no sanctioned typed stop, and no spawned subagent is
+ * listed as running. It stays safe for the spawn→registry race (a child may not
+ * be listed at the exact Stop instant), so it names the await case too. */
 export function closeBlockReason(epicId: string): string {
   return (
-    `Close of ${epicId} is mid-saga: close-finalize has not run. Either run ` +
-    `\`keeper plan close-finalize ${epicId} --project <primary_repo>\` (after the ` +
-    "agents returned) or surface the typed stop verbatim. Never write or " +
-    "commit from this context."
+    `Close of ${epicId} is mid-saga: close-finalize has not run. If you are ` +
+    "awaiting a subagent you just spawned (quality-auditor or close-planner), " +
+    "just end the turn — its completion notification resumes you; do NOT poll " +
+    "the child transcript (TaskOutput/ToolSearch) or finalize early. Otherwise, " +
+    "once the agents have returned, run " +
+    `\`keeper plan close-finalize ${epicId} --project <primary_repo>\` or surface ` +
+    "the typed stop verbatim. Never write or commit from this context."
   );
 }
 
@@ -82,6 +110,7 @@ async function main(): Promise<void> {
     session_id?: string;
     stop_hook_active?: boolean;
     last_assistant_message?: string;
+    background_tasks?: unknown;
   };
 
   // Block-once policy: a prior Stop-hook continuation set this. Blocking again
@@ -119,8 +148,11 @@ async function main(): Promise<void> {
 
   if (marker.kind === "close") {
     if (!marker.epic_id) return;
-    // Lenient: a sanctioned typed stop in the last message means the closer
-    // halted legitimately — allow. Only a bare mid-saga stop blocks.
+    // Two zero-subprocess allow gates: an in-flight subagent the closer spawned
+    // and is awaiting (the harness resumes on its completion), or a sanctioned
+    // typed stop in the last message. A bare mid-saga stop matching neither
+    // blocks.
+    if (closeChildInFlight(payload.background_tasks)) return;
     if (closeStopAllowed(payload.last_assistant_message)) return;
     emitBlock(closeBlockReason(marker.epic_id));
     return;
