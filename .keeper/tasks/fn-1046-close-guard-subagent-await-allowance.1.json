@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "close-branch subagent-await gate",
-  "updated_at": "2026-07-01T20:48:59.098000Z"
+  "updated_at": "2026-07-01T20:55:55.873000Z",
+  "worker_done_at": "2026-07-01T20:55:55.873000Z"
 }

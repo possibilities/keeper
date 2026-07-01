@@ -88,5 +88,5 @@ Extend both tiers of stop-guard.test.ts:
 - [ ] `bun test`, `bun run lint`, and `bun run typecheck` pass from plugins/plan/.
 
 ## Done summary
-
+Close Stop-guard now allows a legitimately-parked closer: new exported non-throwing closeChildInFlight() gates on a top-level background_tasks subagent with status running (presence, not length), allowing the await-stop with zero subprocess while preserving the post-return shell-only block. closeBlockReason rewritten to name the await case and de-fang the spawn race; comments + README corrected to the two-gate reality.
 ## Evidence
