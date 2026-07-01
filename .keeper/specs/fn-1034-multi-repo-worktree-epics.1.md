@@ -86,5 +86,5 @@ geometry). Sandbox `autopilot_state` for flag ON/OFF; `freshMemDb`/`freshDbFile`
 - [ ] New + repurposed tests green; `test/schema-version.test.ts` green
 
 ## Done summary
-
+Added the worktree_multi_repo rollout flag (default OFF) and, behind it, a clustered per-repo lane-group partition: classifyEpicRepo splits a resolved-clean multi-toplevel epic into ordered groups, prepareWorktreeGeometry/attachWorktreeGeometry derive+key geometry per group with one finalize per worktree group and the close worker only on the primary group (non-primary sinks fanned-in via provision before finalize); flag OFF and single-repo epics stay byte-identical.
 ## Evidence
