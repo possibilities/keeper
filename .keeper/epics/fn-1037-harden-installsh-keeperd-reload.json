@@ -7,7 +7,7 @@
     "fn-1033-keeper-owns-its-install-and-claude"
   ],
   "id": "fn-1037-harden-installsh-keeperd-reload",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-01T08:40:38.896000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T08:40:38.727000Z"
+  "updated_at": "2026-07-01T08:40:38.896000Z"
 }
