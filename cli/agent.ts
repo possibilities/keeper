@@ -6,7 +6,10 @@
  * The blocking run-and-capture verbs compose those primitives into the uniform
  * schema-versioned JSON envelope: `keeper agent run <cli> <prompt>` launches,
  * waits, and captures in one process, and `keeper agent wait <handle>` does the
- * wait + capture on an already-launched handle.
+ * wait + capture on an already-launched handle. `run --read-only` prepends a
+ * read-only directive + strips edit tools per harness (detection, not prevention
+ * — no changed-files audit on this verb); codex/pi launch with `CLAUDE*` env
+ * stripped by default (partner isolation).
  *
  * Named launch-config presets (harness/model/effort) live in the catalog
  * `~/.config/keeper/presets.yaml` (panel selections in `panel.yaml`): `keeper

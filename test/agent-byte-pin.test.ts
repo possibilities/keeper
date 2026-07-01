@@ -10,9 +10,18 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { launchEnvForAgent } from "../src/agent/launch-handle";
 import { main } from "../src/agent/main";
 import { buildKeeperAgentLaunchArgv } from "../src/exec-backend";
-import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
+import { READ_ONLY_DIRECTIVE } from "../src/pair-command";
+import {
+  expectExit,
+  makeHarness,
+  runAndCapture,
+} from "./helpers/agent-main-harness";
 
 const CLAUDE_BIN = "/fake-home/.local/bin/claude";
 const CODEX_BIN = "/fake-home/bin/codex";
@@ -161,5 +170,114 @@ describe("keeper agent byte-pin — managed launch carries no posture", () => {
       expect(cmd).not.toContain(flag);
     }
     expect(cmd.join(" ")).not.toContain("CLAUDE");
+  });
+});
+
+/**
+ * Positive byte-pins for the `agent run` POSTURE path (the increment this file's
+ * negative pins anticipated). `agent run` routes through the shared launch helper,
+ * which persists the composed native command in `run.json`. Driving `main()` with
+ * a real on-disk transcript lets the launch→wait→show compose complete, so the
+ * `run.json` `command` is the exact native argv the detached pane would exec.
+ */
+const RUN_UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+function tempDir(): string {
+  return mkdtempSync(join(tmpdir(), "agent-byte-pin-run-"));
+}
+
+/** Write a minimal claude transcript so the run's wait-for-stop resolves at once. */
+function writeClaudeTranscript(home: string, cwd: string, text: string): void {
+  const dir = join(home, ".claude", "projects", cwd.replace(/\//g, "-"));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${RUN_UUID}.jsonl`),
+    `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text }],
+      },
+    })}\n`,
+  );
+}
+
+/** The native `command` the launch persisted to run.json (`tmux-<uuid>/run.json`). */
+async function runCommand(readOnly: boolean): Promise<string[]> {
+  const stateDir = tempDir();
+  const home = tempDir();
+  const cwd = "/fake-home/code/proj";
+  writeClaudeTranscript(home, cwd, "done");
+  const argv = readOnly
+    ? ["run", "--read-only", "claude", "say hi"]
+    : ["run", "claude", "say hi"];
+  const h = makeHarness({
+    argv,
+    rawArgv: true,
+    launcherStateDir: stateDir,
+    transcriptHomeDir: home,
+    cwd,
+    randomUuid: () => RUN_UUID,
+    tmuxCommand: (cmd) =>
+      cmd.includes("has-session")
+        ? { exitCode: 1, stdout: "", stderr: "no session" }
+        : { exitCode: 0, stdout: "keeper agent\x01@1\x01%1\n", stderr: "" },
+  });
+  await expectExit(main(h.deps));
+  const runJson = JSON.parse(
+    readFileSync(
+      join(stateDir, "tmux-runs", `tmux-${RUN_UUID}`, "run.json"),
+      "utf8",
+    ),
+  ) as { command: string[] };
+  return runJson.command;
+}
+
+describe("keeper agent byte-pin — agent run posture", () => {
+  test("run --read-only claude: directive prepended + edit-tool strip present", async () => {
+    const cmd = await runCommand(true);
+    // The claude read-only strip reaches the native command.
+    expect(cmd).toContain("--disallowed-tools");
+    expect(cmd).toContain("Edit,Write,NotebookEdit");
+    // The directive is prepended CALLER-SIDE with a raw `\n\n` join — no `User:`
+    // scaffold (agent run has no role framing), and NOT double-prepended.
+    expect(cmd.at(-1)).toBe(`${READ_ONLY_DIRECTIVE}\n\nsay hi`);
+    expect(cmd.filter((t) => t === READ_ONLY_DIRECTIVE).length).toBe(0);
+  });
+
+  test("run claude (no --read-only): bare prompt, no strip, no directive", async () => {
+    const cmd = await runCommand(false);
+    expect(cmd).not.toContain("--disallowed-tools");
+    expect(cmd.at(-1)).toBe("say hi");
+    expect(cmd.join("\n")).not.toContain(READ_ONLY_DIRECTIVE);
+  });
+});
+
+/**
+ * `agent run codex`/`pi` launch with `CLAUDE*` stripped by default (the
+ * agent-conditional partner-isolation scrub — a new-verb improvement, pinned so a
+ * drift doesn't read as accidental). The scrub is an env-OBJECT transform, not an
+ * argv token: the launch script env is whitelisted, so the only meaningful
+ * observation point is `launchEnvForAgent` — the exact function the run launch
+ * feeds its env through. claude keeps the full inherited env.
+ */
+describe("keeper agent byte-pin — agent run env scrub", () => {
+  const env = { PATH: "/usr/bin", CLAUDE_CODE_X: "leak", ANTHROPIC_X: "kept" };
+
+  for (const agent of ["codex", "pi"] as const) {
+    test(`run ${agent} drops CLAUDE* carriers, keeps the rest`, () => {
+      const out = launchEnvForAgent(agent, env);
+      expect(out.CLAUDE_CODE_X).toBeUndefined();
+      expect(out.PATH).toBe("/usr/bin");
+      // Future-hardening note: only CLAUDE* is stripped today (ANTHROPIC*/*_API_KEY
+      // are a separate, deliberate change) — pin the current contract.
+      expect(out.ANTHROPIC_X).toBe("kept");
+    });
+  }
+
+  test("run claude keeps the full inherited env (no scrub)", () => {
+    expect(launchEnvForAgent("claude", env)).toBe(env);
   });
 });

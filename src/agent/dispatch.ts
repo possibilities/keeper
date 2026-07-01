@@ -61,9 +61,10 @@ Usage:
   keeper agent wait-for-stop <handle> [--stop-timeout-ms <ms>]
                                     Block until a detached run's next stop.
   keeper agent show-last-message <h>   Print a detached run's final message.
-  keeper agent run <cli> <prompt> [--stop-timeout-ms <ms>]
+  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
+                                    --read-only is detection, not prevention.
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -154,10 +155,16 @@ Post-launch transcript subcommands (composable with a detached launch):
                                         transcript path with --agent <kind>).
 
 Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
-  keeper agent run <cli> <prompt> [--stop-timeout-ms <ms>]
+  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
-                                        process. Emits the uniform envelope
+                                        process. --read-only prepends a read-only
+                                        directive and strips edit tools per harness
+                                        — detection, NOT prevention (the strip is
+                                        leaky; there is no changed-files audit on
+                                        this verb). codex/pi launch with CLAUDE*
+                                        env stripped by default (partner isolation).
+                                        Emits the uniform envelope
                                         {schema_version, agent, handle,
                                         transcript_path, resume_target, message,
                                         message_found, elapsed_seconds, outcome};

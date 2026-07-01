@@ -1426,7 +1426,14 @@ event-log/reducer/hook touch. Run any of them with
   JSON envelope (`{schema_version, agent, handle, transcript_path, resume_target,
   message, message_found, elapsed_seconds, outcome}`) for every terminal state,
   the `outcome` mapping to the exit code (completed/no_message 0, timed_out/
-  no_transcript 4, launch_failed 1, bad_args 2). Per-field resolution is `explicit flag > effort
+  no_transcript 4, launch_failed 1, bad_args 2). `run --read-only` prepends a
+  read-only directive and strips edit tools per harness — detection, NOT
+  prevention (the strip is leaky and there is NO changed-files audit on this verb,
+  unlike `keeper pair`'s caller-side git backstop). codex/pi runs launch with
+  `CLAUDE*` env stripped by default (partner identity isolation, not credential
+  security), claude keeps the full inherited env (its `--session-id` pin keeps the
+  transcript distinct); the shared launch helper owns both the scrub and the codex
+  directory-trust seed for `agent run` and `keeper pair` alike. Per-field resolution is `explicit flag > effort
   env > preset > per-harness yaml > native default`, so a preset never overrides an
   explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
   `--x-preset` the launch is byte-identical to a no-preset run. The posture is
@@ -3334,10 +3341,12 @@ is KEPT, `inFlight` releases, and the 120s TTL sweep
 (`PENDING_DISPATCH_TTL_MS > ceilingMs (60s)`, an invariant pinned by a test)
 emits `DispatchExpired` only if the bind truly never lands.
 
-The **`cli/pair.ts` codex pre-launch trust-seed** writes codex's own config dir
-(`${CODEX_HOME:-~/.codex}/config.toml`) — the only partner that needs a seeder.
-Before a codex pair/panel partner launches as an interactive TUI,
-`ensureCodexDirTrust` (`src/codex-trust.ts`, a dep-free leaf) seeds
+The **shared launch helper's codex pre-launch trust-seed** writes codex's own
+config dir (`${CODEX_HOME:-~/.codex}/config.toml`) — the only partner that needs a
+seeder. Before a codex partner launches as an interactive TUI — for both `keeper
+pair`/panel and `keeper agent run codex` — `launchToResolvedHandle`
+(`src/agent/launch-handle.ts`) fires the injected `ensureCodexDirTrust` seam
+(`src/codex-trust.ts`, a dep-free leaf) which seeds
 `[projects."<realpath(cwd)>"] trust_level = "trusted"` so the detached window does
 not hang on codex's directory-trust prompt. It is exact-header idempotent (trust
 is NOT inherited), takes an O_EXCL lock + post-acquire re-check for concurrent

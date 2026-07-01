@@ -121,21 +121,34 @@ const RUN_CAPTURE_AGENTS: ReadonlySet<string> = new Set([
 
 /** Discriminated result of {@link parseRunArgs}. */
 export type ParseRunArgsResult =
-  | { ok: true; cli: AgentKind; prompt: string; stopTimeoutMs: number | null }
+  | {
+      ok: true;
+      cli: AgentKind;
+      prompt: string;
+      stopTimeoutMs: number | null;
+      readOnly: boolean;
+    }
   | { ok: false; error: string };
 
 /**
- * Parse `agent run <cli> <prompt> [--stop-timeout-ms <ms>]`. Two positionals —
- * the partner CLI (claude|codex|pi) and the prompt — plus the optional stop-wait
- * override. A malformed/missing positional, an unknown flag, or an extra
- * positional maps to BAD_ARGS upstream. Pure — exported for tests.
+ * Parse `agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]`. Two
+ * positionals — the partner CLI (claude|codex|pi) and the prompt — plus the
+ * optional read-only posture and stop-wait override. A malformed/missing
+ * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
+ * `--read-only` is detection-not-prevention (a per-harness tool strip + a
+ * caller-prepended directive; the strip is leaky). Pure — exported for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
   let stopTimeoutMs: number | null = null;
+  let readOnly = false;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
+    if (arg === "--read-only") {
+      readOnly = true;
+      continue;
+    }
     if (arg === "--stop-timeout-ms") {
       const value = rest[i + 1];
       if (value === undefined) {
@@ -187,7 +200,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       error: `unexpected extra argument: ${positionals[2]}`,
     };
   }
-  return { ok: true, cli: cli as AgentKind, prompt, stopTimeoutMs };
+  return { ok: true, cli: cli as AgentKind, prompt, stopTimeoutMs, readOnly };
 }
 
 /** A finite positive integer of ms, or null for anything malformed. */
