@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T05:14:52.194000Z",
+  "depends_on": [
+    "fn-1033-keeper-owns-its-install-and-claude.1",
+    "fn-1033-keeper-owns-its-install-and-claude.2"
+  ],
+  "epic": "fn-1033-keeper-owns-its-install-and-claude",
+  "id": "fn-1033-keeper-owns-its-install-and-claude.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "high",
+  "title": "Arthack hands keeper install (buildbot job + decouple)",
+  "updated_at": "2026-07-01T05:14:52.194000Z"
+}
