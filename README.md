@@ -1517,7 +1517,10 @@ event-log/reducer/hook touch. Run any of them with
   deleted); `changed [since:R]` fires when the board's epics / verdicts /
   autopilot config move, with an optional `since:<hash>` anchoring against a
   prior `changed` baseline; `landed <epic>` fires when the named epic's lane is
-  merged to the default branch — a membership read over the durable
+  merged to the default branch (a MULTI-REPO clustered epic lands only after
+  EVERY group has — each `worktree` group merged to its repo's default AND each
+  `serial` group's tasks done, the single `epic_id`-keyed row emitted once,
+  never early on the first group) — a membership read over the durable
   merge-landed observable that **degrades to `complete` semantics (merged ⇔
   done) when worktree mode is off**, the gate a planning daisy-chain wants
   ("author B against A's MERGED files") since under worktree mode a dependent
@@ -3451,6 +3454,29 @@ trigger, then confirms real completion against the main `epics` projection
 (`isEpicDone`) — never a lane-read. A crashed closer that committed code but not
 `done` leaves the epic not-done in the main projection, so finalize no-ops and
 retries rather than pushing incomplete work to default.
+With the multi-repo rollout flag ON (below), an epic whose tasks span >1 resolved
+toplevel no longer rejects — the producer PARTITIONS its tasks by resolved git
+toplevel into per-repo lane GROUPS (a `clustered` resolution), each deriving its OWN
+worktree geometry INDEPENDENTLY (base + ribs + `__close__` sink in its own git) via
+the same `deriveWorktreePlan`. A cross-repo `depends_on` edge is auto-dropped from
+every group's in-group lane geometry and survives ONLY as a readiness serialization
+barrier (readiness's global `taskById` enforces it — no lane-share across repos). One
+group can be `worktree` (a friendly repo → lanes) while a sibling is `serial` (not
+worktree-friendly → its tasks dispatch sequentially on the shared checkout, cutting no
+lane). The epic stays ONE plan unit (one `.keeper/` file, one epic row): the SINGLE
+plan-close worker runs on `primary_repo` ONLY (audit + `status:done`) and gates ALL
+groups' finalizes — code must not land to any default before the epic passes audit;
+every group's `__close__` sink lane is producer-provisioned (a non-primary group's
+rib→base fan-in is producer-side git, no close worker dispatches into it — the producer
+runs it before finalize). After the close succeeds, `finalizeEpic` runs per WORKTREE
+group INDEPENDENTLY — each fanning into its OWN repo's local default — so a stuck group
+never freezes a sibling. Per-repo finalize failures land on DISTINCT
+`close::worktree-finalize:<epic>-<repoHash>` rows (`repoHash` = `repoDirHash(repoDir)`,
+the SAME dir-hash the lane path folds) — no collision with `worktree-recover*` rows or
+each other — level-cleared when that repo finalizes clean. Half-landed (one repo
+merged, another's finalize stuck) is the NORMAL operating state, not an error — no tool
+gives cross-repo atomic landing; the operator retries the failed repo via
+`retry_dispatch` against its per-repo finalize row.
 Lane branch names are deterministic (`keeper/epic/<id>` base, `keeper/epic/<id>--<task>`
 ribs — the FLAT `--` separator keeps a rib from being a path-prefix of the base
 ref, which git would otherwise reject as a directory/file ref conflict the moment a
@@ -3515,13 +3541,21 @@ snapshot-build (`classifyWorktreeRepos` + the nullable `memoizedNullableGitTople
 a fresh per-cycle memo) before the lane geometry compares + places lanes, so the
 gate and dispatch never re-derive from raw strings — a single-repo epic whose raw
 roots differ only by subdir/symlink/trailing-slash is NO LONGER falsely rejected.
-Two error-class sticky rejects survive: `worktree-multi-repo` (the tasks resolve to >1
-distinct toplevel — genuinely unsupported for v1) and `worktree-repo-unresolved` (a
-required root resolved null; re-resolves next cycle via the per-cycle memo). Those,
-plus toggling the mode while a STARTED open epic is in flight (`isEpicStarted`), are
-rejected loud in worktree mode (both reject kinds cleared by `retry_dispatch`); a
+With the durable multi-repo rollout flag OFF (`worktree_multi_repo` on the
+`autopilot_state` singleton, DEFAULT off, runtime-settable via the generic
+`set_autopilot_config` patch — NO new RPC), an epic whose tasks resolve to >1 distinct
+toplevel is a sticky `worktree-multi-repo` reject; flipping the flag ON instead
+CLUSTERS that epic into per-repo lane groups (above) rather than rejecting (flipping the
+default ON is a deliberate post-burn-in operator action, out of scope here). Two
+error-class rejects survive regardless of the flag: `worktree-repo-unresolved` (a
+required root resolved null — the WHOLE epic rejects; re-resolves next cycle via the
+per-cycle memo) and `worktree-no-primary-repo` (one toplevel resolved but the epic
+carries no `primary_repo`, so plan-state writes would degrade to the lane checkout —
+operator-required, OUTSIDE the `worktree-recover*` auto-clear prefix). Those, plus
+toggling the mode while a STARTED open epic is in flight (`isEpicStarted`), are
+rejected loud in worktree mode (each reject kind cleared by `retry_dispatch`); a
 drained / unstarted-open / zero-epic board toggles freely, so the operator's own
-interactive session no longer trips the guard (`keeper autopilot worktree on`
+interactive session never trips the guard (`keeper autopilot worktree on`
 has a `--force` escape hatch for the started-epic guard).
 
 Separately from those error-class rejects, a `disabled` category is a NEUTRAL,
@@ -3555,19 +3589,24 @@ from a linked worktree.
 A cross-epic **merge-gate** keeps a dependent epic from forking its lane off a
 STALE base. In worktree mode a dependent epic B (`depends_on_epics:[A]`) would
 otherwise have its lane cut from the default-branch HEAD before upstream A's lane
-has merged into default — so B builds on a pre-A tree. The gate defers cutting B's
-lane until every SATISFIED (done) SAME-RESOLVED-REPO upstream is contained in the
-LOCAL default branch. It is EPHEMERAL + producer-only: probed ONCE per cycle in
+has merged into default — so B builds on a pre-A tree. The gate defers cutting a
+dependent GROUP's lane until every SATISFIED (done) SAME-RESOLVED-REPO upstream group
+is contained in that repo's LOCAL default branch. The defer map is keyed PER (epic,
+repoDir): a single-repo (`ok`) epic keys its lone repo, a `clustered` multi-repo epic
+keys ONLY the group whose repo has an unmerged same-repo upstream — a sibling group
+whose repo is already clear provisions this cycle. It is EPHEMERAL + producer-only:
+probed ONCE per cycle in
 `loadReconcileSnapshot` (`computeDeferredEpicIds` → a `deferredEpicIds` set the pure
 `reconcile` reads as plain data, shelling git NOWHERE — the same
 snapshot-probe-feeds-pure-`reconcile` architectural slot as the armed-eligibility
 `computeEligibleEpics` gate above, but worktree-specific and git-probed rather than
 projection-read), gated on worktree mode (an
 OFF cycle adds zero git spawns), and minting NO `dispatch_failures` row — a deferred
-epic re-evaluates every cycle and provisions the one AFTER A's finalize merge lands.
-Two no-sticky `continue` arms (one on the work row, one on the close row, both ABOVE
-the budget gate so a deferred epic consumes no budget) suppress both launches, so the
-merge order is never inverted. Same-resolved-repo is decided by the upstream's
+group re-evaluates every cycle and provisions the cycle AFTER its upstream's finalize
+merge lands. Two no-sticky `continue` arms (the work row gated per-group on
+`deferredEpicIds.get(epic)?.has(repoDir)`, the close row on `has(epic)` — ANY group
+deferred — both ABOVE the budget gate so a deferred group consumes no budget) suppress
+the launches, so the merge order is never inverted. Same-resolved-repo is decided by the upstream's
 RESOLVED git toplevel (`worktreeRepoByEpicId`, the shared per-cycle memo — never
 `dep.cross_project`, since two epics can share a repo across project basenames), and
 only DIRECT `resolved_epic_deps` are walked (coverage is inductive: an unmerged
