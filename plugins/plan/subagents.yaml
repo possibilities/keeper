@@ -2,12 +2,13 @@
 #
 # Two consumers route through the shared loader (src/subagents_config.ts):
 #   - build time: render-plugin-templates reads this file from disk and fans out
-#     one generated worker agent per {model × effort} cell.
+#     one self-contained `work` plugin per {model × effort} cell under
+#     workers/<model>-<effort>/ (manifest name work, agent name worker).
 #   - runtime: the compiled keeper-plan binary reads an embedded snapshot of this
 #     file (baked in at `bun build --compile`) so the resolver validates a task's
 #     effort/model against the same axes wherever it runs.
 #
-# Adding a model or effort is a one-line edit here — no per-cell agent files by
+# Adding a model or effort is a one-line edit here — no per-cell plugin dirs by
 # hand. Effort is NOT spawn-overridable in Claude Code, so each effort is baked
 # into its generated agent definition rather than passed at spawn.
 efforts: [medium, high, xhigh, max]
