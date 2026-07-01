@@ -7,7 +7,7 @@
     "fn-1032-retire-the-pair-cli-onto-agent"
   ],
   "id": "fn-1036-reword-retired-pair-surface-comments",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-01T07:40:03.084000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T07:40:02.915000Z"
+  "updated_at": "2026-07-01T07:40:03.084000Z"
 }
