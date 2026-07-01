@@ -9,6 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -21,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import {
+  defaultClaudeStowDir,
   ensureCanonicalStowLinks,
   ensureProfileClaudeJson,
   forceSymlink,
@@ -255,5 +257,27 @@ describe("ensureCanonicalStowLinks", () => {
     expect(log.some((l) => l.includes("KEEPER_AGENT_SKIP_LINK_GUARD"))).toBe(
       true,
     );
+  });
+});
+
+describe("defaultClaudeStowDir", () => {
+  test("resolves to the repo's system/claude/.claude with both leaves present", () => {
+    const dir = defaultClaudeStowDir();
+    expect(dir.endsWith(join("system", "claude", ".claude"))).toBe(true);
+    expect(existsSync(join(dir, "settings.json"))).toBe(true);
+    expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
+  });
+
+  test("the guard creates ~/.claude/{settings.json,CLAUDE.md} from absent against the real source", () => {
+    const home = join(tmpDir, "guard-home");
+    const claudeDir = join(home, ".claude");
+    mkdirSync(claudeDir, { recursive: true });
+    const src = defaultClaudeStowDir();
+    ensureCanonicalStowLinks(src, home, [], {});
+    for (const leaf of ["settings.json", "CLAUDE.md"]) {
+      const link = join(claudeDir, leaf);
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(relative(claudeDir, join(src, leaf)));
+    }
   });
 });

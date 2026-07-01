@@ -180,25 +180,6 @@ export function loadPiLauncherDefaults(
   return { model: value("model"), thinking: value("thinking") };
 }
 
-export function loadClaudeStowDir(
-  configPath: string = launcherConfigPath(),
-): string | null {
-  if (!isFile(configPath)) {
-    return null;
-  }
-  const raw = readMapping(configPath);
-  const v = raw.claude_stow_dir;
-  if (v === null || v === undefined) {
-    return null;
-  }
-  if (typeof v !== "string" || !v.trim()) {
-    throw new ConfigError(
-      `Expected claude_stow_dir to be a non-empty string in ${configPath}`,
-    );
-  }
-  return resolvePath(expandUser(v.trim()));
-}
-
 export interface PluginSources {
   /** Each entry IS a plugin; a missing manifest is fail-loud. */
   pluginDirs: string[];

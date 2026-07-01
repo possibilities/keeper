@@ -85,7 +85,6 @@ export interface HarnessOptions {
   panelSelections?: PanelSelections;
   /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
   findShadowProfileDirs?: () => ShadowProfileFinding[];
-  claudeStowDir?: string | null;
   spawn?: SpawnFn;
   nextCwdOrdinal?: (dirName: string) => number;
   randomUuid?: () => string;
@@ -162,7 +161,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
       model: opts.piLauncherModel ?? null,
       thinking: opts.piLauncherThinking ?? null,
     }),
-    loadClaudeStowDirFn: () => opts.claudeStowDir ?? null,
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
     loadPresetCatalogFn: () => opts.presetCatalog ?? { presets: {} },
     loadPanelSelectionsFn: () =>

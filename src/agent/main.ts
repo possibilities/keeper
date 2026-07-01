@@ -34,7 +34,6 @@ import {
   ConfigError,
   codexConfigPath,
   type LauncherDefaults,
-  loadClaudeStowDir,
   loadLauncherDefaults,
   loadPanelSelections,
   loadPiLauncherDefaults,
@@ -107,6 +106,7 @@ import {
   type ShadowProfileFinding,
 } from "./shadow-profiles";
 import {
+  defaultClaudeStowDir,
   ensureClaudeStateSharing,
   ensureKeeperAgentPiProfileDir,
   ensureKeeperAgentProfileDir,
@@ -152,7 +152,6 @@ export interface MainDeps {
   loadLauncherDefaultsFn: () => LauncherDefaults;
   loadCodexLauncherDefaultsFn: () => LauncherDefaults;
   loadPiLauncherDefaultsFn: () => PiLauncherDefaults;
-  loadClaudeStowDirFn: () => string | null;
   loadPluginSourcesFn: () => PluginSources;
   /**
    * Read the preset catalog from `presets.yaml` (required + validated).
@@ -168,7 +167,6 @@ export interface MainDeps {
   ensureClaudeStateSharingFn: (
     listProfilesFn: () => string[],
     actionLog: string[],
-    claudeStowDir: string | null,
   ) => void;
   ensureKeeperAgentProfileDirFn: (
     profileName: string,
@@ -240,16 +238,15 @@ export function realDeps(): MainDeps {
     loadLauncherDefaultsFn: loadLauncherDefaults,
     loadCodexLauncherDefaultsFn: () => loadLauncherDefaults(codexConfigPath()),
     loadPiLauncherDefaultsFn: loadPiLauncherDefaults,
-    loadClaudeStowDirFn: loadClaudeStowDir,
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
     loadPanelSelectionsFn: (catalog) => loadPanelSelections(catalog),
-    ensureClaudeStateSharingFn: (listProfilesFn, actionLog, claudeStowDir) =>
+    ensureClaudeStateSharingFn: (listProfilesFn, actionLog) =>
       ensureClaudeStateSharing(
         listProfilesFn,
         actionLog,
         homedir(),
-        claudeStowDir,
+        defaultClaudeStowDir(),
       ),
     ensureKeeperAgentProfileDirFn: ensureKeeperAgentProfileDir,
     ensurePiStateSharingFn: (listProfilesFn, actionLog) =>
@@ -1600,12 +1597,7 @@ export async function main(deps: MainDeps): Promise<never> {
   if (agent === "claude") {
     try {
       phase("ensure shared Claude state", () => {
-        const claudeStowDir = deps.loadClaudeStowDirFn();
-        deps.ensureClaudeStateSharingFn(
-          deps.listProfilesFn,
-          actionLog,
-          claudeStowDir,
-        );
+        deps.ensureClaudeStateSharingFn(deps.listProfilesFn, actionLog);
       });
     } catch (exc) {
       if (exc instanceof StateError || exc instanceof ConfigError) {

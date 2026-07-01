@@ -17,6 +17,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -25,9 +26,33 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Raised for fail-loud state errors; main() prints `Error: <msg>` + exit 1. */
 export class StateError extends Error {}
+
+/**
+ * Resolve keeper's own `system/claude/.claude` source dir from this module's
+ * location, then symlink-resolve it to a stable absolute path. This module sits
+ * at `src/agent/state-sharing.ts`, so `../../system/claude/.claude` is the repo's
+ * canonical Claude config (`settings.json`, `CLAUDE.md`) the launch guard
+ * re-asserts. Mirrors `defaultKeeperAgentPath` — resolving through this module's
+ * own path keeps the source correct under `bun link` (the linked binary reaches
+ * the repo via a node_modules symlink; the `realpath` collapses it to one stable
+ * target so the guard's relative link never churns across launches).
+ */
+export function defaultClaudeStowDir(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dir = resolve(here, "..", "..", "system", "claude", ".claude");
+  try {
+    return realpathSync(dir);
+  } catch {
+    // Partial checkout: fall back to the unresolved absolute path rather than
+    // throwing on a pure path computation. The guard's `!existsSync` fail-open
+    // handles the missing-source case at enforce time.
+    return dir;
+  }
+}
 
 const REQUIRED_PROFILE_CLAUDE_JSON: Record<string, unknown> = {
   hasCompletedOnboarding: true,
@@ -766,8 +791,9 @@ function relinkCanonical(linkPath: string, relTarget: string): void {
  * every configured non-default profile dir, plus the `~/.claude-profiles/
  * default/` silo's session-bearing-path links back to canonical. `listProfilesFn`
  * is injected (agentusage's `listProfiles`) so this stays testable without the
- * real catalog. `claudeStowDir` (from `claude.yaml`) drives the launch-time
- * canonical-link guard; null disables it (fail-open).
+ * real catalog. `claudeStowDir` (keeper's `system/claude/.claude`, derived from
+ * the module path) drives the launch-time canonical-link guard; null disables it
+ * (test-only fail-open).
  */
 export function ensureClaudeStateSharing(
   listProfilesFn: () => string[],
@@ -781,14 +807,15 @@ export function ensureClaudeStateSharing(
   const canonicalDir = join(homeDir, ".claude");
   mkdirSync(canonicalDir, { recursive: true });
 
-  // The `claude` stow package owns `~/.claude/{settings.json,CLAUDE.md}` as
-  // relative symlinks into the repo. This guard re-asserts those canonical links
-  // on every launch (Claude's atomic-rename settings write clobbers them into
-  // regular files) BEFORE the profile farm links through them, and hard-errors
-  // on a genuinely divergent clobber. `settings.json`/`CLAUDE.md` also appear in
-  // DEFAULT_SHARED_PATHS, so each profile links them through this freshly-correct
-  // canonical node like every other shared path. A null `claudeStowDir` (key
-  // absent from claude.yaml) disables the guard — fail-open.
+  // Keeper's `system/claude/.claude/` owns `~/.claude/{settings.json,CLAUDE.md}`
+  // as relative symlinks into the repo. This guard re-asserts those canonical
+  // links on every launch (Claude's atomic-rename settings write clobbers them
+  // into regular files) BEFORE the profile farm links through them, and
+  // hard-errors on a genuinely divergent clobber. `settings.json`/`CLAUDE.md`
+  // also appear in DEFAULT_SHARED_PATHS, so each profile links them through this
+  // freshly-correct canonical node like every other shared path. A null
+  // `claudeStowDir` disables the guard — test-only fail-open; production always
+  // resolves a real path via `defaultClaudeStowDir()`.
   if (claudeStowDir !== null) {
     ensureCanonicalStowLinks(claudeStowDir, homeDir, actionLog);
   }

@@ -7,14 +7,13 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
   codexConfigPath,
   keeperConfigDir,
   launcherConfigPath,
-  loadClaudeStowDir,
   loadLauncherDefaults,
   loadPanelSelections,
   loadPiLauncherDefaults,
@@ -98,37 +97,6 @@ describe("loadPiLauncherDefaults", () => {
   test("empty-string value is fail-loud", () => {
     const p = writeYaml("pi.yaml", 'thinking: ""\n');
     expect(() => loadPiLauncherDefaults(p)).toThrow(ConfigError);
-  });
-});
-
-describe("loadClaudeStowDir", () => {
-  test("missing file → null (fail-open)", () => {
-    expect(loadClaudeStowDir(join(tmpDir, "nope.yaml"))).toBeNull();
-  });
-  test("absent key → null (fail-open)", () => {
-    const p = writeYaml("claude.yaml", "model: opus\n");
-    expect(loadClaudeStowDir(p)).toBeNull();
-  });
-  test("~ is expanded and the path is absolutized", () => {
-    const p = writeYaml(
-      "claude.yaml",
-      "claude_stow_dir: ~/code/arthack/system/claude/.claude\n",
-    );
-    expect(loadClaudeStowDir(p)).toBe(
-      join(homedir(), "code/arthack/system/claude/.claude"),
-    );
-  });
-  test("an already-absolute path is preserved", () => {
-    const p = writeYaml("claude.yaml", "claude_stow_dir: /opt/stow/.claude\n");
-    expect(loadClaudeStowDir(p)).toBe("/opt/stow/.claude");
-  });
-  test("empty-string value is fail-loud", () => {
-    const p = writeYaml("claude.yaml", 'claude_stow_dir: ""\n');
-    expect(() => loadClaudeStowDir(p)).toThrow(ConfigError);
-  });
-  test("non-string value is fail-loud", () => {
-    const p = writeYaml("claude.yaml", "claude_stow_dir:\n  - a\n");
-    expect(() => loadClaudeStowDir(p)).toThrow(ConfigError);
   });
 });
 
