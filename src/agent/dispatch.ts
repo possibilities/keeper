@@ -63,11 +63,17 @@ Usage:
   keeper agent show-last-message <h>   Print a detached run's final message.
   keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
                                   [--system-file <path> | --system <text>]
+                                  [--preset <name>] [--session <name>]
+                                  [--output <path>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
                                     --read-only is detection, not prevention.
                                     --system-file/--system prepend a caller-side
                                     System: block (uniform across harnesses).
+                                    --preset applies a launch-config preset (its
+                                    harness must == <cli>); --session names the
+                                    tmux grouping; --output atomically writes the
+                                    envelope to a file on every outcome.
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -160,6 +166,8 @@ Post-launch transcript subcommands (composable with a detached launch):
 Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
   keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
                                   [--system-file <path> | --system <text>]
+                                  [--preset <name>] [--session <name>]
+                                  [--output <path>]
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
                                         process. --read-only prepends a read-only
@@ -172,7 +180,14 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         UNIFORM across claude/codex/pi — user-turn
                                         text, NOT a privileged system prompt. codex/pi
                                         launch with CLAUDE* env stripped by default
-                                        (partner isolation).
+                                        (partner isolation). --preset applies a named
+                                        launch-config preset (its resolved harness
+                                        must == <cli>, else bad_args); --session
+                                        names the tmux session grouping (rides as
+                                        --x-tmux-session, NOT the transcript id);
+                                        --output atomically writes the SAME envelope
+                                        to <path> (temp+rename) on every outcome, in
+                                        addition to stdout.
                                         Emits the uniform envelope
                                         {schema_version, agent, handle,
                                         transcript_path, resume_target, message,

@@ -133,6 +133,17 @@ export type ParseRunArgsResult =
       /** Raw `--system` inline text. Null when unset. Mutually exclusive with
        *  {@link systemFile} — two spellings of one input. */
       system: string | null;
+      /** Raw `--preset` name (unresolved — the pure parser never reads config).
+       *  The handler resolves it and validates its harness == `<cli>`. Null when
+       *  unset. */
+      preset: string | null;
+      /** Raw `--session` name — the tmux session GROUPING (rides as
+       *  `--x-tmux-session`), NOT the transcript session id, so co-grouped runs
+       *  never collide transcripts. Null when unset. */
+      session: string | null;
+      /** Raw `--output` path — the atomic result-file sink the handler writes the
+       *  envelope to on EVERY outcome, in addition to stdout. Null when unset. */
+      output: string | null;
     }
   | { ok: false; error: string };
 
@@ -144,8 +155,11 @@ export type ParseRunArgsResult =
  * `--read-only` is detection-not-prevention (a per-harness tool strip + a
  * caller-prepended directive; the strip is leaky). `--system-file <path>` /
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
- * the parser returns the RAW path/text — the handler reads any file. Pure —
- * exported for tests.
+ * the parser returns the RAW path/text — the handler reads any file.
+ * `--preset <name>` / `--session <name>` / `--output <path>` are additive value
+ * flags (both split and `=` forms): the parser returns the RAW values (config
+ * resolution + the atomic write happen handler-side). ALL default-absent, so an
+ * argv without them stays byte-identical. Pure — exported for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
@@ -153,6 +167,9 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   let readOnly = false;
   let systemFile: string | null = null;
   let system: string | null = null;
+  let preset: string | null = null;
+  let session: string | null = null;
+  let output: string | null = null;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
@@ -214,6 +231,45 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       system = arg.slice("--system=".length);
       continue;
     }
+    if (arg === "--preset") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--preset requires a value" };
+      }
+      preset = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--preset=")) {
+      preset = arg.slice("--preset=".length);
+      continue;
+    }
+    if (arg === "--session") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--session requires a value" };
+      }
+      session = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--session=")) {
+      session = arg.slice("--session=".length);
+      continue;
+    }
+    if (arg === "--output") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--output requires a value" };
+      }
+      output = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--output=")) {
+      output = arg.slice("--output=".length);
+      continue;
+    }
     if (arg.startsWith("--")) {
       return { ok: false, error: `unknown flag: ${arg}` };
     }
@@ -254,6 +310,9 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     readOnly,
     systemFile,
     system,
+    preset,
+    session,
+    output,
   };
 }
 

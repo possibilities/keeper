@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { ensureCodexDirTrust } from "../codex-trust";
 import {
   buildLauncherArgvPrefix,
@@ -95,6 +95,7 @@ import {
   composeRunCapture,
   parseRunArgs,
   type RunCaptureDeps,
+  type RunCaptureEnvelope,
   type RunCaptureResult,
 } from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
@@ -774,10 +775,51 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
  * with the outcome's code. JSON-ONLY on stdout (no bare-text prelude like
  * show-last-message) — every diagnostic already went to stderr, so a programmatic
  * caller parses stdout cleanly.
+ *
+ * When `outputPath` is set (`agent run --output`), the SAME envelope is ALSO
+ * written there ATOMICALLY (temp-in-same-dir + rename) — an additional sink for
+ * detached-leg pollers, written on EVERY outcome, exit-code-independent. A write
+ * failure (a missing parent dir / an unwritable path) is the `--output` path's
+ * OWN bad_args: it emits the bad_args envelope to stdout only (the broken path
+ * gets no retry) and exits 2.
  */
-function emitRunCapture(deps: MainDeps, result: RunCaptureResult): never {
+function emitRunCapture(
+  deps: MainDeps,
+  result: RunCaptureResult,
+  outputPath: string | null = null,
+): never {
+  if (outputPath !== null) {
+    try {
+      writeEnvelopeAtomic(outputPath, result.envelope);
+    } catch (err) {
+      deps.writeErr(
+        `agent: cannot write --output ${outputPath}: ${(err as Error).message}\n`,
+      );
+      const bad = buildRunCaptureEnvelope({ outcome: "bad_args" });
+      deps.write(`${JSON.stringify(bad.envelope)}\n`);
+      return deps.exit(bad.exitCode);
+    }
+  }
   deps.write(`${JSON.stringify(result.envelope)}\n`);
   return deps.exit(result.exitCode);
+}
+
+/**
+ * Atomically write the run-capture envelope (one JSON line) to `target`: a temp
+ * file in the SAME dir (EXDEV-safe — never crosses a volume boundary), then
+ * rename. The `.tmp` name is poller-invisible (a poller matches only the final
+ * path), so the presence flip is atomic. Mirrors panel.ts's `writeFileAtomic`.
+ */
+function writeEnvelopeAtomic(
+  target: string,
+  envelope: RunCaptureEnvelope,
+): void {
+  const tmp = join(
+    dirname(target),
+    `.keeper-agent-run-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  writeFileSync(tmp, `${JSON.stringify(envelope)}\n`);
+  renameSync(tmp, target);
 }
 
 /**
@@ -819,6 +861,38 @@ async function runRunCaptureSubcommand(
   }
   const agent = parsed.cli;
   const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  // `--preset` validation: agent run is otherwise config-free and cannot derive
+  // `<cli>` from the preset, so a preset whose harness disagrees with the
+  // positional is a standalone foot-gun. Resolve HANDLER-SIDE and require the
+  // preset's harness == `<cli>`; a missing catalog / unknown preset (ConfigError)
+  // or a harness mismatch is bad_args (the result-file sink still gets it).
+  if (parsed.preset !== null) {
+    let resolved: Preset;
+    try {
+      resolved = resolvePreset(deps.loadPresetCatalogFn(), parsed.preset);
+    } catch (exc) {
+      if (exc instanceof ConfigError) {
+        deps.writeErr(`agent: ${exc.message}\n`);
+        return emitRunCapture(
+          deps,
+          buildRunCaptureEnvelope({ outcome: "bad_args" }),
+          parsed.output,
+        );
+      }
+      throw exc;
+    }
+    if (resolved.harness !== agent) {
+      deps.writeErr(
+        `agent: --preset ${parsed.preset} pins harness ${resolved.harness}, ` +
+          `but the ${agent} run was given.\n`,
+      );
+      return emitRunCapture(
+        deps,
+        buildRunCaptureEnvelope({ outcome: "bad_args" }),
+        parsed.output,
+      );
+    }
+  }
   // Resolve the `--system-file`/`--system` seam to text HANDLER-SIDE (the pure
   // parser never reads the fs). A relative `--system-file` resolves against the
   // caller cwd; a missing/unreadable file is `bad_args` (exit 2), never a throw.
@@ -836,6 +910,7 @@ async function runRunCaptureSubcommand(
       return emitRunCapture(
         deps,
         buildRunCaptureEnvelope({ outcome: "bad_args" }),
+        parsed.output,
       );
     }
   } else if (parsed.system !== null) {
@@ -867,14 +942,18 @@ async function runRunCaptureSubcommand(
           deps: launchHandleDeps(deps),
           agent,
           prompt,
-          posture: { readOnly: parsed.readOnly },
+          posture: {
+            readOnly: parsed.readOnly,
+            preset: parsed.preset ?? undefined,
+            session: parsed.session ?? undefined,
+          },
           stopTimeoutMs: parsed.stopTimeoutMs,
         }),
     },
     verbDeps,
     agent,
   );
-  return emitRunCapture(deps, result);
+  return emitRunCapture(deps, result, parsed.output);
 }
 
 /**

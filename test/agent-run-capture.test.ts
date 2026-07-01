@@ -14,9 +14,17 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PresetCatalog } from "../src/agent/config";
 import { splitSubcommand } from "../src/agent/dispatch";
 import { main } from "../src/agent/main";
 import type {
@@ -157,118 +165,112 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
   });
 });
 
+/** An `ok:true` parseRunArgs result with the three additive flags defaulting to
+ *  null — the byte-stability baseline every arm layers its overrides onto. */
+function okParse(
+  overrides: Partial<Extract<ReturnType<typeof parseRunArgs>, { ok: true }>>,
+): Extract<ReturnType<typeof parseRunArgs>, { ok: true }> {
+  return {
+    ok: true,
+    cli: "claude",
+    prompt: "p",
+    stopTimeoutMs: null,
+    readOnly: false,
+    systemFile: null,
+    system: null,
+    preset: null,
+    session: null,
+    output: null,
+    ...overrides,
+  };
+}
+
 describe("parseRunArgs", () => {
   test("<cli> <prompt> parses, stop-timeout absent → null, read-only false", () => {
-    expect(parseRunArgs(["claude", "say hi"])).toEqual({
-      ok: true,
-      cli: "claude",
-      prompt: "say hi",
-      stopTimeoutMs: null,
-      readOnly: false,
-      systemFile: null,
-      system: null,
-    });
+    expect(parseRunArgs(["claude", "say hi"])).toEqual(
+      okParse({ prompt: "say hi" }),
+    );
   });
 
   test("--stop-timeout-ms space + equals forms parse", () => {
     expect(
       parseRunArgs(["codex", "p", "--stop-timeout-ms", "1800000"]),
-    ).toEqual({
-      ok: true,
-      cli: "codex",
-      prompt: "p",
-      stopTimeoutMs: 1_800_000,
-      readOnly: false,
-      systemFile: null,
-      system: null,
-    });
-    expect(parseRunArgs(["pi", "p", "--stop-timeout-ms=1500"])).toEqual({
-      ok: true,
-      cli: "pi",
-      prompt: "p",
-      stopTimeoutMs: 1500,
-      readOnly: false,
-      systemFile: null,
-      system: null,
-    });
+    ).toEqual(okParse({ cli: "codex", stopTimeoutMs: 1_800_000 }));
+    expect(parseRunArgs(["pi", "p", "--stop-timeout-ms=1500"])).toEqual(
+      okParse({ cli: "pi", stopTimeoutMs: 1500 }),
+    );
   });
 
   test("--read-only sets readOnly true (exact-match, any position)", () => {
-    expect(parseRunArgs(["claude", "explore", "--read-only"])).toEqual({
-      ok: true,
-      cli: "claude",
-      prompt: "explore",
-      stopTimeoutMs: null,
-      readOnly: true,
-      systemFile: null,
-      system: null,
-    });
+    expect(parseRunArgs(["claude", "explore", "--read-only"])).toEqual(
+      okParse({ prompt: "explore", readOnly: true }),
+    );
     // Exact-match: it is accepted before a positional, not swallowed as one.
-    expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual({
-      ok: true,
-      cli: "codex",
-      prompt: "explore",
-      stopTimeoutMs: null,
-      readOnly: true,
-      systemFile: null,
-      system: null,
-    });
+    expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual(
+      okParse({ cli: "codex", prompt: "explore", readOnly: true }),
+    );
     // Composes with --stop-timeout-ms.
     expect(
       parseRunArgs(["pi", "p", "--read-only", "--stop-timeout-ms", "1500"]),
-    ).toEqual({
-      ok: true,
-      cli: "pi",
-      prompt: "p",
-      stopTimeoutMs: 1500,
-      readOnly: true,
-      systemFile: null,
-      system: null,
-    });
+    ).toEqual(okParse({ cli: "pi", readOnly: true, stopTimeoutMs: 1500 }));
   });
 
   test("--system-file / --system parse as value flags (split + = forms)", () => {
     expect(
       parseRunArgs(["claude", "p", "--system-file", "/tmp/sys.txt"]),
-    ).toEqual({
-      ok: true,
-      cli: "claude",
-      prompt: "p",
-      stopTimeoutMs: null,
-      readOnly: false,
-      systemFile: "/tmp/sys.txt",
-      system: null,
-    });
-    expect(parseRunArgs(["codex", "p", "--system-file=/tmp/sys.txt"])).toEqual({
-      ok: true,
-      cli: "codex",
-      prompt: "p",
-      stopTimeoutMs: null,
-      readOnly: false,
-      systemFile: "/tmp/sys.txt",
-      system: null,
-    });
+    ).toEqual(okParse({ systemFile: "/tmp/sys.txt" }));
+    expect(parseRunArgs(["codex", "p", "--system-file=/tmp/sys.txt"])).toEqual(
+      okParse({ cli: "codex", systemFile: "/tmp/sys.txt" }),
+    );
     // Inline text, both spellings; composes with the other flags.
     expect(
       parseRunArgs(["pi", "p", "--system", "be terse", "--read-only"]),
-    ).toEqual({
-      ok: true,
-      cli: "pi",
-      prompt: "p",
-      stopTimeoutMs: null,
-      readOnly: true,
-      systemFile: null,
-      system: "be terse",
-    });
-    expect(parseRunArgs(["claude", "p", "--system=be terse"])).toEqual({
-      ok: true,
-      cli: "claude",
-      prompt: "p",
-      stopTimeoutMs: null,
-      readOnly: false,
-      systemFile: null,
-      system: "be terse",
-    });
+    ).toEqual(okParse({ cli: "pi", readOnly: true, system: "be terse" }));
+    expect(parseRunArgs(["claude", "p", "--system=be terse"])).toEqual(
+      okParse({ system: "be terse" }),
+    );
+  });
+
+  test("--preset / --session / --output parse as value flags (split + = forms)", () => {
+    expect(parseRunArgs(["claude", "p", "--preset", "opus"])).toEqual(
+      okParse({ preset: "opus" }),
+    );
+    expect(parseRunArgs(["codex", "p", "--preset=fast"])).toEqual(
+      okParse({ cli: "codex", preset: "fast" }),
+    );
+    expect(parseRunArgs(["claude", "p", "--session", "panels"])).toEqual(
+      okParse({ session: "panels" }),
+    );
+    expect(parseRunArgs(["pi", "p", "--session=grp"])).toEqual(
+      okParse({ cli: "pi", session: "grp" }),
+    );
+    expect(parseRunArgs(["claude", "p", "--output", "/tmp/leg.json"])).toEqual(
+      okParse({ output: "/tmp/leg.json" }),
+    );
+    expect(parseRunArgs(["claude", "p", "--output=/tmp/o.yaml"])).toEqual(
+      okParse({ output: "/tmp/o.yaml" }),
+    );
+    // All three compose with each other and the existing posture flags.
+    expect(
+      parseRunArgs([
+        "claude",
+        "p",
+        "--preset",
+        "opus",
+        "--session",
+        "panels",
+        "--output",
+        "/tmp/leg.json",
+        "--read-only",
+      ]),
+    ).toEqual(
+      okParse({
+        preset: "opus",
+        session: "panels",
+        output: "/tmp/leg.json",
+        readOnly: true,
+      }),
+    );
   });
 
   test("--system-file + --system together → bad_args (one input, two spellings)", () => {
@@ -304,6 +306,9 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--stop-timeout-ms"], "requires a value"],
     [["claude", "p", "--system-file"], "--system-file requires a value"],
     [["claude", "p", "--system"], "--system requires a value"],
+    [["claude", "p", "--preset"], "--preset requires a value"],
+    [["claude", "p", "--session"], "--session requires a value"],
+    [["claude", "p", "--output"], "--output requires a value"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);
@@ -656,6 +661,135 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       handle: null,
     });
     expect(h.err.join("")).toContain("<cli> must be");
+  });
+
+  const PRESET_CATALOG: PresetCatalog = {
+    presets: {
+      opus: {
+        harness: "claude",
+        model: null,
+        effort: null,
+        thinking: null,
+        role: null,
+      },
+      fast: {
+        harness: "codex",
+        model: null,
+        effort: null,
+        thinking: null,
+        role: null,
+      },
+    },
+  };
+
+  /** A harness whose faked tmux + on-disk claude transcript let a `claude` run
+   *  compose to `completed`. Extra `agent run` flags go before the positionals. */
+  function completedRunHarness(
+    flags: string[],
+    presetCatalog?: PresetCatalog,
+  ): { h: ReturnType<typeof makeHarness>; transcriptPath: string } {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const transcriptPath = writeClaudeTranscript(home, cwd, sessionId, "done");
+    const h = makeHarness({
+      argv: ["run", ...flags, "claude", "say hi"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      presetCatalog,
+      tmuxCommand: (cmd) =>
+        cmd.includes("has-session")
+          ? { exitCode: 1, stdout: "", stderr: "no session" }
+          : { exitCode: 0, stdout: "keeper agent\x01@1\x01%1\n", stderr: "" },
+    });
+    return { h, transcriptPath };
+  }
+
+  test("--preset with a matching harness validates and composes to completed", async () => {
+    const { h } = completedRunHarness(["--preset", "opus"], PRESET_CATALOG);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "completed" });
+    // A launch actually fired — the preset validation passed, not short-circuited.
+    expect(h.tmuxCommands.length).toBeGreaterThan(0);
+  });
+
+  test("--preset whose harness disagrees with <cli> is bad_args, no launch", async () => {
+    const { h } = completedRunHarness(["--preset", "fast"], PRESET_CATALOG);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain("pins harness codex");
+    // Validation short-circuits BEFORE any tmux launch.
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("--preset naming an unknown preset is bad_args (ConfigError → exit 2)", async () => {
+    const { h } = completedRunHarness(["--preset", "nope"], PRESET_CATALOG);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("--output writes the SAME completed envelope atomically (no .tmp left)", async () => {
+    const outDir = tempDir();
+    const outPath = join(outDir, "leg.json");
+    const { h } = completedRunHarness(["--output", outPath]);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    const stdoutEnvelope = parseEnvelope(h.out);
+    expect(stdoutEnvelope).toMatchObject({ outcome: "completed" });
+    // The file carries the EXACT same envelope the stdout sink emitted.
+    expect(existsSync(outPath)).toBe(true);
+    const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8"));
+    expect(fileEnvelope).toEqual(stdoutEnvelope);
+    // The atomic temp file was renamed away — only the final path remains.
+    expect(readdirSync(outDir)).toEqual(["leg.json"]);
+  });
+
+  test("--output writes the result file on a FAIL outcome (bad_args) too", async () => {
+    const outDir = tempDir();
+    const outPath = join(outDir, "leg.json");
+    // A mismatched --preset is a deterministic fail outcome that still knows the
+    // --output path (write-on-EVERY-outcome, exit-code-independent).
+    const { h } = completedRunHarness(
+      ["--preset", "fast", "--output", outPath],
+      PRESET_CATALOG,
+    );
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(existsSync(outPath)).toBe(true);
+    const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8")) as {
+      outcome: string;
+    };
+    expect(fileEnvelope.outcome).toBe("bad_args");
+  });
+
+  test("--output onto a missing parent dir is the path's own bad_args (exit 2)", async () => {
+    const outPath = join(tempDir(), "no-such-subdir", "leg.json");
+    const { h } = completedRunHarness(["--output", outPath]);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(existsSync(outPath)).toBe(false);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain("cannot write --output");
   });
 });
 

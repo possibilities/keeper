@@ -212,6 +212,8 @@ interface RunCommandOpts {
   readOnly?: boolean;
   system?: string;
   systemFile?: string;
+  preset?: string;
+  session?: string;
 }
 
 /** The native `command` the launch persisted to run.json (`tmux-<uuid>/run.json`). */
@@ -229,6 +231,12 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
   } else if (opts.system !== undefined) {
     flags.push("--system", opts.system);
   }
+  if (opts.preset !== undefined) {
+    flags.push("--preset", opts.preset);
+  }
+  if (opts.session !== undefined) {
+    flags.push("--session", opts.session);
+  }
   const argv = ["run", ...flags, "claude", "say hi"];
   const h = makeHarness({
     argv,
@@ -237,6 +245,18 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
     transcriptHomeDir: home,
     cwd,
     randomUuid: () => RUN_UUID,
+    // A claude-harness preset so `--preset` validation (harness == <cli>) passes.
+    presetCatalog: {
+      presets: {
+        opus: {
+          harness: "claude",
+          model: null,
+          effort: null,
+          thinking: null,
+          role: null,
+        },
+      },
+    },
     tmuxCommand: (cmd) =>
       cmd.includes("has-session")
         ? { exitCode: 1, stdout: "", stderr: "no session" }
@@ -322,6 +342,62 @@ describe("keeper agent byte-pin — agent run posture", () => {
       outcome: string;
     };
     expect(envelope.outcome).toBe("bad_args");
+  });
+});
+
+/**
+ * Byte-pins for the `agent run --preset`/`--session` threading. The positive arm
+ * confirms the two flags reach the launch as the wrapper flags `--x-preset` /
+ * `--x-tmux-session` (session on claude also mints the `KEEPER_TMUX_SESSION` env
+ * carrier); the absent arm is the byte-stability regression — no flag, no wrapper
+ * token — so a no-`--preset`/`--session` run stays byte-identical.
+ */
+describe("keeper agent byte-pin — agent run preset/session threading", () => {
+  test("buildPairLaunchArgv carries --x-preset / --x-tmux-session when set", () => {
+    const cmd = buildPairLaunchArgv({
+      launcherArgvPrefix: [],
+      cli: "claude",
+      prompt: "say hi",
+      readOnly: false,
+      preset: "opus",
+      session: "panels",
+    });
+    // The preset rides as a launcher flag (keeper agent owns model/effort
+    // resolution); the session rides as the tmux grouping flag.
+    expect(cmd).toContain("--x-preset");
+    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("opus");
+    expect(cmd).toContain("--x-tmux-session");
+    expect(cmd[cmd.indexOf("--x-tmux-session") + 1]).toBe("panels");
+    // claude's session grouping also mints the tracked-job env carrier.
+    expect(cmd).toContain("--x-tmux-env");
+    expect(cmd).toContain("KEEPER_TMUX_SESSION=panels");
+  });
+
+  test("buildPairLaunchArgv without preset/session carries NEITHER (absent-flag pin)", () => {
+    const cmd = buildPairLaunchArgv({
+      launcherArgvPrefix: [],
+      cli: "claude",
+      prompt: "say hi",
+      readOnly: false,
+    });
+    expect(cmd).not.toContain("--x-preset");
+    expect(cmd).not.toContain("--x-tmux-session");
+    expect(cmd.join(" ")).not.toContain("KEEPER_TMUX_SESSION");
+  });
+
+  test("agent run --preset threads --x-preset into the launched command", async () => {
+    const cmd = await runCommand({ preset: "opus" });
+    // --x-preset survives into the pane's inner argv (the tmux parser leaves it
+    // for the detached re-exec to resolve); --x-tmux-session is consumed into the
+    // session grouping, so it is pinned at the buildPairLaunchArgv level above.
+    expect(cmd).toContain("--x-preset");
+    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("opus");
+  });
+
+  test("agent run without --preset/--session carries no wrapper posture (regression)", async () => {
+    const cmd = await runCommand();
+    expect(cmd).not.toContain("--x-preset");
+    expect(cmd).not.toContain("--x-tmux-session");
   });
 });
 

@@ -1436,7 +1436,17 @@ event-log/reducer/hook touch. Run any of them with
   directive → `System:` → user prompt) — deliberately user-turn text, NOT a
   privileged system prompt (the native `--append-system-prompt` upgrade is a
   documented future step; keep security-relevant constraints out of this
-  overridable block). codex/pi runs launch with
+  overridable block). `run --preset <name>` applies a named launch-config preset
+  to the run (its resolved harness must equal the `<cli>` positional, else
+  `bad_args` — `agent run` is otherwise config-free and cannot derive `<cli>` from
+  the preset); `run --session <name>` names the tmux session GROUPING (rides as
+  `--x-tmux-session`, distinct from the transcript session id, so co-grouped runs
+  never collide transcripts); `run --output <path>` atomically writes the SAME
+  envelope to `<path>` (a temp file in the same dir + rename, EXDEV-safe) on
+  EVERY outcome, exit-code-independent, an additional sink for detached-leg
+  pollers beyond stdout (a missing parent dir on that path is the `--output`
+  path's own `bad_args`). All three default-absent, so a run without them is
+  byte-identical. codex/pi runs launch with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex

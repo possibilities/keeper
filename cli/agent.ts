@@ -11,7 +11,12 @@
  * — no changed-files audit on this verb); `run --system-file <path>`/`--system
  * <text>` prepend a caller-side `System:` block (mutually exclusive, uniform
  * across harnesses — user-turn text, not a privileged system prompt); codex/pi
- * launch with `CLAUDE*` env stripped by default (partner isolation).
+ * launch with `CLAUDE*` env stripped by default (partner isolation). `run
+ * --preset <name>` applies a launch-config preset (its resolved harness must
+ * equal `<cli>`, else `bad_args`); `run --session <name>` names the tmux session
+ * grouping (rides as `--x-tmux-session`, not the transcript id); `run --output
+ * <path>` atomically writes the SAME envelope to a file (temp+rename) on every
+ * outcome, an additional sink for detached-leg pollers beyond stdout.
  *
  * Named launch-config presets (harness/model/effort) live in the catalog
  * `~/.config/keeper/presets.yaml` (panel selections in `panel.yaml`): `keeper
