@@ -67,6 +67,7 @@ import {
   resolveKeeperAgentPath,
   resolvePlanRoots,
   resolveSockPath,
+  resolveStatuslineRoot,
   resolveUsageRoot,
   resolveUsageScraperRuntime,
   truncateEphemeralProjections,
@@ -144,6 +145,7 @@ import type {
   SetEpicArmedRequestMessage,
   SetEpicArmedResultMessage,
 } from "./server-worker";
+import type { StatuslineWorkerData } from "./statusline-worker";
 import { seedTmuxProjection } from "./tmux-boot-seed";
 import type {
   TmuxClientFocusSnapshotMessage,
@@ -2087,6 +2089,7 @@ export type WorkerName =
   | "exit"
   | "git"
   | "usage"
+  | "statusline"
   | "builds"
   | "usageScraper"
   | "deadLetter"
@@ -2112,6 +2115,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "exit",
   "git",
   "usage",
+  "statusline",
   "builds",
   "usageScraper",
   "deadLetter",
@@ -2136,6 +2140,7 @@ const WATCHER_WORKERS: readonly WorkerName[] = [
   "transcript",
   "plan",
   "usage",
+  "statusline",
   "deadLetter",
   "eventsIngest",
 ] as const;
@@ -4061,6 +4066,93 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (usageWorker)`
+
+  // Spawn the statusline worker in the SAME post-migration window (fn-1024). It
+  // watches the keeper-managed statusLine leaf dir (`~/.local/state/keeper/
+  // statusline/`, one `<token>.json` per session written by `keeper
+  // statusline-sink`) and posts `{kind: "session-telemetry", ...}` messages —
+  // the sixth file-watcher producer-worker instance. Main turns each into a
+  // synthetic `SessionTelemetry` events row on its writable connection. The watch
+  // root is resolved on main via `resolveStatuslineRoot()` and tolerates absence
+  // (no keeper-agent claude session may have rendered a statusLine yet). Gated on
+  // the selector — `null` when unselected.
+  const statuslineWorker = want("statusline")
+    ? new Worker(new URL("./statusline-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          root: resolveStatuslineRoot(),
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies StatuslineWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (statuslineWorker) {
+    const stw = statuslineWorker;
+    // Main stays the SOLE writer: a `session-telemetry` message becomes a
+    // synthetic `SessionTelemetry` events row on the WRITABLE connection, then a
+    // wake pump folds it latest-wins onto the six v100 jobs telemetry columns.
+    // The RAW claude `session_id` (== `jobs.job_id`, the fold's only match key)
+    // rides in `session_id`; the flattened snapshot in `data`. Everything else is
+    // NULL. There is NO tombstone kind — a leaf delete never nulls the columns.
+    stw.onmessage = (
+      ev: MessageEvent<SessionTelemetryMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "session-telemetry") return;
+      // Tolerant mint (shared with usage): a transient writer-lock miss is
+      // logged-and-dropped (recoverable via change-gated re-emit / boot scan)
+      // instead of crashing the daemon; real corruption still throws through to
+      // `fatalExit`.
+      const minted = mintUsageEventTolerant({
+        $ts: Date.now() / 1000,
+        $session_id: msg.id, // RAW claude session_id === jobs.job_id
+        $pid: null,
+        $hook_event: "SessionTelemetry",
+        $event_type: "session_telemetry",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        // Pre-flattened payload — the reducer never re-reads the on-disk leaf.
+        // Pinned by a direct test on `serializeSessionTelemetry`.
+        $data: serializeSessionTelemetry(msg),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      if (minted) {
+        wakePending = true;
+        pumpWakes();
+      }
+    };
+
+    stw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] statusline worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    stw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // end `if (statuslineWorker)`
 
   // Spawn the builds worker — keeperd's FIRST outbound-HTTP producer (not a
   // file-watcher; NOT in WATCHER_WORKERS, so it never dlopens @parcel/watcher).
@@ -6200,6 +6292,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       exitWorker,
       gitWorker,
       usageWorker,
+      statuslineWorker,
       buildsWorker,
       usageScraperWorker,
       deadLetterWorker,

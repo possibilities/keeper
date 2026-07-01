@@ -506,6 +506,24 @@ export function resolveUsageRoot(): string {
 }
 
 /**
+ * Resolve the statusLine leaf directory (fn-1024) — where `keeper statusline-sink`
+ * writes one `<token>.json` per session and the `statusline-worker` watches for
+ * telemetry snapshots. `KEEPER_STATUSLINE_DIR` env wins (hermetic tests point it
+ * at a tmpdir; the sink reads the same override); else
+ * `~/.local/state/keeper/statusline/`, a sibling of the other keeper state dirs.
+ * MUST resolve byte-for-byte to `resolveStatuslineDir` in
+ * `cli/statusline-sink.ts` — the sink writes the leaves, the worker reads them;
+ * the sink keeps its own copy because it cannot import `bun:sqlite`/`src/db.ts`.
+ */
+export function resolveStatuslineRoot(): string {
+  const override = process.env.KEEPER_STATUSLINE_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "statusline");
+}
+
+/**
  * `KEEPER_DEAD_LETTER_DIR` env wins; else `~/.local/state/keeper/dead-letters`.
  * MUST match `resolveDeadLetterDir` in
  * `plugins/keeper/plugin/hooks/events-writer.ts` byte-for-byte (hook writes the

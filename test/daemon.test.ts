@@ -3781,6 +3781,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "exit-watcher.ts": "exit",
   "git-worker.ts": "git",
   "usage-worker.ts": "usage",
+  "statusline-worker.ts": "statusline",
   "builds-worker.ts": "builds",
   "usage-scraper-worker.ts": "usageScraper",
   "dead-letter-worker.ts": "deadLetter",
@@ -3881,7 +3882,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -3898,9 +3899,11 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen wo
   // added `tmuxControl` (the persistent `tmux -C` control-focus worker; gated on
   // `!disableNativeWatcher` — it attaches a REAL tmux client, so it spawns under
   // the spy boot's default `disableNativeWatcher:false` but never in-process).
+  // fn-1024 added `statusline` (the sixth file-watcher producer; watches the
+  // statusLine leaf dir and mints `SessionTelemetry`, reads keeper.db read-only).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(18);
+  expect(spawned).toHaveLength(19);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -3911,6 +3914,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL eighteen wo
     "exit",
     "git",
     "usage",
+    "statusline",
     "builds",
     "usageScraper",
     "deadLetter",
