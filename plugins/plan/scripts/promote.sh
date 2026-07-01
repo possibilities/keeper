@@ -23,6 +23,38 @@ echo "promote: building dist/keeper-plan-bun (hard prerequisite)"
 
 [ -x "${binary}" ] || { echo "promote: build produced no executable at ${binary}" >&2; exit 1; }
 
+# Drift guard. The compiled binary resolves the worker matrix from an EMBEDDED
+# snapshot of subagents.yaml; the template renderer reads that file off DISK. The
+# two copies can only be trusted equal right after a rebuild + re-render, so gate
+# promote on it: a config edit that skipped either fails LOUD here. This cannot
+# live in `bun test` — an in-process test resolves the embed to the same on-disk
+# file and never sees a stale compiled binary.
+keeper_root="$(cd "${repo_root}/../.." && pwd)"
+config="${repo_root}/subagents.yaml"
+
+echo "promote: drift guard — embedded matrix must equal on-disk subagents.yaml"
+while IFS= read -r axis_line; do
+  case "${axis_line}" in
+    efforts:* | models:* | subagents:*)
+      grep -aqF -- "${axis_line}" "${binary}" && continue
+      echo "promote: ABORT — freshly built binary does not embed on-disk config line:" >&2
+      echo "  ${axis_line}" >&2
+      echo "  rebuild (bun run build) after editing ${config}" >&2
+      exit 1
+      ;;
+  esac
+done < "${config}"
+
+echo "promote: drift guard — rendered worker agents must match subagents.yaml"
+( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" >/dev/null )
+drift="$(cd "${keeper_root}" && git status --porcelain plugins/plan/agents)"
+if [ -n "${drift}" ]; then
+  echo "promote: ABORT — rendered plan worker agents diverge from subagents.yaml:" >&2
+  echo "${drift}" >&2
+  echo "  re-render (keeper prompt render-plugin-templates) and commit before promote" >&2
+  exit 1
+fi
+
 mkdir -p "${dest_dir}"
 
 # Copy into the destination dir so the rename is same-filesystem atomic.
