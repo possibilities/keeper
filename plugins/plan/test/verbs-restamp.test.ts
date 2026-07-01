@@ -3,8 +3,8 @@
 // mutating-side companion to verbs-query: the restamping setters
 // (set-description / set-acceptance from file AND stdin, reset incl. --cascade,
 // set-target-repo's touched_repos recompute, the warn-and-write
-// set-primary-repo / set-touched-repos), the non-restamp setters (set-tier,
-// set-branch, set-title), the short-circuiting verbs (invalidate /
+// set-primary-repo / set-touched-repos), the non-restamp setters (set-branch,
+// set-title), the short-circuiting verbs (invalidate /
 // refine-context --invalidate), the dep editors (add-dep fn-N normalization,
 // cross-project via roots, cycle rollback, idempotent rm-dep), add-deps
 // (skip-invalid statuses, error priority), and the fail-forward restamp-failure.
@@ -411,24 +411,10 @@ describe("mv-repo", () => {
 });
 
 // ---------------------------------------------------------------------------
-// set-tier / set-branch / set-title — no restamp
+// set-branch / set-title — no restamp
 // ---------------------------------------------------------------------------
 
 describe("non-restamp setters", () => {
-  test("set-tier writes + leaves the marker (not a restamp member)", () => {
-    // test_restamp_verbs.py::test_set_tier_writes_and_leaves_marker
-    seedState(root, { epicId: "fn-1-tier", nTasks: 1 });
-    stampMarker(root, "fn-1-tier", STALE);
-    const r = runCli(["task", "set-tier", "fn-1-tier.1", "--tier", "high"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
-    expect(r.code).toBe(0);
-    expect(parseCliOutput(r.output).tier).toBe("high");
-    expect(taskDef(root, "fn-1-tier.1").tier).toBe("high");
-    expect(epicDef(root, "fn-1-tier").last_validated_at).toBe(STALE);
-  });
-
   test("set-branch plain write, no restamp", () => {
     // test_restamp_verbs.py::test_set_branch_plain_write_no_restamp
     seedState(root, { epicId: "fn-1-br", nTasks: 1 });

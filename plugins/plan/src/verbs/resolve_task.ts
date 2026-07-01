@@ -1,9 +1,10 @@
 // resolve-task verb — the port of planctl/run_resolve_task.py. A read-only
 // routing lookup: validate the task id, resolve its owning project cwd-
 // agnostically (roots discovery or --project), then return the routing subset
-// (task_id, epic_id, project_path, target_repo, primary_repo, tier, worker_agent,
-// status) with the readonly plan_invocation MERGED into the same payload line.
-// tier is surfaced as an explicit JSON null when unset. Typed errors —
+// (task_id, epic_id, project_path, target_repo, primary_repo, tier, worker_model,
+// worker_agent, status) with the readonly plan_invocation MERGED into the same
+// payload line. tier + worker_model surface as explicit JSON null when unset.
+// Typed errors —
 // BAD_TASK_ID / NOT_A_PROJECT / TASK_NOT_FOUND / AMBIGUOUS_TASK_ID — emit the
 // {success:false, error:{code,message,details?}} envelope + exit 1, mutating
 // nothing. Self-emits, so the dispatcher never fires the generic trailer.
@@ -15,11 +16,7 @@ import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import {
-  mergeTaskState,
-  normalizeTask,
-  workerAgentForTier,
-} from "../models.ts";
+import { mergeTaskState, normalizeTask, workerAgentFor } from "../models.ts";
 import {
   type ProjectContext,
   resolvePlanStateContext,
@@ -121,6 +118,7 @@ export function runResolveTask(opts: {
   const status = (merged.status as string | undefined) ?? "todo";
 
   const tier = (taskDef.tier as string | null) ?? null;
+  const model = (taskDef.model as string | null) ?? null;
 
   const pc = buildPlanInvocationReadonly("resolve-task", projPath, taskId);
   emitReadonly(
@@ -131,7 +129,8 @@ export function runResolveTask(opts: {
       target_repo: targetRepo,
       primary_repo: primaryRepo,
       tier,
-      worker_agent: workerAgentForTier(tier),
+      worker_model: model,
+      worker_agent: workerAgentFor(tier, model),
       status,
     },
     pc,

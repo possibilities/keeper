@@ -32,7 +32,7 @@ import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { generateSuffix, isEpicId, scanMaxEpicId, slugify } from "../ids.ts";
 import { checkEpicTreeInMemory } from "../integrity.ts";
-import { configuredEfforts } from "../models.ts";
+import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
@@ -342,6 +342,7 @@ export function validateScaffoldYaml(
   const depErrors: string[] = [];
   const repoErrors: string[] = [];
   const tierErrors: string[] = [];
+  const modelErrors: string[] = [];
 
   for (let idx = 0; idx < nTasks; idx += 1) {
     const i = idx + 1;
@@ -429,6 +430,21 @@ export function validateScaffoldYaml(
         `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${efforts.join(", ")}`,
       );
     }
+
+    const models = configuredModels();
+    const modelRaw = "model" in entry ? entry.model : null;
+    if (modelRaw === null || modelRaw === undefined) {
+      modelErrors.push(
+        `${prefix}: \`model\` is required (missing) — must be one of ` +
+          `${models.join(", ")}`,
+      );
+    } else if (!isStr(modelRaw)) {
+      errors.push(`${prefix}: \`model\` must be a string`);
+    } else if (!models.includes(modelRaw)) {
+      modelErrors.push(
+        `${prefix}: \`model\` ${pyReprStr(modelRaw)} is not one of ${models.join(", ")}`,
+      );
+    }
   }
 
   // The cross-repo follow-up guard: a multi-repo source REQUIRES an explicit,
@@ -444,6 +460,7 @@ export function validateScaffoldYaml(
       ...epicDepErrors,
       ...repoErrors,
       ...tierErrors,
+      ...modelErrors,
     ]);
   }
 
@@ -478,6 +495,7 @@ export function validateScaffoldYaml(
         ...epicDepErrors,
         ...repoErrors,
         ...tierErrors,
+        ...modelErrors,
       ],
     );
   }
@@ -485,28 +503,41 @@ export function validateScaffoldYaml(
     return validationFailure(
       "dep_invalid",
       "One or more task dependencies are invalid",
-      [...depErrors, ...epicDepErrors, ...repoErrors, ...tierErrors],
+      [
+        ...depErrors,
+        ...epicDepErrors,
+        ...repoErrors,
+        ...tierErrors,
+        ...modelErrors,
+      ],
     );
   }
   if (epicDepErrors.length > 0) {
     return validationFailure(
       "epic_dep_invalid",
       "One or more epic-level dependencies are invalid",
-      [...epicDepErrors, ...repoErrors, ...tierErrors],
+      [...epicDepErrors, ...repoErrors, ...tierErrors, ...modelErrors],
     );
   }
   if (repoErrors.length > 0) {
     return validationFailure(
       "repo_invalid",
       "One or more task `target_repo` values are invalid",
-      [...repoErrors, ...tierErrors],
+      [...repoErrors, ...tierErrors, ...modelErrors],
     );
   }
   if (tierErrors.length > 0) {
     return validationFailure(
       "tier_invalid",
       "One or more task `tier` values are invalid",
-      tierErrors,
+      [...tierErrors, ...modelErrors],
+    );
+  }
+  if (modelErrors.length > 0) {
+    return validationFailure(
+      "model_invalid",
+      "One or more task `model` values are invalid",
+      modelErrors,
     );
   }
   if (repoRequired.length > 0) {
@@ -670,11 +701,13 @@ export function runScaffold(args: ScaffoldArgs): number {
   const taskDepsList: number[][] = []; // 1-based ordinals
   const taskTargetRepos: (string | null)[] = [];
   const taskTiers: string[] = [];
+  const taskModels: string[] = [];
 
   const specErrors: string[] = [];
   const depErrors: string[] = [];
   const repoErrors: string[] = [];
   const tierErrors: string[] = [];
+  const modelErrors: string[] = [];
 
   for (let idx = 0; idx < nTasks; idx += 1) {
     const i = idx + 1;
@@ -689,6 +722,7 @@ export function runScaffold(args: ScaffoldArgs): number {
       taskDepsList.push([]);
       taskTargetRepos.push(null);
       taskTiers.push("");
+      taskModels.push("");
       continue;
     }
 
@@ -787,6 +821,26 @@ export function runScaffold(args: ScaffoldArgs): number {
     } else {
       taskTiers.push(tierRaw);
     }
+
+    const models = configuredModels();
+    const modelRaw = "model" in entry ? entry.model : null;
+    if (modelRaw === null || modelRaw === undefined) {
+      modelErrors.push(
+        `${prefix}: \`model\` is required (missing) — must be one of ` +
+          `${models.join(", ")}`,
+      );
+      taskModels.push("");
+    } else if (!isStr(modelRaw)) {
+      errors.push(`${prefix}: \`model\` must be a string`);
+      taskModels.push("");
+    } else if (!models.includes(modelRaw)) {
+      modelErrors.push(
+        `${prefix}: \`model\` ${pyReprStr(modelRaw)} is not one of ${models.join(", ")}`,
+      );
+      taskModels.push("");
+    } else {
+      taskModels.push(modelRaw);
+    }
   }
 
   // Failure-code priority order — identical to scaffold's run().
@@ -798,6 +852,7 @@ export function runScaffold(args: ScaffoldArgs): number {
       ...epicDepErrors,
       ...repoErrors,
       ...tierErrors,
+      ...modelErrors,
     ];
     emitFailureEnvelope("bad_yaml", "Invalid scaffold YAML shape", allErrors);
     return 1;
@@ -837,6 +892,7 @@ export function runScaffold(args: ScaffoldArgs): number {
         ...epicDepErrors,
         ...repoErrors,
         ...tierErrors,
+        ...modelErrors,
       ],
     );
     return 1;
@@ -845,7 +901,13 @@ export function runScaffold(args: ScaffoldArgs): number {
     emitFailureEnvelope(
       "dep_invalid",
       "One or more task dependencies are invalid",
-      [...depErrors, ...epicDepErrors, ...repoErrors, ...tierErrors],
+      [
+        ...depErrors,
+        ...epicDepErrors,
+        ...repoErrors,
+        ...tierErrors,
+        ...modelErrors,
+      ],
     );
     return 1;
   }
@@ -853,7 +915,7 @@ export function runScaffold(args: ScaffoldArgs): number {
     emitFailureEnvelope(
       "epic_dep_invalid",
       "One or more epic-level dependencies are invalid",
-      [...epicDepErrors, ...repoErrors, ...tierErrors],
+      [...epicDepErrors, ...repoErrors, ...tierErrors, ...modelErrors],
     );
     return 1;
   }
@@ -861,7 +923,7 @@ export function runScaffold(args: ScaffoldArgs): number {
     emitFailureEnvelope(
       "repo_invalid",
       "One or more task `target_repo` values are invalid",
-      [...repoErrors, ...tierErrors],
+      [...repoErrors, ...tierErrors, ...modelErrors],
     );
     return 1;
   }
@@ -869,7 +931,15 @@ export function runScaffold(args: ScaffoldArgs): number {
     emitFailureEnvelope(
       "tier_invalid",
       "One or more task `tier` values are invalid",
-      tierErrors,
+      [...tierErrors, ...modelErrors],
+    );
+    return 1;
+  }
+  if (modelErrors.length > 0) {
+    emitFailureEnvelope(
+      "model_invalid",
+      "One or more task `model` values are invalid",
+      modelErrors,
     );
     return 1;
   }
@@ -1059,6 +1129,7 @@ export function runScaffold(args: ScaffoldArgs): number {
         depends_on: dependsOn,
         target_repo: resolvedTaskTargetRepos[i - 1],
         tier: taskTiers[i - 1],
+        model: taskModels[i - 1],
         snippets: toArray(taskSnippetsList[i - 1]),
         bundles: toArray(taskBundlesList[i - 1]),
         created_at: now,

@@ -69,6 +69,9 @@ export function normalizeTask(
   if (!("tier" in data)) {
     data.tier = null;
   }
+  if (!("model" in data)) {
+    data.model = null;
+  }
   if (!("snippets" in data)) {
     data.snippets = [];
   }
@@ -127,22 +130,30 @@ export function taskPriority(taskData: Record<string, unknown>): number {
 }
 
 /** The canonical worker reasoning tiers (efforts), sourced from the committed
- * subagents.yaml matrix — the single source of truth workerAgentForTier maps.
+ * subagents.yaml matrix — the single source of truth workerAgentFor maps.
  * Read lazily (never at module eval) so a malformed config surfaces a typed
  * error at the call site inside a verb, not as an import-time crash. */
 export function configuredEfforts(): readonly string[] {
   return subagentsMatrix().efforts;
 }
 
-/** Map a task tier (effort) to the `plan` plugin's worker-agent name:
- * `plan:worker-<model>-<effort>` for a configured effort, null when tier is
- * null (records carrying no tier), and throws for a non-null string outside the
- * configured efforts (corrupt-on-disk guard). Model is the sole configured
- * `models:` entry — the one axis of real variation until a task carries its own
- * model. The null return is load-bearing — /plan:work branches on it to stop
- * cleanly. */
-export function workerAgentForTier(tier: string | null): string | null {
-  if (tier === null) {
+/** The canonical worker models, sourced from the committed subagents.yaml
+ * matrix — the model axis of the {model × effort} matrix. Read lazily, same
+ * contract as configuredEfforts. */
+export function configuredModels(): readonly string[] {
+  return subagentsMatrix().models;
+}
+
+/** Compose a task's {tier, model} into the `plan` plugin's worker-agent name
+ * `plan:worker-<model>-<effort>`. Returns null when EITHER axis is null (a
+ * record carrying no tier or no model) — the null return is load-bearing, as
+ * /plan:work branches on it to stop cleanly. Throws for a non-null value outside
+ * the configured efforts/models (corrupt-on-disk guard). */
+export function workerAgentFor(
+  tier: string | null,
+  model: string | null,
+): string | null {
+  if (tier === null || model === null) {
     return null;
   }
   const matrix = subagentsMatrix();
@@ -151,5 +162,10 @@ export function workerAgentForTier(tier: string | null): string | null {
       `unknown tier ${JSON.stringify(tier)}; expected one of ${matrix.efforts.join(", ")} or null`,
     );
   }
-  return `plan:worker-${matrix.models[0]}-${tier}`;
+  if (!matrix.models.includes(model)) {
+    throw new Error(
+      `unknown model ${JSON.stringify(model)}; expected one of ${matrix.models.join(", ")} or null`,
+    );
+  }
+  return `plan:worker-${model}-${tier}`;
 }

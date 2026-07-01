@@ -22,7 +22,7 @@ import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import { mergeTaskState, workerAgentForTier } from "../models.ts";
+import { mergeTaskState, workerAgentFor } from "../models.ts";
 import {
   contextForRoot,
   type ProjectContext,
@@ -234,6 +234,7 @@ export function runClaim(args: ClaimArgs): void {
 
   // Assemble the brief out-of-band (BEFORE the single mutation).
   const tier = (taskDef.tier as string | null | undefined) ?? null;
+  const model = (taskDef.model as string | null | undefined) ?? null;
   const stateRepo = primaryRepo;
   const briefDict = assembleBrief({
     taskId,
@@ -354,7 +355,8 @@ export function runClaim(args: ClaimArgs): void {
       target_repo: targetRepo,
       primary_repo: primaryRepo,
       tier,
-      worker_agent: workerAgentForTier(tier),
+      worker_model: model,
+      worker_agent: workerAgentFor(tier, model),
       task_state: taskState,
       epic_state: epicState,
       brief_ref: briefRef,

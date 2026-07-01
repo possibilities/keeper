@@ -97,8 +97,8 @@ function twoTaskYaml(): string {
   return (
     "epic:\n  title: scaffold smoke test\n  spec: |\n    ## Overview\n" +
     "    A scaffold smoke test.\ntasks:\n  - title: First task\n    deps: []\n" +
-    `    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-    "  - title: Second task\n    deps: [1]\n    tier: medium\n    spec: |\n" +
+    `    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+    "  - title: Second task\n    deps: [1]\n    tier: medium\n    model: opus\n    spec: |\n" +
     `${indent(VALID_TASK_SPEC, 6)}\n`
   );
 }
@@ -124,7 +124,7 @@ function noEpicsOrTasksLanded(): boolean {
 function seedEpic(title = "seed epic"): string {
   const yaml =
     `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    seed.\n` +
-    `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
   const r = run(["scaffold", "--file", writeYaml(yaml)]);
   expect(r.code).toBe(0);
   return parseEnvelope(r.output).epic_id as string;
@@ -191,8 +191,8 @@ describe("scaffold happy path", () => {
     // test_scaffold.py::test_scaffold_forward_ref_resolves
     const yaml =
       "epic:\n  title: forward ref test\n  spec: |\n    ## Overview\n    forward ref.\n" +
-      `tasks:\n  - title: First task\n    deps: [2]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: Second task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: First task\n    deps: [2]\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: Second task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
@@ -206,7 +206,7 @@ describe("scaffold happy path", () => {
     const yaml =
       "epic:\n  title: snippet metadata\n  snippets: [snip-a, snip-b]\n" +
       "  bundles: [bundle/dev-env, bundle/snippeting-main]\n  spec: |\n    ## Overview\n    yes.\n" +
-      "tasks:\n  - title: only task\n    deps: []\n    tier: medium\n" +
+      "tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: opus\n" +
       `    snippets: [task-snip]\n    bundles: [bundle/dev-env]\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
@@ -228,7 +228,7 @@ describe("scaffold happy path", () => {
     // test_scaffold.py::test_scaffold_no_branch_defaults_to_main
     const yaml =
       "epic:\n  title: no branch given\n  spec: |\n    ## Overview\n    yes.\n" +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
@@ -254,7 +254,7 @@ describe("scaffold epic deps", () => {
   function epicDepYaml(depsLiteral: string, title = "dependent epic"): string {
     return (
       `epic:\n  title: ${title}\n  depends_on_epics: ${depsLiteral}\n  spec: |\n    ## Overview\n    x.\n` +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
     );
   }
 
@@ -435,8 +435,8 @@ describe("scaffold failure shapes", () => {
     // test_scaffold.py::test_scaffold_dep_cycle_is_typed
     const yaml =
       "epic:\n  title: cycle\n  spec: |\n    ## Overview\n    cycle.\n" +
-      `tasks:\n  - title: a\n    deps: [2]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: b\n    deps: [1]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: a\n    deps: [2]\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: b\n    deps: [1]\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).not.toBe(0);
     expect(
@@ -490,8 +490,8 @@ describe("scaffold target_repo", () => {
     const [a, b] = twoForeignRepos();
     const yaml =
       "epic:\n  title: per task target repo\n  spec: |\n    ## Overview\n    fan out across repos.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
@@ -511,9 +511,9 @@ describe("scaffold target_repo", () => {
     const [a, b] = twoForeignRepos();
     const yaml =
       "epic:\n  title: mixed dedup\n  spec: |\n    ## Overview\n    mixed.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task C\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task C\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
@@ -682,8 +682,8 @@ describe("scaffold per-task tier", () => {
     // test_scaffold.py::test_scaffold_per_task_tier_persists
     const yaml =
       "epic:\n  title: per task tier\n  spec: |\n    ## Overview\n    tier per task.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: xhigh\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: xhigh\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
@@ -694,7 +694,7 @@ describe("scaffold per-task tier", () => {
   function oneTaskTierYaml(tierLiteral: string, title: string): string {
     return (
       `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    x.\n` +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: ${tierLiteral}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+      `tasks:\n  - title: only task\n    deps: []\n    tier: ${tierLiteral}\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
     );
   }
 
@@ -772,7 +772,7 @@ describe("scaffold per-task tier", () => {
     const tasksBlock = tiers
       .map(
         (tier, i) =>
-          `  - title: tier task ${i + 1}\n    deps: []\n    tier: ${tier}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`,
+          `  - title: tier task ${i + 1}\n    deps: []\n    tier: ${tier}\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`,
       )
       .join("");
     const yaml =
@@ -790,8 +790,8 @@ describe("scaffold per-task tier", () => {
     // test_scaffold.py::test_scaffold_tier_invalid_collects_all_offenders
     const yaml =
       "epic:\n  title: two bad tiers\n  spec: |\n    ## Overview\n    x.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: low\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: extreme\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: low\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: extreme\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).not.toBe(0);
     const err = parseEnvelope(r.output).error as Record<string, unknown>;
@@ -807,6 +807,80 @@ describe("scaffold per-task tier", () => {
   });
 });
 
+describe("scaffold per-task model", () => {
+  test("model persists per task", () => {
+    const yaml =
+      "epic:\n  title: per task model\n  spec: |\n    ## Overview\n    model per task.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`tasks/${epicId}.1.json`).model).toBe("opus");
+  });
+
+  test("missing model field is model_invalid with the allowlist", () => {
+    const yaml =
+      "epic:\n  title: missing model\n  spec: |\n    ## Overview\n    no model.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("model_invalid");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain("missing");
+    expect(blob).toContain("opus");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  test("unknown model value is model_invalid", () => {
+    const yaml =
+      "epic:\n  title: bad model\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("model_invalid");
+    expect((err.details as string[]).some((d) => d.includes("'gpt'"))).toBe(
+      true,
+    );
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  test("non-string model is bad_yaml", () => {
+    const yaml =
+      "epic:\n  title: bad model type\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: 42\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(
+      (err.details as string[]).some((d) =>
+        d.includes("`model` must be a string"),
+      ),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  test("model_invalid accumulates in the SAME pass as tier_invalid; tier wins priority", () => {
+    // Both axes bad on the same task: the accumulate-all pass collects tier AND
+    // model offenders, but tier_invalid is reported first (model does not
+    // short-circuit ahead of it). tier_invalid's details still carry the model
+    // offenders appended so no offender is silently dropped.
+    const yaml =
+      "epic:\n  title: both bad\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: low\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain("'low'");
+    expect(blob).toContain("'gpt'");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Atomicity + dup guard
 // ---------------------------------------------------------------------------
@@ -815,7 +889,7 @@ describe("scaffold dup guard + atomicity", () => {
   function sameSlugYaml(title: string): string {
     return (
       `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    second attempt.\n` +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
     );
   }
 
@@ -934,8 +1008,8 @@ describe("scaffold cross-repo follow-up guard (mint seam)", () => {
   function seedMultiRepoSource(a: string, b: string): string {
     const yaml =
       "epic:\n  title: multi repo source\n  spec: |\n    ## Overview\n    span repos.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).toBe(0);
     return parseEnvelope(r.output).epic_id as string;
@@ -947,7 +1021,7 @@ describe("scaffold cross-repo follow-up guard (mint seam)", () => {
       targetRepo !== null ? `    target_repo: ${targetRepo}\n` : "";
     return (
       "epic:\n  title: follow up of source\n  spec: |\n    ## Overview\n    fu.\n" +
-      `tasks:\n  - title: follow task\n    deps: []\n    tier: medium\n${repoLine}    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+      `tasks:\n  - title: follow task\n    deps: []\n    tier: medium\n    model: opus\n${repoLine}    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
     );
   }
 

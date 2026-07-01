@@ -87,10 +87,12 @@ describe("task group help", () => {
       "set-acceptance",
       "set-description",
       "set-target-repo",
-      "set-tier",
     ]) {
       expect(r.stdout).toMatch(new RegExp(`^  ${sub}\\b`, "m"));
     }
+    // set-tier was removed with the {model × effort} matrix — the tier + model
+    // axes are chosen at plan/refine time, never via an incremental setter.
+    expect(r.stdout).not.toContain("set-tier");
   });
 
   test("unknown task subcommand exits 2", () => {

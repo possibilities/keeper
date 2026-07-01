@@ -1,5 +1,5 @@
 // Unit tests for src/brief.ts (assemble + byte-parity write) and the
-// workerAgentForTier / isTaskId / epicIdFromTask gate helpers — all in-process.
+// workerAgentFor / isTaskId / epicIdFromTask gate helpers — all in-process.
 // The claim/block ZERO-commit guarantee + byte-equal runtime sidecar are owned
 // in-process by verbs-worker.test.ts (fake-VCS gitLogCount delta + runtime
 // read-back); the brief_ref handle is owned by saga-claim.test.ts.
@@ -22,7 +22,7 @@ import {
   writeBrief,
 } from "../src/brief.ts";
 import { epicIdFromTask, isTaskId } from "../src/ids.ts";
-import { workerAgentForTier } from "../src/models.ts";
+import { workerAgentFor } from "../src/models.ts";
 import { serializeStateJson } from "../src/store.ts";
 
 function tmp(prefix: string): string {
@@ -43,11 +43,14 @@ describe("gate helpers", () => {
     expect(() => epicIdFromTask("fn-1-add-auth")).toThrow();
   });
 
-  test("workerAgentForTier: member -> agent, null -> null, bad -> throw", () => {
-    expect(workerAgentForTier("medium")).toBe("plan:worker-opus-medium");
-    expect(workerAgentForTier("xhigh")).toBe("plan:worker-opus-xhigh");
-    expect(workerAgentForTier(null)).toBeNull();
-    expect(() => workerAgentForTier("turbo")).toThrow();
+  test("workerAgentFor: {tier,model} member -> agent, either null -> null, bad -> throw", () => {
+    expect(workerAgentFor("medium", "opus")).toBe("plan:worker-opus-medium");
+    expect(workerAgentFor("xhigh", "opus")).toBe("plan:worker-opus-xhigh");
+    expect(workerAgentFor(null, "opus")).toBeNull();
+    expect(workerAgentFor("medium", null)).toBeNull();
+    expect(workerAgentFor(null, null)).toBeNull();
+    expect(() => workerAgentFor("turbo", "opus")).toThrow();
+    expect(() => workerAgentFor("medium", "gpt")).toThrow();
   });
 });
 

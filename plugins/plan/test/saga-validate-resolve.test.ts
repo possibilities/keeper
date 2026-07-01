@@ -175,13 +175,14 @@ describe("resolve-task routing envelope", () => {
     return parseCliOutput(output);
   }
 
-  test("happy path: tier set → full routing envelope with absolute paths", () => {
+  test("happy path: tier + model set → full routing envelope with absolute paths", () => {
     // test_resolve_task.py::test_resolve_task_happy_path_with_tier
+    // scaffold mints every task with tier=medium + model=opus, so the resolver
+    // composes worker_agent from the task's own axes.
     const { epicId, taskIds } = scaffoldEpic(project, {
       title: "Resolve epic",
     });
     const taskId = taskIds[0] as string;
-    expect(run(["task", "set-tier", taskId, "--tier", "high"]).code).toBe(0);
 
     const r = run(["resolve-task", taskId, "--project", project.root]);
     expect(r.code).toBe(0);
@@ -189,8 +190,9 @@ describe("resolve-task routing envelope", () => {
     expect(obj.success).toBe(true);
     expect(obj.task_id).toBe(taskId);
     expect(obj.epic_id).toBe(epicId);
-    expect(obj.tier).toBe("high");
-    expect(obj.worker_agent).toBe("plan:worker-opus-high");
+    expect(obj.tier).toBe("medium");
+    expect(obj.worker_model).toBe("opus");
+    expect(obj.worker_agent).toBe("plan:worker-opus-medium");
     expect(["todo", "in_progress"]).toContain(obj.status as string);
     expect((obj.target_repo as string).startsWith("/")).toBe(true);
     expect((obj.primary_repo as string).startsWith("/")).toBe(true);
@@ -220,7 +222,6 @@ describe("resolve-task routing envelope", () => {
     // test_resolve_task.py::test_resolve_task_tier_in_vocab
     const { taskIds } = scaffoldEpic(project, { title: "Resolve epic" });
     const taskId = taskIds[0] as string;
-    expect(run(["task", "set-tier", taskId, "--tier", "xhigh"]).code).toBe(0);
     const obj = resolveEnvelope(
       run(["resolve-task", taskId, "--project", project.root]).output,
     );

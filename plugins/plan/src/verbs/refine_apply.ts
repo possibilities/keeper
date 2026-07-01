@@ -35,7 +35,7 @@ import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId, scanMaxTaskId } from "../ids.ts";
-import { configuredEfforts } from "../models.ts";
+import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
@@ -198,13 +198,16 @@ export function runRefineApply(args: RefineApplyArgs): number {
   const newDepsRaw: (string | number)[][] = [];
   // null => omitted -> defaults to epic.primary_repo at mutate time.
   const newTargetRepos: (string | null)[] = [];
-  // Tier is REQUIRED on every add_tasks entry — mirrors scaffold's enforcement.
+  // Tier + model are REQUIRED on every add_tasks entry — mirrors scaffold's
+  // enforcement.
   const newTiers: string[] = [];
+  const newModels: string[] = [];
 
   const specErrors: string[] = [];
   const depErrors: string[] = [];
   const repoErrors: string[] = [];
   const tierErrors: string[] = [];
+  const modelErrors: string[] = [];
 
   for (let idx = 0; idx < nNew; idx += 1) {
     const i = idx + 1;
@@ -219,6 +222,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
       newDepsRaw.push([]);
       newTargetRepos.push(null);
       newTiers.push("");
+      newModels.push("");
       continue;
     }
 
@@ -325,6 +329,26 @@ export function runRefineApply(args: RefineApplyArgs): number {
     } else {
       newTiers.push(tierRaw);
     }
+
+    const models = configuredModels();
+    const modelRaw = "model" in entry ? entry.model : null;
+    if (modelRaw === null || modelRaw === undefined) {
+      modelErrors.push(
+        `${prefix}: \`model\` is required (missing) — must be one of ` +
+          `${models.join(", ")}`,
+      );
+      newModels.push("");
+    } else if (!isStr(modelRaw)) {
+      errors.push(`${prefix}: \`model\` must be a string`);
+      newModels.push("");
+    } else if (!models.includes(modelRaw)) {
+      modelErrors.push(
+        `${prefix}: \`model\` ${pyReprStr(modelRaw)} is not one of ${models.join(", ")}`,
+      );
+      newModels.push("");
+    } else {
+      newModels.push(modelRaw);
+    }
   }
 
   // --- rewrite_specs validation (per-entry) -------------------------
@@ -407,7 +431,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
   // Shape/type errors short-circuit (bad_yaml) — graph integrity below is
   // meaningless when the basic shape is wrong. Failure-code priority order
   // matches run_refine_apply's: bad_yaml -> spec_invalid -> repo_invalid ->
-  // tier_invalid (then dep_invalid / dep_cycle inside the flock).
+  // tier_invalid -> model_invalid (then dep_invalid / dep_cycle inside the flock).
   if (errors.length > 0) {
     emitFailureEnvelope("bad_yaml", "Invalid refine-apply YAML shape", errors);
     return 1;
@@ -416,7 +440,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
     emitFailureEnvelope(
       "spec_invalid",
       "One or more task specs failed validation",
-      [...specErrors, ...repoErrors, ...tierErrors],
+      [...specErrors, ...repoErrors, ...tierErrors, ...modelErrors],
     );
     return 1;
   }
@@ -424,7 +448,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
     emitFailureEnvelope(
       "repo_invalid",
       "One or more add_tasks `target_repo` values are invalid",
-      [...repoErrors, ...tierErrors],
+      [...repoErrors, ...tierErrors, ...modelErrors],
     );
     return 1;
   }
@@ -432,7 +456,15 @@ export function runRefineApply(args: RefineApplyArgs): number {
     emitFailureEnvelope(
       "tier_invalid",
       "One or more add_tasks `tier` values are invalid",
-      tierErrors,
+      [...tierErrors, ...modelErrors],
+    );
+    return 1;
+  }
+  if (modelErrors.length > 0) {
+    emitFailureEnvelope(
+      "model_invalid",
+      "One or more add_tasks `model` values are invalid",
+      modelErrors,
     );
     return 1;
   }
@@ -669,6 +701,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
           depends_on: resolvedNewDeps[i - 1],
           target_repo: resolvedNewTargetRepos[i - 1],
           tier: newTiers[i - 1],
+          model: newModels[i - 1],
           snippets: toArray(newSnippetsList[i - 1]),
           bundles: toArray(newBundlesList[i - 1]),
           created_at: now,

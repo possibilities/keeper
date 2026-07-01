@@ -256,29 +256,29 @@ describe("worker resume", () => {
     expect(readFileSync(statePath, "utf-8")).toBe(before);
   });
 
-  test("persisted non-null tier rides envelope + stderr note", () => {
+  test("persisted non-null tier + model rides envelope + stderr note", () => {
     // test_worker_resume.py::test_worker_resume_tier_set_rides_envelope
+    // scaffold mints tier=medium + model=opus, so both axes ride the envelope
+    // and the resolver composes worker_agent from them.
     const proj = getProj();
     const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
     const taskId = taskIds[0] as string;
-    const setTier = runCli(["task", "set-tier", taskId, "--tier", "high"], {
-      cwd: proj.root,
-      home: proj.home,
-    });
-    expect(setTier.code).toBe(0);
 
     const r = runCli(["worker", "resume", taskId], {
       cwd: proj.root,
       home: proj.home,
     });
     expect(r.code).toBe(0);
-    expect(r.stderr.includes(`Note: task ${taskId} tier is 'high'`)).toBe(true);
+    expect(r.stderr.includes(`Note: task ${taskId} tier is 'medium'`)).toBe(
+      true,
+    );
     const payload = envelope(r.stdout);
     for (const k of [
       "success",
       "task_id",
       "status",
       "tier",
+      "worker_model",
       "brief_ref",
       "nudge",
       "target_repo",
@@ -287,8 +287,9 @@ describe("worker resume", () => {
     ]) {
       expect(k in payload).toBe(true);
     }
-    expect(payload.tier).toBe("high");
-    expect(payload.worker_agent).toBe("plan:worker-opus-high");
+    expect(payload.tier).toBe("medium");
+    expect(payload.worker_model).toBe("opus");
+    expect(payload.worker_agent).toBe("plan:worker-opus-medium");
   });
 
   test("null persisted tier emits raw None note + explicit JSON null", () => {

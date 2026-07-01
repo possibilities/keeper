@@ -369,15 +369,16 @@ For each task, decide:
 - **size**: S (a few hours) or M (a day or two). L must be split.
 - **files** (disjoint = parallel-safe; overlapping = needs an explicit dep)
 - **deps** on sibling tasks (only when files overlap or there's a hard "must-finish-first")
-- **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Every worker runs `opus`; tier is surfaced on the `claim` envelope as `worker_agent: plan:worker-<tier>`, the generated worker agent `/plan:work` spawns. Bands:
+- **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Paired with **model** (below); `claim` composes the two into `worker_agent: plan:worker-<model>-<effort>`, the generated worker agent `/plan:work` spawns. Bands:
   - **`medium`** — single-file edit, mechanical refactor, straight test addition. Acceptance is "do exactly this."
   - **`high`** — multi-file feature in a known pattern, typical bug fix with the root cause named, anything following an obvious in-repo template.
   - **`xhigh`** — multi-step refactor, new-pattern introduction, contract-touching work (RPC, schema, public API, wire format), anything where a wrong abstraction propagates. **Default when in doubt** (the Opus 4.7 default).
   - **`max`** — gnarly debug with no clear hypothesis, evals, security review. Reserved for where deeper reasoning measurably lifts quality; prone to overthinking, don't reach for it casually.
+- **model** (worker model) — one of the configured `models:` axis in `plugins/plan/subagents.yaml` (`opus` today). Required on every task and folds into the per-task entry in 5e beside `tier`. Use `opus` unless you are deliberately A/B-comparing a newly-added model on the same task; adding a model is a one-line config edit, not a per-task decision.
 
 ### 5e. For each task — assemble the YAML entry (cognitive)
 
-No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `deps` (1-based ordinals), `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
+No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `model`, `deps` (1-based ordinals), `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
 
 **Spec markdown — required:** the 4 H2s `## Description`, `## Acceptance`, `## Done summary`, `## Evidence`, in that order, at every depth. Embed structure as `### subsections` inside `## Description` per the 3b task-depth mapping.
 
@@ -424,6 +425,8 @@ SHORT: only `### Approach` and `### Investigation targets`. DEEP: also `### Deta
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
 **Tier** — write the band from 5d as `tier:`. **Required on every task** — scaffold errors `tier_invalid` if missing or unknown. Say the choice in one line per task (*"task 3 is contract-touching — xhigh"*) so the human can redirect.
+
+**Model** — write the model from 5d as `model:`. **Required on every task** — scaffold errors `model_invalid` if missing or unknown. Use `opus` unless deliberately A/B-comparing a newly-added model; no need to narrate the choice per task when it is the default.
 
 **Target repo (cross-repo epics only)** — when a task lands outside `primary_repo`, set `target_repo:` to the absolute path (`~` expands); omit otherwise (defaults to `primary_repo`). `primary_repo` is where scaffold runs, so run `/plan:plan` from it. Do **not** hand-set `epic.touched_repos` — the engine auto-derives it from the resolved per-task `target_repo` set. Canonical wording: `keeper plan scaffold --agent-help`. After a post-scaffold repo directory rename, fix the stored paths in one shot with `keeper plan mv-repo <old> <new>` — not per-task `task set-target-repo`; `mv-repo` rewrites every `primary_repo` / `target_repo` / `touched_repos` match across the board in one commit.
 
@@ -488,6 +491,7 @@ epic:
 tasks:                                 # required, ordered list (>=1 entry), decomposition order
   - title: "<task title>"              # required, non-empty (5e)
     tier: xhigh                        # required, one of medium|high|xhigh|max (5d/5e)
+    model: opus                        # required, one of the configured models (opus today) (5d/5e)
     deps: []                           # 1-based ordinals into this list (5f)
     target_repo: <path>                # optional, absolute path (~ expanded); omit to default
                                        # to primary_repo; epic.touched_repos auto-derives (5e).
@@ -500,6 +504,7 @@ tasks:                                 # required, ordered list (>=1 entry), dec
       ## Evidence
   - title: "<second task title>"
     tier: medium
+    model: opus
     deps: [1]                          # depends on the first task
     spec: |
       ...
@@ -696,6 +701,7 @@ epic:
 add_tasks:                 # new tasks
   - title: <title>
     tier: xhigh            # required (same bands as 5d); absent → tier_invalid
+    model: opus            # required (configured models, opus today); absent → model_invalid
     spec: |                # four-section task spec (same template as 5e)
       ## Description
       ...

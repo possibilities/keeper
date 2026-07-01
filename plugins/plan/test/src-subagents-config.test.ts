@@ -9,7 +9,11 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { configuredEfforts, workerAgentForTier } from "../src/models.ts";
+import {
+  configuredEfforts,
+  configuredModels,
+  workerAgentFor,
+} from "../src/models.ts";
 import {
   loadSubagentsMatrixFromDisk,
   parseSubagentsMatrix,
@@ -54,15 +58,25 @@ describe("subagents matrix loader", () => {
     expect(matrix.subagents.length).toBeGreaterThan(0);
   });
 
-  test("configuredEfforts is sourced from the config; tier validation accepts exactly it", () => {
+  test("configuredEfforts/configuredModels source the axes; workerAgentFor composes exactly them", () => {
     const efforts = configuredEfforts();
     expect(efforts).toEqual(["medium", "high", "xhigh", "max"]);
-    const model = subagentsMatrix().models[0];
-    for (const effort of efforts) {
-      expect(workerAgentForTier(effort)).toBe(`plan:worker-${model}-${effort}`);
+    const models = configuredModels();
+    expect(models).toEqual(["opus"]);
+    for (const model of models) {
+      for (const effort of efforts) {
+        expect(workerAgentFor(effort, model)).toBe(
+          `plan:worker-${model}-${effort}`,
+        );
+      }
     }
-    expect(workerAgentForTier(null)).toBeNull();
-    expect(() => workerAgentForTier("turbo")).toThrow();
+    // A null on EITHER axis returns null (the /plan:work null-stop signal).
+    expect(workerAgentFor(null, models[0] as string)).toBeNull();
+    expect(workerAgentFor(efforts[0] as string, null)).toBeNull();
+    expect(workerAgentFor(null, null)).toBeNull();
+    // A non-null value outside the configured sets throws (corrupt-on-disk guard).
+    expect(() => workerAgentFor("turbo", models[0] as string)).toThrow();
+    expect(() => workerAgentFor(efforts[0] as string, "gpt")).toThrow();
   });
 
   test("a non-mapping document fails loud with a typed error", () => {

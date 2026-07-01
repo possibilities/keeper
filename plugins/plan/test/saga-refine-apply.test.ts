@@ -128,8 +128,8 @@ function taskExists(taskId: string): boolean {
 function seedTwoTaskEpic(): string {
   const yaml =
     "epic:\n  title: refine apply seed\n  spec: |\n    ## Overview\n    seed epic.\n" +
-    `tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-    `  - title: Second task\n    deps: [1]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    `tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+    `  - title: Second task\n    deps: [1]\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
   const path = join(project.root, "seed.yaml");
   writeFileSync(path, yaml, "utf-8");
   const r = run(["scaffold", "--file", path]);
@@ -159,7 +159,7 @@ describe("refine-apply happy path", () => {
   test("add_tasks lands a new task with one invocation", () => {
     // test_refine_apply.py::test_refine_apply_add_task
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
@@ -211,8 +211,8 @@ describe("refine-apply happy path", () => {
     const epicId = seedTwoTaskEpic();
     const delta =
       "add_tasks:\n" +
-      `  - title: New A\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: New B\n    deps: [${epicId}.1, 1]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `  - title: New A\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: New B\n    deps: [${epicId}.1, 1]\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
     expect(parseEnvelope(r.output).added_task_ids).toEqual([
@@ -335,7 +335,7 @@ describe("refine-apply target_repo", () => {
     const foreignA = foreignRepo("foreign-a");
     const primary = realpathSync(project.root);
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    target_repo: ${foreignA}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${foreignA}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
     expect(readTask(`${epicId}.3`).target_repo).toBe(foreignA);
@@ -346,7 +346,7 @@ describe("refine-apply target_repo", () => {
     // test_refine_apply.py::test_refine_apply_add_tasks_omit_target_repo
     const primary = realpathSync(project.root);
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
     expect(readTask(`${epicId}.3`).target_repo).toBe(primary);
@@ -385,7 +385,7 @@ describe("refine-apply target_repo", () => {
     const foreignB = foreignRepo("foreign-b");
     const primary = realpathSync(project.root);
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: New B\n    deps: []\n    tier: medium\n    target_repo: ${foreignB}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: New B\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${foreignB}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
     expect(readEpic(epicId).touched_repos).toEqual([primary, foreignB].sort());
@@ -437,7 +437,7 @@ describe("refine-apply stdin", () => {
   test("--file - reads delta from stdin", () => {
     // test_refine_apply.py::test_refine_apply_reads_yaml_from_stdin
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", "-"], { input: delta });
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
@@ -471,7 +471,7 @@ describe("refine-apply add_tasks tier", () => {
   test("unknown tier value is tier_invalid", () => {
     // test_refine_apply.py::test_refine_apply_add_tasks_invalid_tier_rejected
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: bogus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: bogus\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).not.toBe(0);
     const err = parseEnvelope(r.output).error as Record<string, unknown>;
@@ -489,7 +489,7 @@ describe("refine-apply add_tasks tier", () => {
     const block = tiers
       .map(
         (tier, i) =>
-          `  - title: tier add #${i + 1}\n    deps: []\n    tier: ${tier}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`,
+          `  - title: tier add #${i + 1}\n    deps: []\n    tier: ${tier}\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`,
       )
       .join("");
     const r = run([
@@ -507,7 +507,7 @@ describe("refine-apply add_tasks tier", () => {
   test("non-string tier is bad_yaml", () => {
     // test_refine_apply.py::test_refine_apply_add_tasks_tier_non_string_is_bad_yaml
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: 42\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: 42\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).not.toBe(0);
     const err = parseEnvelope(r.output).error as Record<string, unknown>;
@@ -526,7 +526,7 @@ describe("refine-apply add_tasks tier", () => {
     const delta =
       "add_tasks:\n" +
       `  - title: missing tier\n    deps: []\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: bogus tier\n    deps: []\n    tier: low\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `  - title: bogus tier\n    deps: []\n    tier: low\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).not.toBe(0);
     const details = (parseEnvelope(r.output).error as Record<string, unknown>)
@@ -542,6 +542,47 @@ describe("refine-apply add_tasks tier", () => {
   });
 });
 
+describe("refine-apply add_tasks model", () => {
+  test("missing model is model_invalid with the allowlist", () => {
+    const epicId = seedTwoTaskEpic();
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("model_invalid");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain("missing");
+    expect(blob).toContain("opus");
+    expect(taskExists(`${epicId}.3`)).toBe(false);
+  });
+
+  test("unknown model value is model_invalid", () => {
+    const epicId = seedTwoTaskEpic();
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("model_invalid");
+    expect((err.details as string[]).some((d) => d.includes("'gpt'"))).toBe(
+      true,
+    );
+    expect(taskExists(`${epicId}.3`)).toBe(false);
+  });
+
+  test("model_invalid accumulates in the SAME pass as tier_invalid; tier wins priority", () => {
+    const epicId = seedTwoTaskEpic();
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: low\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain("'low'");
+    expect(blob).toContain("'gpt'");
+    expect(taskExists(`${epicId}.3`)).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Commit-boundary: no-rollback persist-on-pre-commit-failure
 // ---------------------------------------------------------------------------
@@ -551,7 +592,7 @@ describe("refine-apply commit boundary", () => {
     // test_refine_apply.py::test_refine_apply_missing_session_id_persists_writes
     const epicId = seedTwoTaskEpic();
     expect(taskExists(`${epicId}.3`)).toBe(false);
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)], {
       env: { CLAUDE_CODE_SESSION_ID: "" },
     });

@@ -1,36 +1,32 @@
 // Engine-agnostic conformance spec for the epic-graph + task-attribute mutating
 // verbs — translated from tests/test_epic_add_dep.py, tests/test_epic_add_deps.py,
-// tests/test_epic_close.py, tests/test_task_set_tier.py, and
-// tests/test_set_primary_repo_warning.py. Every node is mapped by a
-// source-comment (translated | cited bun unit | drop-with-reason).
+// tests/test_epic_close.py, and tests/test_set_primary_repo_warning.py. Every
+// node is mapped by a source-comment (translated | cited bun unit |
+// drop-with-reason).
 //
 // epic add-dep / add-deps: cycle rejection + rollback, per-edge status results
 // (WIRED / ALREADY_PRESENT / SKIPPED_*), assert-all-no-partial-write, bare-fn-N
 // normalization + the fn-1-vs-fn-10 prefix trap. epic close: closer_done_at-only
-// stamp, the removed --no-audit-required flag, op=close envelope. set-tier core
-// behavior is already pinned in verbs-restamp.test.ts — here only the
-// error/validation/envelope nodes those files add are translated, the rest
-// cited. set-primary-repo / set-touched-repos: the non-blocking warning contract
+// stamp, the removed --no-audit-required flag, op=close envelope.
+// set-primary-repo / set-touched-repos: the non-blocking warning contract
 // (envelope.warnings + WARN: on stderr, write still lands, exit 0).
 //
-// Graph + close + set-tier run on the withProject handle (real git
+// Graph + close run on the withProject handle (real git
 // + planctl init) so the auto-commit is exercised honestly; the set-primary-repo
 // / set-touched-repos warning tests run on a git-FREE planctl project (mirroring
 // the Python _create_project, which never `git init`s) so the non-blocking
 // warning path returns exit 0 without an auto-commit. Epics are minted via the
-// real `epic create` primitive; tasks via the harness scaffoldEpic helper.
+// real `epic create` primitive.
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
   firstJsonPayload,
   gitInit,
   type ProjectHandle,
-  parseCliOutput,
   runCli,
-  scaffoldEpic,
   withProject,
   withTmpdir,
 } from "./harness.ts";
@@ -397,134 +393,6 @@ describe("epic close", () => {
     expect(inv.op).toBe("close");
     expect(inv.target).toBe(epicId);
   });
-});
-
-// ---------------------------------------------------------------------------
-// task set-tier — write/round-trip/heuristic-fallback core is pinned in
-// verbs-restamp.test.ts (test_set_tier_writes_and_leaves_marker) and the null-
-// tier default in src-models.test.ts. Here the validation + envelope nodes.
-// ---------------------------------------------------------------------------
-
-describe("task set-tier (validation + envelope)", () => {
-  // Mint an epic + one task via the harness scaffoldEpic helper (set-tier needs
-  // a real task; scaffold is the only mint path). Returns {epicId, taskId}.
-  function scaffoldOne(): { epicId: string; taskId: string } {
-    const { epicId, taskIds } = scaffoldEpic(project, {
-      title: "Tier epic",
-      nTasks: 1,
-    });
-    return { epicId, taskId: taskIds[0] as string };
-  }
-
-  function readTask(taskId: string): Record<string, unknown> {
-    return JSON.parse(
-      readFileSync(
-        join(project.root, ".keeper", "tasks", `${taskId}.json`),
-        "utf-8",
-      ),
-    );
-  }
-
-  // Hand-null a task's persisted tier to simulate a legacy on-disk record.
-  function handNullTier(taskId: string): void {
-    const path = join(project.root, ".keeper", "tasks", `${taskId}.json`);
-    const def = readTask(taskId);
-    def.tier = null;
-    writeFileSync(path, JSON.stringify(def), "utf-8");
-  }
-
-  test("set-tier writes medium onto a hand-nulled legacy task", () => {
-    // test_task_set_tier.py::test_set_tier_writes_medium
-    const { taskId } = scaffoldOne();
-    handNullTier(taskId);
-    expect(readTask(taskId).tier).toBeNull();
-
-    const r = run(["task", "set-tier", taskId, "--tier", "medium"]);
-    expect(r.code).toBe(0);
-    const payload = parseCliOutput(r.output);
-    expect(payload.task_id).toBe(taskId);
-    expect(payload.tier).toBe("medium");
-    expect(readTask(taskId).tier).toBe("medium");
-  });
-
-  test("set-tier overwrites an existing tier", () => {
-    // test_task_set_tier.py::test_set_tier_overwrites_existing
-    const { taskId } = scaffoldOne();
-    expect(run(["task", "set-tier", taskId, "--tier", "medium"]).code).toBe(0);
-    expect(run(["task", "set-tier", taskId, "--tier", "xhigh"]).code).toBe(0);
-    expect(readTask(taskId).tier).toBe("xhigh");
-  });
-
-  test("warm-write medium → cold-read via show round-trips", () => {
-    // test_task_set_tier.py::test_warm_write_cold_read_round_trip
-    const { taskId } = scaffoldOne();
-    expect(run(["task", "set-tier", taskId, "--tier", "medium"]).code).toBe(0);
-    const r = run(["show", taskId]);
-    expect(r.code).toBe(0);
-    const payload = parseCliOutput(r.output);
-    const task = (payload.task ?? payload) as Record<string, unknown>;
-    expect(task.tier).toBe("medium");
-  });
-
-  test("tier=null surfaces null via show (heuristic-fallback signal)", () => {
-    // test_task_set_tier.py::test_tier_null_triggers_heuristic_fallback
-    const { taskId } = scaffoldOne();
-    handNullTier(taskId);
-
-    const r = run(["show", taskId]);
-    expect(r.code).toBe(0);
-    const task = (parseCliOutput(r.output).task ?? {}) as Record<
-      string,
-      unknown
-    >;
-    expect(task.tier).toBeNull();
-  });
-
-  test("an out-of-vocabulary tier is rejected", () => {
-    // test_task_set_tier.py::test_set_tier_rejects_invalid_tier
-    const { taskId } = scaffoldOne();
-    const r = run(["task", "set-tier", taskId, "--tier", "ultra"]);
-    expect(r.code).not.toBe(0);
-    const out = r.output.toLowerCase();
-    expect(out.includes("invalid") || out.includes("ultra")).toBe(true);
-  });
-
-  test("set-tier on a non-existent task errors", () => {
-    // test_task_set_tier.py::test_set_tier_unknown_task_errors
-    const r = run([
-      "task",
-      "set-tier",
-      "fn-9999-no-task.1",
-      "--tier",
-      "medium",
-    ]);
-    expect(r.code).not.toBe(0);
-    const out = r.output.toLowerCase();
-    expect(out.includes("not found") || out.includes("fn-9999")).toBe(true);
-  });
-
-  test("set-tier on an epic id (not a task id) fails-visibly", () => {
-    // test_task_set_tier.py::test_set_tier_invalid_id_type_errors
-    const { epicId } = scaffoldOne();
-    const r = run(["task", "set-tier", epicId, "--tier", "medium"]);
-    expect(r.code).not.toBe(0);
-    expect(r.output.toLowerCase()).toContain("invalid");
-  });
-
-  test("set-tier envelope carries op=task-set-tier", () => {
-    // test_task_set_tier.py::test_set_tier_envelope_carries_planctl_invocation
-    const { taskId } = scaffoldOne();
-    const r = run(["task", "set-tier", taskId, "--tier", "medium"]);
-    expect(r.code).toBe(0);
-    expect(r.output).toContain('"plan_invocation"');
-    expect(r.output).toContain("task-set-tier");
-  });
-
-  // test_normalize_task_adds_null_tier_on_legacy — CITED: src-models.test.ts
-  //   pins normalize_task's null-tier default (python_only in-process import).
-  // test_normalize_task_preserves_existing_tier — CITED: src-models.test.ts.
-  // test_set_tier_not_in_validation_restamp_verbs — CITED: verbs-restamp.test.ts
-  //   pins set-tier as a non-restamp setter (python_only in-process import).
 });
 
 // ---------------------------------------------------------------------------

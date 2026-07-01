@@ -84,6 +84,7 @@ function followupYamlWithRepo(source: string, targetRepo: string): string {
     "tasks:",
     "  - title: task 1",
     "    tier: medium",
+    "    model: opus",
     `    target_repo: ${targetRepo}`,
     "    spec: |",
   ];
@@ -127,6 +128,7 @@ function followupYaml(
   for (let i = 1; i <= nTasks; i += 1) {
     lines.push(`  - title: task ${i}`);
     lines.push("    tier: medium");
+    lines.push("    model: opus");
     if (i in deps) {
       lines.push(`    deps: [${deps[i]?.join(", ")}]`);
     }
@@ -282,7 +284,7 @@ describe("followup submit", () => {
     const yaml =
       `epic:\n  title: FU\n  depends_on_epics: [${src}]\n  spec: |\n` +
       "    ## Overview\n    x\ntasks:\n" +
-      "  - title: t1\n    tier: medium\n    spec: |\n      just prose, no sections\n";
+      "  - title: t1\n    tier: medium\n    model: opus\n    spec: |\n      just prose, no sections\n";
     const { code, output } = submit(proj, src, yaml);
     expect(code).toBe(1);
     expect(errCode(output)).toBe("spec_invalid");

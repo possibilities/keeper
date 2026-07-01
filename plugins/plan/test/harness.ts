@@ -517,6 +517,7 @@ export function seedState(
       title: `Task ${i}`,
       depends_on: dependsOn,
       tier: "medium",
+      model: "opus",
       target_repo: primaryRepo,
       snippets: [...(taskSnippets[i] ?? [])],
       bundles: [...(taskBundles[i] ?? [])],
@@ -781,9 +782,9 @@ export function seedRuntime(
 // ---------------------------------------------------------------------------
 
 /** Build the scaffold `--file` YAML for an epic + *nTasks* tasks. Each task
- * carries a `seed-<i>` Description marker and tier=medium; *taskDeps* maps a
- * 1-based ordinal to the 1-based ordinals it depends on. Mirrors
- * _scaffold_plan_yaml. */
+ * carries a `seed-<i>` Description marker, tier=medium, and model=opus;
+ * *taskDeps* maps a 1-based ordinal to the 1-based ordinals it depends on.
+ * Mirrors _scaffold_plan_yaml. */
 export function scaffoldPlanYaml(opts: {
   title: string;
   nTasks: number;
@@ -801,7 +802,7 @@ export function scaffoldPlanYaml(opts: {
     const depLine =
       deps && deps.length > 0 ? `    deps: [${deps.join(", ")}]\n` : "";
     blocks.push(
-      `  - title: Task ${i}\n${depLine}    tier: medium\n    spec: |\n${specLines}`,
+      `  - title: Task ${i}\n${depLine}    tier: medium\n    model: opus\n    spec: |\n${specLines}`,
     );
   }
   const branchLine = branch ? `  branch: ${branch}\n` : "";

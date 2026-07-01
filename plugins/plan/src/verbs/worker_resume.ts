@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { assembleBrief, writeBrief } from "../brief.ts";
 import { emitError, formatOutput, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
-import { mergeTaskState, workerAgentForTier } from "../models.ts";
+import { mergeTaskState, workerAgentFor } from "../models.ts";
 import { resolvePlanStateContext, resolveProject } from "../project.ts";
 import { resolveWorkerRepos } from "../runtime_status.ts";
 import { writeWorkMarker } from "../session_markers.ts";
@@ -72,6 +72,7 @@ export function runWorkerResume(opts: {
   const taskPath = join(dataDir, "tasks", `${taskId}.json`);
   let status = "unknown";
   let tier: string | null = null;
+  let model: string | null = null;
   let epicId = taskId.includes(".")
     ? taskId.slice(0, taskId.lastIndexOf("."))
     : taskId;
@@ -86,6 +87,7 @@ export function runWorkerResume(opts: {
       status = (merged.status as string | undefined) ?? "unknown";
       epicId = (merged.epic as string | undefined) ?? epicId;
       tier = (merged.tier as string | null | undefined) ?? null;
+      model = (merged.model as string | null | undefined) ?? null;
     }
   }
 
@@ -170,7 +172,8 @@ export function runWorkerResume(opts: {
       task_id: taskId,
       status,
       tier,
-      worker_agent: workerAgentForTier(tier),
+      worker_model: model,
+      worker_agent: workerAgentFor(tier, model),
       brief_ref: briefRef,
       nudge,
       target_repo: targetRepo,

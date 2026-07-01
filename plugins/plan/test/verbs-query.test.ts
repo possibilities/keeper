@@ -525,6 +525,28 @@ describe("resolve-task", () => {
     expect(env.primary_repo).toBe(proj);
   });
 
+  test("null model → worker_model null + worker_agent null (the null-stop signal)", () => {
+    // A legacy task carrying a tier but no model must stop /plan:work just like
+    // a null-tier task: the resolver returns worker_agent null on EITHER null.
+    const { rootDir, home } = multiRoot();
+    const proj = realpathSync(mkdirAndReturn(join(rootDir, "proj")));
+    seedState(proj, { epicId: "fn-1-cafe", nTasks: 1 });
+    const tp = join(proj, ".keeper", "tasks", "fn-1-cafe.1.json");
+    const td = loadJson(tp);
+    td.model = null; // tier stays medium; only the model axis is unset
+    atomicWriteJson(tp, td);
+    setRoots(home, [rootDir]);
+
+    const r = runCli(["resolve-task", "fn-1-cafe.1"], { cwd: proj, home });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.success).toBe(true);
+    expect(env.tier).toBe("medium");
+    expect(env.worker_model).toBeNull();
+    expect("worker_model" in env).toBe(true);
+    expect(env.worker_agent).toBeNull();
+  });
+
   test("bad id", () => {
     // test_query_verbs.py::test_resolve_task_bad_id
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });

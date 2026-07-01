@@ -58,7 +58,6 @@ import {
   runTaskSetDescription,
 } from "./verbs/task_set_section.ts";
 import { runTaskSetTargetRepo } from "./verbs/task_set_target_repo.ts";
-import { runTaskSetTier } from "./verbs/task_set_tier.ts";
 import { runTasks } from "./verbs/tasks.ts";
 import { runUnblock } from "./verbs/unblock.ts";
 import { runValidate } from "./verbs/validate.ts";
@@ -512,18 +511,6 @@ const TASK_GROUP: GroupSpec = {
         runTaskSetTargetRepo({
           taskId: taskId ?? "",
           path: leafOption(rest, "--path") ?? "",
-          format,
-        });
-      },
-    },
-    {
-      name: "set-tier",
-      shortHelp: "Persist the worker reasoning tier on a task.",
-      run: (rest, format) => {
-        const [taskId] = leafPositionals(rest, new Set(["--tier"]));
-        runTaskSetTier({
-          taskId: taskId ?? "",
-          tier: leafOption(rest, "--tier") ?? "",
           format,
         });
       },

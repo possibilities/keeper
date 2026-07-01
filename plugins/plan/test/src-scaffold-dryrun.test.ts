@@ -41,6 +41,7 @@ function followupYaml(
   for (let i = 1; i <= nTasks; i += 1) {
     lines.push(`  - title: task ${i}`);
     lines.push("    tier: medium");
+    lines.push("    model: opus");
     if (deps[i]) {
       lines.push(`    deps: [${deps[i].join(", ")}]`);
     }
@@ -92,7 +93,7 @@ describe("validateScaffoldYaml", () => {
   test("a spec missing required sections → spec_invalid", () => {
     const yaml =
       "epic:\n  title: FU\n  spec: |\n    ## Overview\n    x\ntasks:\n" +
-      "  - title: t1\n    tier: medium\n    spec: |\n      just prose, no sections\n";
+      "  - title: t1\n    tier: medium\n    model: opus\n    spec: |\n      just prose, no sections\n";
     const result = validate(yaml);
     expect(result.ok).toBe(false);
     expect(result.code).toBe("spec_invalid");
@@ -115,7 +116,7 @@ describe("validateScaffoldYaml", () => {
     // tier_invalid in scaffold's priority order.
     const yaml =
       "epic:\n  title: FU\n  spec: |\n    ## Overview\n    x\ntasks:\n" +
-      "  - title: t1\n    tier: medium\n    spec: |\n      just prose\n" +
+      "  - title: t1\n    tier: medium\n    model: opus\n    spec: |\n      just prose\n" +
       "  - title: t2\n    spec: |\n" +
       `      ${TASK_SPEC}\n`;
     const result = validate(yaml);
@@ -196,7 +197,7 @@ describe("validateScaffoldYaml cross-repo guard", () => {
     // task 2 lacks a tier AND lacks a target_repo; tier_invalid wins.
     const yaml =
       "epic:\n  title: FU\n  spec: |\n    ## Overview\n    x\ntasks:\n" +
-      `  - title: t1\n    tier: medium\n    target_repo: ${A}\n    spec: |\n` +
+      `  - title: t1\n    tier: medium\n    model: opus\n    target_repo: ${A}\n    spec: |\n` +
       `      ${TASK_SPEC}\n` +
       "  - title: t2\n    spec: |\n" +
       `      ${TASK_SPEC}\n`;
