@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T08:40:38.727000Z",
+  "depends_on": [],
+  "epic": "fn-1037-harden-installsh-keeperd-reload",
+  "id": "fn-1037-harden-installsh-keeperd-reload.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Make keeperd reload self-healing",
+  "updated_at": "2026-07-01T08:40:38.727000Z"
+}

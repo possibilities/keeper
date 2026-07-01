@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-01T08:40:38.727000Z",
+  "created_by_close_of": "fn-1033-keeper-owns-its-install-and-claude",
+  "depends_on_epics": [
+    "fn-1033-keeper-owns-its-install-and-claude"
+  ],
+  "id": "fn-1037-harden-installsh-keeperd-reload",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden install.sh keeperd reload",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-01T08:40:38.727000Z"
+}
