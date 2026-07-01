@@ -74,13 +74,13 @@ export function tmuxTranscriptSessionId(
 
 /**
  * The posture half of the launch seam — the {@link buildPairLaunchArgv} opts the
- * two callers vary. `agent run` pins `readOnly:false` and omits the rest; `pair
- * send` fills the full posture (model/effort/session/preset). `cli`/`prompt`/
- * `launcherArgvPrefix` are NOT here — `cli`/`prompt` are explicit args, the prefix
- * is a launch dep.
+ * two callers vary. `agent run` omits everything; `pair send` fills the full
+ * posture (model/effort/session/preset). Read-only is prompting-only (a prompt
+ * directive prepended caller-side), so it is NOT a launch-argv posture here.
+ * `cli`/`prompt`/`launcherArgvPrefix` are NOT here — `cli`/`prompt` are explicit
+ * args, the prefix is a launch dep.
  */
 export interface LaunchPosture {
-  readOnly: boolean;
   model?: string;
   effort?: string;
   session?: string;
@@ -158,7 +158,6 @@ export function launchToResolvedHandle(
     launcherArgvPrefix: [],
     cli: agent,
     prompt,
-    readOnly: posture.readOnly,
     model: posture.model,
     effort: posture.effort,
     session: posture.session,

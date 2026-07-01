@@ -8,8 +8,8 @@
  *
  * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module holds
  * the pure builders only — role loading, prompt assembly, the per-CLI launch
- * argv builder, the git changed-files diff, the env strip, and the output-YAML
- * assembly. It imports `js-yaml` (a serialization dep, not the DB graph) and
+ * argv builder, the env strip, and the output-YAML assembly. It imports
+ * `js-yaml` (a serialization dep, not the DB graph) and
  * `node:fs`/`node:path`/`node:os` for asset reads; it MUST NOT pull `bun:sqlite`
  * or `./db`. The orchestration — the in-process launch→wait→show compose (via
  * the shared `src/agent` run-capture primitives), the SIGTERM handler, the
@@ -29,8 +29,8 @@ import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
 
 /** The partner CLIs `keeper pair` can fan out to — keeper agent's full agent-kind
  *  set. pi pairs read-only and read-write like claude/codex; its read-only
- *  posture is the directive + git backstop, reinforced by `--exclude-tools
- *  edit,write` (pi has no native sandbox of its own). */
+ *  posture is the prompt directive only (prompting, not enforcement — pi has no
+ *  native sandbox of its own). */
 export type PairCli = "claude" | "codex" | "pi";
 
 export const PAIR_CLIS: ReadonlySet<string> = new Set<PairCli>([
@@ -55,10 +55,10 @@ export function isPairRole(value: string): value is PairRole {
 
 /**
  * The read-only directive prepended to the prompt when `--read-only` is set.
- * The directive is the PRIMARY read-only mechanism — purpose-built and visible
- * in the partner's transcript — because the tool strip (`--disallowed-tools`) is
- * leaky (Bash `>` redirection, git, `sed -i` all escape it). The git changed-files
- * snapshot backstops the directive: detection, not prevention.
+ * The directive is the WHOLE read-only mechanism — prompting-only, honest and
+ * best-effort. It rides as user-turn text visible in the partner's transcript
+ * and relies on the model following it; keeper enforces nothing (no tool strip,
+ * no git audit). A partner that ignores it can still touch the tree.
  */
 export const READ_ONLY_DIRECTIVE =
   "READ-ONLY EXPLORE SESSION — Do not create, modify, move, or delete any " +
@@ -156,8 +156,6 @@ export interface PairLaunchOpts {
   /** Reasoning effort (codex only — maps to `-c model_reasoning_effort=`).
    *  Ignored for claude (no effort flag fits the headless surface). */
   effort?: string;
-  /** Read-only posture: claude strips edit tools; codex keeps web search. */
-  readOnly: boolean;
   /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
   session?: string;
   /** A named launch-config preset forwarded as `--x-preset <name>` so the
@@ -233,33 +231,18 @@ export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
  * TUI (not headless `--print`). The interactive shape is what registers the
  * partner as a tracked `jobs` row — keeper agent binds the pane via the
  * `KEEPER_TMUX_SESSION` env carrier {@link buildPairLaunchArgv} injects, and the
- * SessionStart hook stamps the birth session onto the row. The read-only posture
- * strips the edit tools via `--disallowed-tools` (the directive is the primary
- * guard, the strip reinforces it); the write posture accepts edits. Both keep
- * `--dangerously-skip-permissions` so the single-turn partner never stalls on a
+ * SessionStart hook stamps the birth session onto the row. Posture-independent:
+ * read-only is carried by the prompt directive alone (no tool strip), so the
+ * flags are the same either way — `--permission-mode acceptEdits
+ * --dangerously-skip-permissions` so the single-turn partner never stalls on a
  * permission prompt. Pure — exported for tests.
  */
 export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
-  const args: string[] = [];
-  if (opts.readOnly) {
-    // `--disallowed-tools` is variadic — it consumes every following token up to
-    // the next flag. It must NOT be the last flag before the trailing prompt
-    // positional (`buildPairLaunchArgv` appends the prompt last), or the prompt
-    // is swallowed as bogus tool-deny rules. Keep the boolean
-    // `--dangerously-skip-permissions` last so the prompt survives as a clean
-    // positional.
-    args.push(
-      "--disallowed-tools",
-      "Edit,Write,NotebookEdit",
-      "--dangerously-skip-permissions",
-    );
-  } else {
-    args.push(
-      "--permission-mode",
-      "acceptEdits",
-      "--dangerously-skip-permissions",
-    );
-  }
+  const args: string[] = [
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
+  ];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("--model", opts.model);
   }
@@ -274,9 +257,9 @@ export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
  * Web search is ON by default in the interactive TUI, so the deprecated `--enable
  * web_search_request` is dropped (and `exec`/`--skip-git-repo-check` are
  * exec-only with no interactive analog). codex read-only is carried by the
- * directive ONLY (no native codex flag fits "politely explore" — `-s read-only`
- * would also disable web search), so read-only KEEPS the same flags as write; the
- * git changed-files snapshot backstops it. The detached interactive window does
+ * prompt directive ONLY (no native codex flag fits "politely explore" — `-s
+ * read-only` would also disable web search), so read-only KEEPS the same flags
+ * as write; keeper enforces nothing. The detached interactive window does
  * not hang on codex's directory-trust prompt because `keeper pair` pre-seeds the
  * cwd's trust (cli/pair.ts → src/codex-trust.ts, fail-open) before launch. Pure —
  * exported for tests.
@@ -302,22 +285,16 @@ export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
  * isolation mirroring the CLAUDE*-env strip — which ALSO sidesteps pi's
  * directory-trust prompt (the one headless hang), so pi needs no trust-seeder the
  * way codex does (its `trust.json` is a shared profile path a seeder would
- * collide with). Read-only ADDS `--exclude-tools edit,write` (pi's lowercase
- * built-in tool names) as REINFORCEMENT only — the directive + git changed-files
- * snapshot stay the real read-only guards (bash stays leaky, so the strip is not
- * a sandbox). pi uses `thinking`, never `effort`; pairing routes neither here.
- * pi's `--exclude-tools` takes a single comma-joined value (NOT variadic like
- * claude's `--disallowed-tools`), so it can sit last before the trailing prompt
- * positional `buildPairLaunchArgv` appends. Pure — exported for tests.
+ * collide with). Posture-independent: pi read-only is carried by the prompt
+ * directive alone (no `--exclude-tools` strip — bash stays leaky, so a strip was
+ * never a sandbox), so the flags are the same either way. pi uses `thinking`,
+ * never `effort`; pairing routes neither here. Pure — exported for tests.
  */
 export function nativePiArgs(opts: PairLaunchOpts): string[] {
   // `-na` (--no-approve): ignore project-local `.pi/` resources for this run.
   const args = ["-na"];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("--model", opts.model);
-  }
-  if (opts.readOnly) {
-    args.push("--exclude-tools", "edit,write");
   }
   return args;
 }
@@ -331,52 +308,6 @@ export function stopTimeoutMsFromSeconds(timeoutSeconds: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// git changed-files snapshot — read-only backstop (detection, not prevention)
-// ---------------------------------------------------------------------------
-
-/**
- * Diff two `git status --porcelain` snapshots (each a set of porcelain lines)
- * into the sorted list of changed file paths. A `null` snapshot (not a git repo
- * / git unavailable) yields an empty diff — we cannot detect a violation, so we
- * report none. Pure — exported for tests.
- */
-export function diffGitSnapshots(
-  before: ReadonlySet<string> | null,
-  after: ReadonlySet<string> | null,
-): string[] {
-  if (before === null || after === null) {
-    return [];
-  }
-  const files: string[] = [];
-  for (const line of after) {
-    if (before.has(line)) {
-      continue;
-    }
-    if (line.length > 3) {
-      let path = line.slice(3).trim();
-      if (path.includes(" -> ")) {
-        path = path.split(" -> ").at(-1) as string;
-      }
-      files.push(path);
-    }
-  }
-  return files.sort();
-}
-
-/**
- * Parse `git status --porcelain` stdout into a set of lines. Does NOT strip
- * leading spaces — they are part of the porcelain status format. Pure —
- * exported for tests.
- */
-export function parseGitPorcelain(stdout: string): Set<string> {
-  const trimmed = stdout.replace(/\n+$/, "");
-  if (trimmed === "") {
-    return new Set();
-  }
-  return new Set(trimmed.split("\n"));
-}
-
-// ---------------------------------------------------------------------------
 // Env strip — CLAUDE* removal before the partner pane
 // ---------------------------------------------------------------------------
 
@@ -386,6 +317,14 @@ export function parseGitPorcelain(stdout: string): Set<string> {
  * orchestrator's `CLAUDE*` env (config dir, session ids, project context) would
  * cross-contaminate its identity. Returns a fresh object; the input is never
  * mutated. Pure — exported for tests.
+ *
+ * DEFENSE-IN-DEPTH, not the load-bearing gate. The gate is
+ * `launchScriptEnv`'s 5-key allowlist (which already excludes `ANTHROPIC*` /
+ * `*_API_KEY` / `DYLD_*`): the partner pane's real env is that allowlist + the
+ * tmux-server env + the login-shell re-source, and `DYLD_*`/`LD_*` are already
+ * hard-blocked on the `--x-tmux-env` injection channel. Do NOT add
+ * `ANTHROPIC*`/`*_API_KEY` stripping here — a claude partner needs its own auth,
+ * and stripping it would break the partner outright.
  */
 export function stripClaudeEnv(
   base: Record<string, string | undefined>,
@@ -411,11 +350,6 @@ export interface PairOutputOpts {
   role: string;
   /** The partner's final assistant message (null for a tool-only/refusal turn). */
   message: string | null;
-  /** Read-only posture. */
-  readOnly: boolean;
-  /** Files the tree showed as changed around the wait (read-only violation when
-   *  non-empty and `readOnly`). */
-  changedFiles: string[];
   /** keeper agent transcript path drill-down pointer. */
   transcriptPath: string | null;
   /** keeper agent run id handle (the session drill-down key). */
@@ -426,10 +360,9 @@ export interface PairOutputOpts {
 
 /**
  * Assemble the `--output` payload: a top `message` (the partner's final
- * answer), the cli/role echo, the transcript +
- * session drill-down keys, and — on a read-only run that touched the tree — a
- * `read_only_violation` list flagging the leak. Returns the structured object;
- * the caller serializes it to YAML. Pure — exported for tests.
+ * answer), the cli/role echo, and the transcript + session drill-down keys.
+ * Returns the structured object; the caller serializes it to YAML. Pure —
+ * exported for tests.
  */
 export function buildPairOutput(opts: PairOutputOpts): Record<string, unknown> {
   const out: Record<string, unknown> = {
@@ -437,19 +370,6 @@ export function buildPairOutput(opts: PairOutputOpts): Record<string, unknown> {
     role: opts.role,
     message: opts.message ?? "",
   };
-  if (opts.readOnly) {
-    out.read_only = true;
-  }
-  if (opts.changedFiles.length > 0) {
-    out.changed_files = [...opts.changedFiles];
-    if (opts.readOnly) {
-      // A read-only run must never touch the tree. If it did, the sandbox was
-      // bypassed (the directive ignored / a Bash escape) — surface it loudly.
-      // A distinct array copy (not an alias of `changed_files`) so the YAML
-      // serializes both inline rather than emitting an anchor/alias.
-      out.read_only_violation = [...opts.changedFiles];
-    }
-  }
   if (opts.elapsedSeconds !== undefined) {
     out.elapsed_seconds = Math.round(opts.elapsedSeconds * 10) / 10;
   }

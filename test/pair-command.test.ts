@@ -1,8 +1,8 @@
 /**
  * Unit tests for the dep-free `src/pair-command.ts` leaf module: the per-CLI
- * launch argv builder (byte-pinned, read-only flag sets), prompt assembly
- * (directive + role + message ordering), the git changed-files diff, the
- * CLAUDE* env strip, and the output-YAML assembly (read_only_violation flag).
+ * launch argv builder (byte-pinned, posture-independent flag sets), prompt
+ * assembly (directive + role + message ordering), the CLAUDE* env strip, and the
+ * output-YAML assembly.
  */
 
 import { expect, test } from "bun:test";
@@ -11,14 +11,12 @@ import {
   buildPairLaunchArgv,
   buildPairOutput,
   DEFAULT_PAIR_SESSION,
-  diffGitSnapshots,
   isPairRole,
   loadRolePrompt,
   nativeClaudeArgs,
   nativeCodexArgs,
   nativePiArgs,
   PAIR_ROLES,
-  parseGitPorcelain,
   READ_ONLY_DIRECTIVE,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
@@ -94,15 +92,14 @@ test("assemblePrompt: omits the System block when systemPrompt is empty", () => 
 });
 
 // ---------------------------------------------------------------------------
-// native flag sets — claude
+// native flag sets — claude (posture-independent: read-only is prompting-only)
 // ---------------------------------------------------------------------------
 
-test("nativeClaudeArgs: interactive TUI shape — no --print, write posture accepts edits", () => {
+test("nativeClaudeArgs: interactive TUI shape — no --print, accepts edits, no tool strip", () => {
   const args = nativeClaudeArgs({
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "p",
-    readOnly: false,
   });
   expect(args).toEqual([
     "--permission-mode",
@@ -112,27 +109,8 @@ test("nativeClaudeArgs: interactive TUI shape — no --print, write posture acce
   // The interactive tracked-job shape drops the headless flags.
   expect(args).not.toContain("--print");
   expect(args).not.toContain("-p");
-});
-
-test("nativeClaudeArgs: read-only strips edit tools via --disallowed-tools", () => {
-  const args = nativeClaudeArgs({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "p",
-    readOnly: true,
-  });
-  expect(args).toEqual([
-    "--disallowed-tools",
-    "Edit,Write,NotebookEdit",
-    "--dangerously-skip-permissions",
-  ]);
-  // No acceptEdits in read-only; no headless --print.
-  expect(args).not.toContain("acceptEdits");
-  expect(args).not.toContain("--print");
-  // Regression guard: the variadic `--disallowed-tools` must never be the last
-  // flag (it would swallow the prompt `buildPairLaunchArgv` appends). The
-  // trailing flag must be the boolean `--dangerously-skip-permissions`.
-  expect(args.at(-1)).toBe("--dangerously-skip-permissions");
+  // Read-only is prompting-only now — no per-harness tool strip.
+  expect(args).not.toContain("--disallowed-tools");
 });
 
 test("nativeClaudeArgs: --model appended when supplied", () => {
@@ -140,7 +118,6 @@ test("nativeClaudeArgs: --model appended when supplied", () => {
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "p",
-    readOnly: false,
     model: "opus",
   });
   expect(args.slice(-2)).toEqual(["--model", "opus"]);
@@ -150,27 +127,23 @@ test("nativeClaudeArgs: --model appended when supplied", () => {
 // native flag sets — codex
 // ---------------------------------------------------------------------------
 
-test("nativeCodexArgs: interactive YOLO flags in BOTH write and read-only", () => {
-  for (const readOnly of [false, true]) {
-    const args = nativeCodexArgs({
-      launcherArgvPrefix: LAP,
-      cli: "codex",
-      prompt: "p",
-      readOnly,
-    });
-    // Interactive TUI shape — never the headless `exec` one-shot or its exec-only
-    // `--skip-git-repo-check`, and web search is on by default so the deprecated
-    // `--enable web_search_request` is gone.
-    expect(args).not.toContain("exec");
-    expect(args).not.toContain("--skip-git-repo-check");
-    expect(args).not.toContain("--enable");
-    expect(args).not.toContain("web_search_request");
-    // YOLO mode so the single-turn partner never stalls on an approval prompt.
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-    // codex read-only is carried by the directive — same flags as write.
-    // codex must NEVER strip tools the way claude does.
-    expect(args).not.toContain("--disallowed-tools");
-  }
+test("nativeCodexArgs: interactive YOLO flags, never strips tools", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "p",
+  });
+  // Interactive TUI shape — never the headless `exec` one-shot or its exec-only
+  // `--skip-git-repo-check`, and web search is on by default so the deprecated
+  // `--enable web_search_request` is gone.
+  expect(args).not.toContain("exec");
+  expect(args).not.toContain("--skip-git-repo-check");
+  expect(args).not.toContain("--enable");
+  expect(args).not.toContain("web_search_request");
+  // YOLO mode so the single-turn partner never stalls on an approval prompt.
+  expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+  // codex must NEVER strip tools the way claude used to.
+  expect(args).not.toContain("--disallowed-tools");
 });
 
 test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () => {
@@ -178,7 +151,6 @@ test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () 
     launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "p",
-    readOnly: false,
     effort: "high",
   });
   const idx = args.indexOf("-c");
@@ -187,18 +159,17 @@ test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () 
 });
 
 // ---------------------------------------------------------------------------
-// native flag sets — pi
+// native flag sets — pi (posture-independent: read-only is prompting-only)
 // ---------------------------------------------------------------------------
 
-test("nativePiArgs: write posture — only -na, no tool strip, no codex/claude/effort flags", () => {
+test("nativePiArgs: only -na, no tool strip, no codex/claude/effort flags", () => {
   const args = nativePiArgs({
     launcherArgvPrefix: LAP,
     cli: "pi",
     prompt: "p",
-    readOnly: false,
   });
   expect(args).toEqual(["-na"]);
-  // Write posture never strips tools.
+  // Read-only is prompting-only now — no --exclude-tools strip.
   expect(args).not.toContain("--exclude-tools");
   // NEVER codex's YOLO flag (would crash a pi launch) or claude's permission flags.
   expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
@@ -209,26 +180,11 @@ test("nativePiArgs: write posture — only -na, no tool strip, no codex/claude/e
   expect(args).not.toContain("-c");
 });
 
-test("nativePiArgs: read-only adds --exclude-tools edit,write reinforcement (exact lowercase tokens)", () => {
-  const args = nativePiArgs({
-    launcherArgvPrefix: LAP,
-    cli: "pi",
-    prompt: "p",
-    readOnly: true,
-  });
-  expect(args).toEqual(["-na", "--exclude-tools", "edit,write"]);
-  // The `--exclude-tools` value is a single comma-joined token (not variadic), so
-  // it sits safely before the trailing prompt positional.
-  const idx = args.indexOf("--exclude-tools");
-  expect(args[idx + 1]).toBe("edit,write");
-});
-
 test("nativePiArgs: --model appended when supplied", () => {
   const args = nativePiArgs({
     launcherArgvPrefix: LAP,
     cli: "pi",
     prompt: "p",
-    readOnly: false,
     model: "gpt-5.5",
   });
   expect(args).toEqual(["-na", "--model", "gpt-5.5"]);
@@ -239,7 +195,6 @@ test("nativePiArgs: --effort is never emitted even when supplied (pi uses thinki
     launcherArgvPrefix: LAP,
     cli: "pi",
     prompt: "p",
-    readOnly: false,
     effort: "high",
   });
   expect(args).toEqual(["-na"]);
@@ -256,7 +211,6 @@ test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt la
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "THE PROMPT",
-    readOnly: false,
   });
   // The launch spawns the folded `keeper agent` launcher prefix, then the cli
   // token, then the wrapper flags.
@@ -280,7 +234,6 @@ test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION b
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
-    readOnly: false,
     session: "panels",
   });
   // The carrier is what binds the partner into `jobs` as a tracked job, mirroring
@@ -299,7 +252,6 @@ test("buildPairLaunchArgv: codex never gets the binding carrier (stays untracked
     launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "P",
-    readOnly: false,
     session: "pair",
   });
   // codex fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION
@@ -313,7 +265,6 @@ test("buildPairLaunchArgv: codex — agent token is codex, interactive native fl
     launcherArgvPrefix: LAP,
     cli: "codex",
     prompt: "P",
-    readOnly: true,
     effort: "medium",
   });
   expect(argv[LAP.length]).toBe("codex");
@@ -325,21 +276,19 @@ test("buildPairLaunchArgv: codex — agent token is codex, interactive native fl
   expect(argv.at(-1)).toBe("P");
 });
 
-test("buildPairLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no carrier, prompt last", () => {
+test("buildPairLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no strip, no carrier, prompt last", () => {
   const argv = buildPairLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "pi",
     prompt: "THE PI PROMPT",
-    readOnly: true,
     model: "gpt-5.5",
     session: "panels",
   });
   // The agent token is pi (NOT codex — codex's YOLO flag would crash a pi launch).
   expect(argv[LAP.length]).toBe("pi");
   expect(argv).toContain("-na");
-  const xtIdx = argv.indexOf("--exclude-tools");
-  expect(xtIdx).toBeGreaterThanOrEqual(0);
-  expect(argv[xtIdx + 1]).toBe("edit,write");
+  // Read-only is prompting-only now — no --exclude-tools strip on the pi argv.
+  expect(argv).not.toContain("--exclude-tools");
   // NONE of codex's or claude's native flags leak onto the pi argv.
   expect(argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
   expect(argv).not.toContain("--permission-mode");
@@ -359,7 +308,6 @@ test("buildPairLaunchArgv: --x-tmux-session appended when session supplied", () 
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
-    readOnly: false,
     session: "pair-sess",
   });
   const idx = argv.indexOf("--x-tmux-session");
@@ -372,7 +320,6 @@ test("buildPairLaunchArgv: --preset forwards --x-preset so the launcher owns mod
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
-    readOnly: false,
     preset: "claude-opus-xhigh",
   });
   const idx = argv.indexOf("--x-preset");
@@ -394,7 +341,6 @@ test("buildPairLaunchArgv: no preset → no --x-preset flag (zero behavior chang
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
-    readOnly: false,
   });
   expect(argv).not.toContain("--x-preset");
 });
@@ -408,33 +354,6 @@ test("stopTimeoutMsFromSeconds: fractional seconds round UP to ms", () => {
   expect(stopTimeoutMsFromSeconds(0.5)).toBe(500);
   expect(stopTimeoutMsFromSeconds(1.0009)).toBe(1001);
   expect(stopTimeoutMsFromSeconds(599.9999)).toBe(600_000);
-});
-
-// ---------------------------------------------------------------------------
-// git changed-files diff
-// ---------------------------------------------------------------------------
-
-test("parseGitPorcelain: parses lines, preserves leading status spaces", () => {
-  const set = parseGitPorcelain(" M src/a.ts\n?? new.txt\n");
-  expect(set.has(" M src/a.ts")).toBe(true);
-  expect(set.has("?? new.txt")).toBe(true);
-  expect(parseGitPorcelain("").size).toBe(0);
-});
-
-test("diffGitSnapshots: returns sorted new paths; rename arrow → dest", () => {
-  const before = new Set([" M a.ts"]);
-  const after = new Set([
-    " M a.ts",
-    "?? z.txt",
-    "?? b.txt",
-    "R  old.ts -> new.ts",
-  ]);
-  expect(diffGitSnapshots(before, after)).toEqual(["b.txt", "new.ts", "z.txt"]);
-});
-
-test("diffGitSnapshots: a null snapshot yields no detection", () => {
-  expect(diffGitSnapshots(null, new Set(["?? x"]))).toEqual([]);
-  expect(diffGitSnapshots(new Set(), null)).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -463,8 +382,6 @@ test("buildPairOutput: carries message + cli/role + handle drill-down", () => {
     cli: "claude",
     role: "default",
     message: "answer text",
-    readOnly: false,
-    changedFiles: [],
     transcriptPath: "/t/x.jsonl",
     handle: "tmux-h",
     elapsedSeconds: 12.34,
@@ -475,36 +392,9 @@ test("buildPairOutput: carries message + cli/role + handle drill-down", () => {
   expect(out.handle).toBe("tmux-h");
   expect(out.transcript_path).toBe("/t/x.jsonl");
   expect(out.elapsed_seconds).toBe(12.3);
-  // No read_only key on a write run.
+  // The read-only YAML surface is retired — no read_only / changed_files keys.
   expect(out.read_only).toBeUndefined();
-});
-
-test("buildPairOutput: read-only run that changed the tree flags read_only_violation", () => {
-  const out = buildPairOutput({
-    cli: "codex",
-    role: "codereviewer",
-    message: "m",
-    readOnly: true,
-    changedFiles: ["a.ts", "b.ts"],
-    transcriptPath: null,
-    handle: "h",
-  });
-  expect(out.read_only).toBe(true);
-  expect(out.changed_files).toEqual(["a.ts", "b.ts"]);
-  expect(out.read_only_violation).toEqual(["a.ts", "b.ts"]);
-});
-
-test("buildPairOutput: write run with changed files records them WITHOUT a violation", () => {
-  const out = buildPairOutput({
-    cli: "claude",
-    role: "default",
-    message: "m",
-    readOnly: false,
-    changedFiles: ["x.ts"],
-    transcriptPath: null,
-    handle: "h",
-  });
-  expect(out.changed_files).toEqual(["x.ts"]);
+  expect(out.changed_files).toBeUndefined();
   expect(out.read_only_violation).toBeUndefined();
 });
 
@@ -513,8 +403,6 @@ test("buildPairOutput: null message serializes to an empty string message", () =
     cli: "claude",
     role: "default",
     message: null,
-    readOnly: false,
-    changedFiles: [],
     transcriptPath: null,
     handle: "h",
   });

@@ -2,8 +2,8 @@
  * Characterization golden pins for the PURE pair/agent builders the later
  * pair->agent flattening increments (repoint pair, posture flags, panel
  * collapse) will move. Each assertion locks the exact current output so a
- * mechanical refactor that drifts the composed command, the `--output` YAML, the
- * Monitor event lines, or the read-only git backstop fails loudly.
+ * mechanical refactor that drifts the composed command, the `--output` YAML, or
+ * the Monitor event lines fails loudly.
  *
  * Every target here is a pure builder — no subprocess/tmux/git is touched (per
  * CLAUDE.md test isolation). The cross-process `cli/pair.ts` flow is NOT exercised
@@ -14,9 +14,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildPairLaunchArgv,
   buildPairOutput,
-  diffGitSnapshots,
   pairOutputYaml,
-  parseGitPorcelain,
   stopTimeoutMsFromSeconds,
 } from "../src/pair-command";
 
@@ -34,7 +32,6 @@ describe("golden: buildPairLaunchArgv", () => {
         cli: "claude",
         prompt: "do the thing",
         model: "opus",
-        readOnly: false,
         session: "pair",
       }),
     ).toEqual([
@@ -58,13 +55,12 @@ describe("golden: buildPairLaunchArgv", () => {
     ]);
   });
 
-  test("claude read-only launch (preset, no session) — disallowed-tools posture", () => {
+  test("claude read-only launch (preset, no session) — posture-independent flags (no strip)", () => {
     expect(
       buildPairLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "claude",
         prompt: "explore",
-        readOnly: true,
         preset: "reviewer",
       }),
     ).toEqual([
@@ -77,8 +73,8 @@ describe("golden: buildPairLaunchArgv", () => {
       "--x-no-confirm",
       "--x-preset",
       "reviewer",
-      "--disallowed-tools",
-      "Edit,Write,NotebookEdit",
+      "--permission-mode",
+      "acceptEdits",
       "--dangerously-skip-permissions",
       "explore",
     ]);
@@ -92,7 +88,6 @@ describe("golden: buildPairLaunchArgv", () => {
         prompt: "review this",
         model: "gpt-5",
         effort: "high",
-        readOnly: true,
         session: "pair",
       }),
     ).toEqual([
@@ -119,20 +114,18 @@ describe("golden: buildPairLaunchArgv", () => {
       launcherArgvPrefix: PREFIX,
       cli: "codex",
       prompt: "p",
-      readOnly: false,
       session: "pair",
     });
     expect(argv).not.toContain("--x-tmux-env");
   });
 
-  test("pi read-only launch (model + session) — exclude-tools reinforcement", () => {
+  test("pi read-only launch (model + session) — posture-independent flags (no strip)", () => {
     expect(
       buildPairLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "pi",
         prompt: "scan",
         model: "pi-1",
-        readOnly: true,
         session: "pair",
       }),
     ).toEqual([
@@ -148,21 +141,17 @@ describe("golden: buildPairLaunchArgv", () => {
       "-na",
       "--model",
       "pi-1",
-      "--exclude-tools",
-      "edit,write",
       "scan",
     ]);
   });
 });
 
 describe("golden: buildPairOutput + pairOutputYaml", () => {
-  test("write run: message + drill-down keys, no read-only block", () => {
+  test("run: message + drill-down keys", () => {
     const out = buildPairOutput({
       cli: "claude",
       role: "default",
       message: "Here is the answer.",
-      readOnly: false,
-      changedFiles: [],
       transcriptPath: "/transcripts/run-123.jsonl",
       handle: "run-123",
       elapsedSeconds: 12.34,
@@ -185,13 +174,11 @@ describe("golden: buildPairOutput + pairOutputYaml", () => {
     );
   });
 
-  test("read-only run that touched the tree: changed_files + read_only_violation", () => {
+  test("tool-only turn: null message renders as empty string, no read-only surface", () => {
     const out = buildPairOutput({
       cli: "codex",
       role: "codereviewer",
       message: null,
-      readOnly: true,
-      changedFiles: ["a.ts", "b.ts"],
       transcriptPath: null,
       handle: "run-9",
     });
@@ -199,22 +186,12 @@ describe("golden: buildPairOutput + pairOutputYaml", () => {
       cli: "codex",
       role: "codereviewer",
       message: "",
-      read_only: true,
-      changed_files: ["a.ts", "b.ts"],
-      read_only_violation: ["a.ts", "b.ts"],
       handle: "run-9",
     });
     expect(pairOutputYaml(out)).toBe(
       "cli: codex\n" +
         "role: codereviewer\n" +
         "message: ''\n" +
-        "read_only: true\n" +
-        "changed_files:\n" +
-        "  - a.ts\n" +
-        "  - b.ts\n" +
-        "read_only_violation:\n" +
-        "  - a.ts\n" +
-        "  - b.ts\n" +
         "handle: run-9\n",
     );
   });
@@ -268,18 +245,17 @@ describe("golden: [keeper-pair] Monitor event lines", () => {
     );
   });
 
-  test("completed line (changed + elapsed, empty preset dropped)", () => {
+  test("completed line (elapsed, empty preset dropped)", () => {
     expect(
       formatEvent("completed", {
         cli: "codex",
         preset: "",
         output: "/out.yaml",
         "read-only": true || undefined,
-        changed: 2,
         elapsed: 13,
       }),
     ).toBe(
-      "[keeper-pair] completed cli=codex output=/out.yaml read-only=true changed=2 elapsed=13",
+      "[keeper-pair] completed cli=codex output=/out.yaml read-only=true elapsed=13",
     );
   });
 
@@ -307,29 +283,5 @@ describe("golden: stopTimeoutMsFromSeconds", () => {
     expect(stopTimeoutMsFromSeconds(0.5)).toBe(500);
     expect(stopTimeoutMsFromSeconds(1.0005)).toBe(1001);
     expect(stopTimeoutMsFromSeconds(0.0001)).toBe(1);
-  });
-});
-
-describe("golden: diffGitSnapshots / parseGitPorcelain", () => {
-  test("parseGitPorcelain: empty stdout -> empty set; trailing newlines stripped", () => {
-    expect(parseGitPorcelain("")).toEqual(new Set());
-    expect(parseGitPorcelain("\n\n")).toEqual(new Set());
-    expect(parseGitPorcelain(" M a.ts\n?? b.ts\n")).toEqual(
-      new Set([" M a.ts", "?? b.ts"]),
-    );
-  });
-
-  test("diffGitSnapshots: sorted new paths, rename takes the post-arrow path", () => {
-    const before = parseGitPorcelain(" M a.ts\n");
-    const after = parseGitPorcelain(
-      " M a.ts\n?? z.ts\nA  c.ts\nR  old.ts -> new.ts\n",
-    );
-    expect(diffGitSnapshots(before, after)).toEqual(["c.ts", "new.ts", "z.ts"]);
-  });
-
-  test("diffGitSnapshots: a null snapshot reports no detection", () => {
-    expect(diffGitSnapshots(null, parseGitPorcelain("?? b.ts"))).toEqual([]);
-    expect(diffGitSnapshots(parseGitPorcelain("?? b.ts"), null)).toEqual([]);
-    expect(diffGitSnapshots(null, null)).toEqual([]);
   });
 });

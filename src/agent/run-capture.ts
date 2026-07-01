@@ -152,8 +152,9 @@ export type ParseRunArgsResult =
  * positionals — the partner CLI (claude|codex|pi) and the prompt — plus the
  * optional read-only posture and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
- * `--read-only` is detection-not-prevention (a per-harness tool strip + a
- * caller-prepended directive; the strip is leaky). `--system-file <path>` /
+ * `--read-only` is prompting-only: it prepends the read-only directive to the
+ * prompt and relies on the model following it (keeper enforces nothing).
+ * `--system-file <path>` /
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
  * the parser returns the RAW path/text — the handler reads any file.
  * `--preset <name>` / `--session <name>` / `--output <path>` are additive value

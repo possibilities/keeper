@@ -7,8 +7,8 @@
  * schema-versioned JSON envelope: `keeper agent run <cli> <prompt>` launches,
  * waits, and captures in one process, and `keeper agent wait <handle>` does the
  * wait + capture on an already-launched handle. `run --read-only` prepends a
- * read-only directive + strips edit tools per harness (detection, not prevention
- * — no changed-files audit on this verb); `run --system-file <path>`/`--system
+ * read-only directive to the prompt (prompting-only — keeper enforces nothing,
+ * no tool strip, no changed-files audit); `run --system-file <path>`/`--system
  * <text>` prepend a caller-side `System:` block (mutually exclusive, uniform
  * across harnesses — user-turn text, not a privileged system prompt); codex/pi
  * launch with `CLAUDE*` env stripped by default (partner isolation). `run

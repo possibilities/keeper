@@ -9,8 +9,8 @@
  * pair now composes the partner launch IN-PROCESS via the shared `src/agent`
  * run-capture primitives, so the launch + wait/show are driven through INJECTED
  * seams (a canned tmux command runner that forces a `TmuxLaunchError`, and canned
- * wait/show outcomes) — no real tmux, no real git (read-only is off so the git
- * backstop is skipped), no daemon, no subprocess. Each `RunCaptureOutcome` is
+ * wait/show outcomes) — no real tmux, no real git (read-only is prompting-only,
+ * so there is no git audit to skip), no daemon, no subprocess. Each `RunCaptureOutcome` is
  * exercised for its mapping onto pair's 0/1/2 contract.
  *
  * `main()` writes to process.stdout/stderr and calls process.exit() directly, so

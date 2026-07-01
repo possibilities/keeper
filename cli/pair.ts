@@ -29,10 +29,9 @@
  *      and emit `completed` only AFTER the rename (the Monitor event never points
  *      at a half-written file); every failure outcome emits `failed` + exits 1.
  *
- * Read-only posture is layered: the directive (primary) + the per-CLI tool strip
- * (claude `--disallowed-tools`; codex keeps web search) + a git changed-files
- * snapshot taken IN THE PARTNER'S CWD around the wait → `read_only_violation`
- * (detection, not prevention).
+ * Read-only posture is prompting-only: `--read-only` prepends the read-only
+ * directive to the partner's prompt and relies on the model following it. keeper
+ * enforces nothing — no tool strip, no git audit.
  *
  * Exit taxonomy: 0 = completed; 1 = failed (launch/wait/show error, SIGTERM,
  * timeout); 2 = arg fault (bad flags, missing prompt file).
@@ -81,12 +80,10 @@ import {
   assemblePrompt,
   buildPairOutput,
   DEFAULT_PAIR_SESSION,
-  diffGitSnapshots,
   loadRolePrompt,
   PAIR_CLIS,
   type PairCli,
   pairOutputYaml,
-  parseGitPorcelain,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
 } from "../src/pair-command";
@@ -121,7 +118,7 @@ Options:
   --model <m>            Native model (claude --model / codex -m)
   --effort <e>           Reasoning effort (codex only)
   --role <r>             Role prompt: default|planner|codereviewer|coplanner
-  --read-only            Read-only posture (directive + tool strip + git backstop)
+  --read-only            Read-only posture (prepends a directive; prompting-only)
   --output <path>        Write the result YAML here (required)
   --session <s>          Target tmux session for the partner window
   --timeout <s>          Wait timeout in seconds (default 1800)
@@ -176,24 +173,6 @@ function emitEvent(event: string, fields: Record<string, unknown>): void {
     parts.push(`${k}=${v}`);
   }
   process.stdout.write(`${parts.join(" ")}\n`);
-}
-
-/** Capture a `git status --porcelain` snapshot in `cwd`, or null when not a git
- *  repo / git unavailable (the read-only backstop degrades to "no detection"). */
-function gitSnapshot(cwd: string): Set<string> | null {
-  try {
-    const res = Bun.spawnSync(["git", "status", "--porcelain"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (res.exitCode !== 0) {
-      return null;
-    }
-    return parseGitPorcelain(res.stdout.toString());
-  } catch {
-    return null;
-  }
 }
 
 export async function main(
@@ -411,13 +390,6 @@ export async function main(
   });
   startedEmitted = true;
 
-  // Read-only backstop: snapshot the tree in the partner's cwd BEFORE the
-  // partner can run (i.e. before the launch), so a write the partner makes
-  // during its detached turn shows up against this baseline. `after` is taken
-  // once the partner has stopped; the diff is the changed-files set. Detection,
-  // not prevention — the directive + tool strip are the guards (see module doc).
-  const beforeSnapshot = readOnly ? gitSnapshot(cwd) : null;
-
   // ---- launch → wait-for-stop → show-last-message, IN-PROCESS ----
   // The launch + capture run in ONE process on a pinned `ResolvedHandle` held
   // locally for the whole turn (`launchToResolvedHandle` drives the tmux launcher
@@ -431,7 +403,6 @@ export async function main(
   //     transcript session id and the handle is held locally, so the resolver
   //     never falls back to newest-by-mtime onto the driver's own transcript.
   const posture: LaunchPosture = {
-    readOnly,
     model: v.model,
     effort: v.effort,
     // Partners land in a stable named session (`pair` by default, `panels` for
@@ -508,25 +479,14 @@ export async function main(
     }
   }
 
-  // ---- success tail (UNCHANGED): after-snapshot → buildPairOutput → YAML →
-  //      atomic temp-write+rename → completed AFTER the rename → exit 0 ----
-  const afterSnapshot = readOnly ? gitSnapshot(cwd) : null;
-  const changedFiles = diffGitSnapshots(beforeSnapshot, afterSnapshot);
+  // ---- success tail: buildPairOutput → YAML → atomic temp-write+rename →
+  //      completed AFTER the rename → exit 0 ----
   const elapsedSeconds = result.envelope.elapsed_seconds ?? 0;
-
-  if (readOnly && changedFiles.length > 0) {
-    process.stderr.write(
-      `[keeper-pair] WARNING: read-only run reported ${changedFiles.length} changed file(s); ` +
-        `the sandbox may have been bypassed: ${changedFiles.join(", ")}\n`,
-    );
-  }
 
   const outputObj = buildPairOutput({
     cli: pairCli,
     role,
     message: result.envelope.message,
-    readOnly,
-    changedFiles,
     transcriptPath: result.envelope.transcript_path,
     handle: result.envelope.handle ?? "",
     elapsedSeconds,
@@ -560,7 +520,6 @@ export async function main(
     preset: presetName,
     output,
     "read-only": readOnly || undefined,
-    changed: changedFiles.length > 0 ? changedFiles.length : undefined,
     elapsed: Math.round(elapsedSeconds),
   });
   process.exit(0);

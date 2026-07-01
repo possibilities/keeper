@@ -109,10 +109,11 @@ describe("keeper agent byte-pin — pi native argv", () => {
 /**
  * Negative byte-pin: the bare `agent <cli>` launch and the managed
  * `buildKeeperAgentLaunchArgv` worker/dispatch launch must carry NO read-only
- * posture and NO extra `CLAUDE*` env strip. Posture (`--read-only`,
- * `--exclude-tools`, `--disallowed-tools`) belongs only on a future posture-bearing
- * path; this is the byte-stability anchor that keeps later increments from leaking
- * it onto the managed launch surface.
+ * posture and NO extra `CLAUDE*` env strip. Read-only is prompting-only — the
+ * `--read-only` flag never reaches a launched native argv, and the retired
+ * tool-strip flags (`--exclude-tools`/`--disallowed-tools`) are emitted nowhere;
+ * this is the byte-stability anchor that keeps any of them from leaking onto the
+ * managed launch surface.
  */
 const POSTURE_FLAGS = [
   "--read-only",
@@ -273,11 +274,11 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
 }
 
 describe("keeper agent byte-pin — agent run posture", () => {
-  test("run --read-only claude: directive prepended + edit-tool strip present", async () => {
+  test("run --read-only claude: directive prepended, NO tool strip (prompting-only)", async () => {
     const cmd = await runCommand({ readOnly: true });
-    // The claude read-only strip reaches the native command.
-    expect(cmd).toContain("--disallowed-tools");
-    expect(cmd).toContain("Edit,Write,NotebookEdit");
+    // Read-only is prompting-only — the native command carries NO tool strip.
+    expect(cmd).not.toContain("--disallowed-tools");
+    expect(cmd).not.toContain("--exclude-tools");
     // The directive is prepended CALLER-SIDE with a raw `\n\n` join — no `User:`
     // scaffold (agent run has no role framing), and NOT double-prepended.
     expect(cmd.at(-1)).toBe(`${READ_ONLY_DIRECTIVE}\n\nsay hi`);
@@ -358,7 +359,6 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
       launcherArgvPrefix: [],
       cli: "claude",
       prompt: "say hi",
-      readOnly: false,
       preset: "opus",
       session: "panels",
     });
@@ -378,7 +378,6 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
       launcherArgvPrefix: [],
       cli: "claude",
       prompt: "say hi",
-      readOnly: false,
     });
     expect(cmd).not.toContain("--x-preset");
     expect(cmd).not.toContain("--x-tmux-session");
@@ -415,7 +414,6 @@ describe("keeper agent byte-pin — System: prompt uniform across harnesses", ()
         launcherArgvPrefix: [],
         cli,
         prompt: composed,
-        readOnly: false,
       });
       expect(cmd.at(-1)).toBe(composed);
       expect(cmd).not.toContain("--append-system-prompt");

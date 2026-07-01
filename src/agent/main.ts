@@ -923,11 +923,11 @@ async function runRunCaptureSubcommand(
   // `\n\n` join, no `User:` scaffold — `agent run` has no role framing):
   // [read-only directive] → [System: <text>] → [user prompt], UNIFORM across
   // claude/codex/pi. The shared launch helper stays directive-free so pair never
-  // double-prepends; the per-harness tool strip rides via `posture.readOnly`.
-  // Detection, not prevention (the strip is leaky; no changed-files audit here —
-  // that stays pair-side). The `System:` block is user-turn text, NOT a
-  // privileged system prompt — the native `--append-system-prompt` upgrade is a
-  // deliberate future step. An empty-after-trim system value is a no-op skip.
+  // double-prepends. Read-only is prompting-only: the directive is the whole
+  // mechanism (keeper enforces nothing — no tool strip, no changed-files audit).
+  // The `System:` block is user-turn text, NOT a privileged system prompt — the
+  // native `--append-system-prompt` upgrade is a deliberate future step. An
+  // empty-after-trim system value is a no-op skip.
   const promptParts: string[] = [];
   if (parsed.readOnly) {
     promptParts.push(READ_ONLY_DIRECTIVE);
@@ -946,7 +946,6 @@ async function runRunCaptureSubcommand(
           agent,
           prompt,
           posture: {
-            readOnly: parsed.readOnly,
             preset: parsed.preset ?? undefined,
             session: parsed.session ?? undefined,
           },

@@ -1427,9 +1427,9 @@ event-log/reducer/hook touch. Run any of them with
   message, message_found, elapsed_seconds, outcome}`) for every terminal state,
   the `outcome` mapping to the exit code (completed/no_message 0, timed_out/
   no_transcript 4, launch_failed 1, bad_args 2). `run --read-only` prepends a
-  read-only directive and strips edit tools per harness — detection, NOT
-  prevention (the strip is leaky and there is NO changed-files audit on this verb,
-  unlike `keeper pair`'s caller-side git backstop). `run --system-file <path>` /
+  read-only directive to the prompt — prompting-only, keeper enforces nothing (no
+  per-harness tool strip, no changed-files audit; a partner that ignores the
+  directive can still touch the tree). `run --system-file <path>` /
   `--system <text>` (mutually exclusive; a missing file → bad_args) compose a
   caller-side `System:`-prepend into the prompt positional, UNIFORM across
   claude/codex/pi and mirroring pair's `assemblePrompt` block order (read-only

@@ -100,8 +100,6 @@ atomically, only once complete) rather than holding one blocking call open.
   conclusion.
 - `handle` — the `keeper agent` launch handle (correlation id).
 - `elapsed_seconds` — wall time of the partner's turn.
-- `read_only` / `changed_files` / `read_only_violation` — present only on a
-  read-only run; see below.
 
 A terminal `failed` means no usable answer — surface the `error=…` field from
 the event line (launch failure, wait timeout, a partner that produced no
@@ -129,23 +127,14 @@ If the user's ask is slug-less or ambiguous about which CLI/role, pick a
 sensible default (a cross-vendor partner, `default` role) and say what you
 chose — don't stall.
 
-## Read-only posture (detection, not prevention)
+## Read-only posture (prompting-only)
 
-`--read-only` is **layered, and honest about its limits**:
-
-- It prepends a read-only directive to the prompt (the primary guard),
-- strips edit tools per-CLI (claude `--disallowed-tools Edit,Write,…`; pi
-  `--exclude-tools edit,write`; codex keeps web search — pi `bash` stays leaky,
-  so the strip is reinforcement, not a sandbox), and
-- snapshots `git status` in the partner's cwd around the turn as a backstop.
-
-It is **detection, not prevention**: a tool strip + directive do not stop Bash
-writes or `git` inside the partner. If the partner writes anyway, the run
-surfaces it — `changed_files` and a `read_only_violation` list land in the
-output YAML and a WARNING prints. Treat a `read_only_violation` as a real
-signal that the partner bypassed the posture, not noise. Use `--read-only` for
-any "just look / just review / don't change anything" ask, but know the
-guarantee is best-effort.
+`--read-only` is **prompting-only, and honest about its limits**: it prepends a
+read-only directive to the partner's prompt and relies on the model following
+it. keeper enforces nothing — there is no tool strip and no git audit, so
+nothing stops Bash writes or `git` inside the partner if it ignores the
+directive. Use `--read-only` for any "just look / just review / don't change
+anything" ask, but know the guarantee is best-effort.
 
 ## Panel fan-out (`panel start|wait`)
 

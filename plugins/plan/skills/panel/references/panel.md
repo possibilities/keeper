@@ -33,13 +33,13 @@ distinguishable. Every member answers **in parallel** via a detached
 result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
 
 - **A claude member** (`harness: claude`) runs `keeper agent run claude --preset <member> --read-only`.
-  `--read-only` strips its edit tools and prepends an explore-only directive — it reads, greps, and runs
-  bash to research, then reports.
+  `--read-only` prepends an explore-only directive to the prompt — it reads, greps, and runs bash to
+  research, then reports.
 - **A codex member** (`harness: codex`) is the cross-family diversity the panel is built to harvest.
-  Codex's read-only posture is carried by the prompt directive (agent run's read-only is detection, not a
-  changed-files audit) — panelists are explorers, so the leaky strip is acceptable. A codex member runs as
-  an interactive TUI with its cwd directory-trust pre-seeded (fail-open), so its window never hangs on
-  codex's trust prompt.
+  Codex's read-only posture is carried by the same prompt directive (agent run's read-only is
+  prompting-only — keeper enforces nothing) — panelists are explorers, so a best-effort directive is
+  acceptable. A codex member runs as an interactive TUI with its cwd directory-trust pre-seeded
+  (fail-open), so its window never hangs on codex's trust prompt.
 
 No member gets an assigned role or persona — every member answers the human's task straight, and the
 diversity comes from running the panel's preset spread cold (see "No lenses, no personas" above).

@@ -110,7 +110,7 @@ describe("launchToResolvedHandle", () => {
       deps: deps({ tmuxCommand: tmuxRunner(0), errs, now: 12345 }),
       agent: "claude",
       prompt: "say hi",
-      posture: { readOnly: false },
+      posture: {},
       stopTimeoutMs: 5000,
     });
     expect(result.ok).toBe(true);
@@ -133,7 +133,7 @@ describe("launchToResolvedHandle", () => {
       deps: deps({ tmuxCommand: tmuxRunner(1, "boom"), errs }),
       agent: "claude",
       prompt: "say hi",
-      posture: { readOnly: false },
+      posture: {},
       stopTimeoutMs: null,
     });
     expect(result.ok).toBe(false);
@@ -155,7 +155,7 @@ describe("launchToResolvedHandle", () => {
       }),
       agent: "codex",
       prompt: "explore",
-      posture: { readOnly: false },
+      posture: {},
       stopTimeoutMs: null,
     });
     expect(result.ok).toBe(true);
@@ -174,7 +174,7 @@ describe("launchToResolvedHandle", () => {
         deps: deps({ tmuxCommand: tmuxRunner(0), errs, trustCalls }),
         agent,
         prompt: "hi",
-        posture: { readOnly: false },
+        posture: {},
         stopTimeoutMs: null,
       });
       expect(trustCalls.length).toBe(0);

@@ -67,7 +67,7 @@ Usage:
                                   [--output <path>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
-                                    --read-only is detection, not prevention.
+                                    --read-only prepends a directive (prompting-only).
                                     --system-file/--system prepend a caller-side
                                     System: block (uniform across harnesses).
                                     --preset applies a launch-config preset (its
@@ -171,10 +171,9 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
                                         process. --read-only prepends a read-only
-                                        directive and strips edit tools per harness
-                                        — detection, NOT prevention (the strip is
-                                        leaky; there is no changed-files audit on
-                                        this verb). --system-file/--system compose a
+                                        directive to the prompt — prompting-only,
+                                        keeper enforces nothing (no tool strip, no
+                                        changed-files audit). --system-file/--system compose a
                                         caller-side System:-prepend into the prompt
                                         (mutually exclusive; missing file → bad_args),
                                         UNIFORM across claude/codex/pi — user-turn
