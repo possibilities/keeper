@@ -52,5 +52,5 @@ the new `src/keeper-state-dir` import; keep bun:sqlite out.
 - [ ] panel.ts stays bun:sqlite-free; import-island comment updated; lint + typecheck + test green
 
 ## Done summary
-
+Added dep-free keeperStateDir() and made panelStart write durable slug-keyed dirs at ~/.local/state/keeper/panels/<slug>/ (0700) with a boot_epoch_ms + per-leg launched_at manifest written skeleton-first; parseManifest validates the new fields and a deps.bootEpochMs seam makes boot-epoch injectable.
 ## Evidence
