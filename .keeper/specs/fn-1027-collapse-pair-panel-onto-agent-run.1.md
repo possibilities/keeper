@@ -41,5 +41,5 @@ Add three flags to `agent run`, all ADDITIVE + default-absent (absent → byte-i
 - [ ] `dispatch.ts` help + `cli/agent.ts` header + README document the three flags; `bun test` green.
 
 ## Done summary
-
+Added --preset/--session/--output to agent run: three additive default-absent value flags in parseRunArgs, --preset harness==<cli> validation, and an atomic (temp+rename) --output envelope sink written on every outcome via emitRunCapture. Byte-stability preserved; docs + byte-pins updated.
 ## Evidence
