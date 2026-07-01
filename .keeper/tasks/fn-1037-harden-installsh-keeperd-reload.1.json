@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Make keeperd reload self-healing",
-  "updated_at": "2026-07-01T08:40:38.727000Z"
+  "updated_at": "2026-07-01T10:15:13.682000Z",
+  "worker_done_at": "2026-07-01T10:15:13.682000Z"
 }

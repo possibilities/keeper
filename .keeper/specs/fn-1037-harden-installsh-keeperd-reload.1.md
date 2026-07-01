@@ -31,5 +31,5 @@ ordering (`@parcel/watcher` must be present before any reload).
       `bootout || true`, `enable`, no `kickstart -k`.
 
 ## Done summary
-
+Decoupled the keeperd reload content gate from daemon-loaded state in scripts/install.sh: gate now reloads when the plist differs OR keeperd is unregistered, with a bounded bootstrap retry and a launchctl print load-verification that fails loud, so a failed reload no longer latches cmp -s shut.
 ## Evidence
