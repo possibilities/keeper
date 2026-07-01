@@ -44,5 +44,5 @@ Rewrite `test/pair-panel.test.ts`'s log/pid outcome tests to SEED result files (
 - [ ] `bun test` green; no test launches a real subprocess/tmux/git.
 
 ## Done summary
-
+Repointed pair panel legs from detached pair send to agent run (--preset/--read-only/--session/--output/--stop-timeout-ms, timeout translated s->ms), swapped wait terminality from [keeper-pair] log-scraping to result-file outcome polling (completed->ok, else->fail reason=outcome, unparseable->corrupt-result) while keeping the pidfile crash backstop and byte-stable verdict shape, deleted scanLogTerminal and dropped .log from the manifest, restored a gated real-spawn survival proof, and updated the panel-runner/judge/skill/reference docs to the agent-run JSON result envelope.
 ## Evidence
