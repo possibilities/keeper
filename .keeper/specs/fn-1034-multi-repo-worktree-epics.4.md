@@ -53,5 +53,5 @@ serial group's tasks done AND the worktree group merged. Single-repo epic: byte-
 - [ ] Tests green
 
 ## Done summary
-
+computeMergedLaneEntries now aggregates a clustered multi-repo epic: its single epic_id-keyed lane_merged row is emitted only once every group has landed (worktree groups merged to default, serial groups' tasks all done). No schema change; producer-side.
 ## Evidence
