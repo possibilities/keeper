@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add keeper scripts/install.sh + rewrite README install",
-  "updated_at": "2026-07-01T05:14:52.194000Z"
+  "updated_at": "2026-07-01T07:56:36.543000Z",
+  "worker_done_at": "2026-07-01T07:56:36.543000Z"
 }

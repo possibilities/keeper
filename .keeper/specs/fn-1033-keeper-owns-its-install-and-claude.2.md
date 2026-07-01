@@ -58,5 +58,5 @@ on the plugin step. Fix the stale `plist/arthack.keeperd.plist` header comment
 - [ ] `shellcheck` + `scripts/lint-retired-name.sh` clean
 
 ## Done summary
-
+Added idempotent scripts/install.sh (flock-guarded bun install -> bun link -> cmp-gated modern-launchctl reload, no stow); rewrote README ## Install around it and fixed the stale plist header. Guard remains sole owner of the canonical claude leaves.
 ## Evidence
