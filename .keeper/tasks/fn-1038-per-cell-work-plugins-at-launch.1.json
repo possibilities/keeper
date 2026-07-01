@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T14:05:39.841000Z",
+  "depends_on": [],
+  "epic": "fn-1038-per-cell-work-plugins-at-launch",
+  "id": "fn-1038-per-cell-work-plugins-at-launch.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "per-cell work plugin generation and single-load proof",
+  "updated_at": "2026-07-01T14:05:39.841000Z"
+}

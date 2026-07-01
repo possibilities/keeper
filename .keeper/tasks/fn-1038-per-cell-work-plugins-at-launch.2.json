@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T14:05:39.841000Z",
+  "depends_on": [
+    "fn-1038-per-cell-work-plugins-at-launch.1"
+  ],
+  "epic": "fn-1038-per-cell-work-plugins-at-launch",
+  "id": "fn-1038-per-cell-work-plugins-at-launch.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "thread cell plugin-dir through launch and resume",
+  "updated_at": "2026-07-01T14:05:39.841000Z"
+}
