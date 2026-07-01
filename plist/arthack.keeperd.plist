@@ -3,8 +3,9 @@
 <!--
   LaunchAgent template for the keeper reducer daemon (keeperd).
 
-  This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
-  See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
+  This is a TEMPLATE, not an installed agent: `scripts/install.sh` symlinks it
+  into ~/Library/LaunchAgents/ and reloads it via `launchctl bootstrap`. See
+  README.md "Install".
 
   Paths are hard-coded absolute because launchd does NOT source your shell rc,
   so `bun` cannot be found by name. The values below assume:
