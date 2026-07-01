@@ -114,5 +114,5 @@ and unchanged. Pure/injected seams only — no real tmux/subprocess/git.
   new env scrubbing. `bun test` + `bun run typecheck` green.
 
 ## Done summary
-
+Made read-only posture prompting-only: ripped the per-harness tool strip and the git changed-files backstop, keeping only the READ_ONLY_DIRECTIVE prepend on agent run and pair send. Run-capture 9-key envelope unchanged; all docs rewritten to prompting-only.
 ## Evidence
