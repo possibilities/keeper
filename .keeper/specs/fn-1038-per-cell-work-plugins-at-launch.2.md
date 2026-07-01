@@ -33,5 +33,5 @@ Flip `test/autopilot-worker.test.ts:822-836` (assert `--plugin-dir` PRESENT with
 - [ ] Tree still green: `/plan:work` spawns the old agents; the wired cell loads but is unused.
 
 ## Done summary
-
+Threaded the per-cell worker --plugin-dir through the structured LaunchSpec path (exec-backend + buildWorkerCommand twin), resolving the task's {model,tier} cell via a shared workerCellPluginDir helper + cwd-independent KEEPER_ROOT seam, with compose + missing-manifest guards; folded the plan worker model onto the keeper Task projection. /plan:work still spawns the old agents (green — cell loads but is unused).
 ## Evidence
