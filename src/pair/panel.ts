@@ -931,6 +931,21 @@ export async function runPanel(argv: string[]): Promise<void> {
       process.exit(2);
     }
 
+    // The ad-hoc override flags (`--model`/`--effort`/`--role`) only apply to an
+    // ad-hoc member; without a `--preset`/`--cli` selector they would be
+    // silently dropped onto the configured-panel path. Fail loud instead.
+    if (!hasAdHoc) {
+      const orphaned = (["model", "effort", "role"] as const).find(
+        (flag) => parsed.values[flag] !== undefined,
+      );
+      if (orphaned !== undefined) {
+        process.stderr.write(
+          `pair panel start: --${orphaned} requires an ad-hoc member selector (--preset or --cli)\n`,
+        );
+        process.exit(2);
+      }
+    }
+
     let adHoc: AdHocMemberSpec | undefined;
     if (hasAdHoc) {
       // Resolve the `--role` catalog to its prompt text HERE (the CLI layer owns

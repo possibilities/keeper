@@ -592,3 +592,26 @@ test("agent panel start: --panel + --preset together → exit 2 (mutually exclus
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("mutually exclusive");
 });
+
+// An ad-hoc override flag with no --preset/--cli selector would be silently
+// dropped onto the configured path — fail loud instead (finding F1/F4).
+for (const flag of ["model", "effort", "role"] as const) {
+  test(`agent panel start: --${flag} without a selector → exit 2 (fail loud, not silent drop)`, async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "question");
+    const r = await runAgent([
+      "panel",
+      "start",
+      promptFile,
+      "--panel",
+      "default",
+      `--${flag}`,
+      "x",
+      "--dir",
+      join(dir, `scratch-orphan-${flag}`),
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain(`--${flag}`);
+    expect(r.stderr).toContain("--preset");
+  });
+}
