@@ -50,5 +50,5 @@ never append-only. Forward-facing voice only: state current behavior, no fn-ids/
 - [ ] Forward-facing voice throughout (no fn-ids/dates/history); `bun scripts/lint-claude-md.ts` green
 
 ## Done summary
-
+Updated all forward-facing docs for landed multi-repo worktree epics: README worktree section (per-repo lane groups, rollout flag replacing the v1 multi-repo caveat, per-(epic,repoDir) merge-gate, per-repo finalize keys + half-landed stuck-state, all-groups await landed), CLAUDE.md producer-only bullet in place, and the plan/hack skill landed advice qualified for the per-repo slice.
 ## Evidence
