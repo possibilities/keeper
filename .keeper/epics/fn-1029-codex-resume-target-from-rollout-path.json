@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-01T05:02:34.966000Z",
+  "depends_on_epics": [],
+  "id": "fn-1029-codex-resume-target-from-rollout-path",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Codex resume target from rollout path",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-01T05:02:34.966000Z"
+}
