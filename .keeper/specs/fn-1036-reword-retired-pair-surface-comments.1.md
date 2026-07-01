@@ -29,5 +29,5 @@ Comment-only rewording — no behavior change to the launch/panel seam.
 - [ ] typecheck + lint + full suite green, retired-name guard still passes.
 
 ## Done summary
-
+Reworded the retired pair-CLI provenance comments across launch-handle.ts, main.ts, panel.ts, and the launch-handle test to state current single-caller behavior, dropping the deleted 'pair send' verb and 'assemblePrompt' helper names.
 ## Evidence
