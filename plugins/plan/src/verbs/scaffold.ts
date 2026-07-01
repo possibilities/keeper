@@ -32,7 +32,7 @@ import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { generateSuffix, isEpicId, scanMaxEpicId, slugify } from "../ids.ts";
 import { checkEpicTreeInMemory } from "../integrity.ts";
-import { TASK_TIERS } from "../models.ts";
+import { configuredEfforts } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
@@ -415,17 +415,18 @@ export function validateScaffoldYaml(
       }
     }
 
+    const efforts = configuredEfforts();
     const tierRaw = "tier" in entry ? entry.tier : null;
     if (tierRaw === null || tierRaw === undefined) {
       tierErrors.push(
         `${prefix}: \`tier\` is required (missing) — must be one of ` +
-          `${TASK_TIERS.join(", ")}`,
+          `${efforts.join(", ")}`,
       );
     } else if (!isStr(tierRaw)) {
       errors.push(`${prefix}: \`tier\` must be a string`);
-    } else if (!(TASK_TIERS as readonly string[]).includes(tierRaw)) {
+    } else if (!efforts.includes(tierRaw)) {
       tierErrors.push(
-        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${TASK_TIERS.join(", ")}`,
+        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${efforts.join(", ")}`,
       );
     }
   }
@@ -767,19 +768,20 @@ export function runScaffold(args: ScaffoldArgs): number {
       }
     }
 
+    const efforts = configuredEfforts();
     const tierRaw = "tier" in entry ? entry.tier : null;
     if (tierRaw === null || tierRaw === undefined) {
       tierErrors.push(
         `${prefix}: \`tier\` is required (missing) — must be one of ` +
-          `${TASK_TIERS.join(", ")}`,
+          `${efforts.join(", ")}`,
       );
       taskTiers.push("");
     } else if (!isStr(tierRaw)) {
       errors.push(`${prefix}: \`tier\` must be a string`);
       taskTiers.push("");
-    } else if (!(TASK_TIERS as readonly string[]).includes(tierRaw)) {
+    } else if (!efforts.includes(tierRaw)) {
       tierErrors.push(
-        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${TASK_TIERS.join(", ")}`,
+        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${efforts.join(", ")}`,
       );
       taskTiers.push("");
     } else {

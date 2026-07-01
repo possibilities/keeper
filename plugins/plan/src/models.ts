@@ -4,6 +4,8 @@
 // spine utilities applying the same optional-field defaults Python does, so a
 // later mutating-verb wave inherits the shape rather than re-deriving it.
 
+import { subagentsMatrix } from "./subagents_config.ts";
+
 export const SCHEMA_VERSION = 1;
 
 /** Apply defaults for optional epic fields. Mirrors normalize_epic: scrub the
@@ -124,21 +126,27 @@ export function taskPriority(taskData: Record<string, unknown>): number {
   return 999;
 }
 
-/** Worker reasoning tiers — the canonical set workerAgentForTier maps. */
-export const TASK_TIERS = ["medium", "high", "xhigh", "max"] as const;
+/** The canonical worker reasoning tiers (efforts), sourced from the committed
+ * subagents.yaml matrix — the single source of truth workerAgentForTier maps.
+ * Read lazily (never at module eval) so a malformed config surfaces a typed
+ * error at the call site inside a verb, not as an import-time crash. */
+export function configuredEfforts(): readonly string[] {
+  return subagentsMatrix().efforts;
+}
 
 /** Map a task tier to the `plan` plugin's worker-agent name. Mirrors
- * worker_agent_for_tier: `plan:worker-<tier>` for a TASK_TIERS member, null
+ * worker_agent_for_tier: `plan:worker-<tier>` for a configured effort, null
  * when tier is null (records carrying no tier), and throws for a non-null
- * string outside TASK_TIERS (corrupt-on-disk guard). The null return is
- * load-bearing — /plan:work branches on it to stop cleanly. */
+ * string outside the configured efforts (corrupt-on-disk guard). The null return
+ * is load-bearing — /plan:work branches on it to stop cleanly. */
 export function workerAgentForTier(tier: string | null): string | null {
   if (tier === null) {
     return null;
   }
-  if (!(TASK_TIERS as readonly string[]).includes(tier)) {
+  const tiers = configuredEfforts();
+  if (!tiers.includes(tier)) {
     throw new Error(
-      `unknown tier ${JSON.stringify(tier)}; expected one of ${TASK_TIERS.join(", ")} or null`,
+      `unknown tier ${JSON.stringify(tier)}; expected one of ${tiers.join(", ")} or null`,
     );
   }
   return `plan:worker-${tier}`;

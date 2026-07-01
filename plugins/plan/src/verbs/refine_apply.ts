@@ -35,7 +35,7 @@ import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId, scanMaxTaskId } from "../ids.ts";
-import { TASK_TIERS } from "../models.ts";
+import { configuredEfforts } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
@@ -306,19 +306,20 @@ export function runRefineApply(args: RefineApplyArgs): number {
       }
     }
 
+    const efforts = configuredEfforts();
     const tierRaw = "tier" in entry ? entry.tier : null;
     if (tierRaw === null || tierRaw === undefined) {
       tierErrors.push(
         `${prefix}: \`tier\` is required (missing) — must be one of ` +
-          `${TASK_TIERS.join(", ")}`,
+          `${efforts.join(", ")}`,
       );
       newTiers.push("");
     } else if (!isStr(tierRaw)) {
       errors.push(`${prefix}: \`tier\` must be a string`);
       newTiers.push("");
-    } else if (!(TASK_TIERS as readonly string[]).includes(tierRaw)) {
+    } else if (!efforts.includes(tierRaw)) {
       tierErrors.push(
-        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${TASK_TIERS.join(", ")}`,
+        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${efforts.join(", ")}`,
       );
       newTiers.push("");
     } else {
