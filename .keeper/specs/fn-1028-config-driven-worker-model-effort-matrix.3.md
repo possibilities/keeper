@@ -53,5 +53,5 @@ still passes with set-tier recognition retained.
 - [ ] plan/work SKILL.md document `model` as a first-class per-task field; "Every worker runs opus" is pruned.
 
 ## Done summary
-
+model is now a required, config-validated per-task axis: normalizeTask defaults model:null (legacy tasks fold, never throw), scaffold/refine-apply emit model_invalid in the accumulate-all pass after tier_invalid, and the resolver composes plan:worker-<model>-<effort> via workerAgentFor(tier,model) with claim/resume/resolve envelopes carrying worker_model (null on either axis stops /plan:work). set-tier verb removed; deriver keeps historical recognition.
 ## Evidence
