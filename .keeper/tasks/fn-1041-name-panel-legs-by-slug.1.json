@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T15:15:02.387000Z",
+  "depends_on": [],
+  "epic": "fn-1041-name-panel-legs-by-slug",
+  "id": "fn-1041-name-panel-legs-by-slug.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "require slug and name legs",
+  "updated_at": "2026-07-01T15:15:02.387000Z"
+}
