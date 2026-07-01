@@ -52,5 +52,5 @@ expected render of `subagents.yaml` (a removed cell must fail if the stale file 
 - [ ] Naming prose in README / plan CLAUDE.md / work SKILL render-note reflects the matrix.
 
 ## Done summary
-
+Flipped worker agents to a config-driven plan:worker-<model>-<effort> matrix: renderer fans out worker.md.tmpl over subagents.yaml (model × effort), resolver composes the matrix name, SubagentStop matcher collapsed to the plan:worker- prefix, old worker-<tier> files retired, oracle fixture regenerated.
 ## Evidence
