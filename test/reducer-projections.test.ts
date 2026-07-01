@@ -6616,3 +6616,173 @@ test("from-scratch re-fold reproduces the full handoff lifecycle byte-identicall
       .all(),
   ).toEqual(jobsBefore);
 });
+
+// ---------------------------------------------------------------------------
+// SessionTelemetry — statusLine telemetry fold onto the six v100 jobs columns
+// (fn-1024). Jobs-only, latest-wins, COALESCE-merge; NEVER touches
+// state/active_since; NO phantom-row mint before SessionStart; malformed → safe
+// no-op.
+// ---------------------------------------------------------------------------
+
+/** Build a `SessionTelemetry` event's `data` blob (the wire shape main serializes). */
+function telemetryBlob(fields: {
+  model_id?: string | null;
+  model_display?: string | null;
+  effort?: string | null;
+  used_percentage?: number | null;
+  input_tokens?: number | null;
+  window_size?: number | null;
+}): string {
+  return JSON.stringify({
+    model_id: fields.model_id ?? null,
+    model_display: fields.model_display ?? null,
+    effort: fields.effort ?? null,
+    used_percentage: fields.used_percentage ?? null,
+    input_tokens: fields.input_tokens ?? null,
+    window_size: fields.window_size ?? null,
+  });
+}
+
+interface TelemetryRow {
+  state: string;
+  active_since: number | null;
+  current_model_id: string | null;
+  current_model_display: string | null;
+  current_effort: string | null;
+  context_used_percentage: number | null;
+  context_input_tokens: number | null;
+  context_window_size: number | null;
+}
+
+function telemetryRow(session_id: string): TelemetryRow | null {
+  return db
+    .query(
+      `SELECT state, active_since, current_model_id, current_model_display,
+              current_effort, context_used_percentage, context_input_tokens,
+              context_window_size
+         FROM jobs WHERE job_id = ?`,
+    )
+    .get(session_id) as TelemetryRow | null;
+}
+
+test("SessionTelemetry folds onto the six jobs columns and NEVER touches state/active_since (fn-1024)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-t1" });
+  // UserPromptSubmit flips stopped→working and stamps active_since — a live,
+  // non-terminal row with a non-NULL active_since to prove the arm leaves both.
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-t1" });
+  drainAll();
+  const before = telemetryRow("sess-t1");
+  expect(before?.active_since).not.toBeNull();
+
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t1",
+    data: telemetryBlob({
+      model_id: "claude-opus-4-8",
+      model_display: "Opus",
+      effort: "high",
+      used_percentage: 42.5,
+      input_tokens: 85000,
+      window_size: 200000,
+    }),
+  });
+  drainAll();
+  const after = telemetryRow("sess-t1");
+  expect(after).toMatchObject({
+    current_model_id: "claude-opus-4-8",
+    current_model_display: "Opus",
+    current_effort: "high",
+    context_used_percentage: 42.5,
+    context_input_tokens: 85000,
+    context_window_size: 200000,
+  });
+  // Lifecycle columns untouched — display telemetry must not perturb the job.
+  expect(after?.state).toBe(before?.state ?? "");
+  expect(after?.active_since).toBe(before?.active_since ?? null);
+});
+
+test("SessionTelemetry before SessionStart is a clean zero-row no-op — no phantom jobs row (fn-1024)", () => {
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-orphan",
+    data: telemetryBlob({ model_id: "claude-opus-4-8", effort: "high" }),
+  });
+  // The event folds (cursor advances) but matches zero rows — no UPSERT-mint.
+  expect(drainAll()).toBeGreaterThanOrEqual(1);
+  expect(telemetryRow("sess-orphan")).toBeNull();
+  expect(
+    db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number },
+  ).toEqual({ n: 0 });
+});
+
+test("a partial SessionTelemetry merges — effort-only leaves model/context intact (COALESCE) (fn-1024)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-t3" });
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t3",
+    data: telemetryBlob({
+      model_id: "claude-opus-4-8",
+      model_display: "Opus",
+      effort: "high",
+      used_percentage: 30,
+      input_tokens: 60000,
+      window_size: 200000,
+    }),
+  });
+  drainAll();
+  // A follow-up snapshot carrying ONLY effort — every other field null.
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t3",
+    data: telemetryBlob({ effort: "max" }),
+  });
+  drainAll();
+  expect(telemetryRow("sess-t3")).toMatchObject({
+    current_model_id: "claude-opus-4-8", // preserved
+    current_model_display: "Opus", // preserved
+    current_effort: "max", // updated
+    context_used_percentage: 30, // preserved
+    context_input_tokens: 60000, // preserved
+    context_window_size: 200000, // preserved
+  });
+});
+
+test("a malformed SessionTelemetry data blob never throws and leaves the columns intact (fn-1024)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-t4" });
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t4",
+    data: telemetryBlob({ model_id: "claude-opus-4-8", effort: "high" }),
+  });
+  drainAll();
+  const before = telemetryRow("sess-t4");
+  // Garbage body — the guarded parse must fold to a safe no-op, never throw.
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t4",
+    data: "{not valid json",
+  });
+  expect(() => drainAll()).not.toThrow();
+  expect(telemetryRow("sess-t4")).toEqual(before);
+});
+
+test("SessionTelemetry on a terminal (ended) row is a no-op — the columns stay NULL (fn-1024)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-t5" });
+  insertEvent({
+    hook_event: "SessionEnd",
+    session_id: "sess-t5",
+    data: JSON.stringify({ reason: "stop" }),
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "SessionTelemetry",
+    session_id: "sess-t5",
+    data: telemetryBlob({ model_id: "claude-opus-4-8", effort: "high" }),
+  });
+  drainAll();
+  const row = telemetryRow("sess-t5");
+  // The terminal guard (state NOT IN ended/killed) matched zero rows.
+  expect(row?.state).toBe("ended");
+  expect(row?.current_model_id).toBeNull();
+  expect(row?.current_effort).toBeNull();
+});

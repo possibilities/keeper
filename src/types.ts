@@ -557,6 +557,54 @@ export interface Job {
 }
 
 /**
+ * Worker→main message carrying one session's coalesced statusLine telemetry
+ * snapshot (fn-1024). The `statusline-worker` producer posts it; main flattens
+ * the six projection fields into the synthetic `SessionTelemetry` event's `data`
+ * blob via {@link import("./daemon").serializeSessionTelemetry}. `kind` (the
+ * discriminator) and `id` (the correlation key — a claude `session_id` that
+ * equals the hook-sourced `jobs.job_id`) are NOT serialized: `id` rides in
+ * `events.session_id`, mirroring the {@link UsageSnapshotMessage} pipeline. Any
+ * field the statusLine payload omits arrives as `null` and folds latest-wins
+ * without nulling the other columns (COALESCE merge in the reducer arm).
+ */
+export interface SessionTelemetryMessage {
+  kind: "session-telemetry";
+  /** Claude `session_id` — the `jobs.job_id` the fold matches on (rides in `events.session_id`). */
+  id: string;
+  /** Current model id (`model.id`, e.g. `claude-opus-4-8`); null when absent. */
+  model_id: string | null;
+  /** Current model display name (`model.display_name`, e.g. `Opus`); null when absent. */
+  model_display: string | null;
+  /** Current reasoning effort (`effort.level`: low/medium/high/xhigh/max); null when the payload omits it. */
+  effort: string | null;
+  /** Context-window fill percent, taken verbatim from `context_window.used_percentage`; null when absent. */
+  used_percentage: number | null;
+  /** Context-window input-token count (`context_window.total_input_tokens`); null when absent. */
+  input_tokens: number | null;
+  /** Context-window size in tokens (`context_window.context_window_size`); null when absent. */
+  window_size: number | null;
+}
+
+/**
+ * Decoded fold-side shape of a `SessionTelemetry` event's `data` blob (fn-1024),
+ * mirroring the {@link UsageSnapshotMessage}→payload split. Produced by
+ * {@link import("./reducer").extractSessionTelemetry} with every field a
+ * null-fallback (a guarded parse that NEVER throws — unknown/absent → null), so
+ * a malformed or partial blob folds to a safe value. The six fields land on the
+ * matching `jobs` telemetry columns; a `null` field is skipped (COALESCE) so a
+ * partial snapshot never clobbers a column a prior snapshot filled. `kind`/`id`
+ * are event metadata, not carried here.
+ */
+export interface SessionTelemetryPayload {
+  model_id: string | null;
+  model_display: string | null;
+  effort: string | null;
+  used_percentage: number | null;
+  input_tokens: number | null;
+  window_size: number | null;
+}
+
+/**
  * Singleton reducer cursor (`id = 1`). The reducer advances `last_event_id` in
  * the SAME transaction that folds each event into `jobs` — the
  * exactly-once-per-event guarantee under crash + boot drain.

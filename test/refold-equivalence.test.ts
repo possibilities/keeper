@@ -161,6 +161,7 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "InputRequest",
   "RateLimited",
   "ApiError",
+  "SessionTelemetry",
   "Killed",
   // Subagent lifecycle (PreToolUse:Agent body is read via the bridge).
   "SubagentTurn",

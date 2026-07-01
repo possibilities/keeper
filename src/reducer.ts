@@ -66,6 +66,7 @@ import type {
   MergeEscalationAttemptedPayload,
   PermissionPromptKind,
   ResolvedEpicDep,
+  SessionTelemetryPayload,
   SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
@@ -2973,6 +2974,53 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse usage snapshot blob for event id=${event.id} id=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Decode one synthetic `SessionTelemetry` event's `data` blob (fn-1024) into the
+ * six null-fallback telemetry fields, mirroring {@link extractUsageSnapshot}:
+ * guarded `JSON.parse`, every field a type-checked null-fallback, NEVER throws.
+ * A malformed / empty blob folds to `null` (the arm no-ops); an
+ * unknown-typed field folds to `null` individually so the COALESCE merge in the
+ * `SessionTelemetry` jobs arm preserves whatever a prior snapshot wrote. The
+ * `used_percentage` is taken verbatim (never recomputed) — folding a derived %
+ * would break re-fold byte-identity.
+ */
+export function extractSessionTelemetry(
+  event: Event,
+): SessionTelemetryPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<SessionTelemetryPayload>;
+    return {
+      model_id: typeof parsed.model_id === "string" ? parsed.model_id : null,
+      model_display:
+        typeof parsed.model_display === "string" ? parsed.model_display : null,
+      effort: typeof parsed.effort === "string" ? parsed.effort : null,
+      used_percentage:
+        typeof parsed.used_percentage === "number" &&
+        Number.isFinite(parsed.used_percentage)
+          ? parsed.used_percentage
+          : null,
+      input_tokens:
+        typeof parsed.input_tokens === "number" &&
+        Number.isInteger(parsed.input_tokens)
+          ? parsed.input_tokens
+          : null,
+      window_size:
+        typeof parsed.window_size === "number" &&
+        Number.isInteger(parsed.window_size)
+          ? parsed.window_size
+          : null,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse session telemetry blob for event id=${event.id} id=${event.session_id}: ${err}`,
     );
     return null;
   }
@@ -8229,6 +8277,51 @@ function projectJobsRow(db: Database, event: Event): void {
       break;
     }
 
+    case "SessionTelemetry": {
+      // fn-1024: fold one coalesced statusLine telemetry snapshot onto the six
+      // v100 `jobs` columns. Modeled on the ApiError arm's partial UPDATE + the
+      // same terminal guard, but DELIBERATELY narrower on three axes:
+      //   (1) writes ONLY the six telemetry columns + last_event_id/updated_at —
+      //       NEVER `state`/`active_since`; display data must not perturb the job
+      //       lifecycle (touching them would corrupt the timeline sort + board).
+      //   (2) NO syncIfPlanRef fan-out — the embedded jobs[] mirrors carry no
+      //       telemetry columns, so a re-fan would only churn a stale event_id.
+      //   (3) COALESCE(?, col) per column so a PARTIAL snapshot merges — an
+      //       effort-only event (or context-only before the first API call)
+      //       leaves whatever a prior snapshot wrote intact, never nulls it.
+      // A snapshot arriving before SessionStart matches zero rows (the job isn't
+      // seeded) — the correct no-op; this arm NEVER UPSERT-mints a phantom jobs
+      // row. Malformed data folds to null → skip. `used_percentage` is the raw
+      // observed value (never recomputed), so re-fold stays byte-identical.
+      const telemetry = extractSessionTelemetry(event);
+      if (telemetry == null) {
+        break;
+      }
+      db.run(
+        `UPDATE jobs SET current_model_id = COALESCE(?, current_model_id),
+                         current_model_display = COALESCE(?, current_model_display),
+                         current_effort = COALESCE(?, current_effort),
+                         context_used_percentage = COALESCE(?, context_used_percentage),
+                         context_input_tokens = COALESCE(?, context_input_tokens),
+                         context_window_size = COALESCE(?, context_window_size),
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+        [
+          telemetry.model_id,
+          telemetry.model_display,
+          telemetry.effort,
+          telemetry.used_percentage,
+          telemetry.input_tokens,
+          telemetry.window_size,
+          event.id,
+          ts,
+          jobId,
+        ],
+      );
+      break;
+    }
+
     case "InputRequest": {
       // Synthetic event minted by main from a transcript-worker `input-request`
       // message — Claude Code used a built-in interactive tool (e.g.
@@ -8813,6 +8906,13 @@ export function applyEvent(
       projectUsageRow(db, event);
     } else if (event.hook_event === "UsageDeleted") {
       retractUsageRow(db, event);
+    } else if (event.hook_event === "SessionTelemetry") {
+      // fn-1024: a jobs-ONLY telemetry fold. Route it to projectJobsRow (its
+      // `case "SessionTelemetry"` arm folds onto the row keyed by
+      // event.session_id) rather than the final `else`, so it skips the
+      // subagent-invocations sibling projection (a fast no-op for this kind, but
+      // an explicit arm documents the jobs-only scope + keeps the hot path lean).
+      projectJobsRow(db, event);
     } else if (event.hook_event === "BuildSnapshot") {
       projectBuildsRow(db, event);
     } else if (event.hook_event === "BuildDeleted") {

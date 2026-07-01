@@ -159,6 +159,7 @@ import type {
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
+import type { SessionTelemetryMessage } from "./types";
 import type { UsageScraperWorkerData } from "./usage-scraper-worker";
 import type {
   UsageMessage,
@@ -1199,6 +1200,29 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     // companion `last_usage_fold_at` freshness stamp is NOT serialized; the
     // reducer derives it from the event `ts` (never a wall-clock read in a fold).
     lift_at: msg.lift_at,
+  });
+}
+
+/**
+ * Serialize a `SessionTelemetryMessage` into the JSON string that rides in the
+ * synthetic `SessionTelemetry` event's `data` blob (fn-1024). The reducer
+ * (`extractSessionTelemetry`) decodes the same shape; every projection-meaningful
+ * field MUST appear here or the corresponding `jobs` column folds to NULL. NOT
+ * serialized: `kind` (the event-tag discriminator) and `id` (rides in
+ * `events.session_id`, not the data blob) — mirroring {@link
+ * serializeUsageSnapshot}. A `null` field stays `null` on the wire so the fold's
+ * COALESCE merge preserves whatever a prior snapshot wrote.
+ */
+export function serializeSessionTelemetry(
+  msg: SessionTelemetryMessage,
+): string {
+  return JSON.stringify({
+    model_id: msg.model_id,
+    model_display: msg.model_display,
+    effort: msg.effort,
+    used_percentage: msg.used_percentage,
+    input_tokens: msg.input_tokens,
+    window_size: msg.window_size,
   });
 }
 

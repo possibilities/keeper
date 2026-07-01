@@ -61,6 +61,7 @@ import {
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
   selectPendingMergeEscalations,
+  serializeSessionTelemetry,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
@@ -71,9 +72,10 @@ import {
 } from "../src/daemon";
 import { openDb, SCHEMA_VERSION } from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
-import { drain } from "../src/reducer";
+import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
+import type { Event } from "../src/types";
 import { worktreePathFor } from "../src/worktree-plan";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -2157,6 +2159,61 @@ test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field"
   // pipeline's generic entity-key overload.
   expect(wire.kind).toBeUndefined();
   expect(wire.id).toBeUndefined();
+});
+
+test("fn-1024: serializeSessionTelemetry forwards the six telemetry fields and drops kind/id", () => {
+  const wire = JSON.parse(
+    serializeSessionTelemetry({
+      kind: "session-telemetry",
+      id: "sess-xyz",
+      model_id: "claude-opus-4-8",
+      model_display: "Opus",
+      effort: "high",
+      used_percentage: 42.5,
+      input_tokens: 85000,
+      window_size: 200000,
+    }),
+  );
+  expect(wire).toEqual({
+    model_id: "claude-opus-4-8",
+    model_display: "Opus",
+    effort: "high",
+    used_percentage: 42.5,
+    input_tokens: 85000,
+    window_size: 200000,
+  });
+  // `kind` is the event-tag discriminator; `id` rides in events.session_id.
+  expect(wire.kind).toBeUndefined();
+  expect(wire.id).toBeUndefined();
+});
+
+test("fn-1024: serializeSessionTelemetry ↔ extractSessionTelemetry round-trips the six fields (wire-shape aligned)", () => {
+  // A full snapshot serialized by main and decoded by the reducer must recover
+  // exactly the six projection fields — the two ends must never drift on key
+  // names or the whole feature silently folds NULL.
+  const data = serializeSessionTelemetry({
+    kind: "session-telemetry",
+    id: "sess-rt",
+    model_id: "claude-sonnet-4-6",
+    model_display: "Sonnet",
+    effort: "medium",
+    used_percentage: 7.25,
+    input_tokens: 14500,
+    window_size: 1000000,
+  });
+  const decoded = extractSessionTelemetry({
+    id: 1,
+    session_id: "sess-rt",
+    data,
+  } as Event);
+  expect(decoded).toEqual({
+    model_id: "claude-sonnet-4-6",
+    model_display: "Sonnet",
+    effort: "medium",
+    used_percentage: 7.25,
+    input_tokens: 14500,
+    window_size: 1000000,
+  });
 });
 
 test("fn-651: serialized snapshot folds end-to-end — status / subscription_active / error_* are non-NULL after drain", () => {
