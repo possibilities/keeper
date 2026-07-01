@@ -378,6 +378,71 @@ describe("list", () => {
     ]);
     expect(tasks.map((t) => t.status)).toEqual(["todo", "in_progress", "done"]);
   });
+
+  test("un-capped envelope carries all paging keys, truncated:false", () => {
+    seedListCorpus(root);
+    const r = runCli(["list"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.total).toBe(2);
+    expect(env.returned).toBe(2);
+    expect(env.truncated).toBe(false);
+    expect(env.hint).toBeNull();
+    expect((env.epics as unknown[]).length).toBe(2);
+  });
+
+  test("cap counts epics: --limit truncates the top-level rows", () => {
+    for (let i = 1; i <= 4; i += 1) {
+      seedState(root, { epicId: `fn-${i}-e${i}`, nTasks: 2 });
+    }
+    const r = runCli(["list", "--limit", "2"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.total).toBe(4);
+    expect(env.returned).toBe(2);
+    expect(env.truncated).toBe(true);
+    expect(typeof env.hint).toBe("string");
+    expect(
+      (env.epics as Array<Record<string, unknown>>).map((e) => e.id),
+    ).toEqual(["fn-1-e1", "fn-2-e2"]);
+  });
+
+  test("--offset pages deterministically; past total → returned:0, truncated:false", () => {
+    for (let i = 1; i <= 4; i += 1) {
+      seedState(root, { epicId: `fn-${i}-e${i}`, nTasks: 1 });
+    }
+    const page = () =>
+      (
+        primaryEnvelope(
+          runCli(["list", "--limit", "2", "--offset", "2"], { cwd: root })
+            .output,
+        ).epics as Array<Record<string, unknown>>
+      ).map((e) => e.id);
+    expect(page()).toEqual(["fn-3-e3", "fn-4-e4"]);
+    expect(page()).toEqual(["fn-3-e3", "fn-4-e4"]); // stable across calls
+
+    const past = primaryEnvelope(
+      runCli(["list", "--offset", "99"], { cwd: root }).output,
+    );
+    expect(past.total).toBe(4);
+    expect(past.returned).toBe(0);
+    expect(past.truncated).toBe(false);
+    expect(past.hint).toBeNull();
+  });
+
+  test("bad --limit/--offset → exit 2 with a clear message", () => {
+    seedListCorpus(root);
+    for (const bad of [
+      ["list", "--limit", "0"],
+      ["list", "--limit", "-1"],
+      ["list", "--limit", "abc"],
+      ["list", "--offset", "-1"],
+    ]) {
+      const r = runCli(bad, { cwd: root });
+      expect(r.code).toBe(2);
+      expect(r.stderr).toContain("must be an integer");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -489,6 +554,70 @@ describe("tasks", () => {
     expect(r.code).toBe(0);
     expect(trailerObj(r.output)).toBeNull();
     expect("plan_invocation" in primaryEnvelope(r.output)).toBe(false);
+  });
+
+  test("un-capped envelope carries all paging keys, truncated:false", () => {
+    seedState(root, { epicId: "fn-1-cafe", nTasks: 3 });
+    const r = runCli(["tasks"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.total).toBe(3);
+    expect(env.returned).toBe(3);
+    expect(env.truncated).toBe(false);
+    expect(env.hint).toBeNull();
+  });
+
+  test("cap counts tasks: --limit truncates", () => {
+    seedState(root, { epicId: "fn-1-cafe", nTasks: 4 });
+    const r = runCli(["tasks", "--limit", "2"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.total).toBe(4);
+    expect(env.returned).toBe(2);
+    expect(env.truncated).toBe(true);
+    expect(typeof env.hint).toBe("string");
+    expect(
+      (env.tasks as Array<Record<string, unknown>>).map((t) => t.id),
+    ).toEqual(["fn-1-cafe.1", "fn-1-cafe.2"]);
+  });
+
+  test("total is the post-filter count under --status, not a directory count", () => {
+    seedState(root, { epicId: "fn-1-cafe", nTasks: 4 });
+    store(root).saveRuntime("fn-1-cafe.2", {
+      status: "in_progress",
+      assignee: "test@example.com",
+    });
+    store(root).saveRuntime("fn-1-cafe.4", {
+      status: "in_progress",
+      assignee: "test@example.com",
+    });
+    const r = runCli(["tasks", "--status", "in_progress", "--limit", "1"], {
+      cwd: root,
+    });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    // 4 task files on disk, but only 2 match --status in_progress.
+    expect(env.total).toBe(2);
+    expect(env.returned).toBe(1);
+    expect(env.truncated).toBe(true);
+  });
+
+  test("--offset past total → returned:0, truncated:false", () => {
+    seedState(root, { epicId: "fn-1-cafe", nTasks: 2 });
+    const env = primaryEnvelope(
+      runCli(["tasks", "--offset", "99"], { cwd: root }).output,
+    );
+    expect(env.total).toBe(2);
+    expect(env.returned).toBe(0);
+    expect(env.truncated).toBe(false);
+    expect(env.hint).toBeNull();
+  });
+
+  test("bad --limit → exit 2 with a clear message", () => {
+    seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
+    const r = runCli(["tasks", "--limit", "0"], { cwd: root });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("must be an integer");
   });
 });
 

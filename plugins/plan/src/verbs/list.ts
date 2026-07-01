@@ -48,7 +48,12 @@ function renderHuman(data: { epics?: ListEpic[] }): string {
   return lines.join("\n");
 }
 
-export function runList(format: OutputFormat | null): string {
+export function runList(opts: {
+  format: OutputFormat | null;
+  limit: number;
+  offset: number;
+}): string {
+  const { format, limit, offset } = opts;
   const ctx = resolveProject(format);
   const store = new LocalFileStateStore(ctx.stateDir);
 
@@ -66,13 +71,19 @@ export function runList(format: OutputFormat | null): string {
     }
   }
 
-  epics.sort((a, b) => epicSortKey(a) - epicSortKey(b));
+  epics.sort(compareEpics);
+
+  // Cap counts epics (top-level rows); page after the sort so --offset is
+  // stable. Only the paged epics load their nested tasks — total stays the
+  // full epic count.
+  const total = epics.length;
+  const pagedEpics = epics.slice(offset, offset + limit);
 
   const tasksDir = join(ctx.dataDir, "tasks");
   const tasksDirExists = existsSync(tasksDir);
   const result: ListEpic[] = [];
 
-  for (const e of epics) {
+  for (const e of pagedEpics) {
     const eid = typeof e.id === "string" ? e.id : "";
     const epicTasks: Record<string, unknown>[] = [];
     if (tasksDirExists && eid) {
@@ -90,7 +101,7 @@ export function runList(format: OutputFormat | null): string {
       }
     }
 
-    epicTasks.sort((a, b) => taskSortKey(a) - taskSortKey(b));
+    epicTasks.sort(compareTasks);
 
     result.push({
       id: eid,
@@ -105,10 +116,54 @@ export function runList(format: OutputFormat | null): string {
     });
   }
 
-  formatOutput({ success: true, epics: result }, format, (d) =>
-    renderHuman(d as { epics?: ListEpic[] }),
+  const returned = result.length;
+  const truncated = offset + returned < total;
+  const hint = truncated
+    ? "epics truncated; page with --limit/--offset or use 'keeper query epics'"
+    : null;
+
+  formatOutput(
+    { success: true, epics: result, total, returned, truncated, hint },
+    format,
+    (d) => renderHuman(d as { epics?: ListEpic[] }),
   );
   return ctx.projectPath;
+}
+
+/** Sort epics by epic number (unparseable last), id string as tiebreaker so
+ * --offset paging is stable across calls. */
+function compareEpics(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const ka = epicSortKey(a);
+  const kb = epicSortKey(b);
+  if (ka !== kb) {
+    return ka - kb;
+  }
+  return compareIds(idOf(a), idOf(b));
+}
+
+/** Sort tasks by ordinal (unparseable last), id string as tiebreaker. */
+function compareTasks(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const ka = taskSortKey(a);
+  const kb = taskSortKey(b);
+  if (ka !== kb) {
+    return ka - kb;
+  }
+  return compareIds(idOf(a), idOf(b));
+}
+
+function idOf(x: Record<string, unknown>): string {
+  return typeof x.id === "string" ? x.id : "";
+}
+
+/** Lexicographic by UTF-16 code unit — matches Array.prototype.sort default. */
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function epicSortKey(e: Record<string, unknown>): number {

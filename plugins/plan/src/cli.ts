@@ -882,7 +882,11 @@ function dispatch(parsed: ParsedArgs): number {
       // Format-free: cat owns its raw-markdown stdout + exit code.
       return runCat(readPositional(rest), readOption(rest, "--project"));
     case "list":
-      runList(format);
+      runList({
+        format,
+        limit: readIntOption(rest, "--limit", 50, 1),
+        offset: readIntOption(rest, "--offset", 0, 0),
+      });
       break;
     case "mv-repo": {
       // Self-emits (emitMutating on success / emitError on a bad <new>) and owns
@@ -903,6 +907,8 @@ function dispatch(parsed: ParsedArgs): number {
         epic: readOption(rest, "--epic"),
         status: readOption(rest, "--status"),
         format,
+        limit: readIntOption(rest, "--limit", 50, 1),
+        offset: readIntOption(rest, "--offset", 0, 0),
       });
       break;
     case "resolve-task":
@@ -985,6 +991,29 @@ function readOption(rest: string[], name: string): string | null {
 /** True iff the boolean flag `name` is present in the remaining args. */
 function readFlag(rest: string[], name: string): boolean {
   return rest.includes(name);
+}
+
+/** Parse an integer paging option, defaulting when absent. A malformed value
+ * (non-numeric, fractional, or below `min`) is CLI misuse: write a clear
+ * message to stderr and exit 2 (mirrors `keeper board --timeout`). */
+function readIntOption(
+  rest: string[],
+  name: string,
+  def: number,
+  min: number,
+): number {
+  const raw = readOption(rest, name);
+  if (raw === null) {
+    return def;
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    process.stderr.write(
+      `keeper plan: ${name} must be an integer >= ${min} (got '${raw}')\n`,
+    );
+    process.exit(2);
+  }
+  return n;
 }
 
 /** The first positional (non-`--`-prefixed) arg, or "" when absent. A value

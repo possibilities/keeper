@@ -30,8 +30,10 @@ export function runTasks(opts: {
   epic: string | null;
   status: string | null;
   format: OutputFormat | null;
+  limit: number;
+  offset: number;
 }): string {
-  const { epic: epicId, status: statusFilter, format } = opts;
+  const { epic: epicId, status: statusFilter, format, limit, offset } = opts;
   const ctx = resolveProject(format);
   const store = new LocalFileStateStore(ctx.stateDir);
 
@@ -57,20 +59,38 @@ export function runTasks(opts: {
   }
 
   allTasks.sort((a, b) => {
-    const [ea, ta] = parseId((a.id as string | undefined) ?? "");
-    const [eb, tb] = parseId((b.id as string | undefined) ?? "");
+    const ida = (a.id as string | undefined) ?? "";
+    const idb = (b.id as string | undefined) ?? "";
+    const [ea, ta] = parseId(ida);
+    const [eb, tb] = parseId(idb);
     const ka0 = ea ?? 999;
     const kb0 = eb ?? 999;
     if (ka0 !== kb0) {
       return ka0 - kb0;
     }
-    return (ta ?? 999) - (tb ?? 999);
+    const ta0 = ta ?? 999;
+    const tb0 = tb ?? 999;
+    if (ta0 !== tb0) {
+      return ta0 - tb0;
+    }
+    // id-string tiebreaker so --offset paging is stable across calls.
+    return ida < idb ? -1 : ida > idb ? 1 : 0;
   });
+
+  // Cap counts tasks; total is the post-filter count (never a raw directory
+  // count — status is only known after the runtime merge). Page after the sort.
+  const total = allTasks.length;
+  const pageTasks = allTasks.slice(offset, offset + limit);
+  const returned = pageTasks.length;
+  const truncated = offset + returned < total;
+  const hint = truncated
+    ? "tasks truncated; narrow with --epic/--status or page with --limit/--offset"
+    : null;
 
   formatOutput(
     {
       success: true,
-      tasks: allTasks.map((t) => ({
+      tasks: pageTasks.map((t) => ({
         id: t.id ?? null,
         epic: t.epic ?? null,
         title: t.title ?? null,
@@ -78,6 +98,10 @@ export function runTasks(opts: {
         priority: t.priority ?? null,
         assignee: t.assignee ?? null,
       })),
+      total,
+      returned,
+      truncated,
+      hint,
     },
     format,
     (d) => renderHuman(d as Record<string, unknown>),
