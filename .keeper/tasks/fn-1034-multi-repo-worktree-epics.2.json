@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "per-repo finalize failure keys",
-  "updated_at": "2026-07-01T06:05:59.300000Z"
+  "updated_at": "2026-07-01T09:10:02.696000Z",
+  "worker_done_at": "2026-07-01T09:10:02.696000Z"
 }

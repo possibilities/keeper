@@ -57,5 +57,5 @@ finalize block on repo B. Assert `parseDispatchKey` accepts the new key.
 - [ ] Tests green
 
 ## Done summary
-
+Per-repo worktree-finalize failures now key on close::worktree-finalize:<epic>-<repoHash> (reusing worktreePathFor's dir-hash) so N per-repo finalizes never collide on close::<epic> or a recover row, plus a producer level-clear that self-clears a repo's row once it finalizes clean. Provision fan-in conflicts stay epic-keyed so the merge-escalation sweep is unchanged.
 ## Evidence
