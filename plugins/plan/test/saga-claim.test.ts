@@ -81,7 +81,7 @@ describe("claim happy path + brief schema", () => {
     expect(payload.target_repo).toBeTruthy();
     expect(payload.primary_repo).toBeTruthy();
     expect("tier" in payload).toBe(true);
-    expect(payload.worker_agent).toBe("plan:worker-medium");
+    expect(payload.worker_agent).toBe("plan:worker-opus-medium");
     const ts = payload.task_state as Record<string, unknown>;
     expect(ts.status).toBe("in_progress");
     expect(ts.assignee).toBe("alice@example.com");

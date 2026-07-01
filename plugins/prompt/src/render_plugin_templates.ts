@@ -49,6 +49,10 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import yaml from "js-yaml";
+import {
+  loadSubagentsMatrixFromDisk,
+  type SubagentsMatrix,
+} from "../../plan/src/subagents_config.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { renderTemplate, sourceRelpath } from "./render_engine.ts";
 
@@ -118,6 +122,18 @@ function sourceVariants(templatePath: string): string[] {
     return [];
   }
   return variants.map((v) => String(v));
+}
+
+/** The plugin's committed {model × effort} matrix config, or null when the
+ * plugin ships no `subagents.yaml`. Read once per renderAgents pass; a listed
+ * agent template fans out over the sorted cartesian product instead of the 1-D
+ * `variants:` path. A malformed config throws (fail-loud build). */
+function pluginSubagentsMatrix(pluginDir: string): SubagentsMatrix | null {
+  const configPath = join(pluginDir, "subagents.yaml");
+  if (!isFile(configPath)) {
+    return null;
+  }
+  return loadSubagentsMatrixFromDisk(configPath);
 }
 
 /** The sidecar companion path for a rendered output. */
@@ -493,12 +509,16 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
   const agentsDir = join(pluginDir, "agents");
   mkdirSync(agentsDir, { recursive: true });
 
+  const matrix = pluginSubagentsMatrix(pluginDir);
+
   let hadFailures = false;
   for (const tmpl of sortedTemplates(templatesDir)) {
     const stem = baseName(tmpl).slice(0, -TMPL_SUFFIX.length);
     const sourceRel = sourceRelpath(resolve(tmpl), resolve(projectRoot));
     const baseOut = join(agentsDir, `${stem}.md`);
     const variants = sourceVariants(tmpl);
+    const tmplRel = relPosix(resolve(pluginDir), resolve(tmpl));
+    const matrixCell = matrix?.subagents.includes(tmplRel) ? matrix : null;
 
     const emit = (rendered: string, defaultOut: string): void => {
       let resolved: AgentOutput;
@@ -538,7 +558,29 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
       }
     };
 
-    if (variants.length > 0) {
+    if (matrixCell !== null) {
+      // 2-D {model × effort} fan-out: one generated agent per cell, both axes
+      // sorted before the cartesian product for stable output ordering.
+      const models = [...matrixCell.models].sort();
+      const efforts = [...matrixCell.efforts].sort();
+      for (const model of models) {
+        for (const effort of efforts) {
+          const defaultOut = join(agentsDir, `${stem}-${model}-${effort}.md`);
+          const [rendered, failed] = renderOne(tmpl, {
+            current_model: model,
+            current_effort: effort,
+          });
+          if (failed) {
+            hadFailures = true;
+            process.stderr.write(
+              `✗ Failed to render agents/${baseName(defaultOut)}\n`,
+            );
+            continue;
+          }
+          emit(rendered, defaultOut);
+        }
+      }
+    } else if (variants.length > 0) {
       for (const variant of variants) {
         const defaultOut = variant
           ? join(agentsDir, `${stem}-${variant}.md`)

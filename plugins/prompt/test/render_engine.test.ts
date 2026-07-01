@@ -5,8 +5,8 @@
 // frontmatter strip + print()-newline the render-plugin-templates run module
 // applies, and asserts byte-equality against the task-1 oracle goldens
 // (render-plugin-templates.json). This pins the keystone risk — the shell-filter
-// output (live knowctl/date), the `current_variant` binding, and the Jinja
-// keep_trailing_newline whitespace shape all land identically. The mechanics half
+// output (live knowctl/date), the `current_model`/`current_effort` matrix binding,
+// and the Jinja keep_trailing_newline whitespace shape all land identically. The mechanics half
 // asserts the StrictUndefined raise and the failing-shell fallback directly so a
 // regression there names itself rather than surfacing as a byte diff.
 
@@ -66,23 +66,23 @@ describe("render engine — byte-identical vs the promptctl oracle goldens", () 
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_variant: "medium" },
-      golden: "agents/worker-medium.md",
+      vars: { current_model: "opus", current_effort: "medium" },
+      golden: "agents/worker-opus-medium.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_variant: "high" },
-      golden: "agents/worker-high.md",
+      vars: { current_model: "opus", current_effort: "high" },
+      golden: "agents/worker-opus-high.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_variant: "xhigh" },
-      golden: "agents/worker-xhigh.md",
+      vars: { current_model: "opus", current_effort: "xhigh" },
+      golden: "agents/worker-opus-xhigh.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_variant: "max" },
-      golden: "agents/worker-max.md",
+      vars: { current_model: "opus", current_effort: "max" },
+      golden: "agents/worker-opus-max.md",
     },
     {
       template: join(PLAN_TEMPLATES, "skills", "work.md.tmpl"),

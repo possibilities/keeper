@@ -13,6 +13,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import { runCli } from "./harness.ts";
 
@@ -384,19 +385,20 @@ describe("work.md.tmpl agentId capture regex", () => {
   });
 });
 
-const TIERS = ["medium", "high", "xhigh", "max"] as const;
-
-describe("tier-routed worker agents in the plan plugin", () => {
-  for (const tier of TIERS) {
-    test(`agents/worker-${tier}.md is rendered with the tier frontmatter`, () => {
-      const path = join(REPO, "agents", `worker-${tier}.md`);
-      expect(existsSync(path)).toBe(true);
-      const fm = parseFrontmatter(frontmatterBlock(path));
-      expect(fm.name).toBe(`worker-${tier}`);
-      expect(fm.model).toBe("opus");
-      expect(fm.effort).toBe(tier);
-      expect(fm.maxTurns).toBe("300");
-    });
+describe("generated worker agents in the plan plugin", () => {
+  const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+  for (const model of matrix.models) {
+    for (const effort of matrix.efforts) {
+      test(`agents/worker-${model}-${effort}.md is rendered with the {model × effort} frontmatter`, () => {
+        const path = join(REPO, "agents", `worker-${model}-${effort}.md`);
+        expect(existsSync(path)).toBe(true);
+        const fm = parseFrontmatter(frontmatterBlock(path));
+        expect(fm.name).toBe(`worker-${model}-${effort}`);
+        expect(fm.model).toBe(model);
+        expect(fm.effort).toBe(effort);
+        expect(fm.maxTurns).toBe("300");
+      });
+    }
   }
 });
 
@@ -409,7 +411,7 @@ describe("work.md.tmpl spawn shape", () => {
     expect(spawnBlocks.length).toBeGreaterThanOrEqual(2);
     expect(tmpl).not.toContain("work:worker");
     expect(tmpl).not.toContain("plugin-dir");
-    expect(tmpl).toContain("plan:worker-<tier>");
+    expect(tmpl).toContain("plan:worker-<model>-<effort>");
     expect(tmpl).not.toContain('subagent_type=f"plan:worker-{tier}"');
     expect(tmpl).not.toContain("keeper plan task set-tier");
     for (const block of spawnBlocks) {

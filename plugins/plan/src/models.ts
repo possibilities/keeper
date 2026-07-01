@@ -134,20 +134,22 @@ export function configuredEfforts(): readonly string[] {
   return subagentsMatrix().efforts;
 }
 
-/** Map a task tier to the `plan` plugin's worker-agent name. Mirrors
- * worker_agent_for_tier: `plan:worker-<tier>` for a configured effort, null
- * when tier is null (records carrying no tier), and throws for a non-null
- * string outside the configured efforts (corrupt-on-disk guard). The null return
- * is load-bearing — /plan:work branches on it to stop cleanly. */
+/** Map a task tier (effort) to the `plan` plugin's worker-agent name:
+ * `plan:worker-<model>-<effort>` for a configured effort, null when tier is
+ * null (records carrying no tier), and throws for a non-null string outside the
+ * configured efforts (corrupt-on-disk guard). Model is the sole configured
+ * `models:` entry — the one axis of real variation until a task carries its own
+ * model. The null return is load-bearing — /plan:work branches on it to stop
+ * cleanly. */
 export function workerAgentForTier(tier: string | null): string | null {
   if (tier === null) {
     return null;
   }
-  const tiers = configuredEfforts();
-  if (!tiers.includes(tier)) {
+  const matrix = subagentsMatrix();
+  if (!matrix.efforts.includes(tier)) {
     throw new Error(
-      `unknown tier ${JSON.stringify(tier)}; expected one of ${tiers.join(", ")} or null`,
+      `unknown tier ${JSON.stringify(tier)}; expected one of ${matrix.efforts.join(", ")} or null`,
     );
   }
-  return `plan:worker-${tier}`;
+  return `plan:worker-${matrix.models[0]}-${tier}`;
 }

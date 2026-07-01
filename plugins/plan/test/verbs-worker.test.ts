@@ -82,7 +82,7 @@ describe("claim success", () => {
     expect(payload.target_repo).toBe(root);
     expect(payload.primary_repo).toBe(root);
     expect(payload.tier).toBe("medium");
-    expect(payload.worker_agent).toBe("plan:worker-medium");
+    expect(payload.worker_agent).toBe("plan:worker-opus-medium");
     const ts = payload.task_state as Record<string, unknown>;
     expect(ts.status).toBe("in_progress");
     expect(ts.outcome).toBe("CLAIMED");

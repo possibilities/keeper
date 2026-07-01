@@ -288,7 +288,7 @@ describe("worker resume", () => {
       expect(k in payload).toBe(true);
     }
     expect(payload.tier).toBe("high");
-    expect(payload.worker_agent).toBe("plan:worker-high");
+    expect(payload.worker_agent).toBe("plan:worker-opus-high");
   });
 
   test("null persisted tier emits raw None note + explicit JSON null", () => {

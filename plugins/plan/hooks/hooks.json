@@ -37,7 +37,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "plan:worker-medium|plan:worker-high|plan:worker-xhigh|plan:worker-max",
+        "matcher": "plan:worker-",
         "hooks": [
           {
             "type": "command",

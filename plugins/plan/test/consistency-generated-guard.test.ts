@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -23,6 +24,7 @@ import { join } from "node:path";
 
 import { readMarker } from "../plugin/hooks/lib.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
+import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
@@ -94,13 +96,11 @@ describe("hooks.json wiring", () => {
     execFormCmd(bashEntry as Record<string, unknown>, "commit-guard.ts");
   });
 
-  test("registers the subagent-stop-guard for the four worker tiers", () => {
+  test("registers the subagent-stop-guard under the plan:worker- prefix matcher", () => {
     const hooks = readHooks();
     const entry = hooks.SubagentStop[0] as Record<string, unknown>;
-    const matcher = entry.matcher as string;
-    for (const tier of ["medium", "high", "xhigh", "max"]) {
-      expect(matcher).toContain(`plan:worker-${tier}`);
-    }
+    // A single prefix matches every generated worker cell (plan:worker-<model>-<effort>).
+    expect(entry.matcher).toBe("plan:worker-");
     execFormCmd(entry, "subagent-stop-guard.ts");
   });
 
@@ -109,6 +109,30 @@ describe("hooks.json wiring", () => {
     const entry = hooks.Stop[0] as Record<string, unknown>;
     expect("matcher" in entry).toBe(false);
     execFormCmd(entry, "stop-guard.ts");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worker agent set ↔ subagents.yaml matrix (both directions)
+// ---------------------------------------------------------------------------
+
+describe("generated worker agents match the subagents.yaml matrix", () => {
+  test("on-disk worker-*.md set equals the {model × effort} cartesian product", () => {
+    const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+    const expected = new Set<string>();
+    for (const model of matrix.models) {
+      for (const effort of matrix.efforts) {
+        expected.add(`worker-${model}-${effort}.md`);
+      }
+    }
+    const actual = new Set(
+      readdirSync(join(REPO, "agents")).filter(
+        (n) => n.startsWith("worker-") && n.endsWith(".md"),
+      ),
+    );
+    // Both directions: a missing cell fails, and a stale file (a removed cell
+    // whose generated `.md` lingers) fails too — agents carry no orphan prune.
+    expect([...actual].sort()).toEqual([...expected].sort());
   });
 });
 

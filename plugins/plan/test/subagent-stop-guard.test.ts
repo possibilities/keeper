@@ -278,7 +278,7 @@ function stopPayload(extra: Record<string, unknown> = {}): unknown {
     hook_event_name: "SubagentStop",
     session_id: SESSION,
     agent_id: "agent-7",
-    agent_type: "plan:worker-medium",
+    agent_type: "plan:worker-opus-medium",
     stop_hook_active: false,
     ...extra,
   };

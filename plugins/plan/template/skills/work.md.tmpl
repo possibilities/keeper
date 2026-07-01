@@ -15,7 +15,7 @@ disable-model-invocation: true
 
 Drive a single plan task to completion. The task runs inside a fresh `worker` subagent so the main context stays lean; the main context only orchestrates (claim → spawn worker → verify done).
 
-The tier (reasoning effort) was already chosen at planning time and is persisted on the task. `claim` maps it to a `worker_agent` name (`plan:worker-<tier>`) carried on the claim envelope; the four worker agents live in the always-loaded `plan` plugin's `agents/` directory. This skill spawns the emitted `worker_agent` verbatim — it never picks or maps the tier itself.
+The tier (reasoning effort) was already chosen at planning time and is persisted on the task. `claim` maps it to a `worker_agent` name (`plan:worker-<model>-<effort>`) carried on the claim envelope; the generated worker agents (one per `{model × effort}` cell) live in the always-loaded `plan` plugin's `agents/` directory. This skill spawns the emitted `worker_agent` verbatim — it never picks or maps the tier itself.
 
 ## When to invoke
 
@@ -43,7 +43,7 @@ keeper plan claim <task_id>
 - `target_repo` — absolute path the worker cds into for code work (may equal `primary_repo` for single-repo tasks).
 - `primary_repo` — absolute path of the plan state repo (where the `.keeper/` commit lands).
 - `tier` — persisted tier (`medium | high | xhigh | max`). This skill quotes it back for transparency but never picks it.
-- `worker_agent` — the subagent name `claim` derived from the tier (`plan:worker-<tier>`), or `null` for a legacy null-tier task. Phase 2a spawns this verbatim; a `null` value is a hard stop (see Phase 2a).
+- `worker_agent` — the subagent name `claim` derived from the tier (`plan:worker-<model>-<effort>`), or `null` for a legacy null-tier task. Phase 2a spawns this verbatim; a `null` value is a hard stop (see Phase 2a).
 - `task_state`, `epic_state` — runtime + epic metadata (status, title).
 - `brief_ref` — absolute path to the worker's brief JSON (`<primary_repo>/.keeper/state/briefs/<task_id>.json`). `claim` wrote the task spec and epic spec into this file out-of-band; you pass the handle to the worker, which reads it itself. This skill never opens the brief — it is content-blind.
 
@@ -57,11 +57,11 @@ The task is already claimed and the briefing is in working memory (Phase 1). The
 
 ### 2a. Spawn worker subagent
 
-Use the Task tool to invoke the worker subagent named by the claim envelope's `worker_agent` field with a minimal config-only prompt. The worker's shared body lives in `template/agents/worker.md.tmpl` (rendered into `agents/worker-<tier>.md`, one per tier, all loaded by the always-on `plan` plugin and addressable `plan:worker-<tier>`). Do **not** paraphrase those phases here.
+Use the Task tool to invoke the worker subagent named by the claim envelope's `worker_agent` field with a minimal config-only prompt. The worker's shared body lives in `template/agents/worker.md.tmpl` (rendered into `agents/worker-<model>-<effort>.md`, one per `{model × effort}` cell, all loaded by the always-on `plan` plugin and addressable `plan:worker-<model>-<effort>`). Do **not** paraphrase those phases here.
 
 **Null-tier stop.** If the envelope's `worker_agent` is `null` (a legacy null-tier task that never carried a tier), do **not** spawn — surface the typed stop *"tier unset — remediate via /plan:plan <epic_id> refine"* verbatim and stop. The skill never invents a tier or spawns a `plan:worker-None` agent.
 
-**Tier is already chosen** (see the intro) — this skill never picks or persists one. `claim` already mapped the persisted tier to `worker_agent` (`plan:worker-<tier>`); the target agent file owns the model + `effort:`. Spawn the emitted `worker_agent` verbatim, no `model=`.
+**Tier is already chosen** (see the intro) — this skill never picks or persists one. `claim` already mapped the persisted tier to `worker_agent` (`plan:worker-<model>-<effort>`); the target agent file owns the model + `effort:`. Spawn the emitted `worker_agent` verbatim, no `model=`.
 
 **Content-blind spawn.** This skill never inlines spec prose into the worker prompt — `claim` already wrote the task spec and epic spec into the brief JSON at `brief_ref`. You pass the worker only config lines, including `BRIEF_REF`; the worker reads the brief itself in its Phase 1.
 
@@ -99,7 +99,7 @@ Task(
 )
 ```
 
-`subagent_type` is the claim envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so the emitted name resolves directly. Do **not** pass `model=` on the spawn — the target agent file owns the model and effort. The worker returns a capped summary (5 template lines plus at most 3 note lines: what was implemented, files changed, tests run). Don't re-read files the worker already touched — trust the return value.
+`subagent_type` is the claim envelope's `worker_agent` string verbatim (`plan:worker-<model>-<effort>`) — the always-loaded `plan` plugin owns every generated worker agent, so the emitted name resolves directly. Do **not** pass `model=` on the spawn — the target agent file owns the model and effort. The worker returns a capped summary (5 template lines plus at most 3 note lines: what was implemented, files changed, tests run). Don't re-read files the worker already touched — trust the return value.
 
 **Capture `worker_agent_id` from the Task tool result.** The result string ends with `…agentId: <hex> (use SendMessage with to: '<id>' to continue this agent)`. Extract with the regex `agentId:\s*([a-f0-9]{10,})` (the agent_id has no newline before it — `re.search`, not `re.match`). Pin the captured hex string in working memory as `worker_agent_id` for Phase 2b's warm-resume path. If the regex doesn't match (very rare), set `worker_agent_id = None` and continue — Phase 2b's cold path handles missing-id case.
 
@@ -147,7 +147,7 @@ keeper plan reconcile <task_id>
 
 **Cold path (cross-session, or warm SendMessage error):**
 
-1. Shell `keeper plan worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `worker_agent` (the `plan:worker-<tier>` subagent name to spawn, or `null` for a legacy null-tier task), `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below. If `worker_agent` is `null`, surface the typed stop *"tier unset — remediate via /plan:plan <epic_id> refine"* and stop instead of spawning.
+1. Shell `keeper plan worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `worker_agent` (the `plan:worker-<model>-<effort>` subagent name to spawn, or `null` for a legacy null-tier task), `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below. If `worker_agent` is `null`, surface the typed stop *"tier unset — remediate via /plan:plan <epic_id> refine"* and stop instead of spawning.
 
 2. Spawn ONE fresh worker (substitute the envelope's `worker_agent` for `<worker_agent>`) with a config-only prompt carrying `BRIEF_REF` and the resume `nudge`:
 
@@ -159,7 +159,7 @@ keeper plan reconcile <task_id>
    )
    ```
 
-   `subagent_type` is the resume envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so it resolves directly. No `model=` kwarg — the agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `keeper plan done` or continue from implementation).
+   `subagent_type` is the resume envelope's `worker_agent` string verbatim (`plan:worker-<model>-<effort>`) — the always-loaded `plan` plugin owns every generated worker agent, so it resolves directly. No `model=` kwarg — the agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `keeper plan done` or continue from implementation).
 
 3. Re-run `keeper plan reconcile <task_id>` after the spawn returns and re-switch:
    - `done` → continue to Phase 3.
@@ -206,6 +206,6 @@ Include the per-task commit sha from the worker return and `epic_progress.done` 
 - **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the failure surfaces verbatim and the resume path picks it up.
 - **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — it STAMPS the block on the board (`keeper plan block --reason "<CATEGORY>: …"` if not already blocked) and surfaces-and-stops (Phase 2c). The daemon owns escalation to the planner; this orchestrator never SENDS on the bus to escalate, wait, or self-resume a semantic block. It does stay reachable post-block and, when the planner RESUMES it at `work::<task>` over the bus, re-enters the Phase 2b warm-resume after a `keeper plan reconcile <task>` confirms the unblock (PRIMARY); autopilot cold-re-dispatch is the fallback for a dead orchestrator session. The `in_progress_committed` / `in_progress_uncommitted` / `state_uncommitted` verdicts *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b resume machinery). A `tooling_error` verdict surfaces-and-stops (fail closed — never resume against an unreliable verdict).
 - **Delivery cleanliness belongs to the worker, not the orchestrator** — the worker commits its own session files before returning; the orchestrator never inspects, classifies, or commits dirty files, never runs `keeper plan done`, and never commits source on the worker's behalf.
-- **Tier routing is owned by the planner + `claim`, not this skill** — spawn the envelope's `worker_agent` (`plan:worker-<tier>`) verbatim, no `model=`, no tier-read. A `null` `worker_agent` is a typed stop, never a spawn.
+- **Tier routing is owned by the planner + `claim`, not this skill** — spawn the envelope's `worker_agent` (`plan:worker-<model>-<effort>`) verbatim, no `model=`, no tier-read. A `null` `worker_agent` is a typed stop, never a spawn.
 - **Never reads or writes** outside plan state + project code. Never use `TodoWrite` — the plan tooling tracks all tasks.
 

@@ -19,9 +19,10 @@ node_modules/
 # keeper prompt render-plugin-templates; carries _promptctl_path marker).
 agents/practice-scout.md
 
-# Generated per-tier worker agents (rendered from template/agents/worker.md.tmpl
-# into agents/worker-<tier>.md, one per `variants:` entry; addressable
-# plan:worker-<tier> by the always-loaded plan plugin).
+# Generated {model × effort} worker agents (rendered from
+# template/agents/worker.md.tmpl into agents/worker-<model>-<effort>.md, one per
+# cell of the subagents.yaml matrix; addressable plan:worker-<model>-<effort> by
+# the always-loaded plan plugin).
 agents/worker-*.md
 
 # Generated skills (rendered from template/skills/*.md.tmpl;

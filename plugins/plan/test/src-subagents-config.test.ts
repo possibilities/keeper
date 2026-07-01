@@ -57,8 +57,9 @@ describe("subagents matrix loader", () => {
   test("configuredEfforts is sourced from the config; tier validation accepts exactly it", () => {
     const efforts = configuredEfforts();
     expect(efforts).toEqual(["medium", "high", "xhigh", "max"]);
+    const model = subagentsMatrix().models[0];
     for (const effort of efforts) {
-      expect(workerAgentForTier(effort)).toBe(`plan:worker-${effort}`);
+      expect(workerAgentForTier(effort)).toBe(`plan:worker-${model}-${effort}`);
     }
     expect(workerAgentForTier(null)).toBeNull();
     expect(() => workerAgentForTier("turbo")).toThrow();

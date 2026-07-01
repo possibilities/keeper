@@ -1,12 +1,11 @@
 ---
-name: worker-{{ current_variant }}
+name: worker-{{ current_model }}-{{ current_effort }}
 description: Internal task-execution worker — spawned programmatically by `/plan:work` via the emitted `worker_agent` name, never invoked from user requests. Do not invoke directly — use `/plan:work` instead.
-model: opus
-effort: "{{ current_variant }}"
+model: {{ current_model }}
+effort: "{{ current_effort }}"
 disallowedTools: Task
 maxTurns: 300
 color: "#3B82F6"
-variants: [medium, high, xhigh, max]
 ---
 
 # Task Implementation Worker

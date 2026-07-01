@@ -190,7 +190,7 @@ describe("resolve-task routing envelope", () => {
     expect(obj.task_id).toBe(taskId);
     expect(obj.epic_id).toBe(epicId);
     expect(obj.tier).toBe("high");
-    expect(obj.worker_agent).toBe("plan:worker-high");
+    expect(obj.worker_agent).toBe("plan:worker-opus-high");
     expect(["todo", "in_progress"]).toContain(obj.status as string);
     expect((obj.target_repo as string).startsWith("/")).toBe(true);
     expect((obj.primary_repo as string).startsWith("/")).toBe(true);

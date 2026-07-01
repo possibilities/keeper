@@ -56,7 +56,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-high.md",
+    "target_relative": "plugins/plan/agents/worker-opus-high.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -70,7 +70,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-high.md",
+    "target_relative": "plugins/plan/agents/worker-opus-high.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -84,7 +84,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-high.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-high.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -98,7 +98,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-high.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-high.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -112,7 +112,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-max.md",
+    "target_relative": "plugins/plan/agents/worker-opus-max.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -126,7 +126,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-max.md",
+    "target_relative": "plugins/plan/agents/worker-opus-max.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -140,7 +140,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-max.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-max.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -154,7 +154,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-max.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-max.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -168,7 +168,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-medium.md",
+    "target_relative": "plugins/plan/agents/worker-opus-medium.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -182,7 +182,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-medium.md",
+    "target_relative": "plugins/plan/agents/worker-opus-medium.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -196,7 +196,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-medium.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-medium.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -210,7 +210,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-medium.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-medium.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -224,7 +224,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-xhigh.md",
+    "target_relative": "plugins/plan/agents/worker-opus-xhigh.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -238,7 +238,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-xhigh.md",
+    "target_relative": "plugins/plan/agents/worker-opus-xhigh.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -252,7 +252,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-xhigh.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-xhigh.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -266,7 +266,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/worker-xhigh.md.managed-file-dont-edit",
+    "target_relative": "plugins/plan/agents/worker-opus-xhigh.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,

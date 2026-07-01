@@ -44,8 +44,8 @@ describe("gate helpers", () => {
   });
 
   test("workerAgentForTier: member -> agent, null -> null, bad -> throw", () => {
-    expect(workerAgentForTier("medium")).toBe("plan:worker-medium");
-    expect(workerAgentForTier("xhigh")).toBe("plan:worker-xhigh");
+    expect(workerAgentForTier("medium")).toBe("plan:worker-opus-medium");
+    expect(workerAgentForTier("xhigh")).toBe("plan:worker-opus-xhigh");
     expect(workerAgentForTier(null)).toBeNull();
     expect(() => workerAgentForTier("turbo")).toThrow();
   });
