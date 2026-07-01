@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-01T07:40:02.915000Z",
+  "created_by_close_of": "fn-1032-retire-the-pair-cli-onto-agent",
+  "depends_on_epics": [
+    "fn-1032-retire-the-pair-cli-onto-agent"
+  ],
+  "id": "fn-1036-reword-retired-pair-surface-comments",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Reword retired pair-surface comments",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-01T07:40:02.915000Z"
+}

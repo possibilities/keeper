@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T07:40:02.915000Z",
+  "depends_on": [],
+  "epic": "fn-1036-reword-retired-pair-surface-comments",
+  "id": "fn-1036-reword-retired-pair-surface-comments.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Reword stale pair-surface comments",
+  "updated_at": "2026-07-01T07:40:02.915000Z"
+}
