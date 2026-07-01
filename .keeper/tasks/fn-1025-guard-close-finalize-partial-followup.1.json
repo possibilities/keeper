@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T01:29:12.019000Z",
+  "depends_on": [],
+  "epic": "fn-1025-guard-close-finalize-partial-followup",
+  "id": "fn-1025-guard-close-finalize-partial-followup.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Assert partial-followup null ghost",
+  "updated_at": "2026-07-01T01:29:12.019000Z"
+}
