@@ -56,5 +56,5 @@ through this identical machinery (lock + reconcile + boot-epoch + identity).
 - [ ] Reconcile matrix + lock/identity tests pass via injected deps; suite green
 
 ## Done summary
-
+panelStart is now idempotent-by-slug: under a per-slug FileLock it reconciles each leg (reuse terminal, leave running, relaunch no-result/rebooted to a new-generation result path), re-stamping boot-epoch + bumping generation on relaunch, with a prompt/member-set identity guard refusing colliding-slug merges (exit 2).
 ## Evidence

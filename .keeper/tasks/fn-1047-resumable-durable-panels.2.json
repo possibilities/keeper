@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "idempotent-by-slug resume reconcile",
-  "updated_at": "2026-07-01T20:50:34.366000Z"
+  "updated_at": "2026-07-01T21:28:10.877000Z",
+  "worker_done_at": "2026-07-01T21:28:10.877000Z"
 }
