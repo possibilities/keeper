@@ -129,6 +129,7 @@ import {
   baseBranchFor,
   CLOSE_SINK_ID,
   deriveWorktreePlan,
+  repoDirHash,
   type WorktreeAssignment,
   WorktreeCycleError,
   type WorktreePlan,
@@ -460,6 +461,32 @@ export function recoverFailuresToClear(
 }
 
 /**
+ * The id prefix every {@link worktreeFinalizeDispatchId} carries. The producer's
+ * finalize level-clear scopes the OPEN finalize-failure set on it (distinct from the
+ * `worktree-recover:` path-tied slug and the bare `close::<epic>` a provision fan-in
+ * conflict still uses), so a clear never dismisses a recover or escalation row.
+ */
+export const WORKTREE_FINALIZE_ID_PREFIX = "worktree-finalize:";
+
+/**
+ * The `dispatch_failures` id a PER-REPO worktree-finalize failure keys on —
+ * `worktree-finalize:<epicId>-<repoHash>` (composed
+ * `close::worktree-finalize:<epicId>-<repoHash>`). The N per-repo finalizes of ONE
+ * clustered multi-repo epic each land on a DISTINCT row instead of colliding on the
+ * single `close::<epicId>` key, and never collide with a recover row. Slugs nothing
+ * — the epic id is already dispatch-safe and {@link repoDirHash} is base36 — so the
+ * composite passes `parseDispatchKey` (verb `close`, single `::`), exactly like
+ * {@link worktreeRecoverDispatchId}. `repoHash` reuses the lane-path dir-hash so the
+ * producer level-clear targets the SAME row it minted across cycles.
+ */
+export function worktreeFinalizeDispatchId(
+  epicId: string,
+  repoDir: string,
+): string {
+  return `${WORKTREE_FINALIZE_ID_PREFIX}${epicId}-${repoDirHash(repoDir)}`;
+}
+
+/**
  * Pure cooldown predicate. `true` IFF `key` was dispatched within the last
  * `REDISPATCH_COOLDOWN_S` seconds. An absent entry is NOT in cooldown. Read
  * inside the pure `reconcile`; the Map is mutated only in the cycle glue.
@@ -523,6 +550,15 @@ export interface ReconcileSnapshot {
    * (`finalizeEpic`) sharing the `close::<id>` key is NEVER auto-dismissed.
    */
   recoverFailureIds: Set<string>;
+  /**
+   * The `id`s of every OPEN per-repo worktree-FINALIZE dispatch-failure row (its id
+   * carries the {@link WORKTREE_FINALIZE_ID_PREFIX} marker — one row per (epic, repo)
+   * group). The finalize driver level-clears any of these whose repo finalizes clean
+   * this cycle (or whose lane is gone), so an operator who reconciles origin never
+   * needs `retry_dispatch`. SCOPED to the finalize id prefix so a recover row or the
+   * epic-keyed provision fan-in conflict is NEVER auto-dismissed.
+   */
+  finalizeFailureIds: Set<string>;
   /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
@@ -949,6 +985,15 @@ export interface ReconcileDecision {
    * as {@link worktreeFinalize}, so a group is fanned-in only when the epic is done.
    */
   worktreeSinkProvision: WorktreeLaunchInfo[];
+  /**
+   * The OPEN per-repo worktree-finalize dispatch-failure ids (mirrored straight off
+   * `snapshot.finalizeFailureIds`). The finalize driver clears any whose repo
+   * finalizes clean this cycle — the level-triggered auto-clear, so an operator who
+   * reconciles a `worktree-finalize-non-fast-forward` block never needs
+   * `retry_dispatch`. EMPTY of consequence when paused (the clear only fires for a
+   * repo that actually finalized this cycle, and `worktreeFinalize` is empty then).
+   */
+  finalizeFailureIds: Set<string>;
 }
 
 /**
@@ -1867,6 +1912,7 @@ export function reconcile(
     completedRowIds,
     worktreeFinalize,
     worktreeSinkProvision,
+    finalizeFailureIds: snapshot.finalizeFailureIds,
   };
 }
 
@@ -3295,6 +3341,12 @@ export async function runReconcileCycle(
         });
       }
     }
+    // Track the per-repo finalize keys that finalized CLEAN this cycle so the
+    // level-clear after the loop drops their open row. Per-repo keys
+    // (`close::worktree-finalize:<epic>-<repoHash>`) keep the N finalizes of one
+    // clustered epic on DISTINCT rows — never colliding on the single `close::<epic>`
+    // key or on a recover row (a distinct token).
+    const finalizedClean = new Set<string>();
     for (const info of decision.worktreeFinalize) {
       if (signal.aborted) {
         return;
@@ -3304,31 +3356,52 @@ export async function runReconcileCycle(
       if (provisionFailed.has(`${closeKeyEpicId(info)} ${info.repoDir}`)) {
         continue;
       }
+      const finalizeKey = worktreeFinalizeDispatchId(
+        closeKeyEpicId(info),
+        info.repoDir,
+      );
       const result = await deps.worktree.finalizeEpic(info, deps.isEpicDone);
-      // A `retry` failure is a transient environment skip (dirty/off-branch main
-      // checkout): STOP this epic's finalize but mint NO sticky DispatchFailed —
-      // the next cycle retries once the tree settles. A GENUINE block (no `retry`)
-      // — a content conflict, a dirty-lane refusal, OR an origin-ahead non-ff —
-      // becomes the sticky `close::<epic>` row.
-      if (!result.ok && result.retry !== true) {
+      if (result.ok) {
+        // Clean finalize (base merged + torn down) OR the lane is already gone —
+        // eligible to level-clear this repo's synthetic row below.
+        finalizedClean.add(finalizeKey);
+      } else if (result.retry !== true) {
+        // A GENUINE block (a content conflict, a dirty-lane refusal, OR an
+        // origin-ahead non-ff) becomes this repo's sticky finalize row. A `retry`
+        // failure is a transient environment skip (dirty/off-branch main checkout):
+        // STOP this group's finalize but mint NO sticky DispatchFailed — the next
+        // cycle retries once the tree settles, and it must never clear a pre-existing
+        // operator block it could not re-observe this cycle.
         deps.emitDispatchFailed({
           verb: "close",
-          id: closeKeyEpicId(info),
+          id: finalizeKey,
           reason: result.reason,
           dir: info.repoDir,
           ts: deps.now(),
         });
       }
     }
+    // Producer level-triggered auto-clear, mirroring `recoverFailuresToClear`: an
+    // OPEN per-repo finalize row whose repo finalized clean this cycle self-clears, so
+    // an operator who reconciles origin never needs `retry_dispatch`. Scoped to OPEN
+    // `worktree-finalize:*` ids AND gated on an actual clean finalize this cycle, so a
+    // transient skip or a paused cycle (empty `finalizedClean`) never dismisses a live
+    // block, and a still-failing group's sticky row is preserved.
+    for (const id of decision.finalizeFailureIds) {
+      if (finalizedClean.has(id)) {
+        deps.emitDispatchCleared({ verb: "close", id });
+      }
+    }
   }
 }
 
 /**
- * The epic id a worktree-finalize failure is keyed on. The finalize
- * `WorktreeLaunchInfo` always carries the synthetic close-sink assignment, whose
- * branch is `keeper/epic/<epicId>`; strip the `keeper/epic/` prefix back to the
- * epic id so the sticky `DispatchFailed` lands on the SAME `close::<epicId>` key a
- * `retry_dispatch` clears.
+ * The epic id a worktree-finalize `WorktreeLaunchInfo` belongs to. It always carries
+ * the synthetic close-sink assignment, whose branch is `keeper/epic/<epicId>`; strip
+ * the `keeper/epic/` prefix back to the epic id. A finalize block feeds this into
+ * {@link worktreeFinalizeDispatchId} for the PER-REPO row key; a non-primary group's
+ * fan-in provision failure still keys on this bare epic id (`close::<epicId>`) so the
+ * daemon merge-escalation sweep's `planner@<epicId>` resolves.
  */
 function closeKeyEpicId(info: WorktreeLaunchInfo): string {
   const prefix = "keeper/epic/";
@@ -4703,6 +4776,7 @@ export async function loadReconcileSnapshot(
 
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
+  const finalizeFailureIds = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -4718,6 +4792,14 @@ export async function loadReconcileSnapshot(
         isWorktreeRecoverReason(reason)
       ) {
         recoverFailureIds.add(id);
+      }
+      // A per-repo finalize row (`finalizeEpic`'s `worktree-finalize-*` block) is
+      // eligible for the finalize driver's level-clear. Scope on the id prefix so a
+      // recover row and the epic-keyed provision `worktree-merge-conflict` (kept on
+      // `close::<epic>` for the merge-escalation sweep's `planner@<epic>`) are both
+      // excluded.
+      if (verb === "close" && id.startsWith(WORKTREE_FINALIZE_ID_PREFIX)) {
+        finalizeFailureIds.add(id);
       }
     }
   }
@@ -4910,6 +4992,7 @@ export async function loadReconcileSnapshot(
     gitStatusByProjectDir,
     failedKeys,
     recoverFailureIds,
+    finalizeFailureIds,
     liveTabKeys,
     livePaneIds,
     pendingDispatches,

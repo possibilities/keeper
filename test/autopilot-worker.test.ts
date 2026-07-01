@@ -81,10 +81,12 @@ import {
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
+  WORKTREE_FINALIZE_ID_PREFIX,
   type WorktreeDriver,
   type WorktreeLaunchInfo,
   type WorktreeRecoveryFailure,
   type WorktreeRepoResolution,
+  worktreeFinalizeDispatchId,
   worktreeRecoverDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
@@ -94,6 +96,7 @@ import {
   PENDING_DISPATCH_TTL_MS,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
+import { parseDispatchKey } from "../src/dispatch-command";
 import type { LaunchSpec } from "../src/exec-backend";
 import {
   computeReadiness,
@@ -193,6 +196,7 @@ function makeSnapshot(
     gitStatusByProjectDir: new Map(),
     failedKeys: new Set(),
     recoverFailureIds: new Set(),
+    finalizeFailureIds: new Set(),
     liveTabKeys: new Set(),
     // fn-811: read-time backend liveness. Default `null` (probe unavailable) so
     // every pre-fn-811 test keeps the old stopped-always-occupies behavior; the
@@ -5129,6 +5133,199 @@ test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a stick
   expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
 });
 
+// ---------------------------------------------------------------------------
+// fn-1034.2 — per-repo finalize failure rows + producer level-clear
+// ---------------------------------------------------------------------------
+
+/** A DONE clustered two-repo epic (task .1 → /repo-a primary, task .2 → /repo-b). */
+function doneClusteredEpic(): Epic {
+  return makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+}
+
+/** A worktree-ON snapshot for a clustered epic with a pre-seeded open finalize set. */
+function clusteredSnapWithOpenFinalize(
+  epic: Epic,
+  finalizeFailureIds: Set<string>,
+): ReconcileSnapshot {
+  return makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    finalizeFailureIds,
+  });
+}
+
+test("fn-1034 runReconcileCycle: two-repo finalize — one clean, one non-ff → DISTINCT per-repo rows, the clean repo mints nothing, the failed key is retry_dispatch-able", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    finalizeFail: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-finalize-non-fast-forward: origin/main is ahead of main"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = multiRepoSnap([doneClusteredEpic()], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  const bKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-b");
+  const aKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-a");
+  // The two repos' keys are DISTINCT — no collision on the single `close::<epic>`.
+  expect(bKey).not.toBe(aKey);
+  expect(bKey.startsWith(WORKTREE_FINALIZE_ID_PREFIX)).toBe(true);
+  // Only /repo-b's finalize failed → exactly one sticky row on ITS per-repo key; the
+  // clean /repo-a mints nothing.
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "close",
+    id: bKey,
+    dir: "/repo-b",
+  });
+  // The failed repo's row is retry_dispatch-able: `close::<key>` passes the wire
+  // validator (verb close, single `::`, safe token) exactly like a recover key.
+  expect(parseDispatchKey(`close::${bKey}`)).toEqual({
+    ok: true,
+    verb: "close",
+    id: bKey,
+  });
+});
+
+test("fn-1034 runReconcileCycle: a repo whose OPEN finalize row finalizes CLEAN this cycle → producer level-clear (no retry_dispatch needed); a clean sibling with no row is not spuriously cleared", async () => {
+  const bKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-b");
+  const { driver } = makeFakeWorktreeDriver(); // both groups finalize clean
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = clusteredSnapWithOpenFinalize(
+    doneClusteredEpic(),
+    new Set([bKey]),
+  );
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // /repo-b finalized clean → its OPEN row auto-clears. /repo-a also finalized clean
+  // but never had a row (not in the open set), so it is NOT spuriously cleared.
+  expect(depsLog.clears).toEqual([{ verb: "close", id: bKey }]);
+  expect(depsLog.emissions).toEqual([]);
+});
+
+test("fn-1034 runReconcileCycle: a repo whose finalize STILL fails is NOT level-cleared (fail-loud preserved) and re-mints its per-repo row", async () => {
+  const bKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-b");
+  const { driver } = makeFakeWorktreeDriver({
+    finalizeFail: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-finalize-non-fast-forward: origin/main is ahead of main"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = clusteredSnapWithOpenFinalize(
+    doneClusteredEpic(),
+    new Set([bKey]),
+  );
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // /repo-b still non-ff → row re-minted, NEVER cleared.
+  expect(depsLog.clears).toEqual([]);
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({ verb: "close", id: bKey });
+});
+
+test("fn-1034 runReconcileCycle: a TRANSIENT finalize skip neither mints nor level-clears the repo's pre-existing block (could not re-observe it)", async () => {
+  const bKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-b");
+  const { driver } = makeFakeWorktreeDriver({
+    finalizeRetry: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-finalize-dirty-checkout: /repo-b has a dirty working tree"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = clusteredSnapWithOpenFinalize(
+    doneClusteredEpic(),
+    new Set([bKey]),
+  );
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // A transient skip mints no sticky row (never an un-clearable close) AND must not
+  // dismiss the pre-existing operator block it could not re-observe this cycle.
+  expect(depsLog.emissions).toEqual([]);
+  expect(depsLog.clears).toEqual([]);
+});
+
+test("fn-1034 loadReconcileSnapshot: recover rows and per-repo finalize rows load into DISJOINT auto-clear sets — a recover row for repo A cannot dismiss a finalize block on repo B", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (id: string, reason: string, dir: string): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["close", id, reason, dir, 1, 1, 1, 1],
+      );
+    };
+    // Repo A: a recover-originated close failure (eligible for the RECOVER clear).
+    insert("fn-1-foo", "worktree-recover-conflict: merging …", "/repo-a");
+    // Repo B: a per-repo FINALIZE block (eligible for the FINALIZE clear only).
+    const bKey = worktreeFinalizeDispatchId("fn-1-foo", "/repo-b");
+    insert(bKey, "worktree-finalize-non-fast-forward: origin ahead", "/repo-b");
+
+    const snap = await loadReconcileSnapshot(db);
+    // The two auto-clear scopes are DISJOINT: the recover clear only sees the recover
+    // key, the finalize clear only sees the finalize key. Neither can dismiss the
+    // other's row.
+    expect([...snap.recoverFailureIds]).toEqual(["fn-1-foo"]);
+    expect([...snap.finalizeFailureIds]).toEqual([bKey]);
+    expect(snap.recoverFailureIds.has(bKey)).toBe(false);
+    expect(snap.finalizeFailureIds.has("fn-1-foo")).toBe(false);
+    // Both rows still gate dispatch via failedKeys (scoping is orthogonal).
+    expect(snap.failedKeys.has("close::fn-1-foo")).toBe(true);
+    expect(snap.failedKeys.has(`close::${bKey}`)).toBe(true);
+  });
+});
+
 test("fn-1034 reposForRecovery: a clustered epic contributes EACH worktree group's repo; a serial group contributes none", () => {
   const epic = twoRepoEpic();
   const repoMap = classifyWorktreeRepos(
@@ -5465,7 +5662,7 @@ test("fn-959 runReconcileCycle: closer-done epic → finalizeEpic runs AFTER the
   expect(log.finalizes).toHaveLength(1);
 });
 
-test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed keyed on the close row, stops (no teardown observable to caller)", async () => {
+test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed on the per-repo finalize key, stops (no teardown observable to caller)", async () => {
   const { driver } = makeFakeWorktreeDriver({
     finalizeFail: () =>
       "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
@@ -5497,7 +5694,8 @@ test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed 
   expect(depsLog.emissions).toHaveLength(1);
   expect(depsLog.emissions[0]).toMatchObject({
     verb: "close",
-    id: "fn-1-foo", // the close-row key (stripped of keeper/epic/)
+    // The per-repo finalize key (epic id + repo-dir hash), NOT the bare `close::<epic>`.
+    id: worktreeFinalizeDispatchId("fn-1-foo", "/repo"),
     reason:
       "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
   });
@@ -8009,8 +8207,9 @@ test("fn-982 isWorktreeRecoverReason: recover reasons match, finalize/other reas
   expect(isWorktreeRecoverReason("worktree-recover-not-on-default: …")).toBe(
     true,
   );
-  // The close-sink (finalizeEpic) failures share the `close::<id>` key but are
-  // NOT recover-originated — the clobber guard hinges on excluding them.
+  // A close-sink finalize failure is NOT recover-originated — the recover clear's
+  // reason-scope must exclude it (it keys per-repo now, but the reason guard is the
+  // belt-and-suspenders that also excludes the epic-keyed provision fan-in conflict).
   expect(isWorktreeRecoverReason("worktree-finalize-conflict: …")).toBe(false);
   expect(isWorktreeRecoverReason("worktree-teardown-dirty: …")).toBe(false);
   expect(isWorktreeRecoverReason("not-on-default-branch: …")).toBe(false);
@@ -8523,7 +8722,10 @@ test("fn-993 runReconcileCycle: a non-ff finalize (origin ahead) mints an operat
   );
 
   expect(depsLog.emissions).toHaveLength(1);
-  expect(depsLog.emissions[0]).toMatchObject({ verb: "close", id: "fn-1-foo" });
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "close",
+    id: worktreeFinalizeDispatchId("fn-1-foo", "/repo"),
+  });
   expect(depsLog.emissions[0]?.reason).toContain(
     "worktree-finalize-non-fast-forward",
   );

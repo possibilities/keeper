@@ -187,6 +187,18 @@ function shortHash(s: string): string {
 }
 
 /**
+ * The stable dir-hash {@link worktreePathFor} folds into a lane path — {@link
+ * shortHash} over the trailing-slash-stripped repo dir. Exported so a per-repo
+ * synthetic dispatch key (the autopilot's `worktree-finalize:<epic>-<repoHash>`
+ * per-repo finalize-failure row) hashes a repo dir the SAME way the lane path does,
+ * so the producer level-clear targets the exact row it minted. Pure: no wall-clock /
+ * random / syscall.
+ */
+export function repoDirHash(repoDir: string): string {
+  return shortHash(stripTrailingSlash(repoDir));
+}
+
+/**
  * Derive the deterministic worktree plan for an epic's task DAG.
  *
  * @param epicId  The epic id — drives every derived branch name.
