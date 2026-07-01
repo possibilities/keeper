@@ -62,5 +62,5 @@ stale leaves. `sandboxEnv` + `KEEPER_STATUSLINE_DIR` under the per-test tmpdir; 
 - [ ] The pure `Scanner` is unit-tested without booting a Worker/watcher; `bun test` green
 
 ## Done summary
-
+Added src/statusline-worker.ts: a file-watch producer that coalesces statusLine leaf changes into SessionTelemetry events (churn-safe gate key excluding input_tokens, seedFromDb suppression, stripped heartbeat/retraction, bounded leaf GC). Wired 'statusline' into all four daemon worker lists plus the spawn/mint block and added resolveStatuslineRoot in src/db.ts.
 ## Evidence
