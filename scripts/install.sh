@@ -41,16 +41,35 @@ else
 fi
 
 # 3. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
-#    bun steps complete. Gate on content AND loaded state: reload when the live
-#    plist differs from (or is missing against) the repo copy, OR when it matches
-#    but keeperd is not actually registered. `cmp -s` alone reads through the
-#    symlink, so a symlink repointed by a reload that then failed would compare
-#    equal and latch the outage shut on the next run — the loaded-state check
-#    decouples the gate from the symlink so a rerun re-attempts until loaded.
-if cmp -s "${repo_plist}" "${live_plist}" && launchctl print "${service}" >/dev/null 2>&1; then
-  echo "install: keeperd plist unchanged and loaded; no reload"
+#    bun steps complete. Gate on content, loaded state, AND source: reload when
+#    the live plist differs from (or is missing against) the repo copy, OR when it
+#    matches but keeperd is not actually registered, OR when the daemon SOURCE
+#    advanced since the last reload. `cmp -s` alone reads through the symlink, so a
+#    symlink repointed by a reload that then failed would compare equal and latch
+#    the outage shut on the next run — the loaded-state check decouples the gate
+#    from the symlink so a rerun re-attempts until loaded.
+#
+#    Source-change trigger: the plist rarely changes, so a pure code change (new
+#    src/*.ts after a `bun link`) would otherwise leave the running daemon on
+#    stale code — the buildbot `keeper-install` job never bounces keeperd on a
+#    source-only build. Fingerprint the repo HEAD sha across runs (mirroring the
+#    arthack installer's fingerprint pattern) and reload when it advanced. A
+#    missing/undeterminable sha degrades to the plist gate alone (no crash, no
+#    forced bounce).
+fingerprint_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/keeper"
+fingerprint_file="${fingerprint_dir}/install.head"
+current_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
+last_sha="$(cat "${fingerprint_file}" 2>/dev/null || true)"
+source_changed=0
+if [ -n "${current_sha}" ] && [ "${current_sha}" != "${last_sha}" ]; then
+  source_changed=1
+fi
+if cmp -s "${repo_plist}" "${live_plist}" \
+  && launchctl print "${service}" >/dev/null 2>&1 \
+  && [ "${source_changed}" -eq 0 ]; then
+  echo "install: keeperd plist + source unchanged and loaded; no reload"
 else
-  echo "install: keeperd plist changed or not loaded; relink + reload"
+  echo "install: keeperd plist/source changed or not loaded; relink + reload"
   mkdir -p "${HOME}/Library/LaunchAgents"
   ln -sfn "${repo_plist}" "${live_plist}"
   # Modern launchctl surface. bootout-first (|| true — bootstrap over an already
@@ -77,6 +96,12 @@ else
     echo "install: keeperd failed to load after reload; recover with" >&2
     echo "  launchctl bootstrap ${domain} ${live_plist}" >&2
     exit 1
+  fi
+  # Record the reloaded source sha ONLY after keeperd is confirmed loaded, so a
+  # failed reload never latches a fingerprint that would suppress the next retry.
+  if [ -n "${current_sha}" ]; then
+    mkdir -p "${fingerprint_dir}"
+    printf '%s\n' "${current_sha}" >"${fingerprint_file}"
   fi
   echo "install: keeperd reloaded and loaded"
 fi

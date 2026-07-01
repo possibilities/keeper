@@ -378,10 +378,14 @@ describe("presets list discovery surface", () => {
     const h = makeHarness({
       argv: ["presets", "list", "--json"],
       rawArgv: true,
-      presetCatalog: catalog({
-        a: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-        b: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
-      }),
+      presetCatalog: {
+        ...catalog({
+          a: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
+          b: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
+        }),
+        claude_default: "a",
+        codex_default: "b",
+      },
       panelSelections: selections({ duo: ["a", "b"] }, "duo"),
     });
     const code = await expectExit(main(h.deps));
@@ -416,6 +420,7 @@ describe("presets list discovery surface", () => {
         },
       ],
       default: "duo",
+      defaults: { claude: "a", codex: "b", pi: null },
     });
   });
 
@@ -423,9 +428,12 @@ describe("presets list discovery surface", () => {
     const h = makeHarness({
       argv: ["presets", "list"],
       rawArgv: true,
-      presetCatalog: catalog({
-        a: preset({ harness: "claude", model: "opus" }),
-      }),
+      presetCatalog: {
+        ...catalog({
+          a: preset({ harness: "claude", model: "opus" }),
+        }),
+        claude_default: "a",
+      },
       panelSelections: selections({ duo: ["a"] }),
     });
     const code = await expectExit(main(h.deps));
@@ -435,6 +443,8 @@ describe("presets list discovery surface", () => {
     expect(text).toContain("claude");
     expect(text).toContain("model=opus");
     expect(text).toContain("duo");
+    expect(text).toContain("claude_default  a");
+    expect(text).toContain("pi_default  (unset)");
   });
 
   test("a missing catalog yields the discovery error (exit 2), not a crash", async () => {
