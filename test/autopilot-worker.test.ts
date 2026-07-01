@@ -90,7 +90,11 @@ import {
   worktreeRecoverDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
-import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
+import {
+  GIT_SPAWN_TIMEOUT_CODE,
+  type GitExecOptions,
+  type GitRunner,
+} from "../src/commit-work/git-exec";
 import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -9009,6 +9013,58 @@ function gateGit(opts: {
   return fakeAsyncGit(rules);
 }
 
+/**
+ * A CWD-AWARE merge-probe git runner: unlike {@link gateGit} (argv-only rules),
+ * this keys its enumeration + ancestry verdict on the spawn `cwd` (the repo dir),
+ * so a clustered epic's per-group probes across DIFFERENT repos can differ (repo-a
+ * merged while repo-b is not). Per-repo config mirrors `gateGit`'s knobs.
+ */
+function clusterGit(
+  perRepo: Record<
+    string,
+    {
+      lanes?: string[];
+      ancestors?: string[];
+      enumError?: boolean;
+      ancestryTimeout?: boolean;
+    }
+  >,
+  defaultBranch = "main",
+): { run: GitRunner; calls: Array<{ args: string[]; cwd?: string }> } {
+  const calls: Array<{ args: string[]; cwd?: string }> = [];
+  const run: GitRunner = async (
+    args: string[],
+    options: GitExecOptions = {},
+  ) => {
+    const cwd = options.cwd ?? "";
+    calls.push({ args: [...args], cwd });
+    const cfg = perRepo[cwd] ?? {};
+    if (
+      argvStartsWith(args, "for-each-ref") &&
+      argvHas(args, "refs/heads/keeper/epic")
+    ) {
+      return cfg.enumError
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: (cfg.lanes ?? []).join("\n"), stderr: "" };
+    }
+    if (argvStartsWith(args, "symbolic-ref")) {
+      return { code: 0, stdout: `origin/${defaultBranch}\n`, stderr: "" };
+    }
+    if (argvStartsWith(args, "merge-base", "--is-ancestor")) {
+      if (cfg.ancestryTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
+      return {
+        code: (cfg.ancestors ?? []).includes(args[2] ?? "") ? 0 : 1,
+        stdout: "",
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls };
+}
+
 test("fn-1014 computeDeferredEpicIds: a same-repo upstream PRESENT ∧ ancestor of local default → NOT deferred", async () => {
   const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
   const b = makeEpic({
@@ -9436,6 +9492,147 @@ test("fn-1016 computeMergedLaneEntries: entries are sorted by epic_id (stable se
     run,
   );
   expect(entries.map((e) => e.epic_id)).toEqual(["fn-1-a", "fn-2-b"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1034.4 — computeMergedLaneEntries aggregates a CLUSTERED multi-repo epic:
+// the single `epic_id`-keyed row is emitted ONLY once EVERY group has landed
+// (worktree groups merged to their default; serial groups' tasks all done).
+// ---------------------------------------------------------------------------
+
+test("fn-1034.4 computeMergedLaneEntries: two worktree groups — NO row until BOTH bases merged (never early on the first)", async () => {
+  const epic = twoRepoEpic(); // .1→/repo-a, .2→/repo-b, both worktree
+  const epics = [epic];
+  const cls = classifyMultiRepo(epics);
+  // /repo-a merged; /repo-b PRESENT but not an ancestor → NOT merged. Aggregate
+  // must withhold the epic's row on this partial-landed state.
+  const partial = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+    "/repo-b": { lanes: ["keeper/epic/fn-1-foo"], ancestors: [] },
+  });
+  expect(await computeMergedLaneEntries(epics, cls, partial.run)).toEqual([]);
+  // Now /repo-b lands too → the single row appears, keyed epic_id + primaryRepoDir.
+  const both = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+    "/repo-b": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+  });
+  expect(await computeMergedLaneEntries(epics, cls, both.run)).toEqual([
+    { epic_id: "fn-1-foo", repo_dir: "/repo-a" },
+  ]);
+});
+
+test("fn-1034.4 computeMergedLaneEntries: mixed worktree + serial group — landed waits for the serial tasks done AND the worktree lane merged", async () => {
+  // task .1 → /repo-a (worktree), task .2 → /repo-b (serial, not worktree-eligible).
+  const mixed = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "open", // serial group NOT yet done
+      }),
+    ],
+  });
+  const withSerialOpen = classifyWorktreeRepos(
+    [mixed],
+    (r) => r,
+    (top) => ({
+      eligible: top === "/repo-a",
+      reason: `worktree-disabled:no-manifest (${top})`,
+    }),
+    undefined,
+    true,
+  );
+  // /repo-a's lane merged, but the serial group's task .2 is still open → NO row.
+  const aMerged = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+  });
+  expect(
+    await computeMergedLaneEntries([mixed], withSerialOpen, aMerged.run),
+  ).toEqual([]);
+
+  // Flip the serial group's task done → both groups landed → the row appears.
+  const doneEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const withSerialDone = classifyWorktreeRepos(
+    [doneEpic],
+    (r) => r,
+    (top) => ({
+      eligible: top === "/repo-a",
+      reason: `worktree-disabled:no-manifest (${top})`,
+    }),
+    undefined,
+    true,
+  );
+  expect(
+    await computeMergedLaneEntries([doneEpic], withSerialDone, aMerged.run),
+  ).toEqual([{ epic_id: "fn-1-foo", repo_dir: "/repo-a" }]);
+
+  // And the converse: serial group done but the worktree lane NOT merged → NO row.
+  const aUnmerged = clusterGit({
+    "/repo-a": { lanes: ["keeper/epic/fn-1-foo"], ancestors: [] },
+  });
+  expect(
+    await computeMergedLaneEntries([doneEpic], withSerialDone, aUnmerged.run),
+  ).toEqual([]);
+});
+
+test("fn-1034.4 computeMergedLaneEntries: a single-repo epic is byte-identical with the flag ON (stays `ok`, one probe → one row)", async () => {
+  const solo = makeEpic({
+    epic_id: "fn-1-solo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-solo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+    ],
+  });
+  const cls = classifyMultiRepo([solo]); // flag ON — single-repo never clusters
+  expect(cls.get("fn-1-solo")?.kind).toBe("ok");
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-solo"],
+    ancestors: ["keeper/epic/fn-1-solo"],
+  });
+  expect(await computeMergedLaneEntries([solo], cls, run)).toEqual([
+    { epic_id: "fn-1-solo", repo_dir: "/repo-a" },
+  ]);
 });
 
 test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {

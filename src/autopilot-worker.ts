@@ -2312,12 +2312,23 @@ export async function computeDeferredEpicIds(
  *    defers off inconclusive; here the safe default is to UNDER-report, so a
  *    `landed` waiter blocks one more cycle rather than fire early).
  *
- * Only an `ok` epic cuts a lane; a `disabled` (serial, no lane) / multi-repo /
- * unresolved epic is skipped here — the no-lane "merged ⇔ done" degradation lives
- * in the consumer (the snapshot's `landedEpicIds`, and worktree mode OFF). A
- * throwing git probe degrades that epic to NOT merged; the function NEVER throws
- * out of the snapshot build. The per-repo default-branch + lane-enumeration probes
- * are memoized so N epics sharing one repo spawn git once.
+ * A `clustered` multi-repo epic (rollout flag ON) emits its SINGLE `epic_id`-keyed
+ * row (no schema change) ONLY once EVERY group has landed — never early on the
+ * first group merging. "Landed" per group: a `worktree` group's lane merged into
+ * its repo's local default (the same per-group probe as `ok`); a `serial` group
+ * (cuts no lane, lands incrementally on the shared checkout) when ALL its tasks are
+ * administratively done (`worker_phase === "done"`). The producer holds the full
+ * classification, so it knows the group denominator; the consumer
+ * ({@link computeLandedEpicIds}, pure/non-git) keeps its unchanged "row → landed"
+ * logic. Per-repo lane observability continues to ride `worktree_repo_status` — the
+ * `lane_merged` row is NOT overloaded for per-repo display.
+ *
+ * A `disabled` (serial, no lane) / multi-repo / unresolved / no-primary epic is
+ * skipped here — the no-lane "merged ⇔ done" degradation lives in the consumer
+ * (the snapshot's `landedEpicIds`, and worktree mode OFF). A throwing git probe
+ * degrades that epic to NOT merged; the function NEVER throws out of the snapshot
+ * build. The per-repo default-branch + lane-enumeration probes are memoized so N
+ * epics/groups sharing one repo spawn git once.
  */
 export async function computeMergedLaneEntries(
   epics: readonly Epic[],
@@ -2362,34 +2373,78 @@ export async function computeMergedLaneEntries(
     return value;
   };
 
+  // Probe ONE repo's `keeper/epic/<id>` lane for merged-into-default, reusing the
+  // memoized enumeration + ancestry probes. The `ok` verdict verbatim, factored so
+  // a `clustered` epic's per-`worktree`-group probe shares it:
+  //  - enumeration inconclusive → NOT merged (never claim off a failed probe);
+  //  - lane DEFINITIVELY ABSENT → merged-and-torn-down → MERGED (no ancestry probe);
+  //  - PRESENT ∧ ancestor of LOCAL default → MERGED; else (not-ancestor / errored /
+  //    timed-out / unresolvable default) → NOT merged.
+  const laneMergedInRepo = async (
+    repoDir: string,
+    laneBranch: string,
+  ): Promise<boolean> => {
+    const lanes = await enumerateLanes(repoDir);
+    if (!lanes.ok) {
+      return false; // enumeration inconclusive → NOT merged
+    }
+    if (!lanes.branches.has(laneBranch)) {
+      return true; // DEFINITIVELY absent → merged-and-torn-down → MERGED
+    }
+    const localDefault = await resolveLocalDefault(repoDir);
+    if (localDefault === null) {
+      return false; // unresolvable default → NOT merged
+    }
+    // `gitIsAncestorOf`→`false` covers not-ancestor AND an errored/timed-out probe.
+    return gitIsAncestorOf(repoDir, laneBranch, localDefault, run);
+  };
+
   const out: LaneMergedEntry[] = [];
   for (const epic of epics) {
     const resolution = worktreeRepoByEpicId.get(epic.epic_id);
-    // Only an `ok` epic cuts a lane forked off its `repoDir`; everything else has
-    // no lane to probe (the no-lane degradation is the consumer's concern).
-    if (resolution === undefined || resolution.kind !== "ok") {
+    // Only a lane-cutting resolution can land a merge: an `ok` epic (one lane) or a
+    // `clustered` multi-repo epic (one lane per `worktree` group + serial groups).
+    // A `disabled` / multi-repo / unresolved / no-primary epic cuts no lane — the
+    // no-lane degradation is the consumer's concern.
+    if (
+      resolution === undefined ||
+      (resolution.kind !== "ok" && resolution.kind !== "clustered")
+    ) {
       continue;
     }
-    const repoDir = resolution.repoDir;
+    const laneBranch = baseBranchFor(epic.epic_id);
     try {
-      const lanes = await enumerateLanes(repoDir);
-      if (!lanes.ok) {
-        continue; // enumeration inconclusive → NOT merged (never claim off a failed probe)
-      }
-      const laneBranch = baseBranchFor(epic.epic_id);
-      if (!lanes.branches.has(laneBranch)) {
-        // DEFINITIVELY absent → merged-and-torn-down → MERGED (no ancestry probe).
-        out.push({ epic_id: epic.epic_id, repo_dir: repoDir });
+      if (resolution.kind === "ok") {
+        if (await laneMergedInRepo(resolution.repoDir, laneBranch)) {
+          out.push({ epic_id: epic.epic_id, repo_dir: resolution.repoDir });
+        }
         continue;
       }
-      // Present: merged IFF an ancestor of LOCAL default. `gitIsAncestorOf`→`false`
-      // covers BOTH not-ancestor AND an errored/timed-out probe → NOT merged.
-      const localDefault = await resolveLocalDefault(repoDir);
-      if (localDefault === null) {
-        continue; // unresolvable default → NOT merged
+      // CLUSTERED: aggregate ALL groups before emitting the epic's single row (no
+      // early emit on the first group merging). `worktree` group → its lane merged;
+      // `serial` group → all its tasks administratively done (`worker_phase` — the
+      // signal readiness's terminal-completed keys on; liveness is irrelevant to a
+      // landed milestone). The row's `repo_dir` carries `primaryRepoDir`
+      // (observational only — the projection is keyed on epic_id).
+      const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+      let allLanded = true;
+      for (const group of resolution.groups) {
+        const groupLanded =
+          group.mode === "worktree"
+            ? await laneMergedInRepo(group.repoDir, laneBranch)
+            : group.taskIds.every(
+                (id) => taskById.get(id)?.worker_phase === "done",
+              );
+        if (!groupLanded) {
+          allLanded = false;
+          break;
+        }
       }
-      if (await gitIsAncestorOf(repoDir, laneBranch, localDefault, run)) {
-        out.push({ epic_id: epic.epic_id, repo_dir: repoDir });
+      if (allLanded) {
+        out.push({
+          epic_id: epic.epic_id,
+          repo_dir: resolution.primaryRepoDir,
+        });
       }
     } catch (err) {
       // A git probe threw — treat this epic as NOT merged (conservative: never
