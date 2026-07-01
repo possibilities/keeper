@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "cutover to work:worker and retarget the guard",
-  "updated_at": "2026-07-01T14:05:39.841000Z"
+  "updated_at": "2026-07-01T15:27:15.531000Z",
+  "worker_done_at": "2026-07-01T15:27:15.531000Z"
 }

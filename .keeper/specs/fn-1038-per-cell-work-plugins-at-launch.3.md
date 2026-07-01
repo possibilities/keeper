@@ -32,5 +32,5 @@ Invert consistency-skills (:412-414) and consistency-generated-guard (:103); upd
 - [ ] Consistency tests invert; a scanned/installed `work`-name collision is caught by a guard.
 
 ## Done summary
-
+Cut /plan:work over to spawning the constant work:worker in both spawn paths (null-either-axis gate preserved), retargeted the SubagentStop matcher to ^work:worker$, deleted the four generated plan:worker-* agents + sidecars (.gitignore now tracks workers/), added a work-name collision guard, inverted the consistency tests, and regenerated the render/check-generated oracle goldens onto the workers/ tree.
 ## Evidence
