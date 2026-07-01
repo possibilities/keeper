@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T04:39:48.945000Z",
+  "depends_on": [
+    "fn-1028-config-driven-worker-model-effort-matrix.2"
+  ],
+  "epic": "fn-1028-config-driven-worker-model-effort-matrix",
+  "id": "fn-1028-config-driven-worker-model-effort-matrix.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "model as required per-task axis",
+  "updated_at": "2026-07-01T04:39:48.945000Z"
+}
