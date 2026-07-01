@@ -96,7 +96,7 @@ Environment variables:
 
 ## Auto-commit
 
-Every `keeper plan` invocation emits a `plan_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(plan): <op> <target>` commit inline at `output.emit()` via `auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.keeper/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`) emit the envelope but skip the git commit (`files` is empty → no-op). `claim` writes the worker brief to `<primary_repo>/.keeper/state/briefs/<task_id>.json` and returns a `brief_ref` handle, but that brief lives under gitignored `state/`, so it too lands no commit. On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
+Mutating verbs emit a `plan_invocation` NDJSON envelope on stdout scoped to that write, and land a `chore(plan): <op> <target>` commit inline at `output.emit()` via `auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.keeper/` commit landed. Read-only / inspection verbs emit exactly one top-level JSON value and no `plan_invocation` trailer (nothing consumes it on a read, and a second root breaks `json.load` / `jq`). Runtime-only verbs like `claim`/`block` mutate but land no commit (`files` is empty → no-op). `claim` writes the worker brief to `<primary_repo>/.keeper/state/briefs/<task_id>.json` and returns a `brief_ref` handle, but that brief lives under gitignored `state/`, so it too lands no commit. On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
 
 `init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor `CLAUDE_CODE_SESSION_ID`. It lands a `chore(plan): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
@@ -139,11 +139,13 @@ Commands emit JSON by default:
 - Failure: `{"success": false, "error": "..."}`
 - Non-JSON failures print `Error: ...` to stderr and exit non-zero.
 
+**Every read-only / inspection verb emits exactly one top-level JSON value** — one root, zero trailing bytes, so `json.load` and `jq` parse it cleanly (a second root raises "Extra data"). A conformance guard asserts this by parsing roots, not counting lines (a single pretty-printed value spans many lines). Provenance never rides the result stream: read verbs carry no `plan_invocation` trailer.
+
+`keeper plan list` and `keeper plan tasks` bound their output with a `{total, returned, truncated, hint}` envelope wrapping the rows — `truncated: true` and a `hint` string signal a capped set. The `--format human` render is byte-unchanged.
+
 Pass `--format human` for human-readable text/tables.
 `cat` always emits raw markdown regardless of `--format`.
-`validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). With `--epic <id>`, `validate` doubles as the marker **arm**: the create, defer, and close flows run it after wiring deps to flip a freshly-scaffolded epic's null `last_validated_at` to a timestamp (a fresh scaffold mints a not-ready ghost). When the marker is still null, the runner manually invokes `auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and prints a second NDJSON document `{"plan_invocation": {...}}` describing the marker write. Arming an already-stamped epic is a no-op — only the one-line envelope prints (no second document, no commit).
-
-`keeper plan list` renders one row per epic with its title and status.
+`validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). With `--epic <id>`, `validate` doubles as the marker **arm**: the create, defer, and close flows run it after wiring deps to flip a freshly-scaffolded epic's null `last_validated_at` to a timestamp (a fresh scaffold mints a not-ready ghost). When the marker is still null, the runner manually invokes `auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and merges the `plan_invocation` provenance into the single custom envelope — one JSON value on stdout, never a second document. Arming an already-stamped epic is a no-op — only the one envelope prints (no commit).
 
 ## Planning Skills
 
@@ -175,6 +177,8 @@ Each guard verifies live state with a read-only `keeper plan` call before blocki
 ```bash
 keeper plan --agent-help
 ```
+
+To orient on the board, reach for the keeper-native surfaces rather than hand-parsing plan verbs: `keeper status` for the board at a glance, and `keeper query epics --json | jq '.data[]'` for per-task detail (tier/model/title/deps). Every `keeper plan` read still emits one clean JSON value, but the orient surfaces are purpose-built for it.
 
 ## License and Attribution
 
