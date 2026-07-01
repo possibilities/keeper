@@ -127,6 +127,12 @@ export type ParseRunArgsResult =
       prompt: string;
       stopTimeoutMs: number | null;
       readOnly: boolean;
+      /** Raw `--system-file` path (unread — the pure parser never touches the
+       *  filesystem); the handler resolves it to text. Null when unset. */
+      systemFile: string | null;
+      /** Raw `--system` inline text. Null when unset. Mutually exclusive with
+       *  {@link systemFile} — two spellings of one input. */
+      system: string | null;
     }
   | { ok: false; error: string };
 
@@ -136,12 +142,17 @@ export type ParseRunArgsResult =
  * optional read-only posture and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
  * `--read-only` is detection-not-prevention (a per-harness tool strip + a
- * caller-prepended directive; the strip is leaky). Pure — exported for tests.
+ * caller-prepended directive; the strip is leaky). `--system-file <path>` /
+ * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
+ * the parser returns the RAW path/text — the handler reads any file. Pure —
+ * exported for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
   let stopTimeoutMs: number | null = null;
   let readOnly = false;
+  let systemFile: string | null = null;
+  let system: string | null = null;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
@@ -177,10 +188,45 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       stopTimeoutMs = parsed;
       continue;
     }
+    if (arg === "--system-file") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--system-file requires a value" };
+      }
+      systemFile = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--system-file=")) {
+      systemFile = arg.slice("--system-file=".length);
+      continue;
+    }
+    if (arg === "--system") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--system requires a value" };
+      }
+      system = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--system=")) {
+      system = arg.slice("--system=".length);
+      continue;
+    }
     if (arg.startsWith("--")) {
       return { ok: false, error: `unknown flag: ${arg}` };
     }
     positionals.push(arg);
+  }
+
+  // Two spellings of ONE input — never both. The handler reads the file (or
+  // takes the inline text) and composes a single `System:` block.
+  if (systemFile !== null && system !== null) {
+    return {
+      ok: false,
+      error: "cannot combine --system-file and --system",
+    };
   }
 
   const cli = positionals[0];
@@ -200,7 +246,15 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       error: `unexpected extra argument: ${positionals[2]}`,
     };
   }
-  return { ok: true, cli: cli as AgentKind, prompt, stopTimeoutMs, readOnly };
+  return {
+    ok: true,
+    cli: cli as AgentKind,
+    prompt,
+    stopTimeoutMs,
+    readOnly,
+    systemFile,
+    system,
+  };
 }
 
 /** A finite positive integer of ms, or null for anything malformed. */

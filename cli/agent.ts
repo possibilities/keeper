@@ -8,8 +8,10 @@
  * waits, and captures in one process, and `keeper agent wait <handle>` does the
  * wait + capture on an already-launched handle. `run --read-only` prepends a
  * read-only directive + strips edit tools per harness (detection, not prevention
- * — no changed-files audit on this verb); codex/pi launch with `CLAUDE*` env
- * stripped by default (partner isolation).
+ * — no changed-files audit on this verb); `run --system-file <path>`/`--system
+ * <text>` prepend a caller-side `System:` block (mutually exclusive, uniform
+ * across harnesses — user-turn text, not a privileged system prompt); codex/pi
+ * launch with `CLAUDE*` env stripped by default (partner isolation).
  *
  * Named launch-config presets (harness/model/effort) live in the catalog
  * `~/.config/keeper/presets.yaml` (panel selections in `panel.yaml`): `keeper

@@ -165,6 +165,8 @@ describe("parseRunArgs", () => {
       prompt: "say hi",
       stopTimeoutMs: null,
       readOnly: false,
+      systemFile: null,
+      system: null,
     });
   });
 
@@ -177,6 +179,8 @@ describe("parseRunArgs", () => {
       prompt: "p",
       stopTimeoutMs: 1_800_000,
       readOnly: false,
+      systemFile: null,
+      system: null,
     });
     expect(parseRunArgs(["pi", "p", "--stop-timeout-ms=1500"])).toEqual({
       ok: true,
@@ -184,6 +188,8 @@ describe("parseRunArgs", () => {
       prompt: "p",
       stopTimeoutMs: 1500,
       readOnly: false,
+      systemFile: null,
+      system: null,
     });
   });
 
@@ -194,6 +200,8 @@ describe("parseRunArgs", () => {
       prompt: "explore",
       stopTimeoutMs: null,
       readOnly: true,
+      systemFile: null,
+      system: null,
     });
     // Exact-match: it is accepted before a positional, not swallowed as one.
     expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual({
@@ -202,6 +210,8 @@ describe("parseRunArgs", () => {
       prompt: "explore",
       stopTimeoutMs: null,
       readOnly: true,
+      systemFile: null,
+      system: null,
     });
     // Composes with --stop-timeout-ms.
     expect(
@@ -212,7 +222,68 @@ describe("parseRunArgs", () => {
       prompt: "p",
       stopTimeoutMs: 1500,
       readOnly: true,
+      systemFile: null,
+      system: null,
     });
+  });
+
+  test("--system-file / --system parse as value flags (split + = forms)", () => {
+    expect(
+      parseRunArgs(["claude", "p", "--system-file", "/tmp/sys.txt"]),
+    ).toEqual({
+      ok: true,
+      cli: "claude",
+      prompt: "p",
+      stopTimeoutMs: null,
+      readOnly: false,
+      systemFile: "/tmp/sys.txt",
+      system: null,
+    });
+    expect(parseRunArgs(["codex", "p", "--system-file=/tmp/sys.txt"])).toEqual({
+      ok: true,
+      cli: "codex",
+      prompt: "p",
+      stopTimeoutMs: null,
+      readOnly: false,
+      systemFile: "/tmp/sys.txt",
+      system: null,
+    });
+    // Inline text, both spellings; composes with the other flags.
+    expect(
+      parseRunArgs(["pi", "p", "--system", "be terse", "--read-only"]),
+    ).toEqual({
+      ok: true,
+      cli: "pi",
+      prompt: "p",
+      stopTimeoutMs: null,
+      readOnly: true,
+      systemFile: null,
+      system: "be terse",
+    });
+    expect(parseRunArgs(["claude", "p", "--system=be terse"])).toEqual({
+      ok: true,
+      cli: "claude",
+      prompt: "p",
+      stopTimeoutMs: null,
+      readOnly: false,
+      systemFile: null,
+      system: "be terse",
+    });
+  });
+
+  test("--system-file + --system together → bad_args (one input, two spellings)", () => {
+    const res = parseRunArgs([
+      "claude",
+      "p",
+      "--system-file",
+      "/tmp/sys.txt",
+      "--system",
+      "inline",
+    ]);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toContain("cannot combine --system-file and --system");
+    }
   });
 
   test("a --read-only lookalike is still an unknown flag (exact-match only)", () => {
@@ -231,6 +302,8 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--bogus"], "unknown flag"],
     [["claude", "p", "--stop-timeout-ms", "abc"], "must be a positive integer"],
     [["claude", "p", "--stop-timeout-ms"], "requires a value"],
+    [["claude", "p", "--system-file"], "--system-file requires a value"],
+    [["claude", "p", "--system"], "--system requires a value"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);

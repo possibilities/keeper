@@ -62,9 +62,12 @@ Usage:
                                     Block until a detached run's next stop.
   keeper agent show-last-message <h>   Print a detached run's final message.
   keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
+                                  [--system-file <path> | --system <text>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
                                     --read-only is detection, not prevention.
+                                    --system-file/--system prepend a caller-side
+                                    System: block (uniform across harnesses).
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -156,14 +159,20 @@ Post-launch transcript subcommands (composable with a detached launch):
 
 Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
   keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
+                                  [--system-file <path> | --system <text>]
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
                                         process. --read-only prepends a read-only
                                         directive and strips edit tools per harness
                                         — detection, NOT prevention (the strip is
                                         leaky; there is no changed-files audit on
-                                        this verb). codex/pi launch with CLAUDE*
-                                        env stripped by default (partner isolation).
+                                        this verb). --system-file/--system compose a
+                                        caller-side System:-prepend into the prompt
+                                        (mutually exclusive; missing file → bad_args),
+                                        UNIFORM across claude/codex/pi — user-turn
+                                        text, NOT a privileged system prompt. codex/pi
+                                        launch with CLAUDE* env stripped by default
+                                        (partner isolation).
                                         Emits the uniform envelope
                                         {schema_version, agent, handle,
                                         transcript_path, resume_target, message,

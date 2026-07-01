@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { basename, delimiter, isAbsolute, join } from "node:path";
 import { ensureCodexDirTrust } from "../codex-trust";
 import {
   buildLauncherArgvPrefix,
@@ -819,15 +819,46 @@ async function runRunCaptureSubcommand(
   }
   const agent = parsed.cli;
   const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
-  // Read-only prepends the directive CALLER-SIDE (raw `\n\n` join, no `User:`
-  // scaffold — `agent run` has no role framing, unlike pair's `assemblePrompt`).
-  // The shared helper stays directive-free so pair never double-prepends; the
-  // per-harness tool strip rides via `posture.readOnly`. Detection, not
-  // prevention (the strip is leaky; there is no changed-files audit on this
-  // caller — that stays pair-side).
-  const prompt = parsed.readOnly
-    ? `${READ_ONLY_DIRECTIVE}\n\n${parsed.prompt}`
-    : parsed.prompt;
+  // Resolve the `--system-file`/`--system` seam to text HANDLER-SIDE (the pure
+  // parser never reads the fs). A relative `--system-file` resolves against the
+  // caller cwd; a missing/unreadable file is `bad_args` (exit 2), never a throw.
+  let systemText: string | null = null;
+  if (parsed.systemFile !== null) {
+    const path = isAbsolute(parsed.systemFile)
+      ? parsed.systemFile
+      : join(deps.cwd, parsed.systemFile);
+    try {
+      systemText = readFileSync(path, "utf8").trim();
+    } catch (err) {
+      deps.writeErr(
+        `agent: cannot read --system-file ${path}: ${(err as Error).message}\n`,
+      );
+      return emitRunCapture(
+        deps,
+        buildRunCaptureEnvelope({ outcome: "bad_args" }),
+      );
+    }
+  } else if (parsed.system !== null) {
+    systemText = parsed.system.trim();
+  }
+  // Compose CALLER-SIDE, mirroring pair's `assemblePrompt` block order (raw
+  // `\n\n` join, no `User:` scaffold — `agent run` has no role framing):
+  // [read-only directive] → [System: <text>] → [user prompt], UNIFORM across
+  // claude/codex/pi. The shared launch helper stays directive-free so pair never
+  // double-prepends; the per-harness tool strip rides via `posture.readOnly`.
+  // Detection, not prevention (the strip is leaky; no changed-files audit here —
+  // that stays pair-side). The `System:` block is user-turn text, NOT a
+  // privileged system prompt — the native `--append-system-prompt` upgrade is a
+  // deliberate future step. An empty-after-trim system value is a no-op skip.
+  const promptParts: string[] = [];
+  if (parsed.readOnly) {
+    promptParts.push(READ_ONLY_DIRECTIVE);
+  }
+  if (systemText !== null && systemText !== "") {
+    promptParts.push(`System: ${systemText}`);
+  }
+  promptParts.push(parsed.prompt);
+  const prompt = promptParts.join("\n\n");
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),

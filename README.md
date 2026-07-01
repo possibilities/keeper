@@ -1429,7 +1429,14 @@ event-log/reducer/hook touch. Run any of them with
   no_transcript 4, launch_failed 1, bad_args 2). `run --read-only` prepends a
   read-only directive and strips edit tools per harness — detection, NOT
   prevention (the strip is leaky and there is NO changed-files audit on this verb,
-  unlike `keeper pair`'s caller-side git backstop). codex/pi runs launch with
+  unlike `keeper pair`'s caller-side git backstop). `run --system-file <path>` /
+  `--system <text>` (mutually exclusive; a missing file → bad_args) compose a
+  caller-side `System:`-prepend into the prompt positional, UNIFORM across
+  claude/codex/pi and mirroring pair's `assemblePrompt` block order (read-only
+  directive → `System:` → user prompt) — deliberately user-turn text, NOT a
+  privileged system prompt (the native `--append-system-prompt` upgrade is a
+  documented future step; keep security-relevant constraints out of this
+  overridable block). codex/pi runs launch with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex
