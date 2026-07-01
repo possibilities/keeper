@@ -3,18 +3,20 @@
  * cross-OS panel orchestrator (src/pair/panel.ts). Everything OS-specific is
  * injected: a fake `spawn` (records the wrapper argv, never launches), a fake
  * clock + `sleep` (deterministic deadline), and a fake `pidAlive`. The leg
- * outcomes are simulated by writing the `.yaml`/`.log`/`.pidfile` sentinels into
- * a real scratch dir, so terminality + the verdict are exercised against real fs
- * without a single real process. The detached-survival case (the keystone proof
- * that legs outlive `start`'s exit on macOS) is the REAL-spawn sibling in
- * `test/pair-panel.slow.test.ts`.
+ * outcomes are simulated by seeding each leg's `--output` result file (a `keeper
+ * agent run` JSON envelope carrying an `outcome`) plus its `.pidfile` into a real
+ * scratch dir, so terminality + the verdict are exercised against real fs without
+ * a single real process. The detached-survival case (the keystone proof that legs
+ * outlive `start`'s exit and write their result file on macOS) is the REAL-spawn
+ * sibling in `test/pair-panel.slow.test.ts` (skipped unless `KEEPER_RUN_SLOW`).
  *
  * Coverage: member resolution (panel hit / single preset / unknown fail-loud);
  * leg + detach-wrapper argv shape (zero setsid/timeout/gtimeout);
  * `start` manifest persist+print + per-member `--preset` legs; `wait` full-success
- * N-of-N (exit 0, ok:true), mixed-fail (exit 0, ok:false, reason populated),
- * 124-timeout, crash-fail via dead pid past grace, content-blindness, manifest
- * round-trip, `--chunk` ceiling, and corrupt/missing manifest.
+ * N-of-N (exit 0, ok:true), the outcome→verdict mapping (completed→ok, every other
+ * outcome→fail+reason), corrupt-result→fail, 124-timeout, crash-fail via dead pid
+ * past grace, content-blindness, manifest round-trip, `--chunk` ceiling, and
+ * corrupt/missing manifest.
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -133,6 +135,19 @@ function writePrompt(text = "what is the best answer?"): string {
   return p;
 }
 
+/** Seed a leg's `--output` result file with a `keeper agent run` JSON envelope
+ *  carrying the given `outcome` (the field `evaluateLeg` keys off). */
+function seedResult(name: string, outcome: string): void {
+  writeFileSync(
+    join(dir, `${name}.yaml`),
+    `${JSON.stringify({
+      schema_version: 1,
+      outcome,
+      message: outcome === "completed" ? "SECRET_ANSWER_DO_NOT_LEAK" : null,
+    })}\n`,
+  );
+}
+
 function readManifest(): PanelManifest {
   return JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
 }
@@ -189,21 +204,22 @@ test("resolvePanelMembers: a pi single-preset is accepted (pair-launchable)", ()
 
 // ---- argv shape ------------------------------------------------------------
 
-test("buildPanelLegArgv: preset member uses --preset; legacy uses --cli; no banned tokens", () => {
+test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; no banned tokens", () => {
   const presetArgv = buildPanelLegArgv({
     keeperBin: KEEPER_BIN,
     keeperAgentPath: KEEPER_AGENT,
-    promptPath: "/d/prompt.md",
+    prompt: "what is the best answer?",
     member: { name: "rA", harness: "claude", preset: "rA" },
     yamlPath: "/d/rA.yaml",
-    timeoutSeconds: 1800,
+    stopTimeoutMs: 1_800_000,
   });
   expect(presetArgv).toEqual([
     KEEPER_BIN,
     KEEPER_AGENT,
-    "pair",
-    "send",
-    "/d/prompt.md",
+    "agent",
+    "run",
+    "claude",
+    "what is the best answer?",
     "--preset",
     "rA",
     "--read-only",
@@ -211,26 +227,35 @@ test("buildPanelLegArgv: preset member uses --preset; legacy uses --cli; no bann
     "panels",
     "--output",
     "/d/rA.yaml",
-    "--timeout",
-    "1800",
+    "--stop-timeout-ms",
+    "1800000",
   ]);
 
-  const legacyArgv = buildPanelLegArgv({
+  // A presetless member keeps its harness as the `<cli>` positional and drops the
+  // `--preset` flag entirely.
+  const presetlessArgv = buildPanelLegArgv({
     keeperBin: KEEPER_BIN,
     keeperAgentPath: KEEPER_AGENT,
-    promptPath: "/d/prompt.md",
+    prompt: "q",
     member: { name: "codex", harness: "codex" },
     yamlPath: "/d/codex.yaml",
-    timeoutSeconds: 1800,
+    stopTimeoutMs: 1_800_000,
   });
-  expect(legacyArgv).toContain("--cli");
-  expect(legacyArgv).toContain("codex");
-  expect(legacyArgv).not.toContain("--preset");
+  expect(presetlessArgv.slice(0, 5)).toEqual([
+    KEEPER_BIN,
+    KEEPER_AGENT,
+    "agent",
+    "run",
+    "codex",
+  ]);
+  expect(presetlessArgv).not.toContain("--preset");
+  expect(presetlessArgv).not.toContain("--cli");
 
   const wrapper = buildDetachWrapperArgv(presetArgv);
   expect(wrapper.slice(0, 4)).toEqual(["sh", "-c", DETACH_SCRIPT, "--"]);
   // No coreutils detach/bound commands anywhere — not as the spawn binary, and
-  // not inside the detach script (keeper's own `--timeout` FLAG is fine).
+  // not inside the detach script (keeper's own `--stop-timeout-ms` FLAG is fine —
+  // it is a distinct token, never the bare `timeout` binary).
   expect(wrapper[0]).toBe("sh");
   for (const banned of ["setsid", "timeout", "gtimeout"]) {
     expect(DETACH_SCRIPT).not.toContain(banned);
@@ -267,6 +292,12 @@ test("start: persists + prints a manifest, launches every leg detached", async (
     expect(typeof s.env.LOG).toBe("string");
     expect(typeof s.env.PIDFILE).toBe("string");
     expect(s.env.PATH).toBe("/usr/bin"); // base env carried through
+    // The wrapped leg is `agent run`, and the panel's --timeout (s) is translated
+    // to --stop-timeout-ms (900s → 900000ms).
+    const leg = s.argv.slice(4);
+    expect(leg.slice(0, 4)).toEqual([KEEPER_BIN, KEEPER_AGENT, "agent", "run"]);
+    const tIdx = leg.indexOf("--stop-timeout-ms");
+    expect(leg[tIdx + 1]).toBe("900000");
   }
 
   // Manifest persisted AND printed identically.
@@ -364,8 +395,8 @@ async function startLegacy(): Promise<void> {
 
 test("wait: full-success N-of-N → exit 0, ok:true (manifest round-trip)", async () => {
   await startLegacy();
-  writeFileSync(join(dir, "opus.yaml"), "message: hi\n");
-  writeFileSync(join(dir, "codex.yaml"), "message: yo\n");
+  seedResult("opus", "completed");
+  seedResult("codex", "completed");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -391,13 +422,10 @@ test("wait: full-success N-of-N → exit 0, ok:true (manifest round-trip)", asyn
   ]);
 });
 
-test("wait: mixed verdict (one failed log) → exit 0, ok:false, reason populated", async () => {
+test("wait: mixed verdict (one failed outcome) → exit 0, ok:false, reason=outcome", async () => {
   await startLegacy();
-  writeFileSync(join(dir, "opus.yaml"), "message: hi\n");
-  writeFileSync(
-    join(dir, "codex.log"),
-    "[keeper-pair] started cli=codex\n[keeper-pair] failed cli=codex output=/x error=keeper agent launch exited 1: boom\n",
-  );
+  seedResult("opus", "completed");
+  seedResult("codex", "timed_out");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -410,16 +438,57 @@ test("wait: mixed verdict (one failed log) → exit 0, ok:false, reason populate
     status: "fail",
     yaml: null,
   });
-  expect(v.members[1]?.reason).toBe("keeper agent launch exited 1: boom");
+  // The failing leg's reason is the envelope's `outcome`, verbatim.
+  expect(v.members[1]?.reason).toBe("timed_out");
 });
 
-test("wait: content-blind — a panelist answer in .yaml never reaches the verdict", async () => {
+test("wait: every non-completed outcome maps to fail with reason=outcome", async () => {
+  for (const outcome of [
+    "no_message",
+    "no_transcript",
+    "launch_failed",
+    "bad_args",
+  ]) {
+    await startLegacy();
+    seedResult("opus", "completed");
+    seedResult("codex", outcome);
+    const { deps, stdout } = makeDeps({});
+    const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
+    expect(code).toBe(0);
+    const v: PanelVerdict = JSON.parse(stdout().trim());
+    expect(v.ok).toBe(false);
+    expect(v.members[1]).toMatchObject({
+      name: "codex",
+      status: "fail",
+      yaml: null,
+      reason: outcome,
+    });
+  }
+});
+
+test("wait: a present-but-unparseable result file → fail (reason=corrupt-result)", async () => {
   await startLegacy();
-  writeFileSync(join(dir, "opus.yaml"), "message: SECRET_ANSWER_DO_NOT_LEAK\n");
-  writeFileSync(
-    join(dir, "codex.yaml"),
-    "message: SECRET_ANSWER_DO_NOT_LEAK\n",
-  );
+  seedResult("opus", "completed");
+  // A half-written / non-JSON present file — never throws out of wait.
+  writeFileSync(join(dir, "codex.yaml"), "{not json");
+
+  const { deps, stdout } = makeDeps({});
+  const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
+  expect(code).toBe(0);
+  const v: PanelVerdict = JSON.parse(stdout().trim());
+  expect(v.ok).toBe(false);
+  expect(v.members[1]).toMatchObject({
+    name: "codex",
+    status: "fail",
+    reason: "corrupt-result",
+  });
+});
+
+test("wait: content-blind — a panelist answer in the result file never reaches the verdict", async () => {
+  await startLegacy();
+  // seedResult stamps the SECRET marker into each completed envelope's `message`.
+  seedResult("opus", "completed");
+  seedResult("codex", "completed");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -429,8 +498,8 @@ test("wait: content-blind — a panelist answer in .yaml never reaches the verdi
 
 test("wait: a non-terminal leg with a live pid → exit 124 when the chunk elapses", async () => {
   await startLegacy();
-  // opus is done; codex is still running (pid alive, no yaml, no terminal log).
-  writeFileSync(join(dir, "opus.yaml"), "message: hi\n");
+  // opus is done; codex is still running (pid alive, no result file).
+  seedResult("opus", "completed");
   writeFileSync(join(dir, "codex.pidfile"), "4242\n");
 
   const { deps } = makeDeps({ pidAlive: (pid) => pid === 4242 });
@@ -440,8 +509,8 @@ test("wait: a non-terminal leg with a live pid → exit 124 when the chunk elaps
 
 test("wait: a dead pid past the startup grace → crash fail (exit 0, ok:false)", async () => {
   await startLegacy();
-  writeFileSync(join(dir, "opus.yaml"), "message: hi\n");
-  // codex never wrote a yaml or a terminal log line; its pid is gone.
+  seedResult("opus", "completed");
+  // codex never wrote a result file; its pid is gone (crash-without-file).
   writeFileSync(join(dir, "codex.pidfile"), "4242\n");
 
   const { deps, stdout } = makeDeps({ pidAlive: () => false, graceMs: 0 });
@@ -450,7 +519,9 @@ test("wait: a dead pid past the startup grace → crash fail (exit 0, ok:false)"
   const v: PanelVerdict = JSON.parse(stdout().trim());
   expect(v.ok).toBe(false);
   expect(v.members[1]?.status).toBe("fail");
-  expect(v.members[1]?.reason).toContain("exited before producing output");
+  expect(v.members[1]?.reason).toContain(
+    "exited before producing a result file",
+  );
 });
 
 test("wait: a null-pidfile (launch-failed) leg is a terminal fail", async () => {
@@ -462,7 +533,6 @@ test("wait: a null-pidfile (launch-failed) leg is a terminal fail", async () => 
         name: "codex",
         harness: "codex",
         yaml: join(dir, "codex.yaml"),
-        log: join(dir, "codex.log"),
         pidfile: null,
       },
     ],

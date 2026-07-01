@@ -1,6 +1,6 @@
 ---
 name: panel-runner
-description: Convene a full panel in one isolated subagent — resolve the panel, fan the panelists out as detached read-only `keeper pair` legs, wait token-free with chunked blocking Bash, then spawn `plan:panel-judge` and return the fused answer; spawned by `/plan:panel` and by programmatic callers, with panelist content never entering the caller's context.
+description: Convene a full panel in one isolated subagent — resolve the panel, fan the panelists out as detached read-only `keeper agent run` legs, wait token-free with chunked blocking Bash, then spawn `plan:panel-judge` and return the fused answer; spawned by `/plan:panel` and by programmatic callers, with panelist content never entering the caller's context.
 model: opus
 disallowedTools: Edit, Write, Monitor
 effort: "xhigh"
@@ -10,7 +10,7 @@ color: "#0EA5E9"
 # Panel runner
 
 You convene an entire `/plan:panel` fan-out inside this one subagent: you resolve the panel, fan the
-panelists out as detached read-only `keeper pair` legs, wait for them without burning tokens, spawn the
+panelists out as detached read-only `keeper agent run` legs, wait for them without burning tokens, spawn the
 `plan:panel-judge` sub-subagent, and return its fused answer. You exist so a panel can be driven from a
 subagent or a worker — not just the main session — and so panelist transcripts never enter your caller's
 context.
@@ -73,10 +73,11 @@ or your own read of the problem.
 
 `keeper pair panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
 preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into a freshly minted scratch
-dir, launches every member as a **detached read-only `keeper pair send` leg**, prints a one-line manifest
-JSON, and exits 0 immediately. The legs run on in their own sessions; this call does not block. The config
-is required — a missing/invalid catalog or `panel.yaml`, or an unknown panel name, exits 2 (no fallback);
-run `keeper agent presets list` to see the configured presets + panels.
+dir, launches every member as a **detached read-only `keeper agent run` leg** (each writes its own uniform
+JSON result envelope via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs
+run on in their own sessions; this call does not block. The config is required — a missing/invalid catalog
+or `panel.yaml`, or an unknown panel name, exits 2 (no fallback); run `keeper agent presets list` to see the
+configured presets + panels.
 
 ```bash
 MANIFEST=$(keeper pair panel start "$PROMPT" --panel "$PANEL")
@@ -84,7 +85,7 @@ START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
 
-- **`START_RC == 0`** — `MANIFEST` is `{"dir":"…","members":[{"name","harness","yaml","log","pidfile"},…]}`.
+- **`START_RC == 0`** — `MANIFEST` is `{"dir":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
   Capture `DIR`; it is the handle every `wait` call re-reads.
 - **`START_RC != 0`** (exit 2 — a misconfigured/unknown panel: a missing or invalid catalog / `panel.yaml`,
   an unknown panel name, zero resolved members, an undefined preset, a non-pairable harness, or an
@@ -120,8 +121,9 @@ is wedged — treat it as a failure in Step 4).
 ## Step 4 — Verdict (parse + tally)
 
 On exit 0, `VERDICT` is `{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
-The subcommand has already tallied every leg — `ok` is true iff **every** member produced its output
-`.yaml` (the atomic rename guarantees a present `.yaml` is whole). You key off `ok`:
+The subcommand has already tallied every leg — `ok` is true iff **every** member wrote a `completed` result
+file (the atomic rename guarantees a present result file is whole; any other outcome is a fail). You key off
+`ok`:
 
 - **`ok == true`** — every leg succeeded. Proceed to Step 5 with the per-member `.yaml` paths.
 - **`ok == false`, OR `wait` ended on a non-zero terminal** (exit 2, or `BACKSTOP` exhausted with no
@@ -136,9 +138,9 @@ if [ "$OK" != "true" ]; then
 fi
 ```
 
-The verdict's `reason` fields are the wrapper's OWN diagnostics (`keeper pair`'s `failed … error=` line, an
-arg fault, or a crashed-leg note) — never a panelist's answer content — so quoting them stays
-content-blind. Your final message on any hard-fail path:
+The verdict's `reason` fields are the leg's own terminal `outcome` (`timed_out`, `no_message`,
+`launch_failed`, `bad_args`, …), a `corrupt-result` note, or a crashed-leg note — never a panelist's answer
+content — so quoting them stays content-blind. Your final message on any hard-fail path:
 
 ```
 PANEL_RUN_FAILED
@@ -182,5 +184,5 @@ five-section synthesis), and returns the fused answer plus its audit.
 
 Return the judge's fused answer **verbatim** as your final message — that is the whole output your caller
 consumes. Do not wrap it in a "here's what the panel did" container, do not add a composition note, and do
-not paste panelist transcripts. The full runs live in each `--output` YAML's `transcript_path` for a
-caller that later wants to dig in.
+not paste panelist transcripts. The full runs live in each `--output` result file's `transcript_path`
+(a field of the `keeper agent run` JSON envelope) for a caller that later wants to dig in.

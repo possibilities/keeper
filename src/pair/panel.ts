@@ -4,21 +4,23 @@
  * shell (neither exists on stock macOS). All the OS-specific machinery lives here
  * in TS: detachment via a `nohup` double-fork POSIX-shell wrapper (NOT
  * `setsid`/`timeout`/`gtimeout`), a `Date.now()`-deadline poll loop (NOT a shell
- * `timeout`), and atomic same-dir temp-then-rename sentinels (EXDEV-safe on
+ * `timeout`), and atomic same-dir temp-then-rename result files (EXDEV-safe on
  * macOS, where `os.tmpdir()` is a different APFS volume).
  *
  *   - `start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]`
  *     resolves the panel members in-process, copies the prompt into a scratch
- *     dir, launches every member as a DETACHED `keeper pair send` leg, persists
+ *     dir, launches every member as a DETACHED `keeper agent run` leg (each writes
+ *     its own uniform JSON result envelope via `--output`), persists
  *     `<dir>/manifest.json`, prints it, and exits 0 immediately.
  *   - `wait --dir <d> [--chunk <s>]` re-reads the manifest and blocks ONE chunk
  *     polling each leg's terminality; exit 0 + verdict JSON when all legs are
  *     terminal, exit 124 when the chunk elapses (re-issuable), exit 2 on a
  *     missing/corrupt manifest or bad flags.
  *
- * CONTENT-BLIND: `wait` reads each `.yaml` only for EXISTENCE and each `.log`
- * only for the wrapper's own `[keeper-pair]` event / `pair:` arg-fault lines —
- * NEVER a panelist's answer content. `exit 0` means all-terminal, NOT
+ * CONTENT-BLIND: `wait` reads each leg's result file only for its `outcome`
+ * (`completed` → ok; every other outcome → fail, `reason=<outcome>`) — NEVER a
+ * panelist's `message` content — with the pidfile the sole crash backstop for a
+ * leg that dies before producing a file. `exit 0` means all-terminal, NOT
  * all-success: the agent keys off the verdict's `ok` flag.
  *
  * No keeper.db write, no RPC, no third-party deps — `node:*` plus the dep-free
@@ -53,7 +55,8 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Per-leg `keeper pair send --timeout` default (seconds). */
+/** Per-leg `keeper agent run` stop-timeout default (seconds; translated to
+ *  `--stop-timeout-ms` at launch). */
 export const DEFAULT_PANEL_TIMEOUT_SECONDS = 1800;
 /** Default `wait --chunk` (seconds) — the panel-runner's ≤9-min window. */
 export const DEFAULT_PANEL_CHUNK_SECONDS = 540;
@@ -74,22 +77,23 @@ const PANEL_SESSION = "panels";
 // Types
 // ---------------------------------------------------------------------------
 
-/** A resolved panel member. `preset` set → launch via `--preset <preset>`;
- *  absent → the legacy `--cli <harness>` form. `name` is the leg label and the
- *  basename of its `.yaml`/`.log`/`.pidfile`. */
+/** A resolved panel member. `harness` is always the `agent run <cli>` positional;
+ *  `preset` set → the leg also carries `--preset <preset>`. `name` is the leg
+ *  label and the basename of its result file + pidfile. */
 export interface PanelMember {
   name: string;
   harness: PairCli;
   preset?: string;
 }
 
-/** One member's persisted launch record in the manifest. `pidfile` is null when
- *  the leg's spawn threw at launch (it never started → a normal N-of-N fail). */
+/** One member's persisted launch record in the manifest. `yaml` is the leg's
+ *  `--output` result-file path (a `keeper agent run` JSON envelope). `pidfile` is
+ *  null when the leg's spawn threw at launch (it never started → a normal N-of-N
+ *  fail). */
 export interface PanelManifestMember {
   name: string;
   harness: string;
   yaml: string;
-  log: string;
   pidfile: string | null;
 }
 
@@ -99,8 +103,9 @@ export interface PanelManifest {
   members: PanelManifestMember[];
 }
 
-/** One member's verdict line. `status:"ok"` ⇒ `yaml` set, `reason` null;
- *  `status:"fail"` ⇒ `yaml` null, `reason` a wrapper-sourced diagnostic. */
+/** One member's verdict line. `status:"ok"` ⇒ `yaml` (the result-file path) set,
+ *  `reason` null; `status:"fail"` ⇒ `yaml` null, `reason` the failing `outcome`
+ *  (or a crash / corrupt-result note). */
 export interface PanelVerdictMember {
   name: string;
   harness: string;
@@ -225,38 +230,41 @@ export function resolvePanelMembers(
 // ---------------------------------------------------------------------------
 
 /**
- * Build one leg's `keeper pair send` argv:
- *   `<bun> <keeper.ts> pair send <prompt> {--preset <m>|--cli <harness>}
- *     --read-only --session panels --output <dir>/<m>.yaml --timeout <T>`.
+ * Build one leg's `keeper agent run` argv:
+ *   `<bun> <keeper.ts> agent run <harness> <prompt> [--preset <m>] --read-only
+ *     --session panels --output <dir>/<m>.yaml --stop-timeout-ms <ms>`.
  * The `[<bun>, <keeper.ts>]` prefix is the self-re-exec transport (daemon.ts
- * precedent); `--read-only` keeps every panelist a non-mutating explorer. Pure.
+ * precedent); `<harness>` is the `agent run <cli>` positional and `<prompt>` the
+ * task text passed inline (agent run takes the prompt literally, not a file);
+ * `--preset` layers model/effort when the member carries one. `--read-only` keeps
+ * every panelist a non-mutating explorer, and `--output` makes the leg write its
+ * own uniform JSON result envelope atomically. Pure.
  */
 export function buildPanelLegArgv(opts: {
   keeperBin: string;
   keeperAgentPath: string;
-  promptPath: string;
+  prompt: string;
   member: PanelMember;
   yamlPath: string;
-  timeoutSeconds: number;
+  stopTimeoutMs: number;
 }): string[] {
-  const launchFlag =
-    opts.member.preset !== undefined
-      ? ["--preset", opts.member.preset]
-      : ["--cli", opts.member.harness];
+  const presetFlag =
+    opts.member.preset !== undefined ? ["--preset", opts.member.preset] : [];
   return [
     opts.keeperBin,
     opts.keeperAgentPath,
-    "pair",
-    "send",
-    opts.promptPath,
-    ...launchFlag,
+    "agent",
+    "run",
+    opts.member.harness,
+    opts.prompt,
+    ...presetFlag,
     "--read-only",
     "--session",
     PANEL_SESSION,
     "--output",
     opts.yamlPath,
-    "--timeout",
-    String(opts.timeoutSeconds),
+    "--stop-timeout-ms",
+    String(opts.stopTimeoutMs),
   ];
 }
 
@@ -295,60 +303,29 @@ function writeFileAtomic(dir: string, target: string, content: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Terminality (in wait) — log-line authoritative, pid the crash backstop only
+// Terminality (in wait) — result-file authoritative, pid the crash backstop only
 // ---------------------------------------------------------------------------
 
-/** Scan a leg's `.log` for the wrapper's OWN terminal signal. Content-blind:
- *  reads only `[keeper-pair] completed`/`failed` event lines and a `pair: …`
- *  arg-fault stderr line (exit-2 before any event line) — never panelist
- *  content. Returns whether the leg is terminal, whether it failed, and the
- *  captured fail reason. */
-function scanLogTerminal(logPath: string): {
-  terminal: boolean;
-  failed: boolean;
-  reason: string | null;
-} {
+/** Read + parse a leg's `--output` result file to its `outcome`. Content-blind:
+ *  pulls ONLY the `outcome` field off the JSON envelope, never the panelist's
+ *  `message`. Returns the outcome string, or `"corrupt-result"` when the present
+ *  file is missing/unreadable/unparseable/lacks a string `outcome` (never throws
+ *  — a partial or malformed present file is a fail, not a crash of `wait`). */
+function readResultOutcome(yamlPath: string): string {
   let text: string;
   try {
-    text = readFileSync(logPath, "utf8");
+    text = readFileSync(yamlPath, "utf8");
   } catch {
-    return { terminal: false, failed: false, reason: null };
+    return "corrupt-result";
   }
-  let failedLine: string | undefined;
-  let completedLine: string | undefined;
-  let argFaultLine: string | undefined;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("[keeper-pair] failed")) {
-      failedLine = line;
-    } else if (line.startsWith("[keeper-pair] completed")) {
-      completedLine = line;
-    } else if (line.startsWith("pair:") && argFaultLine === undefined) {
-      argFaultLine = line;
-    }
+  try {
+    const parsed = JSON.parse(text) as { outcome?: unknown };
+    return typeof parsed.outcome === "string"
+      ? parsed.outcome
+      : "corrupt-result";
+  } catch {
+    return "corrupt-result";
   }
-  if (failedLine !== undefined) {
-    const idx = failedLine.indexOf("error=");
-    const fromEvent =
-      idx >= 0 ? failedLine.slice(idx + "error=".length).trim() : "";
-    const reason = fromEvent !== "" ? fromEvent : (argFaultLine ?? failedLine);
-    return { terminal: true, failed: true, reason };
-  }
-  if (completedLine !== undefined) {
-    // `completed` is emitted only AFTER the atomic `--output` rename, so a
-    // `completed` log with no `.yaml` (step 1 already missed) is contradictory —
-    // surface it as a fail rather than a silent success.
-    return {
-      terminal: true,
-      failed: true,
-      reason: "leg reported completed but produced no output file",
-    };
-  }
-  if (argFaultLine !== undefined) {
-    // An arg fault (exit 2) prints `pair: …` and exits before any event line.
-    return { terminal: true, failed: true, reason: argFaultLine };
-  }
-  return { terminal: false, failed: false, reason: null };
 }
 
 /** Read + parse a pidfile to a positive int, or null when missing/unparseable. */
@@ -361,9 +338,11 @@ function readPid(pidfile: string): number | null {
   }
 }
 
-/** One member's status, precedence: `.yaml` exists → ok; else `.log` terminal
- *  line → success/fail; else pidfile-dead-past-grace → crash fail; else
- *  running. The pid is the crash backstop ONLY. */
+/** One member's status, precedence: result file present → parse its `outcome`
+ *  (`completed` → ok; anything else → fail with `reason=<outcome>`; unparseable →
+ *  fail `reason=corrupt-result`); else a null/dead pidfile past grace → crash
+ *  fail; else running. The pid is the crash backstop ONLY — a leg that dies
+ *  before writing its file. */
 function evaluateLeg(
   member: PanelManifestMember,
   deps: PanelDeps,
@@ -374,11 +353,11 @@ function evaluateLeg(
   reason: string | null;
 } {
   if (existsSync(member.yaml)) {
-    return { status: "ok", yaml: member.yaml, reason: null };
-  }
-  const log = scanLogTerminal(member.log);
-  if (log.terminal) {
-    return { status: "fail", yaml: null, reason: log.reason };
+    const outcome = readResultOutcome(member.yaml);
+    if (outcome === "completed") {
+      return { status: "ok", yaml: member.yaml, reason: null };
+    }
+    return { status: "fail", yaml: null, reason: outcome };
   }
   // A null pidfile means `start`'s spawn threw — the leg never launched.
   if (member.pidfile === null) {
@@ -395,7 +374,7 @@ function evaluateLeg(
       return {
         status: "fail",
         yaml: null,
-        reason: `leg process ${pid} exited before producing output (no [keeper-pair] terminal line)`,
+        reason: `leg process ${pid} exited before producing a result file`,
       };
     }
   }
@@ -449,7 +428,6 @@ export function parseManifest(
       typeof mm.name !== "string" ||
       typeof mm.harness !== "string" ||
       typeof mm.yaml !== "string" ||
-      typeof mm.log !== "string" ||
       !(mm.pidfile === null || typeof mm.pidfile === "string")
     ) {
       return { ok: false, error: "manifest member has malformed fields" };
@@ -458,7 +436,6 @@ export function parseManifest(
       name: mm.name,
       harness: mm.harness,
       yaml: mm.yaml,
-      log: mm.log,
       pidfile: mm.pidfile,
     });
   }
@@ -544,21 +521,27 @@ export async function panelStart(
     dir = mkdtempSync(join(tmpdir(), "keeper-panel-"));
   }
 
-  const promptPath = join(dir, "prompt.md");
-  writeFileAtomic(dir, promptPath, promptText);
+  // A human-readable copy of the prompt in the scratch dir; the leg receives the
+  // prompt text inline (agent run takes it as a positional, not a file).
+  writeFileAtomic(dir, join(dir, "prompt.md"), promptText);
 
+  // The panel's `--timeout <s>` is the per-leg stop budget; agent run wants ms.
+  const stopTimeoutMs = args.timeoutSeconds * 1000;
   const manifestMembers: PanelManifestMember[] = [];
   for (const member of resolved.members) {
     const yamlPath = join(dir, `${member.name}.yaml`);
+    // `$LOG` still captures the leg's stderr/diagnostics for the crash-without-
+    // file case (the leg dies before writing its result file); it is not read by
+    // `wait`, so it stays out of the manifest.
     const logPath = join(dir, `${member.name}.log`);
     const pidfilePath = join(dir, `${member.name}.pidfile`);
     const legArgv = buildPanelLegArgv({
       keeperBin: deps.keeperBin,
       keeperAgentPath: deps.keeperAgentPath,
-      promptPath,
+      prompt: promptText,
       member,
       yamlPath,
-      timeoutSeconds: args.timeoutSeconds,
+      stopTimeoutMs,
     });
     let launched = true;
     try {
@@ -573,7 +556,6 @@ export async function panelStart(
       name: member.name,
       harness: member.harness,
       yaml: yamlPath,
-      log: logPath,
       pidfile: launched ? pidfilePath : null,
     });
   }
@@ -710,9 +692,9 @@ Usage:
 
 start  resolves the panel members (a panel.yaml panel or a single catalog
        preset; a missing/invalid catalog or panel.yaml is fail-loud exit 2),
-       launches each as a DETACHED read-only \`keeper pair send\` leg in the
+       launches each as a DETACHED read-only \`keeper agent run\` leg in the
        'panels' session, writes <dir>/manifest.json, prints it, and exits 0
-       immediately. Prints {dir, members:[{name,harness,yaml,log,pidfile}]}.
+       immediately. Prints {dir, members:[{name,harness,yaml,pidfile}]}.
 wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        Exit 0 + verdict JSON {dir, ok, members:[{name,harness,status,yaml,reason}]}
        when all legs are terminal; exit 124 when the chunk elapses (re-issue it);
@@ -722,7 +704,7 @@ wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
 Options:
   --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
   --dir <d>         Scratch dir (start: minted when absent; wait: required)
-  --timeout <s>     Per-leg keeper pair send timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
+  --timeout <s>     Per-leg keeper agent run stop-timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
   --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
   --help, -h        Show this help
 `;

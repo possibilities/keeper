@@ -28,16 +28,18 @@ member a named preset in the catalog `~/.config/keeper/presets.yaml` — a `{har
 triple. Run `keeper agent presets list` to see the configured presets + panels.
 `keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
 **preset name** (not its harness), so two panelists on the same harness but different models stay
-distinguishable. Every member answers **in parallel** via `keeper pair send --preset <member> --read-only`,
-then the `plan:panel-judge` subagent fuses them:
+distinguishable. Every member answers **in parallel** via a detached
+`keeper agent run <harness> --preset <member> --read-only` leg that writes its answer as a uniform JSON
+result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
 
-- **A claude member** (`harness: claude`) runs `keeper pair send --preset <member> --read-only`.
+- **A claude member** (`harness: claude`) runs `keeper agent run claude --preset <member> --read-only`.
   `--read-only` strips its edit tools and prepends an explore-only directive — it reads, greps, and runs
   bash to research, then reports.
 - **A codex member** (`harness: codex`) is the cross-family diversity the panel is built to harvest.
-  Codex's read-only posture is carried by the prompt directive plus a changed-files backstop. A codex
-  member runs as an interactive TUI with its cwd directory-trust pre-seeded (fail-open), so its window
-  never hangs on codex's trust prompt.
+  Codex's read-only posture is carried by the prompt directive (agent run's read-only is detection, not a
+  changed-files audit) — panelists are explorers, so the leaky strip is acceptable. A codex member runs as
+  an interactive TUI with its cwd directory-trust pre-seeded (fail-open), so its window never hangs on
+  codex's trust prompt.
 
 No member gets an assigned role or persona — every member answers the human's task straight, and the
 diversity comes from running the panel's preset spread cold (see "No lenses, no personas" above).

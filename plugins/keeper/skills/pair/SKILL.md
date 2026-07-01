@@ -151,9 +151,9 @@ guarantee is best-effort.
 
 `keeper pair panel` is the cross-OS sub-verb the `plan:panel-runner` agent drives to fan ONE question
 out to a whole panel of models at once. It is the multi-leg sibling of `send`: `send` pairs with one
-partner; `panel` resolves a set of members and launches each as its own detached read-only `send` leg,
-then waits for them all token-free. It runs identically on macOS and Linux — all detachment and polling
-live in the binary, with no `setsid`/`timeout`/`gtimeout` on the path. Two operations:
+partner; `panel` resolves a set of members and launches each as its own detached read-only `keeper agent
+run` leg, then waits for them all token-free. It runs identically on macOS and Linux — all detachment and
+polling live in the binary, with no `setsid`/`timeout`/`gtimeout` on the path. Two operations:
 
 ```
 keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
@@ -163,9 +163,9 @@ keeper pair panel wait  --dir <d> [--chunk <s>]
 - **`start`** resolves the panel members from `~/.config/keeper/panel.yaml` (each a preset in the catalog
   `~/.config/keeper/presets.yaml`; a missing/invalid config or unknown panel exits 2 — `keeper agent
   presets list` shows what is configured), mints a scratch dir, copies the prompt in, launches every member as
-  a detached `keeper pair send --read-only` leg in the `panels` session, writes `<dir>/manifest.json`,
+  a detached `keeper agent run --read-only` leg in the `panels` session, writes `<dir>/manifest.json`,
   prints it, and **exits 0 immediately** — it never blocks. Stdout is one line of manifest JSON:
-  `{"dir":"…","members":[{"name","harness","yaml","log","pidfile"},…]}`. Capture `.dir` for the wait.
+  `{"dir":"…","members":[{"name","harness","yaml","pidfile"},…]}`. Capture `.dir` for the wait.
 - **`wait`** re-reads the manifest and blocks ONE `--chunk` window (default 540s, max 570 — one Bash call
   is capped at 600s) polling each leg's terminality, then prints the verdict JSON:
   `{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
@@ -179,9 +179,10 @@ Exit semantics drive the agent's re-issue loop:
 | 2 | bad flags / unreadable prompt / a panel that resolves to zero members / an undefined preset / a non-pairable harness | a missing or corrupt manifest, or bad flags |
 
 `wait` **exit 0 means all-terminal, NOT all-success** — key off the verdict's `ok` flag, which is true
-iff every member produced its output `.yaml`. The verdict is content-blind: `wait` reads each `.yaml`
-only for existence and each `.log` only for the wrapper's own `[keeper-pair]` event / `pair:` arg-fault
-lines, never a panelist's answer. The per-member `reason` on a `fail` is that wrapper-sourced diagnostic.
+iff every member wrote a `completed` result file. The verdict is content-blind: `wait` reads each result
+file only for its `outcome` (never the panelist's `message`), with the pidfile the crash backstop for a leg
+that dies before writing a file. The per-member `reason` on a `fail` is that leg's terminal `outcome`
+(`timed_out`, `no_message`, `launch_failed`, `bad_args`), a `corrupt-result` note, or a crashed-leg note.
 
 The human-facing `PANEL_RUN_FAILED` marker is owned by the **`plan:panel-runner` agent**, not this
 subcommand: the agent emits it (with the failing legs' reasons and the scratch dir) whenever `start`
