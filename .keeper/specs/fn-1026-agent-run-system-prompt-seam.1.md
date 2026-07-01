@@ -45,5 +45,5 @@ Add `--system-file <path>` / `--system <text>` to `agent run`, composed as a `Sy
 - [ ] `dispatch.ts` USAGE/HELP + `cli/agent.ts` header + README ~:1429 document the flags (revise in place).
 
 ## Done summary
-
+Added --system-file/--system to agent run: a uniform caller-side System: prepend into the prompt for all harnesses (mutually exclusive; missing file -> bad_args; empty-after-trim no-op). No native --append-system-prompt and no launch-builder change; pair send byte-stable.
 ## Evidence
