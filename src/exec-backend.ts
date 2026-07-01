@@ -150,10 +150,8 @@ export const MANAGED_EXEC_SESSION = "autopilot" as const;
  *  autopilot dispatch. This constant only names the spawn target. */
 export const AGENTBUS_EXEC_SESSION = "agentbus" as const;
 
-/** Default tmux session name `keeper pair` partners land in (mirrors
- *  `DEFAULT_PAIR_SESSION` in `src/pair-command.ts` — duplicated here so the
- *  managed session-name constants stay colocated in `exec-backend.ts` without
- *  dragging the pair leaf). */
+/** Default tmux session name interactive `keeper agent` pairing partners land in.
+ *  Kept alongside the other managed session-name constants in `exec-backend.ts`. */
 export const PAIR_EXEC_SESSION = "pair" as const;
 
 /** tmux session name `/plan:panel` legs land in. */

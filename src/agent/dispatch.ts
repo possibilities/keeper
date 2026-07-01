@@ -32,8 +32,8 @@ export type Dispatch =
   // kind (the agent-launch) — the leading token is `run` / `wait`.
   | { kind: "run-capture"; rest: string[] }
   | { kind: "wait-capture"; rest: string[] }
-  // The panel fan-out sub-verb (`start|wait`). Routes into the SAME `runPanel`
-  // the `keeper pair panel` branch calls; `rest` carries the `start|wait`
+  // The panel fan-out sub-verb (`start|wait`). Routes into `runPanel`;
+  // `rest` carries the `start|wait`
   // operation + its flags, which `runPanel` owns (self-emits + owns its code).
   | { kind: "panel"; rest: string[] }
   | { kind: "help" }
@@ -214,7 +214,7 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         handle (a run id or a transcript path with
                                         --agent <kind>); same uniform envelope.
 
-Panel fan-out (start | wait — the same engine \`keeper pair panel\` drives):
+Panel fan-out (start | wait):
   keeper agent panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper agent panel wait --dir <d> [--chunk <s>]
                                         Fan a question to a panel of models as

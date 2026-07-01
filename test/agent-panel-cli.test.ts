@@ -1,14 +1,13 @@
 /**
- * `keeper agent panel start|wait` — the routing-parity lock for the panel
- * fan-out exposed under the `agent` namespace. `agent panel` routes into the
- * SAME `src/pair/panel.ts` `runPanel` the `keeper pair panel` branch calls, so
- * the manifest/verdict JSON + exit semantics (0 all-terminal / 124 chunk-elapsed
- * / 2 bad-config) are structurally identical — this suite proves the wiring and
- * asserts byte-identical output against `pair panel` on the same argv.
+ * `keeper agent panel start|wait` — the routing lock for the panel fan-out
+ * exposed under the `agent` namespace. `agent panel` routes into
+ * `src/pair/panel.ts` `runPanel`, so the manifest/verdict JSON + exit semantics
+ * (0 all-terminal / 124 chunk-elapsed / 2 bad-config) come straight from that
+ * engine — this suite proves the wiring and pins the observable output.
  *
  * The pure classifier (`splitSubcommand`) is unit-tested directly. Routing is
  * driven through `src/agent/main` main() with a stubbed MainDeps, patching
- * process.{exit,stdout,stderr} (mirroring pair-cli.test.ts) because `runPanel`
+ * process.{exit,stdout,stderr} because `runPanel`
  * owns its own stdout + exit code via the process globals, not the injected
  * seams. Only the NON-spawning paths are exercised end-to-end (`wait` reads a
  * seeded manifest + result files; a bad-config `start` fails before any leg
@@ -27,7 +26,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main as pairMain } from "../cli/pair";
 import type {
   PanelSelections,
   Preset,
@@ -178,11 +176,6 @@ async function runAgent(argv: string[]): Promise<MainRun> {
   return runCapturing(() => agentMain(h.deps));
 }
 
-/** Drive `keeper pair <argv>` through cli/pair main() (the reference wiring). */
-async function runPair(argv: string[]): Promise<MainRun> {
-  return runCapturing(() => pairMain(argv));
-}
-
 /** Seed a scratch panel dir with a manifest + two completed leg result files. */
 function seedTerminalPanel(): string {
   const pdir = mkdtempSync(join(dir, "panel-"));
@@ -227,37 +220,11 @@ test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)
   expect(r.stdout).not.toContain("SECRET_ANSWER_DO_NOT_LEAK");
 });
 
-test("agent panel wait: verdict is byte-identical to `pair panel wait`", async () => {
-  const pdir = seedTerminalPanel();
-  const agent = await runAgent([
-    "panel",
-    "wait",
-    "--dir",
-    pdir,
-    "--chunk",
-    "540",
-  ]);
-  const pair = await runPair([
-    "panel",
-    "wait",
-    "--dir",
-    pdir,
-    "--chunk",
-    "540",
-  ]);
-  expect(agent.code).toBe(pair.code);
-  expect(agent.stdout).toBe(pair.stdout);
-  expect(agent.stderr).toBe(pair.stderr);
-});
-
-test("agent panel wait: missing manifest → exit 2 (same as pair panel)", async () => {
+test("agent panel wait: missing manifest → exit 2", async () => {
   const missing = join(dir, "no-such-panel-dir");
   const agent = await runAgent(["panel", "wait", "--dir", missing]);
-  const pair = await runPair(["panel", "wait", "--dir", missing]);
   expect(agent.code).toBe(2);
   expect(agent.stderr).toContain("cannot read manifest");
-  expect(agent.code).toBe(pair.code);
-  expect(agent.stderr).toBe(pair.stderr);
 });
 
 test("agent panel wait: no --dir → exit 2", async () => {
@@ -296,13 +263,10 @@ test("agent panel: bare sub-verb → exit 2", async () => {
   expect(r.code).toBe(2);
 });
 
-test("agent panel: unknown operation → exit 2 (same as pair panel)", async () => {
+test("agent panel: unknown operation → exit 2", async () => {
   const agent = await runAgent(["panel", "frobnicate"]);
-  const pair = await runPair(["panel", "frobnicate"]);
   expect(agent.code).toBe(2);
   expect(agent.stderr).toContain("unknown operation");
-  expect(agent.code).toBe(pair.code);
-  expect(agent.stderr).toBe(pair.stderr);
 });
 
 test("agent panel --help → exit 0", async () => {

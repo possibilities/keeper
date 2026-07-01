@@ -1,7 +1,7 @@
 /**
  * Unit tests for the dep-free `src/codex-trust.ts` leaf module: the codex
- * per-directory trust seeder `keeper pair` runs before launching the codex
- * partner as an interactive TUI.
+ * per-directory trust seeder the `keeper agent` launch path runs before
+ * launching a codex partner as an interactive TUI.
  *
  * Pure + in-process: every test injects a tmpdir CODEX_HOME via `env`, so there
  * is NO real codex spawn and NO write to the real `~/.codex`. The cwd key is a

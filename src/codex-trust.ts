@@ -1,6 +1,6 @@
 // Dep-free codex per-directory trust seeder — the ONLY keeper surface that writes
-// codex's own config dir. `keeper pair` (cli/pair.ts) calls ensureCodexDirTrust
-// best-effort BEFORE launching the codex partner as an interactive TUI, so the
+// codex's own config dir. The `keeper agent` launch path calls ensureCodexDirTrust
+// best-effort BEFORE launching a codex partner as an interactive TUI, so the
 // detached window never hangs on codex's "Do you trust the contents of this
 // directory?" prompt.
 //

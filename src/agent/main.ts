@@ -1348,8 +1348,7 @@ export async function main(deps: MainDeps): Promise<never> {
     return runWaitCaptureSubcommand(deps, dispatch.rest);
   }
   if (dispatch.kind === "panel") {
-    // Route into the SAME `runPanel` the `keeper pair panel` branch calls —
-    // additive parity, one engine, two namespaces. `runPanel` self-emits its
+    // Route into `runPanel` — one engine. `runPanel` self-emits its
     // manifest/verdict on stdout and owns its exit code (0 all-terminal / 124
     // chunk-elapsed / 2 bad-config), so it always `process.exit()`s and never
     // returns; the `deps.exit(0)` below only satisfies the `never` return type.

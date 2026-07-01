@@ -1,12 +1,14 @@
 /**
  * Fixture tests for the retired-name guard (scripts/lint-retired-name.sh).
  *
- * The guard covers two retired names: "planctl" (PROGRESSIVE — enforces only the
+ * The guard covers three retired names: "planctl" (PROGRESSIVE — enforces only the
  * frozen-literal surface in scripts/frozen-allowlist.txt: anchors via Check A,
- * count-pins via Check B) and "agentwrap" (ZERO-TOLERANCE — Check C fails on any
- * occurrence repo-wide outside a defined exclusion set). A count-pin's token
- * defaults to "planctl" but a 4th `|<token>` field overrides it (the agentwrap
- * relocation files are pinned that way).
+ * count-pins via Check B), "agentwrap" (ZERO-TOLERANCE — Check C fails on any
+ * occurrence repo-wide outside a defined exclusion set), and "keeper pair"
+ * (ZERO-TOLERANCE — Check D fails on any space-separated occurrence repo-wide
+ * outside the same exclusion set; the colon-separated `keeper:pair` SKILL name
+ * never matches). A count-pin's token defaults to "planctl" but a 4th `|<token>`
+ * field overrides it (the agentwrap relocation files are pinned that way).
  *
  * These drive the script via a sandboxed fixture tree (the guard honors
  * KEEPER_RETIRED_NAME_REPO_ROOT), so no git repo or real source is mutated.
@@ -113,6 +115,34 @@ test("agentwrap zero-tolerance: agentwrap only in excluded files passes", () => 
   expect(runGuard().code).toBe(0);
 });
 
+test("keeper pair zero-tolerance: a planted keeper pair verb fails repo-wide", () => {
+  // Check D greps the whole tree: a stray space-separated "keeper pair" in any
+  // non-excluded file fails, even with an otherwise-empty allowlist (the retired
+  // verb can never return).
+  put("scripts/frozen-allowlist.txt", "");
+  put(
+    "plugins/keeper/skills/pair/SKILL.md",
+    "Run `keeper pair send …` first.\n",
+  );
+
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("KEEPER-PAIR zero-tolerance");
+  expect(stderr).toContain("plugins/keeper/skills/pair/SKILL.md");
+});
+
+test("keeper pair zero-tolerance: the colon-separated keeper:pair SKILL name passes", () => {
+  // The live `keeper:pair` capability (skill name) is colon-separated and must
+  // NOT trip the space-separated retired-verb pattern.
+  put("scripts/frozen-allowlist.txt", "");
+  put(
+    "plugins/plan/skills/hack/SKILL.md",
+    "See the /keeper:pair skill; drive `keeper agent panel`.\n",
+  );
+
+  expect(runGuard().code).toBe(0);
+});
+
 test("a count-pin with an explicit token pins a non-planctl name", () => {
   // The state-dir relocation files are Check-C-excluded by basename but pinned
   // via a `count|...|<n>|agentwrap` record, so a NEW agentwrap token there still
@@ -161,10 +191,11 @@ test("fails when the allowlist is missing", () => {
   expect(stderr).toContain("frozen allowlist not found");
 });
 
-test("the real repo tree passes the guard (planctl frozen surface intact + agentwrap at zero)", () => {
-  // Proves both postures against live source: the planctl anchors/count-pins hold
-  // AND Check C finds zero "agentwrap" outside the exclusion set (the only residue
-  // is the count-pinned state-dir relocation).
+test("the real repo tree passes the guard (planctl frozen surface intact + agentwrap + keeper pair at zero)", () => {
+  // Proves all three postures against live source: the planctl anchors/count-pins
+  // hold, Check C finds zero "agentwrap" outside the exclusion set (the only
+  // residue is the count-pinned state-dir relocation), AND Check D finds zero
+  // space-separated "keeper pair" outside the exclusion set.
   const res = Bun.spawnSync(["bash", GUARD], {
     cwd: join(import.meta.dir, ".."),
   });

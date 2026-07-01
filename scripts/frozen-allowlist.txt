@@ -10,6 +10,13 @@
 # ONLY records this file still carries for it are the count-pins on the two
 # state-dir relocation files that must name their pre-relocation path forever.
 #
+# "keeper pair" (fn-1032) retired to ZERO: the `keeper pair` CLI folded onto
+# `keeper agent` (`agent run` blocking single-shot + `agent panel start|wait`
+# detached/panel fan-out). scripts/lint-retired-name.sh Check D enforces zero
+# space-separated "keeper pair" repo-wide (the colon-separated `keeper:pair` SKILL
+# name is a live capability and never matches). This file carries NO records for
+# it — the check is a pure hardcoded grep-clean with no count-pinned residue.
+#
 # This file is the single source of truth the guard (scripts/lint-retired-name.sh)
 # reads to tell a frozen literal from a renamable symbol.
 #

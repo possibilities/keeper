@@ -1,5 +1,5 @@
 /**
- * `keeper pair panel start|wait` — the cross-OS panel fan-out orchestrator the
+ * `keeper agent panel start|wait` — the cross-OS panel fan-out orchestrator the
  * `plan:panel-runner` agent drives instead of hand-rolling `setsid`/`timeout` in
  * shell (neither exists on stock macOS). All the OS-specific machinery lives here
  * in TS: detachment via a `nohup` double-fork POSIX-shell wrapper (NOT
@@ -825,13 +825,13 @@ export function buildPanelDeps(): PanelDeps {
   };
 }
 
-export const PANEL_HELP = `keeper pair panel — cross-OS panel fan-out (start | wait)
+export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait)
 
 Usage:
-  keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper pair panel start <prompt-file> (--preset <name> | --cli <claude|codex|pi>)
+  keeper agent panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> (--preset <name> | --cli <claude|codex|pi>)
        [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--dir <d>] [--timeout <s>]
-  keeper pair panel wait --dir <d> [--chunk <s>]
+  keeper agent panel wait --dir <d> [--chunk <s>]
 
 start  resolves the panel members (a panel.yaml panel or a single catalog
        preset; a missing/invalid catalog or panel.yaml is fail-loud exit 2),
@@ -862,7 +862,7 @@ Options:
 `;
 
 /**
- * Route `keeper pair panel <start|wait> …`. Parses flags, builds the production
+ * Route `keeper agent panel <start|wait> …`. Parses flags, builds the production
  * deps, dispatches to {@link panelStart}/{@link panelWait}, and exits with their
  * code. Never returns (always exits).
  */

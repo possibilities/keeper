@@ -278,7 +278,7 @@ export interface PresetCatalog {
 /**
  * The panel selections, parsed from `panel.yaml`: named panels (each an ordered
  * list of catalog preset names) plus an optional `default` naming the panel a
- * bare `keeper pair panel start` (no `--panel`) assembles. Resolved against a
+ * bare `keeper agent panel start` (no `--panel`) assembles. Resolved against a
  * {@link PresetCatalog} — every panel member must name a catalog preset whose
  * harness is panel-launchable (claude|codex; pi is rejected at load).
  */

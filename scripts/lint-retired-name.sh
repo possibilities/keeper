@@ -29,8 +29,18 @@
 #       (src/agent/cwd-ordinal.ts + test/agent-cwd-ordinal.test.ts, themselves
 #       count-pinned via Check B so a NEW agentwrap token there still FAILs).
 #
+#   "keeper pair" (fn-1032) — ZERO-TOLERANCE. The `keeper pair` CLI is fully
+#   retired onto `keeper agent` (`agent run` for the blocking single-shot, `agent
+#   panel start|wait` for the detached/panel fan-out).
+#
+#     * Check D (repo-wide grep-clean): NO "keeper pair" (space-separated)
+#       anywhere except a DEFINED exclusion set — this script, the allowlist, the
+#       retirement docs (docs/*retirement*.md), .keeper/ plan history, and this
+#       guard's own fixture test (test/lint-retired-name.test.ts). The `keeper:pair`
+#       SKILL name (colon-separated) is a live capability and never matches.
+#
 # Exit 0 = clean, 1 = a frozen literal was clobbered, a pinned file drifted, or
-# the retired "agentwrap" name resurfaced outside the exclusion set.
+# a retired name ("agentwrap" / "keeper pair") resurfaced outside its exclusion set.
 set -euo pipefail
 
 # KEEPER_RETIRED_NAME_REPO_ROOT overrides the repo root for tests (point it at a
@@ -127,6 +137,32 @@ if [[ -n "$agentwrap_hits" ]]; then
     done <<< "$agentwrap_hits"
 fi
 
+# Check D — "keeper pair" zero-tolerance (repo-wide grep-clean). The fn-1032
+# retirement drove the `keeper pair` CLI to zero, folding it onto `keeper agent`;
+# this asserts the space-separated verb can never return. Same DEFINED exclusion
+# set as Check C minus the count-pinned relocation files (none apply): the guard's
+# own files, the retirement docs, .keeper/ plan history, and this guard's fixture
+# test. The `keeper:pair` SKILL name is colon-separated and never matches the
+# space-separated pattern. Uses plain recursive grep (not git grep) so the
+# fixture-tree tests run git-free.
+keeper_pair_hits="$(
+    grep -rIilE 'keeper pair' "$repo_root" \
+        --exclude-dir=.git \
+        --exclude-dir=node_modules \
+        --exclude-dir=.keeper \
+        --exclude='lint-retired-name.sh' \
+        --exclude='frozen-allowlist.txt' \
+        --exclude='lint-retired-name.test.ts' \
+        --exclude='*retirement*.md' \
+        2>/dev/null || true
+)"
+if [[ -n "$keeper_pair_hits" ]]; then
+    while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        violations+=("KEEPER-PAIR zero-tolerance: retired verb present in ${hit#"${repo_root}"/}")
+    done <<< "$keeper_pair_hits"
+fi
+
 if [[ ${#violations[@]} -gt 0 ]]; then
     echo "ERROR: retired-name guard found ${#violations[@]} violation(s):" >&2
     for v in "${violations[@]}"; do
@@ -138,6 +174,8 @@ if [[ ${#violations[@]} -gt 0 ]]; then
     echo "changed it, re-ratify in scripts/frozen-allowlist.txt, else revert the clobber." >&2
     echo "An AGENTWRAP hit means the fully-retired name resurfaced — rename it to the" >&2
     echo "KEEPER_AGENT_* / keeper-agent equivalent (the name can never return)." >&2
+    echo "A KEEPER-PAIR hit means the retired 'keeper pair' verb resurfaced — repoint it" >&2
+    echo "onto 'keeper agent' (agent run / agent panel start|wait); the verb can never return." >&2
     exit 1
 fi
 

@@ -1,5 +1,5 @@
 /**
- * `keeper pair panel start|wait` — the fast-tier regression lock for the
+ * `keeper agent panel start|wait` — the fast-tier regression lock for the
  * cross-OS panel orchestrator (src/pair/panel.ts). Everything OS-specific is
  * injected: a fake `spawn` (records the wrapper argv, never launches), a fake
  * clock + `sleep` (deterministic deadline), and a fake `pidAlive`. The leg

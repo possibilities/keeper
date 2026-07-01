@@ -1407,7 +1407,7 @@ event-log/reducer/hook touch. Run any of them with
   each a named `{harness, model?, effort?, thinking?, role?}` triple
   (`presets.<name>`) — and `panel.yaml` is the panel SELECTIONS — named panels
   (`panels.<name>`, each an ordered list of catalog preset names) plus an optional
-  `default:` naming the panel a bare `keeper pair panel start` assembles.
+  `default:` naming the panel a bare `keeper agent panel start` assembles.
   `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
   `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
   harness comes from the preset — and `keeper agent presets resolve <name>` emits
@@ -1432,7 +1432,7 @@ event-log/reducer/hook touch. Run any of them with
   directive can still touch the tree). `run --system-file <path>` /
   `--system <text>` (mutually exclusive; a missing file → bad_args) compose a
   caller-side `System:`-prepend into the prompt positional, UNIFORM across
-  claude/codex/pi and mirroring pair's `assemblePrompt` block order (read-only
+  claude/codex/pi in the fixed block order (read-only
   directive → `System:` → user prompt) — deliberately user-turn text, NOT a
   privileged system prompt (the native `--append-system-prompt` upgrade is a
   documented future step; keep security-relevant constraints out of this
@@ -1450,12 +1450,12 @@ event-log/reducer/hook touch. Run any of them with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex
-  directory-trust seed for `agent run` and `keeper pair` alike. Per-field resolution is `explicit flag > effort
+  directory-trust seed for `agent run`. Per-field resolution is `explicit flag > effort
   env > preset > per-harness yaml > native default`, so a preset never overrides an
   explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
   `--x-preset` the launch is byte-identical to a no-preset run. The posture is
-  REQUIRED + validated: any preset referenced by name (`keeper pair --preset`,
-  `keeper dispatch --preset`, `keeper agent --x-preset`) and EVERY panel op
+  REQUIRED + validated: any preset referenced by name (`keeper dispatch --preset`,
+  `keeper agent --x-preset`) and EVERY panel op
   hard-fail (exit 2) on a missing or invalid `presets.yaml`/`panel.yaml`, with a
   message naming the file, the bad name, and the sorted available names. Panel
   members are claude|codex only (pi is rejected at load). Presets are producer-side
@@ -3397,7 +3397,7 @@ emits `DispatchExpired` only if the bind truly never lands.
 The **shared launch helper's codex pre-launch trust-seed** writes codex's own
 config dir (`${CODEX_HOME:-~/.codex}/config.toml`) — the only partner that needs a
 seeder. Before a codex partner launches as an interactive TUI — for both `keeper
-pair`/panel and `keeper agent run codex` — `launchToResolvedHandle`
+agent panel` and `keeper agent run codex` — `launchToResolvedHandle`
 (`src/agent/launch-handle.ts`) fires the injected `ensureCodexDirTrust` seam
 (`src/codex-trust.ts`, a dep-free leaf) which seeds
 `[projects."<realpath(cwd)>"] trust_level = "trusted"` so the detached window does

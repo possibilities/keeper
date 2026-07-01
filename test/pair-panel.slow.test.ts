@@ -1,5 +1,5 @@
 /**
- * `keeper pair panel` — the REAL-spawn detached-survival proof deliberately held
+ * `keeper agent panel` — the REAL-spawn detached-survival proof deliberately held
  * OUT of the fast pure-in-process tier. The fast sibling (`test/pair-panel.test.ts`)
  * injects every effect; this file spawns actual detached `sh` processes to pin the
  * one property that cannot be faked: a leg launched detached+unref'd keeps running

@@ -24,16 +24,16 @@ you pass *paths* to the judge.
 Edit/Write (you write files with Bash heredocs). You spawn exactly one sub-subagent: the judge.
 
 **You run on macOS, where `setsid`, `timeout`, and `gtimeout` do not exist — never shell them.** All
-detachment and polling lives inside `keeper pair panel`: your whole job is to write the prompt file, call
-`keeper pair panel start`, re-issue `keeper pair panel wait`, then spawn the judge. The subcommand owns
+detachment and polling lives inside `keeper agent panel`: your whole job is to write the prompt file, call
+`keeper agent panel start`, re-issue `keeper agent panel wait`, then spawn the judge. The subcommand owns
 every leg's launch, lifetime, and terminality poll.
 
 ## Why blocking Bash, not Monitor
 
 A subagent is **not re-invoked** when a `run_in_background` task exits — Monitor's wake only fires in the
 main session. So your only lever is the **blocking Bash call**: a blocking call bills *zero tokens while it
-blocks* (the model is suspended between emitting the tool_use and receiving the tool_result). `keeper pair
-panel start` launches the legs detached and returns at once; each `keeper pair panel wait` is then one
+blocks* (the model is suspended between emitting the tool_use and receiving the tool_result). `keeper agent
+panel start` launches the legs detached and returns at once; each `keeper agent panel wait` is then one
 blocking poll call that bills zero tokens while it blocks. Never leave a background task unawaited, and
 never poll at the model level (re-invoking yourself every few seconds) — that is the one thing that
 actually burns tokens.
@@ -50,7 +50,7 @@ corrupts the independence the panel runs on.
 ## Step 1 — Build the panelist prompt
 
 Write ONE prompt file with the task **verbatim** plus the short independence instruction. The same file
-goes to every panelist — no lenses, no per-panelist framing. `keeper pair panel start` copies it into the
+goes to every panelist — no lenses, no per-panelist framing. `keeper agent panel start` copies it into the
 scratch dir it mints, so you only need a readable path:
 
 ```bash
@@ -71,7 +71,7 @@ or your own read of the problem.
 
 ## Step 2 — Launch the panel (start)
 
-`keeper pair panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
+`keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
 preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into a freshly minted scratch
 dir, launches every member as a **detached read-only `keeper agent run` leg** (each writes its own uniform
 JSON result envelope via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs
@@ -80,7 +80,7 @@ or `panel.yaml`, or an unknown panel name, exits 2 (no fallback); run `keeper ag
 configured presets + panels.
 
 ```bash
-MANIFEST=$(keeper pair panel start "$PROMPT" --panel "$PANEL")
+MANIFEST=$(keeper agent panel start "$PROMPT" --panel "$PANEL")
 START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
@@ -94,7 +94,7 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
 
 ## Step 3 — Wait token-free (re-issue loop)
 
-`keeper pair panel wait` blocks ONE `--chunk` window (`540`s ≤ 9 min, safely under Bash's hard 10-min
+`keeper agent panel wait` blocks ONE `--chunk` window (`540`s ≤ 9 min, safely under Bash's hard 10-min
 single-call cap) polling every leg's terminality, then exits: **0** = every leg terminal (verdict JSON on
 stdout), **124** = the chunk elapsed (re-issue it), **2** = a missing/corrupt manifest or bad flags.
 Re-issue one blocking call per chunk until exit 0, bounded by a backstop so a wedged leg never loops
@@ -105,7 +105,7 @@ BACKSTOP=6      # ~54 min of 9-min chunks — comfortably past the 30-min per-le
 VERDICT=""
 n=0
 while [ "$n" -lt "$BACKSTOP" ]; do
-  VERDICT=$(keeper pair panel wait --dir "$DIR" --chunk 540)
+  VERDICT=$(keeper agent panel wait --dir "$DIR" --chunk 540)
   WAIT_RC=$?
   [ "$WAIT_RC" -eq 0 ] && break                              # all legs terminal — verdict captured
   [ "$WAIT_RC" -eq 124 ] && { n=$(( n + 1 )); continue; }    # chunk elapsed — re-issue the next chunk

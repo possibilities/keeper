@@ -58,6 +58,6 @@ both answer files fresh in its own context rather than defending an answer it wr
 
 Each panelist receives the human's task **verbatim**, plus a short instruction: *research with web search
 and bash, then return a complete, self-contained answer; you are one of several independent experts and
-will not see the others' work.* Nothing more — no lens, no framing that nudges the conclusion. keeper-pair
-partners have full filesystem access, so the prompt gives directions and the verbatim task, not pre-read
+will not see the others' work.* Nothing more — no lens, no framing that nudges the conclusion. Panelists
+have full filesystem access, so the prompt gives directions and the verbatim task, not pre-read
 content.

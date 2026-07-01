@@ -8,8 +8,8 @@
  * waits, and captures in one process, and `keeper agent wait <handle>` does the
  * wait + capture on an already-launched handle. `keeper agent panel start|wait`
  * fans a question out to a panel of detached read-only run legs and waits for
- * them token-free — the SAME engine `keeper pair panel` drives (routed into
- * `src/pair/panel.ts` `runPanel`, which owns its stdout + exit code). `run
+ * them token-free (routed into `src/pair/panel.ts` `runPanel`, which owns its
+ * stdout + exit code). `run
  * --read-only` prepends a
  * read-only directive to the prompt (prompting-only — keeper enforces nothing,
  * no tool strip, no changed-files audit); `run --system-file <path>`/`--system
