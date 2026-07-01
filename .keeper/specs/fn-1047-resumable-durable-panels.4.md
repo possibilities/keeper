@@ -44,5 +44,5 @@ Forward-facing prose only (no fn-ids/provenance); consolidate, don't append.
 - [ ] CLAUDE.md Sole-writer rules gains the panels-dir sole-writer line; lint-claude-md green
 
 ## Done summary
-
+Documented the resumable durable panel contract across all four caller surfaces: panel-runner Re-entry story, pair SKILL wait/status/prune + idempotent-start, consolidated README panel section + corrected the ephemeral line, and the CLAUDE.md panels-dir sole-writer line (lint-claude-md green).
 ## Evidence
