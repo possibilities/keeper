@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T05:07:38.097000Z",
+  "depends_on": [
+    "fn-1032-retire-the-pair-cli-onto-agent.1"
+  ],
+  "epic": "fn-1032-retire-the-pair-cli-onto-agent",
+  "id": "fn-1032-retire-the-pair-cli-onto-agent.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Delete pair CLI and repoint consumers",
+  "updated_at": "2026-07-01T05:07:38.097000Z"
+}
