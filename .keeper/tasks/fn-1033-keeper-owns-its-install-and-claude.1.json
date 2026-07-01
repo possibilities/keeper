@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Keeper resolves its own claude source",
-  "updated_at": "2026-07-01T05:14:52.194000Z"
+  "updated_at": "2026-07-01T07:50:25.667000Z",
+  "worker_done_at": "2026-07-01T07:50:25.667000Z"
 }

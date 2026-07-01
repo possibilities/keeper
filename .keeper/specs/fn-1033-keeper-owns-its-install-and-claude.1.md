@@ -68,5 +68,5 @@ config — conflating them is the trap both scouts flagged.
 - [ ] `bun test` green; `scripts/lint-retired-name.sh` clean
 
 ## Done summary
-
+Keeper now owns its claude source: vendored arthack's live system/claude/.claude (settings.json, CLAUDE.md, AGENTS.md symlink) byte-identical, retired claude_stow_dir/loadClaudeStowDir, and the launch guard resolves the source from its own module path via defaultClaudeStowDir() (wired in realDeps), preserving the !existsSync + KEEPER_AGENT_SKIP_LINK_GUARD fail-opens.
 ## Evidence
