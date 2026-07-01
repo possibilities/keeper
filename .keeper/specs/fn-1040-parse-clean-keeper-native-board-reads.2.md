@@ -75,5 +75,5 @@ non-numeric → exit 2; `list` cap counts epics, `tasks` cap counts filtered tas
 - [ ] Output stays a single top-level JSON value (task-1 conformance guard passes for list/tasks).
 
 ## Done summary
-
+Bounded keeper plan list/tasks with a default cap of 50 plus --limit/--offset, wrapping JSON in {total, returned, truncated, hint} (list counts epics, tasks counts the post-filter set); bad --limit/--offset exit 2, id-string sort tiebreaker keeps paging deterministic, and the human render stays byte-pinned.
 ## Evidence
