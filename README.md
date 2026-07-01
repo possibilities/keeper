@@ -405,23 +405,48 @@ These are designed to be addable later without rework, but none ship in v1.
 
 ## Install
 
-Keeper has no `install` verb. Wire it up manually:
+`scripts/install.sh` owns keeper's install footprint. It is idempotent — safe to
+re-run, and run by the `keeper-install` buildbot job on every green build.
 
-1. **Clone and install dependencies** (Bun must already be on your machine):
+1. **Clone and run the installer** (Bun must already be on your machine):
 
    ```sh
    git clone <repo-url> ~/code/keeper
    cd ~/code/keeper
-   bun install
+   mkdir -p ~/.local/state/keeper   # launchd does not pre-create the state dir
+   bash scripts/install.sh
    ```
 
-2. **Create the state directory** (launchd does not pre-create it):
+   **What the script does**, in order — each step idempotent, the whole run
+   `flock`-guarded so a concurrent CI build is a no-op EXIT 0:
 
-   ```sh
-   mkdir -p ~/.local/state/keeper
-   ```
+   1. `bun install` — dependencies first; the `@parcel/watcher` native addon
+      (a `trustedDependency`) dyld-crashes keeperd at boot if `node_modules` is
+      absent, so this must precede any reload.
+   2. `bun link` — puts `keeper` on PATH at `~/.bun/bin/keeper`; skipped when
+      already linked.
+   3. keeperd LaunchAgent reload, LAST (so a mid-step kill still leaves the bun
+      steps complete). `cmp -s` gates it on plist content: only when the live
+      `~/Library/LaunchAgents/arthack.keeperd.plist` differs from — or is missing
+      against — the repo copy does it relink and reload via the modern launchctl
+      surface (`bootout` + `enable` + `bootstrap`). `kickstart -k` is never used
+      for a changed plist: it re-spawns the process but keeps the cached
+      registration, so the new plist would not take.
 
-3. **(Optional) Configure roots.** `~/.config/keeper/config.yaml` carries
+   The script does NOT stow anything. The launch-time canonical-link guard
+   (`ensureCanonicalStowLinks`) is the sole owner of
+   `~/.claude/{settings.json,CLAUDE.md}`, healing them from keeper's own module
+   path on the next `keeper agent` launch.
+
+   **Before first bootstrap**, edit `plist/arthack.keeperd.plist` if your
+   username, checkout path, or architecture differ from the defaults: on **Apple
+   Silicon** bun lives at `/opt/homebrew/bin/bun`, on **Intel** Macs at
+   `/usr/local/bin/bun` — fix both `ProgramArguments` and
+   `EnvironmentVariables.PATH`. The plist in `~/Library/LaunchAgents/` must be
+   owned by you and mode `644` (macOS silently ignores a plist with wrong
+   ownership).
+
+2. **(Optional) Configure roots.** `~/.config/keeper/config.yaml` carries
    INDEPENDENT keys:
 
    - `roots` — the project roots the plan worker watches for
@@ -506,48 +531,25 @@ Keeper has no `install` verb. Wire it up manually:
    `keeper_agent_path:` the derived `cli/keeper.ts`). Unknown config keys are
    silently ignored.
 
-4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
-   Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
-   events-writer hook + the branch-guard hook that hard-denies subagent git
-   branch create/switch via the `PreToolUse` deny JSON + the sidecar-writer hook
-   that owns the `~/docs` metadata sidecar AND its git state on
-   `PostToolUse(Write|Edit|MultiEdit|Bash)` (commits every doc write/edit/delete) +
-   the docs-pusher hook that pushes `~/docs` to its remote once per turn on `Stop`,
-   + the
-   `keeper:await` /
-   `keeper:dispatch` / `keeper:autopilot` gateway skills + the `keeper:pair`
-   pairing skill,
-   manifest at
-   `plugins/keeper/.claude-plugin/plugin.json`, command paths in
-   `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
-   behind `keeper plan` + the `plan:*` skills, a native plugin loaded by the
-   launcher). The launcher's `plugin_scan_dirs` points at `~/code/keeper/plugins`,
-   scans the parent, and appends one `--plugin-dir` per manifest-bearing child —
-   so a fresh session auto-loads BOTH plugins from this repo. No symlink step. A
-   `~/.claude/plugins/keeper` symlink double-registers the hook (every
-   invocation writes two `events` rows, with no runtime dedup guard) — there
-   must be none.
+3. **Load the two plugins** by pointing your Claude Code launcher at
+   `~/code/keeper/plugins` (one `--plugin-dir` per manifest-bearing child), so a
+   fresh session auto-loads both from this repo. Both live as peers under
+   `plugins/`: `plugins/keeper/` (the events-writer hook + the branch-guard hook
+   that hard-denies subagent git branch create/switch via the `PreToolUse` deny
+   JSON + the sidecar-writer hook that owns the `~/docs` metadata sidecar AND its
+   git state on `PostToolUse(Write|Edit|MultiEdit|Bash)` (commits every doc
+   write/edit/delete) + the docs-pusher hook that pushes `~/docs` to its remote
+   once per turn on `Stop` + the `keeper:await` / `keeper:dispatch` /
+   `keeper:autopilot` gateway skills + the `keeper:pair` pairing skill; manifest
+   at `plugins/keeper/.claude-plugin/plugin.json`, command paths in
+   `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin behind
+   `keeper plan` + the `plan:*` skills). No symlink step. A
+   `~/.claude/plugins/keeper` symlink double-registers the hook (every invocation
+   writes two `events` rows, with no runtime dedup guard) — there must be none.
 
-5. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
-
-   ```sh
-   ln -s "$PWD/plist/arthack.keeperd.plist" ~/Library/LaunchAgents/
-   ```
-
-   The plist hard-codes absolute paths for `bun`, the repo, and the state dir.
-   Edit `plist/arthack.keeperd.plist` first if your username, checkout path, or
-   architecture differ. On **Apple Silicon** bun lives at `/opt/homebrew/bin/bun`;
-   on **Intel** Macs it is `/usr/local/bin/bun` — fix both `ProgramArguments` and
-   `EnvironmentVariables.PATH` accordingly. The plist in
-   `~/Library/LaunchAgents/` must be owned by you and mode `644` (symlinking a
-   `644` file is fine; macOS silently ignores a plist with wrong ownership).
-
-6. **Bootstrap the daemon** (modern, post-Catalina form — do not use the old
-   `launchctl load -w`):
-
-   ```sh
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
-   ```
+4. **First boot.** `scripts/install.sh` (step 1) bootstraps the LaunchAgent for
+   you; this note explains what that reload sets up and how the daemon behaves on
+   a fresh install.
 
    **Scheduling priority.** The plist runs keeperd at `ProcessType=Standard`
    with `Nice=-5`, NOT the throttled `Background` class. keeperd is the most
@@ -555,18 +557,11 @@ Keeper has no `install` verb. Wire it up manually:
    time — so it must keep scheduling priority under host CPU contention rather
    than starving first. (`Interactive` is deliberately avoided: it removes all
    throttling and can starve the human's foreground work.) `ProcessType` is read
-   at SPAWN, and `Nice` is read from the plist REGISTRATION, so after editing
-   re-register the service with a bootout + bootstrap cycle (a
-   `launchctl kickstart -k` alone re-spawns the process but keeps the cached
-   registration, so a newly-added `Nice` does not take):
-
-   ```sh
-   launchctl bootout gui/$(id -u)/arthack.keeperd
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
-   ```
-
-   Then confirm with `ps -o pid,nice,comm -p <keeperd-pid>` that keeperd is
-   running at nice `-5`.
+   at SPAWN, and `Nice` is read from the plist REGISTRATION — which is why the
+   installer's reload is a bootout + bootstrap cycle, not a `kickstart -k` (that
+   alone re-spawns the process but keeps the cached registration, so a
+   newly-added `Nice` does not take). Confirm with
+   `ps -o pid,nice,comm -p <keeperd-pid>` that keeperd is running at nice `-5`.
 
    **The daemon does the schema work, but the hook no longer needs it to be
    booted to capture events.** Since fn-736 the hook does NOT open SQLite at
@@ -623,7 +618,7 @@ Keeper has no `install` verb. Wire it up manually:
    normal runtime growth is now bounded by the rare `[server-worker]` error
    class plus the weekly rotation sidecar (next step).
 
-7. **Install the rotation sidecar** so `server.stderr` doesn't grow unbounded
+5. **Install the rotation sidecar** so `server.stderr` doesn't grow unbounded
    over weeks even with `KEEPER_TRACE_SERVER=0`:
 
    ```sh
@@ -639,9 +634,9 @@ Keeper has no `install` verb. Wire it up manually:
    reconnect across your subscribe clients each Sunday at 04:00. Inspect with
    `launchctl print gui/$(id -u)/arthack.keeperd.logrotate`.
 
-8. **Install the sitter scanners** (optional) — the read-only sitter set (performance, builds, helptailing) now lives in its own repo at `~/code/sitter`; see that repo's `README.md` for launchd install/uninstall.
+6. **Install the sitter scanners** (optional) — the read-only sitter set (performance, builds, helptailing) now lives in its own repo at `~/code/sitter`; see that repo's `README.md` for launchd install/uninstall.
 
-9. **Verify** the agent is loaded and the projection is live:
+7. **Verify** the agent is loaded and the projection is live:
 
    ```sh
    launchctl print gui/$(id -u)/arthack.keeperd | head
