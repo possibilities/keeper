@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T15:00:07.745000Z",
+  "depends_on": [
+    "fn-1040-parse-clean-keeper-native-board-reads.1",
+    "fn-1040-parse-clean-keeper-native-board-reads.2"
+  ],
+  "epic": "fn-1040-parse-clean-keeper-native-board-reads",
+  "id": "fn-1040-parse-clean-keeper-native-board-reads.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Signpost the clean orient surfaces",
+  "updated_at": "2026-07-01T15:00:07.745000Z"
+}
