@@ -6,6 +6,7 @@
   ],
   "epic": "fn-1028-config-driven-worker-model-effort-matrix",
   "id": "fn-1028-config-driven-worker-model-effort-matrix.4",
+  "model": "opus",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
