@@ -28,5 +28,5 @@ A guard test that a stray scanned `work` plugin is rejected/flagged; docs lint g
 - [ ] A guard prevents a foreign `work`-named plugin from shadowing the cells.
 
 ## Done summary
-
+Doc sweep for the per-cell work-plugin scheme: resolve-task envelope, /plan:work skill row, plan CLAUDE.md, subagents.yaml header, and hooks.json now describe work:worker + launcher --plugin-dir cell selection; README documents the model/effort observability recovery via plan_ref->task join with an optional WORK_CELL_KEY seam. The foreign-work-name collision guard already ships from task .3.
 ## Evidence
