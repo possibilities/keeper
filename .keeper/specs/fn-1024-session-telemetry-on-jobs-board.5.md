@@ -46,5 +46,5 @@ NULL-effort rendering. Docs are prose (no test).
 - [ ] `bun test` green
 
 ## Done summary
-
+Rendered current model, effort (— for unknown, never defaulted low), and context% as truncating jobs-board pills via sessionTelemetryPillSeg, wired into cli/jobs.ts and cli/board.ts; landed the README architecture docs (statusline worker roster, v100 SessionTelemetry event/projection + jobs column-history, statusline-sink CLI catalog, keeper agent --settings launch note). CLAUDE.md sole-writer line and api.py v100 comment already present from prior tasks.
 ## Evidence
