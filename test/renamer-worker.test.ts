@@ -297,19 +297,20 @@ test("computeRenames: a window already named its winner is NOT re-renamed", () =
   expect(computeRenames([c], panes)).toEqual([]);
 });
 
-test("computeRenames: a spawn-name `::` title tabs with `/`, and is not re-renamed once worn", () => {
+test("computeRenames: a spawn-name `::`/`.` title tabs with `/`, and is not re-renamed once worn", () => {
   const c = candidate({
     pane_id: "%1",
     job_id: "a",
     title: "work::fn-1019.2",
     created_at: 100,
   });
-  // Fresh window: the `::` title is emitted as a `/`-formatted tab name.
+  // Fresh window: both the `::` and the task-suffix `.` are emitted as `/` —
+  // tmux rejects both in a window name, so a `.`-bearing name never lands.
   expect(computeRenames([c], [pane("%1", "@1", "stale")])).toEqual([
-    { windowId: "@1", name: "work/fn-1019.2" },
+    { windowId: "@1", name: "work/fn-1019/2" },
   ]);
   // A window already wearing the formatted name is NOT re-emitted (no churn).
-  expect(computeRenames([c], [pane("%1", "@1", "work/fn-1019.2")])).toEqual([]);
+  expect(computeRenames([c], [pane("%1", "@1", "work/fn-1019/2")])).toEqual([]);
 });
 
 test("computeRenames: a candidate whose pane is absent from the sweep is skipped", () => {
