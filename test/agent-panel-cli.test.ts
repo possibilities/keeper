@@ -23,7 +23,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -44,6 +51,7 @@ import {
   type PanelManifest,
   type PanelVerdict,
   panelStart,
+  parseManifest,
   resolveAdHocMember,
 } from "../src/pair/panel";
 import { makeHarness } from "./helpers/agent-main-harness";
@@ -106,6 +114,7 @@ const TOUCHED_ENV_KEYS = [
   "KEEPER_BUS_SOCK",
   "KEEPER_CONFIG",
   "KEEPER_CONFIG_DIR",
+  "KEEPER_STATE_DIR",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -122,6 +131,9 @@ beforeEach(() => {
       // user's real presets never bleed in.
       KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
       KEEPER_CONFIG_DIR: dir,
+      // The durable panel-state root — sandboxed so `start` without `--dir` never
+      // pollutes the real ~/.local/state/keeper.
+      KEEPER_STATE_DIR: join(dir, "keeper-state"),
     },
   });
   for (const k of TOUCHED_ENV_KEYS) {
@@ -336,6 +348,9 @@ test("wrapper KEEPER_AGENT_HELP documents the panel sub-verb", () => {
 
 const AD_HOC_KEEPER_BIN = "/usr/local/bin/bun";
 const AD_HOC_KEEPER_AGENT = "/abs/cli/keeper.ts";
+/** A fixed derived boot instant injected via `deps.bootEpochMs` so the manifest's
+ *  boot-epoch is deterministic (os.uptime is not injectable). */
+const FIXED_BOOT_EPOCH_MS = 1_700_000_000_000;
 
 function mkPreset(
   harness: Preset["harness"],
@@ -382,6 +397,7 @@ function makeAdHocDeps(): { deps: PanelDeps; spawns: AdHocSpawn[] } {
     pidAlive: () => false,
     write: () => {},
     writeErr: () => {},
+    bootEpochMs: () => FIXED_BOOT_EPOCH_MS,
   };
   return { deps, spawns };
 }
@@ -668,6 +684,211 @@ describe("panelStart (ad-hoc member fan-out)", () => {
       readFileSync(join(pdir, "manifest.json"), "utf8"),
     );
     expect(manifest.slug).toBe("duo-run");
+  });
+});
+
+describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
+  test("without --dir → writes keeperStateDir()/panels/<slug>/ (0700); manifest carries boot_epoch_ms + per-leg launched_at", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "what is the best answer?");
+    const { deps, spawns } = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "durable-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(spawns.length).toBe(1);
+
+    // The run lives at the deterministic slug-keyed durable path under the
+    // sandboxed KEEPER_STATE_DIR — a restarted driver rediscovers it from the slug.
+    const panelDir = join(dir, "keeper-state", "panels", "durable-run");
+    expect(existsSync(join(panelDir, "manifest.json"))).toBe(true);
+    // 0700 — private per-user state.
+    expect(statSync(panelDir).mode & 0o777).toBe(0o700);
+
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(panelDir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.dir).toBe(panelDir);
+    expect(manifest.boot_epoch_ms).toBe(FIXED_BOOT_EPOCH_MS);
+    expect(manifest.generation).toBe(1);
+    expect(manifest.members).toHaveLength(1);
+    // The leg spawned OK → launched_at stamped (deps.now() === 0) + pidfile set.
+    expect(manifest.members[0]?.launched_at).toBe(0);
+    expect(typeof manifest.members[0]?.pidfile).toBe("string");
+  });
+
+  test("--dir override wins (no durable dir minted); the boot-epoch seam is injected", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "q");
+    const pdir = join(dir, "override-dir");
+    const { deps } = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "override-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(
+      existsSync(join(dir, "keeper-state", "panels", "override-run")),
+    ).toBe(false);
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(pdir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.dir).toBe(pdir);
+    expect(manifest.boot_epoch_ms).toBe(FIXED_BOOT_EPOCH_MS);
+  });
+
+  test("skeleton is on disk BEFORE the spawn loop; a spawn-throw records pidfile:null + launched_at:null", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "q");
+    const pdir = join(dir, "skeleton-run");
+    // A 2-member panel whose SECOND leg's spawn throws. The spawn fn snapshots the
+    // on-disk manifest at its first call to prove the skeleton was written first.
+    let manifestAtFirstSpawn: PanelManifest | null = null;
+    let spawnCount = 0;
+    const deps: PanelDeps = {
+      ...makeAdHocDeps().deps,
+      loadRegistry: () => ({
+        catalog: {
+          presets: {
+            "opus-x": mkPreset("claude"),
+            "codex-x": mkPreset("codex"),
+          },
+        },
+        selections: { panels: { duo: ["opus-x", "codex-x"] }, default: null },
+      }),
+      spawn: () => {
+        spawnCount += 1;
+        if (manifestAtFirstSpawn === null) {
+          manifestAtFirstSpawn = JSON.parse(
+            readFileSync(join(pdir, "manifest.json"), "utf8"),
+          );
+        }
+        if (spawnCount === 2) {
+          throw new Error("spawn boom");
+        }
+      },
+    };
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "skeleton-run",
+        panel: "duo",
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+
+    // At the first spawn the skeleton was already on disk: both legs present, both
+    // pidfiles set (intended), no launched_at yet, boot-epoch stamped.
+    expect(manifestAtFirstSpawn).not.toBeNull();
+    const skel = manifestAtFirstSpawn as unknown as PanelManifest;
+    expect(skel.members).toHaveLength(2);
+    expect(skel.members.every((m) => typeof m.pidfile === "string")).toBe(true);
+    expect(skel.members.every((m) => m.launched_at === null)).toBe(true);
+    expect(skel.boot_epoch_ms).toBe(FIXED_BOOT_EPOCH_MS);
+
+    // Final: leg 1 launched (pidfile + launched_at); leg 2's spawn threw → pidfile
+    // null (the launch-failed signal wait reads) + launched_at null.
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(pdir, "manifest.json"), "utf8"),
+    );
+    expect(typeof manifest.members[0]?.pidfile).toBe("string");
+    expect(manifest.members[0]?.launched_at).toBe(0);
+    expect(manifest.members[1]?.pidfile).toBeNull();
+    expect(manifest.members[1]?.launched_at).toBeNull();
+  });
+});
+
+describe("parseManifest (durable fields)", () => {
+  test("round-trips boot_epoch_ms + generation + per-leg launched_at", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      boot_epoch_ms: 42,
+      generation: 3,
+      members: [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: "/d/x.yaml",
+          pidfile: "/d/x.pidfile",
+          launched_at: 7,
+        },
+        {
+          name: "y",
+          harness: "claude",
+          yaml: "/d/y.yaml",
+          pidfile: null,
+          launched_at: null,
+        },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.manifest.boot_epoch_ms).toBe(42);
+    expect(r.manifest.generation).toBe(3);
+    expect(r.manifest.members[0]?.launched_at).toBe(7);
+    expect(r.manifest.members[1]?.launched_at).toBeNull();
+  });
+
+  test("rejects a malformed boot_epoch_ms (present but not a number)", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      boot_epoch_ms: "not-a-number",
+      members: [
+        { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
+      ],
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("rejects a malformed per-leg launched_at", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      members: [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: "/d/x.yaml",
+          pidfile: null,
+          launched_at: "soon",
+        },
+      ],
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("tolerates an absent boot-epoch (pre-durable manifest) → defaults 0 / gen 1 / launched_at null", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      members: [
+        { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.manifest.boot_epoch_ms).toBe(0);
+    expect(r.manifest.generation).toBe(1);
+    expect(r.manifest.members[0]?.launched_at).toBeNull();
   });
 });
 

@@ -24,19 +24,18 @@
  * all-success: the agent keys off the verdict's `ok` flag.
  *
  * No keeper.db write, no RPC, no third-party deps — `node:*` plus the dep-free
- * `src/agent/config` + `src/agent/launch-config` + `src/keeper-agent-path`
- * leaves only.
+ * `src/agent/config` + `src/agent/launch-config` + `src/keeper-agent-path` +
+ * `src/keeper-state-dir` leaves only.
  */
 
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { uptime } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -54,6 +53,7 @@ import {
   loadRolePrompt,
 } from "../agent/launch-config";
 import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
+import { keeperStateDir } from "../keeper-state-dir";
 import { slugify } from "../slug";
 
 // ---------------------------------------------------------------------------
@@ -104,20 +104,31 @@ export interface PanelMember {
 /** One member's persisted launch record in the manifest. `yaml` is the leg's
  *  `--output` result-file path (a `keeper agent run` JSON envelope). `pidfile` is
  *  null when the leg's spawn threw at launch (it never started → a normal N-of-N
- *  fail). */
+ *  fail). `launched_at` is the `deps.now()` ms stamp taken right after a
+ *  successful spawn (null in the pre-spawn skeleton and for a spawn-throw leg), so
+ *  a crash mid-fan-out is reconstructable by a resuming driver. Optional so a
+ *  pre-durable-format manifest still parses. */
 export interface PanelManifestMember {
   name: string;
   harness: string;
   yaml: string;
   pidfile: string | null;
+  launched_at?: number | null;
 }
 
 /** The `start`-persisted, `wait`-re-read manifest. `slug` is the run's
  *  agent-authored identifier (each leg launches as `panel::<slug>::<preset>`),
- *  persisted top-level for run correlation. */
+ *  persisted top-level for run correlation. `boot_epoch_ms` is the machine's
+ *  derived boot instant (`deps.now() - os.uptime()*1000`); a resuming driver
+ *  compares it against the current boot to detect a reboot (pre-reboot pidfiles
+ *  are never trusted). `generation` counts (re)launch rounds — the skeleton is
+ *  generation 1; a future reconcile bumps it. Both optional so a pre-durable
+ *  manifest still parses. */
 export interface PanelManifest {
   dir: string;
   slug: string;
+  boot_epoch_ms?: number;
+  generation?: number;
   members: PanelManifestMember[];
 }
 
@@ -170,6 +181,10 @@ export interface PanelDeps {
   pidAlive: (pid: number) => boolean;
   write: (s: string) => void;
   writeErr: (s: string) => void;
+  /** Boot-epoch source (ms). Absent → derived from `now() - os.uptime()*1000`
+   *  (os.uptime is not injectable, so tests inject a fixed epoch here to make a
+   *  reboot mismatch deterministic). */
+  bootEpochMs?: () => number;
   /** Poll cadence override (tests); defaults to {@link POLL_INTERVAL_MS}. */
   pollIntervalMs?: number;
   /** Pid-death grace override (tests); defaults to {@link PID_STARTUP_GRACE_MS}. */
@@ -559,6 +574,18 @@ export function parseManifest(
   if (typeof obj.slug !== "string" || obj.slug === "") {
     return { ok: false, error: "manifest.slug missing or not a string" };
   }
+  // Durable-manifest fields: validated when present (a malformed value is
+  // corrupt), tolerated when absent (a pre-durable-format manifest) so a resuming
+  // driver defaults a missing boot-epoch to 0 → a guaranteed mismatch → relaunch.
+  if (
+    obj.boot_epoch_ms !== undefined &&
+    typeof obj.boot_epoch_ms !== "number"
+  ) {
+    return { ok: false, error: "manifest.boot_epoch_ms is not a number" };
+  }
+  if (obj.generation !== undefined && typeof obj.generation !== "number") {
+    return { ok: false, error: "manifest.generation is not a number" };
+  }
   if (!Array.isArray(obj.members)) {
     return { ok: false, error: "manifest.members missing or not an array" };
   }
@@ -576,14 +603,32 @@ export function parseManifest(
     ) {
       return { ok: false, error: "manifest member has malformed fields" };
     }
+    if (
+      mm.launched_at !== undefined &&
+      mm.launched_at !== null &&
+      typeof mm.launched_at !== "number"
+    ) {
+      return { ok: false, error: "manifest member launched_at is malformed" };
+    }
     members.push({
       name: mm.name,
       harness: mm.harness,
       yaml: mm.yaml,
       pidfile: mm.pidfile,
+      launched_at: typeof mm.launched_at === "number" ? mm.launched_at : null,
     });
   }
-  return { ok: true, manifest: { dir: obj.dir, slug: obj.slug, members } };
+  return {
+    ok: true,
+    manifest: {
+      dir: obj.dir,
+      slug: obj.slug,
+      boot_epoch_ms:
+        typeof obj.boot_epoch_ms === "number" ? obj.boot_epoch_ms : 0,
+      generation: typeof obj.generation === "number" ? obj.generation : 1,
+      members,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -604,11 +649,14 @@ export interface PanelStartArgs {
 }
 
 /**
- * `start`: resolve members → mint/use a scratch dir → copy the prompt in →
- * launch every leg DETACHED → persist + print the manifest → exit 0. Launch-all-
- * then-persist: a per-leg spawn failure is recorded with a null pidfile (so it
- * surfaces as an N-of-N fail in `wait`), and the manifest is written once.
- * Returns the process exit code (0 on success, 2 on an arg/config fault).
+ * `start`: resolve members → derive the run's dir (the deterministic slug-keyed
+ * `~/.local/state/keeper/panels/<slug>/`, or the caller's `--dir` location
+ * override) → copy the prompt in → write the manifest SKELETON (members +
+ * boot-epoch + generation 1) BEFORE the spawn loop → launch every leg DETACHED,
+ * stamping each entry's `launched_at` post-spawn (a spawn throw records a null
+ * pidfile, the N-of-N launch-failed signal `wait` reads) → print the manifest →
+ * exit 0. The skeleton-first write makes a crash mid-fan-out reconstructable by a
+ * resuming driver. Returns the process exit code (0 on success, 2 on a fault).
  */
 export async function panelStart(
   args: PanelStartArgs,
@@ -658,33 +706,67 @@ export async function panelStart(
     return 2;
   }
 
-  // Mint a scratch dir on a real volume (or use the caller's), then keep every
-  // sentinel + output inside it so the legs' same-dir `--output` renames stay
-  // EXDEV-safe.
-  let dir: string;
-  if (args.dir !== undefined && args.dir !== "") {
-    dir = args.dir;
-    try {
-      mkdirSync(dir, { recursive: true });
-    } catch (err) {
-      deps.writeErr(
-        `pair panel start: cannot create --dir '${dir}': ${(err as Error).message}\n`,
-      );
-      return 2;
-    }
-  } else {
-    dir = mkdtempSync(join(tmpdir(), "keeper-panel-"));
+  // Derive the run's dir. `--dir` is a location override; without it the run lives
+  // at the deterministic, slug-keyed durable path (0700) so a restarted driver
+  // rediscovers it from the slug alone. Either way every sentinel + output stays
+  // inside it, keeping the legs' same-dir `--output` renames EXDEV-safe.
+  const dir =
+    args.dir !== undefined && args.dir !== ""
+      ? args.dir
+      : join(keeperStateDir(), "panels", args.slug);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    deps.writeErr(
+      `pair panel start: cannot create panel dir '${dir}': ${(err as Error).message}\n`,
+    );
+    return 2;
   }
 
   // A human-readable copy of the prompt in the scratch dir; the leg receives the
   // prompt text inline (agent run takes it as a positional, not a file).
   writeFileAtomic(dir, join(dir, "prompt.md"), promptText);
 
+  // The machine's derived boot instant; a resuming driver compares it against the
+  // current boot to detect a reboot (os.uptime is not injectable, so a test-only
+  // `deps.bootEpochMs` seam overrides it for a deterministic reboot).
+  const bootEpochMs =
+    deps.bootEpochMs !== undefined
+      ? deps.bootEpochMs()
+      : deps.now() - uptime() * 1000;
+
   // The panel's `--timeout <s>` is the per-leg stop budget; agent run wants ms.
   const stopTimeoutMs = args.timeoutSeconds * 1000;
-  const manifestMembers: PanelManifestMember[] = [];
-  for (const member of resolved.members) {
-    const yamlPath = join(dir, `${member.name}.yaml`);
+
+  // Skeleton first: the intended member set (yaml + pidfile paths), the boot-epoch,
+  // and generation 1, persisted to disk BEFORE the spawn loop so a crash
+  // mid-fan-out leaves a reconstructable manifest a resuming driver can reconcile
+  // against. Each entry is then updated in place post-spawn and re-persisted.
+  const manifest: PanelManifest = {
+    dir,
+    slug: args.slug,
+    boot_epoch_ms: bootEpochMs,
+    generation: 1,
+    members: resolved.members.map((member) => ({
+      name: member.name,
+      harness: member.harness,
+      yaml: join(dir, `${member.name}.yaml`),
+      pidfile: join(dir, `${member.name}.pidfile`),
+      launched_at: null,
+    })),
+  };
+  const manifestPath = join(dir, "manifest.json");
+  const persistManifest = (): void => {
+    writeFileAtomic(
+      dir,
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+  };
+  persistManifest();
+
+  for (const [i, member] of resolved.members.entries()) {
+    const entry = manifest.members[i] as PanelManifestMember;
     // `$LOG` still captures the leg's stderr/diagnostics for the crash-without-
     // file case (the leg dies before writing its result file); it is not read by
     // `wait`, so it stays out of the manifest.
@@ -696,36 +778,23 @@ export async function panelStart(
       prompt: promptText,
       member,
       slug: args.slug,
-      yamlPath,
+      yamlPath: entry.yaml,
       stopTimeoutMs,
     });
-    let launched = true;
     try {
       deps.spawn(buildDetachWrapperArgv(legArgv), {
         env: { ...deps.env, LOG: logPath, PIDFILE: pidfilePath },
         cwd: deps.cwd,
       });
+      entry.launched_at = deps.now();
     } catch {
-      launched = false;
+      // Spawn threw → the leg never started. Null the pidfile (the launch-failed
+      // signal `wait` surfaces as an N-of-N fail); launched_at stays null.
+      entry.pidfile = null;
     }
-    manifestMembers.push({
-      name: member.name,
-      harness: member.harness,
-      yaml: yamlPath,
-      pidfile: launched ? pidfilePath : null,
-    });
+    persistManifest();
   }
 
-  const manifest: PanelManifest = {
-    dir,
-    slug: args.slug,
-    members: manifestMembers,
-  };
-  writeFileAtomic(
-    dir,
-    join(dir, "manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-  );
   deps.write(`${JSON.stringify(manifest)}\n`);
   return 0;
 }
