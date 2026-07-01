@@ -47,5 +47,5 @@ and add all three synopsis surfaces (PANEL_HELP, dispatch USAGE + KEEPER_AGENT_H
 - [ ] Three verbs in all synopsis surfaces (PANEL_HELP + dispatch USAGE + KEEPER_AGENT_HELP + cli JSDoc); suite green
 
 ## Done summary
-
+Added slug-addressed panel wait/status (durable-dir resolution, --dir wins), a non-blocking status snapshot classifying legs via launched_at grace, and a prune GC verb (lock-free + pid-dead + past started-at TTL, TOCTOU-safe rename-to-trash). All three verbs documented in PANEL_HELP, dispatch USAGE + KEEPER_AGENT_HELP, and cli JSDoc.
 ## Evidence
