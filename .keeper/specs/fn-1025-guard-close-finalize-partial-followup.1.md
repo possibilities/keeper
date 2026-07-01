@@ -16,5 +16,5 @@ autopilot-dispatchable with no test to catch it.
 - [ ] bun test stays green.
 
 ## Done summary
-
+Added a regression assertion to the close-finalize partial_followup test: after finalize, the under-provisioned scaffolded follow-up keeps last_validated_at null, mirroring the closed_with_followup arm assertions so a future refactor can't silently make an under-provisioned epic autopilot-dispatchable.
 ## Evidence
