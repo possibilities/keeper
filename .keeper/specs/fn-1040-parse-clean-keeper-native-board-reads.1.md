@@ -100,5 +100,5 @@ line-count heuristic is WRONG.
 - [ ] The dead `emitTrailer` function and `trailerTarget`/`trailerProjectPath` plumbing are removed (no no-op left); stale cli.py / `_emit_readonly_invocation` narration pruned; `bun test plugins/plan/test` and `bun run lint` green.
 
 ## Done summary
-
+Read/inspection keeper plan verbs now emit exactly one top-level JSON value: dropped the generic plan_invocation trailer, folded detect found-false into a single {success,found,error}+exit-1 value, merged validate --epic's invocation into its single envelope, and added a root-counting single-value conformance guard across both formats and the error paths.
 ## Evidence
