@@ -50,5 +50,5 @@ One atomic contract change (the test-harness seam forces one commit). Steps:
 - [ ] Test-seam migrated in one commit; `bun test` green; `lint-retired-name`/`lint-claude-md` clean
 
 ## Done summary
-
+Made a harness <harness>_default preset pointer the single source of a bare keeper agent launch's model/effort/thinking, retired the per-harness claude/codex/pi.yaml readers, and added a fresh-launch fail-loud (exit 2) unless a preset resolves or model+effort are both explicit (codex --profile / pi --model id:thinking count).
 ## Evidence
