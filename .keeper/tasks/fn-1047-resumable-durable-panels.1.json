@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T20:50:34.366000Z",
+  "depends_on": [],
+  "epic": "fn-1047-resumable-durable-panels",
+  "id": "fn-1047-resumable-durable-panels.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "slug-keyed panel state dir",
+  "updated_at": "2026-07-01T20:50:34.366000Z"
+}

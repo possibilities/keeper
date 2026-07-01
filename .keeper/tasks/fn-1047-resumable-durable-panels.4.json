@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T20:50:34.366000Z",
+  "depends_on": [
+    "fn-1047-resumable-durable-panels.3"
+  ],
+  "epic": "fn-1047-resumable-durable-panels",
+  "id": "fn-1047-resumable-durable-panels.4",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "resume callers and docs",
+  "updated_at": "2026-07-01T20:50:34.366000Z"
+}
