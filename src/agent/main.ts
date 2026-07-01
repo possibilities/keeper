@@ -9,8 +9,10 @@ import {
   accessSync,
   constants,
   existsSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -198,6 +200,14 @@ export interface MainDeps {
   launcherStateDir: string;
   transcriptHomeDir: string;
   runTmuxCommandFn: TmuxCommandRunner;
+  /**
+   * Resolve (and idempotently materialize) the keeper-managed statusLine
+   * `--settings` file the claude launch injects, or null to skip the injection.
+   * A seam so the byte-pin harness fixes the path without a real `~/.config`
+   * write; `realDeps()` binds it to {@link ensureStatuslineSettingsFile} under
+   * `~/.config/keeper`.
+   */
+  resolveStatuslineSettingsPathFn: () => string | null;
 }
 
 /** Production deps — the real collaborators. */
@@ -254,6 +264,11 @@ export function realDeps(): MainDeps {
     launcherStateDir: defaultKeeperAgentStateDir(process.env),
     transcriptHomeDir: homedir(),
     runTmuxCommandFn: defaultTmuxCommandRunner,
+    resolveStatuslineSettingsPathFn: () =>
+      ensureStatuslineSettingsFile(
+        join(homedir(), ".config", "keeper"),
+        process.env,
+      ),
   };
 }
 
@@ -512,6 +527,71 @@ function codexWrapperDefaults(args: string[]): string[] {
     defaults.push("--search");
   }
   return defaults;
+}
+
+/** The downstream renderer the statusLine tee chain feeds — the human's own
+ *  visible statusline. `KEEPER_STATUSLINE_CHAIN` overrides the default so an
+ *  operator can point the display at a custom renderer without losing capture. */
+export const DEFAULT_STATUSLINE_CHAIN = "claudectl show-statusline";
+
+function resolveStatuslineChain(env: NodeJS.ProcessEnv): string {
+  const override = (env.KEEPER_STATUSLINE_CHAIN ?? "").trim();
+  return override.length > 0 ? override : DEFAULT_STATUSLINE_CHAIN;
+}
+
+/**
+ * The `statusLine.command` string keeper injects: `tee -i` copies the statusLine
+ * payload into `keeper statusline-sink` (capture) while piping the original bytes
+ * to `<chain>` (the visible render). `bash -c` is MANDATORY — `>(...)` process
+ * substitution is bash-only (sh/dash silently parse-fail, masking capture loss);
+ * `tee -i` + the sink draining stdin to EOF keeps the display pipe alive (a sink
+ * that exits early would SIGPIPE tee and blank the statusline).
+ */
+export function buildStatuslineCommand(chain: string): string {
+  return `bash -c 'tee -i >(keeper statusline-sink) | ${chain}'`;
+}
+
+/** The keeper-managed `--settings` file body (a scalar `statusLine` override). */
+export function buildStatuslineSettingsContent(chain: string): string {
+  return `${JSON.stringify(
+    {
+      statusLine: { type: "command", command: buildStatuslineCommand(chain) },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+/**
+ * Materialize the keeper-managed statusLine `--settings` file (idempotent
+ * write-if-changed) under `dir` and return its path, or null on ANY failure —
+ * fail-open, so a write error just skips the injection and leaves the human's
+ * native statusline untouched. The temp name is DETERMINISTIC (one per dir) so
+ * repeated launches never accumulate orphan temp files.
+ */
+export function ensureStatuslineSettingsFile(
+  dir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  try {
+    const path = join(dir, "agent-statusline-settings.json");
+    const content = buildStatuslineSettingsContent(resolveStatuslineChain(env));
+    let current: string | null = null;
+    try {
+      current = existsSync(path) ? readFileSync(path, "utf8") : null;
+    } catch {
+      current = null;
+    }
+    if (current !== content) {
+      mkdirSync(dir, { recursive: true });
+      const tmp = join(dir, ".agent-statusline-settings.json.tmp");
+      writeFileSync(tmp, content);
+      renameSync(tmp, path);
+    }
+    return path;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1717,6 +1797,23 @@ export async function main(deps: MainDeps): Promise<never> {
     runCmd.push("--strict-mcp-config");
     runCmd.push("--teammate-mode", "in-process");
     actionLog.push("Added --strict-mcp-config --teammate-mode in-process");
+
+    // Inject the keeper-managed statusLine `--settings` file so this session's
+    // model / effort / context-window telemetry is captured onto its jobs row.
+    // Claude branch ONLY (codex/pi have no statusLine). A caller-supplied
+    // `--settings` wins (mirrors the codex web-search override precedent) — we
+    // never clobber it. Fail-open: a null path just skips the injection.
+    if (hasFlagToken(remainingArgs, "--settings")) {
+      actionLog.push("Skipped statusline capture (caller set --settings)");
+    } else {
+      const statuslineSettings = deps.resolveStatuslineSettingsPathFn();
+      if (statuslineSettings !== null) {
+        runCmd.push("--settings", statuslineSettings);
+        actionLog.push(
+          `Injected statusline capture: --settings ${statuslineSettings}`,
+        );
+      }
+    }
   } else {
     const { model: yamlModel, thinking: yamlThinking } =
       deps.loadPiLauncherDefaultsFn();

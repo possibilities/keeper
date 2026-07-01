@@ -92,6 +92,7 @@ function makeHarness(): Harness {
       agent: mkHandler("agent"),
       reclaim: mkHandler("reclaim"),
       bus: mkHandler("bus"),
+      "statusline-sink": mkHandler("statusline-sink"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),

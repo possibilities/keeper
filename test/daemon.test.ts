@@ -2555,7 +2555,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // table registered in LIVE_ONLY_PROJECTIONS, NO cursor rewind: the merged verdict
   // is git-derived and re-emitted each cycle, so an empty log leaves the table
   // empty and the surface is excluded from the byte-identical re-fold charter).
-  expect(SCHEMA_VERSION).toBe(99);
+  // And to 100 via fn-1024 task .1 (the six nullable per-session telemetry columns
+  // on `jobs` — current model / reasoning effort / context-window usage projected
+  // from the Claude Code statusLine payload; additive ALTERs, NO cursor rewind: a
+  // pre-v100 stream carries no `SessionTelemetry` event, so a from-scratch re-fold
+  // leaves the columns NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(100);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

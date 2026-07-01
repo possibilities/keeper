@@ -42,6 +42,8 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "--strict-mcp-config",
       "--teammate-mode",
       "in-process",
+      "--settings",
+      "/fake-home/.config/keeper/agent-statusline-settings.json",
       "--session-id",
       UUID,
       "--name",
@@ -62,6 +64,8 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "--strict-mcp-config",
       "--teammate-mode",
       "in-process",
+      "--settings",
+      "/fake-home/.config/keeper/agent-statusline-settings.json",
     ]);
   });
 });

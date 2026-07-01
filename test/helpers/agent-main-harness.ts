@@ -96,6 +96,8 @@ export interface HarnessOptions {
   launcherStateDir?: string;
   transcriptHomeDir?: string;
   tmuxCommand?: (cmd: string[]) => TmuxCommandResult;
+  /** Statusline `--settings` path seam (default: a fixed fake path, no write). */
+  resolveStatuslineSettingsPath?: () => string | null;
 }
 
 /**
@@ -195,6 +197,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
       }
       return { exitCode: 0, stdout: "", stderr: "" };
     },
+    resolveStatuslineSettingsPathFn:
+      opts.resolveStatuslineSettingsPath ??
+      (() => "/fake-home/.config/keeper/agent-statusline-settings.json"),
   };
 
   return {

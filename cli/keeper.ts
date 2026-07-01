@@ -47,6 +47,7 @@ export const SUBCOMMANDS = [
   "agent",
   "reclaim",
   "bus",
+  "statusline-sink",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -83,6 +84,7 @@ Subcommands:
   agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded keeper agent launcher)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
   bus                 Agent Bus: \`keeper bus <list|resolve|chat send|watch>\`
+  statusline-sink     Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf
 
 Flags:
   --help, -h     Show this help
@@ -197,6 +199,8 @@ export async function main(): Promise<void> {
     agent: async (argv) => (await import("./agent")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
     bus: async (argv) => (await import("./bus")).main(argv),
+    "statusline-sink": async (argv) =>
+      (await import("./statusline-sink")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {
