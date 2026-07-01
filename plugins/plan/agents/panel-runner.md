@@ -54,7 +54,10 @@ corrupts the independence the panel runs on.
 
 Write ONE prompt file with the task **verbatim** plus the short independence instruction. The same file
 goes to every panelist — no lenses, no per-panelist framing. `keeper agent panel start` copies it into the
-scratch dir it mints, so you only need a readable path:
+run's durable slug dir, so you only need a readable path — but keep it **deterministic** (the task is
+verbatim, so add no timestamps, run-ids, or `mktemp`-name interpolation *inside* the text): re-entry re-runs
+this step, and a byte-for-byte-identical prompt is what lets the same slug reconcile instead of colliding
+(see *Re-entry*):
 
 ```bash
 PANEL=default   # or the panel name your caller gave you
@@ -75,11 +78,13 @@ or your own read of the problem.
 ## Step 2 — Launch the panel (start)
 
 `keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
-preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into a freshly minted scratch
-dir, launches every member as a **detached read-only `keeper agent run` leg** named
-`panel::<slug>::<preset>` (each writes its own uniform JSON result envelope via `--output`), prints a
-one-line manifest JSON, and exits 0 immediately. The legs run on in their own sessions; this call does not
-block. `--slug` is REQUIRED (each leg's name); the config is required too — an absent/empty `--slug`, a
+preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into the run's **durable slug
+dir** (`~/.local/state/keeper/panels/<slug>/`, 0700), launches every member as a **detached read-only
+`keeper agent run` leg** named `panel::<slug>::<preset>` (each writes its own uniform JSON result envelope
+via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs run on in their own
+sessions; this call does not block. start is **idempotent by slug** — re-issuing it reconciles the existing
+run rather than blindly re-fanning-out (see *Re-entry*). `--slug` is REQUIRED (each leg's name); the config
+is required too — an absent/empty `--slug`, a
 missing/invalid catalog or `panel.yaml`, or an unknown panel name exits 2 (no fallback); run `keeper agent
 presets list` to see the configured presets + panels.
 
@@ -96,6 +101,22 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   invalid catalog / `panel.yaml`, an unknown panel name, zero resolved members, an undefined preset, a
   non-pairable harness, or an unreadable prompt) — emit the `PANEL_RUN_FAILED` marker (Step 4) with the
   command's stderr as the reason and stop. No legs fanned out.
+
+## Re-entry — resume after a restart
+
+The run's state is **durable**: it lives at `~/.local/state/keeper/panels/<slug>/`, not in your context. So
+a runner killed mid-fan-out (quota, crash, reboot) resumes from the **slug alone** — you do not re-run
+finished legs. To re-attach, redo Steps 1–2 unchanged: rebuild the SAME prompt (byte-for-byte — that is why
+Step 1 stays deterministic) and re-issue `keeper agent panel start "$PROMPT" --slug "$SLUG" --panel
+"$PANEL"`. start reconciles per leg — it **reuses** any terminal result (completed OR failed; resume is not
+retry), **leaves** a running leg alone, and **relaunches** only a leg with no result yet (a reboot relaunches
+every non-terminal leg). A prompt- or member-set mismatch against the stored run exits 2 (a colliding slug,
+not a resume) — so the prompt must reproduce exactly.
+
+Then wait as in Step 3. If you still hold `$DIR` from this session, `wait --dir "$DIR"` works; after a
+restart you have only the slug, so wait by it — `keeper agent panel wait --slug "$SLUG" --chunk 540` is the
+simple re-entry form (`keeper agent panel status --slug "$SLUG"` gives a one-shot non-blocking snapshot).
+Both resolve the same durable dir.
 
 ## Step 3 — Wait token-free (re-issue loop)
 
