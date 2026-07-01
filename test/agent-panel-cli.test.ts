@@ -815,6 +815,121 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
   });
 });
 
+describe("panelStart (reconcile / idempotent-by-slug)", () => {
+  test("re-issuing the same slug reuses a terminal leg — no re-fan-out", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "what is the best answer?");
+    const panelDir = join(dir, "keeper-state", "panels", "resume-run");
+    const first = makeAdHocDeps();
+    await panelStart(
+      {
+        promptFile,
+        slug: "resume-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      first.deps,
+    );
+    expect(first.spawns.length).toBe(1);
+    // The single leg completed (a terminal result file lands in the durable dir).
+    writeFileSync(
+      join(panelDir, "codex-review.yaml"),
+      `${JSON.stringify({ schema_version: 1, outcome: "completed", message: null })}\n`,
+    );
+    const second = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "resume-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    );
+    expect(code).toBe(0);
+    expect(second.spawns.length).toBe(0); // reused, never re-fanned-out
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(panelDir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.generation).toBe(1);
+  });
+
+  test("re-issuing relaunches a no-result dead leg to a new-generation path", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "q");
+    const panelDir = join(dir, "keeper-state", "panels", "relaunch-run");
+    const first = makeAdHocDeps();
+    await panelStart(
+      {
+        promptFile,
+        slug: "relaunch-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      first.deps,
+    );
+    // The leg recorded a pidfile but died before any result (dead pid).
+    writeFileSync(join(panelDir, "codex-review.pidfile"), "9999\n");
+    // graceMs 0 so the same-boot dead pid is not grace-held; makeAdHocDeps's
+    // pidAlive already reads dead.
+    const base = makeAdHocDeps();
+    const deps2: PanelDeps = { ...base.deps, graceMs: 0 };
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "relaunch-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      deps2,
+    );
+    expect(code).toBe(0);
+    expect(base.spawns.length).toBe(1);
+    const leg = legOf(base.spawns[0] as AdHocSpawn);
+    expect(leg[leg.indexOf("--output") + 1]).toBe(
+      join(panelDir, "codex-review.g2.yaml"),
+    );
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(panelDir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.generation).toBe(2);
+  });
+
+  test("a member-set mismatch on re-issue exits 2 (no relaunch)", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "same q");
+    const first = makeAdHocDeps();
+    await panelStart(
+      {
+        promptFile,
+        slug: "collide-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      first.deps,
+    );
+    // Same prompt + slug, a DIFFERENT member (--cli codex → name "codex").
+    const second = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "collide-run",
+        panel: undefined,
+        adHoc: { cli: "codex", readOnly: true },
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    );
+    expect(code).toBe(2);
+    expect(second.spawns.length).toBe(0);
+  });
+});
+
 describe("parseManifest (durable fields)", () => {
   test("round-trips boot_epoch_ms + generation + per-leg launched_at", () => {
     const r = parseManifest({

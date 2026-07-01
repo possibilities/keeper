@@ -85,6 +85,8 @@ function makeDeps(opts: {
   graceMs?: number;
   pollIntervalMs?: number;
   throwOnSpawn?: (argv: string[]) => boolean;
+  bootEpochMs?: PanelDeps["bootEpochMs"];
+  lock?: PanelDeps["lock"];
 }): {
   deps: PanelDeps;
   spawns: SpawnCall[];
@@ -119,6 +121,8 @@ function makeDeps(opts: {
     writeErr: (s) => err.push(s),
     pollIntervalMs: opts.pollIntervalMs,
     graceMs: opts.graceMs,
+    bootEpochMs: opts.bootEpochMs,
+    lock: opts.lock,
   };
   return {
     deps,
@@ -146,6 +150,12 @@ function seedResult(name: string, outcome: string): void {
       message: outcome === "completed" ? "SECRET_ANSWER_DO_NOT_LEAK" : null,
     })}\n`,
   );
+}
+
+/** Seed a leg's `.pidfile` with a pid (simulating the detached wrapper having
+ *  recorded the leg's real backgrounded pid). */
+function seedPidfile(name: string, pid: number): void {
+  writeFileSync(join(dir, `${name}.pidfile`), `${pid}\n`);
 }
 
 function readManifest(): PanelManifest {
@@ -414,6 +424,357 @@ test("start: a ConfigError from the config load exits 2", async () => {
   );
   expect(code).toBe(2);
   expect(stderr()).toContain("bad presets.yaml");
+});
+
+// ---- reconcile (idempotent-by-slug re-issue) -------------------------------
+
+const RECONCILE_BOOT = 1_700_000_000_000;
+
+test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg, relaunches a dead no-result leg to g2", async () => {
+  const catalog: PresetCatalog = {
+    presets: {
+      done: preset("claude"),
+      failed: preset("codex"),
+      dead: preset("claude"),
+      live: preset("codex"),
+    },
+  };
+  const selections: PanelSelections = {
+    panels: { quad: ["done", "failed", "dead", "live"] },
+    default: "quad",
+  };
+  const prompt = writePrompt("reconcile me");
+
+  // First fan-out (fresh): all four legs launch at generation 1.
+  const first = makeDeps({
+    catalog,
+    selections,
+    bootEpochMs: () => RECONCILE_BOOT,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "quad",
+        panel: "quad",
+        dir,
+        timeoutSeconds: 900,
+      },
+      first.deps,
+    ),
+  ).toBe(0);
+  expect(first.spawns.length).toBe(4);
+
+  // Simulate leg outcomes: done→completed, failed→a failed result (both terminal);
+  // dead→dead pid + no result; live→live pid + no result.
+  seedResult("done", "completed");
+  seedResult("failed", "timed_out");
+  seedPidfile("dead", 5555);
+  seedPidfile("live", 4242);
+
+  // Re-issue the SAME start: same boot, graceMs 0 (the dead pid is not grace-held),
+  // and pidAlive true only for the live pid.
+  const second = makeDeps({
+    catalog,
+    selections,
+    bootEpochMs: () => RECONCILE_BOOT,
+    graceMs: 0,
+    pidAlive: (pid) => pid === 4242,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "quad",
+        panel: "quad",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+
+  // Only the dead no-result leg relaunched, to a new-generation result path.
+  expect(second.spawns.length).toBe(1);
+  const leg = second.spawns[0]?.argv.slice(4) ?? [];
+  expect(leg[leg.indexOf("--name") + 1]).toBe("panel::quad::dead");
+  expect(leg[leg.indexOf("--output") + 1]).toBe(join(dir, "dead.g2.yaml"));
+
+  const m = readManifest();
+  expect(m.generation).toBe(2);
+  const byName = Object.fromEntries(m.members.map((x) => [x.name, x]));
+  // Terminal legs kept their generation-1 paths (reused, never relaunched).
+  expect(byName.done?.yaml).toBe(join(dir, "done.yaml"));
+  expect(byName.failed?.yaml).toBe(join(dir, "failed.yaml"));
+  // The live leg is left untouched (still its gen-1 path).
+  expect(byName.live?.yaml).toBe(join(dir, "live.yaml"));
+  // The dead leg repointed to gen 2 (both result + pidfile).
+  expect(byName.dead?.yaml).toBe(join(dir, "dead.g2.yaml"));
+  expect(byName.dead?.pidfile).toBe(join(dir, "dead.g2.pidfile"));
+});
+
+test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live pid); a completed leg is still reused", async () => {
+  const catalog: PresetCatalog = {
+    presets: { done: preset("claude"), running: preset("codex") },
+  };
+  const selections: PanelSelections = {
+    panels: { duo: ["done", "running"] },
+    default: "duo",
+  };
+  const prompt = writePrompt("reboot me");
+
+  const first = makeDeps({
+    catalog,
+    selections,
+    bootEpochMs: () => RECONCILE_BOOT,
+  });
+  await panelStart(
+    { promptFile: prompt, slug: "duo", panel: "duo", dir, timeoutSeconds: 900 },
+    first.deps,
+  );
+  seedResult("done", "completed");
+  seedPidfile("running", 4242); // a pid that was alive pre-reboot
+
+  // Re-issue after a reboot: the derived boot-epoch jumps an hour beyond tolerance.
+  // Even though the pid still reads "alive", a pre-reboot pid can't be trusted.
+  const second = makeDeps({
+    catalog,
+    selections,
+    bootEpochMs: () => RECONCILE_BOOT + 60 * 60_000,
+    pidAlive: () => true,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "duo",
+        panel: "duo",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+
+  // Only the non-terminal leg relaunched; the completed leg was reused.
+  expect(second.spawns.length).toBe(1);
+  const leg = second.spawns[0]?.argv.slice(4) ?? [];
+  expect(leg[leg.indexOf("--name") + 1]).toBe("panel::duo::running");
+  const m = readManifest();
+  expect(m.generation).toBe(2);
+  // The boot-epoch is re-stamped to the current boot.
+  expect(m.boot_epoch_ms).toBe(RECONCILE_BOOT + 60 * 60_000);
+  const byName = Object.fromEntries(m.members.map((x) => [x.name, x]));
+  expect(byName.done?.yaml).toBe(join(dir, "done.yaml")); // reused gen 1
+  expect(byName.running?.yaml).toBe(join(dir, "running.g2.yaml")); // relaunched
+});
+
+test("reconcile: a same-boot leg launched within grace is left (not relaunched) despite a dead pid", async () => {
+  const catalog: PresetCatalog = {
+    presets: { fresh: preset("claude") },
+  };
+  const selections: PanelSelections = {
+    panels: { solo: ["fresh"] },
+    default: "solo",
+  };
+  const prompt = writePrompt("grace me");
+  const clock = { ms: 1000 };
+
+  const first = makeDeps({
+    catalog,
+    selections,
+    clock,
+    bootEpochMs: () => RECONCILE_BOOT,
+  });
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "solo",
+      panel: "solo",
+      dir,
+      timeoutSeconds: 900,
+    },
+    first.deps,
+  );
+  seedPidfile("fresh", 7777); // pid recorded, but the process reads dead
+
+  // Re-issue at the same clock (launched_at === now) with a generous grace and a
+  // dead pid: the leg is too fresh to trust the dead reading → LEFT, not relaunched.
+  const second = makeDeps({
+    catalog,
+    selections,
+    clock,
+    bootEpochMs: () => RECONCILE_BOOT,
+    graceMs: 5000,
+    pidAlive: () => false,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "solo",
+        panel: "solo",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+  expect(second.spawns.length).toBe(0);
+  expect(readManifest().generation).toBe(1);
+});
+
+test("reconcile: an all-terminal re-issue is a no-op (no relaunch, generation unchanged)", async () => {
+  const first = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+    bootEpochMs: () => RECONCILE_BOOT,
+  });
+  const prompt = writePrompt();
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    first.deps,
+  );
+  seedResult("opus", "completed");
+  seedResult("codex", "failed"); // a terminal fail still counts — resume is not retry
+
+  const second = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+    bootEpochMs: () => RECONCILE_BOOT,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "run-x",
+        panel: "default",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+  expect(second.spawns.length).toBe(0);
+  expect(readManifest().generation).toBe(1);
+});
+
+test("reconcile: lock contention fails fast (exit 2), no legs spawned", async () => {
+  const { deps, spawns, stderr } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+    lock: () => null, // another driver already holds the slug
+  });
+  const code = await panelStart(
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    deps,
+  );
+  expect(code).toBe(2);
+  expect(spawns.length).toBe(0);
+  expect(stderr()).toContain("locked by another driver");
+});
+
+test("reconcile: the lock is released after a successful start (a fresh handle can re-acquire)", async () => {
+  let releases = 0;
+  const handle = {
+    release: () => {
+      releases += 1;
+    },
+  };
+  const { deps } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+    lock: () => handle,
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: writePrompt(),
+        slug: "run-x",
+        panel: "default",
+        dir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    ),
+  ).toBe(0);
+  expect(releases).toBe(1);
+});
+
+test("reconcile: a prompt mismatch refuses the resume (exit 2), no relaunch", async () => {
+  const first = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+  });
+  await panelStart(
+    {
+      promptFile: writePrompt("original prompt"),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    first.deps,
+  );
+  // Re-issue the same slug with a DIFFERENT prompt-file content.
+  const other = join(dir, "other-prompt.txt");
+  writeFileSync(other, "a completely different prompt");
+  const second = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+  });
+  const code = await panelStart(
+    {
+      promptFile: other,
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    second.deps,
+  );
+  expect(code).toBe(2);
+  expect(second.spawns.length).toBe(0);
+  expect(second.stderr()).toContain("different prompt");
+});
+
+test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () => {
+  const catalogA: PresetCatalog = {
+    presets: { a1: preset("claude"), a2: preset("codex") },
+  };
+  const selA: PanelSelections = { panels: { p: ["a1", "a2"] }, default: "p" };
+  const prompt = writePrompt("same prompt");
+  const first = makeDeps({ catalog: catalogA, selections: selA });
+  await panelStart(
+    { promptFile: prompt, slug: "run-x", panel: "p", dir, timeoutSeconds: 900 },
+    first.deps,
+  );
+
+  // Re-issue with the SAME prompt but a DIFFERENT member set (a2 → b2).
+  const catalogB: PresetCatalog = {
+    presets: { a1: preset("claude"), b2: preset("codex") },
+  };
+  const selB: PanelSelections = { panels: { p: ["a1", "b2"] }, default: "p" };
+  const second = makeDeps({ catalog: catalogB, selections: selB });
+  const code = await panelStart(
+    { promptFile: prompt, slug: "run-x", panel: "p", dir, timeoutSeconds: 900 },
+    second.deps,
+  );
+  expect(code).toBe(2);
+  expect(second.spawns.length).toBe(0);
+  expect(second.stderr()).toContain("different member set");
 });
 
 // ---- wait ------------------------------------------------------------------

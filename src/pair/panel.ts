@@ -7,11 +7,15 @@
  * `timeout`), and atomic same-dir temp-then-rename result files (EXDEV-safe on
  * macOS, where `os.tmpdir()` is a different APFS volume).
  *
- *   - `start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]`
- *     resolves the panel members in-process, copies the prompt into a scratch
- *     dir, launches every member as a DETACHED `keeper agent run` leg (each writes
- *     its own uniform JSON result envelope via `--output`), persists
- *     `<dir>/manifest.json`, prints it, and exits 0 immediately.
+ *   - `start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]`
+ *     is idempotent-by-slug: it resolves the members in-process and derives the
+ *     run's durable dir from the slug (or the `--dir` override), then under a
+ *     per-slug advisory lock either fans out fresh (copy the prompt in, launch each
+ *     member as a DETACHED `keeper agent run` leg writing its own uniform JSON
+ *     result envelope via `--output`, persist `<dir>/manifest.json`) or RECONCILES
+ *     an existing run — reusing terminal legs, leaving running legs, relaunching
+ *     only no-result legs to a new-generation result path. Prints the manifest and
+ *     exits 0; a colliding-slug prompt/member mismatch or lock contention exits 2.
  *   - `wait --dir <d> [--chunk <s>]` re-reads the manifest and blocks ONE chunk
  *     polling each leg's terminality; exit 0 + verdict JSON when all legs are
  *     terminal, exit 124 when the chunk elapses (re-issuable), exit 2 on a
@@ -25,7 +29,8 @@
  *
  * No keeper.db write, no RPC, no third-party deps — `node:*` plus the dep-free
  * `src/agent/config` + `src/agent/launch-config` + `src/keeper-agent-path` +
- * `src/keeper-state-dir` leaves only.
+ * `src/keeper-state-dir` + `src/usage-flock` (the per-slug advisory lock) leaves
+ * only.
  */
 
 import {
@@ -55,6 +60,7 @@ import {
 import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
 import { keeperStateDir } from "../keeper-state-dir";
 import { slugify } from "../slug";
+import { FileLock } from "../usage-flock";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -75,6 +81,13 @@ const POLL_INTERVAL_MS = 5_000;
  *  `wait` began polling — the pidfile is written a beat after the leg spawns, so
  *  a fresh `wait` gives the leg a moment before trusting a dead pid. */
 const PID_STARTUP_GRACE_MS = 3_000;
+/** Boot-epoch reboot tolerance (ms). Two same-boot `deps.now() - uptime()*1000`
+ *  reads agree within clock jitter (seconds); a reboot resets uptime, so the
+ *  derived boot-epoch jumps forward by the whole downtime + prior uptime (many
+ *  minutes at minimum). A generous minutes-wide band cleanly separates the two: a
+ *  mismatch beyond it means the machine rebooted, so a non-terminal leg's recorded
+ *  pid is a dead pre-reboot process and MUST be relaunched. */
+const BOOT_EPOCH_TOLERANCE_MS = 5 * 60_000;
 /** The tmux session every leg lands in (matches the panel-runner). */
 const PANEL_SESSION = "panels";
 
@@ -159,6 +172,12 @@ export type PanelSpawnFn = (
   opts: { env: Record<string, string | undefined>; cwd: string },
 ) => void;
 
+/** A held advisory lock (FileLock-shaped): the driver releases it once its
+ *  reconcile + fan-out critical section completes. */
+export interface PanelLockHandle {
+  release(): void;
+}
+
 /** The launch-config a panel op needs: the catalog (member harnesses) plus the
  *  panel selections (the panel definitions + the default panel). Both files are
  *  required for any panel op, so they load together. */
@@ -179,6 +198,12 @@ export interface PanelDeps {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   pidAlive: (pid: number) => boolean;
+  /** Per-slug advisory-lock acquire (non-blocking). Returns a releasable handle,
+   *  or null on contention (another driver holds the slug). Absent ⇒ treated as
+   *  always-acquired (injected-deps tests that do not exercise contention).
+   *  Production wraps {@link FileLock.tryAcquire} (flock/CLOEXEC so a detached leg
+   *  never inherits the lock). */
+  lock?: (lockPath: string) => PanelLockHandle | null;
   write: (s: string) => void;
   writeErr: (s: string) => void;
   /** Boot-epoch source (ms). Absent → derived from `now() - os.uptime()*1000`
@@ -494,6 +519,29 @@ function readPid(pidfile: string): number | null {
   }
 }
 
+/** The shared per-leg filesystem probe both `wait`'s verdict ({@link evaluateLeg})
+ *  and `start`'s reconcile ({@link reconcileLeg}) read from: whether the leg's
+ *  result file is present and, if not, its recorded pid's liveness. Never throws.
+ *  A present result short-circuits the pid read (a terminal leg's pid is moot). */
+function probeLeg(
+  member: PanelManifestMember,
+  deps: PanelDeps,
+): { resultPresent: boolean; pid: number | null; pidAlive: boolean } {
+  if (existsSync(member.yaml)) {
+    return { resultPresent: true, pid: null, pidAlive: false };
+  }
+  // A null pidfile means `start`'s spawn threw — the leg never launched.
+  if (member.pidfile === null) {
+    return { resultPresent: false, pid: null, pidAlive: false };
+  }
+  const pid = readPid(member.pidfile);
+  return {
+    resultPresent: false,
+    pid,
+    pidAlive: pid !== null && deps.pidAlive(pid),
+  };
+}
+
 /** One member's status, precedence: result file present → parse its `outcome`
  *  (`completed` → ok; anything else → fail with `reason=<outcome>`; unparseable →
  *  fail `reason=corrupt-result`); else a null/dead pidfile past grace → crash
@@ -508,7 +556,8 @@ function evaluateLeg(
   yaml: string | null;
   reason: string | null;
 } {
-  if (existsSync(member.yaml)) {
+  const probe = probeLeg(member, deps);
+  if (probe.resultPresent) {
     const outcome = readResultOutcome(member.yaml);
     if (outcome === "completed") {
       return { status: "ok", yaml: member.yaml, reason: null };
@@ -523,14 +572,13 @@ function evaluateLeg(
       reason: "leg failed to launch (no process spawned)",
     };
   }
-  const pid = readPid(member.pidfile);
-  if (pid !== null && !deps.pidAlive(pid)) {
+  if (probe.pid !== null && !probe.pidAlive) {
     const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
     if (deps.now() - waitStartMs >= graceMs) {
       return {
         status: "fail",
         yaml: null,
-        reason: `leg process ${pid} exited before producing a result file`,
+        reason: `leg process ${probe.pid} exited before producing a result file`,
       };
     }
   }
@@ -635,6 +683,64 @@ export function parseManifest(
 // Orchestrators
 // ---------------------------------------------------------------------------
 
+/** A leg's per-generation file basename. Generation 1 keeps the bare `<name>`
+ *  (byte-compatible with a pre-reconcile manifest + the `wait` path); a relaunch
+ *  round N≥2 rides `<name>.g<N>` so a still-writing prior-generation leg and its
+ *  relaunched successor never collide on a result path — the live winner stays
+ *  authoritative, so a presumed-dead leg is never SIGTERM'd. */
+function legBaseName(name: string, generation: number): string {
+  return generation <= 1 ? name : `${name}.g${generation}`;
+}
+
+/** The member-set half of the identity guard: true iff the freshly-resolved
+ *  members and the manifest's members are the SAME set (by name+harness).
+ *  Order-independent — a reordered panel is the same run — but an added, removed,
+ *  or retyped member is a colliding-slug cross-run the caller refuses (exit 2),
+ *  since reconcile keys legs by name and a changed set would orphan/add legs. */
+function sameMemberSet(
+  resolved: PanelMember[],
+  manifest: PanelManifestMember[],
+): boolean {
+  if (resolved.length !== manifest.length) {
+    return false;
+  }
+  // JSON-encode the (name, harness) tuple so no delimiter can collide two
+  // distinct members into one key.
+  const key = (name: string, harness: string): string =>
+    JSON.stringify([name, harness]);
+  const have = new Set(manifest.map((m) => key(m.name, m.harness)));
+  return resolved.every((m) => have.has(key(m.name, m.harness)));
+}
+
+/** One leg's reconcile action when a resuming driver re-issues `start`:
+ *   - REUSE — a terminal result file is present (ANY outcome, completed OR failed):
+ *     resume is not retry, so keep it.
+ *   - RELAUNCH on a boot mismatch (machine rebooted → the recorded pid is a dead
+ *     pre-reboot process), OR a same-boot dead/unknown pid past the launch grace.
+ *   - LEAVE — same boot + a live pid (the leg is still running), or a leg launched
+ *     within the startup grace whose dead-pid reading is not yet trustworthy. */
+function reconcileLeg(
+  member: PanelManifestMember,
+  deps: PanelDeps,
+  opts: { bootMismatch: boolean; graceMs: number },
+): "reuse" | "leave" | "relaunch" {
+  const probe = probeLeg(member, deps);
+  if (probe.resultPresent) {
+    return "reuse";
+  }
+  if (opts.bootMismatch) {
+    return "relaunch";
+  }
+  if (probe.pidAlive) {
+    return "leave";
+  }
+  const launchedAt = member.launched_at ?? null;
+  if (launchedAt !== null && deps.now() - launchedAt < opts.graceMs) {
+    return "leave";
+  }
+  return "relaunch";
+}
+
 /** Inputs to {@link panelStart}. `panel` undefined → the `panel.yaml` default.
  *  `adHoc` set → the panel-of-one path: members resolve from the ad-hoc selector
  *  instead of a configured panel name (`panel` is ignored, mutual exclusion
@@ -649,14 +755,22 @@ export interface PanelStartArgs {
 }
 
 /**
- * `start`: resolve members → derive the run's dir (the deterministic slug-keyed
- * `~/.local/state/keeper/panels/<slug>/`, or the caller's `--dir` location
- * override) → copy the prompt in → write the manifest SKELETON (members +
- * boot-epoch + generation 1) BEFORE the spawn loop → launch every leg DETACHED,
- * stamping each entry's `launched_at` post-spawn (a spawn throw records a null
- * pidfile, the N-of-N launch-failed signal `wait` reads) → print the manifest →
- * exit 0. The skeleton-first write makes a crash mid-fan-out reconstructable by a
- * resuming driver. Returns the process exit code (0 on success, 2 on a fault).
+ * `start` — idempotent-by-slug. Resolve members → derive the run's durable dir
+ * (the deterministic slug-keyed `~/.local/state/keeper/panels/<slug>/`, or the
+ * `--dir` location override) → mkdir 0700 → acquire the per-slug advisory lock
+ * (non-blocking; contention fails fast exit 2, never blocks the caller's single
+ * Bash call). With the lock held, either FRESH-START (no prior manifest: copy the
+ * prompt in, write the SKELETON — members + boot-epoch + generation 1 — BEFORE the
+ * spawn loop, launch every leg DETACHED) or RECONCILE an existing run: an identity
+ * guard (byte-exact prompt + same member set, else exit 2) refuses a colliding-slug
+ * merge, then per leg REUSE a terminal result (ANY outcome — resume is not retry),
+ * LEAVE a running leg, or RELAUNCH a no-result / rebooted leg to a new-generation
+ * result path. Re-stamp the boot-epoch + bump the generation whenever a leg
+ * relaunches; each manifest write is atomic (temp-then-rename) so lock-free readers
+ * never see a torn file. Print the manifest, exit 0. Returns the process exit code
+ * (0 on success, 2 on a fault). Every entry's `launched_at` is stamped post-spawn;
+ * a spawn throw records a null pidfile (the N-of-N launch-failed signal `wait`
+ * reads).
  */
 export async function panelStart(
   args: PanelStartArgs,
@@ -723,80 +837,205 @@ export async function panelStart(
     return 2;
   }
 
-  // A human-readable copy of the prompt in the scratch dir; the leg receives the
-  // prompt text inline (agent run takes it as a positional, not a file).
-  writeFileAtomic(dir, join(dir, "prompt.md"), promptText);
-
-  // The machine's derived boot instant; a resuming driver compares it against the
-  // current boot to detect a reboot (os.uptime is not injectable, so a test-only
-  // `deps.bootEpochMs` seam overrides it for a deterministic reboot).
-  const bootEpochMs =
-    deps.bootEpochMs !== undefined
-      ? deps.bootEpochMs()
-      : deps.now() - uptime() * 1000;
-
-  // The panel's `--timeout <s>` is the per-leg stop budget; agent run wants ms.
-  const stopTimeoutMs = args.timeoutSeconds * 1000;
-
-  // Skeleton first: the intended member set (yaml + pidfile paths), the boot-epoch,
-  // and generation 1, persisted to disk BEFORE the spawn loop so a crash
-  // mid-fan-out leaves a reconstructable manifest a resuming driver can reconcile
-  // against. Each entry is then updated in place post-spawn and re-persisted.
-  const manifest: PanelManifest = {
-    dir,
-    slug: args.slug,
-    boot_epoch_ms: bootEpochMs,
-    generation: 1,
-    members: resolved.members.map((member) => ({
-      name: member.name,
-      harness: member.harness,
-      yaml: join(dir, `${member.name}.yaml`),
-      pidfile: join(dir, `${member.name}.pidfile`),
-      launched_at: null,
-    })),
-  };
-  const manifestPath = join(dir, "manifest.json");
-  const persistManifest = (): void => {
-    writeFileAtomic(
-      dir,
-      manifestPath,
-      `${JSON.stringify(manifest, null, 2)}\n`,
+  // A per-slug advisory lock serializes concurrent DRIVERS (never the detached
+  // legs — flock/CLOEXEC keeps the fd out of every child). Non-blocking: contention
+  // fails fast (a blocking acquire would wedge the caller's single Bash call). An
+  // absent seam ⇒ always-acquired (injected-deps tests that skip contention).
+  const lockPath = join(dir, ".lock");
+  const lock =
+    deps.lock !== undefined ? deps.lock(lockPath) : { release: (): void => {} };
+  if (lock === null) {
+    deps.writeErr(
+      `pair panel start: slug '${args.slug}' is locked by another driver (${lockPath}) — a resume is already in progress\n`,
     );
-  };
-  persistManifest();
-
-  for (const [i, member] of resolved.members.entries()) {
-    const entry = manifest.members[i] as PanelManifestMember;
-    // `$LOG` still captures the leg's stderr/diagnostics for the crash-without-
-    // file case (the leg dies before writing its result file); it is not read by
-    // `wait`, so it stays out of the manifest.
-    const logPath = join(dir, `${member.name}.log`);
-    const pidfilePath = join(dir, `${member.name}.pidfile`);
-    const legArgv = buildPanelLegArgv({
-      keeperBin: deps.keeperBin,
-      keeperAgentPath: deps.keeperAgentPath,
-      prompt: promptText,
-      member,
-      slug: args.slug,
-      yamlPath: entry.yaml,
-      stopTimeoutMs,
-    });
-    try {
-      deps.spawn(buildDetachWrapperArgv(legArgv), {
-        env: { ...deps.env, LOG: logPath, PIDFILE: pidfilePath },
-        cwd: deps.cwd,
-      });
-      entry.launched_at = deps.now();
-    } catch {
-      // Spawn threw → the leg never started. Null the pidfile (the launch-failed
-      // signal `wait` surfaces as an N-of-N fail); launched_at stays null.
-      entry.pidfile = null;
-    }
-    persistManifest();
+    return 2;
   }
 
-  deps.write(`${JSON.stringify(manifest)}\n`);
-  return 0;
+  try {
+    const manifestPath = join(dir, "manifest.json");
+    // The machine's derived boot instant; a resuming driver compares it against the
+    // stored one to detect a reboot (os.uptime is not injectable, so a test-only
+    // `deps.bootEpochMs` seam overrides it for a deterministic reboot).
+    const currentBootEpochMs =
+      deps.bootEpochMs !== undefined
+        ? deps.bootEpochMs()
+        : deps.now() - uptime() * 1000;
+    // The panel's `--timeout <s>` is the per-leg stop budget; agent run wants ms.
+    const stopTimeoutMs = args.timeoutSeconds * 1000;
+    const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
+
+    let manifest: PanelManifest;
+    // The legs to (re)launch this call — every member on a fresh start, only the
+    // relaunched ones on a reconcile.
+    const launchTasks: {
+      member: PanelMember;
+      entry: PanelManifestMember;
+      logPath: string;
+    }[] = [];
+
+    if (!existsSync(manifestPath)) {
+      // FRESH START — no prior run for this slug. A human-readable copy of the
+      // prompt (the leg receives the text inline; agent run takes a positional, not
+      // a file), then the skeleton (member set + boot-epoch + generation 1)
+      // persisted BEFORE the spawn loop so a crash mid-fan-out leaves a
+      // reconstructable manifest a resuming driver can reconcile against.
+      writeFileAtomic(dir, join(dir, "prompt.md"), promptText);
+      manifest = {
+        dir,
+        slug: args.slug,
+        boot_epoch_ms: currentBootEpochMs,
+        generation: 1,
+        members: resolved.members.map((member) => ({
+          name: member.name,
+          harness: member.harness,
+          yaml: join(dir, `${legBaseName(member.name, 1)}.yaml`),
+          pidfile: join(dir, `${legBaseName(member.name, 1)}.pidfile`),
+          launched_at: null,
+        })),
+      };
+      resolved.members.forEach((member, i) => {
+        launchTasks.push({
+          member,
+          entry: manifest.members[i] as PanelManifestMember,
+          logPath: join(dir, `${legBaseName(member.name, 1)}.log`),
+        });
+      });
+    } else {
+      // RECONCILE — a prior run for this slug exists. Re-issuing the same start
+      // reuses terminal legs, leaves running legs, and relaunches only no-result
+      // legs; it never blindly re-fans-out.
+      let raw: unknown;
+      try {
+        raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+      } catch (err) {
+        deps.writeErr(
+          `pair panel start: corrupt manifest at ${manifestPath}: ${(err as Error).message}\n`,
+        );
+        return 2;
+      }
+      const parsed = parseManifest(raw);
+      if (!parsed.ok) {
+        deps.writeErr(
+          `pair panel start: corrupt manifest at ${manifestPath}: ${parsed.error}\n`,
+        );
+        return 2;
+      }
+      const existing = parsed.manifest;
+
+      // Identity guard — a colliding slug must never silently merge into another
+      // run. The stored prompt must be byte-exact AND the resolved member set must
+      // match; either mismatch is a different run → exit 2.
+      let storedPrompt: string;
+      try {
+        storedPrompt = readFileSync(join(dir, "prompt.md"), "utf8");
+      } catch {
+        deps.writeErr(
+          `pair panel start: cannot verify slug '${args.slug}' identity (missing ${join(dir, "prompt.md")}) — refusing to reconcile\n`,
+        );
+        return 2;
+      }
+      if (storedPrompt !== promptText) {
+        deps.writeErr(
+          `pair panel start: slug '${args.slug}' already exists with a different prompt — refusing a colliding-run merge (use a new --slug)\n`,
+        );
+        return 2;
+      }
+      if (!sameMemberSet(resolved.members, existing.members)) {
+        deps.writeErr(
+          `pair panel start: slug '${args.slug}' already exists with a different member set — refusing a colliding-run merge (use a new --slug)\n`,
+        );
+        return 2;
+      }
+
+      // A boot mismatch means the machine rebooted since launch → every recorded
+      // pid is a dead pre-reboot process, so every non-terminal leg relaunches.
+      const bootMismatch =
+        Math.abs(currentBootEpochMs - (existing.boot_epoch_ms ?? 0)) >
+        BOOT_EPOCH_TOLERANCE_MS;
+      const priorByName = new Map(existing.members.map((m) => [m.name, m]));
+      const newGeneration = (existing.generation ?? 1) + 1;
+      let relaunched = false;
+      const members: PanelManifestMember[] = [];
+      for (const member of resolved.members) {
+        // Guaranteed present — the member-set guard above passed.
+        const prior = priorByName.get(member.name) as PanelManifestMember;
+        const action = reconcileLeg(prior, deps, { bootMismatch, graceMs });
+        if (action === "reuse" || action === "leave") {
+          members.push(prior);
+          continue;
+        }
+        // RELAUNCH to a fresh per-generation result PATH so a still-writing prior
+        // leg (a pid-recycle / grace race) and its successor never collide on a
+        // path — the live winner is authoritative, so the presumed-dead leg is
+        // never SIGTERM'd.
+        relaunched = true;
+        const base = legBaseName(member.name, newGeneration);
+        const entry: PanelManifestMember = {
+          name: member.name,
+          harness: member.harness,
+          yaml: join(dir, `${base}.yaml`),
+          pidfile: join(dir, `${base}.pidfile`),
+          launched_at: null,
+        };
+        members.push(entry);
+        launchTasks.push({ member, entry, logPath: join(dir, `${base}.log`) });
+      }
+      manifest = {
+        dir,
+        slug: args.slug,
+        // Re-stamp the boot-epoch + bump the generation only when a leg actually
+        // relaunched; a pure reuse/leave reconcile leaves the run's identity intact.
+        boot_epoch_ms: relaunched
+          ? currentBootEpochMs
+          : (existing.boot_epoch_ms ?? currentBootEpochMs),
+        generation: relaunched ? newGeneration : (existing.generation ?? 1),
+        members,
+      };
+    }
+
+    const persistManifest = (): void => {
+      writeFileAtomic(
+        dir,
+        manifestPath,
+        `${JSON.stringify(manifest, null, 2)}\n`,
+      );
+    };
+    persistManifest();
+
+    for (const { member, entry, logPath } of launchTasks) {
+      // A launch-task entry always carries a string pidfile path (nulled only on a
+      // spawn throw below). `$LOG` captures the leg's stderr/diagnostics for the
+      // crash-without-file case; it is not read by `wait`, so it stays out of the
+      // manifest.
+      const pidfilePath = entry.pidfile as string;
+      const legArgv = buildPanelLegArgv({
+        keeperBin: deps.keeperBin,
+        keeperAgentPath: deps.keeperAgentPath,
+        prompt: promptText,
+        member,
+        slug: args.slug,
+        yamlPath: entry.yaml,
+        stopTimeoutMs,
+      });
+      try {
+        deps.spawn(buildDetachWrapperArgv(legArgv), {
+          env: { ...deps.env, LOG: logPath, PIDFILE: pidfilePath },
+          cwd: deps.cwd,
+        });
+        entry.launched_at = deps.now();
+      } catch {
+        // Spawn threw → the leg never started. Null the pidfile (the launch-failed
+        // signal `wait` surfaces as an N-of-N fail); launched_at stays null.
+        entry.pidfile = null;
+      }
+      persistManifest();
+    }
+
+    deps.write(`${JSON.stringify(manifest)}\n`);
+    return 0;
+  } finally {
+    lock.release();
+  }
 }
 
 /** Inputs to {@link panelWait}. */
@@ -881,8 +1120,8 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Build the production deps: real spawn (detached + unref'd), wall clock,
- *  `Bun.sleep`, the pid probe, the real registry loader, and the resolved
- *  launcher transport. */
+ *  `Bun.sleep`, the pid probe, the per-slug advisory lock ({@link FileLock}), the
+ *  real registry loader, and the resolved launcher transport. */
 export function buildPanelDeps(): PanelDeps {
   return {
     keeperBin: process.execPath,
@@ -908,6 +1147,8 @@ export function buildPanelDeps(): PanelDeps {
     now: () => Date.now(),
     sleep: (ms) => Bun.sleep(ms),
     pidAlive,
+    // Non-blocking per-slug lock (flock/CLOEXEC — a detached leg never inherits it).
+    lock: (lockPath) => FileLock.tryAcquire(lockPath),
     write: (s) => process.stdout.write(s),
     writeErr: (s) => process.stderr.write(s),
   };
