@@ -13,10 +13,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  buildAgentLaunchArgv,
+  READ_ONLY_DIRECTIVE,
+} from "../src/agent/launch-config";
 import { launchEnvForAgent } from "../src/agent/launch-handle";
 import { main } from "../src/agent/main";
 import { buildKeeperAgentLaunchArgv } from "../src/exec-backend";
-import { buildPairLaunchArgv, READ_ONLY_DIRECTIVE } from "../src/pair-command";
 import {
   expectExit,
   makeHarness,
@@ -354,8 +357,8 @@ describe("keeper agent byte-pin — agent run posture", () => {
  * token — so a no-`--preset`/`--session` run stays byte-identical.
  */
 describe("keeper agent byte-pin — agent run preset/session threading", () => {
-  test("buildPairLaunchArgv carries --x-preset / --x-tmux-session when set", () => {
-    const cmd = buildPairLaunchArgv({
+  test("buildAgentLaunchArgv carries --x-preset / --x-tmux-session when set", () => {
+    const cmd = buildAgentLaunchArgv({
       launcherArgvPrefix: [],
       cli: "claude",
       prompt: "say hi",
@@ -373,8 +376,8 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     expect(cmd).toContain("KEEPER_TMUX_SESSION=panels");
   });
 
-  test("buildPairLaunchArgv without preset/session carries NEITHER (absent-flag pin)", () => {
-    const cmd = buildPairLaunchArgv({
+  test("buildAgentLaunchArgv without preset/session carries NEITHER (absent-flag pin)", () => {
+    const cmd = buildAgentLaunchArgv({
       launcherArgvPrefix: [],
       cli: "claude",
       prompt: "say hi",
@@ -388,7 +391,7 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     const cmd = await runCommand({ preset: "opus" });
     // --x-preset survives into the pane's inner argv (the tmux parser leaves it
     // for the detached re-exec to resolve); --x-tmux-session is consumed into the
-    // session grouping, so it is pinned at the buildPairLaunchArgv level above.
+    // session grouping, so it is pinned at the buildAgentLaunchArgv level above.
     expect(cmd).toContain("--x-preset");
     expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("opus");
   });
@@ -402,7 +405,7 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
 
 /**
  * The `System:`-composed prompt rides as the FINAL positional for EVERY harness
- * (`buildPairLaunchArgv` places `prompt` last, uniform across claude/codex/pi),
+ * (`buildAgentLaunchArgv` places `prompt` last, uniform across claude/codex/pi),
  * and NO native `--append-system-prompt` is minted — the compose is caller-side
  * user-turn text this increment, not a privileged system prompt.
  */
@@ -410,7 +413,7 @@ describe("keeper agent byte-pin — System: prompt uniform across harnesses", ()
   const composed = "System: be terse\n\nsay hi";
   for (const cli of ["claude", "codex", "pi"] as const) {
     test(`${cli}: composed prompt is the final positional, no --append-system-prompt`, () => {
-      const cmd = buildPairLaunchArgv({
+      const cmd = buildAgentLaunchArgv({
         launcherArgvPrefix: [],
         cli,
         prompt: composed,
