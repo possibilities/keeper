@@ -1,0 +1,19 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T06:05:59.300000Z",
+  "depends_on": [
+    "fn-1034-multi-repo-worktree-epics.1",
+    "fn-1034-multi-repo-worktree-epics.2",
+    "fn-1034-multi-repo-worktree-epics.3",
+    "fn-1034-multi-repo-worktree-epics.4"
+  ],
+  "epic": "fn-1034-multi-repo-worktree-epics",
+  "id": "fn-1034-multi-repo-worktree-epics.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "document multi-repo worktree epics",
+  "updated_at": "2026-07-01T06:05:59.300000Z"
+}

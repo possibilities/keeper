@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T06:05:59.300000Z",
+  "depends_on": [
+    "fn-1034-multi-repo-worktree-epics.1"
+  ],
+  "epic": "fn-1034-multi-repo-worktree-epics",
+  "id": "fn-1034-multi-repo-worktree-epics.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "cross-epic merge-gate per repo group",
+  "updated_at": "2026-07-01T06:05:59.300000Z"
+}
