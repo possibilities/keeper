@@ -349,6 +349,11 @@ export interface SetAutopilotConfigParams {
   /** The durable worktree-mode toggle — a boolean. `true` enables worktree-shaped
    *  autopilot dispatch, `false` disables it (the byte-identical default). */
   worktree_mode?: boolean;
+  /** The durable multi-repo worktree rollout flag — a boolean. `true` lets a
+   *  worktree-mode epic spanning >1 git toplevel provision per-repo lane groups;
+   *  `false` (the byte-identical default) keeps the whole-epic `>1`-toplevel
+   *  reject. Only meaningful when `worktree_mode` is ON. */
+  worktree_multi_repo?: boolean;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch. */
@@ -373,6 +378,7 @@ function validateSetAutopilotConfigParams(
     "max_concurrent_jobs",
     "max_concurrent_per_root",
     "worktree_mode",
+    "worktree_multi_repo",
   ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
@@ -418,6 +424,18 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`worktree_mode\` must be a boolean (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("worktree_multi_repo" in obj) {
+    const raw = obj.worktree_multi_repo;
+    // A strict boolean only — mirrors `worktree_mode`; reject anything else so a
+    // caller gets a clear signal rather than a silently-coerced toggle.
+    if (typeof raw === "boolean") {
+      patch.worktree_multi_repo = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`worktree_multi_repo\` must be a boolean (got ${JSON.stringify(raw)})`,
       );
     }
   }

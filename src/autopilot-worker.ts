@@ -628,8 +628,10 @@ export interface ReconcileSnapshot {
    * (`computeReadiness` lane keys) and dispatch (`attachWorktreeGeometry`) compare
    * and place lanes by RESOLVED toplevel — never raw `target_repo`/`project_dir`
    * strings — and the pure layer never shells git. Each epic resolves to exactly
-   * one of: `ok` (one toplevel, the lane base), `multi-repo` (>1 distinct
-   * toplevel), or `unresolved` (a required root resolved null). NEVER a fold input.
+   * one of: `ok` (one toplevel, the lane base), `clustered` (>1 toplevel with the
+   * multi-repo rollout flag ON — per-repo lane groups), `disabled` (not
+   * worktree-friendly), `multi-repo` (>1 toplevel, flag OFF), `no-primary-repo`, or
+   * `unresolved` (a required root resolved null). NEVER a fold input.
    */
   worktreeRepoByEpicId: Map<string, WorktreeRepoResolution>;
   /**
@@ -699,10 +701,41 @@ export interface ReconcileSnapshot {
  */
 export type WorktreeRepoResolution =
   | { kind: "ok"; repoDir: string }
+  | {
+      kind: "clustered";
+      groups: WorktreeRepoGroup[];
+      primaryRepoDir: string;
+    }
   | { kind: "disabled"; repoDir: string; reason: string }
   | { kind: "multi-repo"; reason: string }
   | { kind: "unresolved"; reason: string }
   | { kind: "no-primary-repo"; reason: string };
+
+/**
+ * One per-repo lane GROUP of a `clustered` multi-repo epic resolution. The epic's
+ * tasks are partitioned by their RESOLVED git toplevel into an ordered list of
+ * these; each group derives its OWN worktree geometry INDEPENDENTLY (its own base
+ * + ribs + `__close__` sink in its own git), and cross-repo `depends_on` edges are
+ * auto-dropped from each group's lane geometry (surviving only as readiness
+ * serialization barriers). A single-repo epic never clusters — it stays the `ok`
+ * (or `disabled`) arm; `clustered` is minted ONLY when the multi-repo rollout flag
+ * is ON and the epic resolves to >1 toplevel.
+ */
+export interface WorktreeRepoGroup {
+  /** This group's RESOLVED git toplevel — the lane base every group task forks off. */
+  repoDir: string;
+  /** The epic task ids resolving to `repoDir`, in `epic.tasks` order. */
+  taskIds: string[];
+  /**
+   * `worktree` — a worktree-friendly repo: provision lanes (base + ribs + sink).
+   * `serial` — a not-worktree-friendly repo (the per-group analogue of the
+   * whole-epic `disabled` fallback): dispatch its tasks sequentially on the shared
+   * checkout (cap-1 on the bare `repoDir`), provisioning no lane. Assessed per
+   * group via `assessRepo` (+ the per-(epic, repoDir) grandfather), so one group
+   * can be `worktree` while a sibling is `serial`.
+   */
+  mode: "worktree" | "serial";
+}
 
 /**
  * In-memory reconciler state — the paused flag plus the set of
@@ -905,6 +938,17 @@ export interface ReconcileDecision {
    * recovery task. Idempotent: `finalizeEpic` skips an already-merged base.
    */
   worktreeFinalize: WorktreeLaunchInfo[];
+  /**
+   * The NON-PRIMARY worktree-group close sinks a CLUSTERED multi-repo epic must
+   * fan-in (rib→base) via the producer's `provision` path BEFORE finalize. Only
+   * the PRIMARY group dispatches a close worker (which provisions + assembles its
+   * base as a side effect of that launch); a non-primary group has no worker to
+   * trigger the fan-in, so the producer runs it here just ahead of merging its
+   * base into default. EMPTY for single-repo (`ok`) epics and whenever worktree
+   * mode is OFF — a byte-identical no-op. Gated on the same `needsFinalize` signal
+   * as {@link worktreeFinalize}, so a group is fanned-in only when the epic is done.
+   */
+  worktreeSinkProvision: WorktreeLaunchInfo[];
 }
 
 /**
@@ -1786,6 +1830,7 @@ export function reconcile(
   // Kept as a SEPARATE pass over the assembled launches so the OFF path is
   // untouched and the worktree logic is isolated.
   const worktreeFinalize: WorktreeLaunchInfo[] = [];
+  const worktreeSinkProvision: WorktreeLaunchInfo[] = [];
   // Gate ALL worktree producer work on not-paused, matching recover() (`:3126`):
   // finalize merges the epic base into the default branch and pushes, which a
   // paused autopilot must not do. Launches are already suppressed while paused, so
@@ -1812,11 +1857,17 @@ export function reconcile(
       completedRowIds,
       closerFinishedIds,
       worktreeFinalize,
+      worktreeSinkProvision,
       worktreeGeometry.byEpicId,
     );
   }
 
-  return { launches, completedRowIds, worktreeFinalize };
+  return {
+    launches,
+    completedRowIds,
+    worktreeFinalize,
+    worktreeSinkProvision,
+  };
 }
 
 /**
@@ -1855,12 +1906,19 @@ export function classifyWorktreeRepos(
     reason: ELIGIBLE_REASON,
   }),
   isGrandfathered: (epicId: string, repoDir: string) => boolean = () => false,
+  multiRepoEnabled = false,
 ): Map<string, WorktreeRepoResolution> {
   const out = new Map<string, WorktreeRepoResolution>();
   for (const epic of epics) {
     out.set(
       epic.epic_id,
-      classifyEpicRepo(epic, resolve, assessRepo, isGrandfathered),
+      classifyEpicRepo(
+        epic,
+        resolve,
+        assessRepo,
+        isGrandfathered,
+        multiRepoEnabled,
+      ),
     );
   }
   return out;
@@ -2186,21 +2244,26 @@ function classifyEpicRepo(
   resolve: (root: string) => string | null,
   assessRepo: (toplevel: string) => WorktreeEligibility,
   isGrandfathered: (epicId: string, repoDir: string) => boolean,
+  multiRepoEnabled: boolean,
 ): WorktreeRepoResolution {
   const projectDir = epic.project_dir ?? "";
   // The required RAW roots: each task's effective root (`target_repo` when set,
   // else the epic `project_dir`). An epic with no tasks still has a close lane, so
-  // resolve its own `project_dir`.
-  const rawRoots =
+  // resolve its own `project_dir`. Capture the per-task RESOLVED toplevel too so a
+  // clustered epic can partition tasks by toplevel WITHOUT re-resolving.
+  const rawByTask: Array<{ taskId: string; raw: string }> =
     epic.tasks.length > 0
-      ? epic.tasks.map((t) =>
-          t.target_repo != null && t.target_repo !== ""
-            ? t.target_repo
-            : projectDir,
-        )
-      : [projectDir];
+      ? epic.tasks.map((t) => ({
+          taskId: t.task_id,
+          raw:
+            t.target_repo != null && t.target_repo !== ""
+              ? t.target_repo
+              : projectDir,
+        }))
+      : [{ taskId: "", raw: projectDir }];
   const resolved = new Set<string>();
-  for (const raw of rawRoots) {
+  const topByTask: Array<{ taskId: string; top: string }> = [];
+  for (const { taskId, raw } of rawByTask) {
     // Short-circuit empties BEFORE the resolver (a `git -C ""` resolves against the
     // daemon's own cwd; the nullable resolver guards this too, belt-and-suspenders).
     if (raw === "") {
@@ -2217,14 +2280,41 @@ function classifyEpicRepo(
       };
     }
     resolved.add(top);
+    if (taskId !== "") {
+      topByTask.push({ taskId, top });
+    }
   }
-  if (resolved.size > 1) {
+  // >1 distinct toplevel with the rollout flag OFF → today's whole-epic reject,
+  // byte-identical (reason + sort). Flag ON drops through to the clustered
+  // partition below.
+  if (resolved.size > 1 && !multiRepoEnabled) {
     return {
       kind: "multi-repo",
       reason: `worktree-multi-repo: epic ${epic.epic_id} spans ${resolved.size} repos (${[...resolved].sort().join(", ")})`,
     };
   }
-  // Exactly one toplevel — `rawRoots` is always non-empty and every element either
+  if (resolved.size > 1) {
+    // Flag ON, multi-toplevel epic → CLUSTERED. Precedence is preserved: the
+    // `unresolved` short-circuit already fired above; `no-primary-repo` is still a
+    // WHOLE-EPIC reject (a lane on ANY group would let plan state degrade to a lane
+    // checkout, since the single plan-close writes to `primary_repo`). Only once
+    // every root resolved and a primary_repo exists do we partition.
+    if (projectDir === "") {
+      return {
+        kind: "no-primary-repo",
+        reason: `worktree-no-primary-repo: epic ${epic.epic_id} has no primary_repo — refusing to provision a lane (plan state would degrade to the lane checkout; set epic.primary_repo and retry)`,
+      };
+    }
+    return clusterEpicRepos(
+      epic,
+      resolve,
+      assessRepo,
+      isGrandfathered,
+      projectDir,
+      topByTask,
+    );
+  }
+  // Exactly one toplevel — `rawByTask` is always non-empty and every element either
   // returned early or added to `resolved`, so `resolved.size === 1` here. The guard
   // keeps the type checker honest for the empty-iterator case it cannot prove away.
   const repoDir = [...resolved][0];
@@ -2272,6 +2362,65 @@ function classifyEpicRepo(
 }
 
 /**
+ * Partition a resolved-clean, primary-backed, MULTI-toplevel epic into ordered
+ * per-repo lane {@link WorktreeRepoGroup}s (the `clustered` arm). Reached ONLY
+ * from {@link classifyEpicRepo} once every root resolved, the rollout flag is ON,
+ * and a `primary_repo` exists — so the loud `unresolved` / `no-primary-repo`
+ * precedence is already honored.
+ *
+ * Groups are ordered by first-appearance in `epic.tasks`; each is assessed for
+ * worktree-eligibility INDEPENDENTLY (its own `assessRepo` verdict, with the
+ * per-(epic, repoDir) grandfather), so one group can be `worktree` while a sibling
+ * is `serial`. `primaryRepoDir` is the resolved toplevel of `project_dir` when it
+ * is one of the group repos (the group that hosts the single plan-close worker),
+ * else the first group's repo — a deterministic fallback that keeps the close
+ * anchored to a real group. Pure: no fs/git beyond the injected `resolve` /
+ * `assessRepo` / grandfather probes (all memoized producer-side).
+ */
+function clusterEpicRepos(
+  epic: Epic,
+  resolve: (root: string) => string | null,
+  assessRepo: (toplevel: string) => WorktreeEligibility,
+  isGrandfathered: (epicId: string, repoDir: string) => boolean,
+  projectDir: string,
+  topByTask: ReadonlyArray<{ taskId: string; top: string }>,
+): WorktreeRepoResolution {
+  // Partition task ids by resolved toplevel, preserving first-appearance order.
+  const taskIdsByRepo = new Map<string, string[]>();
+  const order: string[] = [];
+  for (const { taskId, top } of topByTask) {
+    let bucket = taskIdsByRepo.get(top);
+    if (bucket === undefined) {
+      bucket = [];
+      taskIdsByRepo.set(top, bucket);
+      order.push(top);
+    }
+    bucket.push(taskId);
+  }
+  const groups: WorktreeRepoGroup[] = order.map((repoDir) => {
+    // Per-group worktree-eligibility, mirroring the single-repo `disabled`
+    // downgrade + grandfather: an ineligible repo whose epic has no live lane runs
+    // `serial` (shared checkout); a grandfathered one stays `worktree`.
+    const eligibility = assessRepo(repoDir);
+    const mode: "worktree" | "serial" =
+      eligibility.eligible || isGrandfathered(epic.epic_id, repoDir)
+        ? "worktree"
+        : "serial";
+    return { repoDir, taskIds: taskIdsByRepo.get(repoDir) ?? [], mode };
+  });
+  // The PRIMARY group hosts the single plan-close. Prefer the group whose repo IS
+  // the resolved primary; fall back to the first group so the close always anchors
+  // to a real group's base.
+  const primaryResolved = resolve(projectDir);
+  const primaryRepoDir =
+    primaryResolved !== null &&
+    groups.some((g) => g.repoDir === primaryResolved)
+      ? primaryResolved
+      : (groups[0]?.repoDir ?? "");
+  return { kind: "clustered", groups, primaryRepoDir };
+}
+
+/**
  * PRODUCER: the per-epic grandfather predicate threaded into
  * {@link classifyWorktreeRepos} — true IFF epic `epicId` ALREADY has a live
  * worktree lane on `repoDir`, so a `disabled` verdict must NOT flip it (see the
@@ -2305,12 +2454,34 @@ function worktreeEpicGrandfathered(epicId: string, repoDir: string): boolean {
  *    sticky `DispatchFailed`. No lane was provisioned, so the epic never finalizes.
  *  - `cycle` — a cyclic `depends_on` DAG; the gate already skipped lane-keying, and
  *    dispatch re-throws the carried error to `driveCycle`'s backstop.
+ *  - `clustered` — a multi-repo epic (rollout flag ON): one {@link GroupGeometry}
+ *    per resolved toplevel, each independently a `worktree` plan or a `serial`
+ *    shared-checkout group, plus the `primaryRepoDir` the single plan-close anchors
+ *    to. A single-repo epic never clusters (it stays `ok`/`disabled`).
  */
 type EpicWorktreeGeometry =
   | { kind: "ok"; plan: WorktreePlan; repoDir: string }
+  | {
+      kind: "clustered";
+      groups: GroupGeometry[];
+      primaryRepoDir: string;
+    }
   | { kind: "disabled"; reason: string; repoDir: string }
   | { kind: "reject"; reason: string }
   | { kind: "cycle"; error: WorktreeCycleError };
+
+/**
+ * One per-repo lane group's derived geometry within a `clustered` epic. A
+ * `worktree` group carries its derived {@link WorktreePlan} (base + ribs + sink);
+ * a `serial` group carries none (its tasks dispatch on the shared checkout, keyed
+ * cap-1 on the bare `repoDir`, exactly like the whole-epic `disabled` fallback).
+ */
+interface GroupGeometry {
+  repoDir: string;
+  mode: "worktree" | "serial";
+  /** The derived lane plan — present IFF `mode === "worktree"`. */
+  plan?: WorktreePlan;
+}
 
 /** The gate + dispatch geometry from ONE {@link prepareWorktreeGeometry} pass. */
 interface PreparedWorktreeGeometry {
@@ -2370,6 +2541,66 @@ export function prepareWorktreeGeometry(
       for (const t of epic.tasks) {
         laneKeyById.set(t.task_id, repoDir);
       }
+      continue;
+    }
+    if (resolution !== undefined && resolution.kind === "clustered") {
+      // A CLUSTERED multi-repo epic: derive geometry per group INDEPENDENTLY. Each
+      // group keys its own lanes — a `serial` group keys its tasks (and, if it is
+      // the primary group, the close row) to the bare `repoDir` (the cap-1
+      // shared-checkout mutex); a `worktree` group keys each rib to its lane path.
+      // The single close row keys to the PRIMARY group only. A per-group
+      // `deriveWorktreePlan` drops cross-repo `depends_on` edges (in-group parent
+      // filter), so lanes never fork across a repo boundary. A cyclic in-group DAG
+      // → whole-epic `cycle` geometry (dispatch re-throws to the backstop).
+      const { groups, primaryRepoDir } = resolution;
+      const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+      const groupGeoms: GroupGeometry[] = [];
+      let cycle: WorktreeCycleError | undefined;
+      for (const group of groups) {
+        const isPrimary = group.repoDir === primaryRepoDir;
+        if (group.mode === "serial") {
+          groupGeoms.push({ repoDir: group.repoDir, mode: "serial" });
+          for (const taskId of group.taskIds) {
+            laneKeyById.set(taskId, group.repoDir);
+          }
+          if (isPrimary) {
+            laneKeyById.set(epic.epic_id, group.repoDir);
+          }
+          continue;
+        }
+        const groupTasks = group.taskIds
+          .map((id) => taskById.get(id))
+          .filter((t): t is Task => t !== undefined);
+        let plan: WorktreePlan;
+        try {
+          plan = deriveWorktreePlan(epic.epic_id, group.repoDir, groupTasks);
+        } catch (err) {
+          if (err instanceof WorktreeCycleError) {
+            cycle = err;
+            break;
+          }
+          throw err;
+        }
+        groupGeoms.push({ repoDir: group.repoDir, mode: "worktree", plan });
+        for (const a of plan.assignments) {
+          if (a.isCloseSink) {
+            continue;
+          }
+          laneKeyById.set(a.nodeId, a.worktreePath);
+        }
+        if (isPrimary) {
+          laneKeyById.set(epic.epic_id, plan.baseWorktreePath);
+        }
+      }
+      if (cycle !== undefined) {
+        byEpicId.set(epic.epic_id, { kind: "cycle", error: cycle });
+        continue;
+      }
+      byEpicId.set(epic.epic_id, {
+        kind: "clustered",
+        groups: groupGeoms,
+        primaryRepoDir,
+      });
       continue;
     }
     if (resolution === undefined || resolution.kind !== "ok") {
@@ -2435,6 +2666,13 @@ export function prepareWorktreeGeometry(
  *    projection). The producer merges that base into the default branch + tears
  *    down, confirming real completion via the MAIN projection (`isEpicDone`) first
  *    (`finalizeEpic`) — the closer writes `done` to the PRIMARY repo, not the lane.
+ *  - `clustered` (multi-repo) → stamp each task launch with ITS group's assignment
+ *    (a `serial` group's tasks stay worktree-less on the shared checkout); the
+ *    single close launch maps to the PRIMARY group's sink (worktree-less if the
+ *    primary group is serial). Push ONE `worktreeFinalize` entry per WORKTREE group
+ *    (the single close gates ALL groups' finalizes); a non-primary group's sink
+ *    additionally lands in `worktreeSinkProvision` — no close worker dispatches into
+ *    it, so the producer runs its rib→base fan-in before finalize via `provision`.
  *
  * Pure: a total function of the epics + launches + id sets + the resolved geometry.
  */
@@ -2444,6 +2682,7 @@ function attachWorktreeGeometry(
   completedRowIds: Set<string>,
   closerFinishedIds: Set<string>,
   worktreeFinalize: WorktreeLaunchInfo[],
+  worktreeSinkProvision: WorktreeLaunchInfo[],
   byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
 ): void {
   // Index launches by epic. A task launch belongs to the epic owning the task; a
@@ -2490,6 +2729,90 @@ function attachWorktreeGeometry(
       // the `assertOnDefaultBranch` branch, unmodified cwd), NO `worktreeReject`
       // (mints no sticky), NO finalize (no lane was ever provisioned). The gate
       // already serialized these launches via the shared-toplevel lane key.
+      continue;
+    }
+    if (geom.kind === "clustered") {
+      // A CLUSTERED multi-repo epic: stamp each launch with ITS group's geometry.
+      // Build a per-worktree-group stamp (assignment index + shared lane context),
+      // an id→group map, and the primary group (the one hosting the close).
+      const groupInfoFor = (
+        plan: WorktreePlan,
+        repoDir: string,
+      ): ((a: WorktreeAssignment) => WorktreeLaunchInfo) => {
+        const laneOrder = plan.assignments.map((a) => ({
+          nodeId: a.nodeId,
+          branch: a.branch,
+          worktreePath: a.worktreePath,
+        }));
+        return (assignment) => ({
+          assignment,
+          baseBranch: plan.baseBranch,
+          baseWorktreePath: plan.baseWorktreePath,
+          repoDir,
+          laneOrder,
+          parentBranch: parentBranchFor(assignment, plan, epic.tasks),
+        });
+      };
+      interface GroupStamp {
+        repoDir: string;
+        byNode: Map<string, WorktreeAssignment>;
+        infoFor: (a: WorktreeAssignment) => WorktreeLaunchInfo;
+      }
+      const worktreeGroups: GroupStamp[] = [];
+      const groupByTaskId = new Map<string, GroupStamp>();
+      let primaryGroup: GroupStamp | undefined;
+      for (const g of geom.groups) {
+        if (g.mode !== "worktree" || g.plan === undefined) {
+          continue; // serial group → shared checkout, no lane stamping
+        }
+        const stamp: GroupStamp = {
+          repoDir: g.repoDir,
+          byNode: new Map(g.plan.assignments.map((a) => [a.nodeId, a])),
+          infoFor: groupInfoFor(g.plan, g.repoDir),
+        };
+        worktreeGroups.push(stamp);
+        for (const a of g.plan.assignments) {
+          if (!a.isCloseSink) {
+            groupByTaskId.set(a.nodeId, stamp);
+          }
+        }
+        if (g.repoDir === geom.primaryRepoDir) {
+          primaryGroup = stamp;
+        }
+      }
+      for (const l of epicLaunches) {
+        if (l.verb === "close") {
+          // The single close maps to the PRIMARY group's sink; a serial primary
+          // (no plan) leaves it worktree-less (runs on the shared checkout).
+          const sink = primaryGroup?.byNode.get(CLOSE_SINK_ID);
+          if (primaryGroup !== undefined && sink !== undefined) {
+            l.worktree = primaryGroup.infoFor(sink);
+          }
+          continue;
+        }
+        const stamp = groupByTaskId.get(l.id);
+        const assignment = stamp?.byNode.get(l.id);
+        if (stamp !== undefined && assignment !== undefined) {
+          l.worktree = stamp.infoFor(assignment);
+        }
+        // A serial-group task (or a shell-element with no node) stays worktree-less.
+      }
+      if (needsFinalize) {
+        // One finalize per WORKTREE group — the single close gates them all. A
+        // NON-primary group's sink also needs a producer-side fan-in provision (no
+        // close worker dispatched into it to assemble its base).
+        for (const stamp of worktreeGroups) {
+          const sink = stamp.byNode.get(CLOSE_SINK_ID);
+          if (sink === undefined) {
+            continue;
+          }
+          const sinkInfo = stamp.infoFor(sink);
+          worktreeFinalize.push(sinkInfo);
+          if (stamp.repoDir !== geom.primaryRepoDir) {
+            worktreeSinkProvision.push(sinkInfo);
+          }
+        }
+      }
       continue;
     }
 
@@ -2948,9 +3271,38 @@ export async function runReconcileCycle(
   // `finalizeEpic` skips an already-merged base + resumes a partial teardown
   // (already-gone worktrees no-op).
   if (deps.worktree !== undefined) {
+    // A CLUSTERED epic's NON-PRIMARY worktree groups have no close worker to
+    // trigger their rib→base fan-in, so assemble those bases HERE (via `provision`,
+    // idempotent + crash-recoverable) BEFORE their finalize merges an unassembled
+    // base to default. A fan-in failure (a content conflict merging a rib) mints
+    // the same sticky `close::<epic>` DispatchFailed a finalize block would, and
+    // SKIPS that group's finalize — never merges a half-assembled base. EMPTY for
+    // single-repo epics, so this is a byte-identical no-op there.
+    const provisionFailed = new Set<string>();
+    for (const sink of decision.worktreeSinkProvision) {
+      if (signal.aborted) {
+        return;
+      }
+      const provisioned = await deps.worktree.provision(sink);
+      if (!provisioned.ok) {
+        provisionFailed.add(`${closeKeyEpicId(sink)} ${sink.repoDir}`);
+        deps.emitDispatchFailed({
+          verb: "close",
+          id: closeKeyEpicId(sink),
+          reason: provisioned.reason,
+          dir: sink.repoDir,
+          ts: deps.now(),
+        });
+      }
+    }
     for (const info of decision.worktreeFinalize) {
       if (signal.aborted) {
         return;
+      }
+      // A group whose fan-in provision failed above must NOT finalize — its base is
+      // not assembled, so merging it would push incomplete work to default.
+      if (provisionFailed.has(`${closeKeyEpicId(info)} ${info.repoDir}`)) {
+        continue;
       }
       const result = await deps.worktree.finalizeEpic(info, deps.isEpicDone);
       // A `retry` failure is a transient environment skip (dirty/off-branch main
@@ -4044,10 +4396,20 @@ export function reposForRecovery(
   };
   for (const epic of epics) {
     const resolution = worktreeRepoByEpicId.get(epic.epic_id);
-    if (resolution === undefined || resolution.kind !== "ok") {
+    if (resolution === undefined) {
       continue;
     }
-    push(resolution.repoDir);
+    if (resolution.kind === "ok") {
+      push(resolution.repoDir);
+    } else if (resolution.kind === "clustered") {
+      // A clustered multi-repo epic provisions a lane per WORKTREE group — sweep
+      // each such repo. A serial group cut no lane, so it contributes nothing.
+      for (const group of resolution.groups) {
+        if (group.mode === "worktree") {
+          push(group.repoDir);
+        }
+      }
+    }
   }
   for (const root of knownRoots) {
     push(root);
@@ -4422,6 +4784,17 @@ export async function loadReconcileSnapshot(
   )?.worktree_mode;
   const worktreeMode: boolean = worktreeRaw === 1;
 
+  // The durable multi-repo worktree ROLLOUT flag rides the SAME singleton row —
+  // resolve `worktree_multi_repo truthy` (an absent/never-set row, NULL, or 0 =
+  // OFF, today's whole-epic `>1`-toplevel reject; only a stored 1 = ON). Read only
+  // to feed the producer-side `classifyWorktreeRepos` partition below; the pure
+  // `reconcile` layer never sees it (it reads the already-clustered resolutions).
+  // Projection-pull only so a runtime `set_autopilot_config` lands the next cycle.
+  const worktreeMultiRepoRaw = (
+    autopilotRows[0] as { worktree_multi_repo?: unknown } | undefined
+  )?.worktree_multi_repo;
+  const worktreeMultiRepo: boolean = worktreeMultiRepoRaw === 1;
+
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -4491,6 +4864,7 @@ export async function loadReconcileSnapshot(
         toplevelResolver,
         assessResolver,
         worktreeEpicGrandfathered,
+        worktreeMultiRepo,
       )
     : new Map<string, WorktreeRepoResolution>();
   // The recover sweep's KNOWN-ROOTS set — every git-tracked project dir

@@ -2326,6 +2326,7 @@ function autopilotConfigSetEvent(
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
+    worktree_multi_repo?: boolean;
   },
   sessionId = "autopilot",
 ): number {
@@ -2347,6 +2348,7 @@ function getAutopilotStateConfig() {
     mode: string;
     max_concurrent_per_root: number | null;
     worktree_mode: number | null;
+    worktree_multi_repo: number | null;
   } | null;
 }
 
@@ -2693,6 +2695,84 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with a wo
   drainAll();
   const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
   expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Schema v101 (fn-1034) — `worktree_multi_repo` is the FOURTH scalar config column
+// riding the generic `AutopilotConfigSet` fold, mirroring `worktree_mode`: a
+// BOOLEAN wire field stored as INTEGER 0/1 (DEFAULT NULL/absent = OFF), the
+// reconciler resolving `?? OFF` at read time — never in a fold. Behind it, a
+// worktree-mode epic spanning >1 git toplevel provisions per-repo lane groups.
+// ---------------------------------------------------------------------------
+
+test("AutopilotConfigSet {worktree_multi_repo:true} sets the column to 1 and advances the cursor (fn-1034)", () => {
+  const eventId = autopilotConfigSetEvent({ worktree_multi_repo: true });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.worktree_multi_repo).toBe(1);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+  // INSERT path still materializes the boots-paused / yolo defaults.
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet {worktree_multi_repo:false} sets the column to 0 (explicit OFF) (fn-1034)", () => {
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(1);
+  autopilotConfigSetEvent({ worktree_multi_repo: false });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(0);
+});
+
+test("AutopilotConfigSet {worktree_multi_repo} PRESERVES paused, mode, worktree_mode, and both concurrency columns (fn-1034)", () => {
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 4,
+    max_concurrent_per_root: 3,
+    worktree_mode: true,
+  });
+  drainAll();
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.worktree_multi_repo).toBe(1); // landed
+  expect(row?.worktree_mode).toBe(1); // worktree_mode PRESERVED
+  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
+  expect(row?.max_concurrent_per_root).toBe(3); // per-root PRESERVED
+  expect(row?.paused).toBe(0); // play PRESERVED
+  expect(row?.mode).toBe("armed"); // mode PRESERVED
+});
+
+test("a worktree_mode patch and a pause toggle PRESERVE worktree_multi_repo (fn-1034)", () => {
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(1);
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(1); // preserved
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(1); // preserved
+});
+
+test("AutopilotConfigSet present-but-non-boolean worktree_multi_repo coerces to 0 (OFF) (fn-1034)", () => {
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(1);
+  for (const bad of [1, 0, "true", null]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({ worktree_multi_repo: bad }),
+    });
+    drainAll();
+    expect(getAutopilotStateConfig()?.worktree_multi_repo).toBe(0);
+    autopilotConfigSetEvent({ worktree_multi_repo: true });
+    drainAll();
+  }
 });
 
 // ---------------------------------------------------------------------------

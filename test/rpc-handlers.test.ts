@@ -205,6 +205,7 @@ function autopilotStubBridge(opts: {
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
+      worktree_multi_repo?: boolean;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -226,6 +227,7 @@ function autopilotStubBridge(opts: {
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
+      worktree_multi_repo?: boolean;
     }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
@@ -491,6 +493,39 @@ test("set_autopilot_config rejects a non-boolean worktree_mode (fn-959)", async 
     { worktree_mode: 0 },
     { worktree_mode: "true" },
     { worktree_mode: null },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a worktree_multi_repo boolean patch (fn-1034)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const on = await setAutopilotConfigHandler(
+    { worktree_multi_repo: true },
+    bridge,
+  );
+  expect(on).toEqual({ ok: true, patch: { worktree_multi_repo: true } });
+  const off = await setAutopilotConfigHandler(
+    { worktree_multi_repo: false },
+    bridge,
+  );
+  expect(off).toEqual({ ok: true, patch: { worktree_multi_repo: false } });
+  expect(state.setConfigCalls).toEqual([
+    { worktree_multi_repo: true },
+    { worktree_multi_repo: false },
+  ]);
+});
+
+test("set_autopilot_config rejects a non-boolean worktree_multi_repo (fn-1034)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { worktree_multi_repo: 1 },
+    { worktree_multi_repo: 0 },
+    { worktree_multi_repo: "true" },
+    { worktree_multi_repo: null },
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,

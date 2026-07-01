@@ -4715,6 +4715,433 @@ test("fn-1013.3 reconcile: a grandfathered disabled-toplevel epic dispatches IN 
   }
 });
 
+// ---------------------------------------------------------------------------
+// fn-1034 — MULTI-REPO worktree epics behind the `worktree_multi_repo` rollout
+// flag. With the flag ON, an epic whose tasks span >1 git toplevel PARTITIONS
+// into per-repo lane groups (each independently worktree/serial) instead of the
+// whole-epic `worktree-multi-repo` reject. Flag OFF (the default 5th arg) keeps
+// the reject byte-identical. The fast tier injects a synthetic resolver /
+// eligibility probe / grandfather predicate — no real git.
+// ---------------------------------------------------------------------------
+
+/** A resolver that maps `/repo-a*`→`/repo-a`, `/repo-b*`→`/repo-b`, else null. */
+const abResolve = (r: string): string | null =>
+  r.startsWith("/repo-a")
+    ? "/repo-a"
+    : r.startsWith("/repo-b")
+      ? "/repo-b"
+      : null;
+
+/** A two-repo epic: task .1 → /repo-a, task .2 → /repo-b, primary /repo-a. */
+function twoRepoEpic(): Epic {
+  return makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+}
+
+/** A worktree-ON snapshot with the multi-repo rollout flag ON. */
+function multiRepoSnap(
+  epics: Epic[],
+  resolve: (root: string) => string | null,
+  assessRepo?: (toplevel: string) => { eligible: boolean; reason: string },
+  isGrandfathered?: (epicId: string, repoDir: string) => boolean,
+): ReconcileSnapshot {
+  return makeSnapshot({
+    epics,
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      epics,
+      resolve,
+      assessRepo,
+      isGrandfathered,
+      true,
+    ),
+  });
+}
+
+test("fn-1034 classifyWorktreeRepos: flag OFF keeps the >1 reject; flag ON partitions into ordered per-repo groups", () => {
+  const epic = twoRepoEpic();
+  // Flag OFF (default 5th arg) — byte-identical multi-repo reject.
+  const off = classifyWorktreeRepos([epic], abResolve).get("fn-1-foo");
+  expect(off?.kind).toBe("multi-repo");
+  // Flag ON — clustered per-repo groups.
+  const on = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-foo");
+  expect(on?.kind).toBe("clustered");
+  if (on?.kind !== "clustered") throw new Error("expected clustered");
+  expect(on.groups).toEqual([
+    { repoDir: "/repo-a", taskIds: ["fn-1-foo.1"], mode: "worktree" },
+    { repoDir: "/repo-b", taskIds: ["fn-1-foo.2"], mode: "worktree" },
+  ]);
+  // The primary group hosts the single plan-close: resolve(project_dir=/repo-a).
+  expect(on.primaryRepoDir).toBe("/repo-a");
+});
+
+test("fn-1034 classifyWorktreeRepos: a single-repo epic NEVER clusters (stays `ok`, byte-identical) even with the flag ON", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-solo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-solo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-solo");
+  expect(res).toEqual({ kind: "ok", repoDir: "/repo-a" });
+});
+
+test("fn-1034 classifyWorktreeRepos: precedence preserved — a null root → whole-epic `unresolved`, empty project_dir → whole-epic `no-primary-repo`, even with the flag ON", () => {
+  // (a) A task resolving null → the WHOLE epic is `unresolved`, never a partial cluster.
+  const unresolvable = makeEpic({
+    epic_id: "fn-1-unres",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-unres.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-unres.2",
+        task_number: 2,
+        target_repo: "/nope",
+      }),
+    ],
+  });
+  // (b) A resolved-clean multi-repo epic with NO primary_repo → whole-epic reject.
+  const noPrimary = makeEpic({
+    epic_id: "fn-1-nopri",
+    project_dir: "",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-nopri.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-nopri.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const map = classifyWorktreeRepos(
+    [unresolvable, noPrimary],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  );
+  expect(map.get("fn-1-unres")?.kind).toBe("unresolved");
+  expect(map.get("fn-1-nopri")?.kind).toBe("no-primary-repo");
+});
+
+test("fn-1034 classifyWorktreeRepos: per-group eligibility → one group `worktree`, an ineligible sibling `serial`", () => {
+  const epic = twoRepoEpic();
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    (top) => ({
+      eligible: top === "/repo-a",
+      reason: `worktree-disabled:no-manifest (${top})`,
+    }),
+    undefined,
+    true,
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  expect(res.groups).toEqual([
+    { repoDir: "/repo-a", taskIds: ["fn-1-foo.1"], mode: "worktree" },
+    { repoDir: "/repo-b", taskIds: ["fn-1-foo.2"], mode: "serial" },
+  ]);
+});
+
+test("fn-1034 classifyWorktreeRepos: grandfather runs per (epic, repoDir) — only the grandfathered repo's group stays `worktree`", () => {
+  const epic = twoRepoEpic();
+  const seen: Array<[string, string]> = [];
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    () => ({ eligible: false, reason: "worktree-disabled:probe-error" }),
+    (epicId, repoDir) => {
+      seen.push([epicId, repoDir]);
+      return repoDir === "/repo-a"; // only /repo-a has a live lane
+    },
+    true,
+  ).get("fn-1-foo");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  // /repo-a grandfathered → worktree; /repo-b not → serial.
+  expect(res.groups.map((g) => [g.repoDir, g.mode])).toEqual([
+    ["/repo-a", "worktree"],
+    ["/repo-b", "serial"],
+  ]);
+  // The predicate saw the EPIC id + EACH group's resolved toplevel.
+  expect(seen).toEqual([
+    ["fn-1-foo", "/repo-a"],
+    ["fn-1-foo", "/repo-b"],
+  ]);
+});
+
+test("fn-1034 prepareWorktreeGeometry: clustered epic keys each group's lanes independently; the close row keys the PRIMARY group base", () => {
+  const epic = twoRepoEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  const geom = prepared.byEpicId.get("fn-1-foo");
+  expect(geom?.kind).toBe("clustered");
+  const baseA = worktreePathFor("/repo-a", "keeper/epic/fn-1-foo");
+  const baseB = worktreePathFor("/repo-b", "keeper/epic/fn-1-foo");
+  // Each single-task group inherits its OWN repo's base lane.
+  expect(prepared.laneKeyById.get("fn-1-foo.1")).toBe(baseA);
+  expect(prepared.laneKeyById.get("fn-1-foo.2")).toBe(baseB);
+  // The single close row (epic id) keys ONLY the PRIMARY group's base.
+  expect(prepared.laneKeyById.get("fn-1-foo")).toBe(baseA);
+});
+
+test("fn-1034 prepareWorktreeGeometry: a mixed worktree+serial epic keys each group WITHOUT a cap-1 collision", () => {
+  const epic = twoRepoEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    (top) => ({ eligible: top === "/repo-a", reason: "x" }),
+    undefined,
+    true,
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  const geom = prepared.byEpicId.get("fn-1-foo");
+  expect(geom?.kind).toBe("clustered");
+  if (geom?.kind !== "clustered") throw new Error("expected clustered");
+  expect(geom.groups.map((g) => [g.repoDir, g.mode])).toEqual([
+    ["/repo-a", "worktree"],
+    ["/repo-b", "serial"],
+  ]);
+  const baseA = worktreePathFor("/repo-a", "keeper/epic/fn-1-foo");
+  // Worktree group task → its lane path; serial group task → the BARE repoDir;
+  // close row → the primary (worktree) base. All three are DISTINCT keys — no
+  // collision between the serial bare key, the worktree lane path, and the close.
+  expect(prepared.laneKeyById.get("fn-1-foo.1")).toBe(baseA);
+  expect(prepared.laneKeyById.get("fn-1-foo.2")).toBe("/repo-b");
+  expect(prepared.laneKeyById.get("fn-1-foo")).toBe(baseA);
+  expect(baseA).not.toBe("/repo-b");
+});
+
+test("fn-1034 reconcile: a clustered epic stamps each task launch with ITS group's geometry (no worktreeReject)", () => {
+  const epic = twoRepoEpic();
+  const snap = multiRepoSnap([epic], abResolve);
+  const decision = reconcile(snap, makeState(), 0);
+  const work = decision.launches.filter((l) => l.verb === "work");
+  expect(work.length).toBeGreaterThan(0);
+  for (const l of work) {
+    expect(l.worktreeReject).toBeUndefined();
+    expect(l.worktree).toBeDefined();
+    // Each task's lane lives in ITS OWN group's repo.
+    const expectedRepo = l.id === "fn-1-foo.1" ? "/repo-a" : "/repo-b";
+    expect(l.worktree?.repoDir).toBe(expectedRepo);
+  }
+});
+
+test("fn-1034 reconcile: gate laneKeyById ↔ dispatch worktree paths agree per group for a clustered epic", () => {
+  const epic = twoRepoEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: repoMap,
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  for (const l of decision.launches.filter((x) => x.verb === "work")) {
+    // The dispatch-side worktree path equals the gate's lane key for the same id.
+    expect(l.worktree?.assignment.worktreePath).toBe(
+      prepared.laneKeyById.get(l.id),
+    );
+  }
+});
+
+test("fn-1034 reconcile: a done clustered epic collects ONE finalize per WORKTREE group + a non-primary sink provision request", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  const decision = reconcile(snap, makeState(), 0);
+  // One finalize per worktree group (the single close gates them ALL).
+  expect(decision.worktreeFinalize.map((f) => f.repoDir).sort()).toEqual([
+    "/repo-a",
+    "/repo-b",
+  ]);
+  // Only the NON-primary group needs a producer-side fan-in provision (the primary
+  // group's base is assembled by its close worker); /repo-a is primary.
+  expect(decision.worktreeSinkProvision.map((s) => s.repoDir)).toEqual([
+    "/repo-b",
+  ]);
+});
+
+test("fn-1034 runReconcileCycle: a clustered finalize provisions the non-primary group's sink (fan-in) BEFORE finalizing every group", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The non-primary (/repo-b) sink was provisioned (its rib→base fan-in), since no
+  // close worker dispatches into it.
+  expect(log.provisions).toHaveLength(1);
+  expect(log.provisions[0]?.repoDir).toBe("/repo-b");
+  expect(log.provisions[0]?.assignment.nodeId).toBe("__close__");
+  // Both groups finalized (the single close gated both merges).
+  expect(log.finalizes.map((f) => f.repoDir).sort()).toEqual([
+    "/repo-a",
+    "/repo-b",
+  ]);
+  // Provision ran BEFORE the finalizes (the base must be assembled first).
+  expect(log.calls[0]).toBe("provision:__close__");
+});
+
+test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a sticky close row and SKIPS that group's finalize (never merges an unassembled base)", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionFail: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-merge-conflict: merging a rib into keeper/epic/fn-1-foo"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The fan-in failure minted a sticky close-row DispatchFailed for /repo-b.
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "close",
+    id: "fn-1-foo",
+    dir: "/repo-b",
+  });
+  // ONLY the primary group finalized — the /repo-b base was never assembled.
+  expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
+});
+
+test("fn-1034 reposForRecovery: a clustered epic contributes EACH worktree group's repo; a serial group contributes none", () => {
+  const epic = twoRepoEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    (top) => ({ eligible: top === "/repo-a", reason: "x" }),
+    undefined,
+    true,
+  );
+  // /repo-a is a worktree group (swept); /repo-b is serial (no lane → skipped).
+  expect(reposForRecovery([epic], repoMap)).toEqual(["/repo-a"]);
+});
+
 test("fn-978 cyclic-DAG asymmetry: the gate skips (no key, no throw); reconcile (dispatch) re-throws", () => {
   // A ready root R plus a separate {C1↔C2} cycle: the toposort fails for the whole
   // epic, so the gate leaves it un-keyed (no throw) while the dispatch geometry pass

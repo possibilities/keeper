@@ -392,6 +392,9 @@ from pathlib import Path
 # v100 (fn-1024 task .1) adds the six nullable per-session telemetry columns to
 # ``jobs`` (current model / effort / context-window usage from the statusLine
 # payload); keeper-py never reads them, so only the version whitelist gains 100.
+# v101 (fn-1034 task .1) adds the nullable ``autopilot_state.worktree_multi_repo``
+# rollout flag (multi-repo worktree epics); keeper-py never reads
+# ``autopilot_state``, so only the version whitelist gains 101.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -464,6 +467,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         98,
         99,
         100,
+        101,
     }
 )
 

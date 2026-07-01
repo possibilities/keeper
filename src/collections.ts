@@ -637,6 +637,9 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // Durable worktree-mode toggle (INTEGER 0/1), served so the banner reflects
     // the real durable state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
     "worktree_mode",
+    // Durable multi-repo worktree rollout flag (INTEGER 0/1), read by the
+    // reconciler's `classifyWorktreeRepos` partition each cycle. NOT a jsonColumn.
+    "worktree_multi_repo",
   ],
   pk: "id",
   version: "last_event_id",

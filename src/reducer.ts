@@ -4632,6 +4632,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_jobs: "max_concurrent_jobs",
   max_concurrent_per_root: "max_concurrent_per_root",
   worktree_mode: "worktree_mode",
+  worktree_multi_repo: "worktree_multi_repo",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -4661,6 +4662,13 @@ interface AutopilotConfigSetPayload {
    *  `null` here — there is no unlimited/unset sentinel; a present field always
    *  resolves to a concrete 0/1. */
   worktree_mode?: number;
+  /** The durable multi-repo worktree rollout flag, stored as INTEGER 0/1 (`1` =
+   *  ON = per-repo lane groups for a multi-toplevel epic, `0` = OFF = today's
+   *  whole-epic `>1`-toplevel reject). Same shape/coercion as
+   *  {@link worktree_mode}: the wire field is a BOOLEAN; the parser coerces
+   *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
+   *  resolves to a concrete 0/1. */
+  worktree_multi_repo?: number;
 }
 
 /**
@@ -4713,6 +4721,14 @@ function extractAutopilotConfigSetPayload(
       // to a concrete 0/1 — there is no unset sentinel, so the column never goes
       // NULL via a patch (the reconciler still resolves an absent column `?? OFF`).
       patch.worktree_mode = raw === true ? 1 : 0;
+    }
+    if ("worktree_multi_repo" in parsed) {
+      const raw = parsed.worktree_multi_repo;
+      // BOOLEAN wire field stored as INTEGER 0/1, mirroring `worktree_mode`:
+      // `true` → 1 (ON), anything else (false / null / non-boolean) → 0 (OFF). A
+      // present field always resolves to a concrete 0/1 — the reconciler resolves
+      // an absent column `?? OFF`.
+      patch.worktree_multi_repo = raw === true ? 1 : 0;
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;

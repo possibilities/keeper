@@ -278,3 +278,43 @@ test("tie-break is (task_number, task_id): equal numbers fall back to id order",
     ribBranchFor(EPIC, "fn-1-foo.zeta"),
   );
 });
+
+// ---------------------------------------------------------------------------
+// fn-1034 — per-group derivation for a CLUSTERED multi-repo epic. Each per-repo
+// group calls deriveWorktreePlan with ONLY its own tasks, so a `depends_on` token
+// pointing at a SIBLING group's task (a cross-repo edge) is out-of-group and
+// dropped by the in-group parent filter — it never forks a lane across the repo
+// boundary. Cross-repo deps survive ONLY as readiness serialization barriers.
+// ---------------------------------------------------------------------------
+
+test("fn-1034 per-group: an out-of-group depends_on token is dropped (cross-repo edge → in-group root)", () => {
+  // `g.1` depends on `other.9`, which lives in a SIBLING repo group and is NOT in
+  // the tasks passed here — so `g.1` has no in-group parent and rides the base
+  // lane as a root (no rib, no pre-merge). The cross-repo edge is invisible to the
+  // lane geometry.
+  const { plan, map } = byNode([task("g.1", 1, ["other.9"])]);
+  const base = baseBranchFor(EPIC);
+  const a = map.get("g.1");
+  expect(a?.branch).toBe(base);
+  expect(a?.inherited).toBe(true);
+  expect(a?.preMerges).toEqual([]);
+  // No rib was cut for the phantom cross-repo parent.
+  expect(plan.assignments.map((x) => x.nodeId)).toEqual(["g.1", CLOSE_SINK_ID]);
+});
+
+test("fn-1034 per-group: an in-group fork still ribs; only the cross-repo token is filtered", () => {
+  // `g.J` fans in an IN-GROUP rib (`g.B`) AND a cross-repo token (`other.9`). The
+  // in-group fork/merge is preserved; the cross-repo token is dropped.
+  const tasks = [
+    task("g.P", 1),
+    task("g.A", 2, ["g.P"]),
+    task("g.B", 3, ["g.P"]),
+    task("g.J", 4, ["g.A", "g.B", "other.9"]),
+  ];
+  const { map } = byNode(tasks);
+  const base = baseBranchFor(EPIC);
+  // The in-group diamond is intact: B ribs, J pre-merges B.
+  expect(map.get("g.B")?.branch).toBe(ribBranchFor(EPIC, "g.B"));
+  expect(map.get("g.J")?.branch).toBe(base);
+  expect(map.get("g.J")?.preMerges).toEqual([ribBranchFor(EPIC, "g.B")]);
+});

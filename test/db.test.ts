@@ -2546,8 +2546,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // change), fn-1016 task .1. v100 appends the six nullable per-session telemetry
   // columns to `jobs` (current model / effort / context-window usage from the
   // statusLine payload — an additive ALTER, not an epics-shape change), fn-1024
-  // task .1. The v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(100);
+  // task .1. v101 appends the nullable `autopilot_state.worktree_multi_repo`
+  // rollout flag for multi-repo worktree epics (an additive ALTER, not an
+  // epics-shape change), fn-1034 task .1. The v62→v63 epics-shape migration this
+  // test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(101);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
