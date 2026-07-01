@@ -1226,6 +1226,11 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
         presets,
         panels,
         default: selections.default,
+        defaults: {
+          claude: catalog.claude_default ?? null,
+          codex: catalog.codex_default ?? null,
+          pi: catalog.pi_default ?? null,
+        },
       })}\n`,
     );
     return deps.exit(0);
@@ -1254,6 +1259,16 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
       const marker = selections.default === name ? " (default)" : "";
       lines.push(`  ${name}  [${members.join(", ")}]${marker}`);
     }
+  }
+  lines.push(
+    "Harness defaults (the preset a bare `keeper agent <harness>` resolves):",
+  );
+  for (const [harness, pointer] of [
+    ["claude", catalog.claude_default],
+    ["codex", catalog.codex_default],
+    ["pi", catalog.pi_default],
+  ] as const) {
+    lines.push(`  ${harness}_default  ${pointer ?? "(unset)"}`);
   }
   deps.write(`${lines.join("\n")}\n`);
   return deps.exit(0);
