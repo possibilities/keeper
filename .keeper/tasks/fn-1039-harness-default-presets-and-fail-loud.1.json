@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T14:31:36.551000Z",
+  "depends_on": [],
+  "epic": "fn-1039-harness-default-presets-and-fail-loud",
+  "id": "fn-1039-harness-default-presets-and-fail-loud.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Wire harness-default presets + fail-loud resolution",
+  "updated_at": "2026-07-01T14:31:36.551000Z"
+}
