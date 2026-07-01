@@ -400,9 +400,8 @@ export const WORKER_CELL_BASE: string = join(
  * discovery (`discoverPlugins` step 2b — the IMMEDIATE children of each
  * `plugin_scan_dir`) and returns the first child whose
  * `.claude-plugin/plugin.json` is `name: "work"` yet sits OUTSIDE {@link
- * WORKER_CELL_BASE} — exactly the collision the source epic hit when an arthack
- * `work` plugin in a scan dir shadowed the cell until a rename handoff. Returns
- * the offending manifest path, else null.
+ * WORKER_CELL_BASE} — such a manifest re-claims the `work:worker` name at launch
+ * and shadows the selected cell. Returns the offending manifest path, else null.
  *
  * On-disk I/O by contract — called ONLY from `runReconcileCycle` (the producer),
  * NEVER a `reconcile`/fold arm, so re-fold determinism holds. Fail-safe: an
@@ -3627,9 +3626,8 @@ export async function runReconcileCycle(
         continue;
       }
       // (3) a non-cell `work`-named plugin sitting in a claude `plugin_scan_dir`
-      // would re-claim the `work:worker` constant at launch and silently shadow
-      // the `--plugin-dir`-selected cell — the exact hazard that gated the source
-      // epic's cutover. Probe the REAL scan dirs (not just the repo) and mint a
+      // re-claims the `work:worker` constant at launch and silently shadows
+      // the `--plugin-dir`-selected cell. Probe the REAL scan dirs (not just the repo) and mint a
       // sticky `work-plugin-shadowed` `DispatchFailed` (per-key, cleared by
       // `retry_dispatch`) rather than spawn the wrong worker. On-disk read here in
       // the producer, memoized once per cycle — never a fold.
