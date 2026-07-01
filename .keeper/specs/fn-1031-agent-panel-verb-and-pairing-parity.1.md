@@ -61,5 +61,5 @@ machinery's detachment is already faked/seamed in the existing panel tests; reus
 - [ ] Dep-graph hygiene green; `bun test` + `bun run typecheck` green.
 
 ## Done summary
-
+Routed keeper agent panel start|wait into the existing runPanel (same engine keeper pair panel drives) — additive parity, pair byte-stable. Documented the panel sub-verb in USAGE + wrapper help; new agent-panel-cli test asserts byte-identical verdict/exit vs pair panel.
 ## Evidence
