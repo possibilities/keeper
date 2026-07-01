@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Delete orphaned trailer helper",
-  "updated_at": "2026-07-01T18:13:45.833000Z"
+  "updated_at": "2026-07-01T18:42:17.937000Z",
+  "worker_done_at": "2026-07-01T18:42:17.937000Z"
 }

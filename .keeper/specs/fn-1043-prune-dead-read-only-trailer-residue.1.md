@@ -23,5 +23,5 @@ not reference the removed trailer.
 - [ ] `bun run typecheck` and `bun run lint` are green; `bun test` passes
 
 ## Done summary
-
+Deleted the orphaned exported trailerProjectRoot helper (and its now-dead local expandUser) from project.ts, and re-anchored the saga-close-preflight test comment to the verb's own tilde --project handling. typecheck/lint/tests green.
 ## Evidence
