@@ -29,7 +29,13 @@
 
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
@@ -54,6 +60,7 @@ import {
   epicPresentAndNotDone,
   FINALIZER_GUARD_S,
   type FoundJob,
+  findShadowingWorkManifest,
   isEpicDoneById,
   isEpicInFlight,
   isFinalizerGuarded,
@@ -343,6 +350,12 @@ interface FakeDepsOptions {
    * ignores it anyway); override to drive a crashed-closer (false) gate path.
    */
   isEpicDone?: (epicId: string) => Promise<boolean>;
+  /**
+   * Scan-dir shadow probe. Defaults to `() => null` (no shadowing `work` plugin)
+   * so the fast tier never reads the real launcher plugin config; return a
+   * manifest path to drive the `work-plugin-shadowed` DispatchFailed branch.
+   */
+  probeShadowingWorkManifest?: () => string | null;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -429,6 +442,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     worktree: opts.worktree,
     realpath: opts.realpath ?? ((p: string) => p),
+    probeShadowingWorkManifest: opts.probeShadowingWorkManifest ?? (() => null),
     isEpicDone: opts.isEpicDone ?? (async () => true),
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
@@ -2942,6 +2956,154 @@ test("runReconcileCycle: an out-of-matrix worker cell blocks the launch with a s
   expect(log.emissions.length).toBe(1);
   expect(log.emissions[0]?.reason).toContain("worker-cell-invalid");
   expect(state.inFlight.size).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// findShadowingWorkManifest — scan-dir probe for a `work`-plugin collision (fn-1042)
+// ---------------------------------------------------------------------------
+
+/** Drop a `<scanDir>/<plugin>/.claude-plugin/plugin.json` in the real claude
+ *  scan-dir layout (a plugin dir is an IMMEDIATE child of the scan dir). */
+function dropScanPlugin(scanDir: string, plugin: string, name: string): string {
+  const manifestDir = join(scanDir, plugin, ".claude-plugin");
+  mkdirSync(manifestDir, { recursive: true });
+  const manifest = join(manifestDir, "plugin.json");
+  writeFileSync(manifest, JSON.stringify({ name }));
+  return manifest;
+}
+
+test("findShadowingWorkManifest: flags a `work` plugin in a real scan-dir position (F4)", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-scan-shadow-")));
+  try {
+    const scanDir = join(root, "claude-plugins");
+    const manifest = dropScanPlugin(scanDir, "arthack-work", "work");
+    // A sibling non-`work` plugin in the same scan dir is ignored.
+    dropScanPlugin(scanDir, "some-other", "notes");
+    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
+    expect(findShadowingWorkManifest([scanDir], cellBase)).toBe(manifest);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("findShadowingWorkManifest: a `work` cell UNDER the cell base is not a shadow", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-scan-cell-")));
+  try {
+    // A scan dir pointing straight at the generated workers tree enumerates the
+    // cells (all `work`-named) as children — those are the legitimate source.
+    const cellBase = join(root, "plugins", "plan", "workers");
+    dropScanPlugin(cellBase, "opus-max", "work");
+    dropScanPlugin(cellBase, "sonnet-max", "work");
+    expect(findShadowingWorkManifest([cellBase], cellBase)).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("findShadowingWorkManifest: clean scan dir (no `work` plugin) → null; missing scan dir skipped", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-scan-clean-")));
+  try {
+    const scanDir = join(root, "claude-plugins");
+    dropScanPlugin(scanDir, "keeper", "keeper");
+    dropScanPlugin(scanDir, "plan", "plan");
+    const cellBase = join(root, "workers");
+    expect(
+      findShadowingWorkManifest(
+        [scanDir, join(root, "does-not-exist")],
+        cellBase,
+      ),
+    ).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runReconcileCycle: a shadowing `work` plugin in a scan dir blocks the launch with a sticky DispatchFailed (fn-1042)", async () => {
+  // A non-cell `work` plugin sitting in a real claude scan-dir position would
+  // re-claim `work:worker` at launch and silently spawn the wrong worker. The
+  // producer probes the scan dirs and mints a sticky `work-plugin-shadowed`
+  // DispatchFailed (per-key, retry-clearable) BEFORE any spawn.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-shadow-cycle-")));
+  try {
+    const scanDir = join(root, "claude-plugins");
+    const manifest = dropScanPlugin(scanDir, "arthack-work", "work");
+    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
+    const { deps, log } = makeFakeDeps({
+      probeShadowingWorkManifest: () =>
+        findShadowingWorkManifest([scanDir], cellBase),
+    });
+    const epic = makeEpic({
+      epic_id: "fn-1-foo",
+      project_dir: "/repo",
+      tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+    });
+    const snap = makeSnapshot({ epics: [epic] });
+    const state = makeState();
+    const liveDispatches = new Map<string, LiveDispatch>();
+    const decision = reconcile(snap, state, 0);
+    expect(decision.launches[0]?.pluginDir).toContain(
+      "plugins/plan/workers/opus-max",
+    );
+
+    await runReconcileCycle(
+      decision,
+      state,
+      liveDispatches,
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+
+    expect(log.launches).toEqual([]); // never spawned
+    expect(liveDispatches.size).toBe(0);
+    expect(state.inFlight.size).toBe(0);
+    expect(log.emissions.length).toBe(1);
+    expect(log.emissions[0]).toMatchObject({ verb: "work", id: "fn-1-foo.1" });
+    expect(log.emissions[0]?.reason).toContain("work-plugin-shadowed");
+    expect(log.emissions[0]?.reason).toContain(manifest);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runReconcileCycle: a clean scan dir (no shadow) launches the cell normally (fn-1042)", async () => {
+  // The no-collision path: the scan dir carries no `work` plugin, so the probe
+  // returns null and the `work`-cell launch proceeds — no DispatchFailed.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-shadow-clean-")));
+  try {
+    const scanDir = join(root, "claude-plugins");
+    dropScanPlugin(scanDir, "keeper", "keeper");
+    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
+    const { deps, log, setJobByKey } = makeFakeDeps({
+      probeShadowingWorkManifest: () =>
+        findShadowingWorkManifest([scanDir], cellBase),
+    });
+    setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+    const epic = makeEpic({
+      epic_id: "fn-1-foo",
+      project_dir: "/repo",
+      tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+    });
+    const snap = makeSnapshot({ epics: [epic] });
+    const state = makeState();
+    const liveDispatches = new Map<string, LiveDispatch>();
+    const decision = reconcile(snap, state, 0);
+
+    await runReconcileCycle(
+      decision,
+      state,
+      liveDispatches,
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+
+    expect(log.launches.length).toBe(1); // launched, no shadow gate
+    expect(log.emissions).toEqual([]); // no DispatchFailed
+    expect(liveDispatches.size).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -38,9 +38,15 @@
  * state pause/play.
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 // Shared with the plan plugin's renderer so the launch-time `--plugin-dir` cell
@@ -48,8 +54,16 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 // drift: `workerAgentFor` supplies the matrix-validated throw + null-either-axis
 // stop; `workerCellDir` supplies the SINGLE cell-path convention.
 import { workerAgentFor } from "../plugins/plan/src/models.ts";
-import { workerCellDir } from "../plugins/plan/src/subagents_config.ts";
-import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
+import {
+  WORKERS_BASE,
+  workerCellDir,
+} from "../plugins/plan/src/subagents_config.ts";
+import {
+  ConfigError,
+  loadPluginSources,
+  loadPresetCatalog,
+  type Preset,
+} from "./agent/config";
 import { computeEligibleEpics } from "./armed-closure";
 import {
   BackstopCounters,
@@ -364,6 +378,95 @@ export function workerCellPluginDir(
     "plan",
     workerCellDir(model as string, tier as string),
   );
+}
+
+/**
+ * The ABSOLUTE base of the generated per-cell `work`-plugin tree
+ * (`${KEEPER_ROOT}/plugins/plan/workers`). Every `--plugin-dir`-selected
+ * `work:worker` cell lives UNDER this base; a `work`-named manifest found OUTSIDE
+ * it while scanning a claude `plugin_scan_dir` is a shadowing collision that would
+ * silently steal the `work:worker` constant from the selected cell.
+ */
+export const WORKER_CELL_BASE: string = join(
+  KEEPER_ROOT,
+  "plugins",
+  "plan",
+  WORKERS_BASE,
+);
+
+/**
+ * Producer-side scan-dir probe for a non-cell `work`-named plugin that would
+ * shadow the launch-time `work:worker` cell. Mirrors the launcher's scan-dir
+ * discovery (`discoverPlugins` step 2b — the IMMEDIATE children of each
+ * `plugin_scan_dir`) and returns the first child whose
+ * `.claude-plugin/plugin.json` is `name: "work"` yet sits OUTSIDE {@link
+ * WORKER_CELL_BASE} — exactly the collision the source epic hit when an arthack
+ * `work` plugin in a scan dir shadowed the cell until a rename handoff. Returns
+ * the offending manifest path, else null.
+ *
+ * On-disk I/O by contract — called ONLY from `runReconcileCycle` (the producer),
+ * NEVER a `reconcile`/fold arm, so re-fold determinism holds. Fail-safe: an
+ * unreadable scan dir / missing or malformed manifest is skipped (not a `work`
+ * collision), so a transient fs error never wedges dispatch. Exported for tests.
+ */
+export function findShadowingWorkManifest(
+  scanDirs: readonly string[],
+  cellBase: string = WORKER_CELL_BASE,
+): string | null {
+  const base = resolve(cellBase);
+  for (const scanDir of scanDirs) {
+    let entries: string[];
+    try {
+      entries = readdirSync(scanDir).sort();
+    } catch {
+      // Missing/unreadable scan dir — skipped, mirroring `discoverPlugins`.
+      continue;
+    }
+    for (const name of entries) {
+      const pluginDir = join(scanDir, name);
+      const manifest = join(pluginDir, ".claude-plugin", "plugin.json");
+      let data: { name?: string };
+      try {
+        if (!statSync(pluginDir).isDirectory()) {
+          continue;
+        }
+        data = JSON.parse(readFileSync(manifest, "utf8")) as { name?: string };
+      } catch {
+        // No manifest / malformed JSON — not a `work` collision.
+        continue;
+      }
+      if (data.name !== "work") {
+        continue;
+      }
+      // A cell manifest under the generated base IS the legitimate `work:worker`
+      // source (a scan dir may point straight at the workers tree) — never a shadow.
+      if (resolve(pluginDir).startsWith(base + sep)) {
+        continue;
+      }
+      return manifest;
+    }
+  }
+  return null;
+}
+
+/**
+ * Default {@link ConfirmRunningDeps.probeShadowingWorkManifest} impl: read the
+ * launcher plugin config and scan its real `plugin_scan_dirs` for a shadowing
+ * non-cell `work` manifest. Fail-safe on a missing/invalid config (mirrors
+ * `resolveWorkerLaunchConfig`'s swallow-to-constants posture) — no scan dirs
+ * means nothing to shadow. Producer-only; runs on the worker's reconcile path.
+ */
+function defaultShadowingWorkProbe(): string | null {
+  let scanDirs: readonly string[];
+  try {
+    scanDirs = loadPluginSources().pluginScanDirs;
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      return null;
+    }
+    throw err;
+  }
+  return findShadowingWorkManifest(scanDirs);
 }
 
 /**
@@ -1287,6 +1390,18 @@ export interface ConfirmRunningDeps {
    * normalization seam without a real dir.
    */
   realpath?(p: string): string;
+  /**
+   * Producer-side scan-dir probe for a non-cell `work`-named plugin that would
+   * shadow the launch-time `work:worker` cell (see {@link
+   * findShadowingWorkManifest}). Returns the offending manifest path — the
+   * producer mints a sticky `work-plugin-shadowed` `DispatchFailed` (per-key,
+   * cleared by `retry_dispatch`) instead of spawning the wrong worker — or null
+   * when clean. Defaults to a real-config scan ({@link defaultShadowingWorkProbe})
+   * in `runReconcileCycle` when absent. A PRODUCER read by contract — lives in
+   * `runReconcileCycle`, never a fold arm, so re-fold determinism holds. Injected
+   * so tests assert the guard against a real scan-dir position without live config.
+   */
+  probeShadowingWorkManifest?(): string | null;
   /**
    * Sleep `ms`, abortable via the worker's shutdown signal. Resolves
    * early when `signal.aborted` flips; the caller checks the flag and
@@ -3423,6 +3538,13 @@ export async function runReconcileCycle(
         return p;
       }
     });
+  // Scan-dir shadow probe — resolved once, memoized across the loop (the scan dirs
+  // are cycle-invariant). `undefined` = not yet probed; a first `work`-cell launch
+  // triggers the single on-disk scan, so a cycle with no cell launches never reads
+  // the plugin config. Producer read (never a fold).
+  const probeShadow =
+    deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe;
+  let shadowManifest: string | null | undefined;
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
@@ -3499,6 +3621,30 @@ export async function runReconcileCycle(
             `${join(KEEPER_ROOT, "plugins", "plan")}' (without the cell manifest ` +
             `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
             `cannot resolve 'work:worker')`,
+          dir: plan.cwd,
+          ts: deps.now(),
+        });
+        continue;
+      }
+      // (3) a non-cell `work`-named plugin sitting in a claude `plugin_scan_dir`
+      // would re-claim the `work:worker` constant at launch and silently shadow
+      // the `--plugin-dir`-selected cell — the exact hazard that gated the source
+      // epic's cutover. Probe the REAL scan dirs (not just the repo) and mint a
+      // sticky `work-plugin-shadowed` `DispatchFailed` (per-key, cleared by
+      // `retry_dispatch`) rather than spawn the wrong worker. On-disk read here in
+      // the producer, memoized once per cycle — never a fold.
+      if (shadowManifest === undefined) {
+        shadowManifest = probeShadow();
+      }
+      if (shadowManifest != null) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason:
+            `work-plugin-shadowed: ${shadowManifest} — a non-cell 'work'-named ` +
+            `plugin in a claude plugin_scan_dir would steal 'work:worker' from ` +
+            `the '${plan.pluginDir}' cell at launch (silent wrong-worker spawn); ` +
+            "remove or rename it, then 'keeper retry-dispatch'",
           dir: plan.cwd,
           ts: deps.now(),
         });
