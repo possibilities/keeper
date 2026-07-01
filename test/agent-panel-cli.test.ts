@@ -25,6 +25,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -47,10 +48,16 @@ import { loadRolePrompt } from "../src/agent/launch-config";
 import { main as agentMain } from "../src/agent/main";
 import {
   buildPanelLegArgv,
+  PANEL_HELP,
   type PanelDeps,
   type PanelManifest,
+  type PanelManifestMember,
+  type PanelPruneResult,
+  type PanelStatus,
   type PanelVerdict,
+  panelPrune,
   panelStart,
+  panelStatus,
   parseManifest,
   resolveAdHocMember,
 } from "../src/pair/panel";
@@ -1051,3 +1058,452 @@ for (const flag of ["model", "effort", "role"] as const) {
     expect(r.stderr).toContain("--preset");
   });
 }
+
+// ---------------------------------------------------------------------------
+// status / prune helpers (injected deps + KEEPER_STATE_DIR sandbox)
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** `panelStatus`/`panelPrune` deps with a fixed clock, a pid-liveness predicate,
+ *  and an optional lock seam. Captures stdout/stderr. graceMs is pinned so the
+ *  launched_at grace is deterministic. */
+function makeProbeDeps(opts: {
+  now: number;
+  alive?: (pid: number) => boolean;
+  lock?: PanelDeps["lock"];
+}): { deps: PanelDeps; out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  const deps: PanelDeps = {
+    keeperBin: "/bun",
+    keeperAgentPath: "/keeper.ts",
+    env: {},
+    cwd: "/",
+    loadRegistry: () => ({
+      catalog: { presets: {} },
+      selections: { panels: {}, default: null },
+    }),
+    spawn: () => {},
+    now: () => opts.now,
+    sleep: async () => {},
+    pidAlive: opts.alive ?? (() => false),
+    lock: opts.lock,
+    write: (s) => {
+      out.push(s);
+    },
+    writeErr: (s) => {
+      err.push(s);
+    },
+    graceMs: 3000,
+  };
+  return { deps, out, err };
+}
+
+/** Write a manifest + optional pidfile/result files into a run dir. */
+function seedRunDir(
+  d: string,
+  slug: string,
+  members: PanelManifestMember[],
+  opts: { sentinel?: boolean; pids?: Record<string, string> } = {},
+): void {
+  mkdirSync(d, { recursive: true });
+  if (opts.sentinel !== false) {
+    writeFileSync(join(d, "started-at"), "0\n");
+  }
+  writeFileSync(
+    join(d, "manifest.json"),
+    JSON.stringify({ dir: d, slug, members } satisfies PanelManifest),
+  );
+  for (const [pidfile, pid] of Object.entries(opts.pids ?? {})) {
+    writeFileSync(pidfile, `${pid}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// panel status — non-blocking per-leg snapshot, launched_at grace
+// ---------------------------------------------------------------------------
+
+describe("panelStatus (launched_at grace, no false running)", () => {
+  test("classifies completed/failed/running/absent per leg", () => {
+    const pdir = mkdtempSync(join(dir, "status-"));
+    const NOW = 1_000_000;
+    const members: PanelManifestMember[] = [
+      {
+        name: "done",
+        harness: "claude",
+        yaml: join(pdir, "done.yaml"),
+        pidfile: join(pdir, "done.pid"),
+        launched_at: NOW - 10_000,
+      },
+      {
+        name: "bad",
+        harness: "codex",
+        yaml: join(pdir, "bad.yaml"),
+        pidfile: join(pdir, "bad.pid"),
+        launched_at: NOW - 10_000,
+      },
+      {
+        name: "live",
+        harness: "claude",
+        yaml: join(pdir, "live.yaml"),
+        pidfile: join(pdir, "live.pid"),
+        launched_at: NOW - 10_000,
+      },
+      {
+        name: "deadold",
+        harness: "codex",
+        yaml: join(pdir, "deadold.yaml"),
+        pidfile: join(pdir, "deadold.pid"),
+        launched_at: NOW - 10_000,
+      },
+      {
+        name: "deadnew",
+        harness: "claude",
+        yaml: join(pdir, "deadnew.yaml"),
+        pidfile: join(pdir, "deadnew.pid"),
+        launched_at: NOW - 100,
+      },
+      {
+        name: "nolaunch",
+        harness: "codex",
+        yaml: join(pdir, "nolaunch.yaml"),
+        pidfile: null,
+        launched_at: null,
+      },
+      {
+        name: "gone",
+        harness: "claude",
+        yaml: join(pdir, "gone.yaml"),
+        pidfile: join(pdir, "gone.pid"),
+        launched_at: null,
+      },
+    ];
+    writeFileSync(
+      join(pdir, "manifest.json"),
+      JSON.stringify({
+        dir: pdir,
+        slug: "status-run",
+        boot_epoch_ms: 1,
+        generation: 2,
+        members,
+      }),
+    );
+    writeFileSync(
+      join(pdir, "done.yaml"),
+      JSON.stringify({ outcome: "completed" }),
+    );
+    writeFileSync(
+      join(pdir, "bad.yaml"),
+      JSON.stringify({ outcome: "timed_out" }),
+    );
+    writeFileSync(join(pdir, "live.pid"), "111\n");
+    writeFileSync(join(pdir, "deadold.pid"), "222\n");
+    writeFileSync(join(pdir, "deadnew.pid"), "333\n");
+    // "gone" pidfile is intentionally absent → readPid null + launched_at null → absent.
+
+    const { deps, out } = makeProbeDeps({
+      now: NOW,
+      alive: (pid) => pid === 111,
+    });
+    const code = panelStatus({ dir: pdir }, deps);
+    expect(code).toBe(0);
+    const snap: PanelStatus = JSON.parse(out.join("").trim());
+    const byName = Object.fromEntries(
+      snap.members.map((m) => [m.name, m.status]),
+    );
+    expect(byName.done).toBe("completed");
+    expect(byName.bad).toBe("failed");
+    expect(byName.live).toBe("running");
+    // A long-dead no-result leg reads failed (past grace), NEVER a phantom running.
+    expect(byName.deadold).toBe("failed");
+    // Within its own launched_at grace → still running (pidfile may not be written).
+    expect(byName.deadnew).toBe("running");
+    expect(byName.nolaunch).toBe("failed");
+    expect(byName.gone).toBe("absent");
+    expect(snap.all_terminal).toBe(false);
+    expect(snap.slug).toBe("status-run");
+    expect(snap.generation).toBe(2);
+    // The completed leg carries its result path; the snapshot never reads content.
+    const done = snap.members.find((m) => m.name === "done");
+    expect(done?.yaml).toBe(join(pdir, "done.yaml"));
+  });
+
+  test("all-terminal snapshot → all_terminal true", () => {
+    const pdir = mkdtempSync(join(dir, "status-term-"));
+    seedRunDir(pdir, "term-run", [
+      {
+        name: "x",
+        harness: "codex",
+        yaml: join(pdir, "x.yaml"),
+        pidfile: null,
+        launched_at: null,
+      },
+    ]);
+    writeFileSync(
+      join(pdir, "x.yaml"),
+      JSON.stringify({ outcome: "completed" }),
+    );
+    const { deps, out } = makeProbeDeps({ now: 0 });
+    expect(panelStatus({ dir: pdir }, deps)).toBe(0);
+    const snap: PanelStatus = JSON.parse(out.join("").trim());
+    expect(snap.all_terminal).toBe(true);
+  });
+
+  test("missing manifest → exit 2", () => {
+    const { deps, err } = makeProbeDeps({ now: 0 });
+    expect(panelStatus({ dir: join(dir, "no-such") }, deps)).toBe(2);
+    expect(err.join("")).toContain("cannot read manifest");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wait/status routing — --slug resolves the durable dir, --dir wins
+// ---------------------------------------------------------------------------
+
+/** Seed a terminal run at the durable slug path under the sandboxed state dir. */
+function seedDurableTerminal(slug: string): string {
+  const panelDir = join(dir, "keeper-state", "panels", slug);
+  mkdirSync(panelDir, { recursive: true });
+  writeFileSync(
+    join(panelDir, "manifest.json"),
+    JSON.stringify({
+      dir: panelDir,
+      slug,
+      generation: 1,
+      members: [
+        {
+          name: "opus",
+          harness: "claude",
+          yaml: join(panelDir, "opus.yaml"),
+          pidfile: null,
+        },
+      ],
+    }),
+  );
+  writeFileSync(
+    join(panelDir, "opus.yaml"),
+    JSON.stringify({ outcome: "completed" }),
+  );
+  return panelDir;
+}
+
+test("agent panel wait --slug: resolves the durable slug dir", async () => {
+  const panelDir = seedDurableTerminal("resolve-run");
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--slug",
+    "resolve-run",
+    "--chunk",
+    "540",
+  ]);
+  expect(r.code).toBe(0);
+  const v: PanelVerdict = JSON.parse(r.stdout.trim());
+  expect(v.dir).toBe(panelDir);
+  expect(v.ok).toBe(true);
+});
+
+test("agent panel wait: --dir wins when both --dir and --slug are given", async () => {
+  const pdir = seedTerminalPanel();
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--dir",
+    pdir,
+    "--slug",
+    "nonexistent",
+    "--chunk",
+    "540",
+  ]);
+  expect(r.code).toBe(0);
+  const v: PanelVerdict = JSON.parse(r.stdout.trim());
+  expect(v.dir).toBe(pdir);
+});
+
+test("agent panel wait --slug: an unknown/pruned slug → exit 2 (missing manifest)", async () => {
+  const r = await runAgent(["panel", "wait", "--slug", "never-started"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("cannot read manifest");
+});
+
+test("agent panel wait: neither --dir nor --slug → exit 2", async () => {
+  const r = await runAgent(["panel", "wait"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("--dir");
+});
+
+test("agent panel status --slug: prints the snapshot, exit 0", async () => {
+  seedDurableTerminal("snap-run");
+  const r = await runAgent(["panel", "status", "--slug", "snap-run"]);
+  expect(r.code).toBe(0);
+  const snap: PanelStatus = JSON.parse(r.stdout.trim());
+  expect(snap.slug).toBe("snap-run");
+  expect(snap.members[0]?.status).toBe("completed");
+});
+
+test("agent panel status: neither --dir nor --slug → exit 2", async () => {
+  const r = await runAgent(["panel", "status"]);
+  expect(r.code).toBe(2);
+});
+
+// ---------------------------------------------------------------------------
+// panel prune — lock + live-pid + TTL gates, TOCTOU-safe delete
+// ---------------------------------------------------------------------------
+
+describe("panelPrune (lock-free AND pid-dead AND past TTL)", () => {
+  test("an aged-out lock-free pid-dead dir is trashed then removed", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "old-run");
+    seedRunDir(
+      d,
+      "old-run",
+      [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: join(d, "x.yaml"),
+          pidfile: join(d, "x.pid"),
+        },
+      ],
+      { pids: { [join(d, "x.pid")]: "9999" } },
+    );
+    const { deps, out } = makeProbeDeps({
+      now: Date.now() + 10 * DAY_MS,
+      alive: () => false,
+    });
+    expect(panelPrune({ ttlMs: 1000 }, deps)).toBe(0);
+    expect(existsSync(d)).toBe(false);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.pruned).toContain("old-run");
+    expect(res.kept).not.toContain("old-run");
+  });
+
+  test("a dir with a live leg pid is kept regardless of age", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "live-run");
+    seedRunDir(
+      d,
+      "live-run",
+      [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: join(d, "x.yaml"),
+          pidfile: join(d, "x.pid"),
+        },
+      ],
+      { pids: { [join(d, "x.pid")]: "111" } },
+    );
+    const { deps, out } = makeProbeDeps({
+      now: Date.now() + 10 * DAY_MS,
+      alive: (pid) => pid === 111,
+    });
+    panelPrune({ ttlMs: 1000 }, deps);
+    expect(existsSync(d)).toBe(true);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.kept).toContain("live-run");
+    expect(res.pruned).not.toContain("live-run");
+  });
+
+  test("a lock-held dir (start/reconcile mid-flight) is skipped", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "locked-run");
+    seedRunDir(d, "locked-run", []);
+    const { deps, out } = makeProbeDeps({
+      now: Date.now() + 10 * DAY_MS,
+      lock: (lockPath) =>
+        lockPath.includes("locked-run") ? null : { release: (): void => {} },
+    });
+    panelPrune({ ttlMs: 1000 }, deps);
+    expect(existsSync(d)).toBe(true);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.kept).toContain("locked-run");
+  });
+
+  test("a fresh dir (within TTL) is kept", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "fresh-run");
+    seedRunDir(d, "fresh-run", []);
+    const { deps, out } = makeProbeDeps({
+      now: Date.now(),
+      alive: () => false,
+    });
+    panelPrune({}, deps); // default 3-day TTL — the sentinel is seconds old.
+    expect(existsSync(d)).toBe(true);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.kept).toContain("fresh-run");
+  });
+
+  test("a dir without a started-at sentinel is un-ageable → kept", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "no-sentinel");
+    seedRunDir(d, "no-sentinel", [], { sentinel: false });
+    const { deps, out } = makeProbeDeps({
+      now: Date.now() + 10 * DAY_MS,
+      alive: () => false,
+    });
+    panelPrune({ ttlMs: 1000 }, deps);
+    expect(existsSync(d)).toBe(true);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.kept).toContain("no-sentinel");
+  });
+
+  test("a missing panels root → empty result, exit 0", () => {
+    const { deps, out } = makeProbeDeps({ now: Date.now() });
+    expect(panelPrune({}, deps)).toBe(0);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.pruned).toEqual([]);
+    expect(res.kept).toEqual([]);
+  });
+});
+
+test("agent panel prune: routes + prints a result, exit 0", async () => {
+  const r = await runAgent(["panel", "prune"]);
+  expect(r.code).toBe(0);
+  const res: PanelPruneResult = JSON.parse(r.stdout.trim());
+  expect(Array.isArray(res.pruned)).toBe(true);
+  expect(Array.isArray(res.kept)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// panelStart writes the prune age anchor
+// ---------------------------------------------------------------------------
+
+test("panelStart writes a started-at sentinel on fresh start (prune age anchor)", async () => {
+  const promptFile = join(dir, "ask.md");
+  writeFileSync(promptFile, "q");
+  const { deps } = makeAdHocDeps();
+  await panelStart(
+    {
+      promptFile,
+      slug: "sentinel-run",
+      panel: undefined,
+      adHoc: { preset: "codex-review", readOnly: true },
+      timeoutSeconds: 900,
+    },
+    deps,
+  );
+  const panelDir = join(dir, "keeper-state", "panels", "sentinel-run");
+  expect(existsSync(join(panelDir, "started-at"))).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Synopsis surfaces document the three new verbs
+// ---------------------------------------------------------------------------
+
+test("PANEL_HELP documents status + prune + wait --slug", () => {
+  expect(PANEL_HELP).toContain("panel status");
+  expect(PANEL_HELP).toContain("panel prune");
+  expect(PANEL_HELP).toContain("--slug");
+});
+
+test("top-level USAGE documents panel status + prune", () => {
+  expect(USAGE).toContain("keeper agent panel status");
+  expect(USAGE).toContain("keeper agent panel prune");
+});
+
+test("wrapper KEEPER_AGENT_HELP documents panel status + prune", () => {
+  expect(KEEPER_AGENT_HELP).toContain("keeper agent panel status");
+  expect(KEEPER_AGENT_HELP).toContain("keeper agent panel prune");
+});

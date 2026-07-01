@@ -6,10 +6,13 @@
  * The blocking run-and-capture verbs compose those primitives into the uniform
  * schema-versioned JSON envelope: `keeper agent run <cli> <prompt>` launches,
  * waits, and captures in one process, and `keeper agent wait <handle>` does the
- * wait + capture on an already-launched handle. `keeper agent panel start|wait`
- * fans a question out to a panel of detached read-only run legs and waits for
- * them token-free (routed into `src/pair/panel.ts` `runPanel`, which owns its
- * stdout + exit code). `run
+ * wait + capture on an already-launched handle. `keeper agent panel
+ * start|wait|status|prune` fans a question out to a panel of detached read-only
+ * run legs and waits for them token-free (routed into `src/pair/panel.ts`
+ * `runPanel`, which owns its stdout + exit code); `start` is idempotent by slug
+ * (re-issuing RECONCILES the durable per-slug run instead of re-fanning-out),
+ * `wait`/`status` address a run by `--slug` or `--dir`, and `prune` GCs abandoned
+ * run dirs. `run
  * --read-only` prepends a
  * read-only directive to the prompt (prompting-only — keeper enforces nothing,
  * no tool strip, no changed-files audit); `run --system-file <path>`/`--system

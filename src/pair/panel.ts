@@ -1,5 +1,5 @@
 /**
- * `keeper agent panel start|wait` — the cross-OS panel fan-out orchestrator the
+ * `keeper agent panel start|wait|status|prune` — the cross-OS panel fan-out orchestrator the
  * `plan:panel-runner` agent drives instead of hand-rolling `setsid`/`timeout` in
  * shell (neither exists on stock macOS). All the OS-specific machinery lives here
  * in TS: detachment via a `nohup` double-fork POSIX-shell wrapper (NOT
@@ -16,10 +16,15 @@
  *     an existing run — reusing terminal legs, leaving running legs, relaunching
  *     only no-result legs to a new-generation result path. Prints the manifest and
  *     exits 0; a colliding-slug prompt/member mismatch or lock contention exits 2.
- *   - `wait --dir <d> [--chunk <s>]` re-reads the manifest and blocks ONE chunk
- *     polling each leg's terminality; exit 0 + verdict JSON when all legs are
- *     terminal, exit 124 when the chunk elapses (re-issuable), exit 2 on a
- *     missing/corrupt manifest or bad flags.
+ *   - `wait (--slug <slug> | --dir <d>) [--chunk <s>]` re-reads the manifest and
+ *     blocks ONE chunk polling each leg's terminality; exit 0 + verdict JSON when
+ *     all legs are terminal, exit 124 when the chunk elapses (re-issuable), exit 2
+ *     on a missing/corrupt manifest or bad flags. `--slug` resolves the durable
+ *     dir; `--dir` wins if both are given.
+ *   - `status (--slug <slug> | --dir <d>)` prints a read-only, non-blocking per-leg
+ *     snapshot (completed|running|failed|absent); exit 2 on a missing manifest.
+ *   - `prune` GCs abandoned run dirs under the durable panels root — lock-free AND
+ *     no live leg pid AND past the started-at TTL, via a TOCTOU-safe rename-to-trash.
  *
  * CONTENT-BLIND: `wait` reads each leg's result file only for its `outcome`
  * (`completed` → ok; every other outcome → fail, `reason=<outcome>`) — NEVER a
@@ -36,8 +41,11 @@
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { uptime } from "node:os";
@@ -90,6 +98,19 @@ const PID_STARTUP_GRACE_MS = 3_000;
 const BOOT_EPOCH_TOLERANCE_MS = 5 * 60_000;
 /** The tmux session every leg lands in (matches the panel-runner). */
 const PANEL_SESSION = "panels";
+/** Age past which a terminal, lock-free, pid-dead panel run dir is `panel prune`-
+ *  eligible (mirrors statusline `LEAF_TTL_MS` — a run untouched this long is
+ *  abandoned). Measured off the run's write-once `started-at` sentinel mtime, NOT
+ *  the dir mtime (a leg's result write bumps that). */
+export const PANEL_PRUNE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+/** The run-birth sentinel basename — written once at fresh start, never on a
+ *  reconcile, so its mtime anchors `panel prune`'s age check to the run's original
+ *  start instant. */
+const STARTED_AT_SENTINEL = "started-at";
+/** The `panel prune` trash subdir under the panels root: an eligible run dir is
+ *  renamed here (a same-parent, EXDEV-safe atomic move) before its recursive
+ *  removal, so a lock-free reader never observes a half-deleted dir. */
+const PANEL_TRASH_DIR = ".gc";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -162,6 +183,39 @@ export interface PanelVerdict {
   dir: string;
   ok: boolean;
   members: PanelVerdictMember[];
+}
+
+/** One member's line in the read-only `status` snapshot. Four-way (unlike the
+ *  verdict's binary ok/fail): `completed` (a result file with outcome
+ *  `completed`), `running` (a live pid, or one launched within the startup
+ *  grace), `failed` (a bad-outcome/corrupt result, a spawn-throw leg, or a dead
+ *  pid past the grace), `absent` (no result and no attributable pid — never
+ *  launched, or launched but left no trace). `yaml` is set only when completed. */
+export interface PanelStatusMember {
+  name: string;
+  harness: string;
+  status: "completed" | "running" | "failed" | "absent";
+  yaml: string | null;
+  reason: string | null;
+}
+
+/** The `status` snapshot — a single-pass, non-blocking, non-mutating per-leg
+ *  classification distinct from {@link PanelVerdict}. `all_terminal` is true iff no
+ *  member is still `running` (the terminal set is completed/failed/absent). */
+export interface PanelStatus {
+  dir: string;
+  slug: string;
+  generation: number;
+  all_terminal: boolean;
+  members: PanelStatusMember[];
+}
+
+/** The `prune` result — which slug dirs were reclaimed vs kept, and the panels
+ *  root scanned. */
+export interface PanelPruneResult {
+  root: string;
+  pruned: string[];
+  kept: string[];
 }
 
 /** A detached, fire-and-forget leg spawn (Bun.spawn-shaped subset; injectable
@@ -604,6 +658,66 @@ function buildVerdict(
   return { dir, ok: out.every((m) => m.status === "ok"), members: out };
 }
 
+/** One member's read-only `status` classification. Same result-file precedence as
+ *  {@link evaluateLeg}, but the pid-death grace is anchored on the leg's OWN
+ *  `launched_at` (never a caller-supplied wait-start): a read-only call's
+ *  `now()`-as-wait-start would never elapse the grace, so a long-dead no-result
+ *  leg would report `running` forever. Past that grace a dead pid is `failed`; a
+ *  dead pid with no readable pidfile (or no recorded launch) is `absent`. Never
+ *  throws, never mutates. */
+function classifyLegStatus(
+  member: PanelManifestMember,
+  deps: PanelDeps,
+  opts: { graceMs: number },
+): {
+  status: PanelStatusMember["status"];
+  yaml: string | null;
+  reason: string | null;
+} {
+  const probe = probeLeg(member, deps);
+  if (probe.resultPresent) {
+    const outcome = readResultOutcome(member.yaml);
+    return outcome === "completed"
+      ? { status: "completed", yaml: member.yaml, reason: null }
+      : { status: "failed", yaml: null, reason: outcome };
+  }
+  // A null pidfile means `start`'s spawn threw — the leg never launched.
+  if (member.pidfile === null) {
+    return {
+      status: "failed",
+      yaml: null,
+      reason: "leg failed to launch (no process spawned)",
+    };
+  }
+  if (probe.pidAlive) {
+    return { status: "running", yaml: null, reason: null };
+  }
+  // No result + a dead/unreadable pid. A leg launched within its own grace may not
+  // have written its pidfile yet — still count it running; past the grace the dead
+  // pid is trustworthy.
+  const launchedAt = member.launched_at ?? null;
+  if (launchedAt !== null && deps.now() - launchedAt < opts.graceMs) {
+    return { status: "running", yaml: null, reason: null };
+  }
+  if (probe.pid !== null) {
+    return {
+      status: "failed",
+      yaml: null,
+      reason: `leg process ${probe.pid} exited before producing a result file`,
+    };
+  }
+  // No result, no readable pid, past the grace (or no launch ever recorded) — the
+  // leg is unattributable, neither provably failed nor running.
+  return {
+    status: "absent",
+    yaml: null,
+    reason:
+      launchedAt === null
+        ? "no launch recorded"
+        : "launched but left no pidfile or result",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Manifest parse
 // ---------------------------------------------------------------------------
@@ -880,6 +994,11 @@ export async function panelStart(
       // persisted BEFORE the spawn loop so a crash mid-fan-out leaves a
       // reconstructable manifest a resuming driver can reconcile against.
       writeFileAtomic(dir, join(dir, "prompt.md"), promptText);
+      // The run-birth sentinel: its mtime anchors `panel prune`'s age check (never
+      // the dir mtime, which a leg's result write bumps). Written ONLY here on a
+      // fresh start — a reconcile never rewrites it, so it stays the run's original
+      // start instant even across relaunch generations.
+      writeFileAtomic(dir, join(dir, STARTED_AT_SENTINEL), `${deps.now()}\n`);
       manifest = {
         dir,
         slug: args.slug,
@@ -1103,6 +1222,215 @@ export async function panelWait(
   }
 }
 
+/** Inputs to {@link panelStatus}. */
+export interface PanelStatusArgs {
+  dir: string;
+}
+
+/**
+ * `status`: read the manifest and print a single-pass, NON-blocking, NON-mutating
+ * per-leg snapshot ({@link PanelStatus}). Each leg is classified via the
+ * `launched_at`-anchored grace (a read-only call must never report a long-dead
+ * no-result leg as `running`). Missing/corrupt manifest (an unknown or pruned
+ * slug) → exit 2, consistent with `wait`. Returns the process exit code.
+ */
+export function panelStatus(args: PanelStatusArgs, deps: PanelDeps): number {
+  const manifestPath = join(args.dir, "manifest.json");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (err) {
+    deps.writeErr(
+      `pair panel status: cannot read manifest at ${manifestPath}: ${(err as Error).message}\n`,
+    );
+    return 2;
+  }
+  const parsed = parseManifest(raw);
+  if (!parsed.ok) {
+    deps.writeErr(`pair panel status: corrupt manifest: ${parsed.error}\n`);
+    return 2;
+  }
+  const { dir, slug, generation, members } = parsed.manifest;
+  const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
+  const out: PanelStatusMember[] = members.map((m) => {
+    const c = classifyLegStatus(m, deps, { graceMs });
+    return {
+      name: m.name,
+      harness: m.harness,
+      status: c.status,
+      yaml: c.yaml,
+      reason: c.reason,
+    };
+  });
+  const snapshot: PanelStatus = {
+    dir,
+    slug,
+    generation: generation ?? 1,
+    all_terminal: out.every((m) => m.status !== "running"),
+    members: out,
+  };
+  deps.write(`${JSON.stringify(snapshot)}\n`);
+  return 0;
+}
+
+/** True iff ANY of a run dir's manifest legs has a live pid. A running detached
+ *  leg is lock-free, so this pid probe — not the advisory lock — is what protects
+ *  a live run from `prune`. A missing/corrupt manifest proves no live leg. */
+function hasLiveLeg(slugDir: string, deps: PanelDeps): boolean {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(join(slugDir, "manifest.json"), "utf8"));
+  } catch {
+    return false;
+  }
+  const parsed = parseManifest(raw);
+  if (!parsed.ok) {
+    return false;
+  }
+  for (const m of parsed.manifest.members) {
+    if (m.pidfile === null) {
+      continue;
+    }
+    const pid = readPid(m.pidfile);
+    if (pid !== null && deps.pidAlive(pid)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** TOCTOU-safe delete: rename the run dir into the same-parent trash (an atomic,
+ *  EXDEV-safe move so a lock-free reader never sees a half-deleted dir), then
+ *  recursive-remove the trashed entry. EAFP/fail-open — a vanished source returns
+ *  false (nothing pruned); a failed removal leaves a trash entry the next prune
+ *  sweeps. */
+function trashAndRemove(
+  trashRoot: string,
+  name: string,
+  slugDir: string,
+  deps: PanelDeps,
+): boolean {
+  try {
+    mkdirSync(trashRoot, { recursive: true, mode: 0o700 });
+  } catch {
+    // fall through — the rename below throws + is caught if the trash is unusable.
+  }
+  const trashPath = join(
+    trashRoot,
+    `${name}-${deps.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+  try {
+    renameSync(slugDir, trashPath);
+  } catch {
+    return false;
+  }
+  try {
+    rmSync(trashPath, { recursive: true, force: true });
+  } catch {
+    // best-effort — a leftover trash entry is reclaimed at the next prune.
+  }
+  return true;
+}
+
+/** Inputs to {@link panelPrune}. `ttlMs` overrides {@link PANEL_PRUNE_TTL_MS}
+ *  (tests). */
+export interface PanelPruneArgs {
+  ttlMs?: number;
+}
+
+/**
+ * `prune`: GC abandoned durable panel run dirs under
+ * `~/.local/state/keeper/panels/`. A slug dir is reclaimed ONLY when all three
+ * hold — (a) its per-slug advisory lock is free (no `start`/reconcile mid-flight),
+ * (b) NO manifest leg pid is live (a live detached run is lock-free, so this veto,
+ * not the lock, is the liveness guard), and (c) its `started-at` sentinel mtime is
+ * older than the TTL. Deletion is TOCTOU-safe (rename-to-trash then recursive
+ * remove). Fail-open throughout — an un-ageable (sentinel-less) or in-use dir is
+ * kept, never force-deleted. Prints the {@link PanelPruneResult}; returns 0.
+ */
+export function panelPrune(args: PanelPruneArgs, deps: PanelDeps): number {
+  const ttlMs = args.ttlMs ?? PANEL_PRUNE_TTL_MS;
+  const root = join(keeperStateDir(), "panels");
+  const trashRoot = join(root, PANEL_TRASH_DIR);
+  const pruned: string[] = [];
+  const kept: string[] = [];
+
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    // No panels root → nothing to prune.
+    deps.write(`${JSON.stringify({ root, pruned, kept })}\n`);
+    return 0;
+  }
+
+  // Clear any trash left by a prior interrupted prune first — the main scan skips
+  // the trash dir, so a stranded entry would otherwise leak forever. Fail-open.
+  try {
+    rmSync(trashRoot, { recursive: true, force: true });
+  } catch {
+    // a stubborn leftover is swept next run.
+  }
+
+  for (const name of names) {
+    if (name === PANEL_TRASH_DIR) {
+      continue;
+    }
+    const slugDir = join(root, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(slugDir);
+    } catch {
+      continue; // vanished under us.
+    }
+    if (!st.isDirectory()) {
+      continue;
+    }
+
+    // (a) A held per-slug lock means a start/reconcile is mid-flight → never prune.
+    const lockPath = join(slugDir, ".lock");
+    const lock =
+      deps.lock !== undefined
+        ? deps.lock(lockPath)
+        : { release: (): void => {} };
+    if (lock === null) {
+      kept.push(name);
+      continue;
+    }
+    try {
+      // (b) A live leg pid vetoes deletion regardless of age.
+      if (hasLiveLeg(slugDir, deps)) {
+        kept.push(name);
+        continue;
+      }
+      // (c) The started-at sentinel's mtime must be older than the TTL; an absent
+      // sentinel is un-ageable → keep (never dir mtime, which a leg write bumps).
+      let sentinelMtimeMs: number;
+      try {
+        sentinelMtimeMs = statSync(join(slugDir, STARTED_AT_SENTINEL)).mtimeMs;
+      } catch {
+        kept.push(name);
+        continue;
+      }
+      if (deps.now() - sentinelMtimeMs <= ttlMs) {
+        kept.push(name);
+        continue;
+      }
+      if (trashAndRemove(trashRoot, name, slugDir, deps)) {
+        pruned.push(name);
+      } else {
+        kept.push(name);
+      }
+    } finally {
+      lock.release();
+    }
+  }
+
+  const result: PanelPruneResult = { root, pruned, kept };
+  deps.write(`${JSON.stringify(result)}\n`);
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // CLI entry (production deps)
 // ---------------------------------------------------------------------------
@@ -1154,31 +1482,46 @@ export function buildPanelDeps(): PanelDeps {
   };
 }
 
-export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait)
+export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait | status | prune)
 
 Usage:
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
        [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait --dir <d> [--chunk <s>]
+  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --dir <d>)
+  keeper agent panel prune
 
-start  resolves the panel members (a panel.yaml panel or a single catalog
-       preset; an absent/empty --slug, or a missing/invalid catalog or panel.yaml,
-       is fail-loud exit 2), launches each as a DETACHED read-only
-       \`keeper agent run\` leg named \`panel::<slug>::<preset>\` in the 'panels'
-       session, writes <dir>/manifest.json, prints it, and exits 0 immediately.
-       Prints {dir, slug, members:[{name,harness,yaml,pidfile}]}. An ad-hoc
-       --preset/--cli builds a 1-member panel (pairing = a panel of one);
-       --panel and --preset/--cli are mutually exclusive.
-wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
-       Exit 0 + verdict JSON {dir, ok, members:[{name,harness,status,yaml,reason}]}
-       when all legs are terminal; exit 124 when the chunk elapses (re-issue it);
-       exit 2 on a missing/corrupt manifest or bad flags. Exit 0 means ALL-TERMINAL,
-       not all-success — key off the verdict's 'ok' flag.
+start  idempotent-by-slug. Resolves the panel members (a panel.yaml panel or a
+       single catalog preset; an absent/empty --slug, or a missing/invalid catalog
+       or panel.yaml, is fail-loud exit 2), derives the run's DURABLE dir from the
+       slug (~/.local/state/keeper/panels/<slug>/, 0700 — or the --dir override),
+       and under a per-slug advisory lock either fans out fresh (launch each member
+       as a DETACHED read-only \`keeper agent run\` leg named \`panel::<slug>::<preset>\`
+       in the 'panels' session) or RECONCILES an existing run — reuse terminal legs
+       (completed OR failed; resume is not retry), leave running legs, relaunch only
+       no-result legs. Prints the manifest, exits 0. A colliding-slug prompt/member
+       mismatch or lock contention exits 2. An ad-hoc --preset/--cli builds a
+       1-member panel (pairing = a panel of one); --panel and --preset/--cli are
+       mutually exclusive.
+wait   re-reads the manifest (by --slug or --dir) and blocks ONE --chunk window
+       polling each leg. Exit 0 + verdict JSON {dir, ok, members:[…]} when all legs
+       are terminal; exit 124 when the chunk elapses (re-issue it); exit 2 on a
+       missing/corrupt manifest (an unknown/pruned slug) or bad flags. Exit 0 means
+       ALL-TERMINAL, not all-success — key off the verdict's 'ok' flag.
+status read-only, non-blocking per-leg snapshot {dir, slug, generation,
+       all_terminal, members:[{name,harness,status,yaml,reason}]} where status is
+       completed|running|failed|absent (a dead no-result leg reads failed/absent,
+       never a phantom 'running'). Exit 0; exit 2 on a missing/corrupt manifest.
+prune  GC abandoned run dirs under ~/.local/state/keeper/panels/. Reclaims a slug
+       dir ONLY when its lock is free AND no leg pid is live AND its started-at
+       sentinel is older than the ${PANEL_PRUNE_TTL_MS / 86_400_000}-day TTL; a
+       live or in-reconcile run is always kept. Prints {root, pruned, kept}.
 
 Options:
-  --slug <slug>     REQUIRED run id; each leg launches as panel::<slug>::<preset>
-                    (slugified to [a-z0-9-]; absent/empties-to-nothing → exit 2)
+  --slug <slug>     start: REQUIRED run id (each leg launches as
+                    panel::<slug>::<preset>). wait/status: resolves the durable
+                    slug dir. Slugified to [a-z0-9-]; empties-to-nothing → exit 2.
   --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
   --cli <x>         Ad-hoc single member harness: claude|codex|pi
@@ -1187,16 +1530,43 @@ Options:
   --model <m>       Ad-hoc model override (rides onto the leg)
   --effort <e>      Ad-hoc reasoning effort (codex only)
   --read-only       Ad-hoc read-only posture (forwarded to the leg)
-  --dir <d>         Scratch dir (start: minted when absent; wait: required)
+  --dir <d>         Location override for the run dir. start: replaces the durable
+                    slug dir; wait/status: an alternative to --slug (--dir wins if
+                    both are given).
   --timeout <s>     Per-leg keeper agent run stop-timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
   --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
   --help, -h        Show this help
 `;
 
+/** Resolve a `wait`/`status` run dir from its flags: `--dir` is an explicit
+ *  location override and WINS when both are given; otherwise `--slug` resolves the
+ *  durable slug-keyed dir. A slug that slugifies to nothing, or neither flag, is a
+ *  bad-flags fault (the caller exits 2). Pure. */
+function resolvePanelDir(values: {
+  dir?: string;
+  slug?: string;
+}): { ok: true; dir: string } | { ok: false; msg: string } {
+  if (values.dir !== undefined && values.dir !== "") {
+    return { ok: true, dir: values.dir };
+  }
+  if (values.slug !== undefined && values.slug !== "") {
+    const slug = slugify(values.slug);
+    if (slug === null) {
+      return {
+        ok: false,
+        msg: `--slug '${values.slug}' slugifies to nothing — use [a-z0-9-]`,
+      };
+    }
+    return { ok: true, dir: join(keeperStateDir(), "panels", slug) };
+  }
+  return { ok: false, msg: "--dir <d> or --slug <slug> is required" };
+}
+
 /**
- * Route `keeper agent panel <start|wait> …`. Parses flags, builds the production
- * deps, dispatches to {@link panelStart}/{@link panelWait}, and exits with their
- * code. Never returns (always exits).
+ * Route `keeper agent panel <start|wait|status|prune> …`. Parses flags, builds the
+ * production deps, dispatches to {@link panelStart}/{@link panelWait}/{@link
+ * panelStatus}/{@link panelPrune}, and exits with their code. Never returns
+ * (always exits).
  */
 export async function runPanel(argv: string[]): Promise<void> {
   const op = argv[0];
@@ -1204,9 +1574,9 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.stdout.write(PANEL_HELP);
     process.exit(op === undefined ? 2 : 0);
   }
-  if (op !== "start" && op !== "wait") {
+  if (op !== "start" && op !== "wait" && op !== "status" && op !== "prune") {
     process.stderr.write(
-      `pair panel: unknown operation '${op}' (expected 'start' or 'wait')\n`,
+      `pair panel: unknown operation '${op}' (expected 'start', 'wait', 'status', or 'prune')\n`,
     );
     process.exit(2);
   }
@@ -1336,9 +1706,45 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.exit(code);
   }
 
+  if (op === "prune") {
+    const parsed = parseArgs({
+      args: argv.slice(1),
+      options: { help: { type: "boolean", default: false } },
+      allowPositionals: true,
+    });
+    if (parsed.values.help) {
+      process.stdout.write(PANEL_HELP);
+      process.exit(0);
+    }
+    process.exit(panelPrune({}, deps));
+  }
+
+  if (op === "status") {
+    const parsed = parseArgs({
+      args: argv.slice(1),
+      options: {
+        slug: { type: "string" },
+        dir: { type: "string" },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: true,
+    });
+    if (parsed.values.help) {
+      process.stdout.write(PANEL_HELP);
+      process.exit(0);
+    }
+    const resolved = resolvePanelDir(parsed.values);
+    if (!resolved.ok) {
+      process.stderr.write(`pair panel status: ${resolved.msg}\n`);
+      process.exit(2);
+    }
+    process.exit(panelStatus({ dir: resolved.dir }, deps));
+  }
+
   const parsed = parseArgs({
     args: argv.slice(1),
     options: {
+      slug: { type: "string" },
       dir: { type: "string" },
       chunk: { type: "string" },
       help: { type: "boolean", default: false },
@@ -1349,15 +1755,15 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.stdout.write(PANEL_HELP);
     process.exit(0);
   }
-  const dir = parsed.values.dir;
-  if (dir === undefined || dir === "") {
-    process.stderr.write("pair panel wait: --dir <d> is required\n");
+  const resolved = resolvePanelDir(parsed.values);
+  if (!resolved.ok) {
+    process.stderr.write(`pair panel wait: ${resolved.msg}\n`);
     process.exit(2);
   }
   const chunkSeconds =
     parsed.values.chunk !== undefined
       ? Number(parsed.values.chunk)
       : DEFAULT_PANEL_CHUNK_SECONDS;
-  const code = await panelWait({ dir, chunkSeconds }, deps);
+  const code = await panelWait({ dir: resolved.dir, chunkSeconds }, deps);
   process.exit(code);
 }
