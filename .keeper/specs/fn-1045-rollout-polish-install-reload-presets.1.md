@@ -44,5 +44,5 @@ Two independent small fixes from the presets/install rollout:
 - [ ] `bun test` green; `shellcheck` clean on `scripts/install.sh`
 
 ## Done summary
-
+install.sh now bounces keeperd on a HEAD-sha source change (fingerprint in ~/.local/state/keeper), not only on a plist change; keeper agent presets list surfaces claude_default/codex_default/pi_default in human and --json output.
 ## Evidence

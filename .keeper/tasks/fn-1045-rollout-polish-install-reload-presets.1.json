@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix install reload gate + show presets defaults",
-  "updated_at": "2026-07-01T20:32:25.508000Z"
+  "updated_at": "2026-07-01T20:41:33.479000Z",
+  "worker_done_at": "2026-07-01T20:41:33.479000Z"
 }
