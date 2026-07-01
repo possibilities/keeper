@@ -148,7 +148,7 @@ function setupEpicAndTask(): { epicId: string; taskId: string } {
 // ---------------------------------------------------------------------------
 
 describe("validate --epic marker writes", () => {
-  test("stamps the marker + emits an invocation line on first run", () => {
+  test("stamps the marker + merges the invocation into one value on first run", () => {
     // test_validate_marker.py::test_validate_epic_stamps_marker_on_first_run
     const epicId = createEpic();
     expect(readEpic(epicId).last_validated_at ?? null).toBeNull();
@@ -156,10 +156,11 @@ describe("validate --epic marker writes", () => {
     const r = run(["validate", "--epic", epicId]);
     expect(r.code).toBe(0);
 
+    // ONE JSON value: {valid,errors,warnings} with plan_invocation merged in.
     const docs = parseJsonStream(r.stdout);
-    expect(docs.length).toBe(2);
+    expect(docs.length).toBe(1);
     expect(docs[0]?.valid).toBe(true);
-    const inv = docs[1]?.plan_invocation as Record<string, unknown>;
+    const inv = docs[0]?.plan_invocation as Record<string, unknown>;
     expect(inv).not.toBeUndefined();
     expect(inv.op).toBe("validate");
     expect(inv.target).toBe(epicId);
@@ -167,12 +168,12 @@ describe("validate --epic marker writes", () => {
     expect(readEpic(epicId).last_validated_at).not.toBeNull();
   });
 
-  test("idempotent on an already-stamped epic (no second invocation)", () => {
+  test("idempotent on an already-stamped epic (no re-stamp, one value each)", () => {
     // test_validate_marker.py::test_validate_epic_idempotent_on_already_stamped
     const epicId = createEpic();
     const r1 = run(["validate", "--epic", epicId]);
     expect(r1.code).toBe(0);
-    expect(parseJsonStream(r1.stdout).length).toBe(2);
+    expect(parseJsonStream(r1.stdout).length).toBe(1);
     const tsFirst = readEpic(epicId).last_validated_at;
 
     const r2 = run(["validate", "--epic", epicId]);

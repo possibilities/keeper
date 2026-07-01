@@ -1,24 +1,20 @@
-// validate verb — the port of planctl/run_validate.py. Whole-project (or single
-// --epic) structural integrity, emitting the NON-standard {valid, errors,
-// warnings} envelope through the format path (NOT the success seam), exit 1 on
-// invalid, NO trailer (the dispatcher lists validate in NO_TRACK_COMMANDS). The
-// --epic stamp state machine: when valid AND last_validated_at is null, write
-// the marker + bump updated_at, then auto-commit BEFORE printing a SECOND
-// compact plan_invocation line — so the printed line is the authoritative
-// signal the .planctl/ commit landed; a commit failure prints a compact
-// commit_failed line + exit 1 (the invocation line is NOT printed); an already-
-// stamped epic is a pure no-op (no write, no commit, no second line).
+// validate verb. Whole-project (or single --epic) structural integrity, emitting
+// the NON-standard {valid, errors, warnings} envelope through the format path
+// (NOT the success seam), exit 1 on invalid. Every path prints exactly ONE
+// top-level JSON value.
+//
+// The --epic stamp state machine: when valid AND last_validated_at is null, write
+// the marker + bump updated_at and auto-commit, THEN print the envelope with the
+// plan_invocation MERGED in — so a printed value is the authoritative signal the
+// .keeper/ commit landed. A commit failure folds the commit_failed details into
+// that same single value + exit 1; an already-stamped epic is a pure no-op (no
+// write, no commit) and prints the bare {valid, errors, warnings}.
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { autoCommitFromInvocation, CommitFailed } from "../commit.ts";
-import {
-  compactJson,
-  formatOutput,
-  type OutputFormat,
-  pyDefaultJson,
-} from "../format.ts";
+import { formatOutput, type OutputFormat } from "../format.ts";
 import { validateEpicIntegrityWithWarnings } from "../integrity.ts";
 import { buildPlanInvocation, type MutatingInvocation } from "../invocation.ts";
 import { SCHEMA_VERSION } from "../models.ts";
@@ -178,32 +174,36 @@ export function runValidate(
 
   const valid = errors.length === 0;
 
+  // Marker-write: only with --epic, only on valid. Arm the marker FIRST (write +
+  // commit) via the shared non-exiting seam, then print a SINGLE value: on a
+  // fresh arm the {valid,errors,warnings} envelope with plan_invocation merged in
+  // (the authoritative "commit landed" signal, printed AFTER the commit); on a
+  // commit failure the same envelope with the commit_failed details folded in +
+  // exit 1. An already-stamped epic falls through to the bare envelope below.
+  if (valid && epicId !== null) {
+    const armed = armEpicValidated(epicId, dataDir, ctx.projectPath);
+    if (armed.kind === "commit_failed") {
+      formatOutput({ valid, errors, warnings, ...armed.failure }, format, (d) =>
+        renderHuman(d as ValidateEnvelope),
+      );
+      return 1;
+    }
+    if (armed.kind === "armed") {
+      formatOutput(
+        { valid, errors, warnings, plan_invocation: armed.invocation },
+        format,
+        (d) => renderHuman(d as ValidateEnvelope),
+      );
+      return 0;
+    }
+    // noop (already stamped): fall through to the bare envelope.
+  }
+
   // Non-standard envelope: {valid, errors, warnings} — route through the format
   // path directly, NOT the success seam.
   formatOutput({ valid, errors, warnings }, format, (d) =>
     renderHuman(d as ValidateEnvelope),
   );
-
-  // Marker-write: only with --epic, only on valid. Delegates to the shared
-  // non-exiting arm seam, then applies the CLI's exiting envelope contract — on
-  // commit failure print the compact failure envelope + exit 1 (the invocation
-  // line is NOT printed); on a fresh arm print the spaced plan_invocation line
-  // (distinct from the compact commit_failed line); an already-stamped epic
-  // prints nothing.
-  if (valid && epicId !== null) {
-    const armed = armEpicValidated(epicId, dataDir, ctx.projectPath);
-    if (armed.kind === "commit_failed") {
-      process.stdout.write(`${compactJson(armed.failure)}\n`);
-      process.exit(1);
-    }
-    if (armed.kind === "armed") {
-      // Python prints this line with json.dumps(obj) (default spaced
-      // separators) — distinct from the compact commit_failed line above.
-      process.stdout.write(
-        `${pyDefaultJson({ plan_invocation: armed.invocation })}\n`,
-      );
-    }
-  }
 
   return valid ? 0 : 1;
 }

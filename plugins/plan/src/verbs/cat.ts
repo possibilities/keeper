@@ -1,8 +1,7 @@
-// cat verb — the port of planctl/run_cat.py. Format-free by contract: emits the
-// raw spec markdown bytes to stdout regardless of --format, with NO trailing
-// plan_invocation line (the dispatcher lists cat in NO_TRACK_COMMANDS). An
-// invalid id or a missing spec writes an `Error: ...` line to stderr and exits
-// 1 — the missing-spec message names the resolved absolute spec path.
+// cat verb. Format-free by contract: emits the raw spec markdown bytes to stdout
+// regardless of --format, with no trailing provenance line (cat owns its whole
+// stdout). An invalid id or a missing spec writes an `Error: ...` line to stderr
+// and exits 1 — the missing-spec message names the resolved absolute spec path.
 //
 // Resolution is cwd-then-global (tryResolveOwningProjectForId): a globally-
 // unique id cat's the board that owns it regardless of cwd, so a cross-repo

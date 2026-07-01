@@ -1,11 +1,9 @@
-// detect verb — the port of planctl/run_detect.py. found-true reads meta.json's
-// schema_version (default 0 when meta is absent/corrupt — the intentional
-// asymmetry with status's default of 1); found-false emits a bare {found:false}
-// and never hard-errors. The verb itself never resolves a project (it tolerates
-// a missing data dir), so the read-only trailer is left to dispatch, which
-// resolves independently — on found-false that resolve hits the missing-project
-// guard and tails the error envelope + exit 1, exactly as Python does. The data
-// dir is `.keeper/`.
+// detect verb. found-true reads meta.json's schema_version (default 0 when meta
+// is absent/corrupt — the intentional asymmetry with status's default of 1) and
+// returns exit 0. found-false emits ONE {success:false, found:false, error}
+// value and returns exit 1, so `keeper plan detect || keeper plan init` stays
+// exit-driven while the stream carries exactly one JSON value. The data dir is
+// `.keeper/`.
 
 import { basename, join } from "node:path";
 
@@ -14,7 +12,7 @@ import { findProjectRoot } from "../project.ts";
 import { resolveDataDir } from "../state_path.ts";
 import { loadJsonSafe } from "../store.ts";
 
-export function runDetect(format: OutputFormat | null): void {
+export function runDetect(format: OutputFormat | null): number {
   const projectRoot = findProjectRoot();
   const dataDir = resolveDataDir(projectRoot);
 
@@ -34,8 +32,18 @@ export function runDetect(format: OutputFormat | null): void {
       },
       format,
     );
-    return;
+    return 0;
   }
 
-  formatOutput({ success: true, found: false }, format);
+  // found-false: one value carrying both the found flag and the missing-project
+  // error (matching resolveProject's message), then exit 1.
+  formatOutput(
+    {
+      success: false,
+      found: false,
+      error: "No plan project found. Run 'keeper plan init' first.",
+    },
+    format,
+  );
+  return 1;
 }

@@ -1,21 +1,17 @@
-// planctl-bun CLI dispatch — the read-only-subset entry point.
+// keeper plan CLI dispatch — the hand-rolled command router.
 //
-// Hand-rolled dispatch reproducing the click conventions the conformance harness
-// pins: top-level `--format json|human` plumbed to every verb (both
-// positions), `--help` on stdout (exit 0) with a Commands section, and an
-// unknown-command error on stderr (exit 2) shaped like click's "No such command".
+// Reproduces the click conventions the conformance harness pins: top-level
+// `--format json|human` plumbed to every verb (both positions), `--help` on
+// stdout (exit 0) with a Commands section, and an unknown-command error on
+// stderr (exit 2) shaped like click's "No such command".
 //
-// state-path / detect / status / epics are implemented end-to-end. After a
-// read-only verb runs, the trailing plan_invocation NDJSON line is emitted by
-// re-resolving the project (mirroring cli.py's _emit_readonly_invocation): a
-// genuine resolve failure is swallowed, but a missing-project resolve raises the
-// error envelope + exit 1 inline (the contract for detect's found-false tail).
-// The trailer is suppressed for the cat/validate contract verbs by name.
+// Every read/inspection verb emits exactly ONE top-level JSON value on stdout —
+// no trailing provenance line rides the result stream (a two-value stream breaks
+// json.load and jq). Verbs that need provenance in the event log (claim, block,
+// done, the restamp + close verbs, validate --epic on a fresh stamp) MERGE the
+// plan_invocation into their own single envelope via the emit.ts self-emitters.
 
-import { didSelfEmit } from "./emit.ts";
-import { compactJson, type OutputFormat } from "./format.ts";
-import { buildPlanInvocationReadonly } from "./invocation.ts";
-import { resolveProject, trailerProjectRoot } from "./project.ts";
+import type { OutputFormat } from "./format.ts";
 import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
@@ -71,10 +67,6 @@ export { emitMutating, emitReadonly } from "./emit.ts";
 const PROG = "keeper plan";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 
-// Verbs that own their stdout contract and must bypass the trailer (raw markdown
-// / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
-const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
-
 // Subgroups ("keeper plan <group> <sub>"). A subgroup owns its own --help and
 // subcommand dispatch, so post-command --help is routed to the group, not the
 // top-level help.
@@ -86,12 +78,6 @@ const SUBGROUP_NAMES = new Set([
   "verdict",
   "worker",
 ]);
-
-// Whether a verb already printed its own plan_invocation-bearing envelope is
-// a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
-// self-emit; init self-emits only on its committing path). The dispatcher reads
-// the didSelfEmit() sentinel after the verb runs — the port of cli.py's
-// INVOCATION_EMITTED_SENTINEL — rather than a static name set.
 
 interface CommandSpec {
   name: string;
@@ -520,8 +506,7 @@ const TASK_GROUP: GroupSpec = {
 
 // The `worker` subgroup — resume helpers for dropped /plan:work invocations.
 // `resume` is read-only (regenerates the brief under gitignored state/briefs/,
-// zero commits) and emits its envelope via format_output WITHOUT a readonly
-// trailer (the group dispatch returns before emitTrailer would fire).
+// zero commits) and emits its single envelope via format_output.
 const WORKER_GROUP: GroupSpec = {
   name: "worker",
   description: "Worker resume helpers for dropped /plan:work invocations.",
@@ -539,8 +524,7 @@ const WORKER_GROUP: GroupSpec = {
 
 // Close-phase submit subgroups (audit/verdict/followup submit). Each uses
 // FormattedGroup semantics: the leaf emits {success:true,...} via formatOutput
-// (or the typed error envelope + exit 1) and NO trailing plan_invocation line
-// fires (the group dispatch returns before emitTrailer). All three are
+// (or the typed error envelope + exit 1) as a single JSON value. All three are
 // runtime-state-only — zero .keeper/ commits.
 const AUDIT_RISK_CHOICES = ["Low", "Medium", "High"];
 
@@ -767,33 +751,6 @@ function printHelp(): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Emit the trailing read-only plan_invocation NDJSON line by re-resolving
- * the project — the port of cli.py:_emit_readonly_invocation. resolveProject
- * raises the missing-project error envelope + exit 1 when no data dir
- * resolves (terminating before any trailer prints); a genuine non-exit failure
- * is swallowed so a tracing side-effect never breaks the CLI. */
-function emitTrailer(
-  verb: string,
-  format: OutputFormat | null,
-  target: string | null,
-  projectPathOverride: string | null = null,
-): void {
-  // A read-only verb that resolved its project via --project (close-preflight)
-  // passes that already-validated root here, so the trailer never re-resolves
-  // from cwd — a cwd-outside-the-project invocation must not turn a clean
-  // success into a spurious missing-project error. Absent an override, the
-  // trailer re-resolves from cwd (the cwd-walk verbs' path).
-  const projectPath = projectPathOverride ?? resolveProject(format).projectPath;
-  try {
-    const envelope = {
-      plan_invocation: buildPlanInvocationReadonly(verb, projectPath, target),
-    };
-    process.stdout.write(`${compactJson(envelope)}\n`);
-  } catch {
-    // Never fail the CLI over a tracing side-effect.
-  }
-}
-
 function dispatch(parsed: ParsedArgs): number {
   const { command, format, rest } = parsed;
   if (command === null) {
@@ -806,11 +763,6 @@ function dispatch(parsed: ParsedArgs): number {
     noSuchCommand(command);
   }
 
-  // The generic readonly trailer's target: the verb's first positional id when
-  // it has one (show / refine-context), else null. The id-bearing cases set it.
-  let trailerTarget: string | null = null;
-  let trailerProjectPath: string | null = null;
-
   switch (command) {
     case "state-path": {
       const taskId = readOption(rest, "--task");
@@ -818,8 +770,10 @@ function dispatch(parsed: ParsedArgs): number {
       break;
     }
     case "detect":
-      runDetect(format);
-      break;
+      // found-true → {found:true} exit 0; found-false → a single
+      // {success:false, found:false, error} value + exit 1, so the `detect || init`
+      // idiom survives on the exit code with exactly one JSON value either way.
+      return runDetect(format);
     case "status":
       runStatus(format);
       break;
@@ -865,45 +819,37 @@ function dispatch(parsed: ParsedArgs): number {
     case "init":
       runInit({ format });
       break;
-    case "close-preflight": {
-      // Read-only brief handoff: emits its payload via formatOutput (no
-      // self-emit), so the dispatcher fires the generic readonly trailer with
-      // target=epicId. The error path exits 1 before the trailer.
-      const id = readPositionalSkipping(rest, new Set(["--project"]));
-      const cpfProject = readOption(rest, "--project");
-      runClosePreflight({ epicId: id, project: cpfProject, format });
-      trailerTarget = id.startsWith("fn-") ? id : null;
-      // The verb honored --project; the trailer must resolve through the same
-      // root, not the (possibly unrelated) cwd.
-      trailerProjectPath = trailerProjectRoot(cpfProject);
+    case "close-preflight":
+      // Read-only brief handoff: emits one payload envelope via formatOutput; the
+      // error path exits 1 before that.
+      runClosePreflight({
+        epicId: readPositionalSkipping(rest, new Set(["--project"])),
+        project: readOption(rest, "--project"),
+        format,
+      });
       break;
-    }
     case "close-finalize":
-      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
-      // guards the generic trailer below.
+      // Self-emits its readonly invocation via emitReadonly, merged into its own
+      // single envelope.
       runCloseFinalize({
         epicId: readPositionalSkipping(rest, new Set(["--project"])),
         project: readOption(rest, "--project"),
         format,
       });
       break;
-    case "gist": {
-      // Read-only: emits its payload via formatOutput (no self-emit), so the
-      // dispatcher fires the generic readonly trailer with target=epicId.
-      const id = readPositionalSkipping(rest, new Set(["--desc"]));
+    case "gist":
+      // Read-only: emits one payload envelope via formatOutput.
       runGist({
-        epicId: id,
+        epicId: readPositionalSkipping(rest, new Set(["--desc"])),
         public: readFlag(rest, "--public"),
         noOpen: readFlag(rest, "--no-open"),
         description: readOption(rest, "--desc"),
         format,
       });
-      trailerTarget = id.startsWith("fn-") ? id : null;
       break;
-    }
     case "epic":
       // Subgroup: dispatch the leaf (or group help). The leaf owns its own
-      // invocation tracking, so the parent never fires the generic trailer.
+      // single envelope (a mutating self-emit or a FormattedGroup payload).
       dispatchGroup(EPIC_GROUP, rest, format);
       return 0;
     case "task":
@@ -912,8 +858,8 @@ function dispatch(parsed: ParsedArgs): number {
     case "refine-apply": {
       // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
       // gate's integrity_failed line on failure) and owns its exit code — return
-      // it directly, no generic trailer. The epic id is the positional; --file is
-      // value-taking, so the positional scan must skip its value.
+      // it directly. The epic id is the positional; --file is value-taking, so the
+      // positional scan must skip its value.
       const epicId = readPositionalSkipping(rest, new Set(["--file"]));
       return runRefineApply({
         epicId,
@@ -922,33 +868,25 @@ function dispatch(parsed: ParsedArgs): number {
     }
     case "scaffold":
       // Self-emits (emitMutating on success / emitFailureEnvelope on failure)
-      // and owns its exit code — return it directly, no generic trailer.
+      // and owns its exit code — return it directly.
       return runScaffold({
         file: readOption(rest, "--file") ?? "",
         allowDuplicate: readFlag(rest, "--allow-duplicate"),
         createdByCloseOf: null,
       });
-    case "show": {
-      const id = readPositional(rest);
-      const showProject = readOption(rest, "--project");
-      const showResult = runShow(id, showProject, format);
-      trailerTarget = id.startsWith("fn-") ? id : null;
-      // The verb resolved the OWNING project (cwd-then-global); the trailer must
-      // resolve through that root, not the (possibly non-owning) cwd — a
-      // cross-repo read from a bare cwd must not fail the trailer.
-      trailerProjectPath = showResult.projectPath;
+    case "show":
+      // Read-only: emits one payload envelope via formatOutput.
+      runShow(readPositional(rest), readOption(rest, "--project"), format);
       break;
-    }
     case "cat":
-      // Format-free, no trailer: cat owns its stdout + exit code.
+      // Format-free: cat owns its raw-markdown stdout + exit code.
       return runCat(readPositional(rest), readOption(rest, "--project"));
     case "list":
       runList(format);
       break;
     case "mv-repo": {
       // Self-emits (emitMutating on success / emitError on a bad <new>) and owns
-      // its exit code — return it directly, no generic trailer. Two positionals:
-      // <oldPath> <newPath>.
+      // its exit code — return it directly. Two positionals: <oldPath> <newPath>.
       const [oldPath, newPath] = leafPositionals(rest, new Set());
       return runMvRepo({
         oldPath: oldPath ?? "",
@@ -957,7 +895,7 @@ function dispatch(parsed: ParsedArgs): number {
       });
     }
     case "ready":
-      // --epic is an OPTION, not a positional, so the trailer target stays null.
+      // Read-only: emits one payload envelope. --epic is an OPTION, not a positional.
       runReady(readOption(rest, "--epic") ?? "", format);
       break;
     case "tasks":
@@ -968,8 +906,7 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "resolve-task":
-      // Self-emits its readonly invocation (merged into the payload line) — the
-      // generic trailer never fires (didSelfEmit() guards it below).
+      // Self-emits its readonly invocation merged into its single payload line.
       runResolveTask({
         taskId: readPositional(rest),
         project: readOption(rest, "--project"),
@@ -977,8 +914,8 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "find-task-commit":
-      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
-      // guards the generic trailer below.
+      // Self-emits its readonly invocation via emitReadonly, merged into its
+      // single envelope.
       runFindTaskCommit({
         taskId: readPositional(rest),
         project: readOption(rest, "--project"),
@@ -986,8 +923,8 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "reconcile":
-      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
-      // guards the generic trailer below.
+      // Self-emits its readonly invocation via emitReadonly, merged into its
+      // single envelope.
       runReconcile({
         taskId: readPositional(rest),
         project: readOption(rest, "--project"),
@@ -995,8 +932,7 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "audit":
-      // Subgroup: `submit` emits via format_output with NO plan_invocation
-      // footer (FormattedGroup; the group dispatch returns before the trailer).
+      // Subgroup: `submit` emits one envelope via format_output (FormattedGroup).
       dispatchGroup(AUDIT_GROUP, rest, format);
       return 0;
     case "verdict":
@@ -1006,40 +942,29 @@ function dispatch(parsed: ParsedArgs): number {
       dispatchGroup(FOLLOWUP_GROUP, rest, format);
       return 0;
     case "worker":
-      // Subgroup: dispatch the leaf (or group help). `resume` emits via
-      // format_output with NO plan_invocation footer (the group dispatch
-      // returns before the generic trailer fires).
+      // Subgroup: dispatch the leaf (or group help). `resume` emits one envelope
+      // via format_output (FormattedGroup).
       dispatchGroup(WORKER_GROUP, rest, format);
       return 0;
-    case "refine-context": {
-      const id = readPositional(rest);
-      const rcResult = runRefineContext({
-        epicId: id,
+    case "refine-context":
+      // Read path emits one payload envelope; the --invalidate path self-emits its
+      // merged invocation. Either way, a single JSON value.
+      runRefineContext({
+        epicId: readPositional(rest),
         invalidate: readFlag(rest, "--invalidate"),
         project: readOption(rest, "--project"),
         format,
       });
-      trailerTarget = id.startsWith("fn-") ? id : null;
-      // Read-only path fires the generic trailer; resolve it through the OWNING
-      // project the verb resolved (cwd-then-global), not the cwd. The --invalidate
-      // path self-emits, so didSelfEmit() guards the trailer there.
-      trailerProjectPath = rcResult.projectPath;
       break;
-    }
     case "validate":
-      // Non-standard {valid,errors,warnings} envelope, no trailer: validate owns
-      // its stdout + exit code (and the --epic stamp line).
+      // Non-standard {valid,errors,warnings} envelope: validate owns its stdout +
+      // exit code, merging the plan_invocation into the same value on a fresh
+      // --epic stamp (a single JSON value on every path).
       return runValidate(readOption(rest, "--epic"), format);
     default:
       noSuchCommand(command);
   }
 
-  // A self-emitting verb (claim/block/done always; init on its committing path)
-  // already printed its invocation-bearing envelope — the generic trailer must
-  // not fire on top. didSelfEmit() is the runtime sentinel.
-  if (!NO_TRACK_COMMANDS.has(command) && !didSelfEmit()) {
-    emitTrailer(command, format, trailerTarget, trailerProjectPath);
-  }
   return 0;
 }
 

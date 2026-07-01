@@ -37,8 +37,9 @@ function golden(name: string): string {
   return readFileSync(join(GOLDEN, name), "utf-8");
 }
 
-// Split into [primary, trailer]. Port of _split: the trailing compact
-// plan_invocation NDJSON line, primary newline preserved.
+// Split into [primary, trailer]. Read/inspection verbs emit a single value, so a
+// well-formed run has no trailing compact plan_invocation line and `trailer` is
+// null; primary newline preserved.
 function split(output: string): [string, string | null] {
   const lines = output.split(/(?<=\n)/);
   let trailer: string | null = null;
@@ -78,9 +79,9 @@ function primaryEnvelope(output: string): Record<string, unknown> {
   throw new Error(`no primary JSON envelope in output:\n${output}`);
 }
 
-// Trailing plan_invocation object (parsed) or null. Port of _trailer_obj:
-// scan every JSON object, return the last carrying the key (resolve-task rides
-// the invocation on the same physical line as the envelope).
+// Last plan_invocation object on the stream (parsed) or null. Read verbs carry
+// none (→ null); a merged-footer verb (resolve-task, validate --epic) rides its
+// invocation inside its single envelope, which this scan still finds.
 function trailerObj(output: string): Record<string, unknown> | null {
   let i = 0;
   let found: Record<string, unknown> | null = null;
@@ -245,17 +246,16 @@ describe("show", () => {
     });
   });
 
-  test("trailer carries target", () => {
-    // test_query_verbs.py::test_show_trailer_carries_target
+  test("emits a single value, no invocation trailer", () => {
+    // show is read-only: its payload envelope is the whole stdout, with no
+    // trailing {"plan_invocation"} line riding the result stream.
     seedShowCorpus(root);
     const r = runCli(["show", "fn-1-cafe.1"], { cwd: root });
-    const trailer = trailerObj(r.output);
-    expect(trailer).not.toBeNull();
-    expect((trailer as Record<string, unknown>).op).toBe("show");
-    expect((trailer as Record<string, unknown>).target).toBe("fn-1-cafe.1");
-    expect((trailer as Record<string, unknown>).files).toBeNull();
-    expect((trailer as Record<string, unknown>).repo_root).toBe(root);
-    expect((trailer as Record<string, unknown>).state_repo).toBe(root);
+    expect(r.code).toBe(0);
+    expect(trailerObj(r.output)).toBeNull();
+    const env = primaryEnvelope(r.output);
+    expect(env.type).toBe("task");
+    expect("plan_invocation" in env).toBe(false);
   });
 
   test("task not found errors", () => {
@@ -349,16 +349,16 @@ describe("cat", () => {
 // ---------------------------------------------------------------------------
 
 describe("list", () => {
-  test("human render byte-pinned against the golden", () => {
-    // test_query_verbs.py::test_list_human_golden
+  test("human render byte-pinned against the golden, no trailer pollution", () => {
+    // The human render is the WHOLE stdout — no compact {"plan_invocation"} line
+    // pollutes it (dropping the trailer cleaned both --format json AND human).
     seedListCorpus(root);
     const r = runCli(["--format", "human", "list"], { cwd: root });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.output);
     expect(primary).toBe(golden("list_human.txt"));
-    expect(trailer).not.toBeNull();
-    expect(trailer as string).toContain('"op":"list"');
-    expect(trailer as string).toContain('"target":null');
+    expect(trailer).toBeNull();
+    expect(r.output).not.toContain('"plan_invocation"');
   });
 
   test("json ordering + merged status", () => {
@@ -482,14 +482,13 @@ describe("tasks", () => {
     ).toEqual(["fn-1-cafe.1", "fn-2-zeta.1", "fn-zzz-weird.1"]);
   });
 
-  test("no positional id -> trailer target null", () => {
-    // test_query_verbs.py::test_tasks_no_trailer_target
+  test("emits a single value, no invocation trailer", () => {
+    // tasks is read-only: no trailing {"plan_invocation"} line on the stream.
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
     const r = runCli(["tasks"], { cwd: root });
-    const trailer = trailerObj(r.output);
-    expect(trailer).not.toBeNull();
-    expect((trailer as Record<string, unknown>).op).toBe("tasks");
-    expect((trailer as Record<string, unknown>).target).toBeNull();
+    expect(r.code).toBe(0);
+    expect(trailerObj(r.output)).toBeNull();
+    expect("plan_invocation" in primaryEnvelope(r.output)).toBe(false);
   });
 });
 
@@ -749,8 +748,10 @@ describe("validate", () => {
 // ---------------------------------------------------------------------------
 
 describe("validate --epic", () => {
-  test("stamps on the None transition + emits a second compact invocation", () => {
-    // test_query_verbs.py::test_validate_epic_stamps_on_none_transition
+  test("stamps on the None transition, merging the invocation into ONE value", () => {
+    // On the fresh stamp validate --epic prints a SINGLE JSON value carrying
+    // {valid,errors,warnings} with plan_invocation merged in — printed AFTER the
+    // commit lands, so the value is the authoritative "commit landed" signal.
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
     const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
     expect(loadJson(ep).last_validated_at ?? null).toBeNull();
@@ -764,10 +765,11 @@ describe("validate --epic", () => {
     });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.output);
-    expect((JSON.parse(primary) as Record<string, unknown>).valid).toBe(true);
-    expect(trailer).not.toBeNull();
-    const inv = (JSON.parse(trailer as string) as Record<string, unknown>)
-      .plan_invocation as Record<string, unknown>;
+    // No separate compact trailer line — the invocation rides the one value.
+    expect(trailer).toBeNull();
+    const env = JSON.parse(primary) as Record<string, unknown>;
+    expect(env.valid).toBe(true);
+    const inv = env.plan_invocation as Record<string, unknown>;
     expect(inv.op).toBe("validate");
     expect(inv.target).toBe("fn-1-cafe");
     expect(loadJson(ep).last_validated_at).toBe(FROZEN);

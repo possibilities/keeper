@@ -7,11 +7,11 @@
 //
 // The contract: mutating verbs emit a single compact NDJSON envelope carrying
 // plan_invocation merged in (op / target / subject / .keeper-only files /
-// touched_path_files / repo_root); read-only verbs emit the invocation as a
-// trailing line with subject=null / files=null and never embed it in the
-// primary payload; the emit()->commit reorder makes a success envelope the
-// authoritative "commit landed" signal. Every test runs against a withProject
-// repo (real git + planctl init) so the auto-commit is exercised honestly.
+// touched_path_files / repo_root); read-only verbs emit their payload as a SINGLE
+// JSON value with no trailing invocation line; the emit()->commit reorder makes a
+// success envelope the authoritative "commit landed" signal. Every test runs
+// against a withProject repo (real git + planctl init) so the auto-commit is
+// exercised honestly.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -324,9 +324,10 @@ describe("no-git mutation", () => {
 // Read-only verbs: trailing invocation line, never embedded in primary
 // ---------------------------------------------------------------------------
 
-describe("read-only invocation trailer", () => {
-  test("show/epics/status emit a trailing line (subject/files null), primary clean", () => {
-    // test_envelope.py::test_readonly_verbs_emit_invocation_via_decorator
+describe("read-only single-value output", () => {
+  test("show/epics/status emit ONE JSON value, no trailing invocation line", () => {
+    // Read verbs put no {"plan_invocation"} line on the result stream; the payload
+    // is the whole stdout (json.loads succeeds, jq clean).
     const made = create("Read-only test");
     const epicId = (parseEnvelope(made.output).epic as Record<string, unknown>)
       .id as string;
@@ -341,12 +342,10 @@ describe("read-only invocation trailer", () => {
         .trim()
         .split("\n")
         .find((ln) => ln.trim().startsWith('{"plan_invocation"'));
-      expect(trailing).not.toBeUndefined();
-      const pc = (JSON.parse(trailing as string) as Record<string, unknown>)
-        .plan_invocation as Record<string, unknown>;
-      expect(pc.subject).toBeNull();
-      expect(pc.files).toBeNull();
+      expect(trailing).toBeUndefined();
+      // The primary carries no plan_invocation, and stdout is exactly one value.
       expect("plan_invocation" in parsePrimary(r.output)).toBe(false);
+      expect(() => JSON.parse(r.stdout.trim())).not.toThrow();
     }
   });
 

@@ -1,12 +1,9 @@
-// Mapping record + end-to-end anchor for the invocation-decorator nodes —
-// translated from tests/cli_decorator/test_decorator_hardening.py and
-// tests/cli_decorator/test_no_track_commands.py, plus the canonical drop for
-// tests/test_cli_invoker_guard.py. The Python decorator-internal nodes import
-// planctl.cli's InvocationTrackedGroup / _extract_target / _TARGET_ARG_NAMES
-// directly — there is no compiled-binary seam to instantiate a synthetic click
-// group. Their OBSERVABLE contract (the target the decorator extracts onto the
-// invocation envelope, and the no-track bypass) is pinned end-to-end here
-// against the real binary, which is the engine-agnostic equivalent.
+// End-to-end anchor for the read-verb output contract + the format-free/validate
+// single-value paths. Read/inspection verbs emit exactly ONE top-level JSON value
+// with no trailing plan_invocation line; cat stays pure markdown; validate --epic
+// merges its invocation into that one value on a fresh stamp. Pinned against the
+// real dispatch — the engine-agnostic equivalent of the retired Python decorator
+// nodes (test_decorator_hardening.py / test_no_track_commands.py).
 
 import { beforeEach, describe, expect, test } from "bun:test";
 
@@ -36,28 +33,21 @@ beforeEach(() => {
   seedState(root, { epicId: "fn-7-real", nTasks: 1 });
 });
 
-describe("invocation target extraction (end-to-end equivalent)", () => {
-  test("a canonical id arg becomes the trailer target", () => {
-    // test_decorator_hardening.py::test_extract_target_prefers_canonical_arg_name
-    // test_decorator_hardening.py::test_extract_target_prefers_canonical_name_over_first_arg
-    // test_decorator_hardening.py::test_target_arg_names_constant
-    // The decorator lifts the canonical id arg (task_id/epic_id/id/dep_id) onto
-    // the invocation; show carries a task_id positional, so target == it.
+describe("read verbs emit a single value (no invocation trailer)", () => {
+  test("show emits no trailing invocation line", () => {
+    // show is read-only: its payload is the whole stdout — one JSON value, with no
+    // {"plan_invocation"} line riding the result stream.
     const r = runCli(["show", "fn-7-real.1"], { cwd: root });
     expect(r.code).toBe(0);
-    const t = trailer(r.output);
-    expect(t).not.toBeNull();
-    expect((t as Record<string, unknown>).op).toBe("show");
-    expect((t as Record<string, unknown>).target).toBe("fn-7-real.1");
+    expect(trailer(r.output)).toBeNull();
+    expect(() => JSON.parse(r.stdout.trim())).not.toThrow();
   });
 
-  test("a verb with no id positional yields target null (fallback policy)", () => {
-    // test_decorator_hardening.py::test_extract_target_fallback_policy_non_fn_returns_none
-    // No canonical-named arg and no fn--shaped positional -> target null, never a
-    // leaked arbitrary string.
+  test("epics emits no trailing invocation line", () => {
     const r = runCli(["epics"], { cwd: root });
     expect(r.code).toBe(0);
-    expect((trailer(r.output) as Record<string, unknown>).target).toBeNull();
+    expect(trailer(r.output)).toBeNull();
+    expect(() => JSON.parse(r.stdout.trim())).not.toThrow();
   });
 
   // CITED (end-to-end equivalents elsewhere in this suite — the raise-path /
@@ -83,8 +73,7 @@ describe("no-track commands bypass the invocation decorator", () => {
     expect(r.output).not.toContain('"plan_invocation"');
   });
 
-  test("validate --epic: doc1 {valid,...}, doc2 invocation on first stamp; no doc2 on re-run", () => {
-    // test_no_track_commands.py::test_validate_stdout_contract
+  test("validate --epic: ONE merged value on first stamp; ONE bare value on re-run", () => {
     const env = {
       CLAUDE_CODE_SESSION_ID: "test-no-track",
       KEEPER_PLAN_NOW: "2026-06-06T00:00:00.000000Z",
@@ -92,16 +81,14 @@ describe("no-track commands bypass the invocation decorator", () => {
     const r = runCli(["validate", "--epic", "fn-7-real"], { cwd: root, env });
     expect(r.code).toBe(0);
     const docs = parseDocStream(r.output);
-    expect(docs.length).toBeGreaterThanOrEqual(1);
+    expect(docs.length).toBe(1);
     const doc1 = docs[0] as Record<string, unknown>;
     expect("valid" in doc1).toBe(true);
     expect("errors" in doc1).toBe(true);
     expect("warnings" in doc1).toBe(true);
     if (doc1.valid) {
-      expect(docs.length).toBe(2);
-      expect("plan_invocation" in (docs[1] as Record<string, unknown>)).toBe(
-        true,
-      );
+      // The invocation is MERGED into the one value, not a second doc.
+      expect("plan_invocation" in doc1).toBe(true);
 
       const r2 = runCli(["validate", "--epic", "fn-7-real"], {
         cwd: root,
@@ -110,6 +97,9 @@ describe("no-track commands bypass the invocation decorator", () => {
       const docs2 = parseDocStream(r2.output);
       expect(docs2.length).toBe(1);
       expect((docs2[0] as Record<string, unknown>).valid).toBe(true);
+      expect("plan_invocation" in (docs2[0] as Record<string, unknown>)).toBe(
+        false,
+      );
     }
   });
 });

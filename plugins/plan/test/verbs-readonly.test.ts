@@ -1,14 +1,12 @@
-// Engine-agnostic conformance spec for the four read-only verbs — translated
-// from tests/test_readonly_verbs.py, every node mapped by a source-comment.
-// state-path / detect / status / epics: byte-exact primary envelope + the
-// trailing plan_invocation NDJSON line, the schema_version asymmetry
-// (detect 0, status 1), the --format human surface, and the missing-project
-// error. Each test seeds via the CLI-free seedState builder (the harness port)
-// + chdir, so only the verb-under-test crosses the compiled-binary boundary.
+// Engine-agnostic conformance spec for the four read-only verbs: state-path /
+// detect / status / epics. Each pins the byte-exact primary envelope as a SINGLE
+// top-level JSON value (no trailing plan_invocation line), the schema_version
+// asymmetry (detect 0, status 1), the --format human surface, and the
+// missing-project error. Each test seeds via the CLI-free seedState builder +
+// chdir, so only the verb-under-test crosses the dispatch boundary.
 //
-// Discipline: toStrictEqual for object ports; the byte-exact envelopes pinned
-// as string literals against the resolved tmp root; the trailer rebuilt with
-// the same compact-JSON byte order the binary emits.
+// Discipline: toStrictEqual for object ports; byte-exact envelopes pinned as
+// string literals against the resolved tmp root; `split()` asserts no trailer.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -18,10 +16,10 @@ import { SCHEMA_VERSION } from "../src/models.ts";
 import { LocalFileStateStore, serializeStateJson } from "../src/store.ts";
 import { runCli, seedState, withTmpdir } from "./harness.ts";
 
-// Split CLI stdout into [primary, trailer] — the read-only decorator appends a
-// trailing {"plan_invocation": ...} compact NDJSON line. Port of the pytest
-// _split: the trailing newline is preserved on the primary block. (per-file
-// helper — the harness exposes no split; conftest._split is module-local too.)
+// Split CLI stdout into [primary, trailer]. Read/inspection verbs now emit a
+// single JSON value, so a well-formed run has NO trailing {"plan_invocation": ...}
+// compact line and `trailer` is null — the helper is how each test pins that
+// absence. The trailing newline is preserved on the primary block.
 function split(output: string): [string, string | null] {
   const lines = output.split(/(?<=\n)/);
   let trailer: string | null = null;
@@ -34,23 +32,6 @@ function split(output: string): [string, string | null] {
     trailer = (lines.pop() as string).replace(/\n$/, "");
   }
   return [lines.join(""), trailer];
-}
-
-// Byte-exact compact trailer for a read-only verb. Port of _expected_trailer:
-// the whole {"plan_invocation": {...}} serialized with compact separators,
-// target null for verbs with no positional id, repo_root == state_repo == root.
-function expectedTrailer(op: string, root: string): string {
-  return JSON.stringify({
-    plan_invocation: {
-      files: null,
-      op,
-      target: null,
-      subject: null,
-      touched_path_files: [],
-      repo_root: root,
-      state_repo: root,
-    },
-  });
 }
 
 // Port of _seed_empty_project: a bare .keeper/ skeleton (no epics/tasks).
@@ -102,7 +83,7 @@ describe("state-path", () => {
     expect(primary).toBe(
       `{\n  "success": true,\n  "state_dir": "${root}/.keeper/state"\n}\n`,
     );
-    expect(trailer).toBe(expectedTrailer("state-path", root));
+    expect(trailer).toBeNull();
   });
 
   test("missing project errors (exit 1)", () => {
@@ -140,7 +121,7 @@ describe("detect", () => {
         "  }\n" +
         "}\n",
     );
-    expect(trailer).toBe(expectedTrailer("detect", root));
+    expect(trailer).toBeNull();
   });
 
   test("schema_version default 0 when meta.json absent", () => {
@@ -161,23 +142,24 @@ describe("detect", () => {
         "  }\n" +
         "}\n",
     );
-    expect(trailer).toBe(expectedTrailer("detect", root));
+    expect(trailer).toBeNull();
   });
 
-  test("found-false: bare {found:false} then resolver error + exit 1", () => {
-    // test_readonly_verbs.py::test_detect_found_false
+  test("found-false: single {success:false, found:false, error} value + exit 1", () => {
+    // A non-plan dir emits ONE JSON value carrying the found flag AND the
+    // missing-project error, exiting 1 so the `detect || init` idiom survives.
     const r = runCli(["detect"], { cwd: root });
     expect(r.code).toBe(1);
-    expect(
-      r.stdout.startsWith('{\n  "success": true,\n  "found": false\n}\n'),
-    ).toBe(true);
-    expect(r.stdout).not.toContain('"plan_invocation"');
-    expect(r.stdout).toContain(
+    expect(r.stdout).toBe(
       "{\n" +
         '  "success": false,\n' +
+        '  "found": false,\n' +
         '  "error": "No plan project found. Run \'keeper plan init\' first."\n' +
         "}\n",
     );
+    expect(r.stdout).not.toContain('"plan_invocation"');
+    // Exactly one top-level JSON value (json.loads would succeed, jq clean).
+    expect(() => JSON.parse(r.stdout)).not.toThrow();
   });
 });
 
@@ -205,7 +187,7 @@ describe("status", () => {
         '  "tasks": {\n    "total": 3,\n    "todo": 1,\n    "in_progress": 1,\n' +
         '    "done": 1,\n    "blocked": 0\n  }\n}\n',
     );
-    expect(trailer).toBe(expectedTrailer("status", root));
+    expect(trailer).toBeNull();
   });
 
   test("empty project zero counts", () => {
@@ -227,7 +209,7 @@ describe("status", () => {
         '  "tasks": {\n    "total": 0,\n    "todo": 0,\n    "in_progress": 0,\n' +
         '    "done": 0,\n    "blocked": 0\n  }\n}\n',
     );
-    expect(trailer).toBe(expectedTrailer("status", root));
+    expect(trailer).toBeNull();
   });
 
   test("--format human falls back to JSON bytes", () => {
@@ -283,7 +265,7 @@ describe("epics", () => {
         '        "total": 0,\n        "todo": 0,\n        "in_progress": 0,\n' +
         '        "done": 0,\n        "blocked": 0\n      }\n    }\n  ]\n}\n',
     );
-    expect(trailer).toBe(expectedTrailer("epics", root));
+    expect(trailer).toBeNull();
   });
 
   test("empty project json", () => {
@@ -293,7 +275,7 @@ describe("epics", () => {
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe('{\n  "success": true,\n  "epics": []\n}\n');
-    expect(trailer).toBe(expectedTrailer("epics", root));
+    expect(trailer).toBeNull();
   });
 
   test("--format human table renderer with non-ASCII title", () => {
@@ -306,7 +288,7 @@ describe("epics", () => {
       "fn-1-cafe  Café résumé ☕  [open]  3 tasks (1 todo, 1 in_progress, 1 done)\n" +
         "fn-zzz-weird  Weird  [open]  0 tasks\n",
     );
-    expect(trailer).toBe(expectedTrailer("epics", root));
+    expect(trailer).toBeNull();
   });
 
   test("missing project errors (exit 1)", () => {
