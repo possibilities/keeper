@@ -51,5 +51,5 @@ yields the same parsed object as the disk path. Assert tier validation still acc
 - [ ] Malformed/missing config fails loud with a typed error, not an import-time crash.
 
 ## Done summary
-
+Added plugins/plan/subagents.yaml as the SSOT for the {model x effort} axes and a subagents_config.ts loader with two access modes (runtime parses a compile-time embedded snapshot, build reads disk), both failing loud on a malformed matrix. Retired TASK_TIERS; scaffold/refine-apply/set-tier now read configuredEfforts() from the config with worker names unchanged. Proved the compiled keeper-plan binary validates a tier against the embedded config from an arbitrary cwd.
 ## Evidence
