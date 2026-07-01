@@ -69,5 +69,5 @@ together → exit 2. Pure tier; reuse the faked detachment harness. Keep pair te
   pair-panel green; `bun test` + `bun run typecheck` green.
 
 ## Done summary
-
+Added the ad-hoc single-member (panel-of-one) form to agent panel start: --preset/--cli resolve one member on the same manifest + detached-leg path, mutually exclusive with --panel; --role rides the leg as agent run --system; --model/--effort/--read-only thread onto the ad-hoc leg (agent run gained --model/--effort passthrough). Configured panels + pair stay byte-stable.
 ## Evidence

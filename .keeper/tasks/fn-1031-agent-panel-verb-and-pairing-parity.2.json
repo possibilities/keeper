@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Ad-hoc single member and role port",
-  "updated_at": "2026-07-01T05:07:37.559000Z"
+  "updated_at": "2026-07-01T07:05:36.480000Z",
+  "worker_done_at": "2026-07-01T07:05:36.480000Z"
 }
