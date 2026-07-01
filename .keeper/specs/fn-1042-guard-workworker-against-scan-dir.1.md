@@ -22,5 +22,5 @@ the current guard tests.
 - [ ] Test covers a `work` manifest in a real scan-dir position (F4), plus the clean no-collision path.
 
 ## Done summary
-
+Added a producer-side dispatch preflight in runReconcileCycle that scans the real claude plugin_scan_dirs for a non-cell 'work'-named manifest and mints a sticky per-key work-plugin-shadowed DispatchFailed (retry-clearable) before spawning the wrong worker. Covered by unit + runReconcileCycle tests exercising a work manifest in a real scan-dir position plus the clean path.
 ## Evidence

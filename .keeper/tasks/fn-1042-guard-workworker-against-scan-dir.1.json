@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Preflight work-name scan-dir probe",
-  "updated_at": "2026-07-01T16:35:10.643000Z"
+  "updated_at": "2026-07-01T18:40:31.759000Z",
+  "worker_done_at": "2026-07-01T18:40:31.759000Z"
 }
