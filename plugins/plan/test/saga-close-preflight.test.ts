@@ -408,11 +408,9 @@ describe("close-preflight --project flag", () => {
   });
 
   test("tilde --project from non-project cwd: no spurious missing-project error", () => {
-    // Regression for the trailer/verb tilde disagreement: trailerProjectRoot
-    // must expandUser the flag before its absolute check, matching the verb, so
-    // a `~`-form --project from an outside cwd resolves through the project root
-    // and the read-only trailer never re-resolves from cwd into a missing-project
-    // error envelope.
+    // The verb expands a `~`-form --project before resolving it, so a tilde
+    // --project from an unrelated cwd resolves through the project root rather
+    // than re-resolving from cwd into a spurious missing-project error envelope.
     const proj = getProj();
     // A project under the binary's HOME, so a `~/<name>` --project resolves to it.
     const projName = "tilde-cpf-proj";
