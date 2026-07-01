@@ -192,6 +192,10 @@ describe("resolve-task routing envelope", () => {
     expect(obj.epic_id).toBe(epicId);
     expect(obj.tier).toBe("medium");
     expect(obj.worker_model).toBe("opus");
+    // worker_agent still carries the composed cell name, but post-cutover only
+    // its null-ness gates /plan:work — which spawns the constant work:worker
+    // (the launcher selects the cell via --plugin-dir). The value is vestigial
+    // for the spawn; the composition is asserted as the null-gate contract.
     expect(obj.worker_agent).toBe("plan:worker-opus-medium");
     expect(["todo", "in_progress"]).toContain(obj.status as string);
     expect((obj.target_repo as string).startsWith("/")).toBe(true);

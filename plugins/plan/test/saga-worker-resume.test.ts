@@ -289,6 +289,10 @@ describe("worker resume", () => {
     }
     expect(payload.tier).toBe("medium");
     expect(payload.worker_model).toBe("opus");
+    // worker_agent still carries the composed cell name, but post-cutover only
+    // its null-ness gates the cold-resume spawn — which spawns the constant
+    // work:worker. The value is vestigial for the spawn; the composition is
+    // asserted as the null-gate contract.
     expect(payload.worker_agent).toBe("plan:worker-opus-medium");
   });
 

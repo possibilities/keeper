@@ -37,7 +37,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "plan:worker-",
+        "matcher": "^work:worker$",
         "hooks": [
           {
             "type": "command",

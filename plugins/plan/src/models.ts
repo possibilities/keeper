@@ -144,11 +144,14 @@ export function configuredModels(): readonly string[] {
   return subagentsMatrix().models;
 }
 
-/** Compose a task's {tier, model} into the `plan` plugin's worker-agent name
- * `plan:worker-<model>-<effort>`. Returns null when EITHER axis is null (a
- * record carrying no tier or no model) — the null return is load-bearing, as
- * /plan:work branches on it to stop cleanly. Throws for a non-null value outside
- * the configured efforts/models (corrupt-on-disk guard). */
+/** Derive a task's worker null-gate signal from its {tier, model}. The composed
+ * string is `plan:worker-<model>-<effort>`, but only its NULL-NESS is
+ * load-bearing: /plan:work spawns the constant `work:worker` (the launcher
+ * selects the matching cell at launch via --plugin-dir), so the composed value
+ * is vestigial for the spawn. Returns null when EITHER axis is null (a record
+ * carrying no tier or no model) — the null return is what stops /plan:work
+ * cleanly. Throws for a non-null value outside the configured efforts/models
+ * (corrupt-on-disk guard). */
 export function workerAgentFor(
   tier: string | null,
   model: string | null,

@@ -19,12 +19,6 @@ node_modules/
 # keeper prompt render-plugin-templates; carries _promptctl_path marker).
 agents/practice-scout.md
 
-# Generated {model × effort} worker agents (rendered from
-# template/agents/worker.md.tmpl into agents/worker-<model>-<effort>.md, one per
-# cell of the subagents.yaml matrix; addressable plan:worker-<model>-<effort> by
-# the always-loaded plan plugin).
-agents/worker-*.md
-
 # Generated per-cell `work` plugins (rendered from template/agents/worker.md.tmpl
 # via render_to into workers/<model>-<effort>/{.claude-plugin/plugin.json,
 # agents/worker.md}, one plugin per cell of the subagents.yaml matrix; each loads

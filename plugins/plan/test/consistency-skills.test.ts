@@ -5,9 +5,9 @@
 // (--help exit 0); frontmatter `name:` is the bare verb; the agentId capture
 // regex is `re.search`-shaped; the close coordinator's finalize switch is total
 // over CLOSE_OUTCOMES and carries no stale pointers; the work template spawns
-// the envelope's worker_agent with no bare literal / model= kwarg; the worker
-// template's doc-discipline block holds its shape; and every checked-in epic
-// JSON is clean of the retired audited_into / draft fields.
+// the constant work:worker with no model= kwarg; the worker template's
+// doc-discipline block holds its shape; and every checked-in epic JSON is clean
+// of the retired audited_into / draft fields.
 
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
@@ -385,15 +385,22 @@ describe("work.md.tmpl agentId capture regex", () => {
   });
 });
 
-describe("generated worker agents in the plan plugin", () => {
+describe("generated work plugins in the plan plugin", () => {
   const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
   for (const model of matrix.models) {
     for (const effort of matrix.efforts) {
-      test(`agents/worker-${model}-${effort}.md is rendered with the {model × effort} frontmatter`, () => {
-        const path = join(REPO, "agents", `worker-${model}-${effort}.md`);
-        expect(existsSync(path)).toBe(true);
-        const fm = parseFrontmatter(frontmatterBlock(path));
-        expect(fm.name).toBe(`worker-${model}-${effort}`);
+      test(`workers/${model}-${effort} renders a work plugin with the {model × effort} worker`, () => {
+        const cellDir = join(REPO, "workers", `${model}-${effort}`);
+        const manifestPath = join(cellDir, ".claude-plugin", "plugin.json");
+        expect(existsSync(manifestPath)).toBe(true);
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+          name?: string;
+        };
+        expect(manifest.name).toBe("work");
+        const agentPath = join(cellDir, "agents", "worker.md");
+        expect(existsSync(agentPath)).toBe(true);
+        const fm = parseFrontmatter(frontmatterBlock(agentPath));
+        expect(fm.name).toBe("worker");
         expect(fm.model).toBe(model);
         expect(fm.effort).toBe(effort);
         expect(fm.maxTurns).toBe("300");
@@ -403,15 +410,16 @@ describe("generated worker agents in the plan plugin", () => {
 });
 
 describe("work.md.tmpl spawn shape", () => {
-  test("envelope-driven worker_agent spawn, no bare literal, no model=", () => {
+  test("constant work:worker spawn, no composed literal, no model=", () => {
     const tmpl = readFileSync(WORK_TMPL, "utf-8");
     const spawnBlocks = extractTaskCallBlocks(tmpl).filter((b) =>
-      b.includes("<worker_agent>"),
+      b.includes("work:worker"),
     );
     expect(spawnBlocks.length).toBeGreaterThanOrEqual(2);
-    expect(tmpl).not.toContain("work:worker");
-    expect(tmpl).not.toContain("plugin-dir");
-    expect(tmpl).toContain("plan:worker-<model>-<effort>");
+    expect(tmpl).toContain("work:worker");
+    // The launch mechanism (--plugin-dir cell selection) is documented in prose.
+    expect(tmpl).toContain("plugin-dir");
+    expect(tmpl).not.toContain("plan:worker-<model>-<effort>");
     expect(tmpl).not.toContain('subagent_type=f"plan:worker-{tier}"');
     expect(tmpl).not.toContain("keeper plan task set-tier");
     for (const block of spawnBlocks) {

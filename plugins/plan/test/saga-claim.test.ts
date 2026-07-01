@@ -81,6 +81,10 @@ describe("claim happy path + brief schema", () => {
     expect(payload.target_repo).toBeTruthy();
     expect(payload.primary_repo).toBeTruthy();
     expect("tier" in payload).toBe(true);
+    // worker_agent still carries the composed cell name, but post-cutover only
+    // its null-ness gates /plan:work — which spawns the constant work:worker
+    // (the launcher selects the cell via --plugin-dir). The value is vestigial
+    // for the spawn; the composition is asserted as the null-gate contract.
     expect(payload.worker_agent).toBe("plan:worker-opus-medium");
     const ts = payload.task_state as Record<string, unknown>;
     expect(ts.status).toBe("in_progress");

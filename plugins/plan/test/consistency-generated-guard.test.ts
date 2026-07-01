@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 import { readMarker } from "../plugin/hooks/lib.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
@@ -96,11 +96,12 @@ describe("hooks.json wiring", () => {
     execFormCmd(bashEntry as Record<string, unknown>, "commit-guard.ts");
   });
 
-  test("registers the subagent-stop-guard under the plan:worker- prefix matcher", () => {
+  test("registers the subagent-stop-guard under the ^work:worker$ matcher", () => {
     const hooks = readHooks();
     const entry = hooks.SubagentStop[0] as Record<string, unknown>;
-    // A single prefix matches every generated worker cell (plan:worker-<model>-<effort>).
-    expect(entry.matcher).toBe("plan:worker-");
+    // The anchored full-name matcher fires cross-plugin for the launch-selected
+    // work:worker cell (every cell spawns the constant work:worker).
+    expect(entry.matcher).toBe("^work:worker$");
     execFormCmd(entry, "subagent-stop-guard.ts");
   });
 
@@ -113,26 +114,114 @@ describe("hooks.json wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
-// worker agent set ↔ subagents.yaml matrix (both directions)
+// per-cell work plugin set ↔ subagents.yaml matrix (both directions)
 // ---------------------------------------------------------------------------
 
-describe("generated worker agents match the subagents.yaml matrix", () => {
-  test("on-disk worker-*.md set equals the {model × effort} cartesian product", () => {
+describe("generated work plugins match the subagents.yaml matrix", () => {
+  test("on-disk workers/ cell set equals the {model × effort} cartesian product", () => {
     const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
     const expected = new Set<string>();
     for (const model of matrix.models) {
       for (const effort of matrix.efforts) {
-        expected.add(`worker-${model}-${effort}.md`);
+        expected.add(`${model}-${effort}`);
       }
     }
     const actual = new Set(
-      readdirSync(join(REPO, "agents")).filter(
-        (n) => n.startsWith("worker-") && n.endsWith(".md"),
-      ),
+      readdirSync(join(REPO, "workers"), { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name),
     );
-    // Both directions: a missing cell fails, and a stale file (a removed cell
-    // whose generated `.md` lingers) fails too — agents carry no orphan prune.
+    // Both directions: a missing cell fails, and a stale cell dir (a removed
+    // {model × effort} whose tree lingers) fails too.
     expect([...actual].sort()).toEqual([...expected].sort());
+  });
+
+  test("no stale plan:worker-*.md agents linger in agents/", () => {
+    const stale = readdirSync(join(REPO, "agents")).filter(
+      (n) => n.startsWith("worker-") && n.endsWith(".md"),
+    );
+    expect(stale).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// work-name collision guard: no non-cell plugin named `work` may shadow the
+// launch-selected work:worker cells.
+// ---------------------------------------------------------------------------
+
+/** Every `.claude-plugin/plugin.json` under `root` whose manifest name is
+ * `work`. Skips heavy/irrelevant trees so the walk stays bounded. */
+function findWorkManifests(root: string): string[] {
+  const out: string[] = [];
+  const skip = new Set(["node_modules", ".git", "dist", "build", ".keeper"]);
+  const walk = (dir: string): void => {
+    let entries: ReturnType<typeof readdirSync>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const manifest = join(dir, ".claude-plugin", "plugin.json");
+    if (existsSync(manifest)) {
+      try {
+        const data = JSON.parse(readFileSync(manifest, "utf-8")) as {
+          name?: string;
+        };
+        if (data.name === "work") {
+          out.push(manifest);
+        }
+      } catch {
+        /* malformed manifest — not a `work` collision */
+      }
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || skip.has(e.name)) {
+        continue;
+      }
+      walk(join(dir, e.name));
+    }
+  };
+  walk(root);
+  return out;
+}
+
+/** `work`-named manifests NOT under the workers/ cell base — a shadowing
+ * collision that would steal the constant `work:worker` from the selected cell. */
+function collidingWorkManifests(root: string, workersBase: string): string[] {
+  const base = resolve(workersBase);
+  return findWorkManifests(root).filter(
+    (m) => !resolve(m).startsWith(base + sep),
+  );
+}
+
+describe("work-name collision guard", () => {
+  test("the plan plugin ships no non-cell `work`-named plugin", () => {
+    const hits = collidingWorkManifests(REPO, join(REPO, "workers"));
+    expect(hits).toEqual([]);
+    // Sanity: the cells themselves ARE `work`-named (the guard excludes them).
+    expect(findWorkManifests(join(REPO, "workers")).length).toBeGreaterThan(0);
+  });
+
+  test("the guard fires when a stray `work` plugin is scanned outside workers/", () => {
+    const strayRoot = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-work-collision-")),
+    );
+    try {
+      const strayDir = join(strayRoot, "some-plugin", ".claude-plugin");
+      mkdirSync(strayDir, { recursive: true });
+      writeFileSync(
+        join(strayDir, "plugin.json"),
+        JSON.stringify({ name: "work" }),
+      );
+      const hits = collidingWorkManifests(
+        strayRoot,
+        join(strayRoot, "workers"),
+      );
+      expect(hits.length).toBe(1);
+      expect(hits[0]).toContain("some-plugin");
+    } finally {
+      rmSync(strayRoot, { recursive: true, force: true });
+    }
   });
 });
 
