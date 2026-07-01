@@ -66,5 +66,5 @@ change — pure relocation.
 - [ ] Depgraph hygiene green (new module db-free); `bun test` + `bun run typecheck` green.
 
 ## Done summary
-
+Relocated the shared launch cluster (buildAgentLaunchArgv, native flag sets, stripClaudeEnv, READ_ONLY_DIRECTIVE, role resolver + prompt assets) out of src/pair-command.ts into a db-free src/agent/launch-config.ts with neutral names; pair-command keeps only pair-only symbols. Behavior-stable — keeper pair byte-identical; typecheck/lint/full suite green.
 ## Evidence

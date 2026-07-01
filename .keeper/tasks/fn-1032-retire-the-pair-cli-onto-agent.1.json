@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Relocate shared launch cluster to neutral agent module",
-  "updated_at": "2026-07-01T05:07:38.097000Z"
+  "updated_at": "2026-07-01T07:20:16.384000Z",
+  "worker_done_at": "2026-07-01T07:20:16.384000Z"
 }
