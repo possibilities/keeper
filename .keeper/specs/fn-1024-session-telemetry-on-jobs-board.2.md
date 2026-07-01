@@ -71,5 +71,5 @@ tmpdir. Update the three agent argv golden pins for the new `--settings` default
 - [ ] Agent argv golden pins updated; `bun test` green
 
 ## Done summary
-
+Added the keeper statusline-sink CLI (coalesced, atomic, fail-open per-session leaf writer) and the claude-only bash -c 'tee -i >(...) | <chain>' --settings injection that wires it onto every keeper-agent launch. Confirmed the load-bearing session_id==jobs.job_id correlation via the reducer invariant.
 ## Evidence
