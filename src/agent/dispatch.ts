@@ -32,9 +32,9 @@ export type Dispatch =
   // kind (the agent-launch) — the leading token is `run` / `wait`.
   | { kind: "run-capture"; rest: string[] }
   | { kind: "wait-capture"; rest: string[] }
-  // The panel fan-out sub-verb (`start|wait`). Routes into `runPanel`;
-  // `rest` carries the `start|wait`
-  // operation + its flags, which `runPanel` owns (self-emits + owns its code).
+  // The panel fan-out sub-verb (`start|wait|status|prune`). Routes into
+  // `runPanel`; `rest` carries the operation + its flags, which `runPanel` owns
+  // (self-emits + owns its code).
   | { kind: "panel"; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
@@ -82,14 +82,18 @@ Usage:
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait --dir <d> [--chunk <s>]
+  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --dir <d>)
+  keeper agent panel prune
                                     Fan a question to a panel of detached
                                     read-only run legs (members from a configured
                                     --panel <name>), then wait for them token-free.
-                                    --slug is REQUIRED — each leg launches as
-                                    panel::<slug>::<preset>. start launches + prints
-                                    a manifest; wait blocks one chunk + prints the
-                                    N-of-N verdict. Exit 0 all-terminal / 124
+                                    --slug is REQUIRED on start — each leg launches
+                                    as panel::<slug>::<preset>. start is idempotent
+                                    by slug (reconciles on re-issue); wait/status
+                                    address a run by --slug or --dir. status prints
+                                    a non-blocking per-leg snapshot; prune GCs
+                                    abandoned run dirs. Exit 0 all-terminal / 124
                                     chunk-elapsed / 2 absent-slug-or-bad-config.
   keeper agent --help                  Show this help.
   keeper agent --version               Show the version.
@@ -218,23 +222,33 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         handle (a run id or a transcript path with
                                         --agent <kind>); same uniform envelope.
 
-Panel fan-out (start | wait):
+Panel fan-out (start | wait | status | prune):
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait --dir <d> [--chunk <s>]
+  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --dir <d>)
+  keeper agent panel prune
                                         Fan a question to a panel of models as
                                         detached read-only \`keeper agent run\`
                                         legs, then wait for them token-free.
                                         Members come from a configured --panel
                                         <name> (a panel.yaml panel or a single
-                                        catalog preset). --slug is REQUIRED — each
-                                        leg launches as panel::<slug>::<preset>.
-                                        start launches every leg, prints {dir, slug,
-                                        members}, and exits 0 immediately; wait
-                                        re-reads the manifest, blocks ONE --chunk
-                                        window, and prints the N-of-N verdict. Exit
-                                        0 = all legs terminal (key off the verdict's
-                                        'ok' flag, NOT the code), 124 = chunk elapsed
-                                        (re-issue it), 2 = an absent/empty --slug, a
+                                        catalog preset). --slug is REQUIRED on start
+                                        — each leg launches as panel::<slug>::<preset>
+                                        and the run lives at the durable slug-keyed
+                                        ~/.local/state/keeper/panels/<slug>/. start
+                                        is idempotent by slug: re-issuing the same
+                                        line RECONCILES (reuse terminal legs, leave
+                                        running, relaunch no-result), never a blind
+                                        re-fan-out. wait/status address a run by
+                                        --slug (or --dir; --dir wins). wait blocks
+                                        ONE --chunk window + prints the N-of-N
+                                        verdict; status prints a non-blocking per-leg
+                                        snapshot (completed|running|failed|absent);
+                                        prune GCs abandoned run dirs (lock-free, no
+                                        live pid, past TTL). Exit 0 = all legs
+                                        terminal (key off the verdict's 'ok' flag,
+                                        NOT the code), 124 = chunk elapsed (re-issue
+                                        it), 2 = an absent/empty --slug, a
                                         missing/corrupt manifest, or bad config.
 
 tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit):

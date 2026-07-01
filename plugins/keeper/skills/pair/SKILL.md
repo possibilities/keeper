@@ -78,9 +78,13 @@ cat > "$PROMPT" <<'EOF'
 EOF
 ```
 
-**2. Start the partner detached.** `start` mints a scratch dir, launches the
-leg(s), writes `<dir>/manifest.json`, prints it, and **exits 0 immediately** — it
-never blocks:
+**2. Start the partner detached.** `start` is **idempotent by slug** — it writes
+durable per-slug state at `~/.local/state/keeper/panels/<slug>/`, launches the
+leg(s), writes `<dir>/manifest.json`, prints it, and **exits 0 immediately** (it
+never blocks). Re-issuing the same `start --slug <slug>` with the same prompt
+reconciles the existing run (reuse terminal legs, leave running ones, relaunch
+no-result ones) instead of re-fanning-out; a colliding prompt or member-set exits
+2:
 
 ```bash
 MANIFEST=$(keeper agent panel start "$PROMPT" --slug oauth-review --cli codex --read-only)
@@ -92,8 +96,9 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   from the ask (each leg launches as `panel::<slug>::<preset>`, keeping the run
   identifiable in tmux + forensics). Pick a sensible default, don't stall.
 - The manifest is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
-  Capture `DIR`; every `wait` re-reads it. Each member's `yaml` is that leg's
-  answer-envelope path.
+  Capture `DIR`; every `wait`/`status` re-reads it — or address the run by `--slug
+  <slug>`, the durable form that survives a restart. Each member's `yaml` is that
+  leg's answer-envelope path.
 - Pick the member with `--cli <claude|codex|pi>` (a bare harness, add `--model` /
   `--effort` / `--role` as needed) or `--preset <name>` (a catalog preset), or
   fan out with `--panel <name>`. `--panel` and `--preset`/`--cli` are mutually
@@ -140,6 +145,14 @@ On `ok == false` (or a non-124 `wait` exit, or `BACKSTOP` exhausted), surface th
 failing members' `reason` fields (each is that leg's terminal `outcome` —
 `timed_out`, `no_message`, `launch_failed`, `bad_args` — or a corrupt/crashed-leg
 note) to the human rather than reading a stale answer file.
+
+**Re-entry & housekeeping.** The run's state is durable and slug-keyed, so a
+restarted session re-attaches from the slug alone: `keeper agent panel wait --slug
+<slug>` is the preferred re-entry form (no `$DIR` to carry across the restart), and
+`keeper agent panel status --slug <slug>` is a one-shot NON-blocking snapshot
+(per-leg `completed|running|failed|absent`, no verdict wait). `keeper agent panel
+prune` GCs aged-out terminal run dirs under the panels root — never a live or
+in-reconcile run — for occasional housekeeping.
 
 ## Reading the answer
 

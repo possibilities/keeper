@@ -29,8 +29,10 @@ job→job edge — it MUST NOT populate `(plan_verb, plan_ref)` and never widens
 the `{plan, work, close}` whitelist. A `panel::<slug>::<preset>` spawn name
 (fn-1041, each detached `keeper agent panel` leg) is a THIRD such class: the
 agent-authored `<slug>` mirrors the same `[a-z0-9-]+` grammar and `<preset>` is
-the member's preset name, but panels are ephemeral (no DB row, no event, no
-deriver) so it matches NEITHER anchored spawn-name regex — it likewise never
+the member's preset name, but a panel leg has no keeper-DB footprint (no DB row,
+no event, no deriver — its state is durable *filesystem* state under
+`~/.local/state/keeper/panels/<slug>/`, never keeper.db) so it matches NEITHER
+anchored spawn-name regex — it likewise never
 populates `(plan_verb, plan_ref)` nor widens the `{plan, work, close}` whitelist,
 and unlike `handoff::` it binds no job→job edge at all. Two paired stoppage annotations ride alongside
 the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
@@ -1415,8 +1417,23 @@ event-log/reducer/hook touch. Run any of them with
   panel a `keeper agent panel start` (absent `--panel`) assembles. `panel start`
   requires a `--slug <slug>` (slugified `[a-z0-9-]`, absent/empties-to-nothing →
   exit 2); every leg then launches as `panel::<slug>::<preset>` so each panelist is
-  identifiable in tmux + forensics by which run and which preset it is.
-  `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
+  identifiable in tmux + forensics by which run and which preset it is. A panel run
+  is DURABLE and resumable: its state lives at `~/.local/state/keeper/panels/<slug>/`
+  (0700; `keeper agent panel start` is its sole writer, no daemon/hook touches it),
+  so `start` is IDEMPOTENT by slug — a re-issue reconciles per leg (REUSE any
+  terminal result — completed or failed, since resume is not retry — LEAVE a running
+  leg, RELAUNCH only a no-result leg), never a blind re-fan-out. A per-slug advisory
+  `flock` serializes concurrent drivers; a manifest-stamped `boot_epoch_ms` detects a
+  reboot (every non-terminal leg relaunches, since pre-reboot pidfiles are
+  untrustworthy) while a same-boot pidfile check governs otherwise; a byte-exact
+  prompt + member-set identity guard refuses a colliding-slug cross-run merge
+  (exit 2). Liveness is filesystem-only (result file + boot epoch + pidfile), never
+  keeper.db — `src/pair/panel.ts` stays a dep-free leaf. Three read verbs address a
+  run by `--slug` (or a `--dir` override): `panel wait` blocks a bounded chunk until
+  every leg is terminal, `panel status` prints a non-blocking per-leg snapshot
+  (`completed|running|failed|absent`), and `panel prune` GCs abandoned run dirs
+  (lock-free AND pid-dead AND past a started-at TTL — a live or in-reconcile run is
+  always kept). `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
   `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
   harness comes from the preset — and `keeper agent presets resolve <name>` emits
   the resolved preset/panel JSON. `keeper agent profiles check [--json]` is the
