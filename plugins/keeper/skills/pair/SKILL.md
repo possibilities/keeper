@@ -83,19 +83,23 @@ leg(s), writes `<dir>/manifest.json`, prints it, and **exits 0 immediately** —
 never blocks:
 
 ```bash
-MANIFEST=$(keeper agent panel start "$PROMPT" --cli codex --read-only)
+MANIFEST=$(keeper agent panel start "$PROMPT" --slug oauth-review --cli codex --read-only)
 START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
 
-- The manifest is `{"dir":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
+- `--slug` is **required** — a short kebab run id (`[a-z0-9-]`) you auto-derive
+  from the ask (each leg launches as `panel::<slug>::<preset>`, keeping the run
+  identifiable in tmux + forensics). Pick a sensible default, don't stall.
+- The manifest is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
   Capture `DIR`; every `wait` re-reads it. Each member's `yaml` is that leg's
   answer-envelope path.
 - Pick the member with `--cli <claude|codex|pi>` (a bare harness, add `--model` /
   `--effort` / `--role` as needed) or `--preset <name>` (a catalog preset), or
   fan out with `--panel <name>`. `--panel` and `--preset`/`--cli` are mutually
-  exclusive. A misconfigured/unknown panel, an undefined preset, a non-pairable
-  harness, or an unreadable prompt exits 2 with no leg launched.
+  exclusive. An absent/empty `--slug`, a misconfigured/unknown panel, an undefined
+  preset, a non-pairable harness, or an unreadable prompt exits 2 with no leg
+  launched.
 
 **3. Wait token-free (re-issue loop).** Each `wait` blocks ONE `--chunk` window
 (default 540s ≤ 9 min, safely under Bash's 10-min single-call cap), then exits:

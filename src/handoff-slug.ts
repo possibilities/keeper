@@ -6,82 +6,39 @@
  * log, never re-derived at replay — re-slugifying on a re-fold would let an
  * algorithm change retroactively break the frozen-event invariant).
  *
- * Three pure helpers: {@link slugifyHandoffSlug} (CLI-side normalization),
- * {@link validateHandoffSlug} (the daemon's socket-boundary re-validation — a
- * hand-crafted RPC bypasses the CLI), and {@link handoffSlugExists} (the
- * single-writer uniqueness probe main runs synchronously before the append).
+ * The pure `[a-z0-9-]+` normalize/validate primitives live in the dep-free
+ * `src/slug.ts` leaf; this module re-exports them under handoff-scoped names
+ * (pinning "handoff slug" wording so handoff error strings stay byte-identical)
+ * and adds {@link handoffSlugExists} — the single-writer uniqueness probe main
+ * runs synchronously before the append (the ONE piece that needs `bun:sqlite`).
  */
 
 import type { Database } from "bun:sqlite";
+import {
+  SLUG_MAX_LEN,
+  slugify,
+  type ValidateSlugResult,
+  validateSlug,
+} from "./slug";
 
 /** Max slug length (chars) AFTER slugify. The slug rides as a tmux/spawn name
- *  (`handoff::<slug>`) and inline in the event log, so it stays short. The CLI
- *  truncates to this; the daemon rejects anything longer. */
-export const HANDOFF_SLUG_MAX_LEN = 64;
+ *  (`handoff::<slug>`) and inline in the event log, so it stays short. */
+export const HANDOFF_SLUG_MAX_LEN = SLUG_MAX_LEN;
+
+export type { ValidateSlugResult };
+
+/** Normalize free text to a `[a-z0-9-]+` handoff slug, or `null` when empty. The
+ *  CLI-side gate ({@link slugify} from the dep-free leaf). */
+export const slugifyHandoffSlug = slugify;
 
 /**
- * Normalize free text to a `[a-z0-9-]+` handoff slug, or `null` when the result
- * is empty (the CLI rejects that as misuse — slugs are user-authored, never
- * suffixed). Reimplements the shape of `plugins/plan/src/ids.ts:slugify` WITHOUT
- * importing the peer plan plugin: NFKD → strip combining marks (`\p{M}`) → drop
- * remaining non-ASCII (homoglyphs fall out of the ASCII class) → lowercase →
- * collapse every run of non-`[a-z0-9]` to a single `-` → trim leading/trailing
- * `-` → cap length AFTER the transform. `.`/`..`/all-dash/emoji-only inputs all
- * collapse to empty and return `null`.
- */
-export function slugifyHandoffSlug(text: string): string | null {
-  let s = String(text).normalize("NFKD");
-  // Strip combining marks the NFKD decomposition exposed (é → e + ´).
-  s = s.replace(/\p{M}/gu, "");
-  // Drop anything still outside ASCII (emoji, CJK, homoglyphs).
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: ASCII-only gate.
-  s = s.replace(/[^\x00-\x7F]/g, "");
-  s = s.toLowerCase();
-  // Every run of non-alphanumerics collapses to a single hyphen.
-  s = s.replace(/[^a-z0-9]+/g, "-");
-  s = s.replace(/^-+|-+$/g, "");
-  if (s.length > HANDOFF_SLUG_MAX_LEN) {
-    s = s.slice(0, HANDOFF_SLUG_MAX_LEN).replace(/-+$/g, "");
-  }
-  return s === "" ? null : s;
-}
-
-/** Discriminated result of {@link validateHandoffSlug}. */
-export type ValidateSlugResult = { ok: true } | { ok: false; error: string };
-
-/**
- * Re-validate a slug at the daemon's socket trust boundary. The CLI slugifies,
- * but a hand-crafted RPC bypasses that, so the daemon independently rejects
- * empty / oversized / `.` / `..` / non-`[a-z0-9-]+` / all-hyphen values. Pure —
- * exported for unit reach and reused by the RPC param validator.
+ * Re-validate a handoff slug at the daemon's socket trust boundary. The CLI
+ * slugifies, but a hand-crafted RPC bypasses that, so the daemon independently
+ * rejects empty / oversized / `.` / `..` / non-`[a-z0-9-]+` / all-hyphen values.
+ * Thin "handoff slug"-labeled wrapper over {@link validateSlug}. Pure.
  */
 export function validateHandoffSlug(slug: unknown): ValidateSlugResult {
-  if (typeof slug !== "string" || slug.length === 0) {
-    return { ok: false, error: "handoff slug is empty" };
-  }
-  if (slug === "." || slug === "..") {
-    return { ok: false, error: "handoff slug cannot be '.' or '..'" };
-  }
-  if (slug.length > HANDOFF_SLUG_MAX_LEN) {
-    return {
-      ok: false,
-      error: `handoff slug is ${slug.length} chars, over the ${HANDOFF_SLUG_MAX_LEN}-char cap`,
-    };
-  }
-  if (!/^[a-z0-9-]+$/.test(slug)) {
-    return {
-      ok: false,
-      error:
-        "handoff slug must match [a-z0-9-]+ (lowercase letters, digits, hyphens)",
-    };
-  }
-  if (!/[a-z0-9]/.test(slug)) {
-    return {
-      ok: false,
-      error: "handoff slug must contain at least one letter or digit",
-    };
-  }
-  return { ok: true };
+  return validateSlug(slug, "handoff slug");
 }
 
 /**

@@ -181,6 +181,7 @@ function seedTerminalPanel(): string {
   const pdir = mkdtempSync(join(dir, "panel-"));
   const manifest: PanelManifest = {
     dir: pdir,
+    slug: "seed-run",
     members: [
       {
         name: "opus",
@@ -250,12 +251,50 @@ test("agent panel start: a missing/empty config is fail-loud exit 2 (no leg spaw
     "panel",
     "start",
     promptFile,
+    "--slug",
+    "cfg-run",
     "--panel",
     "default",
     "--dir",
     join(dir, "scratch"),
   ]);
   expect(r.code).toBe(2);
+});
+
+test("agent panel start: a missing --slug → exit 2 with a panel-scoped message", async () => {
+  const promptFile = join(dir, "ask.md");
+  writeFileSync(promptFile, "what is the best answer?");
+  // The slug gate fires BEFORE the config load, so this is a distinct slug fault,
+  // never masked by the sandbox's missing config.
+  const r = await runAgent([
+    "panel",
+    "start",
+    promptFile,
+    "--panel",
+    "default",
+    "--dir",
+    join(dir, "scratch-noslug"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("--slug is required");
+});
+
+test("agent panel start: a --slug that slugifies to nothing → exit 2", async () => {
+  const promptFile = join(dir, "ask.md");
+  writeFileSync(promptFile, "what is the best answer?");
+  const r = await runAgent([
+    "panel",
+    "start",
+    promptFile,
+    "--slug",
+    "...",
+    "--panel",
+    "default",
+    "--dir",
+    join(dir, "scratch-emptyslug"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("slugifies to nothing");
 });
 
 test("agent panel: bare sub-verb → exit 2", async () => {
@@ -282,6 +321,8 @@ test("agent panel --help → exit 0", async () => {
 test("top-level USAGE documents `agent panel start|wait`", () => {
   expect(USAGE).toContain("keeper agent panel start");
   expect(USAGE).toContain("keeper agent panel wait");
+  // The now-required --slug rides the start synopsis.
+  expect(USAGE).toContain("--slug");
 });
 
 test("wrapper KEEPER_AGENT_HELP documents the panel sub-verb", () => {
@@ -442,6 +483,7 @@ describe("buildPanelLegArgv (ad-hoc posture)", () => {
         system: "You are a code reviewer.",
         readOnly: true,
       },
+      slug: "adhoc-run",
       yamlPath: "/d/codex.yaml",
       stopTimeoutMs: 900000,
     });
@@ -456,6 +498,8 @@ describe("buildPanelLegArgv (ad-hoc posture)", () => {
     expect(leg[leg.indexOf("--model") + 1]).toBe("gpt-5");
     expect(leg[leg.indexOf("--effort") + 1]).toBe("high");
     expect(leg).toContain("--read-only");
+    // The leg is named panel::<slug>::<member.name>.
+    expect(leg[leg.indexOf("--name") + 1]).toBe("panel::adhoc-run::codex");
   });
 
   test("an ad-hoc member with readOnly=false drops --read-only + omits posture flags", () => {
@@ -464,6 +508,7 @@ describe("buildPanelLegArgv (ad-hoc posture)", () => {
       keeperAgentPath: AD_HOC_KEEPER_AGENT,
       prompt: "explore",
       member: { name: "claude", harness: "claude", readOnly: false },
+      slug: "adhoc-run",
       yamlPath: "/d/claude.yaml",
       stopTimeoutMs: 900000,
     });
@@ -484,6 +529,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     const code = await panelStart(
       {
         promptFile,
+        slug: "adhoc-run",
         panel: undefined,
         adHoc: { preset: "codex-review", readOnly: true },
         dir: pdir,
@@ -503,6 +549,10 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     ]);
     expect(leg[leg.indexOf("--preset") + 1]).toBe("codex-review");
     expect(leg).toContain("--read-only");
+    // The ad-hoc leg is named panel::<slug>::<member.name>.
+    expect(leg[leg.indexOf("--name") + 1]).toBe(
+      "panel::adhoc-run::codex-review",
+    );
     const manifest: PanelManifest = JSON.parse(
       readFileSync(join(pdir, "manifest.json"), "utf8"),
     );
@@ -519,6 +569,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     const code = await panelStart(
       {
         promptFile,
+        slug: "adhoc-run",
         panel: undefined,
         adHoc: {
           cli: "codex",
@@ -562,6 +613,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     const code = await panelStart(
       {
         promptFile,
+        slug: "adhoc-run",
         panel: undefined,
         adHoc: { cli: "claude", system: roleResult.text, readOnly: true },
         dir: pdir,
@@ -573,6 +625,50 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     const leg = legOf(spawns[0] as AdHocSpawn);
     expect(leg[leg.indexOf("--system") + 1]).toBe(roleResult.text);
   });
+
+  test("a configured 2-member panel names each leg panel::<slug>::<its-preset>", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "what is the best answer?");
+    const pdir = join(dir, "fanout");
+    const spawns: AdHocSpawn[] = [];
+    const deps: PanelDeps = {
+      ...makeAdHocDeps().deps,
+      loadRegistry: () => ({
+        catalog: {
+          presets: {
+            "opus-x": mkPreset("claude"),
+            "codex-x": mkPreset("codex"),
+          },
+        },
+        selections: { panels: { duo: ["opus-x", "codex-x"] }, default: null },
+      }),
+      spawn: (argv) => {
+        spawns.push({ argv });
+      },
+    };
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "duo-run",
+        panel: "duo",
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(spawns.length).toBe(2);
+    // Each leg's --name carries ITS OWN preset, not a shared one.
+    const legA = legOf(spawns[0] as AdHocSpawn);
+    const legB = legOf(spawns[1] as AdHocSpawn);
+    expect(legA[legA.indexOf("--name") + 1]).toBe("panel::duo-run::opus-x");
+    expect(legB[legB.indexOf("--name") + 1]).toBe("panel::duo-run::codex-x");
+    // The manifest records the run slug top-level.
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(pdir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.slug).toBe("duo-run");
+  });
 });
 
 test("agent panel start: --panel + --preset together → exit 2 (mutually exclusive)", async () => {
@@ -582,6 +678,8 @@ test("agent panel start: --panel + --preset together → exit 2 (mutually exclus
     "panel",
     "start",
     promptFile,
+    "--slug",
+    "mx-run",
     "--panel",
     "default",
     "--preset",
@@ -603,6 +701,8 @@ for (const flag of ["model", "effort", "role"] as const) {
       "panel",
       "start",
       promptFile,
+      "--slug",
+      "orphan-run",
       "--panel",
       "default",
       `--${flag}`,

@@ -81,14 +81,16 @@ Usage:
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
-  keeper agent panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper agent panel wait --dir <d> [--chunk <s>]
                                     Fan a question to a panel of detached
                                     read-only run legs (members from a configured
                                     --panel <name>), then wait for them token-free.
-                                    start launches + prints a manifest; wait blocks
-                                    one chunk + prints the N-of-N verdict. Exit 0
-                                    all-terminal / 124 chunk-elapsed / 2 bad-config.
+                                    --slug is REQUIRED — each leg launches as
+                                    panel::<slug>::<preset>. start launches + prints
+                                    a manifest; wait blocks one chunk + prints the
+                                    N-of-N verdict. Exit 0 all-terminal / 124
+                                    chunk-elapsed / 2 absent-slug-or-bad-config.
   keeper agent --help                  Show this help.
   keeper agent --version               Show the version.
 
@@ -217,21 +219,23 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         --agent <kind>); same uniform envelope.
 
 Panel fan-out (start | wait):
-  keeper agent panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
   keeper agent panel wait --dir <d> [--chunk <s>]
                                         Fan a question to a panel of models as
                                         detached read-only \`keeper agent run\`
                                         legs, then wait for them token-free.
                                         Members come from a configured --panel
                                         <name> (a panel.yaml panel or a single
-                                        catalog preset). start launches every leg,
-                                        prints {dir, members}, and exits 0
-                                        immediately; wait re-reads the manifest,
-                                        blocks ONE --chunk window, and prints the
-                                        N-of-N verdict. Exit 0 = all legs terminal
-                                        (key off the verdict's 'ok' flag, NOT the
-                                        code), 124 = chunk elapsed (re-issue it),
-                                        2 = missing/corrupt manifest or bad config.
+                                        catalog preset). --slug is REQUIRED — each
+                                        leg launches as panel::<slug>::<preset>.
+                                        start launches every leg, prints {dir, slug,
+                                        members}, and exits 0 immediately; wait
+                                        re-reads the manifest, blocks ONE --chunk
+                                        window, and prints the N-of-N verdict. Exit
+                                        0 = all legs terminal (key off the verdict's
+                                        'ok' flag, NOT the code), 124 = chunk elapsed
+                                        (re-issue it), 2 = an absent/empty --slug, a
+                                        missing/corrupt manifest, or bad config.
 
 tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit):
   0  success                        2  bad args

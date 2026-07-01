@@ -54,6 +54,7 @@ import {
   loadRolePrompt,
 } from "../agent/launch-config";
 import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
+import { slugify } from "../slug";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -111,9 +112,12 @@ export interface PanelManifestMember {
   pidfile: string | null;
 }
 
-/** The `start`-persisted, `wait`-re-read manifest. */
+/** The `start`-persisted, `wait`-re-read manifest. `slug` is the run's
+ *  agent-authored identifier (each leg launches as `panel::<slug>::<preset>`),
+ *  persisted top-level for run correlation. */
 export interface PanelManifest {
   dir: string;
+  slug: string;
   members: PanelManifestMember[];
 }
 
@@ -353,6 +357,9 @@ export function resolveAdHocMember(
  * these, so its argv stays byte-identical. `--read-only` keeps a panelist a
  * non-mutating explorer (default ON — a configured member omits `readOnly`), and
  * `--output` makes the leg write its own uniform JSON result envelope atomically.
+ * An explicit `--name panel::<slug>::<member.name>` labels the leg by which panel
+ * run + which preset it is; the explicit `--name` suppresses `agent run`'s auto
+ * session-name resolution, so this string is exactly what lands in tmux/forensics.
  * Pure.
  */
 export function buildPanelLegArgv(opts: {
@@ -360,6 +367,7 @@ export function buildPanelLegArgv(opts: {
   keeperAgentPath: string;
   prompt: string;
   member: PanelMember;
+  slug: string;
   yamlPath: string;
   stopTimeoutMs: number;
 }): string[] {
@@ -396,6 +404,8 @@ export function buildPanelLegArgv(opts: {
     opts.yamlPath,
     "--stop-timeout-ms",
     String(opts.stopTimeoutMs),
+    "--name",
+    `panel::${opts.slug}::${m.name}`,
   ];
 }
 
@@ -546,6 +556,9 @@ export function parseManifest(
   if (typeof obj.dir !== "string" || obj.dir === "") {
     return { ok: false, error: "manifest.dir missing or not a string" };
   }
+  if (typeof obj.slug !== "string" || obj.slug === "") {
+    return { ok: false, error: "manifest.slug missing or not a string" };
+  }
   if (!Array.isArray(obj.members)) {
     return { ok: false, error: "manifest.members missing or not an array" };
   }
@@ -570,7 +583,7 @@ export function parseManifest(
       pidfile: mm.pidfile,
     });
   }
-  return { ok: true, manifest: { dir: obj.dir, members } };
+  return { ok: true, manifest: { dir: obj.dir, slug: obj.slug, members } };
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +596,7 @@ export function parseManifest(
  *  enforced by the caller). */
 export interface PanelStartArgs {
   promptFile: string;
+  slug: string;
   panel: string | undefined;
   adHoc?: AdHocMemberSpec;
   dir?: string;
@@ -681,6 +695,7 @@ export async function panelStart(
       keeperAgentPath: deps.keeperAgentPath,
       prompt: promptText,
       member,
+      slug: args.slug,
       yamlPath,
       stopTimeoutMs,
     });
@@ -701,7 +716,11 @@ export async function panelStart(
     });
   }
 
-  const manifest: PanelManifest = { dir, members: manifestMembers };
+  const manifest: PanelManifest = {
+    dir,
+    slug: args.slug,
+    members: manifestMembers,
+  };
   writeFileAtomic(
     dir,
     join(dir, "manifest.json"),
@@ -828,17 +847,18 @@ export function buildPanelDeps(): PanelDeps {
 export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait)
 
 Usage:
-  keeper agent panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper agent panel start <prompt-file> (--preset <name> | --cli <claude|codex|pi>)
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
        [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--dir <d>] [--timeout <s>]
   keeper agent panel wait --dir <d> [--chunk <s>]
 
 start  resolves the panel members (a panel.yaml panel or a single catalog
-       preset; a missing/invalid catalog or panel.yaml is fail-loud exit 2),
-       launches each as a DETACHED read-only \`keeper agent run\` leg in the
-       'panels' session, writes <dir>/manifest.json, prints it, and exits 0
-       immediately. Prints {dir, members:[{name,harness,yaml,pidfile}]}. An
-       ad-hoc --preset/--cli builds a 1-member panel (pairing = a panel of one);
+       preset; an absent/empty --slug, or a missing/invalid catalog or panel.yaml,
+       is fail-loud exit 2), launches each as a DETACHED read-only
+       \`keeper agent run\` leg named \`panel::<slug>::<preset>\` in the 'panels'
+       session, writes <dir>/manifest.json, prints it, and exits 0 immediately.
+       Prints {dir, slug, members:[{name,harness,yaml,pidfile}]}. An ad-hoc
+       --preset/--cli builds a 1-member panel (pairing = a panel of one);
        --panel and --preset/--cli are mutually exclusive.
 wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        Exit 0 + verdict JSON {dir, ok, members:[{name,harness,status,yaml,reason}]}
@@ -847,6 +867,8 @@ wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        not all-success — key off the verdict's 'ok' flag.
 
 Options:
+  --slug <slug>     REQUIRED run id; each leg launches as panel::<slug>::<preset>
+                    (slugified to [a-z0-9-]; absent/empties-to-nothing → exit 2)
   --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
   --cli <x>         Ad-hoc single member harness: claude|codex|pi
@@ -885,6 +907,7 @@ export async function runPanel(argv: string[]): Promise<void> {
     const parsed = parseArgs({
       args: argv.slice(1),
       options: {
+        slug: { type: "string" },
         panel: { type: "string" },
         preset: { type: "string" },
         cli: { type: "string" },
@@ -916,6 +939,24 @@ export async function runPanel(argv: string[]): Promise<void> {
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
       process.stderr.write(
         `pair panel start: --timeout must be a positive number (got ${parsed.values.timeout})\n`,
+      );
+      process.exit(2);
+    }
+
+    // --slug is REQUIRED: it names the run, and each leg launches as
+    // `panel::<slug>::<preset>`. Slugify to `[a-z0-9-]`; absent OR a value that
+    // slugifies to nothing (all non-ASCII / punctuation-only) is misuse → exit 2
+    // with a panel-scoped message (never the leaf's raw string).
+    if (parsed.values.slug === undefined) {
+      process.stderr.write(
+        "pair panel start: --slug is required (a human-meaningful run id; each leg launches as panel::<slug>::<preset>)\n",
+      );
+      process.exit(2);
+    }
+    const slug = slugify(parsed.values.slug);
+    if (slug === null) {
+      process.stderr.write(
+        `pair panel start: --slug '${parsed.values.slug}' slugifies to nothing — use [a-z0-9-]\n`,
       );
       process.exit(2);
     }
@@ -974,6 +1015,7 @@ export async function runPanel(argv: string[]): Promise<void> {
     const code = await panelStart(
       {
         promptFile,
+        slug,
         panel: parsed.values.panel,
         adHoc,
         dir: parsed.values.dir,

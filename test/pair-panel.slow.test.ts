@@ -65,6 +65,7 @@ describe.skipIf(!SLOW_ENABLED)("pair panel — real detached spawn", () => {
     proc.unref();
     const manifest: PanelManifest = {
       dir,
+      slug: "slow-run",
       members: [
         { name, harness: "claude", yaml: yamlPath, pidfile: pidfilePath },
       ],

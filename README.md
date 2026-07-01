@@ -26,7 +26,13 @@ folds, so a worker binds to its task regardless of fold order. A
 plan_verb: the `<slug>` is the handoff's human-authored, host-global-unique id,
 matched by its own anchored `[a-z0-9-]+` regex, and binds the `handoffs`
 job→job edge — it MUST NOT populate `(plan_verb, plan_ref)` and never widens
-the `{plan, work, close}` whitelist. Two paired stoppage annotations ride alongside
+the `{plan, work, close}` whitelist. A `panel::<slug>::<preset>` spawn name
+(fn-1041, each detached `keeper agent panel` leg) is a THIRD such class: the
+agent-authored `<slug>` mirrors the same `[a-z0-9-]+` grammar and `<preset>` is
+the member's preset name, but panels are ephemeral (no DB row, no event, no
+deriver) so it matches NEITHER anchored spawn-name regex — it likewise never
+populates `(plan_verb, plan_ref)` nor widens the `{plan, work, close}` whitelist,
+and unlike `handoff::` it binds no job→job edge at all. Two paired stoppage annotations ride alongside
 the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
 v24) marks a stoppage caused by a terminal Claude-API HTTP failure the
 human hasn't picked up since, and `(last_input_request_at,
@@ -1406,7 +1412,10 @@ event-log/reducer/hook touch. Run any of them with
   strict-validated at load to name a defined preset of the matching harness). The
   `panel.yaml` is the panel SELECTIONS — named panels (`panels.<name>`, each an
   ordered list of catalog preset names) plus an optional `default:` naming the
-  panel a bare `keeper agent panel start` assembles.
+  panel a `keeper agent panel start` (absent `--panel`) assembles. `panel start`
+  requires a `--slug <slug>` (slugified `[a-z0-9-]`, absent/empties-to-nothing →
+  exit 2); every leg then launches as `panel::<slug>::<preset>` so each panelist is
+  identifiable in tmux + forensics by which run and which preset it is.
   `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
   `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
   harness comes from the preset — and `keeper agent presets resolve <name>` emits

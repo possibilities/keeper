@@ -210,6 +210,7 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
     keeperAgentPath: KEEPER_AGENT,
     prompt: "what is the best answer?",
     member: { name: "rA", harness: "claude", preset: "rA" },
+    slug: "my-run",
     yamlPath: "/d/rA.yaml",
     stopTimeoutMs: 1_800_000,
   });
@@ -229,6 +230,8 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
     "/d/rA.yaml",
     "--stop-timeout-ms",
     "1800000",
+    "--name",
+    "panel::my-run::rA",
   ]);
 
   // A presetless member keeps its harness as the `<cli>` positional and drops the
@@ -238,6 +241,7 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
     keeperAgentPath: KEEPER_AGENT,
     prompt: "q",
     member: { name: "codex", harness: "codex" },
+    slug: "my-run",
     yamlPath: "/d/codex.yaml",
     stopTimeoutMs: 1_800_000,
   });
@@ -279,7 +283,13 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   };
   const { deps, spawns, stdout } = makeDeps({ catalog, selections });
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 900 },
+    {
+      promptFile: writePrompt(),
+      slug: "my-run",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
     deps,
   );
   expect(code).toBe(0);
@@ -298,6 +308,9 @@ test("start: persists + prints a manifest, launches every leg detached", async (
     expect(leg.slice(0, 4)).toEqual([KEEPER_BIN, KEEPER_AGENT, "agent", "run"]);
     const tIdx = leg.indexOf("--stop-timeout-ms");
     expect(leg[tIdx + 1]).toBe("900000");
+    // Each leg is named panel::<slug>::<member> so the run + preset are visible.
+    const nameIdx = leg.indexOf("--name");
+    expect(leg[nameIdx + 1]).toMatch(/^panel::my-run::(rA|rB)$/);
   }
 
   // Manifest persisted AND printed identically.
@@ -305,6 +318,7 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   const printed: PanelManifest = JSON.parse(stdout().trim());
   expect(printed).toEqual(persisted);
   expect(persisted.dir).toBe(dir);
+  expect(persisted.slug).toBe("my-run");
   expect(persisted.members.map((m) => m.name)).toEqual(["rA", "rB"]);
   expect(persisted.members[0]?.yaml).toBe(join(dir, "rA.yaml"));
   expect(persisted.members[0]?.pidfile).toBe(join(dir, "rA.pidfile"));
@@ -320,7 +334,13 @@ test("start: an absent --panel uses the panel.yaml default, launching each via -
     selections: DEFAULT_SELECTIONS,
   });
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: undefined, dir, timeoutSeconds: 1800 },
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: undefined,
+      dir,
+      timeoutSeconds: 1800,
+    },
     deps,
   );
   expect(code).toBe(0);
@@ -340,7 +360,13 @@ test("start: no --panel and no default panel is fail-loud (exit 2)", async () =>
     selections: { panels: { default: ["opus", "codex"] }, default: null },
   });
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: undefined, dir, timeoutSeconds: 1800 },
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: undefined,
+      dir,
+      timeoutSeconds: 1800,
+    },
     deps,
   );
   expect(code).toBe(2);
@@ -355,7 +381,13 @@ test("start: a per-leg spawn failure records a null pidfile (no crash)", async (
     throwOnSpawn: (argv) => argv.join(" ").includes("--preset codex"),
   });
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 1800,
+    },
     deps,
   );
   expect(code).toBe(0);
@@ -371,7 +403,13 @@ test("start: a ConfigError from the config load exits 2", async () => {
     throw new ConfigError("bad presets.yaml");
   };
   const code = await panelStart(
-    { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 1800,
+    },
     deps,
   );
   expect(code).toBe(2);
@@ -388,7 +426,13 @@ async function startLegacy(): Promise<void> {
     selections: DEFAULT_SELECTIONS,
   });
   await panelStart(
-    { promptFile: writePrompt(), panel: "default", dir, timeoutSeconds: 1800 },
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 1800,
+    },
     deps,
   );
 }
@@ -528,6 +572,7 @@ test("wait: a null-pidfile (launch-failed) leg is a terminal fail", async () => 
   // Hand-write a manifest with a null pidfile (start's spawn-failure record).
   const manifest: PanelManifest = {
     dir,
+    slug: "run-x",
     members: [
       {
         name: "codex",
@@ -571,6 +616,20 @@ test("wait: corrupt manifest → exit 2", async () => {
 });
 
 test("parseManifest: rejects a malformed members entry", () => {
-  const r = parseManifest({ dir: "/d", members: [{ name: "x" }] });
+  const r = parseManifest({
+    dir: "/d",
+    slug: "run-x",
+    members: [{ name: "x" }],
+  });
+  expect(r.ok).toBe(false);
+});
+
+test("parseManifest: rejects a manifest missing a top-level slug", () => {
+  const r = parseManifest({
+    dir: "/d",
+    members: [
+      { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
+    ],
+  });
   expect(r.ok).toBe(false);
 });

@@ -43,6 +43,9 @@ actually burns tokens.
 Your prompt carries:
 - The **task/question** to panel, *verbatim* — the exact text every panelist must receive.
 - Optionally a **panel name** (default: `default`).
+- Optionally a **`Slug:` line** — the run id `keeper agent panel start` requires. If it is absent,
+  self-derive one: a few kebab words from the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`). Never stall
+  on it — `panel start` exits 2 without a slug, so always pass one.
 
 Treat the task as opaque. Do not summarize, reframe, or pre-read referenced content into it — that
 corrupts the independence the panel runs on.
@@ -73,24 +76,26 @@ or your own read of the problem.
 
 `keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
 preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into a freshly minted scratch
-dir, launches every member as a **detached read-only `keeper agent run` leg** (each writes its own uniform
-JSON result envelope via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs
-run on in their own sessions; this call does not block. The config is required — a missing/invalid catalog
-or `panel.yaml`, or an unknown panel name, exits 2 (no fallback); run `keeper agent presets list` to see the
-configured presets + panels.
+dir, launches every member as a **detached read-only `keeper agent run` leg** named
+`panel::<slug>::<preset>` (each writes its own uniform JSON result envelope via `--output`), prints a
+one-line manifest JSON, and exits 0 immediately. The legs run on in their own sessions; this call does not
+block. `--slug` is REQUIRED (each leg's name); the config is required too — an absent/empty `--slug`, a
+missing/invalid catalog or `panel.yaml`, or an unknown panel name exits 2 (no fallback); run `keeper agent
+presets list` to see the configured presets + panels.
 
 ```bash
-MANIFEST=$(keeper agent panel start "$PROMPT" --panel "$PANEL")
+SLUG="<the Slug: line from your prompt, or a kebab slug you derive from the task>"
+MANIFEST=$(keeper agent panel start "$PROMPT" --slug "$SLUG" --panel "$PANEL")
 START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
 
-- **`START_RC == 0`** — `MANIFEST` is `{"dir":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
+- **`START_RC == 0`** — `MANIFEST` is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
   Capture `DIR`; it is the handle every `wait` call re-reads.
-- **`START_RC != 0`** (exit 2 — a misconfigured/unknown panel: a missing or invalid catalog / `panel.yaml`,
-  an unknown panel name, zero resolved members, an undefined preset, a non-pairable harness, or an
-  unreadable prompt) — emit the `PANEL_RUN_FAILED` marker (Step 4) with the command's stderr as the reason
-  and stop. No legs fanned out.
+- **`START_RC != 0`** (exit 2 — an absent/empty `--slug`, or a misconfigured/unknown panel: a missing or
+  invalid catalog / `panel.yaml`, an unknown panel name, zero resolved members, an undefined preset, a
+  non-pairable harness, or an unreadable prompt) — emit the `PANEL_RUN_FAILED` marker (Step 4) with the
+  command's stderr as the reason and stop. No legs fanned out.
 
 ## Step 3 — Wait token-free (re-issue loop)
 

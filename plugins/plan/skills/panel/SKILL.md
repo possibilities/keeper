@@ -33,7 +33,10 @@ yourself.
 
 Pass the human's task **verbatim** — never summarize, reframe, or pre-read referenced content into it; that
 corrupts the independence the panel runs on. If the human named a specific panel, name it; otherwise the
-runner defaults to the `default` panel.
+runner defaults to the `default` panel. Also **auto-derive a short run slug** — a few kebab words drawn from
+the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`); pick a sensible default, don't stall or ask. Inject it
+as a `Slug:` line so the runner forwards it (each panelist leg launches as `panel::<slug>::<preset>`, keeping
+the run identifiable in tmux + forensics).
 
 ```
 Task(
@@ -41,6 +44,7 @@ Task(
     description="convene panel",
     prompt="""<the human's task, VERBATIM — do not summarize, reframe, or pre-digest it>
 
+Slug: <a short kebab run id you derive from the task, e.g. oauth-token-refresh>
 Panel: <the panel name the human named, or omit this line for the default panel>"""
 )
 ```
