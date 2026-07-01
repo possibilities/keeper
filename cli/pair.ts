@@ -89,7 +89,6 @@ import {
   parseGitPorcelain,
   resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
-  stripClaudeEnv,
 } from "../src/pair-command";
 
 const HELP = `keeper pair — fan a task out to another model CLI via keeper agent
@@ -134,9 +133,9 @@ const DEFAULT_TIMEOUT_SECONDS = 1800;
 /**
  * The process-level seams the in-process compose drives, injected so a test can
  * force a tmux launch failure (a canned `runTmuxCommand`) or canned wait/show
- * outcomes without a real subprocess/tmux. The partner env (CLAUDE-stripped per
- * CLI) is derived inside `main` — it depends on the resolved partner CLI — so it
- * is NOT a seam here.
+ * outcomes without a real subprocess/tmux. The partner launch env (CLAUDE-stripped
+ * per CLI) and the codex directory-trust seed are owned by the shared launch
+ * helper (`launchToResolvedHandle`), not derived here.
  */
 export interface PairSendSeams {
   cwd: string;
@@ -412,36 +411,12 @@ export async function main(
   });
   startedEmitted = true;
 
-  // Partner env. The CLAUDE path launches as an INTERACTIVE TUI bound into the
-  // `jobs` projection (the `KEEPER_TMUX_SESSION` carrier in the launch argv): it
-  // KEEPS the inherited env so keeper agent's own `--session-id` pin — not an env
-  // scrub — is what keeps the partner transcript distinct from the driver's; the
-  // self-collision guard below still backstops the resolver. codex fires no
-  // keeper hooks and stays headless, so it keeps the CLAUDE* env strip that
-  // prevents the orchestrator's identity from leaking into the partner pane.
-  const env =
-    pairCli === "claude"
-      ? (Object.fromEntries(
-          Object.entries(process.env).filter(([, val]) => val !== undefined),
-        ) as Record<string, string>)
-      : stripClaudeEnv(process.env as Record<string, string | undefined>);
-
   // Read-only backstop: snapshot the tree in the partner's cwd BEFORE the
   // partner can run (i.e. before the launch), so a write the partner makes
   // during its detached turn shows up against this baseline. `after` is taken
   // once the partner has stopped; the diff is the changed-files set. Detection,
   // not prevention — the directive + tool strip are the guards (see module doc).
   const beforeSnapshot = readOnly ? gitSnapshot(cwd) : null;
-
-  // codex launches as an interactive TUI, which would hang on codex's
-  // "Do you trust the contents of this directory?" prompt in a never-trusted cwd.
-  // Pre-seed the cwd's per-directory trust into codex's own config dir. Fail-open
-  // by contract (never throws, never blocks): if it can't seed, codex merely
-  // re-prompts and the wait-for-stop timeout reaps the window — never worse than
-  // the headless past. claude fires no trust prompt, so this is codex-only.
-  if (pairCli === "codex") {
-    ensureCodexDirTrust({ cwd, env: process.env });
-  }
 
   // ---- launch → wait-for-stop → show-last-message, IN-PROCESS ----
   // The launch + capture run in ONE process on a pinned `ResolvedHandle` held
@@ -465,14 +440,19 @@ export async function main(
     session: sessionName,
     preset: presetName,
   };
+  // The shared helper owns the launch-env posture: claude keeps the full env
+  // (its `--session-id` pin keeps the partner transcript distinct), codex/pi get
+  // `CLAUDE*` stripped. It also fires the codex directory-trust seed before the
+  // launch (fail-open). Pass the RAW env; the helper scrubs per agent.
   const launchDeps: LaunchHandleDeps = {
-    env,
+    env: process.env,
     cwd,
     tmuxBin: seams.tmuxBin,
     launcherStateDir: seams.launcherStateDir,
     launcherArgvPrefix,
     randomUuid: seams.randomUuid,
     runTmuxCommand: seams.runTmuxCommand,
+    ensureCodexDirTrust,
     now: seams.now,
     writeErr: (s) => {
       process.stderr.write(s);
@@ -495,7 +475,10 @@ export async function main(
           stopTimeoutMs,
         }),
     },
-    { env, homeDir: seams.homeDir },
+    // Transcript resolution reads only homeDir + CODEX_HOME/PI_CODING_AGENT_DIR
+    // (never `CLAUDE*`), so the raw env is byte-neutral here — no launch-env
+    // scrub is needed for resolution.
+    { env: process.env, homeDir: seams.homeDir },
     pairCli,
   );
 

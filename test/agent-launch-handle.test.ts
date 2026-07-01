@@ -17,10 +17,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type LaunchHandleDeps,
+  launchEnvForAgent,
   launchToResolvedHandle,
   tmuxTranscriptSessionId,
 } from "../src/agent/launch-handle";
 import type { TmuxCommandResult } from "../src/agent/tmux-launch";
+import type { EnsureCodexDirTrustOptions } from "../src/codex-trust";
 
 const SESSION_ID = "11111111-1111-1111-1111-111111111111";
 
@@ -28,20 +30,28 @@ function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "agent-launch-handle-test-"));
 }
 
-/** A launch-handle deps bound to an injected tmux runner + a recording stderr. */
+/** A launch-handle deps bound to an injected tmux runner + a recording stderr.
+ *  The codex-trust seam is STUBBED (recording into `opts.trustCalls`) so no real
+ *  `~/.codex` write ever fires. */
 function deps(opts: {
   tmuxCommand: (cmd: string[]) => TmuxCommandResult;
   errs: string[];
   now?: number;
+  env?: NodeJS.ProcessEnv;
+  trustCalls?: EnsureCodexDirTrustOptions[];
 }): LaunchHandleDeps {
   return {
-    env: {},
+    env: opts.env ?? {},
     cwd: "/work/proj",
     tmuxBin: "/usr/bin/tmux",
     launcherStateDir: tempDir(),
     launcherArgvPrefix: ["/bun", "/cli/keeper.ts", "agent"],
     randomUuid: () => SESSION_ID,
     runTmuxCommand: (cmd) => opts.tmuxCommand(cmd),
+    ensureCodexDirTrust: (o) => {
+      opts.trustCalls?.push(o);
+      return "seeded";
+    },
     now: () => opts.now ?? 0,
     writeErr: (s) => opts.errs.push(s),
   };
@@ -132,4 +142,65 @@ describe("launchToResolvedHandle", () => {
     expect(errs.join("")).toContain("Error: ");
     expect(errs.join("")).toContain("failed to create tmux window");
   });
+
+  test("codex launch fires the codex-trust seam once with cwd + raw env", () => {
+    const errs: string[] = [];
+    const trustCalls: EnsureCodexDirTrustOptions[] = [];
+    const result = launchToResolvedHandle({
+      deps: deps({
+        tmuxCommand: tmuxRunner(0),
+        errs,
+        env: { CODEX_HOME: "/x/.codex", CLAUDE_CODE_X: "leak" },
+        trustCalls,
+      }),
+      agent: "codex",
+      prompt: "explore",
+      posture: { readOnly: false },
+      stopTimeoutMs: null,
+    });
+    expect(result.ok).toBe(true);
+    expect(trustCalls.length).toBe(1);
+    expect(trustCalls[0]?.cwd).toBe("/work/proj");
+    // The seam sees the RAW env (codex reads CODEX_HOME off it) — NOT scrubbed.
+    expect(trustCalls[0]?.env.CODEX_HOME).toBe("/x/.codex");
+    expect(trustCalls[0]?.env.CLAUDE_CODE_X).toBe("leak");
+  });
+
+  for (const agent of ["claude", "pi"] as const) {
+    test(`${agent} launch never fires the codex-trust seam`, () => {
+      const errs: string[] = [];
+      const trustCalls: EnsureCodexDirTrustOptions[] = [];
+      launchToResolvedHandle({
+        deps: deps({ tmuxCommand: tmuxRunner(0), errs, trustCalls }),
+        agent,
+        prompt: "hi",
+        posture: { readOnly: false },
+        stopTimeoutMs: null,
+      });
+      expect(trustCalls.length).toBe(0);
+    });
+  }
+});
+
+describe("launchEnvForAgent — agent-conditional CLAUDE* scrub", () => {
+  const env = {
+    PATH: "/usr/bin",
+    CODEX_HOME: "/x/.codex",
+    CLAUDE_CODE_X: "secret",
+    CLAUDECONFIG: "leak",
+  };
+
+  test("claude keeps the full inherited env (no scrub)", () => {
+    expect(launchEnvForAgent("claude", env)).toBe(env);
+  });
+
+  for (const agent of ["codex", "pi"] as const) {
+    test(`${agent} strips every CLAUDE-prefixed key, keeps the rest`, () => {
+      const out = launchEnvForAgent(agent, env);
+      expect(out.CLAUDE_CODE_X).toBeUndefined();
+      expect(out.CLAUDECONFIG).toBeUndefined();
+      expect(out.PATH).toBe("/usr/bin");
+      expect(out.CODEX_HOME).toBe("/x/.codex");
+    });
+  }
 });

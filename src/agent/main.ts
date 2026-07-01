@@ -15,10 +15,12 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, join } from "node:path";
+import { ensureCodexDirTrust } from "../codex-trust";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
+import { READ_ONLY_DIRECTIVE } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
@@ -681,6 +683,7 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     launcherArgvPrefix: deps.launcherArgvPrefix,
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
+    ensureCodexDirTrust,
     now: deps.now,
     writeErr: deps.writeErr,
   };
@@ -736,6 +739,15 @@ async function runRunCaptureSubcommand(
   }
   const agent = parsed.cli;
   const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  // Read-only prepends the directive CALLER-SIDE (raw `\n\n` join, no `User:`
+  // scaffold — `agent run` has no role framing, unlike pair's `assemblePrompt`).
+  // The shared helper stays directive-free so pair never double-prepends; the
+  // per-harness tool strip rides via `posture.readOnly`. Detection, not
+  // prevention (the strip is leaky; there is no changed-files audit on this
+  // caller — that stays pair-side).
+  const prompt = parsed.readOnly
+    ? `${READ_ONLY_DIRECTIVE}\n\n${parsed.prompt}`
+    : parsed.prompt;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
@@ -743,8 +755,8 @@ async function runRunCaptureSubcommand(
         launchToResolvedHandle({
           deps: launchHandleDeps(deps),
           agent,
-          prompt: parsed.prompt,
-          posture: { readOnly: false },
+          prompt,
+          posture: { readOnly: parsed.readOnly },
           stopTimeoutMs: parsed.stopTimeoutMs,
         }),
     },

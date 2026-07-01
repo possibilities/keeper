@@ -15,7 +15,11 @@
  * (pinned by the `agent-launch-handle-depgraph` hygiene test).
  */
 
-import { buildPairLaunchArgv } from "../pair-command";
+import type {
+  CodexTrustStatus,
+  EnsureCodexDirTrustOptions,
+} from "../codex-trust";
+import { buildPairLaunchArgv, stripClaudeEnv } from "../pair-command";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
 import type { ResolvedHandle } from "./pair-subcommands";
@@ -94,9 +98,34 @@ export interface LaunchHandleDeps {
   launcherArgvPrefix: string[];
   randomUuid: () => string;
   runTmuxCommand: TmuxCommandRunner;
+  /**
+   * Seed codex per-directory trust for the launch cwd (codex-only, fired before
+   * the launch) so a detached interactive codex window never hangs on codex's
+   * directory-trust prompt. Injected as a seam — not a direct import — so this
+   * module keeps its "every effect via LaunchHandleDeps" DI contract and tests
+   * stub it (no real `~/.codex` write). Fail-open by contract (never throws).
+   */
+  ensureCodexDirTrust: (opts: EnsureCodexDirTrustOptions) => CodexTrustStatus;
   /** Wall clock (ms), sampled as the handle's `startedAtMs`. */
   now: () => number;
   writeErr: (s: string) => void;
+}
+
+/**
+ * The env the detached partner pane launches with. claude keeps the full
+ * inherited env (its `--session-id` pin, not a scrub, keeps the partner
+ * transcript distinct); codex/pi get `CLAUDE*` stripped so the orchestrator's
+ * identity never leaks into the headless partner. An agent-conditional DEFAULT,
+ * never a user flag — it is identity-isolation, not credential-security. Pure —
+ * exported for the byte-pin tests.
+ */
+export function launchEnvForAgent(
+  agent: AgentKind,
+  env: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return agent === "claude"
+    ? env
+    : stripClaudeEnv(env as Record<string, string | undefined>);
 }
 
 /** Inputs to {@link launchToResolvedHandle}. */
@@ -146,12 +175,19 @@ export function launchToResolvedHandle(
     tmuxLaunch.remainingArgs,
     deps.randomUuid,
   );
+  // Seed codex trust before the launch (codex-only; keyed on agent, not session
+  // id). Fail-open by contract — the seam never throws, so an unseedable trust
+  // merely lets codex re-prompt (reaped by the stop-wait timeout), never worse
+  // than the headless past. Uses the RAW env (codex reads CODEX_HOME off it).
+  if (agent === "codex") {
+    deps.ensureCodexDirTrust({ cwd: deps.cwd, env: deps.env });
+  }
   try {
     const result = launchKeeperAgentInTmux({
       agent,
       innerArgs: tmuxLaunch.remainingArgs,
       options: tmuxLaunch.options,
-      env: deps.env,
+      env: launchEnvForAgent(agent, deps.env),
       cwd: deps.cwd,
       transcriptSessionId,
       startedAtMs,

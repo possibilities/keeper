@@ -158,12 +158,13 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
 });
 
 describe("parseRunArgs", () => {
-  test("<cli> <prompt> parses, stop-timeout absent → null", () => {
+  test("<cli> <prompt> parses, stop-timeout absent → null, read-only false", () => {
     expect(parseRunArgs(["claude", "say hi"])).toEqual({
       ok: true,
       cli: "claude",
       prompt: "say hi",
       stopTimeoutMs: null,
+      readOnly: false,
     });
   });
 
@@ -175,13 +176,51 @@ describe("parseRunArgs", () => {
       cli: "codex",
       prompt: "p",
       stopTimeoutMs: 1_800_000,
+      readOnly: false,
     });
     expect(parseRunArgs(["pi", "p", "--stop-timeout-ms=1500"])).toEqual({
       ok: true,
       cli: "pi",
       prompt: "p",
       stopTimeoutMs: 1500,
+      readOnly: false,
     });
+  });
+
+  test("--read-only sets readOnly true (exact-match, any position)", () => {
+    expect(parseRunArgs(["claude", "explore", "--read-only"])).toEqual({
+      ok: true,
+      cli: "claude",
+      prompt: "explore",
+      stopTimeoutMs: null,
+      readOnly: true,
+    });
+    // Exact-match: it is accepted before a positional, not swallowed as one.
+    expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual({
+      ok: true,
+      cli: "codex",
+      prompt: "explore",
+      stopTimeoutMs: null,
+      readOnly: true,
+    });
+    // Composes with --stop-timeout-ms.
+    expect(
+      parseRunArgs(["pi", "p", "--read-only", "--stop-timeout-ms", "1500"]),
+    ).toEqual({
+      ok: true,
+      cli: "pi",
+      prompt: "p",
+      stopTimeoutMs: 1500,
+      readOnly: true,
+    });
+  });
+
+  test("a --read-only lookalike is still an unknown flag (exact-match only)", () => {
+    const res = parseRunArgs(["claude", "p", "--read-onlyx"]);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toContain("unknown flag");
+    }
   });
 
   test.each([
