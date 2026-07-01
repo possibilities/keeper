@@ -86,6 +86,12 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     monitors: null,
     window_index: null,
     worktree: null,
+    current_model_id: null,
+    current_model_display: null,
+    current_effort: null,
+    context_used_percentage: null,
+    context_input_tokens: null,
+    context_window_size: null,
     ...overrides,
   };
 }

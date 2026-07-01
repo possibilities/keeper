@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 99;
+export const SCHEMA_VERSION = 100;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5464,6 +5464,28 @@ function migrate(db: Database): void {
       // This bump MUST add 99 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the
       // SAME commit (keeper-py never reads `lane_merged`, but the whitelist is a hard
       // membership set); test/schema-version.test.ts enforces it.
+
+      // v99→v100 (fn-1024.1): add the six nullable per-session telemetry columns
+      // to `jobs` — the CURRENT model / reasoning effort / context-window usage
+      // projected from the Claude Code statusLine payload (folded onto the row by
+      // a later `SessionTelemetry` synthetic-event arm). All nullable, NO default:
+      // a `DEFAULT` would poison the NULL=absent invariant the display render
+      // reads and break re-fold byte-identity. APPEND-via-ALTER keeps existing
+      // rows NULL (the zero-event shape) and is re-fold-safe: a pre-v100 stream
+      // carries no `SessionTelemetry` event, so a from-scratch re-fold leaves the
+      // columns NULL byte-identically. Kept OUT of the `CREATE_JOBS` literal (the
+      // :834 rule) so fresh-vs-migrated `PRAGMA table_info(jobs)` stays
+      // byte-identical. NO cursor rewind — do NOT add to the rewind-and-redrain
+      // DELETE list (mirrors the prior display-column adds). Whitelist-only Python
+      // read (keeper-py never reads these columns) — this bump MUST add 100 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "jobs", "current_model_id", "TEXT");
+      addColumnIfMissing(db, "jobs", "current_model_display", "TEXT");
+      addColumnIfMissing(db, "jobs", "current_effort", "TEXT");
+      addColumnIfMissing(db, "jobs", "context_used_percentage", "REAL");
+      addColumnIfMissing(db, "jobs", "context_input_tokens", "INTEGER");
+      addColumnIfMissing(db, "jobs", "context_window_size", "INTEGER");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

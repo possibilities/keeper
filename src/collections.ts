@@ -141,6 +141,16 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // Display-only — the renderer's `worktreeLaneSeg` lifts it into a `[⑂ …]`
     // pill; never a `sortable` / `filters` / `jsonColumns` key.
     "worktree",
+    // Per-session telemetry projected from the Claude Code statusLine payload
+    // (schema v100 / fn-1024), folded latest-wins from `SessionTelemetry`. The
+    // CURRENT model / reasoning effort / context-window usage of a live session.
+    // Display-only — never a `sortable` / `filters` / `jsonColumns` key.
+    "current_model_id",
+    "current_model_display",
+    "current_effort",
+    "context_used_percentage",
+    "context_input_tokens",
+    "context_window_size",
   ],
   pk: "job_id",
   version: "last_event_id",

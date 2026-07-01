@@ -517,6 +517,43 @@ export interface Job {
    * when no window position is known.
    */
   window_index: number | null;
+  /**
+   * The session's CURRENT Claude Code model id (e.g. `claude-opus-4-8`),
+   * projected from the statusLine payload and folded latest-wins by the
+   * `SessionTelemetry` arm (schema v100 / fn-1024). Display-only; NULL until the
+   * first statusLine snapshot lands. Paired with {@link current_model_display}.
+   */
+  current_model_id: string | null;
+  /**
+   * The session's CURRENT model display name (e.g. `Opus`), from the statusLine
+   * payload. Display-only; NULL until the first snapshot. Paired with
+   * {@link current_model_id}.
+   */
+  current_model_display: string | null;
+  /**
+   * The session's CURRENT reasoning-effort level (`low`/`medium`/`high`/`xhigh`/
+   * `max`), from the statusLine payload's `effort.level`. Display-only; NULL when
+   * the payload omits effort or no snapshot has landed.
+   */
+  current_effort: string | null;
+  /**
+   * The session's CURRENT context-window fill, taken directly from the
+   * statusLine payload's `context_window.used_percentage` (never recomputed).
+   * Display-only; NULL until the first snapshot.
+   */
+  context_used_percentage: number | null;
+  /**
+   * The session's CURRENT context-window input-token count
+   * (`context_window.total_input_tokens`). Display-only; NULL until the first
+   * snapshot.
+   */
+  context_input_tokens: number | null;
+  /**
+   * The session's CURRENT context-window size in tokens
+   * (`context_window.context_window_size`). Display-only; NULL until the first
+   * snapshot.
+   */
+  context_window_size: number | null;
 }
 
 /**

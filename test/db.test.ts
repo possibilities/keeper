@@ -214,6 +214,106 @@ test("openDb adds the jobs.handoff_links column defaulting '[]' (fn-946 task .2)
   db.close();
 });
 
+test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-1024 task .1)", () => {
+  // The v99→v100 step (`addColumnIfMissing(jobs, current_model_id / …)`) plumbs
+  // the CURRENT model / effort / context-window usage from the statusLine
+  // payload. All nullable, NO default — a `DEFAULT` would poison the NULL=absent
+  // invariant the render reads and break re-fold byte-identity.
+  const telemetryCols = [
+    { name: "current_model_id", type: "TEXT" },
+    { name: "current_model_display", type: "TEXT" },
+    { name: "current_effort", type: "TEXT" },
+    { name: "context_used_percentage", type: "REAL" },
+    { name: "context_input_tokens", type: "INTEGER" },
+    { name: "context_window_size", type: "INTEGER" },
+  ];
+  const { db } = openDb(":memory:");
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  for (const { name, type } of telemetryCols) {
+    const col = cols.find((c) => c.name === name);
+    expect(col).toBeDefined();
+    expect(col?.type).toBe(type);
+    // Nullable, NO default (re-fold byte-identity + NULL=absent invariant).
+    expect(col?.notnull).toBe(0);
+    expect(col?.dflt_value).toBeNull();
+  }
+  // A bare-inserted row reads NULL for all six (the zero-event shape).
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('jt', 1, 0, 1)",
+  ).run();
+  const r = db
+    .prepare(
+      "SELECT current_model_id, current_model_display, current_effort, context_used_percentage, context_input_tokens, context_window_size FROM jobs WHERE job_id = 'jt'",
+    )
+    .get() as Record<string, unknown>;
+  for (const { name } of telemetryCols) {
+    expect(r[name]).toBeNull();
+  }
+  db.close();
+});
+
+test("the v100 telemetry columns are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1)", () => {
+  // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
+  // `addColumnIfMissing` calls in `migrate()`, so the six columns land as the
+  // trailing six of `table_info(jobs)`, in the same order, on both the fresh
+  // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
+  // re-fold determinism charter depends on.
+  const expectedTail = [
+    "current_model_id",
+    "current_model_display",
+    "current_effort",
+    "context_used_percentage",
+    "context_input_tokens",
+    "context_window_size",
+  ];
+  const tailOf = (database: Database): string[] => {
+    const names = (
+      database.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]
+    ).map((c) => c.name);
+    return names.slice(-expectedTail.length);
+  };
+
+  const { db: fresh } = openDb(":memory:");
+  expect(tailOf(fresh)).toEqual(expectedTail);
+  fresh.close();
+
+  // Build a minimal pre-telemetry jobs DB stamped at an old version; migrate()
+  // appends every missing column idempotently, ending with the v100 six.
+  const old = new Database(dbPath, { create: true });
+  old.run(`
+    CREATE TABLE jobs (
+      job_id TEXT PRIMARY KEY,
+      created_at REAL NOT NULL,
+      cwd TEXT,
+      pid INTEGER,
+      state TEXT NOT NULL DEFAULT 'stopped',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL,
+      title TEXT,
+      title_source TEXT
+    )
+  `);
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '4')");
+  old.close();
+
+  const { db: migrated } = openDb(dbPath);
+  expect(
+    (
+      migrated
+        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value: string }
+    ).value,
+  ).toBe(String(SCHEMA_VERSION));
+  expect(tailOf(migrated)).toEqual(expectedTail);
+  migrated.close();
+});
+
 test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
   // The schema default matches the zero-event projection: a fresh DB with no
   // `HandoffRequested` events drains to an empty `handoffs` table. (Folds land
@@ -2443,9 +2543,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // merge-escalation sweep (an additive ALTER, not an epics-shape change),
   // fn-1009 task .1. v99 adds the `lane_merged` LIVE-ONLY merge-landed observable
   // (a CREATE-only table registered in LIVE_ONLY_PROJECTIONS, not an epics-shape
-  // change), fn-1016 task .1. The v62→v63 epics-shape migration this test exercises
-  // is unchanged.
-  expect(SCHEMA_VERSION).toBe(99);
+  // change), fn-1016 task .1. v100 appends the six nullable per-session telemetry
+  // columns to `jobs` (current model / effort / context-window usage from the
+  // statusLine payload — an additive ALTER, not an epics-shape change), fn-1024
+  // task .1. The v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(100);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

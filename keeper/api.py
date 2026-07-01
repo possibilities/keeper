@@ -389,6 +389,9 @@ from pathlib import Path
 # v98 (fn-1009 task .1) adds the nullable ``dispatch_failures.merge_escalated_at``
 # once-marker for the daemon merge-escalation sweep; keeper-py never reads
 # ``dispatch_failures``, so only the version whitelist gains 98.
+# v100 (fn-1024 task .1) adds the six nullable per-session telemetry columns to
+# ``jobs`` (current model / effort / context-window usage from the statusLine
+# payload); keeper-py never reads them, so only the version whitelist gains 100.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -460,6 +463,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         97,
         98,
         99,
+        100,
     }
 )
 
