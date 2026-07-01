@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-01T01:13:06.974000Z",
+  "depends_on": [
+    "fn-1024-session-telemetry-on-jobs-board.1"
+  ],
+  "epic": "fn-1024-session-telemetry-on-jobs-board",
+  "id": "fn-1024-session-telemetry-on-jobs-board.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "SessionTelemetry event and jobs fold",
+  "updated_at": "2026-07-01T01:13:06.974000Z"
+}
