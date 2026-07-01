@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-01T00:44:42.796000Z",
   "created_at": "2026-07-01T00:24:51.192000Z",
   "depends_on_epics": [],
   "id": "fn-1022-agent-run-read-only-and-trust-posture",
   "last_validated_at": "2026-07-01T00:24:51.244000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Agent run read-only and trust posture",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T00:24:51.192000Z"
+  "updated_at": "2026-07-01T00:44:42.796000Z"
 }
