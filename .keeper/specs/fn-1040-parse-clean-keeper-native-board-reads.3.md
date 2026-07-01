@@ -48,5 +48,5 @@ single-JSON + truncation contract.
 - [ ] `keeper plan --help` signposts the orient surfaces and "don't hand-parse read verbs".
 
 ## Done summary
-
+Added board-orient guardrail to root CLAUDE.md and plan --help pointing agents at keeper status / keeper query epics; documented the single-JSON read contract, truncation envelope, and merged-invocation validate --epic in plugins/plan README + CLAUDE.md.
 ## Evidence
