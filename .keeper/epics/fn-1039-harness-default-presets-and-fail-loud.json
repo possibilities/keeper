@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-01T17:12:12.336000Z",
   "created_at": "2026-07-01T14:31:36.551000Z",
   "depends_on_epics": [
     "fn-1038-per-cell-work-plugins-at-launch"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-01T14:31:52.269000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Harness-default presets and fail-loud resolution",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T14:31:52.249000Z"
+  "updated_at": "2026-07-01T17:12:12.336000Z"
 }
