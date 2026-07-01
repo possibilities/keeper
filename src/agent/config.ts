@@ -1,20 +1,19 @@
 /**
- * Launcher config adapters — the dep-free island that reads both the
- * `~/.config/keeper/{claude,codex,pi,plugins}.yaml` launcher defaults and the
- * `~/.config/keeper/{presets.yaml,panel.yaml}` agent launch-config. YAML parsing
- * is isolated behind one adapter (`parseYaml`) so a js-yaml swap stays a one-line
- * change. Bun.YAML targets YAML 1.2 (no `yes/no/on/off` booleans); the config
- * corpus is boolean-free.
+ * Launcher config adapters — the dep-free island that reads the
+ * `~/.config/keeper/{presets.yaml,panel.yaml,plugins.yaml}` agent launch-config.
+ * YAML parsing is isolated behind one adapter (`parseYaml`) so a js-yaml swap
+ * stays a one-line change. Bun.YAML targets YAML 1.2 (no `yes/no/on/off`
+ * booleans); the config corpus is boolean-free.
  *
- * `claude.yaml` and `codex.yaml` supply `model`/`effort` startup defaults;
- * `pi.yaml` supplies Pi's `model`/`thinking` startup defaults (fail-open: a
- * missing key or file sends no override). `plugins.yaml` supplies the Claude
- * plugin sources (fail-loud on a missing file). The preset catalog
- * (`presets.yaml`) and panel selections (`panel.yaml`) under `~/.config/keeper/`
- * are REQUIRED + validated: any preset referenced by name and every panel op
- * fail-loud (`ConfigError`) on a missing or invalid file — the autopilot worker
- * is the sole fail-open consumer (it catches the throw and coalesces to its
- * constants). Each reader documents its own absence semantics below.
+ * `plugins.yaml` supplies the Claude plugin sources (fail-loud on a missing
+ * file). The preset catalog (`presets.yaml`) is the SINGLE source of a launch's
+ * model/effort/thinking: it holds the named presets plus the top-level
+ * `claude_default`/`codex_default`/`pi_default` pointers naming the preset a bare
+ * `keeper agent <harness>` launch resolves. The panel selections (`panel.yaml`)
+ * name ordered panels over those presets. All are REQUIRED + validated: a preset
+ * referenced by name, a dangling `<harness>_default`, and every panel op fail-loud
+ * (`ConfigError`) on a missing or invalid file — the autopilot worker is the sole
+ * fail-open consumer (it catches the throw and coalesces to its constants).
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -57,18 +56,6 @@ export function expandUser(p: string): string {
   return p;
 }
 
-export function launcherConfigPath(): string {
-  return join(keeperConfigDir(), "claude.yaml");
-}
-
-export function codexConfigPath(): string {
-  return join(keeperConfigDir(), "codex.yaml");
-}
-
-export function piLauncherConfigPath(): string {
-  return join(keeperConfigDir(), "pi.yaml");
-}
-
 export function pluginConfigPath(): string {
   return join(keeperConfigDir(), "plugins.yaml");
 }
@@ -98,16 +85,6 @@ export function panelConfigPath(): string {
   return join(keeperConfigDir(), "panel.yaml");
 }
 
-export interface LauncherDefaults {
-  model: string | null;
-  effort: string | null;
-}
-
-export interface PiLauncherDefaults {
-  model: string | null;
-  thinking: string | null;
-}
-
 function readMapping(configPath: string): Record<string, unknown> {
   const text = readFileSync(configPath, "utf8");
   const raw = parseYaml(text);
@@ -118,66 +95,6 @@ function readMapping(configPath: string): Record<string, unknown> {
     throw new ConfigError(`Expected a mapping in ${configPath}`);
   }
   return raw;
-}
-
-/**
- * Return `(model, effort)` for the startup CLI overrides. Fail-open on absence:
- * a missing config file or unset key yields null for that field (Claude then
- * uses its own settings). A key that IS present must be a non-empty string; a
- * malformed value is fail-loud (ConfigError).
- */
-export function loadLauncherDefaults(
-  configPath: string = launcherConfigPath(),
-): LauncherDefaults {
-  if (!isFile(configPath)) {
-    return { model: null, effort: null };
-  }
-  const raw = readMapping(configPath);
-
-  const value = (key: string): string | null => {
-    const v = raw[key];
-    if (v === null || v === undefined) {
-      return null;
-    }
-    if (typeof v !== "string" || !v.trim()) {
-      throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${configPath}`,
-      );
-    }
-    return v.trim();
-  };
-
-  return { model: value("model"), effort: value("effort") };
-}
-
-/**
- * Return `(model, thinking)` for Pi startup CLI overrides. Fail-open on absence:
- * a missing config file or unset key yields null for that field (Pi then uses
- * its own settings). A key that IS present must be a non-empty string; a
- * malformed value is fail-loud (ConfigError).
- */
-export function loadPiLauncherDefaults(
-  configPath: string = piLauncherConfigPath(),
-): PiLauncherDefaults {
-  if (!isFile(configPath)) {
-    return { model: null, thinking: null };
-  }
-  const raw = readMapping(configPath);
-
-  const value = (key: string): string | null => {
-    const v = raw[key];
-    if (v === null || v === undefined) {
-      return null;
-    }
-    if (typeof v !== "string" || !v.trim()) {
-      throw new ConfigError(
-        `Expected ${key} to be a non-empty string in ${configPath}`,
-      );
-    }
-    return v.trim();
-  };
-
-  return { model: value("model"), thinking: value("thinking") };
 }
 
 export interface PluginSources {
@@ -234,9 +151,10 @@ export type PresetHarness = "claude" | "codex" | "pi";
 
 /**
  * A named launch-config triple. `model`/`effort`/`thinking` are partial: a
- * preset that omits a field layers OVER the per-harness yaml rather than
- * replacing it. `effort` is claude/codex-only, `thinking` is pi-only (never
- * both). `role` is an optional pair-only label carried verbatim.
+ * preset that omits a field sends no override for it (the fresh-launch fail-loud
+ * gate then rejects the launch unless a flag supplies it). `effort` is
+ * claude/codex-only, `thinking` is pi-only (never both). `role` is an optional
+ * pair-only label carried verbatim.
  */
 export interface Preset {
   harness: PresetHarness;
@@ -248,12 +166,21 @@ export interface Preset {
 
 /**
  * The catalog of available presets, parsed from `presets.yaml`: the full set of
- * named `{harness, model?, effort?, thinking?, role?}` triples a launch may pin.
- * Read ONLY by this dep-free config island — the launcher import graph never
- * reaches `src/db.ts`. An empty `presets:` mapping is valid (worker tolerance).
+ * named `{harness, model?, effort?, thinking?, role?}` triples a launch may pin,
+ * plus the top-level `<harness>_default` pointers naming the preset a bare
+ * `keeper agent <harness>` launch resolves. Read ONLY by this dep-free config
+ * island — the launcher import graph never reaches `src/db.ts`. An empty
+ * `presets:` mapping is valid (worker tolerance); each `<harness>_default` is
+ * optional but, when set, must name a defined preset whose harness matches.
  */
 export interface PresetCatalog {
   presets: Record<string, Preset>;
+  /** Preset a bare `keeper agent claude` resolves; null/absent when unset. */
+  claude_default?: string | null;
+  /** Preset a bare `keeper agent codex` resolves; null/absent when unset. */
+  codex_default?: string | null;
+  /** Preset a bare `keeper agent pi` resolves; null/absent when unset. */
+  pi_default?: string | null;
 }
 
 /**
@@ -371,7 +298,12 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
 }
 
 /** Top-level keys each file admits — anything else is a strict-reject. */
-const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set(["presets"]);
+const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
+  "presets",
+  "claude_default",
+  "codex_default",
+  "pi_default",
+]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
 
 /** Reject any unknown top-level key in a config mapping (no silent typos). */
@@ -393,9 +325,10 @@ function rejectUnknownKeys(
  * Read the preset catalog from `presets.yaml`. REQUIRED + validated: a missing
  * file is fail-LOUD (ConfigError) — the reversal of the old fail-open posture. An
  * empty `presets:` mapping is still valid (the worker tolerates a catalog with no
- * presets). Also fail-loud on malformed YAML, an unknown top-level key, or any
- * invalid entry: a bad harness, cross-harness effort+thinking, or a reserved /
- * non-matching name.
+ * presets). Also fail-loud on malformed YAML, an unknown top-level key, any
+ * invalid entry (a bad harness, cross-harness effort+thinking, a reserved /
+ * non-matching name), or a `<harness>_default` pointer that names no defined
+ * preset or one whose harness does not match the key prefix.
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
@@ -415,7 +348,52 @@ export function loadPresetCatalog(
     validatePresetName(name, configPath);
     presets[name] = parsePreset(name, value, configPath);
   }
-  return { presets };
+  return {
+    presets,
+    claude_default: parseHarnessDefault(raw, "claude", presets, configPath),
+    codex_default: parseHarnessDefault(raw, "codex", presets, configPath),
+    pi_default: parseHarnessDefault(raw, "pi", presets, configPath),
+  };
+}
+
+/**
+ * Parse + strict-validate one `<harness>_default` pointer. A structural key
+ * (exempt from `validatePresetName`, mirroring the panel `default` precedent): an
+ * unset key is null; a present one must name a defined preset whose harness
+ * matches the key prefix, else fail-loud with a message naming the file, key,
+ * offending name, and expected harness (mirroring `resolvePreset`).
+ */
+function parseHarnessDefault(
+  raw: Record<string, unknown>,
+  harness: PresetHarness,
+  presets: Record<string, Preset>,
+  configPath: string,
+): string | null {
+  const key = `${harness}_default`;
+  const v = raw[key];
+  if (v === null || v === undefined) {
+    return null;
+  }
+  if (typeof v !== "string" || !v.trim()) {
+    throw new ConfigError(
+      `${key} must be a non-empty string naming a preset in ${configPath}`,
+    );
+  }
+  const name = v.trim();
+  const preset = presets[name];
+  if (preset === undefined) {
+    const available = Object.keys(presets).sort();
+    const list = available.length > 0 ? available.join(", ") : "(none)";
+    throw new ConfigError(
+      `${key} '${name}' is not a defined preset in ${configPath}. Available: ${list}`,
+    );
+  }
+  if (preset.harness !== harness) {
+    throw new ConfigError(
+      `${key} '${name}' pins harness ${preset.harness}, expected ${harness} in ${configPath}`,
+    );
+  }
+  return name;
 }
 
 /**

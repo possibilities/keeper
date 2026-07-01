@@ -137,8 +137,8 @@ export type ParseRunArgsResult =
        *  The handler resolves it and validates its harness == `<cli>`. Null when
        *  unset. */
       preset: string | null;
-      /** Raw `--model` override — rides onto the launch posture (explicit >
-       *  preset > yaml). Null when unset. */
+      /** Raw `--model` override — rides onto the launch posture (an explicit
+       *  --model wins over the preset). Null when unset. */
       model: string | null;
       /** Raw `--effort` override — rides onto the launch posture (codex reasoning
        *  effort). Null when unset. */

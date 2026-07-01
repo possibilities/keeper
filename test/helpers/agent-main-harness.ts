@@ -16,6 +16,43 @@ import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 
+/**
+ * The default preset catalog the harness injects when a test names none: a
+ * complete `<harness>_default` per harness so a bare fresh launch resolves a
+ * model + effort/thinking (matching the production requirement that a fresh
+ * launch pin them) instead of the fresh-launch fail-loud. Bare launches that
+ * don't assert the exact command are unaffected; exact-command tests either see
+ * these injected values or pass their own catalog / explicit flags.
+ */
+export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
+  presets: {
+    "claude-default": {
+      harness: "claude",
+      model: "opus",
+      effort: "high",
+      thinking: null,
+      role: null,
+    },
+    "codex-default": {
+      harness: "codex",
+      model: "gpt",
+      effort: "high",
+      thinking: null,
+      role: null,
+    },
+    "pi-default": {
+      harness: "pi",
+      model: "glm",
+      effort: null,
+      thinking: "high",
+      role: null,
+    },
+  },
+  claude_default: "claude-default",
+  codex_default: "codex-default",
+  pi_default: "pi-default",
+};
+
 /** Throwing exit so a test sees the exit code without killing the runner. */
 export class ExitSignal extends Error {
   constructor(public code: number) {
@@ -73,13 +110,13 @@ export interface HarnessOptions {
   listProfiles?: () => string[];
   /** Profile dir ensureKeeperAgentProfileDirFn returns (default deterministic). */
   profileDir?: string;
-  launcherModel?: string | null;
-  launcherEffort?: string | null;
-  codexLauncherModel?: string | null;
-  codexLauncherEffort?: string | null;
-  piLauncherModel?: string | null;
-  piLauncherThinking?: string | null;
-  /** Preset catalog loadPresetCatalogFn returns (default empty). */
+  /**
+   * Preset catalog loadPresetCatalogFn returns. Default: {@link
+   * DEFAULT_PRESET_CATALOG} — a `<harness>_default` for each harness so a bare
+   * fresh launch resolves a model/effort/thinking instead of the fresh-launch
+   * fail-loud. Pass `{ presets: {} }` to exercise that fail-loud, or a custom
+   * catalog (with its own `<harness>_default`) to pin the injected values.
+   */
   presetCatalog?: PresetCatalog;
   /** Panel selections loadPanelSelectionsFn returns (default empty). */
   panelSelections?: PanelSelections;
@@ -149,20 +186,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
     codexBin,
     piBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
-    loadLauncherDefaultsFn: () => ({
-      model: opts.launcherModel ?? null,
-      effort: opts.launcherEffort ?? null,
-    }),
-    loadCodexLauncherDefaultsFn: () => ({
-      model: opts.codexLauncherModel ?? null,
-      effort: opts.codexLauncherEffort ?? null,
-    }),
-    loadPiLauncherDefaultsFn: () => ({
-      model: opts.piLauncherModel ?? null,
-      thinking: opts.piLauncherThinking ?? null,
-    }),
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
-    loadPresetCatalogFn: () => opts.presetCatalog ?? { presets: {} },
+    loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,
     loadPanelSelectionsFn: () =>
       opts.panelSelections ?? { panels: {}, default: null },
     ensureClaudeStateSharingFn: () => {},

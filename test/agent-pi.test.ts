@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgsForAgent } from "../src/agent/args";
+import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import { ensureKeeperAgentPiProfileDir } from "../src/agent/state-sharing";
 import {
@@ -35,6 +36,27 @@ function piHarness(
     argv: ["pi", ...argv],
     rawArgv: true,
   });
+}
+
+// The harness's default pi_default injects `--thinking high --model glm` on a
+// fresh pi launch (see DEFAULT_PRESET_CATALOG).
+const DEFAULT_THINKING = ["--thinking", "high"];
+const DEFAULT_MODEL = ["--model", "glm"];
+
+/** A catalog whose pi_default pins the given model + thinking. */
+function piDefaultCatalog(model: string, thinking: string): PresetCatalog {
+  return {
+    presets: {
+      "pi-default": {
+        harness: "pi",
+        model,
+        effort: null,
+        thinking,
+        role: null,
+      },
+    },
+    pi_default: "pi-default",
+  };
 }
 
 describe("Pi parse signals", () => {
@@ -59,6 +81,8 @@ describe("Pi command assembly", () => {
     expect(cmd).toEqual([
       h.deps.piBin,
       "hello",
+      ...DEFAULT_THINKING,
+      ...DEFAULT_MODEL,
       "--session-id",
       "00000000-0000-0000-0000-000000000000",
       "--name",
@@ -72,20 +96,18 @@ describe("Pi command assembly", () => {
 
   test("configured model and thinking are injected for Pi", async () => {
     const h = piHarness(["--print", "hello"], {
-      piLauncherModel: "openai/gpt-4o",
-      piLauncherThinking: "high",
+      presetCatalog: piDefaultCatalog("openai/gpt-4o", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["openai/gpt-4o"]);
     expect(flagValues(cmd, "--thinking")).toEqual(["high"]);
   });
 
-  test("explicit native model and thinking suppress configured Pi defaults", async () => {
+  test("explicit native model and thinking suppress the configured Pi default", async () => {
     const h = piHarness(
       ["--print", "--model", "sonnet", "--thinking", "low", "hello"],
       {
-        piLauncherModel: "openai/gpt-4o",
-        piLauncherThinking: "high",
+        presetCatalog: piDefaultCatalog("openai/gpt-4o", "high"),
       },
     );
     const cmd = await runAndCapture(h, main);
@@ -124,8 +146,7 @@ describe("Pi command assembly", () => {
 describe("Pi passthrough commands", () => {
   test("package commands pass through without model or session defaults", async () => {
     const h = piHarness(["list"], {
-      piLauncherModel: "openai/gpt-4o",
-      piLauncherThinking: "high",
+      presetCatalog: piDefaultCatalog("openai/gpt-4o", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "list"]);
@@ -133,8 +154,7 @@ describe("Pi passthrough commands", () => {
 
   test("metadata flags pass through without model or session defaults", async () => {
     const h = piHarness(["--list-models"], {
-      piLauncherModel: "openai/gpt-4o",
-      piLauncherThinking: "high",
+      presetCatalog: piDefaultCatalog("openai/gpt-4o", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "--list-models"]);
@@ -142,13 +162,15 @@ describe("Pi passthrough commands", () => {
 
   test("a package-command-shaped --print prompt is not passthrough", async () => {
     const h = piHarness(["--print", "install"], {
-      piLauncherModel: "openai/gpt-4o",
+      presetCatalog: piDefaultCatalog("openai/gpt-4o", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
       h.deps.piBin,
       "--print",
       "install",
+      "--thinking",
+      "high",
       "--model",
       "openai/gpt-4o",
       "--session-id",

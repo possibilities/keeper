@@ -32,15 +32,10 @@ import {
 } from "./codex-session-index";
 import {
   ConfigError,
-  codexConfigPath,
-  type LauncherDefaults,
-  loadLauncherDefaults,
   loadPanelSelections,
-  loadPiLauncherDefaults,
   loadPluginSources,
   loadPresetCatalog,
   type PanelSelections,
-  type PiLauncherDefaults,
   type PluginSources,
   type Preset,
   type PresetCatalog,
@@ -78,6 +73,10 @@ import {
   hasExplicitCodexEffortArg,
   hasExplicitCodexModelArg,
   hasExplicitCodexProfileArg,
+  hasExplicitEffortArg,
+  hasExplicitModelArg,
+  hasExplicitThinkingArg,
+  piModelColonThinking,
   resolveStartupEffortOverride,
   resolveStartupModelOverride,
   resolveStartupThinkingOverride,
@@ -149,9 +148,6 @@ export interface MainDeps {
   codexBin: string;
   piBin: string;
   pluginConfigPath: string;
-  loadLauncherDefaultsFn: () => LauncherDefaults;
-  loadCodexLauncherDefaultsFn: () => LauncherDefaults;
-  loadPiLauncherDefaultsFn: () => PiLauncherDefaults;
   loadPluginSourcesFn: () => PluginSources;
   /**
    * Read the preset catalog from `presets.yaml` (required + validated).
@@ -235,9 +231,6 @@ export function realDeps(): MainDeps {
     codexBin: resolveCodexBin(process.env),
     piBin: "pi",
     pluginConfigPath: pluginConfigPath(),
-    loadLauncherDefaultsFn: loadLauncherDefaults,
-    loadCodexLauncherDefaultsFn: () => loadLauncherDefaults(codexConfigPath()),
-    loadPiLauncherDefaultsFn: loadPiLauncherDefaults,
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
     loadPanelSelectionsFn: (catalog) => loadPanelSelections(catalog),
@@ -435,6 +428,79 @@ function resolveCodexStartupEffortOverride(
 
 function codexEffortConfigArg(effort: string): string {
   return `model_reasoning_effort="${effort}"`;
+}
+
+/**
+ * Whether a launch supplied its model + effort/thinking explicitly (the
+ * both-explicit escape from the fresh-launch default gate). Per harness: claude
+ * counts `--effort` OR the `CLAUDE_CODE_EFFORT_LEVEL` env; codex counts `-c
+ * model_reasoning_effort=`, and a `--profile` exempts the whole launch (the
+ * profile is the model/effort source); pi counts `--thinking` OR the
+ * `--model <id>:<thinking>` colon shorthand.
+ */
+interface LaunchConfigSignals {
+  model: boolean;
+  effortOrThinking: boolean;
+  exemptAll: boolean;
+}
+
+function resolveLaunchConfigSignals(
+  agent: AgentKind,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): LaunchConfigSignals {
+  if (agent === "codex") {
+    return {
+      model: hasExplicitCodexModelArg(args),
+      effortOrThinking: hasExplicitCodexEffortArg(args),
+      exemptAll: hasExplicitCodexProfileArg(args),
+    };
+  }
+  if (agent === "pi") {
+    const colon = piModelColonThinking(args) !== null;
+    return {
+      model: hasExplicitModelArg(args) || colon,
+      effortOrThinking: hasExplicitThinkingArg(args) || colon,
+      exemptAll: false,
+    };
+  }
+  return {
+    model: hasExplicitModelArg(args),
+    effortOrThinking:
+      hasExplicitEffortArg(args) ||
+      (env.CLAUDE_CODE_EFFORT_LEVEL ?? "").trim() !== "",
+    exemptAll: false,
+  };
+}
+
+/**
+ * The self-healing fresh-launch fail-loud message — names the exact
+ * `<harness>_default` key to set AND the flag alternative, never the resolution
+ * order. keeper no longer silently defers to the agent's native model/effort.
+ */
+function unresolvedDefaultMessage(agent: AgentKind): string {
+  const key = `${agent}_default`;
+  if (agent === "codex") {
+    return (
+      `Error: keeper agent codex: no model/effort resolved for a fresh launch. ` +
+      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
+      `or pass --model <model> -c model_reasoning_effort=<effort> ` +
+      `(or --profile <profile>).\n`
+    );
+  }
+  if (agent === "pi") {
+    return (
+      `Error: keeper agent pi: no model/thinking resolved for a fresh launch. ` +
+      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
+      `or pass --model <model> --thinking <thinking> ` +
+      `(or --model <model>:<thinking>).\n`
+    );
+  }
+  return (
+    `Error: keeper agent claude: no model/effort resolved for a fresh launch. ` +
+    `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
+    `or pass --model <model> --effort <effort>.\n`
+  );
 }
 
 function codexConfigValue(args: string[], index: number): string | null {
@@ -886,6 +952,44 @@ async function runRunCaptureSubcommand(
       deps.writeErr(
         `agent: --preset ${parsed.preset} pins harness ${resolved.harness}, ` +
           `but the ${agent} run was given.\n`,
+      );
+      return emitRunCapture(
+        deps,
+        buildRunCaptureEnvelope({ outcome: "bad_args" }),
+        parsed.output,
+      );
+    }
+  } else if (!(parsed.model !== null && parsed.effort !== null)) {
+    // Fresh-launch fail-loud (mirrors the interactive gate): a run with no
+    // --preset, no catalog `<cli>_default`, and not both --model + --effort
+    // explicit resolves no model/effort — the detached pane would fail-loud, so
+    // short-circuit to bad_args rather than launch a doomed pane. (`agent run` is
+    // always a fresh one-shot, with no --continue/--resume analog.)
+    let catalog: PresetCatalog;
+    try {
+      catalog = deps.loadPresetCatalogFn();
+    } catch (exc) {
+      if (exc instanceof ConfigError) {
+        deps.writeErr(`agent: ${exc.message}\n`);
+        return emitRunCapture(
+          deps,
+          buildRunCaptureEnvelope({ outcome: "bad_args" }),
+          parsed.output,
+        );
+      }
+      throw exc;
+    }
+    const defaultName =
+      (agent === "claude"
+        ? catalog.claude_default
+        : agent === "codex"
+          ? catalog.codex_default
+          : catalog.pi_default) ?? null;
+    if (defaultName === null) {
+      deps.writeErr(
+        `agent: no model/effort resolved for a fresh ${agent} run. ` +
+          `Set ${agent}_default in presets.yaml (see 'keeper agent presets list'), ` +
+          `or pass --preset <name> or --model <model> --effort <effort>.\n`,
       );
       return emitRunCapture(
         deps,
@@ -1557,6 +1661,60 @@ export async function main(deps: MainDeps): Promise<never> {
     actionLog.push("Detected passthrough informational flag");
   }
 
+  // Harness default + fresh-launch fail-loud. A FRESH launch (not a
+  // continuation, not a passthrough; --print IS fresh) with no --x-preset falls
+  // back to the catalog's `<harness>_default` so keeper owns the session's
+  // model/effort/thinking. A launch that already pins BOTH explicitly (the
+  // both-explicit escape) needs no default and never reads the catalog. When the
+  // resolved model OR effort/thinking is still absent, the launch is fail-loud
+  // (exit 2, self-healing message) — keeper no longer silently defers to the
+  // agent's native settings. Resume/continuation + passthrough are exempt.
+  const freshLaunch = !hasContinueOrResume && !shouldPassthrough;
+  const launchSignals = resolveLaunchConfigSignals(
+    agent,
+    remainingArgs,
+    deps.env,
+  );
+  const bothExplicit =
+    launchSignals.exemptAll ||
+    (launchSignals.model && launchSignals.effortOrThinking);
+  if (freshLaunch && !bothExplicit) {
+    if (resolvedPreset === null) {
+      let catalog: PresetCatalog;
+      try {
+        catalog = deps.loadPresetCatalogFn();
+      } catch (exc) {
+        if (exc instanceof ConfigError) {
+          deps.writeErr(`Error: ${exc.message}\n`);
+          return deps.exit(2);
+        }
+        throw exc;
+      }
+      const defaultName =
+        (agent === "claude"
+          ? catalog.claude_default
+          : agent === "codex"
+            ? catalog.codex_default
+            : catalog.pi_default) ?? null;
+      if (defaultName !== null) {
+        resolvedPreset = resolvePreset(catalog, defaultName);
+        actionLog.push(`Resolved ${agent}_default preset '${defaultName}'`);
+      }
+    }
+    const defaultModel = resolvedPreset?.model ?? null;
+    const defaultEffortOrThinking =
+      agent === "pi"
+        ? (resolvedPreset?.thinking ?? null)
+        : (resolvedPreset?.effort ?? null);
+    const modelMissing = defaultModel === null && !launchSignals.model;
+    const secondMissing =
+      defaultEffortOrThinking === null && !launchSignals.effortOrThinking;
+    if (modelMissing || secondMissing) {
+      deps.writeErr(unresolvedDefaultMessage(agent));
+      return deps.exit(2);
+    }
+  }
+
   // Verbosity ladder: level 0 (default) is silent before claude is exec'd;
   // level 1 (--x-verbose) prints one line per startup section; level 2
   // (--x-very-verbose, which implies level 1) adds per-phase timing plus
@@ -1718,12 +1876,10 @@ export async function main(deps: MainDeps): Promise<never> {
       );
     }
 
-    const { model: yamlModel, effort: yamlEffort } =
-      deps.loadCodexLauncherDefaultsFn();
-    // Per-field: preset layers OVER yaml (a model-only preset leaves effort
-    // falling through to yaml). The resolver still gives explicit/env priority.
-    const defaultModel = resolvedPreset?.model ?? yamlModel;
-    const defaultEffort = resolvedPreset?.effort ?? yamlEffort;
+    // Preset (--x-preset or the resolved codex_default) supplies the default;
+    // resolveCodexStartup*Override still gives an explicit flag priority.
+    const defaultModel = resolvedPreset?.model ?? null;
+    const defaultEffort = resolvedPreset?.effort ?? null;
     const startupModel = resolveCodexStartupModelOverride(
       remainingArgs,
       defaultModel,
@@ -1880,13 +2036,10 @@ export async function main(deps: MainDeps): Promise<never> {
   actionLog.push(`Built base ${agentLabel} command`);
 
   if (agent === "claude") {
-    const { model: yamlModel, effort: yamlEffort } =
-      deps.loadLauncherDefaultsFn();
-    // Per-field: preset layers OVER yaml. resolveStartup*Override still encode
-    // explicit > env > default, so the net order is explicit > env > preset >
-    // yaml > native, per field with no new precedence machinery.
-    const defaultModel = resolvedPreset?.model ?? yamlModel;
-    const defaultEffort = resolvedPreset?.effort ?? yamlEffort;
+    // Preset (--x-preset or the resolved claude_default) supplies the default;
+    // resolveStartup*Override still encode explicit > env > default per field.
+    const defaultModel = resolvedPreset?.model ?? null;
+    const defaultEffort = resolvedPreset?.effort ?? null;
     const startupModel = resolveStartupModelOverride(
       remainingArgs,
       defaultModel,
@@ -1930,11 +2083,14 @@ export async function main(deps: MainDeps): Promise<never> {
       }
     }
   } else {
-    const { model: yamlModel, thinking: yamlThinking } =
-      deps.loadPiLauncherDefaultsFn();
-    // Per-field: preset layers OVER yaml (preset.thinking is pi-only).
-    const defaultModel = resolvedPreset?.model ?? yamlModel;
-    const defaultThinking = resolvedPreset?.thinking ?? yamlThinking;
+    // Preset (--x-preset or the resolved pi_default) supplies the default. A
+    // `--model <id>:<thinking>` colon shorthand carries thinking itself, so it
+    // suppresses the default --thinking injection (pi rejects a conflicting flag).
+    const defaultModel = resolvedPreset?.model ?? null;
+    const defaultThinking =
+      piModelColonThinking(remainingArgs) !== null
+        ? null
+        : (resolvedPreset?.thinking ?? null);
     const startupThinking = resolveStartupThinkingOverride(
       remainingArgs,
       defaultThinking,

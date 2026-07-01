@@ -7,6 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { parseArgsForAgent } from "../src/agent/args";
+import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
 
@@ -14,6 +15,28 @@ const CODEX_WRAPPER_DEFAULTS = [
   "--dangerously-bypass-approvals-and-sandbox",
   "--search",
 ];
+
+// The harness's default codex_default injects `--model gpt -c ...="high"` on a
+// fresh codex launch (see DEFAULT_PRESET_CATALOG); a bare launch therefore no
+// longer resolves an empty model/effort — it resolves these.
+const DEFAULT_MODEL = ["--model", "gpt"];
+const DEFAULT_EFFORT = ["-c", 'model_reasoning_effort="high"'];
+
+/** A catalog whose codex_default pins the given model + effort. */
+function codexDefaultCatalog(model: string, effort: string): PresetCatalog {
+  return {
+    presets: {
+      "codex-default": {
+        harness: "codex",
+        model,
+        effort,
+        thinking: null,
+        role: null,
+      },
+    },
+    codex_default: "codex-default",
+  };
+}
 
 function codexHarness(
   argv: string[],
@@ -65,7 +88,13 @@ describe("Codex command assembly", () => {
       cwd: "/fake-home/code/proj",
     });
     const cmd = await runAndCapture(h, main);
-    expect(cmd).toEqual([h.deps.codexBin, ...CODEX_WRAPPER_DEFAULTS, "hello"]);
+    expect(cmd).toEqual([
+      h.deps.codexBin,
+      ...CODEX_WRAPPER_DEFAULTS,
+      ...DEFAULT_MODEL,
+      ...DEFAULT_EFFORT,
+      "hello",
+    ]);
     expect(cmd).not.toContain("--strict-mcp-config");
     expect(cmd).not.toContain("--teammate-mode");
     expect(cmd).not.toContain("--session-id");
@@ -101,6 +130,8 @@ describe("Codex command assembly", () => {
       ...CODEX_WRAPPER_DEFAULTS,
       "--profile",
       "work",
+      ...DEFAULT_MODEL,
+      ...DEFAULT_EFFORT,
       "hello",
     ]);
     expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("work");
@@ -135,14 +166,15 @@ describe("Codex command assembly", () => {
       ...CODEX_WRAPPER_DEFAULTS,
       "--profile",
       "work",
+      ...DEFAULT_MODEL,
+      ...DEFAULT_EFFORT,
       "hello",
     ]);
   });
 
   test("configured model and effort are injected before the Codex subcommand", async () => {
     const h = codexHarness(["exec", "hello"], {
-      codexLauncherModel: "gpt-5.2-codex",
-      codexLauncherEffort: "high",
+      presetCatalog: codexDefaultCatalog("gpt-5.2-codex", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
@@ -157,12 +189,11 @@ describe("Codex command assembly", () => {
     ]);
   });
 
-  test("explicit native model and effort suppress configured defaults", async () => {
+  test("explicit native model and effort suppress the configured default", async () => {
     const h = codexHarness(
       ["-m", "gpt-5.1-codex", "-c", 'model_reasoning_effort="low"', "exec"],
       {
-        codexLauncherModel: "gpt-5.2-codex",
-        codexLauncherEffort: "high",
+        presetCatalog: codexDefaultCatalog("gpt-5.2-codex", "high"),
       },
     );
     const cmd = await runAndCapture(h, main);
@@ -189,6 +220,8 @@ describe("Codex command assembly", () => {
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
       h.deps.codexBin,
+      ...DEFAULT_MODEL,
+      ...DEFAULT_EFFORT,
       "--sandbox",
       "workspace-write",
       "-c",
@@ -206,7 +239,13 @@ describe("Codex command assembly", () => {
       },
     );
     const cmd = await runAndCapture(h, main);
-    expect(cmd).toEqual([h.deps.codexBin, ...CODEX_WRAPPER_DEFAULTS, "hello"]);
+    expect(cmd).toEqual([
+      h.deps.codexBin,
+      ...CODEX_WRAPPER_DEFAULTS,
+      ...DEFAULT_MODEL,
+      ...DEFAULT_EFFORT,
+      "hello",
+    ]);
     expect(cmd).not.toContain("--x-codex-session-name=work item");
     expect(h.codexSessionNameIndexers).toHaveLength(1);
     expect(h.codexSessionNameIndexers[0]).toMatchObject({
@@ -220,8 +259,7 @@ describe("Codex command assembly", () => {
 describe("Codex passthrough commands", () => {
   test("plugin list passes through without model/effort defaults", async () => {
     const h = codexHarness(["plugin", "list"], {
-      codexLauncherModel: "gpt-5.2-codex",
-      codexLauncherEffort: "high",
+      presetCatalog: codexDefaultCatalog("gpt-5.2-codex", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
@@ -251,7 +289,7 @@ describe("Codex passthrough commands", () => {
 
   test("exec remains a wrapped agent run", async () => {
     const h = codexHarness(["exec", "hello"], {
-      codexLauncherModel: "gpt-5.2-codex",
+      presetCatalog: codexDefaultCatalog("gpt-5.2-codex", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
@@ -259,6 +297,8 @@ describe("Codex passthrough commands", () => {
       ...CODEX_WRAPPER_DEFAULTS,
       "--model",
       "gpt-5.2-codex",
+      "-c",
+      'model_reasoning_effort="high"',
       "exec",
       "hello",
     ]);

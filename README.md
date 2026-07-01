@@ -1400,9 +1400,13 @@ event-log/reducer/hook touch. Run any of them with
   read ONLY by the dep-free `src/agent/config.ts` island (the launcher import graph
   never reaches `src/db.ts`): `presets.yaml` is the CATALOG of available presets —
   each a named `{harness, model?, effort?, thinking?, role?}` triple
-  (`presets.<name>`) — and `panel.yaml` is the panel SELECTIONS — named panels
-  (`panels.<name>`, each an ordered list of catalog preset names) plus an optional
-  `default:` naming the panel a bare `keeper agent panel start` assembles.
+  (`presets.<name>`), harness-prefixed by convention (`claude-opus`/`codex-gpt`/
+  `pi-gpt`) — plus the top-level `claude_default`/`codex_default`/`pi_default`
+  pointers naming the preset a bare `keeper agent <harness>` launch resolves (each
+  strict-validated at load to name a defined preset of the matching harness). The
+  `panel.yaml` is the panel SELECTIONS — named panels (`panels.<name>`, each an
+  ordered list of catalog preset names) plus an optional `default:` naming the
+  panel a bare `keeper agent panel start` assembles.
   `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
   `keeper agent --x-preset <name> [args...]` applies one preset — harnessless, the
   harness comes from the preset — and `keeper agent presets resolve <name>` emits
@@ -1445,12 +1449,17 @@ event-log/reducer/hook touch. Run any of them with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex
-  directory-trust seed for `agent run`. Per-field resolution is `explicit flag > effort
-  env > preset > per-harness yaml > native default`, so a preset never overrides an
-  explicit `--model`/`--effort` and a partial preset layers over the yaml; with no
-  `--x-preset` the launch is byte-identical to a no-preset run. The posture is
-  REQUIRED + validated: any preset referenced by name (`keeper dispatch --preset`,
-  `keeper agent --x-preset`) and EVERY panel op
+  directory-trust seed for `agent run`. Per-field resolution is `explicit flag >
+  effort env > preset (--x-preset, else the harness <harness>_default)`, so a
+  preset never overrides an explicit `--model`/`--effort`. A FRESH launch that
+  resolves no model and no effort/thinking — no preset, no `<harness>_default`, and
+  not both explicit (claude `--model`+`--effort`/env, codex `--model`+`-c effort`
+  or `--profile`, pi `--model`+`--thinking` or `--model id:<thinking>`) — is
+  fail-loud (exit 2, a self-healing message naming the key + flag); keeper never
+  silently defers to the agent's native settings. `--continue`/`--resume` and
+  passthrough are exempt. The posture is REQUIRED + validated: any preset
+  referenced by name (`keeper dispatch --preset`, `keeper agent --x-preset`) and
+  EVERY panel op
   hard-fail (exit 2) on a missing or invalid `presets.yaml`/`panel.yaml`, with a
   message naming the file, the bad name, and the sorted available names. Panel
   members are claude|codex only (pi is rejected at load). Presets are producer-side

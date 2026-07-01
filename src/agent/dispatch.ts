@@ -127,14 +127,16 @@ Wrapper flags:
   --x-profile <name>        Select a profile ('default' = native
                                     account; 'auto' picks via the ledger).
   --x-preset <name>         Apply a named launch-config preset from
-                                    ~/.config/keeper/presets.yaml — REQUIRED;
-                                    an unknown name or missing catalog exits 2
-                                    (harness/model/effort defaults BELOW any
+                                    presets.yaml (harness/model/effort BELOW any
                                     explicit --model/--effort or effort env).
                                     With no agent token the harness comes from
                                     the preset; with one, a disagreeing harness
-                                    is rejected. Run \`keeper agent presets list\`
-                                    to see the configured names.
+                                    is rejected. A fresh launch with no --x-preset
+                                    resolves the harness <harness>_default pointer
+                                    instead; one that resolves neither (and is
+                                    not both --model + --effort/--thinking) is
+                                    fail-loud (exit 2). Run
+                                    \`keeper agent presets list\` for the names.
 
 Preset resolution:
   keeper agent presets resolve <name>  Emit the resolved JSON for a single preset

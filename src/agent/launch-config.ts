@@ -167,7 +167,7 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
     "--x-no-confirm",
   ];
   // The named preset rides as a launcher flag so `keeper agent` owns model/effort
-  // resolution (explicit > env > preset > yaml > native). The caller never
+  // resolution (an explicit flag/env still wins over the preset). The caller never
   // re-derives model/effort from the preset — it only reads the preset's harness.
   if (opts.preset !== undefined && opts.preset !== "") {
     wrapperFlags.push("--x-preset", opts.preset);

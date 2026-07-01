@@ -1,8 +1,8 @@
 /**
- * Config adapter pins: launcher model/effort defaults (absent file/key → null,
- * malformed → fail-loud) and plugin sources (missing file fail-loud,
- * ~-expansion). Fixture configs only — the live ~/.config is arthack-owned stow
- * state we must not touch.
+ * Config adapter pins: the preset catalog (`<harness>_default` pointers +
+ * per-preset validation), panel selections, and plugin sources (missing file
+ * fail-loud, ~-expansion). Fixture configs only — the live ~/.config is
+ * arthack-owned stow state we must not touch.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -11,18 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
-  codexConfigPath,
   keeperConfigDir,
-  launcherConfigPath,
-  loadLauncherDefaults,
   loadPanelSelections,
-  loadPiLauncherDefaults,
   loadPluginSources,
   loadPresetCatalog,
   type PresetCatalog,
   panelConfigPath,
-  piLauncherConfigPath,
-  pluginConfigPath,
   presetsCatalogPath,
   resolvePreset,
 } from "../src/agent/config";
@@ -41,64 +35,6 @@ function writeYaml(name: string, body: string): string {
   writeFileSync(p, body);
   return p;
 }
-
-describe("loadLauncherDefaults", () => {
-  test("missing file → all defaults (null/null)", () => {
-    expect(loadLauncherDefaults(join(tmpDir, "nope.yaml"))).toEqual({
-      model: null,
-      effort: null,
-    });
-  });
-  test("present keys are read and trimmed", () => {
-    const p = writeYaml("claude.yaml", "model: opus\neffort: high\n");
-    expect(loadLauncherDefaults(p)).toEqual({
-      model: "opus",
-      effort: "high",
-    });
-  });
-  test("absent key → null for that field", () => {
-    const p = writeYaml("claude.yaml", "model: opus\n");
-    expect(loadLauncherDefaults(p)).toEqual({
-      model: "opus",
-      effort: null,
-    });
-  });
-  test("empty-string value is fail-loud", () => {
-    const p = writeYaml("claude.yaml", 'model: ""\n');
-    expect(() => loadLauncherDefaults(p)).toThrow(ConfigError);
-  });
-  test("non-mapping document is fail-loud", () => {
-    const p = writeYaml("claude.yaml", "- a\n- b\n");
-    expect(() => loadLauncherDefaults(p)).toThrow(ConfigError);
-  });
-});
-
-describe("loadPiLauncherDefaults", () => {
-  test("missing file → all defaults (null/null)", () => {
-    expect(loadPiLauncherDefaults(join(tmpDir, "nope.yaml"))).toEqual({
-      model: null,
-      thinking: null,
-    });
-  });
-  test("present keys are read and trimmed", () => {
-    const p = writeYaml("pi.yaml", "model: opus\nthinking: high\n");
-    expect(loadPiLauncherDefaults(p)).toEqual({
-      model: "opus",
-      thinking: "high",
-    });
-  });
-  test("absent key → null for that field", () => {
-    const p = writeYaml("pi.yaml", "model: opus\n");
-    expect(loadPiLauncherDefaults(p)).toEqual({
-      model: "opus",
-      thinking: null,
-    });
-  });
-  test("empty-string value is fail-loud", () => {
-    const p = writeYaml("pi.yaml", 'thinking: ""\n');
-    expect(() => loadPiLauncherDefaults(p)).toThrow(ConfigError);
-  });
-});
 
 /** A catalog with claude (a), codex (b), and pi (z) presets for panel tests. */
 function catalogFixture(): PresetCatalog {
@@ -136,14 +72,21 @@ describe("loadPresetCatalog", () => {
     );
   });
 
+  const EMPTY_CATALOG = {
+    presets: {},
+    claude_default: null,
+    codex_default: null,
+    pi_default: null,
+  };
+
   test("an empty presets mapping is valid (worker tolerance)", () => {
     const p = writeYaml("presets.yaml", "presets: {}\n");
-    expect(loadPresetCatalog(p)).toEqual({ presets: {} });
+    expect(loadPresetCatalog(p)).toEqual(EMPTY_CATALOG);
   });
 
   test("a whitespace-only file parses to an empty catalog", () => {
     const p = writeYaml("presets.yaml", "\n");
-    expect(loadPresetCatalog(p)).toEqual({ presets: {} });
+    expect(loadPresetCatalog(p)).toEqual(EMPTY_CATALOG);
   });
 
   test("an unknown top-level key is fail-loud (strict reject)", () => {
@@ -260,6 +203,85 @@ describe("loadPresetCatalog", () => {
     }
     expect(msg).toContain("absent.yaml");
     expect(msg).toContain("missing");
+  });
+
+  test("no `<harness>_default` keys → all pointers null", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  a:\n    harness: claude\n",
+    );
+    const cat = loadPresetCatalog(p);
+    expect(cat.claude_default).toBeNull();
+    expect(cat.codex_default).toBeNull();
+    expect(cat.pi_default).toBeNull();
+  });
+
+  test("valid `<harness>_default` pointers name matching presets", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      [
+        "presets:",
+        "  claude-opus:",
+        "    harness: claude",
+        "  codex-gpt:",
+        "    harness: codex",
+        "  pi-gpt:",
+        "    harness: pi",
+        "claude_default: claude-opus",
+        "codex_default: codex-gpt",
+        "pi_default: pi-gpt",
+        "",
+      ].join("\n"),
+    );
+    const cat = loadPresetCatalog(p);
+    expect(cat.claude_default).toBe("claude-opus");
+    expect(cat.codex_default).toBe("codex-gpt");
+    expect(cat.pi_default).toBe("pi-gpt");
+  });
+
+  test("a `<harness>_default` naming no preset is fail-loud", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  a:\n    harness: claude\nclaude_default: ghost\n",
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(/claude_default 'ghost'/);
+  });
+
+  test("a `<harness>_default` whose preset harness mismatches is fail-loud", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  a:\n    harness: codex\nclaude_default: a\n",
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /claude_default 'a' pins harness codex, expected claude/,
+    );
+  });
+
+  test("an empty-string `<harness>_default` is fail-loud", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      'presets:\n  a:\n    harness: claude\ncodex_default: ""\n',
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(/codex_default must be/);
+  });
+
+  test("the `worker` preset name is unaffected by the pointers", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      [
+        "presets:",
+        "  worker:",
+        "    harness: claude",
+        "    model: sonnet",
+        "  claude-opus:",
+        "    harness: claude",
+        "claude_default: claude-opus",
+        "",
+      ].join("\n"),
+    );
+    const cat = loadPresetCatalog(p);
+    expect(cat.presets.worker?.model).toBe("sonnet");
+    expect(cat.claude_default).toBe("claude-opus");
   });
 });
 
@@ -381,45 +403,6 @@ describe("KEEPER_CONFIG_DIR single seam", () => {
     expect(keeperConfigDir()).toBe("/cfg/keeper");
     expect(presetsCatalogPath()).toBe("/cfg/keeper/presets.yaml");
     expect(panelConfigPath()).toBe("/cfg/keeper/panel.yaml");
-  });
-});
-
-describe("per-harness config readers (KEEPER_CONFIG_DIR seam)", () => {
-  let savedConfigDir: string | undefined;
-
-  beforeEach(() => {
-    savedConfigDir = process.env.KEEPER_CONFIG_DIR;
-    delete process.env.KEEPER_CONFIG_DIR;
-  });
-  afterEach(() => {
-    if (savedConfigDir === undefined) delete process.env.KEEPER_CONFIG_DIR;
-    else process.env.KEEPER_CONFIG_DIR = savedConfigDir;
-  });
-
-  test("KEEPER_CONFIG_DIR drives all 4 per-harness path fns to ~/.config/keeper", () => {
-    process.env.KEEPER_CONFIG_DIR = "/cfg/keeper";
-    expect(launcherConfigPath()).toBe("/cfg/keeper/claude.yaml");
-    expect(codexConfigPath()).toBe("/cfg/keeper/codex.yaml");
-    expect(piLauncherConfigPath()).toBe("/cfg/keeper/pi.yaml");
-    expect(pluginConfigPath()).toBe("/cfg/keeper/plugins.yaml");
-  });
-
-  test("KEEPER_CONFIG_DIR seam drives all 4 no-arg readers to the new dir", () => {
-    process.env.KEEPER_CONFIG_DIR = tmpDir;
-    writeFileSync(join(tmpDir, "claude.yaml"), "model: opus\neffort: high\n");
-    writeFileSync(join(tmpDir, "codex.yaml"), "model: gpt\neffort: low\n");
-    writeFileSync(join(tmpDir, "pi.yaml"), "model: pi-1\nthinking: deep\n");
-    writeFileSync(join(tmpDir, "plugins.yaml"), "{}\n");
-    expect(loadLauncherDefaults()).toEqual({ model: "opus", effort: "high" });
-    expect(loadLauncherDefaults(codexConfigPath())).toEqual({
-      model: "gpt",
-      effort: "low",
-    });
-    expect(loadPiLauncherDefaults()).toEqual({
-      model: "pi-1",
-      thinking: "deep",
-    });
-    expect(loadPluginSources()).toEqual({ pluginDirs: [], pluginScanDirs: [] });
   });
 });
 

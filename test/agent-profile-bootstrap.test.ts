@@ -28,6 +28,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
   assertProfileDirNameAllowed,
@@ -39,6 +40,7 @@ import {
   StateError,
 } from "../src/agent/state-sharing";
 import {
+  expectExit,
   flagValues,
   makeHarness,
   runAndCapture,
@@ -598,13 +600,13 @@ describe("main() auto profile routing", () => {
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "multi-claude-1",
-      launcherModel: "fable",
       profileDir: join(home, ".claude-profiles", "multi-claude-1"),
     });
     const cmd = await runAndCapture(h, main);
     expect(h.pickerCalls()).toBe(1);
-    expect(cmd.filter((a) => a === "--model")).toHaveLength(1);
-    expect(cmd[cmd.indexOf("--model") + 1]).toBe("fable");
+    // Resume carries its own session posture — the harness default pointer never
+    // injects a model onto it (fresh-only), so no wrapper --model is added.
+    expect(cmd).not.toContain("--model");
     expect(profileEnv(h)).toBe("multi-claude-1");
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(
       join(home, ".claude-profiles", "multi-claude-1"),
@@ -721,38 +723,56 @@ describe("main() explicit + env profile precedence", () => {
 // ── model/effort startup overrides through main() ───────────────────────────
 
 describe("main() model override", () => {
+  /** A claude_default preset pinning the given model + effort. */
+  const claudeDefaultCatalog = (
+    model: string,
+    effort: string,
+  ): PresetCatalog => ({
+    presets: {
+      "claude-default": {
+        harness: "claude",
+        model,
+        effort,
+        thinking: null,
+        role: null,
+      },
+    },
+    claude_default: "claude-default",
+  });
+
   test("forwards the configured default model for an interactive launch", async () => {
     const h = makeHarness({
       argv: ["--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "default",
-      launcherModel: "fable",
+      presetCatalog: claudeDefaultCatalog("fable", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd.filter((a) => a === "--model")).toHaveLength(1);
     expect(cmd[cmd.indexOf("--model") + 1]).toBe("fable");
   });
 
-  test("sends no --model when the launcher config is absent", async () => {
+  test("a fresh launch with no default resolvable is fail-loud (exit 2)", async () => {
     const h = makeHarness({
       argv: ["--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "default",
-      launcherModel: null,
+      presetCatalog: { presets: {} },
     });
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).not.toContain("--model");
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.spawned.length).toBe(0);
   });
 
   test("preserves an explicit --model over the configured default", async () => {
     const h = makeHarness({
-      argv: ["--print", "--model", "sonnet"],
+      argv: ["--print", "--model", "sonnet", "--effort", "xhigh"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => "default",
-      launcherModel: "fable",
+      presetCatalog: claudeDefaultCatalog("fable", "high"),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd.filter((a) => a === "--model")).toHaveLength(1);

@@ -89,31 +89,18 @@ describe("--x-preset precedence (claude)", () => {
     expect(flagValues(cmd, "--model")).toEqual(["opus"]);
   });
 
-  test("a model-only preset leaves effort falling through to yaml", async () => {
+  test("a model-only preset with no effort is fail-loud on a fresh launch", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
       listProfiles: () => ["default"],
-      launcherEffort: "high",
       presetCatalog: catalog({
         p: preset({ harness: "claude", model: "opus" }),
       }),
     });
-    const cmd = await runAndCapture(h, main);
-    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
-    expect(flagValues(cmd, "--effort")).toEqual(["high"]);
-  });
-
-  test("the preset model layers over yaml when both are set", async () => {
-    const h = makeHarness({
-      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
-      listProfiles: () => ["default"],
-      launcherModel: "sonnet",
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus" }),
-      }),
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("--effort");
+    expect(h.spawned.length).toBe(0);
   });
 });
 
@@ -152,7 +139,7 @@ describe("harnessless run-preset + harness agreement", () => {
       argv: ["--x-preset", "c", "--x-no-confirm", "hi"],
       rawArgv: true,
       presetCatalog: catalog({
-        c: preset({ harness: "codex", model: "gpt-5.5" }),
+        c: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
       }),
     });
     const cmd = await runAndCapture(h, main);
@@ -189,24 +176,124 @@ describe("harnessless run-preset + harness agreement", () => {
   });
 });
 
-describe("no preset → byte-identical to today", () => {
-  test("no --x-preset leaves the spawned argv unchanged", async () => {
-    const base = makeHarness({
+describe("no --x-preset → harness default pointer", () => {
+  test("a fresh launch resolves the catalog claude_default", async () => {
+    const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
+      presetCatalog: {
+        presets: {
+          d: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
+        },
+        claude_default: "d",
+      },
     });
-    const baseCmd = await runAndCapture(base, main);
-    const withRegistry = makeHarness({
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
+    expect(flagValues(cmd, "--effort")).toEqual(["xhigh"]);
+  });
+
+  test("only the matching-harness default is resolved for the launch", async () => {
+    // A catalog carrying every harness default resolves ONLY the claude one for
+    // a claude launch — the codex/pi pointers never touch it.
+    const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-      }),
+      presetCatalog: {
+        presets: {
+          cd: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
+          xd: preset({ harness: "codex", model: "gpt", effort: "high" }),
+        },
+        claude_default: "cd",
+        codex_default: "xd",
+      },
     });
-    const cmd2 = await runAndCapture(withRegistry, main);
-    // A populated registry that no flag references must not touch the launch.
-    expect(cmd2).toEqual(baseCmd);
-    expect(flagValues(cmd2, "--model")).toEqual([]);
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
+  });
+});
+
+describe("fresh-launch fail-loud", () => {
+  const EMPTY: PresetCatalog = { presets: {} };
+
+  test("a bare fresh launch with no default is fail-loud (exit 2)", async () => {
+    const h = makeHarness({
+      argv: ["--x-no-confirm", "hi"],
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("claude_default");
+    expect(h.spawned.length).toBe(0);
+  });
+
+  test("a lone --model (no effort, no default) is fail-loud (exit 2)", async () => {
+    const h = makeHarness({
+      argv: ["--x-no-confirm", "--model", "opus", "hi"],
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.spawned.length).toBe(0);
+  });
+
+  test("both --model and --effort explicit launches (the both-explicit escape)", async () => {
+    const h = makeHarness({
+      argv: ["--x-no-confirm", "--model", "opus", "--effort", "xhigh", "hi"],
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
+    expect(flagValues(cmd, "--effort")).toEqual(["xhigh"]);
+  });
+
+  test("--model + CLAUDE_CODE_EFFORT_LEVEL env is both-explicit (launches)", async () => {
+    const h = makeHarness({
+      argv: ["--x-no-confirm", "--model", "opus", "hi"],
+      env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--model")).toEqual(["opus"]);
+  });
+
+  test("--continue (resume) with no default does NOT fail-loud", async () => {
+    const h = makeHarness({
+      argv: ["--continue"],
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(cmd).not.toContain("--model");
+    expect(cmd).not.toContain("--effort");
+  });
+
+  test("codex --profile is the both-explicit escape (launches)", async () => {
+    const h = makeHarness({
+      agent: "codex",
+      argv: ["--x-no-confirm", "--profile", "native", "hi"],
+      presetCatalog: EMPTY,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(cmd[0]).toBe(h.deps.codexBin);
+    expect(cmd).toContain("native");
+  });
+
+  test("pi --model id:xhigh is thinking-supplied (launches, no --thinking added)", async () => {
+    const h = makeHarness({
+      agent: "pi",
+      argv: ["--x-no-confirm", "--model", "gpt-5.5:xhigh", "hi"],
+      listProfiles: () => ["default"],
+      presetCatalog: EMPTY,
+    });
+    const cmd = await runAndCapture(h, main);
+    // The colon shorthand carries thinking, so keeper adds no conflicting flag.
+    expect(flagValues(cmd, "--model")).toEqual(["gpt-5.5:xhigh"]);
+    expect(cmd).not.toContain("--thinking");
   });
 });
 

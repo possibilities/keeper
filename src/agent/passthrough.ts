@@ -395,3 +395,52 @@ export function resolveStartupThinkingOverride(
   }
   return defaultThinking;
 }
+
+/** Pi thinking tokens valid as a `--model <id>:<thinking>` shorthand suffix. */
+const PI_THINKING_TOKENS: ReadonlySet<string> = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
+/** The value of `--model x` (split) or `--model=x` (joined) before a bare `--`. */
+function piModelArgValue(args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "--") {
+      return null;
+    }
+    if (arg === "--model") {
+      return args[i + 1] ?? null;
+    }
+    if (arg.startsWith("--model=")) {
+      return arg.slice("--model=".length);
+    }
+  }
+  return null;
+}
+
+/**
+ * The pi thinking level embedded in a `--model <id>:<thinking>` shorthand, or
+ * null. pi parses the trailing `:<token>` off its OWN `--model`, so when the
+ * suffix after the LAST `:` is a valid thinking token keeper treats thinking as
+ * caller-supplied — it satisfies the both-explicit escape from the fresh-launch
+ * default gate AND suppresses the default `--thinking` injection (pi would reject
+ * a conflicting flag). A colon-less model, an empty id, or a non-token suffix
+ * yields null.
+ */
+export function piModelColonThinking(args: string[]): string | null {
+  const model = piModelArgValue(args);
+  if (model === null) {
+    return null;
+  }
+  const idx = model.lastIndexOf(":");
+  if (idx <= 0 || idx === model.length - 1) {
+    return null;
+  }
+  const suffix = model.slice(idx + 1);
+  return PI_THINKING_TOKENS.has(suffix) ? suffix : null;
+}

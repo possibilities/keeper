@@ -42,6 +42,10 @@ describe("keeper agent byte-pin — claude native argv", () => {
     expect(cmd).toEqual([
       CLAUDE_BIN,
       "hello world",
+      "--effort",
+      "high",
+      "--model",
+      "opus",
       "--strict-mcp-config",
       "--teammate-mode",
       "in-process",
@@ -85,6 +89,10 @@ describe("keeper agent byte-pin — codex native argv", () => {
       CODEX_BIN,
       "--dangerously-bypass-approvals-and-sandbox",
       "--search",
+      "--model",
+      "gpt",
+      "-c",
+      'model_reasoning_effort="high"',
       "hello",
     ]);
   });
@@ -101,6 +109,10 @@ describe("keeper agent byte-pin — pi native argv", () => {
     expect(cmd).toEqual([
       PI_BIN,
       "hello",
+      "--thinking",
+      "high",
+      "--model",
+      "glm",
       "--session-id",
       UUID,
       "--name",
@@ -249,7 +261,8 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
     transcriptHomeDir: home,
     cwd,
     randomUuid: () => RUN_UUID,
-    // A claude-harness preset so `--preset` validation (harness == <cli>) passes.
+    // A claude-harness preset so `--preset` validation (harness == <cli>) passes;
+    // claude_default lets a bare `agent run claude` clear the fresh-launch gate.
     presetCatalog: {
       presets: {
         opus: {
@@ -260,6 +273,7 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
           role: null,
         },
       },
+      claude_default: "opus",
     },
     tmuxCommand: (cmd) =>
       cmd.includes("has-session")
