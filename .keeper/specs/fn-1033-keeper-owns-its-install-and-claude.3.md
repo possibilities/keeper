@@ -47,5 +47,5 @@ keeper's guard has taken over.
 - [ ] Lands after task 1 + the operator cutover — no `~/.claude` ownership gap
 
 ## Done summary
-
+keeper-install buildbot builder now runs keeper's own scripts/install.sh (workdir /Users/mike/code/keeper), Dependent-gated on keeper's green build; arthack/scripts/install.sh drops the claude stow case and the keeper bun link step while keeping keeper-dependency verifies. checkconfig passes.
 ## Evidence

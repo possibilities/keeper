@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Arthack hands keeper install (buildbot job + decouple)",
-  "updated_at": "2026-07-01T05:14:52.194000Z"
+  "updated_at": "2026-07-01T08:04:56.991000Z",
+  "worker_done_at": "2026-07-01T08:04:56.991000Z"
 }
