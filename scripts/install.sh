@@ -41,13 +41,16 @@ else
 fi
 
 # 3. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
-#    bun steps complete. Gate on content: only reload when the live plist differs
-#    from (or is missing against) the repo copy. `cmp -s` reads through a symlink,
-#    so a live symlink pointing at this repo plist compares equal and no-ops.
-if cmp -s "${repo_plist}" "${live_plist}"; then
-  echo "install: keeperd plist unchanged; no reload"
+#    bun steps complete. Gate on content AND loaded state: reload when the live
+#    plist differs from (or is missing against) the repo copy, OR when it matches
+#    but keeperd is not actually registered. `cmp -s` alone reads through the
+#    symlink, so a symlink repointed by a reload that then failed would compare
+#    equal and latch the outage shut on the next run — the loaded-state check
+#    decouples the gate from the symlink so a rerun re-attempts until loaded.
+if cmp -s "${repo_plist}" "${live_plist}" && launchctl print "${service}" >/dev/null 2>&1; then
+  echo "install: keeperd plist unchanged and loaded; no reload"
 else
-  echo "install: keeperd plist changed; relink + reload"
+  echo "install: keeperd plist changed or not loaded; relink + reload"
   mkdir -p "${HOME}/Library/LaunchAgents"
   ln -sfn "${repo_plist}" "${live_plist}"
   # Modern launchctl surface. bootout-first (|| true — bootstrap over an already
@@ -56,7 +59,26 @@ else
   # but keeps the cached registration, so a changed plist never takes.
   launchctl bootout "${service}" 2>/dev/null || true
   launchctl enable "${service}"
-  launchctl bootstrap "${domain}" "${live_plist}"
+  # bootout is async, so a back-to-back bootstrap can error before the unload
+  # settles. Bounded-retry so a transient failure self-heals within the run
+  # instead of aborting under `set -e` with the symlink already repointed.
+  reloaded=0
+  for attempt in 1 2 3 4 5; do
+    if launchctl bootstrap "${domain}" "${live_plist}" 2>/dev/null; then
+      reloaded=1
+      break
+    fi
+    echo "install: bootstrap attempt ${attempt} did not settle; retrying" >&2
+    sleep 1
+  done
+  # Confirm keeperd is truly registered before declaring success — never trust
+  # the symlink as proof of a completed reload.
+  if [ "${reloaded}" -ne 1 ] || ! launchctl print "${service}" >/dev/null 2>&1; then
+    echo "install: keeperd failed to load after reload; recover with" >&2
+    echo "  launchctl bootstrap ${domain} ${live_plist}" >&2
+    exit 1
+  fi
+  echo "install: keeperd reloaded and loaded"
 fi
 
 echo "install: done"
