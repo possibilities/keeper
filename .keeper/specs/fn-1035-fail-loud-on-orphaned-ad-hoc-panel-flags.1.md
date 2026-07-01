@@ -25,5 +25,5 @@ for `model`/`effort`/`role` (lines 890-892) being non-undefined while
       `--model`, `--effort`, `--role`.
 
 ## Done summary
-
+panel start now exits 2 naming the required --preset/--cli selector when --model/--effort/--role are passed without one, instead of silently dropping the override onto the configured-panel path; a fast-tier contract test pins each flag.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Reject orphaned ad-hoc panel flags",
-  "updated_at": "2026-07-01T07:11:55.536000Z"
+  "updated_at": "2026-07-01T10:05:31.156000Z",
+  "worker_done_at": "2026-07-01T10:05:31.156000Z"
 }
