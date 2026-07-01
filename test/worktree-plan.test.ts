@@ -41,6 +41,7 @@ function task(
     title: taskId,
     target_repo: null,
     tier: null,
+    model: null,
     worker_phase: "open",
     runtime_status: "todo",
     depends_on: dependsOn,

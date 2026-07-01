@@ -567,6 +567,8 @@ test("onChange emits a task snapshot with derived workerPhase + epicId", () => {
       // fn-602: `tier` rides FREE in the embedded JSON; pre-fn-602 task files
       // lack the field and `buildTaskMessage` coerces to `null`.
       tier: null,
+      // `model` rides FREE alongside `tier`; a model-less task file coerces to null.
+      model: null,
       workerPhase: "open",
       runtimeStatus: "todo",
       dependsOn: [],
@@ -1065,6 +1067,8 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
     // tier-less raw task file coerces to `null` via `asString(undefined)`.
     // Bytes match because the slot order is identical across both sites.
     tier: null,
+    // `model` rides in the same slot (right after `tier`) on both sides.
+    model: null,
     workerPhase: "done",
     runtimeStatus: "in_progress",
     dependsOn: [],
@@ -1097,6 +1101,7 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
     // the seed side (`t.tier ?? null`) and the build side (`asString(raw.tier)`
     // → `null` when `raw.tier` is undefined on a tier-less task file).
     tier: null,
+    model: null,
     workerPhase: "open",
     runtimeStatus: "todo",
     dependsOn: [],

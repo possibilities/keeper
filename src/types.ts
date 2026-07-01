@@ -976,6 +976,14 @@ export interface Task {
    */
   tier: string | null;
   /**
+   * Plan-native worker model (the model axis of the {model × effort} worker
+   * matrix). Stored opaque — keeper never branches on the value; the autopilot
+   * producer pairs it with {@link tier} to resolve the launch-time
+   * `--plugin-dir plugins/plan/workers/<model>-<effort>` cell. Null on
+   * legacy task files / shell elements.
+   */
+  model: string | null;
+  /**
    * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
    * `"open"`. Nullable on a shell task element inserted by `syncJobIntoEpic`
    * before any plan-snapshot fold lands.

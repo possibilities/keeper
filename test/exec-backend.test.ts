@@ -602,6 +602,57 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
   ]);
 });
 
+test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --name (byte-pinned)", () => {
+  expect(
+    buildKeeperAgentLaunchArgv({
+      launcherArgvPrefix: LAP,
+      session: "autopilot",
+      prompt: "/plan:work fn-1-x.1",
+      claudeName: "work::fn-1-x.1",
+      model: "sonnet",
+      effort: "max",
+      pluginDir: "/abs/keeper/plugins/plan/workers/opus-max",
+      noConfirm: true,
+    }),
+  ).toEqual([
+    ...LAP,
+    "claude",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
+    "autopilot",
+    "--x-tmux-env",
+    "KEEPER_TMUX_SESSION=autopilot",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--model",
+    "sonnet",
+    "--effort",
+    "max",
+    "--x-no-confirm",
+    "--name",
+    "work::fn-1-x.1",
+    // The cell flag slots AFTER `--name` so the dispatch-key peel is unaffected.
+    "--plugin-dir",
+    "/abs/keeper/plugins/plan/workers/opus-max",
+    "/plan:work fn-1-x.1",
+  ]);
+});
+
+test("buildKeeperAgentLaunchArgv: an empty pluginDir emits no --plugin-dir", () => {
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+    pluginDir: "",
+    noConfirm: true,
+  });
+  expect(argv).not.toContain("--plugin-dir");
+});
+
 test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-confirm flag", () => {
   expect(
     buildKeeperAgentLaunchArgv({

@@ -1558,6 +1558,12 @@ interface EmbeddedTask {
    * `worker_phase`/`runtime_status`).
    */
   tier?: string | null;
+  /**
+   * Plan-native worker model (model axis of the worker matrix): rides FREE in
+   * the embedded JSON alongside `tier` (no schema column). Optional for the same
+   * graceful-degradation reason — a pre-model event folds `snapshot.model ?? null`.
+   */
+  model?: string | null;
   worker_phase?: string | null;
   runtime_status?: string;
   depends_on: string[];
@@ -1654,6 +1660,9 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     // verbatim from the task-def file's top-level `tier` field. Stored
     // opaque — the reducer never branches on the value.
     tier: "high",
+    // The producer also ships `model` (the model axis of the worker matrix)
+    // alongside `tier`; stored opaque and read `snapshot.model ?? null`.
+    model: "opus",
     // Schema v19: the producer (plan-worker → daemon → synthetic event)
     // ships BOTH `worker_phase` (renamed from `status`) and `runtime_status`
     // (plan-native enum). The legacy `status` is still read defensively
@@ -1671,6 +1680,7 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
     tier: "high",
+    model: "opus",
     worker_phase: "done",
     runtime_status: "in_progress",
     // No depends_on in the blob → the embedded element defaults to [].

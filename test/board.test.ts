@@ -101,6 +101,9 @@ function makeTask(overrides: Partial<Task>): Task {
     // here so the fixture compiles under `exactOptionalPropertyTypes`;
     // tests that care about a real tier override via `...overrides`.
     tier: null,
+    // Plan-native worker model (model axis of the worker matrix); NULL here,
+    // real value threaded via `...overrides` where a test cares.
+    model: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
     // open|done) and `runtime_status` added (plan-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's

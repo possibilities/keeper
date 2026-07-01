@@ -1011,6 +1011,7 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     title: string;
     target_repo: string;
     tier: string | null;
+    model: string | null;
     worker_phase: string;
     runtime_status: string;
     depends_on: string[];
@@ -1028,6 +1029,8 @@ test("synthetic EpicSnapshot/TaskSnapshot events fold into epics (tasks embedded
     // embedded element folds to `null` deterministically (graceful-
     // degradation precedent shared with `worker_phase`/`runtime_status`).
     tier: null,
+    // `model` rides FREE alongside `tier`; an omitting event folds to null.
+    model: null,
     // Schema v19: the legacy `status` column was renamed to `worker_phase`
     // (derived worker-phase binary) and a sibling `runtime_status` field
     // surfaces the plan-native enum. A TaskSnapshot blob without a state

@@ -135,6 +135,7 @@ function makeTask(overrides: Partial<Task>): Task {
     title: "task",
     target_repo: null,
     tier: null,
+    model: null,
     worker_phase: "open",
     runtime_status: "todo",
     depends_on: [],
@@ -826,23 +827,60 @@ test("reconcile: task target_repo override wins over epic project_dir for cwd", 
   const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches[0]?.cwd).toBe("/repo-task");
-  // fn-10: no tier-plugin flag ever — the worker command carries no
-  // `--plugin-dir`, regardless of tier.
+  // A task with neither model nor tier resolves no cell — no `--plugin-dir`.
   expect(decision.launches[0]?.workerCommand).not.toContain("--plugin-dir");
+  expect(decision.launches[0]?.pluginDir).toBeNull();
 });
 
-test("reconcile: tier on a `work` row still rides `plan.tier` but never enters the command (fn-10)", () => {
+test("reconcile: a `work` row with a tier but NO model resolves no cell (null-either-axis stop)", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max" })],
   });
   const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(snap, makeState(), 0);
-  // The tier is preserved on the launch plan (board/projection read)…
+  // The tier still rides the launch plan (board/projection read)…
   expect(decision.launches[0]?.tier).toBe("max");
-  // …but no longer threads a `--plugin-dir work-plugins/<tier>` flag into the
-  // spawned command — tier routing moved to the `plan:worker-<tier>` agent.
+  // …but a null model means no {model, effort} cell, so no `--plugin-dir` and a
+  // null pluginDir — the launch falls back to the always-loaded `plan` plugin.
+  expect(decision.launches[0]?.pluginDir).toBeNull();
+  expect(decision.launches[0]?.pluginDirReject).toBeUndefined();
   expect(decision.launches[0]?.workerCommand).not.toContain("--plugin-dir");
-  expect(decision.launches[0]?.workerCommand).not.toContain("work-plugins");
+});
+
+test("reconcile: a `work` row with an in-matrix (model, tier) threads the absolute cell --plugin-dir", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState(), 0);
+  const plan = decision.launches[0];
+  // The resolved cell is an ABSOLUTE path under keeper's plugins/plan/workers,
+  // so a worktree/cross-repo worker launched from another cwd still finds it.
+  expect(plan?.pluginDir).not.toBeNull();
+  expect(plan?.pluginDir?.startsWith("/")).toBe(true);
+  expect(plan?.pluginDir).toContain("plugins/plan/workers/opus-max");
+  expect(plan?.pluginDirReject).toBeUndefined();
+  // The shell-twin command mirrors it after `--name` (the byte drift-guard).
+  expect(plan?.workerCommand).toContain(
+    `--name work::fn-1-foo.1 --plugin-dir ${plan?.pluginDir}`,
+  );
+});
+
+test("reconcile: an out-of-matrix (model, tier) fails at compose — a reject, never a thrown cycle", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", tier: "ludicrous", model: "opus" }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  // reconcile must NOT throw (a deterministic throw would wedge the whole cycle);
+  // the bad pair is carried as a pluginDirReject the producer mints as sticky.
+  const decision = reconcile(snap, makeState(), 0);
+  const plan = decision.launches[0];
+  expect(plan?.pluginDir).toBeNull();
+  expect(plan?.pluginDirReject).toBeDefined();
+  expect(plan?.pluginDirReject).toContain("unknown tier");
+  expect(plan?.workerCommand).not.toContain("--plugin-dir");
 });
 
 // ---------------------------------------------------------------------------
@@ -2448,6 +2486,36 @@ test("buildPlannedLaunchSpec: mirrors buildWorkerCommand's model/effort/name/pro
   expect(cmd).toContain("/plan:work fn-1-foo.1");
 });
 
+test("buildPlannedLaunchSpec + buildWorkerCommand thread a non-null pluginDir in lockstep", () => {
+  const cell = "/abs/keeper/plugins/plan/workers/opus-max";
+  const spec = buildPlannedLaunchSpec(
+    "work",
+    "fn-1-foo.1",
+    WORKER_MODEL,
+    WORKER_EFFORT,
+    undefined,
+    undefined,
+    cell,
+  );
+  expect(spec.pluginDir).toBe(cell);
+  // The shell twin emits `--plugin-dir <cell>` right after `--name`.
+  const cmd = buildWorkerCommand(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    WORKER_MODEL,
+    WORKER_EFFORT,
+    cell,
+  );
+  expect(cmd).toContain(`--name work::fn-1-foo.1 --plugin-dir ${cell}`);
+  // A null pluginDir leaves both byte-unchanged (no cell key, no flag).
+  const bare = buildPlannedLaunchSpec("work", "fn-1-foo.1");
+  expect("pluginDir" in bare).toBe(false);
+  expect(buildWorkerCommand("work", "fn-1-foo.1", "/repo")).not.toContain(
+    "--plugin-dir",
+  );
+});
+
 test("confirmRunning: watermark captured BEFORE launch (excludes stale terminal rows)", async () => {
   // The fake's findJob filters on `last_event_id > watermark`. A stale
   // jobs row for `(work, fn-1-foo.1)` with last_event_id=80 must NOT
@@ -2800,6 +2868,80 @@ test("runReconcileCycle: a tiered `work` task launches directly — no work-plug
   const body = log.launches[0]?.argv.join(" ") ?? "";
   expect(body).not.toContain("--plugin-dir");
   expect(body).not.toContain("work-plugins");
+});
+
+test("runReconcileCycle: a missing worker-cell manifest blocks the launch with a sticky DispatchFailed", async () => {
+  // The task resolves an in-matrix cell (`opus-max`), but the cell's generated
+  // `.claude-plugin/plugin.json` is absent — `claude --plugin-dir` would fall
+  // back to the dir basename and `/plan:work` could not resolve `work:worker`.
+  // The pre-launch guard must short-circuit BEFORE any spawn: one DispatchFailed
+  // carrying a regenerate hint, no launch, no in-flight slot held.
+  const { deps, log } = makeFakeDeps({
+    // cwd exists; the `.claude-plugin/…` manifest under the cell does not.
+    dirExists: (p) => !p.includes(".claude-plugin"),
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.launches[0]?.pluginDir).toContain(
+    "plugins/plan/workers/opus-max",
+  );
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]); // never spawned
+  expect(liveDispatches.size).toBe(0);
+  expect(log.emissions.length).toBe(1);
+  expect(log.emissions[0]).toMatchObject({ verb: "work", id: "fn-1-foo.1" });
+  expect(log.emissions[0]?.reason).toContain("worker-cell-missing");
+  expect(log.emissions[0]?.reason).toContain("render-plugin-templates");
+  expect(state.inFlight.size).toBe(0);
+});
+
+test("runReconcileCycle: an out-of-matrix worker cell blocks the launch with a sticky DispatchFailed", async () => {
+  // A corrupt-on-disk task carrying an effort outside the matrix. reconcile
+  // carries it as a `pluginDirReject` (never a throw); the producer mints the
+  // sticky failure and launches nothing.
+  const { deps, log } = makeFakeDeps();
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", tier: "ludicrous", model: "opus" }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.launches[0]?.pluginDirReject).toBeDefined();
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(log.emissions.length).toBe(1);
+  expect(log.emissions[0]?.reason).toContain("worker-cell-invalid");
+  expect(state.inFlight.size).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

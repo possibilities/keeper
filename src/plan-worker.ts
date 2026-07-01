@@ -158,6 +158,13 @@ export interface PlanTaskMessage {
    */
   tier: string | null;
   /**
+   * Plan-native worker model — the top-level `model` field on the task-def file
+   * (the model axis of the {model × effort} worker matrix). Stored opaque; the
+   * autopilot producer pairs it with `tier` to select the launch-time worker
+   * plugin cell. Null on absent/legacy files (folds to `null` deterministically).
+   */
+  model: string | null;
+  /**
    * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
    * `"open"`. Kept distinct from the plan-native `runtime_status` enum below.
    */
@@ -563,6 +570,13 @@ interface RawTask {
    * task files / unset on newer ones; coerced to `null` by `asString`.
    */
   tier?: unknown;
+  /**
+   * Plan-native worker model: top-level `model` field on the task-def file (the
+   * model axis of the {model × effort} matrix `keeper plan resolve-task` pairs
+   * with `tier`). Stored opaque; absent on legacy files, coerced to `null` by
+   * `asString`.
+   */
+  model?: unknown;
   worker_done_at?: unknown;
   depends_on?: unknown;
 }
@@ -1847,6 +1861,7 @@ export function buildTaskMessage(
     title: asString(raw.title),
     targetRepo: asString(raw.target_repo),
     tier: asString(raw.tier),
+    model: asString(raw.model),
     workerPhase: asString(raw.worker_done_at) !== null ? "done" : "open",
     runtimeStatus,
     dependsOn: asStringArray(raw.depends_on),
@@ -2592,6 +2607,14 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
        * upgrade window.
        */
       tier?: string | null;
+      /**
+       * Plan-native worker model. Absent on pre-model stored task elements;
+       * read defensively (`?? null`) so the reconstructed `PlanTaskMessage.model`
+       * matches `buildTaskMessage`'s `asString(raw.model)` on a fresh re-scan and
+       * the change-gate byte-compare suppresses correctly across the upgrade
+       * window.
+       */
+      model?: string | null;
       // Legacy column name in the embedded JSON — pre-schema-bump rows carry
       // `status`; post-bump rows carry `worker_phase`. Both are read
       // defensively (whichever is present feeds `workerPhase`) so the seed
@@ -2626,6 +2649,11 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         // `asString(raw.tier)` on a tier-less task file so the change-gate
         // byte-compare suppresses on restart.
         tier: t.tier ?? null,
+        // Plan-native worker model. Pre-model stored elements lack the key —
+        // `?? null` matches `buildTaskMessage`'s `asString(raw.model)` on a
+        // model-less task file so the change-gate byte-compare suppresses on
+        // restart. Slot position (right after `tier`) mirrors buildTaskMessage.
+        model: t.model ?? null,
         // The projection stores the derived worker-phase verbatim under
         // `worker_phase` (post-bump) or the legacy `status` key (pre-bump);
         // read whichever is present and default to "open" for a NULL so the

@@ -447,6 +447,13 @@ interface PlanSnapshot {
    * free in the embedded-tasks JSON; no schema column.
    */
   tier?: string | null;
+  /**
+   * plan-native worker model on TaskSnapshot blobs (the model axis of the
+   * {model × effort} worker matrix). Stored opaque (the reducer never branches
+   * on the value). Read defensively (`snapshot.model ?? null`) so an older blob
+   * folds to a null model. Rides free in the embedded-tasks JSON; no schema column.
+   */
+  model?: string | null;
   epic_id?: string | null;
   status?: string | null;
   /**
@@ -651,6 +658,7 @@ function projectPlanRow(db: Database, event: Event): void {
       title: string | null;
       target_repo: string | null;
       tier: string | null;
+      model: string | null;
       worker_phase: string | null;
       runtime_status: string;
       depends_on: string[];
@@ -661,11 +669,14 @@ function projectPlanRow(db: Database, event: Event): void {
       task_number: snapshot.task_number ?? null,
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
-      // The slot order across `target_repo` / `tier` / `worker_phase` etc. must
-      // match `PlanTaskMessage` / `seedFromDb` / the `TaskElement` shell in
-      // `syncJobIntoEpic` — the change-gate `JSON.stringify` byte-compare
-      // relies on consistent slot order across all four sites.
+      // The slot order across `target_repo` / `tier` / `model` / `worker_phase`
+      // etc. must match `PlanTaskMessage` / `seedFromDb` / the `TaskElement`
+      // shell in `syncJobIntoEpic` — the change-gate `JSON.stringify`
+      // byte-compare relies on consistent slot order across all four sites.
       tier: snapshot.tier ?? null,
+      // plan-native worker model — the model axis of the worker matrix; older
+      // blobs lack the key and fold to null.
+      model: snapshot.model ?? null,
       // A pre-rename blob carries `status` instead of `worker_phase`; read
       // whichever is present so a re-fold reproduces the same value.
       worker_phase: snapshot.worker_phase ?? snapshot.status ?? null,
@@ -6087,6 +6098,12 @@ function syncJobIntoEpic(
      * there. A shell element initialises `tier: null`.
      */
     tier?: string | null;
+    /**
+     * plan-native worker model. Optional because older stored elements lack the
+     * key; the OLD-element carve-out spread below preserves whatever was there.
+     * A shell element initialises `model: null`.
+     */
+    model?: string | null;
     worker_phase: string | null;
     runtime_status: string;
     depends_on: unknown[];
@@ -6135,6 +6152,7 @@ function syncJobIntoEpic(
           title: null,
           target_repo: null,
           tier: null,
+          model: null,
           worker_phase: null,
           // Shell element gets the plan `"todo"` default (zero-event
           // projection / `merge_task_state` convention).

@@ -3617,6 +3617,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // (no schema column). An older blob lacks this key and the reducer
           // reads `snapshot.tier ?? null` (graceful degradation).
           tier: msg.tier,
+          // plan-native worker model — rides FREE in the embedded-tasks JSON
+          // (no schema column, like `tier`). An older blob lacks this key and
+          // the reducer reads `snapshot.model ?? null` (graceful degradation).
+          model: msg.model,
           // Derived worker-phase binary (`worker_done_at` present → "done", else
           // "open"), kept distinct from `runtime_status` (plan's native enum).
           worker_phase: msg.workerPhase,

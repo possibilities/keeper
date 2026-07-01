@@ -40,8 +40,15 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+// Shared with the plan plugin's renderer so the launch-time `--plugin-dir` cell
+// selection and the generated `plugins/plan/workers/<model>-<effort>` tree can't
+// drift: `workerAgentFor` supplies the matrix-validated throw + null-either-axis
+// stop; `workerCellDir` supplies the SINGLE cell-path convention.
+import { workerAgentFor } from "../plugins/plan/src/models.ts";
+import { workerCellDir } from "../plugins/plan/src/subagents_config.ts";
 import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
 import { computeEligibleEpics } from "./armed-closure";
 import {
@@ -295,14 +302,81 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
+ * The keeper repo root — the checkout that owns the generated
+ * `plugins/plan/workers/<model>-<effort>` cell tree. A worktree / cross-repo
+ * worker runs with its cwd in ANOTHER repo, so the `--plugin-dir` cell path the
+ * autopilot bakes into a launch must be ABSOLUTE and cwd-independent (a relative
+ * `plugins/plan/workers/...` would resolve against the worker's target repo, not
+ * keeper's). Derived from THIS module's location (`src/…` → `..`) and
+ * `realpath`'d so the daemon's own cwd/PATH can't break it; env-overridable via
+ * `KEEPER_ROOT` (for tests + a non-default checkout), tilde-expanded eagerly at
+ * module load. Mirrors the `resolveKeeperAgentPathDepFree` derive-from-module
+ * shape.
+ */
+export const KEEPER_ROOT: string = ((): string => {
+  const raw = process.env.KEEPER_ROOT;
+  if (raw != null && raw !== "") {
+    const v =
+      raw === "~"
+        ? homedir()
+        : raw.startsWith("~/")
+          ? join(homedir(), raw.slice(2))
+          : raw;
+    return v;
+  }
+  const derived = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  try {
+    return realpathSync(derived);
+  } catch {
+    return derived;
+  }
+})();
+
+/**
+ * Resolve the ABSOLUTE per-cell worker plugin dir for a task's {model, effort}
+ * pair — `${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`. The launcher
+ * points `claude --plugin-dir` here so the worker session loads exactly the one
+ * `work` plugin matching the task.
+ *
+ * Returns `null` when EITHER axis is null (a task carrying no tier or no model,
+ * or a `close` row) — the null return is load-bearing: it preserves the
+ * null-either-axis stop and leaves the launch with no `--plugin-dir` (falling
+ * back to the always-loaded `plan` plugin). THROWS for a non-null value outside
+ * the configured matrix (reusing {@link workerAgentFor}'s corrupt-on-disk guard)
+ * rather than blind-joining a bogus cell path — the caller catches the throw and
+ * turns it into a visible sticky `DispatchFailed`, never an opaque
+ * agent-not-found inside a spawned session. Pure: `subagentsMatrix()` is a
+ * memoized embed parse (no I/O) and `KEEPER_ROOT` is resolved once at load.
+ */
+export function workerCellPluginDir(
+  model: string | null,
+  tier: string | null,
+): string | null {
+  // Validate the pair against the matrix (throws on out-of-matrix) and reuse the
+  // null-either-axis stop — the composed agent name itself is discarded here.
+  if (workerAgentFor(tier, model) === null) {
+    return null;
+  }
+  // Non-null here ⇒ both axes are non-null and in-matrix.
+  return join(
+    KEEPER_ROOT,
+    "plugins",
+    "plan",
+    workerCellDir(model as string, tier as string),
+  );
+}
+
+/**
  * Build the `claude` worker shell command for a `(verb, id, cwd)`, pinned
  * byte-for-byte by `test/autopilot-worker.test.ts`. Lives here rather than
- * re-exported to keep this worker's import graph narrow. The launcher carries
- * no tier flag — the `plan` plugin is always loaded and `/plan:work` spawns the
- * tier worker_agent. `--x-no-confirm` is an extended launcher flag (parsed and
- * stripped before the real claude binary) that suppresses the cwd confirmation
- * prompt so automated dispatch never hangs on a keystroke.
- * Pure — exported for tests.
+ * re-exported to keep this worker's import graph narrow. The session `--model` /
+ * `--effort` are the content-blind orchestrator flags (NOT the task cell); a
+ * `work` task's {model, effort} cell rides the SEPARATE `--plugin-dir <pluginDir>`
+ * (the launch-time `work` plugin `/plan:work` spawns from), emitted right after
+ * `--name` so the reap/classify `--name verb::id` adjacency is preserved.
+ * `--x-no-confirm` is an extended launcher flag (parsed and stripped before the
+ * real claude binary) that suppresses the cwd confirmation prompt so automated
+ * dispatch never hangs on a keystroke. Pure — exported for tests.
  */
 export function buildWorkerCommand(
   verb: Verb,
@@ -310,6 +384,7 @@ export function buildWorkerCommand(
   projectDir: string,
   model: string = WORKER_MODEL,
   effort: string = WORKER_EFFORT,
+  pluginDir: string | null = null,
 ): string {
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   const flags: string[] = [];
@@ -319,6 +394,11 @@ export function buildWorkerCommand(
   flags.push("--x-no-confirm");
   // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
+  // Per-cell worker plugin dir — AFTER `--name` so the dispatch-key peel is
+  // unaffected. Present only for a `work` row whose task resolves a cell.
+  if (pluginDir != null && pluginDir !== "") {
+    flags.push("--plugin-dir", pluginDir);
+  }
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
 }
 
@@ -378,8 +458,10 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
  * env (worktree-mode launches only); absent/empty leaves it off so non-worktree
  * launches stay byte-identical. A non-empty `worktreeBranch` rides as the
  * sibling `KEEPER_PLAN_WORKTREE_BRANCH` env — the durable per-job lane marker
- * (the pure per-node branch, never derived from the path). Pure — exported for
- * tests.
+ * (the pure per-node branch, never derived from the path). A non-null
+ * `pluginDir` rides as the `--plugin-dir` cell (the task's resolved
+ * {model, effort} `work` plugin); null/absent leaves it off (the byte-unchanged
+ * cell-less default). Pure — exported for tests.
  */
 export function buildPlannedLaunchSpec(
   verb: Verb,
@@ -388,12 +470,14 @@ export function buildPlannedLaunchSpec(
   effort: string = WORKER_EFFORT,
   worktreePath?: string,
   worktreeBranch?: string,
+  pluginDir?: string | null,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
     claudeName: dispatchKey(verb, id),
     model,
     effort,
+    ...(pluginDir != null && pluginDir !== "" ? { pluginDir } : {}),
     ...(worktreePath !== undefined && worktreePath !== ""
       ? { worktreePath }
       : {}),
@@ -931,6 +1015,26 @@ export interface PlannedLaunch {
   effort: string;
   /** Task `tier`, only set for `work` rows. */
   tier: string | null;
+  /**
+   * The resolved ABSOLUTE per-cell worker plugin dir for a `work` row whose task
+   * carries an in-matrix {model, effort} pair
+   * (`${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`), else `null` (a
+   * `close` row, a cell-less task, or a row whose compose threw — see
+   * {@link pluginDirReject}). Threaded onto the launch so `runReconcileCycle`
+   * emits it via BOTH the shell twin (`workerCommand`) and the structured spec
+   * ({@link buildPlannedLaunchSpec}) without re-composing.
+   */
+  pluginDir: string | null;
+  /**
+   * Set IFF composing the cell path for this `work` row THREW — an out-of-matrix
+   * `(model, effort)` (corrupt-on-disk task). Carries the throw's message; the
+   * producer mints a sticky `DispatchFailed` (cleared by `retry_dispatch`) and
+   * launches nothing, per-key, so a sibling launch keeps dispatching. Mutually
+   * exclusive with a non-null {@link pluginDir}. Mirrors the `worktreeReject`
+   * pure-reject-carried-to-producer shape so the pure `reconcile` never throws
+   * (a deterministic throw would silently wedge the whole cycle).
+   */
+  pluginDirReject?: string;
   /**
    * `true` IFF this is an EPIC-level finalizer (`close` at the close-row site,
    * keyed by epic id). The cycle glue stamps `state.finalizerGuard[id]` for these
@@ -1866,6 +1970,23 @@ export function reconcile(
       if (budget <= 0) {
         continue;
       }
+      // Resolve the launch-time worker-plugin cell from the TASK's {model, tier}
+      // (NOT the orchestrator's session model/effort). Compose in a try/catch so
+      // a corrupt out-of-matrix pair becomes a per-launch reject the producer
+      // mints as a sticky `DispatchFailed` — a raw throw here would deterministically
+      // wedge the whole reconcile cycle (`driveCycle`'s backstop logs and re-drives).
+      let pluginDir: string | null = null;
+      let pluginDirReject: string | undefined;
+      if (verb === "work") {
+        try {
+          pluginDir = workerCellPluginDir(
+            task.model ?? null,
+            task.tier ?? null,
+          );
+        } catch (err) {
+          pluginDirReject = err instanceof Error ? err.message : String(err);
+        }
+      }
       launches.push({
         verb,
         id: taskId,
@@ -1877,10 +1998,13 @@ export function reconcile(
           cwd,
           snapshot.workerModel,
           snapshot.workerEffort,
+          pluginDir,
         ),
         model: snapshot.workerModel,
         effort: snapshot.workerEffort,
         tier: verb === "work" ? task.tier : null,
+        pluginDir,
+        ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
       });
       budget--;
     }
@@ -1955,6 +2079,8 @@ export function reconcile(
           model: snapshot.workerModel,
           effort: snapshot.workerEffort,
           tier: null,
+          // A `close` row is cell-less — it loads no per-cell worker plugin.
+          pluginDir: null,
           // Every close-row launch is an epic finalizer (`close`);
           // the cycle glue stamps the per-epic guard for these.
           isEpicFinalizer: true,
@@ -3343,6 +3469,42 @@ export async function runReconcileCycle(
       });
       continue;
     }
+    // Per-cell worker-plugin guards, BEFORE any launch side effect (mirrors the
+    // `worktreeReject` / `cwd-missing` per-key skip shape). Both mint a sticky
+    // `DispatchFailed` (cleared by `retry_dispatch`) so a doomed launch never
+    // burns a cold boot, and a sibling launch keeps dispatching.
+    //   (1) an out-of-matrix {model, effort} the pure compose flagged, and
+    //   (2) a cell whose generated plugin manifest is absent — `claude
+    //       --plugin-dir` would fall back to the dir basename and `/plan:work`
+    //       could not resolve `work:worker`. Remediation: regenerate the tree.
+    if (plan.pluginDirReject !== undefined) {
+      deps.emitDispatchFailed({
+        verb: plan.verb,
+        id: plan.id,
+        reason: `worker-cell-invalid: ${plan.pluginDirReject}`,
+        dir: plan.cwd,
+        ts: deps.now(),
+      });
+      continue;
+    }
+    if (plan.pluginDir != null) {
+      const manifest = join(plan.pluginDir, ".claude-plugin", "plugin.json");
+      if (!dirExists(manifest)) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason:
+            `worker-cell-missing: ${plan.pluginDir} — regenerate via ` +
+            `'keeper prompt render-plugin-templates --project-root ` +
+            `${join(KEEPER_ROOT, "plugins", "plan")}' (without the cell manifest ` +
+            `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
+            `cannot resolve 'work:worker')`,
+          dir: plan.cwd,
+          ts: deps.now(),
+        });
+        continue;
+      }
+    }
     // Worktree-mode producer step, BEFORE `confirmRunning` mints the
     // durable Dispatched. `launchCwd` is the cwd `confirmRunning` actually launches
     // into; it starts as the pure `plan.cwd` and is OVERRIDDEN to the lane worktree
@@ -3410,6 +3572,7 @@ export async function runReconcileCycle(
             launchCwd,
             plan.model,
             plan.effort,
+            plan.pluginDir,
           );
     const argv = buildLaunchArgv(shell, workerCommand);
     const spec = buildPlannedLaunchSpec(
@@ -3419,6 +3582,7 @@ export async function runReconcileCycle(
       plan.effort,
       worktreeLane,
       worktreeBranch,
+      plan.pluginDir,
     );
     try {
       const outcome = await confirmRunning(

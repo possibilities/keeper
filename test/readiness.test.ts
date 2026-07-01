@@ -60,6 +60,7 @@ function makeTask(overrides: Partial<Task>): Task {
     title: "task",
     target_repo: null,
     tier: null,
+    model: null,
     // Schema v19: `status` renamed to `worker_phase` (derived binary —
     // open|done) and `runtime_status` added (plan-native enum, default
     // "todo"). Both ride inside the embedded element on the parent epic's

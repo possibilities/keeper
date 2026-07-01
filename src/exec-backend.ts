@@ -92,6 +92,16 @@ export interface LaunchSpec {
   /** `--effort <e>`. Omitted when absent. */
   readonly effort?: string;
   /**
+   * Per-cell worker plugin dir. When set (non-empty), the launch emits
+   * `--plugin-dir <abs>` so the worker session loads exactly the one `work`
+   * plugin matching the task's {model, effort} cell (the producer resolves the
+   * absolute `plugins/plan/workers/<model>-<effort>` path cwd-independently).
+   * Omitted for a launch with no cell (a `close` row, a task with no
+   * tier/model) and for a `--resume` re-attach (an existing session's plugin
+   * set is already pinned), so those launches stay byte-identical.
+   */
+  readonly pluginDir?: string;
+  /**
    * Worktree-mode lane path. When set (non-empty), the launch emits a SECOND
    * `--x-tmux-env KEEPER_PLAN_WORKTREE=<path>` so the worker's `keeper
    * plan` subprocesses resolve `target_repo`/`primary_repo`/`state_repo` to the
@@ -779,6 +789,12 @@ export interface KeeperAgentLaunchOpts {
   readonly model?: string;
   /** `--effort <e>`. Omitted when absent. */
   readonly effort?: string;
+  /**
+   * `--plugin-dir <abs>` — the per-cell worker plugin dir. Emitted right after
+   * `--name` (so the reap/classify `--name` adjacency is preserved and the
+   * dispatch-key peel is unaffected). Omitted when absent.
+   */
+  readonly pluginDir?: string;
   /** Whether to pass `--x-no-confirm` (the cwd-confirm suppressor). */
   readonly noConfirm: boolean;
   /**
@@ -850,6 +866,13 @@ export function buildKeeperAgentLaunchArgv(
   }
   if (opts.claudeName !== undefined) {
     flags.push("--name", opts.claudeName);
+  }
+  // Per-cell worker plugin dir — emitted AFTER `--name` so the reap/classify
+  // `--name verb::id` adjacency the dispatch-key regex peels is preserved. Set
+  // ONLY for a prompt-mode `work` launch whose task resolves a {model,effort}
+  // cell; absent for `close`/cell-less/resume launches (byte-unchanged).
+  if (opts.pluginDir !== undefined && opts.pluginDir !== "") {
+    flags.push("--plugin-dir", opts.pluginDir);
   }
   // Resume mode is `--resume <target>` with NO trailing prompt positional — a
   // re-attach to an existing session. Prompt mode keeps the prompt as the
@@ -1079,6 +1102,9 @@ export async function keeperAgentLaunch(
       : {}),
     ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
     ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
+    ...(deps.spec.pluginDir !== undefined
+      ? { pluginDir: deps.spec.pluginDir }
+      : {}),
     ...(deps.spec.worktreePath !== undefined
       ? { worktreePath: deps.spec.worktreePath }
       : {}),
