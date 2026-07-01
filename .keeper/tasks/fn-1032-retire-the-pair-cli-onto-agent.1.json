@@ -4,6 +4,7 @@
   "depends_on": [],
   "epic": "fn-1032-retire-the-pair-cli-onto-agent",
   "id": "fn-1032-retire-the-pair-cli-onto-agent.1",
+  "model": "opus",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",

@@ -6,6 +6,7 @@
   ],
   "epic": "fn-1031-agent-panel-verb-and-pairing-parity",
   "id": "fn-1031-agent-panel-verb-and-pairing-parity.2",
+  "model": "opus",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
