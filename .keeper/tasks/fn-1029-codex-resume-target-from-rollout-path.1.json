@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fill codex resume_target from rollout path",
-  "updated_at": "2026-07-01T05:02:34.966000Z"
+  "updated_at": "2026-07-01T06:25:46.713000Z",
+  "worker_done_at": "2026-07-01T06:25:46.713000Z"
 }

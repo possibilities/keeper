@@ -84,5 +84,5 @@ planted rollout, assert the bound seam resolves the id. No real `~/.codex`, no t
 - [ ] `dispatch.ts` help notes codex resume_target discovery; `bun test` green.
 
 ## Done summary
-
+Populate the run-capture resume_target for codex by parsing the session uuid from the resolved rollout-<ts>-<uuid>.jsonl transcript via an injected seam; claude/pi keep handle.sessionId and no_transcript stays null. Envelope schema unchanged.
 ## Evidence
