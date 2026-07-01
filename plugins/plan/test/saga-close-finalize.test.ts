@@ -570,6 +570,14 @@ describe("close-finalize partial_followup", () => {
     expect(env.expected_tasks).toBe(2);
     expect(env.actual_tasks).toBe(1);
     expect(epicStatus(proj.root, epicId)).toBe("open");
+    // Mirror of the closed_with_followup arm assertion: the partial path is
+    // deliberately EXCLUDED from the arm block, so the under-provisioned
+    // follow-up must stay a null ghost — never autopilot-dispatchable.
+    const followDef = JSON.parse(readFileSync(fp, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(followDef.last_validated_at).toBeNull();
   });
 });
 
