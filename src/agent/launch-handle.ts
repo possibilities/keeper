@@ -1,14 +1,13 @@
 /**
- * The shared launch→{@link ResolvedHandle} glue behind `agent run` (posture-free)
- * and `pair send` (posture-full). It assembles the per-CLI detached launch argv
- * via `buildAgentLaunchArgv`, mints the pinned transcript session id, drives
- * `launchKeeperAgentInTmux` DIRECTLY (no subprocess re-exec), and returns a
- * {@link RunLaunchResult}. The pinned {@link ResolvedHandle} is held LOCALLY by
- * the caller's compose — no run.json re-resolution, no cross-process kill margin,
- * no self-transcript-collision exposure. Both callers express their config
- * through ONE seam: the posture rides in via {@link LaunchPosture} (the
- * `buildAgentLaunchArgv` opts), every effect via the explicit {@link
- * LaunchHandleDeps}.
+ * The shared launch→{@link ResolvedHandle} glue behind `agent run` and its panel
+ * legs. It assembles the per-CLI detached launch argv via `buildAgentLaunchArgv`,
+ * mints the pinned transcript session id, drives `launchKeeperAgentInTmux`
+ * DIRECTLY (no subprocess re-exec), and returns a {@link RunLaunchResult}. The
+ * pinned {@link ResolvedHandle} is held LOCALLY by the caller's compose — no
+ * run.json re-resolution, no cross-process kill margin, no
+ * self-transcript-collision exposure. The caller expresses its config through ONE
+ * seam: the posture rides in via {@link LaunchPosture} (the `buildAgentLaunchArgv`
+ * opts), every effect via the explicit {@link LaunchHandleDeps}.
  *
  * DEP-GRAPH DISCIPLINE: this module stays db-free (no `src/db.ts` / `bun:sqlite`)
  * — it sits on `cli/agent.ts`'s reach onto the cold-start `keeper plan` path
@@ -74,7 +73,7 @@ export function tmuxTranscriptSessionId(
 
 /**
  * The posture half of the launch seam — the {@link buildAgentLaunchArgv} opts the
- * two callers vary. `agent run` omits everything; `pair send` fills the full
+ * caller varies. A bare `agent run` omits everything; a panel leg fills the full
  * posture (model/effort/session/preset). Read-only is prompting-only (a prompt
  * directive prepended caller-side), so it is NOT a launch-argv posture here.
  * `cli`/`prompt`/`launcherArgvPrefix` are NOT here — `cli`/`prompt` are explicit

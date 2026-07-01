@@ -253,11 +253,11 @@ export interface AdHocMemberSpec {
 }
 
 /**
- * Resolve an ad-hoc selector to a SINGLE {@link PanelMember} — the panel-of-one
- * that replaces `pair send`'s bespoke drive loop. `--preset <name>` resolves its
- * harness (+ model/effort launcher-side via the leg's `--preset`); `--cli <x>` is
- * a bare harness with the explicit `--model`/`--effort` overrides. `--effort` is
- * codex-only (mirrors `pair send`). A harness outside claude|codex|pi, an unknown
+ * Resolve an ad-hoc selector to a SINGLE {@link PanelMember} — a panel-of-one
+ * that drives one member through the shared panel leg path. `--preset <name>`
+ * resolves its harness (+ model/effort launcher-side via the leg's `--preset`);
+ * `--cli <x>` is a bare harness with the explicit `--model`/`--effort` overrides.
+ * `--effort` is codex-only. A harness outside claude|codex|pi, an unknown
  * preset, or effort on a non-codex member fails loud (the caller exits 2). Pure —
  * the resulting member converges on the SAME manifest + leg path a configured
  * panel produces.

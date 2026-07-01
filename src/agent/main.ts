@@ -917,11 +917,11 @@ async function runRunCaptureSubcommand(
   } else if (parsed.system !== null) {
     systemText = parsed.system.trim();
   }
-  // Compose CALLER-SIDE, mirroring pair's `assemblePrompt` block order (raw
-  // `\n\n` join, no `User:` scaffold — `agent run` has no role framing):
+  // Compose CALLER-SIDE (raw `\n\n` join, no `User:` scaffold — `agent run` has
+  // no role framing):
   // [read-only directive] → [System: <text>] → [user prompt], UNIFORM across
-  // claude/codex/pi. The shared launch helper stays directive-free so pair never
-  // double-prepends. Read-only is prompting-only: the directive is the whole
+  // claude/codex/pi. The shared launch helper stays directive-free so the caller
+  // is the sole prepender. Read-only is prompting-only: the directive is the whole
   // mechanism (keeper enforces nothing — no tool strip, no changed-files audit).
   // The `System:` block is user-turn text, NOT a privileged system prompt — the
   // native `--append-system-prompt` upgrade is a deliberate future step. An

@@ -1,6 +1,7 @@
 /**
  * The shared launch→{@link ResolvedHandle} helper (`src/agent/launch-handle.ts`)
- * that backs both `agent run` (posture-free) and `pair send` (posture-full).
+ * that backs `agent run` and its panel legs (a bare run is posture-free, a leg
+ * fills the full posture).
  *
  * Coverage:
  *  - `tmuxTranscriptSessionId`: codex → null, an explicit `--session-id` passes
