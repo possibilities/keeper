@@ -33,5 +33,5 @@ Regenerate oracle fixtures (`bun run capture-oracle` from plugins/prompt). Asser
 - [ ] The old `plan:worker-*` agents remain and the tree is green (coexistence).
 
 ## Done summary
-
+Rendered per-cell work plugins (name=work, agent=worker) into plugins/plan/workers/<model>-<effort>/ via render_to, added the shared workerCellDir helper, extended the oracle+parity tree walks to workers/, and regenerated fixtures — old plan:worker-* agents coexist and the tree is green. Proof: single-load holds (--plugin-dir loads only the target dir's root manifest; workers manifests are depth-2 and never auto-loaded, so no base relocation needed), but the arthack 'work' plugin (~/code/arthack/claude/work) still claims name 'work' in a plugin_scan_dir, so the task-3 cutover is gated on the pending rename-work-skills-to-arthack handoff.
 ## Evidence
