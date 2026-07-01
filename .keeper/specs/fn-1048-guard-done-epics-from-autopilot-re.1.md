@@ -64,5 +64,5 @@ Add to test/readiness.test.ts (pure in-process — no daemon / worker / socket):
 - [ ] `bun test`, lint, and typecheck are green
 
 ## Done summary
-
+Made a status:done epic absorbing in the readiness pipeline: isTaskTerminalCompleted now OR-in the task's own epic status===done (resolved per-task via epicsById), so a done epic never re-dispatches work:: while the three fn-671 liveness clauses still hold a live worker's per-root mutex.
 ## Evidence

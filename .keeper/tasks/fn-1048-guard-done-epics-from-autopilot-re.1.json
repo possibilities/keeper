@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Guard readiness against done-epic dispatch",
-  "updated_at": "2026-07-01T22:29:59.753000Z"
+  "updated_at": "2026-07-01T22:44:04.936000Z",
+  "worker_done_at": "2026-07-01T22:44:04.936000Z"
 }
