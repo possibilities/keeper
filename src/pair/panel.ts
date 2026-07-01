@@ -43,9 +43,12 @@ import {
   loadPanelSelections,
   loadPresetCatalog,
   type PanelSelections,
+  type Preset,
   type PresetCatalog,
+  resolvePreset,
 } from "../agent/config";
 import {
+  loadRolePrompt,
   PAIR_CLIS,
   type PairCli,
   resolvePairKeeperAgentPath,
@@ -79,11 +82,21 @@ const PANEL_SESSION = "panels";
 
 /** A resolved panel member. `harness` is always the `agent run <cli>` positional;
  *  `preset` set → the leg also carries `--preset <preset>`. `name` is the leg
- *  label and the basename of its result file + pidfile. */
+ *  label and the basename of its result file + pidfile.
+ *
+ *  The ad-hoc (panel-of-one) fields are absent for a configured panel member, so
+ *  a configured member's leg argv stays byte-identical: `model`/`effort` layer a
+ *  `--model`/`--effort` override onto the leg, `system` rides as `--system <text>`
+ *  (a resolved `--role` prompt), and `readOnly` (default true) toggles the
+ *  `--read-only` directive — a configured member always defaults to read-only. */
 export interface PanelMember {
   name: string;
   harness: PairCli;
   preset?: string;
+  model?: string;
+  effort?: string;
+  system?: string;
+  readOnly?: boolean;
 }
 
 /** One member's persisted launch record in the manifest. `yaml` is the leg's
@@ -225,20 +238,121 @@ export function resolvePanelMembers(
   return { ok: false, error: `'${name}' is not a known panel or preset` };
 }
 
+/** The ad-hoc single-member selector (pairing = a panel of one). Exactly ONE of
+ *  `preset`/`cli` names the member; `model`/`effort`/`system`/`readOnly` layer the
+ *  per-member posture onto its leg. `system` is the ALREADY-resolved `--role`
+ *  prompt text (the CLI loads it before resolution — this stays pure). */
+export interface AdHocMemberSpec {
+  preset?: string;
+  cli?: string;
+  model?: string;
+  effort?: string;
+  system?: string;
+  readOnly: boolean;
+}
+
+/**
+ * Resolve an ad-hoc selector to a SINGLE {@link PanelMember} — the panel-of-one
+ * that replaces `pair send`'s bespoke drive loop. `--preset <name>` resolves its
+ * harness (+ model/effort launcher-side via the leg's `--preset`); `--cli <x>` is
+ * a bare harness with the explicit `--model`/`--effort` overrides. `--effort` is
+ * codex-only (mirrors `pair send`). A harness outside claude|codex|pi, an unknown
+ * preset, or effort on a non-codex member fails loud (the caller exits 2). Pure —
+ * the resulting member converges on the SAME manifest + leg path a configured
+ * panel produces.
+ */
+export function resolveAdHocMember(
+  catalog: PresetCatalog,
+  spec: AdHocMemberSpec,
+): ResolveMembersResult {
+  let harness: PairCli;
+  let name: string;
+  let preset: string | undefined;
+
+  const hasPreset = spec.preset !== undefined && spec.preset !== "";
+  const hasCli = spec.cli !== undefined && spec.cli !== "";
+  if (hasPreset && hasCli) {
+    return {
+      ok: false,
+      error:
+        "--preset and --cli are mutually exclusive (pick one ad-hoc member)",
+    };
+  }
+  if (hasPreset) {
+    let resolved: Preset;
+    try {
+      resolved = resolvePreset(catalog, spec.preset as string);
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof ConfigError ? err.message : String(err),
+      };
+    }
+    if (!PAIR_CLIS.has(resolved.harness)) {
+      return {
+        ok: false,
+        error: `preset '${spec.preset}' pins harness ${resolved.harness}, which is not pair-launchable (claude|codex|pi only)`,
+      };
+    }
+    harness = resolved.harness as PairCli;
+    name = spec.preset as string;
+    preset = spec.preset as string;
+  } else if (hasCli) {
+    if (!PAIR_CLIS.has(spec.cli as string)) {
+      return {
+        ok: false,
+        error: `--cli must be claude|codex|pi (got ${spec.cli})`,
+      };
+    }
+    harness = spec.cli as PairCli;
+    name = spec.cli as string;
+  } else {
+    return {
+      ok: false,
+      error:
+        "an ad-hoc member requires --preset <name> or --cli <claude|codex|pi>",
+    };
+  }
+
+  if (spec.effort !== undefined && spec.effort !== "" && harness !== "codex") {
+    return { ok: false, error: "--effort is only supported for codex" };
+  }
+
+  return {
+    ok: true,
+    members: [
+      {
+        name,
+        harness,
+        preset,
+        model: spec.model || undefined,
+        effort: spec.effort || undefined,
+        system: spec.system || undefined,
+        readOnly: spec.readOnly,
+      },
+    ],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Leg argv + detachment wrapper (pure)
 // ---------------------------------------------------------------------------
 
 /**
  * Build one leg's `keeper agent run` argv:
- *   `<bun> <keeper.ts> agent run <harness> <prompt> [--preset <m>] --read-only
+ *   `<bun> <keeper.ts> agent run <harness> <prompt> [--preset <m>]
+ *     [--system <text>] [--model <m>] [--effort <e>] [--read-only]
  *     --session panels --output <dir>/<m>.yaml --stop-timeout-ms <ms>`.
  * The `[<bun>, <keeper.ts>]` prefix is the self-re-exec transport (daemon.ts
  * precedent); `<harness>` is the `agent run <cli>` positional and `<prompt>` the
  * task text passed inline (agent run takes the prompt literally, not a file);
- * `--preset` layers model/effort when the member carries one. `--read-only` keeps
- * every panelist a non-mutating explorer, and `--output` makes the leg write its
- * own uniform JSON result envelope atomically. Pure.
+ * `--preset` layers model/effort when the member carries one. The ad-hoc
+ * (panel-of-one) posture layers `--system <text>` (a resolved `--role` prompt)
+ * and explicit `--model`/`--effort` overrides; a configured member sets none of
+ * these, so its argv stays byte-identical. `--read-only` keeps a panelist a
+ * non-mutating explorer (default ON — a configured member omits `readOnly`), and
+ * `--output` makes the leg write its own uniform JSON result envelope atomically.
+ * Pure.
  */
 export function buildPanelLegArgv(opts: {
   keeperBin: string;
@@ -248,17 +362,33 @@ export function buildPanelLegArgv(opts: {
   yamlPath: string;
   stopTimeoutMs: number;
 }): string[] {
-  const presetFlag =
-    opts.member.preset !== undefined ? ["--preset", opts.member.preset] : [];
+  const m = opts.member;
+  const postureFlags: string[] = [];
+  if (m.preset !== undefined) {
+    postureFlags.push("--preset", m.preset);
+  }
+  if (m.system !== undefined && m.system !== "") {
+    postureFlags.push("--system", m.system);
+  }
+  if (m.model !== undefined && m.model !== "") {
+    postureFlags.push("--model", m.model);
+  }
+  if (m.effort !== undefined && m.effort !== "") {
+    postureFlags.push("--effort", m.effort);
+  }
+  // A configured member omits `readOnly` (default ON, byte-stable); an ad-hoc
+  // member forwards its explicit `--read-only` flag.
+  if (m.readOnly ?? true) {
+    postureFlags.push("--read-only");
+  }
   return [
     opts.keeperBin,
     opts.keeperAgentPath,
     "agent",
     "run",
-    opts.member.harness,
+    m.harness,
     opts.prompt,
-    ...presetFlag,
-    "--read-only",
+    ...postureFlags,
     "--session",
     PANEL_SESSION,
     "--output",
@@ -446,10 +576,14 @@ export function parseManifest(
 // Orchestrators
 // ---------------------------------------------------------------------------
 
-/** Inputs to {@link panelStart}. `panel` undefined → the `panel.yaml` default. */
+/** Inputs to {@link panelStart}. `panel` undefined → the `panel.yaml` default.
+ *  `adHoc` set → the panel-of-one path: members resolve from the ad-hoc selector
+ *  instead of a configured panel name (`panel` is ignored, mutual exclusion
+ *  enforced by the caller). */
 export interface PanelStartArgs {
   promptFile: string;
   panel: string | undefined;
+  adHoc?: AdHocMemberSpec;
   dir?: string;
   timeoutSeconds: number;
 }
@@ -474,20 +608,26 @@ export async function panelStart(
     return 2;
   }
 
-  // `--panel` absent → the panel.yaml `default`; neither present is fail-loud.
-  const panelName = args.panel ?? config.selections.default;
-  if (panelName === null || panelName === "") {
-    deps.writeErr(
-      "pair panel start: no --panel given and no default panel set in panel.yaml\n",
+  // Members come from an ad-hoc selector (the panel-of-one) OR a configured panel
+  // name; both converge on the same 1..N-entry manifest + detached-leg path.
+  let resolved: ResolveMembersResult;
+  if (args.adHoc !== undefined) {
+    resolved = resolveAdHocMember(config.catalog, args.adHoc);
+  } else {
+    // `--panel` absent → the panel.yaml `default`; neither present is fail-loud.
+    const panelName = args.panel ?? config.selections.default;
+    if (panelName === null || panelName === "") {
+      deps.writeErr(
+        "pair panel start: no --panel given and no default panel set in panel.yaml\n",
+      );
+      return 2;
+    }
+    resolved = resolvePanelMembers(
+      config.catalog,
+      config.selections,
+      panelName,
     );
-    return 2;
   }
-
-  const resolved = resolvePanelMembers(
-    config.catalog,
-    config.selections,
-    panelName,
-  );
   if (!resolved.ok) {
     deps.writeErr(`pair panel start: ${resolved.error}\n`);
     return 2;
@@ -688,13 +828,17 @@ export const PANEL_HELP = `keeper pair panel — cross-OS panel fan-out (start |
 
 Usage:
   keeper pair panel start <prompt-file> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper pair panel start <prompt-file> (--preset <name> | --cli <claude|codex|pi>)
+       [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--dir <d>] [--timeout <s>]
   keeper pair panel wait --dir <d> [--chunk <s>]
 
 start  resolves the panel members (a panel.yaml panel or a single catalog
        preset; a missing/invalid catalog or panel.yaml is fail-loud exit 2),
        launches each as a DETACHED read-only \`keeper agent run\` leg in the
        'panels' session, writes <dir>/manifest.json, prints it, and exits 0
-       immediately. Prints {dir, members:[{name,harness,yaml,pidfile}]}.
+       immediately. Prints {dir, members:[{name,harness,yaml,pidfile}]}. An
+       ad-hoc --preset/--cli builds a 1-member panel (pairing = a panel of one);
+       --panel and --preset/--cli are mutually exclusive.
 wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
        Exit 0 + verdict JSON {dir, ok, members:[{name,harness,status,yaml,reason}]}
        when all legs are terminal; exit 124 when the chunk elapses (re-issue it);
@@ -703,6 +847,13 @@ wait   re-reads the manifest and blocks ONE --chunk window polling each leg.
 
 Options:
   --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
+  --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
+  --cli <x>         Ad-hoc single member harness: claude|codex|pi
+  --role <r>        Ad-hoc role prompt: default|planner|codereviewer|coplanner
+                    (rides the leg as --system; default/empty adds no block)
+  --model <m>       Ad-hoc model override (rides onto the leg)
+  --effort <e>      Ad-hoc reasoning effort (codex only)
+  --read-only       Ad-hoc read-only posture (forwarded to the leg)
   --dir <d>         Scratch dir (start: minted when absent; wait: required)
   --timeout <s>     Per-leg keeper agent run stop-timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
   --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
@@ -734,6 +885,12 @@ export async function runPanel(argv: string[]): Promise<void> {
       args: argv.slice(1),
       options: {
         panel: { type: "string" },
+        preset: { type: "string" },
+        cli: { type: "string" },
+        model: { type: "string" },
+        effort: { type: "string" },
+        role: { type: "string" },
+        "read-only": { type: "boolean", default: false },
         dir: { type: "string" },
         timeout: { type: "string" },
         help: { type: "boolean", default: false },
@@ -761,10 +918,48 @@ export async function runPanel(argv: string[]): Promise<void> {
       );
       process.exit(2);
     }
+
+    // The configured `--panel` form and the ad-hoc `--preset`/`--cli` form are
+    // mutually exclusive — one member source per launch.
+    const hasAdHoc =
+      parsed.values.preset !== undefined || parsed.values.cli !== undefined;
+    if (parsed.values.panel !== undefined && hasAdHoc) {
+      process.stderr.write(
+        "pair panel start: --panel is mutually exclusive with --preset/--cli (pick a configured panel OR an ad-hoc member)\n",
+      );
+      process.exit(2);
+    }
+
+    let adHoc: AdHocMemberSpec | undefined;
+    if (hasAdHoc) {
+      // Resolve the `--role` catalog to its prompt text HERE (the CLI layer owns
+      // the fs read); it rides the leg as `agent run --system <text>`. An
+      // absent/`default` role is a no-op (no `--system` block).
+      let system: string | undefined;
+      const role = parsed.values.role;
+      if (role !== undefined && role !== "" && role !== "default") {
+        const roleResult = loadRolePrompt(role);
+        if (!roleResult.ok) {
+          process.stderr.write(`pair panel start: ${roleResult.error}\n`);
+          process.exit(2);
+        }
+        system = roleResult.text;
+      }
+      adHoc = {
+        preset: parsed.values.preset,
+        cli: parsed.values.cli,
+        model: parsed.values.model,
+        effort: parsed.values.effort,
+        system,
+        readOnly: parsed.values["read-only"] ?? false,
+      };
+    }
+
     const code = await panelStart(
       {
         promptFile,
         panel: parsed.values.panel,
+        adHoc,
         dir: parsed.values.dir,
         timeoutSeconds,
       },

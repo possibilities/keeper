@@ -948,6 +948,8 @@ async function runRunCaptureSubcommand(
           prompt,
           posture: {
             preset: parsed.preset ?? undefined,
+            model: parsed.model ?? undefined,
+            effort: parsed.effort ?? undefined,
             session: parsed.session ?? undefined,
           },
           stopTimeoutMs: parsed.stopTimeoutMs,

@@ -137,6 +137,12 @@ export type ParseRunArgsResult =
        *  The handler resolves it and validates its harness == `<cli>`. Null when
        *  unset. */
       preset: string | null;
+      /** Raw `--model` override — rides onto the launch posture (explicit >
+       *  preset > yaml). Null when unset. */
+      model: string | null;
+      /** Raw `--effort` override — rides onto the launch posture (codex reasoning
+       *  effort). Null when unset. */
+      effort: string | null;
       /** Raw `--session` name — the tmux session GROUPING (rides as
        *  `--x-tmux-session`), NOT the transcript session id, so co-grouped runs
        *  never collide transcripts. Null when unset. */
@@ -157,10 +163,11 @@ export type ParseRunArgsResult =
  * `--system-file <path>` /
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
  * the parser returns the RAW path/text — the handler reads any file.
- * `--preset <name>` / `--session <name>` / `--output <path>` are additive value
- * flags (both split and `=` forms): the parser returns the RAW values (config
- * resolution + the atomic write happen handler-side). ALL default-absent, so an
- * argv without them stays byte-identical. Pure — exported for tests.
+ * `--preset <name>` / `--model <m>` / `--effort <e>` / `--session <name>` /
+ * `--output <path>` are additive value flags (both split and `=` forms): the
+ * parser returns the RAW values (config resolution, the launch-posture overlay,
+ * and the atomic write happen handler-side). ALL default-absent, so an argv
+ * without them stays byte-identical. Pure — exported for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
@@ -169,6 +176,8 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   let systemFile: string | null = null;
   let system: string | null = null;
   let preset: string | null = null;
+  let model: string | null = null;
+  let effort: string | null = null;
   let session: string | null = null;
   let output: string | null = null;
 
@@ -245,6 +254,32 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       preset = arg.slice("--preset=".length);
       continue;
     }
+    if (arg === "--model") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--model requires a value" };
+      }
+      model = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--model=")) {
+      model = arg.slice("--model=".length);
+      continue;
+    }
+    if (arg === "--effort") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--effort requires a value" };
+      }
+      effort = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--effort=")) {
+      effort = arg.slice("--effort=".length);
+      continue;
+    }
     if (arg === "--session") {
       const value = rest[i + 1];
       if (value === undefined) {
@@ -312,6 +347,8 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     systemFile,
     system,
     preset,
+    model,
+    effort,
     session,
     output,
   };

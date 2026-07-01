@@ -183,6 +183,8 @@ function okParse(
     systemFile: null,
     system: null,
     preset: null,
+    model: null,
+    effort: null,
     session: null,
     output: null,
     ...overrides,
@@ -275,6 +277,25 @@ describe("parseRunArgs", () => {
         readOnly: true,
       }),
     );
+  });
+
+  test("--model / --effort parse as value flags (split + = forms)", () => {
+    expect(parseRunArgs(["codex", "p", "--model", "gpt-5"])).toEqual(
+      okParse({ cli: "codex", model: "gpt-5" }),
+    );
+    expect(parseRunArgs(["claude", "p", "--model=opus"])).toEqual(
+      okParse({ model: "opus" }),
+    );
+    expect(parseRunArgs(["codex", "p", "--effort", "high"])).toEqual(
+      okParse({ cli: "codex", effort: "high" }),
+    );
+    expect(parseRunArgs(["codex", "p", "--effort=low"])).toEqual(
+      okParse({ cli: "codex", effort: "low" }),
+    );
+    // Compose with a preset (explicit override rides alongside the preset name).
+    expect(
+      parseRunArgs(["codex", "p", "--preset", "fast", "--model", "gpt-5"]),
+    ).toEqual(okParse({ cli: "codex", preset: "fast", model: "gpt-5" }));
   });
 
   test("--system-file + --system together → bad_args (one input, two spellings)", () => {

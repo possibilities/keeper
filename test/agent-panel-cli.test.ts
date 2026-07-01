@@ -14,20 +14,40 @@
  * seeded manifest + result files; a bad-config `start` fails before any leg
  * spawns) — the real detached-leg launch is the slow-tier sibling
  * `test/pair-panel.slow.test.ts`, never the fast tier.
+ *
+ * The ad-hoc single-member (pairing = a panel of one) coverage sits here too:
+ * `resolveAdHocMember`/`buildPanelLegArgv` are unit-tested pure, and `panelStart`
+ * is driven with injected deps (a fake spawn capturing the leg argv) to prove an
+ * ad-hoc `--preset`/`--cli` member builds a 1-entry manifest whose leg carries the
+ * resolved harness/model/effort + a `--role` `--system` block, while the mutual
+ * exclusion (`--panel` vs `--preset`/`--cli`) routes to exit 2.
  */
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as pairMain } from "../cli/pair";
+import type {
+  PanelSelections,
+  Preset,
+  PresetCatalog,
+} from "../src/agent/config";
 import {
   KEEPER_AGENT_HELP,
   splitSubcommand,
   USAGE,
 } from "../src/agent/dispatch";
 import { main as agentMain } from "../src/agent/main";
-import type { PanelManifest, PanelVerdict } from "../src/pair/panel";
+import {
+  buildPanelLegArgv,
+  type PanelDeps,
+  type PanelManifest,
+  type PanelVerdict,
+  panelStart,
+  resolveAdHocMember,
+} from "../src/pair/panel";
+import { loadRolePrompt } from "../src/pair-command";
 import { makeHarness } from "./helpers/agent-main-harness";
 import { sandboxEnv } from "./helpers/sandbox-env";
 
@@ -303,4 +323,308 @@ test("top-level USAGE documents `agent panel start|wait`", () => {
 test("wrapper KEEPER_AGENT_HELP documents the panel sub-verb", () => {
   expect(KEEPER_AGENT_HELP).toContain("Panel fan-out");
   expect(KEEPER_AGENT_HELP).toContain("keeper agent panel wait");
+});
+
+// ---------------------------------------------------------------------------
+// Ad-hoc single member (pairing = a panel of one)
+// ---------------------------------------------------------------------------
+
+const AD_HOC_KEEPER_BIN = "/usr/local/bin/bun";
+const AD_HOC_KEEPER_AGENT = "/abs/cli/keeper.ts";
+
+function mkPreset(
+  harness: Preset["harness"],
+  overrides: Partial<Preset> = {},
+): Preset {
+  return {
+    harness,
+    model: null,
+    effort: null,
+    thinking: null,
+    role: null,
+    ...overrides,
+  };
+}
+
+/** A catalog with one codex preset for the ad-hoc `--preset` member. */
+const AD_HOC_CATALOG: PresetCatalog = {
+  presets: { "codex-review": mkPreset("codex", { model: "gpt-5" }) },
+};
+const AD_HOC_SELECTIONS: PanelSelections = { panels: {}, default: null };
+
+interface AdHocSpawn {
+  argv: string[];
+}
+
+/** `panelStart` deps with a fake spawn recording each leg argv (no real
+ *  process), a fixed clock, and a fake registry serving {@link AD_HOC_CATALOG}. */
+function makeAdHocDeps(): { deps: PanelDeps; spawns: AdHocSpawn[] } {
+  const spawns: AdHocSpawn[] = [];
+  const deps: PanelDeps = {
+    keeperBin: AD_HOC_KEEPER_BIN,
+    keeperAgentPath: AD_HOC_KEEPER_AGENT,
+    env: { PATH: "/usr/bin" },
+    cwd: "/work/repo",
+    loadRegistry: () => ({
+      catalog: AD_HOC_CATALOG,
+      selections: AD_HOC_SELECTIONS,
+    }),
+    spawn: (argv) => {
+      spawns.push({ argv });
+    },
+    now: () => 0,
+    sleep: async () => {},
+    pidAlive: () => false,
+    write: () => {},
+    writeErr: () => {},
+  };
+  return { deps, spawns };
+}
+
+/** Strip the `sh -c <script> --` detach wrapper prefix → the leg argv. */
+function legOf(spawn: AdHocSpawn): string[] {
+  return spawn.argv.slice(4);
+}
+
+describe("resolveAdHocMember (pure)", () => {
+  test("--preset resolves the catalog harness + carries the preset name", () => {
+    const r = resolveAdHocMember(AD_HOC_CATALOG, {
+      preset: "codex-review",
+      readOnly: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.members).toEqual([
+      {
+        name: "codex-review",
+        harness: "codex",
+        preset: "codex-review",
+        model: undefined,
+        effort: undefined,
+        system: undefined,
+        readOnly: true,
+      },
+    ]);
+  });
+
+  test("--cli is a bare harness with explicit model/effort, no preset", () => {
+    const r = resolveAdHocMember(AD_HOC_CATALOG, {
+      cli: "codex",
+      model: "gpt-5",
+      effort: "high",
+      readOnly: false,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.members).toEqual([
+      {
+        name: "codex",
+        harness: "codex",
+        preset: undefined,
+        model: "gpt-5",
+        effort: "high",
+        system: undefined,
+        readOnly: false,
+      },
+    ]);
+  });
+
+  test("--preset + --cli together → mutually exclusive error", () => {
+    const r = resolveAdHocMember(AD_HOC_CATALOG, {
+      preset: "codex-review",
+      cli: "codex",
+      readOnly: true,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain("mutually exclusive");
+  });
+
+  test("--effort on a non-codex member → error", () => {
+    const r = resolveAdHocMember(AD_HOC_CATALOG, {
+      cli: "claude",
+      effort: "high",
+      readOnly: true,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain("--effort is only supported for codex");
+  });
+
+  test("an unknown preset / harness / empty selector each fail loud", () => {
+    expect(
+      resolveAdHocMember(AD_HOC_CATALOG, { preset: "nope", readOnly: true }).ok,
+    ).toBe(false);
+    expect(
+      resolveAdHocMember(AD_HOC_CATALOG, { cli: "bogus", readOnly: true }).ok,
+    ).toBe(false);
+    expect(resolveAdHocMember(AD_HOC_CATALOG, { readOnly: true }).ok).toBe(
+      false,
+    );
+  });
+});
+
+describe("buildPanelLegArgv (ad-hoc posture)", () => {
+  test("threads --system/--model/--effort and forwards --read-only", () => {
+    const leg = buildPanelLegArgv({
+      keeperBin: AD_HOC_KEEPER_BIN,
+      keeperAgentPath: AD_HOC_KEEPER_AGENT,
+      prompt: "review this",
+      member: {
+        name: "codex",
+        harness: "codex",
+        model: "gpt-5",
+        effort: "high",
+        system: "You are a code reviewer.",
+        readOnly: true,
+      },
+      yamlPath: "/d/codex.yaml",
+      stopTimeoutMs: 900000,
+    });
+    expect(leg.slice(0, 5)).toEqual([
+      AD_HOC_KEEPER_BIN,
+      AD_HOC_KEEPER_AGENT,
+      "agent",
+      "run",
+      "codex",
+    ]);
+    expect(leg[leg.indexOf("--system") + 1]).toBe("You are a code reviewer.");
+    expect(leg[leg.indexOf("--model") + 1]).toBe("gpt-5");
+    expect(leg[leg.indexOf("--effort") + 1]).toBe("high");
+    expect(leg).toContain("--read-only");
+  });
+
+  test("an ad-hoc member with readOnly=false drops --read-only + omits posture flags", () => {
+    const leg = buildPanelLegArgv({
+      keeperBin: AD_HOC_KEEPER_BIN,
+      keeperAgentPath: AD_HOC_KEEPER_AGENT,
+      prompt: "explore",
+      member: { name: "claude", harness: "claude", readOnly: false },
+      yamlPath: "/d/claude.yaml",
+      stopTimeoutMs: 900000,
+    });
+    expect(leg).not.toContain("--read-only");
+    expect(leg).not.toContain("--system");
+    expect(leg).not.toContain("--model");
+    expect(leg).not.toContain("--effort");
+    expect(leg).not.toContain("--preset");
+  });
+});
+
+describe("panelStart (ad-hoc member fan-out)", () => {
+  test("--preset member → 1-entry manifest; leg carries harness + --preset", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "what is the best answer?");
+    const pdir = join(dir, "adhoc-preset");
+    const { deps, spawns } = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(spawns.length).toBe(1);
+    const leg = legOf(spawns[0] as AdHocSpawn);
+    expect(leg.slice(0, 5)).toEqual([
+      AD_HOC_KEEPER_BIN,
+      AD_HOC_KEEPER_AGENT,
+      "agent",
+      "run",
+      "codex",
+    ]);
+    expect(leg[leg.indexOf("--preset") + 1]).toBe("codex-review");
+    expect(leg).toContain("--read-only");
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(pdir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.members).toHaveLength(1);
+    expect(manifest.members[0]?.name).toBe("codex-review");
+    expect(manifest.members[0]?.harness).toBe("codex");
+  });
+
+  test("--cli member with --model/--effort → 1-entry manifest; leg carries them", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "explore the repo");
+    const pdir = join(dir, "adhoc-cli");
+    const { deps, spawns } = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        panel: undefined,
+        adHoc: {
+          cli: "codex",
+          model: "gpt-5",
+          effort: "high",
+          readOnly: false,
+        },
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(spawns.length).toBe(1);
+    const leg = legOf(spawns[0] as AdHocSpawn);
+    expect(leg[4]).toBe("codex");
+    expect(leg[leg.indexOf("--model") + 1]).toBe("gpt-5");
+    expect(leg[leg.indexOf("--effort") + 1]).toBe("high");
+    expect(leg).not.toContain("--preset");
+    expect(leg).not.toContain("--read-only");
+    const manifest: PanelManifest = JSON.parse(
+      readFileSync(join(pdir, "manifest.json"), "utf8"),
+    );
+    expect(manifest.members).toHaveLength(1);
+    expect(manifest.members[0]?.name).toBe("codex");
+  });
+
+  test("--role codereviewer rides the leg as --system with the catalog text", async () => {
+    // The role catalog resolves to real in-repo prompt text (the CLI layer does
+    // this before panelStart); here we resolve it the same way + assert it lands
+    // on the leg as an `agent run --system` block.
+    const roleResult = loadRolePrompt("codereviewer");
+    expect(roleResult.ok).toBe(true);
+    if (!roleResult.ok) return;
+    expect(roleResult.text.length).toBeGreaterThan(0);
+
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "review this diff");
+    const pdir = join(dir, "adhoc-role");
+    const { deps, spawns } = makeAdHocDeps();
+    const code = await panelStart(
+      {
+        promptFile,
+        panel: undefined,
+        adHoc: { cli: "claude", system: roleResult.text, readOnly: true },
+        dir: pdir,
+        timeoutSeconds: 900,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    const leg = legOf(spawns[0] as AdHocSpawn);
+    expect(leg[leg.indexOf("--system") + 1]).toBe(roleResult.text);
+  });
+});
+
+test("agent panel start: --panel + --preset together → exit 2 (mutually exclusive)", async () => {
+  const promptFile = join(dir, "ask.md");
+  writeFileSync(promptFile, "question");
+  const r = await runAgent([
+    "panel",
+    "start",
+    promptFile,
+    "--panel",
+    "default",
+    "--preset",
+    "codex-review",
+    "--dir",
+    join(dir, "scratch-mx"),
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("mutually exclusive");
 });
