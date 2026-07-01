@@ -22,6 +22,7 @@ import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
+import { runPanel } from "../pair/panel";
 import { READ_ONLY_DIRECTIVE } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
@@ -1343,6 +1344,15 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "wait-capture") {
     return runWaitCaptureSubcommand(deps, dispatch.rest);
+  }
+  if (dispatch.kind === "panel") {
+    // Route into the SAME `runPanel` the `keeper pair panel` branch calls —
+    // additive parity, one engine, two namespaces. `runPanel` self-emits its
+    // manifest/verdict on stdout and owns its exit code (0 all-terminal / 124
+    // chunk-elapsed / 2 bad-config), so it always `process.exit()`s and never
+    // returns; the `deps.exit(0)` below only satisfies the `never` return type.
+    await runPanel(dispatch.rest);
+    return deps.exit(0);
   }
   if (dispatch.kind === "presets-resolve") {
     return runPresetsResolve(deps, dispatch.presetName);
