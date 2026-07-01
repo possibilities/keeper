@@ -40,5 +40,5 @@ fails the guard. Forward-facing prose only (no fn-ids/dates/past-tense).
 - [ ] No residual four-name / "opus constant" language remains; `lint-claude-md.ts` is green.
 
 ## Done summary
-
+Added a promote-time drift guard to plugins/plan/scripts/promote.sh: after the rebuild it asserts the fresh binary embeds the on-disk subagents.yaml axes and that re-rendering leaves plugins/plan/agents clean. Consistency test already drives off the parsed matrix and plan docs were already sweep-clean.
 ## Evidence
