@@ -82,5 +82,5 @@ pair-panel (now `agent panel`) + golden + agent-launch-config green. `bun test` 
 - [ ] `bun test` + `bun run typecheck` + `bun run lint` + the retired-name guard all green.
 
 ## Done summary
-
+Deleted the keeper pair CLI (cli/pair.ts, src/pair-command.ts, pair verb, pair-only tests), rewrote the keeper:pair SKILL onto keeper agent (agent run + Monitor-free agent panel start|wait loop), repointed all docs/comments to keeper agent, and added a zero-tolerance retired-name guard pinning keeper pair at zero. typecheck + lint + full suite + guard all green.
 ## Evidence
