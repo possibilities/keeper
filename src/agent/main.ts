@@ -27,6 +27,7 @@ import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
   type CodexSessionNameIndexerOptions,
+  codexSessionIdFromRolloutPath,
   startCodexSessionNameIndexer,
 } from "./codex-session-index";
 import {
@@ -750,6 +751,8 @@ function runCaptureSeams(deps: MainDeps): RunCaptureDeps {
     waitForStop: runWaitForStop,
     showLastMessage: runShowLastMessage,
     now: deps.now,
+    resolveCodexResumeTarget: ({ transcriptPath }) =>
+      codexSessionIdFromRolloutPath(transcriptPath),
   };
 }
 

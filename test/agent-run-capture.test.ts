@@ -79,11 +79,15 @@ function seams(opts: {
   wait: WaitForStopResult;
   show: ShowLastMessageResult;
   now?: number;
+  resolveCodexResumeTarget?: (args: {
+    transcriptPath: string;
+  }) => string | null;
 }): RunCaptureDeps {
   return {
     waitForStop: async () => opts.wait,
     showLastMessage: async () => opts.show,
     now: () => opts.now ?? 0,
+    resolveCodexResumeTarget: opts.resolveCodexResumeTarget,
   };
 }
 
@@ -440,6 +444,98 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     );
     expect(envelope.resume_target).toBeNull();
     expect(envelope.outcome).toBe("completed");
+  });
+
+  test("codex resume_target is discovered from the transcript via the seam (completed)", async () => {
+    const { envelope } = await captureFromHandle(
+      seams({
+        wait: {
+          ok: true,
+          transcriptPath: "/rollout.jsonl",
+          stop: { ...STOP, agent: "codex" },
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/rollout.jsonl",
+          text: "done",
+          found: true,
+        },
+        resolveCodexResumeTarget: ({ transcriptPath }) => {
+          expect(transcriptPath).toBe("/rollout.jsonl");
+          return "codex-uuid-1";
+        },
+      }),
+      VERB_DEPS,
+      {
+        handle: { ...handle(null), agent: "codex" },
+        handleId: "tmux-c",
+        agent: "codex",
+        startMs: 0,
+      },
+    );
+    expect(envelope.outcome).toBe("completed");
+    expect(envelope.resume_target).toBe("codex-uuid-1");
+  });
+
+  test("codex resume_target is discovered on a timed_out partial", async () => {
+    const { envelope } = await captureFromHandle(
+      seams({
+        wait: { ok: false, error: "timed out waiting for transcript stop" },
+        show: {
+          ok: true,
+          transcriptPath: "/rollout.jsonl",
+          text: "partial",
+          found: true,
+        },
+        resolveCodexResumeTarget: () => "codex-uuid-2",
+      }),
+      VERB_DEPS,
+      {
+        handle: { ...handle(null), agent: "codex" },
+        handleId: "tmux-c",
+        agent: "codex",
+        startMs: 0,
+      },
+    );
+    expect(envelope.outcome).toBe("timed_out");
+    expect(envelope.resume_target).toBe("codex-uuid-2");
+  });
+
+  test("codex no_transcript stays null — the seam is never consulted", async () => {
+    let called = false;
+    const { envelope } = await captureFromHandle(
+      seams({
+        wait: { ok: false, error: "timed out waiting for transcript path" },
+        show: { ok: false, error: "timed out waiting for transcript path" },
+        resolveCodexResumeTarget: () => {
+          called = true;
+          return "should-not-happen";
+        },
+      }),
+      VERB_DEPS,
+      {
+        handle: { ...handle(null), agent: "codex" },
+        handleId: "tmux-c",
+        agent: "codex",
+        startMs: 0,
+      },
+    );
+    expect(envelope.outcome).toBe("no_transcript");
+    expect(envelope.resume_target).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  test("claude keeps handle.sessionId even when the codex seam is bound", async () => {
+    const { envelope } = await captureFromHandle(
+      seams({
+        wait: { ok: true, transcriptPath: "/t.jsonl", stop: STOP },
+        show: { ok: true, transcriptPath: "/t.jsonl", text: "x", found: true },
+        resolveCodexResumeTarget: () => "codex-uuid-should-be-ignored",
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-6", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.resume_target).toBe("sess-1");
   });
 
   test("elapsed_seconds is the now()-startMs delta, rounded to tenths", async () => {

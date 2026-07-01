@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendSessionIndexRow,
+  codexSessionIdFromRolloutPath,
   findCodexSessionId,
 } from "../src/agent/codex-session-index";
 
@@ -39,6 +40,44 @@ function writeRollout(
     })}\n`,
   );
 }
+
+describe("codexSessionIdFromRolloutPath", () => {
+  test("extracts the trailing uuid from a rollout basename", () => {
+    expect(
+      codexSessionIdFromRolloutPath(
+        `/home/.codex/sessions/2026/06/21/rollout-2026-06-21T17-58-04-${SESSION_ID}.jsonl`,
+      ),
+    ).toBe(SESSION_ID);
+  });
+
+  test("works on a bare basename (no directory)", () => {
+    expect(
+      codexSessionIdFromRolloutPath(
+        `rollout-2026-06-21T17-58-04-${SESSION_ID}.jsonl`,
+      ),
+    ).toBe(SESSION_ID);
+  });
+
+  test("returns null for a non-rollout name", () => {
+    expect(codexSessionIdFromRolloutPath(`/x/${SESSION_ID}.jsonl`)).toBeNull();
+  });
+
+  test("returns null when the trailing segment is not a uuid", () => {
+    expect(
+      codexSessionIdFromRolloutPath(
+        "rollout-2026-06-21T17-58-04-notauuid.jsonl",
+      ),
+    ).toBeNull();
+  });
+
+  test("returns null for a rollout with the wrong extension", () => {
+    expect(
+      codexSessionIdFromRolloutPath(
+        `rollout-2026-06-21T17-58-04-${SESSION_ID}.json`,
+      ),
+    ).toBeNull();
+  });
+});
 
 describe("Codex session index helpers", () => {
   test("appendSessionIndexRow writes Codex-compatible JSONL", () => {

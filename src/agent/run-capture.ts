@@ -337,6 +337,16 @@ export interface RunCaptureDeps {
   ) => Promise<ShowLastMessageResult>;
   /** Monotonic-enough wall clock (ms) for deterministic `elapsed_seconds`. */
   now: () => number;
+  /**
+   * Resolve a codex resume target (its session uuid) from the ALREADY-resolved
+   * rollout transcript path. Optional + codex-only: bound in `main.ts` to the
+   * pure `codexSessionIdFromRolloutPath` parser (this module keeps its
+   * types-only, dep-free contract). claude/pi never reach it — their
+   * `handle.sessionId` is pinned at launch and stays authoritative.
+   */
+  resolveCodexResumeTarget?: (args: {
+    transcriptPath: string;
+  }) => string | null;
 }
 
 /**
@@ -373,7 +383,19 @@ export async function captureFromHandle(
   args: CaptureArgs,
 ): Promise<RunCaptureResult> {
   const { handle, handleId, agent, startMs } = args;
-  const resumeTarget = handle.sessionId;
+  const baseResume = handle.sessionId;
+  // claude/pi pin `handle.sessionId` at launch — authoritative, keep it. codex
+  // can't be pinned (it mints its own uuid), so when a transcript resolved and
+  // no id was pinned, discover it POST-STOP from the rollout path via the seam.
+  const resolveResume = (transcriptPath: string | null): string | null => {
+    if (baseResume !== null) {
+      return baseResume;
+    }
+    if (agent !== "codex" || transcriptPath === null) {
+      return null;
+    }
+    return deps.resolveCodexResumeTarget?.({ transcriptPath }) ?? null;
+  };
   const elapsed = (): number => roundTenths((deps.now() - startMs) / 1000);
 
   const wait = await deps.waitForStop(handle, verbDeps);
@@ -387,7 +409,7 @@ export async function captureFromHandle(
         outcome: "no_transcript",
         agent,
         handle: handleId,
-        resumeTarget,
+        resumeTarget: baseResume,
         elapsedSeconds: elapsed(),
       });
     }
@@ -396,7 +418,7 @@ export async function captureFromHandle(
       agent,
       handle: handleId,
       transcriptPath: show.transcriptPath,
-      resumeTarget,
+      resumeTarget: resolveResume(show.transcriptPath),
       message: show.text,
       messageFound: show.found,
       elapsedSeconds: elapsed(),
@@ -415,7 +437,7 @@ export async function captureFromHandle(
     agent,
     handle: handleId,
     transcriptPath,
-    resumeTarget,
+    resumeTarget: resolveResume(transcriptPath),
     message,
     messageFound,
     elapsedSeconds: elapsed(),

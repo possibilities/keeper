@@ -194,7 +194,10 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         message_found, elapsed_seconds, outcome};
                                         outcome ∈ completed|no_message (exit 0) /
                                         timed_out|no_transcript (4) / launch_failed
-                                        (1) / bad_args (2).
+                                        (1) / bad_args (2). codex's resume_target is
+                                        discovered from its rollout file post-stop;
+                                        claude/pi's from the session id pinned at
+                                        launch.
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with

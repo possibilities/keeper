@@ -7,7 +7,7 @@ import {
   readSync,
   statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 export interface CodexSessionNameIndexerOptions {
   codexHome: string;
@@ -73,6 +73,24 @@ export function appendSessionIndexRow(
     join(codexHome, "session_index.jsonl"),
     `${JSON.stringify(row)}\n`,
   );
+}
+
+/**
+ * Extract the codex session uuid from an already-resolved rollout transcript
+ * path. Codex names each rollout `rollout-<ts>-<uuid>.jsonl` and the trailing
+ * uuid IS the id it later resumes by, so the id the outer capture needs is
+ * literally in the filename. Pure string parse (basename only, no FS): a path
+ * whose basename is not a `rollout-…-<uuid>.jsonl` shape returns null.
+ */
+export function codexSessionIdFromRolloutPath(p: string): string | null {
+  const name = basename(p);
+  if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) {
+    return null;
+  }
+  const match = name.match(
+    /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
+  );
+  return match?.[1] ?? null;
 }
 
 export function findCodexSessionId(
