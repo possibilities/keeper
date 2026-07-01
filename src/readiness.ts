@@ -7,11 +7,16 @@
  *
  * Predicate pipeline — first-match-wins per row. RANK ORDER IS LOAD-BEARING;
  * reordering silently breaks autopilot dispatch:
- *   1.   terminal-completed       — task: worker_phase==="done" AND no embedded
- *                                   job working AND no running sub-agent (the
+ *   1.   terminal-completed       — task: (worker_phase==="done" OR the task's
+ *                                   OWN epic is status==="done") AND no embedded
+ *                                   job working AND no running sub-agent. A done
+ *                                   epic is ABSORBING: every task under it reads
+ *                                   completed even with an unstamped per-task
+ *                                   flag, so the reconciler never re-dispatches
+ *                                   `work::` against a finished epic. The
  *                                   liveness clauses hold the verdict at
  *                                   `running:*` until the session is idle, so
- *                                   the mutexes stay held). close: status==="done"
+ *                                   the mutexes stay held. close: status==="done"
  *   1.5. epic-not-materialized    — epic.status == null (no EpicSnapshot folded)
  *   2.   epic-not-validated       — epic.last_validated_at == null (the sole
  *                                   guard against dispatching a mid-plan /
@@ -710,22 +715,39 @@ export function computeReadiness(
 /**
  * Terminal-completed test for a task — predicate 1's condition, factored so the
  * `dep-on-task` upstream check (predicate 8) can ask the SAME question of an
- * arbitrary upstream task directly, ORDER-INDEPENDENTLY. `worker_phase==="done"`
- * is the administrative signal; the three liveness clauses hold a done-but-live
- * task off `completed` until its session is idle (see predicate 1's note).
+ * arbitrary upstream task directly, ORDER-INDEPENDENTLY. The administrative
+ * signal is `worker_phase==="done"` OR the task's OWN parent epic being
+ * `status==="done"` — a done epic is ABSORBING, so a task whose per-task flag
+ * was never stamped (legacy import, `keeper plan epic close --force`) still
+ * reads terminal and the reconciler never re-dispatches `work::` against it
+ * (mirrors the close-row literal in `evaluateCloseRow`). The three liveness
+ * clauses still hold a done-but-live task off `completed` until its session is
+ * idle (see predicate 1's note), so a live worker keeps its per-root mutex.
  *
- * Pure over the task's own fields + the running-subagent index + injected `now`
- * — it never reads another row's in-progress verdict, so a forward dependency
- * (`task.depends_on` pointing at a HIGHER-numbered, not-yet-evaluated task)
- * resolves identically regardless of board-traversal order.
+ * The epic is resolved from `epicsById` via the task's OWN `epic_id`, NOT an
+ * ambient epic param, because predicate 8 shares this function to judge
+ * possibly-cross-epic upstreams — the ambient epic would misjudge a cross-epic
+ * dep. A null/absent `epic_id` (or an id absent from the map) falls back to
+ * `worker_phase`-only and never throws.
+ *
+ * Pure over the task's own fields + the epic index + the running-subagent index
+ * + injected `now` — it never reads another row's in-progress verdict, so a
+ * forward dependency (`task.depends_on` pointing at a HIGHER-numbered,
+ * not-yet-evaluated task) resolves identically regardless of board-traversal
+ * order.
  */
 function isTaskTerminalCompleted(
   task: Task,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
+  epicsById: Map<string, Epic>,
   now: number,
 ): boolean {
+  const ownEpic =
+    task.epic_id == null ? undefined : epicsById.get(task.epic_id);
+  const terminalAdminSignal =
+    task.worker_phase === "done" || ownEpic?.status === "done";
   return (
-    task.worker_phase === "done" &&
+    terminalAdminSignal &&
     !anyEmbeddedJobWorking(task.jobs) &&
     !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
     !embeddedMonitorOccupies(task.jobs, now)
@@ -801,7 +823,7 @@ function evaluateTask(
   // no such backstop, so the `sub-agent-stale` verdict keeps occupying the
   // mutex by design — correctness over throughput, cleared by autopilot pause
   // + manual replay.
-  if (isTaskTerminalCompleted(task, subRunningByJobId, now)) {
+  if (isTaskTerminalCompleted(task, subRunningByJobId, epicsById, now)) {
     return { tag: "completed" };
   }
 
@@ -883,7 +905,7 @@ function evaluateTask(
     const upstreamTask = taskById.get(upstream);
     if (
       upstreamTask === undefined ||
-      !isTaskTerminalCompleted(upstreamTask, subRunningByJobId, now)
+      !isTaskTerminalCompleted(upstreamTask, subRunningByJobId, epicsById, now)
     ) {
       return {
         tag: "blocked",

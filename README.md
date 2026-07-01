@@ -900,6 +900,12 @@ event-log/reducer/hook touch. Run any of them with
   from the three-collection snapshot (see `src/readiness.ts`); a
   blocked row is followed by a `   (reason: <reason>)` continuation
   line so the human reads the cause without scanning the upstream rows.
+  A task whose OWN epic is `status:done` reads `completed` regardless of
+  its per-task `worker_phase`, so a done epic is absorbing and the
+  reconciler never re-dispatches work against a finished epic (a live
+  worker on such a task still holds its per-root mutex via the liveness
+  clauses; to add follow-up work reopen the epic — status → open —
+  first).
   A `runtime-blocked` task the daemon block-escalation producer has
   notified the planner about (a `block_escalations` latch row is armed)
   renders `[blocked:escalated]` instead of `[blocked:runtime-blocked]`

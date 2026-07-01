@@ -488,6 +488,85 @@ test("fn-889 regression: forward depends_on (upstream evaluated later) resolves 
 });
 
 // ---------------------------------------------------------------------------
+// fn-1048: a `status:done` epic is ABSORBING in the readiness pipeline. Any
+// task under it resolves `completed` regardless of the per-task `worker_phase`
+// flag — an epic closed WITHOUT stamping that flag (legacy import, `keeper plan
+// epic close --force`) must not re-feed the reconcile snapshot and re-dispatch
+// `work::`. The terminal gate still honors the three task-scope liveness
+// clauses (fn-671 invariant), and the epic is resolved per-task via `epicsById`
+// so predicate 8's cross-epic `dep-on-task` judges each upstream by its OWN
+// epic.
+// ---------------------------------------------------------------------------
+
+test("fn-1048: task under a status:done epic reads completed even with worker_phase=open", () => {
+  // The core guard: the per-task flag was never stamped (open), but the parent
+  // epic is `status:done`. Pre-fn-1048 this read `ready` and the reconciler
+  // re-dispatched `work::` in a loop; post-fn-1048 the done epic is absorbing.
+  const task = makeTask({ worker_phase: "open" });
+  const epic = makeEpic({ status: "done", tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+});
+
+test("fn-1048: done epic still honors liveness — task with a working embedded job stays running:job-running (fn-671 preserved)", () => {
+  // Absorbing at the ADMIN signal only: a still-live worker on a done-epic task
+  // must keep holding the per-root mutex, so the terminal gate falls through to
+  // predicate 5 (`job-running`) exactly as the fn-671 clauses require.
+  const task = makeTask({
+    worker_phase: "open",
+    jobs: [makeEmbeddedJob({ state: "working" })],
+  });
+  const epic = makeEpic({ status: "done", tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("fn-1048: cross-epic dep-on-task judges the upstream by ITS OWN done epic (epicsById, not the ambient epic)", () => {
+  // A kept `status:open` epic whose task depends on a task living in a
+  // `status:done` epic. The upstream (`worker_phase:open`, never stamped) is
+  // terminal by ITS OWN epic, so the dependent is unblocked. Resolving the
+  // epic from the ambient param instead of `epicsById` would misjudge the
+  // cross-epic upstream and falsely block the dependent.
+  const upstream = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "open",
+  });
+  const doneEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    status: "done",
+    tasks: [upstream],
+  });
+  const dependent = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    depends_on: ["fn-1-foo.1"],
+  });
+  const openEpic = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    status: "open",
+    tasks: [dependent],
+  });
+  const snap = run([openEpic, doneEpic]);
+  // Upstream reads completed by its own done epic; the dependent is unblocked.
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("fn-1048: task with null epic_id in a done epic falls back to worker_phase-only (no throw)", () => {
+  // A shell task element with `epic_id: null` (no plan-snapshot fold landed)
+  // can't resolve its epic, so the gate degrades to `worker_phase`-only —
+  // worker_phase=open stays NOT terminal, and the lookup never throws.
+  const task = makeTask({ epic_id: null, worker_phase: "open" });
+  const epic = makeEpic({ status: "done", tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "ready" });
+});
+
+// ---------------------------------------------------------------------------
 // fn-719: live-worker-monitor occupancy. A work session that backgrounded a
 // test suite and yielded its turn flips its embedded job to `stopped` (so
 // predicates 5/6 clear) while the suite is STILL RUNNING. Task 1 carries the
