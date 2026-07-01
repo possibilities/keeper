@@ -22,6 +22,7 @@ import { join } from "node:path";
 
 import {
   closeBlockReason,
+  closeChildInFlight,
   closeStopAllowed,
   workBlockReason,
 } from "../plugin/hooks/stop-guard.ts";
@@ -90,6 +91,64 @@ describe("closeBlockReason", () => {
     expect(reason).toContain("close-finalize fn-1-x --project");
     expect(reason).toContain("Never write or commit");
   });
+
+  test("names the await case and tells an awaiting closer not to poll or finalize early", () => {
+    const reason = closeBlockReason("fn-1-x");
+    expect(reason).toContain("awaiting a subagent");
+    expect(reason).toContain("end the turn");
+    expect(reason).toMatch(/do NOT poll/i);
+    expect(reason).toContain("finalize early");
+  });
+});
+
+describe("closeChildInFlight", () => {
+  const running = {
+    id: "a1",
+    type: "subagent",
+    status: "running",
+    agent_type: "plan:quality-auditor",
+  };
+  const shellBusWatch = {
+    id: "s1",
+    type: "shell",
+    status: "running",
+    command: "keeper bus watch",
+  };
+  const cases: [string, unknown, boolean][] = [
+    ["running subagent present", [running], true],
+    [
+      "running subagent alongside the shell bus-watch entry",
+      [shellBusWatch, running],
+      true,
+    ],
+    ["completed subagent only", [{ ...running, status: "completed" }], false],
+    ["subagent with absent status", [{ id: "a1", type: "subagent" }], false],
+    [
+      "shell bus-watch entry only (non-empty, no subagent)",
+      [shellBusWatch],
+      false,
+    ],
+    [
+      "running shell (not a subagent)",
+      [{ ...shellBusWatch, type: "shell" }],
+      false,
+    ],
+    ["null entry in the array", [null, running], true],
+    [
+      "malformed entries, no running subagent",
+      [null, 7, "x", { type: "subagent" }],
+      false,
+    ],
+    ["empty array", [], false],
+    ["non-array (object)", { type: "subagent", status: "running" }, false],
+    ["undefined", undefined, false],
+    ["null", null, false],
+  ];
+  for (const [label, bg, expected] of cases) {
+    test(`${label} → ${expected}`, () => {
+      expect(closeChildInFlight(bg)).toBe(expected);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -292,6 +351,57 @@ describe("stop-guard ladder", () => {
     expect(env.reason).toContain("fn-1-x");
     expect(env.reason).toContain("mid-saga");
     // The close branch never calls reconcile — its decision is message-only.
+    expect(planCliCalled).toBe(false);
+  });
+
+  test("close marker + in-flight subagent → allow with zero keeper calls", async () => {
+    writeCloseMarker("fn-1-x");
+    writePlanCliShim({ verdict: "ignored" });
+
+    const { stdout, planCliCalled } = await run(
+      stopPayload({
+        // A bare last message would otherwise block — the running subagent wins.
+        last_assistant_message: "Spawned the auditor, awaiting its report.",
+        background_tasks: [
+          {
+            id: "s1",
+            type: "shell",
+            status: "running",
+            command: "keeper bus watch",
+          },
+          {
+            id: "a1",
+            type: "subagent",
+            status: "running",
+            agent_type: "plan:quality-auditor",
+          },
+        ],
+      }),
+    );
+    expect(stdout).toBe("");
+    expect(planCliCalled).toBe(false);
+  });
+
+  test("close marker + shell bus-watch only + bare message → block (genuine catch preserved)", async () => {
+    writeCloseMarker("fn-1-x");
+    writePlanCliShim({ verdict: "ignored" });
+
+    const { stdout, planCliCalled } = await run(
+      stopPayload({
+        last_assistant_message: "Audit phase done, agents returned.",
+        background_tasks: [
+          {
+            id: "s1",
+            type: "shell",
+            status: "running",
+            command: "keeper bus watch",
+          },
+        ],
+      }),
+    );
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("mid-saga");
     expect(planCliCalled).toBe(false);
   });
 

@@ -166,9 +166,9 @@ The plugin ships three bun hook dispatchers under `hooks/` that keep the `/plan:
 
 - **PreToolUse commit hard-deny** — denies `keeper commit-work` / `git commit` from the main context while the session's claimed task is in progress; worker-context commits (an `agent_id` is present) always pass.
 - **SubagentStop worker guard** — a worker stopping in a non-`done`, non-`BLOCKED:` state gets exactly one corrective round.
-- **Stop checklist guard** — a work-session Stop with a still-in-progress claimed task, or a close-session Stop where `close-finalize` never ran, blocks once with a resume checklist.
+- **Stop checklist guard** — a work-session Stop with a still-in-progress claimed task, or a close-session Stop where `close-finalize` never ran, blocks once with a resume checklist. The close branch blocks only when neither of its two zero-subprocess allow gates fires — a sanctioned typed-stop message, or an in-flight subagent the closer spawned and is awaiting (a `background_tasks` entry with `type:"subagent"` + `status:"running"`).
 
-Each guard verifies live state with a read-only `keeper plan` call before blocking and fails open on any internal error. Session state is one JSON marker per session at `~/.local/state/keeper/sessions/<session_id>.json`. Set `KEEPER_PLAN_GUARD_BYPASS=1` to disable all three guards.
+The work guard verifies live task state with a read-only `keeper plan reconcile` call before blocking; the close branch decides from the Stop payload alone (its typed-stop message and `background_tasks`), spawning no subprocess. All three fail open on any internal error. Session state is one JSON marker per session at `~/.local/state/keeper/sessions/<session_id>.json`. Set `KEEPER_PLAN_GUARD_BYPASS=1` to disable all three guards.
 
 ## Help for Agents
 
