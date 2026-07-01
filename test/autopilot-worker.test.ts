@@ -8955,6 +8955,15 @@ function classifyIdentity(epics: Epic[]): Map<string, WorktreeRepoResolution> {
 }
 
 /**
+ * Identity-resolved classification with the multi-repo rollout flag ON — a
+ * `>1`-toplevel epic partitions into `clustered` per-repo lane groups (worktree
+ * eligible by default) instead of the whole-epic `multi-repo` reject.
+ */
+function classifyMultiRepo(epics: Epic[]): Map<string, WorktreeRepoResolution> {
+  return classifyWorktreeRepos(epics, (r) => r, undefined, undefined, true);
+}
+
+/**
  * A rule-driven git runner for the merge-gate probe. `lanes` are the present
  * `keeper/epic/*` short-names (the enumeration); `enumError` fails the enumeration;
  * `ancestors` are the lane branches that are ancestors of LOCAL default (merged);
@@ -9190,6 +9199,137 @@ test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked u
 });
 
 // ---------------------------------------------------------------------------
+// fn-1034 — the PER-(epic, repoDir) generalization of the merge-gate: a clustered
+// multi-repo downstream defers only the GROUP whose repo has an unmerged same-repo
+// upstream; sibling groups (and cross-repo upstreams) proceed independently.
+// ---------------------------------------------------------------------------
+
+test("fn-1034 computeDeferredEpicIds: a CLUSTERED downstream defers ONLY the group whose repo has an unmerged same-repo upstream; the sibling group proceeds", async () => {
+  // Upstream A cut a lane only in /r1. Downstream B spans {/r1, /r2}: B's /r1 group
+  // shares A's repo (unmerged) → defer; B's /r2 group has NO same-repo upstream →
+  // proceed.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a", target_repo: "/r1" }),
+    ],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/r1",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+    tasks: [
+      makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-2-b.2", epic_id: "fn-2-b", target_repo: "/r2" }),
+    ],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyMultiRepo(epics),
+    run,
+  );
+  // The /r1 group defers (A's r1 base is present-but-not-ancestor); /r2 proceeds.
+  expect(deferred.get("fn-2-b")?.has("/r1")).toBe(true);
+  expect(deferred.get("fn-2-b")?.has("/r2") ?? false).toBe(false);
+});
+
+test("fn-1034 computeDeferredEpicIds: a CLUSTERED upstream with unmerged lanes gates EACH of B's matching groups (per-repo union)", async () => {
+  // Both A and B span {/r1, /r2}. A cut a lane in BOTH, neither merged → both of B's
+  // groups share an unmerged same-repo upstream group → both deferred.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-1-a.2", epic_id: "fn-1-a", target_repo: "/r2" }),
+    ],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/r1",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+    tasks: [
+      makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-2-b.2", epic_id: "fn-2-b", target_repo: "/r2" }),
+    ],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyMultiRepo(epics),
+    run,
+  );
+  expect(deferred.get("fn-2-b")?.has("/r1")).toBe(true);
+  expect(deferred.get("fn-2-b")?.has("/r2")).toBe(true);
+});
+
+test("fn-1034 computeDeferredEpicIds: a CLUSTERED downstream whose same-repo upstream is MERGED in that repo is NOT deferred (absent-lane sibling proceeds too)", async () => {
+  // A merged in /r1 (ancestor of local default); B's /r1 group therefore proceeds,
+  // and B's /r2 group (no same-repo upstream) proceeds — B has no deferred group.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a", target_repo: "/r1" }),
+    ],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/r1",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+    tasks: [
+      makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-2-b.2", epic_id: "fn-2-b", target_repo: "/r2" }),
+    ],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a"],
+    ancestors: ["keeper/epic/fn-1-a"], // A's r1 base merged into local default
+  });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyMultiRepo(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(false);
+});
+
+test("fn-1034 reconcile: a CLUSTERED epic defers ONLY the flagged group's work row; the sibling group's task still launches (no whole-epic suppression, no sticky)", () => {
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-2-b.2", epic_id: "fn-2-b", target_repo: "/r2" }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [b],
+    // Clustered (rollout flag ON) worktree geometry so each group's rib is its own
+    // cap-1 lane key — sibling lanes run concurrently, the whole point of clustering.
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyMultiRepo([b]),
+    // Only the /r1 group is deferred (its same-repo upstream is unmerged).
+    deferredEpicIds: new Map([["fn-2-b", new Set(["/r1"])]]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  // The /r1 group's task is held; the /r2 group's task proceeds — targeted, not global.
+  expect(
+    decision.launches.some((p) => p.verb === "work" && p.id === "fn-2-b.1"),
+  ).toBe(false);
+  expect(
+    decision.launches.some((p) => p.verb === "work" && p.id === "fn-2-b.2"),
+  ).toBe(true);
+  // A pure `continue` — reconcile mints no sticky / dispatch_failures.
+  expect(decision.worktreeFinalize).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
 // fn-1016 — the durable merge-landed observable (computeMergedLaneEntries). An
 // `ok` epic's OWN lane probed merged-into-default → an entry; reuses the SAME
 // per-repo lane-enumeration + ancestry probes as the merge-gate.
@@ -9325,7 +9465,10 @@ test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH supp
   });
   const snap = makeSnapshot({
     epics: [bWork, cClose, control],
-    deferredEpicIds: new Set(["fn-2-b", "fn-3-c"]),
+    deferredEpicIds: new Map([
+      ["fn-2-b", new Set(["/repo-b"])],
+      ["fn-3-c", new Set(["/repo-c"])],
+    ]),
   });
   const decision = reconcile(snap, makeState(), 0);
   // The deferred epics launch NOTHING — neither the work row nor the close row.
@@ -9341,7 +9484,7 @@ test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH supp
   expect(decision.worktreeFinalize).toEqual([]);
 });
 
-test("fn-1014 reconcile: an empty deferredEpicIds is a byte-identical no-op (every gate arm inert)", () => {
+test("fn-1014 reconcile: an empty deferredEpicIds map is a byte-identical no-op (every gate arm inert)", () => {
   const bWork = makeEpic({
     epic_id: "fn-2-b",
     project_dir: "/repo-b",
@@ -9361,7 +9504,7 @@ test("fn-1014 reconcile: an empty deferredEpicIds is a byte-identical no-op (eve
   });
   const snap = makeSnapshot({
     epics: [bWork, cClose],
-    deferredEpicIds: new Set<string>(),
+    deferredEpicIds: new Map<string, Set<string>>(),
   });
   const decision = reconcile(snap, makeState(), 0);
   // With nothing deferred, BOTH the work row and the close row launch normally.

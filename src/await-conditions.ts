@@ -1067,11 +1067,11 @@ export interface DrainedInputs {
  * `drained` predicate (fn-1015). MET when the board is fully at rest:
  * `catching_up===false` AND no in-flight launch AND no running job AND (the
  * open board is empty OR every per-task / per-close-row verdict is
- * `completed`). A deferred-on-upstream-merge epic (the reconciler's
- * `computeDeferredEpicIds` set) always carries a non-`completed` verdict (a
- * ready task / ready close-row held back from cutting its lane), so it reads
- * `waiting` here automatically — the self-resolving carve-out needs no
- * producer-side probe on the client.
+ * `completed`). A deferred-on-upstream-merge epic (a per-(epic, repoDir) entry
+ * in the reconciler's `computeDeferredEpicIds` map) always carries a
+ * non-`completed` verdict (a ready task / ready close-row held back from cutting
+ * its lane), so it reads `waiting` here automatically — the self-resolving
+ * carve-out needs no producer-side probe on the client.
  *
  * Under `--fail-on-stuck` a jam-reason sticky ({@link isJamReason}) escalates
  * to `stuck` (exit 5): the board will not drain without an operator, so an
