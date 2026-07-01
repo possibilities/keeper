@@ -60,5 +60,5 @@ nullable/no-default (a pre-v100 event folds them to NULL byte-identically).
 - [ ] `bun test test/db.test.ts test/schema-version.test.ts test/refold-equivalence.test.ts` green
 
 ## Done summary
-
+Added six nullable v100 jobs telemetry columns (current model/effort/context-window usage) behind a forward-only migration, whitelisted v100 in keeper-py, and plumbed them through JOBS_DESCRIPTOR + the Job type. Schema/refold gates green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Schema migration and jobs telemetry columns",
-  "updated_at": "2026-07-01T01:13:06.974000Z"
+  "updated_at": "2026-07-01T01:38:19.045000Z",
+  "worker_done_at": "2026-07-01T01:38:19.045000Z"
 }
