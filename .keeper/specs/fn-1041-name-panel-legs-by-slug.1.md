@@ -75,5 +75,5 @@ guidance). Update README (panel line + spawn-name class).
 - [ ] `bun run lint && bun run typecheck && bun test` all green
 
 ## Done summary
-
+Extracted pure slug primitives into a dep-free src/slug.ts leaf (handoff-slug.ts re-exports with preserved wording); made 'keeper agent panel start' require --slug and name every leg panel::<slug>::<preset>, threaded through manifest + PANEL_HELP + dispatch synopses + README spawn-name class, with the panel/pair skills and panel-runner auto-deriving and forwarding the slug.
 ## Evidence
