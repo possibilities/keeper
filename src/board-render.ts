@@ -226,6 +226,77 @@ export function permissionPromptPillSeg(at: unknown, kind: unknown): string {
   return ` ${pill(`awaiting:${k}`)}`;
 }
 
+/** Max rendered width of the `[<model>]` telemetry pill body before it is
+ * truncated with a trailing `…` — keeps a long raw model id from blowing out
+ * the finite board width. */
+const TELEMETRY_MODEL_MAX = 20;
+
+/**
+ * Render the optional per-session telemetry pill segment from the six v100
+ * `SessionTelemetry` jobs columns (fn-1024) — a live session's CURRENT model,
+ * reasoning effort, and context-window fill, projected verbatim from the
+ * Claude Code statusLine payload and folded latest-wins onto the row.
+ *
+ * Shape (each piece a self-delimited pill; the whole segment is leading-space
+ * so callers append it unconditionally):
+ *   - `[<model>]` — `current_model_display` preferred over the raw
+ *     `current_model_id`, truncated to {@link TELEMETRY_MODEL_MAX} with a
+ *     trailing `…` when longer.
+ *   - `[effort:<level>]`, or `[effort:—]` when `current_effort` is NULL. The
+ *     em-dash is the tri-state's "unknown" — effort is NEVER defaulted to
+ *     `low`. Always rendered once the segment shows.
+ *   - `[ctx:<n>%]` — `context_used_percentage` rounded; dropped entirely when
+ *     NULL (no placeholder — a session with no context snapshot shows no ctx
+ *     pill).
+ *
+ * Returns `""` until the first snapshot lands (model / effort / context% all
+ * NULL) so a job that never emitted telemetry — any pre-v100 row, an ambient
+ * non-agent session — renders exactly as before. Pure function of the row
+ * (no wall-clock, no env); strings are bound straight from the projection,
+ * never interpolated as SQL/shell.
+ */
+export function sessionTelemetryPillSeg(row: Record<string, unknown>): string {
+  const modelDisplay =
+    typeof row.current_model_display === "string" &&
+    row.current_model_display !== ""
+      ? row.current_model_display
+      : null;
+  const modelId =
+    typeof row.current_model_id === "string" && row.current_model_id !== ""
+      ? row.current_model_id
+      : null;
+  const model = modelDisplay ?? modelId;
+  const effort =
+    typeof row.current_effort === "string" && row.current_effort !== ""
+      ? row.current_effort
+      : null;
+  const pct =
+    typeof row.context_used_percentage === "number" &&
+    Number.isFinite(row.context_used_percentage)
+      ? row.context_used_percentage
+      : null;
+  // Gate: no snapshot has landed → drop the whole segment, so pre-v100 /
+  // ambient sessions render unchanged.
+  if (model === null && effort === null && pct === null) {
+    return "";
+  }
+  const segs: string[] = [];
+  if (model !== null) {
+    const truncated =
+      model.length > TELEMETRY_MODEL_MAX
+        ? `${model.slice(0, TELEMETRY_MODEL_MAX - 1)}…`
+        : model;
+    segs.push(pill(truncated));
+  }
+  // Effort always renders once the segment shows — `—` is the "unknown"
+  // placeholder, never a fabricated `low`.
+  segs.push(pill(`effort:${effort ?? "—"}`));
+  if (pct !== null) {
+    segs.push(pill(`ctx:${Math.round(pct)}%`));
+  }
+  return ` ${segs.join(" ")}`;
+}
+
 // ---------------------------------------------------------------------------
 // Omit-default pill helpers (T1) + verdict-aware suppression (T2/T3)
 // ---------------------------------------------------------------------------

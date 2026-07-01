@@ -28,6 +28,7 @@ import {
   pill,
   renderDeadLetterPill,
   scheduledTaskLinesFor,
+  sessionTelemetryPillSeg,
 } from "../src/board-render";
 import type { ScheduledTask, SubagentInvocation } from "../src/types";
 import { SELECTED_LINE_PREFIX } from "../src/view-shell";
@@ -193,6 +194,88 @@ test("projectJobRow: every state renders its pill, stopped (the default) include
   // `stopped` (the resting state) now renders its pill explicitly.
   expect(projectJobRow({ title: "a", plan_verb: null, state: "stopped" })).toBe(
     `a ${pill("stopped")}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// sessionTelemetryPillSeg — the v100 per-session telemetry segment
+// (`[<model>] [effort:<level>] [ctx:<n>%]`, fn-1024). Gated to "" until a
+// snapshot lands; effort renders `—` (never defaulted to `low`) when NULL;
+// long model names truncate; context% drops entirely when absent.
+// ---------------------------------------------------------------------------
+
+test("sessionTelemetryPillSeg: full telemetry → model, effort, ctx% pills", () => {
+  expect(
+    sessionTelemetryPillSeg({
+      current_model_display: "Opus",
+      current_model_id: "claude-opus-4-8",
+      current_effort: "high",
+      context_used_percentage: 42.5,
+    }),
+  ).toBe(` ${pill("Opus")} ${pill("effort:high")} ${pill("ctx:43%")}`);
+});
+
+test("sessionTelemetryPillSeg: no telemetry columns → empty segment", () => {
+  expect(sessionTelemetryPillSeg({ title: "ambient" })).toBe("");
+  expect(
+    sessionTelemetryPillSeg({
+      current_model_display: null,
+      current_model_id: null,
+      current_effort: null,
+      context_used_percentage: null,
+    }),
+  ).toBe("");
+});
+
+test("sessionTelemetryPillSeg: NULL effort renders '—', never defaulted to low", () => {
+  const seg = sessionTelemetryPillSeg({
+    current_model_display: "Opus",
+    current_effort: null,
+    context_used_percentage: 10,
+  });
+  expect(seg).toBe(` ${pill("Opus")} ${pill("effort:—")} ${pill("ctx:10%")}`);
+  expect(seg).not.toContain("effort:low");
+});
+
+test("sessionTelemetryPillSeg: falls back to model id when display absent", () => {
+  expect(
+    sessionTelemetryPillSeg({
+      current_model_display: null,
+      current_model_id: "claude-opus-4-8",
+      current_effort: "max",
+    }),
+  ).toBe(` ${pill("claude-opus-4-8")} ${pill("effort:max")}`);
+});
+
+test("sessionTelemetryPillSeg: long model name truncates with a trailing …", () => {
+  const seg = sessionTelemetryPillSeg({
+    current_model_display: "some-absurdly-long-model-identifier-name",
+    current_effort: "low",
+  });
+  expect(seg).toBe(` ${pill("some-absurdly-long-…")} ${pill("effort:low")}`);
+});
+
+test("sessionTelemetryPillSeg: NULL context% drops the ctx pill entirely", () => {
+  expect(
+    sessionTelemetryPillSeg({
+      current_model_display: "Opus",
+      current_effort: "high",
+      context_used_percentage: null,
+    }),
+  ).toBe(` ${pill("Opus")} ${pill("effort:high")}`);
+});
+
+test("projectJobRow: telemetry columns append the telemetry pills inline", () => {
+  const line = projectJobRow({
+    title: "live worker",
+    plan_verb: "work",
+    state: "working",
+    current_model_display: "Opus",
+    current_effort: "high",
+    context_used_percentage: 30,
+  });
+  expect(line).toBe(
+    `live worker ${pill("worker")} ${pill("working")} ${pill("Opus")} ${pill("effort:high")} ${pill("ctx:30%")}`,
   );
 });
 

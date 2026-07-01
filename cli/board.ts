@@ -49,6 +49,7 @@ import {
   renderCloseFailurePill,
   renderClosePills,
   renderTaskPills,
+  sessionTelemetryPillSeg,
   startedPill,
   subagentLinesFor,
   validatedPill,
@@ -526,7 +527,7 @@ export async function main(argv: string[]): Promise<void> {
       const role = planVerbLabel(job.plan_verb);
       const roleSeg = role == null ? "" : ` ${pill(role)}`;
       out.push(
-        `    ${seg(job.title)}${roleSeg}${pillOrEmpty(job.state, "stopped")}${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}`,
+        `    ${seg(job.title)}${roleSeg}${pillOrEmpty(job.state, "stopped")}${apiErrorPillSeg(job.last_api_error_at, job.last_api_error_kind)}${sessionTelemetryPillSeg(job)}`,
       );
       // [awaiting:<kind>] on its own continuation line (six-space indent —
       // same depth as this row's sub-agent lines below).

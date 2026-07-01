@@ -88,6 +88,7 @@ import {
   renderTmuxFocusPill,
   scheduledTaskLinesFor,
   sendReplayDeadLetterRpc,
+  sessionTelemetryPillSeg,
   subagentLinesFor,
 } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
@@ -185,7 +186,7 @@ export function projectJobRow(row: Record<string, unknown>): string {
   // between the role and state pills without a stray gap when absent.
   const worktree = worktreeLaneSeg(row);
   const worktreeSeg = worktree === "" ? "" : ` ${worktree}`;
-  const head = `${cwdSeg}${title}${roleSeg}${worktreeSeg}${pillOrEmpty(row.state, "stopped")}${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}`;
+  const head = `${cwdSeg}${title}${roleSeg}${worktreeSeg}${pillOrEmpty(row.state, "stopped")}${apiErrorPillSeg(row.last_api_error_at, row.last_api_error_kind)}${sessionTelemetryPillSeg(row)}`;
   // Continuation lines under the head, at the 2-space depth shared with
   // sub-agent lines. Only the always-visible `awaiting` pills ride here;
   // the backend-coords pill moved out to `renderJobsBody`'s

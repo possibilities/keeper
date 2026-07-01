@@ -1450,6 +1450,19 @@ event-log/reducer/hook touch. Run any of them with
   or malformed catalog's `ConfigError` to those constants, so the daemon never
   crashes on bad config.
 
+  `keeper agent`'s claude branch passes `--settings <file>` straight through to
+  `claude` (it rides the `src/agent/passthrough.ts` claude flag allow-list). The
+  session-telemetry feature (fn-1024) uses this seam to inject a `statusLine`
+  override fleet-wide: a settings FILE (preferred over inline JSON — nested
+  single-quote fragility) wraps the human's display command as `bash -c 'tee -i
+  >(keeper statusline-sink) | <their display>'`, so every render is teed into the
+  telemetry sink while the human's statusline still paints unchanged. The
+  `bash -c` shell is REQUIRED — `>(…)` process substitution is bash-only, and
+  `sh`/`dash` silently parse-fail while the display still prints (masked telemetry
+  loss). This `--settings` scalar override is Claude Code settings precedence #2
+  (loses only to managed policy), replacing the user's `statusLine` for that
+  session — fine, since the chain re-invokes their display.
+
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,
   `server-up` + `reason=unreachable` added in fn-750.2, give-up made
@@ -2451,6 +2464,29 @@ survives `git worktree remove`/`move`. `jobs.worktree` is display-only on
 minus keeper/epic/>]` lane pill (NULL → no pill). keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `94` (whitelist-only; keeper-py never
 reads the `worktree` column).
+As of schema v100 (fn-1024), each job carries six nullable per-session telemetry
+columns projecting a live keeper-agent session's CURRENT Claude Code model,
+reasoning effort, and context-window fill onto the `jobs` board:
+`current_model_id` / `current_model_display` (`model.id` / `model.display_name`),
+`current_effort` (`effort.level`: low/medium/high/xhigh/max — NULL when the
+statusLine payload omits it), and `context_used_percentage` /
+`context_input_tokens` / `context_window_size` (taken verbatim from the
+`context_window` block; the percent is NEVER recomputed, so a from-scratch
+re-fold stays byte-identical). The chain clones the usage-snapshot archetype
+end-to-end: the `keeper statusline-sink` CLI (injected fleet-wide as a `bash -c
+'tee -i >(keeper statusline-sink) | <display>'` statusLine wrapper via `keeper
+agent --settings`) reads the Claude Code statusLine stdin JSON, coalesces it, and
+atomically writes one per-session leaf file; the statusline telemetry producer
+worker watches that leaf directory and posts a `session-telemetry` message that
+main mints into a synthetic `SessionTelemetry` event. The reducer's
+`SessionTelemetry` arm folds it with a partial `UPDATE … COALESCE(?, col)` per
+column onto the row keyed by `job_id` (the statusLine `session_id` equals the
+hook-sourced `jobs.job_id`) — display-only, NEVER touching `state`/`active_since`,
+and a no-op when no live job row matches (it never mints a phantom row). The
+shared `projectJobRow` helper lifts the columns into `[<model>] [effort:<level>]
+[ctx:<n>%]` pills (a NULL effort renders `—`, never a defaulted `low`; long model
+names truncate). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `100`
+(whitelist-only; keeper-py never reads the telemetry columns).
 As of schema v47 (fn-667), the autopilot pause/playing flag is event-sourced
 into a new singleton `autopilot_state` projection table (`id INTEGER PRIMARY
 KEY CHECK (id = 1)`, `paused INTEGER NOT NULL`, plus `last_event_id` /
@@ -3775,15 +3811,29 @@ check asks "does a `handoff::<id>` SessionStart exist?" before re-dispatching)
 and never strands the handoff. The dispatch side-effect lives in the worker,
 NOT the fold — the fold is the pure decider.
 
-The thirteen workers are fully independent; main supervises all thirteen
+A **fourteenth** Worker thread is the statusline telemetry producer (epic
+fn-1024): keeperd's sixth `@parcel/watcher` file-watch producer, it watches the
+keeper-managed statusLine leaf directory (one `<session>.json` per live
+keeper-agent session, written atomically by the `keeper statusline-sink` CLI) and,
+on each change, reads the coalesced leaf, change-gates it against the last-folded
+value (seeded from the `jobs` telemetry columns at boot, mirroring the usage
+producer's `seedFromDb`), and posts a `session-telemetry` message that main mints
+into a synthetic `SessionTelemetry` event folding the session's CURRENT model /
+effort / context-window usage onto the v100 `jobs` columns. It clones the usage
+producer archetype end-to-end (external producer → coalesce → mint → fold); the
+side-effect (the leaf read + gate) lives in the worker, the fold is the pure
+decider, and a leaf whose `session_id` matches no live `jobs.job_id` folds to a
+no-op.
+
+The fourteen workers are fully independent; main supervises all fourteen
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,
 usage, and dead-letter watchers, which deliberately does NOT escalate
 (a re-scan throw is swallowed, never reaching the restart path).
 
-**`@parcel/watcher` load ordering (as of fn-701).** Five of the workers
-(transcript, plan, git, usage, dead-letter) each run their own
+**`@parcel/watcher` load ordering (as of fn-701).** Six of the workers
+(transcript, plan, git, usage, dead-letter, statusline) each run their own
 `import("@parcel/watcher")`. Spawned back-to-back, their FIRST dlopens of the
 native N-API addon race and crash with `symbol 'napi_register_module_v1' not
 found` — residual [Bun #15942](https://github.com/oven-sh/bun/issues/15942)
@@ -3824,8 +3874,11 @@ without paying its cost today.
 
 The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
 the package.json `bin`) that fans into every subcommand — `board`,
-`autopilot`, `git`, `usage`, `builds`, `await`, `status`, `query`, `watch` —
-so all example clients ship as one binary instead of N standalone scripts.
+`autopilot`, `git`, `usage`, `builds`, `await`, `status`, `query`, `watch`,
+`statusline-sink` (the statusLine telemetry sink, injected fleet-wide via
+`keeper agent --settings`; reads the Claude Code statusLine stdin JSON and writes
+one coalesced per-session leaf the statusline worker folds) — so all example
+clients ship as one binary instead of N standalone scripts.
 
 The sitter scanners (performance, builds, helptailing) — read-only out-of-process observers of `keeper.db` and buildbot state — now live in their own repo at `~/code/sitter`. They import nothing from keeper and observe purely through durable contracts (read-only SQLite at a whitelisted schema version, NDJSON telemetry, their own private state tree). See `~/code/sitter` for the daemon set, its launchd jobs, and its architecture.
 
