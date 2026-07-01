@@ -1,13 +1,13 @@
 /**
  * The shared launch→{@link ResolvedHandle} glue behind `agent run` (posture-free)
  * and `pair send` (posture-full). It assembles the per-CLI detached launch argv
- * via `buildPairLaunchArgv`, mints the pinned transcript session id, drives
+ * via `buildAgentLaunchArgv`, mints the pinned transcript session id, drives
  * `launchKeeperAgentInTmux` DIRECTLY (no subprocess re-exec), and returns a
  * {@link RunLaunchResult}. The pinned {@link ResolvedHandle} is held LOCALLY by
  * the caller's compose — no run.json re-resolution, no cross-process kill margin,
  * no self-transcript-collision exposure. Both callers express their config
  * through ONE seam: the posture rides in via {@link LaunchPosture} (the
- * `buildPairLaunchArgv` opts), every effect via the explicit {@link
+ * `buildAgentLaunchArgv` opts), every effect via the explicit {@link
  * LaunchHandleDeps}.
  *
  * DEP-GRAPH DISCIPLINE: this module stays db-free (no `src/db.ts` / `bun:sqlite`)
@@ -19,9 +19,9 @@ import type {
   CodexTrustStatus,
   EnsureCodexDirTrustOptions,
 } from "../codex-trust";
-import { buildPairLaunchArgv, stripClaudeEnv } from "../pair-command";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
+import { buildAgentLaunchArgv, stripClaudeEnv } from "./launch-config";
 import type { ResolvedHandle } from "./pair-subcommands";
 import type { RunLaunchResult } from "./run-capture";
 import {
@@ -73,7 +73,7 @@ export function tmuxTranscriptSessionId(
 }
 
 /**
- * The posture half of the launch seam — the {@link buildPairLaunchArgv} opts the
+ * The posture half of the launch seam — the {@link buildAgentLaunchArgv} opts the
  * two callers vary. `agent run` omits everything; `pair send` fills the full
  * posture (model/effort/session/preset). Read-only is prompting-only (a prompt
  * directive prepended caller-side), so it is NOT a launch-argv posture here.
@@ -140,7 +140,7 @@ export interface LaunchHandleArgs {
 }
 
 /**
- * Assemble the per-CLI detached launch argv (reusing the pair builder for the
+ * Assemble the per-CLI detached launch argv (reusing the shared builder for the
  * native posture flags), strip the cli token, and drive `launchKeeperAgentInTmux`
  * DIRECTLY — no subprocess re-exec. On success the pinned {@link ResolvedHandle}
  * is held LOCALLY by the caller's compose (no run.json re-resolution, no
@@ -154,7 +154,7 @@ export function launchToResolvedHandle(
   // Build with an EMPTY launcherArgvPrefix so the cli token sits first; `.slice(1)`
   // then drops it, leaving the inner args. The REAL prefix rides on the launch
   // request below, where the detached pane re-execs through it.
-  const launchArgv = buildPairLaunchArgv({
+  const launchArgv = buildAgentLaunchArgv({
     launcherArgvPrefix: [],
     cli: agent,
     prompt,

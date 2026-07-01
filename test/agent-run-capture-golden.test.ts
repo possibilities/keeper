@@ -11,8 +11,8 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { buildAgentLaunchArgv } from "../src/agent/launch-config";
 import {
-  buildPairLaunchArgv,
   buildPairOutput,
   pairOutputYaml,
   stopTimeoutMsFromSeconds,
@@ -24,10 +24,10 @@ const PREFIX = [
   "agent",
 ] as const;
 
-describe("golden: buildPairLaunchArgv", () => {
+describe("golden: buildAgentLaunchArgv", () => {
   test("claude write-mode launch (model + session, no preset)", () => {
     expect(
-      buildPairLaunchArgv({
+      buildAgentLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "claude",
         prompt: "do the thing",
@@ -57,7 +57,7 @@ describe("golden: buildPairLaunchArgv", () => {
 
   test("claude read-only launch (preset, no session) — posture-independent flags (no strip)", () => {
     expect(
-      buildPairLaunchArgv({
+      buildAgentLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "claude",
         prompt: "explore",
@@ -82,7 +82,7 @@ describe("golden: buildPairLaunchArgv", () => {
 
   test("codex read-only launch (model + effort + session) — keeps write flags", () => {
     expect(
-      buildPairLaunchArgv({
+      buildAgentLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "codex",
         prompt: "review this",
@@ -110,7 +110,7 @@ describe("golden: buildPairLaunchArgv", () => {
   });
 
   test("codex omits the claude-only KEEPER_TMUX_SESSION env carrier", () => {
-    const argv = buildPairLaunchArgv({
+    const argv = buildAgentLaunchArgv({
       launcherArgvPrefix: PREFIX,
       cli: "codex",
       prompt: "p",
@@ -121,7 +121,7 @@ describe("golden: buildPairLaunchArgv", () => {
 
   test("pi read-only launch (model + session) — posture-independent flags (no strip)", () => {
     expect(
-      buildPairLaunchArgv({
+      buildAgentLaunchArgv({
         launcherArgvPrefix: PREFIX,
         cli: "pi",
         prompt: "scan",

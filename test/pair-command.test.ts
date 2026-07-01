@@ -1,58 +1,19 @@
 /**
- * Unit tests for the dep-free `src/pair-command.ts` leaf module: the per-CLI
- * launch argv builder (byte-pinned, posture-independent flag sets), prompt
- * assembly (directive + role + message ordering), the CLAUDE* env strip, and the
- * output-YAML assembly.
+ * Unit tests for the pair-ONLY symbols of `src/pair-command.ts`: prompt assembly
+ * (directive + role + message ordering), the `--timeout`→ms stop budget, the
+ * output-YAML assembly, and the default session name. The SHARED launch cluster
+ * (argv builder, native flag sets, env strip, role resolver) is tested in
+ * `test/agent-launch-config.test.ts`.
  */
 
 import { expect, test } from "bun:test";
+import { READ_ONLY_DIRECTIVE } from "../src/agent/launch-config";
 import {
   assemblePrompt,
-  buildPairLaunchArgv,
   buildPairOutput,
   DEFAULT_PAIR_SESSION,
-  isPairRole,
-  loadRolePrompt,
-  nativeClaudeArgs,
-  nativeCodexArgs,
-  nativePiArgs,
-  PAIR_ROLES,
-  READ_ONLY_DIRECTIVE,
-  resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
-  stripClaudeEnv,
 } from "../src/pair-command";
-
-// The folded-launcher argv prefix the pair path spawns: `[bun, cli/keeper.ts,
-// "agent"]`. Supersedes the standalone `keeper agent` binary path.
-const LAP = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
-
-// ---------------------------------------------------------------------------
-// roles
-// ---------------------------------------------------------------------------
-
-test("isPairRole: accepts the four ported roles, rejects others", () => {
-  for (const r of PAIR_ROLES) {
-    expect(isPairRole(r)).toBe(true);
-  }
-  expect(isPairRole("bogus")).toBe(false);
-  expect(isPairRole("")).toBe(false);
-});
-
-test("loadRolePrompt: loads each ported role asset; unknown role fails loud", () => {
-  for (const r of PAIR_ROLES) {
-    const res = loadRolePrompt(r);
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.text.length).toBeGreaterThan(0);
-    }
-  }
-  const bad = loadRolePrompt("nope");
-  expect(bad.ok).toBe(false);
-  if (!bad.ok) {
-    expect(bad.error).toContain("unknown role");
-  }
-});
 
 // ---------------------------------------------------------------------------
 // prompt assembly
@@ -92,258 +53,8 @@ test("assemblePrompt: omits the System block when systemPrompt is empty", () => 
 });
 
 // ---------------------------------------------------------------------------
-// native flag sets — claude (posture-independent: read-only is prompting-only)
+// stop-wait budget
 // ---------------------------------------------------------------------------
-
-test("nativeClaudeArgs: interactive TUI shape — no --print, accepts edits, no tool strip", () => {
-  const args = nativeClaudeArgs({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "p",
-  });
-  expect(args).toEqual([
-    "--permission-mode",
-    "acceptEdits",
-    "--dangerously-skip-permissions",
-  ]);
-  // The interactive tracked-job shape drops the headless flags.
-  expect(args).not.toContain("--print");
-  expect(args).not.toContain("-p");
-  // Read-only is prompting-only now — no per-harness tool strip.
-  expect(args).not.toContain("--disallowed-tools");
-});
-
-test("nativeClaudeArgs: --model appended when supplied", () => {
-  const args = nativeClaudeArgs({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "p",
-    model: "opus",
-  });
-  expect(args.slice(-2)).toEqual(["--model", "opus"]);
-});
-
-// ---------------------------------------------------------------------------
-// native flag sets — codex
-// ---------------------------------------------------------------------------
-
-test("nativeCodexArgs: interactive YOLO flags, never strips tools", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-  });
-  // Interactive TUI shape — never the headless `exec` one-shot or its exec-only
-  // `--skip-git-repo-check`, and web search is on by default so the deprecated
-  // `--enable web_search_request` is gone.
-  expect(args).not.toContain("exec");
-  expect(args).not.toContain("--skip-git-repo-check");
-  expect(args).not.toContain("--enable");
-  expect(args).not.toContain("web_search_request");
-  // YOLO mode so the single-turn partner never stalls on an approval prompt.
-  expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-  // codex must NEVER strip tools the way claude used to.
-  expect(args).not.toContain("--disallowed-tools");
-});
-
-test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-    effort: "high",
-  });
-  const idx = args.indexOf("-c");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(args[idx + 1]).toBe('model_reasoning_effort="high"');
-});
-
-// ---------------------------------------------------------------------------
-// native flag sets — pi (posture-independent: read-only is prompting-only)
-// ---------------------------------------------------------------------------
-
-test("nativePiArgs: only -na, no tool strip, no codex/claude/effort flags", () => {
-  const args = nativePiArgs({
-    launcherArgvPrefix: LAP,
-    cli: "pi",
-    prompt: "p",
-  });
-  expect(args).toEqual(["-na"]);
-  // Read-only is prompting-only now — no --exclude-tools strip.
-  expect(args).not.toContain("--exclude-tools");
-  // NEVER codex's YOLO flag (would crash a pi launch) or claude's permission flags.
-  expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-  expect(args).not.toContain("--dangerously-skip-permissions");
-  expect(args).not.toContain("--permission-mode");
-  expect(args).not.toContain("--disallowed-tools");
-  // pi uses thinking, never effort — pairing routes neither through here.
-  expect(args).not.toContain("-c");
-});
-
-test("nativePiArgs: --model appended when supplied", () => {
-  const args = nativePiArgs({
-    launcherArgvPrefix: LAP,
-    cli: "pi",
-    prompt: "p",
-    model: "gpt-5.5",
-  });
-  expect(args).toEqual(["-na", "--model", "gpt-5.5"]);
-});
-
-test("nativePiArgs: --effort is never emitted even when supplied (pi uses thinking)", () => {
-  const args = nativePiArgs({
-    launcherArgvPrefix: LAP,
-    cli: "pi",
-    prompt: "p",
-    effort: "high",
-  });
-  expect(args).toEqual(["-na"]);
-  expect(args).not.toContain("-c");
-  expect(args).not.toContain("high");
-});
-
-// ---------------------------------------------------------------------------
-// launch argv — full composition
-// ---------------------------------------------------------------------------
-
-test("buildPairLaunchArgv: claude — detached tmux wrapper + native + prompt last", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "THE PROMPT",
-  });
-  // The launch spawns the folded `keeper agent` launcher prefix, then the cli
-  // token, then the wrapper flags.
-  expect(argv.slice(0, LAP.length)).toEqual([...LAP]);
-  expect(argv[LAP.length]).toBe("claude");
-  expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
-    "--x-tmux",
-    "--x-tmux-detached",
-    "--x-no-confirm",
-  ]);
-  // Interactive tracked-job shape — never the headless --print -p.
-  expect(argv).not.toContain("--print");
-  // No session supplied → no binding carrier (nothing to name).
-  expect(argv).not.toContain("--x-tmux-env");
-  // The prompt is ALWAYS the final positional element.
-  expect(argv.at(-1)).toBe("THE PROMPT");
-});
-
-test("buildPairLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION binding carrier", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "P",
-    session: "panels",
-  });
-  // The carrier is what binds the partner into `jobs` as a tracked job, mirroring
-  // buildKeeperAgentLaunchArgv. Its value names the same session as the window.
-  const envIdx = argv.indexOf("--x-tmux-env");
-  expect(envIdx).toBeGreaterThanOrEqual(0);
-  expect(argv[envIdx + 1]).toBe("KEEPER_TMUX_SESSION=panels");
-  // And the window session flag is still present + names the same session.
-  const sessIdx = argv.indexOf("--x-tmux-session");
-  expect(sessIdx).toBeGreaterThanOrEqual(0);
-  expect(argv[sessIdx + 1]).toBe("panels");
-});
-
-test("buildPairLaunchArgv: codex never gets the binding carrier (stays untracked)", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "P",
-    session: "pair",
-  });
-  // codex fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION
-  // carrier, even with a session named for the window.
-  expect(argv).not.toContain("--x-tmux-env");
-  expect(argv).toContain("--x-tmux-session");
-});
-
-test("buildPairLaunchArgv: codex — agent token is codex, interactive native flags, prompt last", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "P",
-    effort: "medium",
-  });
-  expect(argv[LAP.length]).toBe("codex");
-  // Interactive TUI — never the headless `exec` one-shot or the deprecated web
-  // search flag.
-  expect(argv).not.toContain("exec");
-  expect(argv).not.toContain("web_search_request");
-  expect(argv).toContain("--dangerously-bypass-approvals-and-sandbox");
-  expect(argv.at(-1)).toBe("P");
-});
-
-test("buildPairLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no strip, no carrier, prompt last", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "pi",
-    prompt: "THE PI PROMPT",
-    model: "gpt-5.5",
-    session: "panels",
-  });
-  // The agent token is pi (NOT codex — codex's YOLO flag would crash a pi launch).
-  expect(argv[LAP.length]).toBe("pi");
-  expect(argv).toContain("-na");
-  // Read-only is prompting-only now — no --exclude-tools strip on the pi argv.
-  expect(argv).not.toContain("--exclude-tools");
-  // NONE of codex's or claude's native flags leak onto the pi argv.
-  expect(argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-  expect(argv).not.toContain("--permission-mode");
-  expect(argv).not.toContain("--disallowed-tools");
-  // Interactive tracked-job shape is claude-only — never the headless --print.
-  expect(argv).not.toContain("--print");
-  // pi fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION carrier,
-  // even with a session named for the window.
-  expect(argv).not.toContain("--x-tmux-env");
-  expect(argv).toContain("--x-tmux-session");
-  // The prompt is ALWAYS the final positional element.
-  expect(argv.at(-1)).toBe("THE PI PROMPT");
-});
-
-test("buildPairLaunchArgv: --x-tmux-session appended when session supplied", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "P",
-    session: "pair-sess",
-  });
-  const idx = argv.indexOf("--x-tmux-session");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(argv[idx + 1]).toBe("pair-sess");
-});
-
-test("buildPairLaunchArgv: --preset forwards --x-preset so the launcher owns model/effort", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "P",
-    preset: "claude-opus-xhigh",
-  });
-  const idx = argv.indexOf("--x-preset");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(argv[idx + 1]).toBe("claude-opus-xhigh");
-  // The base wrapper-flag triad stays the first three flags after the cli token —
-  // preset rides AFTER them, never reordering the load-bearing prefix.
-  expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([
-    "--x-tmux",
-    "--x-tmux-detached",
-    "--x-no-confirm",
-  ]);
-  // The prompt is still the final positional.
-  expect(argv.at(-1)).toBe("P");
-});
-
-test("buildPairLaunchArgv: no preset → no --x-preset flag (zero behavior change)", () => {
-  const argv = buildPairLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "claude",
-    prompt: "P",
-  });
-  expect(argv).not.toContain("--x-preset");
-});
 
 test("stopTimeoutMsFromSeconds: integer seconds → exact ms", () => {
   expect(stopTimeoutMsFromSeconds(1800)).toBe(1_800_000);
@@ -354,23 +65,6 @@ test("stopTimeoutMsFromSeconds: fractional seconds round UP to ms", () => {
   expect(stopTimeoutMsFromSeconds(0.5)).toBe(500);
   expect(stopTimeoutMsFromSeconds(1.0009)).toBe(1001);
   expect(stopTimeoutMsFromSeconds(599.9999)).toBe(600_000);
-});
-
-// ---------------------------------------------------------------------------
-// env strip
-// ---------------------------------------------------------------------------
-
-test("stripClaudeEnv: removes every CLAUDE-prefixed key, keeps the rest", () => {
-  const out = stripClaudeEnv({
-    PATH: "/bin",
-    CLAUDE_CONFIG_DIR: "/c",
-    CLAUDECODE: "1",
-    HOME: "/h",
-    UNDEF: undefined,
-  });
-  expect(out).toEqual({ PATH: "/bin", HOME: "/h" });
-  expect(out.CLAUDE_CONFIG_DIR).toBeUndefined();
-  expect(out.CLAUDECODE).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
@@ -410,29 +104,8 @@ test("buildPairOutput: null message serializes to an empty string message", () =
 });
 
 // ---------------------------------------------------------------------------
-// keeper-agent launcher path resolution
+// tmux session naming
 // ---------------------------------------------------------------------------
-
-test("resolvePairKeeperAgentPath: KEEPER_AGENT_PATH wins; tilde expands; else derived default", () => {
-  // The env override wins.
-  expect(
-    resolvePairKeeperAgentPath(
-      { KEEPER_AGENT_PATH: "/custom/keeper.ts" },
-      "/home/u",
-    ),
-  ).toBe("/custom/keeper.ts");
-  // A leading ~/ in the override expands at resolve time.
-  expect(
-    resolvePairKeeperAgentPath(
-      { KEEPER_AGENT_PATH: "~/bin/keeper.ts" },
-      "/home/u",
-    ),
-  ).toBe("/home/u/bin/keeper.ts");
-  // No override → derived `cli/keeper.ts` default (absolute, ends in keeper.ts).
-  const derived = resolvePairKeeperAgentPath({}, "/home/u");
-  expect(derived.startsWith("/")).toBe(true);
-  expect(derived.endsWith("/cli/keeper.ts")).toBe(true);
-});
 
 test("DEFAULT_PAIR_SESSION is the stable 'pair' session name", () => {
   expect(DEFAULT_PAIR_SESSION).toBe("pair");

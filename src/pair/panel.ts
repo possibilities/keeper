@@ -24,7 +24,8 @@
  * all-success: the agent keys off the verdict's `ok` flag.
  *
  * No keeper.db write, no RPC, no third-party deps — `node:*` plus the dep-free
- * `src/agent/config` + `src/pair-command` leaves only.
+ * `src/agent/config` + `src/agent/launch-config` + `src/keeper-agent-path`
+ * leaves only.
  */
 
 import {
@@ -48,11 +49,11 @@ import {
   resolvePreset,
 } from "../agent/config";
 import {
+  AGENT_CLIS,
+  type AgentCli,
   loadRolePrompt,
-  PAIR_CLIS,
-  type PairCli,
-  resolvePairKeeperAgentPath,
-} from "../pair-command";
+} from "../agent/launch-config";
+import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -91,7 +92,7 @@ const PANEL_SESSION = "panels";
  *  `--read-only` directive — a configured member always defaults to read-only. */
 export interface PanelMember {
   name: string;
-  harness: PairCli;
+  harness: AgentCli;
   preset?: string;
   model?: string;
   effort?: string;
@@ -203,7 +204,7 @@ export function resolvePanelMembers(
           error: `panel '${name}' references undefined preset '${memberName}'`,
         };
       }
-      if (!PAIR_CLIS.has(preset.harness)) {
+      if (!AGENT_CLIS.has(preset.harness)) {
         return {
           ok: false,
           error: `panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
@@ -211,7 +212,7 @@ export function resolvePanelMembers(
       }
       members.push({
         name: memberName,
-        harness: preset.harness as PairCli,
+        harness: preset.harness as AgentCli,
         preset: memberName,
       });
     }
@@ -223,7 +224,7 @@ export function resolvePanelMembers(
 
   const preset = catalog.presets[name];
   if (preset !== undefined) {
-    if (!PAIR_CLIS.has(preset.harness)) {
+    if (!AGENT_CLIS.has(preset.harness)) {
       return {
         ok: false,
         error: `preset '${name}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
@@ -231,7 +232,7 @@ export function resolvePanelMembers(
     }
     return {
       ok: true,
-      members: [{ name, harness: preset.harness as PairCli, preset: name }],
+      members: [{ name, harness: preset.harness as AgentCli, preset: name }],
     };
   }
 
@@ -265,7 +266,7 @@ export function resolveAdHocMember(
   catalog: PresetCatalog,
   spec: AdHocMemberSpec,
 ): ResolveMembersResult {
-  let harness: PairCli;
+  let harness: AgentCli;
   let name: string;
   let preset: string | undefined;
 
@@ -288,23 +289,23 @@ export function resolveAdHocMember(
         error: err instanceof ConfigError ? err.message : String(err),
       };
     }
-    if (!PAIR_CLIS.has(resolved.harness)) {
+    if (!AGENT_CLIS.has(resolved.harness)) {
       return {
         ok: false,
         error: `preset '${spec.preset}' pins harness ${resolved.harness}, which is not pair-launchable (claude|codex|pi only)`,
       };
     }
-    harness = resolved.harness as PairCli;
+    harness = resolved.harness as AgentCli;
     name = spec.preset as string;
     preset = spec.preset as string;
   } else if (hasCli) {
-    if (!PAIR_CLIS.has(spec.cli as string)) {
+    if (!AGENT_CLIS.has(spec.cli as string)) {
       return {
         ok: false,
         error: `--cli must be claude|codex|pi (got ${spec.cli})`,
       };
     }
-    harness = spec.cli as PairCli;
+    harness = spec.cli as AgentCli;
     name = spec.cli as string;
   } else {
     return {
@@ -797,7 +798,7 @@ function pidAlive(pid: number): boolean {
 export function buildPanelDeps(): PanelDeps {
   return {
     keeperBin: process.execPath,
-    keeperAgentPath: resolvePairKeeperAgentPath(),
+    keeperAgentPath: resolveKeeperAgentPathDepFree(),
     env: process.env as Record<string, string | undefined>,
     cwd: process.cwd(),
     loadRegistry: () => {

@@ -55,6 +55,11 @@ import {
   resolvePreset,
 } from "../src/agent/config";
 import {
+  AGENT_CLIS,
+  type AgentCli,
+  loadRolePrompt,
+} from "../src/agent/launch-config";
+import {
   type LaunchHandleDeps,
   type LaunchPosture,
   launchToResolvedHandle,
@@ -74,17 +79,16 @@ import {
   type TmuxCommandRunner,
 } from "../src/agent/tmux-launch";
 import { ensureCodexDirTrust } from "../src/codex-trust";
-import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
+import {
+  buildLauncherArgvPrefix,
+  resolveKeeperAgentPathDepFree,
+} from "../src/keeper-agent-path";
 import { runPanel } from "../src/pair/panel";
 import {
   assemblePrompt,
   buildPairOutput,
   DEFAULT_PAIR_SESSION,
-  loadRolePrompt,
-  PAIR_CLIS,
-  type PairCli,
   pairOutputYaml,
-  resolvePairKeeperAgentPath,
   stopTimeoutMsFromSeconds,
 } from "../src/pair-command";
 
@@ -247,8 +251,8 @@ export async function main(
       process.exit(2);
     }
     // claude|codex|pi all pair-launch, so this only guards a harness outside
-    // PAIR_CLIS (a hypothetical future kind), never pi.
-    if (!PAIR_CLIS.has(preset.harness)) {
+    // AGENT_CLIS (a hypothetical future kind), never pi.
+    if (!AGENT_CLIS.has(preset.harness)) {
       process.stderr.write(
         `pair: preset '${presetName}' pins harness ${preset.harness}, ` +
           "which pairing does not support (claude|codex|pi only)\n",
@@ -300,7 +304,7 @@ export async function main(
     process.stderr.write("pair: missing <prompt-file> positional\n");
     process.exit(2);
   }
-  if (cli === undefined || !PAIR_CLIS.has(cli)) {
+  if (cli === undefined || !AGENT_CLIS.has(cli)) {
     process.stderr.write(
       `pair: --cli must be claude|codex|pi (got ${cli ?? "none"}) — ` +
         "pass --cli or --preset\n",
@@ -328,13 +332,13 @@ export async function main(
     process.exit(2);
   }
 
-  const pairCli = cli as PairCli;
+  const pairCli = cli as AgentCli;
   const cwd = seams.cwd;
   // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the partner is
   // launched + waited-on + read through — the folded `keeper agent` launcher.
   const launcherArgvPrefix = buildLauncherArgvPrefix(
     process.execPath,
-    resolvePairKeeperAgentPath(),
+    resolveKeeperAgentPathDepFree(),
   );
 
   // Partner tmux session. Partners land in a stable named session (`pair` by

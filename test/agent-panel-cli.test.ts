@@ -38,6 +38,7 @@ import {
   splitSubcommand,
   USAGE,
 } from "../src/agent/dispatch";
+import { loadRolePrompt } from "../src/agent/launch-config";
 import { main as agentMain } from "../src/agent/main";
 import {
   buildPanelLegArgv,
@@ -47,7 +48,6 @@ import {
   panelStart,
   resolveAdHocMember,
 } from "../src/pair/panel";
-import { loadRolePrompt } from "../src/pair-command";
 import { makeHarness } from "./helpers/agent-main-harness";
 import { sandboxEnv } from "./helpers/sandbox-env";
 

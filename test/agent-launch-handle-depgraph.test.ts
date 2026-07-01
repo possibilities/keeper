@@ -3,7 +3,7 @@
  * helper (reached via `cli/agent.ts` off the cold-start `keeper plan` / `keeper
  * status` path) MUST NOT pull `src/db.ts` / `bun:sqlite` — that would drag the
  * daemon's DB graph onto a path with no daemon dependency. The module wires only
- * the already-db-free launch primitives (`pair-command` / `tmux-launch` / `args`)
+ * the already-db-free launch primitives (`launch-config` / `tmux-launch` / `args`)
  * and takes every effect as a seam, so its import scan must stay clean.
  *
  * Strips block + line comments BEFORE scanning (the module's own JSDoc names

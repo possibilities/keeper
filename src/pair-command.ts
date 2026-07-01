@@ -1,114 +1,20 @@
 /**
- * Pure, dep-free plumbing for `keeper pair` — the pairing helper that fans a
- * task out to another model CLI (claude / codex / pi) via `keeper agent` as the
- * launch transport, driven from the orchestrating session's Monitor tool. Owns
- * the pairing ergonomics — role prompts, read-only posture, output
- * normalization, the Monitor two-line stdout contract — and delegates the tmux
- * transport + model/effort selection to `keeper agent`.
+ * Pure, dep-free plumbing specific to `keeper pair` — the pairing helper that
+ * fans a task out to another model CLI (claude / codex / pi) via `keeper agent`
+ * as the launch transport. Owns the pair-ONLY ergonomics: prompt assembly, the
+ * `--timeout`→ms budget, the output-YAML result contract, and the default
+ * session name. The SHARED launch cluster (per-CLI argv builder, native flag
+ * sets, env strip, read-only directive, role resolver) lives in the neutral
+ * `src/agent/launch-config.ts` module.
  *
- * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module holds
- * the pure builders only — role loading, prompt assembly, the per-CLI launch
- * argv builder, the env strip, and the output-YAML assembly. It imports
- * `js-yaml` (a serialization dep, not the DB graph) and
- * `node:fs`/`node:path`/`node:os` for asset reads; it MUST NOT pull `bun:sqlite`
- * or `./db`. The orchestration — the in-process launch→wait→show compose (via
- * the shared `src/agent` run-capture primitives), the SIGTERM handler, the
- * atomic write — lives in the thin `cli/pair.ts` entry.
+ * LEAF-MODULE DISCIPLINE (mirrors `src/dispatch-command.ts`): this module imports
+ * `js-yaml` (a serialization dep, not the DB graph) and the dep-free
+ * `src/agent/launch-config.ts` leaf; it MUST NOT pull `bun:sqlite` or `./db`. The
+ * orchestration lives in the thin `cli/pair.ts` entry.
  */
 
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
-import { resolveKeeperAgentPathDepFree } from "./keeper-agent-path";
-
-// ---------------------------------------------------------------------------
-// CLIs, roles, read-only directive
-// ---------------------------------------------------------------------------
-
-/** The partner CLIs `keeper pair` can fan out to — keeper agent's full agent-kind
- *  set. pi pairs read-only and read-write like claude/codex; its read-only
- *  posture is the prompt directive only (prompting, not enforcement — pi has no
- *  native sandbox of its own). */
-export type PairCli = "claude" | "codex" | "pi";
-
-export const PAIR_CLIS: ReadonlySet<string> = new Set<PairCli>([
-  "claude",
-  "codex",
-  "pi",
-]);
-
-/** The ported role prompts, keyed by `--role`. Each maps to an in-repo asset
- *  under `src/pair/prompts/<role>.txt`. An unknown role fails loud at the CLI. */
-export const PAIR_ROLES = [
-  "default",
-  "planner",
-  "codereviewer",
-  "coplanner",
-] as const;
-export type PairRole = (typeof PAIR_ROLES)[number];
-
-export function isPairRole(value: string): value is PairRole {
-  return (PAIR_ROLES as readonly string[]).includes(value);
-}
-
-/**
- * The read-only directive prepended to the prompt when `--read-only` is set.
- * The directive is the WHOLE read-only mechanism — prompting-only, honest and
- * best-effort. It rides as user-turn text visible in the partner's transcript
- * and relies on the model following it; keeper enforces nothing (no tool strip,
- * no git audit). A partner that ignores it can still touch the tree.
- */
-export const READ_ONLY_DIRECTIVE =
-  "READ-ONLY EXPLORE SESSION — Do not create, modify, move, or delete any " +
-  "file, and do not run any state-changing command (no file writes, no " +
-  "`git add`/`git commit`, no installs, no `sed -i`, no `>` redirection to " +
-  "files). Read, search, run read-only commands, analyze, and report your " +
-  "findings. If the task would require a change, describe the change instead " +
-  "of making it.";
-
-/**
- * Resolve the prompts asset dir. The compiled `keeper` binary and the source
- * tree both resolve relative to THIS module's location (`src/pair-command.ts`
- * → `src/pair/prompts/`), so the assets ship alongside the module. Exported for
- * the loader override in tests.
- */
-export function promptsDir(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "pair", "prompts");
-}
-
-/** Discriminated result of {@link loadRolePrompt}. */
-export type LoadRoleResult =
-  | { ok: true; text: string }
-  | { ok: false; error: string };
-
-/**
- * Load a role's system-prompt text from its in-repo asset. Returns a
- * discriminated result so the CLI maps an unknown/unreadable role to a loud
- * `[keeper-pair] failed` line rather than throwing. `dir` is injectable for
- * tests; defaults to {@link promptsDir}.
- */
-export function loadRolePrompt(
-  role: string,
-  dir: string = promptsDir(),
-): LoadRoleResult {
-  if (!isPairRole(role)) {
-    return {
-      ok: false,
-      error: `unknown role '${role}'; available: ${PAIR_ROLES.join(", ")}`,
-    };
-  }
-  const path = join(dir, `${role}.txt`);
-  try {
-    return { ok: true, text: readFileSync(path, "utf8").trim() };
-  } catch (err) {
-    return {
-      ok: false,
-      error: `cannot read role prompt '${role}' at ${path}: ${(err as Error).message}`,
-    };
-  }
-}
+import { type AgentCli, READ_ONLY_DIRECTIVE } from "./agent/launch-config";
 
 // ---------------------------------------------------------------------------
 // Prompt assembly
@@ -137,167 +43,8 @@ export function assemblePrompt(args: {
 }
 
 // ---------------------------------------------------------------------------
-// keeper agent argv builders — per-CLI flag sets
+// Stop-wait budget
 // ---------------------------------------------------------------------------
-
-/** Inputs to {@link buildPairLaunchArgv}. */
-export interface PairLaunchOpts {
-  /** The launcher argv PREFIX (`[<bun>, <abs cli/keeper.ts>, "agent"]`) the spawn
-   *  execs to reach the folded `keeper agent` launcher (built by the caller from
-   *  `process.execPath` + `resolvePairKeeperAgentPath`). The `cli` token + flags
-   *  are appended, yielding `<bun> <keeper.ts> agent <cli> …`. */
-  launcherArgvPrefix: readonly string[];
-  /** Partner CLI. */
-  cli: PairCli;
-  /** The assembled prompt — the FINAL positional argv element. */
-  prompt: string;
-  /** `--model <m>` (claude/pi `--model`, codex `-m`). Omitted when absent. */
-  model?: string;
-  /** Reasoning effort (codex only — maps to `-c model_reasoning_effort=`).
-   *  Ignored for claude (no effort flag fits the headless surface). */
-  effort?: string;
-  /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
-  session?: string;
-  /** A named launch-config preset forwarded as `--x-preset <name>` so the
-   *  launcher owns model/effort resolution — pair never re-derives them. Omitted
-   *  = no preset flag (model/effort fall to the explicit `--model`/`--effort`). */
-  preset?: string;
-}
-
-/**
- * Build the detached `keeper agent` launch argv for a pairing partner. Shape:
- *
- *   `<bun> <abs cli/keeper.ts> agent <cli> --x-tmux
- *     --x-tmux-detached --x-no-confirm
- *     [--x-preset <name>]
- *     [--x-tmux-session <s>] [--x-tmux-env KEEPER_TMUX_SESSION=<s>]
- *     <native cli flags> <prompt>`
- *
- * The `[<bun>, <keeper.ts>, "agent"]` prefix is `launcherArgvPrefix` (resolved by
- * the caller from `process.execPath` + `resolvePairKeeperAgentPath`), since under
- * keeper `process.argv[1]` is `cli/keeper.ts` / `src/daemon.ts` — neither carries
- * the `agent` token. The native flags differ per CLI (see {@link nativeClaudeArgs}
- * / {@link nativeCodexArgs}). The `--x-no-confirm` flag suppresses the
- * cwd-confirm prompt; `--x-tmux-detached` creates the window without
- * stealing focus, so the orchestrating session keeps control.
- *
- * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
- * CLAUDE path only (mirroring `buildKeeperAgentLaunchArgv` in
- * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
- * the `jobs` projection as a tracked job — the launcher injects it into the pane
- * env via tmux `-e`, so the SessionStart hook stamps the session name as the
- * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). codex
- * also launches as an interactive TUI now, but fires no keeper hooks, so it never
- * becomes a tracked job and omits the carrier (it stays UNTRACKED and is reaped
- * CLI-side via the synchronous `shouldReap = pairCli !== "claude"` path). The
- * carrier needs a session to name, so it is added only when `session` is present.
- * Pure — exported for byte-pin tests.
- */
-export function buildPairLaunchArgv(opts: PairLaunchOpts): string[] {
-  const wrapperFlags: string[] = [
-    "--x-tmux",
-    "--x-tmux-detached",
-    "--x-no-confirm",
-  ];
-  // The named preset rides as a launcher flag so `keeper agent` owns model/effort
-  // resolution (explicit > env > preset > yaml > native). pair never re-derives
-  // model/effort from the preset — it only reads the preset's harness/role itself.
-  if (opts.preset !== undefined && opts.preset !== "") {
-    wrapperFlags.push("--x-preset", opts.preset);
-  }
-  if (opts.session !== undefined && opts.session !== "") {
-    wrapperFlags.push("--x-tmux-session", opts.session);
-    if (opts.cli === "claude") {
-      wrapperFlags.push("--x-tmux-env", `KEEPER_TMUX_SESSION=${opts.session}`);
-    }
-  }
-  const native =
-    opts.cli === "claude"
-      ? nativeClaudeArgs(opts)
-      : opts.cli === "codex"
-        ? nativeCodexArgs(opts)
-        : nativePiArgs(opts);
-  return [
-    ...opts.launcherArgvPrefix,
-    opts.cli,
-    ...wrapperFlags,
-    ...native,
-    opts.prompt,
-  ];
-}
-
-/**
- * Native claude flags for a one-turn pairing partner launched as an INTERACTIVE
- * TUI (not headless `--print`). The interactive shape is what registers the
- * partner as a tracked `jobs` row — keeper agent binds the pane via the
- * `KEEPER_TMUX_SESSION` env carrier {@link buildPairLaunchArgv} injects, and the
- * SessionStart hook stamps the birth session onto the row. Posture-independent:
- * read-only is carried by the prompt directive alone (no tool strip), so the
- * flags are the same either way — `--permission-mode acceptEdits
- * --dangerously-skip-permissions` so the single-turn partner never stalls on a
- * permission prompt. Pure — exported for tests.
- */
-export function nativeClaudeArgs(opts: PairLaunchOpts): string[] {
-  const args: string[] = [
-    "--permission-mode",
-    "acceptEdits",
-    "--dangerously-skip-permissions",
-  ];
-  if (opts.model !== undefined && opts.model !== "") {
-    args.push("--model", opts.model);
-  }
-  return args;
-}
-
-/**
- * Native codex flags for a one-turn pairing partner launched as an INTERACTIVE
- * TUI (not the headless `codex exec` one-shot). `--dangerously-bypass-approvals
- * -and-sandbox` runs the turn in YOLO mode so it never stalls on an approval
- * prompt; `-m`/`-c model_reasoning_effort` are valid global/interactive flags.
- * Web search is ON by default in the interactive TUI, so the deprecated `--enable
- * web_search_request` is dropped (and `exec`/`--skip-git-repo-check` are
- * exec-only with no interactive analog). codex read-only is carried by the
- * prompt directive ONLY (no native codex flag fits "politely explore" — `-s
- * read-only` would also disable web search), so read-only KEEPS the same flags
- * as write; keeper enforces nothing. The detached interactive window does
- * not hang on codex's directory-trust prompt because `keeper pair` pre-seeds the
- * cwd's trust (cli/pair.ts → src/codex-trust.ts, fail-open) before launch. Pure —
- * exported for tests.
- */
-export function nativeCodexArgs(opts: PairLaunchOpts): string[] {
-  const args = ["--dangerously-bypass-approvals-and-sandbox"];
-  if (opts.model !== undefined && opts.model !== "") {
-    args.push("-m", opts.model);
-  }
-  if (opts.effort !== undefined && opts.effort !== "") {
-    // codex `-c` parses TOML, so the value is quoted.
-    args.push("-c", `model_reasoning_effort="${opts.effort}"`);
-  }
-  return args;
-}
-
-/**
- * Native pi flags for a one-turn pairing partner launched as an INTERACTIVE TUI.
- * pi has NO per-tool approval gate and NO native sandbox — tools are gated only
- * by allow/deny lists, so it never stalls on an approval prompt (no
- * `--dangerously-*` analog exists or is needed). `-na` (`--no-approve`) makes the
- * partner IGNORE the repo's project-local `.pi/` resources for this run — partner
- * isolation mirroring the CLAUDE*-env strip — which ALSO sidesteps pi's
- * directory-trust prompt (the one headless hang), so pi needs no trust-seeder the
- * way codex does (its `trust.json` is a shared profile path a seeder would
- * collide with). Posture-independent: pi read-only is carried by the prompt
- * directive alone (no `--exclude-tools` strip — bash stays leaky, so a strip was
- * never a sandbox), so the flags are the same either way. pi uses `thinking`,
- * never `effort`; pairing routes neither here. Pure — exported for tests.
- */
-export function nativePiArgs(opts: PairLaunchOpts): string[] {
-  // `-na` (--no-approve): ignore project-local `.pi/` resources for this run.
-  const args = ["-na"];
-  if (opts.model !== undefined && opts.model !== "") {
-    args.push("--model", opts.model);
-  }
-  return args;
-}
 
 /** keeper's `--timeout` (seconds) → the stop-wait budget in ms, threaded onto the
  *  pinned handle's `stopTimeoutMs` so the in-process wait honors it instead of the
@@ -308,44 +55,13 @@ export function stopTimeoutMsFromSeconds(timeoutSeconds: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Env strip — CLAUDE* removal before the partner pane
-// ---------------------------------------------------------------------------
-
-/**
- * Strip every `CLAUDE`-prefixed env var from a copy of the base env. The
- * partner runs as its own session — leaking the
- * orchestrator's `CLAUDE*` env (config dir, session ids, project context) would
- * cross-contaminate its identity. Returns a fresh object; the input is never
- * mutated. Pure — exported for tests.
- *
- * DEFENSE-IN-DEPTH, not the load-bearing gate. The gate is
- * `launchScriptEnv`'s 5-key allowlist (which already excludes `ANTHROPIC*` /
- * `*_API_KEY` / `DYLD_*`): the partner pane's real env is that allowlist + the
- * tmux-server env + the login-shell re-source, and `DYLD_*`/`LD_*` are already
- * hard-blocked on the `--x-tmux-env` injection channel. Do NOT add
- * `ANTHROPIC*`/`*_API_KEY` stripping here — a claude partner needs its own auth,
- * and stripping it would break the partner outright.
- */
-export function stripClaudeEnv(
-  base: Record<string, string | undefined>,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(base)) {
-    if (v !== undefined && !k.startsWith("CLAUDE")) {
-      out[k] = v;
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
 // Output-YAML assembly — the `--output` result contract
 // ---------------------------------------------------------------------------
 
 /** Inputs to {@link buildPairOutput}. */
 export interface PairOutputOpts {
   /** Partner CLI. */
-  cli: PairCli;
+  cli: AgentCli;
   /** Role used. */
   role: string;
   /** The partner's final assistant message (null for a tool-only/refusal turn). */
@@ -384,24 +100,6 @@ export function buildPairOutput(opts: PairOutputOpts): Record<string, unknown> {
  *  tests share one serializer. */
 export function pairOutputYaml(output: Record<string, unknown>): string {
   return yaml.dump(output, { lineWidth: -1 });
-}
-
-// ---------------------------------------------------------------------------
-// keeper-agent launcher path resolution (tilde-expanded; mirrors src/db.ts)
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the absolute keeper CLI entry the pair path launches partners through
- * (`<bun> <this path> agent <cli> …`) — the folded `keeper agent` launcher.
- * db.ts-free (delegates to the shared {@link resolveKeeperAgentPathDepFree} leaf
- * so this surface never drags the DB graph): `KEEPER_AGENT_PATH` > the derived
- * `cli/keeper.ts` default. `env`/`home` injectable for tests.
- */
-export function resolvePairKeeperAgentPath(
-  env: Record<string, string | undefined> = process.env,
-  home: string = homedir(),
-): string {
-  return resolveKeeperAgentPathDepFree(env, home);
 }
 
 // ---------------------------------------------------------------------------

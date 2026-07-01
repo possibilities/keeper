@@ -23,7 +23,6 @@ import {
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
-import { READ_ONLY_DIRECTIVE } from "../pair-command";
 import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
@@ -62,6 +61,7 @@ import {
   USAGE,
   VERSION,
 } from "./dispatch";
+import { READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
   launchToResolvedHandle,
