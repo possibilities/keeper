@@ -55,5 +55,5 @@ Assert inconclusive probe defers. Assert cross-repo upstream never gates.
 - [ ] Tests green
 
 ## Done summary
-
+Generalized the cross-epic merge-gate from whole-epic to per-(epic, repoDir): computeDeferredEpicIds now returns a Map keyed by epic id whose value is the set of that epic's deferred lane repos, so a clustered downstream defers only the group whose repo has an unmerged same-resolved-repo upstream group while sibling groups and cross-repo upstreams proceed; reconcile's work-row suppresses a task only when its own lane repo is deferred and holds the single plan-close while any group is deferred.
 ## Evidence
