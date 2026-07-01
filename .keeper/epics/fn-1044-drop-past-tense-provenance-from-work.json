@@ -7,7 +7,7 @@
     "fn-1042-guard-workworker-against-scan-dir"
   ],
   "id": "fn-1044-drop-past-tense-provenance-from-work",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-01T18:46:30.650000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T18:46:30.444000Z"
+  "updated_at": "2026-07-01T18:46:30.650000Z"
 }
