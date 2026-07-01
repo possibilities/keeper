@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-01T07:40:03.017000Z",
   "created_at": "2026-07-01T05:07:38.097000Z",
   "depends_on_epics": [
     "fn-1031-agent-panel-verb-and-pairing-parity"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-01T05:07:48.507000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Retire the pair CLI onto agent",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T05:07:48.423000Z"
+  "updated_at": "2026-07-01T07:40:03.017000Z"
 }
