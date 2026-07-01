@@ -62,5 +62,5 @@ stays byte-identical with the event in `KEEP_SET_HOOK_EVENTS`.
 - [ ] `bun test` green
 
 ## Done summary
-
+Added serializeSessionTelemetry (daemon) + extractSessionTelemetry (reducer) and a jobs-only COALESCE-merge SessionTelemetry fold arm landing the six v100 telemetry columns without touching state/active_since; added to KEEP_SET_HOOK_EVENTS for byte-identical re-fold.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "SessionTelemetry event and jobs fold",
-  "updated_at": "2026-07-01T01:13:06.974000Z"
+  "updated_at": "2026-07-01T02:23:21.578000Z",
+  "worker_done_at": "2026-07-01T02:23:21.578000Z"
 }
