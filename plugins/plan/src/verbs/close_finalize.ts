@@ -53,6 +53,7 @@ import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
 import { runEpicClose } from "./epic_close.ts";
 import { runScaffold } from "./scaffold.ts";
+import { armEpicValidated } from "./validate.ts";
 
 /** The four terminal outcomes the close coordinator switches on. Every member
  * MUST have a /plan:close skill handler — the exhaustiveness test pins it.
@@ -449,12 +450,17 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   if (epicDef.status === "done") {
     const priorFollowup = findFollowupEpic(stateCtx.dataDir, epicId);
     if (priorFollowup !== null) {
-      emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
-        newEpicId: priorFollowup.epicId,
-      });
+      emitOutcome(
+        CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
+        epicId,
+        ctx,
+        format,
+        stateCtx,
+        { newEpicId: priorFollowup.epicId },
+      );
       return;
     }
-    emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format);
+    emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format, stateCtx);
     return;
   }
 
@@ -517,7 +523,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
 
   // 6. fatal verdict → halt. No close, no scaffold; the epic stays open.
   if (verdict.fatal === true) {
-    emitOutcome(CLOSE_OUTCOMES.FATAL_HALT, epicId, ctx, format, {
+    emitOutcome(CLOSE_OUTCOMES.FATAL_HALT, epicId, ctx, format, stateCtx, {
       fatalReason: (verdict.fatal_reason as string | undefined) ?? "",
     });
     return;
@@ -527,7 +533,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   const expected = expectedClusterOrdinals(verdict);
   if (expected.size === 0) {
     closeEpic(stateCtx, epicId);
-    emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format);
+    emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format, stateCtx);
     return;
   }
 
@@ -538,16 +544,28 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   if (existing !== null) {
     if (existing.actualTasks === expectedCount) {
       closeEpic(stateCtx, epicId);
-      emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
-        newEpicId: existing.epicId,
-      });
+      emitOutcome(
+        CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
+        epicId,
+        ctx,
+        format,
+        stateCtx,
+        { newEpicId: existing.epicId },
+      );
       return;
     }
-    emitOutcome(CLOSE_OUTCOMES.PARTIAL_FOLLOWUP, epicId, ctx, format, {
-      newEpicId: existing.epicId,
-      expectedTasks: expectedCount,
-      actualTasks: existing.actualTasks,
-    });
+    emitOutcome(
+      CLOSE_OUTCOMES.PARTIAL_FOLLOWUP,
+      epicId,
+      ctx,
+      format,
+      stateCtx,
+      {
+        newEpicId: existing.epicId,
+        expectedTasks: expectedCount,
+        actualTasks: existing.actualTasks,
+      },
+    );
     return;
   }
 
@@ -566,9 +584,14 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   }
   const newEpicId = scaffoldFollowup(stateCtx, fp, epicId, format);
   closeEpic(stateCtx, epicId);
-  emitOutcome(CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP, epicId, ctx, format, {
-    newEpicId,
-  });
+  emitOutcome(
+    CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
+    epicId,
+    ctx,
+    format,
+    stateCtx,
+    { newEpicId },
+  );
 }
 
 /** Emit the typed close-finalize outcome envelope (read-only invocation line).
@@ -581,6 +604,7 @@ function emitOutcome(
   epicId: string,
   ctx: ProjectContext,
   format: OutputFormat | null,
+  stateCtx: ProjectContext,
   extra?: {
     newEpicId?: string;
     fatalReason?: string;
@@ -606,6 +630,30 @@ function emitOutcome(
   }
   if (extra?.actualTasks !== undefined) {
     data.actual_tasks = extra.actualTasks;
+  }
+
+  // Arm the follow-up at the single terminal chokepoint. A closed_with_followup
+  // epic is dispatchable only once its validation marker flips null→timestamp;
+  // this covers ALL three closing paths (fresh scaffold + both crash-resume
+  // adopt paths) and deliberately EXCLUDES partial_followup (a half-built tree
+  // must stay a non-dispatchable ghost). The seam is idempotent, so an adopt
+  // path re-arming an already-armed follow-up is a no-op. State routes through
+  // stateCtx (the primary repo): in worktree mode the follow-up lives there, not
+  // in the cwd lane. An arm failure folds INTO this envelope (surfaced verbatim)
+  // rather than hard-exiting after the irreversible close — the dashed ghost is
+  // swept by the next .keeper/ commit.
+  if (
+    outcome === CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP &&
+    extra?.newEpicId !== undefined
+  ) {
+    const arm = armEpicValidated(
+      extra.newEpicId,
+      stateCtx.dataDir,
+      stateCtx.projectPath,
+    );
+    if (arm.kind === "commit_failed") {
+      data.followup_arm = arm.failure;
+    }
   }
 
   const pc = buildPlanInvocationReadonly(

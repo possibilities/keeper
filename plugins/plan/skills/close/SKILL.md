@@ -138,7 +138,7 @@ keeper plan close-finalize <epic_id> --project <primary_repo>
 **Total switch over the four `CloseOutcome` members** (`data.outcome` on the success envelope). The switch MUST stay total — the task-3 exhaustiveness test enforces it; if an outcome is added, update both this switch and that test together:
 
 - **`closed_clean`** → the epic closed with no follow-up (no findings, or every finding culled). Report the clean format.
-- **`closed_with_followup`** → the epic closed and a follow-up epic was scaffolded. Read `data.new_epic_id`. Report the with-followup format.
+- **`closed_with_followup`** → the epic closed and a follow-up epic was scaffolded AND armed (`close-finalize` flips its validation marker to ready so autopilot can dispatch it — a fresh scaffold mints a not-ready ghost). Read `data.new_epic_id`. Report the with-followup format.
 - **`fatal_halt`** → the planner flagged a ship-block; the epic stays OPEN, nothing closed. Read `data.fatal_reason`. Report the fatal-halt format.
 - **`partial_followup`** → a prior `/plan:close` crashed mid-scaffold and left an incomplete follow-up (`data.expected_tasks` vs `data.actual_tasks`). The epic stays OPEN. Surface it and stop: *"Partial follow-up for `<epic_id>` (expected `<expected_tasks>` tasks, found `<actual_tasks>`). A prior `/plan:close` crashed mid-scaffold. Inspect and complete or delete it, then re-run `/plan:close <epic_id>`."*
 
@@ -175,7 +175,7 @@ The `## Audit decisions` table on the follow-up epic (visible via `keeper plan c
 ## Out of scope
 
 - **No report/verdict/follow-up prose in the closer's context** — every artifact lives on disk under `audits/<epic_id>/`; the closer holds refs, hashes, counts, and one-line agent returns only.
-- **No saga logic in the skill** — `close-finalize` owns stale-check, fatal-halt, scaffold-before-close ordering, and idempotency. The skill spawns agents and switches on the typed outcome.
+- **No saga logic in the skill** — `close-finalize` owns stale-check, fatal-halt, scaffold-before-close ordering, follow-up arming, and idempotency. The skill spawns agents and switches on the typed outcome.
 - **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work.
 - **No write to the source epic body** — provenance lives on the follow-up's `depends_on_epics` and its `## Audit decisions` table; the planner's `fatal` flag is the only ship-block gate.
 - **No retry on a typed `close-finalize` error**, and **no `Skill(plan:plan)` dispatch** — surface verbatim and stop — `close-finalize` is idempotent, so a re-run is safe.

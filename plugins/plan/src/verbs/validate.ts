@@ -20,7 +20,7 @@ import {
   pyDefaultJson,
 } from "../format.ts";
 import { validateEpicIntegrityWithWarnings } from "../integrity.ts";
-import { buildPlanInvocation } from "../invocation.ts";
+import { buildPlanInvocation, type MutatingInvocation } from "../invocation.ts";
 import { SCHEMA_VERSION } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { atomicWriteJson, loadJson, loadJsonSafe, nowIso } from "../store.ts";
@@ -60,6 +60,67 @@ function renderHuman(data: ValidateEnvelope): string {
     );
   }
   return lines.join("\n");
+}
+
+/** Outcome of the non-exiting arm seam. `armed` flipped null→timestamp and
+ * committed; `noop` found an already-stamped epic (a pure read); `commit_failed`
+ * wrote the stamp to disk but its auto-commit failed — the compact envelope rides
+ * along so an in-process caller can surface it verbatim without a hard-exit. */
+export type ArmOutcome =
+  | { kind: "armed"; invocation: MutatingInvocation }
+  | { kind: "noop" }
+  | { kind: "commit_failed"; failure: Record<string, unknown> };
+
+/** Arm an epic's validation marker in-process: the null→timestamp write +
+ * updated_at bump + auto-commit, factored out of the `validate --epic` verb so
+ * close-finalize can arm a follow-up WITHOUT the CLI's process.exit (which would
+ * skip runCaptured's stdout restore and corrupt the terminal envelope).
+ * Idempotent — an already-stamped epic is a pure no-op (no write, no commit).
+ * NEVER exits: on commit failure the stamp persists on disk (a re-run
+ * short-circuits and does NOT re-commit; the next mutating verb's auto-commit
+ * sweeps the dirty file) and the compact commit_failed envelope is returned. */
+export function armEpicValidated(
+  epicId: string,
+  dataDir: string,
+  projectPath: string,
+): ArmOutcome {
+  const epicPath = join(dataDir, "epics", `${epicId}.json`);
+  const epicDef = loadJson(epicPath);
+  if (
+    epicDef.last_validated_at !== null &&
+    epicDef.last_validated_at !== undefined
+  ) {
+    return { kind: "noop" };
+  }
+  epicDef.last_validated_at = nowIso();
+  epicDef.updated_at = nowIso();
+  atomicWriteJson(epicPath, epicDef, dataDir);
+
+  const primaryRepo =
+    (epicDef.primary_repo as string | null | undefined) ?? null;
+  const pc = buildPlanInvocation("validate", epicId, null, {
+    repoRoot: projectPath,
+    primaryRepo,
+  });
+  // Auto-commit BEFORE the caller prints its NDJSON line, so a printed line is
+  // the authoritative signal the commit landed.
+  try {
+    autoCommitFromInvocation(pc);
+  } catch (exc) {
+    if (!(exc instanceof CommitFailed)) {
+      throw exc;
+    }
+    return {
+      kind: "commit_failed",
+      failure: {
+        success: false,
+        error: "commit_failed",
+        details: { error: exc.error, message: exc.detail, ...exc.extra },
+        plan_invocation: pc,
+      },
+    };
+  }
+  return { kind: "armed", invocation: pc };
 }
 
 /** Run validate. Returns the process exit code (0 valid, 1 invalid / commit
@@ -123,46 +184,24 @@ export function runValidate(
     renderHuman(d as ValidateEnvelope),
   );
 
-  // Marker-write: only with --epic, only on valid, only on None -> timestamp.
+  // Marker-write: only with --epic, only on valid. Delegates to the shared
+  // non-exiting arm seam, then applies the CLI's exiting envelope contract — on
+  // commit failure print the compact failure envelope + exit 1 (the invocation
+  // line is NOT printed); on a fresh arm print the spaced plan_invocation line
+  // (distinct from the compact commit_failed line); an already-stamped epic
+  // prints nothing.
   if (valid && epicId !== null) {
-    const epicPath = join(dataDir, "epics", `${epicId}.json`);
-    const epicDef = loadJson(epicPath);
-    if (
-      epicDef.last_validated_at === null ||
-      epicDef.last_validated_at === undefined
-    ) {
-      epicDef.last_validated_at = nowIso();
-      epicDef.updated_at = nowIso();
-      atomicWriteJson(epicPath, epicDef, dataDir);
-
-      const primaryRepo =
-        (epicDef.primary_repo as string | null | undefined) ?? null;
-      const pc = buildPlanInvocation("validate", epicId, null, {
-        repoRoot: ctx.projectPath,
-        primaryRepo,
-      });
-      // Auto-commit BEFORE the NDJSON line prints, so the printed line is the
-      // authoritative signal the commit landed. On commit failure, print the
-      // compact failure envelope + exit 1 (the invocation line is NOT printed).
-      try {
-        autoCommitFromInvocation(pc);
-      } catch (exc) {
-        if (!(exc instanceof CommitFailed)) {
-          throw exc;
-        }
-        const failure = {
-          success: false,
-          error: "commit_failed",
-          details: { error: exc.error, message: exc.detail, ...exc.extra },
-          plan_invocation: pc,
-        };
-        process.stdout.write(`${compactJson(failure)}\n`);
-        process.exit(1);
-      }
-
+    const armed = armEpicValidated(epicId, dataDir, ctx.projectPath);
+    if (armed.kind === "commit_failed") {
+      process.stdout.write(`${compactJson(armed.failure)}\n`);
+      process.exit(1);
+    }
+    if (armed.kind === "armed") {
       // Python prints this line with json.dumps(obj) (default spaced
       // separators) — distinct from the compact commit_failed line above.
-      process.stdout.write(`${pyDefaultJson({ plan_invocation: pc })}\n`);
+      process.stdout.write(
+        `${pyDefaultJson({ plan_invocation: armed.invocation })}\n`,
+      );
     }
   }
 

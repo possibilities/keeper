@@ -217,9 +217,8 @@ describe("scaffold happy path", () => {
       "bundle/dev-env",
       "bundle/snippeting-main",
     ]);
-    const stamped = epicDef.last_validated_at as string;
-    expect(stamped).not.toBeNull();
-    expect(stamped.includes(".") && stamped.endsWith("Z")).toBe(true);
+    // scaffold mints the epic as a not-ready ghost (deferred arm).
+    expect(epicDef.last_validated_at).toBeNull();
     const taskDef = readJson(`tasks/${epicId}.1.json`);
     expect(taskDef.snippets).toEqual(["task-snip"]);
     expect(taskDef.bundles).toEqual(["bundle/dev-env"]);
@@ -586,15 +585,16 @@ describe("scaffold target_repo", () => {
 // ---------------------------------------------------------------------------
 
 describe("scaffold mint boundary", () => {
-  test("fresh epic carries a microsecond-precise validated marker", () => {
-    // test_scaffold.py::test_scaffold_fresh_epic_carries_validated_marker
+  test("fresh epic mints a null ghost marker (deferred arm)", () => {
+    // scaffold mints last_validated_at:null — the epic is a not-ready ghost
+    // (blocked by autopilot readiness predicate 2, rendered dashed) until the
+    // create/defer/close flow's trailing `validate --epic` arms it once deps are
+    // wired.
     const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
-    const stamped = readJson(`epics/${epicId}.json`)
-      .last_validated_at as string;
-    expect(stamped).not.toBeNull();
-    expect(stamped.includes(".") && stamped.endsWith("Z")).toBe(true);
+    const marker = readJson(`epics/${epicId}.json`).last_validated_at;
+    expect(marker).toBeNull();
   });
 
   test("the invocation covers the whole tree (one commit)", () => {

@@ -24,7 +24,7 @@ The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id 
 - **Phase 4** — Undersized gate → maybe stop & sketch *(create only)*
 - **Phase 5** — Write the epic tree
 - **Phase 6** — Auto-wire epic dependencies
-- **Phase 7** — Validate (refine path only — scaffold validates inline on create)
+- **Phase 7** — Validate & arm (both paths — arms the ghost scaffold minted)
 - **Phase 8** — Report
 - **Phase R** — Refine an existing id (branches from Phase 1; rejoins at Phase 7)
 
@@ -342,7 +342,7 @@ Word choice is load-bearing — the human picks the flow by picking the phrase. 
 
 ## Phase 5 — Write the epic tree
 
-The mechanical tree-write is a single `keeper plan scaffold --file -` call. The cognitive sub-steps below decide *what goes in the YAML* — title (5a), epic metadata (5b), decomposition (5d), per-task spec + metadata (5e), deps (5f), epic spec (5g) — and the assembled YAML is materialized in one transactional call (5h). Scaffold stamps `last_validated_at` inline on a successful integrity check, so **Phase 7 validate is skipped on the create path**. It does **not** auto-wire epic deps — those must be declared in the YAML (`epic.depends_on_epics`); Phase 6 is a separate step after scaffold.
+The mechanical tree-write is a single `keeper plan scaffold --file -` call. The cognitive sub-steps below decide *what goes in the YAML* — title (5a), epic metadata (5b), decomposition (5d), per-task spec + metadata (5e), deps (5f), epic spec (5g) — and the assembled YAML is materialized in one transactional call (5h). Scaffold mints the epic as a not-ready **ghost** (`last_validated_at: null`, rendered dashed, blocked by autopilot readiness) so no dep-free task can dispatch before its deps are wired; **Phase 7's `validate --epic` arms it** after Phase 6. Scaffold does **not** auto-wire epic deps — those must be declared in the YAML (`epic.depends_on_epics`); Phase 6 is a separate step after scaffold.
 
 The **refine path (Phase R)** uses `refine-apply`, not `scaffold` (scaffold mints fresh ids and is create-path-only).
 
@@ -593,17 +593,19 @@ Precedence is strict: try the bus-resume FIRST and fall through to cold-re-dispa
 
 ---
 
-## Phase 7 — Validate (refine path only)
+## Phase 7 — Validate & arm
 
-**Create path: skip.** Scaffold's inline integrity check (repo existence, four-section task specs, dep graph) already covered it and stamped `last_validated_at`.
+Runs on **both** paths, unconditionally, after Phase 6.
 
-**Refine path:** R1's `refine-context --invalidate` cleared the marker; this re-stamps it on success (`null → timestamp`). `dashctl` and `keeper plan watch` render a null-marker epic as a dashed "ghost" until this runs.
+**Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — `epic add-deps` re-stamps only when it writes ≥1 edge, so a dep-free epic reaches Phase 7 still a ghost and the arm is its only readiness step. `dashctl` and `keeper plan watch` render a null-marker epic dashed until this runs.
+
+**Refine path:** R1's `refine-context --invalidate` cleared the marker; this re-stamps it on success (`null → timestamp`).
 
 ```bash
 keeper plan validate --epic <epic_id>
 ```
 
-**The `--epic` flag is mandatory.** Bare `keeper plan validate` runs the whole-project check and reports `valid: true` but does **not** stamp `last_validated_at` — only the `--epic` form writes the marker.
+**The `--epic` flag is mandatory.** Bare `keeper plan validate` runs the whole-project check and reports `valid: true` but does **not** write `last_validated_at` — only the `--epic` form arms the marker. The arm is idempotent: an already-stamped epic is a pure no-op (no write, no commit).
 
 If `valid: false`, surface the errors verbatim and stop — don't auto-fix. If `valid: true`, continue to Phase 8.
 

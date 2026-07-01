@@ -95,6 +95,13 @@ function readEpic(epicId: string): Record<string, unknown> {
   );
 }
 
+// Arm the epic's validation marker. scaffold mints a null ghost; the create/
+// defer/close flows run `validate --epic` to flip it null→timestamp — so a test
+// that needs a stamped marker (or the invalidate clear path) arms first.
+function armEpic(epicId: string): void {
+  expect(run(["validate", "--epic", epicId]).code).toBe(0);
+}
+
 // ---------------------------------------------------------------------------
 // Epic route: per-task specs
 // ---------------------------------------------------------------------------
@@ -103,6 +110,7 @@ describe("epic route", () => {
   test("multi-task epic returns all per-task specs, ordered", () => {
     // test_refine_context.py::TestEpicRoute::test_multi_task_returns_all_specs
     const { epicId, taskIds } = makeEpic(3);
+    armEpic(epicId);
     const r = run(["refine-context", epicId]);
     expect(r.code).toBe(0);
     const env = envelope(r.output);
@@ -224,6 +232,7 @@ describe("--invalidate", () => {
   test("clears the marker + lands exactly one commit", () => {
     // test_refine_context.py::TestInvalidate::test_invalidate_clears_marker_one_envelope_one_commit
     const { epicId } = makeEpic(1);
+    armEpic(epicId);
     expect(readEpic(epicId).last_validated_at).not.toBeNull();
     const before = gitLogCount(project.root);
 

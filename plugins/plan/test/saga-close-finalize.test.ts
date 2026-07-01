@@ -291,6 +291,10 @@ describe("close-finalize closed_with_followup", () => {
     ) as Record<string, unknown>;
     expect((newDef.depends_on_epics as string[]).includes(epicId)).toBe(true);
     expect(newDef.created_by_close_of).toBe(epicId);
+    // close-finalize ARMS the follow-up: scaffold mints it as a null ghost, and
+    // the finalize chokepoint flips last_validated_at null→timestamp so autopilot
+    // can dispatch it once the source is closed (never a permanent ghost).
+    expect(newDef.last_validated_at).not.toBeNull();
   });
 
   test("an unrelated open dependent (no stamp) is NOT adopted", () => {
@@ -356,6 +360,15 @@ describe("close-finalize closed_with_followup", () => {
     const second = finalize(proj, epicId);
     expect(second.env.outcome).toBe("closed_with_followup");
     expect(second.env.new_epic_id).toBe(newId);
+    // The follow-up is armed across the idempotent status==done adopt path (the
+    // re-run's arm is a no-op — an already-stamped epic short-circuits).
+    const followDef = JSON.parse(
+      readFileSync(
+        join(proj.root, ".keeper", "epics", `${String(newId)}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(followDef.last_validated_at).not.toBeNull();
   });
 
   test("crash-resume adopts a pre-scaffolded follow-up, no duplicate", () => {

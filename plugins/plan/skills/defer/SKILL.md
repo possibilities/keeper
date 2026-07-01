@@ -169,13 +169,21 @@ The success envelope carries `epic_id` (the freshly-minted `fn-N-slug`) and `tas
 
 **On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`): scaffold collected all validation errors in one pass. Read `details`, fix the YAML, and re-run the single scaffold call. Do NOT fall back to incremental verbs. Codes: `bad_yaml`, `spec_invalid`, `ref_invalid`, `dep_invalid`, `dep_cycle`, `id_collision`, `tier_invalid`, `repo_invalid`.
 
+**Arm the epic (mandatory).** Scaffold mints the epic as a not-ready **ghost** (`last_validated_at: null`, rendered dashed, blocked by autopilot readiness). A single-task defer wires no deps, so this arm is the whole readiness step — without it autopilot never dispatches the task:
+
+```bash
+keeper plan validate --epic <epic_id>
+```
+
+`valid: true` flips the marker `null → timestamp`. On `valid: false`, surface the errors verbatim and stop — a fresh scaffold failing validation is a tooling bug, not a spec to auto-fix. The arm is idempotent.
+
 ---
 
 ## Phase 5 — Report
 
 One-line summary citing the new epic id and the defer status:
 
-> *deferred `<epic_id>`: <epic title> — sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
+> *deferred `<epic_id>`: <epic title> — armed and sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
 
 No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer never proactively offers to drive execution (no `/plan:work`, no surprise-launch). The operator skills stay reachable on explicit user intent, never from this flow on its own.
 
@@ -184,7 +192,7 @@ No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer 
 ## Guardrails
 
 - **Never scales up silently.** Phase 3's one-task fit check is the load-bearing gate. If the work won't fit, stop with a concrete alternative — never scaffold a partial epic.
-- **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The only mutating verb in this skill is `keeper plan scaffold` in Phase 4.
+- **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The two mutating verbs in this skill are `keeper plan scaffold` and its trailing `keeper plan validate --epic` arm, both in Phase 4.
 - **Not a job-launcher.** This skill does not spawn a worker, run an audit, or close the epic — autopilot runs the task. Never proactively drive execution from this flow: no `/plan:work`, no surprise-launch. The model-invocable `keeper:dispatch` / `keeper:autopilot` operator skills are reached only on explicit user intent, never from defer on its own.
 - **Subject inference excludes `.keeper/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical plan state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.

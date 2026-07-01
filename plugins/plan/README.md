@@ -141,7 +141,7 @@ Commands emit JSON by default:
 
 Pass `--format human` for human-readable text/tables.
 `cat` always emits raw markdown regardless of `--format`.
-`validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). When `--epic <id>` is given and the epic has never been validated before, the runner manually invokes `auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and prints a second NDJSON document `{"plan_invocation": {...}}` describing the marker write. Re-validating an already-stamped epic produces only the one-line envelope (no second document, no commit).
+`validate` uses a custom envelope: `{"valid": bool, "errors": [...], "warnings": [...]}` (exits 1 on `valid: false`). With `--epic <id>`, `validate` doubles as the marker **arm**: the create, defer, and close flows run it after wiring deps to flip a freshly-scaffolded epic's null `last_validated_at` to a timestamp (a fresh scaffold mints a not-ready ghost). When the marker is still null, the runner manually invokes `auto_commit_from_invocation` (bypassing `emit()` to preserve the custom envelope shape) and prints a second NDJSON document `{"plan_invocation": {...}}` describing the marker write. Arming an already-stamped epic is a no-op — only the one-line envelope prints (no second document, no commit).
 
 `keeper plan list` renders one row per epic with its title and status.
 

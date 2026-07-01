@@ -1123,8 +1123,9 @@ export function runScaffold(args: ScaffoldArgs): number {
       }
     }
 
-    // The inline integrity gate asserts filesystem-repo validity so no trailing
-    // `validate --epic` is needed. epicSpecContent lets the helper assert
+    // The inline integrity gate asserts filesystem-repo validity in-process, so
+    // the trailing `validate --epic` arm never re-checks integrity — it only
+    // flips the ghost marker to ready. epicSpecContent lets the helper assert
     // epic-spec presence from RAM — NO spec file is written before this passes.
     const [integErrors] = checkEpicTreeInMemory(
       epicId,
@@ -1150,9 +1151,12 @@ export function runScaffold(args: ScaffoldArgs): number {
       };
     }
 
-    // Integrity passed — stamp last_validated_at and write the whole tree.
+    // Integrity passed — write the whole tree. The epic mints as a not-ready
+    // ghost (last_validated_at stays null from assembly: blocked by autopilot
+    // readiness predicate 2, rendered dashed) so no dep-free task folds to
+    // [ready] before the create/defer/close flow's trailing `validate --epic`
+    // arms it once deps are wired.
     // The mid-write unwind unlinks SPECS BEFORE JSONs (orphan-spec invariant).
-    epicDef.last_validated_at = nowIso();
     const writtenPaths: string[] = [];
     try {
       atomicWriteJson(epicPath, epicDef, dataDir);
