@@ -61,5 +61,5 @@ close-finalize arm assertion, and prune/rewrite the stale docs.
 - [ ] `bun test` green (and `bun run test:slow` where the close-finalize/scaffold real-git blocks apply); lint + typecheck clean.
 
 ## Done summary
-
+Scaffold now mints last_validated_at:null (a not-ready ghost); create/defer/close flows arm it via validate --epic once deps are wired, with close-finalize using a new non-exiting armEpicValidated seam at the closed_with_followup chokepoint. Docs, help, and scaffold/close-finalize tests updated; bun test + test:slow green.
 ## Evidence
