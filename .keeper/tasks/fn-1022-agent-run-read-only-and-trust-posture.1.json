@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add read-only + move trust/env-scrub",
-  "updated_at": "2026-07-01T00:24:51.192000Z"
+  "updated_at": "2026-07-01T00:42:58.921000Z",
+  "worker_done_at": "2026-07-01T00:42:58.921000Z"
 }

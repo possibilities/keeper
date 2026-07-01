@@ -47,5 +47,5 @@ Keep the negative byte-pin green + add the positive pins (agent run --read-only 
 - [ ] `dispatch.ts` help + `cli/agent.ts` header + README ~:1423 document the flag (detection-not-prevention; no changed-files audit here) + the default codex/pi scrub; README ~:3337 trust-seed attribution moved to the shared launch path.
 
 ## Done summary
-
+Added agent run --read-only (exact-match flag, caller-prepended directive, per-harness tool strip) and moved codex-trust seeding + agent-conditional CLAUDE* env-scrub into the shared launchToResolvedHandle helper; pair delegates both and stays byte-stable. Docs frame read-only as detection-not-prevention.
 ## Evidence
