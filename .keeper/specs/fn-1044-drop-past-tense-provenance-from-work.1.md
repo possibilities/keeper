@@ -21,5 +21,5 @@ shadow hazard and the guard's behavior without the incident retelling.
 - [ ] `bun test` stays green.
 
 ## Done summary
-
+Rewrote findShadowingWorkManifest's doc-comment and the runReconcileCycle probe comment to state the current shadow hazard without past-tense incident provenance, satisfying repo rule #0.
 ## Evidence
