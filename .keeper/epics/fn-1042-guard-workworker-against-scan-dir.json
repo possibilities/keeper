@@ -7,7 +7,7 @@
     "fn-1038-per-cell-work-plugins-at-launch"
   ],
   "id": "fn-1042-guard-workworker-against-scan-dir",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-01T16:35:11.099000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-01T16:35:10.643000Z"
+  "updated_at": "2026-07-01T16:35:11.099000Z"
 }
