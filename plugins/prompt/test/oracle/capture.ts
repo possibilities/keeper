@@ -224,8 +224,9 @@ function captureCheckGenerated(
 
 /** Collect every output file the verb produces under the rendered plugin, in
  *  sorted order, base64'd for byte fidelity. Limited to the dirs the verb
- *  writes (commands/, skills/, agents/) so static hand-authored siblings that
- *  carry no `.tmpl` source are never folded into the golden. */
+ *  writes (commands/, skills/, agents/, and the render_to `workers/` cell tree)
+ *  so static hand-authored siblings that carry no `.tmpl` source are never
+ *  folded into the golden. */
 function collectRenderedTree(pluginRoot: string): PluginTemplateFile[] {
   const files: PluginTemplateFile[] = [];
   const walk = (dir: string): void => {
@@ -245,11 +246,14 @@ function collectRenderedTree(pluginRoot: string): PluginTemplateFile[] {
       });
     }
   };
-  // The verb only writes these three kinds; capturing only the files it
-  // produces keeps the golden free of static, no-template siblings.
+  // The verb writes these kinds; capturing only the files it produces keeps the
+  // golden free of static, no-template siblings. `workers/` holds the render_to
+  // per-cell `work` plugin dirs (each a `.claude-plugin/plugin.json` + an
+  // `agents/worker.md`), fanned out from template/agents/worker.md.tmpl.
   walk(join(pluginRoot, "commands"));
   walk(join(pluginRoot, "skills"));
   walk(join(pluginRoot, "agents"));
+  walk(join(pluginRoot, "workers"));
   files.sort((a, b) => a.relative.localeCompare(b.relative));
   return files;
 }
@@ -268,7 +272,7 @@ function captureRenderPluginTemplates(
   const work = join(tmpdir(), `prompt-oracle-rpt-${process.pid}-${Date.now()}`);
   rmSync(work, { recursive: true, force: true });
   cpSync(livePlanRoot, work, { recursive: true });
-  for (const kind of ["commands", "skills", "agents"]) {
+  for (const kind of ["commands", "skills", "agents", "workers"]) {
     rmSync(join(work, kind), { recursive: true, force: true });
   }
 

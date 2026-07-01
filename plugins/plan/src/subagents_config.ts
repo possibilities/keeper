@@ -118,3 +118,17 @@ export function subagentsMatrix(): SubagentsMatrix {
 export function loadSubagentsMatrixFromDisk(path: string): SubagentsMatrix {
   return coerceMatrix(loadYamlInput(path), path);
 }
+
+/** The workers-base directory (relative to the plan plugin root) under which the
+ * renderer fans out one self-contained `work` plugin per {model × effort} cell.
+ * A SINGLE shared constant so the template's `render_to:` frontmatter and the
+ * launcher's `--plugin-dir` cell selection resolve the same path and can't drift. */
+export const WORKERS_BASE = "workers";
+
+/** The per-cell plugin dir (relative to the plan plugin root) for a
+ * {model, effort} pair: `workers/<model>-<effort>`. The renderer stamps each cell
+ * here via the template's `render_to:`; the launcher selects one here via
+ * `--plugin-dir`. Order (model then effort) mirrors the `render_to:` convention. */
+export function workerCellDir(model: string, effort: string): string {
+  return `${WORKERS_BASE}/${model}-${effort}`;
+}

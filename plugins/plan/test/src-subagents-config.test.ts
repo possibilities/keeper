@@ -19,6 +19,8 @@ import {
   parseSubagentsMatrix,
   SubagentsConfigError,
   subagentsMatrix,
+  WORKERS_BASE,
+  workerCellDir,
 } from "../src/subagents_config.ts";
 import { YamlInputError } from "../src/yaml_input.ts";
 
@@ -77,6 +79,21 @@ describe("subagents matrix loader", () => {
     // A non-null value outside the configured sets throws (corrupt-on-disk guard).
     expect(() => workerAgentFor("turbo", models[0] as string)).toThrow();
     expect(() => workerAgentFor(efforts[0] as string, "gpt")).toThrow();
+  });
+
+  test("workerCellDir composes the shared workers/<model>-<effort> cell path for every matrix cell", () => {
+    const { models, efforts } = subagentsMatrix();
+    for (const model of models) {
+      for (const effort of efforts) {
+        // Mirrors the template's `render_to: workers/{{model}}-{{effort}}` so the
+        // renderer and the launcher resolve the same cell dir.
+        expect(workerCellDir(model, effort)).toBe(
+          `${WORKERS_BASE}/${model}-${effort}`,
+        );
+      }
+    }
+    expect(WORKERS_BASE).toBe("workers");
+    expect(workerCellDir("opus", "high")).toBe("workers/opus-high");
   });
 
   test("a non-mapping document fails loud with a typed error", () => {

@@ -267,7 +267,7 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs oracle", ()
     try {
       const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
       cpSync(livePlanRoot, work, { recursive: true });
-      for (const kind of ["commands", "skills", "agents"]) {
+      for (const kind of ["commands", "skills", "agents", "workers"]) {
         rmSync(join(work, kind), { recursive: true, force: true });
       }
 
@@ -327,5 +327,6 @@ function collectTree(pluginRoot: string): Map<string, string> {
   walk(join(pluginRoot, "commands"));
   walk(join(pluginRoot, "skills"));
   walk(join(pluginRoot, "agents"));
+  walk(join(pluginRoot, "workers"));
   return out;
 }
