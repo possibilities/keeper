@@ -52,7 +52,7 @@ function scaffoldYaml(
     epicExtra +
     "  spec: |\n    ## Overview\n    A creation-verb conformance fixture.\n" +
     "tasks:\n  - title: First task\n" +
-    `    deps: ${deps}\n    tier: ${tier}\n    spec: |\n` +
+    `    deps: ${deps}\n    tier: ${tier}\n    model: opus\n    spec: |\n` +
     `${indent(VALID_TASK_SPEC, 6)}\n`
   );
 }
@@ -91,9 +91,9 @@ describe("scaffold keystone envelope", () => {
     const project = getProject();
     const yaml =
       "epic:\n  title: keystone epic\n  spec: |\n    ## Overview\n    keystone.\n" +
-      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    spec: |\n" +
+      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n" +
       `${indent(VALID_TASK_SPEC, 6)}\n` +
-      "  - title: Second task\n    deps: [1]\n    tier: high\n    spec: |\n" +
+      "  - title: Second task\n    deps: [1]\n    tier: high\n    model: opus\n    spec: |\n" +
       `${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = scaffold(project, yaml);
     expect(r.code).toBe(0);
@@ -178,7 +178,7 @@ describe("yaml scalar matrix (error envelopes)", () => {
     // test_creation_verbs.py::test_yaml_iso_date_title_is_not_a_string
     const yaml =
       "epic:\n  title: 2024-01-01\n  spec: |\n    ## Overview\n    iso date title.\n" +
-      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    spec: |\n" +
+      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n" +
       `${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = scaffold(getProject(), yaml);
     expect(r.code).not.toBe(0);
@@ -193,7 +193,7 @@ describe("yaml scalar matrix (error envelopes)", () => {
     const yaml =
       "epic:\n  title: dup key matrix\n  branch: feat-first\n  branch: feat-second\n" +
       "  spec: |\n    ## Overview\n    duplicate key.\n" +
-      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    spec: |\n" +
+      "tasks:\n  - title: First task\n    deps: []\n    tier: medium\n    model: opus\n    spec: |\n" +
       `${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = scaffold(project, yaml);
     expect(r.code).toBe(0);

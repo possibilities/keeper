@@ -228,7 +228,7 @@ describe("restamp coverage matrix", () => {
     const delta = join(project.root, "add_task.yaml");
     writeFileSync(
       delta,
-      "add_tasks:\n  - title: New task\n    tier: medium\n    spec: |\n" +
+      "add_tasks:\n  - title: New task\n    tier: medium\n    model: opus\n    spec: |\n" +
         "      ## Description\n      x\n      ## Acceptance\n      - [ ] x\n" +
         "      ## Done summary\n\n      ## Evidence\n",
       "utf-8",

@@ -601,7 +601,7 @@ describe("reconcile errors + contract + meta", () => {
       // commit (born), but we exercise the guard via a done task whose stamp is
       // not in HEAD — the verdict must be a clean signal, never tooling_error.
       "epic:\n  title: Unborn guard\n  spec: |\n    ## Overview\n    seed\n" +
-        "tasks:\n  - title: Task 1\n    tier: medium\n    spec: |\n" +
+        "tasks:\n  - title: Task 1\n    tier: medium\n    model: opus\n    spec: |\n" +
         "      ## Description\n      x\n\n      ## Acceptance\n      - [ ] x\n\n" +
         "      ## Done summary\n\n      ## Evidence\n",
       "utf-8",

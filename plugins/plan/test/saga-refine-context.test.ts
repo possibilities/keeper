@@ -73,7 +73,7 @@ function makeEpic(nTasks: number): { epicId: string; taskIds: string[] } {
       .split("\n")
       .map((ln) => `      ${ln}`)
       .join("\n");
-    return `  - title: task ${i}\n    tier: medium\n    spec: |\n${specLines}`;
+    return `  - title: task ${i}\n    tier: medium\n    model: opus\n    spec: |\n${specLines}`;
   }).join("\n");
   const yaml =
     "epic:\n  title: Demo epic\n  branch: demo-branch\n  spec: |\n" +

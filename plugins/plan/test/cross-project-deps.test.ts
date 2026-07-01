@@ -412,6 +412,6 @@ function scaffoldPlanYamlWithDep(title: string, depIds: string[]): string {
   return (
     `epic:\n  title: ${title}\n${depsLine}` +
     "  spec: |\n    ## Overview\n    x.\n" +
-    `tasks:\n  - title: T1\n    tier: medium\n    spec: |\n${taskSpec}\n`
+    `tasks:\n  - title: T1\n    tier: medium\n    model: opus\n    spec: |\n${taskSpec}\n`
   );
 }

@@ -288,7 +288,7 @@ function seedFollowupYaml(s: LaneScenario, nTasks: number): void {
       "      ## Acceptance\n      - [ ] x\n\n" +
       "      ## Done summary\n\n      ## Evidence\n";
     blocks.push(
-      `  - title: Follow task ${i}\n    tier: medium\n    spec: |\n${spec}`,
+      `  - title: Follow task ${i}\n    tier: medium\n    model: opus\n    spec: |\n${spec}`,
     );
   }
   const yaml =

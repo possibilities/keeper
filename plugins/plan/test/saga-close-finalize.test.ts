@@ -130,7 +130,7 @@ function seedFollowupYaml(
       "      ## Acceptance\n      - [ ] x\n\n" +
       "      ## Done summary\n\n      ## Evidence\n";
     blocks.push(
-      `  - title: Follow task ${i}\n    tier: medium\n    spec: |\n${spec}`,
+      `  - title: Follow task ${i}\n    tier: medium\n    model: opus\n    spec: |\n${spec}`,
     );
   }
   const yaml =
@@ -454,8 +454,8 @@ describe("close-finalize cross-repo follow-up guard", () => {
   ): string {
     const yaml =
       "epic:\n  title: multi repo source\n  spec: |\n    ## Overview\n    span repos.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    model: opus\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const planPath = join(proj.root, "_xrepo_source.yaml");
     writeFileSync(planPath, yaml, "utf-8");
     const res = runCli(["scaffold", "--file", planPath], {
@@ -510,7 +510,7 @@ describe("close-finalize cross-repo follow-up guard", () => {
       `epic:\n  title: Follow-up of ${epicId}\n` +
       `  depends_on_epics: [${epicId}]\n` +
       "  spec: |\n    ## Overview\n    follow overview\n" +
-      `tasks:\n  - title: Follow task\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${spec}`;
+      `tasks:\n  - title: Follow task\n    tier: medium\n    model: opus\n    target_repo: ${a}\n    spec: |\n${spec}`;
     writeArtifact(followupPath(proj.root, epicId), yaml);
 
     const { code, env } = finalize(proj, epicId);
