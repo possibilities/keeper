@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-01T18:13:45.833000Z",
+  "created_by_close_of": "fn-1040-parse-clean-keeper-native-board-reads",
+  "depends_on_epics": [
+    "fn-1040-parse-clean-keeper-native-board-reads"
+  ],
+  "id": "fn-1043-prune-dead-read-only-trailer-residue",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Prune dead read-only-trailer residue",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-01T18:13:45.833000Z"
+}
