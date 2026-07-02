@@ -42,5 +42,5 @@ If the helper closure is more tangled than mapped, fall back to moving only reco
 - [ ] Moved code carries no fn-id provenance comments
 
 ## Done summary
-
+Extracted the pure verdict closure (reconcile, worktree lane geometry, failure-key helpers, pure predicates + their types) from autopilot-worker.ts into new src/reconcile-core.ts, re-exporting every moved symbol so all imports and the test import block stay unchanged. Injected the worktrees root through the snapshot so the pure verdict path calls no homedir() at reconcile time; moved the LaneMerged/WorktreeRepoStatus row types to the pure side (re-exported from reducer.ts). No back-import into autopilot-worker; full fast suite + typecheck green, zero behavior change.
 ## Evidence
