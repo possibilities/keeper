@@ -37,5 +37,5 @@ check-generated fixture carries the fixed envelope.
 - [ ] Regenerated fixture diff reviewed for the two known divergence classes (corpus edits, check-generated envelope fix)
 
 ## Done summary
-
+Rebaselined the prompt parity suite as a regression-pin snapshot of the current keeper prompt engine: re-recorded all goldens over the current corpus (114→95 render refs, deleted snippets pruned; check-generated envelope now carries the fixed root-resolution), made check-generated capture+assert hermetic via a temp render tree with a synthetic .git marker, and retired the Python-promptctl parity framing (dropped the verb substitution, kept root tokenization). Full prompt suite green (207 pass).
 ## Evidence

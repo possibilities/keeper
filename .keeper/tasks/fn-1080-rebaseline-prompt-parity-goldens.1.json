@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Re-record parity goldens as regression pins",
-  "updated_at": "2026-07-02T18:02:28.302000Z"
+  "updated_at": "2026-07-02T18:24:25.410000Z",
+  "worker_done_at": "2026-07-02T18:24:25.410000Z"
 }
