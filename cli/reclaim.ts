@@ -30,7 +30,7 @@
  *
  * NOT wired for autopilot/automation: it is an explicit operator step (the full
  * runbook — pause autopilot, bootout daemon, reclaim, bootstrap, await server-up
- * — is in `keeper reclaim --agent-help` and README `## Backup & restore`).
+ * — is in `keeper reclaim --agent-help`).
  */
 
 import {

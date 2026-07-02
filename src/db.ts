@@ -4867,7 +4867,7 @@ function migrate(db: Database): void {
       // replace-by-key merge (`mergeJobLinkSlice`) whose per-event cost is independent
       // of sessions-per-epic AND board size. The new logic is byte-identical to the old
       // PER EVENT, so no live storm — but a rewind-and-redrain is still warranted, for
-      // two reasons named in the README prose (NOT "just in case"): it CONVERGES every
+      // two reasons (NOT "just in case"): it CONVERGES every
       // historical `epics.job_links` cell under the new code path, and it is
       // SELF-VALIDATING — the cursor-0 re-fold that previously took ~15 min (3–4 GB WAL,
       // socket down) now completes in ~1–2 min under the constant-bounded fold, proving
