@@ -29,5 +29,7 @@ For any remediation: before/after replay of the copy with projection-table diff 
 - [ ] `bun test` green
 
 ## Done summary
-
+Audited true re-fold cost via two --replay-from-zero runs over a 775,125-event / 1,263-epic live copy: whole corpus re-folds in 91-95s (~6.6x under the 10-min budget), overall per-event p95 slope flat-to-negative (-18% / +0.6%). VERDICT: CLEAN — no fold reproducibly breaches the 20% slope or 10-min budget, so no reducer or CLAUDE.md change; per-kind slope flags are non-reproducing sub-ms jitter, not accumulating scans. Deliverable is the headroom document (serve-fold-load.ts header + Evidence) with the re-run procedure.
 ## Evidence
+- Commits: 54ee7573
+- Tests: replay-from-zero x2 (775125 events / 1263 epics): 91.2s / 94.6s wall, both well under the 10-min budget, overall per-event p95 slope -18.0% (run1) / +0.6% (run2) — bounded, non-offender, dominant folds flat: PostToolUse 25.6s slope~0, PreToolUse 24.9s +11%, EpicSnapshot 6.0s per-key O(1) single-epic INSERT, per-kind slope flags non-reproducible run-to-run (ApiError 29%->6%, EpicSnapshot 6%->36%, EpicDeleted absent->35%) = sub-ms baseline jitter, justified as non-offenders, VERDICT CLEAN: no fold remediated (none reproducibly breaches); headroom + ~5.1M-event budget-hit projection recorded in serve-fold-load.ts header, re-run: sqlite3 file:~/.local/state/keeper/keeper.db?mode=ro .backup /tmp/kdb-copy.db then bun scripts/serve-fold-load.ts --db /tmp/kdb-copy.db --replay-from-zero (twice), bun test: targeted test/serve-fold-load.test.ts 6/6 green; full suite 584 pre-existing env failures byte-identical at HEAD before change (plan/prompt worktree path resolution + parallel disk-I/O flakes; keeper-core reducer/db/refold pass serially) — zero delta
