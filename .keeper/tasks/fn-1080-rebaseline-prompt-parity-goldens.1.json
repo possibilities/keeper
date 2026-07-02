@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T18:02:28.302000Z",
+  "depends_on": [],
+  "epic": "fn-1080-rebaseline-prompt-parity-goldens",
+  "id": "fn-1080-rebaseline-prompt-parity-goldens.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Re-record parity goldens as regression pins",
+  "updated_at": "2026-07-02T18:02:28.302000Z"
+}
