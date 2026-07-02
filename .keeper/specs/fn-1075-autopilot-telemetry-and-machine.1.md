@@ -51,5 +51,5 @@ simulate the fn-7 shape: one stuck condition over many cycles yields O(1) events
 - [ ] Root CLAUDE.md autopilot paragraph updated minimally; lint-claude-md green
 
 ## Done summary
-
+Producer-side change-gate collapses the per-cycle DispatchFailed storm (emit on first-appearance + reason-change + bounded still-stuck watermark, suppress identical re-emits, clear resets); mergeReadiness now probes dirty before off-branch so a dirty+off-branch checkout reports the actionable dirty cause. CLAUDE.md autopilot paragraph updated minimally; lint green.
 ## Evidence
