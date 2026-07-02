@@ -49,6 +49,7 @@ import {
   countAndToken,
   decodeRow,
   getCollection,
+  liveKeyOf,
   type Row,
   selectByIdsChunked,
   selectVersionsByIdsChunked,
@@ -490,11 +491,13 @@ function formatStages(args: {
  * that used to live as a top-level slot on `ConnState`:
  *
  * - `collection` is the subscription's collection name.
- * - `watched` is the frozen page membership (keyed by the collection's pk),
- *   seeded by the originating `query` and re-diffed on every `data_version`
- *   tick.
- * - `lastSent` maps pk → the collection's version column as last pushed to
- *   this subscription, so the diff emits a `patch` exactly once per advance.
+ * - `watched` is the frozen page membership (keyed by the collection's live key
+ *   — `liveKeyOf`: the composite `(verb, id)` for `dispatch_failures`, the bare
+ *   `pk` otherwise), seeded by the originating `query` and re-diffed on every
+ *   `data_version` tick.
+ * - `lastSent` maps that live key → the collection's version column as last
+ *   pushed to this subscription, so the diff emits a `patch` exactly once per
+ *   advance.
  * - `where` is the resolved filter (clause + bound params) the originating
  *   query was built from; reused on every tick for the membership COUNT+token
  *   so the count cannot drift from the page that produced it.
@@ -646,10 +649,10 @@ function seedSubState(
 ): SubState {
   return {
     collection,
-    watched: new Set(rows.map((r) => String(r[descriptor.pk]))),
+    watched: new Set(rows.map((r) => liveKeyOf(descriptor, r))),
     lastSent: new Map(
       rows.map((r) => [
-        String(r[descriptor.pk]),
+        liveKeyOf(descriptor, r),
         r[descriptor.version] as number,
       ]),
     ),
@@ -2672,10 +2675,12 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       const rows = selectByIdsChunked(db, descriptor, [...changedIds]);
       const _g3 = TRACE ? performance.now() : 0;
       if (TRACE) _accSelect += _g3 - _g2;
-      // Index by the descriptor's pk for per-sub fan-out.
+      // Index by the descriptor's live key for per-sub fan-out — the composite
+      // `(verb, id)` for `dispatch_failures`, the bare `pk` otherwise — so it
+      // agrees with the watched/version keys built from the same `liveKeyOf`.
       const byId = new Map<string, Row>();
       for (const row of rows) {
-        byId.set(String(row[descriptor.pk]), row);
+        byId.set(liveKeyOf(descriptor, row), row);
       }
 
       for (const { sock, subId, sub } of group) {

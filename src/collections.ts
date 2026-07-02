@@ -25,7 +25,19 @@ export type { Row };
  * - `name` — the wire-facing collection name (`query.collection`).
  * - `table` — the SQL table to read.
  * - `columns` — the SELECT list; also the shape served on the wire.
- * - `pk` — the primary-key column; the diff keys watched membership by it.
+ * - `pk` — the primary-key column; the wire/filter/page identity, and the diff
+ *   key UNLESS `liveKeyColumns` overrides it.
+ * - `liveKeyColumns` — an OPTIONAL composite live-diff identity. When the SQL
+ *   identity is `(a, b, …)` but `pk` names only ONE column (e.g.
+ *   `dispatch_failures` keys `(verb, id)` under `pk: "verb"`), same-`pk` rows
+ *   would collapse to one key on the watch path — one `watched`/`lastSent`
+ *   slot, one version-probe bucket, one `byId` fan-out entry — so only one
+ *   row's live patch survives. Setting this makes seed / version-map / diff /
+ *   membership-token key by these columns joined, so each row tracks
+ *   independently. `pk` still owns the wire/filter/page identity; this ONLY
+ *   governs the diff key. Columns MUST be descriptor constants (interpolated —
+ *   the injection invariant) and NON-NULL (a NULL concat operand yields a NULL
+ *   key). Absent → the diff keys by `pk` (unchanged).
  * - `version` — the monotonic per-row column the diff fires on (a row patches
  *   when its `version` advances past `lastSent`). NOT the global frame `rev`.
  * - `sortable` — the allowlist of columns a client may sort by.
@@ -64,6 +76,7 @@ export interface CollectionDescriptor {
   table: string;
   columns: readonly string[];
   pk: string;
+  liveKeyColumns?: readonly string[];
   version: string;
   sortable: ReadonlySet<string>;
   defaultSort: { column: string; dir: "asc" | "desc" };
@@ -582,7 +595,11 @@ export const DEAD_LETTERS_DESCRIPTOR: CollectionDescriptor = {
  * `retry_dispatch` RPC. A reducer projection (re-fold rebuilds it
  * byte-identically). Composite pk `(verb, id)`, but `pk` expects a single
  * column, so `verb` carries the wire identity and `id` rides in `columns` /
- * `filters`.
+ * `filters`. `verb` is a tiny class (`work` / `close`), so the DIFF path keys
+ * by the composite `liveKeyColumns` `(verb, id)` — otherwise two same-verb
+ * rows (e.g. two `worktree-finalize:<epic>-<hash>` closes) would collapse to
+ * one watched/version/patch slot and only one live pill would surface on
+ * `board --watch`.
  */
 export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
   name: "dispatch_failures",
@@ -599,6 +616,7 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
     "merge_escalated_at",
   ],
   pk: "verb",
+  liveKeyColumns: ["verb", "id"],
   version: "last_event_id",
   sortable: new Set(["verb", "id", "ts", "created_at", "updated_at"]),
   defaultSort: { column: "ts", dir: "desc" },
@@ -960,10 +978,51 @@ export function isQueryAllowed(name: string): boolean {
 }
 
 /**
+ * The delimiter joining a composite live-key's columns. `char(31)` (ASCII unit
+ * separator) never appears in a keeper verb / id / epic-id, so the SQL-side
+ * `col || char(31) || col` and the JS-side `join("")` produce the SAME
+ * bytes — the watched set (JS), the version-probe SELECT alias (SQL), the diff
+ * fan-out index (JS), and the membership token (SQL) all agree on one identity.
+ */
+const LIVE_KEY_DELIM = "";
+
+/**
+ * The SQL expression yielding a row's live-diff identity: the composite
+ * `col || char(31) || col …` when `liveKeyColumns` is set, else the single `pk`
+ * column verbatim. Trusted descriptor constants only (the injection invariant),
+ * so it is safe to interpolate wherever the diff path keys watched membership,
+ * the version probe, or the membership token. Byte-identical to `descriptor.pk`
+ * for every single-pk collection, so their generated SQL is unchanged.
+ */
+export function liveKeyExpr(descriptor: CollectionDescriptor): string {
+  const cols = descriptor.liveKeyColumns;
+  if (!cols || cols.length === 0) {
+    return descriptor.pk;
+  }
+  return cols.join(" || char(31) || ");
+}
+
+/**
+ * A row's live-diff identity string, byte-identical to {@link liveKeyExpr}'s SQL
+ * output (same `` delimiter). Mirrors the SQL keying on the JS side — the
+ * seed `watched`/`lastSent` maps and the diff `byId` fan-out index — so the two
+ * halves of the diff never disagree on which row a key names. Falls back to
+ * `String(row[pk])` for a single-pk collection (unchanged behavior).
+ */
+export function liveKeyOf(descriptor: CollectionDescriptor, row: Row): string {
+  const cols = descriptor.liveKeyColumns;
+  if (!cols || cols.length === 0) {
+    return String(row[descriptor.pk]);
+  }
+  return cols.map((c) => String(row[c])).join(LIVE_KEY_DELIM);
+}
+
+/**
  * Read a set of rows by primary key. Empty-set short-circuits to `[]` (a bare
  * `IN ()` is a SQL syntax error); over `MAX_IN_PARAMS` throws ("chunk the
  * caller"). Returns rows in SQLite's emission order (NOT input order). Trusted
- * identifiers interpolated, ids bound (`?`).
+ * identifiers interpolated, ids bound (`?`). Keys by {@link liveKeyExpr} so a
+ * composite-identity collection matches the same ids its diff watches.
  */
 export function selectByIds(
   db: Database,
@@ -982,7 +1041,7 @@ export function selectByIds(
   const sql = `
     SELECT ${descriptor.columns.join(", ")}
       FROM ${descriptor.table}
-     WHERE ${descriptor.pk} IN (${placeholders})
+     WHERE ${liveKeyExpr(descriptor)} IN (${placeholders})
   `;
   // Per-call prepare: the statement shape is arity-dependent and page sizes are
   // small (capped well below MAX_IN_PARAMS), so compile cost is negligible.
@@ -1017,9 +1076,9 @@ export function selectVersionsByIds(
   }
   const placeholders = ids.map(() => "?").join(",");
   const sql = `
-    SELECT ${descriptor.pk} AS pk, ${descriptor.version} AS version
+    SELECT ${liveKeyExpr(descriptor)} AS pk, ${descriptor.version} AS version
       FROM ${descriptor.table}
-     WHERE ${descriptor.pk} IN (${placeholders})
+     WHERE ${liveKeyExpr(descriptor)} IN (${placeholders})
   `;
   const stmt = db.prepare(sql);
   const rows = stmt.all(...ids) as { pk: unknown; version: number | null }[];
@@ -1107,14 +1166,15 @@ export function decodeRow(descriptor: CollectionDescriptor, row: Row): Row {
   return out;
 }
 
-/** A filtered set's size + a membership fingerprint over its pk identities. */
+/** A filtered set's size + a membership fingerprint over its live-key identities. */
 export interface CountAndToken {
   /** `COUNT(*)` over the full filtered set (the WHERE only — no limit/offset). */
   total: number;
   /**
-   * A fingerprint of the matching rows' pk IDENTITIES (never mutable columns),
-   * ordered by pk so it's stable tick-to-tick. Changes iff a row enters/leaves
-   * the filtered set (incl. a balanced swap: one in, one out, `total` steady).
+   * A fingerprint of the matching rows' live-key IDENTITIES (never mutable
+   * columns), ordered by that key so it's stable tick-to-tick. Changes iff a
+   * row enters/leaves the filtered set (incl. a balanced swap: one in, one out,
+   * `total` steady — even two rows sharing a `pk` under a composite live key).
    * The empty set normalizes to `""` so it compares cleanly against a populated
    * set's token.
    */
@@ -1126,11 +1186,13 @@ export interface CountAndToken {
  * caller passes the SAME `whereClause` + `params` that built the page SELECT so
  * the count can never drift from the page.
  *
- * The token is `group_concat(<pk>)` over the matching pk identities. The inner
- * `ORDER BY <pk>` is REQUIRED: `group_concat` order is otherwise plan-dependent,
- * and an unstable token fires phantom `meta` frames every tick. Ordering by the
- * pk (not the display sort) keeps it a pure membership fingerprint. Zero rows →
- * `NULL`, normalized to `""` for a clean-diffing empty set.
+ * The token is `group_concat` over the matching rows' live-key identities
+ * ({@link liveKeyExpr} — the composite `(verb, id)` for `dispatch_failures`, the
+ * bare `pk` otherwise). The inner `ORDER BY` on that same key is REQUIRED:
+ * `group_concat` order is otherwise plan-dependent, and an unstable token fires
+ * phantom `meta` frames every tick. Ordering by the identity (not the display
+ * sort) keeps it a pure membership fingerprint. Zero rows → `NULL`, normalized
+ * to `""` for a clean-diffing empty set.
  */
 export function countAndToken(
   db: Database,
@@ -1139,12 +1201,12 @@ export function countAndToken(
   params: readonly (string | number)[],
 ): CountAndToken {
   const sql = `
-    SELECT COUNT(*) AS n, group_concat(${descriptor.pk}) AS token
+    SELECT COUNT(*) AS n, group_concat(k) AS token
       FROM (
-        SELECT ${descriptor.pk}
+        SELECT ${liveKeyExpr(descriptor)} AS k
           FROM ${descriptor.table}
           ${whereClause}
-         ORDER BY ${descriptor.pk}
+         ORDER BY k
       )
   `;
   const row = db.prepare(sql).get(...params) as {
