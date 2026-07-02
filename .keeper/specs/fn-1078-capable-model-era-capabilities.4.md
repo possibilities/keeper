@@ -48,5 +48,5 @@ Plan suite green; desk-check the auditor's two-axis output against a past close'
 - [ ] Escalation notifications decision-ready; authoring guide landed
 
 ## Done summary
-
+Two-axis quality-auditor (Spec compliance ∥ Standards with smell baseline + tautological-test check), scope-confirm reflex in hack + plan Phase 2d, ticket-vs-fog test in plan Phase 3c, decision-ready escalation briefs in daemon notify bodies + autopilot guardrails, and a new docs/skill-authoring.md codifying the pruning method.
 ## Evidence
