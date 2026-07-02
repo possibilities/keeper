@@ -98,5 +98,5 @@ surfaced). Render-layer only — do NOT touch `computeReadiness`, the reconciler
 - [ ] `bun test` (board + status + new module suites), `bun run typecheck`, `bunx biome check` all green.
 
 ## Done summary
-
+Added pure src/dispatch-failure-pill.ts (classifier + key->target resolver) and wired the board TUI + keeper status to overlay sticky dispatch_failures as [failed:<kind>] pills / dispatch_failure: string[] (schema v2). Closes Gap A (worktree-key join) and Gap B (work:: failures); render-only.
 ## Evidence

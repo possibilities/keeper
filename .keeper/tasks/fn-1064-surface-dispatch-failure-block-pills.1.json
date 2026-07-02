@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Classify dispatch failures into pills",
-  "updated_at": "2026-07-02T06:57:48.484000Z"
+  "updated_at": "2026-07-02T07:17:34.735000Z",
+  "worker_done_at": "2026-07-02T07:17:34.735000Z"
 }
