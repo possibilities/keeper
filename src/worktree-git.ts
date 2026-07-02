@@ -465,7 +465,7 @@ export async function pruneWorktrees(
  * detects it here, aborts, and prunes so the next reconcile cycle re-runs the
  * merge from a clean state (level-triggered retry, no in-process self-heal).
  */
-export async function hasMergeInProgress(
+async function hasMergeInProgress(
   cwd: string,
   run: GitRunner = gitExec,
 ): Promise<boolean> {
