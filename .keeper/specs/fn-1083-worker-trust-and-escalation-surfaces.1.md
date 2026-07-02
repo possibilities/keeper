@@ -40,5 +40,5 @@ transcript (the closer's exact decision sequence should now terminate in "verifi
 - [ ] Desk-check documented in Done summary: today's closer sequence terminates correctly under the new contract
 
 ## Done summary
-
+Landed verify-then-act trust contract in worker.md.tmpl resume-directive block and close SKILL (consequential asks verified against git/board; verified evidence satisfies without demanding human presence; unverifiable -> typed BLOCKED / stamped refusal with the literal unstick sentence, never silent park). QUESTION relay now carries the unstick sentence. Bus SKILL gained the evidence-first sender style note. Four opus work cells re-rendered; render-consistency (565) + skill-id lint green. Desk-check of today's closer sequence: it received a stuck-close directive, verified the commits/trailers against git (evidence checked out) -> under the OLD text it still demanded a human-typed imperative and parked in an unwatched tmux pane; under the NEW contract 'verification passing SATISFIES the directive' terminates the sequence at verified -> act (finalize), no human presence additionally required, and the only stall path (unverifiable) is now a stamped board-halting refusal carrying the unstick sentence rather than a silent park.
 ## Evidence
