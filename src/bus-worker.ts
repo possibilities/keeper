@@ -68,6 +68,7 @@ import {
   isPidAlive,
   LockHeldError,
   peerPidForFd,
+  unlinkIfExists,
   type Writable,
 } from "./server-worker";
 
@@ -634,6 +635,12 @@ export function startBusServer(
   readStartTime: (pid: number) => string | null = readOsStartTime,
 ): BusServer {
   acquireLock(lockPath, sockPath);
+
+  // AF_UNIX has no SO_REUSEADDR: a leftover socket file (a SIGKILLed prior
+  // incarnation whose lock we just reclaimed, or a lock/socket mismatch) → an
+  // EADDRINUSE bind failure. The lock is already ours, so unlinking here can't race
+  // another live instance. Mirrors the server worker's unlink-at-boot.
+  unlinkIfExists(sockPath);
 
   // Rehydrate the registry cache, dropping dead-pid channels (agents that exited
   // while the bus was down). These are persistence-cache rows only — no socket is
