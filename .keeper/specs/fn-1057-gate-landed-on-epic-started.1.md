@@ -25,5 +25,5 @@ Heads-up: use `rg -a` on src/autopilot-worker.ts (a NUL byte ~offset 175300 brea
 - [ ] Full fast suite green
 
 ## Done summary
-
+Gated laneMergedInRepo's definitively-absent arm on epicStarted (exported from await-conditions) so a never-cut lane no longer reads as merged-and-torn-down; await landed now holds for a not-yet-started epic. Probe-failure/clustered/worktree-off arms unchanged.
 ## Evidence
