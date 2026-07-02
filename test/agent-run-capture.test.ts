@@ -43,7 +43,12 @@ import {
   type RunLaunchResult,
   runCaptureExitCode,
 } from "../src/agent/run-capture";
-import { expectExit, makeHarness } from "./helpers/agent-main-harness";
+import { buildPanelLegArgv, type PanelMember } from "../src/pair/panel";
+import {
+  expectExit,
+  flagValues,
+  makeHarness,
+} from "./helpers/agent-main-harness";
 
 const ENVELOPE_KEYS = [
   "agent",
@@ -187,6 +192,7 @@ function okParse(
     effort: null,
     session: null,
     output: null,
+    name: null,
     ...overrides,
   };
 }
@@ -255,6 +261,12 @@ describe("parseRunArgs", () => {
     );
     expect(parseRunArgs(["claude", "p", "--output=/tmp/o.yaml"])).toEqual(
       okParse({ output: "/tmp/o.yaml" }),
+    );
+    expect(
+      parseRunArgs(["claude", "p", "--name", "panel::smoke::opus"]),
+    ).toEqual(okParse({ name: "panel::smoke::opus" }));
+    expect(parseRunArgs(["pi", "p", "--name=panel::smoke::pi"])).toEqual(
+      okParse({ cli: "pi", name: "panel::smoke::pi" }),
     );
     // All three compose with each other and the existing posture flags.
     expect(
@@ -334,6 +346,7 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--preset"], "--preset requires a value"],
     [["claude", "p", "--session"], "--session requires a value"],
     [["claude", "p", "--output"], "--output requires a value"],
+    [["claude", "p", "--name"], "--name requires a value"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);
@@ -341,6 +354,48 @@ describe("parseRunArgs", () => {
       expect(res.error).toContain(needle);
     }
   });
+});
+
+describe("panel leg argv round-trips through the real run-capture parser", () => {
+  // The drift guard: a builder-output-only test passes while `parseRunArgs`
+  // rejects the flag — the exact bug that killed panels. This feeds each
+  // harness's `buildPanelLegArgv` output through the SAME two surfaces the
+  // launcher does (splitSubcommand → parseRunArgs) and fails if they diverge.
+  const SLUG = "smoke-slug";
+  const members: PanelMember[] = [
+    { name: "opus", harness: "claude" },
+    { name: "gpt5", harness: "codex", model: "gpt-5", effort: "high" },
+    { name: "pi-fast", harness: "pi" },
+  ];
+
+  for (const member of members) {
+    test(`${member.harness} leg parses ok with the panel name`, () => {
+      const argv = buildPanelLegArgv({
+        keeperBin: "/abs/bun",
+        keeperAgentPath: "/abs/cli/keeper.ts",
+        prompt: "weigh in",
+        member,
+        slug: SLUG,
+        yamlPath: "/tmp/leg.json",
+        stopTimeoutMs: 1_800_000,
+      });
+      // The top-level keeper dispatcher consumes `[<bun>, <keeper.ts>, "agent"]`
+      // before `agent` main() ever calls splitSubcommand — mirror that boundary.
+      expect(argv[2]).toBe("agent");
+      const dispatch = splitSubcommand(argv.slice(3));
+      expect(dispatch.kind).toBe("run-capture");
+      if (dispatch.kind !== "run-capture") {
+        throw new Error("expected run-capture dispatch");
+      }
+      const parsed = parseRunArgs(dispatch.rest);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        throw new Error(`parseRunArgs rejected the leg: ${parsed.error}`);
+      }
+      expect(parsed.cli).toBe(member.harness);
+      expect(parsed.name).toBe(`panel::${SLUG}::${member.name}`);
+    });
+  }
 });
 
 describe("captureFromHandle — outcome matrix (injected seams)", () => {
@@ -825,6 +880,20 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
     return { h, transcriptPath };
   }
+
+  test("--name threads end-to-end to the tmux window name (-n)", async () => {
+    const { h } = completedRunHarness(["--name", "panel::smoke::opus"]);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    // The window-name knob (`-n`) carries the name on the tmux launch as a
+    // discrete flag token — uniform across harnesses, and the one seam observable
+    // here (the harness-native `--name` rides in the launch script, byte-pinned by
+    // the launch-config goldens). This proves posture.name → options.windowName.
+    const windowNames = h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-n"));
+    expect(windowNames).toContain("panel::smoke::opus");
+  });
 
   test("--preset with a matching harness validates and composes to completed", async () => {
     const { h } = completedRunHarness(["--preset", "opus"], PRESET_CATALOG);

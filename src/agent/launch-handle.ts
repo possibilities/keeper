@@ -84,6 +84,9 @@ export interface LaunchPosture {
   effort?: string;
   session?: string;
   preset?: string;
+  /** Launch NAME — lands on the tmux window name for every harness and on the
+   *  harness-native `--name` for claude/pi (codex has none). Omitted = no name. */
+  name?: string;
 }
 
 /** The effect half of the seam — every collaborator the launch touches, injected. */
@@ -161,6 +164,7 @@ export function launchToResolvedHandle(
     effort: posture.effort,
     session: posture.session,
     preset: posture.preset,
+    name: posture.name,
   });
   const tmuxLaunch = parseKeeperAgentTmuxArgs(launchArgv.slice(1));
   if (tmuxLaunch.error !== null) {

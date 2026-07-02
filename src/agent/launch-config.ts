@@ -130,6 +130,10 @@ export interface AgentLaunchOpts {
    *  Omitted = no preset flag (model/effort fall to the explicit
    *  `--model`/`--effort`). */
   preset?: string;
+  /** Launch NAME. Rides as `--x-tmux-window-name <name>` (the tmux window name,
+   *  EVERY harness) and, for claude/pi only, as the harness-native `--name <name>`
+   *  (codex has no native name flag). Omitted/empty = no name flag. */
+  name?: string;
 }
 
 /**
@@ -178,6 +182,12 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
       wrapperFlags.push("--x-tmux-env", `KEEPER_TMUX_SESSION=${opts.session}`);
     }
   }
+  // The name lands on the tmux window name UNIFORMLY (every harness) via the
+  // launcher's window-name knob; the harness-native `--name` (claude/pi) is added
+  // in the per-CLI native args, so codex legs carry no native name flag.
+  if (opts.name !== undefined && opts.name !== "") {
+    wrapperFlags.push("--x-tmux-window-name", opts.name);
+  }
   const native =
     opts.cli === "claude"
       ? nativeClaudeArgs(opts)
@@ -212,6 +222,11 @@ export function nativeClaudeArgs(opts: AgentLaunchOpts): string[] {
   ];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("--model", opts.model);
+  }
+  // The harness-native session name; an explicit `--name` suppresses the
+  // interactive auto-mint on the detached re-exec.
+  if (opts.name !== undefined && opts.name !== "") {
+    args.push("--name", opts.name);
   }
   return args;
 }
@@ -262,6 +277,11 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   const args = ["-na"];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("--model", opts.model);
+  }
+  // The harness-native session name; an explicit `--name` suppresses the
+  // interactive auto-mint on the detached re-exec.
+  if (opts.name !== undefined && opts.name !== "") {
+    args.push("--name", opts.name);
   }
   return args;
 }

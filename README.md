@@ -1429,14 +1429,19 @@ event-log/reducer/hook touch. Run any of them with
   so `start` is IDEMPOTENT by slug — a re-issue reconciles per leg (REUSE any
   terminal result — completed or failed, since resume is not retry — LEAVE a running
   leg, RELAUNCH only a no-result leg), never a blind re-fan-out. A per-slug advisory
-  `flock` serializes concurrent drivers; a manifest-stamped `boot_epoch_ms` detects a
-  reboot (every non-terminal leg relaunches, since pre-reboot pidfiles are
-  untrustworthy) while a same-boot pidfile check governs otherwise; a byte-exact
-  prompt + member-set identity guard refuses a colliding-slug cross-run merge
-  (exit 2). Liveness is filesystem-only (result file + boot epoch + pidfile), never
-  keeper.db — `src/pair/panel.ts` stays a dep-free leaf. Three read verbs address a
-  run by `--slug` (or a `--dir` override): `panel wait` blocks a bounded chunk until
-  every leg is terminal, `panel status` prints a non-blocking per-leg snapshot
+  `flock` serializes concurrent drivers; a manifest-stamped, sleep-proof
+  (kernel-derived, not `os.uptime()`) `boot_epoch_ms` detects a reboot (every
+  non-terminal leg relaunches, since pre-reboot pidfiles are untrustworthy) while a
+  same-boot pidfile check governs otherwise; a byte-exact prompt + member-set
+  identity guard refuses a colliding-slug cross-run merge (exit 2). Liveness is
+  filesystem-only (a leg's result file, the boot epoch, and its pidfile cross-checked
+  against a captured OS start-time — `ps -o lstart=` — so a recycled pid never reads
+  live), never keeper.db — `src/pair/panel.ts` stays a dep-free leaf. Three read
+  verbs address a run by `--slug` (or a `--dir` override): `panel wait` blocks a
+  bounded chunk until every leg is terminal — or, on a boot-epoch mismatch detected
+  mid-wait, fails the non-terminal legs with a distinct `machine-rebooted` reason and
+  returns promptly (exit 0, `ok:false`) instead of spinning, the driver's cue to
+  re-issue `start` (idempotent reconcile relaunches) then `wait` again; `panel status` prints a non-blocking per-leg snapshot
   (`completed|running|failed|absent`), and `panel prune` GCs abandoned run dirs
   (lock-free AND pid-dead AND past a started-at TTL — a live or in-reconcile run is
   always kept). `KEEPER_CONFIG_DIR` is the single env seam that derives both paths.
@@ -1476,8 +1481,11 @@ event-log/reducer/hook touch. Run any of them with
   envelope to `<path>` (a temp file in the same dir + rename, EXDEV-safe) on
   EVERY outcome, exit-code-independent, an additional sink for detached-leg
   pollers beyond stdout (a missing parent dir on that path is the `--output`
-  path's own `bad_args`). All three default-absent, so a run without them is
-  byte-identical. codex/pi runs launch with
+  path's own `bad_args`); `run --name <name>` labels the launch — it lands on the
+  tmux window name for EVERY harness and on the harness-native `--name` for
+  claude/pi only (codex has none), and an explicit `--name` suppresses `agent
+  run`'s auto session-name mint (framed like `keeper dispatch --name`). All four
+  default-absent, so a run without them is byte-identical. codex/pi runs launch with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex

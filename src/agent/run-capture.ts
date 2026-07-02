@@ -150,6 +150,11 @@ export type ParseRunArgsResult =
       /** Raw `--output` path — the atomic result-file sink the handler writes the
        *  envelope to on EVERY outcome, in addition to stdout. Null when unset. */
       output: string | null;
+      /** Raw `--name` value — the launch NAME. Rides onto the tmux window name for
+       *  every harness, and onto the harness-native `--name` for claude/pi (codex
+       *  has none). An explicit name suppresses the interactive auto-mint on the
+       *  detached re-exec. Null when unset. */
+      name: string | null;
     }
   | { ok: false; error: string };
 
@@ -164,7 +169,7 @@ export type ParseRunArgsResult =
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
  * the parser returns the RAW path/text — the handler reads any file.
  * `--preset <name>` / `--model <m>` / `--effort <e>` / `--session <name>` /
- * `--output <path>` are additive value flags (both split and `=` forms): the
+ * `--output <path>` / `--name <n>` are additive value flags (both split and `=` forms): the
  * parser returns the RAW values (config resolution, the launch-posture overlay,
  * and the atomic write happen handler-side). ALL default-absent, so an argv
  * without them stays byte-identical. Pure — exported for tests.
@@ -180,6 +185,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   let effort: string | null = null;
   let session: string | null = null;
   let output: string | null = null;
+  let name: string | null = null;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
@@ -306,6 +312,19 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       output = arg.slice("--output=".length);
       continue;
     }
+    if (arg === "--name") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--name requires a value" };
+      }
+      name = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--name=")) {
+      name = arg.slice("--name=".length);
+      continue;
+    }
     if (arg.startsWith("--")) {
       return { ok: false, error: `unknown flag: ${arg}` };
     }
@@ -351,6 +370,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     effort,
     session,
     output,
+    name,
   };
 }
 
