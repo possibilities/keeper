@@ -138,24 +138,29 @@ export interface PanelMember {
 /** One member's persisted launch record in the manifest. `yaml` is the leg's
  *  `--output` result-file path (a `keeper agent run` JSON envelope). `pidfile` is
  *  null when the leg's spawn threw at launch (it never started → a normal N-of-N
- *  fail). `launched_at` is the `deps.now()` ms stamp taken right after a
- *  successful spawn (null in the pre-spawn skeleton and for a spawn-throw leg), so
- *  a crash mid-fan-out is reconstructable by a resuming driver. Optional so a
- *  pre-durable-format manifest still parses. */
+ *  fail). `startfile` is the sibling path the detach wrapper writes the leg's OS
+ *  start-time to (`ps -o lstart=`), read back on every liveness check to reject a
+ *  recycled pid; null on a spawn throw, and absent on a pre-durable manifest (→ the
+ *  identity check degrades to bare pid liveness). `launched_at` is the `deps.now()`
+ *  ms stamp taken right after a successful spawn (null in the pre-spawn skeleton and
+ *  for a spawn-throw leg), so a crash mid-fan-out is reconstructable by a resuming
+ *  driver. Optional so a pre-durable-format manifest still parses. */
 export interface PanelManifestMember {
   name: string;
   harness: string;
   yaml: string;
   pidfile: string | null;
+  startfile?: string | null;
   launched_at?: number | null;
 }
 
 /** The `start`-persisted, `wait`-re-read manifest. `slug` is the run's
  *  agent-authored identifier (each leg launches as `panel::<slug>::<preset>`),
  *  persisted top-level for run correlation. `boot_epoch_ms` is the machine's
- *  derived boot instant (`deps.now() - os.uptime()*1000`); a resuming driver
- *  compares it against the current boot to detect a reboot (pre-reboot pidfiles
- *  are never trusted). `generation` counts (re)launch rounds — the skeleton is
+ *  sleep-proof boot instant (`deps.bootEpochMs`, kernel-derived — see that seam);
+ *  a resuming `start`/`wait` compares it against the current boot to detect a
+ *  reboot (pre-reboot pidfiles are never trusted). `generation` counts (re)launch
+ *  rounds — the skeleton is
  *  generation 1; a future reconcile bumps it. Both optional so a pre-durable
  *  manifest still parses. */
 export interface PanelManifest {
@@ -252,6 +257,12 @@ export interface PanelDeps {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   pidAlive: (pid: number) => boolean;
+  /** Live OS start-time probe for a pid (the recycle-guard's identity side),
+   *  paired against the wrapper-captured `startfile`. Absent → the production
+   *  `ps -o lstart=` reader ({@link readPanelStartTime}); tests inject a fake so
+   *  the fast tier never forks `ps`. Returns null when it can't tell (dead pid,
+   *  `ps` error) → the caller fails OPEN (trusts bare pid liveness). */
+  readStartTime?: (pid: number) => string | null;
   /** Per-slug advisory-lock acquire (non-blocking). Returns a releasable handle,
    *  or null on contention (another driver holds the slug). Absent ⇒ treated as
    *  always-acquired (injected-deps tests that do not exercise contention).
@@ -260,9 +271,13 @@ export interface PanelDeps {
   lock?: (lockPath: string) => PanelLockHandle | null;
   write: (s: string) => void;
   writeErr: (s: string) => void;
-  /** Boot-epoch source (ms). Absent → derived from `now() - os.uptime()*1000`
-   *  (os.uptime is not injectable, so tests inject a fixed epoch here to make a
-   *  reboot mismatch deterministic). */
+  /** Boot-epoch source (ms). Production wires the SLEEP-PROOF kernel reader
+   *  ({@link readBootEpochMs}: darwin `kern.boottime` / linux `/proc/stat btime`,
+   *  which — unlike `os.uptime()` on macOS Sonoma+ — does not drift across sleep),
+   *  so `start` and `wait` compare the SAME stable boot instant across a mid-run
+   *  sleep. Absent → the in-process `now() - os.uptime()*1000` fallback (fork-free
+   *  for injected-deps tests, which instead pass a fixed epoch to make a reboot
+   *  mismatch deterministic). */
   bootEpochMs?: () => number;
   /** Poll cadence override (tests); defaults to {@link POLL_INTERVAL_MS}. */
   pollIntervalMs?: number;
@@ -510,11 +525,20 @@ export function buildPanelLegArgv(opts: {
  * `nohup` makes the leg SIGHUP-immune (POSIX on both OSs), `</dev/null` severs
  * stdin so the Bash tool sees EOF, `>"$LOG" 2>&1` captures both streams (NOT
  * `&>>` — `/bin/sh` is bash 3.2 on macOS), `&` backgrounds it, and `echo $!`
- * records the REAL backgrounded pid. `$LOG`/`$PIDFILE` arrive via env. Zero
- * `setsid`/`timeout`/`gtimeout`.
+ * records the REAL backgrounded pid.
+ *
+ * It then captures the leg's OS start-time to `$STARTFILE` (temp-then-`mv` so a
+ * reader never sees a torn value) as the recycle-guard's identity anchor: `$!`
+ * survives the intervening `echo` (only a new `&` job would reset it), so the same
+ * backgrounded pid is probed. `ps -o lstart=` uses the AMBIENT locale/TZ — NOT
+ * `LC_ALL=C TZ=UTC` — so the stored string byte-matches the same-machine live
+ * probe ({@link readPanelStartTime}); forcing UTC would shift the hour and
+ * false-flag every leg as recycled. A `ps` failure (the leg already exited) simply
+ * leaves `$STARTFILE` absent → the check degrades to bare pid liveness.
+ * `$LOG`/`$PIDFILE`/`$STARTFILE` arrive via env. Zero `setsid`/`timeout`/`gtimeout`.
  */
 export const DETACH_SCRIPT =
-  'nohup "$@" </dev/null >"$LOG" 2>&1 & echo $! > "$PIDFILE"';
+  'nohup "$@" </dev/null >"$LOG" 2>&1 & echo $! > "$PIDFILE"; ps -o lstart= -p $! > "$STARTFILE.tmp" 2>/dev/null && mv -f "$STARTFILE.tmp" "$STARTFILE"';
 
 /** Wrap a leg argv in the {@link DETACH_SCRIPT} shell. The `--` is the `$0`
  *  placeholder so the leg argv lands in `"$@"` (`$1..$n`). Pure. */
@@ -573,13 +597,93 @@ function readPid(pidfile: string): number | null {
   }
 }
 
+/** Production live OS start-time probe (the default {@link PanelDeps.readStartTime}).
+ *  `ps -o lstart= -p <pid>` in the AMBIENT locale/TZ, so its trimmed output
+ *  byte-matches the detach wrapper's same-command capture on the same machine (see
+ *  {@link DETACH_SCRIPT}). Platform-uniform (`ps -o lstart=` renders a wall-clock
+ *  date on both darwin and linux) — deliberately NOT `seed-sweep.readOsStartTime`,
+ *  whose linux jiffies format could never match a wrapper `lstart` capture and
+ *  whose import would drag the daemon/`bun:sqlite` graph into this leaf. Returns
+ *  null on a `ps` failure, a dead pid (empty output), or a throw → the caller fails
+ *  OPEN. Only the production deps call it; the fast tier injects a fake. */
+function readPanelStartTime(pid: number): string | null {
+  try {
+    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      timeout: 500,
+    });
+    if (!r.success || r.exitCode !== 0) {
+      return null;
+    }
+    const out = (r.stdout?.toString() ?? "").trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the wrapper-captured start-time from a leg's `startfile`, trimmed. Null
+ *  when the path is absent (pre-durable manifest), the file is missing (the
+ *  wrapper's `ps` capture failed), or empty — every null degrades the recycle
+ *  check to bare pid liveness (today's behavior), never a false "dead". */
+function readStoredStartTime(
+  startfile: string | null | undefined,
+): string | null {
+  if (startfile === null || startfile === undefined) {
+    return null;
+  }
+  try {
+    const v = readFileSync(startfile, "utf8").trim();
+    return v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The recycle guard: `kill(pid,0)` proves a pid is OCCUPIED, not that the CURRENT
+ *  occupant is the leg we launched. Cross-check the wrapper-captured start-time
+ *  against a live probe — a match confirms identity, a mismatch means the pid was
+ *  recycled to an unrelated process (the leg is dead). Two fail-OPEN degradations
+ *  keep a healthy panel from being spuriously killed (a false "dead" fails a live
+ *  panel; a false "alive" only extends a bounded wait): a null STORED value (old
+ *  manifest / capture failure) trusts bare liveness without probing, and a null
+ *  LIVE probe (ps error) trusts bare liveness and RE-probes next entry (never
+ *  memoized). A definitive match/mismatch is memoized per (startfile,pid) so a
+ *  `wait`'s repeated per-tick probes fork `ps` at most once per leg. */
+function legIdentityHolds(
+  member: PanelManifestMember,
+  pid: number,
+  deps: PanelDeps,
+  memo?: Map<string, boolean>,
+): boolean {
+  const stored = readStoredStartTime(member.startfile);
+  if (stored === null) {
+    return true;
+  }
+  const key = `${member.startfile} ${pid}`;
+  const cached = memo?.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const probe = (deps.readStartTime ?? readPanelStartTime)(pid);
+  if (probe === null) {
+    return true; // can't tell → fail open, re-probe next entry (do not memoize)
+  }
+  const holds = probe.trim() === stored;
+  memo?.set(key, holds);
+  return holds;
+}
+
 /** The shared per-leg filesystem probe both `wait`'s verdict ({@link evaluateLeg})
  *  and `start`'s reconcile ({@link reconcileLeg}) read from: whether the leg's
- *  result file is present and, if not, its recorded pid's liveness. Never throws.
- *  A present result short-circuits the pid read (a terminal leg's pid is moot). */
+ *  result file is present and, if not, whether its recorded pid is alive AND still
+ *  the SAME process ({@link legIdentityHolds} — a recycled pid reads dead). Never
+ *  throws. A present result short-circuits the pid read (a terminal leg's pid is
+ *  moot). `memo` (a `wait`-owned per-invocation cache) bounds the `ps` identity
+ *  probe to once per leg across the poll loop. */
 function probeLeg(
   member: PanelManifestMember,
   deps: PanelDeps,
+  memo?: Map<string, boolean>,
 ): { resultPresent: boolean; pid: number | null; pidAlive: boolean } {
   if (existsSync(member.yaml)) {
     return { resultPresent: true, pid: null, pidAlive: false };
@@ -589,11 +693,44 @@ function probeLeg(
     return { resultPresent: false, pid: null, pidAlive: false };
   }
   const pid = readPid(member.pidfile);
-  return {
-    resultPresent: false,
-    pid,
-    pidAlive: pid !== null && deps.pidAlive(pid),
-  };
+  let alive = pid !== null && deps.pidAlive(pid);
+  if (alive && pid !== null) {
+    alive = legIdentityHolds(member, pid, deps, memo);
+  }
+  return { resultPresent: false, pid, pidAlive: alive };
+}
+
+/** Sleep-proof boot-epoch (ms): the machine's wall-clock boot instant, the
+ *  production {@link PanelDeps.bootEpochMs}. macOS Sonoma+ `os.uptime()` EXCLUDES
+ *  time asleep, so `now() - uptime()*1000` drifts FORWARD across every sleep and
+ *  would false-trip the reboot guard mid-run; the kernel's absolute boot timestamp
+ *  does not. Darwin: `sysctl -n kern.boottime` → `{ sec = N, usec = M }` (the
+ *  `\bsec` word boundary skips `usec`). Linux: `/proc/stat` `btime <sec>`. Falls
+ *  back to the uptime arithmetic only when the kernel read fails (unknown platform
+ *  / probe error) — still same-boot-stable within a single session. Production-only
+ *  (forks `sysctl`); the fast tier injects a fixed epoch. */
+function readBootEpochMs(now: () => number): number {
+  try {
+    if (process.platform === "darwin") {
+      const r = Bun.spawnSync(["sysctl", "-n", "kern.boottime"], {
+        timeout: 500,
+      });
+      if (r.success && r.exitCode === 0) {
+        const m = (r.stdout?.toString() ?? "").match(/\bsec = (\d+)/);
+        if (m?.[1] !== undefined) {
+          return Number.parseInt(m[1], 10) * 1000;
+        }
+      }
+    } else if (process.platform === "linux") {
+      const m = readFileSync("/proc/stat", "utf8").match(/^btime (\d+)/m);
+      if (m?.[1] !== undefined) {
+        return Number.parseInt(m[1], 10) * 1000;
+      }
+    }
+  } catch {
+    // fall through to the uptime fallback
+  }
+  return now() - uptime() * 1000;
 }
 
 /** One member's status, precedence: result file present → parse its `outcome`
@@ -605,12 +742,13 @@ function evaluateLeg(
   member: PanelManifestMember,
   deps: PanelDeps,
   waitStartMs: number,
+  memo?: Map<string, boolean>,
 ): {
   status: "ok" | "fail" | "running";
   yaml: string | null;
   reason: string | null;
 } {
-  const probe = probeLeg(member, deps);
+  const probe = probeLeg(member, deps, memo);
   if (probe.resultPresent) {
     const outcome = readResultOutcome(member.yaml);
     if (outcome === "completed") {
@@ -737,8 +875,10 @@ export function parseManifest(
     return { ok: false, error: "manifest.slug missing or not a string" };
   }
   // Durable-manifest fields: validated when present (a malformed value is
-  // corrupt), tolerated when absent (a pre-durable-format manifest) so a resuming
-  // driver defaults a missing boot-epoch to 0 → a guaranteed mismatch → relaunch.
+  // corrupt), tolerated when absent (a pre-durable-format manifest). A missing
+  // boot-epoch is preserved as `undefined` (NEVER coerced to 0) so `wait`'s reboot
+  // guard can fail OPEN on a pre-durable manifest instead of reading 0 as a
+  // reboot; `start` still treats absent as a relaunch via its own `?? 0`.
   if (
     obj.boot_epoch_ms !== undefined &&
     typeof obj.boot_epoch_ms !== "number"
@@ -766,6 +906,13 @@ export function parseManifest(
       return { ok: false, error: "manifest member has malformed fields" };
     }
     if (
+      mm.startfile !== undefined &&
+      mm.startfile !== null &&
+      typeof mm.startfile !== "string"
+    ) {
+      return { ok: false, error: "manifest member startfile is malformed" };
+    }
+    if (
       mm.launched_at !== undefined &&
       mm.launched_at !== null &&
       typeof mm.launched_at !== "number"
@@ -777,6 +924,7 @@ export function parseManifest(
       harness: mm.harness,
       yaml: mm.yaml,
       pidfile: mm.pidfile,
+      startfile: typeof mm.startfile === "string" ? mm.startfile : null,
       launched_at: typeof mm.launched_at === "number" ? mm.launched_at : null,
     });
   }
@@ -786,7 +934,7 @@ export function parseManifest(
       dir: obj.dir,
       slug: obj.slug,
       boot_epoch_ms:
-        typeof obj.boot_epoch_ms === "number" ? obj.boot_epoch_ms : 0,
+        typeof obj.boot_epoch_ms === "number" ? obj.boot_epoch_ms : undefined,
       generation: typeof obj.generation === "number" ? obj.generation : 1,
       members,
     },
@@ -967,9 +1115,11 @@ export async function panelStart(
 
   try {
     const manifestPath = join(dir, "manifest.json");
-    // The machine's derived boot instant; a resuming driver compares it against the
-    // stored one to detect a reboot (os.uptime is not injectable, so a test-only
-    // `deps.bootEpochMs` seam overrides it for a deterministic reboot).
+    // The machine's boot instant, stamped into the manifest so a resuming `start`/
+    // `wait` detects a reboot. Production wires the sleep-proof `deps.bootEpochMs`
+    // (kernel-derived); the inline `now() - uptime()*1000` is the fork-free fallback
+    // for injected-deps tests (which instead pass a fixed epoch). `start` and `wait`
+    // MUST derive through the SAME seam or a sleep would look like a reboot.
     const currentBootEpochMs =
       deps.bootEpochMs !== undefined
         ? deps.bootEpochMs()
@@ -1009,6 +1159,7 @@ export async function panelStart(
           harness: member.harness,
           yaml: join(dir, `${legBaseName(member.name, 1)}.yaml`),
           pidfile: join(dir, `${legBaseName(member.name, 1)}.pidfile`),
+          startfile: join(dir, `${legBaseName(member.name, 1)}.starttime`),
           launched_at: null,
         })),
       };
@@ -1094,6 +1245,7 @@ export async function panelStart(
           harness: member.harness,
           yaml: join(dir, `${base}.yaml`),
           pidfile: join(dir, `${base}.pidfile`),
+          startfile: join(dir, `${base}.starttime`),
           launched_at: null,
         };
         members.push(entry);
@@ -1127,6 +1279,9 @@ export async function panelStart(
       // crash-without-file case; it is not read by `wait`, so it stays out of the
       // manifest.
       const pidfilePath = entry.pidfile as string;
+      // The wrapper writes the leg's OS start-time here (the recycle-guard anchor),
+      // beside the pidfile in the same run dir.
+      const startfilePath = entry.startfile as string;
       const legArgv = buildPanelLegArgv({
         keeperBin: deps.keeperBin,
         keeperAgentPath: deps.keeperAgentPath,
@@ -1138,14 +1293,21 @@ export async function panelStart(
       });
       try {
         deps.spawn(buildDetachWrapperArgv(legArgv), {
-          env: { ...deps.env, LOG: logPath, PIDFILE: pidfilePath },
+          env: {
+            ...deps.env,
+            LOG: logPath,
+            PIDFILE: pidfilePath,
+            STARTFILE: startfilePath,
+          },
           cwd: deps.cwd,
         });
         entry.launched_at = deps.now();
       } catch {
         // Spawn threw → the leg never started. Null the pidfile (the launch-failed
-        // signal `wait` surfaces as an N-of-N fail); launched_at stays null.
+        // signal `wait` surfaces as an N-of-N fail) + the startfile; launched_at
+        // stays null.
         entry.pidfile = null;
+        entry.startfile = null;
       }
       persistManifest();
     }
@@ -1169,6 +1331,16 @@ export interface PanelWaitArgs {
  * All legs terminal → print the verdict JSON, exit 0. Chunk elapsed → exit 124
  * (re-issuable). Missing/corrupt manifest or bad flags → exit 2. Stateless
  * across re-issues. Returns the process exit code.
+ *
+ * REBOOT GUARD (Guard B): a mid-wait reboot kills every recorded leg pid, so a
+ * non-terminal leg can never finish. Derive the current boot instant through the
+ * SAME sleep-proof seam `start` stamps with; if it disagrees with the manifest's
+ * `boot_epoch_ms` beyond {@link BOOT_EPOCH_TOLERANCE_MS}, classify every
+ * non-terminal leg as terminal-failed with a distinct `machine-rebooted` reason
+ * and return promptly (exit 0, `ok:false`) rather than spin to 124 — the driver's
+ * cue to re-issue `start` (idempotent reconcile relaunches the legs) then `wait`
+ * again. An ABSENT `boot_epoch_ms` (pre-durable manifest) fails OPEN — no guard, no
+ * boot derivation. STRICTLY read-only: zero manifest writes, zero relaunches.
  */
 export async function panelWait(
   args: PanelWaitArgs,
@@ -1208,9 +1380,43 @@ export async function panelWait(
   const waitStartMs = deps.now();
   const deadline = waitStartMs + chunkMs;
   const pollMs = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
+  // Per-invocation recycle-probe cache: the `(pid, start_time)` identity is fixed
+  // for the run, so `ps` is forked at most once per leg across every poll tick.
+  const startTimeMemo = new Map<string, boolean>();
+
+  // Guard B: a reboot is a one-shot fact for this invocation — derive it once. An
+  // ABSENT boot-epoch (pre-durable manifest) fails open: no derivation, no guard.
+  const storedBoot = parsed.manifest.boot_epoch_ms;
+  const rebooted =
+    storedBoot !== undefined &&
+    Math.abs(
+      (deps.bootEpochMs !== undefined
+        ? deps.bootEpochMs()
+        : readBootEpochMs(deps.now)) - storedBoot,
+    ) > BOOT_EPOCH_TOLERANCE_MS;
 
   for (;;) {
-    const evals = members.map((m) => evaluateLeg(m, deps, waitStartMs));
+    const evals = members.map((m) =>
+      evaluateLeg(m, deps, waitStartMs, startTimeMemo),
+    );
+    if (rebooted) {
+      // Every pre-reboot pid is dead → a still-"running" leg can never finish.
+      // Turn it terminal-failed with a distinct reason; a leg that already wrote a
+      // result keeps its real (pre-reboot) verdict. Return promptly, no spin.
+      const rebootEvals = evals.map((e) =>
+        e.status === "running"
+          ? {
+              status: "fail" as const,
+              yaml: null,
+              reason: "machine-rebooted",
+            }
+          : e,
+      );
+      deps.write(
+        `${JSON.stringify(buildVerdict(dir, members, rebootEvals))}\n`,
+      );
+      return 0;
+    }
     if (evals.every((e) => e.status !== "running")) {
       deps.write(`${JSON.stringify(buildVerdict(dir, members, evals))}\n`);
       return 0;
@@ -1273,9 +1479,11 @@ export function panelStatus(args: PanelStatusArgs, deps: PanelDeps): number {
   return 0;
 }
 
-/** True iff ANY of a run dir's manifest legs has a live pid. A running detached
- *  leg is lock-free, so this pid probe — not the advisory lock — is what protects
- *  a live run from `prune`. A missing/corrupt manifest proves no live leg. */
+/** True iff ANY of a run dir's manifest legs has a live pid that is STILL the
+ *  process it launched ({@link legIdentityHolds} — a recycled pid must not veto
+ *  `prune`). A running detached leg is lock-free, so this pid probe — not the
+ *  advisory lock — is what protects a live run from `prune`. A missing/corrupt
+ *  manifest proves no live leg. */
 function hasLiveLeg(slugDir: string, deps: PanelDeps): boolean {
   let raw: unknown;
   try {
@@ -1292,7 +1500,7 @@ function hasLiveLeg(slugDir: string, deps: PanelDeps): boolean {
       continue;
     }
     const pid = readPid(m.pidfile);
-    if (pid !== null && deps.pidAlive(pid)) {
+    if (pid !== null && deps.pidAlive(pid) && legIdentityHolds(m, pid, deps)) {
       return true;
     }
   }
@@ -1448,8 +1656,10 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Build the production deps: real spawn (detached + unref'd), wall clock,
- *  `Bun.sleep`, the pid probe, the per-slug advisory lock ({@link FileLock}), the
- *  real registry loader, and the resolved launcher transport. */
+ *  `Bun.sleep`, the pid probe, the sleep-proof boot-epoch + live start-time
+ *  readers (the recycle + reboot guards), the per-slug advisory lock
+ *  ({@link FileLock}), the real registry loader, and the resolved launcher
+ *  transport. */
 export function buildPanelDeps(): PanelDeps {
   return {
     keeperBin: process.execPath,
@@ -1475,6 +1685,10 @@ export function buildPanelDeps(): PanelDeps {
     now: () => Date.now(),
     sleep: (ms) => Bun.sleep(ms),
     pidAlive,
+    readStartTime: readPanelStartTime,
+    // Sleep-proof, kernel-derived boot instant — start + wait share it so a mid-run
+    // sleep never false-trips the reboot guard.
+    bootEpochMs: () => readBootEpochMs(() => Date.now()),
     // Non-blocking per-slug lock (flock/CLOEXEC — a detached leg never inherits it).
     lock: (lockPath) => FileLock.tryAcquire(lockPath),
     write: (s) => process.stdout.write(s),

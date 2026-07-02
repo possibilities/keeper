@@ -998,7 +998,7 @@ describe("parseManifest (durable fields)", () => {
     expect(r.ok).toBe(false);
   });
 
-  test("tolerates an absent boot-epoch (pre-durable manifest) → defaults 0 / gen 1 / launched_at null", () => {
+  test("tolerates an absent boot-epoch (pre-durable manifest) → boot_epoch_ms undefined (NOT 0) / gen 1 / launched_at null", () => {
     const r = parseManifest({
       dir: "/d",
       slug: "run-x",
@@ -1008,9 +1008,49 @@ describe("parseManifest (durable fields)", () => {
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.manifest.boot_epoch_ms).toBe(0);
+    // Absence is preserved as undefined (never coerced to 0) so `wait`'s reboot
+    // guard fails OPEN on a pre-durable manifest instead of reading 0 as a reboot.
+    expect(r.manifest.boot_epoch_ms).toBeUndefined();
     expect(r.manifest.generation).toBe(1);
     expect(r.manifest.members[0]?.launched_at).toBeNull();
+  });
+
+  test("threads a per-leg startfile when present; tolerates its absence (→ null)", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      members: [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: "/d/x.yaml",
+          pidfile: "/d/x.pidfile",
+          startfile: "/d/x.starttime",
+        },
+        { name: "y", harness: "claude", yaml: "/d/y.yaml", pidfile: null },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.manifest.members[0]?.startfile).toBe("/d/x.starttime");
+    expect(r.manifest.members[1]?.startfile).toBeNull();
+  });
+
+  test("rejects a malformed per-leg startfile (present but not a string)", () => {
+    const r = parseManifest({
+      dir: "/d",
+      slug: "run-x",
+      members: [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: "/d/x.yaml",
+          pidfile: null,
+          startfile: 42,
+        },
+      ],
+    });
+    expect(r.ok).toBe(false);
   });
 });
 
@@ -1071,6 +1111,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 function makeProbeDeps(opts: {
   now: number;
   alive?: (pid: number) => boolean;
+  readStartTime?: PanelDeps["readStartTime"];
   lock?: PanelDeps["lock"];
 }): { deps: PanelDeps; out: string[]; err: string[] } {
   const out: string[] = [];
@@ -1088,6 +1129,9 @@ function makeProbeDeps(opts: {
     now: () => opts.now,
     sleep: async () => {},
     pidAlive: opts.alive ?? (() => false),
+    // Fork-free default (the recycle guard degrades to bare liveness); a recycle
+    // test injects a probe that mismatches the seeded startfile.
+    readStartTime: opts.readStartTime ?? (() => null),
     lock: opts.lock,
     write: (s) => {
       out.push(s);
@@ -1255,6 +1299,41 @@ describe("panelStatus (launched_at grace, no false running)", () => {
     expect(panelStatus({ dir: join(dir, "no-such") }, deps)).toBe(2);
     expect(err.join("")).toContain("cannot read manifest");
   });
+
+  test("recycle guard: a live pid with a mismatched start-time reads failed, never running", () => {
+    const pdir = mkdtempSync(join(dir, "status-recycle-"));
+    const NOW = 1_000_000;
+    writeFileSync(
+      join(pdir, "manifest.json"),
+      JSON.stringify({
+        dir: pdir,
+        slug: "recycle-run",
+        generation: 1,
+        members: [
+          {
+            name: "live",
+            harness: "claude",
+            yaml: join(pdir, "live.yaml"),
+            pidfile: join(pdir, "live.pid"),
+            startfile: join(pdir, "live.starttime"),
+            launched_at: NOW - 10_000, // well past the grace
+          },
+        ],
+      }),
+    );
+    writeFileSync(join(pdir, "live.pid"), "111\n");
+    writeFileSync(join(pdir, "live.starttime"), "STORED    \n");
+    const { deps, out } = makeProbeDeps({
+      now: NOW,
+      alive: (pid) => pid === 111, // kill(pid,0) says alive...
+      readStartTime: (pid) => (pid === 111 ? "RECYCLED" : null), // ...a different proc
+    });
+    expect(panelStatus({ dir: pdir }, deps)).toBe(0);
+    const snap: PanelStatus = JSON.parse(out.join("").trim());
+    // A recycled pid past grace reads failed — never a phantom running.
+    expect(snap.members[0]?.status).toBe("failed");
+    expect(snap.all_terminal).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1404,6 +1483,37 @@ describe("panelPrune (lock-free AND pid-dead AND past TTL)", () => {
     const res: PanelPruneResult = JSON.parse(out.join("").trim());
     expect(res.kept).toContain("live-run");
     expect(res.pruned).not.toContain("live-run");
+  });
+
+  test("prune veto: a recycled leg pid (start-time drift) no longer keeps a dir alive", () => {
+    const root = join(dir, "keeper-state", "panels");
+    const d = join(root, "recycled-run");
+    seedRunDir(
+      d,
+      "recycled-run",
+      [
+        {
+          name: "x",
+          harness: "codex",
+          yaml: join(d, "x.yaml"),
+          pidfile: join(d, "x.pid"),
+          startfile: join(d, "x.starttime"),
+        },
+      ],
+      { pids: { [join(d, "x.pid")]: "111" } },
+    );
+    writeFileSync(join(d, "x.starttime"), "STORED    \n");
+    const { deps, out } = makeProbeDeps({
+      now: Date.now() + 10 * DAY_MS,
+      alive: (pid) => pid === 111, // kill(pid,0) says alive...
+      readStartTime: (pid) => (pid === 111 ? "RECYCLED" : null), // ...but recycled
+    });
+    panelPrune({ ttlMs: 1000 }, deps);
+    // The recycled pid is not a live leg → the aged-out dir is reclaimed.
+    expect(existsSync(d)).toBe(false);
+    const res: PanelPruneResult = JSON.parse(out.join("").trim());
+    expect(res.pruned).toContain("recycled-run");
+    expect(res.kept).not.toContain("recycled-run");
   });
 
   test("a lock-held dir (start/reconcile mid-flight) is skipped", () => {
