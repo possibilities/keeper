@@ -40,5 +40,5 @@ Unit-test the pure planner: suite order, cwd per suite, env scrub/inject per var
 - [ ] CLAUDE.md sentence revised in place (lint green); README + plan README edits land; full fast suite green
 
 ## Done summary
-
+Added scripts/test-full.ts: a serial four-suite gate (root, plan, python, prompt) with a pure suite-plan builder (order, cwd, env scrub/inject, timeouts, verdict classification) unit-tested in-process, plus package.json test:full / test:full:slow scripts and the CLAUDE.md/README/plan-README doc updates. Live proof: both variants run and aggregate correctly; the gate surfaced pre-existing plan/prompt (and slow-root real-spawn) failures unrelated to this task.
 ## Evidence
