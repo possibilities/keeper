@@ -16,6 +16,9 @@ repo_plist="${repo_root}/plist/arthack.keeperd.plist"
 live_plist="${HOME}/Library/LaunchAgents/arthack.keeperd.plist"
 service="gui/$(id -u)/arthack.keeperd"
 domain="gui/$(id -u)"
+repo_logrotate_plist="${repo_root}/plist/arthack.keeperd.logrotate.plist"
+live_logrotate_plist="${HOME}/Library/LaunchAgents/arthack.keeperd.logrotate.plist"
+logrotate_service="gui/$(id -u)/arthack.keeperd.logrotate"
 
 # Serialize concurrent runs. CI can queue two green builds; a second concurrent
 # invocation exits 0 (a no-op, never a build failure) rather than racing the
@@ -104,6 +107,41 @@ else
     printf '%s\n' "${current_sha}" >"${fingerprint_file}"
   fi
   echo "install: keeperd reloaded and loaded"
+fi
+
+# 4. Rotation sidecar LaunchAgent. A plist-only agent (its ProgramArguments run
+#    /bin/sh, never keeper code) so there is NO source fingerprint to track — the
+#    gate is content + loaded-state only: reload when the live plist differs from
+#    the repo copy, or matches but is not registered. RunAtLoad=false, so nothing
+#    fires at install time; the weekly `kickstart -k` restarts keeperd, which is
+#    safe by design (autopilot resumes its durable paused state; lanes re-derive).
+#    Same bootout(||true)/enable/bootstrap + bounded-retry discipline as the main
+#    reload above, so a rerun is a clean no-op once loaded.
+if cmp -s "${repo_logrotate_plist}" "${live_logrotate_plist}" \
+  && launchctl print "${logrotate_service}" >/dev/null 2>&1; then
+  echo "install: logrotate sidecar unchanged and loaded; no reload"
+else
+  echo "install: logrotate sidecar changed or not loaded; relink + reload"
+  mkdir -p "${HOME}/Library/LaunchAgents"
+  ln -sfn "${repo_logrotate_plist}" "${live_logrotate_plist}"
+  launchctl bootout "${logrotate_service}" 2>/dev/null || true
+  launchctl enable "${logrotate_service}"
+  logrotate_reloaded=0
+  for attempt in 1 2 3 4 5; do
+    if launchctl bootstrap "${domain}" "${live_logrotate_plist}" 2>/dev/null; then
+      logrotate_reloaded=1
+      break
+    fi
+    echo "install: logrotate bootstrap attempt ${attempt} did not settle; retrying" >&2
+    sleep 1
+  done
+  if [ "${logrotate_reloaded}" -ne 1 ] \
+    || ! launchctl print "${logrotate_service}" >/dev/null 2>&1; then
+    echo "install: logrotate sidecar failed to load after reload; recover with" >&2
+    echo "  launchctl bootstrap ${domain} ${live_logrotate_plist}" >&2
+    exit 1
+  fi
+  echo "install: logrotate sidecar reloaded and loaded"
 fi
 
 echo "install: done"

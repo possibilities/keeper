@@ -628,13 +628,9 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    normal runtime growth is now bounded by the rare `[server-worker]` error
    class plus the weekly rotation sidecar (next step).
 
-5. **Install the rotation sidecar** so `server.stderr` doesn't grow unbounded
-   over weeks even with `KEEPER_TRACE_SERVER=0`:
-
-   ```sh
-   cp plist/arthack.keeperd.logrotate.plist ~/Library/LaunchAgents/
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
-   ```
+5. **Rotation sidecar** — `scripts/install.sh` loads it idempotently (no manual
+   step), so `server.stderr` doesn't grow unbounded over weeks even with
+   `KEEPER_TRACE_SERVER=0`.
 
    The sidecar is a user-LaunchAgent that runs Sunday 04:00 weekly,
    `truncate`s `server.stderr`, and `launchctl kickstart`s the daemon so the

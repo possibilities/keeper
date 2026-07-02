@@ -787,6 +787,41 @@ function freelistPageCount(db: Database): number {
 }
 
 /**
+ * Bytes sitting on the freelist — {@link freelistPageCount} pages × the DB page
+ * size. This is disk the file already occupies that only a full offline
+ * `keeper reclaim` (VACUUM INTO) returns to the filesystem; body-NULLing feeds
+ * this pool but the per-batch `incremental_vacuum` trims only the file tail (and
+ * is a no-op unless the DB was born `auto_vacuum=INCREMENTAL`). Exported for the
+ * daemon's step-latched reclaimable-space log.
+ */
+export function reclaimableFreelistBytes(db: Database): number {
+  const row = db.query("PRAGMA page_size").get() as {
+    page_size?: number;
+  } | null;
+  return freelistPageCount(db) * (row?.page_size ?? 0);
+}
+
+/** Step size (bytes) for the reclaimable-freelist observability log. */
+export const RECLAIMABLE_LOG_STEP_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Step-latch decision for the reclaimable-freelist log. Pure: given the current
+ * reclaimable byte pool and the last-logged step index, returns whether to emit a
+ * line now and the step index to latch next. Logs ONLY on a fresh upward step
+ * crossing — an unconditional per-pass line would grow the very server.stderr this
+ * bounds. The returned step lowers when the pool drains (a reclaim), so the caller
+ * that latches it lets a later regrowth re-log.
+ */
+export function reclaimableLogStep(
+  reclaimableBytes: number,
+  lastLoggedStep: number,
+  stepBytes: number = RECLAIMABLE_LOG_STEP_BYTES,
+): { shouldLog: boolean; step: number } {
+  const step = Math.floor(Math.max(0, reclaimableBytes) / stepBytes);
+  return { shouldLog: step > lastLoggedStep, step };
+}
+
+/**
  * Count KEEP-SET bodies that went missing — genuine data loss, NOT legitimate
  * retention. Post-shed (fn-836.4) there is no `event_blobs` side table: a body
  * is either inline in `events.data` or intentionally NULLed by retention. NULLing

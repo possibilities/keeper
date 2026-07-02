@@ -32,9 +32,12 @@ import {
   deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
   drainColdPayloads,
+  RECLAIMABLE_LOG_STEP_BYTES,
   RETENTION_KEEP_CLASS_PREDICATE,
   RETENTION_SHED_PREDICATE,
   readFoldCursor,
+  reclaimableFreelistBytes,
+  reclaimableLogStep,
   retainColdPayloads,
 } from "../src/compaction";
 import { drain } from "../src/reducer";
@@ -1096,4 +1099,77 @@ test("DEFENSIVE: the keep guard dominates even a hypothetical delete predicate t
   expect(
     db.query("SELECT id FROM events WHERE id = ?").get(topoId),
   ).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// reclaimableFreelistBytes / reclaimableLogStep (fn-1051) — the reclaimable-space
+// observability surface: freelist pages × page size, and the step-latch that logs
+// the pool only on a fresh upward 100MB crossing.
+// ---------------------------------------------------------------------------
+
+test("reclaimableFreelistBytes tracks freelist pages × page size and grows with stranded pages", () => {
+  // The mem template DB is NOT auto_vacuum, so deleted rows strand pages on the
+  // freelist rather than trimming the file tail — exactly the pool a full offline
+  // reclaim would recover.
+  const pageSize = (db.query("PRAGMA page_size").get() as { page_size: number })
+    .page_size;
+  const freelistPages = () =>
+    (db.query("PRAGMA freelist_count").get() as { freelist_count: number })
+      .freelist_count;
+
+  // Invariant holds at the starting point, whatever the template's baseline.
+  expect(reclaimableFreelistBytes(db)).toBe(freelistPages() * pageSize);
+  const before = reclaimableFreelistBytes(db);
+
+  // Grow then delete enough rows to strand more freelist pages.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 200; i++) {
+    insertMutation(`/repo/churn${i}.ts`);
+  }
+  db.run("DELETE FROM events");
+
+  expect(freelistPages()).toBeGreaterThan(0);
+  expect(reclaimableFreelistBytes(db)).toBe(freelistPages() * pageSize);
+  expect(reclaimableFreelistBytes(db)).toBeGreaterThan(before);
+});
+
+test("reclaimableLogStep logs only on a fresh upward step crossing", () => {
+  const step = RECLAIMABLE_LOG_STEP_BYTES;
+
+  // Below the first step from a zero latch: nothing to log.
+  expect(reclaimableLogStep(step - 1, 0)).toEqual({
+    shouldLog: false,
+    step: 0,
+  });
+
+  // First crossing into step 1 logs.
+  expect(reclaimableLogStep(step, 0)).toEqual({ shouldLog: true, step: 1 });
+
+  // Still inside step 1 after latching 1: no re-log.
+  expect(reclaimableLogStep(step + step / 2, 1)).toEqual({
+    shouldLog: false,
+    step: 1,
+  });
+
+  // Growing into step 2 re-logs.
+  expect(reclaimableLogStep(2 * step, 1)).toEqual({ shouldLog: true, step: 2 });
+});
+
+test("reclaimableLogStep re-logs after a drain lowers the latch and the pool regrows", () => {
+  const step = RECLAIMABLE_LOG_STEP_BYTES;
+
+  // Latched at step 3; a reclaim drains the pool near-empty. The returned step
+  // lowers so the caller latches 0 — no spurious log on the drain itself.
+  const drained = reclaimableLogStep(step / 10, 3);
+  expect(drained).toEqual({ shouldLog: false, step: 0 });
+
+  // Regrowth past a step boundary from the lowered latch logs again.
+  expect(reclaimableLogStep(step, drained.step)).toEqual({
+    shouldLog: true,
+    step: 1,
+  });
+});
+
+test("reclaimableLogStep clamps negative input to step 0", () => {
+  expect(reclaimableLogStep(-1, 0)).toEqual({ shouldLog: false, step: 0 });
 });

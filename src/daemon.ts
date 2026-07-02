@@ -53,6 +53,8 @@ import {
   DEFAULT_RETENTION_MAX_BATCHES,
   deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
+  reclaimableFreelistBytes,
+  reclaimableLogStep,
   retainColdPayloads,
 } from "./compaction";
 import {
@@ -5759,6 +5761,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // byte-identical. The shed predicate (`src/compaction.ts`) never strips a body
   // the fold still needs (it excludes any row still owing a `mutation_path`
   // backfill).
+  //
+  // Reclaimable-space observability (fn-1051): body-NULLing feeds pages to the
+  // freelist that only an offline `keeper reclaim` returns to the filesystem. The
+  // step-latch below emits the pool size ONLY on a fresh 100MB step crossing — an
+  // unconditional per-pass line would grow the very server.stderr this epic bounds.
+  let lastLoggedReclaimStep = 0;
   function runRetentionPass(): void {
     if (shuttingDown) return;
     let shed = 0;
@@ -5859,6 +5867,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } catch (err) {
         console.error(
           `[keeperd] retention PASSIVE checkpoint threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      // Reclaimable-space observability: only a pass that moved bytes can have
+      // grown the freelist, so probe it here. Log ONLY on a fresh upward 100MB
+      // step and name the remedy; the latch lowers with the pool so a later
+      // regrowth re-logs. A cheap pragma probe — fail-open on a read throw.
+      try {
+        const reclaimable = reclaimableFreelistBytes(db);
+        const { shouldLog, step } = reclaimableLogStep(
+          reclaimable,
+          lastLoggedReclaimStep,
+        );
+        if (shouldLog) {
+          console.error(
+            `[keeperd] retention: ~${Math.floor(
+              reclaimable / (1024 * 1024),
+            )}MB reclaimable on the freelist; run offline \`keeper reclaim\` to return it to the filesystem`,
+          );
+        }
+        lastLoggedReclaimStep = step;
+      } catch (err) {
+        console.error(
+          `[keeperd] retention reclaimable-space probe threw (non-fatal): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
