@@ -22,6 +22,7 @@ import {
   drain,
   warmGitAttribMemo,
 } from "../src/reducer";
+import { __resetSubagentPreParseMemoForTest } from "../src/subagent-invocations";
 import type { Event } from "../src/types";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
@@ -2124,6 +2125,156 @@ test("fn-892 incremental pass-1 memo: warm-cache fold equals a cold full rescan 
 
   // Byte-identical: the incremental append equals the full scan.
   expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+});
+
+test("fn-1052 SubagentStart parse cache: warm-cache folds equal a cold (reset + single-drain) rebuild byte-for-byte", () => {
+  // The SubagentStart FIFO bridge probe (`findPendingPreToolUseForStart`)
+  // memoizes each candidate blob's `JSON.parse` per event id in a per-`Database`
+  // WeakMap. This proves the WARM path (memo accumulated across several drains,
+  // each interleaving a fresh bridge round) reproduces the SAME
+  // `subagent_invocations` as a COLD rebuild (memo forced cold, one drain) over
+  // the identical log. Two permanently-unbound candidates (a malformed body and
+  // a non-matching subagent_type) stay in the anti-join result on every later
+  // SubagentStart, exercising the negative-cache path across folds.
+  const SESS = "sub-parse-cache-sess";
+  insertEvent({ hook_event: "SessionStart", session_id: SESS });
+  // Malformed body → cached negative; never binds.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-bad",
+    data: "{ not json",
+  });
+  // Non-matching subagent_type → parsed once, never matches "worker".
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-ghost",
+    data: JSON.stringify({
+      tool_input: { subagent_type: "ghost", description: "g", prompt: "gg" },
+    }),
+  });
+  drainAll();
+
+  function bridgeRound(n: number): void {
+    // A matching PreToolUse:Agent below the round's SubagentStart, then the
+    // SubagentStart that FIFO-binds it (its id ceiling includes this candidate,
+    // excludes any later round's).
+    insertEvent({
+      hook_event: "PreToolUse",
+      tool_name: "Agent",
+      session_id: SESS,
+      tool_use_id: `tu-${n}`,
+      data: JSON.stringify({
+        tool_input: {
+          subagent_type: "worker",
+          description: `d${n}`,
+          prompt: `prompt-${n}`,
+        },
+      }),
+    });
+    insertEvent({
+      hook_event: "SubagentStart",
+      session_id: SESS,
+      agent_id: `agent-${n}`,
+      agent_type: "worker",
+    });
+  }
+
+  // WARM path: drain after EACH round so the memo accumulates incrementally.
+  for (let n = 0; n < 3; n++) {
+    bridgeRound(n);
+    drainAll();
+  }
+  const warm = db
+    .query(
+      "SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq",
+    )
+    .all();
+  // Sanity: each round's SubagentStart lifted its matching candidate at start.
+  expect(warm.length).toBe(3);
+  expect(
+    (warm as Array<{ tool_use_id: string | null }>).map((r) => r.tool_use_id),
+  ).toEqual(["tu-0", "tu-1", "tu-2"]);
+
+  // COLD path: rewind the cursor + wipe the projection, FORCE the parse cache
+  // cold, then re-drain the whole log in one pass.
+  db.run("DELETE FROM subagent_invocations");
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetSubagentPreParseMemoForTest(db);
+  drainAll();
+  const cold = db
+    .query(
+      "SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq",
+    )
+    .all();
+
+  // Byte-identical: the warm parse cache equals a cold rebuild.
+  expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+});
+
+test("fn-1052 SubagentStart id ceiling: a SubagentStart does NOT bind a FUTURE PreToolUse:Agent (live-vs-refold divergence closed)", () => {
+  // The ONLY matching candidate is folded AFTER the SubagentStart (higher id).
+  // Because a test drain pre-inserts every row, WITHOUT the ceiling the
+  // SubagentStart fold would see the future PreToolUse:Agent and bind it — the
+  // exact latent divergence from live-fold semantics. WITH the ceiling
+  // (`id < currentEventId`) neither a live fold nor a re-fold at this id sees
+  // it, so the turn-0 row keeps its unbound seed.
+  const SESS = "sub-future-cand-sess";
+  insertEvent({ hook_event: "SessionStart", session_id: SESS });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS,
+    agent_id: "agent-fut",
+    agent_type: "scout",
+  });
+  // Future matching candidate (higher event id than the SubagentStart above).
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-future",
+    data: JSON.stringify({
+      tool_input: {
+        subagent_type: "scout",
+        description: "future",
+        prompt: "later",
+      },
+    }),
+  });
+  drainAll();
+  const row = db
+    .query(
+      "SELECT tool_use_id, description, prompt_chars, subagent_type FROM subagent_invocations WHERE agent_id = 'agent-fut'",
+    )
+    .get() as {
+    tool_use_id: string | null;
+    description: string | null;
+    prompt_chars: number;
+    subagent_type: string | null;
+  };
+  // Unbound seed preserved — the future candidate was ignored.
+  expect(row.tool_use_id).toBeNull();
+  expect(row.description).toBeNull();
+  expect(row.prompt_chars).toBe(0);
+  expect(row.subagent_type).toBe("scout");
+
+  // Re-fold determinism: rewind + wipe + re-drain reproduces the same unbound
+  // row (the ceiling makes both re-fold and live agree).
+  db.run("DELETE FROM subagent_invocations");
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetSubagentPreParseMemoForTest(db);
+  drainAll();
+  const refold = db
+    .query(
+      "SELECT tool_use_id FROM subagent_invocations WHERE agent_id = 'agent-fut'",
+    )
+    .get() as { tool_use_id: string | null };
+  expect(refold.tool_use_id).toBeNull();
 });
 
 test("fn-921 warmGitAttribMemo: pre-warming before the first fold yields the SAME file_attributions as lazy warm-on-first-fold", () => {

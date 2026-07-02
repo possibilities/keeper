@@ -429,6 +429,107 @@ export interface PendingPreToolUseRow {
 }
 
 /**
+ * Parsed-out fields of a candidate `PreToolUse:Agent` body — everything the
+ * FIFO bridge needs EXCEPT the `agentType` comparison (that is a per-call
+ * argument, never a property of the immutable row). `null` marks a blob that
+ * can NEVER match any `agentType`: malformed JSON, a non-object body, a
+ * missing/non-object `tool_input`, or a non-string `subagent_type`.
+ */
+interface ParsedPreToolUseAgent {
+  subagent_type: string;
+  description: string | null;
+  prompt_chars: number;
+}
+
+/**
+ * Per-`Database` parse cache for {@link findPendingPreToolUseForStart} (fn-1052).
+ *
+ * The measured SubagentStart fold cost (avg 2.6s / max 27.6s on the live DB)
+ * was the `JSON.parse` of EVERY still-unbound `PreToolUse:Agent` candidate in
+ * the session, re-paid on every SubagentStart — so per-event cost grew with the
+ * session's accumulated agent-call count. The anti-join SQL stays a LIVE query
+ * (exact by construction — it models PostToolUse:Agent re-binding / FIFO
+ * self-correction across three fold arms, which a materialized pending-set
+ * could not), while the parse of each candidate's `events.data` blob — the
+ * measured cost — is memoized here per EVENT ID. `PreToolUse:Agent` is
+ * retention keep-set (its body is never NULLed), so a row's `data` is immutable
+ * and its parse is stable forever — the cache keys on event id ALONE and needs
+ * no invalidation story.
+ *
+ * Watermark discipline (mirrors the `gitAttribMemos` malformed-row rule): a
+ * malformed / non-matching-shape blob is cached as `null`, so a
+ * permanently-malformed low-id candidate that never binds is parsed exactly
+ * ONCE — it never re-anchors the parse loop on later folds.
+ *
+ * PURE optimization: the match decision (`subagent_type === agentType`) stays
+ * LIVE per call; only the immutable parse is cached. Caching a match DECISION
+ * would smuggle the mutable per-call `agentType` into the fold. So a cold
+ * rebuild on a fresh connection reproduces byte-identical bridge assignments.
+ * Keyed by `Database` via a `WeakMap` so a dropped connection's cache is
+ * collected and a fresh-DB-per-test starts cold by construction. No boot-seed
+ * warmer: unlike `gitAttribMemos` (a whole-`events` scan hoisted out of the
+ * boot lock), this probe is already `session_id`-scoped, so a cold first fold
+ * touches only ONE session's tiny candidate set — there is no global-history
+ * scan to pre-warm, and each session lazily warms on its first SubagentStart.
+ */
+const subagentPreParseMemos = new WeakMap<
+  Database,
+  Map<number, ParsedPreToolUseAgent | null>
+>();
+
+/**
+ * Test-only: drop the per-`Database` PreToolUse:Agent parse cache so the NEXT
+ * {@link findPendingPreToolUseForStart} on this connection re-parses cold.
+ * Production never calls this — the WeakMap collects a dropped connection's
+ * cache on its own, and a fresh-DB-per-test is cold by construction. Exposed so
+ * a warm-vs-cold equivalence test can force a cold parse on a warmed connection.
+ */
+export function __resetSubagentPreParseMemoForTest(db: Database): void {
+  subagentPreParseMemos.delete(db);
+}
+
+/**
+ * Parse one `PreToolUse:Agent` `events.data` blob into the fields the FIFO
+ * bridge needs, or `null` when the blob can never match any `agentType`. NEVER
+ * throws — a malformed body folds to `null`, honoring the reducer's
+ * safe-default contract. Side-effect-free so its result caches by immutable
+ * event id.
+ */
+function parsePreToolUseAgentBlob(data: string): ParsedPreToolUseAgent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const toolInput = (parsed as { tool_input?: unknown }).tool_input;
+  if (typeof toolInput !== "object" || toolInput === null) {
+    return null;
+  }
+  const ti = toolInput as {
+    description?: unknown;
+    prompt?: unknown;
+    subagent_type?: unknown;
+  };
+  if (typeof ti.subagent_type !== "string") {
+    return null;
+  }
+  const description =
+    typeof ti.description === "string" && ti.description.length > 0
+      ? truncateDescription(ti.description)
+      : null;
+  const promptChars = typeof ti.prompt === "string" ? ti.prompt.length : 0;
+  return {
+    subagent_type: ti.subagent_type,
+    description,
+    prompt_chars: promptChars,
+  };
+}
+
+/**
  * Early FIFO bridge for the SubagentStart fold. Returns the earliest
  * `PreToolUse:Agent` event row in this session whose `tool_input.subagent_type`
  * matches the SubagentStart's `agent_type` AND whose `tool_use_id` has not yet
@@ -444,14 +545,24 @@ export interface PendingPreToolUseRow {
  * bridge runs in {@link findBridgePreToolUse} — the canonical overwrite still
  * wins, so steady-state rows match the no-early-bridge behavior.
  *
+ * `currentEventId` is the folding SubagentStart's own event id; the candidate
+ * scan is clamped `id < currentEventId` so it sees only PreToolUse:Agent rows
+ * that existed BEFORE this SubagentStart — exactly what the live fold saw.
+ * Without the ceiling a from-scratch re-fold (every row already present) — or
+ * even a live drain that ingested a batch ahead of the cursor — would bind a
+ * FUTURE candidate the live fold at this id never saw, a latent divergence.
+ *
  * Re-fold determinism: the lookup reads persisted-at-fold-time state only
- * (events rows ordered by id ASC, projection rows scoped to `job_id`). A
- * from-scratch re-fold replays events in id-order and reproduces the same
- * FIFO assignment byte-identically.
+ * (events rows below `currentEventId` ordered by id ASC, projection rows scoped
+ * to `job_id`). A from-scratch re-fold replays events in id-order and
+ * reproduces the same FIFO assignment byte-identically. The per-event-id parse
+ * cache ({@link subagentPreParseMemos}) is a pure optimization over immutable
+ * keep-set bodies, so a warm fold equals a cold rebuild.
  *
  * Returns `null` when:
  * - `agentType` is null / empty (no type to match on; conservative no-lift)
- * - no PreToolUse:Agent row in this session matches the type and is unbound
+ * - no PreToolUse:Agent row below `currentEventId` in this session matches the
+ *   type and is unbound
  * - every matching row has malformed `data` JSON (skipped per row)
  *
  * NEVER throws — the fold's safe-default contract holds.
@@ -460,6 +571,7 @@ export function findPendingPreToolUseForStart(
   db: Database,
   sessionId: string,
   agentType: string | null,
+  currentEventId: number,
 ): PendingPreToolUseRow | null {
   if (agentType == null || agentType.length === 0) {
     return null;
@@ -476,14 +588,19 @@ export function findPendingPreToolUseForStart(
   // keep-set, never shed). The WHERE (session_id, hook_event, tool_name,
   // tool_use_id) + the NOT EXISTS anti-join filter the same indexed scalar
   // columns, so idx_events_tool_use_id keeps covering the seek.
+  // fn-1052: the `e.id < ?` ceiling (a rowid range, intrinsic to the PK — it
+  // does not perturb the covering seek) clamps the candidate set to what the
+  // live fold saw at this SubagentStart. `e.id AS id` feeds the per-event-id
+  // parse cache below.
   const rows = db
     .prepare(
-      `SELECT e.tool_use_id, e.data AS data
+      `SELECT e.id AS id, e.tool_use_id, e.data AS data
          FROM events e
         WHERE e.session_id = ?
               AND e.hook_event = 'PreToolUse'
               AND e.tool_name = 'Agent'
               AND e.tool_use_id IS NOT NULL
+              AND e.id < ?
               AND NOT EXISTS (
                   SELECT 1 FROM subagent_invocations si
                    WHERE si.job_id = ?
@@ -491,41 +608,36 @@ export function findPendingPreToolUseForStart(
               )
         ORDER BY e.id ASC`,
     )
-    .all(sessionId, sessionId) as { tool_use_id: string; data: string }[];
+    .all(sessionId, currentEventId, sessionId) as {
+    id: number;
+    tool_use_id: string;
+    data: string;
+  }[];
+
+  // fn-1052: memoize the per-candidate `JSON.parse` (the measured fold cost) by
+  // immutable event id so an unbound candidate is parsed exactly ONCE across a
+  // session's SubagentStart folds, not re-parsed on every one.
+  let memo = subagentPreParseMemos.get(db);
+  if (memo == null) {
+    memo = new Map();
+    subagentPreParseMemos.set(db, memo);
+  }
 
   for (const row of rows) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(row.data);
-    } catch {
+    let parsed = memo.get(row.id);
+    if (parsed === undefined) {
+      parsed = parsePreToolUseAgentBlob(row.data);
+      memo.set(row.id, parsed);
+    }
+    // A cached `null` is a permanent negative (malformed / non-matching shape).
+    // The `subagent_type === agentType` decision stays LIVE per call — the
+    // per-call `agentType` is never baked into the cache.
+    if (parsed === null || parsed.subagent_type !== agentType) {
       continue;
     }
-    if (typeof parsed !== "object" || parsed === null) {
-      continue;
-    }
-    const toolInput = (parsed as { tool_input?: unknown }).tool_input;
-    if (typeof toolInput !== "object" || toolInput === null) {
-      continue;
-    }
-    const ti = toolInput as {
-      description?: unknown;
-      prompt?: unknown;
-      subagent_type?: unknown;
-    };
-    if (
-      typeof ti.subagent_type !== "string" ||
-      ti.subagent_type !== agentType
-    ) {
-      continue;
-    }
-    const description =
-      typeof ti.description === "string" && ti.description.length > 0
-        ? truncateDescription(ti.description)
-        : null;
-    const promptChars = typeof ti.prompt === "string" ? ti.prompt.length : 0;
     return {
-      description,
-      prompt_chars: promptChars,
+      description: parsed.description,
+      prompt_chars: parsed.prompt_chars,
       tool_use_id: row.tool_use_id,
     };
   }

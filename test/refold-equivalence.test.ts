@@ -69,7 +69,10 @@ import {
 } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { __resetMonitorProvenanceMemoForTest, drain } from "../src/reducer";
-import { resolveBridgeAgentId } from "../src/subagent-invocations";
+import {
+  __resetSubagentPreParseMemoForTest,
+  resolveBridgeAgentId,
+} from "../src/subagent-invocations";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -410,8 +413,8 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
     },
     {
       file: "src/subagent-invocations.ts",
-      needle: "SELECT e.tool_use_id, e.data AS data",
-      why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline",
+      needle: "SELECT e.id AS id, e.tool_use_id, e.data AS data",
+      why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline (fn-1052 adds e.id for the per-event-id parse cache)",
     },
     {
       file: "cli/search-history.ts",
@@ -515,7 +518,10 @@ function insertEvent(overrides: {
   agent_type?: string | null;
   plan_op?: string | null;
   plan_target?: string | null;
+  plan_epic_id?: string | null;
+  plan_subject_present?: number | null;
   plan_files?: string | null;
+  skill_name?: string | null;
   spawn_name?: string | null;
   worktree?: string | null;
 }): number {
@@ -546,8 +552,9 @@ function insertEvent(overrides: {
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
        subagent_agent_id, tool_use_id, agent_id, agent_type, plan_op,
-       plan_target, plan_files, spawn_name, mutation_path, worktree
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       plan_target, plan_epic_id, plan_subject_present, plan_files, skill_name,
+       spawn_name, mutation_path, worktree
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
@@ -563,7 +570,10 @@ function insertEvent(overrides: {
       overrides.agent_type ?? null,
       overrides.plan_op ?? null,
       overrides.plan_target ?? null,
+      overrides.plan_epic_id ?? null,
+      overrides.plan_subject_present ?? null,
       overrides.plan_files ?? null,
+      overrides.skill_name ?? null,
       overrides.spawn_name ?? null,
       mutationPath,
       overrides.worktree ?? null,
@@ -1041,6 +1051,76 @@ test("jobs.worktree: a worktree branch and a NULL serial fold deterministically 
   rewindAndWipeProjections();
   drainAll();
   expect(snapshotProjections().jobs).toEqual(liveJobs);
+});
+
+test("syncPlanLinks orphan bound: a cross-session orphan edge is byte-identical under incremental vs from-scratch re-fold", () => {
+  // The orphan path (a plan invocation whose session has no SessionStart) no
+  // longer runs the O(history×board) cross-session sweep (the 437s time-bomb) —
+  // it merges its OWN slice into the epic's stored job_links. Prove the
+  // deterministic-replayed `epics.job_links` re-folds byte-identically for the
+  // exact cross-session shape the sweep rebuilt: a normal creator + an orphan
+  // refiner on the SAME epic, with the normal session touching a LATER epic so a
+  // ceiling-less re-fold would read a FUTURE invocation at the orphan's last
+  // touch of the first epic. The INCLUSIVE `id <= eventId` ceiling closes that.
+  const EPIC = "fn-1052-orphan-refold";
+  const EPIC2 = "fn-1052-orphan-refold-b";
+  const ORPHAN = "11112222-3333-4444-5555-666677778888";
+  const opener = (sid: string) =>
+    insertEvent({
+      hook_event: "PreToolUse",
+      session_id: sid,
+      tool_name: "Skill",
+      skill_name: "plan:plan",
+    });
+  const planOp = (sid: string, op: string, epic: string) =>
+    insertEvent({
+      hook_event: "PostToolUse",
+      session_id: sid,
+      tool_name: "Bash",
+      plan_op: op,
+      plan_target: epic,
+      plan_epic_id: epic,
+      plan_subject_present: 1,
+    });
+  // INCREMENTAL live fold: drain after each event so every fold sees only
+  // `id <= itself` — the live-fold reality the ceiling reproduces on re-fold.
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_A });
+  drainAll();
+  opener(SESS_A);
+  planOp(SESS_A, "epic-create", EPIC);
+  drainAll();
+  // Orphan (no SessionStart) refines the same epic — its LAST touch.
+  opener(ORPHAN);
+  planOp(ORPHAN, "epic-set-title", EPIC);
+  drainAll();
+  // Normal session touches a LATER epic (future rows after the orphan's touch).
+  opener(SESS_A);
+  planOp(SESS_A, "epic-create", EPIC2);
+  drainAll();
+
+  const liveJobs = snapshotProjections().jobs;
+  const liveEpics = snapshotProjections().epics;
+  const jl = JSON.parse(
+    (
+      db.query("SELECT job_links FROM epics WHERE epic_id = ?").get(EPIC) as {
+        job_links: string;
+      }
+    ).job_links,
+  ) as Array<{ kind: string; job_id: string }>;
+  expect(jl.map((e) => ({ kind: e.kind, job_id: e.job_id }))).toEqual([
+    { kind: "creator", job_id: SESS_A },
+    { kind: "refiner", job_id: ORPHAN },
+  ]);
+  expect(
+    db.query("SELECT job_id FROM jobs WHERE job_id = ?").get(ORPHAN),
+  ).toBeNull();
+
+  // From-scratch re-fold with the WHOLE log present (each fold now sees the
+  // future rows) — the deterministic link projections must be byte-identical.
+  rewindAndWipeProjections();
+  drainAll();
+  expect(snapshotProjections().jobs).toEqual(liveJobs);
+  expect(snapshotProjections().epics).toEqual(liveEpics);
 });
 
 // ---------------------------------------------------------------------------
@@ -2027,6 +2107,94 @@ function rewindAndWipeWidened(): void {
   rewindAndWipeProjections();
   db.run("DELETE FROM scheduled_tasks");
 }
+
+// ---------------------------------------------------------------------------
+// fn-1052 — the SubagentStart FIFO bridge arm. The bridge probe
+// (`findPendingPreToolUseForStart`) now clamps candidates `id < currentEventId`
+// and memoizes each candidate's parse per event id. `PreToolUse:Agent` is
+// keep-set (its body survives any shed), so the bridge re-derives byte-identically
+// across re-folds — with the memo forced COLD on P1 and left WARM on P2, proving
+// the parse cache is a pure optimization. NOTE: this re-fold-vs-re-fold charter
+// cannot catch the live-vs-refold divergence the ceiling closes (both re-folds
+// apply the ceiling identically); that divergence is pinned in
+// reducer-lifecycle.test.ts. Here it pins re-fold DETERMINISM under the ceiling.
+// ---------------------------------------------------------------------------
+
+test("differential re-fold: SubagentStart FIFO bridge (fn-1052 parse cache + id ceiling) is byte-identical across re-folds; future candidate never binds", () => {
+  const SESS = "aaaaaaaa-1111-2222-3333-444444444444";
+  // A matching candidate BELOW its SubagentStart binds; a matching candidate
+  // ABOVE a later SubagentStart (future id) never does.
+  insertEvent({ hook_event: "SessionStart", session_id: SESS });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-below",
+    data: JSON.stringify({
+      tool_input: {
+        subagent_type: "worker",
+        description: "below",
+        prompt: "p",
+      },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS,
+    agent_id: "agent-a",
+    agent_type: "worker",
+  });
+  // agent-b folds BEFORE tu-future exists (lower id) → no unbound worker
+  // candidate below its ceiling → stays unbound.
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS,
+    agent_id: "agent-b",
+    agent_type: "worker",
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-future",
+    data: JSON.stringify({
+      tool_input: {
+        subagent_type: "worker",
+        description: "future",
+        prompt: "p",
+      },
+    }),
+  });
+
+  const snapSubs = () =>
+    db
+      .query(
+        "SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq",
+      )
+      .all();
+
+  drainAll();
+  const p0 = snapSubs() as Array<Record<string, unknown>>;
+  // agent-a lifted the below candidate; agent-b ignored the future one.
+  const a = p0.find((r) => r.agent_id === "agent-a");
+  const b = p0.find((r) => r.agent_id === "agent-b");
+  expect(a?.tool_use_id).toBe("tu-below");
+  expect(a?.description).toBe("below");
+  expect(b?.tool_use_id).toBeNull();
+
+  // P1 — cold rebuild (memo forced cold): byte-identical.
+  rewindAndWipeProjections();
+  __resetSubagentPreParseMemoForTest(db);
+  drainAll();
+  const p1 = snapSubs();
+  expect(p1).toEqual(p0);
+
+  // P2 — warm rebuild (memo left warm): still byte-identical.
+  rewindAndWipeProjections();
+  drainAll();
+  const p2 = snapSubs();
+  expect(p2).toEqual(p1);
+});
 
 // ---------------------------------------------------------------------------
 // fn-934 (task .5) — PHYSICAL ROW-DELETE of the no-op-arm snapshot classes.
