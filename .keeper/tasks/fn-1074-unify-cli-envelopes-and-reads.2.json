@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Migrate bare readers and control-RPC",
-  "updated_at": "2026-07-02T16:14:59.164000Z"
+  "updated_at": "2026-07-02T17:28:01.579000Z",
+  "worker_done_at": "2026-07-02T17:28:01.579000Z"
 }

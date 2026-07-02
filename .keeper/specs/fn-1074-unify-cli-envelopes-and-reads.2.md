@@ -38,5 +38,5 @@ quoted examples in the same commit.
 - [ ] plan epics carries the paging keys; show-session-files untouched
 
 ## Done summary
-
+Migrated the bare readers (show-job, search-history, find-file-history, show-session-events) and every autopilot control op onto the shared {schema_version, ok, error, data} envelope with converged error.{code,message,recovery} (String(e) eliminated); gave plan epics the {total,returned,truncated,hint} paging keys. Left session-state on its Python-parity snake_case shape (no String(e) defect; migrating it breaks the byte-pinned worker-prompt contract).
 ## Evidence
