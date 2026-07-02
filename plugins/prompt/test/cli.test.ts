@@ -8,8 +8,33 @@
 // call process.exit, so these drive main() with those globals captured (exit →
 // a tagged throw so the never-return branches stop).
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { main, positional } from "../src/cli.ts";
+
+// These probes drive real verb runners with no args purely to prove dispatch
+// wiring. Pin the corpus fallback at an empty tmpdir so a verb that resolves the
+// project root (build-snippets, render-plugin-templates, …) finds no corpus and
+// no-ops fast, instead of scanning whatever ambient corpus the dev box happens to
+// hold. Keeps the contract hermetic and quick.
+let corpusHome: string;
+const savedCorpusEnv = process.env.KEEPER_PROMPT_CORPUS_ROOT;
+
+beforeAll(() => {
+  corpusHome = mkdtempSync(join(tmpdir(), "kp-cli-corpus-"));
+  process.env.KEEPER_PROMPT_CORPUS_ROOT = corpusHome;
+});
+
+afterAll(() => {
+  rmSync(corpusHome, { recursive: true, force: true });
+  if (savedCorpusEnv === undefined) {
+    delete process.env.KEEPER_PROMPT_CORPUS_ROOT;
+  } else {
+    process.env.KEEPER_PROMPT_CORPUS_ROOT = savedCorpusEnv;
+  }
+});
 
 class ExitError extends Error {
   readonly code: number;
@@ -72,6 +97,7 @@ const KEEP_VERBS = [
   "save-bundle",
   "validate-bundles",
   "list-bundles",
+  "list-snippets",
   "show-bundle",
 ];
 
@@ -88,6 +114,7 @@ const PORTED_VERBS = new Set([
   "save-bundle",
   "validate-bundles",
   "list-bundles",
+  "list-snippets",
   "show-bundle",
 ]);
 const STUB_VERBS = KEEP_VERBS.filter((v) => !PORTED_VERBS.has(v));

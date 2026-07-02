@@ -1,0 +1,13 @@
+{#-
+name: build-forward-no-fallback
+summary: Build forward — migrate and delete old code, no backwards-compat shims; no fallback paths, fail visibly.
+domain: engineering
+audience: agent
+severity: default
+tags: [engineering, migration, error-handling, fail-fast]
+scope: [any]
+phase: [planning, executing, reviewing]
+-#}
+**Build forward, never backward.** Migrate data and delete old code — no backwards-compat shims, aliases, or translation layers. In a single-owner codebase, change the code and update all call sites.
+
+**No fallback code paths** or "just in case" error recovery unless explicitly asked for. Fail visibly — don't swallow errors or silently degrade. When resilience matters the human will say so; when unsure, stop and ask.

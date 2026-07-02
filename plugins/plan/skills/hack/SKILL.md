@@ -49,7 +49,7 @@ Mode-specific moves:
 
 ### Session history (keeper.db)
 
-<!-- Canonical source: keeper prompt render engineering/keeper-history-forensics -->
+<!-- BAKE:BEGIN keeper prompt render engineering/keeper-history-forensics -->
 
 Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Reach for the read-only `keeper` JSON subcommands below first — they emit a parseable envelope and stay stable across schema shifts; drop to `sqlite3 -readonly` only for an ad-hoc column they don't surface (the daemon is the sole writer — never open the DB read-write).
 
@@ -80,6 +80,8 @@ keeper show-job --session <title>   # the full jobs-projection row (auto-detects
 ```
 
 `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.
+
+<!-- BAKE:END keeper prompt render engineering/keeper-history-forensics -->
 
 ## Prefer the panel for any non-tiny inquiry
 
@@ -112,13 +114,15 @@ A confident "I don't know yet, here's what I've ruled out" is more useful than a
 
 Output conventions, not a mode — they apply whenever a request produces a file artifact (most often a report or research writeup).
 
-<!-- Canonical source: keeper prompt render source-dirs/docs-dir-and-gist-open -->
+<!-- BAKE:BEGIN keeper prompt render source-dirs/docs-dir-and-gist-open -->
 
 When a request asks you to create a document — a writeup, report, brief, or research summary meant to persist as a file — write it under `~/docs/`. A single doc is `~/docs/<name>.md`; a related set gets its own `~/docs/<topic-slug>/` directory. Don't scatter docs into the repo or `/tmp` unless the human names another location.
 
 Every doc carries a companion `~/docs/<name>.yaml` sidecar. Document metadata lives ONLY in that sidecar — never embed a metadata block in the `.md` body.
 
 When the human then asks to "open it" (or "open that doc"), that always means publish both files as a GitHub gist and open it in the browser — `gh gist create <doc>.md <doc>.yaml --web` (markdown first, sidecar second). "Open" is publish-and-view, never a local file open.
+
+<!-- BAKE:END keeper prompt render source-dirs/docs-dir-and-gist-open -->
 
 ### Sketch block (work-shaped, above inline)
 
@@ -152,7 +156,7 @@ Inference rubric:
 - Answer was terse and the human will likely want depth → **→ stay in inquiry** lead, with a specific next action.
 - The answer is work-shaped → size it against the rubric below to pick between inline, sketch-then-route, and `/plan:plan`.
 
-<!-- Canonical source: keeper prompt render engineering/escalate-inline-or-plan -->
+<!-- BAKE:BEGIN keeper prompt render engineering/escalate-inline-or-plan -->
 
 When a request reads as work to do, size it against this rubric before choosing how to act. The same clauses gate both the answer shape and where the work lands.
 
@@ -164,6 +168,8 @@ Tie-breakers:
 
 - Ambiguous between **inline** and **`/plan:plan`** → default to **`/plan:plan`**. Collapsing a plan back into one commit is cheaper than backing out of a premature commit.
 - Ambiguous between **inline** and **`/plan:defer`** → default to **`/plan:defer`**. Capturing it for later is cheaper than an unwanted commit landing now.
+
+<!-- BAKE:END keeper prompt render engineering/escalate-inline-or-plan -->
 
 When the answer is work-shaped and above inline size, lead with **→ produce a sketch in chat**, then route on the human's followup signal:
 
@@ -239,7 +245,7 @@ The one carve-out: commit messages and changelogs are the sanctioned home for hi
 
 **Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The carve-outs at the bottom of the rule below (human-flagged throwaway / debug instrumentation) are the only reasons to skip — and if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
 
-<!-- Canonical source: keeper prompt render engineering/commit-via-keeper-default -->
+<!-- BAKE:BEGIN keeper prompt render engineering/commit-via-keeper-default -->
 
 **Commit source changes with `keeper commit-work`, not raw `git commit`.** `commit-work` runs the project's full lint matrix (ruff + ruff format + ty + cli-boundaries when Python is staged; npm lint per JS/TS package; shellcheck / zig / lua / hadolint per relevant staged file) inside a per-host flock, lands the commit, and pushes to origin — all in one call. Don't invoke linters separately; `commit-work` is the single seam.
 
@@ -260,7 +266,7 @@ keeper commit-work "<type>(<scope>): <summary>
 
 **Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `keeper prompt render engineering/commit-hygiene-flags`.
 
-**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need. **A lint failure is never a coverage gap.** When the commit-work envelope reports `"error": "lint_failed"`, this fallback does not apply — the only permitted recovery is: fix the reported lint errors, re-stage with `git add`, and re-invoke `keeper commit-work` with the same message. Never bare `git commit` or `--no-verify` after a lint failure.
+**Escape hatch — when `commit-work` can't stage the file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), commit with plain `git`. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. **A lint failure is never a coverage gap.** When the envelope reports `"error": "lint_failed"`, this fallback does not apply — the only permitted recovery is: fix the reported lint errors, re-stage with `git add`, and re-invoke `keeper commit-work` with the same message. Never bare `git commit` or `--no-verify` after a lint failure.
 
 **The only times to skip `commit-work`:**
 
@@ -268,6 +274,8 @@ keeper commit-work "<type>(<scope>): <summary>
 - Debugging prints or temporary instrumentation you'll discard before continuing.
 
 In those cases, don't commit at all unless asked.
+
+<!-- BAKE:END keeper prompt render engineering/commit-via-keeper-default -->
 
 Phrasing pattern (lead + alternatives, ≤5 lines total):
 

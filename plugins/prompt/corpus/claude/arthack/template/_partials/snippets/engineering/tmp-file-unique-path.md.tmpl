@@ -1,0 +1,13 @@
+{#-
+name: tmp-file-unique-path
+summary: Tmp-file hygiene — agent-written tmp files get unique mktemp paths; stable names only when re-finding is the point, keyed by subject.
+domain: engineering
+audience: agent
+severity: default
+tags: [tmp, hygiene, mktemp, concurrency, collision]
+scope: [any]
+phase: [executing]
+related: [script-shebang-hygiene]
+-#}
+- Any tmp file an agent writes gets a unique path — mint it with `mktemp` (e.g. `tmpfile=$(mktemp -t scaffold)`) and write there. Never a hardcoded fixed name two concurrent runs would clobber.
+- A *stable* name is acceptable only when re-finding the file later is the point (e.g. a receipt a re-run reads back), and even then key it on a unique subject id — never an unkeyed constant.

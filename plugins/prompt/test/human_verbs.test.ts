@@ -14,6 +14,7 @@ import { z } from "zod";
 import { parseBundle, zodErrorMessage } from "../src/bundle_schema.ts";
 import { findSnippets } from "../src/find_snippets.ts";
 import { listBundles } from "../src/list_bundles.ts";
+import { listSnippets } from "../src/list_snippets.ts";
 import { saveBundle } from "../src/save_bundle.ts";
 import { saveSnippet } from "../src/save_snippet.ts";
 import { ShowBundleError, showBundle } from "../src/show_bundle.ts";
@@ -156,6 +157,56 @@ describe("find-snippets", () => {
   test("zero-score hits are dropped", () => {
     const results = findSnippets("nonexistentqueryterm", root, {});
     expect(results).toEqual([]);
+  });
+});
+
+describe("list-snippets (unranked enumeration)", () => {
+  beforeEach(() => {
+    saveSnippet(root, {
+      name: "beta",
+      domain: "cli",
+      summary: "b",
+      body: "bb",
+    });
+    saveSnippet(root, {
+      name: "alpha",
+      domain: "cli",
+      summary: "a",
+      body: "aa",
+    });
+    saveSnippet(root, {
+      name: "gamma",
+      domain: "web",
+      summary: "g",
+      body: "gg",
+    });
+  });
+
+  test("enumerates every snippet, no query needed, sorted by domain then name", () => {
+    const rows = listSnippets(root);
+    expect(rows.map((r) => `${r.domain}/${r.name}`)).toEqual([
+      "cli/alpha",
+      "cli/beta",
+      "web/gamma",
+    ]);
+  });
+
+  test("--domain scopes the enumeration", () => {
+    const rows = listSnippets(root, "web");
+    expect(rows.map((r) => r.name)).toEqual(["gamma"]);
+  });
+
+  test("empty corpus enumerates to nothing", () => {
+    const empty = mkdtempSync(join(tmpdir(), "kp-empty-"));
+    mkdirSync(
+      join(empty, "claude", "arthack", "template", "_partials", "snippets"),
+      { recursive: true },
+    );
+    try {
+      expect(listSnippets(empty)).toEqual([]);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
   });
 });
 

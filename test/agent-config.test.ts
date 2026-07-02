@@ -6,17 +6,29 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
+  DEFAULT_PLUGINS_YAML,
+  ensureDefaultPluginConfig,
   keeperConfigDir,
   loadPanelSelections,
   loadPluginSources,
   loadPresetCatalog,
   type PresetCatalog,
   panelConfigPath,
+  pluginConfigEntryExists,
   presetsCatalogPath,
   resolvePreset,
 } from "../src/agent/config";
@@ -470,5 +482,46 @@ describe("loadPluginSources", () => {
   test("an empty-string entry is fail-loud", () => {
     const p = writeYaml("plugins.yaml", 'plugin_dirs:\n  - ""\n');
     expect(() => loadPluginSources(p)).toThrow(/non-empty/);
+  });
+});
+
+describe("ensureDefaultPluginConfig (the install.sh write seam)", () => {
+  test("the shipped default is keeper's two plugins and no scan dirs", () => {
+    const p = writeYaml("plugins.yaml", DEFAULT_PLUGINS_YAML);
+    const sources = loadPluginSources(p);
+    expect(sources.pluginScanDirs).toEqual([]);
+    expect(sources.pluginDirs).toHaveLength(2);
+    expect(sources.pluginDirs[0]?.endsWith("/plugins/keeper")).toBe(true);
+    expect(sources.pluginDirs[1]?.endsWith("/plugins/plan")).toBe(true);
+    // The default declares no scan dirs — a fresh machine needs no arthack tree.
+    expect(DEFAULT_PLUGINS_YAML).not.toContain("plugin_scan_dirs");
+  });
+
+  test("absent → writes the default and creates the parent dir", () => {
+    const p = join(tmpDir, "nested", "keeper", "plugins.yaml");
+    expect(pluginConfigEntryExists(p)).toBe(false);
+    expect(ensureDefaultPluginConfig(p)).toBe("written");
+    expect(readFileSync(p, "utf8")).toBe(DEFAULT_PLUGINS_YAML);
+  });
+
+  test("an existing file is left byte-untouched", () => {
+    const sentinel = "plugin_dirs:\n  - ~/mine\n";
+    const p = writeYaml("plugins.yaml", sentinel);
+    expect(pluginConfigEntryExists(p)).toBe(true);
+    expect(ensureDefaultPluginConfig(p)).toBe("exists");
+    expect(readFileSync(p, "utf8")).toBe(sentinel);
+  });
+
+  test("a dangling symlink counts as present and is never clobbered", () => {
+    const link = join(tmpDir, "plugins.yaml");
+    const target = join(tmpDir, "gone.yaml");
+    symlinkSync(target, link);
+    // lstat-based presence: the target does not exist, yet the pointer does.
+    expect(existsSync(target)).toBe(false);
+    expect(pluginConfigEntryExists(link)).toBe(true);
+    expect(ensureDefaultPluginConfig(link)).toBe("exists");
+    // The symlink is intact and no file was written through it.
+    expect(readlinkSync(link)).toBe(target);
+    expect(existsSync(target)).toBe(false);
   });
 });

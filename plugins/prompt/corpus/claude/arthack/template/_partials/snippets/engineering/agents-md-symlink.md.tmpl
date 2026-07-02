@@ -1,0 +1,11 @@
+{#-
+name: agents-md-symlink
+summary: Every CLAUDE.md needs a paired AGENTS.md symlink so all AI tools find the same instructions.
+domain: engineering
+audience: agent
+severity: default
+tags: [claude-md, agents-md, symlink, tooling]
+scope: [any]
+phase: [executing]
+-#}
+Every `CLAUDE.md` must have a paired `AGENTS.md` symlink (`ln -s CLAUDE.md AGENTS.md`) so Codex, Gemini CLI, Cursor, and other AI tools find the same instructions. Always create both together.

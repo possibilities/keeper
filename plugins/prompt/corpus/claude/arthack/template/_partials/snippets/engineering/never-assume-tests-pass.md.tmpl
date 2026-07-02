@@ -1,0 +1,12 @@
+{#-
+name: never-assume-tests-pass
+summary: Always run a test you just wrote or modified — never assume it passes.
+domain: engineering
+audience: agent
+severity: default
+-#}
+**Never assume a test passes.** After writing or modifying a test, run it yourself. Self-reported "should pass" without a run is how regressions land in `main`.
+
+```sh
+uv run --group test pytest tests/unit/test_<name>.py -s
+```

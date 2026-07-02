@@ -64,7 +64,21 @@ done < "${config}"
 # agents/practice-scout.md) is gitignored and so invisible to porcelain, and
 # the hand-authored agents/ files are never rendered.
 echo "promote: rendering per-cell work plugins for the slow-tier cell-set guard"
-( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" >/dev/null )
+( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" )
+
+# Report >0 plugins rendered. The render step is a SILENT no-op on an
+# already-rendered tree (only changed files print `✓ Rendered`), so counting
+# stdout lines is unreliable — verify the plan plugin's per-cell tree exists on
+# disk instead. A zero here means discoverPluginDirs failed to find the plan
+# plugin under the keeper-root --project-root (the `plugins/*` scan branch).
+plan_workers="${keeper_root}/plugins/plan/workers"
+cell_count="$(find "${plan_workers}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+if [ "${cell_count}" -eq 0 ]; then
+  echo "promote: ABORT — render produced no plan-plugin work cells under ${plan_workers}" >&2
+  echo "  discoverPluginDirs must scan plugins/* so a keeper-root --project-root finds the plan plugin" >&2
+  exit 1
+fi
+echo "promote: rendered the plan plugin — ${cell_count} work cell(s) under plugins/plan/workers/"
 
 # Real-git slow-tier gate. The fast `bun test` suite is pure (no real git), so a
 # git-effect regression passes every commit gate; this is the routine surface

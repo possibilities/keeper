@@ -67,7 +67,7 @@ each), not one.
 
 ## Orient first (optional)
 
-<!-- Canonical source: keeper prompt render engineering/orient -->
+<!-- POINTER: keeper prompt render engineering/orient -->
 
 When the brief depends on the current board — "hand off whatever's stuck", "spawn someone on the failing epic" — read it in one call first: `keeper status --json` prints autopilot config, per-row readiness verdicts, counts, `drained`/`jammed`, in-flight, and needs-human in a single envelope (exit 0 on any board state). For the full orient step run `keeper prompt render engineering/orient`. A self-contained brief needs no orient — skip to Step 1.
 

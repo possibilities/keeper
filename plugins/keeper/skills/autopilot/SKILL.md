@@ -84,7 +84,7 @@ clarifying question — fail loud on ambiguity, never guess a global-state mutat
 
 ## Orient — reading autopilot state
 
-<!-- Canonical source: keeper prompt render engineering/orient -->
+<!-- POINTER: keeper prompt render engineering/orient -->
 
 Read state with `keeper status --json`, NEVER the live stream:
 

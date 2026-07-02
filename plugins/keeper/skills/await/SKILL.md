@@ -85,7 +85,7 @@ invocation, not an ambiguity.
 
 ## Orient / discover the board
 
-<!-- Canonical source: keeper prompt render engineering/orient -->
+<!-- POINTER: keeper prompt render engineering/orient -->
 
 When the user's reference is to "the board" rather than a known id — "ping me
 when a new epic shows up", "when anything moves", "when it's all done" — orient

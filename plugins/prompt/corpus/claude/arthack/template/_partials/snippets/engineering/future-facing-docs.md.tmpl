@@ -1,0 +1,19 @@
+{#-
+name: future-facing-docs
+summary: Developer docs describe current state, never narrate how it got here — no version history, no migration changelog, no inline ticket IDs. Reads like a reference, not a changelog.
+domain: engineering
+audience: agent
+severity: guard
+tags: [docs, writing, future-facing, history, changelog, claude-md, readme]
+scope: [any]
+phase: [executing, reviewing]
+related: [claude-md-scope]
+-#}
+**Developer-facing docs describe the system as it is now — never narrate how it got here.** Applies to every advice surface: `README.md`, `CLAUDE.md`/`AGENTS.md`, design notes, command/skill prompts, CLI `--help` / `--agent-help` strings, and hook messages. Git holds the evolution; the doc holds the current truth.
+
+- **No version history.** Don't write "V1 was X, V2 added Y, V3 added Z." Describe what exists today.
+- **No migration changelog.** Don't enumerate "schema v4 added column A, v5 added B, v6 added C." State the current shape. Keep at most the *forward rule* an agent needs (e.g. "migrations are forward-only via `migrate()`"), not the table of past steps.
+- **No inline ticket/PR IDs** (`fn-NNN`, `#123`) as load-bearing references. They mean nothing to an agent without the tracker, and the behavior is already described. At most one pointer to where plans live.
+- **No "formerly" / "we switched from X to Y" / "renamed from."** The current name and shape are the only ones that matter.
+
+Ask of every paragraph: *"Does this read like a changelog entry or a reference description?"* It should read like a reference. If you find yourself writing the story of a change, stop — that story belongs in the commit message and the PR, not in a doc that is re-read on every future task. **Carve-out:** commit messages and changelogs are the sanctioned home for history — they *should* narrate what changed in past tense; the rule binds only the re-read advice surfaces above.
