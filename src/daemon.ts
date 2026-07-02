@@ -58,6 +58,8 @@ import {
   retainColdPayloads,
 } from "./compaction";
 import {
+  clearDispatchMintGate,
+  evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
   resolveBackstopLogPath,
@@ -74,6 +76,7 @@ import {
   resolveStatuslineRoot,
   resolveUsageRoot,
   resolveUsageScraperRuntime,
+  runDispatchMintGate,
   truncateEphemeralProjections,
 } from "./db";
 import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
@@ -373,6 +376,30 @@ export const PENDING_DISPATCH_TTL_MS = 120_000;
  * write-triggered wake never fires and the slot would stay held indefinitely.
  */
 export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Durable dispatch-mint rate-limit gate window (ms). Within this window after a
+ * `verb::id` dispatchKey minted a `Dispatched` event, a re-mint of the SAME key is
+ * SUPPRESSED (no second event row) — the restart-surviving guard against one
+ * logical dispatch amplifying into N same-instant rows (pre-launch abort loops,
+ * restart storms, the insert→fold gap). Sized strictly BELOW the
+ * `PENDING_DISPATCH_TTL_MS` (120s) TTL and the `REDISPATCH_COOLDOWN_S` (200s)
+ * cooldown so a LEGITIMATE re-dispatch (a TTL-expired re-mint at 120s+, a
+ * cooldown-cadence retry at 200s+) passes the gate untouched — only a same-intent
+ * burst inside the window is squashed. The window is absolute from the FROZEN
+ * first mint (suppression never re-stamps it), so a restart never resets the clock
+ * and a legit key can never be suppressed forever.
+ */
+export const DISPATCH_MINT_GATE_WINDOW_MS = 60_000;
+
+/**
+ * Eviction horizon (ms) for a stale `dispatch_mint_gate` row. A row older than
+ * this has long since stopped suppressing (window elapsed) and only holds space,
+ * so the producer TTL sweep prunes it. Kept a few windows past
+ * `DISPATCH_MINT_GATE_WINDOW_MS` so a row is never evicted while it can still
+ * suppress.
+ */
+export const DISPATCH_MINT_GATE_EVICT_MS = DISPATCH_MINT_GATE_WINDOW_MS * 5;
 
 /**
  * Events-log live-ingest poll-is-truth fallback cadence. The `@parcel/watcher`
@@ -2769,8 +2796,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * `dispatch_failures` row (the reducer's fold arm). The composite `${verb}::${id}`
    * rides as the entity-key (`session_id`) overload so a re-fold correlates the clear
    * to its row without re-parsing the data blob. Caller sets `wakePending` + pumps.
+   *
+   * ALSO clears the durable `dispatch_mint_gate` row for the key — the single choke
+   * point every `DispatchCleared` mint flows through (the `retry_dispatch` RPC fast
+   * path and the recover auto-clear), so a human retry or a recover-cleared failure
+   * re-dispatches IMMEDIATELY instead of waiting out the mint-gate window. The gate
+   * DELETE is a direct producer write (the gate is NOT a projection), idempotent,
+   * and runs before the event insert so a clear is never swallowed.
    */
   function mintDispatchClearedEvent(verb: string, id: string): void {
+    clearDispatchMintGate(db, `${verb}::${id}`);
     stmts.insertEvent.run({
       $ts: Date.now() / 1000,
       $session_id: `${verb}::${id}`,
@@ -5133,53 +5168,81 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    *
    * DURABLE before launch: the worker AWAITS this ack BEFORE `launch()`, so the
    * reply MUST fire on every path (`ok:true` once the insert lands, `ok:false`
-   * when it throws). The worker launches only on `ok:true`; an `ok:false` or
-   * ack-timeout aborts WITHOUT launching — strictly preferable to the
-   * fire-and-forget race that re-opened the double-dispatch window. NON-FATAL on
-   * insert failure.
+   * when it throws OR when the durable gate suppresses). The worker launches only
+   * on `ok:true`; an `ok:false` or ack-timeout aborts WITHOUT launching — strictly
+   * preferable to the fire-and-forget race that re-opened the double-dispatch
+   * window. NON-FATAL on insert failure.
+   *
+   * DURABLE MINT GATE: one logical dispatch attempt otherwise amplifies into N
+   * same-instant `Dispatched` rows (pre-launch abort loops, restart storms, the
+   * insert→fold gap). The gate read + the conditional event insert run in ONE
+   * `BEGIN IMMEDIATE` transaction on main's writable connection: a re-mint of the
+   * same `verb::id` inside `DISPATCH_MINT_GATE_WINDOW_MS` inserts NO row and
+   * replies a DISTINCT suppressed ack (`ok:false, suppressed:true`); a fresh mint
+   * stamps the gate AND inserts atomically, so a crash between them can neither
+   * un-dedup the next attempt nor suppress a legit one forever. Suppression does
+   * NOT re-stamp the gate — the window stays absolute from the frozen first mint.
    */
   function handleDispatchedMint(msg: DispatchedMessage): void {
     const { id, payload } = msg;
+    const dispatchKey = `${payload.verb}::${payload.id}`;
     const data = JSON.stringify(payload);
     let ok = false;
+    let suppressed = false;
     try {
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: `${payload.verb}::${payload.id}`,
-        $pid: null,
-        $hook_event: "Dispatched",
-        $event_type: "pending_dispatches",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: payload.dir,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      // The ack promises INSERT durability ONLY — not the fold (idempotent on the
-      // next drain). The committed INSERT is the whole contract.
-      ok = true;
+      const nowMs = Date.now();
+      // The gate read + the conditional insert run atomically in ONE
+      // `BEGIN IMMEDIATE`. `onFreshMint` runs only on the mint branch (gate empty
+      // or window elapsed); a re-mint inside the window suppresses without
+      // inserting. `ok` flips to true only after the insert lands.
+      ({ suppressed } = runDispatchMintGate(
+        db,
+        dispatchKey,
+        nowMs,
+        DISPATCH_MINT_GATE_WINDOW_MS,
+        () => {
+          stmts.insertEvent.run({
+            $ts: nowMs / 1000,
+            $session_id: dispatchKey,
+            $pid: null,
+            $hook_event: "Dispatched",
+            $event_type: "pending_dispatches",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: payload.dir,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: data,
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $plan_op: null,
+            $plan_target: null,
+            $plan_epic_id: null,
+            $plan_task_id: null,
+            $plan_subject_present: null,
+            $config_dir: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $plan_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+            $worktree: null,
+          });
+          // The ack promises INSERT durability ONLY — not the fold (idempotent on
+          // the next drain). The committed INSERT is the whole contract.
+          ok = true;
+        },
+      ));
     } catch (err) {
+      // A throw rolls back BOTH the gate stamp and the insert, so `ok` stays
+      // false and `suppressed` stays false — the worker aborts on a real error,
+      // never on a phantom suppression.
       console.error(
         `[keeperd] Dispatched mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -5187,11 +5250,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
     }
     // Reply on EVERY path — the worker is blocked awaiting this ack before it
-    // launches; a `false` reply tells it to abort. Reply IMMEDIATELY after the
-    // INSERT, BEFORE the (potentially slow) reducer pump: the launch must not
-    // wait on the drain, and the ack already reflects everything it promises.
-    // Outbox ordering is UNCHANGED — the insert still precedes the launch. The
-    // `?.` keeps it null-safe for the type system on an unselected-autopilot boot.
+    // launches. A suppressed mint replies a DISTINCT `ok:false, suppressed:true`
+    // (a benign dedup, not an error) and needs no pump (nothing was inserted).
+    // The `?.` keeps it null-safe for the type system on an unselected-autopilot
+    // boot.
+    if (suppressed) {
+      autopilotWorkerInstance?.postMessage({
+        type: "dispatched-ack",
+        id,
+        ok: false,
+        suppressed: true,
+      } satisfies DispatchedAckMessage);
+      return;
+    }
+    // Reply IMMEDIATELY after the committed INSERT, BEFORE the (potentially slow)
+    // reducer pump: the launch must not wait on the drain, and the ack already
+    // reflects everything it promises. Outbox ordering is UNCHANGED — the insert
+    // still precedes the launch.
     autopilotWorkerInstance?.postMessage({
       type: "dispatched-ack",
       id,
@@ -5552,6 +5627,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // same writer that mints — no read/mint race against the reducer's UPSERT.
   function sweepExpiredPendingDispatches(): void {
     if (shuttingDown) return;
+    // Prune stale `dispatch_mint_gate` rows FIRST (unconditionally — the pending
+    // sweep below early-returns when nothing is aged). A gate row older than the
+    // evict horizon has long since stopped suppressing; this bounds the durable
+    // table. Producer write on main's writable connection, non-fatal on failure.
+    try {
+      evictStaleDispatchMintGate(
+        db,
+        (Date.now() - DISPATCH_MINT_GATE_EVICT_MS) / 1000,
+      );
+    } catch (err) {
+      console.error(
+        `[keeperd] dispatch_mint_gate eviction threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     let aged: { verb: string; id: string; dispatched_at: number }[];
     try {
       aged = selectExpiredPendingDispatches(db, Date.now());

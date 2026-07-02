@@ -395,6 +395,9 @@ from pathlib import Path
 # v101 (fn-1034 task .1) adds the nullable ``autopilot_state.worktree_multi_repo``
 # rollout flag (multi-repo worktree epics); keeper-py never reads
 # ``autopilot_state``, so only the version whitelist gains 101.
+# v102 (fn-1061 task .1) adds the durable ``dispatch_mint_gate`` producer table
+# (the one-logical-dispatch-one-row rate-limit gate); keeper-py never reads it, so
+# only the version whitelist gains 102.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -468,6 +471,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         99,
         100,
         101,
+        102,
     }
 )
 

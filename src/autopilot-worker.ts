@@ -5197,14 +5197,21 @@ export interface DispatchedMessage {
 
 /**
  * Main → worker: durable-ack reply paired with {@link DispatchedMessage}. Sent
- * ONLY after main has inserted (or failed to insert) the `Dispatched` event.
- * `ok` is `true` on a successful insert; `confirmRunning` launches only on
- * `ok:true`.
+ * ONLY after main has resolved the `Dispatched` mint. `ok` is `true` on a
+ * successful insert; `confirmRunning` launches only on `ok:true`.
+ *
+ * `suppressed` distinguishes the durable-gate SUPPRESSED outcome (`ok:false,
+ * suppressed:true`) — a re-mint of the same `verb::id` inside the mint-gate window,
+ * which inserts NO event row — from an insert FAILURE (`ok:false` with `suppressed`
+ * absent/`false`). Both abort the launch, but the consumer treats them differently:
+ * a suppressed mint is a benign dedup (do NOT clear the redispatch cooldown), an
+ * insert failure is a real error. Absent ⇒ not suppressed.
  */
 export interface DispatchedAckMessage {
   type: "dispatched-ack";
   id: number;
   ok: boolean;
+  suppressed?: boolean;
 }
 
 /**

@@ -2379,7 +2379,10 @@ mis-groups a card. The **ephemeral** class
 charter exclusion: in-flight runtime state that IS folded by the boot drain but
 `truncateEphemeralProjections` empties AFTER the drain and BEFORE serving, so the
 runtime set is rebuilt from current reality at boot rather than replayed (NOT in
-the re-fold wipe list, NOT byte-identical). As of
+the re-fold wipe list, NOT byte-identical). The sibling dispatch table
+`dispatch_mint_gate` (fn-1061, the durable mint gate) is DELIBERATELY NOT in this
+class — it is producer state (like `dead_letters`), never folded and never
+boot-truncated, because its whole job is to survive restart. As of
 schema v32 (fn-634, narrowed at v63/fn-756), `epics` adds
 `default_visible` as a VIRTUAL generated column SQLite computes from
 `CASE WHEN status='open' THEN 1 ELSE 0 END`,
@@ -2886,7 +2889,12 @@ prior "re-fold reproduces the table byte-identically" claim no longer holds, and
 must not: a rewinding migration's full re-fold would otherwise RESURRECT weeks-old
 phantoms that consume the dispatch budget + per-root mutex — the v76→v79 jam where
 5 phantoms BLOCKED-by-`dispatch_failures` starved all dispatch). keeper-py's
-`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `50` (whitelist-only).
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `50` (whitelist-only). CONTRAST the
+fn-1061 `dispatch_mint_gate` (v102), a DURABLE producer table at the same mint site
+(detailed under the re-dispatch cooldown below): it is the OPPOSITE class —
+never folded, never boot-truncated, kept across restart on purpose — so one logical
+dispatch mints one row even across the insert→fold gap that `pending_dispatches`'
+boot-EMPTY reset cannot cover.
 
 The producer side of this lifecycle is hardened independently of the reducer,
 schema, and `keeper/api.py` (`SCHEMA_VERSION` stays 59). The mint is
@@ -3438,11 +3446,14 @@ both — the window must outlast the WHOLE round-trip (pending row surviving a
 full TTL, then the sweep tick that clears the phantom), not merely the TTL. The
 load-bearing ordering chain is `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS
 (120s) < REDISPATCH_COOLDOWN_S (200s)` (a shorter window re-introduces
-over-dispatch at expiry, k8s #129795). It is dispatch-side scheduling ONLY:
-in-memory, never written to the event log / projections / reducer / RPC
-surface, boots EMPTY on restart (safe — autopilot boots paused and the first
-cycle rebuilds suppression from the live projection), and is mutated ONLY in
-the cycle glue (`reconcile` stays pure — it never writes the Map). A definitive
+over-dispatch at expiry, k8s #129795). The in-memory cooldown Map is
+dispatch-side scheduling ONLY: never written to the event log / projections /
+reducer / RPC surface, and mutated ONLY in the cycle glue (`reconcile` stays
+pure — it never writes the Map). THIS MAP boots EMPTY on restart — deliberately:
+it is a soft-scheduling cadence hint, safe to lose because autopilot boots paused
+and the first cycle rebuilds suppression from the live projection, AND because the
+durable `dispatch_mint_gate` (below) — not this Map — is the restart-surviving
+one-row-per-dispatch guarantee. A definitive
 launch failure (`launch.ok===false` → `DispatchFailed`) or a PRE-LAUNCH abort
 (`aborted-prelaunch` — ack reject / `{ok:false}` / shutdown racing the ack:
 nothing launched) CLEARS the entry so `failedKeys` owns stickiness and a human
@@ -3455,6 +3466,30 @@ window — never compounding across cycles, the perpetual-suppression trap). Eac
 cycle prunes expired entries (`sweepRedispatchCooldown`, mirroring
 `server-worker.ts`'s `reapStuckPending`, wrapped so a sweep throw can't bounce
 the daemon). **The cooldown covers all verbs, dispatch-side, in-memory.**
+**fn-1061 adds the DURABLE `dispatch_mint_gate` — the restart-surviving
+one-logical-dispatch-one-row guarantee the in-memory cooldown cannot give.** The
+in-memory Map is the amplifier's escape hatch: a pre-launch abort CLEARS it (so
+`failedKeys` / `retry_dispatch` own stickiness), so a suppress→abort→clear loop, a
+restart storm, or the insert→fold gap can re-mint the same `verb::id` many times in
+one instant — the observed 4×/15×-in-0m `Dispatched` bursts. The gate closes that
+at the mint site: `handleDispatchedMint` wraps the gate read + the event insert in
+ONE `BEGIN IMMEDIATE` on main's writable connection (so the check spans the
+insert→fold gap the ack's INSERT-not-fold promise leaves open), and a re-mint of a
+key whose durable `minted_at` is within `DISPATCH_MINT_GATE_WINDOW_MS` (60s) inserts
+NO event row and replies a DISTINCT `dispatched-ack{ok:false, suppressed:true}` — a
+benign dedup, never a hung ack and never a fake `ok`. The window is FROZEN at the
+first mint (suppression never re-stamps it), sized strictly below the 120s TTL and
+200s cooldown so a LEGITIMATE re-dispatch (TTL-expired at 120s, cooldown-cadence at
+200s+) passes untouched. It is PRODUCER STATE, not a projection (same class as
+`dead_letters`): NEVER folded, so it is DELIBERATELY absent from
+`EPHEMERAL_PROJECTIONS` (it must NOT boot-truncate — durability is the point), from
+the rewinding-migration DELETE list, and from the re-fold-equivalence charter; and
+`minted_at` is producer wall-clock, never an event `ts`, so no fold reads it.
+`retry_dispatch` (via `clearDispatchMintGate`, the single `DispatchCleared` choke
+point) DELETEs the key's gate row so the human fast-path is never swallowed, and
+stale rows age out riding the `pending_dispatches` TTL sweep
+(`evictStaleDispatchMintGate`). No constraint is added to the append-only `events`
+table (historical dup rows must not break migration).
 The row discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
 TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
 `DispatchExpired`) — so both the launch → SessionStart blind window and the
