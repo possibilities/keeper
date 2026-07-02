@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T03:58:53.959000Z",
+  "depends_on": [
+    "fn-1061-dedup-autopilot-dispatch-mint.1"
+  ],
+  "epic": "fn-1061-dedup-autopilot-dispatch-mint",
+  "id": "fn-1061-dedup-autopilot-dispatch-mint.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Suppressed outcome in confirm-runner",
+  "updated_at": "2026-07-02T03:58:53.959000Z"
+}
