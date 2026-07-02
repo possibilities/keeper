@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T02:05:06.243000Z",
+  "depends_on": [],
+  "epic": "fn-1057-gate-landed-on-epic-started",
+  "id": "fn-1057-gate-landed-on-epic-started.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Gate landed on epic started",
+  "updated_at": "2026-07-02T02:05:06.243000Z"
+}
