@@ -46,5 +46,5 @@ resume nudge; clean → passes; git-failure → passes WITH visible marker. No r
 - [ ] worker.md.tmpl carries the close-out contract at top-of-prompt; renders regenerated
 
 ## Done summary
-
+Machine-gate worker close-out on the session-files observable: reconcile surfaces dirty_session_files (count | null fail-open marker) via a new fail-open PlanVcs.sessionDirtyPaths probe; stop-guard + subagent-stop-guard consume it (undischarged files drive the finish-and-commit nudge, unreadable probe fails open with a visible signal); worker.md.tmpl carries the own-your-close-out contract at top-of-prompt.
 ## Evidence
