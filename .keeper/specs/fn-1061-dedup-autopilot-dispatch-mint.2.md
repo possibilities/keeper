@@ -46,5 +46,5 @@ ok/indoubt/aborted cases unchanged.
 - [ ] README passages revised in place per epic Docs gaps
 
 ## Done summary
-
+Added the suppressed-dup ConfirmOutcome: a mint-gate-suppressed ack (ok:false,suppressed:true) yields no launch, no DispatchFailed, failedKeys untouched, and RE-STAMPS the redispatch cooldown so a persistent pre-launch suppression can't hot-loop. Revised the README cooldown-outcome table in place.
 ## Evidence

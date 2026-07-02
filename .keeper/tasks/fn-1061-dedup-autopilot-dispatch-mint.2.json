@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Suppressed outcome in confirm-runner",
-  "updated_at": "2026-07-02T03:58:53.959000Z"
+  "updated_at": "2026-07-02T04:32:47.046000Z",
+  "worker_done_at": "2026-07-02T04:32:47.046000Z"
 }
