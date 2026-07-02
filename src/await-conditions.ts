@@ -82,6 +82,11 @@
  */
 
 import type { MonitorEntry } from "./derivers";
+import {
+  MERGE_ESCALATION_REASON_TOKEN,
+  WORKTREE_FINALIZE_NON_FF_REASON,
+  WORKTREE_RECOVER_REASON_PREFIX,
+} from "./dispatch-failure-key";
 import type { BlockReason, ReadinessSnapshot, Verdict } from "./readiness";
 import type { Epic, GitStatus, Job, Task } from "./types";
 
@@ -1013,34 +1018,24 @@ export function monitorRunningState(
 // ---------------------------------------------------------------------------
 
 /**
- * The two `dispatch_failures.reason` families that mean a human MUST act before
- * the board can drain — the jam allowlist for `await drained --fail-on-stuck`.
- * `worktree-finalize-non-fast-forward` is an origin-ahead non-ff needing an
- * operator to reconcile origin; `worktree-merge-conflict` is a close-sink
- * content conflict. The `worktree-recover*` auto-clear prefix is EXCLUDED — a
- * recover-originated row self-clears level-triggered once its git resolves, so
- * it is never an operator jam. Held as local constants (the source of truth is
- * `daemon.ts`'s `MERGE_ESCALATION_REASON_TOKEN` + `autopilot-worker.ts`'s
- * `WORKTREE_RECOVER_REASON_PREFIX`; `test/await-conditions.test.ts` pins the
- * equality so they never drift) to keep this module an import leaf.
- */
-const JAM_FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
-const JAM_MERGE_CONFLICT_PREFIX = "worktree-merge-conflict";
-const WORKTREE_RECOVER_PREFIX = "worktree-recover";
-
-/**
  * Is this `dispatch_failures.reason` an operator jam (an open-board sticky that
- * will NOT self-resolve)? The `worktree-recover*` auto-clear prefix is excluded
- * FIRST so a `worktree-recover-conflict` never counts despite sharing the
- * `worktree-` namespace. Exported for the `drained` jam check + its test.
+ * will NOT self-resolve)? The jam allowlist for `await drained --fail-on-stuck`:
+ * `worktree-finalize-non-fast-forward` (an origin-ahead non-ff needing an operator
+ * to reconcile origin) and a `worktree-merge-conflict` close-sink content conflict.
+ * The `worktree-recover*` auto-clear prefix is excluded FIRST — a recover row
+ * self-clears level-triggered once its git resolves, so a `worktree-recover-conflict`
+ * never counts despite sharing the `worktree-` namespace. Tokens come from the
+ * dep-free `dispatch-failure-key` leaf (the single dispatch-failure vocabulary), so
+ * this leaf module adopts them with no drift risk. Exported for the `drained` jam
+ * check + its test.
  */
 export function isJamReason(reason: string): boolean {
-  if (reason.startsWith(WORKTREE_RECOVER_PREFIX)) {
+  if (reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX)) {
     return false;
   }
   return (
-    reason === JAM_FINALIZE_NON_FF_REASON ||
-    reason.startsWith(JAM_MERGE_CONFLICT_PREFIX)
+    reason === WORKTREE_FINALIZE_NON_FF_REASON ||
+    reason.startsWith(MERGE_ESCALATION_REASON_TOKEN)
   );
 }
 

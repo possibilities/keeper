@@ -20,18 +20,10 @@
  *     path-keyed null-epic row or a zero-match.
  */
 
-/** The reason→kind map, MOST-SPECIFIC-FIRST. Prefix-matched (not
- * substring-contains) so a longer literal is tested before any shorter sibling
- * could shadow it. No entry here is a prefix of another, so this ordering is
- * also collision-free by construction. */
-const CLASSIFY_RULES: ReadonlyArray<{ prefix: string; kind: string }> = [
-  { prefix: "worktree-multi-repo", kind: "multi-repo" },
-  { prefix: "worktree-finalize-non-fast-forward", kind: "non-ff" },
-  { prefix: "worktree-finalize-conflict", kind: "merge-conflict" },
-  { prefix: "worktree-recover-conflict", kind: "merge-conflict" },
-  { prefix: "worktree-recover-dirty-checkout", kind: "dirty-tree" },
-  { prefix: "worktree-merge-conflict", kind: "merge-conflict" },
-];
+import {
+  DISPATCH_FAILURE_DISPLAY_RULES,
+  WORKTREE_CLOSE_KEY_PREFIXES,
+} from "./dispatch-failure-key";
 
 /**
  * Collapse a raw `dispatch_failures.reason` to a short display KIND. Ordered
@@ -42,7 +34,7 @@ const CLASSIFY_RULES: ReadonlyArray<{ prefix: string; kind: string }> = [
  * a bare `[failed:]` pill.
  */
 export function classifyDispatchFailure(reason: string): string {
-  for (const rule of CLASSIFY_RULES) {
+  for (const rule of DISPATCH_FAILURE_DISPLAY_RULES) {
     if (reason.startsWith(rule.prefix)) {
       return rule.kind;
     }
@@ -55,12 +47,6 @@ export function classifyDispatchFailure(reason: string): string {
 export type FailureTarget =
   | { kind: "task"; taskId: string }
   | { kind: "epic"; epicId: string };
-
-/** Worktree-mode close keys prefix the epic (or a path) with one of these. */
-const WORKTREE_CLOSE_KEY_PREFIXES = [
-  "worktree-finalize:",
-  "worktree-recover:",
-] as const;
 
 /** A matched epic id must be followed by one of these delimiters (or
  * end-of-string) so `fn-106` never claims an `fn-1061-…` key. */

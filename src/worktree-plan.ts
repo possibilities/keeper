@@ -26,9 +26,12 @@
  *    directory/file ref conflict)
  * Worktree paths resolve to a directory under `~/worktrees/`, OUTSIDE the repo
  * tree, named `<repoName>-<hash>--<branch-slug>` (the dir-hash disambiguates
- * same-basename repos). The home dir is the one environment read here — constant
- * within the daemon process, so re-derivation stays byte-identical — and safe
- * because this runs producer-only, never in a fold.
+ * same-basename repos). The worktrees root is INJECTABLE (`worktreesRoot`): the
+ * reconciler threads `${homedir()}/worktrees` in from the producer side so the
+ * pure verdict path reaches no environment. When no root is injected the helpers
+ * fall back to reading `homedir()` themselves — the one environment read here,
+ * constant within the daemon process so re-derivation stays byte-identical, and
+ * safe because that fallback runs producer-only, never in a fold.
  *
  * Determinism is sacred: the toposort breaks ties on the existing
  * `(task_number, task_id)` order, the inheritance walk consumes that one order,
@@ -153,21 +156,32 @@ export function ribBranchFor(epicId: string, taskId: string): string {
  * rib's own — still unambiguous + collision-free, since the slug is an injective
  * image of the unique branch name.
  *
- * PURE function of (repoDir, branch): the hash folds only the (already realpath'd
- * by the producer) repo dir, no wall-clock / random / syscall, so the producer
- * (provision) and teardown (removeWorktree) derive a byte-identical path and the
- * path-equality comparisons on both sides still hold. The trailing slash is
- * stripped before hashing so `<dir>` and `<dir>/` map to the same lane.
+ * PURE function of (repoDir, branch, worktreesRoot): the hash folds only the
+ * (already realpath'd by the producer) repo dir, no wall-clock / random / syscall,
+ * so the producer (provision) and teardown (removeWorktree) derive a byte-identical
+ * path and the path-equality comparisons on both sides still hold. The trailing
+ * slash is stripped before hashing so `<dir>` and `<dir>/` map to the same lane.
  * Kept outside the repo tree so a worktree is never nested inside the repo it
- * forks from. Resolves the home dir from the environment — safe because this runs
- * PRODUCER-ONLY (the autopilot worktree driver), never inside a fold.
+ * forks from.
+ *
+ * `worktreesRoot` is the parent dir every lane hangs under. When passed (the
+ * autopilot reconciler injects `${homedir()}/worktrees` from the producer-side
+ * snapshot), this function reaches NO environment — keeping the pure verdict path
+ * env-free. When omitted, it falls back to reading `homedir()` itself, yielding the
+ * byte-identical `${homedir()}/worktrees` root — safe because that fallback runs
+ * PRODUCER-ONLY, never inside a fold.
  */
-export function worktreePathFor(repoDir: string, branch: string): string {
+export function worktreePathFor(
+  repoDir: string,
+  branch: string,
+  worktreesRoot?: string,
+): string {
   const stripped = stripTrailingSlash(repoDir);
   const repoName = baseName(stripped) || "repo";
   const hash = shortHash(stripped);
   const slug = branch.replace(/\//g, "-");
-  return `${homedir()}/worktrees/${repoName}-${hash}--${slug}`;
+  const root = worktreesRoot ?? `${homedir()}/worktrees`;
+  return `${root}/${repoName}-${hash}--${slug}`;
 }
 
 /**
@@ -207,6 +221,11 @@ export function repoDirHash(repoDir: string): string {
  *                — see `classifyWorktreeRepos`) — drives worktree paths. Must be
  *                non-empty; an empty repo dir is a producer bug.
  * @param tasks   The epic's tasks (`epic.tasks`). Read-only; not mutated.
+ * @param worktreesRoot The parent dir every lane path hangs under, threaded to
+ *                {@link worktreePathFor}. When passed (the reconciler injects
+ *                `${homedir()}/worktrees` producer-side), the derivation reaches no
+ *                environment; when omitted it falls back to reading `homedir()`,
+ *                yielding the byte-identical root.
  * @returns The {@link WorktreePlan} — base lane + every node assignment in
  *          toposort order, `__close__` last.
  * @throws WorktreeCycleError on a `depends_on` cycle.
@@ -215,9 +234,10 @@ export function deriveWorktreePlan(
   epicId: string,
   repoDir: string,
   tasks: Task[],
+  worktreesRoot?: string,
 ): WorktreePlan {
   const baseBranch = baseBranchFor(epicId);
-  const baseWorktreePath = worktreePathFor(repoDir, baseBranch);
+  const baseWorktreePath = worktreePathFor(repoDir, baseBranch, worktreesRoot);
 
   const order = toposort(tasks);
 
@@ -318,7 +338,7 @@ export function deriveWorktreePlan(
       nodeId: taskId,
       isCloseSink: false,
       branch,
-      worktreePath: worktreePathFor(repoDir, branch),
+      worktreePath: worktreePathFor(repoDir, branch, worktreesRoot),
       inherited: inheritedFlag.get(taskId) ?? true,
       preMerges,
       assertBranch: branch,

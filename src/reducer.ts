@@ -44,6 +44,13 @@ import {
   normalizePlanOp,
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
+// The row types for the `WorktreeRepoStatus` / `LaneMerged` folds live on the pure
+// verdict side (the reconcile snapshot references them); re-exported here so
+// existing `from "./reducer"` importers keep resolving.
+import type {
+  LaneMergedEntry,
+  WorktreeRepoStatusEntry,
+} from "./reconcile-core";
 import {
   extractTurnSeq,
   findBridgePreToolUse,
@@ -71,6 +78,10 @@ import type {
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
 import { asAccountState } from "./usage-scrape-runner";
+
+// Re-export the `WorktreeRepoStatus` / `LaneMerged` fold row contracts (now defined
+// on the pure verdict side) so existing `from "./reducer"` importers keep resolving.
+export type { LaneMergedEntry, WorktreeRepoStatusEntry };
 
 /**
  * Default batch size for {@link drain}. Each event folds in its OWN
@@ -3513,23 +3524,6 @@ function foldTmuxClientFocusSnapshot(db: Database, event: Event): void {
 }
 
 /**
- * One entry of a synthetic `WorktreeRepoStatus` event (fn-1013) — the
- * worktree-eligibility verdict for ONE epic the autopilot reconciler marked
- * `disabled` (a not-worktree-friendly repo → serial shared-checkout dispatch).
- * `mode` is the dispatch shape (`serial`); `reason` names the disabling signal (a
- * `worktree-disabled:*` string). The event's `data` carries the FULL current
- * disabled set as `{ entries: WorktreeRepoStatusEntry[] }`; the fold replaces the
- * whole table with it (a cheap full-set replace bounded by board size). Defined
- * here so the producer (autopilot worker) and this fold share one contract.
- */
-export interface WorktreeRepoStatusEntry {
-  epic_id: string;
-  repo_dir: string;
-  mode: string;
-  reason: string;
-}
-
-/**
  * Null-safe decode of a `WorktreeRepoStatus` event's `data` blob into the
  * validated entry array. Returns `[]` on a missing / empty / malformed blob OR a
  * non-array `entries` (the fold then clears the table — the disabled set is
@@ -3609,24 +3603,6 @@ function foldWorktreeRepoStatus(db: Database, event: Event): void {
       [e.epic_id, e.repo_dir, e.mode, e.reason, event.id, event.ts],
     );
   }
-}
-
-/**
- * One entry of a synthetic `LaneMerged` event — ONE epic whose worktree
- * lane branch (`keeper/epic/<id>`) the autopilot reconciler probed as merged into
- * the LOCAL default branch (an ancestor of default, OR torn-down after a merge —
- * keeper deletes a base only once it is an ancestor of default). The durable
- * "merge-landed" observable the planning daisy-chain needs ("author B against A's
- * MERGED reality"), which `complete` (done-AND-idle) does not guarantee in
- * worktree mode (a dependent lane is cut before the upstream's finalize merge
- * lands). The event's `data` carries the FULL current merged set as
- * `{ entries: LaneMergedEntry[] }`; the fold replaces the whole table with it (a
- * cheap full-set replace bounded by board size). Defined here so the producer
- * (autopilot worker) and this fold share one contract.
- */
-export interface LaneMergedEntry {
-  epic_id: string;
-  repo_dir: string;
 }
 
 /**
