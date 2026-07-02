@@ -36,8 +36,9 @@ const TASK_ID_LINE = /^\s*TASK_ID:\s*(\S+)\s*$/m;
  * this window. */
 const TRANSCRIPT_READ_LIMIT = 256 * 1024;
 
-/** Per-verdict resume nudges — verbatim from the work skill's Phase 2b switch
- * (template/skills/work.md.tmpl). `null` means "never block on this verdict":
+/** Per-verdict resume nudges — the directive text sent to the worker on each
+ * reconcile verdict, mirroring the worker's own resume contract
+ * (template/agents/worker.md.tmpl). `null` means "never block on this verdict":
  * a `not_started` worker is the orchestrator's call to make, never a trap, and
  * the terminal/fail-open verdicts are handled before this map is consulted. */
 export const VERDICT_NUDGE: Record<string, (taskId: string) => string | null> =

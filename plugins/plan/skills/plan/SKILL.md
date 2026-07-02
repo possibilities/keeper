@@ -372,7 +372,7 @@ For each task, decide:
 - **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Paired with **model** (below); `claim` composes the two into `worker_agent: plan:worker-<model>-<effort>`, the generated worker agent `/plan:work` spawns. Bands:
   - **`medium`** — single-file edit, mechanical refactor, straight test addition. Acceptance is "do exactly this."
   - **`high`** — multi-file feature in a known pattern, typical bug fix with the root cause named, anything following an obvious in-repo template.
-  - **`xhigh`** — multi-step refactor, new-pattern introduction, contract-touching work (RPC, schema, public API, wire format), anything where a wrong abstraction propagates. **Default when in doubt** (the Opus 4.7 default).
+  - **`xhigh`** — multi-step refactor, new-pattern introduction, contract-touching work (RPC, schema, public API, wire format), anything where a wrong abstraction propagates. **Default when in doubt** (the highest-capability tier).
   - **`max`** — gnarly debug with no clear hypothesis, evals, security review. Reserved for where deeper reasoning measurably lifts quality; prone to overthinking, don't reach for it casually.
 - **model** (worker model) — one of the configured `models:` axis in `plugins/plan/subagents.yaml` (`opus` today). Required on every task and folds into the per-task entry in 5e beside `tier`. Use `opus` unless you are deliberately A/B-comparing a newly-added model on the same task; adding a model is a one-line config edit, not a per-task decision.
 
@@ -520,7 +520,7 @@ YAML_EOF
 
 Capture from the success envelope and pin for Phase 6/8: `epic_id` (`fn-N-slug`), `task_ids` (ordered `<epic_id>.M`), and `repo_distribution` (`{repo_path: count}` — eyeball on a cross-repo epic; an all-primary distribution flags a forgotten `target_repo:`).
 
-**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`, no writes land): scaffold collected all errors in one pass. Codes — `bad_yaml` (parse/shape/type), `spec_invalid` (task spec malformed), `dep_invalid` (out-of-range/self ordinal), `dep_cycle`, `epic_dep_invalid` (an `epic.depends_on_epics` entry fails the cross-project resolver — bad shape / not found / done / ambiguous / would cycle; fn-600), `id_collision`, `tier_invalid`. Read `details`, fix every entry in the YAML, re-run the single call. Do **not** fall back to incremental verbs.
+**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`, no writes land): scaffold collected all errors in one pass. Codes (the scaffold validator's full set) — `bad_yaml` (parse/shape/type), `spec_invalid` (task spec malformed), `dep_invalid` (out-of-range/self ordinal), `epic_dep_invalid` (an `epic.depends_on_epics` entry fails the cross-project resolver — bad shape / not found / done / ambiguous / would cycle), `repo_invalid` (a task `target_repo` outside the discovered set), `tier_invalid`, `model_invalid`, `repo_required` (a multi-repo source needs an explicit in-set per-task `target_repo`), `dep_cycle`, `id_collision`, `duplicate_epic` (a same-slug sibling epic; `--allow-duplicate` overrides). Read `details`, fix every entry in the YAML, re-run the single call. Do **not** fall back to incremental verbs.
 
 Scaffold leaves the epic uncommitted-to-deps by design — proceed to Phase 6.
 
@@ -550,7 +550,7 @@ Lines that don't match → log and skip. Do **not** process `### Reverse Depende
 keeper plan epic add-deps --skip-invalid <epic_id> <dep_id> [<dep_id> ...]
 ```
 
-`--skip-invalid` routes per-edge errors into the success envelope's `results` array (`{dep_id, status, reason}`, status ∈ `WIRED | ALREADY_PRESENT | SKIPPED_*`) instead of failing the call (exit stays 0). `WIRED` = newly written; `ALREADY_PRESENT` = idempotent re-run; `SKIPPED_*` = classifier rejected, human sees the reason.
+`--skip-invalid` routes per-edge errors into the success envelope's `results` array (`{dep_id, status}`, status ∈ `WIRED | ALREADY_PRESENT | SKIPPED_*`) instead of failing the call (exit stays 0). `WIRED` = newly written; `ALREADY_PRESENT` = idempotent re-run; `SKIPPED_*` = the classifier rejected the edge, and the specific status names why (e.g. `SKIPPED_AMBIGUOUS`).
 
 **4. Fold overlap/reverse-dep "why" into the epic spec `## References`** (durable context for `keeper plan cat <epic>` later), and emit one Phase 8 line per dep — two shapes only, never hybrid:
 

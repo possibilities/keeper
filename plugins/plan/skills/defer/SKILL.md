@@ -167,7 +167,7 @@ YAML_EOF
 
 The success envelope carries `epic_id` (the freshly-minted `fn-N-slug`) and `task_ids` (a one-element list `[<epic_id>.1]`). Pin both for Phase 5.
 
-**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`): scaffold collected all validation errors in one pass. Read `details`, fix the YAML, and re-run the single scaffold call. Do NOT fall back to incremental verbs. Codes: `bad_yaml`, `spec_invalid`, `ref_invalid`, `dep_invalid`, `dep_cycle`, `id_collision`, `tier_invalid`, `repo_invalid`.
+**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`): scaffold collected all validation errors in one pass. Read `details`, fix the YAML, and re-run the single scaffold call. Do NOT fall back to incremental verbs. Codes (the scaffold validator's full set): `bad_yaml`, `spec_invalid`, `dep_invalid`, `epic_dep_invalid`, `repo_invalid`, `tier_invalid`, `model_invalid`, `repo_required`, `dep_cycle`, `id_collision`, `duplicate_epic`.
 
 **Arm the epic (mandatory).** Scaffold mints the epic as a not-ready **ghost** (`last_validated_at: null`, rendered dashed, blocked by autopilot readiness). A single-task defer wires no deps, so this arm is the whole readiness step — without it autopilot never dispatches the task:
 
