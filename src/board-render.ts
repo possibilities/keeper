@@ -22,6 +22,7 @@
  * already import from it, so external import paths keep resolving.
  */
 
+import { classifyDispatchFailure } from "./dispatch-failure-pill";
 import { glyphForToken } from "./icon-theme";
 import {
   type ClientFrame,
@@ -443,26 +444,26 @@ export function renderClosePills(
 }
 
 /**
- * Render the trailing `[failed:<kind>]` pill for a CLOSE ROW whose
- * `close::<epic>` dispatch is parked STICKY in the `dispatch_failures`
- * projection (the reconciler ATTEMPTED the close and it failed — e.g. a
- * worktree merge conflict at `finalizeEpic`). `computeReadiness` is pure and
- * never reads that projection, so the close row's readiness verdict still reads
- * `ready`; without this pill the board would show a dispatchable close while
- * autopilot is jammed on the sticky failure. The pill carries only the failure
- * KIND — the reason's leading token, before the first `:` or whitespace — so a
- * multi-line `reason` (the conflict dump) stays one scannable pill; the
- * colorizer routes `failed:*` to the red `error` bucket.
+ * Render the trailing `[failed:<kind>]` pill for a board row whose dispatch is
+ * parked STICKY in the `dispatch_failures` projection — a `close::<epic>` the
+ * reconciler ATTEMPTED and that jammed (e.g. a worktree merge conflict at
+ * `finalizeEpic`), OR a `work::<task>` the reconciler rejected (e.g. a
+ * `worktree-multi-repo` gate). `computeReadiness` is pure and never reads that
+ * projection, so the row's readiness verdict still reads `ready`; without this
+ * pill the board would show a dispatchable row while autopilot is jammed on the
+ * sticky failure. The pill carries only the failure KIND (via
+ * `classifyDispatchFailure` — the short display vocab) so a multi-line `reason`
+ * (the conflict dump) stays one scannable pill; the colorizer routes `failed:*`
+ * to the red `error` bucket.
  *
- * Returns `""` when there is no sticky close failure, else a `' '`-prefixed
- * pill string.
+ * Returns `""` when there is no sticky failure, else a `' '`-prefixed pill
+ * string.
  */
-export function renderCloseFailurePill(reason: string | undefined): string {
+export function renderDispatchFailurePill(reason: string | undefined): string {
   if (reason === undefined || reason === "") {
     return "";
   }
-  const kind = reason.split(/[:\s]/, 1)[0] ?? reason;
-  return ` ${pill(`failed:${kind}`)}`;
+  return ` ${pill(`failed:${classifyDispatchFailure(reason)}`)}`;
 }
 
 // ---------------------------------------------------------------------------

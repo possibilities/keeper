@@ -1,0 +1,152 @@
+/**
+ * Unit tests for the pure `src/dispatch-failure-pill.ts` leaf module: the
+ * `classifyDispatchFailure` reason→short-KIND map (ordered prefix rules +
+ * never-empty fallback) and the `resolveFailureTarget` key→board-target join
+ * (work=verbatim; bare + worktree-mode close keys; boundary-checked longest
+ * match; path-keyed null-epic + zero-match → null). No socket / clock / DB.
+ */
+
+import { describe, expect, test } from "bun:test";
+import {
+  classifyDispatchFailure,
+  resolveFailureTarget,
+} from "../src/dispatch-failure-pill";
+
+describe("classifyDispatchFailure", () => {
+  test("maps the known worktree reasons to the short display vocab", () => {
+    expect(classifyDispatchFailure("worktree-multi-repo")).toBe("multi-repo");
+    expect(classifyDispatchFailure("worktree-finalize-conflict")).toBe(
+      "merge-conflict",
+    );
+    expect(classifyDispatchFailure("worktree-recover-conflict")).toBe(
+      "merge-conflict",
+    );
+    expect(classifyDispatchFailure("worktree-merge-conflict")).toBe(
+      "merge-conflict",
+    );
+    expect(classifyDispatchFailure("worktree-recover-dirty-checkout")).toBe(
+      "dirty-tree",
+    );
+    expect(classifyDispatchFailure("worktree-finalize-non-fast-forward")).toBe(
+      "non-ff",
+    );
+  });
+
+  test("classifies by prefix, ignoring a trailing multi-line detail dump", () => {
+    const reason =
+      "worktree-merge-conflict: merging keeper/epic/fn-1-a into main\nCONFLICT (content): README.md";
+    expect(classifyDispatchFailure(reason)).toBe("merge-conflict");
+  });
+
+  test("keeps distinct operator actions distinct (no over-collapse)", () => {
+    const kinds = new Set([
+      classifyDispatchFailure("worktree-multi-repo"),
+      classifyDispatchFailure("worktree-recover-dirty-checkout"),
+      classifyDispatchFailure("worktree-finalize-non-fast-forward"),
+      classifyDispatchFailure("worktree-merge-conflict"),
+    ]);
+    expect(kinds).toEqual(
+      new Set(["multi-repo", "dirty-tree", "non-ff", "merge-conflict"]),
+    );
+  });
+
+  test("falls back to the leading token before the first : or whitespace", () => {
+    expect(classifyDispatchFailure("some-novel-reason: detail")).toBe(
+      "some-novel-reason",
+    );
+    expect(classifyDispatchFailure("bare-token")).toBe("bare-token");
+    expect(classifyDispatchFailure("lead more words")).toBe("lead");
+  });
+
+  test("never returns an empty string — a degenerate reason yields `unknown`", () => {
+    expect(classifyDispatchFailure("")).toBe("unknown");
+    expect(classifyDispatchFailure(":leading-colon")).toBe("unknown");
+    expect(classifyDispatchFailure(" leading-space")).toBe("unknown");
+  });
+});
+
+describe("resolveFailureTarget", () => {
+  const epicIds = ["fn-1-a", "fn-106", "fn-1061-foo", "fn-9-x"];
+
+  test("a work row resolves to its task verbatim (epicIds unused)", () => {
+    expect(
+      resolveFailureTarget({ verb: "work", id: "fn-9-x.2", dir: "" }, []),
+    ).toEqual({ kind: "task", taskId: "fn-9-x.2" });
+  });
+
+  test("an empty work id resolves to null", () => {
+    expect(
+      resolveFailureTarget({ verb: "work", id: "", dir: "" }, epicIds),
+    ).toBeNull();
+  });
+
+  test("a bare close::<epic> resolves to that epic directly", () => {
+    expect(
+      resolveFailureTarget({ verb: "close", id: "fn-9-x", dir: "" }, epicIds),
+    ).toEqual({ kind: "epic", epicId: "fn-9-x" });
+  });
+
+  test("a worktree-finalize close key resolves to its epic", () => {
+    expect(
+      resolveFailureTarget(
+        { verb: "close", id: "worktree-finalize:fn-9-x-abc123", dir: "" },
+        epicIds,
+      ),
+    ).toEqual({ kind: "epic", epicId: "fn-9-x" });
+  });
+
+  test("boundary-checked longest-match: fn-106 never claims an fn-1061 key", () => {
+    // The fn-1061 key must resolve to fn-1061-foo (longest match), NOT fn-106.
+    expect(
+      resolveFailureTarget(
+        { verb: "close", id: "worktree-finalize:fn-1061-foo-hash", dir: "" },
+        epicIds,
+      ),
+    ).toEqual({ kind: "epic", epicId: "fn-1061-foo" });
+    // A bare fn-106 key resolves to fn-106 (end-of-string boundary), not fn-1061.
+    expect(
+      resolveFailureTarget({ verb: "close", id: "fn-106", dir: "" }, epicIds),
+    ).toEqual({ kind: "epic", epicId: "fn-106" });
+  });
+
+  test("a path-keyed recover row (/-leading remainder) → null", () => {
+    expect(
+      resolveFailureTarget(
+        {
+          verb: "close",
+          id: "worktree-recover:/Users/mike/code/arthack",
+          dir: "",
+        },
+        epicIds,
+      ),
+    ).toBeNull();
+  });
+
+  test("a slugged recover key that matches no epic → null (zero-match)", () => {
+    expect(
+      resolveFailureTarget(
+        {
+          verb: "close",
+          id: "worktree-recover:Users-mike-code-arthack",
+          dir: "",
+        },
+        epicIds,
+      ),
+    ).toBeNull();
+  });
+
+  test("a close key for an unknown epic → null", () => {
+    expect(
+      resolveFailureTarget(
+        { verb: "close", id: "fn-404-ghost", dir: "" },
+        epicIds,
+      ),
+    ).toBeNull();
+  });
+
+  test("an unknown verb → null", () => {
+    expect(
+      resolveFailureTarget({ verb: "plan", id: "fn-9-x", dir: "" }, epicIds),
+    ).toBeNull();
+  });
+});

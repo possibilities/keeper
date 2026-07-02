@@ -30,6 +30,10 @@
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import {
+  classifyDispatchFailure,
+  resolveFailureTarget,
+} from "../src/dispatch-failure-pill";
 import type { BootStatus, Row } from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
@@ -41,8 +45,9 @@ import {
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
 
-/** Envelope schema version for `keeper status`. */
-export const STATUS_SCHEMA_VERSION = 1;
+/** Envelope schema version for `keeper status`. v2 adds the additive
+ * `dispatch_failure: string[]` field to the per-task + close-row views. */
+export const STATUS_SCHEMA_VERSION = 2;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -61,7 +66,10 @@ Usage:
 
 Prints ONE {schema_version, ok, error, data} envelope: autopilot config, the
 per-epic/-task/-close-row readiness verdicts, aggregate counts, drained/jammed
-booleans, in-flight launches, needs-human signals, and {rev, catching_up}.
+booleans, in-flight launches, needs-human signals, and {rev, catching_up}. Each
+task + close view also carries dispatch_failure: string[] — the sticky
+dispatch_failures block KINDS (multi-repo / merge-conflict / dirty-tree / non-ff)
+readiness can't see; [] when clean.
 
 Flags:
   --json                   Emit JSON (default; accepted for symmetry)
@@ -77,6 +85,7 @@ Exit codes:
 Examples:
   keeper status --json | jq .data.autopilot
   keeper status | jq '.data.drained, .data.jammed'
+  keeper status --json | jq '.data.board.epics[].tasks[].dispatch_failure, .data.board.epics[].close.dispatch_failure'
 `;
 
 // ---------------------------------------------------------------------------
@@ -99,6 +108,14 @@ export interface StatusBootInfo {
 interface VerdictView {
   verdict: string;
   pill: string;
+  // Sorted-unique short KIND tokens for any sticky `dispatch_failures` block on
+  // this row (multi-repo / merge-conflict / dirty-tree / non-ff / …). Additive
+  // (v2), `[]` when clean. Populated on task + close views; the epic-level view
+  // stays `[]` (a close-row block lives on `close`, not the epic verdict).
+  // NAMED `dispatch_failure` (not `blocked_by`) to avoid a collision with the
+  // plan tooling's dependency-id field and the paradox of "blocked" on a
+  // `ready`-verdict row — readiness is untouched here.
+  dispatch_failure: string[];
 }
 
 interface TaskView extends VerdictView {
@@ -157,9 +174,13 @@ export interface StatusEnvelope {
  *  dispatchable). */
 function verdictView(v: Verdict | undefined): VerdictView {
   if (v === undefined) {
-    return { verdict: "unknown", pill: "[blocked:unknown]" };
+    return {
+      verdict: "unknown",
+      pill: "[blocked:unknown]",
+      dispatch_failure: [],
+    };
   }
-  return { verdict: v.tag, pill: formatPill(v) };
+  return { verdict: v.tag, pill: formatPill(v), dispatch_failure: [] };
 }
 
 /** Tally a verdict map by tag. `blocked` absorbs every non-ready/running/done. */
@@ -196,6 +217,41 @@ export function buildStatusEnvelope(
   boot: StatusBootInfo,
   dispatchFailures: readonly Row[],
 ): StatusEnvelope {
+  // Resolve + classify each sticky `dispatch_failures` row to its board target
+  // (a `work::` row → its task, a `close::` row — bare or worktree-mode-keyed →
+  // its epic close row) via the shared pure module, collecting sorted-unique
+  // KIND tokens per target. Render-only + additive; `verdict`/`pill`/`counts`
+  // (readiness semantics) stay untouched. A `null` resolution (path-keyed
+  // null-epic row / zero-match) drops silently — a missing pill, never a throw.
+  const epicIds = snap.epics.map((e) => e.epic_id);
+  const taskFailureKinds = new Map<string, Set<string>>();
+  const closeFailureKinds = new Map<string, Set<string>>();
+  for (const r of dispatchFailures) {
+    const target = resolveFailureTarget(
+      {
+        verb: String(r.verb ?? ""),
+        id: String(r.id ?? ""),
+        dir: String(r.dir ?? ""),
+      },
+      epicIds,
+    );
+    if (target === null) {
+      continue;
+    }
+    const kind = classifyDispatchFailure(String(r.reason ?? ""));
+    const bucket =
+      target.kind === "task" ? taskFailureKinds : closeFailureKinds;
+    const key = target.kind === "task" ? target.taskId : target.epicId;
+    let set = bucket.get(key);
+    if (set === undefined) {
+      set = new Set<string>();
+      bucket.set(key, set);
+    }
+    set.add(kind);
+  }
+  const sortedKinds = (m: Map<string, Set<string>>, key: string): string[] =>
+    [...(m.get(key) ?? [])].sort();
+
   const board = {
     epics: snap.epics.map((epic): EpicView => {
       const closeVerdict = snap.readiness.perCloseRow.get(epic.epic_id);
@@ -207,9 +263,16 @@ export function buildStatusEnvelope(
           (task): TaskView => ({
             task_id: task.task_id,
             ...verdictView(snap.readiness.perTask.get(task.task_id)),
+            dispatch_failure: sortedKinds(taskFailureKinds, task.task_id),
           }),
         ),
-        close: closeVerdict === undefined ? null : verdictView(closeVerdict),
+        close:
+          closeVerdict === undefined
+            ? null
+            : {
+                ...verdictView(closeVerdict),
+                dispatch_failure: sortedKinds(closeFailureKinds, epic.epic_id),
+              },
       };
     }),
   };

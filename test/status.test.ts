@@ -157,7 +157,12 @@ describe("buildStatusEnvelope shape", () => {
     expect(epic?.verdict).toBe("ready");
     expect(epic?.pill).toBe("[ready]");
     expect(epic?.tasks).toEqual([
-      { task_id: "fn-1-a.1", verdict: "ready", pill: "[ready]" },
+      {
+        task_id: "fn-1-a.1",
+        verdict: "ready",
+        pill: "[ready]",
+        dispatch_failure: [],
+      },
     ]);
     expect(epic?.close?.verdict).toBe("blocked");
     expect(epic?.close?.pill).toContain("dep-on-task");
@@ -199,6 +204,83 @@ describe("buildStatusEnvelope shape", () => {
     ).data;
     expect(d?.autopilot.mode).toBe("yolo");
     expect(d?.autopilot.armed).toEqual([]);
+  });
+
+  test("dispatch_failure surfaces sticky blocks on task + close views (schema v2)", () => {
+    const snap = makeSnap({
+      epics: [
+        {
+          epic_id: "fn-9-x",
+          status: "open",
+          tasks: [{ task_id: "fn-9-x.1" }, { task_id: "fn-9-x.2" }],
+        },
+      ],
+      perEpic: { "fn-9-x": { tag: "ready" } },
+      perTask: {
+        "fn-9-x.1": { tag: "ready" },
+        "fn-9-x.2": { tag: "ready" },
+      },
+      perCloseRow: { "fn-9-x": { tag: "ready" } },
+    });
+    const failures: Row[] = [
+      // Three per-repo worktree-mode close keys for the SAME epic (Gap A — a
+      // bare `.get(epicId)` would miss the hashed keys). Two distinct KINDS,
+      // one dup → sorted-unique collection on the close view.
+      {
+        verb: "close",
+        id: "worktree-finalize:fn-9-x-h1",
+        reason: "worktree-finalize-conflict",
+      },
+      {
+        verb: "close",
+        id: "worktree-finalize:fn-9-x-h2",
+        reason: "worktree-finalize-non-fast-forward",
+      },
+      {
+        verb: "close",
+        id: "worktree-finalize:fn-9-x-h3",
+        reason: "worktree-recover-conflict",
+      },
+      // A `work::`-blocked ready task (Gap B).
+      { verb: "work", id: "fn-9-x.1", reason: "worktree-multi-repo" },
+    ];
+    const env = buildStatusEnvelope(snap, BOOT, failures);
+    expect(env.schema_version).toBe(2);
+    const epic = env.data?.board.epics[0];
+    // close row resolves all three hashed keys → sorted-unique kinds.
+    expect(epic?.close?.dispatch_failure).toEqual(["merge-conflict", "non-ff"]);
+    // task .1 carries the work block; task .2 is clean.
+    const t1 = epic?.tasks.find((t) => t.task_id === "fn-9-x.1");
+    const t2 = epic?.tasks.find((t) => t.task_id === "fn-9-x.2");
+    expect(t1?.dispatch_failure).toEqual(["multi-repo"]);
+    expect(t2?.dispatch_failure).toEqual([]);
+    // the epic-level view stays [] — a close block lives on `close`.
+    expect(epic?.dispatch_failure).toEqual([]);
+  });
+
+  test("a null-epic / zero-match failure drops silently (no pill, no throw)", () => {
+    const snap = makeSnap({
+      epics: [
+        { epic_id: "fn-9-x", status: "open", tasks: [{ task_id: "fn-9-x.1" }] },
+      ],
+      perEpic: { "fn-9-x": { tag: "ready" } },
+      perTask: { "fn-9-x.1": { tag: "ready" } },
+      perCloseRow: { "fn-9-x": { tag: "ready" } },
+    });
+    const failures: Row[] = [
+      // path-keyed recover row → null-epic, dropped.
+      {
+        verb: "close",
+        id: "worktree-recover:/Users/mike/code/other",
+        reason: "worktree-recover-dirty-checkout",
+      },
+      // resolves to no known epic → dropped.
+      { verb: "close", id: "fn-404-ghost", reason: "worktree-merge-conflict" },
+    ];
+    const env = buildStatusEnvelope(snap, BOOT, failures);
+    const epic = env.data?.board.epics[0];
+    expect(epic?.close?.dispatch_failure).toEqual([]);
+    expect(epic?.tasks[0]?.dispatch_failure).toEqual([]);
   });
 });
 

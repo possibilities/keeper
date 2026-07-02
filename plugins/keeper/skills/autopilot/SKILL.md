@@ -217,7 +217,10 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 
 1. `keeper status --json | jq .data.autopilot` → read `{paused, mode, armed,
    worktree_mode, …}`; the same envelope's `data.in_flight` / `data.needs_human`
-   cover in-flight launches and anything needing an operator.
+   cover in-flight launches and anything needing an operator. For a faster
+   per-row jam read, `.data.board.epics[].tasks[].dispatch_failure` and
+   `.data.board.epics[].close.dispatch_failure` name the sticky block KIND
+   (multi-repo / merge-conflict / dirty-tree / non-ff) on the exact wedged row.
 2. Report paused/playing, mode, armed epics, and any in-flight or stuck
    dispatches. NEVER `keeper autopilot --watch` (it hangs).
 

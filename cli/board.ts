@@ -46,8 +46,8 @@ import {
   pill,
   pillOrEmpty,
   planVerbLabel,
-  renderCloseFailurePill,
   renderClosePills,
+  renderDispatchFailurePill,
   renderTaskPills,
   sessionTelemetryPillSeg,
   startedPill,
@@ -55,6 +55,7 @@ import {
   validatedPill,
 } from "../src/board-render";
 import { DEFAULT_MAX_CONCURRENT_PER_ROOT, resolveSockPath } from "../src/db";
+import { resolveFailureTarget } from "../src/dispatch-failure-pill";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
   formatPill,
@@ -125,7 +126,9 @@ Examples:
   keeper board --watch    # force the live stream even when piped
 
 Pill glyphs use Nerd Font icons and show-defaults; the jobs list and
-dead-letter banner are shown by 'keeper jobs'.
+dead-letter banner are shown by 'keeper jobs'. A red '[failed:<kind>]' pill on
+a task or close row marks a sticky dispatch_failures block readiness can't see
+(kinds: multi-repo, merge-conflict, dirty-tree, non-ff).
 `;
 
 /**
@@ -465,13 +468,19 @@ export async function main(argv: string[]): Promise<void> {
   // Mutated in place (clear+re-add) on each edge so the closure identity the
   // renderer captured stays stable.
   const armedSet = new Set<string>();
-  // The live close-row sticky-failure set — epicId → failure `reason`, fed by a
-  // parallel `dispatch_failures` subscription below (the readiness composite is
-  // pure and never reads the sticky-failure projection). `renderEpicBlock` reads
-  // this to render the `[failed:<kind>]` pill on a jammed close row. Mutated in
-  // place (clear + re-add) on each edge so the closure identity the renderer
-  // captured stays stable.
+  // The live sticky-failure sets, fed by a parallel `dispatch_failures`
+  // subscription below (the readiness composite is pure and never reads the
+  // sticky-failure projection). `closeFailures` is keyed by the RAW close id
+  // (`fn-1-a` OR `worktree-finalize:<epic>-<hash>` / `worktree-recover:<path>`)
+  // and resolved to its epic at RENDER time via `resolveFailureTarget` — the
+  // epic→key join needs the full epic-id set, only present on the readiness
+  // snapshot. `workFailures` is keyed by task id (a `work::` id is the task id
+  // verbatim, so it resolves in this pass). `renderEpicBlock` reads both to
+  // render the `[failed:<kind>]` pill on a jammed close row / blocked task.
+  // Mutated in place (clear + re-add) on each edge so the closure identity the
+  // renderer captured stays stable.
   const closeFailures = new Map<string, string>();
+  const workFailures = new Map<string, string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // Autopilot banner state — the metadata `keeper autopilot` pins at its top
@@ -564,6 +573,28 @@ export async function main(argv: string[]): Promise<void> {
     return map.get(id) ?? { tag: "blocked", reason: { kind: "unknown" } };
   }
 
+  // Resolve the sticky CLOSE failure reason (if any) for this epic. The raw
+  // `dispatch_failures` close id is `close::<epic>` OR a worktree-mode
+  // `worktree-finalize:<epic>-<hash>` / `worktree-recover:<path>` form, so a
+  // bare `closeFailures.get(epicId)` misses the worktree keys. Route each raw
+  // key through the shared boundary-checked join and return the reason whose
+  // resolved target is this epic. Failures are few → the per-epic scan is cheap.
+  function closeFailureReasonFor(
+    epicId: string,
+    epicIds: readonly string[],
+  ): string | undefined {
+    for (const [rawId, reason] of closeFailures) {
+      const target = resolveFailureTarget(
+        { verb: "close", id: rawId, dir: "" },
+        epicIds,
+      );
+      if (target?.kind === "epic" && target.epicId === epicId) {
+        return reason;
+      }
+    }
+    return undefined;
+  }
+
   function renderEpicBlock(
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -602,9 +633,6 @@ export async function main(argv: string[]): Promise<void> {
     }
     const epicDepsSeg =
       epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
-    // `epicIds` is no longer used for filtering; kept in the signature for API
-    // stability. Read once to silence the lint.
-    void epicIds;
     const epicId = seg(row.epic_id);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
@@ -643,7 +671,10 @@ export async function main(argv: string[]): Promise<void> {
       // reference; ready/completed/running stay inline. The
       // `[task-repo:<basename>]` divergence pill follows the verdict wherever
       // it lands (see `taskRepoPillSeg`).
-      const taskPillSeg = `${taskVerdictPill(taskVerdict, taskId, escalatedTaskIds)}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
+      // The trailing `[failed:<kind>]` pill sits inline after the verdict (e.g.
+      // `[ready] [failed:multi-repo]`) when this task's `work::<task>` dispatch
+      // is parked sticky in `dispatch_failures` — readiness can't see it.
+      const taskPillSeg = `${taskVerdictPill(taskVerdict, taskId, escalatedTaskIds)}${taskRepoPillSeg(t.target_repo, row.project_dir)}${renderDispatchFailurePill(workFailures.get(taskId))}`;
       const taskIdLines =
         taskVerdict.tag === "blocked"
           ? [`    [${taskId}]`, `    ${taskPillSeg}`]
@@ -672,7 +703,7 @@ export async function main(argv: string[]): Promise<void> {
       // when this epic's `close::<epic>` is parked sticky in `dispatch_failures`
       // — the one signal that distinguishes a dispatchable close row from one
       // the reconciler already tried and that jammed (readiness can't see it).
-      `  X. Quality audit and close${renderClosePills(row, closeVerdict)}${renderCloseFailurePill(closeFailures.get(epicId))}`,
+      `  X. Quality audit and close${renderClosePills(row, closeVerdict)}${renderDispatchFailurePill(closeFailureReasonFor(epicId, [...epicIds]))}`,
       ...closeIdLines,
       ...renderJobLines(subagentIndex, row.jobs),
     );
@@ -849,13 +880,15 @@ export async function main(argv: string[]): Promise<void> {
   });
 
   // A parallel `dispatch_failures` subscription — the readiness composite is
-  // pure and never reads the sticky-failure projection, so a `close::<epic>`
-  // dispatch that failed STICKY (e.g. a worktree merge conflict) renders as a
-  // dispatchable `[ready]` close row with no sign autopilot is jammed. On each
-  // edge we rebuild `closeFailures` in place from the `verb='close'` rows (keyed
-  // by the epic id; a `recoverWorktrees` failure is path-tied under a different
-  // id and is intentionally skipped) and re-emit so the `[failed:<kind>]` pill
-  // repaints live. Report to the snapshot latch exactly once; inert in live mode.
+  // pure and never reads the sticky-failure projection, so a `close::<epic>` OR
+  // `work::<task>` dispatch that failed STICKY (e.g. a worktree merge conflict,
+  // a multi-repo gate) renders as a dispatchable `[ready]` row with no sign
+  // autopilot is jammed. On each edge we rebuild BOTH sticky-failure maps in
+  // place in ONE pass: `closeFailures` keyed by the RAW close id (resolved to
+  // its epic at render time, so worktree-mode keys join), `workFailures` keyed
+  // by task id (a `work::` id is the task id verbatim). Then re-emit so the
+  // `[failed:<kind>]` pill repaints live. Report to the snapshot latch exactly
+  // once; inert in live mode. No second subscription (no 5th latch / race).
   let closeFailStreamReported = false;
   const closeFailHandle = subscribeCollection({
     sockPath,
@@ -863,13 +896,24 @@ export async function main(argv: string[]): Promise<void> {
     collection: "dispatch_failures",
     onRows: (rows) => {
       closeFailures.clear();
+      workFailures.clear();
       for (const r of rows) {
-        if (seg(r.verb) !== "close") {
+        const verb = seg(r.verb);
+        const id = seg(r.id);
+        if (id === "") {
           continue;
         }
-        const id = seg(r.id);
-        if (id !== "") {
-          closeFailures.set(id, seg(r.reason));
+        const reason = seg(r.reason);
+        if (verb === "close") {
+          closeFailures.set(id, reason);
+        } else if (verb === "work") {
+          const target = resolveFailureTarget(
+            { verb, id, dir: seg(r.dir) },
+            [],
+          );
+          if (target?.kind === "task") {
+            workFailures.set(target.taskId, reason);
+          }
         }
       }
       // Re-emit BEFORE reporting the stream. `reportSnapshotStream` can resolve

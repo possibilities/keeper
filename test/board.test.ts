@@ -43,8 +43,8 @@ import {
   iconizePills,
   pill,
   pillOrEmpty,
-  renderCloseFailurePill,
   renderClosePills,
+  renderDispatchFailurePill,
   renderTaskPills,
   startedPill,
   subagentLinesFor,
@@ -1848,40 +1848,53 @@ test("renderClosePills: renders a non-open status value verbatim", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderCloseFailurePill — the sticky close-row dispatch-failure pill. Carries
-// only the failure KIND (the reason's leading token) so a multi-line conflict
-// dump stays one scannable pill; the `failed:*` colorizer branch routes it red.
+// renderDispatchFailurePill — the sticky dispatch-failure pill for a task or
+// close row. Carries only the short display KIND (via `classifyDispatchFailure`)
+// so a multi-line conflict dump stays one scannable pill; the `failed:*`
+// colorizer branch routes it red.
 // ---------------------------------------------------------------------------
 
-test("renderCloseFailurePill: empty / undefined reason renders nothing", () => {
-  expect(renderCloseFailurePill(undefined)).toBe("");
-  expect(renderCloseFailurePill("")).toBe("");
+test("renderDispatchFailurePill: empty / undefined reason renders nothing", () => {
+  expect(renderDispatchFailurePill(undefined)).toBe("");
+  expect(renderDispatchFailurePill("")).toBe("");
 });
 
-test("renderCloseFailurePill: a multi-line reason keeps only the leading kind token", () => {
-  // The live shape: `<kind>: <detail…>` where the detail is a multi-line merge
-  // conflict dump. Only `worktree-merge-conflict` survives into the pill.
+test("renderDispatchFailurePill: a multi-line conflict reason collapses to merge-conflict", () => {
+  // The live shape: `<reason>: <detail…>` where the detail is a multi-line merge
+  // conflict dump. Only the short `merge-conflict` KIND survives into the pill.
   const reason =
     "worktree-merge-conflict: merging keeper/epic/fn-1005--…\nCONFLICT (content): README.md";
-  expect(renderCloseFailurePill(reason)).toBe(
-    ` ${pill("failed:worktree-merge-conflict")}`,
+  expect(renderDispatchFailurePill(reason)).toBe(
+    ` ${pill("failed:merge-conflict")}`,
   );
 });
 
-test("renderCloseFailurePill: a colon-free kind passes through whole", () => {
-  expect(renderCloseFailurePill("worktree-finalize-non-fast-forward")).toBe(
-    ` ${pill("failed:worktree-finalize-non-fast-forward")}`,
+test("renderDispatchFailurePill: known reasons map to the short display vocab", () => {
+  expect(renderDispatchFailurePill("worktree-multi-repo")).toBe(
+    ` ${pill("failed:multi-repo")}`,
+  );
+  expect(renderDispatchFailurePill("worktree-finalize-non-fast-forward")).toBe(
+    ` ${pill("failed:non-ff")}`,
+  );
+  expect(renderDispatchFailurePill("worktree-recover-dirty-checkout")).toBe(
+    ` ${pill("failed:dirty-tree")}`,
   );
 });
 
-test("renderCloseFailurePill: the pill colorizes red via the failed:* branch", () => {
+test("renderDispatchFailurePill: an unknown reason falls back to its leading token", () => {
+  expect(renderDispatchFailurePill("some-novel-reason: detail")).toBe(
+    ` ${pill("failed:some-novel-reason")}`,
+  );
+});
+
+test("renderDispatchFailurePill: the pill colorizes red via the failed:* branch", () => {
   // The `failed:*` → error routing is pinned exhaustively above; here just
   // confirm the helper's pill lands in that bucket (red SGR wraps the token).
   const colored = colorizePillsInLine(
-    renderCloseFailurePill("worktree-merge-conflict: …").trimStart(),
+    renderDispatchFailurePill("worktree-merge-conflict: …").trimStart(),
   );
   expect(colored).toContain(ERROR);
-  expect(colored).toContain("failed:worktree-merge-conflict");
+  expect(colored).toContain("failed:merge-conflict");
   expect(colored).toContain(RESET);
 });
 
