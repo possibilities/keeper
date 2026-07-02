@@ -26,5 +26,5 @@ After (1): `file src/pair/panel.ts` reports text and `git grep hasSeenPid -- src
 - [ ] `bun test` and plugins/plan tests green
 
 ## Done summary
-
+Swept three verified papercuts: replaced the raw NUL in panel.ts's liveness memo key with a \0 escape (file now reads as text, key byte-identical at runtime), dropped the dead export on worktree-git.ts hasMergeInProgress, and removed promote.sh's provably-dead git-status drift guard while keeping the render that feeds the slow-tier cell-set guard.
 ## Evidence
