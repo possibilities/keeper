@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T09:09:42.458000Z",
+  "depends_on": [],
+  "epic": "fn-1066-wire-real-git-slow-tier-gate",
+  "id": "fn-1066-wire-real-git-slow-tier-gate.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "De-rot and isolate slow git tier",
+  "updated_at": "2026-07-02T09:09:42.458000Z"
+}

@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T09:09:42.458000Z",
+  "depends_on": [],
+  "epic": "fn-1066-wire-real-git-slow-tier-gate",
+  "id": "fn-1066-wire-real-git-slow-tier-gate.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/sitter",
+  "tier": "medium",
+  "title": "Verify sitter repin channel",
+  "updated_at": "2026-07-02T09:09:42.458000Z"
+}
