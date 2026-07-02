@@ -11,12 +11,26 @@
  * ASC for stable chronology.
  *
  * Read-only open via `openDb(path, { readonly: true })`, closed in `finally`.
- * NO schema-version guard (in-binary readers deliberately skip it). A read
- * failure surfaces as an error envelope (`{ success: false, error }`), NOT an
- * empty result. `--session-id` is REQUIRED.
+ * NO schema-version guard (in-binary readers deliberately skip it). Output rides
+ * the shared one-shot envelope (`cli/envelope.ts`): a hit is
+ * `data:{session_id, events}` (exit 0); a keeper.db read failure is `ok:false`
+ * with `error.{code,message,recovery}` (exit 1), NOT an empty result.
+ * Argument-usage errors (incl. missing `--session-id`) stay on stderr (exit 2),
+ * never the envelope.
  */
 
 import { openDb, resolveDbPath } from "../src/db";
+import {
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+  RECOVERY_DB_READ,
+  successEnvelope,
+} from "./envelope";
+
+/** Envelope schema version for `keeper show-session-events`. */
+export const SHOW_SESSION_EVENTS_SCHEMA_VERSION = 1;
 
 const HELP = `keeper show-session-events --session-id <id> [options]
 
@@ -83,11 +97,6 @@ function parseLimit(raw: string | undefined): number {
   return n;
 }
 
-/** Emit a pretty (`indent=2`, trailing `\n`) JSON envelope. */
-function printPretty(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
 interface SpineRow {
   ts: number;
   hook_event: string;
@@ -123,7 +132,10 @@ function showSessionEvents(
   }
 }
 
-export function main(argv: string[]): void {
+export function main(
+  argv: string[],
+  sink: EnvelopeSink = processEnvelopeSink,
+): void {
   const args = parseArgs(argv);
   if (args.help) {
     process.stdout.write(HELP);
@@ -136,15 +148,29 @@ export function main(argv: string[]): void {
     process.stderr.write(HELP);
     process.exit(2);
   }
-  // A read failure surfaces as an error envelope, never an empty result.
+  // A read failure surfaces as an ok:false envelope, never an empty result.
   let rows: SpineRow[];
   try {
     rows = showSessionEvents(resolveDbPath(), args.sessionId, args.limit);
-  } catch (e) {
-    printPretty({ success: false, error: String(e) });
-    process.exit(1);
+  } catch {
+    emitEnvelope(
+      errorEnvelope(SHOW_SESSION_EVENTS_SCHEMA_VERSION, {
+        code: "read_failed",
+        message:
+          "could not read the session event spine from the keeper database",
+        recovery: RECOVERY_DB_READ,
+      }),
+      sink,
+    );
+    return;
   }
-  printPretty({ success: true, session_id: args.sessionId, events: rows });
+  emitEnvelope(
+    successEnvelope(SHOW_SESSION_EVENTS_SCHEMA_VERSION, {
+      session_id: args.sessionId,
+      events: rows,
+    }),
+    sink,
+  );
 }
 
 if (import.meta.main) {

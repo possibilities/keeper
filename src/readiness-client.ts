@@ -60,6 +60,7 @@
 import {
   projectMaxConcurrentJobs,
   projectWorktreeMode,
+  projectWorktreeMultiRepo,
 } from "../cli/autopilot";
 import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
@@ -213,6 +214,11 @@ export interface ReadinessClientSnapshot {
   readonly maxConcurrentJobs: number | null;
   readonly maxConcurrentPerRoot: number;
   readonly worktreeMode: boolean;
+  // The durable multi-repo worktree rollout flag off the same `autopilot_state`
+  // singleton (`false` on an empty/malformed row). ADDITIVE alongside
+  // `worktreeMode` — surfaced so `keeper status .data.autopilot` and `keeper
+  // autopilot show` round-trip every durable knob off ONE snapshot.
+  readonly worktreeMultiRepo: boolean;
   // The durable MERGE-LANDED set — epic ids whose work is provably on the
   // default branch, for `keeper await landed` and `keeper status`. Sorted, stable.
   // Present ONLY under the `includeRecentDoneEpics` opt-in (the OFF degradation
@@ -1888,6 +1894,7 @@ export function subscribeReadiness(
     const autopilotRows = projectRows<Record<string, unknown>>(autopilotState);
     const maxConcurrentJobs = projectMaxConcurrentJobs(autopilotRows);
     const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
+    const worktreeMultiRepo = projectWorktreeMultiRepo(autopilotRows) ?? false;
     const eligibleEpicIdsSorted =
       eligibleEpicIds === undefined ? undefined : [...eligibleEpicIds].sort();
     // The merge-landed set, computed ONLY under the `includeRecentDoneEpics`
@@ -1918,6 +1925,7 @@ export function subscribeReadiness(
       maxConcurrentJobs,
       maxConcurrentPerRoot,
       worktreeMode,
+      worktreeMultiRepo,
       ...(landedEpicIds === undefined ? {} : { landedEpicIds }),
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,

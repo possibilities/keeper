@@ -29,9 +29,12 @@ import {
   resolveSession,
 } from "../cli/dispatch";
 import {
+  buildHelpIndex,
   type DispatchDeps,
   dispatch,
+  EXIT_CODES,
   isSubcommand,
+  SUBCOMMAND_META,
   SUBCOMMANDS,
   type Subcommand,
   USAGE,
@@ -84,6 +87,7 @@ function makeHarness(): Harness {
       "find-file-history": mkHandler("find-file-history"),
       "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
+      "session-summary": mkHandler("session-summary"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),
@@ -232,6 +236,91 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("dispatch")).toBe(true);
     await dispatch(["dispatch", "work::fn-1-x.2"], h.deps);
     expect(h.calls).toEqual([{ sub: "dispatch", argv: ["work::fn-1-x.2"] }]);
+  });
+
+  test("--help --json emits the machine-readable command index, exit 0", async () => {
+    const h = makeHarness();
+    let caught: unknown;
+    try {
+      await dispatch(["--help", "--json"], h.deps);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExitError);
+    expect((caught as ExitError).code).toBe(0);
+    expect(h.stderr).toEqual([]);
+    expect(h.calls).toEqual([]);
+    const parsed = JSON.parse(h.stdout.join("")) as ReturnType<
+      typeof buildHelpIndex
+    >;
+    // Flat introspection shape — NOT wrapped in the one-shot envelope, so a
+    // direct `jq '.subcommands'` reads the array (per the epic quick command).
+    expect(Array.isArray(parsed.subcommands)).toBe(true);
+    expect(parsed.subcommands.map((s) => s.name)).toEqual([...SUBCOMMANDS]);
+    expect(parsed.exit_codes).toEqual(EXIT_CODES);
+  });
+
+  test("plain --help stays human USAGE even with no --json", async () => {
+    const h = makeHarness();
+    try {
+      await dispatch(["--help"], h.deps);
+    } catch {
+      /* swallow ExitError */
+    }
+    expect(h.stdout.join("")).toBe(USAGE);
+  });
+});
+
+describe("cli/keeper command index", () => {
+  test("covers every subcommand with a non-empty summary", () => {
+    const index = buildHelpIndex();
+    // Catches a future statusline-sink-class gap: a new subcommand cannot land
+    // without a summary (the Record type) and this asserts it is non-empty.
+    for (const name of SUBCOMMANDS) {
+      const entry = index.subcommands.find((s) => s.name === name);
+      expect(entry).toBeDefined();
+      expect((entry as { summary: string }).summary.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("two-level subcommands enumerate their verb names", () => {
+    const index = buildHelpIndex();
+    const byName = new Map(index.subcommands.map((s) => [s.name, s]));
+    for (const name of [
+      "plan",
+      "prompt",
+      "agent",
+      "bus",
+      "autopilot",
+    ] as const) {
+      const verbs = byName.get(name)?.verbs;
+      expect(Array.isArray(verbs)).toBe(true);
+      expect((verbs as readonly string[]).length).toBeGreaterThan(0);
+    }
+    // A leaf (non-two-level) subcommand omits verbs entirely.
+    expect(byName.get("status")?.verbs).toBeUndefined();
+  });
+
+  test("marks exactly the --agent-help-bearing subcommands", () => {
+    const index = buildHelpIndex();
+    const flagged = index.subcommands
+      .filter((s) => s.agent_help)
+      .map((s) => String(s.name))
+      .sort();
+    expect(flagged).toEqual(
+      ["autopilot", "commit-work", "dispatch", "handoff", "reclaim"].sort(),
+    );
+    // The metadata source of truth agrees with the projected index.
+    for (const s of index.subcommands) {
+      expect(s.agent_help).toBe(SUBCOMMAND_META[s.name].agentHelp === true);
+    }
+  });
+
+  test("publishes the shared exit-code taxonomy", () => {
+    const index = buildHelpIndex();
+    for (const code of ["0", "1", "2", "3", "4", "5"]) {
+      expect(index.exit_codes[code]?.length ?? 0).toBeGreaterThan(0);
+    }
   });
 });
 

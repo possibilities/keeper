@@ -92,7 +92,8 @@ Usage:
   keeper await <condition> [<id>] [and <condition> [<id>]]... [flags]
 
 Conditions (one per segment; join with the literal 'and' to wait for ALL):
-  complete <id>      task done+approved, or epic popped off the board
+  complete <id>      done-AND-idle: the task/epic is done+approved AND its work
+                     session has gone idle, or the epic has popped off the board
   started <id>       work has begun on the task/epic (monotonic milestone)
   unblocked <id>     row is workable now (concurrency mutexes don't block)
   git-clean          cwd's git root has no dirty/orphaned files (no id)
@@ -112,6 +113,8 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      Edge-triggered: never satisfied on first paint
   changed [since:R]  the board's epics/verdicts/autopilot move. Edge-triggered;
                      since:<hash> anchors against a prior 'changed' baseline
+  landed <epic>      the epic's worktree lane has merged into the LOCAL default
+                     branch (the finalize merge landed) — later than 'complete'
 
 Flags:
   --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3

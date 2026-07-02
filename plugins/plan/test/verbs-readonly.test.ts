@@ -263,7 +263,9 @@ describe("epics", () => {
         '      "branch_name": "main",\n' +
         '      "task_summary": {\n' +
         '        "total": 0,\n        "todo": 0,\n        "in_progress": 0,\n' +
-        '        "done": 0,\n        "blocked": 0\n      }\n    }\n  ]\n}\n',
+        '        "done": 0,\n        "blocked": 0\n      }\n    }\n  ],\n' +
+        '  "total": 2,\n  "returned": 2,\n  "truncated": false,\n' +
+        '  "hint": null\n}\n',
     );
     expect(trailer).toBeNull();
   });
@@ -274,7 +276,10 @@ describe("epics", () => {
     const r = runCli(["epics"], { cwd: root });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
-    expect(primary).toBe('{\n  "success": true,\n  "epics": []\n}\n');
+    expect(primary).toBe(
+      '{\n  "success": true,\n  "epics": [],\n  "total": 0,\n' +
+        '  "returned": 0,\n  "truncated": false,\n  "hint": null\n}\n',
+    );
     expect(trailer).toBeNull();
   });
 

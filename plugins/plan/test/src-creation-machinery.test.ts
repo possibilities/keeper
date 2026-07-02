@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { checkGlobalNameUnique } from "../src/discovery.ts";
-import { emitFailureEnvelope } from "../src/emit.ts";
+import { emitFailureEnvelope, recoveryForPlanCode } from "../src/emit.ts";
 import { withEpicIdLock } from "../src/flock.ts";
 import {
   generateSuffix,
@@ -307,7 +307,7 @@ describe("expandPath", () => {
 // ===========================================================================
 
 describe("emitFailureEnvelope", () => {
-  test("prints one compact NDJSON line with the error triplet", () => {
+  test("prints one compact NDJSON line with the error object + recovery", () => {
     const lines: string[] = [];
     const orig = process.stdout.write;
     // @ts-expect-error — narrow override for the duration of the test.
@@ -322,17 +322,43 @@ describe("emitFailureEnvelope", () => {
     }
     expect(lines).toHaveLength(1);
     const env = JSON.parse(lines[0] as string);
-    expect(env).toEqual({
-      success: false,
-      error: {
-        code: "bad_yaml",
-        message: "YAML parse error: x",
-        details: ["file: -"],
-      },
-    });
+    // The converged error sub-object carries {code, message, details, recovery}.
+    expect(env.success).toBe(false);
+    expect(env.error.code).toBe("bad_yaml");
+    expect(env.error.message).toBe("YAML parse error: x");
+    expect(env.error.details).toEqual(["file: -"]);
+    expect(env.error.recovery).toBe(recoveryForPlanCode("bad_yaml"));
+    expect(typeof env.error.recovery).toBe("string");
+    expect(env.error.recovery.length).toBeGreaterThan(0);
     // Compact: no spaces after separators.
     expect(lines[0]).not.toContain('": ');
     expect(lines[0]?.endsWith("\n")).toBe(true);
+  });
+
+  test("an explicit recovery overrides the code registry", () => {
+    const lines: string[] = [];
+    const orig = process.stdout.write;
+    // @ts-expect-error — narrow override for the duration of the test.
+    process.stdout.write = (chunk: string) => {
+      lines.push(chunk);
+      return true;
+    };
+    try {
+      emitFailureEnvelope("bad_yaml", "x", [], "do the specific thing");
+    } finally {
+      process.stdout.write = orig;
+    }
+    const env = JSON.parse(lines[0] as string);
+    expect(env.error.recovery).toBe("do the specific thing");
+  });
+
+  test("an unlisted code falls back to the default recovery", () => {
+    expect(recoveryForPlanCode("totally_unknown_code")).toBe(
+      recoveryForPlanCode("another_unknown"),
+    );
+    expect(recoveryForPlanCode("totally_unknown_code").length).toBeGreaterThan(
+      0,
+    );
   });
 });
 

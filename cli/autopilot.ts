@@ -48,6 +48,16 @@ import {
 import type { Epic, Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 import { queryCollection, sendControlRpc } from "./control-rpc";
+import {
+  type Envelope,
+  emitEnvelope,
+  errorEnvelope,
+  RECOVERY_DAEMON_DOWN,
+  successEnvelope,
+} from "./envelope";
+
+/** Envelope schema version for `keeper autopilot show`. */
+export const AUTOPILOT_SHOW_SCHEMA_VERSION = 1;
 
 const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
@@ -61,12 +71,18 @@ Usage:
   keeper autopilot disarm <epic-id> [--sock <path>]
   keeper autopilot worktree <on|off> [--force] [--sock <path>]
   keeper autopilot retry <verb::id> [--sock <path>]
+  keeper autopilot show [--sock <path>]
   keeper autopilot --help
 
 Subcommands:
   (none)   Open the alt-screen viewer rendering the live current /
            stopped / failed / armed / dependencies sections plus the
            paused + mode + armed-count banner.
+  show     Print the durable autopilot config as ONE
+           {schema_version, ok, error, data} JSON envelope and exit:
+           {paused, mode, worktree_mode, worktree_multi_repo, armed,
+           max_concurrent_jobs, max_concurrent_per_root}. Read-only — the
+           capture surface for a take-over (every durable knob round-trips).
   pause    Send set_autopilot_paused {paused:true} and exit.
   play     Send set_autopilot_paused {paused:false} and exit.
   mode     Send set_autopilot_mode {mode:<yolo|armed>} and exit. yolo works
@@ -123,6 +139,25 @@ The viewer is read-only — every dispatch, dedup, confirm, settle, and reap
 decision happens in keeperd's autopilot worker thread. Use pause / play
 to toggle the worker (boots PAUSED for safety), mode / arm / disarm to gate
 which epics armed mode works, and retry to clear a sticky failure row.
+
+Run \`keeper autopilot --agent-help\` for the terse operator runbook.
+`;
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+const AGENT_HELP = `keeper autopilot — operator runbook (agent-facing)
+
+Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
+
+  keeper autopilot pause | play
+  keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
+  keeper autopilot arm <epic> | disarm <epic>
+  keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
+  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo
+  keeper autopilot worktree <on|off> [--force]
+
+Read state from the [paused]/mode/armed banner (\`keeper autopilot --snapshot\`).
+An unpaused autopilot that "does nothing" is usually a readiness gate firing
+correctly, not a bug. Exit codes: 0 ok · 1 daemon-unreachable/generic · 2 arg fault.
 `;
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
@@ -432,6 +467,22 @@ export function projectWorktreeMode(
 }
 
 /**
+ * Coerce a singleton `autopilot_state` wire row's `worktree_multi_repo` column
+ * (NULLABLE INTEGER: `1` ON, NULL/0 OFF — the durable multi-repo rollout flag) to
+ * a boolean. Mirrors {@link projectWorktreeMode}: an empty row set returns `null`
+ * so a caller can leave its seed untouched; only a stored `1` is ON, every other
+ * value (NULL, 0, absent column, non-1) is OFF. Pure — exported for tests.
+ */
+export function projectWorktreeMultiRepo(
+  rows: Record<string, unknown>[],
+): boolean | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  return rows[0]?.worktree_multi_repo === 1;
+}
+
+/**
  * Project the `armed_epics` wire rows to a sorted list of the explicitly-armed
  * epic ids. Re-sorted by `epic_id` ASC for a stable, deterministic armed-
  * section render. Pure — exported for tests.
@@ -446,6 +497,91 @@ export function projectArmedEpics(rows: Record<string, unknown>[]): string[] {
   }
   out.sort();
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// `autopilot show` — the durable config as ONE envelope-shaped read.
+// ---------------------------------------------------------------------------
+
+/**
+ * The durable autopilot config + runtime state served by `keeper autopilot
+ * show`. Mirrors `keeper status .data.autopilot` field-for-field so the two
+ * reads agree, plus `worktree_multi_repo` — the durable rollout flag a
+ * capture/restore take-over must round-trip.
+ */
+export interface AutopilotShowData {
+  paused: boolean;
+  mode: "yolo" | "armed";
+  worktree_mode: boolean;
+  worktree_multi_repo: boolean;
+  armed: string[];
+  max_concurrent_jobs: number | null;
+  max_concurrent_per_root: number;
+}
+
+export type AutopilotShowEnvelope = Envelope<AutopilotShowData>;
+
+/**
+ * Build the `autopilot show` success envelope from the raw `autopilot_state`
+ * singleton rows + `armed_epics` rows. Reuses the SAME projectors the viewer
+ * banner and the readiness snapshot consume, so `show`, `status
+ * .data.autopilot`, and the banner never diverge. Defaults match the daemon's
+ * boot state on a never-configured board: paused (boot-safe), yolo, worktree
+ * off, multi-repo off, unlimited global cap, per-root 1. PURE — no socket — so a
+ * fixture pins the shape.
+ */
+export function buildAutopilotShowEnvelope(
+  autopilotRows: Record<string, unknown>[],
+  armedRows: Record<string, unknown>[],
+): AutopilotShowEnvelope {
+  return successEnvelope(AUTOPILOT_SHOW_SCHEMA_VERSION, {
+    paused: projectAutopilotPaused(autopilotRows) ?? true,
+    mode: projectAutopilotMode(autopilotRows) ?? "yolo",
+    worktree_mode: projectWorktreeMode(autopilotRows) ?? false,
+    worktree_multi_repo: projectWorktreeMultiRepo(autopilotRows) ?? false,
+    armed: projectArmedEpics(armedRows),
+    max_concurrent_jobs: projectMaxConcurrentJobs(autopilotRows),
+    max_concurrent_per_root: projectMaxConcurrentPerRoot(autopilotRows),
+  });
+}
+
+export interface RunAutopilotShowDeps {
+  writeStdout: (s: string) => void;
+  exit: (code: number) => never;
+  /** Read a collection over the socket (injected for tests). */
+  query: (
+    sock: string,
+    collection: string,
+  ) => Promise<Record<string, unknown>[]>;
+}
+
+/**
+ * Read the `autopilot_state` singleton + `armed_epics` and print the config
+ * envelope. Two best-effort `query` round-trips (read-only — never
+ * `sendControlRpc`); a transport throw lands an `ok:false` envelope on stdout,
+ * exit 1 (mirrors `keeper status` / `keeper query`), never empty stdout + prose.
+ */
+export async function runAutopilotShow(
+  sockPath: string,
+  deps: RunAutopilotShowDeps,
+): Promise<void> {
+  let autopilotRows: Record<string, unknown>[];
+  let armedRows: Record<string, unknown>[];
+  try {
+    autopilotRows = await deps.query(sockPath, "autopilot_state");
+    armedRows = await deps.query(sockPath, "armed_epics");
+  } catch (err) {
+    emitEnvelope(
+      errorEnvelope(AUTOPILOT_SHOW_SCHEMA_VERSION, {
+        code: "autopilot_show_failed",
+        message: err instanceof Error ? err.message : String(err),
+        recovery: RECOVERY_DAEMON_DOWN,
+      }),
+      deps,
+    );
+    return;
+  }
+  emitEnvelope(buildAutopilotShowEnvelope(autopilotRows, armedRows), deps);
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +769,14 @@ export function buildSetConfigFrame(
   };
 }
 
+/** Envelope schema version for the autopilot control ops (pause/play/mode/
+ *  arm/disarm/retry/config/worktree) — versions the `data` payload the daemon
+ *  echoes back through `sendControlRpc`. */
+export const AUTOPILOT_CONTROL_SCHEMA_VERSION = 1;
+
+/** Emit a CLI-usage error (bad args / unknown subcommand) on stderr, exit 1.
+ *  Distinct from server / transport failures, which ride the shared envelope on
+ *  stdout via `sendControlRpc`. */
 function die(message: string): never {
   process.stderr.write(`autopilot: ${message}\n`);
   process.exit(1);
@@ -994,6 +1138,7 @@ export async function main(argv: string[]): Promise<void> {
       // manually below (exit 2 on a non-positive / non-numeric value).
       timeout: { type: "string" },
       help: { type: "boolean", default: false },
+      "agent-help": { type: "boolean", default: false },
       // `worktree <on|off> --force` — bypass the mid-epic toggle guard.
       force: { type: "boolean", default: false },
     },
@@ -1002,6 +1147,10 @@ export async function main(argv: string[]): Promise<void> {
 
   if (parsed.values.help) {
     process.stdout.write(HELP);
+    process.exit(0);
+  }
+  if (parsed.values["agent-help"]) {
+    process.stdout.write(AGENT_HELP);
     process.exit(0);
   }
 
@@ -1055,7 +1204,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetPausedFrame(id, subcommand === "pause"),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
@@ -1071,7 +1220,12 @@ export async function main(argv: string[]): Promise<void> {
       die("'retry' requires a non-empty <verb::id> key");
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildRetryFrame(id, dispatchKey), id, die);
+    await sendControlRpc(
+      sockPath,
+      buildRetryFrame(id, dispatchKey),
+      id,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
+    );
     return;
   }
 
@@ -1088,7 +1242,12 @@ export async function main(argv: string[]): Promise<void> {
       die(`'mode' must be one of yolo | armed (got ${JSON.stringify(mode)})`);
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildSetModeFrame(id, mode), id, die);
+    await sendControlRpc(
+      sockPath,
+      buildSetModeFrame(id, mode),
+      id,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
+    );
     return;
   }
 
@@ -1107,7 +1266,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetArmedFrame(id, epicId, subcommand === "arm"),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
@@ -1145,7 +1304,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { max_concurrent_jobs: cap }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1166,7 +1325,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { max_concurrent_per_root: n }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1182,7 +1341,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { worktree_multi_repo: value === "on" }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1210,13 +1369,27 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetConfigFrame(id, { worktree_mode: onoff === "on" }),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
 
+  if (subcommand === "show") {
+    if (rest.length > 0) {
+      die(
+        `'show' takes no positional args (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    await runAutopilotShow(sockPath, {
+      writeStdout: (s) => process.stdout.write(s),
+      exit: (code) => process.exit(code),
+      query: (sock, collection) => queryCollection(sock, collection),
+    });
+    return;
+  }
+
   die(
-    `unknown subcommand '${subcommand}' (expected pause | play | mode | config | arm | disarm | retry | worktree); pass --help for usage.`,
+    `unknown subcommand '${subcommand}' (expected pause | play | mode | config | arm | disarm | retry | worktree | show); pass --help for usage.`,
   );
 }
 

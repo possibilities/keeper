@@ -240,10 +240,22 @@ async function readStdin(): Promise<string> {
 
 /**
  * Entry point. Drain stdin fully, then coalesce-write the leaf. EVERY step is
- * wrapped so the process never throws — the caller always exits 0. `_argv` is
- * unused (the sink is machine-invoked with the payload on stdin).
+ * wrapped so the process never throws — the caller always exits 0. `argv` is
+ * inspected ONLY for a `--help`/`-h` probe (the sink is otherwise machine-
+ * invoked with the payload on stdin, no arguments).
  */
-export async function main(_argv: string[]): Promise<void> {
+export const HELP =
+  "keeper statusline-sink — internal statusLine tee; not for agent use. " +
+  "Machine-invoked with the Claude Code statusLine JSON on stdin; coalesces it " +
+  "into a per-session leaf the statusline-worker folds. Takes no arguments.\n";
+
+export async function main(argv: string[]): Promise<void> {
+  // A --help/-h probe (the dispatcher forwards it) must print + exit WITHOUT
+  // blocking on a stdin drain — no payload is piped in the help case.
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(HELP);
+    return;
+  }
   let raw = "";
   try {
     raw = await readStdin();

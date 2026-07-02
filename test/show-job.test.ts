@@ -8,7 +8,12 @@
 
 import type { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
-import { decodeFor, type ResolveResult, resolveJob } from "../cli/show-job";
+import {
+  buildEnvelope,
+  decodeFor,
+  type ResolveResult,
+  resolveJob,
+} from "../cli/show-job";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -296,5 +301,58 @@ describe("decodeFor — JSON-TEXT columns", () => {
     ]) {
       expect(col in row).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildEnvelope — the ResolveResult → shared one-shot envelope mapping. Proves
+// success rides `data` and every failure rides `error.{code,message,recovery}`
+// (String(e) eliminated), with the ambiguous candidate list on error.details.
+// ---------------------------------------------------------------------------
+
+describe("buildEnvelope: envelope mapping", () => {
+  test("ok → data:{job,resolution}, ok:true, error:null", () => {
+    seed({ job_id: "j1", title: "T", cwd: "/x", state: "working" });
+    const env = buildEnvelope(
+      resolveJob(db, { jobId: "j1" }),
+      "session-id",
+      false,
+    );
+    expect(env.ok).toBe(true);
+    expect(env.error).toBeNull();
+    const data = env.data as {
+      job: Record<string, unknown>;
+      resolution: Record<string, unknown>;
+    };
+    expect(data.job.job_id).toBe("j1");
+    expect(data.resolution.method).toBe("session-id");
+    expect(data.resolution.matched_field).toBe("session_id");
+  });
+
+  test("not_found → ok:false with a stable code + recovery, data:null", () => {
+    const env = buildEnvelope({ kind: "not_found" }, "session-id", false);
+    expect(env.ok).toBe(false);
+    expect(env.data).toBeNull();
+    expect(env.error?.code).toBe("not_found");
+    expect(env.error?.recovery.length).toBeGreaterThan(0);
+    // No raw String(e) / stack / path leak — a clean corrective message.
+    expect(env.error?.message).not.toContain("/");
+  });
+
+  test("ambiguous → ok:false, code 'ambiguous', candidates on error.details", () => {
+    seed({ job_id: "j1", state: "working", backend_exec_pane_id: "%1" });
+    seed({ job_id: "j2", state: "working", backend_exec_pane_id: "%2" });
+    const result = resolveJob(db, { paneIds: ["%1", "%2"] });
+    expect(result.kind).toBe("ambiguous");
+    const env = buildEnvelope(result, "pane", false);
+    expect(env.ok).toBe(false);
+    expect(env.error?.code).toBe("ambiguous");
+    const details = env.error?.details as {
+      candidates: Array<{ job_id: string }>;
+    };
+    expect(details.candidates.map((c) => c.job_id).sort()).toEqual([
+      "j1",
+      "j2",
+    ]);
   });
 });

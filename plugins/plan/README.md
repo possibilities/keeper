@@ -136,8 +136,10 @@ If you use a context-dump tool, add `.keeper/` to its ignore file so plan data d
 Commands emit JSON by default:
 
 - Success: `{"success": true, ...}`
-- Failure: `{"success": false, "error": "..."}`
+- Failure: `{"success": false, "error": "..."}` for a single-code commit failure; the accumulate-all failure path (scaffold / refine-apply) emits the converged error OBJECT `{"success": false, "error": {"code", "message", "details": [...], "recovery"}}` — `recovery` is an actionable next step keyed on `code` (see `docs/problem-codes.md`).
 - Non-JSON failures print `Error: ...` to stderr and exit non-zero.
+
+The plan `emit()` family is deliberately exempt from keeper's shared one-shot envelope (`{schema_version, ok, error, data}` in `cli/envelope.ts`): its `{success, ...data, plan_invocation}` shape is frozen for Python byte-parity and the one-JSON-root guard, and converges with the shared surface only on the error sub-object's `{code, message, recovery}` fields.
 
 **Every read-only / inspection verb emits exactly one top-level JSON value** — one root, zero trailing bytes, so `json.load` and `jq` parse it cleanly (a second root raises "Extra data"). A conformance guard asserts this by parsing roots, not counting lines (a single pretty-printed value spans many lines). Provenance never rides the result stream: read verbs carry no `plan_invocation` trailer.
 
@@ -179,7 +181,7 @@ The work guard verifies live task state with a read-only `keeper plan reconcile`
 keeper plan --agent-help
 ```
 
-To orient on the board, reach for the keeper-native surfaces rather than hand-parsing plan verbs: `keeper status` for the board at a glance, and `keeper query epics --json | jq '.data[]'` for per-task detail (tier/model/title/deps). Every `keeper plan` read still emits one clean JSON value, but the orient surfaces are purpose-built for it.
+To orient on the board, reach for the keeper-native surfaces rather than hand-parsing plan verbs: `keeper status` for the board at a glance, and `keeper query tasks` for per-task detail (tier/model/title/deps + the live readiness verdict). Every `keeper plan` read still emits one clean JSON value, but the orient surfaces are purpose-built for it.
 
 ## License and Attribution
 

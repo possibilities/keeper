@@ -1,0 +1,88 @@
+# Problem-code registry
+
+The keeper-native CLI emits machine-matchable failure codes so an agent can
+branch on `error.code` instead of scraping prose. Every `ok:false` envelope from
+the shared helper (`cli/envelope.ts`) carries `error.{code, message, recovery}`;
+the plan family's converged error sub-object carries
+`error.{code, message, details, recovery}`. This file is the loadable registry:
+for each code, what it means, the recovery contract, and whether a retry is safe.
+
+The envelope shape and its exemptions live in `cli/envelope.ts`. `code` is
+stable and never repurposed; `message` is corrective (never a stack trace or a
+filesystem path); `recovery` is the actionable next step. New codes are added
+here in the same change that introduces them.
+
+## Shared-helper family (`keeper status`, `keeper query`)
+
+These ride the `{schema_version, ok, error, data}` envelope on stdout. A bad
+board / bad domain state is `data` at exit 0; only a transport or usage failure
+is `ok:false` at exit 1, and the envelope still lands on stdout.
+
+| code           | emitted by     | meaning                                                                                   | recovery                                                                 | retry-safe |
+| -------------- | -------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------- |
+| `unreachable`  | `keeper status`| The daemon did not answer within the bounded connect deadline (it is down or starting).   | Confirm the daemon is running (its LaunchAgent restarts it), then retry.  | yes (read-only) |
+| `connect`      | `keeper status`| A connect / transport fault reaching the daemon socket, short of the deadline.            | Confirm the daemon and socket path, then retry.                          | yes (read-only) |
+| `query_failed` | `keeper query` | Any transport failure during a query round-trip: connect fail, response timeout, a daemon `error` frame, or a malformed / unexpected frame. `message` carries the specific cause. | Retry the read; a query is read-only and retry-safe. If it persists, confirm the daemon is running. | yes (read-only) |
+
+Every code above is a read-path failure, so a retry never risks a double-mutate.
+
+## In-binary bare readers (`show-job`, `search-history`, `find-file-history`, `show-session-events`)
+
+These open keeper.db read-only and ride the `{schema_version, ok, error, data}`
+envelope. A hit is `data` at exit 0; a keeper.db read failure or a resolver miss
+is `ok:false` at exit 1, still on stdout. Messages are corrective — never a raw
+`String(e)`, a stack trace, or a filesystem path.
+
+| code          | emitted by        | meaning                                                            | recovery                                                                          | retry-safe |
+| ------------- | ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------- |
+| `read_failed` | the bare readers  | keeper.db could not be opened / read for this one-shot read.       | Retry — the read opens keeper.db read-only and never mutates. If it persists, confirm the daemon is healthy. | yes (read-only) |
+| `not_found`   | `keeper show-job` | No job matched the given selectors.                               | Widen or correct the selector (--session-id / --session / --cwd / --pane), or run with no selector to auto-detect. | yes (read-only) |
+| `ambiguous`   | `keeper show-job` | The selectors matched more than one job; `error.details.candidates` lists them. | Add a narrowing selector (--session-id pins one) or pass --latest to take the most recent. | yes (read-only) |
+
+**Compatibility note:** the bare readers previously emitted
+`{success:false, error:"<String(e)>"}` on failure. The `error` field is now the
+converged `{code, message, recovery}` object; consumers scraping the old flat
+`error` string should read `error.code` (or `error.message`) instead.
+
+## Autopilot control ops (`keeper autopilot pause|play|mode|arm|disarm|retry|config|worktree`)
+
+Each control op round-trips one control RPC and rides the shared envelope. The
+daemon's echoed result value is `data` (ok:true, exit 0); a server rejection,
+transport fault, or unexpected frame is `ok:false` (exit 1) on stdout. A control
+RPC MUTATES, so the transport-failure recovery is mutate-aware (a pre-send
+connect failure is safe to retry; a mid-flight timeout may already have applied).
+CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
+
+| code                   | meaning                                                                 | recovery                                                                                             | retry-safe |
+| ---------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
+| `rpc_unreachable`      | The daemon did not answer the control RPC over its socket.              | Confirm the daemon is running. A pre-send connect failure is safe to retry; a mid-flight timeout may have applied — re-read state (`keeper autopilot` / `keeper status`) before retrying. | conditional |
+| `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                | yes (not applied) |
+| `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.       | Retry; if it persists, confirm the daemon and CLI are the same version.                             | conditional |
+
+## Plan family (`keeper plan` accumulate-all failures)
+
+`plugins/plan/src/emit.ts::emitFailureEnvelope` prints
+`{"success": false, "error": {code, message, details, recovery}}` (the plan
+`emit()` family is exempt from the shared envelope for Python byte-parity and the
+one-JSON-root guard — it converges only on this error sub-object). `details` is a
+string list of every issue found; `recovery` is resolved from the code registry
+in `emit.ts` (`recoveryForPlanCode`, fallback for an unlisted code). These are
+input-validation failures surfaced BEFORE any commit, so re-running after fixing
+the input is always safe.
+
+| code                 | meaning                                                        | recovery                                                                    |
+| -------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `bad_yaml`           | The scaffold / refine YAML is malformed.                      | Fix the reported parse or shape error in the input and re-run.              |
+| `dep_cycle`          | The task dependency graph has a cycle.                        | Break the cycle among the listed tasks, then re-run.                        |
+| `dep_invalid`        | A declared task dependency does not resolve.                  | Correct the referenced task id (or remove the edge) and re-run.            |
+| `epic_dep_invalid`   | A declared epic dependency does not resolve.                  | Correct the referenced epic id (or remove the edge) and re-run.           |
+| `duplicate_epic`     | An epic with this slug already exists.                        | Choose a distinct slug, or pass `--allow-duplicate` to create a sibling.    |
+| `id_collision`       | A generated id collides with an existing artifact.           | Re-run with a distinct slug or id.                                          |
+| `integrity_failed`   | The post-write integrity check failed; nothing was committed.| Re-run the verb; if it persists, inspect the reported artifacts.           |
+| `target_invalid`     | The target id is not well-formed or does not exist.          | Correct the target and re-run.                                             |
+| `spec_invalid`       | A task or epic spec field is missing or malformed.          | Fix the reported spec field and re-run.                                    |
+| `model_invalid`      | The declared model is not recognized.                        | Set a supported model value and re-run.                                    |
+| `tier_invalid`       | The declared tier is out of range.                           | Set a supported tier value and re-run.                                     |
+| `repo_invalid`       | The repo path is not a valid git repo root.                 | Correct the repo path and re-run.                                         |
+| `missing_session_id` | No session id is available for a mutating verb.             | Ensure the invocation carries a session id and re-run.                    |
+| *(unlisted)*         | Any other accumulate-all failure code.                       | Fix the reported problems in the input and re-run; `details` lists them.   |

@@ -12,12 +12,25 @@
  * straight from `events.data`.
  *
  * Read-only open via `openDb(path, { readonly: true })`, closed in `finally`.
- * NO schema-version guard (in-binary readers deliberately skip it). A read
- * failure surfaces as an error envelope (`{ success: false, error }`), NOT an
- * empty result.
+ * NO schema-version guard (in-binary readers deliberately skip it). Output rides
+ * the shared one-shot envelope (`cli/envelope.ts`): a hit is `data:{matches}`
+ * (exit 0); a keeper.db read failure is `ok:false` with
+ * `error.{code,message,recovery}` (exit 1), NOT an empty result. Argument-usage
+ * errors stay on stderr (exit 2), never the envelope.
  */
 
 import { openDb, resolveDbPath } from "../src/db";
+import {
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+  RECOVERY_DB_READ,
+  successEnvelope,
+} from "./envelope";
+
+/** Envelope schema version for `keeper search-history`. */
+export const SEARCH_HISTORY_SCHEMA_VERSION = 1;
 
 const HELP = `keeper search-history <term> [options]
 
@@ -83,11 +96,6 @@ function parseLimit(raw: string | undefined): number {
   return n;
 }
 
-/** Emit a pretty (`indent=2`, trailing `\n`) JSON envelope. */
-function printPretty(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
 interface HistoryRow {
   ts: number;
   session_id: string;
@@ -129,7 +137,10 @@ function escapeLike(term: string): string {
   return term.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
-export function main(argv: string[]): void {
+export function main(
+  argv: string[],
+  sink: EnvelopeSink = processEnvelopeSink,
+): void {
   const args = parseArgs(argv);
   if (args.help) {
     process.stdout.write(HELP);
@@ -140,15 +151,25 @@ export function main(argv: string[]): void {
     process.stderr.write(HELP);
     process.exit(2);
   }
-  // A read failure surfaces as an error envelope, never an empty result.
+  // A read failure surfaces as an ok:false envelope, never an empty result.
   let rows: HistoryRow[];
   try {
     rows = searchHistory(resolveDbPath(), args.term, args.limit);
-  } catch (e) {
-    printPretty({ success: false, error: String(e) });
-    process.exit(1);
+  } catch {
+    emitEnvelope(
+      errorEnvelope(SEARCH_HISTORY_SCHEMA_VERSION, {
+        code: "read_failed",
+        message: "could not read prompt history from the keeper database",
+        recovery: RECOVERY_DB_READ,
+      }),
+      sink,
+    );
+    return;
   }
-  printPretty({ success: true, matches: rows });
+  emitEnvelope(
+    successEnvelope(SEARCH_HISTORY_SCHEMA_VERSION, { matches: rows }),
+    sink,
+  );
 }
 
 if (import.meta.main) {

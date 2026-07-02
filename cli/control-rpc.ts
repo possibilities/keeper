@@ -23,6 +23,13 @@ import {
   type Row,
   type ServerFrame,
 } from "../src/protocol";
+import {
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+  successEnvelope,
+} from "./envelope";
 
 /**
  * Hard upper bound on how long a one-shot round-trip waits for the matching
@@ -202,36 +209,69 @@ export async function queryCollection<R extends Row = Row>(
 }
 
 /**
- * Send one control RPC and exit. On `rpc_result` writes the value as one
- * JSON line to stdout and exits 0; on `error` / connect-fail / timeout
- * surfaces the reason via `die` (exit 1).
+ * Send one control RPC and emit the shared one-shot envelope
+ * (`cli/envelope.ts`), then exit. On `rpc_result` the daemon's echoed value is
+ * `data` (ok:true, exit 0); a daemon `error` frame, a connect/timeout transport
+ * fault, or an unexpected frame is `ok:false` with `error.{code,message,recovery}`
+ * on stdout (exit 1) — never bare stderr prose. `schemaVersion` versions the
+ * `data` payload (per-verb, injected by the caller); the sink is injectable for
+ * tests.
  *
- * `die` is injectable so each CLI surface keeps its own error prefix; it
- * defaults to a generic `keeper:`-prefixed exit-1 sink.
+ * A control RPC MUTATES, so the transport-failure recovery is mutate-aware: a
+ * connect failure before the request was sent is safe to retry, but a mid-flight
+ * timeout may already have applied — re-read state before retrying.
  */
 export async function sendControlRpc(
   sockPath: string,
   frame: ClientFrame,
   matchId: string,
-  die: (message: string) => never = defaultDie,
+  schemaVersion: number,
+  sink: EnvelopeSink = processEnvelopeSink,
 ): Promise<void> {
   let response: ServerFrame;
   try {
     response = await roundTrip(sockPath, frame, matchId);
-  } catch (err) {
-    die((err as Error).message);
+  } catch {
+    emitEnvelope(
+      errorEnvelope(schemaVersion, {
+        code: "rpc_unreachable",
+        message:
+          "the keeper daemon did not answer the control RPC over its socket",
+        recovery:
+          "Confirm the daemon is running (its LaunchAgent restarts it). A " +
+          "connect failure before the request was sent is safe to retry; a " +
+          "mid-flight timeout may already have applied — re-read state with " +
+          "'keeper autopilot' or 'keeper status' before retrying.",
+      }),
+      sink,
+    );
+    return;
   }
   if (response.type === "rpc_result") {
-    process.stdout.write(`${JSON.stringify(response.value)}\n`);
-    process.exit(0);
+    emitEnvelope(successEnvelope(schemaVersion, response.value), sink);
+    return;
   }
   if (response.type === "error") {
-    die(`server error ${response.code}: ${response.message}`);
+    emitEnvelope(
+      errorEnvelope(schemaVersion, {
+        code: response.code || "rpc_rejected",
+        message: response.message || "the daemon rejected the control RPC",
+        recovery:
+          "Correct the request per the error code, then retry — a rejected " +
+          "control RPC did not mutate state.",
+      }),
+      sink,
+    );
+    return;
   }
-  die(`unexpected frame type: ${response.type}`);
-}
-
-function defaultDie(message: string): never {
-  process.stderr.write(`keeper: ${message}\n`);
-  process.exit(1);
+  emitEnvelope(
+    errorEnvelope(schemaVersion, {
+      code: "rpc_unexpected_frame",
+      message: `the daemon returned an unexpected frame type: ${response.type}`,
+      recovery:
+        "Retry; if it persists, the daemon protocol may be mismatched — " +
+        "confirm the daemon and CLI are the same version.",
+    }),
+    sink,
+  );
 }

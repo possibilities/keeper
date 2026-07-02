@@ -8,9 +8,12 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  flattenTaskRows,
   parseQueryArgs,
   QUERY_SCHEMA_VERSION,
   runQueryCommand,
+  runTasksCommand,
+  VIRTUAL_QUERY_COLLECTIONS,
 } from "../cli/query";
 import {
   buildStatusEnvelope,
@@ -61,6 +64,7 @@ interface SnapOverrides {
   maxConcurrentJobs?: number | null;
   maxConcurrentPerRoot?: number;
   worktreeMode?: boolean;
+  worktreeMultiRepo?: boolean;
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
@@ -98,6 +102,7 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
       o.maxConcurrentJobs === undefined ? null : o.maxConcurrentJobs,
     maxConcurrentPerRoot: o.maxConcurrentPerRoot ?? 1,
     worktreeMode: o.worktreeMode ?? false,
+    worktreeMultiRepo: o.worktreeMultiRepo ?? false,
     readiness: {
       perTask: toMap(o.perTask),
       perCloseRow: toMap(o.perCloseRow),
@@ -132,6 +137,7 @@ describe("buildStatusEnvelope shape", () => {
       maxConcurrentJobs: 3,
       maxConcurrentPerRoot: 2,
       worktreeMode: true,
+      worktreeMultiRepo: true,
     });
     const env = buildStatusEnvelope(snap, BOOT, []);
     expect(env.schema_version).toBe(STATUS_SCHEMA_VERSION);
@@ -145,6 +151,7 @@ describe("buildStatusEnvelope shape", () => {
       paused: false,
       mode: "armed",
       worktree_mode: true,
+      worktree_multi_repo: true,
       armed: ["fn-1-a"],
       max_concurrent_jobs: 3,
       max_concurrent_per_root: 2,
@@ -245,7 +252,7 @@ describe("buildStatusEnvelope shape", () => {
       { verb: "work", id: "fn-9-x.1", reason: "worktree-multi-repo" },
     ];
     const env = buildStatusEnvelope(snap, BOOT, failures);
-    expect(env.schema_version).toBe(2);
+    expect(env.schema_version).toBe(STATUS_SCHEMA_VERSION);
     const epic = env.data?.board.epics[0];
     // close row resolves all three hashed keys → sorted-unique kinds.
     expect(epic?.close?.dispatch_failure).toEqual(["merge-conflict", "non-ff"]);
@@ -369,14 +376,24 @@ describe("buildStatusEnvelope drained/jammed", () => {
 });
 
 describe("buildStatusErrorEnvelope", () => {
-  test("transport failure envelope is parseable JSON with ok:false", () => {
-    const env = buildStatusErrorEnvelope("unreachable: down");
+  test("transport failure envelope carries the error object with ok:false", () => {
+    const env = buildStatusErrorEnvelope({
+      code: "unreachable",
+      message: "unreachable: down",
+      recovery: "restart the daemon",
+    });
     expect(env).toEqual({
       schema_version: STATUS_SCHEMA_VERSION,
       ok: false,
-      error: "unreachable: down",
+      error: {
+        code: "unreachable",
+        message: "unreachable: down",
+        recovery: "restart the daemon",
+      },
       data: null,
     });
+    // message preserves the old bare string so a stringifying consumer degrades.
+    expect(env.error?.message).toBe("unreachable: down");
   });
 });
 
@@ -511,7 +528,7 @@ describe("runQueryCommand", () => {
     expect(h.err).toEqual([]);
   });
 
-  test("a transport throw maps to a clean exit-1 stderr message, empty stdout", async () => {
+  test("a transport throw lands an ok:false envelope on stdout, exit 1, empty stderr", async () => {
     const h = harness(() =>
       Promise.reject(
         new Error("daemon error querying 'epics': bad_frame: nope"),
@@ -519,7 +536,152 @@ describe("runQueryCommand", () => {
     );
     await run(h);
     expect(h.code).toBe(1);
-    expect(h.out).toEqual([]);
-    expect(h.err.join("")).toContain("bad_frame");
+    // The failure rides stdout as an envelope — never empty stdout + stderr prose.
+    expect(h.err).toEqual([]);
+    const env = JSON.parse(h.out.join(""));
+    expect(env.schema_version).toBe(QUERY_SCHEMA_VERSION);
+    expect(env.ok).toBe(false);
+    expect(env.data).toBeNull();
+    expect(env.error.code).toBe("query_failed");
+    expect(env.error.message).toContain("bad_frame");
+    expect(typeof env.error.recovery).toBe("string");
+    expect(env.error.recovery.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// keeper query tasks — derived flat-task view + readiness verdict
+// ---------------------------------------------------------------------------
+
+/** A readiness snapshot with two tasks under one epic + their per-task verdicts
+ *  (the shape `flattenTaskRows` reads). Minimal cast, as elsewhere. */
+function taskSnap(): ReadinessClientSnapshot {
+  const epics = [
+    {
+      epic_id: "fn-1-a",
+      tasks: [
+        {
+          task_id: "fn-1-a.1",
+          epic_id: "fn-1-a",
+          title: "Do X",
+          tier: "high",
+          model: "opus",
+          depends_on: [],
+          runtime_status: "todo",
+        },
+        {
+          task_id: "fn-1-a.2",
+          epic_id: "fn-1-a",
+          title: "Do Y",
+          tier: "low",
+          model: "sonnet",
+          depends_on: ["fn-1-a.1"],
+          runtime_status: "blocked",
+        },
+      ],
+    },
+  ];
+  const perTask = new Map<string, Verdict>([
+    ["fn-1-a.1", { tag: "ready" }],
+    // fn-1-a.2 deliberately ABSENT → the inert unknown view.
+  ]);
+  return {
+    epics,
+    readiness: {
+      perTask,
+      perCloseRow: new Map(),
+      perEpic: new Map(),
+      diagnostics: [],
+    },
+  } as unknown as ReadinessClientSnapshot;
+}
+
+describe("flattenTaskRows", () => {
+  test("one row per task carries the plan fields + live verdict", () => {
+    const rows = flattenTaskRows(taskSnap());
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toEqual({
+      epic_id: "fn-1-a",
+      task_id: "fn-1-a.1",
+      title: "Do X",
+      tier: "high",
+      model: "opus",
+      depends_on: [],
+      runtime_status: "todo",
+      verdict: "ready",
+      pill: "[ready]",
+    });
+    // a perTask miss renders the inert [blocked:unknown] view (matches board).
+    expect(rows[1]?.verdict).toBe("unknown");
+    expect(rows[1]?.pill).toBe("[blocked:unknown]");
+    expect(rows[1]?.depends_on).toEqual(["fn-1-a.1"]);
+  });
+
+  test("a scalar --filter exact-matches; unknown/non-scalar keys ignored", () => {
+    expect(
+      flattenTaskRows(taskSnap(), { runtime_status: "todo" }),
+    ).toHaveLength(1);
+    expect(flattenTaskRows(taskSnap(), { epic_id: "fn-1-a" })).toHaveLength(2);
+    expect(flattenTaskRows(taskSnap(), { verdict: "unknown" })).toHaveLength(1);
+    // unknown key → ignored (forward-compat), not a zero-match.
+    expect(flattenTaskRows(taskSnap(), { bogus: "x" })).toHaveLength(2);
+  });
+});
+
+describe("keeper query tasks routing + runner", () => {
+  test("'tasks' is a recognized virtual collection that parses", () => {
+    expect(VIRTUAL_QUERY_COLLECTIONS.has("tasks")).toBe(true);
+    const r = parseQueryArgs(["tasks"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.args.collection).toBe("tasks");
+  });
+
+  test("runTasksCommand success prints the flat rows envelope, exit 0", async () => {
+    const out: string[] = [];
+    let code: number | null = null;
+    await runTasksCommand(
+      { collection: "tasks", filter: {}, sock: "/tmp/s" },
+      {
+        fetchSnapshot: () => Promise.resolve(taskSnap()),
+        writeStdout: (s) => out.push(s),
+        exit: (c: number): never => {
+          code = c;
+          throw new ExitError(c);
+        },
+      },
+    ).catch((e) => {
+      if (!(e instanceof ExitError)) throw e;
+    });
+    expect(code as number | null).toBe(0);
+    const env = JSON.parse(out.join(""));
+    expect(env.schema_version).toBe(QUERY_SCHEMA_VERSION);
+    expect(env.ok).toBe(true);
+    expect(env.data).toHaveLength(2);
+    expect(env.data[0].task_id).toBe("fn-1-a.1");
+  });
+
+  test("a fetchSnapshot throw lands an ok:false envelope on stdout, exit 1", async () => {
+    const out: string[] = [];
+    let code: number | null = null;
+    await runTasksCommand(
+      { collection: "tasks", filter: {}, sock: "/tmp/s" },
+      {
+        fetchSnapshot: () => Promise.reject(new Error("unreachable: down")),
+        writeStdout: (s) => out.push(s),
+        exit: (c: number): never => {
+          code = c;
+          throw new ExitError(c);
+        },
+      },
+    ).catch((e) => {
+      if (!(e instanceof ExitError)) throw e;
+    });
+    expect(code as number | null).toBe(1);
+    const env = JSON.parse(out.join(""));
+    expect(env.ok).toBe(false);
+    expect(env.data).toBeNull();
+    expect(env.error.code).toBe("query_failed");
+    expect(env.error.message).toContain("unreachable");
+    expect(env.error.recovery.length).toBeGreaterThan(0);
   });
 });
