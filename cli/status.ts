@@ -44,6 +44,14 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
+import {
+  type Envelope,
+  emitEnvelope,
+  errorEnvelope,
+  type ProblemError,
+  RECOVERY_DAEMON_DOWN,
+  successEnvelope,
+} from "./envelope";
 
 /** Envelope schema version for `keeper status`. v2 adds the additive
  * `dispatch_failure: string[]` field to the per-task + close-row views. */
@@ -162,12 +170,7 @@ export interface StatusData {
   catching_up: boolean;
 }
 
-export interface StatusEnvelope {
-  schema_version: number;
-  ok: boolean;
-  error: string | null;
-  data: StatusData | null;
-}
+export type StatusEnvelope = Envelope<StatusData>;
 
 /** Render one (possibly absent) verdict to its JSON view. A miss renders the
  *  same inert `[blocked:unknown]` the board uses (visible bug indicator, never
@@ -303,53 +306,45 @@ export function buildStatusEnvelope(
   const jammed = atRest && needsHumanTotal > 0;
   const drained = atRest && needsHumanTotal === 0;
 
-  return {
-    schema_version: STATUS_SCHEMA_VERSION,
-    ok: true,
-    error: null,
-    data: {
-      autopilot: {
-        paused: snap.autopilotPaused,
-        mode: snap.autopilotMode,
-        worktree_mode: snap.worktreeMode,
-        armed: snap.autopilotEligibleEpicIds ?? [],
-        max_concurrent_jobs: snap.maxConcurrentJobs,
-        max_concurrent_per_root: snap.maxConcurrentPerRoot,
-      },
-      board,
-      counts: {
-        epics: epicTally,
-        tasks: tallyVerdicts(snap.readiness.perTask),
-        close_rows: tallyVerdicts(snap.readiness.perCloseRow),
-      },
-      drained,
-      jammed,
-      in_flight: {
-        pending_dispatches: pendingDispatches,
-        running_jobs: runningJobs,
-        total: inFlightTotal,
-      },
-      needs_human: {
-        dead_letters: deadLetters,
-        block_escalations: blockEscalations,
-        stuck_dispatches: stuckDispatches,
-        finalize_non_ff: finalizeNonFf,
-        total: needsHumanTotal,
-      },
-      rev: boot.rev,
-      catching_up: boot.catching_up,
+  return successEnvelope(STATUS_SCHEMA_VERSION, {
+    autopilot: {
+      paused: snap.autopilotPaused,
+      mode: snap.autopilotMode,
+      worktree_mode: snap.worktreeMode,
+      armed: snap.autopilotEligibleEpicIds ?? [],
+      max_concurrent_jobs: snap.maxConcurrentJobs,
+      max_concurrent_per_root: snap.maxConcurrentPerRoot,
     },
-  };
+    board,
+    counts: {
+      epics: epicTally,
+      tasks: tallyVerdicts(snap.readiness.perTask),
+      close_rows: tallyVerdicts(snap.readiness.perCloseRow),
+    },
+    drained,
+    jammed,
+    in_flight: {
+      pending_dispatches: pendingDispatches,
+      running_jobs: runningJobs,
+      total: inFlightTotal,
+    },
+    needs_human: {
+      dead_letters: deadLetters,
+      block_escalations: blockEscalations,
+      stuck_dispatches: stuckDispatches,
+      finalize_non_ff: finalizeNonFf,
+      total: needsHumanTotal,
+    },
+    rev: boot.rev,
+    catching_up: boot.catching_up,
+  });
 }
 
-/** The transport-failure envelope (exit 1, but still parseable JSON on stdout). */
-export function buildStatusErrorEnvelope(error: string): StatusEnvelope {
-  return {
-    schema_version: STATUS_SCHEMA_VERSION,
-    ok: false,
-    error,
-    data: null,
-  };
+/** The transport-failure envelope (exit 1, but still parseable JSON on stdout).
+ *  `error.message` carries the human string; `error.code` is stable and
+ *  machine-matchable; `error.recovery` is the actionable next step. */
+export function buildStatusErrorEnvelope(error: ProblemError): StatusEnvelope {
+  return errorEnvelope(STATUS_SCHEMA_VERSION, error);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,8 +490,7 @@ export async function runStatus(
       failures = [];
     }
     const envelope = buildStatusEnvelope(snap, latestBoot, failures);
-    deps.writeStdout(`${JSON.stringify(envelope, null, 2)}\n`);
-    deps.exit(0);
+    emitEnvelope(envelope, deps);
   };
 
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
@@ -515,9 +509,15 @@ export async function runStatus(
     done = true;
     disposeHandle();
     const reason = err.code === "unreachable" ? "unreachable" : "connect";
-    const envelope = buildStatusErrorEnvelope(`${reason}: ${err.message}`);
-    deps.writeStdout(`${JSON.stringify(envelope, null, 2)}\n`);
-    deps.exit(1);
+    // `message` preserves the old bare-string ("unreachable: <detail>") so a
+    // consumer that stringifies `error` degrades readably; `code` is the stable
+    // match key; `recovery` is the actionable step.
+    const envelope = buildStatusErrorEnvelope({
+      code: reason,
+      message: `${reason}: ${err.message}`,
+      recovery: RECOVERY_DAEMON_DOWN,
+    });
+    emitEnvelope(envelope, deps);
   };
 
   handle = subscribeReadiness({

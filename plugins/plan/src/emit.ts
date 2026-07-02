@@ -183,23 +183,80 @@ export function emitReadonlyData(
   formatOutput({ success: true, ...data }, format);
 }
 
+// Recovery guidance keyed on the accumulate-all failure code — the plan family's
+// converged error sub-object carries {code, message, details, recovery}, so an
+// agent gets an actionable next step without hand-rolling one per code. An
+// unlisted code falls back to DEFAULT_PLAN_RECOVERY.
+const DEFAULT_PLAN_RECOVERY =
+  "Fix the reported problems in the input and re-run the verb; the details " +
+  "list every issue found.";
+
+const PLAN_ERROR_RECOVERY: Record<string, string> = {
+  bad_yaml:
+    "The scaffold/refine YAML is malformed. Fix the reported parse or shape " +
+    "error in the input and re-run the verb.",
+  dep_cycle:
+    "The task dependency graph has a cycle. Break the cycle among the listed " +
+    "tasks so the graph is acyclic, then re-run.",
+  dep_invalid:
+    "A declared task dependency does not resolve. Correct the referenced task " +
+    "id (or remove the edge) and re-run.",
+  epic_dep_invalid:
+    "A declared epic dependency does not resolve. Correct the referenced epic " +
+    "id (or remove the edge) and re-run.",
+  duplicate_epic:
+    "An epic with this slug already exists. Choose a distinct slug, or pass " +
+    "--allow-duplicate to intentionally create a sibling.",
+  id_collision:
+    "A generated id collides with an existing artifact. Re-run with a distinct " +
+    "slug or id.",
+  integrity_failed:
+    "The post-write integrity check failed and the write was not committed. " +
+    "Re-run the verb; if it persists, inspect the reported artifacts.",
+  target_invalid:
+    "The target id is not well-formed or does not exist. Correct the target " +
+    "and re-run.",
+  spec_invalid:
+    "A task or epic spec field is missing or malformed. Fix the reported spec " +
+    "field and re-run.",
+  model_invalid:
+    "The declared model is not recognized. Set a supported model value and " +
+    "re-run.",
+  tier_invalid:
+    "The declared tier is out of range. Set a supported tier value and re-run.",
+  repo_invalid:
+    "The repo path is not a valid git repo root. Correct the repo path and " +
+    "re-run.",
+  missing_session_id:
+    "No session id is available for this mutating verb. Ensure the invocation " +
+    "carries a session id and re-run.",
+};
+
+/** Resolve the recovery string for a plan failure code (fallback on an unlisted
+ * code). Exposed so the problem-code registry doc and callers stay in sync. */
+export function recoveryForPlanCode(code: string): string {
+  return PLAN_ERROR_RECOVERY[code] ?? DEFAULT_PLAN_RECOVERY;
+}
+
 /** The accumulate-all failure emit path — the port of run_scaffold._emit_failure.
  * Prints ONE compact NDJSON line
- *   {"success":false,"error":{"code","message","details":[strings]}}
+ *   {"success":false,"error":{"code","message","details":[strings],"recovery"}}
  * BYPASSING the invocation builder (a pre-commit failure has no invocation to
  * embed) — a sibling of the landed emit paths, never a modification of them.
  * Scaffold / refine-apply accumulate every error across buckets and emit one
  * envelope describing the dominant code with all details; this is that single
- * write. Does NOT exit on its own — the caller returns the non-zero code so the
+ * write. `recovery` defaults to the code registry but a caller may override it.
+ * Does NOT exit on its own — the caller returns the non-zero code so the
  * dispatcher owns process exit. */
 export function emitFailureEnvelope(
   code: string,
   message: string,
   details: string[],
+  recovery: string = recoveryForPlanCode(code),
 ): void {
   const envelope = {
     success: false,
-    error: { code, message, details },
+    error: { code, message, details, recovery },
   };
   process.stdout.write(`${compactJson(envelope)}\n`);
 }

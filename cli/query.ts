@@ -17,8 +17,9 @@
  *
  * Output (success): one `{schema_version, ok, error, data}` JSON envelope on
  * stdout where `data` is the row array; exit 0. A daemon `error` frame (or any
- * transport failure) surfaces as a clean one-line message on stderr, exit 1 —
- * never a stack trace, and stdout stays empty.
+ * transport failure) surfaces as the SAME envelope with `ok:false` and
+ * `error.{code,message,recovery}` on stdout, exit 1 (mirrors `keeper status`) —
+ * never a stack trace, and never empty stdout + stderr prose.
  */
 
 import { parseArgs } from "node:util";
@@ -26,6 +27,12 @@ import { isQueryAllowed, QUERY_READ_ALLOWLIST } from "../src/collections";
 import { resolveSockPath } from "../src/db";
 import type { FilterValue } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
+import {
+  emitEnvelope,
+  errorEnvelope,
+  RECOVERY_DAEMON_DOWN,
+  successEnvelope,
+} from "./envelope";
 
 /** Envelope schema version for `keeper query`. */
 export const QUERY_SCHEMA_VERSION = 1;
@@ -166,8 +173,9 @@ export interface RunQueryDeps {
 
 /**
  * Execute one query and print the JSON envelope. A `queryCollection` throw
- * (daemon `error` frame, connect-fail, timeout, malformed frame) maps to a
- * clean exit-1 message on stderr — never a stack trace, and stdout stays empty.
+ * (daemon `error` frame, connect-fail, timeout, malformed frame) maps to an
+ * `ok:false` envelope on stdout, exit 1 — never a stack trace, never empty
+ * stdout + stderr prose.
  */
 export async function runQueryCommand(
   args: ParsedQueryArgs,
@@ -181,19 +189,17 @@ export async function runQueryCommand(
       Object.keys(args.filter).length > 0 ? args.filter : undefined,
     );
   } catch (err) {
-    deps.writeStderr(
-      `keeper query: ${err instanceof Error ? err.message : String(err)}\n`,
+    emitEnvelope(
+      errorEnvelope(QUERY_SCHEMA_VERSION, {
+        code: "query_failed",
+        message: err instanceof Error ? err.message : String(err),
+        recovery: RECOVERY_DAEMON_DOWN,
+      }),
+      deps,
     );
-    deps.exit(1);
+    return;
   }
-  const envelope = {
-    schema_version: QUERY_SCHEMA_VERSION,
-    ok: true,
-    error: null,
-    data: rows,
-  };
-  deps.writeStdout(`${JSON.stringify(envelope, null, 2)}\n`);
-  deps.exit(0);
+  emitEnvelope(successEnvelope(QUERY_SCHEMA_VERSION, rows), deps);
 }
 
 export async function main(argv: string[]): Promise<void> {

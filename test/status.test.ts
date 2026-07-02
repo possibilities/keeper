@@ -369,14 +369,24 @@ describe("buildStatusEnvelope drained/jammed", () => {
 });
 
 describe("buildStatusErrorEnvelope", () => {
-  test("transport failure envelope is parseable JSON with ok:false", () => {
-    const env = buildStatusErrorEnvelope("unreachable: down");
+  test("transport failure envelope carries the error object with ok:false", () => {
+    const env = buildStatusErrorEnvelope({
+      code: "unreachable",
+      message: "unreachable: down",
+      recovery: "restart the daemon",
+    });
     expect(env).toEqual({
       schema_version: STATUS_SCHEMA_VERSION,
       ok: false,
-      error: "unreachable: down",
+      error: {
+        code: "unreachable",
+        message: "unreachable: down",
+        recovery: "restart the daemon",
+      },
       data: null,
     });
+    // message preserves the old bare string so a stringifying consumer degrades.
+    expect(env.error?.message).toBe("unreachable: down");
   });
 });
 
@@ -511,7 +521,7 @@ describe("runQueryCommand", () => {
     expect(h.err).toEqual([]);
   });
 
-  test("a transport throw maps to a clean exit-1 stderr message, empty stdout", async () => {
+  test("a transport throw lands an ok:false envelope on stdout, exit 1, empty stderr", async () => {
     const h = harness(() =>
       Promise.reject(
         new Error("daemon error querying 'epics': bad_frame: nope"),
@@ -519,7 +529,15 @@ describe("runQueryCommand", () => {
     );
     await run(h);
     expect(h.code).toBe(1);
-    expect(h.out).toEqual([]);
-    expect(h.err.join("")).toContain("bad_frame");
+    // The failure rides stdout as an envelope — never empty stdout + stderr prose.
+    expect(h.err).toEqual([]);
+    const env = JSON.parse(h.out.join(""));
+    expect(env.schema_version).toBe(QUERY_SCHEMA_VERSION);
+    expect(env.ok).toBe(false);
+    expect(env.data).toBeNull();
+    expect(env.error.code).toBe("query_failed");
+    expect(env.error.message).toContain("bad_frame");
+    expect(typeof env.error.recovery).toBe("string");
+    expect(env.error.recovery.length).toBeGreaterThan(0);
   });
 });
