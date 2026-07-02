@@ -28,6 +28,7 @@ import { workerAgentFor } from "../plugins/plan/src/models.ts";
 import { workerCellDir } from "../plugins/plan/src/subagents_config.ts";
 import { computeEligibleEpics } from "./armed-closure";
 import { defaultPlanPrompt } from "./dispatch-command";
+import { WORKTREE_RECOVER_KEY_PREFIX } from "./dispatch-failure-key";
 import type { LaunchSpec } from "./exec-backend";
 import {
   computeReadiness,
@@ -301,7 +302,9 @@ export function dispatchKey(verb: Verb, id: string): DispatchKey {
  * validator rejects, stranding the row).
  */
 export function worktreeRecoverDispatchId(dir: string): string {
-  return `worktree-recover:${dir.replace(/[/\\]+/g, "-").replace(/^-+/, "")}`;
+  return `${WORKTREE_RECOVER_KEY_PREFIX}${dir
+    .replace(/[/\\]+/g, "-")
+    .replace(/^-+/, "")}`;
 }
 
 /**
@@ -320,7 +323,7 @@ export function worktreeRecoverEpicDispatchId(
   epicId: string,
   repoDir: string,
 ): string {
-  return `worktree-recover:${epicId}-${repoDirHash(repoDir)}`;
+  return `${WORKTREE_RECOVER_KEY_PREFIX}${epicId}-${repoDirHash(repoDir)}`;
 }
 
 /**

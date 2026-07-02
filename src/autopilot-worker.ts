@@ -83,6 +83,11 @@ import {
   readGitProjectionSeedRequired,
 } from "./db";
 import {
+  assertNever,
+  routeDispatchFailure,
+  WORKTREE_FINALIZE_ID_PREFIX,
+} from "./dispatch-failure-key";
+import {
   createTmuxPaneOps,
   keeperAgentLaunch,
   type LaunchSpec,
@@ -163,6 +168,15 @@ import {
 } from "./worktree-git";
 import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 
+// The dispatch-failure vocabulary + typed row router live in the dep-free
+// `./dispatch-failure-key` leaf; re-exported here so every existing
+// `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
+// loader routes recover/finalize failure rows through `routeDispatchFailure`.
+export {
+  isWorktreeRecoverReason,
+  WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_RECOVER_REASON_PREFIX,
+} from "./dispatch-failure-key";
 export type {
   DispatchKey,
   LaneMergedEntry,
@@ -421,21 +435,6 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
 }
 
 /**
- * The `reason` prefix every {@link recoverWorktrees} failure carries
- * (`worktree-recover-conflict`, `-push-failed`, `-not-on-default`, …). The
- * level-triggered auto-clear keys on it to scope clearing to RECOVER-originated
- * `dispatch_failures` rows ONLY: a normal close-sink failure (`finalizeEpic`'s
- * `worktree-finalize-*`) can share the same `close::<epicId>` key, and clearing
- * that one would silently dismiss a legitimate block.
- */
-export const WORKTREE_RECOVER_REASON_PREFIX = "worktree-recover";
-
-/** Whether a `dispatch_failures.reason` originated in {@link recoverWorktrees}. */
-export function isWorktreeRecoverReason(reason: string): boolean {
-  return reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX);
-}
-
-/**
  * Level-triggered auto-clear set: given the OPEN recover-originated dispatch ids
  * (`snapshot.recoverFailureIds`) and THIS cycle's fresh recover failures, return
  * the ids whose underlying git has since resolved (the junk branch was deleted,
@@ -460,14 +459,6 @@ export function recoverFailuresToClear(
   }
   return cleared;
 }
-
-/**
- * The id prefix every {@link worktreeFinalizeDispatchId} carries. The producer's
- * finalize level-clear scopes the OPEN finalize-failure set on it (distinct from the
- * `worktree-recover:` path-tied slug and the bare `close::<epic>` a provision fan-in
- * conflict still uses), so a clear never dismisses a recover or escalation row.
- */
-export const WORKTREE_FINALIZE_ID_PREFIX = "worktree-finalize:";
 
 /**
  * The `dispatch_failures` id a PER-REPO worktree-finalize failure keys on —
@@ -3612,24 +3603,34 @@ export async function loadReconcileSnapshot(
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
       failedKeys.add(dispatchKey(verb as Verb, id));
-      // A recover-originated `close::<id>` row is eligible for the glue's
-      // level-triggered auto-clear. Scope on the reason marker so a non-recover
-      // close failure sharing the key is excluded (the clobber guard).
+      // Route each row through the typed classifier for its auto-clear scope. A
+      // `worktree-recover` row (reason marker — a non-recover close sharing the key
+      // is excluded, the clobber guard) is eligible for the recover glue's clear; a
+      // `worktree-finalize` row (id prefix — the epic-keyed provision
+      // `worktree-merge-conflict` kept on `close::<epic>` for the merge-escalation
+      // sweep is excluded) is eligible for the finalize driver's clear. The two
+      // scopes stay DISJOINT.
       const reason = (row as { reason?: unknown }).reason;
-      if (
-        verb === "close" &&
-        typeof reason === "string" &&
-        isWorktreeRecoverReason(reason)
-      ) {
-        recoverFailureIds.add(id);
-      }
-      // A per-repo finalize row (`finalizeEpic`'s `worktree-finalize-*` block) is
-      // eligible for the finalize driver's level-clear. Scope on the id prefix so a
-      // recover row and the epic-keyed provision `worktree-merge-conflict` (kept on
-      // `close::<epic>` for the merge-escalation sweep's `planner@<epic>`) are both
-      // excluded.
-      if (verb === "close" && id.startsWith(WORKTREE_FINALIZE_ID_PREFIX)) {
-        finalizeFailureIds.add(id);
+      const route = routeDispatchFailure({
+        verb,
+        id,
+        reason: typeof reason === "string" ? reason : "",
+        dir: "",
+      });
+      switch (route.kind) {
+        case "worktree-recover":
+          recoverFailureIds.add(id);
+          break;
+        case "worktree-finalize":
+          finalizeFailureIds.add(id);
+          break;
+        case "work-task":
+        case "merge-escalation":
+        case "close-plain":
+        case "unknown":
+          break;
+        default:
+          assertNever(route);
       }
     }
   }

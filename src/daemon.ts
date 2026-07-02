@@ -86,6 +86,10 @@ import type {
 } from "./dead-letter-worker";
 import { extractMutationPath } from "./derivers";
 import { isRetryableDispatchKey } from "./dispatch-command";
+import {
+  isMergeEscalationReason,
+  MERGE_ESCALATION_REASON_TOKEN,
+} from "./dispatch-failure-key";
 import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
@@ -876,15 +880,13 @@ export async function runBlockEscalationSweep(
 // fn-1009 — daemon worktree-merge-conflict close-escalation producer
 // ---------------------------------------------------------------------------
 
-/**
- * The EXACT leading reason token a stuck worktree fan-in close mints (the close-sink
- * provision pre-merge content conflict — `worktree-merge-conflict: merging <source>
- * into <base> — <stderr>`). The escalation gate matches the leading token (the text
- * up to the first `:`) against this EXACTLY — never a `worktree-merge` prefix — so
- * the excluded `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
- * `worktree-finalize-non-fast-forward` / `worktree-recover*` siblings never escalate.
- */
-export const MERGE_ESCALATION_REASON_TOKEN = "worktree-merge-conflict";
+// The escalation reason token lives in the dep-free `dispatch-failure-key` leaf
+// (the single dispatch-failure vocabulary). Re-exported here so the SQL twin
+// `selectPendingMergeEscalations` and `keeper query` keep importing it from
+// `daemon`. The gate matches the leading token EXACTLY — never a `worktree-merge`
+// prefix — so `worktree-merge-lock-timeout` / `-local-timeout` and the
+// `worktree-finalize-*` / `worktree-recover*` siblings never escalate.
+export { MERGE_ESCALATION_REASON_TOKEN };
 
 /**
  * A sticky `worktree-merge-conflict` close failure row — the merge-escalation
@@ -942,17 +944,17 @@ export function selectPendingMergeEscalations(
 
 /**
  * The escalation gate: escalate IFF the reason's leading token (the text up to the
- * first `:`) is EXACTLY {@link MERGE_ESCALATION_REASON_TOKEN}. Defense-in-depth over
- * {@link selectPendingMergeEscalations}'s SQL filter (re-applied per row in the
- * sweep). Pure; never throws; null/colon-less reason → false. The exact-token match
- * is what keeps the `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
+ * first `:`) is EXACTLY {@link MERGE_ESCALATION_REASON_TOKEN}. Routes through the
+ * `dispatch-failure-key` leaf's {@link isMergeEscalationReason} so this gate and the
+ * row router can never diverge — defense-in-depth over {@link
+ * selectPendingMergeEscalations}'s SQL filter (re-applied per row in the sweep).
+ * Pure; never throws; null/colon-less reason → false. The exact-token match keeps
+ * the `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
  * `worktree-finalize-non-fast-forward` / `worktree-recover*` siblings OUT.
  */
 export function shouldEscalateMergeConflict(reason: string | null): boolean {
   if (reason == null) return false;
-  const colon = reason.indexOf(":");
-  if (colon < 0) return false;
-  return reason.slice(0, colon).trim() === MERGE_ESCALATION_REASON_TOKEN;
+  return isMergeEscalationReason(reason);
 }
 
 /**
