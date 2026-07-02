@@ -39,5 +39,5 @@ green on any CLAUDE.md-adjacent doc edit.
 - [ ] Snapshot tests pin both bodies
 
 ## Done summary
-
+Restyled buildMergeEscalationBody and buildBlockEscalationBody pause-first + evidence-first, closing with the literal unstick commands (retry+play / play). Added the monitor-liveness supervision subsection to the autopilot operator runbook and pinned both bodies with snapshot tests.
 ## Evidence
