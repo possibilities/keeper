@@ -73,5 +73,5 @@ worker.md, hack/SKILL.md, plugins/plan/README.md.
 - [ ] full bun test green
 
 ## Done summary
-
+lint_failed envelope now carries a static recovery contract (fix→restage→re-invoke) and every keeper-side escape-hatch copy is scoped with the pinned lint carve-out; render oracle golden refreshed, root + prompt suites green.
 ## Evidence
