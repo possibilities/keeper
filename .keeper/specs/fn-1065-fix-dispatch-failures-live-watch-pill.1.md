@@ -24,5 +24,5 @@ rules forbid a live sub in-suite).
 - [ ] Initial snapshot + status unchanged; no reducer/fold/RPC change.
 
 ## Done summary
-
+Gave dispatch_failures a composite (verb, id) live-diff identity via an optional liveKeyColumns descriptor seam + liveKeyExpr/liveKeyOf helpers, routing seed/version-map/byId-fanout/membership-token through it so two same-verb rows each track and pill independently on board --watch. Byte-identical to pk for single-pk collections; no reducer/fold/RPC change. Covered by unit tests at the pure diff/version seam.
 ## Evidence

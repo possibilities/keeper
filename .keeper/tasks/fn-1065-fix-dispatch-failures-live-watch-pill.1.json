@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Composite-key dispatch_failures live diff",
-  "updated_at": "2026-07-02T07:26:23.908000Z"
+  "updated_at": "2026-07-02T07:43:56.314000Z",
+  "worker_done_at": "2026-07-02T07:43:56.314000Z"
 }
