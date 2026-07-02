@@ -44,5 +44,5 @@ secondary doesn't). Prefix parity test against the literal string.
 - [ ] Secondary-repo lane naming verified and handled (or surfaced as a typed finding in the Done summary)
 
 ## Done summary
-
+close-preflight/close-finalize trailer scan is now lane-aware: findCommitGroups(epicId) probes each repo's keeper/epic/<epic_id> lane branch and scans it when present, else HEAD (single-repo/non-worktree unchanged, missing ref never drops a repo). Secondary-repo lane naming verified identical (reconcile derives keeper/epic/<epic_id> from the epic id alone); a plan-local prefix constant is pinned to keeper's KEEPER_EPIC_BRANCH_PREFIX by a parity test, no worktree-git import.
 ## Evidence
