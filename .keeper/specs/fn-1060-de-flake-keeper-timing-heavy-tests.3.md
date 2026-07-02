@@ -31,5 +31,5 @@ Fixed test survives `--rerun-each 20` under induced load; the block-checklist co
 - [ ] `cd plugins/plan && bun test` green; the named test survives a --rerun-each 20 sweep under load
 
 ## Done summary
-
+Captured the flake signature: runPlanCli's 5000ms timeout kills the nested #!/usr/bin/env bun keeper shim under host contention (deterministic repro: elapsed=5151ms, guard fails open, empty stdout, JSON.parse throws 'Unexpected EOF' at ~5.4s, matching the buildbot). Fixed by emitting the shim as POSIX sh (near-instant start, no bun cold-start) in writePlanCliShim; the guard's real subprocess block-checklist contract is unchanged. Named test survives --rerun-each 40 under load avg ~217 with 0 failures.
 ## Evidence
