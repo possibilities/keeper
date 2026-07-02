@@ -44,5 +44,5 @@ None (research). The document's Acceptance checkboxes are the bar.
 - [ ] End-state design + follow-up epic decomposition ready for /plan:plan
 
 ## Done summary
-
+Delivered ~/docs/arthack-dissolution-study.md (+ yaml sidecar): full keeper→arthack edge inventory (launch config, hook layer, prompt corpus, CLI refs) with file:line + observed-usage grounding; 18-row own/gate/drop verdict matrix; the worker plugin-isolation gate answered with data (workers run permission_mode=default, auto_approve is load-bearing — gate is right but gated on keeper owning worker perms + corpus); standalone end-state design + 6-epic follow-up decomposition ready for /plan:plan.
 ## Evidence
