@@ -40,5 +40,5 @@ Warm-vs-cold byte-equality (memo accumulated across drains vs reset+single-drain
 - [ ] README incident paragraph + diagnostics note; full fast suite green
 
 ## Done summary
-
+Bounded the SubagentStart FIFO bridge fold: memoized each PreToolUse:Agent candidate's JSON.parse per event id in a per-Database WeakMap (anti-join SQL stays a live query), killing the O(accumulated-agent-calls) parse cost, and added the missing 'id < currentEventId' candidate ceiling that closes a latent live-vs-refold divergence. No schema bump; warm-vs-cold and re-fold-determinism tests ship.
 ## Evidence
