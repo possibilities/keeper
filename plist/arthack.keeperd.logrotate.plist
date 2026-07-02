@@ -15,12 +15,14 @@
   Cadence: Sunday 04:00 weekly. The weekly restart cost is acceptable;
   the operator-visible restart is announced in README.md's install section.
 
-  Install:
+  Install is owned by scripts/install.sh (idempotent bootout/enable/bootstrap),
+  which symlinks this plist into ~/Library/LaunchAgents/ and loads it. Manual
+  equivalent, if ever needed:
     cp plist/arthack.keeperd.logrotate.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 
   Failures are observable via:
-    launchctl print gui/$UID/arthack.keeperd.logrotate
+    launchctl print gui/$(id -u)/arthack.keeperd.logrotate
 
   (No StandardOutPath / StandardErrorPath here — output goes to the user's
   default launchd log, which is the right place for a rare scheduled job.)
@@ -33,7 +35,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>truncate -s 0 "$HOME/.local/state/keeper/server.stderr" &amp;&amp; launchctl kickstart -k gui/$UID/arthack.keeperd</string>
+		<string>truncate -s 0 "$HOME/.local/state/keeper/server.stderr" &amp;&amp; launchctl kickstart -k gui/$(id -u)/arthack.keeperd</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>

@@ -75,6 +75,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
 
 /**
  * Keep the most-recent N events' bodies inline UNCONDITIONALLY, regardless of
@@ -206,16 +207,22 @@ export const RETENTION_KEEP_CLASS_PREDICATE = `hook_event = 'TmuxTopologySnapsho
  *
  * A body is eligible to be NULLed iff it is in {@link RETENTION_SHED_CLASS_PREDICATE}
  * AND it does NOT still owe a `mutation_path` backfill. The second clause is the
- * re-fold safety gate: a mutation row whose body holds a promotable `file_path`
- * the column does not yet carry (`mutation_path IS NULL AND json_extract(...) IS
- * NOT NULL`) is the ONE case where the body is still the sole copy of fold-read
- * data, so it is excluded until the backfill promotes it. The `json_extract` is
- * the LONE json parse in the whole predicate and only ever bites the four
- * mutation tools — every OTHER shed class has no `mutation_path` to backfill, so
- * the guard is a no-op for it (extract is NULL on a non-mutation body, the `NOT
- * (NULL ... AND ...)` short-circuits to "not excluded"). A malformed /
- * file_path-less mutation body (extract NULL) is freely sheddable — the fold
- * reads NULL either way.
+ * re-fold safety gate: a row still owing a backfill — one of the four mutation
+ * tools ({@link MUTATION_TOOL_SQL_PREDICATE}) whose body holds a promotable
+ * `file_path` the column does not yet carry (`mutation_path IS NULL AND
+ * json_extract(...) IS NOT NULL`) — is the ONE case where the body is still the
+ * sole copy of fold-read data, so it is excluded until the backfill promotes it.
+ *
+ * The guard is scoped to those four tools EXPLICITLY, mirroring
+ * {@link extractMutationPath}'s tool gate. It has to be: the shed CLASS is
+ * deliberately wider than the mutation tools (Read/WebFetch/Skill/ToolSearch and
+ * others), and those non-mutation tools ALSO carry `tool_input.file_path` in
+ * their bodies — but they own no `mutation_path` column and no fold reads their
+ * body, so their bodies are freely sheddable. Without the tool scope the
+ * `json_extract IS NOT NULL` arm fired on every such row and pinned its body
+ * inline forever. The `json_extract` is the LONE json parse in the predicate and
+ * now only bites the four mutation tools. A malformed / file_path-less mutation
+ * body (extract NULL) is freely sheddable — the fold reads NULL either way.
  *
  * Keep-set bodies structurally fail the class match and are NEVER touched. The
  * explicit {@link RETENTION_KEEP_CLASS_PREDICATE} (`TmuxTopologySnapshot`) is
@@ -226,7 +233,8 @@ export const RETENTION_KEEP_CLASS_PREDICATE = `hook_event = 'TmuxTopologySnapsho
 export const RETENTION_SHED_PREDICATE = `${RETENTION_SHED_CLASS_PREDICATE}
    AND NOT (${RETENTION_KEEP_CLASS_PREDICATE})
    AND NOT (
-         mutation_path IS NULL
+         (${MUTATION_TOOL_SQL_PREDICATE})
+         AND mutation_path IS NULL
          AND CASE WHEN json_valid(data)
                   THEN json_extract(data, '$.tool_input.file_path')
              END IS NOT NULL
@@ -776,6 +784,41 @@ function freelistPageCount(db: Database): number {
     freelist_count?: number;
   } | null;
   return row?.freelist_count ?? 0;
+}
+
+/**
+ * Bytes sitting on the freelist — {@link freelistPageCount} pages × the DB page
+ * size. This is disk the file already occupies that only a full offline
+ * `keeper reclaim` (VACUUM INTO) returns to the filesystem; body-NULLing feeds
+ * this pool but the per-batch `incremental_vacuum` trims only the file tail (and
+ * is a no-op unless the DB was born `auto_vacuum=INCREMENTAL`). Exported for the
+ * daemon's step-latched reclaimable-space log.
+ */
+export function reclaimableFreelistBytes(db: Database): number {
+  const row = db.query("PRAGMA page_size").get() as {
+    page_size?: number;
+  } | null;
+  return freelistPageCount(db) * (row?.page_size ?? 0);
+}
+
+/** Step size (bytes) for the reclaimable-freelist observability log. */
+export const RECLAIMABLE_LOG_STEP_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Step-latch decision for the reclaimable-freelist log. Pure: given the current
+ * reclaimable byte pool and the last-logged step index, returns whether to emit a
+ * line now and the step index to latch next. Logs ONLY on a fresh upward step
+ * crossing — an unconditional per-pass line would grow the very server.stderr this
+ * bounds. The returned step lowers when the pool drains (a reclaim), so the caller
+ * that latches it lets a later regrowth re-log.
+ */
+export function reclaimableLogStep(
+  reclaimableBytes: number,
+  lastLoggedStep: number,
+  stepBytes: number = RECLAIMABLE_LOG_STEP_BYTES,
+): { shouldLog: boolean; step: number } {
+  const step = Math.floor(Math.max(0, reclaimableBytes) / stepBytes);
+  return { shouldLog: step > lastLoggedStep, step };
 }
 
 /**

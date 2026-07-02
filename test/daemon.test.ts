@@ -37,6 +37,7 @@ import {
   buildPendingDispatchSweepRecords,
   checkKeeperAgentPresence,
   type DaemonHandle,
+  DEAD_LETTER_RETENTION_MS,
   decideGitSeedWatchdog,
   drainToCompletion,
   effectiveBlockEscalationRepo,
@@ -54,6 +55,7 @@ import {
   type PlannerNotifyResult,
   parseBlockedCategory,
   prewarmWatcherAddon,
+  pruneRecoveredDeadLetters,
   recoverOneDeadLetter,
   runBlockEscalationSweep,
   runMergeEscalationSweep,
@@ -1742,6 +1744,298 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
   // one record at a time, and a partial recovery is still strictly better
   // than the row never appearing on the board).
   expect(job.state).toBe("stopped");
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// pruneRecoveredDeadLetters (fn-1051 task .2 — resurrection-safe retention)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert one `dead_letters` row in an arbitrary lifecycle state — the recovered
+ * / poison seeds the retention prune consumes (`seedDeadLetter` only ever writes
+ * `waiting`). `bindings` is irrelevant to the prune, so a fixed `'{}'` suffices.
+ */
+function seedDlRow(
+  db: ReturnType<typeof openDb>["db"],
+  opts: {
+    dl_id: string;
+    status: "waiting" | "recovered" | "poison";
+    dl_written_at: number;
+    recovered_at?: number | null;
+    source_file?: string | null;
+    pid?: number | null;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, 'sess', 'PreToolUse', ?, ?, ?, '{}', ?, ?, NULL, ?)`,
+  ).run(
+    opts.dl_id,
+    opts.dl_written_at,
+    opts.dl_written_at,
+    opts.pid ?? null,
+    opts.status,
+    opts.recovered_at ?? null,
+    opts.source_file ?? null,
+  );
+}
+
+const PROBE_DEAD = (): boolean => false; // sealed: writing pid is gone
+const PROBE_ALIVE = (): boolean => true; // unsealed: writing pid still running
+const DL_NOW_MS = 2_000_000_000_000;
+// One day PAST the cutoff (unix seconds — the stored unit).
+const DL_AGED_SEC = DL_NOW_MS / 1000 - DEAD_LETTER_RETENTION_MS / 1000 - 86_400;
+// One hour ago — comfortably INSIDE the retention window.
+const DL_FRESH_SEC = DL_NOW_MS / 1000 - 3_600;
+
+function dlCount(db: ReturnType<typeof openDb>["db"]): number {
+  return (
+    db.query("SELECT COUNT(*) AS n FROM dead_letters").get() as { n: number }
+  ).n;
+}
+
+test("pruneRecoveredDeadLetters: fully-recovered aged SEALED file → file unlinked + its rows deleted", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const file = join(dir, "4242.ndjson");
+  writeFileSync(file, "line-a\nline-b\n");
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 4242,
+  });
+  seedDlRow(db, {
+    dl_id: "r2",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 4242,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedFiles).toBe(1);
+  expect(res.prunedRows).toBe(2);
+  expect(existsSync(file)).toBe(false);
+  expect(dlCount(db)).toBe(0);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: a `waiting` row keeps its whole file inline (rows + file SACRED)", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const file = join(dir, "555.ndjson");
+  writeFileSync(file, "x\n");
+  seedDlRow(db, {
+    dl_id: "w1",
+    status: "waiting",
+    dl_written_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 555,
+  });
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 555,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedFiles).toBe(0);
+  expect(res.prunedRows).toBe(0);
+  expect(existsSync(file)).toBe(true);
+  expect(dlCount(db)).toBe(2);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: a LIVE-pid file is skipped even when fully recovered + aged", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const file = join(dir, "888.ndjson");
+  writeFileSync(file, "x\n");
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 888,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_ALIVE,
+  });
+
+  expect(res.prunedFiles).toBe(0);
+  expect(existsSync(file)).toBe(true);
+  expect(dlCount(db)).toBe(1);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, fresh kept); events-log file NEVER unlinked", () => {
+  const { db } = freshMemDb();
+  const dlDir = mkdtempSync(join(tmpDir, "dl-"));
+  const eventsLogDir = mkdtempSync(join(tmpDir, "el-"));
+  const eventsLogFile = join(eventsLogDir, "777.ndjson");
+  writeFileSync(eventsLogFile, "poison-bytes\n");
+  // Poison rows point source_file at an events-log file (the ingester owns it).
+  seedDlRow(db, {
+    dl_id: "p-old",
+    status: "poison",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: null,
+    source_file: eventsLogFile,
+    pid: 777,
+  });
+  seedDlRow(db, {
+    dl_id: "p-new",
+    status: "poison",
+    dl_written_at: DL_FRESH_SEC,
+    recovered_at: null,
+    source_file: eventsLogFile,
+    pid: 777,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dlDir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedRows).toBe(1);
+  expect(res.prunedFiles).toBe(0);
+  expect(existsSync(eventsLogFile)).toBe(true);
+  const remaining = db.query("SELECT dl_id FROM dead_letters").all() as {
+    dl_id: string;
+  }[];
+  expect(remaining.map((r) => r.dl_id)).toEqual(["p-new"]);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: recovered rows with source_file NULL age-prune by ROW (no file to resurrect them)", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  seedDlRow(db, {
+    dl_id: "n-old",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: null,
+  });
+  seedDlRow(db, {
+    dl_id: "n-new",
+    status: "recovered",
+    dl_written_at: DL_FRESH_SEC,
+    recovered_at: DL_FRESH_SEC,
+    source_file: null,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedRows).toBe(1);
+  expect(res.prunedFiles).toBe(0);
+  const remaining = db.query("SELECT dl_id FROM dead_letters").all() as {
+    dl_id: string;
+  }[];
+  expect(remaining.map((r) => r.dl_id)).toEqual(["n-new"]);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: crash between unlink and delete → next pass sweeps the orphan rows (missing file is a no-op)", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const file = join(dir, "4242.ndjson");
+  // The prior pass crashed AFTER unlink, BEFORE the row delete: the file is
+  // already gone but the recovered rows survive. This pass must sweep them.
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: file,
+    pid: 4242,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedFiles).toBe(1);
+  expect(res.prunedRows).toBe(1);
+  expect(dlCount(db)).toBe(0);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: a fully-recovered file INSIDE the retention window is not pruned (age gate)", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const file = join(dir, "999.ndjson");
+  writeFileSync(file, "x\n");
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_FRESH_SEC,
+    recovered_at: DL_FRESH_SEC,
+    source_file: file,
+    pid: 999,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedFiles).toBe(0);
+  expect(existsSync(file)).toBe(true);
+  expect(dlCount(db)).toBe(1);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: a recovered source_file OUTSIDE the dead-letter dir is never unlinked (path scope) and its row survives", () => {
+  const { db } = freshMemDb();
+  const dir = mkdtempSync(join(tmpDir, "dl-"));
+  const outside = mkdtempSync(join(tmpDir, "out-"));
+  const strayFile = join(outside, "4242.ndjson");
+  writeFileSync(strayFile, "x\n");
+  seedDlRow(db, {
+    dl_id: "r1",
+    status: "recovered",
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: DL_AGED_SEC,
+    source_file: strayFile,
+    pid: 4242,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedFiles).toBe(0);
+  // Path scope kept the unlink inside `dir`; the row stays too (deleting it while
+  // its file survives would resurrect it on the next scan).
+  expect(existsSync(strayFile)).toBe(true);
+  expect(dlCount(db)).toBe(1);
   db.close();
 });
 

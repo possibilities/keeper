@@ -252,7 +252,9 @@ keyed by `dl_id` and idempotent under re-scan; status flips
 `waiting → recovered` only when the human triggers the `replay_dead_letter`
 RPC. It is NOT a reducer projection — re-folding the event log never touches
 it, because dead letters are the audit log of events that NEVER made it into
-the event log to be folded), and `scheduled_tasks` (schema v68, fn-813 — one
+the event log to be folded; recovered rows + their fully-sealed NDJSON archive
+prune on a 7-day horizon, resurrection-safe (unlink-first, `waiting` rows
+sacred — see the dead-letter recovery narrative below)), and `scheduled_tasks` (schema v68, fn-813 — one
 row per cron a Claude session armed via the `CronCreate` tool, keyed by the
 composite `(job_id, cron_id)`; folded from the `CronCreate` / `CronDelete`
 `PostToolUse` pair, a CronCreate upserts an `active` row (a re-created id
@@ -626,13 +628,9 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    normal runtime growth is now bounded by the rare `[server-worker]` error
    class plus the weekly rotation sidecar (next step).
 
-5. **Install the rotation sidecar** so `server.stderr` doesn't grow unbounded
-   over weeks even with `KEEPER_TRACE_SERVER=0`:
-
-   ```sh
-   cp plist/arthack.keeperd.logrotate.plist ~/Library/LaunchAgents/
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
-   ```
+5. **Rotation sidecar** — `scripts/install.sh` loads it idempotently (no manual
+   step), so `server.stderr` doesn't grow unbounded over weeks even with
+   `KEEPER_TRACE_SERVER=0`.
 
    The sidecar is a user-LaunchAgent that runs Sunday 04:00 weekly,
    `truncate`s `server.stderr`, and `launchctl kickstart`s the daemon so the
@@ -2471,6 +2469,22 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+Recovered rows and their NDJSON archive do not accumulate forever: the
+producer-side retention pass (`pruneRecoveredDeadLetters`, on main
+alongside the compaction shed) prunes both past a 7-day horizon. The
+coupling is resurrection-specific — `scanDeadLetterDir` INSERT-OR-IGNOREs
+every surviving line, so a row deleted while its file can still be scanned
+re-imports as `waiting` and re-replays a duplicate event. So a dead-letter
+FILE is pruned only when every row referencing it is `recovered` and aged
+AND its writing pid is dead (sealed, so no more lines will be appended),
+prunability DB-derived from a GROUP BY (never a line-count/file read — a
+torn trailing line yields fewer rows than lines), and then unlink FIRST,
+delete rows second (a crash between the two orphans harmless `recovered`
+rows a later pass sweeps). `waiting` rows are SACRED and never touched;
+`recovered` rows with no source file, and aged `poison` rows (whose
+`source_file` points at ingester-owned events-log files the prune never
+unlinks — the ingester's durable byte-offset already prevents re-ingest),
+delete by ROW alone.
 As of schema v48 (fn-668), each Claude session's terminal-multiplexer
 backend-exec coordinates are materialized as first-class columns on the
 `events` row and (folded onto) the `jobs` projection. The hook reads pure
@@ -4018,17 +4032,24 @@ main's writable connection, paced (≤500 rows/batch, ≤20 batches/pass). The
 shed-set is a POSITIVE allow-list over CHEAP HEADER COLUMNS only
 (`RETENTION_SHED_CLASS_PREDICATE`: `hook_event`/`tool_name`/`plan_op`/
 `subagent_agent_id`, no json parse) — a new/unlisted event type defaults to KEPT
-(fail-safe). fn-837 widened it from the four mutation tools to every class no fold
-reads: PostToolUse Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch,
+(fail-safe). The class is every event type no live fold reads:
+PostToolUse Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch,
 non-`keeper-plan` PostToolUse:Bash (`keeper plan` Bash KEEPS — `state_repo` is fold-read),
 modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`; legacy NULL-id Agent
 KEEPS — its `agentId` is fold-read), non-Agent PreToolUse / PostToolUseFailure tool
 bodies (PreToolUse:Agent is the subagent bridge; failure:Agent has the legacy
 `agentId` fallback), and SubagentStart/SubagentStop/BackendExecSnapshot/Notification
 (cheap-column folds). The full `RETENTION_SHED_PREDICATE` is that class allow-list
-AND a mutation-tool-specific backfill guard (the lone `json_extract`, only ever
-biting the four mutation tools that still owe a `mutation_path` promotion); it also
-gates past the recent window AND strictly below the fold cursor. After each batch
+AND a backfill guard scoped EXPLICITLY to the four mutation tools
+(`MUTATION_TOOL_SQL_PREDICATE` in `src/derivers.ts`, shared with the historical
+backfill and mirroring `extractMutationPath`): a row of those four whose
+`mutation_path` is still NULL but whose body carries a promotable
+`tool_input.file_path` stays inline until the backfill promotes it — the lone
+`json_extract` in the predicate. The wider shed class (Read/WebFetch/Skill/…)
+ALSO carries `tool_input.file_path` in its bodies, but owns no `mutation_path`
+column and no fold reads it, so those bodies shed freely — the tool scope is
+exactly what keeps the guard from pinning them inline forever. It also gates past
+the recent window AND strictly below the fold cursor. After each batch
 `PRAGMA incremental_vacuum` returns the freed overflow pages to the file tail (a
 no-op unless the file was born `auto_vacuum=INCREMENTAL`, baked by `reclaimDb`
 above). Because no fold reads a shed-class body (and the mutation tools' file_path
@@ -4310,27 +4331,9 @@ incremental_vacuum`. `reclaimDb(dbPath, outputPath)` in `src/backup.ts` does the
 restart → verify procedure. Keep the pre-shed snapshot as the rollback until the
 restarted COALESCE-free binary verifies `event_blobs` is gone.
 
-### One-time widened-shed catch-up reclaim (fn-837.2)
-
-fn-837 widened the steady-state retention predicate from the four mutation tools to
-every fold-unread class (see `## Compaction` above). That makes a ~600k-row
-historical backlog newly eligible, but the steady-state 300s timer (≤20 batches ≈
-≤10k rows/pass) would take 5+ hours to drain it, and per-batch `incremental_vacuum`
-lags so the FILE won't shrink without a full `VACUUM INTO`. So the prompt reclaim is
-a TWO-STEP offline op: a catch-up drain (online) then a daemon-stopped VACUUM.
-
-`bun scripts/reclaim-db.ts` runs the catch-up drain — `drainColdPayloads` in
-`src/compaction.ts` loops the SAME paced retention pass (≤500 rows/tx, elevated
-per-pass batch cap, NEVER one giant UPDATE) until a pass sheds nothing; idempotent
-and resumable, safe to run while keeperd is UP (it is the daemon's own paced pass,
-just driven to completion). It then reprints the offline reclaim runbook. Run with
-`--dry-run` to print the runbook only.
-
-The runbook (`reclaimInstructions(...)` in `src/backup.ts`, the single source of
-truth) sequences: pause autopilot FIRST (it is level-triggered on `PRAGMA
-data_version`, which the VACUUM bumps) → catch-up drain → precheck free disk + stop
-the daemon → snapshot → `wal_checkpoint(FULL)` → `reclaimDb` `VACUUM INTO` (bakes
-`auto_vacuum=INCREMENTAL` + `quick_check` gate) → atomic `mv` + clear stale
-`-wal`/`-shm` → restart → `keeper await server-up` → verify DB ~0.6 GB,
-`PRAGMA auto_vacuum=2`, search-history forensics intact → re-enable autopilot. Keep
-the pre-reclaim snapshot as the rollback until verification passes.
+The generic offline reclaim mechanism — a catch-up drain (`drainColdPayloads` in
+`src/compaction.ts`, driven by `bun scripts/reclaim-db.ts`; the SAME paced pass
+looped until a pass sheds nothing, idempotent and safe while keeperd is UP) then a
+daemon-stopped `VACUUM INTO` via `reclaimInstructions(...)` in `src/backup.ts` —
+stays live for whenever a newly-widened or newly-corrected shed predicate makes a
+historical backlog eligible and the file needs to physically shrink.

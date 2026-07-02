@@ -49,6 +49,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
 
 /** `meta` key for the crash-safe resume watermark (highest processed id). */
 export const BACKFILL_WATERMARK_KEY = "mutation_path_backfill_watermark";
@@ -91,11 +92,11 @@ export interface BackfillResult {
 }
 
 /**
- * The mutation-tool predicate shared by every query here, ARM A/B, and the
- * forward deriver: `(PostToolUse, Write/Edit/MultiEdit/NotebookEdit)`.
+ * The mutation-tool predicate shared by every query here, ARM A/B, the forward
+ * deriver, AND compaction's shed guard — the one dep-free
+ * {@link MUTATION_TOOL_SQL_PREDICATE} in `src/derivers.ts`.
  */
-const MUTATION_TOOL_PREDICATE = `hook_event = 'PostToolUse'
-   AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`;
+const MUTATION_TOOL_PREDICATE = MUTATION_TOOL_SQL_PREDICATE;
 
 /**
  * The guarded extract over `events.data` (post-shed there is no side table to
