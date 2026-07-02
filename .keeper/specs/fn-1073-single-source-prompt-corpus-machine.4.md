@@ -43,5 +43,5 @@ eyeball for leaked template syntax.
 - [ ] 19 orphans deleted or wired into bundles; choosectl/assistctl swept to devctl in both snippets and the parent CLAUDE.md
 
 ## Done summary
-
+Cleaned the authoring corpus: synced escalate-inline-or-plan to autopilot phrasing (removed /plan:next), resolved 4 [[wikilink]] leaks into keeper prompt render cites, trimmed commit-via-keeper-default's escape-hatch paragraph, deleted 19 orphaned snippets, and swept choosectl/assistctl to devctl. build-snippets --check green; /Users/mike/code/CLAUDE.md edited but not committed (outside any git repo).
 ## Evidence
