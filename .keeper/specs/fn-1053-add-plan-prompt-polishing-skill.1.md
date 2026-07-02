@@ -108,5 +108,5 @@ pbcopy offer and confirm `pbpaste` matches the displayed bytes.
 - [ ] All prose forward-facing (no fn-ids, dates, or history)
 
 ## Done summary
-
+Added static hand-authored slash-only /plan:prompt skill (interactive one-change-per-turn prompt polishing toward a named word-count rung, clipboard-only export, writes nothing to disk) and indexed it in the plan README skills table + CLAUDE.md.
 ## Evidence
