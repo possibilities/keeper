@@ -51,8 +51,10 @@ import {
   computeDeferredEpicIds,
   computeMergedLaneEntries,
   confirmRunning,
+  createDispatchFailedGate,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
+  DISPATCH_FAILED_WATERMARK_SEC,
   type DispatchClearedPayload,
   type DispatchedAck,
   type DispatchedPayload,
@@ -10650,4 +10652,112 @@ test("fn-1014 regression: an UNMERGED keeper/epic base (NOT an ancestor of defau
   expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-1075 — createDispatchFailedGate (producer-side DispatchFailed change-gate)
+// The reconcile re-derives every failure from live git each cycle, so an
+// unconditional emit storms one event per cycle for a persistently-stuck
+// condition. The gate collapses identical re-emits while surfacing new
+// conditions, reason changes, and a bounded still-stuck liveness watermark.
+// ---------------------------------------------------------------------------
+
+function failedPayload(
+  overrides: Partial<DispatchFailedPayload> = {},
+): DispatchFailedPayload {
+  return {
+    verb: "close",
+    id: "worktree-recover:fn-1-foo-abc123",
+    reason: "worktree-recover-dirty-checkout: /repo has a dirty working tree",
+    dir: "/repo",
+    ts: 1000,
+    ...overrides,
+  };
+}
+
+test("createDispatchFailedGate: FIRST appearance of a (verb,id) emits", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload())).toBe(true);
+});
+
+test("createDispatchFailedGate: an identical re-emit inside the watermark window is suppressed", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
+  // Same (verb,id,reason), a later ts still inside the interval → collapse.
+  expect(gate.shouldEmit(failedPayload({ ts: 1001 }))).toBe(false);
+  expect(gate.shouldEmit(failedPayload({ ts: 1899 }))).toBe(false);
+});
+
+test("createDispatchFailedGate: a REASON CHANGE for the same (verb,id) emits immediately", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
+  // dirty→conflict is new, actionable information — never swallowed, even 1s later.
+  expect(
+    gate.shouldEmit(
+      failedPayload({
+        ts: 1001,
+        reason: "worktree-recover-conflict: merging base into main — boom",
+      }),
+    ),
+  ).toBe(true);
+  // ...and the new reason becomes the baseline: its own re-emit is now suppressed.
+  expect(
+    gate.shouldEmit(
+      failedPayload({
+        ts: 1002,
+        reason: "worktree-recover-conflict: merging base into main — boom",
+      }),
+    ),
+  ).toBe(false);
+});
+
+test("createDispatchFailedGate: a still-unchanged condition re-announces on the watermark, then re-anchors the clock", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
+  // Just short of the interval → suppressed; exactly one interval later → watermark.
+  expect(gate.shouldEmit(failedPayload({ ts: 1899 }))).toBe(false);
+  expect(gate.shouldEmit(failedPayload({ ts: 1900 }))).toBe(true);
+  // The watermark re-anchored the clock: the next interval is measured from 1900.
+  expect(gate.shouldEmit(failedPayload({ ts: 2799 }))).toBe(false);
+  expect(gate.shouldEmit(failedPayload({ ts: 2800 }))).toBe(true);
+});
+
+test("createDispatchFailedGate: noteClear resets the gate so a re-failure re-emits immediately", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
+  expect(gate.shouldEmit(failedPayload({ ts: 1001 }))).toBe(false);
+  gate.noteClear("close", "worktree-recover:fn-1-foo-abc123");
+  // Resolution dropped the row — the very next failure of this (verb,id) is new.
+  expect(gate.shouldEmit(failedPayload({ ts: 1002 }))).toBe(true);
+});
+
+test("createDispatchFailedGate: distinct (verb,id) conditions are gated independently", () => {
+  const gate = createDispatchFailedGate(900);
+  expect(gate.shouldEmit(failedPayload({ id: "a", ts: 1000 }))).toBe(true);
+  expect(gate.shouldEmit(failedPayload({ id: "b", ts: 1000 }))).toBe(true);
+  // A's suppression does not gate B, and vice versa.
+  expect(gate.shouldEmit(failedPayload({ id: "a", ts: 1001 }))).toBe(false);
+  expect(gate.shouldEmit(failedPayload({ id: "b", ts: 1001 }))).toBe(false);
+  // Same id, different verb is a distinct key (the NUL-joined composite).
+  expect(
+    gate.shouldEmit(failedPayload({ verb: "work", id: "a", ts: 1001 })),
+  ).toBe(true);
+});
+
+test("createDispatchFailedGate: the storm shape — one stuck condition over many cycles yields O(watermarks), not one event per cycle", () => {
+  const watermark = 900;
+  const gate = createDispatchFailedGate(watermark);
+  let emitted = 0;
+  // 4000 cycles, one per simulated second, an identical persistently-stuck
+  // condition re-derived every cycle (the review's single-stuck-worktree shape).
+  for (let ts = 1000; ts < 5000; ts++) {
+    if (gate.shouldEmit(failedPayload({ ts }))) emitted++;
+  }
+  // First appearance + one watermark per interval — a handful, never 4000.
+  expect(emitted).toBeLessThanOrEqual(Math.ceil(4000 / watermark) + 1);
+  expect(emitted).toBeGreaterThan(0);
+});
+
+test("DISPATCH_FAILED_WATERMARK_SEC is a bounded, non-trivial liveness interval", () => {
+  expect(DISPATCH_FAILED_WATERMARK_SEC).toBe(15 * 60);
 });
