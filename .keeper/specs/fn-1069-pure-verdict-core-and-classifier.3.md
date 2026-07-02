@@ -41,5 +41,5 @@ Exhaustive unit tests on the parser incl. the historical collision shapes (recov
 - [ ] Durable strings, projections, and SCHEMA_VERSION untouched; `bun test` green
 
 ## Done summary
-
+Added src/dispatch-failure-key.ts: a dep-free leaf holding the single dispatch-failure vocabulary plus a semantics-preserving typed row router (literal-kind union + assertNever). Routed the merge-escalation gate, recover-clear, and finalize-clear sites through it, and unified the pill table + await-conditions jam leaf on the same source.
 ## Evidence
