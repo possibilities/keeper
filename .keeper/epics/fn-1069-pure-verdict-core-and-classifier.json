@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T09:13:38.227000Z",
+  "depends_on_epics": [
+    "fn-1066-wire-real-git-slow-tier-gate"
+  ],
+  "id": "fn-1069-pure-verdict-core-and-classifier",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Pure verdict core and classifier",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T09:13:38.227000Z"
+}
