@@ -1476,8 +1476,11 @@ event-log/reducer/hook touch. Run any of them with
   envelope to `<path>` (a temp file in the same dir + rename, EXDEV-safe) on
   EVERY outcome, exit-code-independent, an additional sink for detached-leg
   pollers beyond stdout (a missing parent dir on that path is the `--output`
-  path's own `bad_args`). All three default-absent, so a run without them is
-  byte-identical. codex/pi runs launch with
+  path's own `bad_args`); `run --name <name>` labels the launch — it lands on the
+  tmux window name for EVERY harness and on the harness-native `--name` for
+  claude/pi only (codex has none), and an explicit `--name` suppresses `agent
+  run`'s auto session-name mint (framed like `keeper dispatch --name`). All four
+  default-absent, so a run without them is byte-identical. codex/pi runs launch with
   `CLAUDE*` env stripped by default (partner identity isolation, not credential
   security), claude keeps the full inherited env (its `--session-id` pin keeps the
   transcript distinct); the shared launch helper owns both the scrub and the codex

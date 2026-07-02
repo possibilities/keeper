@@ -111,6 +111,61 @@ describe("golden: buildAgentLaunchArgv", () => {
     expect(argv).not.toContain("--x-tmux-env");
   });
 
+  test("claude with --name — window-name knob + native --name, both pinned", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "claude",
+        prompt: "weigh in",
+        session: "panels",
+        name: "panel::smoke::opus",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "claude",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "--x-tmux-session",
+      "panels",
+      "--x-tmux-env",
+      "KEEPER_TMUX_SESSION=panels",
+      "--x-tmux-window-name",
+      "panel::smoke::opus",
+      "--permission-mode",
+      "acceptEdits",
+      "--dangerously-skip-permissions",
+      "--name",
+      "panel::smoke::opus",
+      "weigh in",
+    ]);
+  });
+
+  test("codex with --name — window-name knob only, NO native --name", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "codex",
+        prompt: "weigh in",
+        name: "panel::smoke::gpt5",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "codex",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "--x-tmux-window-name",
+      "panel::smoke::gpt5",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "weigh in",
+    ]);
+  });
+
   test("pi read-only launch (model + session) — posture-independent flags (no strip)", () => {
     expect(
       buildAgentLaunchArgv({

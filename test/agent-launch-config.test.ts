@@ -79,6 +79,16 @@ test("nativeClaudeArgs: --model appended when supplied", () => {
   expect(args.slice(-2)).toEqual(["--model", "opus"]);
 });
 
+test("nativeClaudeArgs: --name appended (claude has a native name flag)", () => {
+  const args = nativeClaudeArgs({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "p",
+    name: "panel::smoke::opus",
+  });
+  expect(args.slice(-2)).toEqual(["--name", "panel::smoke::opus"]);
+});
+
 // ---------------------------------------------------------------------------
 // native flag sets — codex
 // ---------------------------------------------------------------------------
@@ -100,6 +110,17 @@ test("nativeCodexArgs: interactive YOLO flags, never strips tools", () => {
   expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
   // codex must NEVER strip tools the way claude used to.
   expect(args).not.toContain("--disallowed-tools");
+});
+
+test("nativeCodexArgs: --name is NEVER emitted (codex has no native name flag)", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "p",
+    name: "panel::smoke::gpt5",
+  });
+  expect(args).not.toContain("--name");
+  expect(args).not.toContain("panel::smoke::gpt5");
 });
 
 test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () => {
@@ -144,6 +165,16 @@ test("nativePiArgs: --model appended when supplied", () => {
     model: "gpt-5.5",
   });
   expect(args).toEqual(["-na", "--model", "gpt-5.5"]);
+});
+
+test("nativePiArgs: --name appended (pi has a native name flag)", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    name: "panel::smoke::pi-fast",
+  });
+  expect(args.slice(-2)).toEqual(["--name", "panel::smoke::pi-fast"]);
 });
 
 test("nativePiArgs: --effort is never emitted even when supplied (pi uses thinking)", () => {
@@ -299,6 +330,62 @@ test("buildAgentLaunchArgv: no preset → no --x-preset flag (zero behavior chan
     prompt: "P",
   });
   expect(argv).not.toContain("--x-preset");
+});
+
+test("buildAgentLaunchArgv: --name lands on the tmux window name for EVERY harness", () => {
+  for (const cli of ["claude", "codex", "pi"] as const) {
+    const argv = buildAgentLaunchArgv({
+      launcherArgvPrefix: LAP,
+      cli,
+      prompt: "P",
+      name: "panel::smoke::x",
+    });
+    const idx = argv.indexOf("--x-tmux-window-name");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[idx + 1]).toBe("panel::smoke::x");
+  }
+});
+
+test("buildAgentLaunchArgv: native --name for claude/pi, but NEVER for codex", () => {
+  const claude = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "P",
+    name: "panel::smoke::opus",
+  });
+  const nIdx = claude.indexOf("--name");
+  expect(nIdx).toBeGreaterThanOrEqual(0);
+  expect(claude[nIdx + 1]).toBe("panel::smoke::opus");
+
+  const pi = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "P",
+    name: "panel::smoke::pi",
+  });
+  const piIdx = pi.indexOf("--name");
+  expect(piIdx).toBeGreaterThanOrEqual(0);
+  expect(pi[piIdx + 1]).toBe("panel::smoke::pi");
+
+  // codex carries the window name but NO native --name (it has no such flag).
+  const codex = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "P",
+    name: "panel::smoke::gpt5",
+  });
+  expect(codex).toContain("--x-tmux-window-name");
+  expect(codex).not.toContain("--name");
+});
+
+test("buildAgentLaunchArgv: no name → no window-name flag, no native --name (zero behavior change)", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "P",
+  });
+  expect(argv).not.toContain("--x-tmux-window-name");
+  expect(argv).not.toContain("--name");
 });
 
 // ---------------------------------------------------------------------------

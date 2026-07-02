@@ -1052,6 +1052,7 @@ async function runRunCaptureSubcommand(
             model: parsed.model ?? undefined,
             effort: parsed.effort ?? undefined,
             session: parsed.session ?? undefined,
+            name: parsed.name ?? undefined,
           },
           stopTimeoutMs: parsed.stopTimeoutMs,
         }),
