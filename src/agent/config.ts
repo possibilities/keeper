@@ -16,9 +16,15 @@
  * fail-open consumer (it catches the throw and coalesces to its constants).
  */
 
-import { readFileSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -105,11 +111,68 @@ export interface PluginSources {
 }
 
 /**
+ * The keeper-only default `plugins.yaml` written by scripts/install.sh (via the
+ * `ensure-plugin-config` bridge) when no file exists — keeper's own two plugins
+ * and NO arthack scan dirs, so `keeper agent` launches on a machine with no
+ * arthack checkout. This module is the SINGLE source of the body; install.sh
+ * emits it verbatim rather than embedding a divergent copy.
+ */
+export const DEFAULT_PLUGINS_YAML = `# Default keeper-owned Claude plugin sources for the \`keeper agent\` launcher.
+# scripts/install.sh writes this (from DEFAULT_PLUGINS_YAML in
+# src/agent/config.ts) when no ~/.config/keeper/plugins.yaml exists; an existing
+# file or symlink is left byte-untouched. No arthack scan dirs — a fresh machine
+# needs only keeper's own two plugins.
+#
+# Each entry IS a plugin (carries .claude-plugin/plugin.json) and is a hard
+# dependency: a missing manifest is fail-loud. \`~\` is expanded.
+plugin_dirs:
+  - ~/code/keeper/plugins/keeper  # keeper: hook + \`keeper:\` NL skills
+  - ~/code/keeper/plugins/plan    # plan: \`/plan:*\` NL skills
+`;
+
+/**
+ * True when an entry already exists at `path` — a regular file, a directory, OR
+ * a symlink, INCLUDING a dangling one (lstat, never stat, so a pointer at a
+ * since-removed target still reads as present). The installer's never-clobber
+ * gate: an existing machine keeps whatever it has.
+ */
+export function pluginConfigEntryExists(
+  path: string = pluginConfigPath(),
+): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Write keeper's default `plugins.yaml` when — and ONLY when — no entry exists
+ * at `path` (see {@link pluginConfigEntryExists}: a symlink, even dangling,
+ * counts as present). Returns `"written"` on a fresh write, `"exists"` when it
+ * left an existing file/symlink byte-untouched. Creates the parent dir as
+ * needed. Idempotent: safe to re-run from install.sh / CI on every build.
+ */
+export function ensureDefaultPluginConfig(
+  path: string = pluginConfigPath(),
+  content: string = DEFAULT_PLUGINS_YAML,
+): "written" | "exists" {
+  if (pluginConfigEntryExists(path)) {
+    return "exists";
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+  return "written";
+}
+
+/**
  * Return `(pluginDirs, pluginScanDirs)` from plugins.yaml. Build-forward, no
- * fallback: the config ships via the `arthack` stow package, so a missing FILE
- * is fail-loud (ConfigError). Entries are `~`-expanded and resolved absolute.
- * The asymmetry between the two keys is enforced downstream (the manifest check
- * in the plugin-discovery module), not here — both are read identically.
+ * fallback: a missing FILE is fail-loud (ConfigError) — scripts/install.sh
+ * writes keeper's {@link DEFAULT_PLUGINS_YAML} on a fresh machine. Entries are
+ * `~`-expanded and resolved absolute. The asymmetry between the two keys is
+ * enforced downstream (the manifest check in the plugin-discovery module), not
+ * here — both are read identically.
  */
 export function loadPluginSources(
   configPath: string = pluginConfigPath(),
@@ -117,8 +180,8 @@ export function loadPluginSources(
   if (!isFile(configPath)) {
     throw new ConfigError(
       `Launcher plugin config missing at ${configPath}. ` +
-        "It ships via the `arthack` stow package — run scripts/install.sh " +
-        "(or restore the file) before launching.",
+        "Run keeper's scripts/install.sh to write the default, or create " +
+        `${configPath} with a plugin_dirs list before launching.`,
     );
   }
   const raw = readMapping(configPath);

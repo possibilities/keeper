@@ -43,6 +43,15 @@ else
   ( cd "${repo_root}" && bun link )
 fi
 
+# 2b. Default launcher plugin config. `keeper agent` fail-loud-requires
+#     ~/.config/keeper/plugins.yaml; ship keeper's own default (keeper's two
+#     plugins, no arthack scan dirs) when the file is absent so a fresh machine
+#     launches without arthack's stow package. The write decision + never-clobber
+#     gate live in src/agent/config.ts (an existing file OR symlink — even a
+#     dangling one — is left byte-untouched); this is a thin caller.
+echo "install: ensure default plugins.yaml"
+( cd "${repo_root}" && bun run scripts/ensure-plugin-config.ts )
+
 # 3. Render the plan plugin's generated files (per-cell work plugins, skills/work,
 #    agents/practice-scout) so a fresh clone can spawn work:worker and the plan
 #    consistency suites run instead of skipping. Every rendered output + sidecar is
