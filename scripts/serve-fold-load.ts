@@ -30,6 +30,18 @@
  *      `drain` path, broken down by `hook_event` so the fat-tail folds
  *      (`GitSnapshot` / `Commit` re-fanning the big projections) are named.
  *
+ * fn-1067 adds a fourth, opt-in `--replay-from-zero` mode: the TRUE re-fold cost
+ * audit. It wipes ONLY the deterministic-replayed projection class (mirroring the
+ * rewinding migration's exact list in `src/db.ts` — never the live-only git
+ * surface, whose floor is RAISED so its O(history) fold self-gates), resets the
+ * cursor to 0, and replays the WHOLE corpus through the real `applyEvent`, timing
+ * every fold. It emits per-fold p50/p95 keyed by kind, the total wall time, and a
+ * two-point (first-half vs second-half) per-event slope per kind — the honest
+ * scaling detector (flat = bounded fold, growth = accumulating-state scan). A
+ * kind whose p95 grows >20% between halves, or a >10-minute total replay, is a
+ * confirmed offender for task .2. See {@link measureReplayFromZero} + the re-run
+ * procedure in `HELP` below. DESTRUCTIVE — run only on a COPY.
+ *
  * Substrate: by default the harness SYNTHESIZES a live-size projection + event
  * log into a tmp DB so it runs standalone and deterministically (seeded PRNG).
  * Pass `--db <path>` to point at a COPY of a real keeper.db (read-only for the
@@ -53,6 +65,10 @@
  *                        OR the tail window size when --db is given.
  *   --iterations <n>     Samples per measured leg (default: 30).
  *   --seed <n>           PRNG seed for synthesis (default: 744).
+ *   --replay-from-zero   DESTRUCTIVE re-fold cost audit (fn-1067); runs INSTEAD
+ *                        of legs 1-4. Wipes + rebuilds the deterministic
+ *                        projections and times every fold from id 0. Use a COPY.
+ *   --replay-batch <n>   drain() batch size for --replay-from-zero (default: 50).
  *   --json               Emit the full report as JSON.
  *   --help, -h           Show this help.
  *
@@ -70,7 +86,7 @@ import {
   selectByIdsChunked,
   selectVersionsByIdsChunked,
 } from "../src/collections";
-import { openDb } from "../src/db";
+import { LIVE_ONLY_PROJECTIONS, openDb } from "../src/db";
 import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
 import {
   diffTick,
@@ -79,6 +95,7 @@ import {
   type SubState,
   type Writable,
 } from "../src/server-worker";
+import type { Event } from "../src/types";
 
 const HELP = `serve-fold-load — controlled serve/fold latency harness (fn-744.1)
 
@@ -93,12 +110,23 @@ Options:
   --fold-events <n>    Events to fold / tail window when --db given (default: 3000).
   --iterations <n>     Samples per measured leg (default: 30).
   --seed <n>           PRNG seed for synthesis (default: 744).
+  --replay-from-zero   DESTRUCTIVE replay-from-zero re-fold cost audit (fn-1067).
+                       Wipes + rebuilds the deterministic projections and times
+                       every fold from id 0. Runs INSTEAD of the four legs above.
+                       Use only on a COPY. Pair with --db.
+  --replay-batch <n>   drain() batch size for --replay-from-zero (default: 50).
   --json               Emit the full report as JSON.
   --help, -h           Show this help.
 
 Measures cold-connect, update-under-burst, and per-fold latency at live scale and
 names the dominant cost. Standalone (synthesizes a live-size projection) unless
 --db points at a COPY of a real keeper.db. NEVER pass the live keeper.db.
+
+Replay-from-zero re-run procedure (records the fn-1067 audit numbers):
+  cp ~/.local/state/keeper/keeper.db /tmp/kdb-copy.db
+  cp ~/.local/state/keeper/keeper.db-wal /tmp/kdb-copy.db-wal 2>/dev/null || true
+  cp ~/.local/state/keeper/keeper.db-shm /tmp/kdb-copy.db-shm 2>/dev/null || true
+  bun scripts/serve-fold-load.ts --db /tmp/kdb-copy.db --replay-from-zero
 `;
 
 // ---------------------------------------------------------------------------
@@ -122,12 +150,17 @@ function summary(values: number[]): {
   p99: number;
   max: number;
 } {
+  // Reduce, never `Math.max(...values)`: the replay-from-zero leg passes the
+  // whole corpus (~774k folds), and spreading that many array elements as call
+  // arguments overflows the engine's argument limit (RangeError).
+  let max = Number.NaN;
+  for (const v of values) max = Number.isNaN(max) || v > max ? v : max;
   return {
     n: values.length,
     p50: pct(values, 0.5),
     p95: pct(values, 0.95),
     p99: pct(values, 0.99),
-    max: values.length ? Math.max(...values) : Number.NaN,
+    max,
   };
 }
 
@@ -476,6 +509,22 @@ function measureUpdateBurst(
   };
 }
 
+/**
+ * The exact `events` column list {@link drain} reads into an {@link Event} row.
+ * Kept byte-identical to `reducer.ts`'s drain SELECT so the harness folds the
+ * same shape the daemon does — `applyEvent` reads `plan_*` (the current names;
+ * the pre-v31 `planctl_*` names are long renamed) and `worktree`. A missing or
+ * misnamed column silently NULLs a fold input, so this single source of truth
+ * feeds both the tail-window fold leg and the replay-from-zero mode.
+ */
+const FOLD_EVENT_COLUMNS = `id, ts, session_id, pid, hook_event, event_type,
+        tool_name, matcher, cwd, permission_mode, agent_id, agent_type,
+        stop_hook_active, data, subagent_agent_id, spawn_name, start_time,
+        slash_command, skill_name, plan_op, plan_target, plan_epic_id,
+        plan_task_id, plan_subject_present, tool_use_id, config_dir, plan_files,
+        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+        worktree`;
+
 interface FoldResult {
   events: number;
   perFoldMs: ReturnType<typeof summary>;
@@ -512,20 +561,13 @@ function measureFold(
   const from = Math.max(0, head - windowSize);
   const rows = db
     .query(
-      `SELECT events.id AS id, ts, session_id, pid, hook_event, event_type,
-              tool_name, matcher, cwd, permission_mode, agent_id, agent_type,
-              stop_hook_active, data, subagent_agent_id, spawn_name, start_time,
-              slash_command, skill_name, planctl_op, planctl_target,
-              planctl_epic_id, planctl_task_id, planctl_subject_present,
-              tool_use_id, config_dir, planctl_files, backend_exec_type,
-              backend_exec_session_id, backend_exec_pane_id
+      `SELECT ${FOLD_EVENT_COLUMNS}
          FROM events
-        WHERE events.id > ?
-        ORDER BY events.id ASC
+        WHERE id > ?
+        ORDER BY id ASC
         LIMIT ?`,
     )
-    // biome-ignore lint/suspicious/noExplicitAny: raw Event-shaped rows for applyEvent
-    .all(from, windowSize) as any[];
+    .all(from, windowSize) as Event[];
 
   const all: number[] = [];
   const byTypeMap = new Map<string, number[]>();
@@ -644,6 +686,283 @@ function measureBatchHold(
 }
 
 // ---------------------------------------------------------------------------
+// Leg 5 — replay-from-zero (fn-1067 .1): the TRUE re-fold cost audit
+// ---------------------------------------------------------------------------
+
+/**
+ * A fold breaching either threshold is a confirmed scaling offender for task .2:
+ * a per-event p95 that grows >20% between the corpus's first and second halves
+ * (an accumulating-state scan), OR a total replay past 10 minutes on this
+ * machine (an unbounded aggregate cost regardless of slope).
+ */
+export const SLOPE_OFFENDER_PCT = 20;
+export const REPLAY_BUDGET_MS = 10 * 60 * 1000;
+
+/**
+ * Checkpoint the WAL every N folds so a long replay's growing `-wal` does not
+ * silently inflate the SECOND half's reader cost (a false-positive slope).
+ * PASSIVE-class space reclamation only — run OUTSIDE the timed `applyEvent`
+ * call, so no fold's measured duration includes a checkpoint. Pure measurement
+ * hygiene: SQLite fold output is checkpoint-cadence-independent.
+ */
+const REPLAY_CHECKPOINT_EVERY = 50_000;
+
+export interface HalfSummary {
+  n: number;
+  p50: number;
+  p95: number;
+}
+
+export interface FoldSlope {
+  /** `hook_event` kind, or `__overall__` for the whole-corpus row. */
+  kind: string;
+  first: HalfSummary;
+  second: HalfSummary;
+  /**
+   * Per-event p95 growth from the first half to the second, as a percent.
+   * `null` when it cannot be computed honestly: a kind absent from either half
+   * (no two-point line), or a first-half p95 of 0 (no baseline to divide by).
+   * A `null` slope is NEVER an offender — the two-point test only convicts a
+   * kind present, and non-trivially costed, in BOTH halves.
+   */
+  p95SlopePct: number | null;
+  offender: boolean;
+}
+
+function halfSummary(ms: number[]): HalfSummary {
+  return { n: ms.length, p50: pct(ms, 0.5), p95: pct(ms, 0.95) };
+}
+
+/**
+ * The two-point slope for one fold kind (or the overall corpus): compare the
+ * per-event p95 of its first-half samples against its second-half samples.
+ * Pure — the unit-tested core of the audit's scaling detector.
+ */
+export function foldSlope(
+  kind: string,
+  first: number[],
+  second: number[],
+): FoldSlope {
+  const f = halfSummary(first);
+  const s = halfSummary(second);
+  const computable = f.n > 0 && s.n > 0 && f.p95 > 0;
+  const p95SlopePct = computable ? ((s.p95 - f.p95) / f.p95) * 100 : null;
+  return {
+    kind,
+    first: f,
+    second: s,
+    p95SlopePct,
+    offender: p95SlopePct !== null && p95SlopePct > SLOPE_OFFENDER_PCT,
+  };
+}
+
+/**
+ * Split fold-order samples at the corpus midpoint and emit the two-point slope
+ * for the whole corpus plus one per `hook_event` kind. `samples` MUST be in
+ * fold order (ascending event id) — the split is positional, so the first
+ * `floor(n/2)` samples are the first half. Pure; the harness feeds it every
+ * replayed fold, the smoke test feeds it hand-built arrays.
+ */
+export function twoPointSlopes(samples: { kind: string; ms: number }[]): {
+  overall: FoldSlope;
+  byKind: FoldSlope[];
+} {
+  const mid = Math.floor(samples.length / 2);
+  const overallFirst: number[] = [];
+  const overallSecond: number[] = [];
+  const firstByKind = new Map<string, number[]>();
+  const secondByKind = new Map<string, number[]>();
+  const push = (m: Map<string, number[]>, k: string, v: number): void => {
+    const arr = m.get(k);
+    if (arr) arr.push(v);
+    else m.set(k, [v]);
+  };
+  samples.forEach((sample, i) => {
+    const inFirst = i < mid;
+    (inFirst ? overallFirst : overallSecond).push(sample.ms);
+    push(inFirst ? firstByKind : secondByKind, sample.kind, sample.ms);
+  });
+  const kinds = [
+    ...new Set([...firstByKind.keys(), ...secondByKind.keys()]),
+  ].sort();
+  const byKind = kinds.map((k) =>
+    foldSlope(k, firstByKind.get(k) ?? [], secondByKind.get(k) ?? []),
+  );
+  return {
+    overall: foldSlope("__overall__", overallFirst, overallSecond),
+    byKind,
+  };
+}
+
+/**
+ * Whether a table exists — guards the wipe below so the harness survives a copy
+ * of an older/newer schema without throwing on a since-renamed table.
+ */
+function tableExists(
+  db: ReturnType<typeof openDb>["db"],
+  name: string,
+): boolean {
+  return (
+    (
+      db
+        .query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .all(name) as unknown[]
+    ).length > 0
+  );
+}
+
+/**
+ * Wipe ONLY the deterministic-replayed projection class and reset the cursor to
+ * 0, mirroring the rewinding migration's exact list (the v84→v85 full
+ * rewind-and-redrain in `src/db.ts`). The LIVE-ONLY surface
+ * ({@link LIVE_ONLY_PROJECTIONS}) is wiped but its git floor is RAISED to
+ * `max(events.id)` (never reset to 0), so the from-scratch replay's
+ * `GitSnapshot` / tmux folds self-gate below the floor and no-op — refolding the
+ * live-only git surface re-arms the `computeRepoBashWindows` O(history)
+ * time-bomb and would both distort the numbers and dominate the wall clock.
+ * `commit_trailer_facts` is DELIBERATELY not wiped (an `INSERT OR IGNORE` fold
+ * keyed by `event_id` PK — it re-folds byte-identically from id 0 without one).
+ */
+function wipeDeterministicProjections(
+  db: ReturnType<typeof openDb>["db"],
+): void {
+  const del = (t: string): void => {
+    if (tableExists(db, t)) db.run(`DELETE FROM ${t}`);
+  };
+  db.transaction(() => {
+    db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+    // Deterministic reducer projections (jobs + epics lead the migration list).
+    del("jobs");
+    del("epics");
+    // Live-only surface: wipe the rows, but the git floor RAISE below — not a
+    // reset to 0 — is what keeps the replay off the O(history) git fold.
+    for (const t of LIVE_ONLY_PROJECTIONS) del(t);
+    if (tableExists(db, "jobs")) {
+      db.run(
+        `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+      );
+    }
+    if (tableExists(db, "git_projection_state")) {
+      db.run(
+        `UPDATE git_projection_state
+            SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                seed_required = 1,
+                updated_at = unixepoch('now', 'subsec')
+          WHERE id = 1`,
+      );
+    }
+    del("subagent_invocations");
+    del("usage");
+    del("profiles");
+    del("dispatch_failures");
+    del("autopilot_state");
+    del("pending_dispatches");
+    del("dispatch_never_bound");
+    del("block_escalations");
+    del("handoffs");
+    del("armed_epics");
+    del("builds");
+  })();
+}
+
+interface ReplayResult {
+  events: number;
+  wallMs: number;
+  batchSize: number;
+  checkpoints: number;
+  exceedsBudget: boolean;
+  perFoldMs: ReturnType<typeof summary>;
+  overall: FoldSlope;
+  /** Per-kind slopes, sorted offenders-first then by descending slope. */
+  byKind: FoldSlope[];
+  /** Per-kind total fold time, for the report's cost attribution. */
+  totalMsByKind: Map<string, number>;
+}
+
+/**
+ * Leg 5 — a TRUE replay from id 0. Wipes the deterministic-replayed class
+ * ({@link wipeDeterministicProjections}), checkpoints the WAL, then loops the
+ * SAME batched SELECT + per-event `applyEvent` that {@link drain} runs — timing
+ * each fold individually (drain does not expose per-fold latency) — to
+ * completion. Emits per-fold p50/p95 keyed by `hook_event`, the total wall
+ * time, and the two-point (first-half vs second-half) slope per kind.
+ *
+ * DESTRUCTIVE: only ever run against a COPY of a real keeper.db. The projection
+ * is rebuilt by the replay, but the git floor is left raised — the copy is
+ * disposable.
+ */
+function measureReplayFromZero(
+  db: ReturnType<typeof openDb>["db"],
+  batchSize: number,
+): ReplayResult {
+  wipeDeterministicProjections(db);
+  // Reader cost is proportional to WAL size — start the timed replay on a
+  // checkpointed WAL (best practice: sqlite.org/wal.html).
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+
+  const query = db.query(
+    `SELECT ${FOLD_EVENT_COLUMNS}
+       FROM events
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT ?`,
+  );
+
+  const all: number[] = [];
+  const samples: { kind: string; ms: number }[] = [];
+  const totalMsByKind = new Map<string, number>();
+  let cursor = 0;
+  let sinceCheckpoint = 0;
+  let checkpoints = 0;
+
+  const wall0 = performance.now();
+  for (;;) {
+    const rows = query.all(cursor, batchSize) as Event[];
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const t0 = performance.now();
+      applyEvent(db, row);
+      const d = performance.now() - t0;
+      const kind = row.hook_event ?? "?";
+      all.push(d);
+      samples.push({ kind, ms: d });
+      totalMsByKind.set(kind, (totalMsByKind.get(kind) ?? 0) + d);
+      cursor = row.id;
+      sinceCheckpoint += 1;
+    }
+    if (sinceCheckpoint >= REPLAY_CHECKPOINT_EVERY) {
+      db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+      sinceCheckpoint = 0;
+      checkpoints += 1;
+    }
+  }
+  const wallMs = performance.now() - wall0;
+
+  const { overall, byKind } = twoPointSlopes(samples);
+  // Offenders first, then steepest slope; nulls (uncomputable) sink to the end.
+  byKind.sort((a, b) => {
+    const rank = (x: FoldSlope): number =>
+      x.offender ? 2 : x.p95SlopePct !== null ? 1 : 0;
+    if (rank(a) !== rank(b)) return rank(b) - rank(a);
+    return (b.p95SlopePct ?? -Infinity) - (a.p95SlopePct ?? -Infinity);
+  });
+
+  return {
+    events: samples.length,
+    wallMs,
+    batchSize,
+    checkpoints,
+    exceedsBudget: wallMs > REPLAY_BUDGET_MS,
+    perFoldMs: summary(all),
+    overall,
+    byKind,
+    totalMsByKind,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -656,6 +975,8 @@ interface Args {
   iterations: number;
   seed: number;
   json: boolean;
+  replayFromZero: boolean;
+  replayBatch: number;
 }
 
 function parse(argv: string[]): Args | "help" {
@@ -670,6 +991,8 @@ function parse(argv: string[]): Args | "help" {
       iterations: { type: "string" },
       seed: { type: "string" },
       json: { type: "boolean", default: false },
+      "replay-from-zero": { type: "boolean", default: false },
+      "replay-batch": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
     allowPositionals: false,
@@ -691,6 +1014,8 @@ function parse(argv: string[]): Args | "help" {
     iterations: num(values.iterations, 30),
     seed: num(values.seed, 744),
     json: values.json ?? false,
+    replayFromZero: values["replay-from-zero"] ?? false,
+    replayBatch: num(values["replay-batch"], DEFAULT_BATCH_SIZE),
   };
 }
 
@@ -806,6 +1131,71 @@ function printReport(
   L("══════════════════════════════════════════════════════════════════");
 }
 
+function printReplayReport(
+  replay: ReplayResult,
+  scale: { epics: number; events: number; source: string },
+): void {
+  const L = (s: string) => process.stdout.write(`${s}\n`);
+  const secs = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
+  const slopeStr = (s: FoldSlope): string =>
+    s.p95SlopePct === null
+      ? "n/a"
+      : `${s.p95SlopePct >= 0 ? "+" : ""}${s.p95SlopePct.toFixed(1)}%`;
+  L("");
+  L("══ serve-fold-load: REPLAY-FROM-ZERO ═════════════════════════════");
+  L(`source: ${scale.source}`);
+  L(
+    `events=${scale.events}  epics(rebuilt)=${scale.epics}  batch=${replay.batchSize}  wal_checkpoints=${replay.checkpoints}`,
+  );
+  L("");
+  L("── TOTAL REPLAY ──");
+  L(
+    `  wall clock ${secs(replay.wallMs)}  → budget ${replay.exceedsBudget ? "EXCEEDED (>10min)" : "OK (<10min)"}`,
+  );
+  L(
+    `  per-fold   p50 ${fmt(replay.perFoldMs.p50)}  p95 ${fmt(replay.perFoldMs.p95)}  p99 ${fmt(replay.perFoldMs.p99)}  max ${fmt(replay.perFoldMs.max)}`,
+  );
+  L("");
+  L("── TWO-POINT SLOPE (first half vs second half of corpus) ──");
+  L(
+    `  offender threshold: per-event p95 slope > ${SLOPE_OFFENDER_PCT}% between halves`,
+  );
+  L(
+    `  overall    p95 1st ${fmt(replay.overall.first.p95)}  p95 2nd ${fmt(replay.overall.second.p95)}  slope ${slopeStr(replay.overall)}${replay.overall.offender ? "  <-- OFFENDER" : ""}`,
+  );
+  L("");
+  L(`  by hook_event (p95 1st-half -> 2nd-half):`);
+  L(
+    `    ${"event".padEnd(24)}${"n".padStart(9)}${"p95(1)".padStart(10)}${"p95(2)".padStart(10)}${"slope".padStart(9)}${"total".padStart(11)}  flag`,
+  );
+  for (const s of replay.byKind) {
+    const n = s.first.n + s.second.n;
+    const total = replay.totalMsByKind.get(s.kind) ?? 0;
+    L(
+      `    ${s.kind.padEnd(24)}${String(n).padStart(9)}${fmt(s.first.p95).padStart(10)}${fmt(s.second.p95).padStart(10)}${slopeStr(s).padStart(9)}${`${total.toFixed(0)}ms`.padStart(11)}  ${s.offender ? "OFFENDER" : ""}`,
+    );
+  }
+  L("");
+  L("── VERDICT ──");
+  const offenders = replay.byKind.filter((s) => s.offender).map((s) => s.kind);
+  if (offenders.length === 0 && !replay.exceedsBudget) {
+    L("  CLEAN: no fold breaches the slope or wall-clock thresholds.");
+  } else {
+    if (offenders.length > 0)
+      L(
+        `  SLOPE OFFENDERS (>${SLOPE_OFFENDER_PCT}% p95 growth): ${offenders.join(", ")}`,
+      );
+    if (replay.exceedsBudget)
+      L(
+        `  WALL-CLOCK OFFENDER: total replay ${secs(replay.wallMs)} > 10min budget.`,
+      );
+    L(
+      "  → task .2 must remediate with a sanctioned shape or explicitly justify.",
+    );
+  }
+  L("══════════════════════════════════════════════════════════════════");
+}
+
 async function main(argv: string[]): Promise<void> {
   let args: Args | "help";
   try {
@@ -850,6 +1240,41 @@ async function main(argv: string[]): Promise<void> {
     const eventCount = (
       db.query(`SELECT COUNT(*) c FROM events`).get() as { c: number }
     ).c;
+
+    // Replay-from-zero is a distinct, DESTRUCTIVE mode: it wipes + rebuilds the
+    // deterministic projections, so it runs INSTEAD of the four serve/fold legs
+    // (which measure the projection as-is). Rebuilt epics count is read after.
+    if (args.replayFromZero) {
+      const replay = measureReplayFromZero(db, args.replayBatch);
+      const rebuiltEpics = (
+        db.query(`SELECT COUNT(*) c FROM epics`).get() as { c: number }
+      ).c;
+      if (args.json) {
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              mode: "replay-from-zero",
+              source,
+              scale: { epics: rebuiltEpics, events: eventCount },
+              args,
+              replay: {
+                ...replay,
+                totalMsByKind: Object.fromEntries(replay.totalMsByKind),
+              },
+            },
+            null,
+            2,
+          )}\n`,
+        );
+      } else {
+        printReplayReport(replay, {
+          epics: rebuiltEpics,
+          events: eventCount,
+          source,
+        });
+      }
+      return;
+    }
 
     const cold = measureColdConnect(db, args.iterations);
     const burst = measureUpdateBurst(
