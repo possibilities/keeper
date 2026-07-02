@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T11:06:51.443000Z",
+  "created_by_close_of": "fn-1066-wire-real-git-slow-tier-gate",
+  "depends_on_epics": [
+    "fn-1066-wire-real-git-slow-tier-gate"
+  ],
+  "id": "fn-1072-fix-sitter-repin-verify-doc-command",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix sitter repin-verify doc command",
+  "touched_repos": [
+    "/Users/mike/code/sitter"
+  ],
+  "updated_at": "2026-07-02T11:06:51.443000Z"
+}
