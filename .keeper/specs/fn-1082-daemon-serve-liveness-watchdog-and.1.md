@@ -42,5 +42,5 @@ production-only; no test boots a daemon.
 - [ ] CLAUDE.md carve-out sentence landed; lint green; fast suite green
 
 ## Done summary
-
+Added the serve-liveness watchdog: a pure verdict (decideServeLivenessWatchdog) fed each interval by real bounded-timeout reads on keeperd.sock + bus.sock (accept-stall detector) plus a main-loop lag histogram (busy-wedge belt), escalating a detected wedge straight to fatalExit; boot grace + N-consecutive guards prevent false restarts. Also added the unconditional bus.sock unlink-at-boot and the CLAUDE.md carve-out sentence.
 ## Evidence

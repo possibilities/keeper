@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Serve-liveness watchdog",
-  "updated_at": "2026-07-02T22:07:06.870000Z"
+  "updated_at": "2026-07-02T22:26:27.593000Z",
+  "worker_done_at": "2026-07-02T22:26:27.593000Z"
 }
