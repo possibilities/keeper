@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Durable dispatch mint gate",
-  "updated_at": "2026-07-02T03:58:53.959000Z"
+  "updated_at": "2026-07-02T04:23:46.100000Z",
+  "worker_done_at": "2026-07-02T04:23:46.100000Z"
 }

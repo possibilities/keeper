@@ -61,5 +61,5 @@ clears the gate; eviction prunes stale rows; schema-version test green.
 - [ ] No events-table constraint; no change to fold logic
 
 ## Done summary
-
+Added the durable dispatch_mint_gate table (v101->v102) that suppresses same-verb::id re-mints within a 60s window at the Dispatched mint site, wrapping the gate check + event insert in one transaction; re-mints reply a distinct ok:false,suppressed:true ack, retry_dispatch clears the gate, and stale rows age out on the pending-dispatch sweep.
 ## Evidence
