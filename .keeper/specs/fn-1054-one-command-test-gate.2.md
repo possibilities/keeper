@@ -36,5 +36,5 @@ The whole change is inside tests; the proof is the full fast suite green across 
 - [ ] All six stale/dangling comments fixed; repeated full-suite runs green
 
 ## Done summary
-
+Test-isolation fixes: daemon.test.ts runArchiveScript now uses sandboxEnv (inert dlDir param dropped), positive-gate fixed sleeps converted to retryUntil while negative/timing settles are kept with reason comments, and six stale references to non-existent *.slow.test.ts siblings were deleted or reworded. Full fast suite green (5262 pass, 0 fail) plus repeated converted-site runs stable.
 ## Evidence
