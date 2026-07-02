@@ -192,6 +192,8 @@ The parent makes a control decision from this — return-value tokens tax every 
 
 If you cannot complete the task — spec unclear, dep broken, scope ballooned, tooling broken — return this exact shape instead of a completion summary. Do not call `keeper plan done`. Do not commit empty work.
 
+**Chasing a bug before you escalate?** When the blocker is a failure you can't explain — a test failing for an unclear reason, an intermittent flake, a regression — reach for the `keeper:debug` skill first: it builds a red-capable feedback loop and gathers the evidence a decision-ready `BLOCKED:` needs, and its own hard stop ("no loop can be built") is exactly the signal to escalate here.
+
 ```
 BLOCKED: <CATEGORY>
 Task: $TASK_ID
