@@ -6,7 +6,7 @@
     "fn-1081-close-pipeline-integrity"
   ],
   "id": "fn-1083-worker-trust-and-escalation-surfaces",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-02T22:08:46.349000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T22:08:37.049000Z"
+  "updated_at": "2026-07-02T22:08:46.349000Z"
 }
