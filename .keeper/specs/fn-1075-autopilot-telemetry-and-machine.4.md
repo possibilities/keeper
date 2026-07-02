@@ -46,5 +46,5 @@ parsing + flag-assembly seams).
 - [ ] lint_failed spike root-caused with evidence (fixed if trivial, filed if not)
 
 ## Done summary
-
+Documented plugin composition per launch channel (docs/plugin-composition-map.md) with file:line grounding: every claude launch — interactive AND autopilot worker — inherits the full plugins.yaml (keeper+plan+arthack) via the sole agent==='claude' gate (main.ts:2194); the per-cell --plugin-dir is additive, not isolating. Corrected the CLAUDE.md worker-launch sentence, annotated the discovery gate + the events-writer logged-vs-executed skew (stored data=typed command, arthack rewrites what runs). Standing test test/plugin-composition-map.test.ts pins the config-parse and flag-assembly seams. lint_failed spike forensics: NOT a lint regression — a measurement artifact. Events carry ZERO genuine commit-work lint_failed envelopes (0/787k); every count is a substring proxy. 2026-07-02 had 146 mentions of which 89 (61%) co-occur with fn-1062/fn-1075, two epics literally scoped around commit-work lint failures; baseline days show 0 meta-epic co-occurrence. No code fix applies (filed, not fixed).
 ## Evidence
