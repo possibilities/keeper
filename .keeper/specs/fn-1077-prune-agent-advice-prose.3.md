@@ -43,5 +43,5 @@ the sibling task.
 - [ ] Fencing guards and sacred blocks verbatim; renders regenerated
 
 ## Done summary
-
+Pruned restated advice across five plan skills and five scout/auditor briefs: single-stated duplicated panel-routing/commit/quiet-wrapup/bookend guidance, collapsed plan Phase 5's re-narration of the 3b depth tables to references, and gated design-system/frontend content behind explicit presence lead-ins while trimming practice-scout's tutorial-voice star heuristics. Sacred fences, .keeper/-exclusion guards, and BAKE blocks left byte-verbatim; renders regenerate cleanly.
 ## Evidence
