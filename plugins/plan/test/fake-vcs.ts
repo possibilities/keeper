@@ -84,6 +84,10 @@ interface RepoState {
 
 const repos = new Map<string, RepoState>();
 let commitCounter = 0;
+/** Per-repo override for sessionDirtyPaths (tests): a `string[]` forces that
+ * exact dirty set, `null` forces the fail-open (git-unreadable) signal. Unset ⇒
+ * the fake derives the set from the `.keeper/` snapshot diff. */
+const sessionDirtyOverrides = new Map<string, string[] | null>();
 /** Whether the fake reports a present git binary. A test arms absence via
  * setGitBinaryPresent(false) to drive the fail-closed source-scan path. */
 let gitBinaryPresent = true;
@@ -346,12 +350,20 @@ export function fakeCommitTaskJson(root: string, taskId: string): void {
   }
 }
 
+/** Force `sessionDirtyPaths(root)` to return `value` (tests): a `string[]` is an
+ * exact dirty set, `null` drives the fail-open (git-unreadable) signal the
+ * close-out gate surfaces as a visible marker. Cleared by resetFakeVcs. */
+export function setSessionDirty(root: string, value: string[] | null): void {
+  sessionDirtyOverrides.set(normRoot(root), value);
+}
+
 /** Clear all fake-repo state — call in a global beforeEach so per-test repos
  * never bleed across tests sharing a (reused) path. */
 export function resetFakeVcs(): void {
   repos.clear();
   commitCounter = 0;
   gitBinaryPresent = true;
+  sessionDirtyOverrides.clear();
 }
 
 /** Arm the fake to report git as absent (false) or present (true). Drives the
@@ -482,5 +494,17 @@ export const fakeVcs: PlanVcs = {
   firstSourceShaShort(taskId, cwd): string | null {
     const shas = matchingSourceShas(repoFor(cwd), taskId);
     return shas.length > 0 ? (shas[0] as string).slice(0, 7) : null;
+  },
+
+  sessionDirtyPaths(cwd): string[] | null {
+    const key = normRoot(cwd);
+    if (sessionDirtyOverrides.has(key)) {
+      return sessionDirtyOverrides.get(key) as string[] | null;
+    }
+    const state = repos.get(key);
+    if (!state) {
+      return [];
+    }
+    return [...diffAgainstSnapshot(key, state.snapshot)].sort();
   },
 };

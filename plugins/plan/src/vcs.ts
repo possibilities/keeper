@@ -127,6 +127,15 @@ export interface PlanVcs {
    * `git log -1 --format=%h --grep="Task: <id>" --fixed-strings` in `cwd`, or
    * null on any failure / miss. Used by worker resume's nudge. */
   firstSourceShaShort(taskId: string, cwd: string): string | null;
+
+  /** Repo-relative paths git reports dirty across `cwd`'s whole work tree via
+   * `git status --porcelain=v1 --untracked-files=all` (modified / untracked /
+   * deleted, rename taking the destination) — a worker's undischarged session
+   * files, the close-out gate's observable. Returns [] for a clean tree and
+   * `null` when git could not be read (missing binary / not a work tree / any
+   * spawn failure): the FAIL-OPEN signal the gate surfaces as a VISIBLE marker
+   * rather than a silent false-clean read. Used by reconcile's close-out probe. */
+  sessionDirtyPaths(cwd: string): string[] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +394,20 @@ export const realGitVcs: PlanVcs = {
     } catch {
       return null;
     }
+  },
+
+  sessionDirtyPaths(cwd): string[] | null {
+    // Fail-OPEN: runReadGit maps a missing binary / non-repo / spawn failure to
+    // a non-zero exit, which becomes `null` (the visible marker) rather than a
+    // false-clean []. handleRename=true keeps a moved on-hook file in the set.
+    const result = runReadGit(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      cwd,
+    );
+    if (result.exitCode !== 0) {
+      return null;
+    }
+    return parseStatusPaths(result.stdout, true);
   },
 };
 

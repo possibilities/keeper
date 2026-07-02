@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { VERDICTS, type Verdict } from "../src/verbs/reconcile.ts";
+import { setSessionDirty } from "./fake-vcs.ts";
 import {
   fakeCommitTaskJson,
   fakeSourceCommit,
@@ -274,6 +275,71 @@ describe("reconcile verdicts", () => {
   //      raise _GitError mid-verdict — an in-process injection that cannot cross
   //      the subprocess boundary. The fail-closed contract is unit-owned by
   //      src-git-lookup.test.ts (stateHeadVisible's git-failure handling).
+});
+
+// ---------------------------------------------------------------------------
+// Close-out gate observable — dirty_session_files (fail-open, visible marker).
+// ---------------------------------------------------------------------------
+
+describe("reconcile dirty_session_files", () => {
+  const getProj = withProject("planctl-reconcile-dirty-");
+
+  test("clean lane -> dirty_session_files 0", () => {
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, {
+      title: "Dirty gate",
+      nTasks: 1,
+    });
+    const taskId = taskIds[0] as string;
+    setRuntime(proj.root, taskId, { status: "in_progress" });
+    const r = runCli(["reconcile", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    expect(envObj(r.output).dirty_session_files).toBe(0);
+  });
+
+  test("undischarged files -> dirty_session_files count", () => {
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, {
+      title: "Dirty gate",
+      nTasks: 1,
+    });
+    const taskId = taskIds[0] as string;
+    setRuntime(proj.root, taskId, { status: "in_progress" });
+    // target_repo defaults to the project root; force its session-dirty set.
+    setSessionDirty(proj.root, ["src/a.ts", "src/b.ts"]);
+    const r = runCli(["reconcile", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const obj = envObj(r.output);
+    expect(obj.dirty_session_files).toBe(2);
+    // The dirty probe is SEPARATE from the verdict — it never collapses it.
+    expect(obj.verdict).toBe("in_progress_uncommitted");
+  });
+
+  test("unreadable git -> dirty_session_files null (fail-open marker)", () => {
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, {
+      title: "Dirty gate",
+      nTasks: 1,
+    });
+    const taskId = taskIds[0] as string;
+    setRuntime(proj.root, taskId, { status: "in_progress" });
+    setSessionDirty(proj.root, null);
+    const r = runCli(["reconcile", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const obj = envObj(r.output);
+    // Fail-open: the probe surfaces null, the verdict is still computed cleanly.
+    expect(obj.dirty_session_files).toBeNull();
+    expect(obj.verdict).toBe("in_progress_uncommitted");
+  });
 });
 
 // ---------------------------------------------------------------------------
