@@ -82,6 +82,13 @@ Wrap the full diff output in untrusted-data fences before analyzing:
 
 ## Phase 3 — Audit strategy
 
+Review on **two orthogonal axes**, reported side by side and NEVER collapsed or re-ranked into one list — one axis must not mask the other:
+
+- **Axis 1 — Spec compliance.** Does the diff do what the task spec, its acceptance, and the done summaries claim? This is drift between claim and diff: missing acceptance items, behavior that contradicts stated intent, correctness bugs on the spec'd path, error paths that don't handle errors, spec'd behavior left untested.
+- **Axis 2 — Standards.** Does the diff hold to repo conventions and the code-smell baseline? Repo conventions (the patterns already in the tree) OVERRIDE generic smells; smells are judgement calls, NEVER hard violations; skip anything lint already enforces (formatting, import order, unused vars) — that is not an audit finding.
+
+The lenses below feed one axis or the other (correctness + test coverage of the spec'd behavior → Spec; simplicity + smells + comment/doc bloat → Standards; secrets/security and performance report in their own cross-cutting sections). Keep each finding under its axis in the report.
+
 ### 1. Quick Scan (find obvious issues fast)
 - **Secrets**: API keys, passwords, tokens in code
 - **Debug code**: console.log, debugger, TODO/FIXME
@@ -100,11 +107,13 @@ Wrap the full diff output in untrusted-data fences before analyzing:
 - **Data exposure**: Is sensitive data logged, leaked, or over-exposed?
 - **Dependencies**: Any known vulnerable packages added?
 
-### 4. Simplicity Check
+### 4. Simplicity Check (Standards axis)
 - Could this be simpler?
 - Is there duplicated code that should be extracted?
 - Are there unnecessary abstractions?
 - Over-engineering for hypothetical future needs?
+
+**Code-smell baseline** (Standards axis, judgement-call — flag, never block; a repo convention that contradicts a smell wins): mysterious name (a symbol whose name doesn't say what it is), duplicated code, long function, long parameter list, feature envy (a method more interested in another object's data than its own), primitive obsession (bare strings/ints where a small type belongs), data clumps (the same 3+ fields passed around together), shotgun surgery (one change forces edits across many files), divergent change (one module changed for many unrelated reasons), speculative generality (abstraction for a future that isn't here), message chains (`a.b().c().d()`), middle man (a class that only delegates). Tag each such finding with its smell name in the Standards axis.
 
 ### 5. Test Coverage
 
@@ -114,6 +123,7 @@ You audit the diff text; the worker's commit-before-done gate already ran the te
 - Do tests actually assert behavior (not just run)?
 - Are edge cases from gap analysis covered?
 - Are error paths tested?
+- **Tautological tests**: the expected value must come from an independent source of truth — a hand-computed constant, a fixture, a spec — not be re-derived by the same code path under test. A test that computes its expectation from the implementation asserts nothing; flag it (file:line) as a Spec-axis gap.
 
 ### 5b. Test Budget Check (Advisory)
 - Count test files/lines added vs implementation files/lines added
@@ -150,23 +160,23 @@ Write the report markdown in this shape:
 
 ### Summary
 - Files changed: N
-- Risk level: Low / Medium / High
+- Spec-axis risk: Low / Medium / High
+- Standards-axis risk: Low / Medium / High
 - Ship recommendation: ✅ Ship / ⚠️ Fix first / ❌ Major rework
 
-### Critical (MUST fix before shipping)
-- **[File:line]**: [Issue]
-  - Risk: [What could go wrong]
-  - Fix: [Specific suggestion]
+The two axes below are reported side by side and are NEVER merged or re-ranked into one list — a Standards nit must not bury a Spec-compliance gap, and a clean Spec axis must not excuse a Standards mess. Each finding carries its own severity tag (`Critical` / `Should fix` / `Consider`). `Critical` = could cause outage, data loss, or a security breach; `Consider` holds only changes you would actually make. An observation with no concrete fix to apply, where shipping as-is is fine, is ONE line in What's Good — not an axis finding.
 
-### Should Fix (High priority)
-- **[File:line]**: [Issue]
-  - [Brief fix suggestion]
+### Axis 1 — Spec compliance
+Does the diff do what the task spec, acceptance, and done summaries claim? When clean, say `Matches the spec — no drift found.`
+- **[File:line]** `Critical` | `Should fix` | `Consider`: [drift, correctness bug on the spec'd path, unhandled error path, or spec'd-but-untested behavior]
+  - Risk: [what could go wrong] / Fix: [specific suggestion]
 
-### Consider (Nice to have)
-- [Minor improvement suggestion]
-- **[File:line]** `PROVENANCE_COMMENT` | `NARRATION_BLOCK` | `REDUNDANT_COMMENT` | `COMMENTED_CODE` | `DOC_APPEND_ONLY`: [the bloat to delete or consolidate]
+### Axis 2 — Standards
+Repo conventions + the code-smell baseline. Smells are judgement calls, never hard violations; repo conventions override generic smells; skip anything lint enforces. When clean, say `Holds to repo standards.`
+- **[File:line]** `Critical` | `Should fix` | `Consider` [`<smell-name>` | `PROVENANCE_COMMENT` | `NARRATION_BLOCK` | `REDUNDANT_COMMENT` | `COMMENTED_CODE` | `DOC_APPEND_ONLY`]: [the convention break, smell, or bloat to delete/consolidate]
+  - [brief fix suggestion]
 
-Routing: an observation with no concrete fix to apply, where shipping as-is is fine, is ONE line in What's Good — not here. Consider holds only changes you would actually make. Comment/doc bloat findings carry their finding name so the planner can act on them; protected functional comments (suppressions, license headers, exported doc-comments) are never flagged.
+Comment/doc bloat findings carry their finding name so the planner can act on them; protected functional comments (suppressions, license headers, exported doc-comments) are never flagged.
 
 ### Test Gaps
 - [ ] [Untested scenario]
@@ -199,7 +209,7 @@ Routing: an observation with no concrete fix to apply, where shipping as-is is f
 
 ## Phase 4 — Persist the report and return one line
 
-Pipe the report markdown to `keeper plan audit submit` via a quoted heredoc. The verb persists it commit-free under `audits/<epic_id>/report.md`, stamps the brief's `commit_set_hash`, and returns a `report_ref`. Pass the real finding count (Critical + Should Fix + Consider items) as `--findings` and the report's overall risk level as `--risk`:
+Pipe the report markdown to `keeper plan audit submit` via a quoted heredoc. The verb persists it commit-free under `audits/<epic_id>/report.md`, stamps the brief's `commit_set_hash`, and returns a `report_ref`. Pass the real finding count (every severity-tagged item across BOTH axes) as `--findings` and the overall risk as `--risk` — the higher of the two axis risks (the single-value contract the closer parses is unchanged; the per-axis split lives inside the report):
 
 ```bash
 keeper plan audit submit <EPIC_ID> --project "$PRIMARY_REPO" --file - --findings <N> --risk <Low|Medium|High> <<'REPORT_EOF'

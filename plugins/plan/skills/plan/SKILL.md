@@ -220,6 +220,7 @@ A uniform 1-by-1 prose Q&A over every `### Priority Questions` bullet in the pin
 - For a real question: write one short **explainer paragraph** (the tradeoff, why it matters, what each direction implies), then ask the one question. Wait. Let the conversation unfold — pushback, follow-ups, premise changes are all fine. Advance only when the thread is resolved.
 - `skip`/`pass` are valid — record and advance.
 - Synthesize each answer into working-memory refinements (create: feed Phase 3 on; refine: feed R4 on).
+- **Scope-confirm reflex:** when an answer settles one axis but leaves an adjacent one unstated (the human picked the auth mechanism but not the session-store, the schema but not the migration order), state your assumption on that unstated axis in one sentence before decomposing on it — don't silently pick and bake it into tasks. Fires on a genuinely unstated axis only; never re-litigate a directive the human already gave.
 
 If the gap-analyst returned no Priority Questions, skip this phase. Do **not** re-spawn gap-analyst after Q&A — trust the answers. (Refine may re-ask questions answered on the original run; expected.)
 
@@ -289,6 +290,8 @@ If yes → **1 task**. Scale up only when one or more of these apply:
 - **Keystone-plus-fallback** — a risky approach with a known alternative, isolated so its fallback is scoped to one task.
 
 When in doubt between 1 task and 2, pick 1 — the refine path can add task 2 later. State the bias back: *"cohesive — single file, no scale-up triggers"* or name which trigger(s) pushed you to split.
+
+**Ticket-vs-fog test (per candidate task):** before a piece becomes a task, ask *"can I state the question this task answers precisely, right now?"* If yes, it's a ticket — decompose it. If the answer is still "we'll figure out X once Y lands" or "explore whether Z is worth doing," it's **fog**, not a task: leave it out of the plan (or park it as a one-line open question in the epic body), never mint a fake task whose acceptance can't be stated yet. Speculative work stays fog until it sharpens into a statable question.
 
 ---
 
