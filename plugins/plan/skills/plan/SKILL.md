@@ -392,9 +392,11 @@ Template (STANDARD — add/remove H3s per 3b):
 
 ### Approach
 
-<2–4 sentences on how to build it>
+<2–4 sentences: the behavioral contract — interfaces, invariants, the observable outcome — and the why. Not a file-by-file diff recipe.>
 
 ### Investigation targets
+
+*Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
 
 **Required** (read before coding):
 - path/to/file:line — why it matters
@@ -412,8 +414,8 @@ Template (STANDARD — add/remove H3s per 3b):
 
 ## Acceptance
 
-- [ ] criterion 1
-- [ ] criterion 2
+- [ ] <observable outcome — an interface, contract, or behavior verifiable without reading the diff; no file:line>
+- [ ] <criterion 2, same discipline>
 
 ## Done summary
 
@@ -421,6 +423,8 @@ Template (STANDARD — add/remove H3s per 3b):
 ```
 
 Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Design context` is the optional frontend-only row, gated on DESIGN.md.
+
+**Durable-behavioral specs — the template determines what every future worker receives, and a spec sits in the DAG for days before one reads it, so write for that lag.** `### Approach` states the behavioral contract (interfaces, invariants, the observable outcome) and the *why* — it orients, it is not a diff recipe. `## Acceptance` is the checkable + exhaustive bar the worker's completion criteria consume: each item an observable outcome — an interface exists, a contract holds, a suite is green — independently verifiable **without reading the diff**. **Never cite `file:line` in Acceptance** — paths drift while the spec waits and a line-number criterion rots into a false checkbox; `file:line` lives only in `### Investigation targets`, planner-verified at authoring time, cheap to re-verify, and carrying the staleness caveat so a worker re-checks before relying.
 
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
