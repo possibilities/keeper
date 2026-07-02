@@ -52,7 +52,12 @@ function renderHuman(data: { epics?: EpicEntry[] }): string {
   return lines.join("\n");
 }
 
-export function runEpics(format: OutputFormat | null): string {
+export function runEpics(opts: {
+  format: OutputFormat | null;
+  limit: number;
+  offset: number;
+}): string {
+  const { format, limit, offset } = opts;
   const ctx = resolveProject(format);
   const store = new LocalFileStateStore(ctx.stateDir);
 
@@ -74,10 +79,16 @@ export function runEpics(format: OutputFormat | null): string {
   // Python's list.sort.
   epics.sort((a, b) => sortKey(a) - sortKey(b));
 
+  // Cap counts epics (top-level rows); page after the sort so --offset is
+  // stable. Only the paged epics load their per-epic task summary — total stays
+  // the full epic count. Mirrors the list/tasks paging contract.
+  const total = epics.length;
+  const pagedEpics = epics.slice(offset, offset + limit);
+
   const tasksDir = join(ctx.dataDir, "tasks");
   const tasksDirExists = existsSync(tasksDir);
   const resultEpics: EpicEntry[] = [];
-  for (const e of epics) {
+  for (const e of pagedEpics) {
     const eid = typeof e.id === "string" ? e.id : "";
     const summary: TaskSummary = {
       total: 0,
@@ -114,8 +125,16 @@ export function runEpics(format: OutputFormat | null): string {
     });
   }
 
-  formatOutput({ success: true, epics: resultEpics }, format, (d) =>
-    renderHuman(d as { epics?: EpicEntry[] }),
+  const returned = resultEpics.length;
+  const truncated = offset + returned < total;
+  const hint = truncated
+    ? "epics truncated; page with --limit/--offset or use 'keeper query epics'"
+    : null;
+
+  formatOutput(
+    { success: true, epics: resultEpics, total, returned, truncated, hint },
+    format,
+    (d) => renderHuman(d as { epics?: EpicEntry[] }),
   );
   return ctx.projectPath;
 }

@@ -34,11 +34,15 @@
  *   - `keeper watch`: the streaming `{sequence, type, data}` frame shape.
  */
 
-/** The failure sub-object every `ok:false` envelope carries. */
+/** The failure sub-object every `ok:false` envelope carries. `details` is an
+ *  OPTIONAL structured diagnostic (e.g. an ambiguous read's candidate list) —
+ *  additive, mirrors the plan family's converged error object; omitted when
+ *  there is nothing structured to carry. */
 export interface ProblemError {
   code: string;
   message: string;
   recovery: string;
+  details?: unknown;
 }
 
 /** The one-shot envelope shape. `data` is the payload on success, `null` on
@@ -90,3 +94,19 @@ export const RECOVERY_DAEMON_DOWN =
   "The keeper daemon did not answer over its socket. Confirm it is running " +
   "(its LaunchAgent restarts it), then retry — this read is retry-safe and " +
   "never mutates state.";
+
+/** Recovery guidance for a keeper.db read failure — shared by the in-binary
+ *  bare readers that open keeper.db read-only. A read never mutates, so a retry
+ *  is always safe. */
+export const RECOVERY_DB_READ =
+  "Retry the read — it opens keeper.db read-only and never mutates state. If it " +
+  "persists, confirm the keeper daemon is healthy (its LaunchAgent restarts it).";
+
+/** The default stdout + `process.exit` sink for the in-binary one-shot readers.
+ *  Tests inject a capturing sink instead (see `test/envelope.test.ts`). */
+export const processEnvelopeSink: EnvelopeSink = {
+  writeStdout: (s: string) => {
+    process.stdout.write(s);
+  },
+  exit: (code: number): never => process.exit(code),
+};

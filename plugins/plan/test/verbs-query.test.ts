@@ -446,6 +446,73 @@ describe("list", () => {
 });
 
 // ---------------------------------------------------------------------------
+// epics (per-epic task summary + paging parity with list/tasks)
+// ---------------------------------------------------------------------------
+
+describe("epics", () => {
+  test("un-capped envelope carries all paging keys, truncated:false", () => {
+    seedListCorpus(root);
+    const r = runCli(["epics"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.success).toBe(true);
+    expect(env.total).toBe(2);
+    expect(env.returned).toBe(2);
+    expect(env.truncated).toBe(false);
+    expect(env.hint).toBeNull();
+    const epics = env.epics as Array<Record<string, unknown>>;
+    expect(epics.map((e) => e.id)).toEqual(["fn-1-cafe", "fn-2-zeta"]);
+    // The per-epic task summary rides through unchanged.
+    expect(epics[0]?.task_summary).toStrictEqual({
+      total: 3,
+      todo: 1,
+      in_progress: 1,
+      done: 1,
+      blocked: 0,
+    });
+  });
+
+  test("--limit truncates the top-level epic rows; hint is set", () => {
+    for (let i = 1; i <= 4; i += 1) {
+      seedState(root, { epicId: `fn-${i}-e${i}`, nTasks: 2 });
+    }
+    const r = runCli(["epics", "--limit", "2"], { cwd: root });
+    expect(r.code).toBe(0);
+    const env = primaryEnvelope(r.output);
+    expect(env.total).toBe(4);
+    expect(env.returned).toBe(2);
+    expect(env.truncated).toBe(true);
+    expect(typeof env.hint).toBe("string");
+    expect(
+      (env.epics as Array<Record<string, unknown>>).map((e) => e.id),
+    ).toEqual(["fn-1-e1", "fn-2-e2"]);
+  });
+
+  test("--offset pages deterministically; past total → returned:0, truncated:false", () => {
+    for (let i = 1; i <= 4; i += 1) {
+      seedState(root, { epicId: `fn-${i}-e${i}`, nTasks: 1 });
+    }
+    const page = () =>
+      (
+        primaryEnvelope(
+          runCli(["epics", "--limit", "2", "--offset", "2"], { cwd: root })
+            .output,
+        ).epics as Array<Record<string, unknown>>
+      ).map((e) => e.id);
+    expect(page()).toEqual(["fn-3-e3", "fn-4-e4"]);
+    expect(page()).toEqual(["fn-3-e3", "fn-4-e4"]); // stable across calls
+
+    const past = primaryEnvelope(
+      runCli(["epics", "--offset", "99"], { cwd: root }).output,
+    );
+    expect(past.total).toBe(4);
+    expect(past.returned).toBe(0);
+    expect(past.truncated).toBe(false);
+    expect(past.hint).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ready (met / unmet dep classification)
 // ---------------------------------------------------------------------------
 

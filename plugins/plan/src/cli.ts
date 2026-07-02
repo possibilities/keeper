@@ -783,7 +783,11 @@ function dispatch(parsed: ParsedArgs): number {
       runStatus(format);
       break;
     case "epics":
-      runEpics(format);
+      runEpics({
+        format,
+        limit: readIntOption(rest, "--limit", 50, 1),
+        offset: readIntOption(rest, "--offset", 0, 0),
+      });
       break;
     case "claim":
       runClaim({

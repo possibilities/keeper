@@ -15,8 +15,14 @@
  * codes); the resolver `resolveJob(db, selectors)` is PURE over a db handle +
  * fully-resolved plain-data selectors, so every path is unit-testable in-process
  * via `freshMemDb()` with no tmux/env/fs. NO schema-version guard (in-binary
- * readers deliberately skip it); a read failure surfaces as an error envelope
- * (`{ success: false, error }`), distinct from `not_found`.
+ * readers deliberately skip it).
+ *
+ * Output rides the shared one-shot envelope (`cli/envelope.ts`):
+ * `{schema_version, ok, error, data}`. A resolved job is `data:{job, resolution}`
+ * (exit 0); a `not_found` / `ambiguous` domain miss and a keeper.db read failure
+ * are `ok:false` with `error.{code,message,recovery}` (exit 1) — the ambiguous
+ * case carries its candidate list on `error.details.candidates`. Argument-usage
+ * errors stay on stderr (exit 2), never the envelope.
  */
 
 import type { Database } from "bun:sqlite";
@@ -28,6 +34,18 @@ import {
   execBackendEnvMeta,
   localeDefaultedEnv,
 } from "../src/exec-backend";
+import {
+  type Envelope,
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+  RECOVERY_DB_READ,
+  successEnvelope,
+} from "./envelope";
+
+/** Envelope schema version for `keeper show-job` (versions the `data` payload). */
+export const SHOW_JOB_SCHEMA_VERSION = 1;
 
 const HELP = `keeper show-job [selectors] [options]
 
@@ -60,11 +78,6 @@ Options:
  * reducer stays untouched; terminal states are `ended` / `killed`.
  */
 const LIVE_STATES = new Set(["working", "stopped"]);
-
-/** Emit a pretty (`indent=2`, trailing `\n`) JSON envelope. */
-function printPretty(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
 
 // ---------------------------------------------------------------------------
 // Selectors — plain data handed to the pure resolver
@@ -417,7 +430,10 @@ function normalizePane(raw: string): string {
 // main — all impure resolution + envelope + exit codes
 // ---------------------------------------------------------------------------
 
-export function main(argv: string[]): void {
+export function main(
+  argv: string[],
+  sink: EnvelopeSink = processEnvelopeSink,
+): void {
   const args = parseArgs(argv);
   if (args.help) {
     process.stdout.write(HELP);
@@ -458,12 +474,21 @@ export function main(argv: string[]): void {
   let db: Database;
   try {
     db = openDb(resolveDbPath(), { readonly: true }).db;
-  } catch (e) {
-    // A broken DB ≠ no job — distinct from not_found.
-    printPretty({ success: false, error: String(e) });
-    process.exit(1);
+  } catch {
+    // A broken DB ≠ no job — a read failure, distinct from not_found. Emit a
+    // clean corrective message (no path / stack leak in an agent-facing error).
+    emitEnvelope(
+      errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
+        code: "read_failed",
+        message: "could not open the keeper database for reading",
+        recovery: RECOVERY_DB_READ,
+      }),
+      sink,
+    );
+    return;
   }
 
+  let envelope: Envelope<unknown>;
   try {
     let result: ResolveResult;
     let method: string;
@@ -490,14 +515,19 @@ export function main(argv: string[]): void {
       method = auto.method;
     }
 
-    emit(result, method, args.raw);
-  } catch (e) {
+    envelope = buildEnvelope(result, method, args.raw);
+  } catch {
     // A query throw mid-resolution is a read failure, not not_found.
-    printPretty({ success: false, error: String(e) });
-    process.exit(1);
+    envelope = errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
+      code: "read_failed",
+      message: "could not read from the keeper database",
+      recovery: RECOVERY_DB_READ,
+    });
   } finally {
     db.close();
   }
+
+  emitEnvelope(envelope, sink);
 }
 
 /** Label the resolution method for an explicit-selector run. */
@@ -556,28 +586,43 @@ function autoDetect(
   return { result: { kind: "not_found" }, method: "auto" };
 }
 
-/** Print the envelope and set the exit code for a resolved result. */
-function emit(result: ResolveResult, method: string, raw: boolean): void {
+/** Build the one-shot envelope for a resolved result. A hit is `data`
+ *  (ok:true); `not_found` / `ambiguous` are `ok:false` with a stable error code
+ *  and actionable recovery — the ambiguous case carries its candidate list on
+ *  `error.details.candidates`. Exported for the mapping unit test. */
+export function buildEnvelope(
+  result: ResolveResult,
+  method: string,
+  raw: boolean,
+): Envelope<unknown> {
   if (result.kind === "ok") {
     const job = decodeFor(result.row, raw);
     const resolution: Record<string, unknown> = { method };
     if (result.matchedField !== undefined) {
       resolution.matched_field = result.matchedField;
     }
-    printPretty({ success: true, job, resolution });
-    return;
+    return successEnvelope(SHOW_JOB_SCHEMA_VERSION, { job, resolution });
   }
   if (result.kind === "not_found") {
-    printPretty({ success: false, error: "not_found", candidates: [] });
-    process.exit(1);
+    return errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
+      code: "not_found",
+      message: "no job matched the given selectors",
+      recovery:
+        "Widen or correct the selector (--session-id / --session / --cwd / " +
+        "--pane), or run with no selector to auto-detect; this read never " +
+        "mutates state.",
+    });
   }
   // ambiguous
-  printPretty({
-    success: false,
-    error: "ambiguous",
-    candidates: result.candidates.map(candidateView),
+  return errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
+    code: "ambiguous",
+    message: `the selectors matched ${result.candidates.length} jobs; narrow to one`,
+    recovery:
+      "Add a narrowing selector (--session-id pins exactly one) or pass " +
+      "--latest to take the most recent; the matches are on " +
+      "error.details.candidates.",
+    details: { candidates: result.candidates.map(candidateView) },
   });
-  process.exit(1);
 }
 
 if (import.meta.main) {

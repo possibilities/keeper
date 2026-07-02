@@ -26,6 +26,39 @@ is `ok:false` at exit 1, and the envelope still lands on stdout.
 
 Every code above is a read-path failure, so a retry never risks a double-mutate.
 
+## In-binary bare readers (`show-job`, `search-history`, `find-file-history`, `show-session-events`)
+
+These open keeper.db read-only and ride the `{schema_version, ok, error, data}`
+envelope. A hit is `data` at exit 0; a keeper.db read failure or a resolver miss
+is `ok:false` at exit 1, still on stdout. Messages are corrective — never a raw
+`String(e)`, a stack trace, or a filesystem path.
+
+| code          | emitted by        | meaning                                                            | recovery                                                                          | retry-safe |
+| ------------- | ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------- |
+| `read_failed` | the bare readers  | keeper.db could not be opened / read for this one-shot read.       | Retry — the read opens keeper.db read-only and never mutates. If it persists, confirm the daemon is healthy. | yes (read-only) |
+| `not_found`   | `keeper show-job` | No job matched the given selectors.                               | Widen or correct the selector (--session-id / --session / --cwd / --pane), or run with no selector to auto-detect. | yes (read-only) |
+| `ambiguous`   | `keeper show-job` | The selectors matched more than one job; `error.details.candidates` lists them. | Add a narrowing selector (--session-id pins one) or pass --latest to take the most recent. | yes (read-only) |
+
+**Compatibility note:** the bare readers previously emitted
+`{success:false, error:"<String(e)>"}` on failure. The `error` field is now the
+converged `{code, message, recovery}` object; consumers scraping the old flat
+`error` string should read `error.code` (or `error.message`) instead.
+
+## Autopilot control ops (`keeper autopilot pause|play|mode|arm|disarm|retry|config|worktree`)
+
+Each control op round-trips one control RPC and rides the shared envelope. The
+daemon's echoed result value is `data` (ok:true, exit 0); a server rejection,
+transport fault, or unexpected frame is `ok:false` (exit 1) on stdout. A control
+RPC MUTATES, so the transport-failure recovery is mutate-aware (a pre-send
+connect failure is safe to retry; a mid-flight timeout may already have applied).
+CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
+
+| code                   | meaning                                                                 | recovery                                                                                             | retry-safe |
+| ---------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
+| `rpc_unreachable`      | The daemon did not answer the control RPC over its socket.              | Confirm the daemon is running. A pre-send connect failure is safe to retry; a mid-flight timeout may have applied — re-read state (`keeper autopilot` / `keeper status`) before retrying. | conditional |
+| `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                | yes (not applied) |
+| `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.       | Retry; if it persists, confirm the daemon and CLI are the same version.                             | conditional |
+
 ## Plan family (`keeper plan` accumulate-all failures)
 
 `plugins/plan/src/emit.ts::emitFailureEnvelope` prints

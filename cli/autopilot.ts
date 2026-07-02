@@ -633,6 +633,14 @@ export function buildSetConfigFrame(
   };
 }
 
+/** Envelope schema version for the autopilot control ops (pause/play/mode/
+ *  arm/disarm/retry/config/worktree) — versions the `data` payload the daemon
+ *  echoes back through `sendControlRpc`. */
+export const AUTOPILOT_CONTROL_SCHEMA_VERSION = 1;
+
+/** Emit a CLI-usage error (bad args / unknown subcommand) on stderr, exit 1.
+ *  Distinct from server / transport failures, which ride the shared envelope on
+ *  stdout via `sendControlRpc`. */
 function die(message: string): never {
   process.stderr.write(`autopilot: ${message}\n`);
   process.exit(1);
@@ -1055,7 +1063,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetPausedFrame(id, subcommand === "pause"),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
@@ -1071,7 +1079,12 @@ export async function main(argv: string[]): Promise<void> {
       die("'retry' requires a non-empty <verb::id> key");
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildRetryFrame(id, dispatchKey), id, die);
+    await sendControlRpc(
+      sockPath,
+      buildRetryFrame(id, dispatchKey),
+      id,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
+    );
     return;
   }
 
@@ -1088,7 +1101,12 @@ export async function main(argv: string[]): Promise<void> {
       die(`'mode' must be one of yolo | armed (got ${JSON.stringify(mode)})`);
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildSetModeFrame(id, mode), id, die);
+    await sendControlRpc(
+      sockPath,
+      buildSetModeFrame(id, mode),
+      id,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
+    );
     return;
   }
 
@@ -1107,7 +1125,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetArmedFrame(id, epicId, subcommand === "arm"),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
@@ -1145,7 +1163,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { max_concurrent_jobs: cap }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1166,7 +1184,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { max_concurrent_per_root: n }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1182,7 +1200,7 @@ export async function main(argv: string[]): Promise<void> {
         sockPath,
         buildSetConfigFrame(id, { worktree_multi_repo: value === "on" }),
         id,
-        die,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
       );
       return;
     }
@@ -1210,7 +1228,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetConfigFrame(id, { worktree_mode: onoff === "on" }),
       id,
-      die,
+      AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );
     return;
   }
