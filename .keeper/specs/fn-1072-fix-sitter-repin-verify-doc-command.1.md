@@ -14,5 +14,5 @@ as fallback (e.g. `"file:${KEEPER_DB:-$HOME/.local/state/keeper/keeper.db}?mode=
 - [ ] The command, copy-pasted as-is, opens the keeper DB read-only and prints the schema_version both with `KEEPER_DB` set and unset.
 
 ## Done summary
-
+Fixed the repin-verify README cross-check command: replaced the single-quoted URI (which blocked $KEEPER_DB expansion) with a double-quoted URI using the documented default fallback, verified working with KEEPER_DB set and unset.
 ## Evidence

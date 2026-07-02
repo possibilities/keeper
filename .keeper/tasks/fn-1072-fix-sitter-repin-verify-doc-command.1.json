@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/sitter",
   "tier": "medium",
   "title": "Fix repin-verify sqlite quoting",
-  "updated_at": "2026-07-02T11:06:51.443000Z"
+  "updated_at": "2026-07-02T11:15:59.493000Z",
+  "worker_done_at": "2026-07-02T11:15:59.493000Z"
 }
