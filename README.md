@@ -3555,7 +3555,14 @@ genuine divergent-CONTENT conflict still fails loud + sticky, above — only the
 human's-WIP-blocks-the-merge case degrades.) Finalize is idempotent: a re-run
 after a partial post-merge/post-push crash sees the base already an ancestor of
 default (no-op merge), an up-to-date push, and resumes teardown (an already-gone
-worktree removal no-ops).
+worktree removal no-ops). After a CLEAN removal (`removed`, never `dirty`), teardown
+sweeps a residue-only husk dir git can leave behind: an lstat-walk removes a leftover
+holding NOTHING but `.claude` session residue and `git worktree prune`s from the main
+repo, but ANY other content — a non-`.claude` top-level entry, or any symlink / device /
+socket anywhere in the subtree — leaves the dir byte-untouched (the whole blast-radius
+defense). The husk sweep is best-effort: a failure is swallowed-and-logged, NEVER a
+teardown failure row (teardown already succeeded), and is gated on each repo's OWN
+removal so one dirty checkout can't suppress another's cleanup.
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 (pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or

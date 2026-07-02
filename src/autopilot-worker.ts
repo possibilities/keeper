@@ -138,6 +138,7 @@ import {
   listWorktrees as gitListWorktrees,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
+  pruneWorktreeHusk as gitPruneWorktreeHusk,
   pruneWorktrees as gitPruneWorktrees,
   remotePushFastForwardable as gitRemotePushFastForwardable,
   removeWorktree as gitRemoveWorktree,
@@ -4223,6 +4224,16 @@ export function createWorktreeDriver(
               reason: `worktree-teardown-dirty: ${p} has uncommitted changes — ${removed.stderr}`,
             };
           }
+          // Removed clean (THIS path's own result): sweep a residue-only `.claude`
+          // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
+          // must NEVER become a teardown failure row (teardown already succeeded).
+          try {
+            await gitPruneWorktreeHusk(repoDir, p, run);
+          } catch (err) {
+            console.error(
+              `[autopilot-worker] worktree husk prune ${p}: ${errMsg(err)}`,
+            );
+          }
         }
         // Prune the worktree admin entries BEFORE deleting branches: a checked-out
         // branch blocks its delete, and a crash-orphaned admin entry (its dir
@@ -4920,6 +4931,16 @@ export async function recoverWorktrees(
               dir: repo,
             });
             continue;
+          }
+          // Removed clean (THIS lane's own result): sweep a residue-only `.claude`
+          // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
+          // must NEVER mint a recover failure row (teardown already succeeded).
+          try {
+            await gitPruneWorktreeHusk(repo, wt, run);
+          } catch (err) {
+            console.error(
+              `[autopilot-worker] worktree husk prune ${wt}: ${errMsg(err)}`,
+            );
           }
           await gitPruneWorktrees(repo, run);
         }

@@ -37,6 +37,8 @@
  * the worktree/merge lifecycle are covered by the real-git `*.slow.test.ts`.
  */
 
+import { lstat, readdir, rm } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -1036,6 +1038,112 @@ export async function removeWorktree(
     return { kind: "removed" };
   }
   return { kind: "dirty", stderr: (r.stdout + r.stderr).trim() };
+}
+
+/** The ONLY top-level entry a husk dir may hold to be swept: session residue. */
+const HUSK_RESIDUE_ENTRY = ".claude";
+
+/**
+ * After a clean {@link removeWorktree}, sweep a residue-only HUSK directory left
+ * behind at `worktreePath` — a leftover holding NOTHING but `.claude` session
+ * residue (`git worktree remove` can strip its tracked tree yet leave an ignored
+ * `.claude/` dir, so the path lingers empty-but-present). Content-gated and
+ * blast-radius-safe:
+ *  - NO-OP when the path is already gone (the normal clean-remove case) or is not
+ *    a real directory — a symlink or file AT the path is left byte-untouched;
+ *  - an lstat-walk (NEVER stat, so a symlink stays a symlink) VETOES the whole
+ *    deletion — leaving the dir byte-untouched — if any top-level entry is not
+ *    `.claude`, if any node anywhere in the subtree is not a plain file or dir (a
+ *    symlink, device, socket, or fifo), or if any child `resolve`s outside the
+ *    root;
+ *  - only when the ENTIRE subtree is plain files/dirs under `.claude` does it rm
+ *    the dir and then run a metadata-only, idempotent `git worktree prune` from
+ *    the MAIN repo cwd (NEVER from inside the removed path).
+ *
+ * Best-effort: an unexpected fs / prune error PROPAGATES so the caller can
+ * swallow-and-log it — teardown already succeeded, so minting a failure row here
+ * would be an unactionable sticky jam.
+ */
+export async function pruneWorktreeHusk(
+  mainRepoCwd: string,
+  worktreePath: string,
+  run: GitRunner = gitExec,
+): Promise<void> {
+  const root = resolve(worktreePath);
+  try {
+    const rootStat = await lstat(root);
+    // A symlink or file AT the worktree path is never ours to delete.
+    if (!rootStat.isDirectory()) {
+      return;
+    }
+  } catch (err) {
+    if (isEnoent(err)) {
+      return; // already gone — the normal clean-remove case
+    }
+    throw err;
+  }
+  if (!(await isResidueOnlyDir(root, root, true))) {
+    return; // vetoed — leave the dir byte-untouched
+  }
+  await rm(root, { recursive: true, force: true });
+  await pruneWorktrees(mainRepoCwd, run);
+}
+
+/**
+ * lstat-walk `dir`, returning true IFF every node is a plain file or directory
+ * contained within `rootReal` — and, at the top level (`isTop`), every entry is
+ * `.claude`. ANY symlink / device / socket / fifo, any `resolve` containment
+ * escape, or any unreadable dir returns false (veto). Never follows a symlink
+ * (lstat, not stat), so a symlinked entry is rejected rather than traversed.
+ */
+async function isResidueOnlyDir(
+  dir: string,
+  rootReal: string,
+  isTop: boolean,
+): Promise<boolean> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    if (isTop && name !== HUSK_RESIDUE_ENTRY) {
+      return false; // a non-`.claude` top-level entry vetoes the whole sweep
+    }
+    const child = resolve(dir, name);
+    if (child !== rootReal && !child.startsWith(rootReal + sep)) {
+      return false; // containment escape
+    }
+    let st: Awaited<ReturnType<typeof lstat>>;
+    try {
+      st = await lstat(child);
+    } catch {
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      return false; // veto ANY symlink — never traverse it
+    }
+    if (st.isDirectory()) {
+      if (!(await isResidueOnlyDir(child, rootReal, false))) {
+        return false;
+      }
+      continue;
+    }
+    if (!st.isFile()) {
+      return false; // device / socket / fifo / other non-regular node vetoes
+    }
+  }
+  return true;
+}
+
+/** True when a thrown fs error is a missing-path ENOENT. */
+function isEnoent(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: string }).code === "ENOENT"
+  );
 }
 
 // ---------------------------------------------------------------------------

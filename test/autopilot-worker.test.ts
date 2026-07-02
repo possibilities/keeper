@@ -30,6 +30,7 @@
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -7826,6 +7827,134 @@ test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) o
   );
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
   expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+// fn-1050 — teardown sweeps a residue-only `.claude` husk dir git left behind.
+// Real tmpdirs (fs in tests is fine); the git legs go through the fake runner.
+
+test("fn-1050 recoverWorktrees pass-3: a residue-only husk is swept per-lane; a dirty lane's husk is left intact (no cross-lane suppression)", async () => {
+  // Two merged, absent-epic base lanes in ONE repo. Lane A tears down clean → its
+  // `.claude`-only husk dir is swept. Lane B's `worktree remove` refuses (dirty) →
+  // its husk is left byte-untouched and a dirty row minted, WITHOUT suppressing
+  // lane A's cleanup.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-recover-")));
+  try {
+    const huskA = join(dir, "wt-a");
+    const huskB = join(dir, "wt-b");
+    for (const h of [huskA, huskB]) {
+      mkdirSync(join(h, ".claude"), { recursive: true });
+      writeFileSync(join(h, ".claude", "settings.json"), "{}");
+    }
+    const brA = "keeper/epic/fn-a-foo";
+    const brB = "keeper/epic/fn-b-bar";
+    const { run, calls } = makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${huskA}\nHEAD y\nbranch refs/heads/${brA}\n\n` +
+        `worktree ${huskB}\nHEAD z\nbranch refs/heads/${brB}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [brA, brB],
+      defaultBranch: "main",
+      ancestors: new Set([brA, brB]), // both merged → safe to sweep
+      repoHead: "main",
+      dirtyRemoveAt: new Set([huskB]), // lane B refuses removal
+    });
+    const failures = await recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      run,
+      undefined,
+      async () => false,
+    );
+    // Lane A's husk was swept; lane B's is left intact (the helper is gated on the
+    // clean-remove result, so it is never invoked on B's dirty outcome).
+    expect(existsSync(huskA)).toBe(false);
+    expect(existsSync(huskB)).toBe(true);
+    // Exactly one failure — lane B's dirty teardown — and lane A still deleted.
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.reason).toContain(
+      "worktree-recover-base-teardown-dirty",
+    );
+    expect(failures[0]?.reason).toContain(huskB);
+    expect(calls.some((c) => c.args === `branch -D ${brA}`)).toBe(true);
+    expect(calls.some((c) => c.args === `branch -D ${brB}`)).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fn-1050 recoverWorktrees pass-3: a husk-prune throw is swallowed+logged, never minting a recover row (teardown already succeeded)", async () => {
+  // The husk sweep hits an unexpected fs error (the lane path resolves THROUGH a
+  // file → ENOTDIR on lstat). The call site swallows-and-logs it: NO failure row,
+  // and teardown (already done) still deletes the merged branch.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-throw-")));
+  try {
+    writeFileSync(join(dir, "afile"), "not a dir");
+    const badPath = join(dir, "afile", "sub"); // lstat → ENOTDIR (throws)
+    const br = "keeper/epic/fn-1-foo";
+    const { run, calls } = makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${badPath}\nHEAD z\nbranch refs/heads/${br}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [br],
+      defaultBranch: "main",
+      ancestors: new Set([br]),
+      repoHead: "main",
+    });
+    const failures = await recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      run,
+      undefined,
+      async () => false,
+    );
+    expect(failures).toEqual([]); // the throw minted no row
+    expect(calls.some((c) => c.args === `branch -D ${br}`)).toBe(true); // teardown finished
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fn-1050 finalizeEpic teardown: a residue-only base husk is swept after a clean removal", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-finalize-")));
+  try {
+    const wt = join(dir, "keeper-epic-fn-1-foo");
+    mkdirSync(join(wt, ".claude"), { recursive: true });
+    writeFileSync(join(wt, ".claude", "settings.json"), "{}");
+    const baseInfo = makeFinalizeInfo();
+    const info: WorktreeLaunchInfo = {
+      ...baseInfo,
+      baseWorktreePath: wt,
+      assignment: { ...baseInfo.assignment, worktreePath: wt },
+    };
+    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+      args,
+    ) => {
+      const joined = args.join(" ");
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
+      }
+      if (joined.startsWith("symbolic-ref")) {
+        return { code: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (joined === "rev-parse --abbrev-ref HEAD") {
+        return { code: 0, stdout: "main\n", stderr: "" };
+      }
+      if (joined.startsWith("merge-base --is-ancestor")) {
+        return { code: 0, stdout: "", stderr: "" }; // not-ahead → straight to teardown
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+      info,
+      async () => true,
+    );
+    expect(res).toEqual({ ok: true });
+    expect(existsSync(wt)).toBe(false); // the base husk was swept
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("fn-990 recoverWorktrees pass-3: an UNMERGED orphan base is preserved (never force-deleted)", async () => {

@@ -9,8 +9,22 @@
  * against a real repo lives in `worktree-git-realgit.slow.test.ts`.
  */
 
-import { expect, test } from "bun:test";
-import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
+import { afterEach, expect, test } from "bun:test";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  GIT_SPAWN_TIMEOUT_CODE,
+  type GitRunner,
+} from "../src/commit-work/git-exec";
 import {
   branchExists,
   classifyLinkedWorktree,
@@ -26,6 +40,7 @@ import {
   mergeBranchInto,
   mergeReadiness,
   parseWorktreeList,
+  pruneWorktreeHusk,
   pruneWorktrees,
   remotePushFastForwardable,
   removeWorktree,
@@ -840,6 +855,152 @@ test("removeWorktree: dirty tree → remove fails → dirty result, never forced
   expect(
     calls.filter((c) => argvStartsWith(c.args, "worktree", "remove")),
   ).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// pruneWorktreeHusk — sweep a residue-only `.claude` husk after a clean remove.
+// Real per-test tmpdirs (fs in tests is fine); the `git worktree prune` leg goes
+// through the injected runner. The gate is the whole blast-radius defense, so the
+// veto/abort paths are covered as thoroughly as the happy path.
+// ---------------------------------------------------------------------------
+
+const huskTmpDirs: string[] = [];
+function makeHuskTmp(): string {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-husk-"));
+  huskTmpDirs.push(dir);
+  return dir;
+}
+function prunedFrom(calls: { args: string[]; cwd?: string }[]): string[] {
+  return calls
+    .filter((c) => argvStartsWith(c.args, "worktree", "prune"))
+    .map((c) => c.cwd ?? "");
+}
+afterEach(() => {
+  for (const dir of huskTmpDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pruneWorktreeHusk: only-`.claude` husk → dir swept + prune from the MAIN repo cwd", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(join(wt, ".claude"), { recursive: true });
+  writeFileSync(join(wt, ".claude", "settings.json"), "{}");
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(false); // husk swept
+  const prune = calls.find((c) => argvStartsWith(c.args, "worktree", "prune"));
+  expect(prune?.args).toEqual(["worktree", "prune", "--expire", "now"]);
+  // Pruned from the MAIN repo, NEVER from inside the removed path.
+  expect(prune?.cwd).toBe("/main-repo");
+});
+
+test("pruneWorktreeHusk: deeply-nested plain files under `.claude` → still swept", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(join(wt, ".claude", "a", "b"), { recursive: true });
+  writeFileSync(join(wt, ".claude", "a", "b", "c.txt"), "residue");
+  writeFileSync(join(wt, ".claude", "top.json"), "{}");
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(false);
+  expect(prunedFrom(calls)).toEqual(["/main-repo"]);
+});
+
+test("pruneWorktreeHusk: an empty husk dir → swept (vacuously residue-only)", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(wt, { recursive: true });
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(false);
+  expect(prunedFrom(calls)).toEqual(["/main-repo"]);
+});
+
+test("pruneWorktreeHusk: an extra top-level entry (real ignored work) → dir byte-untouched, no prune", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(join(wt, ".claude"), { recursive: true });
+  mkdirSync(join(wt, "node_modules"), { recursive: true }); // real ignored work
+  writeFileSync(join(wt, ".env"), "SECRET=1"); // a real dotfile
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(true);
+  expect(existsSync(join(wt, "node_modules"))).toBe(true);
+  expect(existsSync(join(wt, ".env"))).toBe(true);
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: a top-level `.git` gitlink present → vetoed (worktree not truly gone)", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(join(wt, ".claude"), { recursive: true });
+  writeFileSync(join(wt, ".git"), "gitdir: /repo/.git/worktrees/wt\n");
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(true);
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: a symlink INSIDE `.claude` → whole deletion vetoed, target never followed", async () => {
+  const base = makeHuskTmp();
+  const outside = join(base, "outside.txt");
+  writeFileSync(outside, "important");
+  const wt = join(base, "wt");
+  mkdirSync(join(wt, ".claude"), { recursive: true });
+  symlinkSync(outside, join(wt, ".claude", "link"));
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(true); // vetoed
+  expect(existsSync(outside)).toBe(true); // never followed / removed
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: a top-level `.claude` that is a symlink → vetoed (never traversed)", async () => {
+  const base = makeHuskTmp();
+  const realClaude = join(base, "real-claude");
+  mkdirSync(realClaude, { recursive: true });
+  writeFileSync(join(realClaude, "f"), "x");
+  const wt = join(base, "wt");
+  mkdirSync(wt, { recursive: true });
+  symlinkSync(realClaude, join(wt, ".claude"));
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(existsSync(wt)).toBe(true);
+  expect(existsSync(realClaude)).toBe(true);
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: the worktree path ITSELF is a symlink → left untouched, no prune", async () => {
+  const base = makeHuskTmp();
+  const realDir = join(base, "real");
+  mkdirSync(join(realDir, ".claude"), { recursive: true });
+  const wt = join(base, "wt-link");
+  symlinkSync(realDir, wt);
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run);
+  expect(lstatSync(wt).isSymbolicLink()).toBe(true); // the link is left in place
+  expect(existsSync(realDir)).toBe(true); // its target is never removed
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: an already-gone path → no-op (no throw, no prune)", async () => {
+  const wt = join(makeHuskTmp(), "does-not-exist");
+  const { run, calls } = fakeAsyncGit();
+  await pruneWorktreeHusk("/main-repo", wt, run); // must not throw
+  expect(prunedFrom(calls)).toEqual([]);
+});
+
+test("pruneWorktreeHusk: a prune failure PROPAGATES for the caller to swallow (dir already swept)", async () => {
+  const wt = join(makeHuskTmp(), "wt");
+  mkdirSync(join(wt, ".claude"), { recursive: true });
+  const run: GitRunner = async (args) => {
+    if (argvStartsWith(args, "worktree", "prune")) {
+      throw new Error("prune boom");
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await expect(pruneWorktreeHusk("/main-repo", wt, run)).rejects.toThrow(
+    "prune boom",
+  );
+  // The rm ran BEFORE the prune, so the husk is already gone; the caller logs the
+  // throw and teardown (already succeeded) is unaffected.
+  expect(existsSync(wt)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
