@@ -495,7 +495,12 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     .filter((id): id is string => Boolean(id));
   let commitGroups: CommitGroupResult[];
   try {
-    commitGroups = findCommitGroups(taskIds, primaryRepo, touchedRepos);
+    // Pass epicId so the scan is lane-aware, IDENTICAL to close-preflight: both run
+    // while the epic's commits still live on the `keeper/epic/<epic_id>` lane (the
+    // merge to default happens post-finalize), so a HEAD-only re-derive here would
+    // miss lane-only commits and drift the hash → a spurious STALE_ARTIFACTS on
+    // every worktree close.
+    commitGroups = findCommitGroups(taskIds, primaryRepo, touchedRepos, epicId);
   } catch (exc) {
     if (exc instanceof AllReposBrokenError) {
       emitFinalizeError(

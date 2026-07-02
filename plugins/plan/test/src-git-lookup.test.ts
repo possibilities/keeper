@@ -15,8 +15,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-import { AllReposBrokenError, findCommitGroups } from "../src/commit_lookup.ts";
+// The parity target: keeper's canonical lane-branch prefix. The plan plugin
+// re-derives its own copy (never imports worktree-git.ts in src); this test pins
+// the two equal so a rename in keeper fails loud here.
+import { KEEPER_EPIC_BRANCH_PREFIX as KEEPER_LANE_PREFIX } from "../../../src/worktree-git.ts";
+import {
+  AllReposBrokenError,
+  findCommitGroups,
+  KEEPER_EPIC_BRANCH_PREFIX,
+  laneBranchFor,
+} from "../src/commit_lookup.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   computeVerdict,
@@ -107,6 +115,47 @@ describe("findCommitGroups (confirmed trailer scan)", () => {
     } finally {
       rmSync(broken, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// commit_lookup.findCommitGroups — the lane-aware epic-close scan. An epicId
+// makes the scan probe the deterministic lane branch `keeper/epic/<epic_id>` per
+// repo (present → scan the ref so lane-only commits surface; absent → HEAD).
+// ---------------------------------------------------------------------------
+
+describe("findCommitGroups lane-aware epic-close scan", () => {
+  const epicId = "fn-1-x";
+  const taskId = "fn-1-x.1";
+
+  test("epicId scans the lane branch — a lane-only commit surfaces, HEAD is blind", () => {
+    const sha = fakeSourceCommit(repo, `feat: lane\n\nTask: ${taskId}\n`, {
+      refs: [laneBranchFor(epicId)],
+    });
+    // The ref-less (find-task-commit) scan is HEAD-only → blind to a lane-only
+    // commit; the epic-close scan probes the lane ref → finds it.
+    expect(findCommitGroups([taskId], repo, null)).toEqual([]);
+    expect(findCommitGroups([taskId], repo, null, epicId)).toEqual([
+      { repo: resolvedRepo, shas: [sha] },
+    ]);
+  });
+
+  test("no lane branch → HEAD fallback, byte-identical to the ref-less scan", () => {
+    // An on-main commit (default HEAD ref) with no lane: the probe misses, the
+    // scan falls back to HEAD. Single-repo / non-worktree / post-finalize (lane
+    // pruned) geometry — never drops the repo, matches the ref-less result.
+    const sha = commit(`feat: on main\n\nTask: ${taskId}\n`, repo);
+    expect(findCommitGroups([taskId], repo, null, epicId)).toEqual([
+      { repo: resolvedRepo, shas: [sha] },
+    ]);
+    expect(findCommitGroups([taskId], repo, null, epicId)).toEqual(
+      findCommitGroups([taskId], repo, null),
+    );
+  });
+
+  test("lane prefix parity: the plan-local constant equals keeper's KEEPER_EPIC_BRANCH_PREFIX", () => {
+    expect(KEEPER_EPIC_BRANCH_PREFIX).toBe(KEEPER_LANE_PREFIX);
+    expect(laneBranchFor("fn-9-z")).toBe(`${KEEPER_LANE_PREFIX}fn-9-z`);
   });
 });
 

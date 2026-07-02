@@ -167,6 +167,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       tasks.filter((t) => t.id).map((t) => t.id as string),
       primaryRepo,
       touchedRepos,
+      epicId,
     );
   } catch (exc) {
     if (exc instanceof AllReposBrokenError) {

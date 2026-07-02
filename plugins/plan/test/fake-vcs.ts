@@ -19,9 +19,10 @@
 // failNextStatus) to exercise the CommitFailed / contention-retry paths without
 // real git.
 //
-// The READ surface (isGitRepo / hasHead / trailerCommitShas / sourceCommitShas /
-// committedTaskJson / shortStatusAndDiff / firstSourceShaShort) answers the
-// post-worker verbs' git archaeology from an in-memory model: seeded source
+// The READ surface (isGitRepo / hasHead / resolveRef / trailerCommitShas /
+// sourceCommitShas / committedTaskJson / shortStatusAndDiff / firstSourceShaShort)
+// answers the post-worker verbs' git archaeology from an in-memory model: seeded
+// source
 // commits (fakeSourceCommit — a worker's `Task:`-trailer commit) and a committed
 // `.keeper/` blob overlay (fakeCommitTaskJson + every commit() re-snapshot). The
 // trailer matcher reproduces git's interpret-trailers all-or-nothing block rule,
@@ -62,6 +63,12 @@ interface FakeSourceCommit {
   sha: string;
   /** The raw commit message, including any trailing `Task:` trailer block. */
   message: string;
+  /** The refs this commit is reachable from — the fake analogue of "which
+   * branches contain it". Default `["HEAD"]` (the ordinary case: on the main
+   * branch, found by a ref-less scan). A lane-ONLY commit carries the epic lane
+   * ref `keeper/epic/<epic_id>` and NOT HEAD, so a HEAD scan misses it and only
+   * the lane-ref scan finds it — exactly the worktree-epic pre-merge geometry. */
+  refs: string[];
 }
 
 /** Per-repo fake state: the auto-commit log + the last committed `.keeper/`
@@ -232,12 +239,22 @@ function trailerTaskValues(message: string): string[] {
   return values;
 }
 
-/** Source commits in `state` carrying a confirmed `Task: <taskId>` trailer,
- * NEWEST-FIRST (a real `git log` reads newest-first). */
-function matchingSourceShas(state: RepoState, taskId: string): string[] {
+/** Source commits in `state` carrying a confirmed `Task: <taskId>` trailer AND
+ * reachable from `ref` (default HEAD, matching a ref-less `git log`), NEWEST-FIRST
+ * (a real `git log` reads newest-first). A ref-scoped scan (`keeper/epic/<id>`)
+ * therefore sees a lane-only commit a HEAD scan omits. */
+function matchingSourceShas(
+  state: RepoState,
+  taskId: string,
+  ref?: string,
+): string[] {
+  const wantRef = ref ?? "HEAD";
   const shas: string[] = [];
   for (let i = state.sourceCommits.length - 1; i >= 0; i--) {
     const c = state.sourceCommits[i] as FakeSourceCommit;
+    if (!c.refs.includes(wantRef)) {
+      continue;
+    }
     if (trailerTaskValues(c.message).includes(taskId)) {
       shas.push(c.sha);
     }
@@ -319,10 +336,16 @@ export function failNextStatus(
  * git READS (find-task-commit's trailerCommitShas, reconcile's sourceCommitShas,
  * worker-resume's firstSourceShaShort) return its sha when the trailer matches.
  * Returns the full 40-char hex sha. The repo is auto-registered if needed, so a
- * test may seed without a prior initRepo. */
+ * test may seed without a prior initRepo.
+ *
+ * `opts.refs` overrides which refs reach the commit (default `["HEAD"]` — the
+ * ordinary on-main commit a ref-less scan finds). Seed a LANE-ONLY commit with
+ * `{ refs: ["keeper/epic/<id>"] }`: it is NOT on HEAD, so only the epic-close
+ * lane-ref scan (and `resolveRef`'s lane probe) sees it. */
 export function fakeSourceCommit(
   root: string,
   messageWithTrailers: string,
+  opts?: { refs?: string[] },
 ): string {
   // Ensure a `.git/` exists so the isGitRepo gate passes for a bare seed.
   if (!existsSync(join(root, ".git"))) {
@@ -331,7 +354,11 @@ export function fakeSourceCommit(
   const state = repoFor(root);
   commitCounter += 1;
   const sha = commitCounter.toString(16).padStart(40, "0");
-  state.sourceCommits.push({ sha, message: messageWithTrailers });
+  state.sourceCommits.push({
+    sha,
+    message: messageWithTrailers,
+    refs: opts?.refs ?? ["HEAD"],
+  });
   return sha;
 }
 
@@ -450,8 +477,24 @@ export const fakeVcs: PlanVcs = {
     );
   },
 
-  trailerCommitShas(taskId, repo): string[] {
-    return matchingSourceShas(repoFor(repo), taskId);
+  resolveRef(ref, repo): string | null {
+    const state = repos.get(normRoot(repo));
+    if (!state) {
+      return null;
+    }
+    // The ref resolves iff some seeded commit is reachable from it (newest such is
+    // the tip). A lane that no commit carries reads absent → null → HEAD fallback.
+    for (let i = state.sourceCommits.length - 1; i >= 0; i--) {
+      const c = state.sourceCommits[i] as FakeSourceCommit;
+      if (c.refs.includes(ref)) {
+        return c.sha;
+      }
+    }
+    return null;
+  },
+
+  trailerCommitShas(taskId, repo, ref): string[] {
+    return matchingSourceShas(repoFor(repo), taskId, ref);
   },
 
   sourceCommitShas(taskId, repo): string[] {
