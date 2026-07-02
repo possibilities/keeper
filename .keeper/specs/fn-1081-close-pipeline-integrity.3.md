@@ -43,5 +43,5 @@ via pure seam with fake worktree list; message text snapshot tests.
 - [ ] Refusal texts name resume/reclaim before --force; dispatch skill + plan README updated to match
 
 ## Done summary
-
+close-preflight claims the epic with a fail-loud-loser exclusivity check (typed CLOSE_ALREADY_CLAIMED for the second claimant; close-finalize releases the claim on error too); manual close:: dispatch resolves the epic lane worktree via one bounded git worktree-list with a project_dir fallback warning; race-guard refusals name warm-resume/reclaim before --force. Dispatch skill + plan README updated.
 ## Evidence
