@@ -46,5 +46,5 @@ cases; gate tests: emit-once, reason-change, clear-on-gone; pill test for the ne
 - [ ] All emits route the change-gate (O(1) per condition); refold-equivalence green
 
 ## Done summary
-
+Reconciler now surfaces and auto-reclaims wedged dispatch slots: a stopped session whose pane is the dead exec-shell tail past a grace threshold is killed with a slot-reclaimed signal, an ambiguous (live/parked or within-grace) one surfaces slot-occupied with no kill, and both level-clear when the occupant is gone — all reason-scoped through the change-gate so a genuine close::<epic> conflict is never touched; reconcile stays pure with liveness entering via the snapshot.
 ## Evidence
