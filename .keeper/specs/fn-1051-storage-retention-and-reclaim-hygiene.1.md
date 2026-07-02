@@ -36,5 +36,5 @@ Red-first: "a PostToolUse:Read row carrying tool_input.file_path SHEDS" fails on
 - [ ] README compaction prose reconciled; stale runbook pruned; full fast suite green
 
 ## Done summary
-
+Scoped the compaction shed guard to the four mutation tools via a shared dep-free MUTATION_TOOL_SQL_PREDICATE in src/derivers.ts (consumed by both the historical backfill and the retention shed guard), so Read/WebFetch/Skill/ToolSearch bodies carrying tool_input.file_path now shed instead of being pinned inline forever. Class predicate and data-loss sentinel byte-unchanged; added a red-first Read-shed assertion and extended the re-fold-equivalence stream to cover the newly-shed class; reconciled README compaction prose and pruned the completed fn-837.2 catch-up runbook.
 ## Evidence
