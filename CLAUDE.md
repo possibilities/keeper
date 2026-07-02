@@ -97,10 +97,7 @@ imperative guardrails only.
 
 ## Test isolation
 
-- **One fast pure-in-process tier.** `bun test` is the whole suite (only `test:opentui` splits out).
-  NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary
-  DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never
-  hang or synchronously spin; production is the integration safety net.
+- **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all four suites serially — root, plan, python, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the integration safety net.
 - **Sandbox ALL SIX state classes** under the per-test tmpdir for any test on the real state surface:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
   and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never `{ ...process.env, KEEPER_DB }`;

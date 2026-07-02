@@ -681,7 +681,7 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    `sandboxEnv(...)` in `test/helpers/sandbox-env.ts` rather than restating the
    path list at each spawn site (it sets the state paths LAST so a caller can't
    strand one). The
-   suite carries TWO complementary test helpers (fn-769): `sandboxEnv` isolates
+   suite carries TWO complementary test helpers: `sandboxEnv` isolates
    the state paths for any test that exercises the real state surface, while the
    template-DB helper in `test/helpers/template-db.ts`
    (`freshMemDb()` / `freshDbFile()`) serves pure in-process unit tests that only
@@ -696,12 +696,19 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
    async condition holds and is the canonical replacement for a
    fixed `Bun.sleep` deadline race. `bun run test` routes through the concurrency
-   gate `scripts/test-gate.ts` (fn-904), which caps per-run parallelism
+   gate `scripts/test-gate.ts`, which caps per-run parallelism
    (`KEEPER_TEST_PARALLEL`, default 5) and adds `--no-orphans` so concurrent agent
    runs coexist by bounding each run rather than a host-wide lock; git-boundary
    surfaces are tested through a pure seam (producers against synthetic
    porcelain/snapshot fixtures, commit/push against a faked runner), never real
-   git. The
+   git. `bun run test:full` (`scripts/test-full.ts`) is the one-command local gate
+   — root (incl. opentui), plan, python, and prompt suites run SERIALLY through
+   their existing scripts with per-suite verdicts and an aggregate 0/1 exit. It
+   OWNS the tier: fast mode SCRUBS `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` from
+   every child so an ambient shell value can't promote a suite, and `test:full:slow`
+   injects them for the real-git/subprocess tiers. Each suite is spawned as its own
+   process group and a per-suite timeout kills the whole group (no orphaned
+   descendants); `KEEPER_TEST_BAIL` stops at the first failure. The
    restore worker (epic fn-677) writes
    `~/.local/state/keeper/restore.json` as a dumb single-tier
    `{schema_version, current}` live mirror — a DISASTER FALLBACK only, since the

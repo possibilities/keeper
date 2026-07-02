@@ -720,10 +720,6 @@ test("extractCommit clamps non-positive / non-numeric committed_at_ms to 0", () 
   }
 });
 
-// resolveHeadOidViaFs (fs-only HEAD ground truth) needs REAL git to produce the
-// ground-truth oids it must match — slow-quarantined in
-// `test/git-worker-realgit.slow.test.ts` (fn-904.2).
-
 // ---------------------------------------------------------------------------
 // decideHeadDivergence — pure decision for the emitSnapshot wedge guard. Suppress
 // (and eventually trip) ONLY when git-derived HEAD and fs-derived HEAD disagree;
@@ -1757,11 +1753,6 @@ test("shouldWatchRoot: null probe + currentlyWatched=false → skip (fail-closed
   expect(shouldWatchRoot(root, null, { currentlyWatched: false })).toBe(false);
 });
 
-// probeWatchMembership (the combined `git status --porcelain=v2 --branch` spawn)
-// is exercised against REAL git in `test/git-worker-realgit.slow.test.ts` —
-// it spawns git by definition, so it can't be made git-free with a synthetic
-// verdict (fn-904.2).
-
 // ---------------------------------------------------------------------------
 // decideReconcileTransitions — cooling-hysteresis pure decision. The drop
 // path waits ≥ dwell ms before unsubscribing a clean+pushed root; a re-
@@ -2066,10 +2057,6 @@ test("discoverProjectRoots: .keeper repo always watched without probe spawn", ()
   expect(probeSpawnCount.n).toBe(0);
   db.close();
 });
-
-// The dirty/clean-non-.keeper + monotonicity + clean+pushed-watched-drops cases
-// drive the REAL `probeWatchMembership` git spawn against a real upstream repo —
-// slow-quarantined in `test/git-worker-realgit.slow.test.ts` (fn-904.2).
 
 test("discoverProjectRoots: TTL memo prevents repeated probe spawns in steady state", () => {
   // A dirty repo's verdict is cached at the hot TTL when watched; calling

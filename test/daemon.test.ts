@@ -79,6 +79,7 @@ import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
 import type { Event } from "../src/types";
 import { worktreePathFor } from "../src/worktree-plan";
+import { sandboxEnv } from "./helpers/sandbox-env";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -2276,13 +2277,9 @@ function dlLine(dlId: string, sessionId: string): string {
 }
 
 /** Run the archive script as a subprocess against the sandboxed DB + dl dir. */
-function runArchiveScript(dlDir: string, args: string[] = []): void {
+function runArchiveScript(args: string[] = []): void {
   const proc = Bun.spawnSync(["bun", ARCHIVE_SCRIPT, ...args], {
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_DEAD_LETTER_DIR: dlDir,
-    },
+    env: sandboxEnv({ tmpDir, dbPath }),
   });
   if (proc.exitCode !== 0) {
     throw new Error(
@@ -2308,7 +2305,7 @@ test("archive eligibility: a file with one still-waiting record is left in place
     dlLine("dl-ok", "sess-ok") + dlLine("dl-wait", "sess-wait"),
   );
 
-  runArchiveScript(dlDir, ["--apply"]);
+  runArchiveScript(["--apply"]);
 
   // allConfirmed === false (the waiting record is not in `confirmed`) → the
   // whole file stays, never archived on a guess.
@@ -2336,7 +2333,7 @@ test("archive eligibility: a recovered record with no replayed_event_id is exclu
   const file = join(dlDir, "noid.ndjson");
   writeFileSync(file, dlLine("dl-noid", "sess-noid"));
 
-  runArchiveScript(dlDir, ["--apply"]);
+  runArchiveScript(["--apply"]);
 
   expect(existsSync(file)).toBe(true);
   expect(existsSync(join(dlDir, "archive", "noid.ndjson"))).toBe(false);
@@ -2353,7 +2350,7 @@ test("archive eligibility: an all-torn file (ids.length === 0) is left untouched
   // to confirm landed).
   writeFileSync(file, "not json\n{bad\n");
 
-  runArchiveScript(dlDir, ["--apply"]);
+  runArchiveScript(["--apply"]);
 
   expect(existsSync(file)).toBe(true);
   expect(existsSync(join(dlDir, "archive", "torn.ndjson"))).toBe(false);
@@ -2373,12 +2370,12 @@ test("archive eligibility: --apply moves a fully-confirmed file to the archive/ 
 
   // Dry run first: every record is confirmed, but without --apply the file
   // stays put (only reported).
-  runArchiveScript(dlDir);
+  runArchiveScript();
   expect(existsSync(file)).toBe(true);
   expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(false);
 
   // --apply moves the eligible file into archive/.
-  runArchiveScript(dlDir, ["--apply"]);
+  runArchiveScript(["--apply"]);
   expect(existsSync(file)).toBe(false);
   expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(true);
 });

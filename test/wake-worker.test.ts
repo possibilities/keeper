@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import { watchLoop } from "../src/wake-worker";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -52,8 +53,8 @@ test("watchLoop posts a wake when another connection commits", async () => {
     )
     .run();
 
-  // Give the 25ms poll a few cycles to observe the commit.
-  await Bun.sleep(120);
+  // Wait for the poll to observe the commit and post a wake (positive gate).
+  await retryUntil(() => (wakes >= 1 ? wakes : null));
   shutdown = true;
   await loop;
 
@@ -110,6 +111,8 @@ test("watchLoop resolves once isShutdown flips with no writes", async () => {
     25,
   );
 
+  // Negative settle: with no commits the loop must post zero wakes; only a
+  // fixed wait can disprove a spurious wake.
   await Bun.sleep(80);
   shutdown = true;
   await loop; // must resolve, not hang
@@ -161,6 +164,8 @@ test("watchLoop maxIdleMs=0 (default) fires NO idle wake without a commit", asyn
     25,
   );
 
+  // Negative settle: the idle path is disabled (maxIdleMs=0), so a commit-less
+  // loop must stay silent; only a fixed wait can disprove an idle wake.
   await Bun.sleep(120);
   shutdown = true;
   await loop;
@@ -188,6 +193,9 @@ test("watchLoop coalesces a commit and an overdue idle tick (one wake per turn)"
 
   // Commit once mid-flight; the rest of the wakes come from the idle timer.
   const writer = openDb(dbPath).db;
+  // Fixed durations are load-bearing here: the test measures inter-wake spacing,
+  // so the ~60ms pre-commit gap and ~160ms post-commit tail must stay fixed
+  // (a retryUntil would collapse the timing characteristic the assertion checks).
   await Bun.sleep(60);
   writer
     .query(
