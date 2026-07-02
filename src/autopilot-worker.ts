@@ -65,6 +65,7 @@ import {
   type Preset,
 } from "./agent/config";
 import { computeEligibleEpics } from "./armed-closure";
+import { epicStarted } from "./await-conditions";
 import {
   BackstopCounters,
   type BackstopMessage,
@@ -2652,19 +2653,26 @@ export async function computeMergedLaneEntries(
   // memoized enumeration + ancestry probes. The `ok` verdict verbatim, factored so
   // a `clustered` epic's per-`worktree`-group probe shares it:
   //  - enumeration inconclusive → NOT merged (never claim off a failed probe);
-  //  - lane DEFINITIVELY ABSENT → merged-and-torn-down → MERGED (no ancestry probe);
+  //  - lane DEFINITIVELY ABSENT ∧ the epic ever started → merged-and-torn-down →
+  //    MERGED (no ancestry probe); DEFINITIVELY ABSENT ∧ never started → NOT
+  //    merged (the lane was never cut, not torn down after a merge — inferring
+  //    merged here fires `landed` spuriously on a fresh dep-blocked epic);
   //  - PRESENT ∧ ancestor of LOCAL default → MERGED; else (not-ancestor / errored /
   //    timed-out / unresolvable default) → NOT merged.
   const laneMergedInRepo = async (
     repoDir: string,
     laneBranch: string,
+    epicHasStarted: boolean,
   ): Promise<boolean> => {
     const lanes = await enumerateLanes(repoDir);
     if (!lanes.ok) {
       return false; // enumeration inconclusive → NOT merged
     }
     if (!lanes.branches.has(laneBranch)) {
-      return true; // DEFINITIVELY absent → merged-and-torn-down → MERGED
+      // DEFINITIVELY absent → merged-and-torn-down → MERGED, but ONLY if the epic
+      // ever started. A never-started epic's lane is absent because it was never
+      // cut, so absence proves nothing about merge (keep `landed` waiting).
+      return epicHasStarted;
     }
     const localDefault = await resolveLocalDefault(repoDir);
     if (localDefault === null) {
@@ -2688,9 +2696,13 @@ export async function computeMergedLaneEntries(
       continue;
     }
     const laneBranch = baseBranchFor(epic.epic_id);
+    // A never-started epic never cut a lane, so an absent lane must NOT read as
+    // merged-and-torn-down. `status === "done"` is a belt-and-suspenders disjunct
+    // (a done epic must have started) so a done epic always reports landed.
+    const started = epicStarted(epic) || epic.status === "done";
     try {
       if (resolution.kind === "ok") {
-        if (await laneMergedInRepo(resolution.repoDir, laneBranch)) {
+        if (await laneMergedInRepo(resolution.repoDir, laneBranch, started)) {
           out.push({ epic_id: epic.epic_id, repo_dir: resolution.repoDir });
         }
         continue;
@@ -2706,7 +2718,7 @@ export async function computeMergedLaneEntries(
       for (const group of resolution.groups) {
         const groupLanded =
           group.mode === "worktree"
-            ? await laneMergedInRepo(group.repoDir, laneBranch)
+            ? await laneMergedInRepo(group.repoDir, laneBranch, started)
             : group.taskIds.every(
                 (id) => taskById.get(id)?.worker_phase === "done",
               );
