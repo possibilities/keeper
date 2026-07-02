@@ -116,7 +116,7 @@ const BLOCK_ESCALATIONS_PAGE_LIMIT = 0;
 // The `tmux_client_focus` singleton (fn-952) — at most one row (`id = 1`), so
 // unbounded (0) like the other singleton collections.
 const TMUX_CLIENT_FOCUS_PAGE_LIMIT = 0;
-// The `lane_merged` observable (fn-1016) — one row per merged-lane epic, bounded
+// The `lane_merged` observable — one row per merged-lane epic, bounded
 // by board size, so unbounded (0) like the other epic-keyed collections.
 const LANE_MERGED_PAGE_LIMIT = 0;
 const POLL_MS = 500;
@@ -213,7 +213,7 @@ export interface ReadinessClientSnapshot {
   readonly maxConcurrentJobs: number | null;
   readonly maxConcurrentPerRoot: number;
   readonly worktreeMode: boolean;
-  // fn-1016: the durable MERGE-LANDED set — epic ids whose work is provably on the
+  // The durable MERGE-LANDED set — epic ids whose work is provably on the
   // default branch, for `keeper await landed` and `keeper status`. Sorted, stable.
   // Present ONLY under the `includeRecentDoneEpics` opt-in (the OFF degradation
   // reads done epics, which only join `epics` then) — `undefined` for board/dash so
@@ -460,7 +460,7 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
 }
 
 /**
- * Compute the durable MERGE-LANDED set (fn-1016) — the epic ids whose work is
+ * Compute the durable MERGE-LANDED set — the epic ids whose work is
  * provably on the default branch — degrading cleanly across worktree mode. PURE
  * (no socket, no clock), so the snapshot path and tests share one source of truth.
  *
@@ -1666,7 +1666,7 @@ export function subscribeReadiness(
           limit: EPICS_PAGE_LIMIT,
         })
       : null;
-  // fn-1016 OPT-IN: the merge-landed observable, gated on the SAME
+  // OPT-IN: the merge-landed observable, gated on the SAME
   // `includeRecentDoneEpics` flag as the recent-done window — the OFF-mode
   // degradation (`landed` ⇔ `done`) reads done epics, which only join `epics` under
   // that opt-in, so the two are intrinsically coupled. When off it is `null` (never
@@ -1731,7 +1731,7 @@ export function subscribeReadiness(
       // (`null` otherwise — board/dash never wait on it, so their gate stays
       // unchanged). Empty produces a `result` with `rows: []`, so it clears.
       (epicsRecentDone !== null && !epicsRecentDone.gotResult) ||
-      // fn-1016 OPT-IN: gate on the merge-landed observable ONLY when opted in
+      // OPT-IN: gate on the merge-landed observable ONLY when opted in
       // (`null` otherwise). The table exists from migration, so empty produces a
       // `result` with `rows: []` and still clears the gate.
       (laneMerged !== null && !laneMerged.gotResult)
@@ -1890,7 +1890,7 @@ export function subscribeReadiness(
     const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
     const eligibleEpicIdsSorted =
       eligibleEpicIds === undefined ? undefined : [...eligibleEpicIds].sort();
-    // fn-1016: the merge-landed set, computed ONLY under the `includeRecentDoneEpics`
+    // The merge-landed set, computed ONLY under the `includeRecentDoneEpics`
     // opt-in (the `laneMerged` state is `null` otherwise). Worktree mode ON → the
     // `lane_merged` projection ids; OFF → degrades to DONE epics (read off the merged
     // `epicsTyped`, which carries recent-done under this same opt-in). `undefined` for

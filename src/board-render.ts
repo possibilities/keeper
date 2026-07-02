@@ -14,12 +14,9 @@
  * a `main()`-scoped `seg`); the trivial `v == null ? "" : String(v)`
  * is inlined here for the one call site.
  *
- * History: extracted from `cli/board.ts` (~lines 300-897, 1060-1086)
- * via fn-658.1 ahead of splitting `keeper board` into a sibling
- * `keeper board` (epics-only) + `keeper jobs` pair. Behavior is
- * unchanged — only the module boundary moves. `cli/board.ts` re-
- * exports every name `test/board.test.ts` and `scripts/drain-dead-letters.ts`
- * already import from it, so external import paths keep resolving.
+ * `cli/board.ts` re-exports every name `test/board.test.ts` and
+ * `scripts/drain-dead-letters.ts` import from it, so external import paths
+ * keep resolving.
  */
 
 import { classifyDispatchFailure } from "./dispatch-failure-pill";
@@ -35,7 +32,7 @@ import { collapseSubagentsByName } from "./readiness-client";
 import type { ScheduledTask, SubagentInvocation } from "./types";
 
 // ---------------------------------------------------------------------------
-// Iconized pill core (fn-713 follow-on)
+// Iconized pill core
 // ---------------------------------------------------------------------------
 //
 // Every STATE pill is rendered as `[<glyph>::<token-text>]` — the `::`
@@ -45,7 +42,7 @@ import type { ScheduledTask, SubagentInvocation } from "./types";
 // summary) gets no icon and renders as a plain `[<token>]` pill — so the
 // icon layer is additive, never lossy. The companion change is "show
 // defaults": the resting value of every fixed-slot enum now renders an
-// explicit pill (reversing the fn-708 omit-default convention) so a viewer
+// explicit pill (reversing the omit-default convention) so a viewer
 // sees every state, never an absence to decode.
 
 /** The body of an iconized pill (no brackets): `"<glyph>::<token>"` or, when
@@ -136,7 +133,7 @@ export function apiErrorPillSeg(at: unknown, kind: unknown): string {
 /**
  * Render the optional `[awaiting:<kind>]` pill segment from the
  * `jobs.(last_input_request_at, last_input_request_kind)` pair (schema
- * v25 — the two-field signal cloned one-for-one off fn-616's
+ * v25 — the two-field signal cloned one-for-one off the
  * `apiErrorPillSeg` shape). The reducer stamps both columns together on
  * the `InputRequest` fold (a synthetic event minted by
  * `matchAskUserQuestion` in `src/transcript-worker.ts` when a real
@@ -180,7 +177,7 @@ export function inputRequestPillSeg(at: unknown, kind: unknown): string {
 /**
  * Render the optional `[awaiting:<kind>]` pill segment from the
  * `jobs.(last_permission_prompt_at, last_permission_prompt_kind)` pair
- * (schema v52, fn-686 — a near-exact clone of {@link inputRequestPillSeg}
+ * (schema v52 — a near-exact clone of {@link inputRequestPillSeg}
  * with the one structural divergence noted below).
  *
  * The reducer stamps both columns together on the `Notification` fold
@@ -234,7 +231,7 @@ const TELEMETRY_MODEL_MAX = 20;
 
 /**
  * Render the optional per-session telemetry pill segment from the six v100
- * `SessionTelemetry` jobs columns (fn-1024) — a live session's CURRENT model,
+ * `SessionTelemetry` jobs columns — a live session's CURRENT model,
  * reasoning effort, and context-window fill, projected verbatim from the
  * Claude Code statusLine payload and folded latest-wins onto the row.
  *
@@ -303,7 +300,7 @@ export function sessionTelemetryPillSeg(row: Record<string, unknown>): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The lossless-consolidation primitive (epic fn-708, transform T1
+ * The lossless-consolidation primitive (transform T1
  * "omit-default"). Render a ` [value]` pill segment ONLY when `value`
  * differs from its single resting/default value; render `""` (no pill)
  * at the default. Absence of the pill ≡ the default — a uniform rule
@@ -318,7 +315,7 @@ export function sessionTelemetryPillSeg(row: Record<string, unknown>): string {
  * byte-compare and the existing test style hold.
  */
 export function pillOrEmpty(value: unknown, dflt: string): string {
-  // fn-713 follow-on: SHOW the default (reverses fn-708 omit-default). The
+  // SHOW the default (reverses the omit-default convention). The
   // resting value now renders an explicit iconized pill so the viewer sees
   // every state. A null / non-string / empty value coalesces to `dflt` (so a
   // malformed projection cell renders the resting pill, never `[]`). The
@@ -329,7 +326,7 @@ export function pillOrEmpty(value: unknown, dflt: string): string {
 
 /**
  * Map the epic's `last_validated_at` to the omit-default `[validated]`
- * pill segment (epic fn-708, T1). The producer-side `asString`
+ * pill segment (T1). The producer-side `asString`
  * (`src/plan-worker.ts`) already collapses empty-string / non-string
  * values to `null`, so the predicate is simply `v != null`: render
  * ` [validated]` when validated, `""` otherwise (absence ≡ `unvalidated`).
@@ -347,8 +344,8 @@ export function validatedPill(lastValidatedAt: unknown): string {
 }
 
 /**
- * Render the trailing `[armed]` pill segment for a board EPIC HEADER (fn-751).
- * Omit-default convention (mirrors the pre-fn-713 `validatedPill` shape):
+ * Render the trailing `[armed]` pill segment for a board EPIC HEADER.
+ * Omit-default convention (the same rule as the other omit-default pills):
  * ` [armed]` when the epic is explicitly armed, `""` otherwise — absence ≡
  * not armed. v1 surfaces EXPLICIT-armed epics only (matches the autopilot
  * screen's armed list); the dep-pulled-in closure is a documented future
@@ -372,7 +369,7 @@ export function startedPill(isStarted: boolean): string {
 }
 
 /**
- * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
+ * Render the trailing pill segment for a board TASK LINE —
  * the consolidated `[${runtime_status}] [${worker_phase}]` closure. Pure
  * `f(task, verdict)` — no readiness recompute, no wall-clock, no env;
  * `verdict` is already in scope at the call site. There is no `[approval]`
@@ -396,8 +393,8 @@ export function renderTaskPills(
   task: Record<string, unknown>,
   _verdict: Verdict,
 ): string {
-  // fn-713 follow-on: SHOW every fixed-slot enum at its current value
-  // (reverses fn-708 omit-default AND drops the verdict-aware T3 suppression)
+  // SHOW every fixed-slot enum at its current value
+  // (reverses the omit-default convention AND drops the verdict-aware T3 suppression)
   // — runtime_status / worker_phase now render on every task row, defaults
   // included, each as an iconized `[<glyph>::<token>]` pill. The `_verdict`
   // arg is retained for call / test arity but no longer consulted.
@@ -417,7 +414,7 @@ export function renderTaskPills(
 }
 
 /**
- * Render the trailing pill segment for a board CLOSE ROW (epic fn-708) —
+ * Render the trailing pill segment for a board CLOSE ROW —
  * the consolidated `[${status}]` closure. Pure `f(epicRow, verdict)`. There
  * is no `[approval]` pill: the approval surface does not exist.
  *
@@ -512,7 +509,7 @@ type PillBucket = Exclude<keyof typeof SGR, "reset">;
 const PILL_COLORS: Record<string, PillBucket> = {
   running: "blue",
   in_progress: "active",
-  // fn-669: `working` (a live interactive session in the `keeper jobs`
+  // `working` (a live interactive session in the `keeper jobs`
   // TUI) joins `running` in the bright-blue "in motion right now" hue.
   // It was previously `active`/cyan, which reads as nearly-default
   // foreground on many terminals — the blue is the visible signal a
@@ -521,7 +518,7 @@ const PILL_COLORS: Record<string, PillBucket> = {
   // emits the bare `working` state pill), so the shared hue introduces
   // no in-view ambiguity.
   working: "blue",
-  // fn-751 (schema v62): the `[armed]` epic-header pill (rendered when the
+  // Schema v62: the `[armed]` epic-header pill (rendered when the
   // epic is present in the `armed_epics` presence table). Active/cyan bucket
   // — a "live, human-chosen structural signal" rather than a
   // success/error/warn state.
@@ -531,12 +528,12 @@ const PILL_COLORS: Record<string, PillBucket> = {
   validated: "success",
   ready: "success",
   done: "success",
-  // fn-708: the labeled worker-phase survivor pill. `[worker-done]` is the
+  // The labeled worker-phase survivor pill. `[worker-done]` is the
   // de-ambiguated render of `worker_phase=done` (never bare `[done]`, to
   // avoid collision with runtime `done`). Green/success — it is a done
   // signal, same family as bare `[done]`.
   "worker-done": "success",
-  // fn-708: the relabeled manual runtime block flag. `[rt:blocked]` is
+  // The relabeled manual runtime block flag. `[rt:blocked]` is
   // `runtime_status=blocked` rendered with the `rt:` prefix so it never
   // collides with the verdict `[blocked:*]` family. Yellow/warn — same
   // "something is in the way" family as bare `[blocked]`.
@@ -544,7 +541,7 @@ const PILL_COLORS: Record<string, PillBucket> = {
   failed: "error",
   rejected: "error",
   killed: "error",
-  // fn-635: a structurally-broken cross-project epic dep (full-id miss,
+  // A structurally-broken cross-project epic dep (full-id miss,
   // bare-id miss, or ambiguous bare-id with no same-project disambiguator)
   // renders red — distinct from the amber `[blocked]` family. The
   // colorizer's prefix branch below routes `blocked:dep-on-epic-dangling
@@ -562,7 +559,7 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * Apply SGR coloring to bracketed pill tokens in a single rendered line.
  * Pure string→string: matches `[<token>]`, looks the inner token up in
  * `PILL_COLORS`, and falls back to the `warn` bucket for any `blocked:*`
- * payload (so `[blocked:dep-on-task fn-614.2]` colors the same as
+ * payload (so `[blocked:dep-on-task <task-id>]` colors the same as
  * `[blocked]`) AND to the `error` bucket for any `failed:*` payload (so
  * the six `[failed:<kind>]` api-error pills minted by `apiErrorPillSeg`
  * color the same as a bare `[failed]`) AND to the `warn` bucket for any
@@ -575,7 +572,7 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * colors the same as `[blocked]`) AND to the `blue` (bright blue) bucket
  * for any `running:*` payload (so the `[running:<kind>]` motion pills minted
  * by `formatPill` for the reasons split out of `BlockReason` —
- * `job-running`, `sub-agent-running`, and (fn-638.4)
+ * `job-running`, `sub-agent-running`, and
  * `sub-agent-stale` — color the same as a bare `[running]`, EXCEPT the
  * `running:sub-agent-stale` payload, which is routed to the `warn`
  * (yellow) bucket by a more-specific branch above the generic
@@ -597,7 +594,7 @@ const PILL_COLORS: Record<string, PillBucket> = {
  */
 function bucketForToken(token: string): PillBucket | undefined {
   let bucket = PILL_COLORS[token];
-  // fn-635: `blocked:dep-on-epic-dangling <id>` → red (distinct from the amber
+  // `blocked:dep-on-epic-dangling <id>` → red (distinct from the amber
   // `blocked:*` family). MUST precede the generic `blocked:` → warn fallback.
   if (
     bucket === undefined &&
@@ -617,13 +614,13 @@ function bucketForToken(token: string): PillBucket | undefined {
   if (bucket === undefined && token.startsWith("task-repo:")) {
     bucket = "warn";
   }
-  // fn-643.5: `dead-letter:N` banner pill → warn ("things to fix right now").
+  // `dead-letter:N` banner pill → warn ("things to fix right now").
   if (bucket === undefined && token.startsWith("dead-letter:")) {
     bucket = "warn";
   }
-  // fn-638.4: `running:sub-agent-stale` → warn (distinct from fresh
+  // `running:sub-agent-stale` → warn (distinct from fresh
   // `running:*` blue); MUST precede the generic `running:` fallback.
-  // fn-719: `running:monitor-stale` joins it — a past-soft-TTL live-worker
+  // `running:monitor-stale` joins it — a past-soft-TTL live-worker
   // monitor still occupies the mutex but renders distinctly so a human sees
   // the possibly-abandoned slot.
   if (
@@ -640,7 +637,7 @@ function bucketForToken(token: string): PillBucket | undefined {
 
 export function colorizePillsInLine(line: string): string {
   return line.replace(/\[([^\]]+)\]/g, (match, inner: string) => {
-    // fn-713 follow-on: iconized pills are `<glyph>::<token>`. Color keys on
+    // Iconized pills are `<glyph>::<token>`. Color keys on
     // the TEXT token (after `::`); the SGR wraps the WHOLE inner so the glyph
     // inherits the same hue. Plain pills (no `::` — dep refs, backend coords)
     // key on the whole inner, exactly as before.
@@ -669,12 +666,12 @@ export function colorizePillsInLine(line: string): string {
  * and `title` still null. The legacy header build
  * (`${seg(epic_number)} ${seg(title)}`) collapsed that to a lone space —
  * surfacing as a blank `(keeper)  [unvalidated]` line with no way to tell
- * WHICH epic the row belonged to. Per the fn-700 "show it blocked, don't
+ * WHICH epic the row belonged to. Per the "show it blocked, don't
  * hide" decision, fall back to the `epic_id` (non-null on the `Epic`
  * projection — `src/types.ts`) so the row is always identifiable, never
  * hidden.
  *
- * Pure module function — fn-700.2 extracted this out of `cli/board.ts`'s
+ * Pure module function — extracted out of `cli/board.ts`'s
  * non-exported `renderEpicBlock` closure (mirroring the
  * {@link renderJobLinkLines} / {@link subagentLinesFor} extractions) so
  * `test/board.test.ts` can assert the fallback directly without standing
@@ -725,12 +722,12 @@ export function renderDeadLetterPill(waitingCount: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// tmux client-focus banner pill (fn-952)
+// tmux client-focus banner pill
 // ---------------------------------------------------------------------------
 
 /**
  * Render the persistent `[focus <session>:<win> %<pane>]` banner pill from the
- * `tmux_client_focus` singleton (fn-952). Renders `[focus: none]` when the
+ * `tmux_client_focus` singleton. Renders `[focus: none]` when the
  * singleton is absent (no-tmux env or a worker that never connected) OR its
  * `status` is anything other than `'focused'` (the worker's `'none'` derivation),
  * OR the location fields are missing/malformed. `pane_id` already carries tmux's
@@ -784,7 +781,7 @@ export function renderTmuxFocusPill(
  * in practice). Each line carries
  * `{subagent_type}{annotations}: {description}{ status-pill}` —
  * `description` is dropped when null/empty so any status pill stays
- * anchored next to the type. The status pill follows the fn-708
+ * anchored next to the type. The status pill follows the
  * omit-default rule (T1, B18): it is rendered ONLY for the non-resting
  * states (`running` / `failed` / `unknown` / `superseded`); `ok`, a
  * null/missing status, and the empty string all encode the resting value
@@ -801,7 +798,7 @@ export function renderTmuxFocusPill(
  * section jobs (flush left) get three. Returns `[]` for jobs with
  * no recorded invocations so callers can spread unconditionally.
  *
- * Pure module function — fn-658.1 lifted this out of `cli/board.ts`'s
+ * Pure module function — lifted out of `cli/board.ts`'s
  * `main()` closure so the shared module can serve both the board and
  * jobs renderers. The trivial `seg` helper the closure used
  * (`v == null ? "" : String(v)`) is inlined at the one call site
@@ -831,7 +828,7 @@ export function subagentLinesFor(
       annotations.length === 0 ? "" : ` (${annotations.join(", ")})`;
     const head = `${type}${annSeg}`;
     const label = desc === "" ? head : `${head}: ${desc}`;
-    // fn-708 (T1, B18): omit the status pill at its resting/absent values —
+    // T1, B18: omit the status pill at its resting/absent values —
     // `ok` (the chosen resting-success value), a null/missing status, and the
     // empty string all fold to NO pill (absence ≡ ok). Previously a null
     // status emitted a literal empty `[]`; that latent noise is gone here.
@@ -840,11 +837,11 @@ export function subagentLinesFor(
     //
     // The static `SubagentInvocation.status` type is the five-member union
     // (no null / empty), but the runtime value off a narrowed wire frame can
-    // arrive null/undefined (cf. the fn-697.2 safe-7 decode), so the guard is
+    // arrive null/undefined (cf. the safe-7 decode), so the guard is
     // read through `unknown` to keep the defensive null/empty drop honest —
     // same posture as the prior `g.row.status == null ? "" : String(...)`.
-    // fn-713 follow-on: SHOW the status at its current value, `ok` included
-    // (reverses fn-708 omit-default), as an iconized pill. A null / empty
+    // SHOW the status at its current value, `ok` included
+    // (reverses the omit-default convention), as an iconized pill. A null / empty
     // status coalesces to the resting `ok`.
     const statusRaw: unknown = g.row.status;
     const status =

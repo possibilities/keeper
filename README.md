@@ -107,6 +107,10 @@ neither:
   migration resets their floor and re-seeds rather than wiping. Ephemeral projections
   (`EPHEMERAL_PROJECTIONS`, e.g. `pending_dispatches`) fold during the drain but are truncated before
   serving so in-flight state rebuilds from current reality.
+- **Worktree mode** (opt-in, off by default) runs the autopilot's per-epic tasks in isolated git
+  worktrees on `keeper/epic/<id>` lanes so sibling tasks build in parallel without colliding, then
+  merges each finished lane back to the default branch. The lane/merge-gate invariants live in
+  [CLAUDE.md](./CLAUDE.md).
 - **Example clients** ship as one binary — `keeper board`, `keeper jobs`, `keeper autopilot`,
   `keeper git`, `keeper usage`, `keeper await`, `keeper status`, `keeper query`.
 

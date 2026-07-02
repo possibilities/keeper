@@ -3612,7 +3612,7 @@ function foldWorktreeRepoStatus(db: Database, event: Event): void {
 }
 
 /**
- * One entry of a synthetic `LaneMerged` event (fn-1016) — ONE epic whose worktree
+ * One entry of a synthetic `LaneMerged` event — ONE epic whose worktree
  * lane branch (`keeper/epic/<id>`) the autopilot reconciler probed as merged into
  * the LOCAL default branch (an ancestor of default, OR torn-down after a merge —
  * keeper deletes a base only once it is an ancestor of default). The durable
@@ -3673,7 +3673,7 @@ function extractLaneMerged(event: Event): LaneMergedEntry[] {
 }
 
 /**
- * Fold one synthetic `LaneMerged` event (fn-1016) into the LIVE-ONLY
+ * Fold one synthetic `LaneMerged` event into the LIVE-ONLY
  * `lane_merged` projection — a full-set REPLACE: wipe the table, then INSERT one
  * row per merged-lane epic carried in the event. The autopilot worker posts the
  * FULL current merged set whenever it changes, so the table always reflects the
@@ -8876,7 +8876,7 @@ export function applyEvent(
       // charter. A malformed payload clears the table; the fold never throws.
       foldWorktreeRepoStatus(db, event);
     } else if (event.hook_event === "LaneMerged") {
-      // fn-1016 — the LIVE-ONLY merge-landed observable (sole owner of
+      // The LIVE-ONLY merge-landed observable (sole owner of
       // `lane_merged`). Full-set REPLACE from the autopilot worker's current
       // merged-lane set (posted only when it changes). NO floor/seed: the verdict
       // is git-derived (a per-cycle ancestry probe) and re-emitted each cycle, so

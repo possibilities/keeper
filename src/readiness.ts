@@ -489,7 +489,7 @@ export function computeReadiness(
   // LEAF and never derives it. Appended LAST so default-reliant call sites stay
   // valid.
   eligibleEpicIds?: Set<string>,
-  // fn-905: the PER-ROOT git-seed gate. While the live-only git surface is
+  // The PER-ROOT git-seed gate. While the live-only git surface is
   // UNSEEDED for a given root (the daemon restarted and the boot-seed hasn't
   // established a `git_status` row above the floor for it yet), it reads EMPTY —
   // so a dispatch decision into that root would race against a surface that
@@ -503,7 +503,7 @@ export function computeReadiness(
   // simulator callers (and the byte-identical re-fold simulator) behave exactly
   // as before. Producers pass an empty set whenever `seed_required` is CLEAR.
   unseededRoots: ReadonlySet<string> = new Set<string>(),
-  // fn-954: the per-root dispatch concurrency count N — how many tasks may
+  // The per-root dispatch concurrency count N — how many tasks may
   // dispatch concurrently into a single root, distributed fairly across the
   // root's epics by `applyPerRootRoundRobinAllocator` (which REPLACES the
   // per-epic + per-root mutexes). Default 1 = today's hardcoded one-task-per-root
@@ -513,7 +513,7 @@ export function computeReadiness(
   // (not the imported `DEFAULT_MAX_CONCURRENT_PER_ROOT`) keeps readiness an import
   // LEAF. Appended LAST so default-reliant call sites stay valid.
   maxConcurrentPerRoot: number = 1,
-  // fn-959: the worktree-mode LANE re-key. When worktree mode is ON the producer
+  // The worktree-mode LANE re-key. When worktree mode is ON the producer
   // derives, per epic, the pure DAG → worktree topology and threads each node's
   // worktree path here (task_id → lane path, plus epic_id → the BASE lane path
   // for the close sink). The per-root allocator then keys on the lane path
@@ -654,7 +654,7 @@ export function computeReadiness(
     }
   }
 
-  // Post-pass allocator (fn-954) — mutates `perTask` / `perCloseRow` in board
+  // Post-pass allocator — mutates `perTask` / `perCloseRow` in board
   // traversal order. ONE pass supersedes the two legacy mutexes: it distributes
   // up to `maxConcurrentPerRoot` (N) concurrent slots per root fairly across the
   // root's epics via round-robin. N=1 is byte-identical (it delegates verbatim to
@@ -672,7 +672,7 @@ export function computeReadiness(
     laneKeyById,
   );
 
-  // fn-905: PER-ROOT unseeded-git gate. Force UNKNOWN only for a row whose
+  // PER-ROOT unseeded-git gate. Force UNKNOWN only for a row whose
   // `effectiveRoot` is unseeded, so the autopilot can't dispatch into a root
   // that reads empty merely because the boot-seed hasn't established it — while a
   // seeded sibling root still dispatches (the coupling is gone). Keyed on the
@@ -1390,7 +1390,7 @@ export function applySingleTaskPerRootMutex(
   // eligibility-blind occupancy claim. Yolo (`undefined`) keeps close rows
   // eligibility-blind.
   eligibleEpicIds?: Set<string>,
-  // fn-959: the worktree-mode lane re-key (task_id / epic_id → lane path). When a
+  // The worktree-mode lane re-key (task_id / epic_id → lane path). When a
   // row's id is present the mutex keys on its lane path, not `effectiveRoot` —
   // each worktree is a CAP-1 lane and parallel sibling lanes (distinct paths) run
   // concurrently. Empty (the default) = today's `effectiveRoot` keying, byte-
@@ -1449,7 +1449,7 @@ export function applySingleTaskPerRootMutex(
   }
 
   // Demote a ready task to `single-task-per-root` (extracted so the legacy
-  // single-pass and the fn-770 two-pass share one mutation site).
+  // single-pass and the two-pass share one mutation site).
   const demoteTask = (taskId: string): void => {
     perTask.set(taskId, {
       tag: "blocked",
@@ -1570,7 +1570,7 @@ export function applySingleTaskPerRootMutex(
 }
 
 /**
- * Per-root N-slot round-robin allocator (predicates 11+12, fn-954). The SINGLE
+ * Per-root N-slot round-robin allocator (predicates 11+12). The SINGLE
  * post-pass `computeReadiness` runs — it SUPERSEDES the two independent mutexes
  * (`applySingleTaskPerEpicMutex` + `applySingleTaskPerRootMutex`, kept exported
  * for their direct unit tests). `maxConcurrentPerRoot` (N, threaded from
@@ -1596,7 +1596,7 @@ export function applySingleTaskPerRootMutex(
  * `single-task-per-root`. At N=1 this reduces to today's per-epic-first
  * attribution.
  *
- * The armed two-pass + close-row eligibility gate (fn-770/fn-835) carry through
+ * The armed two-pass + close-row eligibility gate carry through
  * BOTH paths: pass-1 physical occupancy is eligibility-blind; in armed mode an
  * eligible epic's ready rows claim free slots before any ineligible sibling, and
  * an ineligible `ready` close row neither claims nor demotes (mirroring the
@@ -1605,7 +1605,7 @@ export function applySingleTaskPerRootMutex(
  * `maxConcurrentJobs` budget as an absolute ceiling (demoted rows never reach
  * it). Exported so the test suite can drive N>1 directly.
  *
- * fn-959 worktree mode (`laneKeyById` non-empty): every row keys on its lane
+ * Worktree mode (`laneKeyById` non-empty): every row keys on its lane
  * worktree path, and each lane is FORCED cap-1 (two agents in one worktree index
  * = corruption) REGARDLESS of `maxConcurrentPerRoot`. Worktree mode therefore
  * routes through the lane-keyed per-root mutex ONLY — NOT the per-epic mutex,
@@ -1622,11 +1622,11 @@ export function applyPerRootRoundRobinAllocator(
   fallbackRoots: Set<string> = new Set(),
   maxConcurrentPerRoot = 1,
   eligibleEpicIds?: Set<string>,
-  // fn-959: the worktree-mode lane re-key (task_id / epic_id → lane path). See
+  // The worktree-mode lane re-key (task_id / epic_id → lane path). See
   // {@link rootKeyForRow} + the worktree-mode note above.
   laneKeyById: ReadonlyMap<string, string> = new Map(),
 ): void {
-  // fn-959 worktree mode: lane-keyed, cap-1-per-lane, NO per-epic collapse. Run
+  // Worktree mode: lane-keyed, cap-1-per-lane, NO per-epic collapse. Run
   // ONLY the per-root mutex (re-keyed on lane paths) so parallel sibling lanes of
   // one epic dispatch concurrently while same-lane rows serialize. `N` is
   // deliberately ignored — a lane is never N>1.
@@ -1908,7 +1908,7 @@ function effectiveRoot(
 }
 
 /**
- * fn-959 — the per-row ALLOCATOR key. In worktree mode the producer supplies a
+ * The per-row ALLOCATOR key. In worktree mode the producer supplies a
  * `rowId → lane-worktree-path` map (`laneKeyById`); a row whose id is present
  * keys on its lane path (each worktree a CAP-1 lane), so two parallel sibling
  * lanes — even within ONE epic — are DISTINCT keys and dispatch concurrently,

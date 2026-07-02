@@ -905,8 +905,8 @@ CREATE TABLE IF NOT EXISTS worktree_repo_status (
 `;
 
 /**
- * `lane_merged` projection table — the LIVE-ONLY "merge-landed observable"
- * (fn-1016). One row per epic whose worktree lane branch (`keeper/epic/<id>`) the
+ * `lane_merged` projection table — the LIVE-ONLY "merge-landed observable".
+ * One row per epic whose worktree lane branch (`keeper/epic/<id>`) the
  * autopilot reconciler probed as merged into the LOCAL default branch (an ancestor
  * of default, OR torn-down after the merge), folded from a synthetic `LaneMerged`
  * event the worker posts when the merged set changes. The durable signal the
@@ -1727,7 +1727,7 @@ export const LIVE_ONLY_PROJECTIONS = [
   // `rewindLiveProjection` wipe (no floor/seed of its own) is repopulated by the
   // live producer — the same shape as `tmux_client_focus`.
   "worktree_repo_status",
-  // fn-1016 — the merge-landed observable. The verdict is git-derived (a per-cycle
+  // The merge-landed observable. The verdict is git-derived (a per-cycle
   // lane-is-ancestor-of-default probe), so it must NOT be deterministic-replayed;
   // the reconciler re-emits it each cycle, so the bare `rewindLiveProjection` wipe
   // (no floor/seed of its own) is repopulated by the live producer — the same
@@ -5592,7 +5592,7 @@ function migrate(db: Database): void {
       // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "dispatch_failures", "merge_escalated_at", "REAL");
 
-      // v98→v99 (fn-1016.1): add the LIVE-ONLY `lane_merged` projection table — the
+      // v98→v99: add the LIVE-ONLY `lane_merged` projection table — the
       // durable merge-landed observable. CREATEd idempotently in the always-run base
       // schema block above (`CREATE_LANE_MERGED`, `IF NOT EXISTS`), so an existing DB
       // gains the empty table on this boot and the live producer repopulates it; no

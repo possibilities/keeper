@@ -1185,7 +1185,7 @@ export function epicRemovedMet(
 }
 
 /**
- * `landed` predicate (fn-1016) — "this epic's lane is merged to the default
+ * `landed` predicate — "this epic's lane is merged to the default
  * branch." A thin membership read over the durable MERGE-LANDED set
  * (`ReadinessClientSnapshot.landedEpicIds`, computed by task-1's
  * `computeLandedEpicIds`), so the worktree ON/OFF degradation is ALREADY baked
