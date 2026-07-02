@@ -46,5 +46,5 @@ green untouched except the added recovery key on failure envelopes.
 - [ ] plan emitFailureEnvelope carries recovery; plan success family byte-unchanged (Python parity suite green)
 
 ## Done summary
-
+Extracted the shared {schema_version, ok, error, data} envelope with a {code, message, recovery} error object into cli/envelope.ts; migrated status + query onto it (query transport failure now lands an ok:false envelope on stdout), converged plan emitFailureEnvelope to carry recovery via a code registry, and wrote docs/problem-codes.md.
 ## Evidence
