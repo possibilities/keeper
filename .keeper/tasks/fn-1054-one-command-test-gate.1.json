@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T01:29:12.591000Z",
+  "depends_on": [],
+  "epic": "fn-1054-one-command-test-gate",
+  "id": "fn-1054-one-command-test-gate.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Add the test full orchestrator",
+  "updated_at": "2026-07-02T01:29:12.591000Z"
+}
