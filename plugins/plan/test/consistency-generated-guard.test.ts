@@ -30,6 +30,12 @@ const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
 const POST_HOOK = join(REPO, "plugin", "hooks", "post-hook.ts");
 
+// workers/ is gitignored (rendered per-cell from subagents.yaml), so a clean
+// checkout that never ran render-plugin-templates has no cells on disk. The two
+// tests that enumerate real cells skip there instead of failing hard; promote.sh
+// renders before its drift guards, so promotion-time coverage is preserved.
+const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
+
 function readHooks(): Record<string, Array<Record<string, unknown>>> {
   const data = JSON.parse(
     readFileSync(join(REPO, "hooks", "hooks.json"), "utf-8"),
@@ -118,23 +124,26 @@ describe("hooks.json wiring", () => {
 // ---------------------------------------------------------------------------
 
 describe("generated work plugins match the subagents.yaml matrix", () => {
-  test("on-disk workers/ cell set equals the {model × effort} cartesian product", () => {
-    const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
-    const expected = new Set<string>();
-    for (const model of matrix.models) {
-      for (const effort of matrix.efforts) {
-        expected.add(`${model}-${effort}`);
+  test.skipIf(!WORKERS_RENDERED)(
+    "on-disk workers/ cell set equals the {model × effort} cartesian product",
+    () => {
+      const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+      const expected = new Set<string>();
+      for (const model of matrix.models) {
+        for (const effort of matrix.efforts) {
+          expected.add(`${model}-${effort}`);
+        }
       }
-    }
-    const actual = new Set(
-      readdirSync(join(REPO, "workers"), { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => e.name),
-    );
-    // Both directions: a missing cell fails, and a stale cell dir (a removed
-    // {model × effort} whose tree lingers) fails too.
-    expect([...actual].sort()).toEqual([...expected].sort());
-  });
+      const actual = new Set(
+        readdirSync(join(REPO, "workers"), { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name),
+      );
+      // Both directions: a missing cell fails, and a stale cell dir (a removed
+      // {model × effort} whose tree lingers) fails too.
+      expect([...actual].sort()).toEqual([...expected].sort());
+    },
+  );
 
   test("no stale plan:worker-*.md agents linger in agents/", () => {
     const stale = readdirSync(join(REPO, "agents")).filter(
@@ -195,12 +204,17 @@ function collidingWorkManifests(root: string, workersBase: string): string[] {
 }
 
 describe("work-name collision guard", () => {
-  test("the plan plugin ships no non-cell `work`-named plugin", () => {
-    const hits = collidingWorkManifests(REPO, join(REPO, "workers"));
-    expect(hits).toEqual([]);
-    // Sanity: the cells themselves ARE `work`-named (the guard excludes them).
-    expect(findWorkManifests(join(REPO, "workers")).length).toBeGreaterThan(0);
-  });
+  test.skipIf(!WORKERS_RENDERED)(
+    "the plan plugin ships no non-cell `work`-named plugin",
+    () => {
+      const hits = collidingWorkManifests(REPO, join(REPO, "workers"));
+      expect(hits).toEqual([]);
+      // Sanity: the cells themselves ARE `work`-named (the guard excludes them).
+      expect(findWorkManifests(join(REPO, "workers")).length).toBeGreaterThan(
+        0,
+      );
+    },
+  );
 
   test("the guard fires when a stray `work` plugin is scanned outside workers/", () => {
     const strayRoot = realpathSync(
