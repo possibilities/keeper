@@ -39,5 +39,5 @@ Render consistency + skill-id lint green; no behavioral tests (guidance prose).
 - [ ] A reviewer can quote the hard rule, the same-session clause, the fixture line, and the cap from the current files
 
 ## Done summary
-
+Editorial pass: 5f now states the hard same-file dep rule (echoed in 5d/5e/2c), Phase 6 carries the same-session multi-epic overlap clause, repo-scout and docs-gap-scout flag recorded-fixture/golden coupling (cross-repo included), and Phase 2b states the four-scout fan-out cap with bounded interrupt-rebrief. Defer left unchanged (single-task, no inter-task dep text to mirror).
 ## Evidence
