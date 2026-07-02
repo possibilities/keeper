@@ -21,25 +21,14 @@ git repo, other agents going idle, or an AND-combination of these.
 
 ## When this fires
 
-The user's ask has two shapes glued together:
+The user's ask glues two shapes together:
 
 1. **A wait condition** — words like *wait*, *block*, *hold off*, *when …
-   is done*, *after … finishes*, *once … is ready*, *as soon as …*. The
-   condition is one (or more) of:
-   - a **keeper plan id** state — *"once fn-643-…-hook.4 is complete"*,
-     *"as soon as fn-650 is ready"*, *"when work starts on fn-650"*.
-   - a **git** state — *"when the project is clean"*, *"once everything's
-     committed"*, *"after there are no uncommitted changes"*.
-   - a **jobs** state — *"when the other agents finish"*, *"once everyone
-     else is done working"*, *"after no one else is editing the repo"*.
-   - a **monitor** state — *"when my dev server finishes"*, *"once my
-     background script is done"*, *"after my build watcher stops"*. Scoped
-     to THIS session's own background monitors.
-   - a **combination** — *"wait until the repo is clean AND the other
-     agents are done"*.
+   is done*, *after … finishes*, *once … is ready*, *as soon as …*, over a
+   keeper plan id, a git state, other agents, an own-session monitor, or a
+   combination (the *Parse* table below enumerates every form).
 2. **A follow-up** to run when the condition holds — *then review it*,
-   *then run the tests*, *and ping me*, *and commit*, *and start the next
-   task*, etc.
+   *then run the tests*, *and ping me*, *and commit*, etc.
 
 The user does NOT need to say "keeper" / "epic" / "task" / "await". A
 bare *"do a full review once fn-643-…-hook.4 is complete"* or *"commit
@@ -93,90 +82,61 @@ first with one read: `keeper status --json` prints autopilot config, per-row
 readiness verdicts, counts, `drained`/`jammed`, in-flight, and needs-human in a
 single envelope (exit 0 on any board state). Use it to discover which epics
 exist, whether the board is already drained, and which condition fits. For the
-full orient step run `keeper prompt render engineering/orient`. The Step 1
-`keeper plan show` pre-check below only verifies a KNOWN id; `keeper status`
-is how you discover the board before picking a condition.
+full orient step run `keeper prompt render engineering/orient`.
 
 ## Step 1 — Pre-check plan targets are on-board (plan conditions only)
 
 This pre-check applies **only to `complete` / `started` / `unblocked`** (and
 optionally `epic-removed` / `landed`, whose epic id you can verify exists
-today). The other
-conditions — `git-clean`, `agents-idle`, `server-up`, `monitor-running`,
-`drained`, `epic-added`, `changed` — have **no `keeper plan show` pre-check**:
-they read live keeper projections (or, for `server-up`, just wait for the daemon
-to serve), so there is nothing to refuse upfront; skip straight to step 2 for
-them. `server-up` in particular deliberately blocks while keeperd is down, and
-`epic-added` deliberately waits for an epic that does not exist yet — so an
-"is it on board?" check would be self-defeating for both.
+today). The other conditions — `git-clean`, `agents-idle`, `server-up`,
+`monitor-running`, `drained`, `epic-added`, `changed` — have **no pre-check**
+(they read live projections, or deliberately wait for something not present
+yet); skip straight to step 2.
 
 **`monitor-running` self-refuses at arm time.** If the selector matches no
-running monitor in this session, `keeper await` emits `failed
-reason=no-match` exit 1 instead of an instant `met` (the premature-unblock
-guard). The catch: the own-session monitor list is snapshotted on each
-**Stop**, so arm `monitor-running` in a turn **after** a Stop has captured
-the monitor — NOT the same turn you launch it (that race trips the
-refusal). If you just launched the background task this turn, let it
-appear in a `keeper jobs` snapshot first, then wire the await.
+running monitor in this session, `keeper await` emits `failed reason=no-match`
+exit 1 instead of an instant `met` (the premature-unblock guard). The
+own-session monitor list is snapshotted on each **Stop**, so arm
+`monitor-running` in a turn **after** a Stop has captured the monitor — NOT the
+same turn you launch it (that race trips the refusal). Confirm it in a bare
+`keeper jobs` snapshot first (a one-shot read in an agent — never append
+`--watch`, it hangs), then wire the await.
 
-> **Reading `keeper jobs` from an agent.** A bare `keeper jobs` already
-> behaves as a one-shot snapshot read in an agent (non-TTY stdout, fn-772):
-> it prints the current frame plus a final `keeper-meta:` JSON line and
-> exits, so you can run it directly (e.g. `keeper jobs | tail -1` for just
-> the parseable record). Do NOT append `--snapshot` — it's redundant here.
-> NEVER append `--watch`: that forces the live stream and HANGS the tool
-> call forever. (The "snapshot" the bullets above refer to is the daemon's
-> Stop-time monitor-list capture — a separate concept from this output
-> mode, but the bare command is the right way to observe it.)
-
-For each plan segment, verify the id exists and is awaitable before
-wiring Monitor. `keeper plan show` is read-only and fast.
-
-```bash
-keeper plan show <target> --format json
-```
+For each plan segment, verify the id exists and is awaitable off the LIVE board —
+never a `keeper plan show` file read. A **task** id resolves in `keeper query
+tasks --json` (one row per open-epic task, carrying `runtime_status` + the
+readiness verdict); an **epic** id resolves in `keeper status --json` under
+`data.board.epics[]` (carrying the epic `status`). Both are one-shot envelope
+reads that never touch plan file state.
 
 Refuse to wire Monitor in any of these cases — the event will never fire:
 
-- **Nonexistent** — `keeper plan show` exits non-zero or returns `success:
-  false`. Tell the user the id doesn't exist; ask them to double-check.
-- **Already complete** (for `condition=complete`):
-  - Task: `task.runtime_status == "done"` (fn-756 — completion is the
-    worker-done signal alone; no approval gate).
-  - Epic: `epic.status == "done"`.
-  Tell the user the target has already popped off the board — there's
-  nothing to await — and offer to just run the follow-up now.
-- **Already started** (for `condition=started`): work has already begun if
-  the target carries any job, `task.runtime_status` is `in_progress`/`done`,
-  or `task.worker_phase == "done"` (epic: any task satisfies that). There's
-  nothing to await — tell the user and offer to run the follow-up now.
-  `keeper await started <id>` against an already-started target fires `met`
-  immediately (no refuse-upfront), so wiring it is harmless, but the
-  follow-up runs right away rather than on a real edge.
+- **Off-board** — the id appears in neither read (it never existed, or already
+  completed and closed off the board). Tell the user it isn't on the board; if
+  they expected it done, offer to run the follow-up now.
+- **Already complete** (for `condition=complete`): the task row's `runtime_status
+  == "done"`, or the epic's `status == "done"`. The target has already popped off
+  the board — nothing to await; offer to run the follow-up now.
+- **Already started** (for `condition=started`): the task row's `runtime_status`
+  is `in_progress`/`done` (epic: any task satisfies that). There's nothing to
+  await — tell the user and offer to run the follow-up now. `keeper await started
+  <id>` against an already-started target fires `met` immediately (no
+  refuse-upfront), so wiring it is harmless, but the follow-up runs right away
+  rather than on a real edge.
 
-If the target is on-board and the condition isn't already met, continue
-to step 2. (For `condition=unblocked` you may skip the
-already-unblocked check — `keeper await unblocked` with an already-
-workable target fires `met` immediately, which is the correct behavior.)
+If the target is on-board and the condition isn't already met, continue to step
+2. (For `condition=unblocked` skip the already-unblocked check — `keeper await
+unblocked` with an already-workable target fires `met` immediately, which is
+correct.)
 
-> **`complete` is done-AND-idle, not done-alone.** `complete` fires on the
-> readiness `completed` verdict, which requires the row to be done AND every
-> owning subagent to have gone idle — the same moment autopilot treats the work
-> as truly finished and unblocks downstream tasks. A row whose worker reports
-> done while a subagent is still winding down (a stale subagent) reads
-> `runtime_status: done` in the plan-show pre-check above, but `await complete`
-> deliberately HOLDS until that subagent goes idle rather than firing on the
-> worker-done signal alone. The pre-check's `runtime_status == "done"` /
-> `epic.status == "done"` test stays the right "already popped off the board"
-> shortcut; just know the live wait is gated on idle, so it can hold a beat
-> past plan-done while a subagent settles.
+> **`complete` is done-AND-idle.** The live wait can HOLD a beat past plan-done
+> while a stale subagent settles, even though the pre-check's `runtime_status ==
+> "done"` already reads as "popped off the board."
 
-> **`started <id> --require-transition` warns.** `started` is a monotonic
-> latch — it fires once and has NO second edge. Pairing it with
-> `--require-transition` against an already-started target makes the wait
-> hang until timeout (it sits waiting for an edge that never comes). Do not
-> add `--require-transition` to a `started` wait unless the target is
-> verifiably not-yet-started at arm time.
+> **`started --require-transition` warns.** `started` is a monotonic latch with
+> NO second edge; pairing it with `--require-transition` against an
+> already-started target hangs the wait until timeout. Only add it when the
+> target is verifiably not-yet-started at arm time.
 
 ## Step 2 — Wire the Monitor
 
@@ -188,14 +148,8 @@ Monitor({
 })
 ```
 
-Examples of the `command` field:
-
-- `keeper await complete fn-643-keeper-hook-dead-letters.4`
-- `keeper await git-clean`
-- `keeper await agents-idle`
-- `keeper await server-up`
-- `keeper await monitor-running cmd:bun run dev`
-- `keeper await git-clean and agents-idle`
+The `command` field is `keeper await` plus the condition form(s) from the
+*Parse* table, AND-joined for a combination.
 
 Defaults and overrides:
 
@@ -204,12 +158,10 @@ Defaults and overrides:
   finishes" wait must outlive individual model turns. Only drop
   `persistent` when the user gave a hard wall-clock bound.
 - **For a bounded wait** ("within the hour", "give it 30 minutes"), use
-  `timeout_ms` on the Monitor invocation instead of `keeper await
-  --timeout`. Let Monitor own the deadline. On timeout Monitor SIGTERMs
-  the process and `keeper await` emits `[keeper-await] failed
+  `timeout_ms` on the Monitor invocation — NOT `keeper await --timeout`. Let
+  Monitor own the deadline as the single source of truth. On timeout Monitor
+  SIGTERMs the process and `keeper await` emits `[keeper-await] failed
   reason=timeout` exit 3 through the same flush path.
-- **Do NOT pass `keeper await --timeout`** — Monitor's `timeout_ms` is
-  the single source of truth for the deadline.
 - **Stuck verdicts** (job-rejected, dep-on-epic-dangling) keep waiting
   by default. Add `--fail-on-stuck` only if the user explicitly wants
   the wait to surrender on those.
@@ -310,8 +262,8 @@ how they want to proceed — do NOT silently run the follow-up.
 > User: "Do a full review when fn-643-keeper-hook-dead-letters.4 is
 > complete."
 
-1. `keeper plan show fn-643-keeper-hook-dead-letters.4 --format json` →
-   task exists, `runtime_status != "done"`. Proceed.
+1. `keeper query tasks --json` → the `fn-643-keeper-hook-dead-letters.4` row
+   exists, `runtime_status != "done"`. Proceed.
 2. `Monitor({ command: "keeper await complete
    fn-643-keeper-hook-dead-letters.4", description: "wait for fn-643.4
    complete then review", persistent: true })`.
@@ -325,60 +277,6 @@ how they want to proceed — do NOT silently run the follow-up.
 2. `Monitor({ command: "keeper await git-clean", description: "wait for
    clean repo then push", persistent: true })`.
 3. On `met` → run the push.
-
-### Wait until other agents finish (agents-idle)
-
-> User: "When the other agents are done, run the full test suite."
-
-1. No pre-check — `agents-idle` has no off-board state. Skip step 1.
-2. `Monitor({ command: "keeper await agents-idle", description: "wait
-   for other agents idle then test", persistent: true })`.
-3. On `met` → run the tests.
-
-### Wait until keeper is back up (server-up)
-
-> User: "Wait until keeper is back up, then show me the board."
-
-1. No pre-check — `server-up` deliberately blocks WHILE keeperd is down, so
-   a board pre-check would be self-defeating. Skip step 1.
-2. `Monitor({ command: "keeper await server-up", description: "wait for
-   keeperd to serve then show board", persistent: true })`.
-3. On `[keeper-await] met condition=server-up …` → run the follow-up.
-
-A plain `keeper await <id>` reconnects FOREVER (fn-757) — it blocks
-straight through a keeperd bounce and never exits `reason=unreachable`, so
-in the common case you do NOT need this recovery dance; just let the
-original wait ride. `server-up` is only the recovery path for a wait armed
-with the opt-in `--connect-timeout` flag (which DOES exit
-`reason=unreachable` past its deadline): arm `keeper await server-up` to
-block through the bounce, then re-arm the original wait — or simply re-arm
-it WITHOUT `--connect-timeout` so it waits forever.
-
-### Wait until my background script finishes (monitor-running)
-
-> User: "Ping me when my dev server stops."
-
-1. No `keeper plan show` pre-check — `monitor-running` has no off-board state.
-   Confirm the monitor already shows in a `keeper jobs` snapshot (it must
-   have been captured by a prior Stop); if you just launched it THIS turn,
-   wait for the next snapshot before arming.
-2. `Monitor({ command: "keeper await monitor-running cmd:bun run dev",
-   description: "wait for dev server to stop then ping", persistent: true })`.
-3. On `[keeper-await] met condition=monitor-running …` → ping the user. On
-   `failed reason=no-match` → the selector matched nothing; re-check the
-   command string against `keeper jobs`.
-
-### Wait until the whole board drains (drained)
-
-> User: "Let me know when the autopilot's worked through everything."
-
-1. No `keeper plan show` pre-check — `drained` is a board-level predicate.
-   Optionally `keeper status --json` first to confirm it isn't already at rest.
-2. `Monitor({ command: "keeper await drained", description: "wait for the
-   board to drain then ping", persistent: true })`.
-3. On `[keeper-await] met condition=drained …` → ping the user. To surrender on
-   an operator jam instead of waiting, add `--fail-on-stuck` (a sticky
-   `dispatch_failures` row then exits 5).
 
 ### Combination (AND)
 
@@ -394,28 +292,10 @@ it WITHOUT `--connect-timeout` so it waits forever.
 
 ## What NOT to do
 
-- Do not pass `keeper await --timeout`. Monitor's `timeout_ms` owns the
-  deadline.
-- Do not run the `keeper plan show` pre-check for `git-clean` / `agents-idle`
-  — they have no off-board state. The pre-check is for `complete` /
-  `unblocked` only.
-- Do not wire a plan Monitor without the `keeper plan show` pre-check — a
-  doomed Monitor that immediately exits `failed reason=not-found` is bad
-  UX.
+- Do not wire a plan Monitor without the Step 1 board pre-check — a doomed
+  Monitor that immediately exits `failed reason=not-found` is bad UX.
 - Do not pass an id to `git-clean` / `agents-idle` / `server-up` — they're
   nullary (`git-clean` / `agents-idle` are project-scoped to the cwd's git
   root; `server-up` is daemon-scoped).
-- Do not AND `server-up` with another condition (`server-up and …`, either
-  order) — it's mutually exclusive and rejected at parse time. To both wait
-  for the daemon AND a board state, run `server-up` first, then re-arm the
-  board wait once it fires `met`.
-- Do not arm `monitor-running` in the SAME turn you launch the background
-  task — the own-session monitor list is snapshotted on Stop, so a
-  same-turn arm races the snapshot and trips `failed reason=no-match`.
-  Arm it after the monitor appears in a `keeper jobs` snapshot.
-- Do not use a substring/partial command for a `monitor-running` selector —
-  matching is EXACT on the full command string (or use `kind:<kind>`).
-- Do not run the follow-up on `failed`. Surface the terminal line and
-  ask.
 - Do not invent ids. If the user gives a slug-less reference ("the
   promotion epic") and you can't disambiguate, ask.
