@@ -54,8 +54,9 @@ import {
 } from "./envelope";
 
 /** Envelope schema version for `keeper status`. v2 adds the additive
- * `dispatch_failure: string[]` field to the per-task + close-row views. */
-export const STATUS_SCHEMA_VERSION = 2;
+ * `dispatch_failure: string[]` field to the per-task + close-row views; v3 adds
+ * the additive `autopilot.worktree_multi_repo` durable-config field. */
+export const STATUS_SCHEMA_VERSION = 3;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -142,6 +143,7 @@ export interface StatusData {
     paused: boolean;
     mode: "yolo" | "armed";
     worktree_mode: boolean;
+    worktree_multi_repo: boolean;
     armed: readonly string[];
     max_concurrent_jobs: number | null;
     max_concurrent_per_root: number;
@@ -311,6 +313,7 @@ export function buildStatusEnvelope(
       paused: snap.autopilotPaused,
       mode: snap.autopilotMode,
       worktree_mode: snap.worktreeMode,
+      worktree_multi_repo: snap.worktreeMultiRepo,
       armed: snap.autopilotEligibleEpicIds ?? [],
       max_concurrent_jobs: snap.maxConcurrentJobs,
       max_concurrent_per_root: snap.maxConcurrentPerRoot,

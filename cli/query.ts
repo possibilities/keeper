@@ -26,6 +26,12 @@ import { parseArgs } from "node:util";
 import { isQueryAllowed, QUERY_READ_ALLOWLIST } from "../src/collections";
 import { resolveSockPath } from "../src/db";
 import type { FilterValue } from "../src/protocol";
+import { formatPill } from "../src/readiness";
+import {
+  type ReadinessClientHandle,
+  type ReadinessClientSnapshot,
+  subscribeReadiness,
+} from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
 import {
   emitEnvelope,
@@ -37,7 +43,26 @@ import {
 /** Envelope schema version for `keeper query`. */
 export const QUERY_SCHEMA_VERSION = 1;
 
-const ALLOWLIST_SORTED = [...QUERY_READ_ALLOWLIST].sort();
+/**
+ * DERIVED collections `keeper query` serves that are NOT raw daemon tables: a
+ * `tasks` view flattens every open epic's tasks into one row-per-task carrying
+ * the plan fields PLUS the live readiness verdict (reusing `computeReadiness`
+ * via the readiness subscribe, never re-derived). These bypass the
+ * {@link QUERY_READ_ALLOWLIST} registry gate (they have no descriptor) but ride
+ * the SAME envelope + exit model.
+ */
+export const VIRTUAL_QUERY_COLLECTIONS: ReadonlySet<string> = new Set([
+  "tasks",
+]);
+
+/** Bounded connect deadline for the derived `tasks` readiness subscribe — a
+ *  one-shot read must give up rather than reconnect forever on a down daemon. */
+const TASKS_CONNECT_DEADLINE_MS = 10_000;
+
+const ALLOWLIST_SORTED = [
+  ...QUERY_READ_ALLOWLIST,
+  ...VIRTUAL_QUERY_COLLECTIONS,
+].sort();
 
 export const HELP = `keeper query — one-shot read of an allowlisted daemon collection
 
@@ -61,7 +86,13 @@ Flags:
 Allowlisted collections:
   ${ALLOWLIST_SORTED.join(", ")}
 
+Derived views (not raw tables):
+  tasks   One row per open-epic task — epic_id, task_id, title, tier, model,
+          depends_on, runtime_status, and the live readiness verdict + pill.
+          Retires the 'query epics --json | jq .data[]' per-task pipeline.
+
 Examples:
+  keeper query tasks --json | jq '.data[] | {task_id, verdict}'
   keeper query epics --json | jq '.data[].epic_id'
   keeper query jobs --filter state=working
   keeper query dispatch_failures
@@ -127,7 +158,10 @@ export function parseQueryArgs(argv: string[]): ParseFailure | ParseSuccess {
     };
   }
   const collection = positionals[0] ?? "";
-  if (!isQueryAllowed(collection)) {
+  if (
+    !isQueryAllowed(collection) &&
+    !VIRTUAL_QUERY_COLLECTIONS.has(collection)
+  ) {
     return {
       ok: false,
       message: `collection '${collection}' is not readable via 'keeper query' (allowed: ${ALLOWLIST_SORTED.join(", ")})`,
@@ -202,6 +236,172 @@ export async function runQueryCommand(
   emitEnvelope(successEnvelope(QUERY_SCHEMA_VERSION, rows), deps);
 }
 
+// ---------------------------------------------------------------------------
+// Derived `tasks` view — flat task rows + live readiness verdict.
+// ---------------------------------------------------------------------------
+
+/** One flat task row of the derived `tasks` view. `depends_on` is the plan
+ *  dependency id list; `verdict`/`pill` are the live readiness verdict (a miss
+ *  renders the inert `[blocked:unknown]`, matching the board). */
+export interface TaskRow {
+  epic_id: string;
+  task_id: string;
+  title: string | null;
+  tier: string | null;
+  model: string | null;
+  depends_on: string[];
+  runtime_status: string;
+  verdict: string;
+  pill: string;
+}
+
+/** The scalar `tasks` fields a `--filter k=v` may exact-match against;
+ *  array/derived fields and unknown keys are ignored (forward-compat, mirroring
+ *  the server-side filter gate). */
+const TASK_FILTER_FIELDS: ReadonlySet<string> = new Set([
+  "epic_id",
+  "task_id",
+  "tier",
+  "model",
+  "runtime_status",
+  "verdict",
+]);
+
+/** Apply the query `--filter` map to the flat task rows: each scalar-field
+ *  string value ANDs an exact match; non-string values and non-scalar/unknown
+ *  keys are skipped. */
+function applyTaskFilter(
+  rows: TaskRow[],
+  filter: Record<string, FilterValue>,
+): TaskRow[] {
+  const entries = Object.entries(filter).filter(
+    (e): e is [string, string] =>
+      TASK_FILTER_FIELDS.has(e[0]) && typeof e[1] === "string",
+  );
+  if (entries.length === 0) {
+    return rows;
+  }
+  return rows.filter((row) =>
+    entries.every(
+      ([k, v]) =>
+        String((row as unknown as Record<string, unknown>)[k] ?? "") === v,
+    ),
+  );
+}
+
+/**
+ * Flatten a readiness snapshot into the `tasks` view: one row per task across
+ * every (open) epic, in the snapshot's deterministic epic/task order, carrying
+ * the plan fields plus the live readiness verdict from `snap.readiness.perTask`
+ * (reused, NEVER re-derived). PURE — a fixture pins the shape.
+ */
+export function flattenTaskRows(
+  snap: ReadinessClientSnapshot,
+  filter: Record<string, FilterValue> = {},
+): TaskRow[] {
+  const rows: TaskRow[] = [];
+  for (const epic of snap.epics) {
+    for (const task of epic.tasks) {
+      const v = snap.readiness.perTask.get(task.task_id);
+      rows.push({
+        epic_id: task.epic_id ?? epic.epic_id,
+        task_id: task.task_id,
+        title: task.title,
+        tier: task.tier,
+        model: task.model,
+        depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],
+        runtime_status: task.runtime_status,
+        verdict: v?.tag ?? "unknown",
+        pill: v === undefined ? "[blocked:unknown]" : formatPill(v),
+      });
+    }
+  }
+  return applyTaskFilter(rows, filter);
+}
+
+export interface RunTasksDeps {
+  /** Resolve the first readiness snapshot (injected for tests). */
+  fetchSnapshot: (sock: string) => Promise<ReadinessClientSnapshot>;
+  writeStdout: (s: string) => void;
+  exit: (code: number) => never;
+}
+
+/**
+ * Execute the derived `tasks` query: resolve one readiness snapshot, flatten to
+ * task rows, print the envelope. A `fetchSnapshot` throw (down daemon / fatal
+ * pre-paint frame) maps to an `ok:false` envelope on stdout, exit 1 — the SAME
+ * shape + exit model as the raw `runQueryCommand` path.
+ */
+export async function runTasksCommand(
+  args: ParsedQueryArgs,
+  deps: RunTasksDeps,
+): Promise<void> {
+  let snap: ReadinessClientSnapshot;
+  try {
+    snap = await deps.fetchSnapshot(args.sock);
+  } catch (err) {
+    emitEnvelope(
+      errorEnvelope(QUERY_SCHEMA_VERSION, {
+        code: "query_failed",
+        message: err instanceof Error ? err.message : String(err),
+        recovery: RECOVERY_DAEMON_DOWN,
+      }),
+      deps,
+    );
+    return;
+  }
+  emitEnvelope(
+    successEnvelope(QUERY_SCHEMA_VERSION, flattenTaskRows(snap, args.filter)),
+    deps,
+  );
+}
+
+/**
+ * Real `fetchSnapshot`: open a bounded readiness subscribe, resolve on the FIRST
+ * composite snapshot, then dispose. A pre-paint fatal (`unreachable`/`connect`)
+ * rejects. A single `done` latch guards the snapshot↔fatal race. Mirrors
+ * `keeper status`'s one-shot orient.
+ */
+function fetchFirstReadinessSnapshot(
+  sock: string,
+): Promise<ReadinessClientSnapshot> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let handle: ReadinessClientHandle | null = null;
+    const dispose = (): void => {
+      if (handle !== null) {
+        try {
+          handle.dispose();
+        } catch {
+          // dispose is idempotent
+        }
+        handle = null;
+      }
+    };
+    handle = subscribeReadiness({
+      sockPath: sock,
+      idPrefix: `query-tasks-${process.pid}`,
+      onSnapshot: (snap) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        dispose();
+        resolve(snap);
+      },
+      onFatal: (err) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        dispose();
+        reject(new Error(`${err.code}: ${err.message}`));
+      },
+      giveUpPolicy: { deadlineMs: TASKS_CONNECT_DEADLINE_MS },
+    });
+  });
+}
+
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseQueryArgs(argv);
   if (!parsed.ok) {
@@ -212,6 +412,15 @@ export async function main(argv: string[]): Promise<void> {
     process.stderr.write(`keeper query: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
     process.exit(1);
+  }
+
+  if (VIRTUAL_QUERY_COLLECTIONS.has(parsed.args.collection)) {
+    await runTasksCommand(parsed.args, {
+      fetchSnapshot: fetchFirstReadinessSnapshot,
+      writeStdout: (s) => process.stdout.write(s),
+      exit: (code) => process.exit(code),
+    });
+    return;
   }
 
   await runQueryCommand(parsed.args, {

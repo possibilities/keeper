@@ -92,13 +92,14 @@ keeper status --json | jq .data.autopilot
 ```
 
 It prints ONE `{schema_version, ok, error, data}` envelope and exits — no TUI
-snapshot dance, no reconnect loop. `data.autopilot` IS the global singleton:
+snapshot dance, no reconnect loop. `data.autopilot` IS the global singleton
+(the same durable config `keeper autopilot show` returns as its own envelope):
 
 ```json
-{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "max_concurrent_jobs": null, "max_concurrent_per_root": 1 }
+{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "worktree_multi_repo": false, "max_concurrent_jobs": null, "max_concurrent_per_root": 1 }
 ```
 
-Read those six fields to answer "what's it doing" and to capture before a
+Read those seven fields to answer "what's it doing" and to capture before a
 take-over. The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
 (pending + running launches), and `data.needs_human` (dead-letters, escalations,
 stuck dispatches) cover what it's CURRENTLY doing — so one read covers both the
@@ -131,13 +132,15 @@ NEVER capture/restore (that would auto-undo a deliberate pause).
 you might change in your working context for the whole window:
 
 ```bash
-keeper status --json | jq .data.autopilot   # → {paused, mode, armed, worktree_mode, max_concurrent_jobs, max_concurrent_per_root}
+keeper status --json | jq .data.autopilot   # → {paused, mode, armed, worktree_mode, worktree_multi_repo, max_concurrent_jobs, max_concurrent_per_root}
 ```
 
-Capture `{paused, mode, armed, worktree_mode, max_concurrent_jobs,
-max_concurrent_per_root}` — capturing fewer than the fields your take-over
-touches produces a wrong GLOBAL state on restore. Pin them; do not re-derive
-from memory later.
+Capture `{paused, mode, armed, worktree_mode, worktree_multi_repo,
+max_concurrent_jobs, max_concurrent_per_root}` — capturing fewer than the fields
+your take-over touches produces a wrong GLOBAL state on restore. Pin them; do
+not re-derive from memory later. (`keeper autopilot show` returns the same seven
+durable fields as its own envelope; restore `worktree_multi_repo` via `keeper
+autopilot config worktree_multi_repo on|off`.)
 
 **2 — Drive.** Run the control ops the take-over needs (pause, mode, arm, …).
 Wire the restore plan PER MUTATING PHASE as you go — track exactly which fields

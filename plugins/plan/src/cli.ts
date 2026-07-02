@@ -745,7 +745,9 @@ function printHelp(): void {
   lines.push("");
   lines.push("To orient on the board, prefer the keeper-native surfaces over");
   lines.push("hand-parsing a read verb: `keeper status` for the board, and");
-  lines.push("`keeper query epics --json | jq '.data[]'` for per-task detail.");
+  lines.push(
+    "`keeper query tasks` for per-task detail (tier/model/deps + verdict).",
+  );
   lines.push("Every read verb still emits exactly one clean JSON value.");
   lines.push("");
   lines.push("Commands:");

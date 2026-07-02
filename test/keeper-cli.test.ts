@@ -84,6 +84,7 @@ function makeHarness(): Harness {
       "find-file-history": mkHandler("find-file-history"),
       "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
+      "session-summary": mkHandler("session-summary"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),
