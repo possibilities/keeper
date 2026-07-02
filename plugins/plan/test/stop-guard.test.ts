@@ -209,15 +209,22 @@ function writeCloseMarker(epicId: string): void {
   );
 }
 
+// A POSIX sh shim, NOT a bun one: the guard's runPlanCli spawns this on PATH
+// under a 5s timeout, and a nested bun cold-start races that budget under host
+// contention (timeout → null envelope → guard fails open → empty stdout, so the
+// block assertions see nothing). sh starts near-instantly, so runPlanCli always
+// gets its envelope in time — the guard's real subprocess stdin/stdout contract
+// is still exercised end-to-end. Touches the sentinel (proving reconcile ran),
+// prints the envelope, exits.
 function writePlanCliShim(envelope: unknown, exitCode = 0): void {
   const shim = join(binDir, "keeper");
+  const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
   writeFileSync(
     shim,
-    `#!/usr/bin/env bun\n` +
-      `import { writeFileSync } from "node:fs";\n` +
-      `writeFileSync(${JSON.stringify(sentinel)}, "1");\n` +
-      `process.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\n` +
-      `process.exit(${exitCode});\n`,
+    `#!/bin/sh\n` +
+      `: > ${sq(sentinel)}\n` +
+      `printf '%s\\n' ${sq(JSON.stringify(envelope))}\n` +
+      `exit ${exitCode}\n`,
     "utf-8",
   );
   chmodSync(shim, 0o755);
