@@ -13,7 +13,8 @@
  */
 
 import { expect, test } from "bun:test";
-import { isWarnOnly, scanText } from "../scripts/lint-claude-md";
+import { readFileSync } from "node:fs";
+import { isWarnOnly, scanReadme, scanText } from "../scripts/lint-claude-md";
 
 const CLEAN = [
   "keeper — event-sourced control-data daemon.",
@@ -99,4 +100,81 @@ test("over 100 but at-or-under 120 lines is warn-only (no SIZE finding)", () => 
   const text = Array.from({ length: 110 }, (_, i) => `- rule ${i}`).join("\n");
   expect(isWarnOnly(text)).toBe(true);
   expect(scanText(text).filter((f) => f.kind === "SIZE")).toEqual([]);
+});
+
+// --- scanReadme: the README front-door hard-cap + content gate ---
+
+const README_CLEAN = [
+  "# keeper",
+  "",
+  "An event-sourced control-data daemon.",
+  "",
+  "## What it is",
+  "",
+  "- A local daemon that folds Claude Code events into a projection.",
+  "",
+  "## Install",
+  "",
+  "- `bun install && keeper up`.",
+  "",
+].join("\n");
+
+test("clean README front door passes scanReadme with no findings", () => {
+  expect(scanReadme(README_CLEAN)).toEqual([]);
+});
+
+test("over 250 lines FAILs scanReadme with a SIZE finding", () => {
+  const text = Array.from({ length: 260 }, (_, i) => `- line ${i}`).join("\n");
+  const size = scanReadme(text).filter((f) => f.kind === "SIZE");
+  expect(size.length).toBe(1);
+  expect(size[0].message).toContain("exceeds the 250-line cap");
+});
+
+test("over 24576 bytes FAILs scanReadme (multibyte so bytes ≠ chars)", () => {
+  // Multibyte content: each `€` is 3 UTF-8 bytes, so byte count outruns both
+  // char and line count — the byte cap trips well under 250 lines.
+  const big = "€".repeat(2000);
+  const text = Array.from({ length: 20 }, () => `- ${big}`).join("\n");
+  expect(text.split("\n").length).toBeLessThanOrEqual(250);
+  expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(24576);
+  const size = scanReadme(text).filter((f) => f.kind === "SIZE");
+  expect(size.length).toBe(1);
+  expect(size[0].message).toContain("exceeds the 24576-byte cap");
+});
+
+test("scanReadme has no warn tier — exactly at 250 lines passes", () => {
+  const text = Array.from({ length: 250 }, (_, i) => `- line ${i}`).join("\n");
+  expect(text.split("\n").length).toBe(250);
+  expect(scanReadme(text).filter((f) => f.kind === "SIZE")).toEqual([]);
+});
+
+test("scanReadme flags each re-narration fingerprint class", () => {
+  for (const [line, tag] of [
+    ["- the fn-123 fix made the fold incremental.", "[fn-id]"],
+    ["- v74 seeded the retention shed class.", "[version-number]"],
+    ["- the 2026-06-23 unreachable-live-agent bug.", "[iso-date]"],
+    ["- the relay previously spawned the worker.", "[provenance]"],
+  ] as const) {
+    const findings = scanReadme(line);
+    expect(findings.some((f) => f.message.includes(tag))).toBe(true);
+  }
+});
+
+test("scanReadme carries the CLAUDE.md false-positive guards", () => {
+  const line =
+    "- When you bump SCHEMA_VERSION, add it to SUPPORTED_SCHEMA_VERSIONS.";
+  expect(scanReadme(line)).toEqual([]);
+});
+
+test("lint script epilogue points to tighten/delete, never README relocation", () => {
+  const src = readFileSync(
+    new URL("../scripts/lint-claude-md.ts", import.meta.url),
+    "utf8",
+  );
+  // The reversed funnel: guidance is tighten/delete, README is NOT a target.
+  expect(src).toContain("Tighten or delete");
+  expect(src).toContain("README is NOT a relocation target.");
+  // The old funnel wording must not survive anywhere in the script.
+  expect(src).not.toContain("Relocate the offending lines");
+  expect(src).not.toContain("belong in README `## Architecture`");
 });

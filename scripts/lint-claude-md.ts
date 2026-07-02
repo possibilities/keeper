@@ -1,34 +1,44 @@
 #!/usr/bin/env bun
 /**
- * CLAUDE.md size + re-narration guard. The root CLAUDE.md is the agent
- * guardrail file: it must stay a short list of imperative rules, not a
- * per-feature architecture narration. Two costs drove the cut — Codex
- * truncates the AGENTS.md symlink at a 32 KiB project-doc cap, and dense
+ * CLAUDE.md + README.md size/content guard. Both docs stay lean: CLAUDE.md is
+ * the agent guardrail file (a short list of imperative rules, not a per-feature
+ * architecture narration), and README.md is a lean front door, not the append
+ * target for every feature's rationale. Two costs drove the CLAUDE.md cut —
+ * Codex truncates the AGENTS.md symlink at a 32 KiB project-doc cap, and dense
  * how-it-works prose dilutes the handful of rules that change agent behavior.
- * Architecture/rationale prose lives in README `## Architecture` instead.
+ * When a rule or paragraph outgrows either file, tighten or delete it:
+ * consolidate into an existing rule, move a local contract into a code comment,
+ * or drop it — git history and the `.keeper/` specs archive all provenance.
+ * README is NOT a relocation target.
  *
  *   bun scripts/lint-claude-md.ts
  *
  * Exits 0 when clean, 1 listing each violation. Scans the LITERAL `CLAUDE.md`
- * path only — never a glob (the `AGENTS.md` symlink would double-hit) and never
- * README / plugins/plan/CLAUDE.md (those legitimately carry fn-/version
- * history).
+ * and `README.md` paths only — never a glob (the `AGENTS.md` symlink would
+ * double-hit) and never plugins/plan/CLAUDE.md (it legitimately carries fn-/
+ * version history).
  *
- * Two gate classes:
- *  - SIZE: FAIL above 120 lines OR 16384 bytes; warn-only (exit 0) above 100.
+ * Two gate classes (both files):
+ *  - SIZE: CLAUDE.md FAILs above 120 lines OR 16384 bytes (warn-only, exit 0,
+ *    above 100); README.md FAILs above 250 lines OR 24576 bytes (hard cap, no
+ *    warn tier).
  *  - CONTENT: FAIL on a re-narration fingerprint per line — `fn-NNN`, a
  *    lowercase version number (`v74`, NOT the all-caps `SCHEMA_VERSION`), an
  *    ISO date, or a past-tense provenance word. The banned vocabulary lives
- *    HERE; never quote it in CLAUDE.md prose (a future rule that must show a
+ *    HERE; never quote it in either doc's prose (a future rule that must show a
  *    date/version in an example will trip the scanner — acceptable, zero
  *    tolerance).
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const MAX_LINES = 120;
 const WARN_LINES = 100;
 const MAX_BYTES = 16384;
+
+// README.md is a lean front door — hard caps, no warn tier.
+const README_MAX_LINES = 250;
+const README_MAX_BYTES = 24576;
 
 /** Per-line content fingerprints. A match on any FAILs the lint. */
 const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
@@ -66,8 +76,7 @@ export type Finding = {
 export function scanText(text: string): Finding[] {
   const findings: Finding[] = [];
 
-  const lines = text.split("\n");
-  const lineCount = lines.length;
+  const lineCount = text.split("\n").length;
   const byteCount = Buffer.byteLength(text, "utf8");
 
   if (lineCount > MAX_LINES) {
@@ -85,6 +94,49 @@ export function scanText(text: string): Finding[] {
     });
   }
 
+  findings.push(...scanContent(text));
+  return findings;
+}
+
+/**
+ * Scan README.md for the front-door size caps + the same re-narration
+ * fingerprints. Pure over its input (no fs), parallel to `scanText`. README
+ * caps are HARD (strict `>`, no warn tier): a README over cap is a hard FAIL
+ * so the front door can never re-monolithize. Boundary + line-counting
+ * semantics match `scanText` exactly.
+ */
+export function scanReadme(text: string): Finding[] {
+  const findings: Finding[] = [];
+
+  const lineCount = text.split("\n").length;
+  const byteCount = Buffer.byteLength(text, "utf8");
+
+  if (lineCount > README_MAX_LINES) {
+    findings.push({
+      kind: "SIZE",
+      line: 0,
+      message: `${lineCount} lines exceeds the ${README_MAX_LINES}-line cap`,
+    });
+  }
+  if (byteCount > README_MAX_BYTES) {
+    findings.push({
+      kind: "SIZE",
+      line: 0,
+      message: `${byteCount} bytes exceeds the ${README_MAX_BYTES}-byte cap`,
+    });
+  }
+
+  findings.push(...scanContent(text));
+  return findings;
+}
+
+/**
+ * Per-line re-narration fingerprint scan shared by `scanText` and `scanReadme`
+ * — one source of truth for the CONTENT patterns + false-positive guards.
+ */
+function scanContent(text: string): Finding[] {
+  const findings: Finding[] = [];
+  const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     for (const { name, re } of CONTENT_PATTERNS) {
@@ -97,7 +149,6 @@ export function scanText(text: string): Finding[] {
       }
     }
   }
-
   return findings;
 }
 
@@ -109,36 +160,52 @@ export function isWarnOnly(text: string): boolean {
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const CLAUDE_MD_PATH = `${REPO_ROOT}/CLAUDE.md`;
+const README_PATH = `${REPO_ROOT}/README.md`;
 
 function main(): number {
-  const text = readFileSync(CLAUDE_MD_PATH, "utf8");
-  const findings = scanText(text);
+  const claudeText = readFileSync(CLAUDE_MD_PATH, "utf8");
+  const findings: { file: string; finding: Finding }[] = scanText(
+    claudeText,
+  ).map((finding) => ({ file: "CLAUDE.md", finding }));
 
-  if (isWarnOnly(text)) {
+  if (isWarnOnly(claudeText)) {
     console.error(
-      `[lint-claude-md] WARN: ${text.split("\n").length} lines is over the ` +
+      `[lint-claude-md] WARN: ${claudeText.split("\n").length} lines is over the ` +
         `${WARN_LINES}-line soft target (hard cap ${MAX_LINES}) — keep trimming.`,
     );
   }
 
+  // README.md is scanned when present, so the gate is a strict no-op in a repo
+  // without one (mirrors the lint-matrix existsSync guard).
+  if (existsSync(README_PATH)) {
+    const readmeText = readFileSync(README_PATH, "utf8");
+    findings.push(
+      ...scanReadme(readmeText).map((finding) => ({
+        file: "README.md",
+        finding,
+      })),
+    );
+  }
+
   if (findings.length === 0) {
-    console.log("[lint-claude-md] ok — CLAUDE.md within size + content limits");
+    console.log(
+      "[lint-claude-md] ok — CLAUDE.md + README.md within size + content limits",
+    );
     return 0;
   }
 
-  console.error(
-    `[lint-claude-md] ${findings.length} violation(s) in CLAUDE.md:`,
-  );
-  for (const f of findings) {
-    const where = f.line > 0 ? `:${f.line}` : "";
-    console.error(`  - CLAUDE.md${where} [${f.kind}] ${f.message}`);
+  console.error(`[lint-claude-md] ${findings.length} violation(s):`);
+  for (const { file, finding } of findings) {
+    const where = finding.line > 0 ? `:${finding.line}` : "";
+    console.error(`  - ${file}${where} [${finding.kind}] ${finding.message}`);
   }
   console.error(
-    "\nCLAUDE.md is the imperative-guardrail file, not a change log. Architecture\n" +
-      "and rationale prose — the how-it-works and the per-feature history —\n" +
-      "belong in README `## Architecture`. Relocate the offending lines there\n" +
-      "and keep CLAUDE.md to short, current rules (don't quote dates/versions/\n" +
-      "fn-ids even in examples; the scanner is zero-tolerance per line).",
+    "\nCLAUDE.md is the imperative-guardrail file and README.md is a lean front\n" +
+      "door — neither is a change log or a relocation target. Tighten or delete:\n" +
+      "consolidate into an existing rule, move a local contract into a code\n" +
+      "comment, or drop it — git history and the `.keeper/` specs archive all\n" +
+      "provenance (don't quote dates/versions/fn-ids even in examples; the\n" +
+      "scanner is zero-tolerance per line).",
   );
   return 1;
 }
