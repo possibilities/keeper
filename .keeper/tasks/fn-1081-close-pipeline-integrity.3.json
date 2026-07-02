@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T22:06:10.239000Z",
+  "depends_on": [
+    "fn-1081-close-pipeline-integrity.1"
+  ],
+  "epic": "fn-1081-close-pipeline-integrity",
+  "id": "fn-1081-close-pipeline-integrity.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Close claim exclusivity and dispatch lane",
+  "updated_at": "2026-07-02T22:06:10.239000Z"
+}
