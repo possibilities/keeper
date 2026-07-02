@@ -1,7 +1,7 @@
 ---
 name: docs-gap-scout
 description: Identify documentation that may need updates based on the planned changes.
-model: claude-sonnet-4-6
+model: opus
 disallowedTools: Edit, Write, Task
 effort: "medium"
 color: "#06B6D4"

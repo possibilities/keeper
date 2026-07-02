@@ -50,7 +50,7 @@ imperative guardrails only.
   `PreToolUse` JSON envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows + logs).
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook.** Keep imports to `node:*` + the
   dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit}.ts` helpers; never the plan plugin.
-- **A `~/docs` hook may spawn a bounded git subprocess** against the `~/docs` repo only — never a keeper-DB write, never `git fetch`/rebase/force-push.
+- **A `~/docs` hook may spawn a bounded git subprocess** — read-only probes (e.g. a `rev-parse` for sidecar provenance) against the session repo are fine; the hard line is NO mutating git or DB write outside the `~/docs` repo, and never `git fetch`/rebase/force-push even there.
 
 ## Migrations
 

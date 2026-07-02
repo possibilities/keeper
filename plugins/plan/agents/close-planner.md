@@ -201,7 +201,7 @@ keeper plan followup submit <EPIC_ID> --project "$PRIMARY_REPO" --file - <<'YAML
 YAML_EOF
 ```
 
-On a `{success: false, ...}` reject — the scaffold dry-run codes (`bad_yaml` / `spec_invalid` / `ref_invalid` / `dep_invalid` / `epic_dep_invalid` / `repo_invalid` / `repo_required` (a multi-repo source needs an explicit, in-set per-task `target_repo` — add one) / `tier_invalid` / `dep_cycle`) or `TASK_COUNT_MISMATCH` (plan task count != verdict's expected cluster count) — fix the named defect and resubmit. **Self-correction budget: 3 resubmits, shared with Phase 4's budget** (3 total typed-reject retries across both submits). On exhaustion, surface the last reject verbatim and stop. A `TASK_COUNT_MISMATCH` means your clustering and your verdict ordinals disagree — reconcile them, do not pad the plan with filler tasks.
+On a `{success: false, ...}` reject — the scaffold dry-run codes (`bad_yaml` / `spec_invalid` / `dep_invalid` / `epic_dep_invalid` / `repo_invalid` / `repo_required` (a multi-repo source needs an explicit, in-set per-task `target_repo` — add one) / `tier_invalid` / `model_invalid` / `dep_cycle` / `id_collision` / `duplicate_epic`) or `TASK_COUNT_MISMATCH` (plan task count != verdict's expected cluster count) — fix the named defect and resubmit. **Self-correction budget: 3 resubmits, shared with Phase 4's budget** (3 total typed-reject retries across both submits). On exhaustion, surface the last reject verbatim and stop. A `TASK_COUNT_MISMATCH` means your clustering and your verdict ordinals disagree — reconcile them, do not pad the plan with filler tasks.
 
 Capture `followup_ref` from the success envelope.
 

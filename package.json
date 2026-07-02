@@ -13,6 +13,7 @@
     "assert-comment-only": "bun scripts/assert-comment-only.ts",
     "lint:retired-name": "bash scripts/lint-retired-name.sh",
     "lint:claude-md": "bun scripts/lint-claude-md.ts",
+    "lint:skill-ids": "bun scripts/lint-skill-ids.ts",
     "typecheck": "tsc --noEmit",
     "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts test/dash-app.test.ts test/dash-shell.test.ts",
     "test": "bun scripts/test-gate.ts --timeout=10000 --path-ignore-patterns='plugins/**' --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts' --path-ignore-patterns='test/dash-app.test.ts' --path-ignore-patterns='test/dash-shell.test.ts' && bun run test:opentui",

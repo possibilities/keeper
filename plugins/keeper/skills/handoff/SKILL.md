@@ -22,12 +22,12 @@ argument-hint: --slug <slug> --prompt "<brief>" [--dir <path>] [--title "<t>"]
 Turn a "hand this off" / "create a handoff" request into a single
 `keeper handoff` Bash call. `keeper handoff` enqueues a contextful brief for a
 fresh `claude` worker; a keeperd worker opens a new window in your tmux session
-and boots it into the configured `handoff_prompt_prefix` (`/hack` on this
-machine) with your brief INLINE as its `/hack` REQUEST (no `keeper handoff show`
-round-trip). The handoff-ee runs the full `/hack` workflow — investigate first,
-and for work-shaped briefs park at `/hack`'s confirm beat with a concrete
+and boots it into the configured `handoff_prompt_prefix` (currently `/hack`)
+with your brief INLINE as that prefix's REQUEST (no `keeper handoff show`
+round-trip). The handoff-ee runs the full prefix workflow — investigate first,
+and for work-shaped briefs park at the prefix's confirm beat with a concrete
 proposal, awaiting a plain-text greenlight in that window before any code lands.
-A handoff SEEDS a `/hack` session; it does NOT run the work autonomously. The
+A handoff SEEDS a prefix session; it does NOT run the work autonomously. The
 enqueue is event-sourced and durable.
 
 Fire-and-forget describes YOUR posture, not the handoff-ee's: you fire the one
@@ -83,10 +83,10 @@ Assemble these from the conversation:
    what to investigate or build, plus the surrounding context it needs to start
    cold (paths, findings, constraints). This is the worker's whole world — be
    generous, but the brief is capped at 64KB (an over-cap brief is REJECTED,
-   never truncated). The brief is the handoff-ee's `/hack` REQUEST, so it deeply
+   never truncated). The brief is the handoff-ee's prefix REQUEST, so it deeply
    shapes what happens — but write it as a request, NOT an order: avoid "just do
-   it / land it / commit it" phrasing, which pushes the handoff-ee past `/hack`'s
-   confirm beat and back into executing blind. If you've already written it to a
+   it / land it / commit it" phrasing, which pushes the handoff-ee past the
+   prefix's confirm beat and back into executing blind. If you've already written it to a
    file, use `--prompt-file`.
 3. **A title** (`--title`) — a short human label for the handoff (optional but
    recommended; it surfaces on the board).
