@@ -212,11 +212,14 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         transcript_path, resume_target, message,
                                         message_found, elapsed_seconds, outcome};
                                         outcome ∈ completed|no_message (exit 0) /
-                                        timed_out|no_transcript (4) / launch_failed
-                                        (1) / bad_args (2). codex's resume_target is
-                                        discovered from its rollout file post-stop;
-                                        claude/pi's from the session id pinned at
-                                        launch.
+                                        timed_out|no_transcript|transcript_ambiguous
+                                        (4) / launch_failed (1) / bad_args (2).
+                                        codex's resume_target is discovered from its
+                                        rollout file post-stop; claude/pi's from the
+                                        session id pinned at launch. transcript_
+                                        ambiguous means a concurrent same-cwd codex
+                                        session collided and the leg refused to guess
+                                        a foreign transcript.
   keeper agent wait <handle> [--stop-timeout-ms <ms>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with

@@ -592,10 +592,10 @@ describe("pinned transcript resolution (decoy collision)", () => {
       sessionId: PARTNER,
       pathTimeoutMs: 200,
     });
-    expect(resolved).toBe(partnerPath);
+    expect(resolved).toEqual({ ok: true, path: partnerPath });
   });
 
-  test("strict mode returns null (not the decoy) when the pinned file is absent", async () => {
+  test("strict mode times out (not the decoy) when the pinned file is absent", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
     // Only the decoy exists; the pinned partner file is absent.
@@ -612,7 +612,163 @@ describe("pinned transcript resolution (decoy collision)", () => {
       sessionId: PARTNER,
       pathTimeoutMs: 200,
     });
-    expect(resolved).toBeNull();
+    expect(resolved).toEqual({ ok: false, reason: "timeout" });
+  });
+});
+
+describe("codex transcript attribution (concurrent-session collision)", () => {
+  const LEG_ID = "019eec40-1111-7142-9363-5c1535537ee6";
+  const CONCURRENT_ID = "019eec41-2222-7163-afa1-7facaaf72122";
+  const SECOND_LEG_ID = "019eec42-3333-7163-afa1-7facaaf72133";
+
+  /**
+   * Fabricate a codex rollout with independently-controlled attribution signals:
+   * `createdAtMs` (its `session_meta` timestamp — the creation instant the fix
+   * keys on) and `mtimeMs` (its filesystem mtime — a concurrent session's keeps
+   * advancing past launch). The filename embeds `id` for the resume-target parse.
+   */
+  function writeCodexRollout(
+    home: string,
+    opts: {
+      id: string;
+      cwd: string;
+      createdAtMs: number;
+      mtimeMs: number;
+    },
+  ): string {
+    const created = new Date(opts.createdAtMs);
+    const year = String(created.getFullYear());
+    const month = String(created.getMonth() + 1).padStart(2, "0");
+    const day = String(created.getDate()).padStart(2, "0");
+    const dir = join(home, ".codex", "sessions", year, month, day);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `rollout-2026-07-01T22-48-06-${opts.id}.jsonl`);
+    writeFileSync(
+      path,
+      `${JSON.stringify({
+        timestamp: created.toISOString(),
+        type: "session_meta",
+        payload: { id: opts.id, cwd: opts.cwd },
+      })}\n${JSON.stringify({
+        timestamp: new Date(opts.mtimeMs).toISOString(),
+        type: "event_msg",
+        payload: { type: "task_complete", last_agent_message: "answer" },
+      })}\n`,
+    );
+    const seconds = opts.mtimeMs / 1000;
+    utimesSync(path, seconds, seconds);
+    return path;
+  }
+
+  test("finds the leg's own rollout beside a fresher pre-launch concurrent session", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const launchMs = Date.parse("2026-07-01T22:48:02Z");
+    // A concurrent human session created 2.3 min BEFORE launch, still being
+    // written (mtime advances past launch) — the exact wrong-file trap.
+    writeCodexRollout(home, {
+      id: CONCURRENT_ID,
+      cwd,
+      createdAtMs: launchMs - 136_000,
+      mtimeMs: launchMs + 30_000,
+    });
+    // The leg's own rollout, created just after launch.
+    const legPath = writeCodexRollout(home, {
+      id: LEG_ID,
+      cwd,
+      createdAtMs: launchMs + 4_000,
+      mtimeMs: launchMs + 20_000,
+    });
+
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd,
+      env: { CODEX_HOME: join(home, ".codex") },
+      homeDir: home,
+      startedAtMs: launchMs,
+      sessionId: null,
+      pathTimeoutMs: 200,
+    });
+    expect(resolved).toEqual({ ok: true, path: legPath });
+  });
+
+  test("two post-launch same-cwd rollouts collide → ambiguous, never a guess", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const launchMs = Date.parse("2026-07-01T22:48:02Z");
+    writeCodexRollout(home, {
+      id: LEG_ID,
+      cwd,
+      createdAtMs: launchMs + 2_000,
+      mtimeMs: launchMs + 10_000,
+    });
+    writeCodexRollout(home, {
+      id: SECOND_LEG_ID,
+      cwd,
+      createdAtMs: launchMs + 5_000,
+      mtimeMs: launchMs + 20_000,
+    });
+
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd,
+      env: { CODEX_HOME: join(home, ".codex") },
+      homeDir: home,
+      startedAtMs: launchMs,
+      sessionId: null,
+      pathTimeoutMs: 200,
+    });
+    expect(resolved).toEqual({ ok: false, reason: "ambiguous" });
+  });
+
+  test("only a pre-launch concurrent rollout exists → times out, never attaches", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const launchMs = Date.parse("2026-07-01T22:48:02Z");
+    // A same-cwd session created before launch, mtime still advancing — must NOT
+    // be attributed to the leg; the leg's own file simply never appeared.
+    writeCodexRollout(home, {
+      id: CONCURRENT_ID,
+      cwd,
+      createdAtMs: launchMs - 136_000,
+      mtimeMs: launchMs + 30_000,
+    });
+
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd,
+      env: { CODEX_HOME: join(home, ".codex") },
+      homeDir: home,
+      startedAtMs: launchMs,
+      sessionId: null,
+      pathTimeoutMs: 60,
+      pollIntervalMs: 20,
+    });
+    expect(resolved).toEqual({ ok: false, reason: "timeout" });
+  });
+
+  test("a same-instant rollout in a DIFFERENT cwd is not the leg's → times out", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const launchMs = Date.parse("2026-07-01T22:48:02Z");
+    writeCodexRollout(home, {
+      id: CONCURRENT_ID,
+      cwd: "/fake-home/code/other",
+      createdAtMs: launchMs + 3_000,
+      mtimeMs: launchMs + 10_000,
+    });
+
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd,
+      env: { CODEX_HOME: join(home, ".codex") },
+      homeDir: home,
+      startedAtMs: launchMs,
+      sessionId: null,
+      pathTimeoutMs: 60,
+      pollIntervalMs: 20,
+    });
+    expect(resolved).toEqual({ ok: false, reason: "timeout" });
   });
 });
 

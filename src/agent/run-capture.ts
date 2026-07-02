@@ -35,14 +35,18 @@ export const RUN_CAPTURE_SCHEMA_VERSION = 1;
 /**
  * The closed set of terminal outcomes. Each maps to a process exit code via
  * {@link runCaptureExitCode}: completed/no_message succeed (0), timed_out/
- * no_transcript are retryable (4), launch_failed is internal (1), bad_args is a
- * malformed invocation (2).
+ * no_transcript/transcript_ambiguous are retryable (4), launch_failed is internal
+ * (1), bad_args is a malformed invocation (2). `transcript_ambiguous` is distinct
+ * from `no_transcript`: the transcript did NOT simply fail to appear — a codex
+ * leg found more than one same-cwd rollout it could not attribute to itself (a
+ * concurrent session collided), so it refuses to guess a foreign answer.
  */
 export type RunCaptureOutcome =
   | "completed"
   | "no_message"
   | "timed_out"
   | "no_transcript"
+  | "transcript_ambiguous"
   | "launch_failed"
   | "bad_args";
 
@@ -70,6 +74,7 @@ const OUTCOME_EXIT_CODE: Record<RunCaptureOutcome, number> = {
   no_message: 0,
   timed_out: 4,
   no_transcript: 4,
+  transcript_ambiguous: 4,
   launch_failed: 1,
   bad_args: 2,
 };
@@ -460,11 +465,15 @@ export async function captureFromHandle(
   if (!wait.ok) {
     // The wait did not reach a stop. Probe the transcript: if it resolves, the
     // stop simply never came before the deadline (timed_out, partial captured);
-    // if it does not, the path never appeared (no_transcript).
+    // if it does not, either a concurrent same-cwd session made attribution
+    // ambiguous (transcript_ambiguous — refuse to guess a foreign answer) or the
+    // path never appeared (no_transcript).
     const show = await deps.showLastMessage(handle, verbDeps);
     if (!show.ok) {
+      const ambiguous =
+        show.reason === "ambiguous" || wait.reason === "ambiguous";
       return buildRunCaptureEnvelope({
-        outcome: "no_transcript",
+        outcome: ambiguous ? "transcript_ambiguous" : "no_transcript",
         agent,
         handle: handleId,
         resumeTarget: baseResume,
