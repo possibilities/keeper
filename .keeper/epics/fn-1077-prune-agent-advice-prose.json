@@ -8,7 +8,7 @@
     "fn-1075-autopilot-telemetry-and-machine"
   ],
   "id": "fn-1077-prune-agent-advice-prose",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-02T16:20:18.985000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T16:18:18.418000Z"
+  "updated_at": "2026-07-02T16:20:18.985000Z"
 }
