@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T22:08:37.224000Z",
+  "depends_on_epics": [],
+  "id": "fn-1084-planning-guidance-from-retro",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Planning guidance from retro",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T22:08:37.224000Z"
+}

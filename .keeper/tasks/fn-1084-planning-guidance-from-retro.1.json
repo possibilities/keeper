@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T22:08:37.224000Z",
+  "depends_on": [],
+  "epic": "fn-1084-planning-guidance-from-retro",
+  "id": "fn-1084-planning-guidance-from-retro.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Retro guidance editorial pass",
+  "updated_at": "2026-07-02T22:08:37.224000Z"
+}
