@@ -92,6 +92,18 @@ export const ENVELOPE_SCHEMA_VERSION = 1;
 const IDLE_THRESHOLD_S = 15 * 60;
 
 /**
+ * Freshness floor: force a genuine scrape when the last SUCCESSFUL scrape is older
+ * than this, bypassing BOTH the cooldown (rate-limit park) and idle skip gates. A
+ * parked/idle account otherwise coasts on carried-forward usage until its derived
+ * `lift_at` — so a provider-side quota reset that lands EARLIER than the predicted
+ * lift stays invisible for days. The floor caps that blind window: every account is
+ * re-read at least once per interval no matter its park/idle state. Anchored on
+ * `last_successful_fetch_at` (the last real look), which every skip carries forward,
+ * so it measures time-since-actual-scrape — not reset by parked/idle heartbeats.
+ */
+const FORCED_SCRAPE_FLOOR_S = 15 * 60;
+
+/**
  * Sub-cadence cap on the NO-SCRAPE sleeps (cooldown, idle, restart-delay): a
  * parked account re-resolves its tier→multiplier within ~one poll instead of
  * staying frozen until a multi-day cooldown lifts. ONLY the no-scrape sleeps are
@@ -654,6 +666,27 @@ function priorNum(prior: Record<string, unknown>, key: string): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/**
+ * The freshness-floor bypass ({@link FORCED_SCRAPE_FLOOR_S}): true when the last
+ * SUCCESSFUL scrape is STRICTLY older than the floor — or absent/unparseable (never
+ * scraped, so force one). Strict `>` so an exactly-at-the-floor prior still parks;
+ * the ~60s poll cadence makes `>` vs `>=` immaterial in production. Pure over `now`.
+ */
+export function forcedScrapeDue(
+  prior: Record<string, unknown>,
+  now: Date,
+): boolean {
+  const last = priorStr(prior, "last_successful_fetch_at");
+  if (last === null) {
+    return true;
+  }
+  const lastMs = new Date(last).getTime();
+  if (Number.isNaN(lastMs)) {
+    return true;
+  }
+  return (now.getTime() - lastMs) / 1000 > FORCED_SCRAPE_FLOOR_S;
+}
+
 /** Read the prior `usage` sub-object, else null. */
 function priorUsage(prior: Record<string, unknown>): ScrapeUsage | null {
   return isRecord(prior.usage) ? (prior.usage as ScrapeUsage) : null;
@@ -890,12 +923,20 @@ export class AccountLoop {
     // gates and forces a scrape so the corrected tier reaches the envelope at once.
     // Compare against the on-disk prior, NOT acct's pre-resolve value: boot already
     // corrects `acct.multiplier`, so an in-memory before/after compare never fires.
+    // The freshness floor ({@link forcedScrapeDue}) is a THIRD bypass: a parked/idle
+    // account still gets a real scrape once its last success ages past the floor, so
+    // a provider-side quota reset before the derived `lift_at` is caught within one
+    // floor window instead of coasting on stale usage until the predicted lift.
     if (existsSync(path)) {
       const prior = loadEnvelope(path);
       const priorMult = priorNum(prior, "multiplier");
       const multiplierChanged =
         priorMult !== null && priorMult !== acct.multiplier;
-      if (!multiplierChanged && prior.status !== "stale") {
+      if (
+        !multiplierChanged &&
+        !forcedScrapeDue(prior, now) &&
+        prior.status !== "stale"
+      ) {
         const cooldown = this.maybeCooldownSkip(prior, now);
         if (cooldown !== null) {
           return cooldown;

@@ -37,6 +37,7 @@ import {
   buildEnvelope,
   deriveLiftAt,
   type Envelope,
+  forcedScrapeDue,
   isUsageId,
   type LoopClock,
   liftIsInFuture,
@@ -149,6 +150,39 @@ describe("liftIsInFuture", () => {
     expect(liftIsInFuture("2026-06-24T13:00:00", now)).toBe(false); // naive
     expect(liftIsInFuture("not-a-date", now)).toBe(false);
     expect(liftIsInFuture(123, now)).toBe(false);
+  });
+});
+
+describe("forcedScrapeDue", () => {
+  const now = new Date("2026-06-24T12:00:00-04:00"); // floor is 15m
+  test("true past the floor (or absent/garbage), false within — strict at the edge", () => {
+    // Older than 15m → force a scrape.
+    expect(
+      forcedScrapeDue(
+        { last_successful_fetch_at: "2026-06-24T11:40:00-04:00" },
+        now,
+      ),
+    ).toBe(true); // 20m
+    // Within 15m → let the park/idle gate decide.
+    expect(
+      forcedScrapeDue(
+        { last_successful_fetch_at: "2026-06-24T11:50:00-04:00" },
+        now,
+      ),
+    ).toBe(false); // 10m
+    // Exactly at the floor is NOT past it (strict `>`).
+    expect(
+      forcedScrapeDue(
+        { last_successful_fetch_at: "2026-06-24T11:45:00-04:00" },
+        now,
+      ),
+    ).toBe(false); // exactly 15m
+    // Never scraped / unparseable / missing → force.
+    expect(forcedScrapeDue({ last_successful_fetch_at: null }, now)).toBe(true);
+    expect(forcedScrapeDue({ last_successful_fetch_at: "garbage" }, now)).toBe(
+      true,
+    );
+    expect(forcedScrapeDue({}, now)).toBe(true);
   });
 });
 
@@ -555,7 +589,7 @@ describe("AccountLoop idle gate", () => {
           account_state: null,
           usage: { session: { percent_used: 4, resets_at: null } },
           lift_at: null,
-          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_successful_fetch_at: "2026-06-24T11:50:00-04:00",
           last_skipped_fetch_at: null,
           last_failed_fetch_at: null,
           next_fetch_at: "2026-06-24T11:02:00-04:00",
@@ -666,7 +700,7 @@ describe("AccountLoop cooldown gate", () => {
             },
           },
           lift_at: "2026-06-24T13:00:00-04:00",
-          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_successful_fetch_at: "2026-06-24T11:50:00-04:00",
           last_skipped_fetch_at: null,
           last_failed_fetch_at: null,
           next_fetch_at: "2026-06-24T11:02:00-04:00",
@@ -754,6 +788,97 @@ describe("AccountLoop cooldown gate", () => {
   });
 });
 
+describe("AccountLoop freshness floor", () => {
+  // A prior parked at a future lift AND idle — both skip gates would normally hold.
+  // Only the last SUCCESSFUL scrape's age decides whether the floor forces a scrape.
+  function writeParkedPrior(lastSuccess: string): void {
+    const acct: Account = {
+      id: "default",
+      target: "claude",
+      profile: "default",
+      multiplier: 5,
+    };
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
+    writeFileSync(
+      join(tmpDir, "default.json"),
+      JSON.stringify(
+        buildEnvelope(acct, {
+          status: "idle",
+          subscription_active: true,
+          account_state: null,
+          usage: {
+            session: {
+              percent_used: 100,
+              resets_at: "2026-06-25T00:00:00-04:00",
+            },
+          },
+          lift_at: "2026-06-25T00:00:00-04:00", // a day out → cooldown would park
+          last_successful_fetch_at: lastSuccess,
+          last_skipped_fetch_at: null,
+          last_failed_fetch_at: null,
+          next_fetch_at: "2026-06-24T11:31:00-04:00",
+          error: null,
+        }),
+        null,
+        2,
+      ),
+    );
+  }
+
+  test("a parked+idle profile past the 15m floor scrapes despite a future lift_at", async () => {
+    writeParkedPrior("2026-06-24T11:40:00-04:00"); // 20m before the clock → past floor
+    const calls: ScrapeAccount[] = [];
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      latestActivity: () => 0, // idle too — the floor must bypass BOTH gates
+      runScrape: stubRunner(
+        {
+          kind: "ok",
+          no_subscription: false,
+          usage: {},
+          subscription_active: true,
+        },
+        calls,
+      ),
+    });
+    await new AccountLoop(
+      { id: "default", target: "claude", profile: "default", multiplier: 5 },
+      deps,
+    ).runCycleNoThrow();
+    // The floor forced a real scrape past the cooldown + idle gates: a provider-side
+    // reset before the derived lift is caught here instead of days later.
+    expect(calls).toHaveLength(1);
+    expect(readEnvelope(tmpDir, "default").status).toBe("active");
+  });
+
+  test("a parked profile still WITHIN the 15m floor keeps parking (no scrape)", async () => {
+    writeParkedPrior("2026-06-24T11:50:00-04:00"); // 10m before the clock → within floor
+    const calls: ScrapeAccount[] = [];
+    const deps = makeDeps({
+      stateDir: tmpDir,
+      clock: fixedClock("2026-06-24T12:00:00-04:00"),
+      latestActivity: () =>
+        new Date("2026-06-24T12:00:00-04:00").getTime() / 1000,
+      runScrape: stubRunner(
+        {
+          kind: "ok",
+          no_subscription: false,
+          usage: {},
+          subscription_active: true,
+        },
+        calls,
+      ),
+    });
+    await new AccountLoop(
+      { id: "default", target: "claude", profile: "default", multiplier: 5 },
+      deps,
+    ).runCycleNoThrow();
+    expect(calls).toHaveLength(0); // within the floor → cooldown park still applies
+    expect(readEnvelope(tmpDir, "default").status).toBe("idle");
+  });
+});
+
 describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
   // A prior envelope at `mult`, parked with a future lift_at so the cooldown gate
   // would normally park the account until the lift.
@@ -773,7 +898,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
           account_state: null,
           usage: { session: { percent_used: 100, resets_at: lift } },
           lift_at: lift,
-          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_successful_fetch_at: "2026-06-24T11:50:00-04:00",
           last_skipped_fetch_at: null,
           last_failed_fetch_at: null,
           next_fetch_at: "2026-06-24T11:02:00-04:00",
@@ -953,7 +1078,7 @@ describe("AccountLoop multiplier sub-cadence (parked re-resolve)", () => {
             },
           },
           lift_at: "2026-06-25T00:00:00-04:00",
-          last_successful_fetch_at: "2026-06-24T11:00:00-04:00",
+          last_successful_fetch_at: "2026-06-24T11:50:00-04:00",
           last_skipped_fetch_at: "2026-06-24T11:30:00-04:00",
           last_failed_fetch_at: null,
           next_fetch_at: "2026-06-24T11:31:00-04:00",
