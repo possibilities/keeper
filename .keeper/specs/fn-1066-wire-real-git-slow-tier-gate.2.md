@@ -32,5 +32,5 @@ Simulate a clean checkout by temporarily moving workers/ aside and running the g
 - [ ] test-full.ts env scrub untouched
 
 ## Done summary
-
+promote.sh now runs the real-git slow tier by default and hard-blocks promotion on any failure; --skip-slow is a loud emergency bypass. consistency-generated-guard.test.ts skips its two workers/-enumerating tests when the gitignored cells are absent so a clean checkout fails soft.
 ## Evidence
