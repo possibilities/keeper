@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T16:19:28.546000Z",
+  "depends_on_epics": [
+    "fn-1077-prune-agent-advice-prose"
+  ],
+  "id": "fn-1078-capable-model-era-capabilities",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Capable-model era capabilities",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T16:19:28.546000Z"
+}
