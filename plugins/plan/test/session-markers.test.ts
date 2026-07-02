@@ -24,6 +24,7 @@ import { join } from "node:path";
 
 import {
   type CliResult,
+  parseCliOutput,
   runCli,
   scaffoldEpic,
   seedRuntime,
@@ -330,5 +331,94 @@ describe("worker resume marker", () => {
     expect(r.code).toBe(0);
     expect(markerPresent(proj.home)).toBe(true);
     expect(readMarker(proj.home).task_id).toBe(taskId);
+  });
+});
+
+// close-preflight's claim step asserts exclusivity across sessions: the first
+// claimant holds the epic, a second concurrent one fails loud with a typed
+// CLOSE_ALREADY_CLAIMED. Two distinct session ids under ONE home make the rival
+// marker observable.
+describe("close-claim exclusivity (fail-loud loser)", () => {
+  const getProj = withProject("keeper-plan-close-claim-");
+
+  const SID_A = "close-session-a";
+  const SID_B = "close-session-b";
+
+  function preflight(proj: Proj, epicId: string, sid: string): CliResult {
+    return runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: sid },
+    });
+  }
+
+  function markerFor(home: string, sid: string): string {
+    return join(home, ".local", "state", "keeper", "sessions", `${sid}.json`);
+  }
+
+  // A single-task epic with its task done — ready to close.
+  function readyEpic(proj: Proj, title: string): string {
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title, nTasks: 1, env: { CLAUDE_CODE_SESSION_ID: SID_A } },
+    );
+    for (const tid of taskIds) {
+      seedRuntime(proj.root, tid, { status: "done" });
+    }
+    return epicId;
+  }
+
+  test("a second concurrent close claim fails loud; the first is unaffected", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Exclusive close epic");
+
+    // Session A claims first — succeeds and holds the marker.
+    const a = preflight(proj, epicId, SID_A);
+    expect(a.code).toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+
+    // Session B races the same epic — loses, fails loud with the typed
+    // CLOSE_ALREADY_CLAIMED error, and leaves no marker of its own.
+    const b = preflight(proj, epicId, SID_B);
+    expect(b.code).not.toBe(0);
+    const env = parseCliOutput(b.output);
+    expect(env.success).toBe(false);
+    const error = env.error as {
+      code: string;
+      details?: Record<string, unknown>;
+    };
+    expect(error.code).toBe("CLOSE_ALREADY_CLAIMED");
+    expect(error.details?.held_by_session).toBe(SID_A);
+    expect(existsSync(markerFor(proj.home, SID_B))).toBe(false);
+
+    // A's claim survives B's failed attempt.
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+  });
+
+  test("the same session re-running preflight re-claims its own epic (no self-block)", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Self reclaim epic");
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    // A second preflight from the SAME session must not treat its own marker as
+    // a rival — it re-claims cleanly.
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+  });
+
+  test("a finalize error releases the claim (so a re-close is never jammed)", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Finalize error release epic");
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+    // Finalize with no verdict/report submitted -> a typed error, which MUST
+    // release the claim: a leaked marker would jam every re-run's preflight with
+    // CLOSE_ALREADY_CLAIMED.
+    const fin = runCli(["close-finalize", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: SID_A },
+    });
+    expect(fin.code).not.toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(false);
   });
 });

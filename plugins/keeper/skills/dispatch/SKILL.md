@@ -163,25 +163,38 @@ override)` line when any of:
 
 - **a pending dispatch** for the key is already in flight, or
 - **autopilot is unpaused** — `autopilot is unpaused — it may dispatch this
-  key itself; pause it or pass --force`, or
-- **a live job** for the key already occupies a slot.
+  key itself; pause it first`, or
+- **a running worker** occupies the slot — `a live worker for <key> is running
+  (job state=working); let it finish`, or
+- **a stopped worker** still holds the slot — `a stopped worker for <key> still
+  holds the slot (job state=stopped); warm-resume its session over the bus, or
+  reclaim the dead pane`.
 
-The unpaused-autopilot refusal is the most likely one. **Surface the refusal
-to the user and ASK how to proceed — never auto-pause and never pass `--force`
-on your own.** Offer the two options:
+Every refusal names the right-path recovery BEFORE `--force`. **Surface the
+refusal to the user and ASK how to proceed — never auto-pause, never
+warm-resume, and never pass `--force` on your own.** Match the recovery to the
+reason:
 
-1. Pause the autopilot first (via **`keeper:autopilot`**), then re-run the
-   dispatch — the clean path when you want the autopilot out of the way.
-2. Pass `--force` to skip the guard for this one launch — only when the user
-   explicitly confirms it. `--force` is human-gated; it is never a skill
-   default.
+1. **Unpaused autopilot** (the most likely one) → pause it first (via
+   **`keeper:autopilot`**), then re-run — the clean path when you want the
+   autopilot out of the way.
+2. **A stopped worker** → warm-resume its session over the bus (**`keeper:bus`**)
+   if it is still live, or reclaim the dead pane; only then consider `--force`.
+3. **`--force`** → skip the guard for this one launch — only when the user
+   explicitly confirms it. It is human-gated; never a skill default.
+
+**Boot-window duplicate (accepted).** A manual `close::` spawned while a
+reconciler closer is still booting can both start — the CLI has no sanctioned
+pre-announce write path, so this narrow race costs one wasted boot. It is
+harmless: the close-preflight claim step fails the second closer loud with a
+typed `CLOSE_ALREADY_CLAIMED`, and `close-finalize` is idempotent.
 
 ## Exit taxonomy
 
 | Exit | Meaning | Your action |
 |---|---|---|
 | 0 | Dispatched (or `--dry-run` previewed). | Surface the `dispatched …` line. |
-| 1 | Resolution / launch failure (`die`). | Read the `dispatch: …` message. **Distinguish:** an unknown-id / not-on-board failure (`no epic '…' in the board`, `no task '…' under epic '…'`, empty-cwd) means the target is wrong — re-check the id. A `cwd-missing: <path>` failure means the resolved repo dir no longer exists on disk (typically a renamed-away repo) — fix with `keeper plan mv-repo <old> <new>` (rewrites the board's `primary_repo` / `target_repo` / `touched_repos`), then re-dispatch. A daemon-unreachable failure (`cannot reach daemon to resolve cwd (…)`) means keeperd is down — surface that. The race-guard refusal is also exit 1 — handle it via Step 3's surface-and-ask. |
+| 1 | Resolution / launch failure (`die`). | Read the `dispatch: …` message. **Distinguish:** an unknown-id / not-on-board failure (`no epic '…' in the board`, `no task '…' under epic '…'`, empty-cwd) means the target is wrong — re-check the id. A `cwd-missing: <path>` failure means the resolved repo dir no longer exists on disk (typically a renamed-away repo) — fix with `keeper plan mv-repo <old> <new>` (rewrites the board's `primary_repo` / `target_repo` / `touched_repos`), then re-dispatch. A daemon-unreachable failure (`cannot reach daemon to resolve cwd (…)`) means keeperd is down — surface that. The race-guard refusal is also exit 1 (including a `stopped worker … warm-resume … or reclaim` occupancy refusal) — handle it via Step 3's surface-and-ask. |
 | 2 | Arg fault. | Mode misuse (both forms, or neither), a malformed `<verb>::<id>` key, or the prompt cap (NUL byte / over 96 KB) — for a large prompt, route it to `--prompt-file`. |
 
 ## Examples
@@ -205,7 +218,10 @@ on your own.** Offer the two options:
 
 1. `keeper status --json` → the `fn-871-…-skills` epic is on
    `data.board.epics[]`, `status != "done"`. Proceed.
-2. `keeper dispatch close::fn-871-…-skills` (race-guard handling as above).
+2. `keeper dispatch close::fn-871-…-skills` (race-guard handling as above). For a
+   worktree epic this runs the closer IN the epic lane (`keeper/epic/<id>`); when
+   no lane worktree is registered it prints `dispatch: no epic lane worktree for
+   '<epic>'; launching close in <dir>` and runs in the main checkout.
 
 ### Run a one-off prompt (free form)
 
@@ -226,6 +242,8 @@ on your own.** Offer the two options:
 
 ## Guardrails
 
-- **Surface-and-ask on the race guard.** The skill never auto-pauses and never
-  self-arms `--force` — it surfaces the refusal verbatim and asks (pause via
-  `keeper:autopilot` then retry, or `--force` on explicit confirmation).
+- **Surface-and-ask on the race guard.** The skill never auto-pauses,
+  auto-resumes, or self-arms `--force` — it surfaces the refusal verbatim and
+  asks, matching the recovery to the reason (pause via `keeper:autopilot`,
+  warm-resume a stopped worker via `keeper:bus`, or `--force` on explicit
+  confirmation).

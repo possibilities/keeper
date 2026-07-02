@@ -365,12 +365,55 @@ describe("cli/dispatch resolvePlanCwd", () => {
     expect(res).toEqual({ ok: true, cwd: "/epic/dir" });
   });
 
-  test("close: resolves the epic project_dir", async () => {
+  test("close: runs in the epic lane worktree when one is registered", async () => {
     const q = stubQuery({
       epics: [{ epic_id: "fn-1-foo", project_dir: "/epic/dir", tasks: [] }],
     });
-    const res = await resolvePlanCwd(q, "close", "fn-1-foo", () => true);
-    expect(res).toEqual({ ok: true, cwd: "/epic/dir" });
+    const res = await resolvePlanCwd(
+      q,
+      "close",
+      "fn-1-foo",
+      () => true,
+      () => Promise.resolve("/epic/dir/.worktrees/fn-1-foo"),
+    );
+    expect(res).toEqual({ ok: true, cwd: "/epic/dir/.worktrees/fn-1-foo" });
+  });
+
+  test("close: no lane worktree → falls back to project_dir with a warning", async () => {
+    const q = stubQuery({
+      epics: [{ epic_id: "fn-1-foo", project_dir: "/epic/dir", tasks: [] }],
+    });
+    const res = await resolvePlanCwd(
+      q,
+      "close",
+      "fn-1-foo",
+      () => true,
+      () => Promise.resolve(null),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.cwd).toBe("/epic/dir");
+      expect(res.warning).toContain("no epic lane worktree for 'fn-1-foo'");
+    }
+  });
+
+  test("close: lane resolved but missing on disk → falls back to project_dir with a warning", async () => {
+    const q = stubQuery({
+      epics: [{ epic_id: "fn-1-foo", project_dir: "/epic/dir", tasks: [] }],
+    });
+    // Lane path resolves but does not exist; project_dir does.
+    const res = await resolvePlanCwd(
+      q,
+      "close",
+      "fn-1-foo",
+      (d) => d === "/epic/dir",
+      () => Promise.resolve("/epic/dir/.worktrees/gone"),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.cwd).toBe("/epic/dir");
+      expect(res.warning).toContain("no epic lane worktree");
+    }
   });
 
   test("work: resolved cwd missing on disk → cwd-missing miss (not a silent launch)", async () => {
@@ -456,19 +499,38 @@ describe("cli/dispatch checkRaceGuard", () => {
     expect(tripped).toContain("pending_dispatches");
   });
 
-  test("autopilot unpaused (paused=0) → refuses, naming autopilot", async () => {
+  test("autopilot unpaused (paused=0) → refuses, pause-first before the --force suffix", async () => {
     const q = stubQuery({ autopilot_state: [{ id: 1, paused: 0 }] });
     const tripped = await checkRaceGuard(q, "work", "fn-1-x.2");
-    expect(tripped).toContain("autopilot");
+    expect(tripped).toContain("autopilot is unpaused");
+    expect(tripped).toContain("pause it first");
+    // --force is the caller's suffix, never inside the reason itself.
+    expect(tripped).not.toContain("--force");
   });
 
-  test("live working job for the key → refuses, naming the live job", async () => {
+  test("working job for the key → refuses, naming the running worker", async () => {
     const q = stubQuery({
       autopilot_state: paused,
       jobs: [{ plan_verb: "work", plan_ref: "fn-1-x.2", state: "working" }],
     });
     const tripped = await checkRaceGuard(q, "work", "fn-1-x.2");
-    expect(tripped).toContain("live job");
+    expect(tripped).toContain("a live worker for work::fn-1-x.2 is running");
+    expect(tripped).toContain("let it finish");
+  });
+
+  test("stopped job for the key → refuses, naming warm-resume + reclaim before --force", async () => {
+    const q = stubQuery({
+      autopilot_state: paused,
+      jobs: [{ plan_verb: "close", plan_ref: "fn-1-x", state: "stopped" }],
+    });
+    const tripped = await checkRaceGuard(q, "close", "fn-1-x");
+    expect(tripped).toContain(
+      "a stopped worker for close::fn-1-x still holds the slot",
+    );
+    expect(tripped).toContain("warm-resume");
+    expect(tripped).toContain("reclaim");
+    // Recovery is named ahead of --force; the caller owns the --force suffix.
+    expect(tripped).not.toContain("--force");
   });
 
   test("a working job for a DIFFERENT key does not trip the guard", async () => {
@@ -563,6 +625,10 @@ async function runMain(
     launch?: LaunchFn;
     promptPrefix?: string;
     dirExists?: (dir: string) => boolean;
+    resolveLaneDir?: (
+      projectDir: string,
+      epicId: string,
+    ) => Promise<string | null>;
   },
 ): Promise<MainRun> {
   const out: string[] = [];
@@ -945,6 +1011,50 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("cwd-missing: /renamed-away");
     expect(launch.calls).toEqual([]);
+  });
+
+  test("plan-form close:: runs the closer in the epic lane dir (dry-run)", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [{ epic_id: "fn-2-y", project_dir: "/epic/dir", tasks: [] }]
+          : [],
+      );
+    const r = await runMain(
+      ["close::fn-2-y", "--session", "scratch", "--force", "--dry-run"],
+      {
+        query,
+        launch: launch.fn,
+        dirExists: () => true,
+        resolveLaneDir: () => Promise.resolve("/epic/dir/.worktrees/fn-2-y"),
+      },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("/epic/dir/.worktrees/fn-2-y");
+    expect(r.stdout).toContain("key:         close::fn-2-y");
+  });
+
+  test("plan-form close:: with no lane warns and runs in project_dir (dry-run)", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [{ epic_id: "fn-2-y", project_dir: "/epic/dir", tasks: [] }]
+          : [],
+      );
+    const r = await runMain(
+      ["close::fn-2-y", "--session", "scratch", "--force", "--dry-run"],
+      {
+        query,
+        launch: launch.fn,
+        dirExists: () => true,
+        resolveLaneDir: () => Promise.resolve(null),
+      },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("cwd:         /epic/dir");
+    expect(r.stderr).toContain("no epic lane worktree for 'fn-2-y'");
   });
 });
 
