@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-02T14:12:35.205000Z",
   "created_at": "2026-07-02T09:14:35.347000Z",
   "depends_on_epics": [
     "fn-1069-pure-verdict-core-and-classifier"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-02T09:15:26.557000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Bounded papercut sweep",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T09:15:26.557000Z"
+  "updated_at": "2026-07-02T14:12:35.205000Z"
 }
