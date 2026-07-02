@@ -42,5 +42,5 @@ carries its content. Verify quoted CLI shapes against the live commands post-env
 - [ ] No keeper skill hand-parses a keeper plan read; orient sites carry the pointer marker
 
 ## Done summary
-
+Pruned redundant prose from the six keeper operator skills: collapsed await's three warning triplets and dropped 4 of 7 examples (421→301), repointed await/dispatch pre-checks off keeper plan show onto keeper query tasks / status --json, consolidated autopilot capture/restore + --watch to one statement each, and collapsed the duplicated What-NOT/Guardrails bookends across all six. Sacred contracts (failure taxonomy, envelope shapes, race-guard surface-and-ask, capture-restore, anti-spoof doctrine, pair BACKSTOP) verbatim-intact; bus untouched.
 ## Evidence
