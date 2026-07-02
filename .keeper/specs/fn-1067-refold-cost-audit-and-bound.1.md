@@ -33,5 +33,5 @@ The script is measurement tooling, not production surface — a smoke unit test 
 - [ ] Numbers recorded in Evidence with the exact re-run command
 
 ## Done summary
-
+Fixed the stale planctl_* fold SELECT (now plan_*/worktree) so serve-fold-load runs green on a current-schema copy, and added --replay-from-zero: wipes only the deterministic-replayed class (git floor raised so the O(history) git fold self-gates), replays from id 0, emits per-fold p50/p95 by kind + a two-point half-vs-half slope. Replay of 774,612 events (batch=50) = 79-90s wall (well under the 10min budget); per-fold p50 0.08ms / p95 0.18-0.22ms / p99 0.75-0.79ms / max 15-22ms. Heavy folds are FLAT: PostToolUse (~23s total, p95 0.13-0.17ms) and PreToolUse (~22s total) both show negative half-vs-half slopes; GitSnapshot is floor-gated to 0.04ms. No confirmed O(history) scaling fold — only trivial small-n kinds (<12ms total, e.g. AutopilotCapSet/SubagentStop) flicker near +20% run-to-run for task .2 to justify as noise. Re-run: cp ~/.local/state/keeper/keeper.db /tmp/kdb-copy.db (plus -wal/-shm) && bun scripts/serve-fold-load.ts --db /tmp/kdb-copy.db --replay-from-zero
 ## Evidence
