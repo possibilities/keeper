@@ -7955,7 +7955,8 @@ test("fn-1050 finalizeEpic teardown: a residue-only base husk is swept after a c
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
+  // 30s scoped budget: a pure fakeRun git seam with no I/O loop — the ~12s worst case is event-loop starvation under parallel load, not work. Global --timeout=10000 stays the hang detector.
+}, 30_000);
 
 test("fn-990 recoverWorktrees pass-3: an UNMERGED orphan base is preserved (never force-deleted)", async () => {
   const base = "keeper/epic/fn-1-foo";

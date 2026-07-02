@@ -859,7 +859,8 @@ test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly
   expect(total2).toBe(N_FILES * LINES_PER);
 
   db.close();
-});
+  // 30s scoped budget: the cost is PRODUCTION scanEventsLogDir folding 300 rows (the exactly-once contract), not test seed — shrinking the fixture would weaken the proof; event-loop starvation under parallel load can breach 10s. Global --timeout=10000 stays the hang detector.
+}, 30_000);
 
 /**
  * Build a PostToolUse:Write events-log record. `withMutationPath` controls
