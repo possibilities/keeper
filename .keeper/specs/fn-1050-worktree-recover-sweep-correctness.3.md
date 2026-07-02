@@ -34,5 +34,7 @@ Cover: only-`.claude` husk â†’ removed + prune invoked; extra top-level entry â†
 - [ ] Both call sites gated per-repo; full fast suite green
 
 ## Done summary
-
+Added pruneWorktreeHusk in src/worktree-git.ts: a content-gated lstat-walk that, after a clean removeWorktree, sweeps a worktree leftover ONLY when it holds nothing but .claude residue (any non-.claude top-level entry, any symlink/device/socket in the subtree, or a containment escape vetoes the whole deletion, leaving the dir byte-untouched), then rm's and runs a metadata-only git worktree prune from the main repo cwd. Wired at both teardown sites (finalize teardown loop + recover pass-3), each gated on ITS OWN repo's removed result and wrapped so a husk-prune throw is swallowed-and-logged, never a dispatch failure row; README teardown sentence added.
 ## Evidence
+- Commits: 5b7c6302
+- Tests: test/worktree-git.test.ts pruneWorktreeHusk: 10 pass, test/autopilot-worker.test.ts fn-1050 husk wiring: 3 pass
