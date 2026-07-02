@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Panel liveness pid and reboot guards",
-  "updated_at": "2026-07-02T00:13:37.305000Z"
+  "updated_at": "2026-07-02T01:28:21.568000Z",
+  "worker_done_at": "2026-07-02T01:28:21.568000Z"
 }

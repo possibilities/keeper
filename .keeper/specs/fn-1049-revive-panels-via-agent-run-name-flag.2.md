@@ -43,5 +43,5 @@ All through injected `PanelDeps` (fake `readStartTime`, fake boot epoch, fake cl
 - [ ] Full fast suite green
 
 ## Done summary
-
+Hardened panel liveness: the detach wrapper captures each leg's OS start-time (ps -o lstart=), cross-checked on every wait/reconcile/status/prune probe so a recycled pid reads dead (fail-open on null/absent); wait now derives a sleep-proof kernel boot epoch and, on a mid-wait reboot, fails non-terminal legs with a distinct machine-rebooted reason and returns promptly (read-only, no manifest write).
 ## Evidence
