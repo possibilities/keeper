@@ -29,5 +29,5 @@ Prove the test can fail: temporarily add a `node:os` value import to the core in
 - [ ] Runs in the fast tier
 
 ## Done summary
-
+Added test/reconcile-core-depgraph.test.ts — a fast-tier transitive import-boundary walker over reconcile-core.ts's relative-import closure (import-type aware, comment-stripped) that hard-bans impure drivers (bun:sqlite/bun:*, a db gateway, worktree-git, exec-backend, node:child_process/net/http) and wall-clock (Date.now/new Date). node:fs/os module-load reads (KEEPER_ROOT, worktrees fallback, model-effort YAML parse) and readiness.ts's one read-path diagnostic clock are grandfathered as shrink-only ratchet baselines, since the literal node:fs/os hard-ban was infeasible against the move-only .1 core; drivers + wall-clock bans pass cleanly and a new banned edge from any other closure file hard-fails.
 ## Evidence
