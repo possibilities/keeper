@@ -40,5 +40,5 @@ bash scripts/lint-retired-name.sh green on the purged tree with forbid records a
 - [ ] Full fast suite green
 
 ## Done summary
-
+Purged retired planctl/chatctl vocabulary from all live agent-facing surfaces (frozen schema/trailer literals untouched), corrected the root CLAUDE.md three-peer plugin paragraph, and added a forbid-kind arm to lint-retired-name.sh with allowlist header + fixtures pinning the cleaned set to zero regrowth. Both lints and the full fast suite are green.
 ## Evidence
