@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T16:16:30.929000Z",
+  "depends_on": [],
+  "epic": "fn-1075-autopilot-telemetry-and-machine",
+  "id": "fn-1075-autopilot-telemetry-and-machine.4",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Plugin composition map and lint spike forensics",
+  "updated_at": "2026-07-02T16:16:30.929000Z"
+}

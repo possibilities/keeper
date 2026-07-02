@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T16:16:30.929000Z",
+  "depends_on_epics": [],
+  "id": "fn-1075-autopilot-telemetry-and-machine",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Autopilot telemetry and machine contracts",
+  "touched_repos": [
+    "/Users/mike/code/arthack",
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T16:16:30.929000Z"
+}
