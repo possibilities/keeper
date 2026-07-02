@@ -1400,6 +1400,110 @@ test("fn-762 runReconcileCycle: indoubt RE-STAMPS the cooldown ONCE at resolutio
   expect(restamped).toBeGreaterThan(1000);
 });
 
+test("fn-1061 runReconcileCycle: a SUPPRESSED-DUP RE-STAMPS the cooldown (damp, not clear); no launch, no DispatchFailed, failedKeys untouched", async () => {
+  // The durable mint gate suppressed this re-mint (ack {ok:false,
+  // suppressed:true}) → outcome `suppressed-dup`. Unlike a pre-launch abort
+  // (which CLEARS the cooldown so re-dispatch is free), suppression must DAMP:
+  // the cooldown is RE-STAMPED so the next reconcile holds the key back. An
+  // advancing clock proves the stamp MOVED (re-stamped, not a stale no-op).
+  let clock = 1000;
+  const { deps, log } = makeFakeDeps({
+    ceilingMs: 50,
+    pollIntervalMs: 5,
+    now: () => clock++,
+    dispatchedAck: { ok: false, suppressed: true },
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 1000);
+  expect(decision.launches.length).toBe(1);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // Never launched, no DispatchFailed, no live entry (nothing confirmed).
+  expect(log.launches.length).toBe(0);
+  expect(log.emissions).toEqual([]);
+  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
+  // The mint request WAS issued (it's what the gate suppressed).
+  expect(log.dispatchedEmissions.length).toBe(1);
+  // Cooldown RE-STAMPED — moved past the dispatch-time value (1000), NOT cleared.
+  const restamped = state.redispatchCooldown.get("work::fn-1-foo.1");
+  expect(restamped).toBeDefined();
+  expect(restamped).toBeGreaterThan(1000);
+  // failedKeys is a projection-derived snapshot input; suppression mints no
+  // DispatchFailed, so it stays untouched — the snapshot's set is unchanged.
+  expect(snap.failedKeys.size).toBe(0);
+});
+
+test("fn-1061 runReconcileCycle: a PERSISTENT pre-launch suppression does NOT hot-loop (cycle 2 is damped by the re-stamped cooldown)", async () => {
+  // Contrast fn-762's aborted-prelaunch, which CLEARS the cooldown so cycle 2
+  // re-dispatches immediately (a suppress→clear→re-dispatch hot loop). A
+  // suppressed-dup RE-STAMPS the cooldown, so the very next reconcile within
+  // REDISPATCH_COOLDOWN_S (200s) produces NO launch — exactly one mint attempt
+  // ever fires across the two cycles.
+  let clock = 1000;
+  const { deps, log } = makeFakeDeps({
+    ceilingMs: 50,
+    pollIntervalMs: 5,
+    now: () => clock++,
+    dispatchedAck: { ok: false, suppressed: true },
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+
+  // Cycle 1: reconcile produces the launch; the gate suppresses it → re-stamp.
+  const d1 = reconcile(snap, state, clock);
+  expect(d1.launches.length).toBe(1);
+  await runReconcileCycle(
+    d1,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  expect(state.redispatchCooldown.get("work::fn-1-foo.1")).toBeDefined();
+
+  // Cycle 2: the re-stamped cooldown (well inside the 200s window) makes
+  // reconcile SUPPRESS the launch — no second dispatch attempt fires.
+  const d2 = reconcile(snap, state, clock);
+  expect(d2.launches.length).toBe(0);
+  await runReconcileCycle(
+    d2,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // Exactly ONE suppressed mint attempt across both cycles — no hot loop, no
+  // DispatchFailed, no live entry.
+  expect(log.dispatchedEmissions.length).toBe(1);
+  expect(log.launches.length).toBe(0);
+  expect(log.emissions).toEqual([]);
+  expect(liveDispatches.size).toBe(0);
+});
+
 // ---------------------------------------------------------------------------
 // fn-742 — per-epic finalizer guard (close re-dispatch serialization)
 // ---------------------------------------------------------------------------
@@ -2662,6 +2766,35 @@ test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted-prelaunch, 
   expect(log.launches.length).toBe(0); // never launched
   expect(log.emissions).toEqual([]); // no DispatchFailed
   // The mint request was still issued (it's what got rejected by main).
+  expect(log.dispatchedEmissions.length).toBe(1);
+});
+
+test("confirmRunning (fn-1061): suppressed ack {ok:false, suppressed:true} → suppressed-dup, no launch, NO DispatchFailed", async () => {
+  // The durable mint gate suppressed this re-mint (same verb::id inside the
+  // gate window). Distinct from an insert failure: the ack carries
+  // `suppressed:true`, so confirmRunning returns the benign `suppressed-dup`
+  // outcome (a live attempt is presumed in flight / freshly minted) rather
+  // than `aborted-prelaunch`. No launch, no DispatchFailed either way.
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 200,
+    dispatchedAck: { ok: false, suppressed: true },
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("suppressed-dup");
+  expect(log.launches.length).toBe(0); // never launched
+  expect(log.emissions).toEqual([]); // no DispatchFailed
+  // The mint request was still issued (it's what the gate suppressed).
   expect(log.dispatchedEmissions.length).toBe(1);
 });
 

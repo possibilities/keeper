@@ -3455,14 +3455,21 @@ and the first cycle rebuilds suppression from the live projection, AND because t
 durable `dispatch_mint_gate` (below) — not this Map — is the restart-surviving
 one-row-per-dispatch guarantee. A definitive
 launch failure (`launch.ok===false` → `DispatchFailed`) or a PRE-LAUNCH abort
-(`aborted-prelaunch` — ack reject / `{ok:false}` / shutdown racing the ack:
-nothing launched) CLEARS the entry so `failedKeys` owns stickiness and a human
-`retry_dispatch` re-dispatches without waiting out the cooldown; `ok`,
-`indoubt`, and a POST-LAUNCH abort (`aborted-postlaunch` — a mid-poll shutdown
-after the launch fired, when a ghost worker may exist) all KEEP it. The
-`indoubt` outcome RE-STAMPS the entry ONCE at resolution (the dispatch-time
-stamp is up to `ceilingMs` stale by then; a single refresh restarts the
-window — never compounding across cycles, the perpetual-suppression trap). Each
+(`aborted-prelaunch` — ack-wait reject / an INSERT-failure `{ok:false}` (gate
+`suppressed` absent) / shutdown racing the ack: nothing launched) CLEARS the entry
+so `failedKeys` owns stickiness and a human `retry_dispatch` re-dispatches without
+waiting out the cooldown. `ok` and a POST-LAUNCH abort (`aborted-postlaunch` — a
+mid-poll shutdown after the launch fired, when a ghost worker may exist) KEEP the
+dispatch-time stamp untouched. `indoubt` and `suppressed-dup` RE-STAMP the entry
+ONCE at resolution: `indoubt` because the dispatch-time stamp is up to `ceilingMs`
+stale by then, and `suppressed-dup` (the durable mint gate suppressed the re-mint —
+ack `{ok:false, suppressed:true}`, a live attempt presumed in flight or freshly
+minted) because it must DAMP the loop rather than re-arm it — CLEARING it (as a
+pre-launch abort does) would re-open the suppress→abort→clear→re-dispatch amplifier
+the gate exists to break. `suppressed-dup` leaves `failedKeys` untouched (the work
+is not failed) and records no live entry (nothing launched). The refresh restarts
+the window ONCE — never compounding across cycles (the perpetual-suppression
+trap). Each
 cycle prunes expired entries (`sweepRedispatchCooldown`, mirroring
 `server-worker.ts`'s `reapStuckPending`, wrapped so a sweep throw can't bounce
 the daemon). **The cooldown covers all verbs, dispatch-side, in-memory.**
