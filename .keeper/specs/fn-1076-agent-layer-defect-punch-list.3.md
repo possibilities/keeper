@@ -31,5 +31,5 @@ Fixture-style: run the lint against a synthetic bad tree in a tmpdir; both plugi
 - [ ] Lint exists, runs in the fast tier, fails on a keeper/keeper-await-style fixture, passes the live tree
 
 ## Done summary
-
+Added scripts/lint-skill-ids.ts — a fast-tier guard catching the plugin skill double-prefix defect class (keeper/keeper-await), wired as lint:skill-ids beside lint-claude-md with a fixture test that fails on a synthetic bad tree and passes the live plugins/.
 ## Evidence
