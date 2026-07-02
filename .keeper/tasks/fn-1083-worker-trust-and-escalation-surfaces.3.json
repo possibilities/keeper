@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T22:08:37.049000Z",
+  "depends_on": [],
+  "epic": "fn-1083-worker-trust-and-escalation-surfaces",
+  "id": "fn-1083-worker-trust-and-escalation-surfaces.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Escalation directive bodies and supervision docs",
+  "updated_at": "2026-07-02T22:08:37.049000Z"
+}
