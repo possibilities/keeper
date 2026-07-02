@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T07:26:23.908000Z",
+  "created_by_close_of": "fn-1064-surface-dispatch-failure-block-pills",
+  "depends_on_epics": [
+    "fn-1064-surface-dispatch-failure-block-pills"
+  ],
+  "id": "fn-1065-fix-dispatch-failures-live-watch-pill",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix dispatch_failures live-watch pill collapse",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T07:26:23.908000Z"
+}
