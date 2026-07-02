@@ -9726,8 +9726,14 @@ test("fn-1016 computeMergedLaneEntries: a lane PRESENT ∧ NOT an ancestor → N
   expect(entries).toEqual([]);
 });
 
-test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration ok) → MERGED-and-torn-down, no ancestry probe", async () => {
-  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration ok) on a STARTED epic → MERGED-and-torn-down, no ancestry probe", async () => {
+  // A started signal (a task in progress) is what distinguishes a torn-down lane
+  // from a never-cut one — fn-1057 gates the absent arm on it.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-a.1", runtime_status: "done" })],
+  });
   const epics = [a];
   const { run, calls } = gateGit({ lanes: [] }); // enumeration ok, A's lane gone
   const entries = await computeMergedLaneEntries(
@@ -9738,6 +9744,21 @@ test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration 
   expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
   // A definitively-absent lane short-circuits to merged WITHOUT an ancestry probe.
   expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1057 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane on a NEVER-STARTED epic → NOT merged (the lane was never cut, so `landed` waits)", async () => {
+  // A freshly scaffolded dep-blocked epic: no jobs, no started task. Its lane is
+  // absent because it was never cut — inferring merged here fires `landed`
+  // spuriously the instant the epic is armed.
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const epics = [a];
+  const { run } = gateGit({ lanes: [] }); // enumeration ok, A's lane absent
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([]);
 });
 
 test("fn-1016 computeMergedLaneEntries: an enumeration FAILURE → NOT merged (never claim merged off an inconclusive probe)", async () => {
