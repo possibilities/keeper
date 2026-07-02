@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T09:11:47.992000Z",
+  "depends_on": [],
+  "epic": "fn-1068-docs-posture-reconciliation",
+  "id": "fn-1068-docs-posture-reconciliation.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Reconcile stale autopilot docs",
+  "updated_at": "2026-07-02T09:11:47.992000Z"
+}
