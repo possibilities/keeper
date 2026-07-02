@@ -1127,10 +1127,13 @@ test("selectVersionsByIdsChunked: > MAX_IN_PARAMS ids return ALL versions (no th
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const n = MAX_IN_PARAMS * 2 + 17; // spans 3 batches
   const ids: string[] = [];
-  for (let i = 0; i < n; i++) {
-    seedEpic(db, `fn-${i}`, { epic_number: i, last_event_id: i });
-    ids.push(`fn-${i}`);
-  }
+  // Seed in ONE transaction — ~2015 per-row autocommit fsyncs collapse to one, keeping the loop under the 10s ceiling under host I/O load.
+  db.transaction(() => {
+    for (let i = 0; i < n; i++) {
+      seedEpic(db, `fn-${i}`, { epic_number: i, last_event_id: i });
+      ids.push(`fn-${i}`);
+    }
+  })();
   // The unchunked helper would throw on this id-set.
   expect(() => selectVersionsByIds(db, EPICS_DESCRIPTOR, ids)).toThrow();
   const map = selectVersionsByIdsChunked(db, EPICS_DESCRIPTOR, ids);
@@ -1144,10 +1147,13 @@ test("selectByIdsChunked: > MAX_IN_PARAMS ids return ALL rows (no throw)", () =>
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const n = MAX_IN_PARAMS + 5; // spans 2 batches
   const ids: string[] = [];
-  for (let i = 0; i < n; i++) {
-    seedJob(db, `j-${i}`, { last_event_id: i });
-    ids.push(`j-${i}`);
-  }
+  // Seed in ONE transaction — ~1004 per-row autocommit fsyncs collapse to one, keeping the loop under the 10s ceiling under host I/O load.
+  db.transaction(() => {
+    for (let i = 0; i < n; i++) {
+      seedJob(db, `j-${i}`, { last_event_id: i });
+      ids.push(`j-${i}`);
+    }
+  })();
   const rows = selectByIdsChunked(db, JOBS_DESCRIPTOR, ids);
   expect(rows.length).toBe(n);
   db.close();

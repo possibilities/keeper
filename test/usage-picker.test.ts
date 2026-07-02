@@ -186,43 +186,28 @@ describe("rotation", () => {
 
 // ---------- weighted balancing ----------------------------------------------
 
+// The large-N statistical proportionality proofs (the 5x-weighting and
+// all-sessions-burned distributions at full N, plus the headroom/missing-usage
+// even-split proofs) live in the slow sibling `test/usage-picker.slow.test.ts`
+// behind KEEPER_RUN_SLOW — ~2000 serial disk-bound picks blow the fast tier's
+// 10s ceiling under contention. The fast tier keeps deterministic weighting
+// coverage below via the injected monotonic clock (exact pick order + credit
+// math), not a shrunken statistical sample.
 describe("weighted balancing", () => {
-  test("5x picked five times as often at equal headroom", () => {
+  test("5x multiplier outstrides 1x deterministically at equal headroom", () => {
+    // Stride scheduling is deterministic under a monotonic clock: pick the
+    // eligible profile minimizing count/weight, ties by name. With weights
+    // pro=1, max5=5 the first six picks resolve to a clean 5:1 split — the
+    // proportionality the slow tier reproves statistically at N=600.
     installMonotonicClock();
     writeConfig(["pro", "max5"]);
     writeEnvelope("pro", { subscription_active: true, multiplier: 1 });
     writeEnvelope("max5", { subscription_active: true, multiplier: 5 });
 
-    for (let i = 0; i < 600; i++) {
-      pickProfile();
-    }
+    const picks = Array.from({ length: 6 }, () => pickProfile());
 
-    const counts = readCounts();
-    const ratio = counts.max5 / counts.pro;
-    expect(ratio).toBeGreaterThanOrEqual(4.5);
-    expect(ratio).toBeLessThanOrEqual(5.5);
-  });
-
-  test("headroom scales multiplier to even split", () => {
-    installMonotonicClock();
-    writeConfig(["a", "b"]);
-    writeEnvelope("a", {
-      subscription_active: true,
-      multiplier: 10,
-      session_percent: 50.0,
-    });
-    writeEnvelope("b", {
-      subscription_active: true,
-      multiplier: 5,
-      session_percent: 0.0,
-    });
-
-    for (let i = 0; i < 400; i++) {
-      pickProfile();
-    }
-
-    const counts = readCounts();
-    expect(Math.abs(counts.a - counts.b)).toBeLessThanOrEqual(1);
+    expect(picks).toEqual(["max5", "pro", "max5", "max5", "max5", "max5"]);
+    expect(readCounts()).toEqual({ pro: 1, max5: 5 });
   });
 
   test("equal weights degrade to round-robin", () => {
@@ -236,51 +221,6 @@ describe("weighted balancing", () => {
 
     expect(new Set(picks.slice(0, 3))).toEqual(new Set(["p1", "p2", "p3"]));
     expect(readCounts()).toEqual({ p1: 2, p2: 2, p3: 2 });
-  });
-
-  test("all sessions burned falls back to multiplier credit", () => {
-    installMonotonicClock();
-    writeConfig(["pro", "max5"]);
-    writeEnvelope("pro", {
-      subscription_active: true,
-      multiplier: 1,
-      session_percent: 100.0,
-    });
-    writeEnvelope("max5", {
-      subscription_active: true,
-      multiplier: 5,
-      session_percent: 100.0,
-    });
-
-    for (let i = 0; i < 600; i++) {
-      pickProfile();
-    }
-
-    const counts = readCounts();
-    expect(counts.pro + counts.max5).toBe(600);
-    const ratio = counts.max5 / counts.pro;
-    expect(ratio).toBeGreaterThanOrEqual(4.5);
-    expect(ratio).toBeLessThanOrEqual(5.5);
-  });
-
-  test("missing usage means full headroom", () => {
-    installMonotonicClock();
-    writeConfig(["nousage", "nosession", "nopercent", "full"]);
-    writeEnvelope("nousage", { subscription_active: true, usage: null });
-    writeEnvelope("nosession", { subscription_active: true, usage: {} });
-    writeEnvelope("nopercent", {
-      subscription_active: true,
-      usage: { session: {} },
-    });
-    writeEnvelope("full", { subscription_active: true, session_percent: 0.0 });
-
-    for (let i = 0; i < 400; i++) {
-      pickProfile();
-    }
-
-    const counts = readCounts();
-    const vals = Object.values(counts);
-    expect(Math.max(...vals) - Math.min(...vals)).toBeLessThanOrEqual(1);
   });
 
   test("new entrant gets no catch-up burst", () => {
