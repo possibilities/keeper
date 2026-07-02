@@ -19,6 +19,7 @@ import {
   DEFAULT_STOP_TIMEOUT_MS,
   findLastMessage,
   type TranscriptStop,
+  type WaitForPathOutcome,
   waitForTranscriptPath,
   waitForTranscriptStop,
 } from "./transcript-watch";
@@ -225,7 +226,7 @@ export interface VerbDeps {
 
 export type WaitForStopResult =
   | { ok: true; transcriptPath: string; stop: TranscriptStop }
-  | { ok: false; error: string };
+  | { ok: false; error: string; reason?: "timeout" | "ambiguous" };
 
 /**
  * Block until the handle's transcript shows the next per-backend stop event,
@@ -236,10 +237,11 @@ export async function runWaitForStop(
   handle: ResolvedHandle,
   deps: VerbDeps,
 ): Promise<WaitForStopResult> {
-  const transcriptPath = await resolveTranscriptPath(handle, deps);
-  if (transcriptPath === null) {
-    return { ok: false, error: "timed out waiting for transcript path" };
+  const resolved = await resolveTranscriptPath(handle, deps);
+  if (!resolved.ok) {
+    return transcriptPathFailure(resolved.reason);
   }
+  const transcriptPath = resolved.path;
   const outcome = await waitForTranscriptStop({
     agent: handle.agent,
     cwd: handle.cwd,
@@ -259,6 +261,7 @@ export async function runWaitForStop(
     const source = handle.stopTimeoutMs !== null ? "caller" : "default";
     return {
       ok: false,
+      reason: "timeout",
       error: `timed out waiting for transcript stop after ${effectiveMs}ms (${source})`,
     };
   }
@@ -267,7 +270,7 @@ export async function runWaitForStop(
 
 export type ShowLastMessageResult =
   | { ok: true; transcriptPath: string; text: string | null; found: boolean }
-  | { ok: false; error: string };
+  | { ok: false; error: string; reason?: "timeout" | "ambiguous" };
 
 /**
  * Resolve the handle's transcript and return the partner's final assistant
@@ -280,10 +283,11 @@ export async function runShowLastMessage(
   handle: ResolvedHandle,
   deps: VerbDeps,
 ): Promise<ShowLastMessageResult> {
-  const transcriptPath = await resolveTranscriptPath(handle, deps);
-  if (transcriptPath === null) {
-    return { ok: false, error: "timed out waiting for transcript path" };
+  const resolved = await resolveTranscriptPath(handle, deps);
+  if (!resolved.ok) {
+    return transcriptPathFailure(resolved.reason);
   }
+  const transcriptPath = resolved.path;
   const last = findLastMessage(handle.agent, transcriptPath);
   return {
     ok: true,
@@ -295,14 +299,17 @@ export async function runShowLastMessage(
 
 /**
  * A direct-path handle resolves to itself; a run-id handle polls for the
- * backend's transcript file (bounded by the watcher's path timeout).
+ * backend's transcript file (bounded by the watcher's path timeout). The
+ * `ambiguous` failure — a codex leg colliding with a concurrent same-cwd session
+ * — is propagated distinctly so the caller never degrades it into a plain
+ * path-timeout (or, worse, a guessed foreign transcript).
  */
 async function resolveTranscriptPath(
   handle: ResolvedHandle,
   deps: VerbDeps,
-): Promise<string | null> {
+): Promise<WaitForPathOutcome> {
   if (handle.transcriptPath !== null) {
-    return handle.transcriptPath;
+    return { ok: true, path: handle.transcriptPath };
   }
   return waitForTranscriptPath({
     agent: handle.agent,
@@ -312,4 +319,22 @@ async function resolveTranscriptPath(
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
   });
+}
+
+/** Map a transcript-path resolution failure to a verb result — carrying the
+ *  `reason` so run-capture separates a concurrent-session collision
+ *  (`transcript_ambiguous`) from a transcript that never appeared. */
+function transcriptPathFailure(reason: "timeout" | "ambiguous"): {
+  ok: false;
+  error: string;
+  reason: "timeout" | "ambiguous";
+} {
+  return {
+    ok: false,
+    reason,
+    error:
+      reason === "ambiguous"
+        ? "transcript ambiguous: multiple concurrent same-cwd sessions match, cannot attribute"
+        : "timed out waiting for transcript path",
+  };
 }

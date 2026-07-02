@@ -46,6 +46,26 @@ export type WaitForStopOutcome =
   | { ok: true; stop: TranscriptStop }
   | { ok: false; timedOut: true };
 
+/**
+ * A single-tick transcript-path lookup.
+ *  - `found`: exactly one positively-attributed transcript.
+ *  - `pending`: nothing attributable yet — the caller keeps polling.
+ *  - `ambiguous`: more than one candidate the leg cannot attribute to itself
+ *    (a concurrent same-cwd codex session collided). TERMINAL — never guessed,
+ *    since a confident wrong transcript is worse than a retryable failure.
+ */
+type TranscriptPathLookup =
+  | { kind: "found"; path: string }
+  | { kind: "pending" }
+  | { kind: "ambiguous" };
+
+/** The terminal outcome of {@link waitForTranscriptPath}: a resolved path, or a
+ *  failure discriminated so the caller maps a concurrent-session collision to a
+ *  DISTINCT non-completed outcome rather than the plain path-timeout. */
+export type WaitForPathOutcome =
+  | { ok: true; path: string }
+  | { ok: false; reason: "timeout" | "ambiguous" };
+
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_PATH_TIMEOUT_MS = 30_000;
 /**
@@ -58,17 +78,22 @@ const START_SLOP_MS = 1_000;
 
 export async function waitForTranscriptPath(
   opts: TranscriptWatchOptions,
-): Promise<string | null> {
+): Promise<WaitForPathOutcome> {
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const deadline = Date.now() + (opts.pathTimeoutMs ?? DEFAULT_PATH_TIMEOUT_MS);
 
   while (true) {
-    const path = findTranscriptPath(opts);
-    if (path !== null) {
-      return path;
+    const lookup = findTranscriptPath(opts);
+    if (lookup.kind === "found") {
+      return { ok: true, path: lookup.path };
+    }
+    // A concurrent-session collision won't resolve by waiting (both files keep
+    // being written), so fail loud immediately rather than burning the deadline.
+    if (lookup.kind === "ambiguous") {
+      return { ok: false, reason: "ambiguous" };
     }
     if (Date.now() >= deadline) {
-      return null;
+      return { ok: false, reason: "timeout" };
     }
     await sleep(pollIntervalMs);
   }
@@ -185,14 +210,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function findTranscriptPath(opts: TranscriptWatchOptions): string | null {
-  if (opts.agent === "claude") {
-    return findClaudeTranscriptPath(opts);
-  }
+function findTranscriptPath(
+  opts: TranscriptWatchOptions,
+): TranscriptPathLookup {
   if (opts.agent === "codex") {
     return findCodexTranscriptPath(opts);
   }
-  return findPiTranscriptPath(opts);
+  // claude/pi pin their session id at launch, so their resolution is exact-or-
+  // absent — never ambiguous. Map the string|null shape onto the lookup union.
+  const path =
+    opts.agent === "claude"
+      ? findClaudeTranscriptPath(opts)
+      : findPiTranscriptPath(opts);
+  return path === null ? { kind: "pending" } : { kind: "found", path };
 }
 
 function findClaudeTranscriptPath(opts: TranscriptWatchOptions): string | null {
@@ -215,16 +245,44 @@ function findClaudeTranscriptPath(opts: TranscriptWatchOptions): string | null {
   return newestFreshFile(jsonlFiles(projectDir, false), opts.startedAtMs);
 }
 
-function findCodexTranscriptPath(opts: TranscriptWatchOptions): string | null {
+function findCodexTranscriptPath(
+  opts: TranscriptWatchOptions,
+): TranscriptPathLookup {
   const codexHome =
     (opts.env.CODEX_HOME ?? "").trim() || join(opts.homeDir, ".codex");
   const files = jsonlFiles(join(codexHome, "sessions"), true).filter((path) => {
     const name = basename(path);
     return name.startsWith("rollout-") && name.endsWith(".jsonl");
   });
-  const fresh = freshFiles(files, opts.startedAtMs);
-  const cwdMatches = fresh.filter((path) => readCodexCwd(path) === opts.cwd);
-  return newestFile(cwdMatches) ?? newestFile(fresh);
+  // Positive attribution, NEVER a newest-by-mtime guess. A codex leg cannot pin
+  // its session id at launch, so a rollout is attributable to the leg only when
+  // it is (a) still being written since launch (fresh mtime), (b) CREATED at or
+  // after the launch instant — a rollout whose session_meta timestamp predates
+  // launch belongs to a concurrent session even while its mtime keeps advancing,
+  // the exact wrong-file trap the newest-by-mtime heuristic fell into — and (c)
+  // rooted at the leg's cwd. Exactly one survivor IS the leg's transcript; more
+  // than one is an unresolvable concurrent-session collision (ambiguous, never
+  // guessed); none yet means keep polling for the leg's own file to appear.
+  const floor = opts.startedAtMs - START_SLOP_MS;
+  const cwdMatches = files.filter((path) => {
+    const stat = safeStat(path);
+    if (stat === null || stat.mtimeMs < floor) {
+      return false;
+    }
+    const meta = readCodexRolloutMeta(path);
+    if (meta.createdAtMs === null || meta.createdAtMs < floor) {
+      return false;
+    }
+    return meta.cwd === opts.cwd;
+  });
+  const [first] = cwdMatches;
+  if (cwdMatches.length === 1 && first !== undefined) {
+    return { kind: "found", path: first };
+  }
+  if (cwdMatches.length > 1) {
+    return { kind: "ambiguous" };
+  }
+  return { kind: "pending" };
 }
 
 function findPiTranscriptPath(opts: TranscriptWatchOptions): string | null {
@@ -524,16 +582,33 @@ function safeStat(path: string): { mtimeMs: number } | null {
   }
 }
 
-function readCodexCwd(path: string): string | null {
+/**
+ * Read a codex rollout's `session_meta` line for the two attribution signals the
+ * codex path lookup needs: the recorded `cwd` and the creation instant
+ * (`createdAtMs`, from the meta `timestamp`). The timestamp is codex's own ISO
+ * string with a timezone — authoritative and unambiguous, unlike the tz-naive
+ * timestamp embedded in the filename. Either field is null when the meta line is
+ * absent/unparseable, which the caller treats as "cannot attribute".
+ */
+function readCodexRolloutMeta(path: string): {
+  cwd: string | null;
+  createdAtMs: number | null;
+} {
   for (const line of readLines(path, 64 * 1024)) {
     if (!line.includes('"type":"session_meta"')) {
       continue;
     }
     const parsed = parseJsonObject(line);
-    const payload = objectValue(parsed?.payload);
-    return stringValue(payload?.cwd);
+    if (parsed === null) {
+      return { cwd: null, createdAtMs: null };
+    }
+    const payload = objectValue(parsed.payload);
+    return {
+      cwd: stringValue(payload?.cwd),
+      createdAtMs: objectTimestampMs(parsed),
+    };
   }
-  return null;
+  return { cwd: null, createdAtMs: null };
 }
 
 function readPiMeta(path: string): { id: string | null; cwd: string | null } {

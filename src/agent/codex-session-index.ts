@@ -20,7 +20,6 @@ interface Candidate {
   id: string;
   cwd: string | null;
   createdAtMs: number;
-  mtimeMs: number;
 }
 
 /**
@@ -108,8 +107,12 @@ export function findCodexSessionId(
     if (cwdMatches.length === 1) {
       return cwdMatches[0]?.id ?? null;
     }
+    // More than one post-launch rollout shares the leg's cwd — a concurrent
+    // codex session collided. There is no id to pin at launch, so refuse to
+    // guess (never a newest-by-mtime pick): naming the wrong session's rollout is
+    // worse than leaving it unnamed.
     if (cwdMatches.length > 1) {
-      return newestCandidate(cwdMatches)?.id ?? null;
+      return null;
     }
   }
 
@@ -145,20 +148,10 @@ function findCandidateSessions(
       if (meta.createdAtMs < opts.startedAtMs - 1000) {
         continue;
       }
-      candidates.push({ ...meta, mtimeMs: stat.mtimeMs });
+      candidates.push(meta);
     }
   }
   return candidates;
-}
-
-function newestCandidate(candidates: Candidate[]): Candidate | null {
-  let newest: Candidate | null = null;
-  for (const candidate of candidates) {
-    if (newest === null || candidate.mtimeMs > newest.mtimeMs) {
-      newest = candidate;
-    }
-  }
-  return newest;
 }
 
 function sessionDayDirs(root: string, startedAtMs: number): string[] {

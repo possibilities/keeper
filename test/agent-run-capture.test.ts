@@ -111,6 +111,7 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
       "no_message",
       "timed_out",
       "no_transcript",
+      "transcript_ambiguous",
       "launch_failed",
       "bad_args",
     ] as const) {
@@ -169,6 +170,7 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
     expect(runCaptureExitCode("no_message")).toBe(0);
     expect(runCaptureExitCode("timed_out")).toBe(4);
     expect(runCaptureExitCode("no_transcript")).toBe(4);
+    expect(runCaptureExitCode("transcript_ambiguous")).toBe(4);
     expect(runCaptureExitCode("launch_failed")).toBe(1);
     expect(runCaptureExitCode("bad_args")).toBe(2);
   });
@@ -491,6 +493,37 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
       outcome: "no_transcript",
       message: null,
       transcript_path: null,
+    });
+    expect(exitCode).toBe(4);
+  });
+
+  test("concurrent same-cwd collision → transcript_ambiguous (exit 4), never a foreign answer", async () => {
+    const { envelope, exitCode } = await captureFromHandle(
+      seams({
+        wait: {
+          ok: false,
+          reason: "ambiguous",
+          error: "transcript ambiguous: multiple concurrent same-cwd sessions",
+        },
+        show: {
+          ok: false,
+          reason: "ambiguous",
+          error: "transcript ambiguous: multiple concurrent same-cwd sessions",
+        },
+      }),
+      VERB_DEPS,
+      {
+        handle: { ...handle(null), agent: "codex" },
+        handleId: "tmux-amb",
+        agent: "codex",
+        startMs: 0,
+      },
+    );
+    expect(envelope).toMatchObject({
+      outcome: "transcript_ambiguous",
+      message: null,
+      transcript_path: null,
+      resume_target: null,
     });
     expect(exitCode).toBe(4);
   });

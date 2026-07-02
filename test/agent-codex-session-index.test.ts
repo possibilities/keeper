@@ -136,4 +136,32 @@ describe("Codex session index helpers", () => {
       }),
     ).toBeNull();
   });
+
+  test("findCodexSessionId refuses to guess when two post-launch rollouts share the cwd", () => {
+    const home = codexHome();
+    const startedAtMs = Date.now();
+    // Two concurrent same-cwd sessions both created at/after launch — no id to
+    // pin, so naming either would risk labeling the wrong session. Return null.
+    writeRollout(
+      home,
+      "019eec31-01f1-7163-afa1-7facaaf72122",
+      "/fake-home/code/keeper",
+      startedAtMs,
+    );
+    writeRollout(
+      home,
+      "019eec32-02f2-7164-bfb2-8fbdbbf83233",
+      "/fake-home/code/keeper",
+      startedAtMs,
+    );
+
+    expect(
+      findCodexSessionId({
+        codexHome: home,
+        threadName: "synthetic name",
+        expectedCwd: "/fake-home/code/keeper",
+        startedAtMs,
+      }),
+    ).toBeNull();
+  });
 });
