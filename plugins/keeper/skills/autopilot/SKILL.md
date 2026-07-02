@@ -184,6 +184,18 @@ take-over with an armed `keeper:await`: capture state, make your change, arm
 `keeper:await` for the board/condition that should end the window, and restore
 on its `met`. See `keeper:await` for wiring the Monitor.
 
+## Monitor liveness
+
+Long-running supervision liveness-checks its monitors every heartbeat and
+re-arms on loss. A daemon restart or session churn kills a `keeper bus watch`
+inbox consumer and armed `keeper:await` Monitors SILENTLY — the watch just stops
+delivering, no error surfaced, so a parked worker's question or an escalation
+notify can land in a dead channel and be missed. Re-attach is the consumer's
+job: on each supervision heartbeat confirm your inbox watch is still on the bus
+(`keeper bus list` shows your channel) and any armed await is still live, and
+re-arm whichever dropped. A supervisor that trusts a once-armed monitor to stay
+live past a daemon bounce is running blind.
+
 ## Examples
 
 ### Pause it (bare control op)
