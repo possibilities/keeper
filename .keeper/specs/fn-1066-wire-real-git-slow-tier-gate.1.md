@@ -33,5 +33,5 @@ Three consecutive clean runs of `bun run test:slow` from plugins/plan. Also run 
 - [ ] Fast tier (`bun test` from plugins/plan and repo root) untouched and green
 
 ## Done summary
-
+Routed all slow-tier real-git spawns through one shared harness isolation env (gitIsolationEnv: pinned GIT_CONFIG_GLOBAL, NOSYSTEM, ceiling dir, fixed dates, GIT_* unsets) on the subprocess env with no process.env mutation, and consolidated the duplicated inline git/gitQuiet/isAncestor/headSha/commitCount helpers into the harness. Slow tier passes 3 consecutive clean runs and holds green under a poisoned global git config.
 ## Evidence
