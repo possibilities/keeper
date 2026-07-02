@@ -39,5 +39,5 @@ as behavioral.
 - [ ] Handoff brief guidance carries the same discipline; validator contract unchanged
 
 ## Done summary
-
+Made authored task specs durable-behavioral: plan 5e (and defer's echo) Acceptance is now observable and file:line-free while Investigation targets keep file:line with a staleness note; handoff brief guidance gains the same discipline plus reference-don't-duplicate and redact-secrets. Four-section validator contract unchanged.
 ## Evidence
