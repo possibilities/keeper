@@ -42,6 +42,27 @@
  * confirmed offender for task .2. See {@link measureReplayFromZero} + the re-run
  * procedure in `HELP` below. DESTRUCTIVE — run only on a COPY.
  *
+ * Measured headroom (fn-1067 .2 audit, corpus of 775,125 events / 1,263 epics,
+ * two `--replay-from-zero` runs on this machine): the whole corpus re-folds in
+ * 91–95s wall — ~6.6x under the 10-minute budget — and the OVERALL per-event p95
+ * slope between corpus halves is flat-to-negative (−18% / +0.6% across the two
+ * runs), the definitive bounded-fold signal. The dominant cost is per-key
+ * upserts with flat per-event cost: PostToolUse (~25s total, slope ~0), PreToolUse
+ * (~25s, +11%), EpicSnapshot (~6s, single-epic INSERT keyed by epic_id, so O(1)
+ * per event regardless of board size). VERDICT: CLEAN — no fold breaches either
+ * threshold reproducibly, so no reducer change is warranted (the known O(history)
+ * scans — git attribution pass-1 {@link GitAttribMemo}-adjacent, monitor
+ * provenance — were already bounded by prior work). The per-kind slope FLAGS the
+ * harness prints (e.g. SubagentStop, UserPromptSubmit, ApiError, EpicSnapshot) do
+ * NOT reproduce run-to-run (ApiError 29%→6%, EpicSnapshot 6%→36%, EpicDeleted
+ * absent→35%): they are jitter on sub-millisecond baselines (p95 0.15–0.44ms,
+ * where a ~0.1ms GC/scheduling blip is a large percentage), NOT accumulating-state
+ * scans — a real scan shows a STABLE positive slope (cf. the 437s syncPlanLinks
+ * incident). Linear projection at the current flat per-event rate (~0.118ms/event
+ * amortized): the 10-minute budget is first reached near ~5.1M events, ~6.6x the
+ * current corpus. Re-measure via the procedure in `HELP` when the corpus grows a
+ * multiple, or when a new fold lands on the applyEvent hot path.
+ *
  * Substrate: by default the harness SYNTHESIZES a live-size projection + event
  * log into a tmp DB so it runs standalone and deterministically (seeded PRNG).
  * Pass `--db <path>` to point at a COPY of a real keeper.db (read-only for the
@@ -122,11 +143,14 @@ Measures cold-connect, update-under-burst, and per-fold latency at live scale an
 names the dominant cost. Standalone (synthesizes a live-size projection) unless
 --db points at a COPY of a real keeper.db. NEVER pass the live keeper.db.
 
-Replay-from-zero re-run procedure (records the fn-1067 audit numbers):
-  cp ~/.local/state/keeper/keeper.db /tmp/kdb-copy.db
-  cp ~/.local/state/keeper/keeper.db-wal /tmp/kdb-copy.db-wal 2>/dev/null || true
-  cp ~/.local/state/keeper/keeper.db-shm /tmp/kdb-copy.db-shm 2>/dev/null || true
+Replay-from-zero re-run procedure (regenerates the fn-1067 audit numbers in the
+header above). Use sqlite .backup for a consistent snapshot of the LIVE,
+actively-written DB — a raw cp of the .db + -wal can race the daemon's writes:
+  sqlite3 "file:$HOME/.local/state/keeper/keeper.db?mode=ro" ".backup /tmp/kdb-copy.db"
   bun scripts/serve-fold-load.ts --db /tmp/kdb-copy.db --replay-from-zero
+  # Run it twice: a per-kind slope that flips in/out of the offender set between
+  # runs is sub-ms jitter, not a scaling scan. The overall slope + total wall are
+  # the stable signals — an offender must reproduce to count.
 `;
 
 // ---------------------------------------------------------------------------
