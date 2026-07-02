@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-02T04:02:16.497000Z",
   "created_at": "2026-07-02T03:12:08.731000Z",
   "depends_on_epics": [],
   "id": "fn-1059-gut-readme-to-lean-front-door",
   "last_validated_at": "2026-07-02T03:12:15.406000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Gut README to lean front door",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T03:12:15.406000Z"
+  "updated_at": "2026-07-02T04:02:16.497000Z"
 }
