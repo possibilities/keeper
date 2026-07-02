@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
-// Golden-fixture capture against the production `keeper prompt` engine.
+// Golden-fixture capture against the production `keeper prompt` engine — the
+// recorded snapshots the regression-pin suite (parity.test.ts) asserts against.
 //
 // Re-run deliberately, when the arthack corpus or the plan-plugin templates
-// change, to refresh the render goldens the parity suite asserts against:
+// change, to refresh the goldens (a diff is expected — eyeball it before
+// committing so a new bug is never frozen as golden):
 //
 //     bun run capture-oracle           # from plugins/prompt/
 //     bun test/oracle/capture.ts
@@ -11,6 +13,12 @@
 // from the live index) and the full plan-plugin render tree — never a subset,
 // so no template can silently diverge later. Output lands under
 // test/oracle/fixtures/ as JSON the test reads back.
+//
+// The plan-plugin verbs (check-generated, render-plugin-templates) are captured
+// hermetically: the plan plugin is rendered into a throwaway copy carrying a
+// synthetic `.git` marker, so the recorded envelopes never depend on whether the
+// launch-generated (gitignored) render tree happens to be materialized on the
+// capture host.
 //
 // Resolution: the arthack corpus root comes from --arthack-root / $ARTHACK_ROOT
 // with a ~/code/arthack fallback; the keeper root is this checkout (three dirs
@@ -164,13 +172,68 @@ function captureRender(arthackRoot: string): RenderFixture[] {
 }
 
 // ---------------------------------------------------------------------------
-// check-generated — every real generated file in the plan plugin, both modes
+// Hermetic plan-plugin render tree — the shared substrate for both the
+// check-generated and render-plugin-templates fixtures
+// ---------------------------------------------------------------------------
+
+/** A throwaway plan-plugin render tree: a copy of `plugins/plan` with every
+ *  template freshly rendered and a synthetic `.git` marker at its root. */
+interface RenderedPlanTree {
+  /** Temp dir root — a copy of `plugins/plan` (its own project root). */
+  work: string;
+  /** render-plugin-templates stdout, machine roots already tokenized. */
+  stdout: string;
+  exitCode: number;
+}
+
+/** Render the plan plugin's templates into a throwaway copy so the live tree is
+ *  never mutated and EVERY template re-renders from scratch (an already-rendered
+ *  tree is a silent no-op). A synthetic `.git` file at the copy root makes
+ *  `check-generated` resolve the copy as the project root, so its envelopes are
+ *  hermetic — they never depend on the launch-generated tree being materialized
+ *  in the live checkout. Caller owns cleanup of `.work`. */
+function renderPlanTree(
+  keeperRoot: string,
+  arthackRoot: string,
+): RenderedPlanTree {
+  const livePlanRoot = join(keeperRoot, "plugins", "plan");
+  const work = join(
+    tmpdir(),
+    `prompt-oracle-plan-${process.pid}-${Date.now()}`,
+  );
+  rmSync(work, { recursive: true, force: true });
+  cpSync(livePlanRoot, work, { recursive: true });
+  writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
+  for (const kind of ["commands", "skills", "agents", "workers"]) {
+    rmSync(join(work, kind), { recursive: true, force: true });
+  }
+
+  const r = runOracle(
+    ["render-plugin-templates", "--project-root", work],
+    work,
+  );
+  if (r.code !== 0) {
+    rmSync(work, { recursive: true, force: true });
+    throw new Error(
+      `render-plugin-templates failed (exit ${r.code}): ${r.stderr}`,
+    );
+  }
+
+  const roots = { arthackRoot, keeperRoot: work };
+  return {
+    work,
+    stdout: tokenizeRoots(r.stdout.toString("utf-8"), roots),
+    exitCode: r.code,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// check-generated — every generated file in the rendered tree, both modes
 // ---------------------------------------------------------------------------
 
 /** Discover every generated primary file (a file with a sibling sidecar) plus
- *  every sidecar itself under the plan plugin — the full marked-file universe. */
-function generatedTargets(keeperRoot: string): string[] {
-  const planRoot = join(keeperRoot, "plugins", "plan");
+ *  every sidecar itself under the rendered tree — the full marked-file universe. */
+function generatedTargets(planRoot: string): string[] {
   const found: string[] = [];
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir).sort()) {
@@ -191,19 +254,19 @@ function generatedTargets(keeperRoot: string): string[] {
 }
 
 function captureCheckGenerated(
-  keeperRoot: string,
+  tree: RenderedPlanTree,
   arthackRoot: string,
 ): CheckGeneratedFixture[] {
-  const targets = generatedTargets(keeperRoot);
-  const roots = { arthackRoot, keeperRoot };
+  const targets = generatedTargets(tree.work);
+  const roots = { arthackRoot, keeperRoot: tree.work };
   const out: CheckGeneratedFixture[] = [];
   for (const target of targets) {
     for (const on of ["write", "read"] as const) {
-      const r = runOracle(["check-generated", target, "--on", on], keeperRoot);
+      const r = runOracle(["check-generated", target, "--on", on], tree.work);
       const tokenized = tokenizeRoots(r.stdout.toString("utf-8"), roots);
       const envelope = JSON.parse(tokenized) as Record<string, unknown>;
       out.push({
-        target_relative: relative(keeperRoot, target),
+        target_relative: relative(tree.work, target),
         on,
         envelope_raw: envelope,
         exit_code: r.code,
@@ -259,43 +322,14 @@ function collectRenderedTree(pluginRoot: string): PluginTemplateFile[] {
 }
 
 function captureRenderPluginTemplates(
-  keeperRoot: string,
-  arthackRoot: string,
+  tree: RenderedPlanTree,
 ): PluginTemplatesFixture {
-  const planRootRel = join("plugins", "plan");
-  const livePlanRoot = join(keeperRoot, planRootRel);
-
-  // Render against a throwaway copy so the live plan plugin is never mutated,
-  // and strip the rendered dirs first so EVERY template re-renders and the
-  // `✓ Rendered` stdout is captured (an already-rendered tree is a silent
-  // no-op).
-  const work = join(tmpdir(), `prompt-oracle-rpt-${process.pid}-${Date.now()}`);
-  rmSync(work, { recursive: true, force: true });
-  cpSync(livePlanRoot, work, { recursive: true });
-  for (const kind of ["commands", "skills", "agents", "workers"]) {
-    rmSync(join(work, kind), { recursive: true, force: true });
-  }
-
-  const r = runOracle(
-    ["render-plugin-templates", "--project-root", work],
-    work,
-  );
-  if (r.code !== 0) {
-    rmSync(work, { recursive: true, force: true });
-    throw new Error(
-      `render-plugin-templates failed (exit ${r.code}): ${r.stderr}`,
-    );
-  }
-
-  const roots = { arthackRoot, keeperRoot: work };
   const fixture: PluginTemplatesFixture = {
-    plugin_root_relative: planRootRel,
-    stdout: tokenizeRoots(r.stdout.toString("utf-8"), roots),
-    exit_code: r.code,
-    files: collectRenderedTree(work),
+    plugin_root_relative: join("plugins", "plan"),
+    stdout: tree.stdout,
+    exit_code: tree.exitCode,
+    files: collectRenderedTree(tree.work),
   };
-  rmSync(work, { recursive: true, force: true });
-
   if (fixture.files.length === 0) {
     throw new Error("render-plugin-templates produced no output files");
   }
@@ -320,11 +354,15 @@ function main(): void {
   mkdirSync(FIXTURES_DIR, { recursive: true });
 
   const render = captureRender(arthackRoot);
-  const checkGenerated = captureCheckGenerated(KEEPER_ROOT, arthackRoot);
-  const pluginTemplates = captureRenderPluginTemplates(
-    KEEPER_ROOT,
-    arthackRoot,
-  );
+  const tree = renderPlanTree(KEEPER_ROOT, arthackRoot);
+  let checkGenerated: CheckGeneratedFixture[];
+  let pluginTemplates: PluginTemplatesFixture;
+  try {
+    checkGenerated = captureCheckGenerated(tree, arthackRoot);
+    pluginTemplates = captureRenderPluginTemplates(tree);
+  } finally {
+    rmSync(tree.work, { recursive: true, force: true });
+  }
 
   const manifest: OracleManifest = {
     arthack_root: arthackRoot,

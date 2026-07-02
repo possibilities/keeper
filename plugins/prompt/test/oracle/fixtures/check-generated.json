@@ -1,6 +1,6 @@
 [
   {
-    "target_relative": "plugins/plan/agents/practice-scout.md",
+    "target_relative": "agents/practice-scout.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -14,7 +14,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/practice-scout.md",
+    "target_relative": "agents/practice-scout.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -28,7 +28,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/practice-scout.md.managed-file-dont-edit",
+    "target_relative": "agents/practice-scout.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -42,7 +42,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/agents/practice-scout.md.managed-file-dont-edit",
+    "target_relative": "agents/practice-scout.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -56,7 +56,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/skills/work/SKILL.md",
+    "target_relative": "skills/work/SKILL.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -70,7 +70,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/skills/work/SKILL.md",
+    "target_relative": "skills/work/SKILL.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -84,7 +84,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/skills/work/SKILL.md.managed-file-dont-edit",
+    "target_relative": "skills/work/SKILL.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -98,7 +98,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/skills/work/SKILL.md.managed-file-dont-edit",
+    "target_relative": "skills/work/SKILL.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -112,7 +112,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-high/.claude-plugin/plugin.json",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -126,7 +126,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-high/.claude-plugin/plugin.json",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -140,7 +140,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-high/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -154,7 +154,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-high/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -168,7 +168,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/agents/worker.md",
+    "target_relative": "workers/opus-high/agents/worker.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -182,7 +182,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/agents/worker.md",
+    "target_relative": "workers/opus-high/agents/worker.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -196,7 +196,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-high/agents/worker.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -210,7 +210,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-high/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-high/agents/worker.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -224,7 +224,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-max/.claude-plugin/plugin.json",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -238,7 +238,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-max/.claude-plugin/plugin.json",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -252,7 +252,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-max/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -266,7 +266,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-max/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -280,7 +280,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/agents/worker.md",
+    "target_relative": "workers/opus-max/agents/worker.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -294,7 +294,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/agents/worker.md",
+    "target_relative": "workers/opus-max/agents/worker.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -308,7 +308,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-max/agents/worker.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -322,7 +322,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-max/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-max/agents/worker.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -336,7 +336,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-medium/.claude-plugin/plugin.json",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -350,7 +350,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-medium/.claude-plugin/plugin.json",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -364,7 +364,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -378,7 +378,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -392,7 +392,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/agents/worker.md",
+    "target_relative": "workers/opus-medium/agents/worker.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -406,7 +406,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/agents/worker.md",
+    "target_relative": "workers/opus-medium/agents/worker.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -420,7 +420,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-medium/agents/worker.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -434,7 +434,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-medium/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-medium/agents/worker.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -448,7 +448,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-xhigh/.claude-plugin/plugin.json",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -462,7 +462,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/.claude-plugin/plugin.json",
+    "target_relative": "workers/opus-xhigh/.claude-plugin/plugin.json",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -476,7 +476,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -490,7 +490,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "target_relative": "workers/opus-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -504,7 +504,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/agents/worker.md",
+    "target_relative": "workers/opus-xhigh/agents/worker.md",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -518,7 +518,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/agents/worker.md",
+    "target_relative": "workers/opus-xhigh/agents/worker.md",
     "on": "write",
     "envelope_raw": {
       "marked": true,
@@ -532,7 +532,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-xhigh/agents/worker.md.managed-file-dont-edit",
     "on": "read",
     "envelope_raw": {
       "marked": true,
@@ -546,7 +546,7 @@
     "exit_code": 0
   },
   {
-    "target_relative": "plugins/plan/workers/opus-xhigh/agents/worker.md.managed-file-dont-edit",
+    "target_relative": "workers/opus-xhigh/agents/worker.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
