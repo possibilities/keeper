@@ -1644,14 +1644,22 @@ export interface DispatchedPayload {
  * Durable-ack reply shape for {@link ConfirmRunningDeps.emitDispatched}
  * `ok:true` means main DURABLY inserted the `Dispatched` event
  * onto the writable connection before replying; `ok:false` means the
- * insert threw (a writer-lock contention or DB failure). The reconciler
- * launches ONLY on `ok:true`; an `ok:false` (or a rejected ack-wait —
- * timeout / shutdown) aborts WITHOUT launching, so the SessionStart-
- * drains-before-`Dispatched` race that would re-open the double-
- * dispatch window is closed.
+ * insert threw (a writer-lock contention or DB failure) OR the durable
+ * mint gate SUPPRESSED a re-mint of the same `verb::id` inside the gate
+ * window. The reconciler launches ONLY on `ok:true`; an `ok:false` (or a
+ * rejected ack-wait — timeout / shutdown) aborts WITHOUT launching, so the
+ * SessionStart-drains-before-`Dispatched` race that would re-open the
+ * double-dispatch window is closed.
+ *
+ * `suppressed` splits the two `ok:false` flavors: `suppressed:true` is a
+ * benign mint-gate dedup (a live attempt is presumed in flight / freshly
+ * minted, so `confirmRunning` returns `"suppressed-dup"` and the cycle glue
+ * RE-STAMPS the cooldown instead of clearing it); absent/`false` is a real
+ * insert failure (`"aborted-prelaunch"`, cooldown CLEARED).
  */
 export interface DispatchedAck {
   ok: boolean;
+  suppressed?: boolean;
 }
 
 /**
@@ -1668,7 +1676,7 @@ export interface DispatchExpiredPayload {
 }
 
 /**
- * Confirm outcome — internal to `runReconcileCycle`. Five-way:
+ * Confirm outcome — internal to `runReconcileCycle`. Six-way:
  *  - `"ok"` — the SessionStart `jobs` row landed before the ceiling; promoted to
  *    `liveDispatches`.
  *  - `"failed"` — `launch()` returned `{ok:false}` (or threw); mints a STICKY
@@ -1677,21 +1685,28 @@ export interface DispatchExpiredPayload {
  *    row. UNKNOWN, not failed (the backend execs `claude` cold past the ceiling). NO
  *    `DispatchFailed`; the `pending_dispatches` row is KEPT so the TTL sweep
  *    mints `DispatchExpired` if the bind never arrives.
- *  - `"aborted-prelaunch"` — an abort BEFORE `launch()` (ack `{ok:false}` /
- *    ack-wait reject / shutdown racing the ack). The launch never happened; the
- *    cycle glue CLEARS the cooldown + finalizer stamps (`failedKeys` owns
- *    stickiness).
+ *  - `"aborted-prelaunch"` — an abort BEFORE `launch()` (ack `{ok:false}` insert
+ *    failure / ack-wait reject / shutdown racing the ack). The launch never
+ *    happened; the cycle glue CLEARS the cooldown + finalizer stamps (`failedKeys`
+ *    owns stickiness).
  *  - `"aborted-postlaunch"` — an abort AFTER `launch()` fired (mid-poll
  *    shutdown). The launch DID happen, so the cycle glue KEEPS the stamps so a
  *    fold-lag-blind re-dispatch can't double-launch the worktree. No
  *    `DispatchFailed` either way (shutdown is clean teardown).
+ *  - `"suppressed-dup"` — the durable mint gate SUPPRESSED this re-mint (ack
+ *    `{ok:false, suppressed:true}`): NO event row landed and a live attempt is
+ *    presumed in flight / freshly minted. The launch never happened, but unlike
+ *    `"aborted-prelaunch"` this is a benign dedup — the cycle glue RE-STAMPS the
+ *    cooldown (damp, do NOT re-arm) and does NOT set `failedKeys` (the work is
+ *    not failed). No `DispatchFailed`.
  */
 export type ConfirmOutcome =
   | "ok"
   | "failed"
   | "indoubt"
   | "aborted-prelaunch"
-  | "aborted-postlaunch";
+  | "aborted-postlaunch"
+  | "suppressed-dup";
 
 /**
  * Default poll cadence — every 1s. Spec says ~1-2s; we pick 1000ms so a
@@ -3458,6 +3473,15 @@ export async function confirmRunning(
     return "aborted-prelaunch";
   }
   if (!ack.ok) {
+    if (ack.suppressed === true) {
+      // Durable mint gate SUPPRESSED this re-mint (same `verb::id` inside the
+      // gate window): NO row landed and a live attempt is presumed in flight (or
+      // freshly minted by the winning mint). This is a benign dedup, not a
+      // failure — return the distinct `"suppressed-dup"` outcome so the cycle
+      // glue RE-STAMPS the cooldown (damp, do NOT re-arm) instead of CLEARING it.
+      // Clearing here is the in-lifetime amplifier: suppress→clear→re-dispatch.
+      return "suppressed-dup";
+    }
     // Durable insert failed on main. Abort without launching — no row
     // landed, so no TTL cleanup needed; the next reconcile cycle re-attempts.
     return "aborted-prelaunch";
@@ -3806,6 +3830,19 @@ export async function runReconcileCycle(
         // expire early relative to the in-doubt launch it must suppress. A SINGLE
         // refresh — never compounding across cycles (re-stamping on every retry
         // is the perpetual-suppression trap). Lockstep with the finalizer guard.
+        state.redispatchCooldown.set(plan.key, deps.now());
+        if (plan.isEpicFinalizer) {
+          state.finalizerGuard.set(plan.id, deps.now());
+        }
+      } else if (outcome === "suppressed-dup") {
+        // The durable mint gate suppressed this re-mint (a live attempt is in
+        // flight / freshly minted). RE-STAMP the cooldown rather than CLEAR it:
+        // a pre-launch abort clears (nothing launched, so re-dispatch freely),
+        // but suppression must DAMP — clearing here re-arms the very loop the
+        // gate exists to break (suppress→clear→re-dispatch→suppress…). `failedKeys`
+        // is left untouched (the work is not failed) and no live entry is
+        // recorded (this attempt did not launch). Keep the finalizer guard
+        // lockstep with the cooldown, as the indoubt arm does.
         state.redispatchCooldown.set(plan.key, deps.now());
         if (plan.isEpicFinalizer) {
           state.finalizerGuard.set(plan.id, deps.now());
@@ -5197,14 +5234,21 @@ export interface DispatchedMessage {
 
 /**
  * Main → worker: durable-ack reply paired with {@link DispatchedMessage}. Sent
- * ONLY after main has inserted (or failed to insert) the `Dispatched` event.
- * `ok` is `true` on a successful insert; `confirmRunning` launches only on
- * `ok:true`.
+ * ONLY after main has resolved the `Dispatched` mint. `ok` is `true` on a
+ * successful insert; `confirmRunning` launches only on `ok:true`.
+ *
+ * `suppressed` distinguishes the durable-gate SUPPRESSED outcome (`ok:false,
+ * suppressed:true`) — a re-mint of the same `verb::id` inside the mint-gate window,
+ * which inserts NO event row — from an insert FAILURE (`ok:false` with `suppressed`
+ * absent/`false`). Both abort the launch, but the consumer treats them differently:
+ * a suppressed mint is a benign dedup (do NOT clear the redispatch cooldown), an
+ * insert failure is a real error. Absent ⇒ not suppressed.
  */
 export interface DispatchedAckMessage {
   type: "dispatched-ack";
   id: number;
   ok: boolean;
+  suppressed?: boolean;
 }
 
 /**
@@ -5692,7 +5736,7 @@ function main(): void {
       const pending = pendingDispatchAcks.get(msg.id);
       if (pending) {
         pendingDispatchAcks.delete(msg.id);
-        pending.resolve({ ok: msg.ok });
+        pending.resolve({ ok: msg.ok, suppressed: msg.suppressed });
       }
       return;
     }

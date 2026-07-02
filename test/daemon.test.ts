@@ -38,6 +38,8 @@ import {
   checkKeeperAgentPresence,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
+  DISPATCH_MINT_GATE_EVICT_MS,
+  DISPATCH_MINT_GATE_WINDOW_MS,
   decideGitSeedWatchdog,
   drainToCompletion,
   effectiveBlockEscalationRepo,
@@ -72,7 +74,16 @@ import {
   type WorkerName,
   withBootDrainCheckpointTuning,
 } from "../src/daemon";
-import { openDb, SCHEMA_VERSION } from "../src/db";
+import {
+  clearDispatchMintGate,
+  EPHEMERAL_PROJECTIONS,
+  evictStaleDispatchMintGate,
+  openDb,
+  readDispatchMintGate,
+  runDispatchMintGate,
+  SCHEMA_VERSION,
+  upsertDispatchMintGate,
+} from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
@@ -80,7 +91,7 @@ import { isPidAlive } from "../src/server-worker";
 import type { Event } from "../src/types";
 import { worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
-import { freshMemDb } from "./helpers/template-db";
+import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -2914,8 +2925,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // (appending the nullable `autopilot_state.worktree_multi_repo` rollout flag for
   // multi-repo worktree epics — an additive ALTER, NO cursor rewind: the fold never
   // reads it, the reconciler resolves it `?? OFF`, so a from-scratch re-fold leaves
-  // it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(101);
+  // it NULL byte-identical). And to 102 via fn-1061 task .1 (the DURABLE producer-
+  // owned `dispatch_mint_gate` table — the one-logical-dispatch-one-row rate-limit
+  // gate at the `Dispatched` mint site; a CREATE-only table, NO cursor rewind:
+  // producer state like `dead_letters`, never folded, so it is excluded from
+  // `EPHEMERAL_PROJECTIONS`, the rewind DELETE list, and the byte-identical re-fold
+  // charter, and an empty log leaves the table empty).
+  expect(SCHEMA_VERSION).toBe(102);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -2989,6 +3005,280 @@ test("selectExpiredPendingDispatches measures TTL against frozen dispatched_at (
 test("selectExpiredPendingDispatches on an empty pending_dispatches table returns []", () => {
   const { db } = freshMemDb();
   expect(selectExpiredPendingDispatches(db, 1_700_000_000_000)).toEqual([]);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1061 task .1 — the DURABLE dispatch-mint rate-limit gate. One logical
+// dispatch = one durable `Dispatched` row: the gate read + the conditional event
+// insert are one transaction at the mint site, a re-mint of the same `verb::id`
+// inside the window is suppressed, the gate survives a restart, `retry_dispatch`
+// (via `clearDispatchMintGate`) clears it, and stale rows age out via eviction.
+// ---------------------------------------------------------------------------
+
+/** Insert a minimal `Dispatched` event exactly as the mint site does. */
+function insertDispatchedRow(
+  db: ReturnType<typeof openDb>["db"],
+  dispatchKey: string,
+  tsSec: number,
+): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'Dispatched', 'pending_dispatches', '{}')`,
+    [tsSec, dispatchKey],
+  );
+}
+
+function countDispatchedRows(
+  db: ReturnType<typeof openDb>["db"],
+  dispatchKey: string,
+): number {
+  return (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND hook_event = 'Dispatched'",
+      )
+      .get(dispatchKey) as { n: number }
+  ).n;
+}
+
+test("DISPATCH_MINT_GATE_WINDOW_MS is 60s, below the TTL, and the evict horizon sits a few windows past it", () => {
+  // Sized strictly below the 120s pending-dispatch TTL (and the 200s cooldown) so
+  // a legit re-dispatch passes the gate; eviction is kept past the window so a row
+  // is never pruned while it can still suppress.
+  expect(DISPATCH_MINT_GATE_WINDOW_MS).toBe(60_000);
+  expect(DISPATCH_MINT_GATE_WINDOW_MS).toBeLessThan(PENDING_DISPATCH_TTL_MS);
+  expect(DISPATCH_MINT_GATE_EVICT_MS).toBeGreaterThan(
+    DISPATCH_MINT_GATE_WINDOW_MS,
+  );
+});
+
+test("openDb materializes the durable dispatch_mint_gate table (NOT an ephemeral projection)", () => {
+  const { db } = freshMemDb();
+  const tables = new Set(
+    (
+      db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+        name: string;
+      }[]
+    ).map((t) => t.name),
+  );
+  expect(tables.has("dispatch_mint_gate")).toBe(true);
+  // Producer state (same class as dead_letters), NOT a boot-truncated projection.
+  expect(EPHEMERAL_PROJECTIONS as readonly string[]).not.toContain(
+    "dispatch_mint_gate",
+  );
+  db.close();
+});
+
+test("runDispatchMintGate: first mint runs onFreshMint and stamps the gate", () => {
+  const { db } = freshMemDb();
+  const key = "work::fn-1-foo.1";
+  const t0 = 1_700_000_000_000;
+  let mints = 0;
+  const { suppressed } = runDispatchMintGate(
+    db,
+    key,
+    t0,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => {
+      mints += 1;
+    },
+  );
+  expect(suppressed).toBe(false);
+  expect(mints).toBe(1);
+  // The gate is stamped at `nowMs / 1000` (unix-epoch seconds).
+  expect(readDispatchMintGate(db, key)).toBe(t0 / 1000);
+  db.close();
+});
+
+test("runDispatchMintGate: a re-mint inside the window is suppressed and inserts NO second events row", () => {
+  const { db } = freshMemDb();
+  const key = "work::fn-1-foo.1";
+  const t0 = 1_700_000_000_000;
+
+  const first = runDispatchMintGate(
+    db,
+    key,
+    t0,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => insertDispatchedRow(db, key, t0 / 1000),
+  );
+  expect(first.suppressed).toBe(false);
+  expect(countDispatchedRows(db, key)).toBe(1);
+
+  // Re-mint 30s later — inside the 60s window: suppressed, onFreshMint never runs.
+  let secondRan = false;
+  const second = runDispatchMintGate(
+    db,
+    key,
+    t0 + 30_000,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => {
+      secondRan = true;
+      insertDispatchedRow(db, key, (t0 + 30_000) / 1000);
+    },
+  );
+  expect(second.suppressed).toBe(true);
+  expect(secondRan).toBe(false);
+  // Still EXACTLY one durable row for the logical dispatch.
+  expect(countDispatchedRows(db, key)).toBe(1);
+  db.close();
+});
+
+test("runDispatchMintGate: a re-mint AFTER the window passes (legit re-dispatch) mints a second row", () => {
+  const { db } = freshMemDb();
+  const key = "work::fn-1-foo.1";
+  const t0 = 1_700_000_000_000;
+
+  runDispatchMintGate(db, key, t0, DISPATCH_MINT_GATE_WINDOW_MS, () =>
+    insertDispatchedRow(db, key, t0 / 1000),
+  );
+  // A TTL-cadence re-dispatch at +120s (past the 60s window) passes untouched.
+  const later = t0 + PENDING_DISPATCH_TTL_MS;
+  const { suppressed } = runDispatchMintGate(
+    db,
+    key,
+    later,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => insertDispatchedRow(db, key, later / 1000),
+  );
+  expect(suppressed).toBe(false);
+  expect(countDispatchedRows(db, key)).toBe(2);
+  // The mint branch re-stamped the gate to the later time.
+  expect(readDispatchMintGate(db, key)).toBe(later / 1000);
+  db.close();
+});
+
+test("runDispatchMintGate: suppression does NOT re-stamp the gate (window stays anchored to the frozen first mint)", () => {
+  const { db } = freshMemDb();
+  const key = "work::fn-1-foo.1";
+  const t0 = 1_700_000_000_000;
+
+  runDispatchMintGate(db, key, t0, DISPATCH_MINT_GATE_WINDOW_MS, () => {});
+  // A drip of suppressed re-mints across the window must not renew it.
+  for (const dt of [10_000, 20_000, 50_000]) {
+    const { suppressed } = runDispatchMintGate(
+      db,
+      key,
+      t0 + dt,
+      DISPATCH_MINT_GATE_WINDOW_MS,
+      () => {},
+    );
+    expect(suppressed).toBe(true);
+    // Gate still anchored to t0 — never advanced by a suppress.
+    expect(readDispatchMintGate(db, key)).toBe(t0 / 1000);
+  }
+  // So the very next attempt just past 60s from t0 passes, not perpetually blocked.
+  const past = runDispatchMintGate(
+    db,
+    key,
+    t0 + DISPATCH_MINT_GATE_WINDOW_MS,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => {},
+  );
+  expect(past.suppressed).toBe(false);
+  db.close();
+});
+
+test("runDispatchMintGate: a throw from onFreshMint rolls back the gate stamp (atomicity — the next attempt is NOT wrongly suppressed)", () => {
+  const { db } = freshMemDb();
+  const key = "work::fn-1-foo.1";
+  const t0 = 1_700_000_000_000;
+
+  expect(() =>
+    runDispatchMintGate(db, key, t0, DISPATCH_MINT_GATE_WINDOW_MS, () => {
+      throw new Error("insert failed");
+    }),
+  ).toThrow("insert failed");
+  // The transaction rolled back: no gate row, so a real retry is not suppressed.
+  expect(readDispatchMintGate(db, key)).toBeNull();
+  const retry = runDispatchMintGate(
+    db,
+    key,
+    t0 + 1_000,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => {},
+  );
+  expect(retry.suppressed).toBe(false);
+  db.close();
+});
+
+test("the dispatch_mint_gate survives a daemon restart within the window (durable, read fresh from disk)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-mint-gate-"));
+  const path = join(dir, "keeper.db");
+  const t0 = 1_700_000_000_000;
+  try {
+    // Boot 1: mint stamps the gate, then the daemon "restarts" (close).
+    const boot1 = freshDbFile(path);
+    runDispatchMintGate(
+      boot1.db,
+      "work::fn-1-foo.1",
+      t0,
+      DISPATCH_MINT_GATE_WINDOW_MS,
+      () => insertDispatchedRow(boot1.db, "work::fn-1-foo.1", t0 / 1000),
+    );
+    boot1.db.close();
+
+    // Boot 2: a fresh connection reads the persisted gate row — a re-mint 30s
+    // later (still inside the window) is suppressed across the restart.
+    const boot2 = openDb(path);
+    expect(readDispatchMintGate(boot2.db, "work::fn-1-foo.1")).toBe(t0 / 1000);
+    const { suppressed } = runDispatchMintGate(
+      boot2.db,
+      "work::fn-1-foo.1",
+      t0 + 30_000,
+      DISPATCH_MINT_GATE_WINDOW_MS,
+      () =>
+        insertDispatchedRow(boot2.db, "work::fn-1-foo.1", (t0 + 30_000) / 1000),
+    );
+    expect(suppressed).toBe(true);
+    expect(countDispatchedRows(boot2.db, "work::fn-1-foo.1")).toBe(1);
+    boot2.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("clearDispatchMintGate: clearing a key (the retry_dispatch fast path) lets an immediate re-mint pass", () => {
+  const { db } = freshMemDb();
+  const key = "close::fn-1-foo";
+  const t0 = 1_700_000_000_000;
+
+  runDispatchMintGate(db, key, t0, DISPATCH_MINT_GATE_WINDOW_MS, () => {});
+  // A human retry clears the gate row...
+  clearDispatchMintGate(db, key);
+  expect(readDispatchMintGate(db, key)).toBeNull();
+  // ...so an immediate re-mint (well inside the window) is NOT suppressed.
+  const { suppressed } = runDispatchMintGate(
+    db,
+    key,
+    t0 + 1_000,
+    DISPATCH_MINT_GATE_WINDOW_MS,
+    () => {},
+  );
+  expect(suppressed).toBe(false);
+  db.close();
+});
+
+test("evictStaleDispatchMintGate prunes rows past the cutoff and keeps fresh ones", () => {
+  const { db } = freshMemDb();
+  const nowMs = 1_700_000_000_000;
+  const nowSec = nowMs / 1000;
+  // Stale: stamped a full evict horizon + a window ago.
+  upsertDispatchMintGate(
+    db,
+    "work::stale.1",
+    nowSec -
+      (DISPATCH_MINT_GATE_EVICT_MS + DISPATCH_MINT_GATE_WINDOW_MS) / 1000,
+  );
+  // Fresh: stamped just now — still inside the window.
+  upsertDispatchMintGate(db, "work::fresh.1", nowSec);
+
+  const cutoffSec = (nowMs - DISPATCH_MINT_GATE_EVICT_MS) / 1000;
+  const evicted = evictStaleDispatchMintGate(db, cutoffSec);
+  expect(evicted).toBe(1);
+  expect(readDispatchMintGate(db, "work::stale.1")).toBeNull();
+  expect(readDispatchMintGate(db, "work::fresh.1")).toBe(nowSec);
   db.close();
 });
 

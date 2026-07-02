@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 101;
+export const SCHEMA_VERSION = 102;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1162,6 +1162,123 @@ CREATE TABLE IF NOT EXISTS dispatch_never_bound (
     PRIMARY KEY (verb, id)
 )
 `;
+
+/**
+ * `dispatch_mint_gate` — the DURABLE producer-owned rate-limit gate at the
+ * `Dispatched` mint site. One logical dispatch attempt can otherwise amplify into
+ * N same-instant `Dispatched` event rows (pre-launch abort loops, restart storms,
+ * the insert→fold gap). This table records the wall-clock (`minted_at`, unix-epoch
+ * SECONDS) of the last minted event per `verb::id` `dispatch_key`; the mint site
+ * reads it in the SAME transaction as the event insert and SUPPRESSES a re-mint of
+ * the same key inside the gate window (`DISPATCH_MINT_GATE_WINDOW_MS`), so one
+ * logical dispatch = one durable record.
+ *
+ * PRODUCER STATE, NOT a reducer projection — same class as `dead_letters`: it is
+ * NEVER folded from events, so it is DELIBERATELY absent from
+ * {@link EPHEMERAL_PROJECTIONS} (durable across restarts — the in-memory cooldown
+ * is what stays ephemeral), from the rewinding-migration DELETE list, and from the
+ * re-fold-equivalence comparison. `minted_at` is wall-clock a PRODUCER stamps, not
+ * an event `ts`, so it never enters a fold. Rows age out via the producer TTL
+ * sweep (`evictStaleDispatchMintGate`), and `retry_dispatch` clears a key's row so
+ * the human fast-path is never swallowed.
+ */
+const CREATE_DISPATCH_MINT_GATE = `
+CREATE TABLE IF NOT EXISTS dispatch_mint_gate (
+    dispatch_key TEXT PRIMARY KEY,
+    minted_at REAL NOT NULL
+)
+`;
+
+/**
+ * Read the `minted_at` (unix-epoch seconds) of the last minted `Dispatched` event
+ * for `dispatchKey`, or `null` when the gate has no row. Producer helper — call it
+ * INSIDE the mint transaction on main's writable connection so the read + the
+ * conditional event insert are atomic.
+ */
+export function readDispatchMintGate(
+  db: Database,
+  dispatchKey: string,
+): number | null {
+  const row = db
+    .query("SELECT minted_at FROM dispatch_mint_gate WHERE dispatch_key = ?")
+    .get(dispatchKey) as { minted_at: number } | undefined;
+  return row ? row.minted_at : null;
+}
+
+/**
+ * Stamp (`INSERT ... ON CONFLICT DO UPDATE`) the gate row for `dispatchKey` with
+ * `mintedAtSec` (unix-epoch seconds). Called only on the FRESH-mint branch, in the
+ * same transaction as the event insert.
+ */
+export function upsertDispatchMintGate(
+  db: Database,
+  dispatchKey: string,
+  mintedAtSec: number,
+): void {
+  db.query(
+    `INSERT INTO dispatch_mint_gate (dispatch_key, minted_at)
+     VALUES (?, ?)
+     ON CONFLICT(dispatch_key) DO UPDATE SET minted_at = excluded.minted_at`,
+  ).run(dispatchKey, mintedAtSec);
+}
+
+/**
+ * DELETE the gate row for `dispatchKey` — the `retry_dispatch` / `DispatchCleared`
+ * fast-path so a human retry (or a recover auto-clear) re-dispatches immediately
+ * without waiting out the gate window.
+ */
+export function clearDispatchMintGate(db: Database, dispatchKey: string): void {
+  db.query("DELETE FROM dispatch_mint_gate WHERE dispatch_key = ?").run(
+    dispatchKey,
+  );
+}
+
+/**
+ * Prune every gate row older than `cutoffSec` (unix-epoch seconds). A row past the
+ * window has long since stopped suppressing; this producer sweep bounds the table.
+ * Returns the number of rows evicted.
+ */
+export function evictStaleDispatchMintGate(
+  db: Database,
+  cutoffSec: number,
+): number {
+  const res = db
+    .query("DELETE FROM dispatch_mint_gate WHERE minted_at < ?")
+    .run(cutoffSec);
+  return Number(res.changes ?? 0);
+}
+
+/**
+ * The transactional core of the `Dispatched` mint gate. Reads the gate row and,
+ * INSIDE one `BEGIN IMMEDIATE` transaction on `db`, either SUPPRESSES (a re-mint of
+ * `dispatchKey` whose frozen `minted_at` is within `windowMs` of `nowMs` — no gate
+ * write, `onFreshMint` NOT called) or MINTS (stamps the gate at `nowMs` AND runs
+ * `onFreshMint` — the event insert — atomically). Returns `{ suppressed }`.
+ *
+ * Suppression NEVER re-stamps the gate, so the window is absolute from the frozen
+ * first mint. A throw from `onFreshMint` rolls back BOTH the gate stamp and the
+ * insert (atomicity) and propagates — the caller treats it as a real failure, not
+ * a suppression. `nowMs` and `windowMs` are milliseconds; `minted_at` is seconds.
+ */
+export function runDispatchMintGate(
+  db: Database,
+  dispatchKey: string,
+  nowMs: number,
+  windowMs: number,
+  onFreshMint: () => void,
+): { suppressed: boolean } {
+  let suppressed = false;
+  db.transaction(() => {
+    const mintedAt = readDispatchMintGate(db, dispatchKey);
+    if (mintedAt !== null && nowMs - mintedAt * 1000 < windowMs) {
+      suppressed = true;
+      return;
+    }
+    upsertDispatchMintGate(db, dispatchKey, nowMs / 1000);
+    onFreshMint();
+  }).immediate();
+  return { suppressed };
+}
 
 /**
  * `block_escalations` projection table — the escalate-once LATCH for the daemon
@@ -2340,6 +2457,7 @@ function migrate(db: Database): void {
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_DISPATCH_NEVER_BOUND);
+      db.run(CREATE_DISPATCH_MINT_GATE);
       db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_HANDOFFS);
@@ -5529,6 +5647,20 @@ function migrate(db: Database): void {
         "worktree_multi_repo",
         "INTEGER",
       );
+
+      // v101→v102 (fn-1061 task .1): add the DURABLE producer-owned
+      // `dispatch_mint_gate` table — the rate-limit gate that squashes N
+      // same-instant `Dispatched` rows for one logical dispatch down to one durable
+      // record. CREATEd idempotently in the always-run base schema block above
+      // (`CREATE_DISPATCH_MINT_GATE`, `IF NOT EXISTS`), so an existing DB gains the
+      // empty table on this boot and the mint site populates it; no ALTER /
+      // backfill / cursor rewind. Producer state (same class as `dead_letters`), NOT
+      // a reducer projection — so it is DELIBERATELY excluded from
+      // `EPHEMERAL_PROJECTIONS`, from the rewinding-migration DELETE list, and from
+      // the re-fold-equivalence charter. Whitelist-only Python read (keeper-py never
+      // reads `dispatch_mint_gate`, but the whitelist is a hard membership set) —
+      // this bump MUST add 102 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
+      // the SAME commit; test/schema-version.test.ts enforces it.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

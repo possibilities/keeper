@@ -2548,9 +2548,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // statusLine payload — an additive ALTER, not an epics-shape change), fn-1024
   // task .1. v101 appends the nullable `autopilot_state.worktree_multi_repo`
   // rollout flag for multi-repo worktree epics (an additive ALTER, not an
-  // epics-shape change), fn-1034 task .1. The v62→v63 epics-shape migration this
+  // epics-shape change), fn-1034 task .1. v102 adds the durable
+  // `dispatch_mint_gate` producer table (the one-logical-dispatch-one-row
+  // rate-limit gate at the `Dispatched` mint site — a CREATE-only table, not an
+  // epics-shape change), fn-1061 task .1. The v62→v63 epics-shape migration this
   // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(101);
+  expect(SCHEMA_VERSION).toBe(102);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
