@@ -68,5 +68,5 @@ and do NOT edit `plugins/plan/agents/docs-gap-scout.md` (generic, out of scope).
 - [ ] CLAUDE.md ≤120 lines and `bun scripts/lint-claude-md.ts` exits 0; `bun test` green
 
 ## Done summary
-
+Gutted README from 4,466 to 121 lines / ~7KB (front door: what/is-NOT, compact system map, minimal install/uninstall incl. the two no-code-home manual steps, lean Architecture invariants, code-runbook backup pointer); deleted Example clients + Inspect + the Install/Architecture/Backup bulk. Repointed all seven code/CLAUDE.md cross-references forward-facing; CLAUDE.md stays 117 lines and lint-green.
 ## Evidence
