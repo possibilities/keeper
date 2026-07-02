@@ -126,11 +126,15 @@ export interface LaunchSpec {
 }
 
 /** One row of a `list-panes -a` sweep: the server-global pane id, its window
- *  id (`@N`), and the window's current name. The renamer worker keys windows by
- *  `windowId` and compares `windowName` to decide whether a rename is owed. */
+ *  id (`@N`), the pane's current foreground command (`pane_current_command`),
+ *  and the window's current name. The renamer worker keys windows by `windowId`
+ *  and compares `windowName`; the reconciler's slot-occupancy gate reads
+ *  `currentCommand` to tell a live claude from the dead `exec $SHELL -l -i`
+ *  shell tail holding a stopped session's pane. */
 export interface PaneInfo {
   readonly paneId: string;
   readonly windowId: string;
+  readonly currentCommand: string;
   readonly windowName: string;
 }
 
@@ -382,12 +386,15 @@ export function buildTmuxServerPidArgs(): string[] {
 }
 
 /**
- * Build the tmux `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'`
- * sweep argv. Pure — exported for tests. `-a` spans every session on the
- * server. The format is TAB-delimited with `window_name` LAST so the renamer's
- * 2-split parse keeps a tab inside an arbitrary window name from corrupting the
- * pane/window fields (names are free user text — tabs, colons, unicode all
- * survive).
+ * Build the tmux `list-panes -a -F
+ * '#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}'` sweep argv.
+ * Pure — exported for tests. `-a` spans every session on the server. The format is
+ * TAB-delimited with `window_name` LAST so the parse's final split keeps a tab
+ * inside an arbitrary window name from corrupting the three leading FIXED fields
+ * (pane id / window id / current command); names are free user text — tabs,
+ * colons, unicode all survive. `pane_current_command` is a bare process name (no
+ * tabs) so it rides a fixed field. `pane_id` stays FIRST so `classifyCloseKind`'s
+ * leading-field match is unaffected.
  */
 export function buildTmuxListPanesArgs(): string[] {
   return [
@@ -395,7 +402,7 @@ export function buildTmuxListPanesArgs(): string[] {
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{window_name}",
+    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}",
   ];
 }
 
@@ -656,12 +663,13 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
-      // to skip this cycle. Parse is tab-delimited with `window_name` LAST and
-      // a 2-split limit so a tab inside an arbitrary window name cannot bleed
-      // into the pane/window fields. Malformed lines are dropped silently — a
-      // partial sweep is still a usable snapshot. The locale-defaulted env is
-      // LOAD-BEARING: a C-locale client sanitizes the TAB delimiters to `_`,
-      // which would drop every line and read as an empty sweep.
+      // to skip this cycle. Parse takes the THREE leading fixed fields (pane id /
+      // window id / current command) off the first three tabs, with `window_name`
+      // LAST so a tab inside an arbitrary window name cannot bleed into them.
+      // Malformed lines are dropped silently — a partial sweep is still a usable
+      // snapshot. The locale-defaulted env is LOAD-BEARING: a C-locale client
+      // sanitizes the TAB delimiters to `_`, which would drop every line and read
+      // as an empty sweep.
       const res = await runCapture(buildTmuxListPanesArgs(), {
         env: localeDefaultedEnv(
           process.env as Record<string, string | undefined>,
@@ -683,13 +691,18 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
         if (secondTab < 0) {
           continue;
         }
+        const thirdTab = line.indexOf("\t", secondTab + 1);
+        if (thirdTab < 0) {
+          continue;
+        }
         const paneId = line.slice(0, firstTab);
         const windowId = line.slice(firstTab + 1, secondTab);
-        const windowName = line.slice(secondTab + 1);
+        const currentCommand = line.slice(secondTab + 1, thirdTab);
+        const windowName = line.slice(thirdTab + 1);
         if (paneId === "" || windowId === "") {
           continue;
         }
-        panes.push({ paneId, windowId, windowName });
+        panes.push({ paneId, windowId, currentCommand, windowName });
       }
       return panes;
     },
