@@ -36,5 +36,5 @@ it; refold-equivalence green.
 - [ ] Historical events fold to safe defaults; refold-equivalence green
 
 ## Done summary
-
+Killed and DispatchExpired reaps now carry a producer-stamped reason: Killed folds onto a new nullable jobs.kill_reason column (schema v103, orthogonal to close_kind) exposed in query jobs + show-job; DispatchExpired carries a reason on its event blob. Historical events fold to NULL with re-fold determinism preserved.
 ## Evidence
