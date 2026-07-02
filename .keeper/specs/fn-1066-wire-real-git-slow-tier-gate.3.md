@@ -24,5 +24,7 @@ Evidence is the observed pin value vs keeper's meta(schema_version), plus a live
 - [ ] Verification procedure documented in the sitter README repin section
 
 ## Done summary
-
+Verified live: sitter pin max 102 equals keeper.db meta(schema_version) 102 -- cross-checked four ways: repin --json (live_version=102, pin_max=102, would_arm=false), a direct read-only sqlite query of meta, keeper src SCHEMA_VERSION=102, and the checked-in fixture schema-v102.sql with FIXTURE_SCHEMA_VERSION=102. Pin was NOT stale so repin-schema was correctly not run; added a 'Verifying the pin tracks keeper' checklist to the sitter README so the next keeper schema bump has a written procedure.
 ## Evidence
+- Commits: 4cbe7d6
+- Tests: bun test: 726 pass / 0 fail, bun run sitters/repin/watch.ts --json: live_version=102 pin_max=102 would_arm=false, sqlite3 read-only meta.schema_version=102 (TEXT)
