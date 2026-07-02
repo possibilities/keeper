@@ -37,5 +37,5 @@ manual proof: move the real file aside, run install.sh, `keeper agent claude --h
 - [ ] ConfigError recovery text references keeper's own install path, not arthack's stow
 
 ## Done summary
-
+install.sh writes keeper's own default plugins.yaml (its two plugins, no arthack scan dirs) when absent via the ensure-plugin-config bridge; existing file/symlink (even dangling) left untouched; ConfigError recovery text now names keeper's install path, not arthack stow.
 ## Evidence
