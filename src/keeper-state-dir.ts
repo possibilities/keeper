@@ -1,9 +1,9 @@
 /**
  * `~/.local/state/keeper/` — keeper's durable per-user STATE root, the sibling of
  * `keeperConfigDir()`'s `~/.config/keeper/` (src/agent/config.ts). Deliberately
- * NON-XDG: it mirrors the Python daemon/api `STATE_DIR` and the usage-picker
- * convention (`src/usage-picker.ts`), NOT the XDG-honoring
- * `defaultKeeperAgentStateDir` / `keeper-agent` dir the tmux launcher uses.
+ * NON-XDG: it matches the usage-picker convention (`src/usage-picker.ts`), NOT
+ * the XDG-honoring `defaultKeeperAgentStateDir` / `keeper-agent` dir the tmux
+ * launcher uses.
  *
  * `KEEPER_STATE_DIR` overrides it — the single env seam (the test-isolation lever,
  * since os.homedir() ignores $HOME on macOS, and a production override).

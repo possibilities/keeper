@@ -3,11 +3,9 @@
  * write cycles on a shared sidecar file (the picker.json ledger, and — for
  * external consumers — any data file they open themselves).
  *
- * Vendored from agentusage's `src/flock.ts` (a 1:1 port — the picker ledger is a
- * cross-runtime invariant the Python `pick_profile` coexists on, so the libc
- * calls must NOT be paraphrased). DB-free leaf: imports only `bun:ffi` +
- * `node:fs`, never `src/db.ts`, so the `keeper agent` cold-start stays cheap.
- * Mirrors keeper's own `src/commit-work/flock.ts` libc/flock precedent.
+ * DB-free leaf: imports only `bun:ffi` + `node:fs`, never `src/db.ts`, so the
+ * `keeper agent` cold-start stays cheap. Mirrors keeper's own
+ * `src/commit-work/flock.ts` libc/flock precedent.
  *
  * Two macOS-aarch64 correctness hazards, both asserted in tests because they
  * fail SILENTLY:

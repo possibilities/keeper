@@ -1,17 +1,19 @@
 /**
- * Behavior pins for the dumb credit-weighted picker (`src/usage-picker.ts`),
- * vendored from agentusage's `src/api.ts`: rotation, 5x-weighting
- * proportionality, headroom scaling, stale-still-rotates, missing-usage→full-
- * headroom, new-entrant-no-catch-up-burst, over-100 clamp, garbage-multiplier
- * coercion, empty/skip paths, corrupt-state-reset-not-fatal, never-raises-on-
- * unreadable-state-dir, and the rate-limit cooldown (future/past/all-cooling/
- * malformed lift_at). The real multi-process flock-contention scenario is too
- * heavy for the fast tier and has no automated slow-tier sibling.
+ * Behavior pins for the buffered-LRU profile picker (`src/usage-picker.ts`):
+ * pure LRU rotation (name ties, new-entrant catch-up, corrupt-stamp ordering),
+ * the five-rung admission ladder (buffer → overflow → any-unparked →
+ * all-subscribed → DEFAULT), the `pending` burst reservation and its
+ * scrape-driven reset, rollover grace, multiplier coercion as the reservation
+ * divisor, the v2 ledger shape + `last_pick` forensic blob, and the fail-open
+ * / never-throws contract (corrupt state, unreadable state dir, rate-limit
+ * cooldown). Every scenario pins deterministically under `installMonotonicClock`
+ * — no statistical sampling, no real daemon, per-test tmpdir only.
  *
  * The picker reads two sources redirected into tmp: per-account envelopes under
  * the state dir (via `setStateDir`) and the catalog at
  * `$XDG_CONFIG_HOME/agentusage/config.yaml` (via the env var). The clock is
- * pinned with `setClock` (the DI seam replacing Python's `_MonotonicClock`).
+ * pinned with `setClock` — one `nowFn()` read per pick, so stamps strictly
+ * increase and LRU order is exact.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -66,8 +68,6 @@ function writeConfig(profiles: string[]): void {
   writeFileSync(join(configHome, "agentusage", "config.yaml"), yaml);
 }
 
-const UNSET = Symbol("unset");
-
 interface EnvelopeOpts {
   subscription_active: unknown;
   target?: string;
@@ -75,6 +75,10 @@ interface EnvelopeOpts {
   lift_at?: unknown;
   multiplier?: unknown;
   session_percent?: unknown;
+  week_percent?: unknown;
+  session_resets_at?: unknown;
+  week_resets_at?: unknown;
+  last_successful_fetch_at?: unknown;
   usage?: unknown;
   error?: unknown;
 }
@@ -82,10 +86,32 @@ interface EnvelopeOpts {
 function writeEnvelope(name: string, opts: EnvelopeOpts): void {
   let usage: unknown = opts.usage;
   if (usage === undefined) {
-    usage =
-      opts.session_percent === undefined
-        ? null
-        : { session: { percent_used: opts.session_percent } };
+    const hasSession =
+      opts.session_percent !== undefined ||
+      opts.session_resets_at !== undefined;
+    const hasWeek =
+      opts.week_percent !== undefined || opts.week_resets_at !== undefined;
+    if (!hasSession && !hasWeek) {
+      usage = null;
+    } else {
+      const built: Record<string, unknown> = {};
+      if (hasSession) {
+        const s: Record<string, unknown> = {};
+        if (opts.session_percent !== undefined)
+          s.percent_used = opts.session_percent;
+        if (opts.session_resets_at !== undefined)
+          s.resets_at = opts.session_resets_at;
+        built.session = s;
+      }
+      if (hasWeek) {
+        const w: Record<string, unknown> = {};
+        if (opts.week_percent !== undefined) w.percent_used = opts.week_percent;
+        if (opts.week_resets_at !== undefined)
+          w.resets_at = opts.week_resets_at;
+        built.week = w;
+      }
+      usage = built;
+    }
   }
   const envelope: Record<string, unknown> = {
     schema_version: 1,
@@ -99,33 +125,45 @@ function writeEnvelope(name: string, opts: EnvelopeOpts): void {
   if (opts.error !== undefined) {
     envelope.error = opts.error;
   }
-  if (opts.multiplier !== undefined && opts.multiplier !== UNSET) {
+  if (opts.multiplier !== undefined) {
     envelope.multiplier = opts.multiplier;
+  }
+  if (opts.last_successful_fetch_at !== undefined) {
+    envelope.last_successful_fetch_at = opts.last_successful_fetch_at;
   }
   writeFileSync(join(stateDir, `${name}.json`), JSON.stringify(envelope));
 }
 
-function readCounts(): Record<string, number> {
-  const state = JSON.parse(readFileSync(join(stateDir, "picker.json"), "utf8"));
-  const out: Record<string, number> = {};
-  for (const [name, entry] of Object.entries(state.picks)) {
-    out[name] = (entry as { count: number }).count;
-  }
-  return out;
+// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic ledger shape
+function readState(): any {
+  return JSON.parse(readFileSync(join(stateDir, "picker.json"), "utf8"));
 }
+
+// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic ledger shape
+function readPicks(): Record<string, any> {
+  return readState().picks;
+}
+
+function seedState(state: unknown): void {
+  writeFileSync(join(stateDir, "picker.json"), JSON.stringify(state));
+}
+
+// Fixed base for the pinned clock. `isoOffset` derives from the SAME base so
+// relative lift_at / resets_at stamps stay consistent with the pinned `now`.
+const CLOCK_BASE = Date.UTC(2026, 0, 1, 0, 0, 0);
 
 /** Monotonic clock — strictly increasing stamps, defeats microsecond ties. */
 function installMonotonicClock(): void {
   let counter = 0;
   setClock(() => {
     counter += 1;
-    return new Date(Date.UTC(2026, 0, 1, 0, 0, counter));
+    return new Date(CLOCK_BASE + counter * 1000);
   });
 }
 
-/** ISO stamp offset from real `now()` by `seconds`, with explicit tz offset. */
+/** ISO stamp offset from the pinned clock base by `seconds`, with explicit tz. */
 function isoOffset(seconds: number): string {
-  const d = new Date(Date.now() + seconds * 1000);
+  const d = new Date(CLOCK_BASE + seconds * 1000);
   const pad = (n: number, w = 2) => String(n).padStart(w, "0");
   const off = -d.getTimezoneOffset();
   const sign = off >= 0 ? "+" : "-";
@@ -137,10 +175,10 @@ function isoOffset(seconds: number): string {
   );
 }
 
-// ---------- rotation --------------------------------------------------------
+// ---------- LRU rotation ----------------------------------------------------
 
-describe("rotation", () => {
-  test("pick rotates round-robin", () => {
+describe("LRU rotation", () => {
+  test("rotates oldest-first with name tie-break", () => {
     installMonotonicClock();
     writeConfig(["p1", "p2", "p3"]);
     for (const name of ["p1", "p2", "p3"]) {
@@ -149,8 +187,60 @@ describe("rotation", () => {
 
     const picks = Array.from({ length: 6 }, () => pickProfile());
 
-    expect(new Set(picks.slice(0, 3))).toEqual(new Set(["p1", "p2", "p3"]));
-    expect(readCounts()).toEqual({ p1: 2, p2: 2, p3: 2 });
+    // All start absent (epoch-oldest) → name order; then strict LRU rotation.
+    expect(picks).toEqual(["p1", "p2", "p3", "p1", "p2", "p3"]);
+  });
+
+  test("a new entrant is picked once, then rotates to the back", () => {
+    installMonotonicClock();
+    // Established ledger: p1, p2 already stamped (clearly older than the clock).
+    seedState({
+      schema_version: 2,
+      picks: {
+        p1: {
+          last_picked_at: "2025-01-01T00:00:00+00:00",
+          pending: 0,
+          seen_fetch_at: null,
+        },
+        p2: {
+          last_picked_at: "2025-01-01T00:00:01+00:00",
+          pending: 0,
+          seen_fetch_at: null,
+        },
+      },
+    });
+    writeConfig(["p1", "p2", "fresh"]);
+    for (const name of ["p1", "p2", "fresh"]) {
+      writeEnvelope(name, { subscription_active: true });
+    }
+
+    // fresh has no stamp → epoch-oldest → picked first (one catch-up turn)…
+    expect(pickProfile()).toBe("fresh");
+    // …then it holds the newest stamp and rotates to the back (no burst).
+    expect(pickProfile()).not.toBe("fresh");
+    expect(pickProfile()).not.toBe("fresh");
+  });
+
+  test("corrupt last_picked_at sorts oldest without throwing", () => {
+    installMonotonicClock();
+    seedState({
+      schema_version: 2,
+      picks: {
+        valid: { last_picked_at: "2025-06-01T00:00:00+00:00", pending: 0 },
+        corrupt: { last_picked_at: "not-a-date", pending: 0 },
+        naive: { last_picked_at: "2030-01-01T00:00:00", pending: 0 },
+      },
+    });
+    writeConfig(["valid", "corrupt", "naive"]);
+    for (const name of ["valid", "corrupt", "naive"]) {
+      writeEnvelope(name, { subscription_active: true });
+    }
+
+    // corrupt + naive both sort epoch-oldest; name tie → corrupt first. Once
+    // they take real 2026 stamps, the parseable 2025 stamp on "valid" is oldest.
+    expect(pickProfile()).toBe("corrupt");
+    expect(pickProfile()).toBe("naive");
+    expect(pickProfile()).toBe("valid");
   });
 
   test("stale account still rotates", () => {
@@ -163,222 +253,85 @@ describe("rotation", () => {
 
     expect(picks).toEqual(new Set(["p1", "p2"]));
   });
-
-  test("stale Claude /usage endpoint throttle is skipped", () => {
-    installMonotonicClock();
-    writeConfig(["ok", "throttled"]);
-    writeEnvelope("ok", { subscription_active: true, status: "active" });
-    writeEnvelope("throttled", {
-      subscription_active: true,
-      status: "stale",
-      error: {
-        type: "ClaudeUsageEndpointRateLimited",
-        message: "retry later",
-        at: isoOffset(-60),
-      },
-    });
-
-    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
-
-    expect(picks).toEqual(new Set(["ok"]));
-  });
 });
 
-// ---------- weighted balancing ----------------------------------------------
+// ---------- admission ladder ------------------------------------------------
 
-// The large-N statistical proportionality proofs (the 5x-weighting and
-// all-sessions-burned distributions at full N, plus the headroom/missing-usage
-// even-split proofs) live in the slow sibling `test/usage-picker.slow.test.ts`
-// behind KEEPER_RUN_SLOW — ~2000 serial disk-bound picks blow the fast tier's
-// 10s ceiling under contention. The fast tier keeps deterministic weighting
-// coverage below via the injected monotonic clock (exact pick order + credit
-// math), not a shrunken statistical sample.
-describe("weighted balancing", () => {
-  test("5x multiplier outstrides 1x deterministically at equal headroom", () => {
-    // Stride scheduling is deterministic under a monotonic clock: pick the
-    // eligible profile minimizing count/weight, ties by name. With weights
-    // pro=1, max5=5 the first six picks resolve to a clean 5:1 split — the
-    // proportionality the slow tier reproves statistically at N=600.
+describe("admission ladder", () => {
+  test("rung 1: account at the buffer excluded, just-under admitted", () => {
     installMonotonicClock();
-    writeConfig(["pro", "max5"]);
-    writeEnvelope("pro", { subscription_active: true, multiplier: 1 });
-    writeEnvelope("max5", { subscription_active: true, multiplier: 5 });
+    writeConfig(["over", "under"]);
+    // over: session 85 (>= 80) — never admitted. under: session 0 — stays
+    // admitted for many picks (pending inflation < 80).
+    writeEnvelope("over", { subscription_active: true, session_percent: 85 });
+    writeEnvelope("under", { subscription_active: true, session_percent: 0 });
 
-    const picks = Array.from({ length: 6 }, () => pickProfile());
+    const picks = Array.from({ length: 5 }, () => pickProfile());
 
-    expect(picks).toEqual(["max5", "pro", "max5", "max5", "max5", "max5"]);
-    expect(readCounts()).toEqual({ pro: 1, max5: 5 });
+    expect(picks.every((p) => p === "under")).toBe(true);
+    expect(readState().last_pick.rung).toBe(1);
   });
 
-  test("equal weights degrade to round-robin", () => {
+  test("rung 1: the weekly buffer also gates", () => {
     installMonotonicClock();
-    writeConfig(["p1", "p2", "p3"]);
-    for (const name of ["p1", "p2", "p3"]) {
-      writeEnvelope(name, { subscription_active: true, multiplier: 5 });
-    }
+    writeConfig(["weekhot", "fine"]);
+    writeEnvelope("weekhot", { subscription_active: true, week_percent: 95 });
+    writeEnvelope("fine", { subscription_active: true, session_percent: 0 });
 
-    const picks = Array.from({ length: 6 }, () => pickProfile());
+    const picks = Array.from({ length: 4 }, () => pickProfile());
 
-    expect(new Set(picks.slice(0, 3))).toEqual(new Set(["p1", "p2", "p3"]));
-    expect(readCounts()).toEqual({ p1: 2, p2: 2, p3: 2 });
+    expect(picks.every((p) => p === "fine")).toBe(true);
   });
 
-  test("new entrant gets no catch-up burst", () => {
+  test("rung 2: overflow when every unparked profile exceeds the buffer", () => {
     installMonotonicClock();
-    // Seed an established ledger: p1 and p2 already have substantial counts.
-    writeFileSync(
-      join(stateDir, "picker.json"),
-      JSON.stringify({
-        schema_version: 1,
-        picks: {
-          p1: { count: 50, last_picked_at: "2026-01-01T00:00:00+00:00" },
-          p2: { count: 50, last_picked_at: "2026-01-01T00:00:00+00:00" },
-        },
-      }),
-    );
-    writeConfig(["p1", "p2", "fresh"]);
-    for (const name of ["p1", "p2", "fresh"]) {
-      writeEnvelope(name, { subscription_active: true, multiplier: 1 });
-    }
+    writeConfig(["a", "b"]);
+    // Both over the 80 buffer, both under the 90 overflow cap.
+    writeEnvelope("a", { subscription_active: true, session_percent: 85 });
+    writeEnvelope("b", { subscription_active: true, session_percent: 82 });
 
-    // fresh enters crediting at min(50, 50) = 50, tying p1/p2; name tie-break
-    // makes its first pick a single pick, not a burst back to parity.
-    expect(pickProfile()).toBe("fresh");
-    expect(pickProfile()).not.toBe("fresh");
+    const chosen = pickProfile();
+
+    expect(["a", "b"]).toContain(chosen);
+    expect(readState().last_pick.rung).toBe(2);
   });
 
-  test("percent_used over 100 clamps to zero headroom", () => {
+  test("rung 3: any-unparked when every profile exceeds overflow", () => {
     installMonotonicClock();
-    writeConfig(["bad", "good"]);
-    writeEnvelope("bad", {
-      subscription_active: true,
-      multiplier: 20,
-      session_percent: 150.0,
-    });
-    writeEnvelope("good", {
-      subscription_active: true,
-      multiplier: 1,
-      session_percent: 0.0,
-    });
+    writeConfig(["a", "b"]);
+    writeEnvelope("a", { subscription_active: true, session_percent: 92 });
+    writeEnvelope("b", { subscription_active: true, session_percent: 95 });
 
-    for (let i = 0; i < 50; i++) {
-      pickProfile();
-    }
+    const chosen = pickProfile();
 
-    const counts = readCounts();
-    expect(counts.bad ?? 0).toBe(0);
-    expect(counts.good).toBe(50);
+    expect(["a", "b"]).toContain(chosen);
+    expect(readState().last_pick.rung).toBe(3);
   });
 
-  test.each([0, -5, "garbage", 3.5, true, null])(
-    "garbage multiplier %p treated as one",
-    (badMultiplier) => {
-      installMonotonicClock();
-      writeConfig(["weird", "one"]);
-      writeEnvelope("weird", {
+  test("rung 3: a stalled scraper degrades the fleet to plain LRU rotation", () => {
+    installMonotonicClock();
+    writeConfig(["a", "b"]);
+    // Frozen fetch stamp: pending never resets, so it accumulates without
+    // bound and eventually drives effective usage past overflow for everyone.
+    for (const name of ["a", "b"]) {
+      writeEnvelope(name, {
         subscription_active: true,
-        multiplier: badMultiplier,
+        session_percent: 0,
+        last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
       });
-      writeEnvelope("one", { subscription_active: true, multiplier: 1 });
+    }
 
-      for (let i = 0; i < 200; i++) {
-        pickProfile();
-      }
+    const picks = Array.from({ length: 50 }, () => pickProfile());
 
-      const counts = readCounts();
-      expect(Math.abs(counts.weird - counts.one)).toBeLessThanOrEqual(1);
-    },
-  );
-});
-
-// ---------- empty / skip paths ----------------------------------------------
-
-describe("empty / skip paths", () => {
-  test("no eligible returns default without writing state", () => {
-    writeConfig(["p1", "p2"]);
-    writeEnvelope("p1", { subscription_active: false });
-    // p2 has no envelope at all.
-
-    expect(pickProfile()).toBe("default");
-    expect(existsSync(join(stateDir, "picker.json"))).toBe(false);
+    // Never throws, keeps rotating across both profiles, and the reservation
+    // pressure has demoted the fleet to the any-unparked backstop.
+    expect(picks.filter((p) => p === "a").length).toBeGreaterThan(0);
+    expect(picks.filter((p) => p === "b").length).toBeGreaterThan(0);
+    expect(readState().last_pick.rung).toBe(3);
   });
 
-  test("no config returns default", () => {
-    expect(pickProfile()).toBe("default");
-  });
-
-  test("unsubscribed and missing and codex are skipped", () => {
+  test("rung 4: parked profiles are included when nothing is unparked", () => {
     installMonotonicClock();
-    writeConfig(["sub", "nosub", "missing", "weird"]);
-    writeEnvelope("sub", { subscription_active: true });
-    writeEnvelope("nosub", { subscription_active: false });
-    // "missing": no envelope written.
-    writeEnvelope("weird", { subscription_active: true, target: "codex" });
-
-    const picks = new Set(Array.from({ length: 5 }, () => pickProfile()));
-
-    expect(picks).toEqual(new Set(["sub"]));
-    expect(readCounts()).toEqual({ sub: 5 });
-  });
-});
-
-// ---------- fail-open -------------------------------------------------------
-
-describe("fail-open", () => {
-  test("corrupt picker state is reset not fatal", () => {
-    installMonotonicClock();
-    writeConfig(["p1"]);
-    writeEnvelope("p1", { subscription_active: true });
-    writeFileSync(join(stateDir, "picker.json"), "{ not json at all ]");
-
-    expect(pickProfile()).toBe("p1");
-    expect(readCounts()).toEqual({ p1: 1 });
-  });
-
-  test("pick never raises on unreadable state dir", () => {
-    const blocker = join(tmpDir, "blocker");
-    writeFileSync(blocker, "i am a file, not a dir");
-    setStateDir(blocker);
-    writeConfig(["p1"]);
-    expect(pickProfile()).toBe("default");
-  });
-});
-
-// The real multi-process flock-contention scenario (spawns ~30 child processes)
-// is too heavy for the fast tier and has no automated slow-tier sibling; the
-// flock path is left to manual verification.
-
-// ---------- rate-limit cooldown (lift_at) -----------------------------------
-
-describe("rate-limit cooldown", () => {
-  test("future lift_at excludes profile", () => {
-    writeConfig(["cool", "hot"]);
-    writeEnvelope("cool", { subscription_active: true });
-    writeEnvelope("hot", {
-      subscription_active: true,
-      lift_at: isoOffset(3600),
-    });
-
-    const picks = new Set(Array.from({ length: 5 }, () => pickProfile()));
-
-    expect(picks).toEqual(new Set(["cool"]));
-    expect(readCounts()).toEqual({ cool: 5 });
-  });
-
-  test("past lift_at does not exclude profile", () => {
-    writeConfig(["p1", "p2"]);
-    writeEnvelope("p1", {
-      subscription_active: true,
-      lift_at: isoOffset(-3600),
-    });
-    writeEnvelope("p2", { subscription_active: true });
-
-    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
-
-    expect(picks).toEqual(new Set(["p1", "p2"]));
-  });
-
-  test("all rate limited falls back to subscribed set", () => {
     writeConfig(["p1", "p2"]);
     writeEnvelope("p1", {
       subscription_active: true,
@@ -392,17 +345,404 @@ describe("rate-limit cooldown", () => {
     const picks = Array.from({ length: 4 }, () => pickProfile());
 
     expect(picks.every((p) => ["p1", "p2"].includes(p))).toBe(true);
-    const counts = readCounts();
-    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(4);
+    expect(readState().last_pick.rung).toBe(4);
+  });
+
+  test("rung 5: zero subscribed returns DEFAULT with NO state write", () => {
+    writeConfig(["p1", "p2"]);
+    writeEnvelope("p1", { subscription_active: false });
+    // p2 has no envelope at all.
+
+    expect(pickProfile()).toBe("default");
+    expect(existsSync(join(stateDir, "picker.json"))).toBe(false);
+  });
+
+  test("a fresh low-tier account is picked ahead of a heavily-used high-tier one", () => {
+    // The reported starvation: under stride the burned 20x kept winning. Model
+    // it — burned20x was just picked, fresh1x has never been picked (absent).
+    installMonotonicClock();
+    seedState({
+      schema_version: 2,
+      picks: {
+        burned20x: {
+          last_picked_at: "2025-06-01T00:00:00+00:00",
+          pending: 0,
+          seen_fetch_at: null,
+        },
+      },
+    });
+    writeConfig(["burned20x", "fresh1x"]);
+    writeEnvelope("burned20x", {
+      subscription_active: true,
+      multiplier: 20,
+      session_percent: 69,
+    });
+    writeEnvelope("fresh1x", {
+      subscription_active: true,
+      multiplier: 1,
+      session_percent: 0,
+    });
+
+    // Both admitted (under buffer); LRU with fresh1x absent → fresh1x wins the
+    // opening turn ahead of the burned 20x, and neither starves after.
+    expect(pickProfile()).toBe("fresh1x");
+    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
+    expect(picks).toEqual(new Set(["burned20x", "fresh1x"]));
+  });
+
+  test("usage-endpoint throttle parks a profile out of the primary rungs", () => {
+    installMonotonicClock();
+    writeConfig(["ok", "throttled"]);
+    writeEnvelope("ok", { subscription_active: true, session_percent: 0 });
+    writeEnvelope("throttled", {
+      subscription_active: true,
+      session_percent: 0,
+      error: {
+        type: "ClaudeUsageEndpointRateLimited",
+        message: "retry later",
+        at: isoOffset(-60),
+      },
+    });
+
+    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["ok"]));
+  });
+
+  test("unsubscribed and missing and codex profiles are skipped", () => {
+    installMonotonicClock();
+    writeConfig(["sub", "nosub", "missing", "weird"]);
+    writeEnvelope("sub", { subscription_active: true });
+    writeEnvelope("nosub", { subscription_active: false });
+    // "missing": no envelope written.
+    writeEnvelope("weird", { subscription_active: true, target: "codex" });
+
+    const picks = new Set(Array.from({ length: 5 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["sub"]));
+  });
+});
+
+// ---------- burst reservation (pending) -------------------------------------
+
+describe("burst reservation", () => {
+  test("burst launches spread across profiles instead of piling onto one", () => {
+    installMonotonicClock();
+    // A greedy lowest-percent picker would pile every burst pick onto "low";
+    // LRU + reservation spreads them.
+    writeConfig(["low", "high"]);
+    writeEnvelope("low", {
+      subscription_active: true,
+      session_percent: 0,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+    writeEnvelope("high", {
+      subscription_active: true,
+      session_percent: 50,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    const picks = Array.from({ length: 4 }, () => pickProfile());
+
+    expect(new Set(picks)).toEqual(new Set(["low", "high"]));
+    expect(picks.filter((p) => p === "low").length).toBe(2);
+    expect(picks.filter((p) => p === "high").length).toBe(2);
+  });
+
+  test("pending accumulates within a scrape window and resets when the fetch stamp changes", () => {
+    installMonotonicClock();
+    writeConfig(["a"]);
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 0,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    pickProfile();
+    pickProfile();
+    pickProfile();
+    expect(readPicks().a.pending).toBe(3);
+    expect(readPicks().a.seen_fetch_at).toBe("2026-01-01T00:00:00+00:00");
+
+    // Fresh scrape lands: reconcile resets pending to 0, then the pick bumps it.
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 0,
+      last_successful_fetch_at: "2026-01-01T01:00:00+00:00",
+    });
+    pickProfile();
+    expect(readPicks().a.pending).toBe(1);
+    expect(readPicks().a.seen_fetch_at).toBe("2026-01-01T01:00:00+00:00");
+  });
+
+  test("null-to-string fetch stamp resets pending; null-to-null does not", () => {
+    installMonotonicClock();
+    writeConfig(["nullstamp", "flip"]);
+    // nullstamp: never has a fetch stamp → pending accumulates forever.
+    writeEnvelope("nullstamp", {
+      subscription_active: true,
+      session_percent: 0,
+    });
+    // flip: starts with no stamp, later gains one.
+    writeEnvelope("flip", { subscription_active: true, session_percent: 0 });
+
+    // Two full rounds (LRU alternates), so each profile is picked twice.
+    pickProfile();
+    pickProfile();
+    pickProfile();
+    pickProfile();
+    expect(readPicks().nullstamp.pending).toBe(2);
+    expect(readPicks().flip.pending).toBe(2);
+
+    // flip gains a fetch stamp (null → string) → its pending resets next pick;
+    // nullstamp stays null → null and keeps accumulating.
+    writeEnvelope("flip", {
+      subscription_active: true,
+      session_percent: 0,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+    // flip is LRU-oldest (nullstamp was picked most recently), so it goes next.
+    expect(pickProfile()).toBe("flip");
+    expect(readPicks().flip.pending).toBe(1);
+    expect(readPicks().nullstamp.pending).toBe(2);
+  });
+
+  test("reservation divisor is pending * STEP / multiplier", () => {
+    installMonotonicClock();
+    writeConfig(["m5"]);
+    // multiplier 5, STEP_SESSION 5 → each pick adds 5*1/5 = 1 to effective
+    // session. Starting at 78, admission (< 80) survives one pick then gates.
+    writeEnvelope("m5", {
+      subscription_active: true,
+      multiplier: 5,
+      session_percent: 78,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    // Pick 1: effective 78 < 80 → rung 1.
+    expect(pickProfile()).toBe("m5");
+    expect(readState().last_pick.rung).toBe(1);
+    // Pick 2: pending 1 → effective 78 + 1 = 79 < 80 → still rung 1.
+    pickProfile();
+    expect(readState().last_pick.rung).toBe(1);
+    // Pick 3: pending 2 → effective 78 + 2 = 80 → out of rung 1, into overflow.
+    pickProfile();
+    expect(readState().last_pick.rung).toBe(2);
+  });
+});
+
+// ---------- rollover grace --------------------------------------------------
+
+describe("rollover grace", () => {
+  test("a tz-aware past resets_at zeroes that window's scraped percent", () => {
+    installMonotonicClock();
+    writeConfig(["expired", "other"]);
+    // expired reads 99% but its window reset in the past (tz-aware) → grace
+    // treats it as 0 → admitted to rung 1 alongside other.
+    writeEnvelope("expired", {
+      subscription_active: true,
+      usage: {
+        session: { percent_used: 99, resets_at: isoOffset(-3600) },
+      },
+    });
+    writeEnvelope("other", { subscription_active: true, session_percent: 50 });
+
+    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["expired", "other"]));
+    expect(readState().last_pick.rung).toBe(1);
+  });
+
+  test("a naive past resets_at gets no grace", () => {
+    installMonotonicClock();
+    writeConfig(["naive", "fine"]);
+    // Naive (offset-less) resets_at → no grace → 99% still gates it out.
+    writeEnvelope("naive", {
+      subscription_active: true,
+      usage: {
+        session: { percent_used: 99, resets_at: "2020-01-01T00:00:00" },
+      },
+    });
+    writeEnvelope("fine", { subscription_active: true, session_percent: 0 });
+
+    const picks = Array.from({ length: 5 }, () => pickProfile());
+
+    expect(picks.every((p) => p === "fine")).toBe(true);
+  });
+
+  test("grace never touches pending (self-clears on the next scrape)", () => {
+    installMonotonicClock();
+    writeConfig(["g"]);
+    writeEnvelope("g", {
+      subscription_active: true,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+      usage: { session: { percent_used: 99, resets_at: isoOffset(-3600) } },
+    });
+
+    pickProfile();
+    pickProfile();
+
+    // Grace zeroed the gate math but the reservation still accrued.
+    expect(readPicks().g.pending).toBe(2);
+  });
+});
+
+// ---------- ledger shape ----------------------------------------------------
+
+describe("ledger v2", () => {
+  test("persists the v2 shape: schema_version, per-profile fields, last_pick", () => {
+    installMonotonicClock();
+    writeConfig(["a"]);
+    writeEnvelope("a", {
+      subscription_active: true,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    const chosen = pickProfile();
+    const state = readState();
+
+    expect(state.schema_version).toBe(2);
+    const entry = state.picks.a;
+    expect(typeof entry.last_picked_at).toBe("string");
+    expect(entry.pending).toBe(1);
+    expect(entry.seen_fetch_at).toBe("2026-01-01T00:00:00+00:00");
+    // No stride-era `count` field survives.
+    expect(entry.count).toBeUndefined();
+    expect(state.last_pick).toMatchObject({ profile: chosen, rung: 1 });
+    expect(typeof state.last_pick.at).toBe("string");
+  });
+
+  test("a v1 picker.json is treated as absent (discarded on first pick)", () => {
+    installMonotonicClock();
+    seedState({
+      schema_version: 1,
+      picks: {
+        p1: { count: 99, last_picked_at: "2099-01-01T00:00:00+00:00" },
+      },
+    });
+    writeConfig(["p1", "p2"]);
+    for (const name of ["p1", "p2"]) {
+      writeEnvelope(name, { subscription_active: true });
+    }
+
+    // v1 discarded → both start absent → name order → p1 first.
+    expect(pickProfile()).toBe("p1");
+    expect(readState().schema_version).toBe(2);
+    expect(readState().picks.p1.count).toBeUndefined();
+  });
+
+  test.each([0, -5, "garbage", 3.5, true, null])(
+    "garbage multiplier %p coerces to 1 in the reservation divisor",
+    (badMultiplier) => {
+      installMonotonicClock();
+      // If the divisor were not coerced to 1, a garbage value (0 → ÷0,
+      // "garbage" → NaN) would break the gate math and desync the rotation.
+      // Coerced to 1, "weird" and "one" share identical effective math and
+      // rotate evenly.
+      writeConfig(["weird", "one"]);
+      writeEnvelope("weird", {
+        subscription_active: true,
+        multiplier: badMultiplier,
+        session_percent: 0,
+        last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+      });
+      writeEnvelope("one", {
+        subscription_active: true,
+        multiplier: 1,
+        session_percent: 0,
+        last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+      });
+
+      const picks = Array.from({ length: 20 }, () => pickProfile());
+      const weird = picks.filter((p) => p === "weird").length;
+      const one = picks.filter((p) => p === "one").length;
+
+      expect(Math.abs(weird - one)).toBeLessThanOrEqual(1);
+    },
+  );
+});
+
+// ---------- fail-open -------------------------------------------------------
+
+describe("fail-open", () => {
+  test("corrupt picker state is reset, not fatal", () => {
+    installMonotonicClock();
+    writeConfig(["p1"]);
+    writeEnvelope("p1", { subscription_active: true });
+    writeFileSync(join(stateDir, "picker.json"), "{ not json at all ]");
+
+    expect(pickProfile()).toBe("p1");
+    expect(readState().schema_version).toBe(2);
+    expect(readPicks().p1.pending).toBe(1);
+  });
+
+  test("pick never raises on an unreadable state dir", () => {
+    const blocker = join(tmpDir, "blocker");
+    writeFileSync(blocker, "i am a file, not a dir");
+    setStateDir(blocker);
+    writeConfig(["p1"]);
+    expect(pickProfile()).toBe("default");
+  });
+});
+
+// ---------- rate-limit cooldown (lift_at) -----------------------------------
+
+describe("rate-limit cooldown", () => {
+  test("future lift_at parks a profile out of the primary rungs", () => {
+    installMonotonicClock();
+    writeConfig(["cool", "hot"]);
+    writeEnvelope("cool", { subscription_active: true, session_percent: 0 });
+    writeEnvelope("hot", {
+      subscription_active: true,
+      session_percent: 0,
+      lift_at: isoOffset(3600),
+    });
+
+    const picks = new Set(Array.from({ length: 5 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["cool"]));
+  });
+
+  test("past lift_at does not park a profile", () => {
+    installMonotonicClock();
+    writeConfig(["p1", "p2"]);
+    writeEnvelope("p1", {
+      subscription_active: true,
+      lift_at: isoOffset(-3600),
+    });
+    writeEnvelope("p2", { subscription_active: true });
+
+    const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
+
+    expect(picks).toEqual(new Set(["p1", "p2"]));
+  });
+
+  test("all parked falls through to the rung-4 all-subscribed backstop", () => {
+    installMonotonicClock();
+    writeConfig(["p1", "p2"]);
+    writeEnvelope("p1", {
+      subscription_active: true,
+      lift_at: isoOffset(3600),
+    });
+    writeEnvelope("p2", {
+      subscription_active: true,
+      lift_at: isoOffset(7200),
+    });
+
+    const picks = Array.from({ length: 4 }, () => pickProfile());
+
+    expect(picks.every((p) => ["p1", "p2"].includes(p))).toBe(true);
+    expect(readState().last_pick.rung).toBe(4);
   });
 
   test("malformed lift_at is ignored (non-string / unparseable / naive)", () => {
+    installMonotonicClock();
     writeConfig(["garbage", "naive", "good"]);
     writeEnvelope("garbage", {
       subscription_active: true,
       lift_at: "not-a-date",
     });
-    // Naive ISO (no tz offset) — corrupted envelope, must not block selection.
+    // Naive ISO (no tz offset) — corrupted envelope, must not park it.
     writeEnvelope("naive", {
       subscription_active: true,
       lift_at: "2099-01-01T00:00:00",
@@ -420,7 +760,6 @@ describe("rate-limit cooldown", () => {
 describe("listProfiles", () => {
   test("reads catalog", () => {
     writeConfig(["alpha", "beta"]);
-    // Exercised through pickProfile's eligibility too, but assert directly.
     expect(listProfiles()).toEqual(["alpha", "beta"]);
   });
 
