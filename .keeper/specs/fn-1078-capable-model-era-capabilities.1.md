@@ -40,5 +40,5 @@ body against a real past failure (pick one from the review evidence) as a desk c
 - [ ] Worker template points to it from the escalation path
 
 ## Done summary
-
+Added keeper:debug skill (loop-before-hypothesis, escalate-not-ask, cannot-build-a-loop hard stop, cites keeper-history-forensics via POINTER) and pointed the worker template's escalation section to it.
 ## Evidence
