@@ -22,8 +22,9 @@
 //
 // The READ surface is the set the post-worker verbs consult:
 //  - isGitRepo / hasHead: the repo-shape gates,
+//  - resolveRef: the epic-close lane-branch probe (present → scan that ref),
 //  - trailerCommitShas: commit_lookup.ts's grep + interpret-trailers confirmed
-//    scan (find-task-commit),
+//    scan (find-task-commit; the epic close scopes it to the lane ref),
 //  - sourceCommitShas: reconcile.ts's %(trailers:valueonly) unit-sep scan,
 //  - committedTaskJson: reconcile.ts's HEAD:<task.json> cat-file blob,
 //  - shortStatusAndDiff / firstSourceShaShort: worker_resume.ts's nudge probes.
@@ -95,11 +96,21 @@ export interface PlanVcs {
    * orphan branch reads false (a distinct signal, NOT an error). */
   hasHead(repo: string): boolean;
 
+  /** The commit sha `ref` resolves to via `git rev-parse --verify <ref>`, or null
+   * when the ref is absent / invalid / git unreadable — a clean miss AND any error
+   * both fold to null, NEVER a throw. The epic-close scan probes the deterministic
+   * lane branch per repo: non-null → scan that ref, null → fall back to HEAD (so a
+   * repo without a lane, or a missing-ref error, is never dropped). */
+  resolveRef(ref: string, repo: string): string | null;
+
   /** Full %H shas in `repo` carrying a confirmed `Task: <taskId>` trailer via the
    * commit_lookup technique (`git log --grep` prefilter +
    * `git interpret-trailers --parse` confirmation), newest-first. A clean miss is
-   * []. Used by find-task-commit. */
-  trailerCommitShas(taskId: string, repo: string): string[];
+   * []. `ref`, when given, scopes the scan to that revision (`git log <ref>`) — the
+   * epic close scans the lane branch `keeper/epic/<epic_id>` to see lane-only
+   * commits; omitted, the scan defaults to HEAD (find-task-commit's byte-identical
+   * behavior). */
+  trailerCommitShas(taskId: string, repo: string, ref?: string): string[];
 
   /** Full %H shas in `repo` carrying a trailer-authentic `Task: <taskId>` via the
    * reconcile technique (`%(trailers:key=Task,valueonly=true)` + unit-sep split,
@@ -282,10 +293,30 @@ export const realGitVcs: PlanVcs = {
     return runReadGit(["rev-parse", "--verify", "HEAD"], repo).exitCode === 0;
   },
 
-  trailerCommitShas(taskId, repo): string[] {
-    // Stage 1: `git log --grep` fixed-string prefilter; non-zero exit → [].
+  resolveRef(ref, repo): string | null {
+    // `--quiet` makes an absent ref exit non-zero with no output instead of a
+    // fatal error, so a clean miss and a genuine failure both land here as a
+    // non-zero exit → null (the HEAD-fallback signal), never a throw.
+    const result = runReadGit(["rev-parse", "--verify", "--quiet", ref], repo);
+    if (result.exitCode !== 0) {
+      return null;
+    }
+    const sha = result.stdout.trim();
+    return sha.length > 0 ? sha : null;
+  },
+
+  trailerCommitShas(taskId, repo, ref): string[] {
+    // Stage 1: `git log [<ref>] --grep` fixed-string prefilter; non-zero exit → [].
+    // The optional revision (the epic lane branch) precedes the options so an
+    // omitted ref scans HEAD exactly as before.
     const grep = runReadGit(
-      ["log", `--grep=Task: ${taskId}`, "-F", "--pretty=format:%H"],
+      [
+        "log",
+        ...(ref !== undefined ? [ref] : []),
+        `--grep=Task: ${taskId}`,
+        "-F",
+        "--pretty=format:%H",
+      ],
       repo,
     );
     if (grep.exitCode !== 0) {

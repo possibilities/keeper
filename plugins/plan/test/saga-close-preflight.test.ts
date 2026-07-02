@@ -29,7 +29,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { briefPath, computeCommitSetHash } from "../src/audit_artifacts.ts";
-import { AllReposBrokenError, findCommitGroups } from "../src/commit_lookup.ts";
+import {
+  AllReposBrokenError,
+  findCommitGroups,
+  laneBranchFor,
+} from "../src/commit_lookup.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import { initRepo as fakeInitRepo, fakeVcs } from "./fake-vcs.ts";
 import {
@@ -525,6 +529,39 @@ describe("findCommitGroups unit (test_close_preflight.py TestCommitLookup)", () 
     expect(findCommitGroups(["fn-1-foo.1"], repoA, [repoB, repoA])).toEqual([
       { repo: repoB, shas: [shaB] },
       { repo: repoA, shas: [shaA] },
+    ]);
+  });
+
+  test("epic-close multi-repo mixed: primary lane-only + secondary HEAD both group", () => {
+    // The worktree-epic close geometry: the primary's source commit lives ONLY on
+    // the epic lane `keeper/epic/<id>` (pre-merge), a secondary repo has no lane
+    // so its commit is on HEAD. The epicId-scoped scan probes each repo: lane ref
+    // in the primary, HEAD fallback in the secondary — neither is dropped.
+    const epicId = "fn-1-foo";
+    const primary = gitRepo("primary");
+    const secondary = gitRepo("secondary");
+    const shaP = fakeSourceCommit(primary, "feat: p\n\nTask: fn-1-foo.1\n", {
+      refs: [laneBranchFor(epicId)],
+    });
+    const shaS = seedCommit(secondary, "fn-1-foo.2");
+    // HEAD-only (no epicId) is blind to the primary's lane-only commit.
+    expect(
+      findCommitGroups(["fn-1-foo.1", "fn-1-foo.2"], primary, [
+        primary,
+        secondary,
+      ]),
+    ).toEqual([{ repo: secondary, shas: [shaS] }]);
+    // Lane-aware close scan surfaces both, in touched_repos order.
+    expect(
+      findCommitGroups(
+        ["fn-1-foo.1", "fn-1-foo.2"],
+        primary,
+        [primary, secondary],
+        epicId,
+      ),
+    ).toEqual([
+      { repo: primary, shas: [shaP] },
+      { repo: secondary, shas: [shaS] },
     ]);
   });
 

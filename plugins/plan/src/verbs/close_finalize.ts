@@ -67,15 +67,27 @@ export const CLOSE_OUTCOMES = {
 
 export type CloseOutcome = (typeof CLOSE_OUTCOMES)[keyof typeof CLOSE_OUTCOMES];
 
+/** The epic whose close claim this finalize invocation holds — stashed by
+ * runCloseFinalize (its sole caller) so the shared error chokepoint releases the
+ * claim on any terminal error. A failed close attempt MUST free the epic, else a
+ * leaked marker jams every re-run's preflight with CLOSE_ALREADY_CLAIMED;
+ * process.exit() in the chokepoint precludes a finally, and one CLI invocation is
+ * one process, so a per-invocation stash is single-writer. */
+let finalizeClaimEpicId: string | null = null;
+
 /** Emit a typed close-finalize error envelope and exit 1. Shape
  * {success:false, error:{code,message,details?}} — no plan_invocation line.
- * Mirrors _emit_finalize_error. */
+ * Releases the close claim first (symmetric with emitOutcome's clear on the
+ * success outcomes). Mirrors _emit_finalize_error. */
 function emitFinalizeError(
   code: string,
   message: string,
   format: OutputFormat | null,
   details?: Record<string, unknown>,
 ): never {
+  if (finalizeClaimEpicId !== null) {
+    clearCloseMarker(finalizeClaimEpicId);
+  }
   const error: Record<string, unknown> = { code, message };
   if (details !== undefined) {
     error.details = details;
@@ -406,6 +418,10 @@ export interface CloseFinalizeArgs {
 
 export function runCloseFinalize(args: CloseFinalizeArgs): void {
   const { epicId, project, format } = args;
+  // Stash the claim so any terminal error (via emitFinalizeError) releases it —
+  // a failed close must free the epic for a clean re-run. Set fresh every
+  // invocation before any error path can fire.
+  finalizeClaimEpicId = epicId;
 
   // 1. validate id (epic-shape; a task-shaped id names its parent epic).
   if (!isEpicId(epicId)) {
@@ -495,7 +511,12 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     .filter((id): id is string => Boolean(id));
   let commitGroups: CommitGroupResult[];
   try {
-    commitGroups = findCommitGroups(taskIds, primaryRepo, touchedRepos);
+    // Pass epicId so the scan is lane-aware, IDENTICAL to close-preflight: both run
+    // while the epic's commits still live on the `keeper/epic/<epic_id>` lane (the
+    // merge to default happens post-finalize), so a HEAD-only re-derive here would
+    // miss lane-only commits and drift the hash → a spurious STALE_ARTIFACTS on
+    // every worktree close.
+    commitGroups = findCommitGroups(taskIds, primaryRepo, touchedRepos, epicId);
   } catch (exc) {
     if (exc instanceof AllReposBrokenError) {
       emitFinalizeError(

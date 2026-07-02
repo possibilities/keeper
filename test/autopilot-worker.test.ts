@@ -50,6 +50,7 @@ import {
   closerJobFinished,
   computeDeferredEpicIds,
   computeMergedLaneEntries,
+  computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
   createWorktreeDriver,
@@ -64,6 +65,7 @@ import {
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
+  isBareShellCommand,
   isEpicDoneById,
   isEpicInFlight,
   isFinalizerGuarded,
@@ -87,6 +89,8 @@ import {
   reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
+  SLOT_RECLAIM_GRACE_SEC,
+  type SlotOccupancySignal,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
@@ -219,11 +223,17 @@ function makeSnapshot(
     failedKeys: new Set(),
     recoverFailureIds: new Set(),
     finalizeFailureIds: new Set(),
+    // Slot-occupancy: default no OPEN slot rows so the slot pass mints no clears in
+    // pre-existing tests; the slot tests override it to drive the level-clear.
+    slotOccupancyFailures: [],
     liveTabKeys: new Set(),
     // fn-811: read-time backend liveness. Default `null` (probe unavailable) so
     // every pre-fn-811 test keeps the old stopped-always-occupies behavior; the
     // liveness-gated tests override it with a live-pane set.
     livePaneIds: null,
+    // Slot-occupancy foreground-command map, null in lockstep with `livePaneIds`
+    // (degraded probe) so the slot pass stays inert; the slot tests override both.
+    paneCommandById: null,
     // fn-721: the launch-window occupancy set feeding the cross-sibling
     // `dispatch-pending` occupant. Default empty; tests that exercise the
     // occupant override it.
@@ -697,6 +707,271 @@ test("isOccupyingJob: plan_verb mismatch (stale non-work verb shares plan_ref) �
     }),
   );
   expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", null)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// isBareShellCommand — the dead-claude shell-tail signature
+// ---------------------------------------------------------------------------
+
+test("isBareShellCommand: known shells (incl. login `-` forms) are bare shells", () => {
+  for (const cmd of [
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "tcsh",
+    "csh",
+  ]) {
+    expect(isBareShellCommand(cmd)).toBe(true);
+    // The login-shell argv0 `-` prefix is stripped before the lookup.
+    expect(isBareShellCommand(`-${cmd}`)).toBe(true);
+  }
+});
+
+test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclaim)", () => {
+  // The catastrophic over-match guard: a running claude reads as its own process,
+  // never a shell, so the criterion can never classify a live session as dead.
+  for (const cmd of [
+    "claude",
+    "node",
+    "bun",
+    "vim",
+    "git",
+    "",
+    "unknown-cmd",
+  ]) {
+    expect(isBareShellCommand(cmd)).toBe(false);
+  }
+  // A missing command entry (probe degraded / pane gone) is "cannot prove dead".
+  expect(isBareShellCommand(undefined)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// computeSlotOccupancy — visibility + provable-dead reclaim + level-clear
+// ---------------------------------------------------------------------------
+
+/** One stopped occupant holding `(verb, id)`'s slot, with an overridable pane
+ *  command / age. Returns the three snapshot liveness fields the pass reads. */
+function oneOccupant(over: {
+  verb?: "work" | "close";
+  id?: string;
+  state?: string;
+  pane?: string;
+  command?: string;
+  updated_at?: number;
+}): {
+  jobs: Map<string, Job>;
+  livePaneIds: Set<string>;
+  paneCommandById: Map<string, string>;
+} {
+  const pane = over.pane ?? "%7";
+  const jobs = new Map<string, Job>([
+    [
+      "j",
+      makeJob({
+        job_id: "j",
+        plan_verb: over.verb ?? "close",
+        plan_ref: over.id ?? "fn-1-foo",
+        state: over.state ?? "stopped",
+        backend_exec_pane_id: pane,
+        updated_at: over.updated_at ?? 800,
+      }),
+    ],
+  ]);
+  return {
+    jobs,
+    livePaneIds: new Set([pane]),
+    paneCommandById: new Map([[pane, over.command ?? "zsh"]]),
+  };
+}
+
+/** The pass input with sane defaults (now=1000, wanted, playing, no open rows). */
+function slotInput(
+  over: Partial<Parameters<typeof computeSlotOccupancy>[0]>,
+): Parameters<typeof computeSlotOccupancy>[0] {
+  return {
+    jobs: new Map(),
+    livePaneIds: new Set<string>(),
+    paneCommandById: new Map<string, string>(),
+    openSlotFailures: [],
+    wantsDispatch: () => true,
+    paused: false,
+    now: 1000,
+    ...over,
+  };
+}
+
+test("computeSlotOccupancy: dead (stopped + bare shell + grace elapsed) → reclaim + slot-reclaimed", () => {
+  // idle 200s ≥ the 120s default grace, pane foreground is the bare shell tail.
+  const occ = oneOccupant({ command: "zsh", updated_at: 800 });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  const sig: SlotOccupancySignal = out.failures[0];
+  expect(sig.verb).toBe("close");
+  expect(sig.id).toBe("fn-1-foo");
+  expect(sig.reclaimPaneId).toBe("%7"); // the kill is issued
+  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+  expect(out.clears).toEqual([]);
+});
+
+test("computeSlotOccupancy: bare shell but WITHIN grace → slot-occupied, NO kill", () => {
+  // idle 50s < 120s grace — a bare shell that JUST appeared could be a teardown
+  // frame, so surface only; never kill inside the grace window.
+  const occ = oneOccupant({ command: "zsh", updated_at: 950 });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: a live/parked claude pane → slot-occupied, NEVER killed (even past grace)", () => {
+  // The resumable session: its pane still runs `claude`, so it is NOT provably dead
+  // regardless of age — killing it would be the catastrophic failure.
+  const occ = oneOccupant({ command: "claude", updated_at: 0 });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: login `-zsh` past grace is still reclaimed (dash stripped)", () => {
+  const occ = oneOccupant({ command: "-zsh", updated_at: 800 });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures[0].reclaimPaneId).toBe("%7");
+});
+
+test("computeSlotOccupancy: grace boundary — idle === grace reclaims, idle < grace occupies", () => {
+  const atBoundary = computeSlotOccupancy(
+    slotInput({
+      ...oneOccupant({ command: "zsh", updated_at: 880 }),
+      now: 1000,
+    }),
+  );
+  expect(atBoundary.failures[0].reclaimPaneId).toBe("%7"); // 120 ≥ 120
+  const justUnder = computeSlotOccupancy(
+    slotInput({
+      ...oneOccupant({ command: "zsh", updated_at: 881 }),
+      now: 1000,
+    }),
+  );
+  expect(justUnder.failures[0].reclaimPaneId).toBeNull(); // 119 < 120
+});
+
+test("computeSlotOccupancy: a dead work-task slot reclaims on (work, task)", () => {
+  const occ = oneOccupant({
+    verb: "work",
+    id: "fn-1-foo.2",
+    command: "bash",
+    pane: "%3",
+    updated_at: 800,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures[0].verb).toBe("work");
+  expect(out.failures[0].id).toBe("fn-1-foo.2");
+  expect(out.failures[0].reclaimPaneId).toBe("%3");
+});
+
+test("computeSlotOccupancy: pane gone (absent from the sweep) → not occupying → no signal", () => {
+  const occ = oneOccupant({ command: "zsh", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      livePaneIds: new Set(["%99"]), // the job's %7 is gone
+      paneCommandById: new Map([["%99", "zsh"]]),
+    }),
+  );
+  expect(out.failures).toEqual([]);
+});
+
+test("computeSlotOccupancy: a WORKING job is healthy occupancy → no slot signal", () => {
+  const occ = oneOccupant({
+    state: "working",
+    command: "zsh",
+    updated_at: 800,
+  });
+  expect(computeSlotOccupancy(slotInput(occ)).failures).toEqual([]);
+});
+
+test("computeSlotOccupancy: not-wanted key (completed / unarmed) leaves the inspection window", () => {
+  // A stopped session whose row `reconcile` no longer wants to dispatch keeps its
+  // post-run inspection window — never surfaced, never killed.
+  const occ = oneOccupant({ command: "zsh", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(out.failures).toEqual([]);
+});
+
+test("computeSlotOccupancy: paused → fully inert (no failures, no clears)", () => {
+  const occ = oneOccupant({ command: "zsh", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      paused: true,
+      openSlotFailures: [{ verb: "close", id: "fn-1-foo" }],
+    }),
+  );
+  expect(out.failures).toEqual([]);
+  expect(out.clears).toEqual([]);
+});
+
+test("computeSlotOccupancy: degraded probe (null livePaneIds / paneCommandById) → inert", () => {
+  const occ = oneOccupant({ command: "zsh", updated_at: 800 });
+  expect(
+    computeSlotOccupancy(slotInput({ ...occ, livePaneIds: null })).failures,
+  ).toEqual([]);
+  expect(
+    computeSlotOccupancy(slotInput({ ...occ, paneCommandById: null })).failures,
+  ).toEqual([]);
+});
+
+test("computeSlotOccupancy: level-clear — an OPEN slot row with no occupant this cycle clears", () => {
+  // Occupant gone (empty jobs): the open slot failure self-clears, no retry_dispatch.
+  const out = computeSlotOccupancy(
+    slotInput({ openSlotFailures: [{ verb: "close", id: "fn-1-foo" }] }),
+  );
+  expect(out.failures).toEqual([]);
+  expect(out.clears).toEqual([{ verb: "close", id: "fn-1-foo" }]);
+});
+
+test("computeSlotOccupancy: an OPEN slot row whose occupant is STILL active is NOT cleared", () => {
+  // The key is re-signaled (active) this cycle, so it is never in the clear set —
+  // failure and clear are disjoint by construction.
+  const occ = oneOccupant({ command: "claude", updated_at: 0 }); // occupied, live
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      openSlotFailures: [{ verb: "close", id: "fn-1-foo" }],
+    }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.clears).toEqual([]);
+});
+
+test("computeSlotOccupancy: clears only the open key whose occupant left, keeps the active one", () => {
+  // Two open slot rows: fn-1-foo still occupied (live claude), fn-2-bar's occupant
+  // gone. Only the vacated one clears; the live one keeps its visible row.
+  const occ = oneOccupant({ id: "fn-1-foo", command: "claude", updated_at: 0 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      openSlotFailures: [
+        { verb: "close", id: "fn-1-foo" },
+        { verb: "close", id: "fn-2-bar" },
+      ],
+    }),
+  );
+  expect(out.clears).toEqual([{ verb: "close", id: "fn-2-bar" }]);
+});
+
+test("computeSlotOccupancy: SLOT_RECLAIM_GRACE_SEC is the default grace, overridable per call", () => {
+  expect(SLOT_RECLAIM_GRACE_SEC).toBe(120);
+  // With a tiny injected grace, a just-stopped bare shell reclaims immediately.
+  const occ = oneOccupant({ command: "zsh", updated_at: 999 }); // idle 1s
+  const out = computeSlotOccupancy(slotInput({ ...occ, graceSec: 1 }));
+  expect(out.failures[0].reclaimPaneId).toBe("%7");
 });
 
 // ---------------------------------------------------------------------------
@@ -3551,8 +3826,13 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
 test("fn-811: loadReconcileSnapshot maps a listPanes probe into livePaneIds", async () => {
   await withSeededDb(async (db) => {
     const snap = await loadReconcileSnapshot(db, async () => [
-      { paneId: "%1", windowId: "@1", windowName: "w1" },
-      { paneId: "%2", windowId: "@2", windowName: "w2" },
+      {
+        paneId: "%1",
+        windowId: "@1",
+        currentCommand: "claude",
+        windowName: "w1",
+      },
+      { paneId: "%2", windowId: "@2", currentCommand: "zsh", windowName: "w2" },
     ]);
     expect(snap.livePaneIds).not.toBeNull();
     expect([...(snap.livePaneIds ?? [])].sort()).toEqual(["%1", "%2"]);
@@ -10729,6 +11009,31 @@ test("createDispatchFailedGate: noteClear resets the gate so a re-failure re-emi
   gate.noteClear("close", "worktree-recover:fn-1-foo-abc123");
   // Resolution dropped the row — the very next failure of this (verb,id) is new.
   expect(gate.shouldEmit(failedPayload({ ts: 1002 }))).toBe(true);
+});
+
+test("createDispatchFailedGate: a slot occupied→reclaimed reason change emits, then collapses (O(1) per condition)", () => {
+  // The slot reasons ride the SAME gate: a stable reason collapses, and the
+  // ambiguous→provably-dead escalation (slot-occupied → slot-reclaimed) is a reason
+  // change the gate must surface. Clear-on-gone resets so a recurrence re-signals.
+  const gate = createDispatchFailedGate(900);
+  const occupied = failedPayload({
+    verb: "close",
+    id: "fn-1-foo",
+    reason: "slot-occupied: stopped close session holds the slot (pane %7 zsh)",
+    ts: 1000,
+  });
+  const reclaimed = failedPayload({
+    verb: "close",
+    id: "fn-1-foo",
+    reason: "slot-reclaimed: reaped dead close session (pane %7 zsh)",
+    ts: 1001,
+  });
+  expect(gate.shouldEmit(occupied)).toBe(true); // first appearance
+  expect(gate.shouldEmit({ ...occupied, ts: 1002 })).toBe(false); // stable → collapse
+  expect(gate.shouldEmit(reclaimed)).toBe(true); // occupied→reclaimed → emit
+  expect(gate.shouldEmit({ ...reclaimed, ts: 1003 })).toBe(false); // new baseline
+  gate.noteClear("close", "fn-1-foo");
+  expect(gate.shouldEmit({ ...occupied, ts: 1004 })).toBe(true); // reset → re-signal
 });
 
 test("createDispatchFailedGate: distinct (verb,id) conditions are gated independently", () => {

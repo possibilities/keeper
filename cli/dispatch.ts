@@ -48,6 +48,7 @@ import {
   resolvePreset,
 } from "../src/agent/config";
 import { resolveWorkerLaunchConfig } from "../src/autopilot-worker";
+import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
 import {
   resolveConfig,
   resolveKeeperAgentPath,
@@ -64,6 +65,7 @@ import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
+import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
 import { queryCollection } from "./control-rpc";
 
 /**
@@ -112,6 +114,13 @@ export interface MainDeps {
    *  `existsSync`; injected so a test drives the `cwd-missing` branch (or
    *  asserts a resolved-but-nonexistent fixture path) without a real dir. */
   readonly dirExists?: (dir: string) => boolean;
+  /** Epic lane-worktree resolver for a `close::` dispatch. Defaults to the
+   *  bounded `git worktree list` probe; injected so a test drives the lane /
+   *  fallback branches with a fake worktree list and zero real git. */
+  readonly resolveLaneDir?: (
+    projectDir: string,
+    epicId: string,
+  ) => Promise<string | null>;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -188,26 +197,71 @@ interface EpicRow extends Row {
 }
 
 /**
+ * Resolve the epic's lane worktree dir from a SINGLE bounded `git worktree list`
+ * in `projectDir`, filtered to the epic base branch `keeper/epic/<epicId>`.
+ * Returns the lane path, or null when no lane worktree is registered (a
+ * non-worktree epic, or the lane was torn down). Any git failure / timeout fails
+ * open to null — the caller falls back to `project_dir` with a warning. Bounded
+ * to one local git op so a manual `close::` dispatch never spawns unbounded work.
+ */
+async function resolveEpicLaneWorktree(
+  projectDir: string,
+  epicId: string,
+): Promise<string | null> {
+  const target = `${KEEPER_EPIC_BRANCH_PREFIX}${epicId}`;
+  let entries: Awaited<ReturnType<typeof listWorktrees>>;
+  try {
+    entries = await listWorktrees(projectDir, (args, opts) =>
+      gitExec(args, { ...opts, timeoutMs: GIT_LOCAL_TIMEOUT_MS }),
+    );
+  } catch {
+    return null;
+  }
+  for (const e of entries) {
+    if (e.branch === null) {
+      continue;
+    }
+    const short = e.branch.startsWith("refs/heads/")
+      ? e.branch.slice("refs/heads/".length)
+      : e.branch;
+    if (short === target) {
+      return e.path;
+    }
+  }
+  return null;
+}
+
+/**
  * Resolve the launch cwd for a plan-form dispatch from the `epics` projection.
  * Mirrors the reconciler's cwd rules (`src/autopilot-worker.ts`):
  *   - work: the parent epic's `tasks[]` entry → `target_repo ?? project_dir`.
- *   - close: the epic's `project_dir`.
+ *   - close: the epic lane worktree (`keeper/epic/<epic_id>`) when one is
+ *     registered — so a lane-only commit set is visible — else `project_dir`.
  * Returns a discriminated result so the caller distinguishes daemon-unreachable
  * (transport throw) from not-found / empty-cwd / cwd-missing (resolution miss)
- * for distinct error text + a clean exit 1 that launches nothing.
+ * for distinct error text + a clean exit 1 that launches nothing. On the close
+ * fallback the result carries a `warning` the caller prints (best-effort note,
+ * never a launch block).
  *
  * `dirExists` is the on-disk existence probe (defaults to `existsSync`),
  * injected for tests. A resolved cwd that does not exist on disk — typically a
  * renamed-away repo dir — fails LOUD with `cwd-missing: <path>` instead of
  * launching a worker into a stale path that silently never runs. Remediation:
- * `keeper plan mv-repo <old> <new>`.
+ * `keeper plan mv-repo <old> <new>`. `resolveLaneDir` is the lane-resolution
+ * seam (defaults to the bounded git probe), injected for tests.
  */
 export async function resolvePlanCwd(
   query: QueryFn,
   verb: RetryDispatchVerb,
   id: string,
   dirExists: (dir: string) => boolean = existsSync,
-): Promise<{ ok: true; cwd: string } | { ok: false; error: string }> {
+  resolveLaneDir: (
+    projectDir: string,
+    epicId: string,
+  ) => Promise<string | null> = resolveEpicLaneWorktree,
+): Promise<
+  { ok: true; cwd: string; warning?: string } | { ok: false; error: string }
+> {
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
   // prefix. close: id IS the epic id. The epic filter resolves both.
   const epicId = verb === "work" ? id.replace(/\.\d+$/, "") : id;
@@ -236,7 +290,23 @@ export async function resolvePlanCwd(
     if (!dirExists(projectDir)) {
       return { ok: false, error: `cwd-missing: ${projectDir}` };
     }
-    return { ok: true, cwd: projectDir };
+    // Worktree epic: run the closer IN the epic lane (as the reconciler does) so
+    // a lane-only commit set is visible. No lane worktree (non-worktree epic, or
+    // torn down) → fall back to project_dir with a note.
+    let laneDir: string | null;
+    try {
+      laneDir = await resolveLaneDir(projectDir, epicId);
+    } catch {
+      laneDir = null;
+    }
+    if (laneDir !== null && dirExists(laneDir)) {
+      return { ok: true, cwd: laneDir };
+    }
+    return {
+      ok: true,
+      cwd: projectDir,
+      warning: `no epic lane worktree for '${epicId}'; launching close in ${projectDir}`,
+    };
   }
   // work: walk the parent epic's tasks for the matching task id.
   const task = (epic.tasks ?? []).find((t) => t.task_id === id);
@@ -263,11 +333,14 @@ export async function resolvePlanCwd(
 }
 
 /**
- * Plan-form race guard. Best-effort scan: refuses (naming the tripped
- * condition) when a `pending_dispatches` row for the key exists, autopilot is
- * unpaused, or a live/`working` job carries the plan key (client-side scan —
- * `jobs` has no `plan_verb`/`plan_ref` filter). Returns the tripped-condition
- * string, or `null` when clear. Skipped by the caller under `--force`.
+ * Plan-form race guard. Best-effort scan: refuses (naming the tripped condition
+ * and the right-path recovery) when a `pending_dispatches` row for the key
+ * exists, autopilot is unpaused, or a `working`/`stopped` job carries the plan
+ * key (client-side scan — `jobs` has no `plan_verb`/`plan_ref` filter). Each
+ * refusal names the recovery BEFORE `--force` (the caller appends the `--force`
+ * suffix, keeping it last): a stopped-but-live worker warm-resumes over the bus,
+ * a dead one is reclaimed. Returns the tripped-condition string, or `null` when
+ * clear. Skipped by the caller under `--force`.
  *
  * A daemon-unreachable read here is treated as "clear" — the launch surface
  * itself will fail loudly if the daemon is truly gone, and a manual hatch must
@@ -287,7 +360,7 @@ export async function checkRaceGuard(
     const state = await query("autopilot_state", { id: 1 });
     const paused = state[0]?.paused;
     if (paused === 0 || paused === false) {
-      return "autopilot is unpaused — it may dispatch this key itself; pause it or pass --force";
+      return "autopilot is unpaused — it may dispatch this key itself; pause it first";
     }
     // jobs has no plan_verb/plan_ref filter — scan the live set client-side.
     const jobs = await query("jobs");
@@ -298,7 +371,13 @@ export async function checkRaceGuard(
         (j.state === "working" || j.state === "stopped"),
     );
     if (live !== undefined) {
-      return `a live job for ${key} already occupies a slot (job state=${String(live.state)})`;
+      // A stopped worker still occupies the slot (its launcher pane survives).
+      // Name the right path first: warm-resume its session over the bus if it's
+      // live, else reclaim the dead pane — --force (caller suffix) is last.
+      if (live.state === "stopped") {
+        return `a stopped worker for ${key} still holds the slot (job state=stopped); warm-resume its session over the bus, or reclaim the dead pane`;
+      }
+      return `a live worker for ${key} is running (job state=working); let it finish`;
     }
   } catch {
     // Transient read failure — do not block a manual launch on it.
@@ -506,9 +585,13 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       verb,
       id,
       deps.dirExists ?? existsSync,
+      deps.resolveLaneDir ?? resolveEpicLaneWorktree,
     );
     if (!cwdResult.ok) {
       die(cwdResult.error);
+    }
+    if (cwdResult.warning !== undefined) {
+      process.stderr.write(`dispatch: ${cwdResult.warning}\n`);
     }
     cwd = cwdResult.cwd;
     prompt = defaultPlanPrompt(verb, id);

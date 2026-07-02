@@ -22,6 +22,20 @@ import { resolve as resolveAbs } from "node:path";
 import { isTaskId } from "./ids.ts";
 import { getVcs } from "./vcs.ts";
 
+/** The keeper worktree lane base-branch prefix, re-derived LOCALLY here — the
+ * plan plugin never imports src/worktree-git.ts (its KEEPER_EPIC_BRANCH_PREFIX)
+ * to stay decoupled from the daemon internals. A parity test pins this literal to
+ * keeper's constant, so a rename there fails loudly rather than silently
+ * reintroducing the lane-blind close halt. */
+export const KEEPER_EPIC_BRANCH_PREFIX = "keeper/epic/";
+
+/** The deterministic epic lane base branch — `keeper/epic/<epic_id>` — checked
+ * out by every worktree lane of the epic (identical in the primary AND every
+ * secondary repo: reconcile derives it from the epic id alone, never the repo). */
+export function laneBranchFor(epicId: string): string {
+  return `${KEEPER_EPIC_BRANCH_PREFIX}${epicId}`;
+}
+
 /** Raised when every repo in the resolved scan set is missing or not a git repo.
  * Carries the broken repo paths so the calling verb can surface them in its
  * error envelope (details.broken_repos). A scan set with even one usable repo
@@ -79,11 +93,21 @@ export interface CommitGroupResult {
  * Shas are deduped within a repo group; full %H. A clean miss is an empty result.
  * Throws AllReposBrokenError only when EVERY resolved repo is missing or not a
  * git repo; a single broken entry is skipped with a stderr note; an empty
- * resolved set returns [] and never throws. Mirrors find_commit_groups. */
+ * resolved set returns [] and never throws. Mirrors find_commit_groups.
+ *
+ * `epicId`, when given (the epic-close callers — close-preflight/close-finalize),
+ * makes the scan lane-aware: each repo is first probed for the deterministic lane
+ * branch `keeper/epic/<epic_id>` (visible in the primary checkout's shared ref
+ * store even before the lane merges to default). Present → scan that ref so
+ * lane-ONLY commits appear; absent (or a probe failure) → scan HEAD exactly as
+ * today, so a repo is never dropped, single-repo/non-worktree closes are
+ * byte-identical, and a post-finalize re-run self-heals (lane pruned → HEAD
+ * reaches the merged commits). Omitted (find-task-commit) → always HEAD. */
 export function findCommitGroups(
   taskIds: string[],
   primaryRepo: string,
   touchedRepos: string[] | null | undefined,
+  epicId?: string | null,
 ): CommitGroupResult[] {
   const repos = resolveRepoSet(primaryRepo, touchedRepos);
   if (repos.length === 0) {
@@ -94,6 +118,7 @@ export function findCommitGroups(
   const validTaskIds = taskIds.filter((tid) => isTaskId(tid));
 
   const vcs = getVcs();
+  const laneRef = epicId ? laneBranchFor(epicId) : null;
   const grouped = new Map<string, string[]>();
   const order: string[] = [];
   const broken: string[] = [];
@@ -108,8 +133,15 @@ export function findCommitGroups(
       continue;
     }
     anyUsable = true;
+    // Lane probe (epic close only): scan the lane branch when it resolves in THIS
+    // repo, else fall back to HEAD (undefined ref). Probed once per repo — the
+    // lane ref may be present in the primary and absent in a secondary.
+    const scanRef =
+      laneRef !== null && vcs.resolveRef(laneRef, repo) !== null
+        ? laneRef
+        : undefined;
     for (const taskId of validTaskIds) {
-      for (const sha of vcs.trailerCommitShas(taskId, repo)) {
+      for (const sha of vcs.trailerCommitShas(taskId, repo, scanRef)) {
         let shas = grouped.get(repo);
         if (shas === undefined) {
           shas = [];

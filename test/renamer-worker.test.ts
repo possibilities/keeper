@@ -129,7 +129,7 @@ const pane = (
   paneId: string,
   windowId: string,
   windowName: string,
-): PaneInfo => ({ paneId, windowId, windowName });
+): PaneInfo => ({ paneId, windowId, currentCommand: "zsh", windowName });
 
 // ---------------------------------------------------------------------------
 // renameCandidates — the projection filter

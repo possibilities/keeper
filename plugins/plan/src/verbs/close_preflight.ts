@@ -34,7 +34,7 @@ import {
   type ProjectContext,
   resolveProject,
 } from "../project.ts";
-import { writeCloseMarker } from "../session_markers.ts";
+import { claimCloseExclusive } from "../session_markers.ts";
 import { getTaskSection } from "../specs.ts";
 import { hasDataDir } from "../state_path.ts";
 
@@ -167,6 +167,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       tasks.filter((t) => t.id).map((t) => t.id as string),
       primaryRepo,
       touchedRepos,
+      epicId,
     );
   } catch (exc) {
     if (exc instanceof AllReposBrokenError) {
@@ -203,9 +204,20 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
   };
   const briefRef = writeBriefArtifact(primaryRepo, epicId, brief);
 
-  // Mark this session as closing the epic (guard contract). Success path only;
-  // fail-open.
-  writeCloseMarker(epicId);
+  // Claim the close exclusively (guard contract + duplicate-close guard). Writes
+  // this session's close marker, then asserts no rival live closer holds the
+  // epic — a second concurrent claimant fails loud so it exits instead of
+  // re-running the whole audit. Success path only; fail-open on marker IO.
+  const lost = claimCloseExclusive(epicId);
+  if (lost !== null) {
+    emitPreflightError(
+      "CLOSE_ALREADY_CLAIMED",
+      `epic ${epicId} is already being closed by another live session — ` +
+        "resume that closer over the bus rather than starting a second one",
+      format,
+      { held_by_session: lost.heldBy },
+    );
+  }
 
   formatOutput(
     {
