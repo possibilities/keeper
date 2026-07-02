@@ -81,7 +81,8 @@ Return this markdown to the caller. Omit any section that genuinely has no signa
 ### Test Patterns
 - Tests live in: [location]
 - Naming: [pattern]
-- Fixtures: [if any]
+- Fixtures: [if any — recorded fixtures, golden/snapshot files, vendored corpora]
+- Fixture coupling: when the change edits content that recorded fixtures, goldens, or vendored corpora pin, flag that fixture surface as a likely-update target — including cross-repo fixtures that pin this repo's output
 
 ### Design System (if DESIGN.md found and well-formed)
 - Location: `DESIGN.md` (or wherever)

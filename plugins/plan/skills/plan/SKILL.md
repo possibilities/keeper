@@ -82,6 +82,8 @@ Both paths run this block. The **create path** enters here and runs **all four s
 
 **Which scouts run.** Create: all four, unconditionally. Refine: only the scouts R3 marked `run` — delete the skipped scouts' `Task()` calls entirely.
 
+**Fan-out cap — four, always.** The four named scouts ARE the parallel block; four is the ceiling for one concurrent sweep. Never multiply scouts per-file or per-area into an unbounded fan-out — that exhausts the account's session limits. Keep each sweep bounded; if a sweep is interrupted mid-flight, re-brief the surviving scouts with a narrower bounded scope on the next pass rather than resuming one wide open-ended fan-out.
+
 Spawn via the Task tool **in one assistant message block** so they run concurrently. Each scout persists its report; the Task return value is that same markdown. After all return, **pin each report in working memory and do not re-invoke any scout** — the pinned reports feed Phase 5e (task Investigation targets) and 5g (epic References / Docs gaps / Best practices), and all four also feed the gap-analyst in Phase 2c.
 
 Each brief = the **subject context** block followed by the scout's instruction:
@@ -185,7 +187,9 @@ the fixed-heading markdown report per your agent spec.
 
 Hard epic dependencies are always OK to control inter-epic work coordination;
 do not raise inter-epic file/data overlap as a Priority Question — the planner
-auto-wires overlaps via `epic add-deps` upstream.
+wires overlaps via `epic add-deps` upstream: from epic-scout for epics that
+already have commits, and from the specs directly for sibling epics scaffolded
+in this same session (epic-scout is blind to those — see Phase 6).
 ```
 
 **Refine path — skipped scouts.** For each scout R3 skipped, put exactly one of (a) the scout's return markdown, or (b) `(skipped: <rationale from R3>)` under its `--- <scout> report ---` header — never both, never the literal `OR if skipped:`. Zero-survivors example:
@@ -370,8 +374,8 @@ Guided by the decomposition bias from 3c; spec richness flows from the depth pic
 For each task, decide:
 - **title** (3–6 words, slugifies)
 - **size**: S (a few hours) or M (a day or two). L must be split.
-- **files** (disjoint = parallel-safe; overlapping = needs an explicit dep)
-- **deps** on sibling tasks (only when files overlap or there's a hard "must-finish-first")
+- **files** (disjoint = parallel-safe; any shared path means the two tasks MUST carry a dep edge — same-file parallel tasks collide at worktree fan-in)
+- **deps** on sibling tasks (required whenever `Files:` overlap, per above; otherwise only for a hard "must-finish-first")
 - **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Paired with **model** (below); `claim` composes the two into `worker_agent: plan:worker-<model>-<effort>`, the generated worker agent `/plan:work` spawns. Bands:
   - **`medium`** — single-file edit, mechanical refactor, straight test addition. Acceptance is "do exactly this."
   - **`high`** — multi-file feature in a known pattern, typical bug fix with the root cause named, anything following an obvious in-repo template.
@@ -381,7 +385,7 @@ For each task, decide:
 
 ### 5e. For each task — assemble the YAML entry (cognitive)
 
-No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `model`, `deps` (1-based ordinals), `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
+No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `model`, `deps` (1-based ordinals — mandatory between any two tasks whose `Files:` share a path, see 5f), `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
 
 **Spec markdown — required:** the 4 H2s `## Description`, `## Acceptance`, `## Done summary`, `## Evidence`, in that order, at every depth. Embed structure as `### subsections` inside `## Description` per the 3b task-depth mapping.
 
@@ -439,7 +443,7 @@ Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Des
 
 ### 5f. Declare cross-task dependencies (cognitive)
 
-`deps:` is a list of **1-based ordinals** into `tasks:` — `deps: [1]` = "depends on the first task," identical to the `.M` suffix scaffold assigns. Scaffold resolves forward refs (two-pass id allocation) and runs `detect_cycles` before any write. Declare a dep only when files overlap or there's a hard "must-finish-first." A 1-task epic has `deps: []` everywhere.
+`deps:` is a list of **1-based ordinals** into `tasks:` — `deps: [1]` = "depends on the first task," identical to the `.M` suffix scaffold assigns. Scaffold resolves forward refs (two-pass id allocation) and runs `detect_cycles` before any write. **Hard rule: any two tasks whose `Files:` lists share even one path MUST carry a dep edge between them** — parallel same-file tasks conflict at worktree fan-in, and worktree lanes defer that conflict to fan-in, they do not prevent it; the dep edge is the fix. Beyond that rule, declare a dep only for a genuine hard "must-finish-first." A 1-task epic has `deps: []` everywhere.
 
 ### 5g. Assemble the epic spec markdown (cognitive)
 
@@ -573,6 +577,8 @@ Epic deps overlap: <epic_id> → <dep_id> (<dep title>): <why from Overlaps bull
 An id in both sections produces one `wired:` line (Dependencies pass) and one `overlap:` line (Overlaps pass); an id in one section produces that one line. Both prefixes emit on every pass regardless of whether the edge was already present — the Overlaps scout's independent surfacing stays visible. Omit both lines when Phase 6 was skipped.
 
 **Refine path (R5b):** run the same batch wire after rewriting the epic spec, additive-only — `add-deps` is idempotent per edge, and never call `epic rm-dep`. The log noise on already-present edges is the audit signal, not a regression.
+
+**Same-session multi-epic overlap (epic-scout's blind spot).** epic-scout detects overlaps only against epics that already have commits; sibling epics you scaffold in this *same* planning session have none yet, so their file collisions are structurally invisible to it. When one session scaffolds more than one epic, reason about shared files across the whole portfolio from the specs themselves (each epic's task `Files:` lists) and wire `depends_on_epics` for every colliding pair. This is the 5f same-file rule applied one level up — between sibling epics rather than sibling tasks — and epic-scout cannot do it for you.
 
 ### Cross-skill orchestration awareness (multi-epic)
 
