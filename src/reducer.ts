@@ -5354,7 +5354,12 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       // mis-assignment self-corrects. `null` when no type to match on or no
       // unbound PreToolUse row qualifies — leaves the historical SubagentStart
       // defaults (NULL / NULL / 0) in place.
-      const pendingPre = findPendingPreToolUseForStart(db, jobId, seedType);
+      const pendingPre = findPendingPreToolUseForStart(
+        db,
+        jobId,
+        seedType,
+        event.id,
+      );
       const _saT2 = performance.now();
       const seedToolUseId = pendingPre?.tool_use_id ?? null;
       const seedDescription = pendingPre?.description ?? null;

@@ -36,6 +36,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  __resetSubagentPreParseMemoForTest,
   type BridgeEventInput,
   type CanonicalRow,
   canonicalizeRow,
@@ -169,6 +170,7 @@ function driveEvent(ev: FixtureEvent): void {
       db,
       ev.session_id,
       ev.agent_type,
+      ev.id,
     );
     db.run(
       `INSERT INTO subagent_invocations (
@@ -1014,9 +1016,21 @@ function bind(
 }
 
 describe("findPendingPreToolUseForStart", () => {
+  // fn-1052: the candidate scan clamps `id < currentEventId`. These FIFO / type
+  // / bind / defensive-parse cases seed candidates at low ids and assert
+  // behavior UNRELATED to the ceiling, so they pass a ceiling above every
+  // seeded id (mirroring a SubagentStart that folds strictly AFTER its
+  // candidates). The dedicated ceiling cases at the end drive it directly.
+  const AFTER_ALL_CANDIDATES = Number.MAX_SAFE_INTEGER;
+
   test("returns null when no PreToolUse:Agent exists in session", () => {
     expect(
-      findPendingPreToolUseForStart(db, "sess-empty", "Explore"),
+      findPendingPreToolUseForStart(
+        db,
+        "sess-empty",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      ),
     ).toBeNull();
   });
 
@@ -1028,7 +1042,9 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "d", prompt: "p", subagent_type: "Explore" },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", null)).toBeNull();
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", null, AFTER_ALL_CANDIDATES),
+    ).toBeNull();
   });
 
   test("returns null when agentType is empty string", () => {
@@ -1039,7 +1055,9 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "d", prompt: "p", subagent_type: "Explore" },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "")).toBeNull();
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "", AFTER_ALL_CANDIDATES),
+    ).toBeNull();
   });
 
   test("single matching PreToolUse: returns its description / prompt_chars / tool_use_id", () => {
@@ -1054,7 +1072,14 @@ describe("findPendingPreToolUseForStart", () => {
       },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+    expect(
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      ),
+    ).toEqual({
       description: "Find auth code",
       prompt_chars: 19,
       tool_use_id: "toolu_solo",
@@ -1076,7 +1101,12 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "second", prompt: "pp2", subagent_type: "Explore" },
       2.0,
     );
-    const result = findPendingPreToolUseForStart(db, "sess-x", "Explore");
+    const result = findPendingPreToolUseForStart(
+      db,
+      "sess-x",
+      "Explore",
+      AFTER_ALL_CANDIDATES,
+    );
     expect(result?.tool_use_id).toBe("toolu_first");
     expect(result?.description).toBe("first");
   });
@@ -1098,7 +1128,12 @@ describe("findPendingPreToolUseForStart", () => {
     );
     // Bind toolu_first to an existing subagent_invocations row in this session.
     bind("sess-x", "agent_prev", 0, "toolu_first");
-    const result = findPendingPreToolUseForStart(db, "sess-x", "Explore");
+    const result = findPendingPreToolUseForStart(
+      db,
+      "sess-x",
+      "Explore",
+      AFTER_ALL_CANDIDATES,
+    );
     expect(result?.tool_use_id).toBe("toolu_second");
     expect(result?.description).toBe("second");
   });
@@ -1118,7 +1153,14 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "explore thing", prompt: "pp", subagent_type: "Explore" },
       2.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+    expect(
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      ),
+    ).toEqual({
       description: "explore thing",
       prompt_chars: 2,
       tool_use_id: "toolu_explore",
@@ -1133,7 +1175,14 @@ describe("findPendingPreToolUseForStart", () => {
       { description: "a thing", prompt: "p", subagent_type: "Explore" },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-B", "Explore")).toBeNull();
+    expect(
+      findPendingPreToolUseForStart(
+        db,
+        "sess-B",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      ),
+    ).toBeNull();
   });
 
   test("malformed JSON skipped, next matching row wins", () => {
@@ -1146,7 +1195,12 @@ describe("findPendingPreToolUseForStart", () => {
       2.0,
     );
     expect(
-      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.tool_use_id,
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      )?.tool_use_id,
     ).toBe("toolu_good");
   });
 
@@ -1158,7 +1212,14 @@ describe("findPendingPreToolUseForStart", () => {
       { prompt: "abc", subagent_type: "Explore" },
       1.0,
     );
-    expect(findPendingPreToolUseForStart(db, "sess-x", "Explore")).toEqual({
+    expect(
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      ),
+    ).toEqual({
       description: null,
       prompt_chars: 3,
       tool_use_id: "toolu_nodesc",
@@ -1174,7 +1235,12 @@ describe("findPendingPreToolUseForStart", () => {
       1.0,
     );
     expect(
-      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.prompt_chars,
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      )?.prompt_chars,
     ).toBe(0);
   });
 
@@ -1191,8 +1257,135 @@ describe("findPendingPreToolUseForStart", () => {
       1.0,
     );
     expect(
-      findPendingPreToolUseForStart(db, "sess-x", "Explore")?.description
-        ?.length,
+      findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      )?.description?.length,
     ).toBe(DESCRIPTION_MAX_CHARS);
+  });
+
+  // -------------------------------------------------------------------------
+  // fn-1052 — the `id < currentEventId` ceiling. The candidate scan must see
+  // ONLY PreToolUse:Agent rows that existed before the folding SubagentStart,
+  // matching live-fold semantics. Without it a from-scratch re-fold binds a
+  // FUTURE candidate the live fold never saw (a latent live-vs-refold
+  // divergence the re-fold-vs-re-fold charter cannot catch).
+  // -------------------------------------------------------------------------
+
+  test("id ceiling: a FUTURE matching candidate (id >= currentEventId) is NOT returned — the latent live-vs-refold divergence", () => {
+    // The ONLY matching candidate lies ABOVE the ceiling. Pre-fix (no ceiling)
+    // this row binds; post-fix neither a live fold nor a re-fold at this id
+    // sees it. Candidate at id 10, SubagentStart folds at id 5.
+    insertPre(
+      10,
+      "sess-x",
+      "toolu_future",
+      { description: "future", prompt: "later", subagent_type: "Explore" },
+      10.0,
+    );
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore", 5),
+    ).toBeNull();
+    // Same corpus, a ceiling ABOVE the candidate → it binds. Proves the null
+    // above was the ceiling, not a missing/mismatched candidate.
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore", 11)?.tool_use_id,
+    ).toBe("toolu_future");
+  });
+
+  test("id ceiling is EXCLUSIVE of currentEventId: a candidate AT the ceiling id is excluded", () => {
+    insertPre(
+      7,
+      "sess-x",
+      "toolu_at",
+      { description: "at", prompt: "p", subagent_type: "Explore" },
+      7.0,
+    );
+    // `id < 7` excludes id 7; `id < 8` includes it.
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore", 7),
+    ).toBeNull();
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore", 8)?.tool_use_id,
+    ).toBe("toolu_at");
+  });
+
+  test("id ceiling: FIFO among below-ceiling candidates, future ones ignored", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_below1",
+      { description: "b1", prompt: "p", subagent_type: "Explore" },
+      1.0,
+    );
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_below2",
+      { description: "b2", prompt: "p", subagent_type: "Explore" },
+      2.0,
+    );
+    insertPre(
+      9,
+      "sess-x",
+      "toolu_future",
+      { description: "fut", prompt: "p", subagent_type: "Explore" },
+      9.0,
+    );
+    // Ceiling at 5: only ids 1,2 qualify; FIFO picks the earliest.
+    expect(
+      findPendingPreToolUseForStart(db, "sess-x", "Explore", 5)?.tool_use_id,
+    ).toBe("toolu_below1");
+  });
+
+  // -------------------------------------------------------------------------
+  // fn-1052 — the per-event-id parse cache. A warm cache (accumulated across
+  // repeated probes on the same connection) yields byte-identical results to a
+  // cold parse (memo reset). A permanently-malformed low-id candidate is cached
+  // as a negative — it never re-anchors the parse loop.
+  // -------------------------------------------------------------------------
+
+  test("parse cache: warm repeated probes equal a cold (reset) probe byte-for-byte", () => {
+    insertPre(
+      1,
+      "sess-x",
+      "toolu_bad",
+      null, // malformed — cached as a permanent negative
+      1.0,
+    );
+    insertPre(
+      2,
+      "sess-x",
+      "toolu_ok",
+      { description: "ok", prompt: "prompt", subagent_type: "Explore" },
+      2.0,
+    );
+    // Warm the cache with several probes (parses each candidate once, then hits
+    // the memo on every later probe).
+    let warm: ReturnType<typeof findPendingPreToolUseForStart> = null;
+    for (let i = 0; i < 4; i++) {
+      warm = findPendingPreToolUseForStart(
+        db,
+        "sess-x",
+        "Explore",
+        AFTER_ALL_CANDIDATES,
+      );
+    }
+    // Force the cache cold, re-probe once.
+    __resetSubagentPreParseMemoForTest(db);
+    const cold = findPendingPreToolUseForStart(
+      db,
+      "sess-x",
+      "Explore",
+      AFTER_ALL_CANDIDATES,
+    );
+    expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+    expect(cold).toEqual({
+      description: "ok",
+      prompt_chars: 6,
+      tool_use_id: "toolu_ok",
+    });
   });
 });

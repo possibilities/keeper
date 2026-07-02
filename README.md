@@ -731,7 +731,10 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    the lock) — one read tells you whether a slow fold was starved or busy. The
    slow event types each emit a per-pass `[*-breakdown]` line above their own
    `*_FOLD_BREAKDOWN_MS` gate: `[gitfold-breakdown]` (GitSnapshot per-pass +
-   pass-1 per-arm split), `[commitfold-breakdown]`, `[subagentfold-breakdown]`,
+   pass-1 per-arm split), `[commitfold-breakdown]`, `[subagentfold-breakdown]`
+   (SubagentStart: `extractTurnSeq` vs the `findPendingPreToolUseForStart` FIFO
+   bridge probe vs the row INSERT — the probe's candidate-parse cost is memoized
+   per event id since fn-1052, so it stays silent even for long sessions),
    `[ptufold-breakdown]` (PostToolUse), and `[pretufold-breakdown]` (PreToolUse
    — covers the `/plan:plan` opener fold). The commit / PostToolUse / PreToolUse
    breakdowns carry `plan_*` counters (calls, touched epics, swept sessions,
@@ -2980,6 +2983,29 @@ the ephemeral / autopilot tables replicated so the re-fold cannot resurrect a ph
 `pending_dispatches` dispatch jam. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `81` (whitelist-only; keeper-py reads `jobs` / `epics` over the socket, not the
 fold internals).
+The SubagentStart FIFO bridge probe (`findPendingPreToolUseForStart`, fn-1052) no
+longer `JSON.parse`s every still-unbound `PreToolUse:Agent` candidate on every
+SubagentStart (avg 2.6s / max 27.6s on the live DB, per the `[subagentfold-breakdown]`
+split), a per-event cost that grew with a session's accumulated agent-call count. The
+anti-join SQL stays a LIVE query (exact by construction — it models PostToolUse:Agent
+re-binding + FIFO self-correction across three fold arms, which a materialized
+pending-set could not), while each candidate blob's parse — the measured cost — is
+memoized per EVENT ID in a per-`Database` `WeakMap`. `PreToolUse:Agent` is retention
+keep-set (its body is never NULLed), so a row's `data` is immutable and the cache keys
+on event id ALONE with no invalidation story; a malformed / non-matching-shape blob
+caches as a negative, so it is parsed exactly once and never re-anchors the loop. The
+same change adds the missing candidate ceiling `id < currentEventId`: without it a
+from-scratch re-fold — or a live drain that ingested a batch ahead of the cursor —
+bound a FUTURE candidate the live fold at that id never saw, a latent live-vs-refold
+divergence the re-fold-vs-re-fold charter cannot catch. The parse cache is a PURE
+optimization (a warm fold equals a cold rebuild byte-for-byte); the ceiling
+deliberately CHANGES what a from-scratch re-fold produces where a future-candidate
+match existed, converging it onto live-fold semantics — so it lands WITHOUT a schema
+bump, migration, or projection wipe (the fix is to the fold, which every future fold
+and re-fold honors, never a wipe of the live projection). No boot-seed warmer: the
+probe is already `session_id`-scoped, so a cold first fold touches only one session's
+tiny candidate set — there is no global-history scan to hoist out of the boot lock
+(unlike `gitAttribMemos`), and each session lazily warms on its first SubagentStart.
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`

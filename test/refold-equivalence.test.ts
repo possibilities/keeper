@@ -69,7 +69,10 @@ import {
 } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { __resetMonitorProvenanceMemoForTest, drain } from "../src/reducer";
-import { resolveBridgeAgentId } from "../src/subagent-invocations";
+import {
+  __resetSubagentPreParseMemoForTest,
+  resolveBridgeAgentId,
+} from "../src/subagent-invocations";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -410,8 +413,8 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
     },
     {
       file: "src/subagent-invocations.ts",
-      needle: "SELECT e.tool_use_id, e.data AS data",
-      why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline",
+      needle: "SELECT e.id AS id, e.tool_use_id, e.data AS data",
+      why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline (fn-1052 adds e.id for the per-event-id parse cache)",
     },
     {
       file: "cli/search-history.ts",
@@ -2027,6 +2030,94 @@ function rewindAndWipeWidened(): void {
   rewindAndWipeProjections();
   db.run("DELETE FROM scheduled_tasks");
 }
+
+// ---------------------------------------------------------------------------
+// fn-1052 — the SubagentStart FIFO bridge arm. The bridge probe
+// (`findPendingPreToolUseForStart`) now clamps candidates `id < currentEventId`
+// and memoizes each candidate's parse per event id. `PreToolUse:Agent` is
+// keep-set (its body survives any shed), so the bridge re-derives byte-identically
+// across re-folds — with the memo forced COLD on P1 and left WARM on P2, proving
+// the parse cache is a pure optimization. NOTE: this re-fold-vs-re-fold charter
+// cannot catch the live-vs-refold divergence the ceiling closes (both re-folds
+// apply the ceiling identically); that divergence is pinned in
+// reducer-lifecycle.test.ts. Here it pins re-fold DETERMINISM under the ceiling.
+// ---------------------------------------------------------------------------
+
+test("differential re-fold: SubagentStart FIFO bridge (fn-1052 parse cache + id ceiling) is byte-identical across re-folds; future candidate never binds", () => {
+  const SESS = "aaaaaaaa-1111-2222-3333-444444444444";
+  // A matching candidate BELOW its SubagentStart binds; a matching candidate
+  // ABOVE a later SubagentStart (future id) never does.
+  insertEvent({ hook_event: "SessionStart", session_id: SESS });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-below",
+    data: JSON.stringify({
+      tool_input: {
+        subagent_type: "worker",
+        description: "below",
+        prompt: "p",
+      },
+    }),
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS,
+    agent_id: "agent-a",
+    agent_type: "worker",
+  });
+  // agent-b folds BEFORE tu-future exists (lower id) → no unbound worker
+  // candidate below its ceiling → stays unbound.
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS,
+    agent_id: "agent-b",
+    agent_type: "worker",
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS,
+    tool_use_id: "tu-future",
+    data: JSON.stringify({
+      tool_input: {
+        subagent_type: "worker",
+        description: "future",
+        prompt: "p",
+      },
+    }),
+  });
+
+  const snapSubs = () =>
+    db
+      .query(
+        "SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq",
+      )
+      .all();
+
+  drainAll();
+  const p0 = snapSubs() as Array<Record<string, unknown>>;
+  // agent-a lifted the below candidate; agent-b ignored the future one.
+  const a = p0.find((r) => r.agent_id === "agent-a");
+  const b = p0.find((r) => r.agent_id === "agent-b");
+  expect(a?.tool_use_id).toBe("tu-below");
+  expect(a?.description).toBe("below");
+  expect(b?.tool_use_id).toBeNull();
+
+  // P1 — cold rebuild (memo forced cold): byte-identical.
+  rewindAndWipeProjections();
+  __resetSubagentPreParseMemoForTest(db);
+  drainAll();
+  const p1 = snapSubs();
+  expect(p1).toEqual(p0);
+
+  // P2 — warm rebuild (memo left warm): still byte-identical.
+  rewindAndWipeProjections();
+  drainAll();
+  const p2 = snapSubs();
+  expect(p2).toEqual(p1);
+});
 
 // ---------------------------------------------------------------------------
 // fn-934 (task .5) — PHYSICAL ROW-DELETE of the no-op-arm snapshot classes.
