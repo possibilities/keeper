@@ -148,7 +148,7 @@ Task: $TASK_ID"
 
 **Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
-**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need. **A lint failure is never a coverage gap.** When the commit-work envelope reports `"error": "lint_failed"`, this fallback does not apply — the only permitted recovery is: fix the reported lint errors, re-stage with `git add`, and re-invoke `keeper commit-work` with the same message. Never bare `git commit` or `--no-verify` after a lint failure.
+**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly:** stage only the files you're committing by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This never applies to a `lint_failed` envelope — that has exactly one recovery (fix, re-stage, re-invoke `commit-work` per above), never a bare `git commit` or `--no-verify`.
 
 If you reach this phase with a clean tree (a predecessor already shipped the source commit — see Phase 1), skip it: *"tree clean, no source commit needed."*
 
@@ -218,16 +218,5 @@ The parent stops the loop and surfaces this verbatim.
 
 ## Rules
 
-- **Resume directives outrank phases.** If your turn opens with a parent directive, follow it and skip phases it supersedes.
-- **One pass per file region.** Don't re-read a span you've already read in this turn.
 - **One task only.** Implement exactly the task you were given; don't touch sibling tasks.
 - **Never end a turn text-only to wait on an external event** (a Monitor notification, a test run, human input). Every turn either calls a tool or delivers the final return — prose like "waiting for X" with no paired action ends the agent loop and drops the task. Poll with a bounded Bash command (an explicit timeout plus retry count) or return `BLOCKED: EXTERNAL_BLOCKED` naming what is needed. Returning `BLOCKED` is not idle-waiting — it hands the wait UP to the parent orchestrator session, which holds the paired bus-inbox wake; the parent may later re-engage you with a resume directive (see "Resume directives outrank everything below"). You never hold the wait yourself.
-- **Test before commit, commit before done.** Phase 3 → 4 → 5. Two commits per task in history: source first (your `keeper commit-work` in Phase 4), state second (auto-committed inline by `keeper plan done` in Phase 5).
-- **Budgets & trust** (standing rules — a resume directive skips phase text, so these hold even then):
-  - **Two-full-suite-run cap per invocation, foreground only.** Run targeted tests first, then ONE full pass; never background a test run or idle-wait on one. The cap bounds full passes only — fix-then-targeted-rerun on your own code is uncapped.
-  - **Never disable a test to get green** — no skip markers, commented assertions, weakened matchers, or deletions. Escalate instead.
-  - **Mandatory delivery self-check on every path** (including no-op tasks) via `keeper session-state`; never reason over raw `git status` / porcelain.
-  - **Trust git over envelopes.** On a suspect `keeper commit-work` / `keeper plan done` envelope, run `git log` ground truth, side with git, retry the verb once, then `BLOCKED: TOOLING_FAILURE` carrying both outputs.
-  - **Return cap: 5 template lines + at most 3 note lines,** evidence by reference, no self-check narration.
-- **`keeper commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — read the named files, fix per stderr, re-stage, re-invoke. Don't patch the tool you're calling.
-- **No `TodoWrite`.** The plan tooling tracks tasks.

@@ -201,12 +201,5 @@ Include the per-task commit sha from the worker return and `epic_progress.done` 
 
 ## Guardrails
 
-- **Never auto-closes the epic** — closing runs through the separate, automated `/plan:close` audit, never this orchestrator.
-- **Post-worker assessment is a single `keeper plan reconcile` call + a total switch on its seven verdicts** (Phase 2b) — no `keeper plan show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. The orchestrator speaks only in typed verdicts.
-- **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `keeper plan done`, and self-checks its own delivery cleanliness before returning. A `done` verdict implies both commits landed and no session file of the worker's is left dirty.
-- **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the failure surfaces verbatim and the resume path picks it up.
-- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — it STAMPS the block on the board (`keeper plan block --reason "<CATEGORY>: …"` if not already blocked) and surfaces-and-stops (Phase 2c). The daemon owns escalation to the planner; this orchestrator never SENDS on the bus to escalate, wait, or self-resume a semantic block. It does stay reachable post-block and, when the planner RESUMES it at `work::<task>` over the bus, re-enters the Phase 2b warm-resume after a `keeper plan reconcile <task>` confirms the unblock (PRIMARY); autopilot cold-re-dispatch is the fallback for a dead orchestrator session. The `in_progress_committed` / `in_progress_uncommitted` / `state_uncommitted` verdicts *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b resume machinery). A `tooling_error` verdict surfaces-and-stops (fail closed — never resume against an unreliable verdict).
-- **Delivery cleanliness belongs to the worker, not the orchestrator** — the worker commits its own session files before returning; the orchestrator never inspects, classifies, or commits dirty files, never runs `keeper plan done`, and never commits source on the worker's behalf.
-- **Tier + model routing is owned by the planner + the launcher, not this skill** — spawn the constant `work:worker`, no `model=`, no tier/model-read. A `null` `worker_agent` is a typed stop, never a spawn.
 - **Never reads or writes** outside plan state + project code. Never use `TodoWrite` — the plan tooling tracks all tasks.
 
