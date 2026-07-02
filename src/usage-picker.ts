@@ -1,5 +1,5 @@
 /**
- * Profile picker — the client-side balancer the README's data contract feeds.
+ * Profile picker — the client-side balancer over the agentusage usage envelopes.
  *
  * Vendored from agentusage's `src/api.ts` (a 1:1 port). The producer scrapes each
  * account and writes `~/.local/state/agentusage/<id>.json` envelopes; this module

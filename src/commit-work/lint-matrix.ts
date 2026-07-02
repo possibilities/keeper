@@ -386,11 +386,15 @@ export async function runScopedLint(
     });
   }
 
-  // 10 --- claude-md (CLAUDE.md size + re-narration guard; keeper-only). Gated
-  //        on CLAUDE.md being staged AND the script existing at cwd, so it is a
-  //        strict no-op in any other repo (commit-work is a general tool). ---
+  // 10 --- claude-md (CLAUDE.md + README.md size + re-narration guard;
+  //        keeper-only). Gated on CLAUDE.md OR README.md being staged AND the
+  //        script existing at cwd, so it is a strict no-op in any other repo
+  //        (commit-work is a general tool). The script scans both files, so a
+  //        README-only commit is gated too. ---
   const claudeMdScript = join(cwd, "scripts", "lint-claude-md.ts");
-  if (stagedFiles.includes("CLAUDE.md") && existsSync(claudeMdScript)) {
+  const docsStaged =
+    stagedFiles.includes("CLAUDE.md") || stagedFiles.includes("README.md");
+  if (docsStaged && existsSync(claudeMdScript)) {
     tasks.push({
       order: 10,
       run: async () => {
@@ -398,7 +402,9 @@ export async function runScopedLint(
         return r.code !== 0
           ? {
               linter: "claude-md",
-              files: ["CLAUDE.md"],
+              files: stagedFiles.filter(
+                (f) => f === "CLAUDE.md" || f === "README.md",
+              ),
               stderr: failureStderr("claude-md", r),
             }
           : null;

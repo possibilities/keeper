@@ -124,10 +124,8 @@ Examples:
   keeper board | tail -1  # one-shot snapshot; last line is parseable JSON
   keeper board --watch    # force the live stream even when piped
 
-Pill conventions (show-defaults + Nerd Font icons), readiness verdicts,
-per-frame /tmp sidecars, and the rendering reference live in README.md's
-'keeper board' section. The bottom jobs list and dead-letter banner moved
-to 'keeper jobs'.
+Pill glyphs use Nerd Font icons and show-defaults; the jobs list and
+dead-letter banner are shown by 'keeper jobs'.
 `;
 
 /**

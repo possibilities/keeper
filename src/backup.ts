@@ -740,7 +740,7 @@ export function verifyReclaim(
 /**
  * The DOCUMENTED offline reclaim procedure — pause autopilot, catch-up drain,
  * checkpoint, reclaim, gate, atomic mv, clear stale sidecars, restart, verify.
- * Rendered as a single source of truth here AND in README `## Backup & restore`.
+ * Rendered as a single source of truth here.
  *
  * Covers BOTH offline reclaims: the fn-836.4 `event_blobs` shed and the fn-837
  * retention-predicate widening. The fn-837 version prepends the autopilot-pause
@@ -805,7 +805,7 @@ export function reclaimInstructions(
  * The DOCUMENTED restore procedure (the task Acceptance requires it be
  * documented, not assumed). Also rendered by `scripts/backup-db.ts` after a
  * successful backup so the operator always has the steps to hand. Kept as a
- * single source of truth here AND in README `## Backup & restore`.
+ * single source of truth here.
  */
 export function restoreInstructions(
   snapshotPath: string,
