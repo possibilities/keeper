@@ -6,7 +6,7 @@
     "fn-1070-bounded-papercut-sweep"
   ],
   "id": "fn-1071-expose-multi-repo-worktree-flag",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-02T09:39:04.959000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T09:38:58.390000Z"
+  "updated_at": "2026-07-02T09:39:04.959000Z"
 }
