@@ -5082,7 +5082,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint a synthetic `LaneMerged` event (fn-1016) carrying the FULL current
+   * Mint a synthetic `LaneMerged` event carrying the FULL current
    * merge-landed set, folded into the LIVE-ONLY `lane_merged` observable. Workers
    * never write the DB; the worker dedupes (posts only when the set changes), so
    * this fires at most once per set-change. The merged set rides `data` as

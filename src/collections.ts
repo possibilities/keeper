@@ -891,7 +891,7 @@ export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `lane_merged` descriptor (fn-1016) — the LIVE-ONLY merge-landed observable.
+ * The `lane_merged` descriptor — the LIVE-ONLY merge-landed observable.
  * One row per epic whose worktree lane branch (`keeper/epic/<id>`) the autopilot
  * reconciler probed as merged into the LOCAL default branch (ancestor-of-default,
  * or torn-down after the merge), folded from a synthetic `LaneMerged` event the
