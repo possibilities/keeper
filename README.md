@@ -567,6 +567,13 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    `~/.claude/plugins/keeper` symlink double-registers the hook (every invocation
    writes two `events` rows, with no runtime dedup guard) — there must be none.
 
+   A THIRD peer lives under `plugins/` but is NOT a Claude Code plugin and is not
+   loaded by the launcher: `plugins/prompt` is a Bun package — the snippet/bundle
+   substrate engine behind `keeper prompt <verb>` — routed in-process directly from
+   the `keeper` binary rather than registered as a hook or skill. It carries no
+   `.claude-plugin/plugin.json` manifest and takes no `--plugin-dir` entry; it is a
+   library the CLI dispatches to, so the launcher's plugin-dir count stays two.
+
 4. **First boot.** `scripts/install.sh` (step 1) bootstraps the LaunchAgent for
    you; this note explains what that reload sets up and how the daemon behaves on
    a fresh install.
@@ -1921,7 +1928,7 @@ import; `KEEPER_DOCS_PUSH_LOG` overrides the skip-log for tests). It only PUSHES
 the sidecar-writer owns the commits — so the two hooks together make keeper the sole
 reliable owner of `~/docs` git state.
 
-A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
+The read-only UDS subscribe server runs on its own Worker thread. It mirrors
 the wake worker's archetype — its own read-only connection, its own
 `data_version` poll — but instead of waking the reducer it owns an external
 endpoint: a Unix-domain socket (guarded by a PID-liveness lock file) speaking
@@ -1985,7 +1992,7 @@ cap-held-after-sweep reject — the genuine anomaly. There is NO ping/pong heart
 (a faithfully-ponging orphan is indistinguishable from a quiet live viewer);
 the load-bearing fix for the orphan class is the client-side self-exit below.
 
-A **third** Worker thread is the transcript-title producer: it watches the
+The transcript-title producer Worker thread watches the
 external transcript tree (the `claude_projects_root` from
 `~/.config/keeper/config.yaml`, default `~/.claude/projects`) with
 `@parcel/watcher`, forward-tails each changed JSONL from a stored byte-offset,
@@ -2007,7 +2014,7 @@ successful stat+scan, cleared on ENOENT) skips any file unchanged since its
 last scan — so the backstop no longer re-reads hundreds of MB/min of static
 transcripts, while the fn-720 rescued accounting is byte-identical.
 
-A **fourth** Worker thread is the plan producer: it watches each configured
+The plan producer Worker thread watches each configured
 project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
 `.keeper/{epics,tasks}/*.json` files with `@parcel/watcher`, safe-parses each
 changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and a
@@ -2048,8 +2055,8 @@ fires once at fold-time on the producer side, never inside the
 `BEGIN IMMEDIATE` transaction. A `git commit` does not change the file's
 worktree bytes so FSEvents will not re-fire on commit; the `pending` set is
 drained by the same gated `recheckPending()` from FOUR triggers. As of fn-705
-the plan producer is realtime end to end, mirroring the eighth-worker
-(autopilot) model: it polls `PRAGMA data_version` on its own read-only
+the plan producer is realtime end to end, mirroring the autopilot worker
+model: it polls `PRAGMA data_version` on its own read-only
 connection (`PLAN_DB_POLL_MS`, 100ms — the cadence the sibling producers
 share) so every keeper DB write, the close fold included, drives a
 single-flight gated rescan that drains `pending` + re-ingests changed
@@ -2356,7 +2363,7 @@ wiped-and-replayed alongside the deterministic ones. As of schema v83 (fn-907)
 the same live-producer-fed class covers a SECOND surface: the two tmux
 location columns on `jobs` — `backend_exec_session_id` (the pane's CURRENT tmux
 session) and `window_index` (its left-to-right visual position). The persistent
-`tmux -C` control worker (epic fn-968 — the tenth worker) reads the whole-server
+`tmux -C` control worker reads the whole-server
 pane set over its existing framed re-read and mints one authoritative
 `TmuxTopologySnapshot` event; a live-only fold keyed on
 `(generation_id, pane_id)` overwrites those two columns in real time on any
@@ -2778,7 +2785,7 @@ event must not re-route into the projection, preserving the deterministic re-fol
 of the OTHER columns).
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
-plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded
+plugin-armed `keeper bus watch` monitor, an agent-armed `keeper await`, a backgrounded
 `bun test`. It folds purely from each Stop event's `data.background_tasks`
 snapshot (`type:"shell"` allowlist, stable-sorted by id, capped at 50
 defensively): every entry carries a three-way `kind` provenance label
@@ -2824,7 +2831,7 @@ projection `src/readiness.ts` never reads, and the embedded job shape
 readiness operates on did not carry it). The boolean is derived by
 `hasLiveWorkerMonitor(jobs.monitors)`: `true` iff ANY entry is a
 WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`) — `ambient`
-session-watchers (the plugin-armed chatctl bus, a never-claimed background
+session-watchers (the plugin-armed `keeper bus watch` monitor, a never-claimed background
 shell) NEVER count, because they were not launched by the work session's
 own turn and must not occupy the autopilot mutex. It is stamped at the Stop
 fold's `jobs.monitors`-write site (the only seam that refreshes the monitor
@@ -3206,7 +3213,7 @@ The replace swaps only the `subscription` variable; the line stream's byte
 offsets are untouched, so the post-re-arm rescan re-anchors nothing and emits
 no phantom titles.
 
-A **fifth** Worker thread is the usage CONSUMER: it watches the flat leaf
+The usage-consumer Worker thread watches the flat leaf
 usage state directory (`~/.local/state/agentusage/`, one `<id>.json` per
 account) with `@parcel/watcher`, safe-parses each changed file, and posts a
 `usage-snapshot` message to main (and a `usage-deleted` tombstone when a file
@@ -3229,7 +3236,7 @@ of the existing change-gated boot-scan path.
 
 Feeding that consumer is the usage-scraper PRODUCER worker (`src/usage-scraper-worker.ts`):
 keeperd both produces AND consumes the per-account Claude/Codex usage data. It is
-wired like the builds poller (a non-watcher, config-gated poll producer, NOT a
+wired like the builds-worker poll producer below (a non-watcher, config-gated poll producer, NOT a
 `@parcel/watcher` member) and is gated on a resolvable runtime — an absolute `uv`
 binary path (`usage_scraper_uv_path`) plus the agentusage project dir
 (`usage_scraper_project_dir`); an unresolved runtime leaves the worker un-spawned
@@ -3272,7 +3279,32 @@ producers never race the same files, so the worker simply un-arms if a lock is
 held. `KEEPER_AGENTUSAGE_ROOT` moves the producer + consumer + the vendored
 picker's ledger off the real state dir together (the test-isolation seam).
 
-A **sixth** Worker thread is the exit-watcher: it owns a kqueue (macOS) or
+The builds producer Worker thread (`src/builds-worker.ts`) is keeperd's FIRST
+outbound-HTTP producer — the only worker that polls a network endpoint instead of
+watching the filesystem. On a fixed ~15s cadence it polls the local buildbot
+master's REST API, derives one latest-build snapshot per registered (non-ghost)
+builder, and posts typed `{kind:"build-snapshot"|"build-deleted"}` messages to
+main; main — and only main — turns those into synthetic `BuildSnapshot` /
+`BuildDeleted` events rows, which the reducer folds into the `builds` projection.
+The worker never writes the DB: it opens a READ-ONLY `openDb` connection SOLELY to
+seed the boot change-gate from `builds` (a restart must NOT re-emit every builder)
+and otherwise only posts messages, keeping main the sole writer. Its poll loop is
+`setTimeout`-after-completion with an in-flight skip flag, NEVER `setInterval` — a
+hung cycle skips its slot rather than queuing an overlapping request. Each fetch
+gets a MANUAL `AbortController` deadline (`AbortSignal.timeout()` mis-fires on
+Bun/macOS, [oven-sh/bun#7512](https://github.com/oven-sh/bun/issues/7512)) cleared
+in a `finally`, combined with the worker's shutdown signal via `AbortSignal.any` so
+shutdown aborts an in-flight request; the shutdown handler also clears the pending
+timer. Fixed cadence, no backoff, no circuit breaker: EVERY transient failure —
+fetch rejection, non-2xx, non-JSON 200 body, a partial cycle — is contained INSIDE
+the loop and degrades to a silent no-op, so none reaches the worker's top-level
+error path (main wires `onerror`/`close` to `fatalExit`) and buildbot being down
+never crash-loops the daemon. Builder disappearance is enumeration-gated: a builder
+ABSENT from a SUCCESSFUL `/api/v2/builders` enumeration is tombstoned
+(`build-deleted`), but deletion is NEVER inferred from a failed cycle — a transient
+outage must not retract every row.
+
+The exit-watcher Worker thread owns a kqueue (macOS) or
 pidfd+epoll (Linux) fd via `bun:ffi`, polls `data_version` to keep its watch
 set in sync with the candidate `jobs` rows (`state IN ('working','stopped')
 AND pid IS NOT NULL`), and posts an `exit` message whenever a tracked pid
@@ -3310,8 +3342,8 @@ fold is a safe no-op. The age gate keys on `created_at`, NOT `updated_at` (late
 git-count/title/monitor writes reset `updated_at` on a stopped row); each reap
 logs one forensic stderr line with `(jobId, pid, start_time, reason)`.
 
-A **seventh** Worker thread is the dead-letter watcher (schema v37, fn-643):
-it watches `~/.local/state/keeper/dead-letters/` with `@parcel/watcher` and
+The dead-letter watcher Worker thread (schema v37) watches
+`~/.local/state/keeper/dead-letters/` with `@parcel/watcher` and
 posts a contentless `{kind: "dead-letter-changed"}` message to main on every
 change. Main owns the actual `dead_letters` write — scans the dir, reads
 each NDJSON file, parses each line, and `INSERT OR IGNORE`s into
@@ -3326,7 +3358,7 @@ the shared debounced re-scan scheduler. Distinct from the other six
 producers it does NOT mint synthetic `events` rows — the import is a
 direct operational-table write — and it is NOT a fold.
 
-An **eighth** Worker thread is the autopilot reconciler (schema v42, fn-661):
+The autopilot reconciler Worker thread (schema v42) is
 a server-side, level-triggered, change-driven control loop that owns dispatch
 decision, launch, confirmation, dedup, and (config-gated) reap. It polls
 `PRAGMA data_version` on its own read-only connection like the other
@@ -3797,7 +3829,7 @@ carries its OWN producer-stamped `close_kind` and membership is a per-row
 predicate over it (no per-row "this is where the crash happened" anchor). Epic
 fn-819 adds a generation BOUNDARY the restore-worker records — a
 `BackendExecStart` synthetic event minted on a tmux-server-pid change (see the
-ninth worker below) — and the generation-scoped `deriveLastGenerationSet`
+restore-snapshot worker below) — and the generation-scoped `deriveLastGenerationSet`
 (`restore-agents --last-generation`) bounds candidates to the PREVIOUS session
 generation ("the session you just lost") rather than the whole crash-like pool.
 It runs the SAME membership/filters, then keeps only candidates whose `Killed`
@@ -3848,8 +3880,8 @@ wrapper, since the launcher mints its own window).
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.
 
-A **ninth** Worker thread is the restore-snapshot worker (epic fn-677; freeze
-machinery RETIRED in fn-817): a pure CONSUMER that opens its own read-only
+The restore-snapshot Worker thread (freeze machinery retired) is a pure
+CONSUMER that opens its own read-only
 connection, polls `PRAGMA data_version` via the shared `watchLoop` primitive, and
 on every change reads the `jobs` + `epics` projections through the same `runQuery`
 read seam the autopilot worker uses. It rewrites
@@ -3870,7 +3902,7 @@ column bumps that power the DB-derived set are separate, and carry their
 
 The window_index this worker mirrors into `restore.json` rides straight off each
 job's `jobs` projection row, kept fresh by the control-worker's
-`TmuxTopologySnapshot` fold (see the tenth worker) — the restore worker no longer
+`TmuxTopologySnapshot` fold (see the tmux control-mode worker below) — the restore worker no longer
 probes tmux for topology. It retains a SINGLE event-log channel on its ~1s timer
 wake, UNGATED by a live tmux job (epic fn-819): a `tmux display-message -p
 '#{pid}'` probe reads the tmux SERVER pid (the backend "generation" handle), and
@@ -3887,8 +3919,8 @@ side-file. Write failures are swallowed to stderr (next pulse retries); only an
 unhandled throw out of the watch loop escalates to `onerror`/`close` →
 fatalExit.
 
-A **tenth** Worker thread is the tmux control-mode worker (epic fn-952, extended
-by fn-968): a persistent `tmux -C` control client parked on an anchor session,
+The tmux control-mode Worker thread is a persistent `tmux -C` control client
+parked on an anchor session,
 gated on `hasLiveTmuxJob` (no live tmux job ⇒ nothing to observe, so it stays
 disconnected and re-checks on a ~1s connect-gate poll). On connect it bootstraps
 the no-output flags and, debouncing the control-mode notification burst into one
@@ -3914,7 +3946,7 @@ OTHER `jobs` columns still re-fold byte-identically). A `%exit` / EOF triggers a
 backoff reconnect (a fresh generation re-read on every connect); a flapping server
 escalates to `fatalExit` after the consecutive-failure cap.
 
-An **eleventh** Worker thread is the tmux window-renamer (epic fn-801): a
+The tmux window-renamer Worker thread is a
 pure EXTERNAL ACTUATOR that opens its own read-only connection, polls
 `PRAGMA data_version` via the shared `watchLoop` primitive, and on every
 change names each tmux WINDOW hosting a live Claude session after that
@@ -3941,7 +3973,7 @@ unhandled throw out of the watch loop escalates via `onerror`/`close` →
 fatalExit. Human windows get useful tab names for free; autopilot's managed
 windows (deliberately launched unnamed) finally get labels.
 
-A **twelfth** Worker thread is the Agent Bus relay (epic fn-875): a local
+The Agent Bus relay Worker thread is a local
 inter-agent message bus that is PHYSICALLY OUT of keeper.db's blast radius. It
 opens keeper.db READ-ONLY (for `jobs` identity reads — session_id, title,
 `name_history`, start_time — never a write) and owns its OWN writable `bus.db`
@@ -4006,8 +4038,8 @@ keeper plugin's `experimental.monitors` manifest); that Monitor is INVISIBLE to
 the hook stream, so it does NOT populate `jobs.monitors` — which is correct, bus
 presence is the `bus.db` registry, not the hook-fed projection.
 
-A **thirteenth** Worker thread is the handoff dispatcher (epic fn-946):
-level-triggered on `PRAGMA data_version`, it picks an actionable
+The handoff dispatcher Worker thread is
+level-triggered on `PRAGMA data_version`: it picks an actionable
 `requested`/stale-`dispatching` `handoffs` row (selection is
 `handoff_id`-lexicographic — the `handoff_id` is the human-authored slug, so the
 order is slug-alphabetical, not temporal; there is no created-at column to order
@@ -4020,8 +4052,8 @@ check asks "does a `handoff::<id>` SessionStart exist?" before re-dispatching)
 and never strands the handoff. The dispatch side-effect lives in the worker,
 NOT the fold — the fold is the pure decider.
 
-A **fourteenth** Worker thread is the statusline telemetry producer (epic
-fn-1024): keeperd's sixth `@parcel/watcher` file-watch producer, it watches the
+The statusline telemetry producer Worker thread is
+keeperd's sixth `@parcel/watcher` file-watch producer: it watches the
 keeper-managed statusLine leaf directory (one `<session>.json` per live
 keeper-agent session, written atomically by the `keeper statusline-sink` CLI) and,
 on each change, reads the coalesced leaf, change-gates it against the last-folded
@@ -4034,7 +4066,7 @@ side-effect (the leaf read + gate) lives in the worker, the fold is the pure
 decider, and a leaf whose `session_id` matches no live `jobs.job_id` folds to a
 no-op.
 
-The fourteen workers are fully independent; main supervises all fourteen
+The workers are fully independent; main supervises all their
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,

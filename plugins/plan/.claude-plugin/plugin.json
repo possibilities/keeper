@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Plan orchestration skills — survey, launch, and supervise planctl projects",
+  "description": "Plan orchestration skills — survey, launch, and supervise keeper plan projects",
   "version": "1.0.0",
   "author": {
     "name": "ArtHack"

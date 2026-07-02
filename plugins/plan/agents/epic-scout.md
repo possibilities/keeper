@@ -19,7 +19,7 @@ You receive:
 
 ### 1. List open epics
 
-Redirect `keeper plan epics` stdout to a temp file, then extract the FIRST JSON document with `raw_decode` so the parse survives a leading OSC terminal-escape prefix, the pretty-printed multi-line `{success, epics: [...]}` object, and the trailing single-line `planctl_invocation` envelope:
+Redirect `keeper plan epics` stdout to a temp file, then extract the JSON document with `raw_decode` so the parse survives a leading OSC terminal-escape prefix — the read verb emits exactly one JSON value (the pretty-printed multi-line `{success, epics: [...]}` object), no trailer:
 
 ```bash
 keeper plan epics > /tmp/epics.json
@@ -29,14 +29,14 @@ keeper plan epics > /tmp/epics.json
 import json
 raw = open("/tmp/epics.json").read()
 start = raw.index("{")                     # slice past any OSC prefix
-obj, _ = json.JSONDecoder().raw_decode(raw[start:])   # FIRST document only; ignores the trailing envelope
+obj, _ = json.JSONDecoder().raw_decode(raw[start:])   # the one JSON value; tolerates a leading OSC prefix
 assert obj["success"], obj                 # check success before reading epics
 epics = obj["epics"]
 ```
 
 Filter client-side to `status: "open"` epics only. Skip epics with `status: "done"`. If a `Target epic to exclude: <id>` line is present in the brief, also remove that epic from the candidate list before proceeding.
 
-**Cross-project pool (fn-600).** The candidate set is the **cross-project pool** of open epics across every project under the configured `roots`, not just the cwd project's epics. `epic.depends_on_epics` resolves bare `fn-N` ids cwd-first-then-global, so any open epic in any discovered project is a valid dependency / overlap / reverse-dependency candidate for the new plan. When the human runs planctl with no `roots` configured, the pool collapses to the cwd project alone — single-repo workflows behave as before.
+**Cross-project pool (fn-600).** The candidate set is the **cross-project pool** of open epics across every project under the configured `roots`, not just the cwd project's epics. `epic.depends_on_epics` resolves bare `fn-N` ids cwd-first-then-global, so any open epic in any discovered project is a valid dependency / overlap / reverse-dependency candidate for the new plan. When the planner runs with no `roots` configured, the pool collapses to the cwd project alone — a single-repo setup simply sees only its own project.
 
 ### 2. For each open epic, read its spec
 

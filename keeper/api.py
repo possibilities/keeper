@@ -15,7 +15,7 @@ Seven readers; all stdlib-only and gated on
   ``cli_common.session_context``'s psutil ancestor walk.
 - ``get_session_identity_for_pid(pid)`` — live identity of the session
   owning *pid* as ``{session_id, title, name_history}``, or ``None``.
-  Reads ``jobs`` in one pid-keyed query.  Consumed by chatctl to attribute
+  Reads ``jobs`` in one pid-keyed query.  Consumed by the Agent Bus to attribute
   and resolve agents by their current title or any former name.
 - ``get_latest_session()`` — most-recently-updated job's
   ``{session-id, cwd, session-name}`` (``session-name`` omitted when
@@ -648,7 +648,7 @@ def get_session_identity_for_pid(pid: int) -> dict | None:
          "title": "<current name>" | None,    # NULL title -> None
          "name_history": ["<oldest>", ..., "<newest>"]}
 
-    Purpose-built single-read seam for chatctl, which keys its channels by the
+    Purpose-built single-read seam for the Agent Bus, which keys its channels by the
     Claude harness pid and needs the *live* (post-rename) session title plus
     the full name history together — replacing the frozen launch-argv name
     that went stale on every rename.  Composes what ``get_session_for_pid`` /

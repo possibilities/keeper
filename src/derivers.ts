@@ -320,7 +320,7 @@ export function extractBackgroundTasks(
  * Schema v59 (fn-719 task 1): the provenance-filtered occupancy fact
  * derived from a `jobs.monitors` JSON-array value. `true` when ANY entry
  * is a WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`); `ambient`
- * session-watchers (the plugin/harness-armed chatctl bus, a never-claimed
+ * session-watchers (the plugin/harness-armed Agent Bus, a never-claimed
  * background shell) NEVER count — they were not launched by the work
  * session's own turn, so they must not occupy the autopilot mutex.
  *
