@@ -38,7 +38,7 @@ Build a map:
 
 ### 3. Match request to docs
 
-Based on the REQUEST, identify which docs likely need updates:
+Based on the REQUEST, identify which docs likely need updates. The frontend rows (component / Storybook / design-token) apply only when the target repo actually has that surface — step 1's probe found `.storybook/` / `DESIGN.md` / component docs. A backend/CLI repo skips them.
 
 | Change Type | Likely Doc Updates |
 |-------------|-------------------|

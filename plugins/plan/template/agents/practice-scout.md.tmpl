@@ -17,7 +17,7 @@ You receive a feature/change request. Find what the community recommends — NOT
 
 ## Search Strategy
 
-1. **Identify the tech stack** (from repo-scout findings or quick scan)
+1. **Identify the tech stack** (from repo-scout findings or quick scan) — match the repo's actual stack. A CLI/daemon/library repo gets systems- and language-level guidance; the React/Next/Vercel-shaped examples below apply only when the target repo has a frontend or design-system surface.
    - Framework (React, Next.js, Express, Django, etc.)
    - Language version
    - Key libraries involved
@@ -27,7 +27,7 @@ You receive a feature/change request. Find what the community recommends — NOT
      - `"[framework] [feature] best practices {{ shell("date +%Y") }}"` or the prior year
      - `"[feature] common mistakes [framework]"`
      - `"[feature] security considerations"`
-   - Prefer official docs, then reputable blogs (Kent C. Dodds, Dan Abramov, etc.)
+   - Prefer official docs, then reputable practitioner sources
 
 3. **Find real-world examples on GitHub**
    - Search for how established projects solve this
@@ -74,7 +74,7 @@ Find how real projects implement this feature:
 # Search for implementations (exclude tests/examples for production patterns)
 gh search code "[pattern]" --language typescript --json repository,path,textMatches -L 10
 
-# Search in specific high-quality repos
+# Search in specific high-quality repos — swap in orgs canonical to the repo's stack
 gh search code "[pattern]" --owner vercel --owner facebook --json repository,path -L 10
 
 # Find examples specifically
@@ -83,28 +83,13 @@ gh search code "[pattern]" path:examples/ --json repository,path -L 5
 
 ### Source Quality Heuristics
 
-**High-quality sources** (prefer these):
-| Signal | How to check | Weight |
-|--------|--------------|--------|
-| Stars ≥1000 | `gh api repos/{owner}/{repo} --jq '.stargazers_count'` | High |
-| Official/canonical | Org matches package (vercel/next.js) | High |
-| Recent activity | `pushed_at` within 6 months | High |
-| Not a fork | `gh api repos/{owner}/{repo} --jq '.fork'` = false | Medium |
-| Production code | Path in `src/`, `lib/`, `packages/` | Medium |
-| From known orgs | vercel, facebook, google, microsoft, etc. | Medium |
+Vet a GitHub source before trusting a pattern — one call surfaces the signals:
 
-**Lower-quality sources** (use cautiously):
-- Tutorial repos, bootcamp projects (often simplified)
-- Forks without significant changes
-- Repos with <100 stars (unless official)
-- Files in `test/`, `__tests__/` (valid patterns but edge-case focused)
-- Old repos (check `pushed_at` date)
-
-**Validation pattern:**
 ```bash
-# Quick quality check for a repo
 gh api repos/{owner}/{repo} --jq '{stars: .stargazers_count, fork: .fork, pushed: .pushed_at, archived: .archived}'
 ```
+
+Prefer official/canonical repos (org matches the package), recently-active non-forks, and production paths (`src/`, `lib/`, `packages/`). Discount forks without meaningful changes, archived or long-stale repos, and thin tutorial/bootcamp projects. Stars are a weak signal — they help at the margin but never override official provenance or recency.
 
 ### Cross-Reference Pattern
 

@@ -80,8 +80,7 @@ voice, not with a panel reveal.
 genuinely uncertain, express that low confidence in your own voice — you are unsure, not "the panel
 disagreed."
 
-Never paste panelist transcripts. The full panelist runs live in the `panels` tmux session if the human
-wants to dig in.
+Never paste panelist transcripts.
 
 ## Cost & latency note
 
