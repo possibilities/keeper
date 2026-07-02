@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T09:14:35.347000Z",
+  "depends_on": [],
+  "epic": "fn-1070-bounded-papercut-sweep",
+  "id": "fn-1070-bounded-papercut-sweep.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Unify fresh launch gates",
+  "updated_at": "2026-07-02T09:14:35.347000Z"
+}
