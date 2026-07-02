@@ -30,5 +30,5 @@ CLI test: config verb round-trips worktree_multi_repo on/off envelopes. Reject t
 - [ ] Tests cover both; `bun test` green
 
 ## Done summary
-
+Exposed worktree_multi_repo on/off through the autopilot config verb (boolean patch via the existing set_autopilot_config RPC) and reworded the multi-toplevel worktree reject to name the off flag plus the exact enabling command, keeping the stable worktree-multi-repo routing prefix.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Expose flag and fix reject reason",
-  "updated_at": "2026-07-02T09:38:58.390000Z"
+  "updated_at": "2026-07-02T14:25:54.425000Z",
+  "worker_done_at": "2026-07-02T14:25:54.425000Z"
 }
