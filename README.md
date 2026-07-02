@@ -115,13 +115,15 @@ on `WHERE col IS NOT NULL`. The plan columns ride three partial indexes
 sharing the `WHERE plan_op IS NOT NULL` predicate: `idx_events_plan_session`
 on `(session_id, id)` for the per-session ordered scan, plus the Tier 2
 `idx_events_plan_epic` on `(plan_epic_id, session_id, id)` and
-`idx_events_plan_target` on `(plan_target, session_id, id)` for the
-reducer's `syncPlanLinks` ORPHAN-path cross-session sweep — the sweep is a UNION
-of `plan_epic_id IN (...)` and `plan_target IN (...)` so the planner
-SEARCHes both indexes (a cross-column `OR` would have to scan one). The normal
-per-session-merge path no longer runs this sweep; it re-derives only the
-triggering session via `idx_events_plan_session`, so per-event cost is
-independent of board size.
+`idx_events_plan_target` on `(plan_target, session_id, id)`. As of fn-1052 the
+`syncPlanLinks` ORPHAN path also re-derives per session (via the shared
+`mergeJobLinkSlice`) instead of the old cross-session sweep, so BOTH paths now
+scan only the triggering session through `idx_events_plan_session` and per-event
+cost is independent of board size. The removed sweep was the SOLE reader of the
+`idx_events_plan_epic` / `idx_events_plan_target` pair (its `plan_epic_id IN
+(...)` UNION `plan_target IN (...)` session discovery), so the two are now
+vestigial — kept only because dropping them needs a migration (a future cleanup
+can), harmless on the tiny partial `WHERE plan_op IS NOT NULL` footprint.
 `events.config_dir` rides without its own index — it is read off
 `jobs.config_dir` (a steady-state attribution column), not the event log.
 
@@ -738,10 +740,10 @@ re-run, and run by the `keeper-install` buildbot job on every green build.
    `[ptufold-breakdown]` (PostToolUse), and `[pretufold-breakdown]` (PreToolUse
    — covers the `/plan:plan` opener fold). The commit / PostToolUse / PreToolUse
    breakdowns carry `plan_*` counters (calls, touched epics, swept sessions,
-   trailer-fact rows + load ms) that attribute the `syncPlanLinks` fan-out. On
-   the normal per-session-merge path `swept_sessions` is 1 (only the triggering
-   session is re-derived); a count growing with board size means the orphan
-   full-sweep path fired.
+   trailer-fact rows + load ms + per-epic re-derive ms) that attribute the
+   `syncPlanLinks` fan-out. Since fn-1052 BOTH paths (normal and orphan) re-derive
+   per session, so `plan_swept_sessions` equals `plan_calls` (1 per call); a value
+   above it is the tell of a fan-out regression back to a cross-session sweep.
    Steady folds stay silent, so a quiet `server.stderr` is the fold-latency
    all-clear.
 
@@ -3006,6 +3008,36 @@ and re-fold honors, never a wipe of the live projection). No boot-seed warmer: t
 probe is already `session_id`-scoped, so a cold first fold touches only one session's
 tiny candidate set — there is no global-history scan to hoist out of the boot lock
 (unlike `gitAttribMemos`), and each session lazily warms on its first SubagentStart.
+The `syncPlanLinks` ORPHAN path (a plan invocation whose session has no folded
+SessionStart) no longer runs the cross-session sweep EITHER (fn-1052) — it takes
+the SAME per-session `mergeJobLinkSlice` path fn-888 gave the normal path, so BOTH
+are bounded to O(local degree) and `isOrphan` now gates ONLY the `jobs.epic_links`
+write. The removed sweep loaded the WHOLE `commit_trailer_facts` table, ran a
+cross-session `plan_epic_id`/`plan_target IN (...)` events scan, then re-derived
+each touched epic over EVERY session that ever touched it — an O(history × board)
+fold behind the documented 437s incident (a `/plan:plan` opener on an orphan
+session). The merge is byte-identical to the full rebuild PER EVENT: the
+enrichment-freshness invariant (every enriched jobs write fans out via
+`syncJobLinksOnJobWrite`) keeps every OTHER session's stored entry current, and
+every session touching the epic already re-derived it in id order, so the stored
+cell is complete for all sessions but the triggering one — the sweep was
+pre-merge-era conservatism, not a correctness need. The same change adds the
+missing INCLUSIVE id ceiling (`id <= eventId` on the events read, `event_id <=
+eventId` on the per-session facts read): a from-scratch re-fold — or a live drain
+that ingested a batch ahead of the cursor — otherwise reads a FUTURE invocation
+the live fold at that id never saw, safe only while a LATER touch reconciles and
+unsafe exactly when the event is an epic's LAST touch. The ceiling is INCLUSIVE (a
+deliberate departure from the SubagentStart probe's exclusive `id <
+currentEventId`) because `foldCommit` INSERTs the current commit's OWN trailer
+fact BEFORE calling `syncPlanLinks`, so an exclusive clamp would drop the commit's
+own creator/refiner edge. Both land WITHOUT a schema bump, migration, or wipe —
+the fix is to the fold, byte-identical per event, which every future fold and
+re-fold honors. No boot-seed warmer: the orphan path is incident-response (~0
+firings on the live DB), and the merge reads only the triggering session's slice +
+the epic's stored cell, so there is no global-history scan to hoist. Validation:
+incremental-vs-batch byte-identity over the orphan-last-touch and
+orphan→normal-transition scenarios, plus inclusive-clamp guards (both channels)
+that go red under an exclusive clamp.
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`

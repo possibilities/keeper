@@ -2541,6 +2541,7 @@ function foldCommit(db: Database, event: Event): void {
       sweptSessions: 0,
       factsRows: 0,
       factsLoadMs: 0,
+      deriveJobLinksMs: 0,
     };
     if (
       commit.plan_op != null &&
@@ -6235,15 +6236,19 @@ let _syncIfPlanRefAccumMs: number | null = null;
 
 /**
  * When non-null, {@link syncPlanLinks} accumulates its fan-out cardinality
- * (touched epics, swept sessions) and the commit-trailer load cost into this
- * object. Armed ONLY around the dispatch sites in {@link applyEvent} (the
- * commit, PostToolUse, and PreToolUse breakdown arms) so the breakdown lines can
- * carry the plan fan-out shape without threading a param through the two fixed
- * `syncPlanLinks` call sites. `calls` counts invocations so a fold that fires
- * the fan-out more than once still reports a faithful total. Pure
- * instrumentation: never read into a projection write, never influences a branch
- * — re-fold determinism is untouched. A fold is single-threaded, so the
- * module-scoped accumulator can't interleave.
+ * (touched epics, swept sessions), the commit-trailer load cost, and the
+ * per-epic `deriveJobLinks` re-derive cost into this object. Armed ONLY around
+ * the dispatch sites in {@link applyEvent} (the commit, PostToolUse, and
+ * PreToolUse breakdown arms) so the breakdown lines can carry the plan fan-out
+ * shape without threading a param through the two fixed `syncPlanLinks` call
+ * sites. `calls` counts invocations so a fold that fires the fan-out more than
+ * once still reports a faithful total. `sweptSessions` is now always `calls`
+ * (each call processes exactly ITS session's slice — the former cross-session
+ * orphan sweep is gone), so a value above `calls` is the tell of a regression
+ * back to an unbounded fan-out. Pure instrumentation: never read into a
+ * projection write, never influences a branch — re-fold determinism is
+ * untouched. A fold is single-threaded, so the module-scoped accumulator can't
+ * interleave.
  */
 interface SyncPlanLinksAccum {
   calls: number;
@@ -6251,6 +6256,7 @@ interface SyncPlanLinksAccum {
   sweptSessions: number;
   factsRows: number;
   factsLoadMs: number;
+  deriveJobLinksMs: number;
 }
 let _syncPlanLinksAccum: SyncPlanLinksAccum | null = null;
 
@@ -6267,7 +6273,8 @@ function formatSyncPlanFanout(acc: SyncPlanLinksAccum): string {
     `plan_touched_epics=${acc.touchedEpics} ` +
     `plan_swept_sessions=${acc.sweptSessions} ` +
     `plan_facts_rows=${acc.factsRows} ` +
-    `plan_facts_load_ms=${acc.factsLoadMs.toFixed(0)}`
+    `plan_facts_load_ms=${acc.factsLoadMs.toFixed(0)} ` +
+    `plan_derive_ms=${acc.deriveJobLinksMs.toFixed(0)}`
   );
 }
 
@@ -6936,112 +6943,43 @@ function mintPlanFileAttributions(db: Database, event: Event): void {
  */
 
 /**
- * One in-memory grouping of every durable commit-trailer fact in the log,
- * built by a single indexed read of the `commit_trailer_facts` projection (the
- * fn-807 table — zero `Commit`-blob scans, replacing the old per-session +
- * per-epic-sweep scans that re-walked every `Commit` blob once per swept
- * session). {@link syncPlanLinks} loads this once per call and reuses it for
- * the current session's facts, the cross-session sweep, and the per-epic
- * rebuild.
+ * One session's commit-trailer invocations read via the
+ * `idx_commit_trailer_facts_session` index, clamped INCLUSIVE of `maxEventId`.
+ * Both `syncPlanLinks` channels use this per-session slice — constant per-event
+ * cost independent of board size (there is no whole-table load).
  *
- * `factsBySession` maps `committer_session_id` → that session's commit-trailer
- * {@link ClassifierInvocation}s in `event_id` ASC order (the table's
- * `ORDER BY event_id ASC` preserves the historical `events.id` total order, so
- * the classifier's ts-tie dedup sees an identical input sequence). A commit-only
- * session (zero stdout-scrape rows) still appears, so its creator/refiner edge
- * surfaces.
- */
-interface CommitTrailerFacts {
-  factsBySession: Map<string, ClassifierInvocation[]>;
-}
-
-/**
- * Read the `commit_trailer_facts` projection (the fn-807 table) ONCE and group
- * it by `committer_session_id`. The projection is the de-blobbed read path: each
- * row was written by {@link foldCommit} (or backfilled at the v66→v67 migration)
- * through the SAME extractCommit + parsePlanRef path, so there are ZERO
- * `Commit`-blob scans here — the table replaces the old per-session blob sweep
- * AND the single-scan loader that preceded it. No SQL `json_extract` rides any
- * WHERE, so no malformed-blob throw surface exists on this path.
+ * The `event_id <= maxEventId` clamp is INCLUSIVE (a DELIBERATE departure from
+ * the exclusive `id < currentEventId` clamp used by memos that run AFTER the
+ * current event's own row lands): {@link foldCommit} INSERTs THIS commit's own
+ * fact into `commit_trailer_facts` BEFORE it calls `syncPlanLinks`, so an
+ * exclusive clamp would drop the commit's own creator/refiner edge. The clamp
+ * also pins live-fold semantics — a re-fold at `maxEventId` never reads a fact
+ * appended by a LATER commit of this session (which would only reconcile if a
+ * still-later touch of the epic re-fired, and never does when this event is the
+ * epic's last touch).
  *
  * Each row maps to one {@link ClassifierInvocation} with `ts = committed_at_ms /
  * 1000` (so it falls inside the open-ended final `/plan:plan` window),
  * `epic_id` the stored `plan_epic_id` (frozen at write time via the same
  * target→epic split the scrape deriver uses), and `subject_present = true` (a
- * trailer only rides a mutating chore commit). `ORDER BY event_id ASC` is the
- * same total order the old `ORDER BY events.id ASC` produced, so the
- * classifier's ts-tie dedup sees an identical input sequence. Pure read; never
- * throws.
- */
-function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
-  const rows = db
-    .query(
-      `SELECT event_id, committer_session_id, plan_op, plan_target,
-              plan_epic_id, committed_at_ms
-         FROM commit_trailer_facts
-        ORDER BY event_id ASC`,
-    )
-    .all() as {
-    event_id: number;
-    committer_session_id: string;
-    plan_op: string;
-    plan_target: string;
-    plan_epic_id: string | null;
-    committed_at_ms: number;
-  }[];
-  const factsBySession = new Map<string, ClassifierInvocation[]>();
-  for (const r of rows) {
-    const inv: ClassifierInvocation = {
-      ts: r.committed_at_ms / 1000,
-      op: r.plan_op,
-      target: r.plan_target,
-      epic_id: r.plan_epic_id,
-      subject_present: true,
-      event_id: r.event_id,
-    };
-    const existing = factsBySession.get(r.committer_session_id);
-    if (existing != null) {
-      existing.push(inv);
-    } else {
-      factsBySession.set(r.committer_session_id, [inv]);
-    }
-  }
-  return { factsBySession };
-}
-
-/**
- * One session's commit-trailer invocations from the pre-grouped
- * {@link CommitTrailerFacts}. A commit-only session (no scrape-side rows) still
- * returns its facts; a session with no commit trailers returns `[]`.
- */
-function commitTrailerInvocationsFor(
-  facts: CommitTrailerFacts,
-  sessionId: string,
-): ClassifierInvocation[] {
-  return facts.factsBySession.get(sessionId) ?? [];
-}
-
-/**
- * One session's commit-trailer invocations read DIRECTLY via the
- * `idx_commit_trailer_facts_session` index — the normal-path counterpart to
- * {@link loadAllCommitTrailerFacts}, which loads EVERY session's facts. The
- * per-session merge needs only the triggering session's slice, so this avoids
- * the whole-table load (constant per-event cost independent of board size).
- * `ORDER BY event_id ASC` preserves the historical total order the classifier's
- * ts-tie dedup depends on. Pure indexed read; never throws.
+ * trailer only rides a mutating chore commit). `ORDER BY event_id ASC`
+ * preserves the historical total order the classifier's ts-tie dedup depends
+ * on. A commit-only session (no scrape-side rows) still returns its facts.
+ * Pure indexed read; never throws.
  */
 function commitTrailerInvocationsForSession(
   db: Database,
   sessionId: string,
+  maxEventId: number,
 ): ClassifierInvocation[] {
   const rows = db
     .query(
       `SELECT event_id, plan_op, plan_target, plan_epic_id, committed_at_ms
          FROM commit_trailer_facts
-        WHERE committer_session_id = ?
+        WHERE committer_session_id = ? AND event_id <= ?
         ORDER BY event_id ASC`,
     )
-    .all(sessionId) as {
+    .all(sessionId, maxEventId) as {
     event_id: number;
     plan_op: string;
     plan_target: string;
@@ -7058,37 +6996,6 @@ function commitTrailerInvocationsForSession(
   }));
 }
 
-/**
- * Every distinct `committer_session_id` whose commit-trailer facts touch ANY of
- * `epicIds` — the commit-channel counterpart to {@link syncPlanLinks}'s
- * scrape-side session sweep. Without it, a session that ONLY ever produced
- * commit-trailer edges would be invisible to the per-epic `deriveJobLinks`
- * rebuild. A commit "touches" an epic when the trailer's target parses to that
- * epic OR the raw target equals the epic id — the SAME predicate the per-epic
- * sweep used, now evaluated over the pre-grouped facts. Pure; never throws.
- */
-function commitTrailerSessionsForEpics(
-  facts: CommitTrailerFacts,
-  epicIds: ReadonlySet<string>,
-): Set<string> {
-  const sessions = new Set<string>();
-  if (epicIds.size === 0) {
-    return sessions;
-  }
-  for (const [sid, invs] of facts.factsBySession) {
-    for (const inv of invs) {
-      if (
-        (inv.epic_id !== null && epicIds.has(inv.epic_id)) ||
-        (inv.target !== null && epicIds.has(inv.target))
-      ) {
-        sessions.add(sid);
-        break;
-      }
-    }
-  }
-  return sessions;
-}
-
 function syncPlanLinks(
   db: Database,
   sessionId: string,
@@ -7098,54 +7005,52 @@ function syncPlanLinks(
   // The backing jobs row must exist for an epic_links UPDATE to land. A plan
   // invocation in a session with no SessionStart is an orphan; skip the
   // jobs-side write but still re-derive every touched epic's job_links so
-  // symmetry holds. This row's presence ALSO selects the per-epic strategy: the
-  // normal path (row present) runs an idempotent per-SESSION replace-by-key
-  // merge using this session's pre-state diff; the orphan path (row absent) has
-  // no pre-state to diff and retains the full cross-session sweep. The choice is
-  // a pure function of the event id (the jobs row exists deterministically at
-  // this cursor position), so re-fold stays byte-identical.
+  // symmetry holds. The row's presence gates ONLY the jobs-side write below —
+  // BOTH paths re-derive each touched epic's job_links via the SAME per-session
+  // replace-by-key merge, bounded to O(local degree). The orphan path no longer
+  // runs a cross-session sweep: it used to re-derive every touched epic over
+  // EVERY session that ever touched it (a whole-table commit-facts load + a
+  // cross-session events scan + an O(touchedEpics × sessions) re-derive) — an
+  // O(history × board) re-fold time-bomb, the documented 437s incident. The
+  // strategy is a pure function of the event id (the jobs row exists
+  // deterministically at this cursor position), so re-fold stays byte-identical.
   const jobsRow = db
     .query("SELECT epic_links FROM jobs WHERE job_id = ?")
     .get(sessionId) as { epic_links: string | null } | null;
   const isOrphan = jobsRow == null;
 
-  // Commit-trailer facts. The orphan path needs the WHOLE pre-grouped log (its
-  // cross-session sweep rebuilds every touched epic over every session); the
-  // normal path needs only THIS session's slice for the merge, read via the
-  // per-session index — constant per-event cost regardless of board size.
+  // This session's commit-trailer facts — the SAME per-session slice for both
+  // channels, read via the per-session index and clamped INCLUSIVE of the
+  // current event (see {@link commitTrailerInvocationsForSession}). Constant
+  // per-event cost regardless of board size.
   const _splFactsT0 = _syncPlanLinksAccum != null ? performance.now() : 0;
-  const orphanCommitFacts: CommitTrailerFacts | null = isOrphan
-    ? loadAllCommitTrailerFacts(db)
-    : null;
-  const thisSessionCommitFacts =
-    orphanCommitFacts != null
-      ? commitTrailerInvocationsFor(orphanCommitFacts, sessionId)
-      : commitTrailerInvocationsForSession(db, sessionId);
+  const thisSessionCommitFacts = commitTrailerInvocationsForSession(
+    db,
+    sessionId,
+    eventId,
+  );
   if (_syncPlanLinksAccum != null) {
     _syncPlanLinksAccum.calls += 1;
     _syncPlanLinksAccum.factsLoadMs += performance.now() - _splFactsT0;
-    let _factsRows = thisSessionCommitFacts.length;
-    if (orphanCommitFacts != null) {
-      _factsRows = 0;
-      for (const invs of orphanCommitFacts.factsBySession.values()) {
-        _factsRows += invs.length;
-      }
-    }
-    _syncPlanLinksAccum.factsRows += _factsRows;
+    _syncPlanLinksAccum.factsRows += thisSessionCommitFacts.length;
   }
 
-  // Load this session's plan invocations (ASC by event id — the `id`
-  // doubles as the classifier's total-order tiebreak on `ts`-ties); the
-  // partial composite index serves this without a full-table scan.
+  // Load this session's plan invocations (ASC by event id — the `id` doubles as
+  // the classifier's total-order tiebreak on `ts`-ties), clamped INCLUSIVE of
+  // the current event id. Live-fold semantics: the fold at `eventId` must see
+  // ONLY `id <= eventId`, so a re-fold (whole log present) never reads a FUTURE
+  // invocation of this session. The old unbounded read was safe only because a
+  // later touch reconciled — which fails exactly when this event is an epic's
+  // LAST touch. The partial composite index serves this without a full scan.
   const invRows = db
     .query(
       `SELECT id, ts, plan_op, plan_target, plan_epic_id,
               plan_subject_present
          FROM events
-        WHERE session_id = ? AND plan_op IS NOT NULL
+        WHERE session_id = ? AND plan_op IS NOT NULL AND id <= ?
         ORDER BY id ASC`,
     )
-    .all(sessionId) as {
+    .all(sessionId, eventId) as {
     id: number;
     ts: number;
     plan_op: string;
@@ -7174,7 +7079,10 @@ function syncPlanLinks(
 
   // Read the pre-state epic_links so we know which epics' job_links need a
   // re-derive (every target that appears in EITHER pre or post — a removed
-  // edge still needs its epic's job_links updated to drop the stale entry).
+  // edge still needs its epic's job_links updated to drop the stale entry). An
+  // orphan has no jobs row, so its pre-state is empty — identical to the prior
+  // orphan behavior, which also read `[]` here; edges only ever accrete (no
+  // unlink op exists), so a post-only touched set drops nothing.
   const preEpicLinks =
     jobsRow != null ? parseEmbeddedLinks<EpicLink>(jobsRow.epic_links) : [];
   const touchedEpics = new Set<string>();
@@ -7186,11 +7094,15 @@ function syncPlanLinks(
   }
   if (_syncPlanLinksAccum != null) {
     _syncPlanLinksAccum.touchedEpics += touchedEpics.size;
+    // Each call now processes exactly ITS session's slice — no cross-session
+    // sweep. Recorded as 1 so a value above `calls` flags a fan-out regression.
+    _syncPlanLinksAccum.sweptSessions += 1;
   }
 
-  // UPDATE the jobs row's epic_links. Skip when the backing row does not
-  // exist (orphan invocation — no SessionStart for this session_id yet).
-  if (jobsRow != null) {
+  // UPDATE the jobs row's epic_links. Skip on the orphan path (no backing row —
+  // no SessionStart for this session_id yet); this is the ONLY branch `isOrphan`
+  // gates now that both paths share the per-session merge below.
+  if (!isOrphan) {
     db.run(
       "UPDATE jobs SET epic_links = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
       [JSON.stringify(newEpicLinks), eventId, ts, sessionId],
@@ -7201,106 +7113,25 @@ function syncPlanLinks(
     return;
   }
 
-  // ORPHAN-PATH cross-session sweep (full rebuild). Only the orphan path builds
-  // this — it has no per-session pre-state to diff, so it re-derives every
-  // touched epic over EVERY session that ever touched it (the wide commit-facts
-  // load above). The normal path skips all of this and merges this session's
-  // slice into the existing array instead.
-  let invocationsBySession: Map<string, ClassifierInvocation[]> | null = null;
-  if (isOrphan) {
-    // Step 1: find every distinct session_id with at least one plan invocation
-    // touching any of `touchedEpics` (epic id as plan_epic_id or
-    // plan_target). UNION (not OR) so the planner uses BOTH partial indexes —
-    // SQLite picks one index per cross-column OR, but a UNION's branches each
-    // SEARCH their own index. The session_id set is identical to the OR form, so
-    // re-fold determinism holds.
-    const targetList = [...touchedEpics];
-    const placeholders = targetList.map(() => "?").join(",");
-    const sessionRows = db
-      .query(
-        `SELECT session_id
-           FROM events
-          WHERE plan_op IS NOT NULL
-            AND plan_epic_id IN (${placeholders})
-          UNION
-         SELECT session_id
-           FROM events
-          WHERE plan_op IS NOT NULL
-            AND plan_target IN (${placeholders})`,
-      )
-      .all(...targetList, ...targetList) as { session_id: string }[];
-    // Add the current session too, in case it touched a pre-state epic that no
-    // invocation now references (a dropped refiner edge) so its now-stale
-    // job_links entry gets pulled.
-    const sessionIds = new Set<string>(sessionRows.map((r) => r.session_id));
-    sessionIds.add(sessionId);
-    // The scrape-side sweep only sees sessions with populated sparse columns; add
-    // every commit-channel session (whose `Commit` events carry NULL sparse
-    // columns) touching a touched epic so the per-epic rebuild sees its
-    // commit-only creator/refiner.
-    for (const sid of commitTrailerSessionsForEpics(
-      // biome-ignore lint/style/noNonNullAssertion: orphanCommitFacts is set iff isOrphan.
-      orphanCommitFacts!,
-      touchedEpics,
-    )) {
-      sessionIds.add(sid);
-    }
-    if (_syncPlanLinksAccum != null) {
-      _syncPlanLinksAccum.sweptSessions += sessionIds.size;
-    }
+  // This session's single-session slice input: its scrape invocations UNIONed
+  // with its commit-trailer facts (the two-channel union), keyed under the
+  // triggering session id. Fed to `deriveJobLinks` per touched epic so the
+  // classifier emits exactly this session's creator/refiner edge for the merge.
+  const thisSessionSlice = new Map([[sessionId, invocations]]);
 
-    invocationsBySession = new Map<string, ClassifierInvocation[]>();
-    for (const sid of sessionIds) {
-      const sidInvRows = db
-        .query(
-          `SELECT id, ts, plan_op, plan_target, plan_epic_id,
-                  plan_subject_present
-             FROM events
-            WHERE session_id = ? AND plan_op IS NOT NULL
-            ORDER BY id ASC`,
-        )
-        .all(sid) as {
-        id: number;
-        ts: number;
-        plan_op: string;
-        plan_target: string | null;
-        plan_epic_id: string | null;
-        plan_subject_present: number | null;
-      }[];
-      const sidInvocations: ClassifierInvocation[] = sidInvRows.map((r) => ({
-        ts: r.ts,
-        op: normalizePlanOp(r.plan_op),
-        target: r.plan_target,
-        epic_id: r.plan_epic_id,
-        subject_present: r.plan_subject_present === 1,
-        event_id: r.id,
-      }));
-      // UNION this session's commit-trailer facts so the per-epic rebuild
-      // classifies BOTH channels symmetrically. Concat is safe — the classifier
-      // dedups + re-sorts by the total order (ts, event_id).
-      sidInvocations.push(
-        // biome-ignore lint/style/noNonNullAssertion: orphanCommitFacts is set iff isOrphan.
-        ...commitTrailerInvocationsFor(orphanCommitFacts!, sid),
-      );
-      invocationsBySession.set(sid, sidInvocations);
-    }
-  } else if (_syncPlanLinksAccum != null) {
-    // Normal path sweeps exactly one session (the triggering session merges its
-    // own slice). Record it so the breakdown counter stays honest.
-    _syncPlanLinksAccum.sweptSessions += 1;
-  }
-
-  // The normal path's single-session slice input: this session's scrape
-  // invocations UNIONed with its commit-trailer facts (the two-channel union),
-  // keyed under the triggering session id. Fed to `deriveJobLinks` per touched
-  // epic so the classifier emits exactly this session's creator/refiner edge.
-  const thisSessionSlice: Map<string, ClassifierInvocation[]> | null = isOrphan
-    ? null
-    : new Map([[sessionId, invocations]]);
-
-  // Step 2: re-derive job_links for each touched epic and UPDATE the epic row
-  // (shell-insert a missing one), inside the same transaction for byte-identical
-  // re-fold.
+  // Re-derive job_links for each touched epic via the per-session replace-by-key
+  // merge and UPDATE the epic row (shell-insert a missing one), inside the same
+  // transaction for byte-identical re-fold. The merge drops THIS session's
+  // entries from the stored array, splices its freshly-derived+enriched slice,
+  // and preserves every OTHER session's entry VERBATIM. The enrichment-freshness
+  // invariant — every enriched-column jobs-write already fans out via
+  // `syncJobLinksOnJobWrite` — makes the preserved entries byte-identical to a
+  // full cross-session re-derive, for the ORPHAN path as much as the normal one
+  // (the removed sweep was pre-merge-era conservatism, not a correctness need;
+  // every session touching this epic already re-derived it in id order, so the
+  // stored array is complete for all sessions but this one). Enrichment is
+  // limited to THIS session's spliced entries.
+  const _splDeriveT0 = _syncPlanLinksAccum != null ? performance.now() : 0;
   for (const epicId of touchedEpics) {
     // Pre-filter tombstoned epics before the derive loop: a deleted epic gets no
     // job_links UPDATE / shell-insert (it would resurrect a ghost row). An
@@ -7310,33 +7141,16 @@ function syncPlanLinks(
       continue;
     }
 
-    let enriched: JobLinkEntry[];
-    if (isOrphan) {
-      // ORPHAN: full re-derive over every swept session, then enrich every
-      // entry — there is no pre-state to preserve.
-      // biome-ignore lint/style/noNonNullAssertion: invocationsBySession is set iff isOrphan.
-      const newJobLinks = deriveJobLinks(invocationsBySession!, epicId);
-      enriched = newJobLinks.map((e) => enrichJobLink(db, e));
-      sortJobLinks(enriched);
-    } else {
-      // NORMAL: replace-by-key merge. Drop THIS session's entries from the
-      // existing array, splice its freshly-derived+enriched slice, preserve
-      // every other session's entry VERBATIM (the enrichment-freshness
-      // invariant — every enriched-column jobs-write already fans out via
-      // `syncJobLinksOnJobWrite` — makes that byte-identical to a full
-      // re-derive). Enrichment is limited to THIS session's spliced entries.
-      const epicRow = db
-        .query("SELECT job_links FROM epics WHERE epic_id = ?")
-        .get(epicId) as { job_links: string | null } | null;
-      const existing =
-        epicRow != null
-          ? parseEmbeddedLinks<JobLinkEntry>(epicRow.job_links)
-          : [];
-      // biome-ignore lint/style/noNonNullAssertion: thisSessionSlice is set iff !isOrphan.
-      const sliceLinks = deriveJobLinks(thisSessionSlice!, epicId);
-      const sliceEnriched = sliceLinks.map((e) => enrichJobLink(db, e));
-      enriched = mergeJobLinkSlice(existing, sessionId, sliceEnriched);
-    }
+    const epicRow = db
+      .query("SELECT job_links FROM epics WHERE epic_id = ?")
+      .get(epicId) as { job_links: string | null } | null;
+    const existing =
+      epicRow != null
+        ? parseEmbeddedLinks<JobLinkEntry>(epicRow.job_links)
+        : [];
+    const sliceLinks = deriveJobLinks(thisSessionSlice, epicId);
+    const sliceEnriched = sliceLinks.map((e) => enrichJobLink(db, e));
+    const enriched = mergeJobLinkSlice(existing, sessionId, sliceEnriched);
     const jobLinksJson = JSON.stringify(enriched);
 
     const epicExists = db
@@ -7361,6 +7175,9 @@ function syncPlanLinks(
         [epicId, eventId, ts, jobLinksJson],
       );
     }
+  }
+  if (_syncPlanLinksAccum != null) {
+    _syncPlanLinksAccum.deriveJobLinksMs += performance.now() - _splDeriveT0;
   }
 }
 
@@ -9071,6 +8888,7 @@ export function applyEvent(
         sweptSessions: 0,
         factsRows: 0,
         factsLoadMs: 0,
+        deriveJobLinksMs: 0,
       };
       const _ptuT0 = performance.now();
       projectJobsRow(db, event);
@@ -9117,6 +8935,7 @@ export function applyEvent(
           sweptSessions: 0,
           factsRows: 0,
           factsLoadMs: 0,
+          deriveJobLinksMs: 0,
         };
       }
       const _ptueT0 = _ptuePre ? performance.now() : 0;

@@ -2475,6 +2475,212 @@ test("syncPlanLinks: missing jobs row at enrichment defaults to safe values (no 
   ]);
 });
 
+/**
+ * Fold `steps` INCREMENTALLY (drain after EVERY step, so each fold sees only
+ * `id <= itself`), snapshot the deterministic link projections, then rewind +
+ * wipe them + batch re-drain (every fold now sees the WHOLE log — including
+ * FUTURE rows) and re-snapshot. The INCLUSIVE `id <= eventId` ceiling on
+ * `syncPlanLinks`' reads is what makes the two byte-identical: without it a
+ * batch re-fold reads future invocations at an epic's last touch, which no later
+ * fold reconciles. `commit_trailer_facts` is wiped too (a rewinding migration
+ * wipes the deterministic-replayed class), so the facts are rebuilt in id order.
+ * Returns both JSON snapshots for a byte comparison. Shard-local helper.
+ */
+function foldIncrementalVsBatch(steps: Array<() => void>): {
+  incr: { epics: string; jobs: string };
+  batch: { epics: string; jobs: string };
+} {
+  for (const step of steps) {
+    step();
+    drainAll();
+  }
+  const incr = {
+    epics: JSON.stringify(
+      db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+    ),
+    jobs: JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  };
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM commit_trailer_facts");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  drainAll();
+  const batch = {
+    epics: JSON.stringify(
+      db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+    ),
+    jobs: JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  };
+  return { incr, batch };
+}
+
+test("syncPlanLinks: orphan path merges cross-session job_links (bounded merge replaces the removed sweep)", () => {
+  // The orphan path no longer runs a cross-session sweep (the O(history×board)
+  // 437s time-bomb) — it merges its OWN slice into the epic's stored job_links,
+  // which already carries the creator from the normal session's earlier fold.
+  // Both edges must survive: proof the per-session replace-merge covers the
+  // cross-session case the full rebuild used to.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-normal-x" });
+  planPlanOpener("sess-normal-x");
+  planEvent({
+    sessionId: "sess-normal-x",
+    op: "epic-create",
+    target: "fn-20-xsess",
+    epicId: "fn-20-xsess",
+    subjectPresent: true,
+  });
+  // Orphan refiner — no SessionStart for sess-orphan-x, so it takes the
+  // (now-merge) orphan path with no jobs-side write.
+  planPlanOpener("sess-orphan-x");
+  planEvent({
+    sessionId: "sess-orphan-x",
+    op: "epic-set-title",
+    target: "fn-20-xsess",
+    epicId: "fn-20-xsess",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(
+    db.query("SELECT job_id FROM jobs WHERE job_id = ?").get("sess-orphan-x"),
+  ).toBeNull();
+  expect(
+    getJobLinks("fn-20-xsess").map((e) => ({ kind: e.kind, job_id: e.job_id })),
+  ).toEqual([
+    { kind: "creator", job_id: "sess-normal-x" },
+    { kind: "refiner", job_id: "sess-orphan-x" },
+  ]);
+});
+
+test("syncPlanLinks: orphan as an epic's LAST touch is byte-identical under incremental vs batch re-fold", () => {
+  // The divergence scenario the id ceiling closes: an orphan event is the last
+  // touch of fn-21-lt (nothing touches it afterward, so no later fold would
+  // reconcile a future-read), while the normal session STILL has a later plan
+  // op (touching a different epic) that a ceiling-less batch re-fold would read
+  // into fn-21-lt's last touch. With the inclusive ceiling, both folds agree.
+  const { incr, batch } = foldIncrementalVsBatch([
+    () => {
+      insertEvent({ hook_event: "SessionStart", session_id: "s-lt" });
+    },
+    () => {
+      planPlanOpener("s-lt");
+      planEvent({
+        sessionId: "s-lt",
+        op: "epic-create",
+        target: "fn-21-lt",
+        epicId: "fn-21-lt",
+        subjectPresent: true,
+      });
+    },
+    () => {
+      // Orphan (no SessionStart) refines fn-21-lt — its LAST touch.
+      planPlanOpener("o-lt");
+      planEvent({
+        sessionId: "o-lt",
+        op: "epic-set-title",
+        target: "fn-21-lt",
+        epicId: "fn-21-lt",
+        subjectPresent: true,
+      });
+    },
+    () => {
+      // The normal session's FUTURE plan op (a different epic) — present in the
+      // batch re-fold when fn-21-lt's last touch (the orphan above) re-folds.
+      planPlanOpener("s-lt");
+      planEvent({
+        sessionId: "s-lt",
+        op: "epic-create",
+        target: "fn-21b-lt",
+        epicId: "fn-21b-lt",
+        subjectPresent: true,
+      });
+    },
+  ]);
+  expect(batch.epics).toBe(incr.epics);
+  expect(batch.jobs).toBe(incr.jobs);
+});
+
+test("syncPlanLinks: orphan→normal transition (late SessionStart) is byte-identical under incremental vs batch re-fold", () => {
+  // A session flips orphan→normal mid-history: it fires a plan op BEFORE its
+  // SessionStart folds (orphan path, no jobs write), then the SessionStart mints
+  // the jobs row, then a later plan op takes the normal path. The batch re-fold
+  // sees the late SessionStart + the future plan op when the FIRST (orphan) op
+  // re-folds; the inclusive ceiling keeps both folds byte-identical.
+  const { incr, batch } = foldIncrementalVsBatch([
+    () => {
+      planPlanOpener("s-tr");
+      planEvent({
+        sessionId: "s-tr",
+        op: "epic-create",
+        target: "fn-23-tr",
+        epicId: "fn-23-tr",
+        subjectPresent: true,
+      });
+    },
+    () => {
+      insertEvent({ hook_event: "SessionStart", session_id: "s-tr" });
+    },
+    () => {
+      planPlanOpener("s-tr");
+      planEvent({
+        sessionId: "s-tr",
+        op: "epic-set-title",
+        target: "fn-23-tr",
+        epicId: "fn-23-tr",
+        subjectPresent: true,
+      });
+    },
+  ]);
+  expect(batch.epics).toBe(incr.epics);
+  expect(batch.jobs).toBe(incr.jobs);
+});
+
+test("syncPlanLinks: the triggering commit's OWN trailer fact lands (INCLUSIVE event-id clamp)", () => {
+  // foldCommit INSERTs the commit's fact into commit_trailer_facts BEFORE it
+  // calls syncPlanLinks, so the per-session facts read clamps INCLUSIVE of the
+  // current event id (event_id <= eventId — a deliberate departure from the
+  // exclusive `< currentEventId` memo pattern). An exclusive clamp would drop
+  // the commit's own fact; a commit-only session (no scrape rows) makes that
+  // fact the SOLE source of the edge, so the clamp is load-bearing.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planOp: "scaffold",
+    planTarget: "fn-22-inclusive",
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-22-inclusive" },
+  ]);
+  expect(
+    getJobLinks("fn-22-inclusive").map((e) => ({
+      kind: e.kind,
+      job_id: e.job_id,
+    })),
+  ).toEqual([{ kind: "creator", job_id: TEST_UUID }]);
+});
+
+test("syncPlanLinks: the triggering plan invocation's OWN edge lands (INCLUSIVE event-id clamp, scrape channel)", () => {
+  // The events read clamps `id <= eventId` INCLUSIVE so the CURRENT invocation
+  // (the one that fired the fold) is in its own input. An exclusive clamp would
+  // drop it and mint no edge on the session's first/only plan op.
+  insertEvent({ hook_event: "SessionStart", session_id: "s-inc" });
+  planPlanOpener("s-inc");
+  planEvent({
+    sessionId: "s-inc",
+    op: "epic-create",
+    target: "fn-24-inc",
+    epicId: "fn-24-inc",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(getEpicLinks("s-inc")).toEqual([
+    { kind: "creator", target: "fn-24-inc" },
+  ]);
+});
+
 test("syncPlanLinks: widened-shape EpicSnapshot ON CONFLICT does not blank enriched fields", () => {
   // Mirror the classic carve-out test but assert the WIDENED-shape
   // payload survives. Without the carve-out, an approval RPC → file
