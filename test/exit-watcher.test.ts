@@ -97,9 +97,13 @@ test("diffLoop fires onTick once at boot and again on each commit by another con
   // turn to let the awaited Bun.sleep enter the polling phase.
   await Bun.sleep(50);
 
-  // A SEPARATE writer commit (another seed) must drive a second tick.
+  // A SEPARATE writer commit (another seed) must drive a second tick that
+  // observes BOTH rows (positive gate).
   seedJobsRow(writer, "sess-after-boot", 5252, "darwin:bar");
-  await Bun.sleep(100);
+  await retryUntil(() => {
+    const last = ticks[ticks.length - 1];
+    return last && last.length === 2 ? last : null;
+  });
 
   shutdown = true;
   await loop;
@@ -151,7 +155,8 @@ test("diffLoop emits all non-terminal rows INCLUDING NULL-pid ones (fn-743)", as
     25,
   );
 
-  await Bun.sleep(50);
+  // Wait for the boot tick to capture all three non-terminal rows (positive gate).
+  await retryUntil(() => (lastTick && lastTick.length === 3 ? lastTick : null));
   shutdown = true;
   await loop;
 
@@ -263,11 +268,14 @@ test("diffLoop+mock: every new candidate row triggers exactly one add()", async 
   // Boot tick: sess-a only.
   await Bun.sleep(50);
   seedJobsRow(writer, "sess-b", 7002, "darwin:b");
-  await Bun.sleep(80);
+  // Wait for the sess-b add (positive gate) before re-triggering.
+  await retryUntil(() => (addCalls.some((c) => c.pid === 7002) ? true : null));
   // Re-trigger another commit to confirm no DUPLICATE add for sess-a.
   writer.run(
     "UPDATE jobs SET last_event_id = last_event_id + 1 WHERE job_id = 'sess-a'",
   );
+  // Settle: the re-trigger must NOT fire a second add for sess-a (dedup
+  // negative — only a wait can disprove a duplicate).
   await Bun.sleep(80);
 
   shutdown = true;

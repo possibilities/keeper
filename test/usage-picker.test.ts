@@ -5,8 +5,8 @@
  * headroom, new-entrant-no-catch-up-burst, over-100 clamp, garbage-multiplier
  * coercion, empty/skip paths, corrupt-state-reset-not-fatal, never-raises-on-
  * unreadable-state-dir, and the rate-limit cooldown (future/past/all-cooling/
- * malformed lift_at). The real multi-process flock-contention test lives in the
- * slow-tier sibling `usage-picker-flock.slow.test.ts`.
+ * malformed lift_at). The real multi-process flock-contention scenario is too
+ * heavy for the fast tier and has no automated slow-tier sibling.
  *
  * The picker reads two sources redirected into tmp: per-account envelopes under
  * the state dir (via `setStateDir`) and the catalog at
@@ -404,9 +404,9 @@ describe("fail-open", () => {
   });
 });
 
-// The real multi-process flock-contention test lives in
-// `usage-picker-flock.slow.test.ts` (spawns ~30 child processes — too heavy for
-// the fast tier; runs under `bun run test:full`).
+// The real multi-process flock-contention scenario (spawns ~30 child processes)
+// is too heavy for the fast tier and has no automated slow-tier sibling; the
+// flock path is left to manual verification.
 
 // ---------- rate-limit cooldown (lift_at) -----------------------------------
 
