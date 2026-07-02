@@ -3584,24 +3584,47 @@ genuine divergent-CONTENT conflict still fails loud + sticky, above — only the
 human's-WIP-blocks-the-merge case degrades.) Finalize is idempotent: a re-run
 after a partial post-merge/post-push crash sees the base already an ancestor of
 default (no-op merge), an up-to-date push, and resumes teardown (an already-gone
-worktree removal no-ops).
+worktree removal no-ops). After a CLEAN removal (`removed`, never `dirty`), teardown
+sweeps a residue-only husk dir git can leave behind: an lstat-walk removes a leftover
+holding NOTHING but `.claude` session residue and `git worktree prune`s from the main
+repo, but ANY other content — a non-`.claude` top-level entry, or any symlink / device /
+socket anywhere in the subtree — leaves the dir byte-untouched (the whole blast-radius
+defense). The husk sweep is best-effort: a failure is swallowed-and-logged, NEVER a
+teardown failure row (teardown already succeeded), and is gated on each repo's OWN
+removal so one dirty checkout can't suppress another's cleanup.
 Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 (pass-1 is filtered to `keeper/epic/*` branches — a foreign linked worktree such
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
 pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
-`keeper/epic/*` scan decoupled from the recent-done window. Pass-2 runs the SAME
-shared-checkout prechecks as finalize (dirty / off-branch / non-fast-forward →
-skip), but surfaces them as `worktree-recover-*` reasons so the level-triggered
+`keeper/epic/*` scan decoupled from the recent-done window. The sweep SET itself
+excludes linked worktrees: a lane's `--show-toplevel` is the lane, so a lane
+registers as its own git-projection root and would leak into the sweep where
+pass-2 fails `off-branch` by construction — each candidate repo is classified via
+`classifyLinkedWorktree` (git-dir vs common-dir, submodule-guarded), a linked lane
+is SKIPPED and an inconclusive probe DEFERS that repo for the cycle (never
+fail-open into the off-branch path; level-triggered retry re-sweeps next cycle).
+Pass-2 runs the SAME shared-checkout prechecks as finalize (dirty / off-branch /
+non-fast-forward → skip), but surfaces them as `worktree-recover-*` reasons whose
+DETAIL names the operator remedy (e.g. `not-on-default` says to switch the checkout
+back to the default branch, committing/stashing first) so the level-triggered
 auto-clear lifts the block the moment the tree settles. A recover merge
-conflict still fails LOUD and blocks ONLY its own `close::<epic>` key (per-key
-`failedKeys`) — but it is LEVEL-TRIGGERED, never a sticky board-jam: each cycle
-re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the sticky
-row (a synthetic `DispatchCleared`, the same fold arm `retry_dispatch` mints) the
-moment the git resolves — junk branch deleted, conflict merged, or epic reaped —
-so a human just fixes the git, never `retry_dispatch`. The auto-clear is SCOPED to
-recover-reason rows (`worktree-recover*`) so a normal close-sink (`finalizeEpic`)
-failure sharing the `close::<epic>` key is never clobbered. A successful close
+conflict still fails LOUD — but it is LEVEL-TRIGGERED, never a sticky board-jam:
+each cycle re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the
+sticky row (a synthetic `DispatchCleared`, the same fold arm `retry_dispatch` mints)
+the moment the git resolves — junk branch deleted, conflict merged, or epic reaped —
+so a human just fixes the git, never `retry_dispatch`. An epic-tied recover failure
+lands on a DISTINCT `close::worktree-recover:<epic>-<repoHash>` row (`repoHash` =
+`repoDirHash(repoDir)`, the SAME dir-hash finalize keys on) — the recover sibling of
+the finalize per-repo key — so a main checkout and its multi-repo dirs never collide
+(last-writer-wins UPSERT) on the single `close::<epic>` key and mask each other's
+actionable reason (the fn-7 incident: a lane's `not-on-default` noise masked the main
+checkout's `dirty-checkout`); a pass-1 failure with no epic (list/abort/default/base)
+keeps the per-dir `worktree-recover:<dirSlug>` key. The auto-clear is SCOPED to
+recover-reason rows (`worktree-recover*`), so a normal close-sink (`finalizeEpic`)
+failure sharing the `close::<epic>` key is never clobbered — and an old-scheme
+bare-`close::<epic>` recover row from before this keying self-heals (level-clears) on
+the first post-fix cycle, since the fresh failure now mints the per-repo key. A successful close
 prunes its now-merged lane branches — every rib (`keeper/epic/<id>--<task>`) THEN
 the base (`git branch -D`), each AFTER its worktree teardown and each gated on
 is-ancestor-of-default so an unmerged/diverged ref is NEVER force-deleted — so a

@@ -30,6 +30,7 @@
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -77,6 +78,7 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
+  recoverFailureDispatchId,
   recoverFailuresToClear,
   recoverWorktrees,
   refreshSuppressionForOpenPending,
@@ -95,6 +97,7 @@ import {
   type WorktreeRepoResolution,
   worktreeFinalizeDispatchId,
   worktreeRecoverDispatchId,
+  worktreeRecoverEpicDispatchId,
 } from "../src/autopilot-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -103,11 +106,16 @@ import {
   type GitRunner,
 } from "../src/commit-work/git-exec";
 import {
+  MERGE_ESCALATION_REASON_TOKEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  shouldEscalateMergeConflict,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
-import { parseDispatchKey } from "../src/dispatch-command";
+import {
+  isRetryableDispatchKey,
+  parseDispatchKey,
+} from "../src/dispatch-command";
 import type { LaunchSpec } from "../src/exec-backend";
 import {
   computeReadiness,
@@ -7413,6 +7421,8 @@ function makeRecoveryGit(state: {
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
+  linkedWorktreeAt?: Set<string>; // cwds whose git-dir ≠ common-dir → a linked lane (skipped by the sweep filter)
+  probeErrorAt?: Set<string>; // cwds whose git-dir/common-dir probe exits nonzero → defer the repo this cycle
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
   calls: { cwd: string; args: string; env?: Record<string, string> }[];
@@ -7528,7 +7538,27 @@ function makeRecoveryGit(state: {
         stderr: "",
       };
     }
+    if (
+      joined.startsWith("rev-parse --path-format=absolute --git-common-dir")
+    ) {
+      if (state.probeErrorAt?.has(cwd)) {
+        return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      }
+      // A linked worktree's common-dir points at the SHARED parent .git (≠ its
+      // per-worktree git-dir); a main/standalone checkout's common-dir EQUALS its
+      // git-dir. `classifyLinkedWorktree` keys the linked verdict on the inequality.
+      return {
+        code: 0,
+        stdout: state.linkedWorktreeAt?.has(cwd)
+          ? "/shared/.git\n"
+          : `${cwd}/.git\n`,
+        stderr: "",
+      };
+    }
     if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
+      if (state.probeErrorAt?.has(cwd)) {
+        return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      }
       return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
     }
     if (joined.startsWith("rev-parse --verify --quiet refs/remotes/origin/")) {
@@ -7797,6 +7827,134 @@ test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) o
   );
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
   expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+// fn-1050 — teardown sweeps a residue-only `.claude` husk dir git left behind.
+// Real tmpdirs (fs in tests is fine); the git legs go through the fake runner.
+
+test("fn-1050 recoverWorktrees pass-3: a residue-only husk is swept per-lane; a dirty lane's husk is left intact (no cross-lane suppression)", async () => {
+  // Two merged, absent-epic base lanes in ONE repo. Lane A tears down clean → its
+  // `.claude`-only husk dir is swept. Lane B's `worktree remove` refuses (dirty) →
+  // its husk is left byte-untouched and a dirty row minted, WITHOUT suppressing
+  // lane A's cleanup.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-recover-")));
+  try {
+    const huskA = join(dir, "wt-a");
+    const huskB = join(dir, "wt-b");
+    for (const h of [huskA, huskB]) {
+      mkdirSync(join(h, ".claude"), { recursive: true });
+      writeFileSync(join(h, ".claude", "settings.json"), "{}");
+    }
+    const brA = "keeper/epic/fn-a-foo";
+    const brB = "keeper/epic/fn-b-bar";
+    const { run, calls } = makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${huskA}\nHEAD y\nbranch refs/heads/${brA}\n\n` +
+        `worktree ${huskB}\nHEAD z\nbranch refs/heads/${brB}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [brA, brB],
+      defaultBranch: "main",
+      ancestors: new Set([brA, brB]), // both merged → safe to sweep
+      repoHead: "main",
+      dirtyRemoveAt: new Set([huskB]), // lane B refuses removal
+    });
+    const failures = await recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      run,
+      undefined,
+      async () => false,
+    );
+    // Lane A's husk was swept; lane B's is left intact (the helper is gated on the
+    // clean-remove result, so it is never invoked on B's dirty outcome).
+    expect(existsSync(huskA)).toBe(false);
+    expect(existsSync(huskB)).toBe(true);
+    // Exactly one failure — lane B's dirty teardown — and lane A still deleted.
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.reason).toContain(
+      "worktree-recover-base-teardown-dirty",
+    );
+    expect(failures[0]?.reason).toContain(huskB);
+    expect(calls.some((c) => c.args === `branch -D ${brA}`)).toBe(true);
+    expect(calls.some((c) => c.args === `branch -D ${brB}`)).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fn-1050 recoverWorktrees pass-3: a husk-prune throw is swallowed+logged, never minting a recover row (teardown already succeeded)", async () => {
+  // The husk sweep hits an unexpected fs error (the lane path resolves THROUGH a
+  // file → ENOTDIR on lstat). The call site swallows-and-logs it: NO failure row,
+  // and teardown (already done) still deletes the merged branch.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-throw-")));
+  try {
+    writeFileSync(join(dir, "afile"), "not a dir");
+    const badPath = join(dir, "afile", "sub"); // lstat → ENOTDIR (throws)
+    const br = "keeper/epic/fn-1-foo";
+    const { run, calls } = makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${badPath}\nHEAD z\nbranch refs/heads/${br}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [br],
+      defaultBranch: "main",
+      ancestors: new Set([br]),
+      repoHead: "main",
+    });
+    const failures = await recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      run,
+      undefined,
+      async () => false,
+    );
+    expect(failures).toEqual([]); // the throw minted no row
+    expect(calls.some((c) => c.args === `branch -D ${br}`)).toBe(true); // teardown finished
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fn-1050 finalizeEpic teardown: a residue-only base husk is swept after a clean removal", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr-husk-finalize-")));
+  try {
+    const wt = join(dir, "keeper-epic-fn-1-foo");
+    mkdirSync(join(wt, ".claude"), { recursive: true });
+    writeFileSync(join(wt, ".claude", "settings.json"), "{}");
+    const baseInfo = makeFinalizeInfo();
+    const info: WorktreeLaunchInfo = {
+      ...baseInfo,
+      baseWorktreePath: wt,
+      assignment: { ...baseInfo.assignment, worktreePath: wt },
+    };
+    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+      args,
+    ) => {
+      const joined = args.join(" ");
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
+      }
+      if (joined.startsWith("symbolic-ref")) {
+        return { code: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (joined === "rev-parse --abbrev-ref HEAD") {
+        return { code: 0, stdout: "main\n", stderr: "" };
+      }
+      if (joined.startsWith("merge-base --is-ancestor")) {
+        return { code: 0, stdout: "", stderr: "" }; // not-ahead → straight to teardown
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+      info,
+      async () => true,
+    );
+    expect(res).toEqual({ ok: true });
+    expect(existsSync(wt)).toBe(false); // the base husk was swept
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("fn-990 recoverWorktrees pass-3: an UNMERGED orphan base is preserved (never force-deleted)", async () => {
@@ -8459,6 +8617,66 @@ test("fn-959.7 recoverWorktrees: repos are deduped — one sweep per distinct re
   );
 });
 
+test("fn-1050 recoverWorktrees: a linked-worktree lane in the sweep set is SKIPPED (no off-branch row)", async () => {
+  // The bug: a lane's `--show-toplevel` is the lane itself, so it registers as its
+  // own git-projection root and leaks into the sweep set; pass-2 then fails
+  // `off-branch` by construction (its HEAD is the `keeper/epic/*` branch). The
+  // filter classifies the lane linked and skips it BEFORE any pass runs.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n`,
+    linkedWorktreeAt: new Set([lane]),
+    epicBases: ["keeper/epic/fn-1-foo"], // a done base that WOULD mint off-branch if swept
+    defaultBranch: "main",
+    repoHead: "keeper/epic/fn-1-foo", // the lane's HEAD is its lane branch, never default
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees([lane], async () => true, run);
+  expect(failures).toEqual([]);
+  // Skipped before pass-1: the lane's worktree list was never even enumerated.
+  expect(calls.some((c) => c.args.startsWith("worktree list"))).toBe(false);
+});
+
+test("fn-1050 recoverWorktrees: a linked-worktree probe ERROR defers the repo (no row, no sweep)", async () => {
+  // Every probe inconclusive/error DEFERS — never fail-open into the off-branch
+  // path. Level-triggered retry re-sweeps next cycle.
+  const repo = "/repo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree ${repo}\nHEAD x\nbranch refs/heads/main\n\n`,
+    probeErrorAt: new Set([repo]),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    repoHead: "feature-x", // off default → would mint off-branch if swept
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees([repo], async () => true, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args.startsWith("worktree list"))).toBe(false);
+});
+
+test("fn-1050 recoverWorktrees: a main/standalone checkout is still swept (probe → standalone)", async () => {
+  // The filter must not skip a real main checkout: its done base still merges.
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    repoHead: "main",
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.some(
+      (c) => c.cwd === "/repo" && c.args.startsWith("merge --no-edit"),
+    ),
+  ).toBe(true);
+});
+
 test("fn-959.7 isEpicDoneById: pk-lookup resolves a DONE epic unbounded by the recent-done window", async () => {
   await withSeededDb(async (db) => {
     // A done epic whose `updated_at` is FAR past the 1800s recent-done window —
@@ -8523,29 +8741,26 @@ test("fn-982 isWorktreeRecoverReason: recover reasons match, finalize/other reas
   expect(isWorktreeRecoverReason("not-on-default-branch: …")).toBe(false);
 });
 
-test("fn-982 recoverFailuresToClear: an open recover id with NO fresh failure this cycle → cleared", () => {
+test("fn-1050 recoverFailuresToClear: an open per-repo recover id with NO fresh failure this cycle → cleared", () => {
   // The branch was deleted / conflict resolved / epic reaped — recover emits no
   // failure for it this cycle, so its sticky row auto-clears (no retry_dispatch).
-  const open = new Set(["fn-1-foo", "fn-2-bar"]);
+  const dir = "/repo";
+  const fooKey = worktreeRecoverEpicDispatchId("fn-1-foo", dir);
+  const barKey = worktreeRecoverEpicDispatchId("fn-2-bar", dir);
+  const open = new Set([fooKey, barKey]);
   const fresh: WorktreeRecoveryFailure[] = [
-    {
-      epicId: "fn-2-bar",
-      reason: "worktree-recover-conflict: …",
-      dir: "/repo",
-    },
+    { epicId: "fn-2-bar", reason: "worktree-recover-conflict: …", dir },
   ];
   // fn-1-foo resolved (absent from fresh) → cleared; fn-2-bar still failing → kept.
-  expect(recoverFailuresToClear(open, fresh)).toEqual(["fn-1-foo"]);
+  expect(recoverFailuresToClear(open, fresh)).toEqual([fooKey]);
 });
 
-test("fn-982 recoverFailuresToClear: a still-failing recover id is NOT cleared (fail-loud preserved)", () => {
-  const open = new Set(["fn-1-foo"]);
+test("fn-1050 recoverFailuresToClear: a still-failing per-repo recover id is NOT cleared (fail-loud preserved)", () => {
+  const dir = "/repo";
+  const fooKey = worktreeRecoverEpicDispatchId("fn-1-foo", dir);
+  const open = new Set([fooKey]);
   const fresh: WorktreeRecoveryFailure[] = [
-    {
-      epicId: "fn-1-foo",
-      reason: "worktree-recover-conflict: …",
-      dir: "/repo",
-    },
+    { epicId: "fn-1-foo", reason: "worktree-recover-conflict: …", dir },
   ];
   expect(recoverFailuresToClear(open, fresh)).toEqual([]);
 });
@@ -8562,6 +8777,102 @@ test("fn-982 recoverFailuresToClear: a path-tied recover id keys on the dir slug
   expect(recoverFailuresToClear(open, stillFailing)).toEqual([]);
   // Next cycle the dir is clean (no failure) → the path-tied row clears.
   expect(recoverFailuresToClear(open, [])).toEqual([pathId]);
+});
+
+test("fn-1050 recoverFailureDispatchId: epic-tied → per-(epic,repo); null-epic → dir slug; the two never collide", () => {
+  const dir = "/repo";
+  const epicTied = recoverFailureDispatchId({
+    epicId: "fn-1-foo",
+    reason: "worktree-recover-conflict: …",
+    dir,
+  });
+  const pathTied = recoverFailureDispatchId({
+    epicId: null,
+    reason: "worktree-recover-abort-failed: …",
+    dir,
+  });
+  // The single helper the mint and the clear BOTH call routes to the two id families,
+  // so a one-sided key change can never strand a row un-clearable.
+  expect(epicTied).toBe(worktreeRecoverEpicDispatchId("fn-1-foo", dir));
+  expect(pathTied).toBe(worktreeRecoverDispatchId(dir));
+  // Collision-risk assertion: the epic-keyed base36-hash id never equals the raw dir
+  // slug for the SAME dir, so the two families can never cross-clear.
+  expect(epicTied).not.toBe(pathTied);
+});
+
+test("fn-1050 worktreeRecoverEpicDispatchId: one epic's two repos mint DISTINCT rows (no cross-repo masking)", () => {
+  // Mirrors the finalize per-repo family: concurrent recover failures on a main
+  // checkout and a multi-repo dir land on separate rows, never one `close::<epic>`.
+  const aKey = worktreeRecoverEpicDispatchId("fn-1-foo", "/repo-a");
+  const bKey = worktreeRecoverEpicDispatchId("fn-1-foo", "/repo-b");
+  expect(aKey).not.toBe(bKey);
+  // Never the bare epic id — that collision (last-writer-wins UPSERT) IS the masking bug.
+  expect(aKey).not.toBe("fn-1-foo");
+});
+
+test("fn-1050 worktreeRecoverEpicDispatchId: composite is retry_dispatch-able, survives boot GC, never intersects the merge-escalation token", () => {
+  const key = worktreeRecoverEpicDispatchId(
+    "fn-1050-worktree-recover-sweep-correctness",
+    "/repo",
+  );
+  // `close::worktree-recover:<epic>-<hash>` passes the wire validator (verb close,
+  // single `::`, safe id token) exactly like the finalize key — so boot GC RETAINS it
+  // (gcUnretryableDispatchFailures only sweeps rows this predicate rejects).
+  expect(parseDispatchKey(`close::${key}`)).toEqual({
+    ok: true,
+    verb: "close",
+    id: key,
+  });
+  expect(isRetryableDispatchKey("close", key)).toBe(true);
+  // Disjoint from the daemon merge-escalation EXACT reason token: the id never carries
+  // it, and a recover REASON (`worktree-recover-*`) never trips the escalate-once sweep
+  // meant for provision/finalize `worktree-merge-conflict` blocks.
+  expect(key.startsWith(MERGE_ESCALATION_REASON_TOKEN)).toBe(false);
+  expect(
+    shouldEscalateMergeConflict("worktree-recover-conflict: merging …"),
+  ).toBe(false);
+});
+
+test("fn-1050 deploy transition: an old-scheme bare-epic recover row self-heals in one cycle; a genuine close-sink conflict is untouched", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (id: string, reason: string): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["close", id, reason, "/repo", 1, 1, 1, 1],
+      );
+    };
+    // A persisted OLD-scheme recover row (keyed on the bare epic id `close::fn-1-foo`)
+    // + a GENUINE finalizeEpic close-sink conflict that also shares a `close::<epic>`
+    // key but carries a NON-recover reason.
+    insert("fn-1-foo", "worktree-recover-conflict: merging …");
+    insert("fn-2-bar", "worktree-finalize-conflict: merging …");
+
+    const snap = await loadReconcileSnapshot(db);
+    // The old bare recover row loads into the clear-eligible set (reason-scoped); the
+    // finalize conflict is EXCLUDED, so the recover auto-clear can never dismiss it.
+    expect(snap.recoverFailureIds.has("fn-1-foo")).toBe(true);
+    expect(snap.recoverFailureIds.has("fn-2-bar")).toBe(false);
+    // No unblocked window during the transition: the cycle-start snapshot still gates
+    // the close on the OLD bare key, so `reconcile` (which reads THIS snapshot) keeps a
+    // still-blocked epic blocked while the clear/mint below folds only for NEXT cycle.
+    expect(snap.failedKeys.has("close::fn-1-foo")).toBe(true);
+
+    // This cycle the SAME epic still fails recovery — but the fresh failure now mints
+    // the per-repo key, so the old bare row has NO match and self-heals (level-clears),
+    // while the finalize conflict (never in recoverFailureIds) is untouched.
+    const fresh: WorktreeRecoveryFailure[] = [
+      {
+        epicId: "fn-1-foo",
+        reason: "worktree-recover-conflict: …",
+        dir: "/repo",
+      },
+    ];
+    expect(recoverFailuresToClear(snap.recoverFailureIds, fresh)).toEqual([
+      "fn-1-foo",
+    ]);
+  });
 });
 
 test("fn-982 loadReconcileSnapshot.recoverFailureIds: scopes to recover-reason close rows, excludes finalize close rows (clobber guard)", async () => {
