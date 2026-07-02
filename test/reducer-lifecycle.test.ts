@@ -7253,6 +7253,78 @@ test("Killed fold: a malformed payload folds to a safe no-op and still advances 
 });
 
 // ---------------------------------------------------------------------------
+// Schema-v103 kill_reason — WHY keeper reaped the job (which Killed producer arm
+// minted the reap), folded from the producer-stamped payload as an opaque string
+// copy. Orthogonal to close_kind (HOW the session died). fn-1075 task .2.
+// ---------------------------------------------------------------------------
+
+function getKillReason(jobId = "sess-a"): string | null {
+  const row = db
+    .query("SELECT kill_reason FROM jobs WHERE job_id = ?")
+    .get(jobId) as { kill_reason: string | null } | null;
+  return row?.kill_reason ?? null;
+}
+
+for (const reason of [
+  "exit_watched",
+  "boot_unwatchable",
+  "boot_pid_dead",
+  "boot_pid_recycled",
+]) {
+  test(`Killed fold copies kill_reason="${reason}" onto the jobs row`, () => {
+    insertEvent({ hook_event: "SessionStart" });
+    insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+    insertEvent({
+      hook_event: "Killed",
+      data: JSON.stringify({
+        pid: 4242,
+        start_time: null,
+        close_kind: "pid_died",
+        reason,
+      }),
+    });
+    drainAll();
+    const job = getJob();
+    expect(job?.state).toBe("killed");
+    expect(getKillReason()).toBe(reason);
+    // Orthogonal to close_kind — both fold independently.
+    expect(getCloseKind()).toBe("pid_died");
+  });
+}
+
+test("Killed fold leaves kill_reason NULL when the payload omits it (legacy re-fold)", () => {
+  // A pre-v103 Killed payload carries no `reason`; kill_reason folds to NULL so
+  // a from-scratch re-fold reproduces the zero-event default.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({
+      pid: 4242,
+      start_time: null,
+      close_kind: "pid_died",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getKillReason()).toBeNull();
+});
+
+test("Killed fold treats a non-string kill_reason as NULL (defensive, never coerced)", () => {
+  // A garbage reason value must not masquerade as a real reason — it folds to
+  // NULL, and the row still flips to killed (the kill itself is honored).
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ pid: 4242, start_time: null, reason: 42 }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getKillReason()).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // Schema-v71 window_index — the visual window-order column the
 // WindowIndexSnapshot was RETIRED in fn-907: the standalone window-index fold
 // (fn-817) is subsumed by the TmuxTopologySnapshot live-location fold (which

@@ -257,12 +257,13 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1)", () => {
+test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
-  // `addColumnIfMissing` calls in `migrate()`, so the six columns land as the
-  // trailing six of `table_info(jobs)`, in the same order, on both the fresh
+  // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
+  // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on.
+  // re-fold determinism charter depends on. `kill_reason` (v103) is the current
+  // final appended column, trailing the v100 telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -270,6 +271,7 @@ test("the v100 telemetry columns are the byte-identical tail on fresh vs migrate
     "context_used_percentage",
     "context_input_tokens",
     "context_window_size",
+    "kill_reason",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -2551,9 +2553,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // epics-shape change), fn-1034 task .1. v102 adds the durable
   // `dispatch_mint_gate` producer table (the one-logical-dispatch-one-row
   // rate-limit gate at the `Dispatched` mint site — a CREATE-only table, not an
-  // epics-shape change), fn-1061 task .1. The v62→v63 epics-shape migration this
-  // test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(102);
+  // epics-shape change), fn-1061 task .1. v103 appends the nullable
+  // `jobs.kill_reason` column (WHY keeper reaped a job — the producer arm that
+  // minted the synthetic `Killed`; an additive ALTER, not an epics-shape
+  // change), fn-1075 task .2. The v62→v63 epics-shape migration this test
+  // exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(103);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

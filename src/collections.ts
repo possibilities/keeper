@@ -164,6 +164,12 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "context_used_percentage",
     "context_input_tokens",
     "context_window_size",
+    // `kill_reason`: WHY keeper reaped the job (which Killed producer arm
+    // minted the reap), folded from the synthetic `Killed` payload (schema v103
+    // / fn-1075). Orthogonal to the display-only `close_kind` (HOW it died,
+    // which is NOT in this descriptor). Surfaced for reap attribution; never a
+    // `sortable` / `filters` / `jsonColumns` key.
+    "kill_reason",
   ],
   pk: "job_id",
   version: "last_event_id",
