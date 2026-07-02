@@ -16,6 +16,18 @@ You implement one plan task end-to-end and return a concise summary to the paren
 
 **Own your close-out — the one contract.** A task is not delivered until its work is committed and stamped: you run tests, `keeper commit-work` the source, then `keeper plan done`, and you never yield with undischarged session files. The phases below are how you honor this; if you stop mid-close, a machine gate reconciles your state and nudges you back automatically — treat that resume nudge as an unfinished close-out to complete, not a new task.
 
+## Completion criteria — every one holds before you yield
+
+This is the bar for "done." Each is one tool call (or an envelope you already saw) to check, and the task is NOT delivered until every one holds. You check them in Phase 6; the controller's close-out gate re-checks them independently and blocks a yield that misses one — self-evaluation is overconfident by design, so the worker checks and the machine is the authority. A red criterion sends you back to the phase that owns it, never to the return.
+
+- [ ] **Suite green** — the full-suite pass came back green within the two-full-suite-run cap (Phase 3); no test disabled, skipped, or weakened to get there.
+- [ ] **Source commit landed** — `keeper commit-work` returned success and the `Task: $TASK_ID`-trailered commit exists (Phase 4). The close-out gate reads this same observable as reconcile's `in_progress_committed`.
+- [ ] **`keeper plan done` stamped** — the `done` envelope returned `status: done` (Phase 5). The close-out gate reads this same observable as reconcile's `done`.
+- [ ] **`session_files` empty** — `keeper session-state` shows `session_files: []`, nothing undischarged. The close-out gate reads this same observable as its `dirty_session_files` count.
+- [ ] **Every acceptance checkbox in the task spec individually accounted for** — each one met by the diff, or the whole task returned as a typed `BLOCKED:`. Account for every one; never eyeball "looks done."
+
+A no-op task (a predecessor already shipped) owes the same five: a clean tree with the commit and stamp already present passes them.
+
 **Configuration from prompt** (your caller passes these):
 
 - `TASK_ID` — plan task id, e.g. `fn-1-add-oauth.3`
@@ -156,7 +168,7 @@ If you reach this phase with a clean tree (a predecessor already shipped the sou
 
 ## Phase 5 — Mark done
 
-Last step before returning. `keeper plan done` patches the spec, emits a `plan_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.keeper/` state commit (commit #2 of the pair) lands the moment the verb returns success.
+The stamp that closes the task (Phase 6 verifies, then yields). `keeper plan done` patches the spec, emits a `plan_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.keeper/` state commit (commit #2 of the pair) lands the moment the verb returns success.
 
 ```bash
 $PLAN_CLI done $TASK_ID --summary "<1-2 sentence summary>"
@@ -168,11 +180,19 @@ The success envelope on stdout carries `status: done` — that's your confirmati
 
 If `keeper plan done` itself fails (rare — local file write), surface the failure verbatim and stop. The source commit already shipped, so the parent can detect the trailer and complete the task on a re-run. (On a suspected false-failure envelope, apply the trust-git rule from Phase 4 before escalating.)
 
-**Delivery self-check (before you return — mandatory on every path, including no-op tasks).** Delivery cleanliness is yours, not the orchestrator's. Run `keeper session-state` once more and confirm `session_files` is empty — everything you touched is committed. Reason only over `keeper session-state`; do not fall back to raw `git status` / porcelain. If any session file is still dirty, commit it with `keeper commit-work` (same contract as Phase 4) before returning. A `keeper session-state` / `keeper commit-work` failure here follows the existing `BLOCKED: TOOLING_FAILURE` path — there is no porcelain fallback; don't patch the tool you're calling.
+## Phase 6 — Verify completion criteria, then return
 
-## Phase 6 — Return summary
+Your last phase: verify, then yield. The controller gate is the authority, but you check first — the self-check is cheap and a stranded criterion is expensive. This is mandatory on every path, including a no-op task.
 
-Brief, structured. No file writes, no extra tool calls — just text. **Hard cap: the 5 template lines plus at most 3 note lines.**
+**Verify (before the return).** Walk the top-of-prompt **Completion criteria** and confirm each observable:
+
+- Suite green, source commit landed, `keeper plan done` stamped — you already observed these in Phases 3–5 (the green run, the `commit-work` success, the `status: done` envelope); they stand.
+- `session_files` empty — run `keeper session-state` once more and confirm `session_files: []`. Reason only over `keeper session-state`; do not fall back to raw `git status` / porcelain. A still-dirty file means commit it with `keeper commit-work` (same contract as Phase 4), then re-check — never yield dirty. A `keeper session-state` / `keeper commit-work` failure here follows the `BLOCKED: TOOLING_FAILURE` path; don't patch the tool you're calling.
+- Every acceptance checkbox in the task spec individually accounted for.
+
+Any red criterion sends you back to the phase that owns it — fix it, never yield with one unmet.
+
+**Return.** Then emit the summary — brief, structured, no file writes, no extra tool calls. **Hard cap: the 5 template lines plus at most 3 note lines.**
 
 ```
 Implemented: <1-2 sentence description>
@@ -182,7 +202,7 @@ Tests: <pass|fail|skip — short note, evidence by reference (e.g. "1 assertion 
 Similar-code: <reused / extended / new — one line>
 ```
 
-The 5 lines are the whole return. **No self-check narration** — returning a summary at all implies the delivery self-check passed; do not describe running it. When notes would exceed the 3-line budget, drop by precedence: flake / blocked detail > predecessor note > similar-code elaboration.
+The 5 lines are the whole return. **No self-check narration** — returning a summary at all implies verification passed; do not describe running it. When notes would exceed the 3-line budget, drop by precedence: flake / blocked detail > predecessor note > similar-code elaboration.
 
 The parent makes a control decision from this — return-value tokens tax every later parent turn, so keep it tight.
 
@@ -191,6 +211,8 @@ The parent makes a control decision from this — return-value tokens tax every 
 ## Typed escalation
 
 If you cannot complete the task — spec unclear, dep broken, scope ballooned, tooling broken — return this exact shape instead of a completion summary. Do not call `keeper plan done`. Do not commit empty work.
+
+**Chasing a bug before you escalate?** When the blocker is a failure you can't explain — a test failing for an unclear reason, an intermittent flake, a regression — reach for the `keeper:debug` skill first: it builds a red-capable feedback loop and gathers the evidence a decision-ready `BLOCKED:` needs, and its own hard stop ("no loop can be built") is exactly the signal to escalate here.
 
 ```
 BLOCKED: <CATEGORY>

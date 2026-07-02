@@ -86,8 +86,13 @@ Assemble these from the conversation:
    never truncated). The brief is the handoff-ee's prefix REQUEST, so it deeply
    shapes what happens — but write it as a request, NOT an order: avoid "just do
    it / land it / commit it" phrasing, which pushes the handoff-ee past the
-   prefix's confirm beat and back into executing blind. If you've already written it to a
-   file, use `--prompt-file`.
+   prefix's confirm beat and back into executing blind. Write it durable and
+   behavioral: state the outcomes and contracts to deliver and *why*, not a
+   line-by-line diff recipe. **Reference, don't duplicate** — point to the files,
+   findings, and paths the worker should read rather than pasting large spans
+   that rot as the repo moves. **Redact secrets** — the brief is event-sourced
+   and durable, so keep tokens, keys, and credentials out of it; name where they
+   live instead. If you've already written it to a file, use `--prompt-file`.
 3. **A title** (`--title`) — a short human label for the handoff (optional but
    recommended; it surfaces on the board).
 4. **The launch directory** (`--dir`, optional) — the directory the handoff-ee

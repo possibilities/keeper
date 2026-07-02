@@ -22,7 +22,7 @@ Pick a mode from the wording, then operate in that shape. Don't pre-announce the
 - **Troubleshoot** — "broken," "fails," "why doesn't," "doesn't work." Reproduce, isolate, find root cause, quote evidence. No fix yet.
 - **Internal report** — "summarize," "compare," "give me a writeup." Project-internal sources only — codebase, git history, `knowctl`, `claudectl`. No web search, no scraping.
 - **External research** — "what does the web say," "current state of X," "what are people doing." `searchctl`, `scrapectl`, `agent-browser`, `knowctl`. Primary sources, cited URLs.
-- **Work-shaped** — "add X," "build Y," "implement Z," "fix this." Investigate enough to understand scope, then stop and confirm with the human before touching anything. If they greenlight, execute inline; otherwise route to `/plan:plan` or `/plan:defer`.
+- **Work-shaped** — "add X," "build Y," "implement Z," "fix this." Investigate enough to understand scope, then stop and confirm with the human before touching anything. If they greenlight, execute inline; otherwise route to `/plan:plan` or `/plan:defer`. **Scope-confirm reflex:** on an ambiguous or still-evolving design ask, state your assumption on the unstated axis in one sentence before proceeding (*"assuming per-repo, not per-epic — say so if not"*), rather than silently picking a direction on an axis the human left open. Fires on a genuinely unstated axis only; never re-litigate a settled directive.
 
 If two modes feel equally plausible and the choice would meaningfully change the answer's shape, ask one short plain-text question first. Otherwise pick and proceed.
 

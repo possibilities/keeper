@@ -116,7 +116,7 @@ Build a single-task scaffold YAML. The epic sorts in normal `epic_number` order 
 
 **Tier** — pick one of `medium | high | xhigh | max` per the bands in `/plan:plan` Phase 3c. For a truly tiny defer subject, `medium` is the usual pick; bump to `high` only when the subject touches a known pattern in multiple files.
 
-**Task spec** — assemble the four-section markdown (`## Description`, `## Acceptance`, `## Done summary`, `## Evidence`). SHORT depth — include only `### Approach` and `### Investigation targets` inside `## Description`. Investigation targets come from the pinned `repo-scout` report when Phase 2 ran; omit the subsection when Phase 2 was skipped.
+**Task spec** — assemble the four-section markdown (`## Description`, `## Acceptance`, `## Done summary`, `## Evidence`). SHORT depth — include only `### Approach` and `### Investigation targets` inside `## Description`. Approach states the behavioral contract and the why; Acceptance is behavioral — observable outcomes verifiable without the diff, never `file:line` (a deferred spec waits on the board while paths drift). `file:line` lives only in Investigation targets, which come from the pinned `repo-scout` report when Phase 2 ran (omit the subsection when Phase 2 was skipped) and carry the staleness caveat so the worker re-checks before relying.
 
 **Epic spec** — minimal `## Overview` paragraph; `## Quick commands` block with one verification line if useful; `## Acceptance` mirroring the single task's acceptance criteria.
 
@@ -148,16 +148,18 @@ tasks:
 
       ### Approach
 
-      <2–4 sentences on how to build it>
+      <2–4 sentences: the behavioral contract and the why — not a diff recipe>
 
       ### Investigation targets
+
+      *Verify before relying — planner-verified file:line at authoring time, but the repo moves.*
 
       **Required** (read before coding):
       - <path:line> — why it matters
 
       ## Acceptance
 
-      - [ ] <criterion>
+      - [ ] <observable outcome, verifiable without reading the diff; no file:line>
 
       ## Done summary
 

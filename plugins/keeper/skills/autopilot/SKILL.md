@@ -247,3 +247,9 @@ on its `met`. See `keeper:await` for wiring the Monitor.
 - **A take-over always owes its restore.** Bare ops just run (no capture);
   capture → drive → restore is take-over-window-only, and the window is not
   discharged until the restore lands on its explicit close signal.
+- **Escalations surface as decision-ready briefs.** When you relay a `needs_human`
+  row (a sticky non-ff, a merge-conflict close, a blocked task) to the human, give
+  a decision-ready brief — what happened, what the autopilot already tried or
+  prepared, and the one decision you need — never a raw failure dump. The daemon's
+  own bus notifications (block + merge escalations) already follow this shape;
+  match it when you speak for them.
