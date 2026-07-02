@@ -55,5 +55,5 @@ DELETE test/usage-picker.slow.test.ts outright — its statistical stride-propor
 - [ ] `bun test test/usage-picker.test.ts` green; slow file deleted; DB-free imports and never-throws contract unchanged
 
 ## Done summary
-
+Replaced the stride-scheduling picker with buffered LRU: pure LRU rotation over a five-rung fail-open admission ladder (buffer/overflow/any-unparked/all-subscribed/DEFAULT), a pending burst reservation reconciled per pick against last_successful_fetch_at, rollover grace, and a v2 picker.json ledger with a last_pick forensic blob. Deleted the slow stride-proportionality suite.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Rewrite picker to buffered LRU",
-  "updated_at": "2026-07-02T06:35:37.737000Z"
+  "updated_at": "2026-07-02T06:52:45.891000Z",
+  "worker_done_at": "2026-07-02T06:52:45.891000Z"
 }
