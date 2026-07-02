@@ -81,6 +81,15 @@ const FORBIDDEN_TRAILER_ERROR =
 
 const DEFAULT_MAX_FILES = 500;
 
+// Recovery contract carried in the lint_failed envelope, injected at the agent's
+// decision point. A lint failure is never a staging-coverage gap, so the only
+// permitted recovery loops back through commit-work — never a bare-git bypass.
+const LINT_FAILED_RECOVERY =
+  "Fix the reported lint errors in the files listed, re-stage them with " +
+  "`git add <files>`, then re-invoke `keeper commit-work` with the same " +
+  "message. Do NOT fall back to bare `git commit` or use `--no-verify` — a " +
+  "lint failure is not a coverage gap.";
+
 // ---------------------------------------------------------------------------
 // Python-byte-parity JSON serializers
 // ---------------------------------------------------------------------------
@@ -588,6 +597,7 @@ async function runInner(
           linter: err.linter,
           files: err.files,
           stderr: err.stderr,
+          recovery: LINT_FAILED_RECOVERY,
         });
         return 1;
       }

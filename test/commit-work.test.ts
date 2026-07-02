@@ -671,6 +671,11 @@ describe("commit-work: lint_failed", () => {
     expect(parsed.files).toEqual(["bad.py"]);
     expect(typeof parsed.stderr).toBe("string");
     expect(parsed.stderr.length).toBeGreaterThan(0);
+    // Recovery contract present + non-empty, steering fix→restage→re-invoke.
+    expect(typeof parsed.recovery).toBe("string");
+    expect(parsed.recovery.length).toBeGreaterThan(0);
+    expect(parsed.recovery).toContain("re-invoke `keeper commit-work`");
+    expect(parsed.recovery).toContain("not a coverage gap");
     // Compact single line.
     expect(stdout.trimEnd()).not.toContain("\n");
     // The commit was GATED — never issued.
