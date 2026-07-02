@@ -33,5 +33,5 @@ Docs-only; the proof is the grep sweep in Quick commands plus reading the modifi
 - [ ] Both chatctl monitor examples name the live bus monitor
 
 ## Done summary
-
+One README pass: added a builds producer Worker thread section (distilled from src/builds-worker.ts) and repaired the dangling builds-poller cross-ref; de-numbered all 13 Nth-Worker-thread leads + 4 ordinal cross-refs to named prose and made the summary line number-free; added a keeper prompt paragraph; named the live keeper bus watch monitor in both former chatctl examples.
 ## Evidence
