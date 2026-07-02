@@ -44,5 +44,5 @@ lands under scripts/ as a manual tool, not in the test suites.
 - [ ] Any serve-code fix keeps both suites green; repro tooling isolated from production state
 
 ## Done summary
-
+Bounded-effort finding. Built scripts/repro-serve-wedge.ts (red-capable Bun.listen UDS accept-stall repro with a real-read probe detector); the wedge (Bun #8044 low-lag accept-stall, confirmed by the parked-kevent64 CPU sample) did not reproduce under aggressive load on Bun 1.3.14, so ~/docs/2026-07-02-fn-1082-2-serve-wedge-finding.md documents the wedge class, repro attempts, ruled-out classes, and upstream linkage, with task .1's watchdog as the standing mitigation. The 'file is not a database' rider is identified+filed: a rare boot-correlated keeper.db reader-NOTADB across all PRAGMA data_version pollers (exit-watcher/git-worker/plan-worker), NOT a sweep-opened stray file; the sweep already tolerates it.
 ## Evidence
