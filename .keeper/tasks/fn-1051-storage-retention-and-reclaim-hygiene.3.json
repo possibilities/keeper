@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Wire logrotate sidecar and freelist log",
-  "updated_at": "2026-07-02T00:51:20.005000Z"
+  "updated_at": "2026-07-02T01:53:20.513000Z",
+  "worker_done_at": "2026-07-02T01:53:20.513000Z"
 }

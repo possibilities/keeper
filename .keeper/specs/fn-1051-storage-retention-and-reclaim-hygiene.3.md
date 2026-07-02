@@ -35,5 +35,5 @@ The freelist helper + step-latch logic get fast-tier unit tests (pure math + inj
 - [ ] README install step updated; full fast suite green
 
 ## Done summary
-
+Fixed the logrotate sidecar plist to resolve $(id -u) under launchd /bin/sh and made install.sh load it idempotently; added reclaimableFreelistBytes + a step-latched reclaimable-space log that fires only on 100MB freelist crossings naming 'keeper reclaim'.
 ## Evidence
