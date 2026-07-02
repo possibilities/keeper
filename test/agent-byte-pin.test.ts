@@ -262,13 +262,14 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
     cwd,
     randomUuid: () => RUN_UUID,
     // A claude-harness preset so `--preset` validation (harness == <cli>) passes;
-    // claude_default lets a bare `agent run claude` clear the fresh-launch gate.
+    // claude_default lets a bare `agent run claude` clear the fresh-launch gate,
+    // which requires the resolved default to supply BOTH model + second axis.
     presetCatalog: {
       presets: {
         opus: {
           harness: "claude",
-          model: null,
-          effort: null,
+          model: "opus",
+          effort: "high",
           thinking: null,
           role: null,
         },

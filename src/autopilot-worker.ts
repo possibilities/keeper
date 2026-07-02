@@ -407,8 +407,24 @@ function defaultShadowingWorkProbe(): string | null {
  * constants here, so the daemon never crashes on bad config. Re-resolved per
  * cycle (cheap single-file parse) so a preset edit lands without a daemon bounce;
  * never file-watched.
+ *
+ * A non-claude `preset.harness` is IGNORED (autopilot dispatch is claude-only
+ * until harness dispatch lands) but WARNED once per distinct offending value via
+ * `warned` — the reconcile cycle re-calls this per tick, so the memo keeps the
+ * drop from becoming per-cycle log spam. Never throws on the drop.
  */
-export function resolveWorkerLaunchConfig(configPath?: string): {
+/**
+ * Distinct non-claude `worker`-preset harness values already warned about, so
+ * {@link resolveWorkerLaunchConfig} logs the drop ONCE per offending value
+ * rather than every reconcile cycle. Producer-side process memo (never a fold
+ * input); tests inject a fresh set to observe the once-per-value contract.
+ */
+const droppedWorkerHarnessWarned = new Set<string>();
+
+export function resolveWorkerLaunchConfig(
+  configPath?: string,
+  warned: Set<string> = droppedWorkerHarnessWarned,
+): {
   model: string;
   effort: string;
 } {
@@ -427,6 +443,18 @@ export function resolveWorkerLaunchConfig(configPath?: string): {
     } else {
       throw err;
     }
+  }
+  if (
+    preset !== undefined &&
+    preset.harness !== "claude" &&
+    !warned.has(preset.harness)
+  ) {
+    warned.add(preset.harness);
+    console.error(
+      `[autopilot-worker] worker preset pins harness '${preset.harness}', but ` +
+        `autopilot dispatch ignores non-claude harness values until harness ` +
+        `dispatch lands — launching on claude.`,
+    );
   }
   return {
     model: preset?.model ?? WORKER_MODEL,

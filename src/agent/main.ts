@@ -503,6 +503,29 @@ function unresolvedDefaultMessage(agent: AgentKind): string {
   );
 }
 
+/**
+ * The shared fresh-launch readiness core both gates route through: does the
+ * RESOLVED preset (plus any explicit-flag `signals`) supply BOTH a model and the
+ * harness's correct SECOND AXIS — `effort` for claude/codex, `thinking` for pi?
+ * Pure; each gate keeps its OWN emission contract (the run path emits its
+ * bad_args envelope, the launcher path keeps its exit-2 fail-loud message). A
+ * null `preset` means no default resolved, so readiness rests entirely on the
+ * flags. The both-explicit / profile-exempt escape is the caller's to short-
+ * circuit before calling this — a caller in the both-explicit branch never asks.
+ */
+function resolveLaunchReadiness(
+  agent: AgentKind,
+  preset: Preset | null,
+  signals: LaunchConfigSignals,
+): boolean {
+  const model = preset?.model ?? null;
+  const second =
+    agent === "pi" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
+  const modelResolved = model !== null || signals.model;
+  const secondResolved = second !== null || signals.effortOrThinking;
+  return modelResolved && secondResolved;
+}
+
 function codexConfigValue(args: string[], index: number): string | null {
   const arg = args[index];
   if (arg === "-c" || arg === "--config") {
@@ -928,54 +951,50 @@ async function runRunCaptureSubcommand(
   }
   const agent = parsed.cli;
   const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
-  // `--preset` validation: agent run is otherwise config-free and cannot derive
-  // `<cli>` from the preset, so a preset whose harness disagrees with the
-  // positional is a standalone foot-gun. Resolve HANDLER-SIDE and require the
-  // preset's harness == `<cli>`; a missing catalog / unknown preset (ConfigError)
-  // or a harness mismatch is bad_args (the result-file sink still gets it).
+  const runBadArgs = (): Promise<never> =>
+    emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+      parsed.output,
+    );
+  // Fresh-launch readiness gate (mirrors the interactive launcher gate through
+  // the shared {@link resolveLaunchReadiness} core, each keeping its OWN emission
+  // contract — here bad_args, there exit 2). `agent run` is always a fresh
+  // one-shot (no --continue/--resume analog), so an underspecified preset /
+  // `<cli>_default` that resolves neither a model nor the harness's second axis
+  // (effort for claude/codex, thinking for pi) would launch a DOOMED detached
+  // pane surfacing as no_transcript/timed_out — short-circuit to bad_args instead.
+  // The both-explicit escape (`--model` + `--effort`) needs no default and never
+  // reads the catalog. `--preset` is config-free otherwise, so its harness must
+  // equal the positional `<cli>`; a missing catalog / unknown preset (ConfigError)
+  // is bad_args too. The result-file sink still gets every bad_args envelope.
+  const runBothExplicit = parsed.model !== null && parsed.effort !== null;
+  let runPreset: Preset | null = null;
   if (parsed.preset !== null) {
-    let resolved: Preset;
     try {
-      resolved = resolvePreset(deps.loadPresetCatalogFn(), parsed.preset);
+      runPreset = resolvePreset(deps.loadPresetCatalogFn(), parsed.preset);
     } catch (exc) {
       if (exc instanceof ConfigError) {
         deps.writeErr(`agent: ${exc.message}\n`);
-        return emitRunCapture(
-          deps,
-          buildRunCaptureEnvelope({ outcome: "bad_args" }),
-          parsed.output,
-        );
+        return runBadArgs();
       }
       throw exc;
     }
-    if (resolved.harness !== agent) {
+    if (runPreset.harness !== agent) {
       deps.writeErr(
-        `agent: --preset ${parsed.preset} pins harness ${resolved.harness}, ` +
+        `agent: --preset ${parsed.preset} pins harness ${runPreset.harness}, ` +
           `but the ${agent} run was given.\n`,
       );
-      return emitRunCapture(
-        deps,
-        buildRunCaptureEnvelope({ outcome: "bad_args" }),
-        parsed.output,
-      );
+      return runBadArgs();
     }
-  } else if (!(parsed.model !== null && parsed.effort !== null)) {
-    // Fresh-launch fail-loud (mirrors the interactive gate): a run with no
-    // --preset, no catalog `<cli>_default`, and not both --model + --effort
-    // explicit resolves no model/effort — the detached pane would fail-loud, so
-    // short-circuit to bad_args rather than launch a doomed pane. (`agent run` is
-    // always a fresh one-shot, with no --continue/--resume analog.)
+  } else if (!runBothExplicit) {
     let catalog: PresetCatalog;
     try {
       catalog = deps.loadPresetCatalogFn();
     } catch (exc) {
       if (exc instanceof ConfigError) {
         deps.writeErr(`agent: ${exc.message}\n`);
-        return emitRunCapture(
-          deps,
-          buildRunCaptureEnvelope({ outcome: "bad_args" }),
-          parsed.output,
-        );
+        return runBadArgs();
       }
       throw exc;
     }
@@ -985,17 +1004,26 @@ async function runRunCaptureSubcommand(
         : agent === "codex"
           ? catalog.codex_default
           : catalog.pi_default) ?? null;
-    if (defaultName === null) {
+    if (defaultName !== null) {
+      runPreset = resolvePreset(catalog, defaultName);
+    }
+  }
+  // Route the resolved preset (or default) plus the explicit --model/--effort
+  // flags through the shared readiness core. The both-explicit escape already
+  // supplies both axes, so it skips the check.
+  if (!runBothExplicit) {
+    const runSignals: LaunchConfigSignals = {
+      model: parsed.model !== null,
+      effortOrThinking: parsed.effort !== null,
+      exemptAll: false,
+    };
+    if (!resolveLaunchReadiness(agent, runPreset, runSignals)) {
       deps.writeErr(
         `agent: no model/effort resolved for a fresh ${agent} run. ` +
           `Set ${agent}_default in presets.yaml (see 'keeper agent presets list'), ` +
           `or pass --preset <name> or --model <model> --effort <effort>.\n`,
       );
-      return emitRunCapture(
-        deps,
-        buildRunCaptureEnvelope({ outcome: "bad_args" }),
-        parsed.output,
-      );
+      return runBadArgs();
     }
   }
   // Resolve the `--system-file`/`--system` seam to text HANDLER-SIDE (the pure
@@ -1717,15 +1745,10 @@ export async function main(deps: MainDeps): Promise<never> {
         actionLog.push(`Resolved ${agent}_default preset '${defaultName}'`);
       }
     }
-    const defaultModel = resolvedPreset?.model ?? null;
-    const defaultEffortOrThinking =
-      agent === "pi"
-        ? (resolvedPreset?.thinking ?? null)
-        : (resolvedPreset?.effort ?? null);
-    const modelMissing = defaultModel === null && !launchSignals.model;
-    const secondMissing =
-      defaultEffortOrThinking === null && !launchSignals.effortOrThinking;
-    if (modelMissing || secondMissing) {
+    // Shared readiness core (same as the run gate): the resolved model AND the
+    // harness's second axis (effort for claude/codex, thinking for pi) must both
+    // resolve from the preset or an explicit flag.
+    if (!resolveLaunchReadiness(agent, resolvedPreset, launchSignals)) {
       deps.writeErr(unresolvedDefaultMessage(agent));
       return deps.exit(2);
     }
