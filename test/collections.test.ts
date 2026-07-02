@@ -19,13 +19,17 @@ import { join } from "node:path";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
   BUILDS_DESCRIPTOR,
+  countAndToken,
   DEAD_LETTERS_DESCRIPTOR,
+  DISPATCH_FAILURES_DESCRIPTOR,
   DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
   EPICS_RECENT_DONE_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
+  liveKeyExpr,
+  liveKeyOf,
   PENDING_DISPATCHES_DESCRIPTOR,
   PROFILES_DESCRIPTOR,
   SCHEDULED_TASKS_DESCRIPTOR,
@@ -1371,5 +1375,122 @@ test("runQuery pages a seeded scheduled_tasks row filtered by job_id (schema v68
   expect(Object.keys(row).sort()).toEqual(
     [...SCHEDULED_TASKS_DESCRIPTOR.columns].sort(),
   );
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// Composite live-key identity (fn-1065). `dispatch_failures` declares
+// `pk: "verb"` while its real identity is `(verb, id)` and `verb` is a tiny
+// class (`work` / `close`). The DIFF path keys watched membership / the version
+// probe / the byId fan-out / the membership token by `liveKeyExpr` so two
+// same-verb rows track independently instead of collapsing to one live pill on
+// `board --watch`. These exercise that seam WITHOUT a real subscription.
+// ---------------------------------------------------------------------------
+
+function seedDispatchFailure(
+  db: Database,
+  verb: string,
+  id: string,
+  opts: Partial<{ reason: string; last_event_id: number }> = {},
+): void {
+  db.query(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    verb,
+    id,
+    opts.reason ?? "worktree-finalize-non-fast-forward",
+    null,
+    1.0,
+    opts.last_event_id ?? 1,
+    1.0,
+    1.0,
+  );
+}
+
+test("liveKeyExpr: single-pk descriptor falls back to the bare pk column (SQL unchanged)", () => {
+  expect(liveKeyExpr(EPICS_DESCRIPTOR)).toBe(EPICS_DESCRIPTOR.pk);
+  expect(liveKeyExpr(JOBS_DESCRIPTOR)).toBe(JOBS_DESCRIPTOR.pk);
+});
+
+test("liveKeyExpr: dispatch_failures composes (verb, id) into one SQL identity", () => {
+  expect(liveKeyExpr(DISPATCH_FAILURES_DESCRIPTOR)).toBe(
+    "verb || char(31) || id",
+  );
+});
+
+test("liveKeyOf: two same-verb dispatch_failures rows produce DISTINCT keys", () => {
+  const a = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-1",
+  });
+  const b = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-2",
+  });
+  expect(a).not.toBe(b);
+  // A single-pk descriptor still keys by the pk value alone (unchanged).
+  expect(liveKeyOf(EPICS_DESCRIPTOR, { epic_id: "fn-9" })).toBe("fn-9");
+});
+
+test("selectVersionsByIds: two same-verb dispatch_failures rows track as two keys, not one", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedDispatchFailure(db, "close", "fn-1", { last_event_id: 5 });
+  seedDispatchFailure(db, "close", "fn-2", { last_event_id: 7 });
+  const k1 = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-1",
+  });
+  const k2 = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-2",
+  });
+  const map = selectVersionsByIds(db, DISPATCH_FAILURES_DESCRIPTOR, [k1, k2]);
+  // The pk-collapse bug returned ONE entry keyed by "close"; the composite key
+  // gives each row its own version cursor for the diff's change detection.
+  expect(map.size).toBe(2);
+  expect(map.get(k1)).toBe(5);
+  expect(map.get(k2)).toBe(7);
+  db.close();
+});
+
+test("selectByIdsChunked: composite ids fetch BOTH same-verb rows for the diff fan-out", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedDispatchFailure(db, "close", "fn-1", { reason: "merge-conflict" });
+  seedDispatchFailure(db, "close", "fn-2", { reason: "non-fast-forward" });
+  const k1 = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-1",
+  });
+  const k2 = liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, {
+    verb: "close",
+    id: "fn-2",
+  });
+  const rows = selectByIdsChunked(db, DISPATCH_FAILURES_DESCRIPTOR, [k1, k2]);
+  expect(rows.length).toBe(2);
+  // Re-index by liveKeyOf exactly as the diff's byId fan-out does — two entries,
+  // one patch frame each (never a single collapsed "close" slot).
+  const byId = new Map(
+    rows.map((r) => [liveKeyOf(DISPATCH_FAILURES_DESCRIPTOR, r), r]),
+  );
+  expect(byId.size).toBe(2);
+  expect(byId.get(k1)?.reason).toBe("merge-conflict");
+  expect(byId.get(k2)?.reason).toBe("non-fast-forward");
+  db.close();
+});
+
+test("countAndToken: membership token distinguishes two same-verb rows (composite fingerprint)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedDispatchFailure(db, "close", "fn-1");
+  const one = countAndToken(db, DISPATCH_FAILURES_DESCRIPTOR, "", []);
+  seedDispatchFailure(db, "close", "fn-2");
+  const two = countAndToken(db, DISPATCH_FAILURES_DESCRIPTOR, "", []);
+  expect(one.total).toBe(1);
+  expect(two.total).toBe(2);
+  // A group_concat over the bare `verb` would read "close,close" and miss a
+  // balanced same-verb swap; the composite fingerprint carries both ids.
+  expect(two.token).not.toBe(one.token);
+  expect(two.token).toContain("fn-1");
+  expect(two.token).toContain("fn-2");
   db.close();
 });
