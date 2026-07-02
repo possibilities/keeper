@@ -160,6 +160,21 @@ function seedStream(): { coldMutationId: number; promptId: number } {
   // commits it clean (discharges).
   const coldMutationId = insertMutation("/repo/cold.ts", { ts: 100 });
 
+  // SHED-CLASS (non-mutation): a Read carrying `tool_input.file_path`. No fold
+  // reads its body, so retention sheds it — seeded here so the re-fold proof
+  // covers the class this fix newly sheds.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Read",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    ts: 120,
+    data: JSON.stringify({
+      tool_input: { file_path: "/repo/cold.ts" },
+      tool_response: { ok: true },
+    }),
+  });
+
   insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo",
@@ -344,6 +359,20 @@ test("retention never strips a shed-class row still owing a mutation_path backfi
     data: JSON.stringify({ tool_input: {}, tool_response: { ok: true } }),
     mutation_path: null,
   });
+  // A NON-mutation shed-class row (Read) whose body carries `tool_input.file_path`
+  // but owns no `mutation_path` — no fold reads its body, so it MUST shed. The
+  // backfill guard is scoped to the four mutation tools; a Read is outside it.
+  const readWithPathId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Read",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    data: JSON.stringify({
+      tool_input: { file_path: "/repo/read-me.ts" },
+      tool_response: { ok: true },
+    }),
+    mutation_path: null,
+  });
   // Trailing keep-set events so every seeded shed-class row sits strictly below
   // the fold cursor (`id < cursor`).
   for (let i = 0; i < 3; i++) {
@@ -376,6 +405,15 @@ test("retention never strips a shed-class row still owing a mutation_path backfi
   expect(
     (
       db.query("SELECT data FROM events WHERE id = ?").get(noPathId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+  // Read row carrying file_path but owing no backfill: body SHEDS (guard is
+  // mutation-tool-scoped; a Read is not one of the four).
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(readWithPathId) as {
         data: string | null;
       }
     ).data,

@@ -226,6 +226,21 @@ export function extractMutationPath(
 }
 
 /**
+ * The SQL twin of {@link extractMutationPath}'s tool gate: the exact four
+ * mutation tools `(PostToolUse, {Write,Edit,MultiEdit,NotebookEdit})` a row must
+ * match to ever owe a `mutation_path` backfill. Unaliased columns so it drops
+ * into any query over `events` directly.
+ *
+ * Deriving both the backfill's row scope and compaction's shed guard from this
+ * ONE constant is the point: the guard must exclude exactly the rows the
+ * backfill still owes, and any future drift between "which tools carry a
+ * promotable file_path" and "which rows the shed guard protects" would silently
+ * NULL the sole copy of fold-read data. Hook-safe: a plain string, no I/O.
+ */
+export const MUTATION_TOOL_SQL_PREDICATE = `hook_event = 'PostToolUse'
+   AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`;
+
+/**
  * One entry in the reducer-projected `jobs.monitors` JSON array. Three-way
  * provenance — `monitor` / `bash-bg` / `ambient` (the last is harness-armed,
  * no launch event in this session's stream). Each Stop's `background_tasks`
