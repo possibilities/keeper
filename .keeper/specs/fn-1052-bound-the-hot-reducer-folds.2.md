@@ -42,5 +42,5 @@ New equivalence cases: orphan event as last touch of an epic a future event also
 - [ ] README orphan prose revised + incident paragraph; full fast suite green
 
 ## Done summary
-
+Bounded the syncPlanLinks orphan fold: extended the per-session mergeJobLinkSlice to the orphan path (eliminating the whole-table commit-facts load + cross-session sweep — the O(history×board) 437s time-bomb), added INCLUSIVE id ceilings to the events + facts reads (live-fold semantics), and added the deriveJobLinks (plan_derive_ms) breakdown segment. Measured orphan frequency first (~0, incident-response). Byte-identical per event, no schema bump/rewind.
 ## Evidence

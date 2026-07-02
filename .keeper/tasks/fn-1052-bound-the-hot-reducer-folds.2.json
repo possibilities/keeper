@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Bound the orphan plan-link sweep",
-  "updated_at": "2026-07-02T01:08:56.437000Z"
+  "updated_at": "2026-07-02T02:21:42.324000Z",
+  "worker_done_at": "2026-07-02T02:21:42.324000Z"
 }
