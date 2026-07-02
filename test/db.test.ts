@@ -5101,9 +5101,10 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   // shape; v23→v24 then renamed `rate_limited_at` into the two-field pair
   // `(last_api_error_at, last_api_error_kind)` — both NULL on every
   // seeded jobs row (no `RateLimited` / `ApiError` event in the fixture).
-  // Both seeded jobs rows carry NULL title + default state `'stopped'`
-  // (the v19 schema's NOT NULL DEFAULT 'stopped' on the jobs lifecycle
-  // column), so the enriched defaults flow through.
+  // Both seeded jobs rows carry NULL title. Each session fires a
+  // PreToolUse/PostToolUse:Bash tool event on the re-fold, which un-stops the
+  // SessionStart-resting `'stopped'` row to `'working'` (fn-1056 bare arm) — so
+  // the enriched state is `'working'`, not the v19 schema `'stopped'` default.
   const epicRow = db
     .prepare("SELECT epic_id, job_links FROM epics WHERE epic_id = ?")
     .get("fn-7-scaff") as { epic_id: string; job_links: string } | null;
@@ -5126,7 +5127,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
       kind: "creator",
       job_id: "sess-creator-scaffold",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -5138,7 +5139,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
       kind: "refiner",
       job_id: "sess-refiner-twoword",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,

@@ -1044,6 +1044,32 @@ test("jobs.worktree: a worktree branch and a NULL serial fold deterministically 
 });
 
 // ---------------------------------------------------------------------------
+// fn-1056: the bare tool-event un-stop arm is event-carried (reads only event.ts
+// + the pre-update state), so a plain Stop → tool-event → working sequence MUST
+// re-fold byte-identically. Pins the new arm inside the byte-identical charter.
+// ---------------------------------------------------------------------------
+
+test("jobs bare un-stop: a plain Stop → PostToolUse (stopped → working) folds and re-folds byte-identically", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_A });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: SESS_A });
+  insertEvent({ hook_event: "Stop", session_id: SESS_A });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: SESS_A,
+  });
+  drainAll();
+
+  const liveJobs = snapshotProjections().jobs as Array<Record<string, unknown>>;
+  // The tool event un-stopped the row back to 'working'.
+  expect(liveJobs.find((j) => j.job_id === SESS_A)?.state).toBe("working");
+
+  rewindAndWipeProjections();
+  drainAll();
+  expect(snapshotProjections().jobs).toEqual(liveJobs);
+});
+
+// ---------------------------------------------------------------------------
 // `block_escalations` latch (fn-941) — the escalate-once gate for the daemon
 // block-escalation producer. A DETERMINISTIC-replayed projection cloned from
 // `dispatch_never_bound`: it MUST re-fold byte-identically from a from-scratch

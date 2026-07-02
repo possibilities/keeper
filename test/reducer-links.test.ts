@@ -427,6 +427,33 @@ test("UserPromptSubmit on a plan_ref job updates embedded state to working", () 
   expect(taskJobs[0]?.state).toBe("working");
 });
 
+test("fn-1056: the bare tool-event un-stop of a plan_ref job fans into the embedded task entry (stopped → working)", () => {
+  // A plan_ref job dropped to 'stopped' by a plain Stop must revive its embedded
+  // task.jobs mirror when a tool event un-stops it — the new arm's syncIfPlanRef
+  // fan-out is gated on changes > 0 exactly like the sibling arms.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-unstop-fan",
+    spawn_name: "work::fn-1-foo.1",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-unstop-fan",
+  });
+  insertEvent({ hook_event: "Stop", session_id: "sess-unstop-fan" });
+  drainAll();
+  expect(getTaskJobs("fn-1-foo.1")[0]?.state).toBe("stopped");
+
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-unstop-fan",
+  });
+  drainAll();
+  // The embedded mirror followed the jobs-row un-stop.
+  expect(getTaskJobs("fn-1-foo.1")[0]?.state).toBe("working");
+});
+
 test("title change on a plan_ref job propagates to the embedded entry", () => {
   insertEvent({
     hook_event: "SessionStart",
@@ -984,7 +1011,7 @@ test("syncPlanLinks: single-session single-window one creator emits creator edge
       kind: "creator",
       job_id: "sess-creator",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1028,7 +1055,7 @@ test("syncPlanLinks: single-session create-then-refine same epic emits ONE creat
       kind: "creator",
       job_id: "sess-cr",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1094,7 +1121,7 @@ test("syncPlanLinks: two sessions touching the same epic both appear in job_link
       kind: "creator",
       job_id: "sess-a-fan",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1106,7 +1133,7 @@ test("syncPlanLinks: two sessions touching the same epic both appear in job_link
       kind: "refiner",
       job_id: "sess-b-fan",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1190,7 +1217,7 @@ test("syncPlanLinks: cross-session sweep re-derives a touched epic's job_links a
       kind: "refiner",
       job_id: "sess-A-xs",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1202,7 +1229,7 @@ test("syncPlanLinks: cross-session sweep re-derives a touched epic's job_links a
       kind: "refiner",
       job_id: "sess-B-xs",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1245,7 +1272,7 @@ test("syncPlanLinks: cross-session sweep re-derives a touched epic's job_links a
       kind: "creator",
       job_id: "sess-A-xs",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1257,7 +1284,7 @@ test("syncPlanLinks: cross-session sweep re-derives a touched epic's job_links a
       kind: "refiner",
       job_id: "sess-B-xs",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1285,7 +1312,7 @@ test("syncPlanLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out wor
       kind: "creator",
       job_id: "sess-carveout",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1317,7 +1344,7 @@ test("syncPlanLinks: EpicSnapshot ON CONFLICT preserves job_links (carve-out wor
       kind: "creator",
       job_id: "sess-carveout",
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1407,7 +1434,7 @@ test("fn-695: commit-only scaffold (scrape NULL) still mints a creator edge via 
       kind: "creator",
       job_id: TEST_UUID,
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1451,7 +1478,7 @@ test("fn-695: scrape + commit for the same (epic, kind, job) dedup to one creato
       kind: "creator",
       job_id: TEST_UUID,
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1502,7 +1529,7 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
       kind: "creator",
       job_id: TEST_UUID,
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1514,7 +1541,7 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
       kind: "refiner",
       job_id: TEST_UUID_2,
       title: null,
-      state: "stopped",
+      state: "working",
       last_api_error_at: null,
       last_api_error_kind: null,
       last_input_request_at: null,
@@ -1942,12 +1969,13 @@ test("syncPlanLinks: re-fold determinism (rewind + DELETE + drain reproduces byt
 // ---------------------------------------------------------------------------
 
 test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded state on every linked epic", () => {
-  // Seed: a plan creator edge → epic gets a job_links entry whose
-  // initial enriched state is "stopped" (the jobs row's default after
-  // SessionStart). A subsequent UserPromptSubmit flips state to
-  // "working" and the reverse fan-out must re-stamp the entry. The fold
-  // keeps `job_links.state` fresh for the board's `[creator]/[refiner]
-  // [working]` job-link line; no readiness predicate consumes it.
+  // Seed: a plan creator edge → epic gets a job_links entry. The plan tool
+  // events (opener + invocation) un-stop the row to "working", so a Stop is
+  // folded to drive it back to "stopped" for a genuine flip. A subsequent
+  // UserPromptSubmit flips state to "working" and the reverse fan-out must
+  // re-stamp the entry. The fold keeps `job_links.state` fresh for the board's
+  // `[creator]/[refiner] [working]` job-link line; no readiness predicate
+  // consumes it.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-flip" });
   planPlanOpener("sess-flip");
   planEvent({
@@ -1957,6 +1985,8 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
     epicId: "fn-12-flip",
     subjectPresent: true,
   });
+  // Stop drives the tool-event-working row back to "stopped".
+  insertEvent({ hook_event: "Stop", session_id: "sess-flip" });
   drainAll();
   expect(getJobLinks("fn-12-flip")).toEqual([
     {
@@ -2360,7 +2390,8 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
   drainAll();
   const after = getJobLinks("fn-15-carve");
   expect(after).toHaveLength(2);
-  // A: kind=creator preserved, state flipped to working.
+  // A: kind=creator preserved, state working (A un-stopped on its plan tool
+  // events and its UserPromptSubmit re-stamps the entry).
   expect(after[0]).toEqual({
     kind: "creator",
     job_id: "sess-A-carve",
@@ -2373,12 +2404,13 @@ test("syncJobLinksOnJobWrite: cross-session OLD-entry carve-out preserves other 
     last_permission_prompt_at: null,
     last_permission_prompt_kind: null,
   });
-  // B: untouched (state still default "stopped").
+  // B: untouched by A's jobs-write — survives verbatim as "working" (B
+  // un-stopped on its own plan tool events).
   expect(after[1]).toEqual({
     kind: "refiner",
     job_id: "sess-B-carve",
     title: null,
-    state: "stopped",
+    state: "working",
     last_api_error_at: null,
     last_api_error_kind: null,
     last_input_request_at: null,

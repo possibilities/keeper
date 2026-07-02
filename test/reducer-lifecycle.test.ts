@@ -6667,15 +6667,25 @@ test("SessionEnd moves state to ended", () => {
 
 test("no-op event types advance cursor without touching jobs", () => {
   insertEvent({ hook_event: "SessionStart" });
-  const ptId = insertEvent({ hook_event: "PreToolUse", tool_name: "Bash" });
-  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash" });
-  const lastId = insertEvent({ hook_event: "SubagentStop" });
+  // Agent-lifecycle events fold subagent_invocations, never jobs.state — a
+  // genuine jobs no-op. (Pre/PostToolUse are NOT used here: they now un-stop a
+  // 'stopped' row, so they would touch jobs — covered by the tool-event revival
+  // tests below.)
+  const startId = insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-noop",
+    agent_type: "Explore",
+  });
+  const lastId = insertEvent({
+    hook_event: "SubagentStop",
+    agent_id: "sub-noop",
+  });
   drainAll();
   // jobs row stays at the SessionStart projection — state untouched.
   expect(getJob()?.state).toBe("stopped");
   // cursor walked past every no-op row.
   expect(getCursor()).toBe(lastId);
-  expect(getCursor()).toBeGreaterThan(ptId);
+  expect(getCursor()).toBeGreaterThan(startId);
 });
 
 test("unknown forward-compat event type advances cursor, no jobs write", () => {
@@ -6790,6 +6800,162 @@ test("UserPromptSubmit with a killed task-notification on a terminal row stays t
 });
 
 // ---------------------------------------------------------------------------
+// fn-1056 — bare tool-event un-stop: a PLAIN-stopped row (both annotation pairs
+// NULL) folds back to 'working' on the next Pre/PostToolUse. A session that ended
+// a turn to wait on background tasks reads 'stopped' via the plain Stop fold; when
+// it resumes straight into tool events with no UserPromptSubmit, the two
+// annotation-gated un-stops never fire. The third bare arm treats any
+// current-session tool event as proof of liveness. The `state='stopped'` WHERE is
+// the resurrection guard — terminal rows are untouchable by construction.
+// ---------------------------------------------------------------------------
+
+test("fn-1056: a plain-stopped row (both annotations NULL) folds back to working on the next PreToolUse", () => {
+  // The red-first repro: SessionStart → UPS → Stop leaves a 'stopped' row with
+  // NO annotation pair set; a following PreToolUse must un-stop it to 'working'
+  // and stamp active_since to the tool-event ts (the stopped→working edge).
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 8000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(8000);
+});
+
+test("fn-1056: a plain-stopped row folds back to working on the next PostToolUse", () => {
+  // Post as well as Pre — both drive the bare un-stop.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({ hook_event: "Stop" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 8000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(8000);
+});
+
+test("fn-1056: an ended row is NEVER resurrected by a tool event (terminal guard)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  const activeSinceBefore = getJob()?.active_since ?? null;
+
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 8000 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 8001 });
+  drainAll();
+  const job = getJob();
+  // The `state='stopped'` WHERE can never match an 'ended' row.
+  expect(job?.state).toBe("ended");
+  expect(job?.active_since).toBe(activeSinceBefore);
+});
+
+test("fn-1056: a killed row is NEVER resurrected by a tool event (terminal guard)", () => {
+  // SessionStart seeds pid 4242 / start_time NULL (helper default), so the
+  // loose pid-only Killed match flips the row terminal.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ pid: 4242, start_time: null }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  const activeSinceBefore = getJob()?.active_since ?? null;
+
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 8000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("killed");
+  expect(job?.active_since).toBe(activeSinceBefore);
+});
+
+test("fn-1056: a WORKING row is untouched by a tool event (hot path cold — no active_since churn)", () => {
+  // The 50+/turn tool path must not re-stamp active_since on an already-working
+  // row: the `state='stopped'` WHERE no-ops, so active_since holds at the
+  // original rising edge and last_event_id does NOT advance on the bare arm.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  drainAll();
+  const before = getJob();
+  expect(before?.state).toBe("working");
+  expect(before?.active_since).toBe(5000);
+  const lastEventIdBefore = before?.last_event_id;
+
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 8000 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 8001 });
+  drainAll();
+  const after = getJob();
+  expect(after?.state).toBe("working");
+  expect(after?.active_since).toBe(5000);
+  // No annotation pair and already working → no arm fired → row untouched.
+  expect(after?.last_event_id).toBe(lastEventIdBefore);
+});
+
+test("fn-1056: an annotation-carrying stopped row still revives through the EXISTING arm (ordering)", () => {
+  // Composition: a stopped row with the api-error pair set un-stops + stamps
+  // active_since through the api-error clear arm (which runs BEFORE the bare
+  // arm); the bare arm then sees state already 'working' and no-ops. The pair
+  // is cleared exactly once and active_since is stamped exactly once.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "ApiError",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  drainAll();
+  const stopped = db
+    .query("SELECT state, last_api_error_at FROM jobs WHERE job_id = 'sess-a'")
+    .get() as { state: string; last_api_error_at: number | null };
+  expect(stopped.state).toBe("stopped");
+  expect(stopped.last_api_error_at).not.toBeNull();
+
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 8000 });
+  drainAll();
+  const resumed = db
+    .query(
+      "SELECT state, active_since, last_api_error_at, last_api_error_kind FROM jobs WHERE job_id = 'sess-a'",
+    )
+    .get() as {
+    state: string;
+    active_since: number | null;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+  };
+  expect(resumed.state).toBe("working");
+  expect(resumed.active_since).toBe(8000);
+  expect(resumed.last_api_error_at).toBeNull();
+  expect(resumed.last_api_error_kind).toBeNull();
+});
+
+test("fn-1056 re-fold determinism: a stopped→tool-event→working sequence re-folds byte-identical", () => {
+  // jobs is deterministic-replayed and the bare arm reads only event.ts + the
+  // pre-update state, never wall-clock — a from-scratch re-fold must reproduce
+  // the un-stopped row byte-for-byte.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 8000 });
+  drainAll();
+  const before = db.query("SELECT * FROM jobs WHERE job_id = 'sess-a'").get();
+  expect((before as { state: string }).state).toBe("working");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db.query("SELECT * FROM jobs WHERE job_id = 'sess-a'").get();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // fn-784 — `active_since`: the unified-timeline recency key, stamped on the
 // rising edge into `working` and held otherwise.
 // ---------------------------------------------------------------------------
@@ -6811,23 +6977,24 @@ test("active_since: a brand-new SessionStart-only job that never prompted is NUL
   expect(job?.active_since).toBeNull();
 });
 
-test("active_since: HELD across Stop→stopped and subagent/monitor churn (no re-stamp)", () => {
+test("active_since: HELD across Stop→stopped and subagent-lifecycle churn (no re-stamp)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
   // Stop drops the row to 'stopped' but carries no active_since clause.
   insertEvent({ hook_event: "Stop" });
-  // Sub-agent + monitor activity mid-life: none re-stamp active_since.
+  // Sub-agent lifecycle churn mid-life: SubagentStart/Stop fold
+  // subagent_invocations, never jobs.state, so the row stays 'stopped' and
+  // active_since is untouched. (A Pre/PostToolUse WOULD un-stop the row and
+  // re-stamp active_since to the tool-event ts — covered by the tool-event
+  // revival tests below.)
   insertEvent({
-    hook_event: "PreToolUse",
-    tool_name: "Task",
-    subagent_agent_id: "sub-1",
+    hook_event: "SubagentStart",
+    agent_id: "sub-1",
+    agent_type: "Explore",
   });
-  insertEvent({
-    hook_event: "PostToolUse",
-    tool_name: "Monitor",
-    background_task_id: "mon-1",
-  });
+  insertEvent({ hook_event: "SubagentStop", agent_id: "sub-1" });
   drainAll();
+  expect(getJob()?.state).toBe("stopped");
   expect(getJob()?.active_since).toBe(5000);
 });
 

@@ -8456,6 +8456,44 @@ function projectJobsRow(db: Database, event: Event): void {
       if (resPP.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
+      // Bare un-stop for a PLAIN-stopped row (both annotation pairs NULL). A
+      // session that ended a turn to wait on background tasks gets flipped to
+      // 'stopped' by the plain Stop fold; when it resumes straight into tool
+      // events (no UserPromptSubmit, so no UPS revival — the live repro: a Stop
+      // followed by a flood of Pre/PostToolUse), the two annotation-gated arms
+      // above never fire, and the row reads 'stopped' indefinitely while
+      // demonstrably working. This third arm treats ANY current-session tool
+      // event as proof of liveness and un-stops the row.
+      //
+      // Composes with the annotation-clearing arms by running LAST: an
+      // annotation-carrying stopped row already un-stopped + stamped active_since
+      // through the api-error / input-request arms, so state is 'working' here
+      // and the `state = 'stopped'` WHERE no-ops (no double-stamp). This arm owns
+      // only the both-NULL case they skip.
+      //
+      // The `state = 'stopped'` WHERE is the resurrection guard (same rationale
+      // as the annotation arms' literal-'stopped' CASE, :8398-8405): an
+      // 'ended'/'killed' row is untouchable by construction — a late async tool
+      // event on a genuinely-dead session can never resurrect a terminal row.
+      // The WHERE already pins state='stopped', so the SET is unconditional
+      // within it: active_since stamps to `event.ts` on the genuine
+      // stopped→working rising edge (the rising-edge discipline the sibling
+      // CASEs encode). Working rows never match, so the 50+/turn hot path stays
+      // cold. Tradeoff: a stray tool event after a real stop flips the row
+      // 'working' until the next Stop folds it back — acceptable by design for a
+      // 'stopped' (non-terminal) row. Pure over the event log — re-fold
+      // deterministic.
+      const resUnstop = db.run(
+        `UPDATE jobs SET state = 'working',
+                         active_since = ?,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND state = 'stopped'`,
+        [ts, event.id, ts, jobId],
+      );
+      if (resUnstop.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       break;
     }
 

@@ -42,16 +42,24 @@ last_input_request_kind)` (schema v25) marks a stoppage awaiting a human
 answer to a built-in interactive tool that fires no hook of its own
 (currently `ask_user_question`, future-extensible). Both pairs paired-NULL
 together: stamped on the matching reducer fold, cleared on the next
-`UserPromptSubmit` / `SessionStart` revival. They ALSO clear on the next
-`PreToolUse` / `PostToolUse` tool event — a tool after a stop proves the
-session resumed (the CLI internally retried the transient API error, or the
-human answered the in-tool question), so the same fold that NULLs the pair
-also un-stops the row back to `working` (`state` and `active_since` both gated
-on the literal `state = 'stopped'`, so it never resurrects an `ended`/`killed`
-row and never churns `active_since` when the subagent-suppressed api-error case
-left state at `working`). Each clear is gated on its own
-column-is-not-NULL hot-path predicate, keeping the UPDATE cold on the 50+/turn
-tool path. The `killed` state is the sibling terminal state to
+`UserPromptSubmit` / `SessionStart` revival. This is the canonical un-stop
+contract (cross-referenced elsewhere): a `stopped` row folds back to `working`
+on EITHER a `UserPromptSubmit` (a fresh prompt, or a non-`killed`
+task-notification — the `killed` shutdown variant is suppressed) OR any
+`PreToolUse` / `PostToolUse` tool event, which is proof of liveness (the CLI
+internally retried the transient API error, the human answered the in-tool
+question, or the session simply resumed its turn into more tools with no
+intervening prompt). The tool-event fold carries THREE
+`state = 'stopped'`-gated un-stop arms — so none can resurrect an
+`ended`/`killed` row: (1) the api-error pair clear and (2) the input-request
+pair clear, each of which NULLs its pair AND un-stops in one write, plus (3) a
+bare un-stop for a PLAIN-stopped row (both pairs already NULL) that would
+otherwise read `stopped` indefinitely while streaming tool events. `active_since`
+re-stamps only on the genuine `stopped → working` rising edge (never churned when
+the subagent-suppressed api-error case left state at `working`). Each arm rides
+its own hot-path predicate — `column IS NOT NULL` for the pair clears,
+`state = 'stopped'` for the bare arm — keeping the UPDATE cold on the 50+/turn
+tool path for working rows. The `killed` state is the sibling terminal state to
 `ended`: reached not from a SessionEnd hook but from synthetic `Killed` events
 from three producers — the boot seed sweep, the exit-watcher's kernel arm, and
 the exit-watcher's periodic dead-pid re-probe (the slow backstop for a kernel
@@ -3050,11 +3058,10 @@ row changes
 `(title, state, last_api_error_at, last_api_error_kind,
 last_input_request_at, last_input_request_kind)`, keeping the
 projection in lockstep with the session's last-known lifecycle. The
-two stoppage pairs follow the single canonical clearing contract above
-(stamp on `ApiError` / `InputRequest`; clear + un-stop to `working` on
-the next `UserPromptSubmit` / `SessionStart` revival OR `PreToolUse` /
-`PostToolUse` tool event, each gated on its column-is-not-NULL hot-path
-predicate so the 50+/turn tool path stays cold). Each epic also embeds its plan/close-verb (epic-form)
+two stoppage pairs follow the single canonical un-stop contract stated in the
+intro (the `UserPromptSubmit` / `SessionStart` revival plus the three
+`state = 'stopped'`-gated tool-event arms), so a `state` re-stamp fans through
+here identically whether it came from a prompt or a bare tool event. Each epic also embeds its plan/close-verb (epic-form)
 jobs as a `jobs` JSON array, and each task element embeds its own
 work-verb (task-form) jobs as a nested `jobs` sub-array — fanned in
 from the reducer's jobs-side writes whenever a SessionStart spawn name
@@ -4087,7 +4094,7 @@ list — lives in [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a plan-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped on ApiError / InputRequest folds; both clear on the next UPS/SessionStart revival OR PreToolUse/PostToolUse tool event (gated on column-is-not-NULL), and that tool-event clear also un-stops a stopped row back to working):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a plan-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped on ApiError / InputRequest folds; both clear on the next UPS/SessionStart revival OR PreToolUse/PostToolUse tool event (gated on column-is-not-NULL); per the canonical un-stop contract (see intro), ANY PreToolUse/PostToolUse also un-stops a stopped row back to working — including a plain-stopped row with both pairs already NULL, via a third state='stopped'-gated arm):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, active_since, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
