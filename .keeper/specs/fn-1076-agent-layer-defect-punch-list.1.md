@@ -44,5 +44,5 @@ grep-verifiable: ref_invalid, claude-sonnet-4-6, "Opus 4.7" all zero; plan suite
 - [ ] Comment misattribution fixed; renders regenerated
 
 ## Done summary
-
+Swept plan-plugin skills/agents/hook: collapsed the three scaffold error-code lists to the real emitter set (killed phantom ref_invalid), dropped the phantom {dep_id,status,reason} field to {dep_id,status}, de-pinned scout model to opus, de-hardcoded the panel model pair to config-driven wording, and fixed the subagent-stop-guard nudge attribution.
 ## Evidence
