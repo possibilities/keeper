@@ -181,7 +181,7 @@ The work guard verifies live task state with a read-only `keeper plan reconcile`
 keeper plan --agent-help
 ```
 
-To orient on the board, reach for the keeper-native surfaces rather than hand-parsing plan verbs: `keeper status` for the board at a glance, and `keeper query epics --json | jq '.data[]'` for per-task detail (tier/model/title/deps). Every `keeper plan` read still emits one clean JSON value, but the orient surfaces are purpose-built for it.
+To orient on the board, reach for the keeper-native surfaces rather than hand-parsing plan verbs: `keeper status` for the board at a glance, and `keeper query tasks` for per-task detail (tier/model/title/deps + the live readiness verdict). Every `keeper plan` read still emits one clean JSON value, but the orient surfaces are purpose-built for it.
 
 ## License and Attribution
 

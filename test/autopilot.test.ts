@@ -24,10 +24,12 @@
  *       viewer symbols.
  */
 
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
+  AUTOPILOT_SHOW_SCHEMA_VERSION,
   assertNoMidEpicDispatch,
   autopilotBannerLabel,
+  buildAutopilotShowEnvelope,
   buildCurrentRows,
   buildRetryFrame,
   buildSetArmedFrame,
@@ -42,9 +44,11 @@ import {
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
   projectWorktreeMode,
+  projectWorktreeMultiRepo,
   projectWorktreeStatusRows,
   renderBody,
   renderDependencyGraph,
+  runAutopilotShow,
 } from "../cli/autopilot";
 import { computeReadiness } from "../src/readiness";
 import type {
@@ -170,6 +174,7 @@ function buildSnap(
     maxConcurrentJobs: null,
     maxConcurrentPerRoot: 1,
     worktreeMode: false,
+    worktreeMultiRepo: false,
     readiness,
   };
 }
@@ -1317,4 +1322,120 @@ test("renderDependencyGraph — skips epics with no tasks, omits the dep clause 
   const empty = makeEpic({ epic_id: "fn-3-baz", epic_number: 3, tasks: [] });
   const lines = renderDependencyGraph(buildSnap([epic, empty]));
   expect(lines).toEqual(["fn-2-bar", "  ○ .1"]);
+});
+
+// ---------------------------------------------------------------------------
+// projectWorktreeMultiRepo — the durable multi-repo rollout flag coercion.
+// ---------------------------------------------------------------------------
+
+describe("projectWorktreeMultiRepo", () => {
+  test("empty rows → null (leave the seed untouched)", () => {
+    expect(projectWorktreeMultiRepo([])).toBeNull();
+  });
+  test("only a stored 1 is ON; 0 / NULL / non-1 are OFF", () => {
+    expect(projectWorktreeMultiRepo([{ worktree_multi_repo: 1 }])).toBe(true);
+    expect(projectWorktreeMultiRepo([{ worktree_multi_repo: 0 }])).toBe(false);
+    expect(projectWorktreeMultiRepo([{ worktree_multi_repo: null }])).toBe(
+      false,
+    );
+    expect(projectWorktreeMultiRepo([{}])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// keeper autopilot show — durable config as ONE envelope-shaped read.
+// ---------------------------------------------------------------------------
+
+describe("buildAutopilotShowEnvelope", () => {
+  test("round-trips every durable knob incl. worktree_multi_repo", () => {
+    const env = buildAutopilotShowEnvelope(
+      [
+        {
+          paused: 1,
+          mode: "armed",
+          worktree_mode: 1,
+          worktree_multi_repo: 1,
+          max_concurrent_jobs: 5,
+          max_concurrent_per_root: 3,
+        },
+      ],
+      [{ epic_id: "fn-2-b" }, { epic_id: "fn-1-a" }],
+    );
+    expect(env.schema_version).toBe(AUTOPILOT_SHOW_SCHEMA_VERSION);
+    expect(env.ok).toBe(true);
+    expect(env.error).toBeNull();
+    expect(env.data).toEqual({
+      paused: true,
+      mode: "armed",
+      worktree_mode: true,
+      worktree_multi_repo: true,
+      armed: ["fn-1-a", "fn-2-b"],
+      max_concurrent_jobs: 5,
+      max_concurrent_per_root: 3,
+    });
+  });
+
+  test("a never-configured board defaults to the boot-safe singleton", () => {
+    const env = buildAutopilotShowEnvelope([], []);
+    expect(env.ok).toBe(true);
+    expect(env.data).toEqual({
+      paused: true,
+      mode: "yolo",
+      worktree_mode: false,
+      worktree_multi_repo: false,
+      armed: [],
+      max_concurrent_jobs: null,
+      max_concurrent_per_root: 1,
+    });
+  });
+});
+
+describe("runAutopilotShow", () => {
+  test("success prints the config envelope and exits 0", async () => {
+    const out: string[] = [];
+    let code: number | null = null;
+    class ExitError extends Error {}
+    await runAutopilotShow("/tmp/s", {
+      writeStdout: (s) => out.push(s),
+      exit: (c: number): never => {
+        code = c;
+        throw new ExitError();
+      },
+      query: (_sock, collection) =>
+        Promise.resolve(
+          collection === "autopilot_state"
+            ? [{ paused: 0, mode: "yolo", worktree_multi_repo: 0 }]
+            : [],
+        ),
+    }).catch((e) => {
+      if (!(e instanceof ExitError)) throw e;
+    });
+    expect(code as number | null).toBe(0);
+    const env = JSON.parse(out.join(""));
+    expect(env.ok).toBe(true);
+    expect(env.data.paused).toBe(false);
+    expect(env.data.worktree_multi_repo).toBe(false);
+  });
+
+  test("a query throw lands an ok:false envelope on stdout, exit 1", async () => {
+    const out: string[] = [];
+    let code: number | null = null;
+    class ExitError extends Error {}
+    await runAutopilotShow("/tmp/s", {
+      writeStdout: (s) => out.push(s),
+      exit: (c: number): never => {
+        code = c;
+        throw new ExitError();
+      },
+      query: () => Promise.reject(new Error("unreachable: down")),
+    }).catch((e) => {
+      if (!(e instanceof ExitError)) throw e;
+    });
+    expect(code as number | null).toBe(1);
+    const env = JSON.parse(out.join(""));
+    expect(env.ok).toBe(false);
+    expect(env.data).toBeNull();
+    expect(env.error.code).toBe("autopilot_show_failed");
+    expect(env.error.recovery.length).toBeGreaterThan(0);
+  });
 });
