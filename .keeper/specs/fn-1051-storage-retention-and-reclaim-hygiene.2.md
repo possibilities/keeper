@@ -40,5 +40,5 @@ Sandbox KEEPER_DEAD_LETTER_DIR via sandboxEnv. Cover: fully-recovered aged seale
 - [ ] README dead-letter retention prose consolidated; full fast suite green
 
 ## Done summary
-
+Added pruneRecoveredDeadLetters to the main-thread retention pass: resurrection-safe file-coupled prune (unlink-first, DB-derived prunability, sealed-pid gate) of fully-recovered aged dead-letter files, plus row-only prune of source_file-NULL recovered rows and aged poison rows (events-log files never unlinked); waiting rows stay sacred. README dead-letter prose consolidated.
 ## Evidence

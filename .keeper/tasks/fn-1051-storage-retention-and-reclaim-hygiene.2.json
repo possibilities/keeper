@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Recovered dead-letter retention pass",
-  "updated_at": "2026-07-02T00:51:20.005000Z"
+  "updated_at": "2026-07-02T01:42:44.581000Z",
+  "worker_done_at": "2026-07-02T01:42:44.581000Z"
 }
