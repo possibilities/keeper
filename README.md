@@ -66,12 +66,13 @@ path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`);
 owned by you and mode `644` or macOS silently ignores it. Optional roots and runtimes live in
 `~/.config/keeper/config.yaml`.
 
-Two manual steps have no code home:
+`keeper agent` loads keeper's two plugins (`plugins/keeper`, `plugins/plan`) from
+`~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine and leaves untouched when
+a file or symlink is already there. Do NOT add a `~/.claude/plugins/keeper` symlink — it double-registers
+the hook (two `events` rows per invocation).
 
-- **Load the plugins.** Point your Claude Code launcher's `plugin_scan_dirs` at `~/code/keeper/plugins`
-  (one `--plugin-dir` per manifest-bearing child — `plugins/keeper` and `plugins/plan`). There is NO
-  symlink step: a `~/.claude/plugins/keeper` symlink double-registers the hook (two `events` rows per
-  invocation).
+One manual step has no code home:
+
 - **Sitter scanners (optional).** The read-only sitter set lives in its own repo at `~/code/sitter`;
   install and uninstall it per that repo's `README.md`.
 
@@ -83,7 +84,7 @@ rm ~/Library/LaunchAgents/arthack.keeperd.plist
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 rm ~/.config/tmux/conf.d/zz-keeper-guard.conf
-# Remove the plugin_scan_dirs entry pointing at ~/code/keeper/plugins from your claude launcher.
+rm ~/.config/keeper/plugins.yaml   # the shipped keeper-agent plugin sources
 # Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```

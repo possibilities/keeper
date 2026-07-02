@@ -43,6 +43,15 @@ else
   ( cd "${repo_root}" && bun link )
 fi
 
+# 2b. Default launcher plugin config. `keeper agent` fail-loud-requires
+#     ~/.config/keeper/plugins.yaml; ship keeper's own default (keeper's two
+#     plugins, no arthack scan dirs) when the file is absent so a fresh machine
+#     launches without arthack's stow package. The write decision + never-clobber
+#     gate live in src/agent/config.ts (an existing file OR symlink — even a
+#     dangling one — is left byte-untouched); this is a thin caller.
+echo "install: ensure default plugins.yaml"
+( cd "${repo_root}" && bun run scripts/ensure-plugin-config.ts )
+
 # 3. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it
