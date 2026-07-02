@@ -12,8 +12,8 @@ description: >-
   (that is `keeper:dispatch`); "prioritize this" / "do this next" alone never
   triggers this skill (plan state carries no board-priority knob — only an
   explicit autopilot/armed reference does); NOT for planning (`/plan:plan`).
-allowed-tools: Bash Monitor
-argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | worktree <on|off> | retry <verb::id> | show
+allowed-tools: Bash
+argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | worktree <on|off> | config <key> <val> | retry <verb::id> | show
 ---
 
 # autopilot
@@ -68,6 +68,7 @@ flags." Every control op below is a bare one-shot Bash call:
 | Disarm an epic | "disarm fn-X", "stop arming fn-X" | `keeper autopilot disarm fn-N-slug` |
 | Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
 | Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
+| Multi-repo worktree grouping | "cluster a multi-repo epic into per-repo lanes", "multi-repo worktree mode" — durable rollout flag, default OFF, only meaningful with worktree mode on | `keeper autopilot config worktree_multi_repo <on\|off>` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
 | Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper status --json \| jq .data.autopilot` (read) |
@@ -99,7 +100,10 @@ snapshot dance, no reconnect loop. `data.autopilot` IS the global singleton:
 ```
 
 Read those six fields to answer "what's it doing" and to capture before a
-take-over. The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
+take-over. `worktree_multi_repo` is a durable config field you can SET (see the
+parse table) but it is NOT surfaced in `data.autopilot` today — so you cannot
+read back its current value here; set it deliberately rather than capturing it.
+The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
 (pending + running launches), and `data.needs_human` (dead-letters, escalations,
 stuck dispatches) cover what it's CURRENTLY doing — so one read covers both the
 config and the activity. Exit 0 on any board state; exit 1 only on
@@ -182,8 +186,7 @@ you the wheel:
 For "pause and do something manually at a point WHILE work runs," combine a
 take-over with an armed `keeper:await`: capture state, make your change, arm
 `keeper:await` for the board/condition that should end the window, and restore
-on its `met`. See `keeper:await` for wiring the Monitor. The `Monitor` tool is
-allowed here ONLY for that cross-ref — a bare control op never needs it.
+on its `met`. See `keeper:await` for wiring the Monitor.
 
 ## Examples
 
