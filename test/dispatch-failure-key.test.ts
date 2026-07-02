@@ -13,10 +13,13 @@ import {
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
   isMergeEscalationReason,
+  isSlotOccupancyReason,
   isWorktreeRecoverReason,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   routeDispatchFailure,
+  SLOT_OCCUPIED_REASON_PREFIX,
+  SLOT_RECLAIMED_REASON_PREFIX,
   WORKTREE_CLOSE_KEY_PREFIXES,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_NON_FF_REASON,
@@ -134,6 +137,23 @@ const CATALOG: DispatchFailureIdentity[] = [
   // Work-task rows.
   row("work", "fn-1-foo.2", "job-rejected: not eligible"),
   row("work", "fn-2-bar.1", "cwd-missing: /gone"),
+  // Slot-occupancy rows on the NATURAL key (close epic id / work task id) — verb
+  // distinguishes the board target; the reason (not the key/router) scopes the clear.
+  row(
+    "close",
+    EPIC,
+    "slot-reclaimed: reaped dead close session (pane %7 zsh, stopped 300s)",
+  ),
+  row(
+    "close",
+    EPIC,
+    "slot-occupied: stopped close session holds the slot (pane %7 claude)",
+  ),
+  row(
+    "work",
+    "fn-1-foo.2",
+    "slot-reclaimed: reaped dead work session (pane %3 bash, stopped 240s)",
+  ),
   // Unknown verbs preserve raw strings.
   row("open", "whatever", "some-reason: x"),
 ];
@@ -306,6 +326,31 @@ describe("preserved predicate helpers", () => {
     expect(isMergeEscalationReason("")).toBe(false);
   });
 
+  test("isSlotOccupancyReason matches both slot prefixes and nothing else", () => {
+    expect(
+      isSlotOccupancyReason("slot-reclaimed: reaped dead close session"),
+    ).toBe(true);
+    expect(
+      isSlotOccupancyReason("slot-occupied: stopped work session holds it"),
+    ).toBe(true);
+    // Not a slot reason: worktree families, bare close reasons, empty.
+    expect(isSlotOccupancyReason("worktree-recover-conflict: x")).toBe(false);
+    expect(isSlotOccupancyReason("worktree-finalize-non-fast-forward: x")).toBe(
+      false,
+    );
+    expect(isSlotOccupancyReason("cwd-missing: /gone")).toBe(false);
+    expect(isSlotOccupancyReason("")).toBe(false);
+    // The two prefixes are collision-free — neither is a prefix of the other.
+    expect(
+      SLOT_RECLAIMED_REASON_PREFIX.startsWith(SLOT_OCCUPIED_REASON_PREFIX),
+    ).toBe(false);
+    expect(
+      SLOT_OCCUPIED_REASON_PREFIX.startsWith(SLOT_RECLAIMED_REASON_PREFIX),
+    ).toBe(false);
+    expect(SLOT_RECLAIMED_REASON_PREFIX).toBe("slot-reclaimed");
+    expect(SLOT_OCCUPIED_REASON_PREFIX).toBe("slot-occupied");
+  });
+
   test("leadingReasonToken: text before the first colon, trimmed; '' without a colon", () => {
     expect(leadingReasonToken("worktree-merge-conflict: x")).toBe(
       "worktree-merge-conflict",
@@ -345,6 +390,8 @@ describe("single vocabulary source", () => {
       ["worktree-recover-conflict", "merge-conflict"],
       ["worktree-recover-dirty-checkout", "dirty-tree"],
       ["worktree-merge-conflict", "merge-conflict"],
+      ["slot-reclaimed", "slot-reclaimed"],
+      ["slot-occupied", "slot-occupied"],
     ]);
   });
 });

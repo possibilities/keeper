@@ -166,7 +166,7 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{window_name}",
+    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}",
   ]);
 });
 
@@ -279,12 +279,12 @@ test("createTmuxPaneOps.focusPane: ENOENT throw → { ok: false }, never throws 
 // createTmuxPaneOps.listPanes — server-wide sweep, tab-safe parse, null degrade
 // ---------------------------------------------------------------------------
 
-test("createTmuxPaneOps.listPanes: parses (paneId, windowId, windowName) from one -a sweep", async () => {
+test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, windowName) from one -a sweep", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        stdout: "%1\t@1\twork::fn-1-x.2\n%2\t@2\tplain shell\n",
+        stdout: "%1\t@1\tclaude\twork::fn-1-x.2\n%2\t@2\tzsh\tplain shell\n",
         exitCode: 0,
       },
     },
@@ -294,18 +294,30 @@ test("createTmuxPaneOps.listPanes: parses (paneId, windowId, windowName) from on
   const got = await ops.listPanes();
   expect(calls[0]).toEqual(buildTmuxListPanesArgs());
   expect(got).toEqual([
-    { paneId: "%1", windowId: "@1", windowName: "work::fn-1-x.2" },
-    { paneId: "%2", windowId: "@2", windowName: "plain shell" },
+    {
+      paneId: "%1",
+      windowId: "@1",
+      currentCommand: "claude",
+      windowName: "work::fn-1-x.2",
+    },
+    {
+      paneId: "%2",
+      windowId: "@2",
+      currentCommand: "zsh",
+      windowName: "plain shell",
+    },
   ]);
 });
 
-test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowName (2-split limit)", async () => {
+test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowName (final split)", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // window name itself contains a tab, a colon, and unicode.
-        stdout: "%7\t@7\tweird:\tname é\n",
+        // window name itself contains a tab, a colon, and unicode; the three
+        // leading fixed fields (pane/window/command) are taken off the first
+        // three tabs, so a name-internal tab never bleeds into them.
+        stdout: "%7\t@7\tzsh\tweird:\tname é\n",
         exitCode: 0,
       },
     },
@@ -314,18 +326,23 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
   const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
   const got = await ops.listPanes();
   expect(got).toEqual([
-    { paneId: "%7", windowId: "@7", windowName: "weird:\tname é" },
+    {
+      paneId: "%7",
+      windowId: "@7",
+      currentCommand: "zsh",
+      windowName: "weird:\tname é",
+    },
   ]);
 });
 
-test("createTmuxPaneOps.listPanes: drops malformed lines (missing tabs / empty ids), keeps the rest", async () => {
+test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty ids), keeps the rest", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // line 1 has no tab; line 2 has one tab only; line 3 has empty pane id;
-        // line 4 is well-formed (and a name may be empty — that is valid).
-        stdout: "garbage\n%2\tonlyone\n\t@3\tname\n%4\t@4\t\n",
+        // line 1 has no tab; line 2 has one tab only; line 3 is 3-tab but has an
+        // empty pane id; line 4 is well-formed (and a name may be empty — valid).
+        stdout: "garbage\n%2\tonlyone\n\t@3\tsh\tname\n%4\t@4\tsh\t\n",
         exitCode: 0,
       },
     },
@@ -333,7 +350,9 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (missing tabs / empty i
   );
   const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
   const got = await ops.listPanes();
-  expect(got).toEqual([{ paneId: "%4", windowId: "@4", windowName: "" }]);
+  expect(got).toEqual([
+    { paneId: "%4", windowId: "@4", currentCommand: "sh", windowName: "" },
+  ]);
 });
 
 test("createTmuxPaneOps.listPanes: non-zero exit (no server) → null", async () => {

@@ -218,8 +218,11 @@ on its `met`. See `keeper:await` for wiring the Monitor.
    worktree_mode, …}`; the same envelope's `data.in_flight` / `data.needs_human`
    cover in-flight launches and anything needing an operator. For a faster
    per-row jam read, `.data.board.epics[].tasks[].dispatch_failure` and
-   `.data.board.epics[].close.dispatch_failure` name the sticky block KIND
-   (multi-repo / merge-conflict / dirty-tree / non-ff) on the exact wedged row.
+   `.data.board.epics[].close.dispatch_failure` name the block KIND on the exact
+   wedged row: the operator-action jams (multi-repo / merge-conflict / dirty-tree /
+   non-ff, cleared by `retry`), plus the self-clearing occupancy signals
+   `slot-occupied` (a stopped session holds the slot — visibility only) and
+   `slot-reclaimed` (a provably-dead session's pane was auto-killed to free it).
 2. Report paused/playing, mode, armed epics, and any in-flight or stuck
    dispatches.
 

@@ -71,6 +71,27 @@ export const WORKTREE_CLOSE_KEY_PREFIXES = [
   WORKTREE_RECOVER_KEY_PREFIX,
 ] as const;
 
+/**
+ * The `reason` prefix the reconciler mints when it AUTO-RECLAIMS a slot held by a
+ * provably-dead stopped session — one whose pane's foreground command is the bare
+ * `exec $SHELL -l -i` tail AND whose grace age elapsed. It kills the dead pane and
+ * mints this visible `DispatchFailed` on the wedged key `(verb, id)`, level-cleared
+ * the cycle the occupant is gone. Verb-NEUTRAL: the row's `verb` (`work`/`close`)
+ * carries the board target, so one prefix covers a reaped worker or closer alike.
+ * The row lands on the NATURAL key, so the auto-clear is scoped by reason (never a
+ * genuine `close::<epic>` conflict) — {@link isSlotOccupancyReason}.
+ */
+export const SLOT_RECLAIMED_REASON_PREFIX = "slot-reclaimed";
+
+/**
+ * The `reason` prefix the reconciler mints when a stopped-but-LIVE session holds a
+ * slot it cannot PROVE dead — a possibly-resumable pane whose foreground is still
+ * `claude`, or a bare shell still inside the grace window. Visibility ONLY, never a
+ * kill ("when in doubt, surface, do not reclaim"). Level-cleared the cycle the
+ * stopped-live occupant is gone (its pane died or it resumed to `working`).
+ */
+export const SLOT_OCCUPIED_REASON_PREFIX = "slot-occupied";
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -78,7 +99,9 @@ export type DispatchFailureDisplayKind =
   | "multi-repo"
   | "non-ff"
   | "merge-conflict"
-  | "dirty-tree";
+  | "dirty-tree"
+  | "slot-reclaimed"
+  | "slot-occupied";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -98,6 +121,8 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: "worktree-recover-conflict", kind: "merge-conflict" },
   { prefix: "worktree-recover-dirty-checkout", kind: "dirty-tree" },
   { prefix: MERGE_ESCALATION_REASON_TOKEN, kind: "merge-conflict" },
+  { prefix: SLOT_RECLAIMED_REASON_PREFIX, kind: "slot-reclaimed" },
+  { prefix: SLOT_OCCUPIED_REASON_PREFIX, kind: "slot-occupied" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────
@@ -193,6 +218,22 @@ export function routeDispatchFailure(
  */
 export function isWorktreeRecoverReason(reason: string): boolean {
   return reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX);
+}
+
+/**
+ * Whether a `dispatch_failures.reason` is a slot-occupancy signal — a reclaimed
+ * dead slot ({@link SLOT_RECLAIMED_REASON_PREFIX}) OR an occupied-but-not-killed
+ * one ({@link SLOT_OCCUPIED_REASON_PREFIX}). The prefix gate that scopes the
+ * reconciler's level-triggered slot auto-clear to slot rows ONLY, so a genuine
+ * `close::<epic>` conflict sharing the natural key is NEVER auto-dismissed — the
+ * same reason-scope discipline {@link isWorktreeRecoverReason} enforces for
+ * recover. Pure; NEVER throws.
+ */
+export function isSlotOccupancyReason(reason: string): boolean {
+  return (
+    reason.startsWith(SLOT_RECLAIMED_REASON_PREFIX) ||
+    reason.startsWith(SLOT_OCCUPIED_REASON_PREFIX)
+  );
 }
 
 /**

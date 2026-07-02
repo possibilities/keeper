@@ -84,6 +84,7 @@ import {
 } from "./db";
 import {
   assertNever,
+  isSlotOccupancyReason,
   routeDispatchFailure,
   WORKTREE_FINALIZE_ID_PREFIX,
 } from "./dispatch-failure-key";
@@ -173,6 +174,7 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
+  isSlotOccupancyReason,
   isWorktreeRecoverReason,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
@@ -184,6 +186,9 @@ export type {
   ReconcileDecision,
   ReconcileSnapshot,
   ReconcileState,
+  SlotOccupancyDecision,
+  SlotOccupancyInput,
+  SlotOccupancySignal,
   Verb,
   WorktreeLaunchInfo,
   WorktreeRecoveryFailure,
@@ -200,8 +205,10 @@ export {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   closerJobFinished,
+  computeSlotOccupancy,
   dispatchKey,
   FINALIZER_GUARD_S,
+  isBareShellCommand,
   isEpicInFlight,
   isFinalizerGuarded,
   isFinalizerVerb,
@@ -212,6 +219,7 @@ export {
   REDISPATCH_COOLDOWN_S,
   reconcile,
   recoverFailureDispatchId,
+  SLOT_RECLAIM_GRACE_SEC,
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -613,6 +621,15 @@ export interface ConfirmRunningDeps {
    * underlying git is resolved, so no operator `retry_dispatch` is needed.
    */
   emitDispatchCleared(payload: DispatchClearedPayload): void;
+  /**
+   * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
+   * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
+   * effect the slot-occupancy reclaim takes, gated behind the strict
+   * bare-shell-past-grace criterion in the pure decision. Optional — a partial
+   * test deps stays visibility-only. NEVER throws (killWindow degrades to a logged
+   * `{ ok: false }` on a TOCTOU window-already-gone, itself the desired end state).
+   */
+  reclaimSlotPane?(paneId: string): Promise<void>;
   /**
    * Emit the FULL current worktree-disabled set to main (fn-1013) for the
    * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
@@ -1938,6 +1955,35 @@ export async function runReconcileCycle(
   const probeShadow =
     deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe;
   let shadowManifest: string | null | undefined;
+  // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
+  // Surface every wedged slot (a stopped-but-live session blocking a wanted mint)
+  // as a visible `DispatchFailed` through the change-gate, and KILL the pane of a
+  // provably-dead occupant (`reclaimPaneId`) to free its slot. The kill re-issues
+  // every cycle the condition persists (until the pane is gone) INDEPENDENT of the
+  // gate's emit-suppression, so a first-cycle TOCTOU miss self-heals. Clears fire
+  // symmetrically off the pure decision. All reason-scoped upstream, so a genuine
+  // `close::<epic>` conflict on the shared key is never touched.
+  for (const sig of decision.slotOccupancy) {
+    if (signal.aborted) {
+      return;
+    }
+    deps.emitDispatchFailed({
+      verb: sig.verb,
+      id: sig.id,
+      reason: sig.reason,
+      dir: sig.dir,
+      ts: deps.now(),
+    });
+    if (sig.reclaimPaneId !== null) {
+      await deps.reclaimSlotPane?.(sig.reclaimPaneId);
+    }
+  }
+  for (const clr of decision.slotOccupancyClears) {
+    if (signal.aborted) {
+      return;
+    }
+    deps.emitDispatchCleared({ verb: clr.verb, id: clr.id });
+  }
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
@@ -3706,11 +3752,25 @@ export async function loadReconcileSnapshot(
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
   const finalizeFailureIds = new Set<string>();
+  const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
       failedKeys.add(dispatchKey(verb as Verb, id));
+      const reason = (row as { reason?: unknown }).reason;
+      const reasonStr = typeof reason === "string" ? reason : "";
+      // Slot-occupancy rows (`slot-reclaimed` / `slot-occupied`, on the NATURAL key)
+      // feed the slot pass's level-clear. Collected off the REASON — verb-agnostic
+      // (a `work` OR `close` slot row) — because the typed router short-circuits a
+      // `work` row to `work-task`; the reason scope is the clobber guard that keeps a
+      // genuine `close::<epic>` conflict sharing the key out of the clear set.
+      if (
+        (verb === "work" || verb === "close") &&
+        isSlotOccupancyReason(reasonStr)
+      ) {
+        slotOccupancyFailures.push({ verb, id });
+      }
       // Route each row through the typed classifier for its auto-clear scope. A
       // `worktree-recover` row (reason marker — a non-recover close sharing the key
       // is excluded, the clobber guard) is eligible for the recover glue's clear; a
@@ -3718,11 +3778,10 @@ export async function loadReconcileSnapshot(
       // `worktree-merge-conflict` kept on `close::<epic>` for the merge-escalation
       // sweep is excluded) is eligible for the finalize driver's clear. The two
       // scopes stay DISJOINT.
-      const reason = (row as { reason?: unknown }).reason;
       const route = routeDispatchFailure({
         verb,
         id,
-        reason: typeof reason === "string" ? reason : "",
+        reason: reasonStr,
         dir: "",
       });
       switch (route.kind) {
@@ -3829,11 +3888,19 @@ export async function loadReconcileSnapshot(
   // null fallback keeps every stopped row occupying, so an un-probeable cycle
   // can only over-suppress, never double-dispatch.
   let livePaneIds: ReadonlySet<string> | null = null;
+  // Live pane id → foreground command, from the SAME sweep — the slot-occupancy gate
+  // reads it to tell a live/parked `claude` from the dead `exec $SHELL -l -i` tail.
+  // Null in lockstep with `livePaneIds` (degraded/absent probe), so the slot gate
+  // stays inert on an un-probeable cycle.
+  let paneCommandById: ReadonlyMap<string, string> | null = null;
   if (listPanes !== undefined) {
     try {
       const panes = await listPanes();
       if (panes !== null) {
         livePaneIds = new Set(panes.map((pane) => pane.paneId));
+        paneCommandById = new Map(
+          panes.map((pane) => [pane.paneId, pane.currentCommand]),
+        );
       }
     } catch (err) {
       console.error(
@@ -3941,8 +4008,10 @@ export async function loadReconcileSnapshot(
     failedKeys,
     recoverFailureIds,
     finalizeFailureIds,
+    slotOccupancyFailures,
     liveTabKeys,
     livePaneIds,
+    paneCommandById,
     pendingDispatches,
     mode,
     armedIds,
@@ -4204,6 +4273,16 @@ function main(): void {
         kind: "dispatch-cleared",
         payload,
       } satisfies DispatchClearedMessage);
+    },
+    reclaimSlotPane: async (paneId) => {
+      // Kill the dead session's window to free its slot. Fire-and-log: killWindow
+      // never throws, and a nonzero exit is the benign TOCTOU (the window already
+      // died — the outcome we wanted). The visible `slot-reclaimed` failure carries
+      // the operator signal regardless.
+      const res = await paneOps.killWindow(paneId);
+      if (!res.ok && res.error) {
+        noteLine(`[autopilot-worker] slot reclaim kill-window: ${res.error}`);
+      }
     },
     // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
     // changes, so a stable board mints zero `WorktreeRepoStatus` events. The

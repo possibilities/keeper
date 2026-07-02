@@ -28,7 +28,11 @@ import { workerAgentFor } from "../plugins/plan/src/models.ts";
 import { workerCellDir } from "../plugins/plan/src/subagents_config.ts";
 import { computeEligibleEpics } from "./armed-closure";
 import { defaultPlanPrompt } from "./dispatch-command";
-import { WORKTREE_RECOVER_KEY_PREFIX } from "./dispatch-failure-key";
+import {
+  SLOT_OCCUPIED_REASON_PREFIX,
+  SLOT_RECLAIMED_REASON_PREFIX,
+  WORKTREE_RECOVER_KEY_PREFIX,
+} from "./dispatch-failure-key";
 import type { LaunchSpec } from "./exec-backend";
 import {
   computeReadiness,
@@ -396,6 +400,15 @@ export interface ReconcileSnapshot {
    */
   finalizeFailureIds: Set<string>;
   /**
+   * The `(verb, id)` of every OPEN slot-occupancy `dispatch_failures` row (its
+   * `reason` carries a {@link isSlotOccupancyReason} prefix — `slot-reclaimed` /
+   * `slot-occupied`). The slot pass level-clears any whose key no longer has a
+   * wanted stopped-live occupant this cycle. SCOPED to the slot REASON (collected
+   * at read time) so a genuine `close::<epic>` conflict sharing the natural key is
+   * NEVER auto-dismissed — the reason-scope discipline the recover clear uses.
+   */
+  slotOccupancyFailures: { verb: Verb; id: string }[];
+  /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
    * BEFORE `launch()` and the discharging `SessionStart` has not folded yet (the
@@ -414,6 +427,15 @@ export interface ReconcileSnapshot {
    * {@link loadReconcileSnapshot}; NEVER read in a fold.
    */
   livePaneIds: ReadonlySet<string> | null;
+  /**
+   * Live pane id → its tmux `pane_current_command` (foreground process), from the
+   * SAME read-time `listPanes()` sweep as {@link livePaneIds}. The slot-occupancy
+   * gate reads it to tell a live/parked `claude` from the dead `exec $SHELL -l -i`
+   * shell tail holding a stopped session's pane. `null` on the same degraded/absent
+   * probe as `livePaneIds` (then the slot gate stays inert — no reclaim, no signal).
+   * Assembled in {@link loadReconcileSnapshot}; NEVER read in a fold.
+   */
+  paneCommandById: ReadonlyMap<string, string> | null;
   /**
    * The open `pending_dispatches` rows projected into the {@link PendingDispatch}[]
    * shape `computeReadiness` consumes for the cross-sibling `dispatch-pending`
@@ -875,6 +897,21 @@ export interface ReconcileDecision {
    * repo that actually finalized this cycle, and `worktreeFinalize` is empty then).
    */
   finalizeFailureIds: Set<string>;
+  /**
+   * The slot-occupancy signals this cycle: one per wanted `(verb, id)` key whose
+   * mint is blocked by a stopped-but-LIVE occupant. Each is a visible `DispatchFailed`
+   * the producer routes through the change-gate; a non-null `reclaimPaneId` also
+   * tells the producer to KILL that pane (a provably-dead session — bare shell tail
+   * past its grace). EMPTY when paused or the liveness probe is degraded.
+   */
+  slotOccupancy: SlotOccupancySignal[];
+  /**
+   * The OPEN slot-occupancy failure keys whose occupant is GONE this cycle (pane
+   * died, resumed to `working`, or the row's verdict completed) — the producer emits
+   * a `DispatchCleared` for each. Mirrors `finalizeFailureIds`'s level-clear;
+   * reason-scoped upstream so it never touches a genuine `close::<epic>` conflict.
+   */
+  slotOccupancyClears: { verb: Verb; id: string }[];
 }
 /**
  * One recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
@@ -979,6 +1016,178 @@ function isStoppedJobLive(
     return false;
   }
   return livePaneIds.has(paneId);
+}
+
+// ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
+
+/**
+ * Producer-`ts` seconds a `stopped` job's dead shell-tail pane must persist before
+ * the reconciler AUTO-RECLAIMS its slot. The bare-shell foreground command already
+ * proves claude exited (a live/parked claude reads `claude`/`node`/`bun`); the grace
+ * is the secondary guard against a transient teardown/startup frame where the pane
+ * momentarily shows the shell. Anchored on `job.updated_at` (the last fold instant —
+ * frozen once the session stopped), compared to the reconcile `now`.
+ */
+export const SLOT_RECLAIM_GRACE_SEC = 120;
+
+/**
+ * The idle-shell foreground command names the launch wrapper's trailing
+ * `exec $SHELL -l -i` tail reports via tmux `pane_current_command` once the hosted
+ * claude exits. CONSERVATIVE by construction — every entry is unambiguously a shell,
+ * never a claude worker (`claude`/`node`/`bun`) — so a probe missing a shell name
+ * UNDER-matches (ambiguous → visibility only), never the catastrophic over-match
+ * that would kill a live session.
+ */
+const BARE_SHELL_COMMANDS: ReadonlySet<string> = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "fish",
+  "dash",
+  "ksh",
+  "tcsh",
+  "csh",
+]);
+
+/**
+ * Is a tmux `pane_current_command` the bare `exec $SHELL -l -i` tail — i.e. claude
+ * has exited and only the trailing login shell holds the pane? A leading `-` (the
+ * login-shell argv0 convention) is stripped first. `undefined` (pane absent from the
+ * command map — probe degraded, or pane gone) is NOT a bare shell: the conservative
+ * answer is "cannot prove dead." Pure — exported for the dead/live/ambiguous matrix.
+ */
+export function isBareShellCommand(command: string | undefined): boolean {
+  if (command === undefined) {
+    return false;
+  }
+  const bare = command.startsWith("-") ? command.slice(1) : command;
+  return BARE_SHELL_COMMANDS.has(bare);
+}
+
+/** One slot-occupancy signal — a visible `DispatchFailed` on a wedged `(verb, id)`,
+ *  plus (when provably dead) the pane to kill. `reclaimPaneId === null` is
+ *  visibility-only (a possibly-resumable occupant). */
+export interface SlotOccupancySignal {
+  verb: Verb;
+  id: string;
+  reason: string;
+  dir: string | null;
+  reclaimPaneId: string | null;
+}
+
+/** The pure inputs the slot-occupancy pass reads — all liveness enters via the
+ *  snapshot fields, so the decision stays a total function (re-fold safe). */
+export interface SlotOccupancyInput {
+  jobs: Map<string, Job>;
+  livePaneIds: ReadonlySet<string> | null;
+  paneCommandById: ReadonlyMap<string, string> | null;
+  /** OPEN slot-reason `dispatch_failures` keys (reason-scoped at read time). */
+  openSlotFailures: readonly { verb: Verb; id: string }[];
+  /** True IFF `reconcile` would dispatch `(verb, id)` if the slot were free (the
+   *  readiness verdict maps to a verb) — the "mint is blocked / slot is needed" gate
+   *  that leaves a completed row's inspection window untouched. */
+  wantsDispatch: (verb: Verb, id: string) => boolean;
+  paused: boolean;
+  now: number;
+  graceSec?: number;
+}
+
+/** The slot-occupancy pass output: the failures to surface (+ optional reclaim) and
+ *  the open rows to clear. */
+export interface SlotOccupancyDecision {
+  failures: SlotOccupancySignal[];
+  clears: { verb: Verb; id: string }[];
+}
+
+const slotKey = (verb: Verb, id: string): string => `${verb} ${id}`;
+
+/**
+ * Surface — and, when provably dead, reclaim — a slot held by a stopped-but-LIVE
+ * session, so a wedged dispatch slot is never silent. For each `stopped` job whose
+ * pane is still live AND whose key `reconcile` still wants to dispatch (the mint is
+ * blocked): a bare-shell pane past its grace is DEAD → kill it and mint
+ * `slot-reclaimed`; anything else (a live/parked `claude`, or a bare shell still in
+ * grace) is `slot-occupied` visibility-only. Every OPEN slot row whose key got no
+ * fresh signal (occupant gone / resumed to `working` / verdict completed) is cleared.
+ *
+ * Pure + re-fold-safe: reads only the snapshot's liveness fields and the readiness-
+ * derived `wantsDispatch` gate. INERT (empty) when paused or the probe is degraded
+ * (`livePaneIds`/`paneCommandById` null) — the conservative silent-occupy fallback.
+ * A killed resumable session is the catastrophic failure, so the DEAD criterion is
+ * strictly the bare-shell-past-grace conjunction; when in doubt it surfaces only.
+ */
+export function computeSlotOccupancy(
+  input: SlotOccupancyInput,
+): SlotOccupancyDecision {
+  const failures: SlotOccupancySignal[] = [];
+  const clears: { verb: Verb; id: string }[] = [];
+  const { livePaneIds, paneCommandById } = input;
+  // Paused or degraded probe → no slot side effects at all.
+  if (input.paused || livePaneIds === null || paneCommandById === null) {
+    return { failures, clears };
+  }
+  const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
+  const activeKeys = new Set<string>();
+  for (const job of input.jobs.values()) {
+    if (job.state !== "stopped") {
+      continue;
+    }
+    const verb = job.plan_verb;
+    const id = job.plan_ref;
+    if ((verb !== "work" && verb !== "close") || id == null || id === "") {
+      continue;
+    }
+    const paneId = job.backend_exec_pane_id;
+    // The stopped arm of `isOccupyingJob`, inlined so a definite live pane id is in
+    // hand: no pane / a pane gone from the sweep is not a live-provable occupant.
+    if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
+      continue;
+    }
+    // Slot not needed → leave it. A completed row keeps its post-run inspection
+    // window (the trailing shell); an unarmed / not-ready row holds nothing worth
+    // reclaiming this cycle.
+    if (!input.wantsDispatch(verb, id)) {
+      continue;
+    }
+    const key = slotKey(verb, id);
+    if (activeKeys.has(key)) {
+      continue; // one signal per key even if two stopped rows share it
+    }
+    activeKeys.add(key);
+    const command = paneCommandById.get(paneId);
+    const dead =
+      isBareShellCommand(command) && input.now - job.updated_at >= graceSec;
+    // Reason text is STABLE across cycles (pane id + command only, never the growing
+    // idle age) so the producer change-gate suppresses re-emits — one event per
+    // condition, not one per cycle. The row's `ts` carries the age. The
+    // occupied→dead transition IS a reason change, so it re-emits (actionable).
+    if (dead) {
+      failures.push({
+        verb,
+        id,
+        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${verb} session (pane ${paneId} ${command ?? "?"})`,
+        dir: job.cwd,
+        reclaimPaneId: paneId,
+      });
+    } else {
+      failures.push({
+        verb,
+        id,
+        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${verb} session holds the slot (pane ${paneId} ${command ?? "?"})`,
+        dir: job.cwd,
+        reclaimPaneId: null,
+      });
+    }
+  }
+  // Level-triggered auto-clear: an OPEN slot row whose key got NO signal this cycle
+  // self-clears. `openSlotFailures` is reason-scoped at snapshot read time, so a
+  // genuine `close::<epic>` conflict sharing the key is never in it → never cleared.
+  for (const open of input.openSlotFailures) {
+    if (!activeKeys.has(slotKey(open.verb, open.id))) {
+      clears.push({ verb: open.verb, id: open.id });
+    }
+  }
+  return { failures, clears };
 }
 
 /**
@@ -1433,12 +1642,32 @@ export function reconcile(
     );
   }
 
+  // Slot-occupancy visibility + auto-reclaim: surface (and, when provably dead,
+  // reclaim) a stopped-but-live session wedging a slot `reconcile` still wants. The
+  // `wantsDispatch` gate reuses the SAME readiness pass (a verdict that maps to a
+  // verb = the mint is blocked), so a completed row's inspection window is left
+  // alone. Inert when paused / probe degraded.
+  const slot = computeSlotOccupancy({
+    jobs: snapshot.jobs,
+    livePaneIds: snapshot.livePaneIds,
+    paneCommandById: snapshot.paneCommandById,
+    openSlotFailures: snapshot.slotOccupancyFailures,
+    wantsDispatch: (verb, id) =>
+      verb === "work"
+        ? verbForVerdict("task", readiness.perTask.get(id)) !== null
+        : verbForVerdict("close", readiness.perCloseRow.get(id)) !== null,
+    paused: state.paused,
+    now,
+  });
+
   return {
     launches,
     completedRowIds,
     worktreeFinalize,
     worktreeSinkProvision,
     finalizeFailureIds: snapshot.finalizeFailureIds,
+    slotOccupancy: slot.failures,
+    slotOccupancyClears: slot.clears,
   };
 }
 /**

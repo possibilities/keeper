@@ -38,6 +38,24 @@ describe("classifyDispatchFailure", () => {
     expect(classifyDispatchFailure(reason)).toBe("merge-conflict");
   });
 
+  test("maps the slot-occupancy reasons to their distinct display kinds", () => {
+    expect(
+      classifyDispatchFailure(
+        "slot-reclaimed: reaped dead close session (pane %7 zsh, stopped 300s)",
+      ),
+    ).toBe("slot-reclaimed");
+    expect(
+      classifyDispatchFailure(
+        "slot-occupied: stopped close session holds the slot (pane %7 claude)",
+      ),
+    ).toBe("slot-occupied");
+    // Distinct kinds — reclaimed (a kill happened) reads differently from occupied
+    // (visibility-only), and neither collapses into a worktree kind.
+    expect(classifyDispatchFailure("slot-reclaimed: x")).not.toBe(
+      classifyDispatchFailure("slot-occupied: x"),
+    );
+  });
+
   test("keeps distinct operator actions distinct (no over-collapse)", () => {
     const kinds = new Set([
       classifyDispatchFailure("worktree-multi-repo"),
