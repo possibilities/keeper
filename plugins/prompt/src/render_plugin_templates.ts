@@ -229,10 +229,12 @@ function writeWithSidecar(
   return primaryChanged;
 }
 
-/** Return plugin roots: claude/*\/, apps/*\/, plus one-level-deeper trees, union
- * with the root-level .claude-plugin/plugin.json marker. Deduped by resolved
- * path; sorted globs everywhere for byte stability. Mirrors
- * _discover_plugin_dirs. */
+/** Return plugin roots: claude/*\/, apps/*\/, plugins/*\/, plus one-level-deeper
+ * trees, union with the root-level .claude-plugin/plugin.json marker. Deduped by
+ * resolved path; sorted globs everywhere for byte stability. Scanning `plugins/*`
+ * lets a keeper repo-root `--project-root` discover the plan plugin (and any
+ * future sibling under `plugins/`), so renders resolve from keeper's own root.
+ * Mirrors _discover_plugin_dirs. */
 function discoverPluginDirs(projectRoot: string): string[] {
   const plugins: string[] = [];
   const seen = new Set<string>();
@@ -252,7 +254,7 @@ function discoverPluginDirs(projectRoot: string): string[] {
     plugins.push(candidate);
   };
 
-  for (const parentName of ["claude", "apps"]) {
+  for (const parentName of ["claude", "apps", "plugins"]) {
     const parent = join(projectRoot, parentName);
     if (!isDir(parent)) {
       continue;
@@ -438,13 +440,16 @@ interface AgentOutput {
 }
 
 /** Resolve the final agent output path using post-render frontmatter. When
- * `render_to:` is declared, the target dir is `<root>/<render_to>/agents` and the
- * stem follows the rendered `name:` field; a per-tier plugin.json manifest path +
- * its rendered `manifest_description` are returned alongside. Path-traversal
- * guarded. A `render_to:` template missing `manifest_description:` throws.
- * Mirrors _resolve_agent_output. */
+ * `render_to:` is declared, the target dir is `<pluginDir>/<render_to>/agents`
+ * (render_to names a sub-plugin WITHIN the owning plugin, so it is resolved
+ * against the plugin root, never the project root — the two coincide only when a
+ * plugin is rendered as its own project root) and the stem follows the rendered
+ * `name:` field; a per-tier plugin.json manifest path + its rendered
+ * `manifest_description` are returned alongside. Path-traversal guarded. A
+ * `render_to:` template missing `manifest_description:` throws. Mirrors
+ * _resolve_agent_output. */
 function resolveAgentOutput(
-  projectRoot: string,
+  pluginDir: string,
   stem: string,
   defaultOut: string,
   rendered: string,
@@ -462,11 +467,11 @@ function resolveAgentOutput(
     };
   }
 
-  const projectResolved = resolve(projectRoot);
-  const targetDir = resolve(join(projectRoot, renderTo, "agents"));
-  if (!isRelativeTo(targetDir, projectResolved)) {
+  const pluginResolved = resolve(pluginDir);
+  const targetDir = resolve(join(pluginDir, renderTo, "agents"));
+  if (!isRelativeTo(targetDir, pluginResolved)) {
     throw new ValueErrorLike(
-      `render_to escapes project root: '${renderTo}' → ${targetDir}`,
+      `render_to escapes plugin root: '${renderTo}' → ${targetDir}`,
     );
   }
   mkdirSync(targetDir, { recursive: true });
@@ -483,11 +488,11 @@ function resolveAgentOutput(
     );
   }
   const manifestPath = resolve(
-    join(projectRoot, renderTo, ".claude-plugin", "plugin.json"),
+    join(pluginDir, renderTo, ".claude-plugin", "plugin.json"),
   );
-  if (!isRelativeTo(manifestPath, projectResolved)) {
+  if (!isRelativeTo(manifestPath, pluginResolved)) {
     throw new ValueErrorLike(
-      `render_to manifest escapes project root: '${renderTo}' → ${manifestPath}`,
+      `render_to manifest escapes plugin root: '${renderTo}' → ${manifestPath}`,
     );
   }
   return {
@@ -524,7 +529,7 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
       let resolved: AgentOutput;
       try {
         resolved = resolveAgentOutput(
-          projectRoot,
+          pluginDir,
           stem,
           defaultOut,
           rendered,

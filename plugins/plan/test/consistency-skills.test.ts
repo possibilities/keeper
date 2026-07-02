@@ -20,6 +20,12 @@ import { runCli } from "./harness.ts";
 const REPO = join(import.meta.dir, "..");
 const CWD = mkdtempSync(join(tmpdir(), "planctl-consistency-"));
 
+// workers/ is gitignored (rendered per-cell from subagents.yaml), so a clean
+// checkout that never ran render-plugin-templates has no cells on disk. The
+// per-cell enumeration below skips there instead of failing hard; install.sh and
+// promote.sh render before the suite runs, so real-checkout coverage is preserved.
+const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
+
 // Multi-word verb prefixes the CLI exposes as nested groups. When a `keeper plan
 // <words…>` reference starts with one of these, both words form the verb path.
 const MULTIWORD_PREFIXES = new Set([
@@ -389,22 +395,25 @@ describe("generated work plugins in the plan plugin", () => {
   const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
   for (const model of matrix.models) {
     for (const effort of matrix.efforts) {
-      test(`workers/${model}-${effort} renders a work plugin with the {model × effort} worker`, () => {
-        const cellDir = join(REPO, "workers", `${model}-${effort}`);
-        const manifestPath = join(cellDir, ".claude-plugin", "plugin.json");
-        expect(existsSync(manifestPath)).toBe(true);
-        const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
-          name?: string;
-        };
-        expect(manifest.name).toBe("work");
-        const agentPath = join(cellDir, "agents", "worker.md");
-        expect(existsSync(agentPath)).toBe(true);
-        const fm = parseFrontmatter(frontmatterBlock(agentPath));
-        expect(fm.name).toBe("worker");
-        expect(fm.model).toBe(model);
-        expect(fm.effort).toBe(effort);
-        expect(fm.maxTurns).toBe("300");
-      });
+      test.skipIf(!WORKERS_RENDERED)(
+        `workers/${model}-${effort} renders a work plugin with the {model × effort} worker`,
+        () => {
+          const cellDir = join(REPO, "workers", `${model}-${effort}`);
+          const manifestPath = join(cellDir, ".claude-plugin", "plugin.json");
+          expect(existsSync(manifestPath)).toBe(true);
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+            name?: string;
+          };
+          expect(manifest.name).toBe("work");
+          const agentPath = join(cellDir, "agents", "worker.md");
+          expect(existsSync(agentPath)).toBe(true);
+          const fm = parseFrontmatter(frontmatterBlock(agentPath));
+          expect(fm.name).toBe("worker");
+          expect(fm.model).toBe(model);
+          expect(fm.effort).toBe(effort);
+          expect(fm.maxTurns).toBe("300");
+        },
+      );
     }
   }
 });

@@ -43,7 +43,19 @@ else
   ( cd "${repo_root}" && bun link )
 fi
 
-# 3. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
+# 3. Render the plan plugin's generated files (per-cell work plugins, skills/work,
+#    agents/practice-scout) so a fresh clone can spawn work:worker and the plan
+#    consistency suites run instead of skipping. Every rendered output + sidecar is
+#    gitignored, so this regenerates them locally on each install — the exact render
+#    command lives in the repo, recoverable, not in shell history. The prompt engine
+#    carries its own deps (liquidjs) that the repo-root `bun install` above does not
+#    reach, so install them in-tree first, then render from the keeper root
+#    (discoverPluginDirs scans plugins/* to find the plan plugin under it).
+echo "install: rendering plan-plugin generated files"
+( cd "${repo_root}/plugins/prompt" && bun install )
+( cd "${repo_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${repo_root}" )
+
+# 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it
 #    matches but keeperd is not actually registered, OR when the daemon SOURCE
@@ -109,7 +121,7 @@ else
   echo "install: keeperd reloaded and loaded"
 fi
 
-# 4. Rotation sidecar LaunchAgent. A plist-only agent (its ProgramArguments run
+# 5. Rotation sidecar LaunchAgent. A plist-only agent (its ProgramArguments run
 #    /bin/sh, never keeper code) so there is NO source fingerprint to track — the
 #    gate is content + loaded-state only: reload when the live plist differs from
 #    the repo copy, or matches but is not registered. RunAtLoad=false, so nothing
