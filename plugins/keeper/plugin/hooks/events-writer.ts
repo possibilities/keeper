@@ -799,6 +799,12 @@ export function buildEventBindings(
     agent_id: agentId,
     agent_type: agentType,
     stop_hook_active: stopHookActive,
+    // The ORIGINAL stdin payload, verbatim. Claude Code hands every PreToolUse
+    // hook the pre-rewrite tool_input, so a Bash command stored here is the one
+    // TYPED, not the one EXECUTED — arthack's PreToolUse dispatcher independently
+    // returns an updatedInput (python3→uv run, npm→pnpm, …) that changes what
+    // runs. Miners must not read `data`'s command as the executed process; see
+    // docs/plugin-composition-map.md (logged-vs-executed skew).
     data: raw,
     subagent_agent_id: subagentAgentId,
     spawn_name: spawnName,

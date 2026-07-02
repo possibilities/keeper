@@ -2191,6 +2191,12 @@ export async function main(deps: MainDeps): Promise<never> {
     note(`session: ${sessionName}`);
   }
 
+  // This gate is the SOLE plugin-discovery seam and keys ONLY on the agent CLI,
+  // not the launch channel — an autopilot/dispatch worker is a plain `keeper
+  // agent claude …` (exec-backend.ts buildKeeperAgentLaunchArgv), so it inherits
+  // the FULL plugins.yaml (keeper + plan + arthack) exactly like an interactive
+  // session. The per-cell worker `--plugin-dir` (exec-backend.ts) is ADDITIVE,
+  // not isolating. Reality map: docs/plugin-composition-map.md.
   if (agent === "claude") {
     phase("discover plugin dirs", () => {
       let sources: ReturnType<typeof loadPluginSources>;
