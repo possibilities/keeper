@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T16:18:18.418000Z",
+  "depends_on_epics": [
+    "fn-1073-single-source-prompt-corpus-machine",
+    "fn-1074-unify-cli-envelopes-and-reads",
+    "fn-1075-autopilot-telemetry-and-machine"
+  ],
+  "id": "fn-1077-prune-agent-advice-prose",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Prune agent advice prose",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T16:18:18.418000Z"
+}
