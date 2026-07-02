@@ -51,43 +51,243 @@ export const SUBCOMMANDS = [
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
+/**
+ * Per-subcommand metadata — the SINGLE source of truth the human `USAGE` block
+ * and the machine `keeper --help --json` command index are both generated from,
+ * so the two can never drift. `verbs` enumerates a two-level subcommand's verb
+ * names (a static table the dispatcher owns, NOT introspected from the sub-CLI);
+ * `agentHelp` marks a subcommand that carries a `--agent-help` operator runbook
+ * distinct from `--help` (the index publishes this so an agent never assumes a
+ * runbook that isn't there). The `Record<Subcommand, …>` type enforces that a
+ * new subcommand cannot land without a summary.
+ */
+export interface SubcommandMeta {
+  readonly summary: string;
+  readonly verbs?: readonly string[];
+  readonly agentHelp?: boolean;
+}
+
+export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
+  board: {
+    summary: "Epics board (TTY: live TUI; non-TTY: one snapshot + exit)",
+  },
+  jobs: {
+    summary:
+      "Jobs list w/ dead-letter banner + 'r' replay (TTY: live; non-TTY: snapshot)",
+  },
+  git: {
+    summary: "Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)",
+  },
+  usage: {
+    summary: "Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)",
+  },
+  autopilot: {
+    summary:
+      "Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)",
+    verbs: [
+      "pause",
+      "play",
+      "mode",
+      "config",
+      "arm",
+      "disarm",
+      "worktree",
+      "retry",
+    ],
+    agentHelp: true,
+  },
+  builds: {
+    summary:
+      "Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)",
+  },
+  dash: {
+    summary: "Read-only opening screen: header + PLAN + AGENTS (TTY-only)",
+  },
+  status: {
+    summary:
+      "One-shot unified board + autopilot JSON read (orient in one call)",
+  },
+  query: {
+    summary: "One-shot read of an allowlisted daemon collection (JSON)",
+  },
+  watch: { summary: "NDJSON tail of coarse board deltas (never exits)" },
+  await: { summary: "Block until a plan/git/job condition holds" },
+  "commit-work": {
+    summary: "Stage session-attributed files, lint, commit, push",
+    agentHelp: true,
+  },
+  "setup-tmux": {
+    summary: "Provision the tmux control plane (dash + work sessions)",
+  },
+  "session-state": {
+    summary: "Current session git context + on-hook files (JSON)",
+  },
+  "show-session-files": {
+    summary: "Session's on-hook dirty files grouped by repo (JSON)",
+  },
+  "search-history": {
+    summary: "Search UserPromptSubmit history by LIKE term (JSON)",
+  },
+  "find-file-history": {
+    summary: "List file attributions matching a path fragment (JSON)",
+  },
+  "show-session-events": {
+    summary: "Prompt/tool-call spine for one session (JSON)",
+  },
+  "show-job": {
+    summary:
+      "One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)",
+  },
+  "session-summary": {
+    summary:
+      "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
+  },
+  plan: {
+    summary:
+      "The plan CLI: `keeper plan <verb>` runs the plan dispatcher in-process",
+    verbs: [
+      "status",
+      "epics",
+      "tasks",
+      "ready",
+      "show",
+      "cat",
+      "list",
+      "scaffold",
+      "init",
+      "claim",
+      "done",
+      "block",
+      "unblock",
+      "verdict",
+      "close-preflight",
+      "close-finalize",
+      "validate",
+      "audit",
+      "reconcile",
+      "gist",
+      "mv-repo",
+      "followup",
+    ],
+  },
+  prompt: {
+    summary:
+      "Snippet/bundle substrate engine: `keeper prompt <verb>` runs the prompt CLI in-process",
+    verbs: [
+      "render",
+      "check-generated",
+      "render-plugin-templates",
+      "build-snippets",
+      "find-snippets",
+      "save-snippet",
+      "save-bundle",
+      "validate-bundles",
+      "list-bundles",
+      "show-bundle",
+    ],
+  },
+  dispatch: {
+    summary:
+      "Manually fire one claude worker into a tmux window (client-side escape hatch)",
+    agentHelp: true,
+  },
+  handoff: {
+    summary:
+      "Enqueue a fire-and-forget claude worker with a contextful brief (`keeper handoff show <id>` reads it)",
+    agentHelp: true,
+  },
+  agent: {
+    summary:
+      "Launch an agent CLI: `keeper agent <claude|codex|pi> [args...]` (folded keeper agent launcher)",
+    verbs: [
+      "claude",
+      "codex",
+      "pi",
+      "run",
+      "wait",
+      "panel",
+      "presets",
+      "transcript",
+    ],
+  },
+  reclaim: {
+    summary:
+      "OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)",
+    agentHelp: true,
+  },
+  bus: {
+    summary: "Agent Bus: `keeper bus <list|resolve|chat send|watch>`",
+    verbs: ["list", "watch", "wake", "chat"],
+  },
+  "statusline-sink": {
+    summary:
+      "Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf",
+  },
+};
+
+/**
+ * The shared exit-code taxonomy, published in `keeper --help --json` so every
+ * one-shot command's exit semantics live in one machine-readable place. Codes
+ * 0/1/2 are the common core; 3–5 are await-specific (and 3 doubles as handoff's
+ * slug-collision). The one deliberate DIVERGENCE: `keeper <sub>` unknown-
+ * subcommand exits 1, but the `plan`/`prompt` sub-CLIs exit 2 on an unknown
+ * VERB (Click/argparse parity is frozen for Python byte-compat) — documented
+ * here rather than silently reconciled.
+ */
+export const EXIT_CODES: Record<string, string> = {
+  "0": "success — a bad board/domain state is still ok:true data at exit 0, never a nonzero exit",
+  "1": "transport/usage/generic failure — the JSON error envelope still lands on stdout, never empty stdout + stderr prose",
+  "2": "argument fault (dispatch/handoff/commit-work bad flags); also the plan/prompt sub-CLIs' unknown-verb exit (Click parity), whereas a keeper unknown-subcommand exits 1",
+  "3": "await: own-deadline timeout; handoff: slug already in use",
+  "4": "await: watched target was deleted",
+  "5": "await: stuck verdict (only under --fail-on-stuck)",
+};
+
+/** The `keeper --help --json` command index. A discovery/introspection surface,
+ *  deliberately EXEMPT from the `{schema_version, ok, error, data}` one-shot
+ *  envelope (like `watch`/`cat`) — it is neither a state read nor a mutate and
+ *  cannot fail transport, so it prints its shape flat for a direct `jq
+ *  '.subcommands'`. */
+export interface HelpIndex {
+  subcommands: Array<{
+    name: Subcommand;
+    summary: string;
+    verbs?: readonly string[];
+    agent_help: boolean;
+  }>;
+  exit_codes: Record<string, string>;
+}
+
+export function buildHelpIndex(): HelpIndex {
+  return {
+    subcommands: SUBCOMMANDS.map((name) => {
+      const meta = SUBCOMMAND_META[name];
+      const entry: HelpIndex["subcommands"][number] = {
+        name,
+        summary: meta.summary,
+        agent_help: meta.agentHelp === true,
+      };
+      if (meta.verbs !== undefined) entry.verbs = meta.verbs;
+      return entry;
+    }),
+    exit_codes: EXIT_CODES,
+  };
+}
+
+const SUBCOMMAND_LINES = SUBCOMMANDS.map(
+  (name) => `  ${name.padEnd(19)} ${SUBCOMMAND_META[name].summary}`,
+).join("\n");
+
 export const USAGE = `keeper — unified CLI for the keeper TUIs
 
 Usage:
   keeper <subcommand> [options]
 
 Subcommands:
-  board               Epics board (TTY: live TUI; non-TTY: one snapshot + exit)
-  jobs                Jobs list w/ dead-letter banner + 'r' replay (TTY: live; non-TTY: snapshot)
-  git                 Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)
-  usage               Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)
-  autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
-  builds              Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)
-  dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
-  status              One-shot unified board + autopilot JSON read (orient in one call)
-  query               One-shot read of an allowlisted daemon collection (JSON)
-  watch               NDJSON tail of coarse board deltas (never exits)
-  await               Block until a plan/git/job condition holds
-  commit-work         Stage session-attributed files, lint, commit, push
-  setup-tmux          Provision the tmux control plane (dash + work sessions)
-  session-state       Current session git context + on-hook files (JSON)
-  show-session-files  Session's on-hook dirty files grouped by repo (JSON)
-  search-history      Search UserPromptSubmit history by LIKE term (JSON)
-  find-file-history   List file attributions matching a path fragment (JSON)
-  show-session-events Prompt/tool-call spine for one session (JSON)
-  show-job            One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)
-  session-summary     Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)
-  plan                The plan CLI: \`keeper plan <verb>\` runs the plan dispatcher in-process
-  prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
-  dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
-  handoff             Enqueue a fire-and-forget claude worker with a contextful brief (\`keeper handoff show <id>\` reads it)
-  agent               Launch an agent CLI: \`keeper agent <claude|codex|pi> [args...]\` (folded keeper agent launcher)
-  reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
-  bus                 Agent Bus: \`keeper bus <list|resolve|chat send|watch>\`
-  statusline-sink     Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf
+${SUBCOMMAND_LINES}
 
 Flags:
-  --help, -h     Show this help
+  --help, -h     Show this help (\`--help --json\` → machine-readable command index)
   --version, -V  Show keeper version
 
 The six snapshot-capable viewer subcommands (board/jobs/git/usage/autopilot/builds)
@@ -99,7 +299,8 @@ TTY), \`--watch\` (force the live stream even when piped — never exits), or
 TTY-ONLY (no snapshot mode), so a non-TTY stdout exits 1 rather than printing a
 frame.
 
-Run \`keeper <subcommand> --help\` for subcommand-specific options.
+Run \`keeper <subcommand> --help\` for subcommand-specific options, and
+\`keeper --help --json\` for the machine-readable command index + exit-code table.
 `;
 
 export type SubcommandHandler = (argv: string[]) => Promise<void> | void;
@@ -144,6 +345,12 @@ export async function dispatch(
   }
 
   if (first === "--help" || first === "-h") {
+    // `keeper --help --json` → the machine-readable command index (a flat,
+    // envelope-exempt introspection shape); plain `--help` → the human USAGE.
+    if (argv.includes("--json")) {
+      deps.stdout(`${JSON.stringify(buildHelpIndex(), null, 2)}\n`);
+      deps.exit(0);
+    }
     deps.stdout(USAGE);
     deps.exit(0);
   }

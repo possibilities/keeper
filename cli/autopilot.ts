@@ -139,6 +139,25 @@ The viewer is read-only — every dispatch, dedup, confirm, settle, and reap
 decision happens in keeperd's autopilot worker thread. Use pause / play
 to toggle the worker (boots PAUSED for safety), mode / arm / disarm to gate
 which epics armed mode works, and retry to clear a sticky failure row.
+
+Run \`keeper autopilot --agent-help\` for the terse operator runbook.
+`;
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+const AGENT_HELP = `keeper autopilot — operator runbook (agent-facing)
+
+Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
+
+  keeper autopilot pause | play
+  keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
+  keeper autopilot arm <epic> | disarm <epic>
+  keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
+  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo
+  keeper autopilot worktree <on|off> [--force]
+
+Read state from the [paused]/mode/armed banner (\`keeper autopilot --snapshot\`).
+An unpaused autopilot that "does nothing" is usually a readiness gate firing
+correctly, not a bug. Exit codes: 0 ok · 1 daemon-unreachable/generic · 2 arg fault.
 `;
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
@@ -1119,6 +1138,7 @@ export async function main(argv: string[]): Promise<void> {
       // manually below (exit 2 on a non-positive / non-numeric value).
       timeout: { type: "string" },
       help: { type: "boolean", default: false },
+      "agent-help": { type: "boolean", default: false },
       // `worktree <on|off> --force` — bypass the mid-epic toggle guard.
       force: { type: "boolean", default: false },
     },
@@ -1127,6 +1147,10 @@ export async function main(argv: string[]): Promise<void> {
 
   if (parsed.values.help) {
     process.stdout.write(HELP);
+    process.exit(0);
+  }
+  if (parsed.values["agent-help"]) {
+    process.stdout.write(AGENT_HELP);
     process.exit(0);
   }
 

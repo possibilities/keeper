@@ -73,6 +73,24 @@ The brief is capped at 64KB — an over-cap brief is REJECTED (exit 2), never
 truncated, because it rides inline in the event log and a fold reads it back.
 
 Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault, 3 slug already in use.
+
+Run \`keeper handoff --agent-help\` for the terse operator runbook.
+`;
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+const AGENT_HELP = `keeper handoff — operator runbook (agent-facing)
+
+Enqueue a fire-and-forget claude worker with a contextful brief; keeperd boots it
+inline in your tmux session. The brief rides inline in the event log.
+
+  keeper handoff --slug <slug> --prompt "<brief>" [--title <t>] [--dir <path>]
+  keeper handoff --slug <slug> --prompt-file <path> [...]
+  keeper handoff show <slug>      # read back the stored brief (inspection)
+
+Rules: --slug is globally unique (reuse → exit 3); brief cap 64KB (over → exit 2,
+REJECTED never truncated); --dir launches cross-repo (default: caller's cwd).
+Exit codes: 0 enqueued · 1 daemon-unreachable/generic · 2 arg fault · 3 slug in use.
+NOT a plan-id launch (that is keeper dispatch) or messaging a running agent (keeper bus).
 `;
 
 /** Discriminated result of {@link resolveTargetDir}. */
@@ -237,12 +255,17 @@ export async function main(argv: string[]): Promise<void> {
       dir: { type: "string" },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
+      "agent-help": { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   if (parsed.values.help) {
     process.stdout.write(HELP);
+    process.exit(0);
+  }
+  if (parsed.values["agent-help"]) {
+    process.stdout.write(AGENT_HELP);
     process.exit(0);
   }
 
