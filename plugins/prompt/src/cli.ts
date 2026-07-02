@@ -16,6 +16,7 @@ import { runBuildSnippets } from "./build_snippets.ts";
 import { run as runCheckGenerated } from "./check_generated.ts";
 import { runFindSnippets } from "./find_snippets.ts";
 import { runListBundles } from "./list_bundles.ts";
+import { runListSnippets } from "./list_snippets.ts";
 import { resolveProjectRoot } from "./project_root.ts";
 import { run as runRender } from "./render.ts";
 import { runRenderPluginTemplates } from "./render_plugin_templates.ts";
@@ -52,6 +53,10 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "list-bundles",
     shortHelp: "List bundles across one or all runtime namespaces.",
+  },
+  {
+    name: "list-snippets",
+    shortHelp: "Enumerate every snippet id (unranked), optionally by --domain.",
   },
   {
     name: "render",
@@ -189,8 +194,10 @@ function dispatch(parsed: ParsedArgs): number {
   // matching case body with a call into its `src/<verb>.ts` runner.
   switch (command) {
     case "render": {
-      const ref = parsed.rest.find((a) => !a.startsWith("-"));
-      return runRender(ref, format);
+      const ref = positional(parsed.rest, ["--project-root"]);
+      const explicit = readOption(parsed.rest, "--project-root") ?? null;
+      const projectRoot = resolveProjectRoot(explicit);
+      return runRender(ref, projectRoot, format);
     }
     case "check-generated": {
       const file = parsed.rest.find((a) => !a.startsWith("-"));
@@ -213,8 +220,10 @@ function dispatch(parsed: ParsedArgs): number {
         "--phase",
         "--bundle",
         "--limit",
+        "--project-root",
       ]);
-      const projectRoot = resolveProjectRoot(null);
+      const explicit = readOption(parsed.rest, "--project-root") ?? null;
+      const projectRoot = resolveProjectRoot(explicit);
       const limitStr = readOption(parsed.rest, "--limit");
       return runFindSnippets(
         query,
@@ -280,6 +289,14 @@ function dispatch(parsed: ParsedArgs): number {
       const projectRoot = resolveProjectRoot(null);
       const namespace = readOption(parsed.rest, "--namespace") ?? null;
       return runListBundles(projectRoot, namespace, format, (rows, fmt) =>
+        formatOutput(rows, fmt),
+      );
+    }
+    case "list-snippets": {
+      const explicit = readOption(parsed.rest, "--project-root") ?? null;
+      const projectRoot = resolveProjectRoot(explicit);
+      const domain = readOption(parsed.rest, "--domain") ?? null;
+      return runListSnippets(projectRoot, domain, format, (rows, fmt) =>
         formatOutput(rows, fmt),
       );
     }

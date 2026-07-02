@@ -15,15 +15,15 @@
 //   bare snippet id  emit the single snippet body, frontmatter stripped.
 //   unknown prefix / traversal  error (propagated from refs.parse).
 //
-// Corpus resolution: a bare invocation from any cwd resolves the project root via
-// project_root.ts (walk to `.git`, fall back to `~/code/arthack`) so the arthack
-// corpus is found from keeper / home. Output is raw stdout — no JSON envelope and
-// (the one deliberate drop vs the oracle) NO stderr token footer.
+// Corpus resolution: the caller resolves the project root via project_root.ts
+// (an explicit `--project-root`, else the corpus-holding `.git` root, else the
+// configured authoring home) and passes it in, so the corpus is found from keeper
+// / home. Output is raw stdout — no JSON envelope and (the one deliberate drop vs
+// the oracle) NO stderr token footer.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import yaml from "js-yaml";
-import { resolveProjectRoot } from "./project_root.ts";
 import {
   loadSnippetIndex,
   type ParsedRef,
@@ -217,14 +217,19 @@ function defaultWarn(msg: string): void {
 }
 
 /** `keeper prompt render <ref>` runner. Raw stdout, no token footer. Returns the
- * process exit code. Mirrors run_render.py run, minus the stderr token footer. */
-export function run(ref: string | undefined, format: unknown): number {
+ * process exit code. The caller resolves `projectRoot` (an explicit
+ * `--project-root`, else the corpus-aware walk). Mirrors run_render.py run, minus
+ * the stderr token footer. */
+export function run(
+  ref: string | undefined,
+  projectRoot: string,
+  format: unknown,
+): number {
   void format; // render emits raw text regardless of --format (oracle parity).
   if (!ref) {
     process.stderr.write("Error: missing argument 'REF'\n");
     return 2;
   }
-  const projectRoot = resolveProjectRoot(null);
   let rendered: string;
   try {
     rendered = render(ref, projectRoot);
