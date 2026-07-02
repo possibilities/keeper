@@ -40,5 +40,5 @@ Red-first: Stop-stopped row (both annotations NULL) + PreToolUse → working wit
 - [ ] README revival contract consolidated to the intro + cross-refs; full fast suite green
 
 ## Done summary
-
+Added a third bare Pre/PostToolUse un-stop arm (WHERE state='stopped') so a plain-stopped row with both annotation pairs NULL revives to working on any tool event; terminal rows stay untouchable. Classified the live repro (plain Stop then tool-event flood, no UPS) and re-affirmed the killed-suppression; consolidated the README revival contract to the intro.
 ## Evidence
