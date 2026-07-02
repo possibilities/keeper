@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T03:12:08.731000Z",
+  "depends_on": [
+    "fn-1059-gut-readme-to-lean-front-door.1"
+  ],
+  "epic": "fn-1059-gut-readme-to-lean-front-door",
+  "id": "fn-1059-gut-readme-to-lean-front-door.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Reverse lint funnel, gate README",
+  "updated_at": "2026-07-02T03:12:08.731000Z"
+}

@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T03:12:08.731000Z",
+  "depends_on": [],
+  "epic": "fn-1059-gut-readme-to-lean-front-door",
+  "id": "fn-1059-gut-readme-to-lean-front-door.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gut README and repoint cross-references",
+  "updated_at": "2026-07-02T03:12:08.731000Z"
+}
