@@ -4,7 +4,7 @@
   "created_at": "2026-07-02T18:02:28.302000Z",
   "depends_on_epics": [],
   "id": "fn-1080-rebaseline-prompt-parity-goldens",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-02T18:02:36.774000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T18:02:28.302000Z"
+  "updated_at": "2026-07-02T18:02:36.774000Z"
 }
