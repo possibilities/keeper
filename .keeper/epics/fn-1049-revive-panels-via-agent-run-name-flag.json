@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-02T01:30:13.203000Z",
   "created_at": "2026-07-02T00:13:37.305000Z",
   "depends_on_epics": [],
   "id": "fn-1049-revive-panels-via-agent-run-name-flag",
   "last_validated_at": "2026-07-02T00:13:42.991000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Revive panels via agent run name flag",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T00:13:42.991000Z"
+  "updated_at": "2026-07-02T01:30:13.203000Z"
 }
