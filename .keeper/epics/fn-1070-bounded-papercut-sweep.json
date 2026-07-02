@@ -6,7 +6,7 @@
     "fn-1069-pure-verdict-core-and-classifier"
   ],
   "id": "fn-1070-bounded-papercut-sweep",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-02T09:15:26.557000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-02T09:14:35.347000Z"
+  "updated_at": "2026-07-02T09:15:26.557000Z"
 }
