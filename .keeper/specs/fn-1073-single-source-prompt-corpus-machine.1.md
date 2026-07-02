@@ -43,5 +43,5 @@ fallback (resolution decisions through a pure seam, no real git). Verify by runn
 - [ ] used-in is populated by build-snippets from a consumer scan, or removed everywhere with the band-aid note in arthack CLAUDE.md deleted
 
 ## Done summary
-
+render and find-snippets now accept --project-root and resolve the corpus from any repo via a config-driven (KEEPER_PROMPT_CORPUS_ROOT) fallback when the .git root holds no corpus; added the list-snippets enumeration verb, making find_snippets' phantom-verb hints real. used-in was already populated by build-snippets (findUsages).
 ## Evidence
