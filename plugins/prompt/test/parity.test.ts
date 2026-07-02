@@ -1,19 +1,27 @@
-// Differential-parity suite: the ported `keeper prompt` engine vs the captured
-// Python `promptctl` oracle goldens (test/oracle/fixtures/).
+// Regression-pin snapshot suite for the `keeper prompt` engine.
+//
+// The suite locks the current engine's output against recorded goldens
+// (test/oracle/fixtures/), captured from `keeper prompt` itself over the live
+// arthack corpus + plan-plugin templates. It is NOT a Python-parity gate — the
+// promptctl port it once guarded is complete; these goldens now pin the engine
+// against its own future drift. Re-record deliberately via `bun run
+// capture-oracle` (see oracle/capture.ts) when the corpus or templates change,
+// eyeballing the diff so a new bug is never frozen as golden.
 //
 // Two halves:
-//   1. HARNESS INTEGRITY — asserts the fixtures are captured non-empty for all
-//      three hot verbs and that the normalizer's one intentional transform
-//      (`promptctl ` → `keeper prompt ` + machine-root tokenization) is the
-//      only thing it does. These pass NOW; they pin the capture infra itself.
-//   2. CANDIDATE PARITY — runs `keeper prompt <verb>` and asserts byte-identical
-//      output against the normalized oracle goldens. These are RED until the
-//      verb-port tasks land `keeper prompt`; that is by design — this file is
-//      the conformance gate every later task in the epic turns green.
+//   1. HARNESS INTEGRITY — asserts the recorded universe is captured non-empty
+//      across every verb surface (render / check-generated / render-plugin-
+//      templates) and that the sole canonicalizer (machine-root tokenization) is
+//      the only transform the compare applies. Guards the capture infra so
+//      coverage can't silently shrink.
+//   2. REGRESSION PIN — runs each verb and asserts its output equals the
+//      recorded golden. Expected values are read from disk, never recomputed by
+//      the assert-time code path, so a genuine engine regression surfaces as a
+//      byte diff rather than passing vacuously.
 //
 // Run: bun test plugins/prompt/test/parity.test.ts   (from keeper root)
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
@@ -23,6 +31,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -35,9 +44,7 @@ import type {
 } from "./oracle/fixture-types.ts";
 import {
   type NormalizeRoots,
-  normalizeCandidate,
-  normalizeOracle,
-  substituteVerb,
+  normalize,
   tokenizeRoots,
 } from "./oracle/normalize.ts";
 
@@ -58,8 +65,7 @@ const pluginTemplates = loadJson<PluginTemplatesFixture>(
 );
 
 /** Live roots for re-tokenizing candidate output. arthack resolves through the
- *  manifest's capture root if it still exists, else the env/HOME fallback the
- *  port will use. */
+ *  manifest's capture root; the keeper root is this checkout. */
 const roots: NormalizeRoots = {
   arthackRoot: manifest.arthack_root,
   keeperRoot: KEEPER_ROOT,
@@ -78,9 +84,9 @@ function runCandidate(
   };
 }
 
-/** True once `keeper prompt` is a wired subcommand. Until a verb-port task
- *  lands it, the candidate half is expected red — this lets those assertions
- *  fail with a clear "not wired yet" signal instead of a confusing byte diff. */
+/** True once `keeper prompt` is a wired subcommand. Kept as a precondition guard
+ *  so a broken wiring fails with a clear "not wired" signal rather than a
+ *  confusing byte diff. */
 function keeperPromptWired(): boolean {
   const probe = spawnSync("keeper", ["prompt", "--help"], {
     encoding: "utf-8",
@@ -91,12 +97,38 @@ function keeperPromptWired(): boolean {
 
 const PROMPT_WIRED = keeperPromptWired();
 
+/** Render the plan plugin into a throwaway copy with a synthetic `.git` marker,
+ *  mirroring oracle/capture.ts. Returns the temp root (caller cleans up). The
+ *  `.git` makes check-generated resolve the copy as its project root, so the
+ *  assertion is hermetic — independent of whether the launch-generated
+ *  (gitignored) render tree is materialized in the live checkout. */
+function renderPlanTree(): string {
+  const work = mkdtempSync(join(tmpdir(), "prompt-parity-plan-"));
+  const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
+  cpSync(livePlanRoot, work, { recursive: true });
+  writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
+  for (const kind of ["commands", "skills", "agents", "workers"]) {
+    rmSync(join(work, kind), { recursive: true, force: true });
+  }
+  const r = runCandidate(
+    ["render-plugin-templates", "--project-root", work],
+    work,
+  );
+  if (r.code !== 0) {
+    rmSync(work, { recursive: true, force: true });
+    throw new Error(
+      `render-plugin-templates failed (exit ${r.code}): ${r.stderr}`,
+    );
+  }
+  return work;
+}
+
 // ===========================================================================
-// 1. HARNESS INTEGRITY — passes now; pins the capture infra
+// 1. HARNESS INTEGRITY — pins the capture infra so coverage can't shrink
 // ===========================================================================
 
-describe("oracle fixtures captured non-empty for all three hot verbs", () => {
-  test("manifest records both capture roots and the oracle path", () => {
+describe("goldens captured non-empty across every verb surface", () => {
+  test("manifest records both capture roots and the engine path", () => {
     expect(manifest.arthack_root).toBeTruthy();
     expect(manifest.keeper_root).toBeTruthy();
     expect(manifest.oracle_path).toBeTruthy();
@@ -104,9 +136,10 @@ describe("oracle fixtures captured non-empty for all three hot verbs", () => {
 
   test("render: every snippet + bundle + sketch ref captured", () => {
     expect(renderFixtures.length).toBeGreaterThan(0);
-    // The live corpus is ~90 snippets + ~11 bundles + sketches; a capture that
-    // silently sampled a handful would let untested templates diverge later.
-    expect(renderFixtures.length).toBeGreaterThanOrEqual(100);
+    // The live corpus is ~70 snippets + ~11 bundles + ~11 sketches; a capture
+    // that silently sampled a handful would let untested templates diverge
+    // later, so hold a floor comfortably above realistic corpus pruning.
+    expect(renderFixtures.length).toBeGreaterThanOrEqual(80);
     const bundles = renderFixtures.filter((r) => r.ref.startsWith("bundle/"));
     const sketches = renderFixtures.filter((r) => r.ref.startsWith("sketch/"));
     const snippets = renderFixtures.filter((r) => !r.ref.includes("/"));
@@ -119,8 +152,8 @@ describe("oracle fixtures captured non-empty for all three hot verbs", () => {
     }
     // Snippet + bundle bodies are never empty. A sketch CAN render empty (its
     // snippet_ids all skipped under the deletion-drift policy) — that empty
-    // body is itself a parity golden the candidate must reproduce, so it is
-    // captured, not asserted non-empty here.
+    // body is itself a golden the engine must reproduce, so it is captured, not
+    // asserted non-empty here.
     for (const r of [...snippets, ...bundles]) {
       expect(Buffer.from(r.stdout_b64, "base64").length).toBeGreaterThan(0);
     }
@@ -156,19 +189,7 @@ describe("oracle fixtures captured non-empty for all three hot verbs", () => {
   });
 });
 
-describe("normalizer applies ONLY the promptctl→keeper prompt + root transforms", () => {
-  test("substituteVerb rewrites the command-position verb, leaves prose", () => {
-    expect(substituteVerb("promptctl render foo")).toBe(
-      "keeper prompt render foo",
-    );
-    // A bare word "promptctl" with no trailing space (prose mention) is left
-    // alone — only the command-position `promptctl ` prefix is the port's diff.
-    expect(substituteVerb("the promptctl engine")).toBe(
-      "the keeper prompt engine",
-    );
-    expect(substituteVerb("see `promptctl`.")).toBe("see `promptctl`.");
-  });
-
+describe("the canonicalizer applies ONLY machine-root tokenization", () => {
   test("tokenizeRoots replaces both machine roots, longest-first", () => {
     const r: NormalizeRoots = {
       arthackRoot: "/home/u/code/arthack",
@@ -179,31 +200,28 @@ describe("normalizer applies ONLY the promptctl→keeper prompt + root transform
   });
 
   test("normalize is the IDENTITY on already-canonical text", () => {
-    // Output that has no oracle verb and no machine root must pass through
-    // untouched — proving the runner adds no incidental transform.
+    // Output that carries no machine root must pass through untouched — proving
+    // the compare adds no incidental transform beyond root tokenization.
     const canonical =
       "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n";
-    expect(normalizeOracle(canonical, roots)).toBe(canonical);
-    expect(normalizeCandidate(canonical, roots)).toBe(canonical);
+    expect(normalize(canonical, roots)).toBe(canonical);
   });
 
-  test("the ONLY oracle→candidate delta is the verb rename", () => {
-    // Given a baked oracle envelope, the candidate's expected form differs from
-    // the raw oracle bytes by exactly the verb substitution and nothing else.
-    const oracleCmd = "promptctl render-plugin-templates --project-root /r";
-    const candidateCmd =
-      "keeper prompt render-plugin-templates --project-root /r";
-    expect(substituteVerb(oracleCmd)).toBe(candidateCmd);
-    // Reverse-substituting the candidate yields the oracle — bijective on the
-    // command prefix, so no third transform hides in the diff.
-    expect(candidateCmd.replace("keeper prompt ", "promptctl ")).toBe(
-      oracleCmd,
+  test("normalize is exactly root tokenization (no other rewrite)", () => {
+    const r: NormalizeRoots = {
+      arthackRoot: "/a/arthack",
+      keeperRoot: "/a/keeper",
+    };
+    const raw = "src /a/arthack/s and /a/keeper/t only\n";
+    expect(normalize(raw, r)).toBe(tokenizeRoots(raw, r));
+    expect(normalize(raw, r)).toBe(
+      "src <ARTHACK_ROOT>/s and <KEEPER_ROOT>/t only\n",
     );
   });
 });
 
 // ===========================================================================
-// 2. CANDIDATE PARITY — RED until `keeper prompt` lands; green once verbs port
+// 2. REGRESSION PIN — the engine's output vs its recorded goldens
 // ===========================================================================
 
 describe("keeper prompt is a wired subcommand", () => {
@@ -212,53 +230,62 @@ describe("keeper prompt is a wired subcommand", () => {
   });
 });
 
-describe("render: byte-identical vs oracle across the full ref universe", () => {
+describe("render: byte-identical vs golden across the full ref universe", () => {
   for (const fx of renderFixtures) {
     test(`render ${fx.ref}`, () => {
-      const want = normalizeOracle(
+      const want = normalize(
         Buffer.from(fx.stdout_b64, "base64").toString("utf-8"),
         roots,
       );
       const r = runCandidate(["render", fx.ref], manifest.arthack_root);
       expect(r.code).toBe(fx.exit_code);
-      const got = normalizeCandidate(r.stdout.toString("utf-8"), roots);
+      const got = normalize(r.stdout.toString("utf-8"), roots);
       expect(got).toBe(want);
     });
   }
 });
 
-describe("check-generated: byte-identical envelope vs oracle, both modes", () => {
+describe("check-generated: byte-identical envelope vs golden, both modes", () => {
+  let planTree: string | null = null;
+
+  beforeAll(() => {
+    if (PROMPT_WIRED) {
+      planTree = renderPlanTree();
+    }
+  });
+  afterAll(() => {
+    if (planTree) {
+      rmSync(planTree, { recursive: true, force: true });
+    }
+  });
+
   for (const fx of checkFixtures) {
     test(`check-generated ${fx.target_relative} --on ${fx.on}`, () => {
-      const target = join(KEEPER_ROOT, fx.target_relative);
-      const r = runCandidate(
-        ["check-generated", target, "--on", fx.on],
-        KEEPER_ROOT,
-      );
+      if (!PROMPT_WIRED || planTree === null) {
+        // Re-probe (not the narrowed const) so the type stays boolean.
+        expect(keeperPromptWired()).toBe(true);
+        return;
+      }
+      const work = planTree;
+      const target = join(work, fx.target_relative);
+      const r = runCandidate(["check-generated", target, "--on", fx.on], work);
       expect(r.code).toBe(fx.exit_code);
+      const workRoots: NormalizeRoots = {
+        arthackRoot: manifest.arthack_root,
+        keeperRoot: work,
+      };
       const gotEnvelope = JSON.parse(
-        tokenizeRoots(r.stdout.toString("utf-8"), roots),
+        tokenizeRoots(r.stdout.toString("utf-8"), workRoots),
       ) as Record<string, unknown>;
-      // Oracle envelope: tokenized at capture, verb-substituted here.
-      const wantEnvelope = JSON.parse(
-        substituteVerb(JSON.stringify(fx.envelope_raw)),
-      ) as Record<string, unknown>;
-      // Candidate envelope: verb-substitute too (no-op if already canonical).
-      const gotCanonical = JSON.parse(
-        substituteVerb(JSON.stringify(gotEnvelope)),
-      ) as Record<string, unknown>;
-      expect(gotCanonical).toEqual(wantEnvelope);
+      expect(gotEnvelope).toEqual(fx.envelope_raw);
     });
   }
 });
 
-describe("render-plugin-templates: byte-identical tree + sidecars vs oracle", () => {
+describe("render-plugin-templates: byte-identical tree + sidecars vs golden", () => {
   test("full plan-plugin render matches the golden tree", () => {
-    // Keep the byte-diff assertion meaningful: until the verb is wired the
-    // candidate render can't run, so assert the wiring precondition and let
-    // THAT be the single red signal rather than a spurious empty-tree diff.
-    // Re-probe (not the narrowed module const) so the type stays boolean.
-    if (!keeperPromptWired()) {
+    if (!PROMPT_WIRED) {
+      // Re-probe (not the narrowed const) so the type stays boolean.
       expect(keeperPromptWired()).toBe(true);
       return;
     }
@@ -281,11 +308,8 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs oracle", ()
         arthackRoot: manifest.arthack_root,
         keeperRoot: work,
       };
-      const gotStdout = normalizeCandidate(
-        r.stdout.toString("utf-8"),
-        candidateRoots,
-      );
-      expect(gotStdout).toBe(normalizeOracle(pluginTemplates.stdout, roots));
+      const gotStdout = normalize(r.stdout.toString("utf-8"), candidateRoots);
+      expect(gotStdout).toBe(normalize(pluginTemplates.stdout, roots));
 
       // Compare the rendered tree file-by-file.
       const gotFiles = collectTree(work);
@@ -297,8 +321,8 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs oracle", ()
       );
       expect(new Set(gotFiles.keys())).toEqual(new Set(wantByRel.keys()));
       for (const [rel, gotContent] of gotFiles) {
-        const want = normalizeOracle(wantByRel.get(rel) as string, roots);
-        const got = normalizeCandidate(gotContent, candidateRoots);
+        const want = normalize(wantByRel.get(rel) as string, roots);
+        const got = normalize(gotContent, candidateRoots);
         expect(got).toBe(want);
       }
     } finally {

@@ -1,37 +1,26 @@
-// The differential-parity normalizer: the ONE intentional diff between the
-// Python `promptctl` oracle and the ported `keeper prompt` engine.
+// Snapshot canonicalizer: the ONE transform applied to both the recorded golden
+// and the live `keeper prompt` output before byte-comparison.
 //
-// The port renames the binary, so two byte-shapes drift on purpose:
-//   1. command/regenerate cites: the literal `promptctl ` verb prefix becomes
-//      `keeper prompt ` (in `regenerate_cmd`, sidecar `_warning` bodies, and the
-//      block/warn message text the hooks surface).
-//   2. machine-absolute paths: the oracle bakes the capturing host's absolute
-//      repo roots into `regenerate_cmd` / `source_template` / `message`. Those
-//      are environment, not behavior — they get tokenized so a fixture captured
-//      on one machine compares clean against a render on another.
-//
-// Both transforms are applied to BOTH sides before byte-comparison, so the
-// parity assertion sees only genuine rendering divergence. Path tokenization is
-// symmetric (oracle and candidate alike); the verb substitution is one-way
-// (oracle `promptctl ` → canonical `keeper prompt `) because that is the single
-// sanctioned behavioral change of the port.
+// The goldens bake the capturing host's absolute repo roots into envelopes
+// (`regenerate_cmd` / `source_template` / `message`) and rendered bodies. Those
+// paths are environment, not behavior — they get tokenized to placeholders so a
+// fixture captured on one machine (or under one temp render root) compares clean
+// against a render on another. The transform is symmetric: applied identically
+// to the recorded golden and the live output, so the comparison sees only
+// genuine rendering divergence, never a host-path artifact.
 
-/** The oracle's verb prefix. A trailing space scopes it to command position so
- *  a snippet body that merely mentions the word "promptctl" is untouched. */
-const ORACLE_VERB = "promptctl ";
-/** The ported engine's verb prefix. */
-const KEEPER_VERB = "keeper prompt ";
-
-/** Placeholder tokens for the two machine-absolute repo roots the oracle bakes
- *  into envelopes. Capture records the live roots in the fixture manifest; both
- *  comparison sides tokenize against them so the compare is host-independent. */
+/** Placeholder tokens for the two machine-absolute repo roots baked into
+ *  envelopes and rendered bodies. Capture records the live roots in the fixture
+ *  manifest; both comparison sides tokenize against them so the compare is
+ *  host-independent. */
 export const ARTHACK_ROOT_TOKEN = "<ARTHACK_ROOT>";
 export const KEEPER_ROOT_TOKEN = "<KEEPER_ROOT>";
 
 export interface NormalizeRoots {
   /** Absolute path to the arthack corpus repo (snippet/bundle source). */
   arthackRoot: string;
-  /** Absolute path to the keeper repo (plugin-template consumer root). */
+  /** Absolute path to the keeper root the fixture was rendered under (the repo
+   *  root, or the temp render root used for the hermetic plan-plugin capture). */
   keeperRoot: string;
 }
 
@@ -64,27 +53,10 @@ export function tokenizeRoots(text: string, roots: NormalizeRoots): string {
   return out;
 }
 
-/** Apply the one-way verb substitution `promptctl ` → `keeper prompt ` to the
- *  ORACLE side only. The candidate already emits `keeper prompt `, so it is a
- *  no-op there — calling it on both sides is safe and idempotent. */
-export function substituteVerb(text: string): string {
-  return replaceAll(text, ORACLE_VERB, KEEPER_VERB);
-}
-
-/** Full normalization applied to the ORACLE fixture before comparison: tokenize
- *  roots, then rename the verb. This is the canonical form every later
- *  verb-port task asserts its candidate output against. */
-export function normalizeOracle(text: string, roots: NormalizeRoots): string {
-  return substituteVerb(tokenizeRoots(text, roots));
-}
-
-/** Normalization applied to the CANDIDATE (`keeper prompt`) output before
- *  comparison: tokenize roots only — the candidate already speaks
- *  `keeper prompt`, so no verb rewrite is owed. Kept distinct from
- *  `normalizeOracle` so the asymmetry of the port is explicit at the callsite. */
-export function normalizeCandidate(
-  text: string,
-  roots: NormalizeRoots,
-): string {
-  return substituteVerb(tokenizeRoots(text, roots));
+/** Canonicalize a recorded golden or a live render into the host-independent
+ *  comparison form: machine-absolute repo roots → placeholder tokens. This is
+ *  the ONLY transform the regression-pin suite applies, and it is applied
+ *  symmetrically to both sides so no incidental rewrite hides in the diff. */
+export function normalize(text: string, roots: NormalizeRoots): string {
+  return tokenizeRoots(text, roots);
 }

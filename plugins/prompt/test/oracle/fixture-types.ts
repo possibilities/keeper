@@ -1,7 +1,7 @@
-// Shared shape of the captured oracle fixtures. Both the capture script and the
-// parity test import these so the on-disk layout has one definition.
+// Shared shape of the recorded golden fixtures. Both the capture script and the
+// regression-pin suite import these so the on-disk layout has one definition.
 
-/** One captured `promptctl render <ref>` invocation. */
+/** One recorded `keeper prompt render <ref>` invocation. */
 export interface RenderFixture {
   /** The substrate ref rendered (bare snippet id, `bundle/<name>`, or
    *  `sketch/<name>`). */
@@ -13,14 +13,16 @@ export interface RenderFixture {
   exit_code: number;
 }
 
-/** One captured `promptctl check-generated <file> --on <mode>` invocation. */
+/** One recorded `keeper prompt check-generated <file> --on <mode>` invocation,
+ *  captured against a hermetically-rendered plan-plugin tree. */
 export interface CheckGeneratedFixture {
-  /** The target file, repo-relative to the keeper root (path-stable). */
+  /** The target file, relative to the temp render root the tree was rendered
+   *  under (path-stable). */
   target_relative: string;
   /** The `--on` mode the envelope was captured under. */
   on: "read" | "write";
-  /** The parsed JSON envelope, with absolute roots already tokenized and the
-   *  verb substitution NOT yet applied (the test applies `normalizeOracle`). */
+  /** The parsed JSON envelope, with absolute roots already tokenized to
+   *  placeholders at capture time. */
   envelope_raw: Record<string, unknown>;
   /** Process exit code. */
   exit_code: number;
@@ -50,12 +52,12 @@ export interface PluginTemplatesFixture {
 
 /** Top-level manifest written alongside the per-verb fixtures. */
 export interface OracleManifest {
-  /** The live absolute roots the capture ran against — recorded so the parity
-   *  test can re-tokenize / de-tokenize for a host-independent compare. */
+  /** The live absolute roots the capture ran against — recorded so the
+   *  regression-pin suite can re-tokenize for a host-independent compare. */
   arthack_root: string;
   keeper_root: string;
-  /** The `promptctl --version`-equivalent identity of the oracle binary, for
-   *  drift forensics if a later capture diverges. */
+  /** Path to the `keeper` binary that recorded the goldens, for drift forensics
+   *  if a later capture diverges. */
   oracle_path: string;
   /** ISO capture timestamp (forensic only; never asserted). */
   captured_at: string;
