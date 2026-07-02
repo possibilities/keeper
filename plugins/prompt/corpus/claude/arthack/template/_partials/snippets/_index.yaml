@@ -1,0 +1,301 @@
+snippets:
+  - name: agents-md-symlink
+    summary: Every CLAUDE.md needs a paired AGENTS.md symlink so all AI tools find the same instructions.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - claude-md
+      - agents-md
+      - symlink
+      - tooling
+    scope:
+      - any
+    phase:
+      - executing
+    path: _partials/snippets/engineering/agents-md-symlink.md.tmpl
+    token-estimate: 49
+    used-in: []
+  - name: build-forward-no-fallback
+    summary: Build forward — migrate and delete old code, no backwards-compat shims; no fallback paths, fail visibly.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - engineering
+      - migration
+      - error-handling
+      - fail-fast
+    scope:
+      - any
+    phase:
+      - planning
+      - executing
+      - reviewing
+    path: _partials/snippets/engineering/build-forward-no-fallback.md.tmpl
+    token-estimate: 106
+    used-in: []
+  - name: claude-md-scope
+    summary: CLAUDE.md is for small, localized, repo-specific rules — not architecture, walkthroughs, or changelogs. Keep it minimal; prune on edit.
+    domain: engineering
+    audience: agent
+    severity: guard
+    tags:
+      - claude-md
+      - agents-md
+      - docs
+      - scope
+      - minimal
+      - prune
+    scope:
+      - any
+    phase:
+      - executing
+      - reviewing
+    related:
+      - future-facing-docs
+      - agents-md-symlink
+    path: _partials/snippets/engineering/claude-md-scope.md.tmpl
+    token-estimate: 361
+    used-in: []
+  - name: code-comment-style
+    summary: Default to no comments — write one only when the WHY is non-obvious; never provenance/narration; prune on touch; protected suppressions/licenses/doc-comments never deleted; docs prune never append-only.
+    domain: engineering
+    audience: agent
+    severity: guard
+    tags:
+      - comments
+      - code-style
+      - provenance
+      - prune
+      - docs
+      - no-narration
+    scope:
+      - any
+    phase:
+      - executing
+      - reviewing
+    related:
+      - future-facing-docs
+      - claude-md-scope
+    path: _partials/snippets/engineering/code-comment-style.md.tmpl
+    token-estimate: 421
+    used-in: []
+  - name: commit-hygiene-flags
+    summary: Never --no-verify / --no-gpg-sign / --amend / git add -A — applies to all commit-emitting layers.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - git
+      - commit
+      - hygiene
+      - no-verify
+      - amend
+      - hooks
+    scope:
+      - any
+    phase:
+      - executing
+      - reviewing
+    related:
+      - agents-md-symlink
+    path: _partials/snippets/engineering/commit-hygiene-flags.md.tmpl
+    token-estimate: 140
+    used-in: []
+  - name: commit-via-keeper-default
+    summary: Default to `keeper commit-work` for committing source changes — runs the project's lint matrix, lands the commit under a flock, pushes to origin. Skip only for explicit experimental or debugging scratch.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - git
+      - commit
+      - keeper
+      - lint
+      - push
+    scope:
+      - any
+    phase:
+      - executing
+    topics:
+      - engineering
+      - git
+      - commit
+    related:
+      - commit-hygiene-flags
+    path: _partials/snippets/engineering/commit-via-keeper-default.md.tmpl
+    token-estimate: 628
+    used-in: []
+  - name: escalate-inline-or-plan
+    summary: 'Size a work-shaped request to choose where it lands: inline (1-2 files, no new contracts, wanted now), /plan:plan (multi-module or new contract or 3+ moves), or /plan:defer (inline-shaped but not now). Tie-break toward plan over inline, defer over now.'
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - escalation
+      - sizing
+      - routing
+      - planning
+    scope:
+      - any
+    phase:
+      - executing
+    related:
+      - commit-via-keeper-default
+    path: _partials/snippets/engineering/escalate-inline-or-plan.md.tmpl
+    token-estimate: 315
+    used-in: []
+  - name: future-facing-docs
+    summary: Developer docs describe current state, never narrate how it got here — no version history, no migration changelog, no inline ticket IDs. Reads like a reference, not a changelog.
+    domain: engineering
+    audience: agent
+    severity: guard
+    tags:
+      - docs
+      - writing
+      - future-facing
+      - history
+      - changelog
+      - claude-md
+      - readme
+    scope:
+      - any
+    phase:
+      - executing
+      - reviewing
+    related:
+      - claude-md-scope
+    path: _partials/snippets/engineering/future-facing-docs.md.tmpl
+    token-estimate: 371
+    used-in: []
+  - name: keeper-history-forensics
+    summary: Read-only recipes against keeper.db — every prompt, tool call, file mutation, and subagent run across all sessions. Find who touched a file, search past prompts, replay what a session or worker actually did.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - keeper
+      - history
+      - forensics
+      - sessions
+      - sqlite
+    scope:
+      - any
+    phase:
+      - executing
+    related:
+      - commit-via-keeper-default
+    path: _partials/snippets/engineering/keeper-history-forensics.md.tmpl
+    token-estimate: 474
+    used-in: []
+  - name: network-service-hardening
+    summary: Network listeners need IP filtering (Tailscale CGNAT + localhost) and auth; no unauthenticated endpoints.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - network
+      - security
+      - tailscale
+      - auth
+      - hardening
+    scope:
+      - any
+    phase:
+      - planning
+      - executing
+      - reviewing
+    path: _partials/snippets/engineering/network-service-hardening.md.tmpl
+    token-estimate: 115
+    used-in: []
+  - name: never-assume-tests-pass
+    summary: Always run a test you just wrote or modified — never assume it passes.
+    domain: engineering
+    audience: agent
+    severity: default
+    path: _partials/snippets/engineering/never-assume-tests-pass.md.tmpl
+    token-estimate: 57
+    used-in: []
+  - name: orient
+    summary: Orient before steering the keeper board — read the whole board (autopilot config + per-row readiness verdicts + counts + drained/jammed + in-flight + needs-human) in one `keeper status --json` call before dispatching, pausing, handing off, or wiring an await.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - keeper
+      - autopilot
+      - board
+      - status
+      - orient
+    scope:
+      - any
+    phase:
+      - executing
+    topics:
+      - engineering
+      - keeper
+      - autopilot
+    related:
+      - keeper-history-forensics
+    path: _partials/snippets/engineering/orient.md.tmpl
+    token-estimate: 473
+    used-in: []
+  - name: script-shebang-hygiene
+    summary: Script hygiene — never zsh shebangs; shebanged scripts need .sh/.py extension and chmod +x.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - scripts
+      - shebang
+      - bash
+      - hygiene
+    scope:
+      - any
+    phase:
+      - executing
+    path: _partials/snippets/engineering/script-shebang-hygiene.md.tmpl
+    token-estimate: 49
+    used-in: []
+  - name: tmp-file-unique-path
+    summary: Tmp-file hygiene — agent-written tmp files get unique mktemp paths; stable names only when re-finding is the point, keyed by subject.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - tmp
+      - hygiene
+      - mktemp
+      - concurrency
+      - collision
+    scope:
+      - any
+    phase:
+      - executing
+    related:
+      - script-shebang-hygiene
+    path: _partials/snippets/engineering/tmp-file-unique-path.md.tmpl
+    token-estimate: 97
+    used-in: []
+  - name: docs-dir-and-gist-open
+    summary: Documents go under ~/docs (a related set gets ~/docs/<topic-slug>); doc metadata lives only in the .yaml sidecar; "open it" means publish both files with gh gist create <doc>.md <doc>.yaml --web.
+    domain: source-dirs
+    audience: agent
+    severity: guard
+    tags:
+      - docs
+      - gist
+      - gh
+      - output
+      - conventions
+    scope:
+      - any
+    phase:
+      - executing
+    topics:
+      - source-dirs
+      - output-conventions
+    path: _partials/snippets/source-dirs/docs-dir-and-gist-open.md.tmpl
+    token-estimate: 190
+    used-in: []

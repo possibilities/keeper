@@ -1,0 +1,38 @@
+{#-
+name: orient
+summary: Orient before steering the keeper board — read the whole board (autopilot config + per-row readiness verdicts + counts + drained/jammed + in-flight + needs-human) in one `keeper status --json` call before dispatching, pausing, handing off, or wiring an await.
+domain: engineering
+audience: agent
+severity: default
+tags: [keeper, autopilot, board, status, orient]
+scope: [any]
+phase: [executing]
+topics: [engineering, keeper, autopilot]
+related: [keeper-history-forensics]
+-#}
+**Orient before you steer the board.** Before dispatching a worker, pausing or arming the autopilot, handing off, or wiring an await, read the whole board in one call:
+
+```bash
+keeper status --json
+```
+
+It prints ONE `{schema_version, ok, error, data}` envelope and exits — no TUI snapshot dance, no reconnect loop. `data` carries:
+
+- `autopilot` — `{paused, mode, armed, worktree_mode, max_concurrent_jobs, max_concurrent_per_root}`, the global singleton.
+- `board.epics` — per-epic readiness verdicts, each with its task rows and close row.
+- `counts` — `{epics, tasks, close_rows}` tallies (`ready`/`running`/`completed`/`blocked`).
+- `drained` / `jammed` — the board is fully at rest / has an operator jam (a sticky `dispatch_failures` row).
+- `in_flight` — `{pending_dispatches, running_jobs, total}`.
+- `needs_human` — `{dead_letters, block_escalations, stuck_dispatches, finalize_non_ff, total}`.
+- `rev` / `catching_up` — the boot cursor; a `catching_up:true` read is provisional.
+
+Exit 0 on ANY board state (a bad board is DATA), exit 1 only on transport/usage; a down daemon gives up after a bounded ~10s connect deadline rather than hanging. `jq` the field you need:
+
+```bash
+keeper status --json | jq .data.autopilot
+keeper status --json | jq '.data.drained, .data.jammed, .data.needs_human.total'
+```
+
+Need the raw rows of one collection? `keeper query <collection> [--filter k=v] --json` reads any allowlisted collection (`epics`, `jobs`, `dispatch_failures`, `autopilot_state`, `armed_epics`, `pending_dispatches`, …) in one read-only round-trip; an off-allowlist name is rejected at parse time. Want a live tail instead of a one-shot read? `keeper watch --json` streams coarse NDJSON board deltas (epic added/removed, verdict change, job-state change, autopilot change) and never exits.
+
+Orient → decide → act → (optionally) `keeper await` the condition that ends the work.

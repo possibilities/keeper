@@ -1,0 +1,22 @@
+id: engineering-rules
+snippet_ids:
+- build-forward-no-fallback
+- network-service-hardening
+- script-shebang-hygiene
+- tmp-file-unique-path
+- agents-md-symlink
+- claude-md-scope
+- future-facing-docs
+- never-assume-tests-pass
+- commit-hygiene-flags
+- commit-via-keeper-default
+- code-comment-style
+summary: Cross-cutting engineering policy — build forward, network hardening, script
+  hygiene, tmp-file unique paths, AGENTS.md symlink, CLAUDE.md scope + future-facing
+  docs, never-assume-tests-pass, commit-hygiene-flags, commit-via-keeper-default,
+  code-comment-style.
+tags:
+- engineering
+- policy
+- security
+created_at: '2026-05-18T02:29:14.312316Z'

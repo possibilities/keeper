@@ -13,6 +13,7 @@ import {
   findGitRoot,
   hasCorpus,
   resolveProjectRoot,
+  vendoredCorpusRoot,
 } from "../src/project_root.ts";
 
 let root: string;
@@ -73,8 +74,16 @@ describe("fallbackCorpusRoot", () => {
     expect(fallbackCorpusRoot()).toBe(root);
   });
 
-  test("defaults to ~/code/arthack when the env is unset", () => {
-    expect(fallbackCorpusRoot()).toMatch(/[/\\]code[/\\]arthack$/);
+  test("defaults to the in-repo vendored corpus when the env is unset", () => {
+    expect(fallbackCorpusRoot()).toBe(vendoredCorpusRoot());
+    expect(fallbackCorpusRoot()).toMatch(/plugins[/\\]prompt[/\\]corpus$/);
+  });
+});
+
+describe("vendoredCorpusRoot", () => {
+  test("resolves plugins/prompt/corpus beside the engine", () => {
+    expect(vendoredCorpusRoot()).toMatch(/plugins[/\\]prompt[/\\]corpus$/);
+    expect(hasCorpus(vendoredCorpusRoot())).toBe(true);
   });
 });
 

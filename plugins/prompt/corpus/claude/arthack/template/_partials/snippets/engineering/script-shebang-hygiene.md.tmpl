@@ -1,0 +1,12 @@
+{#-
+name: script-shebang-hygiene
+summary: Script hygiene — never zsh shebangs; shebanged scripts need .sh/.py extension and chmod +x.
+domain: engineering
+audience: agent
+severity: default
+tags: [scripts, shebang, bash, hygiene]
+scope: [any]
+phase: [executing]
+-#}
+- Never use `#!/usr/bin/env zsh`. Use `#!/usr/bin/env bash` or `#!/usr/bin/env -S uv run --script`.
+- Scripts with shebangs must have extensions (`.sh` or `.py`) and be executable (`chmod +x`).

@@ -1,0 +1,28 @@
+# Provenance for the vendored keeper-relevant snippet corpus subset.
+# Upstream authoring home is the arthack corpus; two-way drift is by design —
+# this lock IS the review point. Regenerate with scripts/vendor-corpus.ts; the
+# prompt-suite drift test re-hashes the vendored tree against `files` below.
+upstream:
+  repo: arthack
+  remote: git@github.com:possibilities/arthack.git
+  path: claude/arthack/template/_partials
+  sha: 0134fe441178b61e52ecda2d8108e0d47158463f
+filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
+files:
+  claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
+  claude/arthack/template/_partials/snippets/_index.yaml: 3674b3833a127360f9e59d3c9976ece25029ae0eb2970198571618af6cfda637
+  claude/arthack/template/_partials/snippets/engineering/agents-md-symlink.md.tmpl: 61b73be6a5c6fb55c9bb838fc3065bec00b086fed59f1d9164ebb07637f7c245
+  claude/arthack/template/_partials/snippets/engineering/build-forward-no-fallback.md.tmpl: 508fa1c40b0c61de5b8a1d2f0dee17482af4d8a62ac2d5440d03d9c555ca5577
+  claude/arthack/template/_partials/snippets/engineering/claude-md-scope.md.tmpl: 67aab3e5032248ace1f549785e2fe89e5547e6954bbebd73cf3624100f007eb7
+  claude/arthack/template/_partials/snippets/engineering/code-comment-style.md.tmpl: 8ed4a93224d2a344cf4f1d361d9bd41bce2c68a14488a03e6d281e9c5d122049
+  claude/arthack/template/_partials/snippets/engineering/commit-hygiene-flags.md.tmpl: ff840e006dccf1e2c667f4fe5edfdef94e3ed4c94e94d2053173631b7abd7862
+  claude/arthack/template/_partials/snippets/engineering/commit-via-keeper-default.md.tmpl: 7ccd36aa5c5fc7ea53592e24b1439da0156ec753737340fd3845398a9450f935
+  claude/arthack/template/_partials/snippets/engineering/escalate-inline-or-plan.md.tmpl: 812e953b1584d91ee6308b8c9e4aebdcabee0a842ff999884f3e7bd094801745
+  claude/arthack/template/_partials/snippets/engineering/future-facing-docs.md.tmpl: e25ea5703a4b547f5146d830764eafa0be2a10db4ecbdd23d89aec199ca26c83
+  claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 9716788e042f19e845b3587765c8e51f1bf83e399a708934818b0271b32e28bc
+  claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 42297fa00860e86eb326e1e8d505c1bc1a6fa37b3fa01a92e3e20d6f99817408
+  claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3
+  claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: 9a39a73c6c3b5f0e1ab63724b11bbe9091a5a89f964be70f1df9896a3aa31b32
+  claude/arthack/template/_partials/snippets/engineering/script-shebang-hygiene.md.tmpl: fcdb00c0dfe0e6d1476424c83d7b4fa5b517b3965261ea18c892338ac164cc24
+  claude/arthack/template/_partials/snippets/engineering/tmp-file-unique-path.md.tmpl: 4f00bf6453ff15e20b08d7722f8e6d782f8adb9d12e4ca52ffe2b82ece91257f
+  claude/arthack/template/_partials/snippets/source-dirs/docs-dir-and-gist-open.md.tmpl: 9d2e2850ec6d9789dfceb99b28f2bd16517798c30e62c2636f3d70fe38bae821

@@ -1,17 +1,19 @@
 // Corpus-root resolution for `keeper prompt`. The snippet/bundle corpus lives at
-// `claude/arthack/template/_partials/` — historically in the arthack source repo,
-// not keeper's. Resolution walks up from cwd to the nearest `.git` root, but that
-// root only wins when it actually holds a corpus; otherwise it falls back to the
-// configured authoring home so `keeper prompt render` resolves from any repo
-// (notably keeper's own root, which carries no corpus).
+// `claude/arthack/template/_partials/` — authored upstream in the arthack repo,
+// vendored into keeper under `plugins/prompt/corpus/`. Resolution walks up from
+// cwd to the nearest `.git` root, but that root only wins when it actually holds
+// a corpus; otherwise it falls back to the vendored corpus so `keeper prompt
+// render` resolves from any repo (notably keeper's own root, which carries no
+// corpus of its own — the vendored subset ships beside the engine).
 //
-// The fallback home is config-driven via `KEEPER_PROMPT_CORPUS_ROOT` so a vendored
-// corpus can become the primary source without another engine change; it defaults
-// to `~/code/arthack` (the claudectl default home).
+// The fallback home is config-driven via `KEEPER_PROMPT_CORPUS_ROOT` (point it at
+// an arthack checkout to author against the full upstream corpus); unset, it is
+// the vendored subset shipped in-repo, so a fresh clone renders with no arthack
+// checkout present.
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Corpus marker relative to a project root: the partials dir every render reads
  * from. A root without it holds no corpus and cannot serve renders. */
@@ -39,14 +41,22 @@ export function findGitRoot(start: string): string | null {
   }
 }
 
+/** The vendored corpus root shipped beside the engine (`plugins/prompt/corpus`),
+ * resolved from this module's own location so it is found regardless of cwd. Its
+ * `claude/arthack/template/_partials/` subtree is the keeper-relevant subset. */
+export function vendoredCorpusRoot(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "corpus");
+}
+
 /** The config-driven home fallback corpus root: `KEEPER_PROMPT_CORPUS_ROOT` when
- * set, else `~/code/arthack`. */
+ * set (an arthack checkout, for authoring against the full corpus), else the
+ * in-repo vendored subset. */
 export function fallbackCorpusRoot(): string {
   const configured = process.env.KEEPER_PROMPT_CORPUS_ROOT?.trim();
   if (configured) {
     return resolve(configured);
   }
-  return join(homedir(), "code", "arthack");
+  return vendoredCorpusRoot();
 }
 
 /** Resolve the corpus project root: an explicit `--project-root` wins outright;

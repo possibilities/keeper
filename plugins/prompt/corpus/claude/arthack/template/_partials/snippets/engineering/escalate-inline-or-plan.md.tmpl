@@ -1,0 +1,21 @@
+{#-
+name: escalate-inline-or-plan
+summary: 'Size a work-shaped request to choose where it lands: inline (1-2 files, no new contracts, wanted now), /plan:plan (multi-module or new contract or 3+ moves), or /plan:defer (inline-shaped but not now). Tie-break toward plan over inline, defer over now.'
+domain: engineering
+audience: agent
+severity: default
+tags: [escalation, sizing, routing, planning]
+scope: [any]
+phase: [executing]
+related: [commit-via-keeper-default]
+-#}
+When a request reads as work to do, size it against this rubric before choosing how to act. The same clauses gate both the answer shape and where the work lands.
+
+- **Inline** when the change fits one or two files, introduces no schema / protocol / UX boundary change, the direction reads as a single coherent move, AND the human wants it done now. Answer with the short pre-work paragraph and execute on plain-text greenlight.
+- **`/plan:plan`** when the work spans multiple modules, adds a worker / RPC / migration / screen, introduces a new contract, or reads as ≥3 independently sequenceable moves. Decompose rather than commit.
+- **`/plan:defer`** when the work is inline-shaped (one cohesive task, no new contracts) BUT the human signaled "not now" / "later" / "follow up" / "queue this up" semantics. Capture it as a normal-sorted single-task epic; autopilot runs it when it reaches the front of the board.
+
+Tie-breakers:
+
+- Ambiguous between **inline** and **`/plan:plan`** → default to **`/plan:plan`**. Collapsing a plan back into one commit is cheaper than backing out of a premature commit.
+- Ambiguous between **inline** and **`/plan:defer`** → default to **`/plan:defer`**. Capturing it for later is cheaper than an unwanted commit landing now.

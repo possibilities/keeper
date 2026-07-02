@@ -88,7 +88,7 @@ can't resolve it to an exact id, ask. Do not invent ids.
 
 ## Orient first
 
-<!-- Canonical source: keeper prompt render engineering/orient -->
+<!-- POINTER: keeper prompt render engineering/orient -->
 
 Before firing a worker, read the board in one call: `keeper status --json`
 prints autopilot config (`{paused, mode, …}`), per-row readiness verdicts,

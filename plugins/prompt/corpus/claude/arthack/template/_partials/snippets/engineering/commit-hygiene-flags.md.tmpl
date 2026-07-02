@@ -1,0 +1,12 @@
+{#-
+name: commit-hygiene-flags
+summary: Never --no-verify / --no-gpg-sign / --amend / git add -A — applies to all commit-emitting layers.
+domain: engineering
+audience: agent
+severity: default
+tags: [git, commit, hygiene, no-verify, amend, hooks]
+scope: [any]
+phase: [executing, reviewing]
+related: [agents-md-symlink]
+-#}
+**Never `--no-verify`, never `--no-gpg-sign`, never `--amend`.** **Never `git add -A` or `git add .`** — only explicit paths. These rules apply at every commit-emitting layer: CLI mutation verbs, hook post-commits, agent-driven `git commit` calls. Bypassing hooks or signing, amending shipped commits, or scooping untracked files into a commit by accident are the four ways a clean commit history corrodes — and none of them have legitimate use in this repo. If a hook fails, fix it; if a signature fails, fix it; if a commit shipped wrong, ship a new one.

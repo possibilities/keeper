@@ -1,0 +1,40 @@
+{#-
+name: keeper-history-forensics
+summary: 'Read-only recipes against keeper.db — every prompt, tool call, file mutation, and subagent run across all sessions. Find who touched a file, search past prompts, replay what a session or worker actually did.'
+domain: engineering
+audience: agent
+severity: default
+tags: [keeper, history, forensics, sessions, sqlite]
+scope: [any]
+phase: [executing]
+related: [commit-via-keeper-default]
+-#}
+Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Reach for the read-only `keeper` JSON subcommands below first — they emit a parseable envelope and stay stable across schema shifts; drop to `sqlite3 -readonly` only for an ad-hoc column they don't surface (the daemon is the sole writer — never open the DB read-write).
+
+**Who last touched a file** — then replay that session:
+
+```bash
+keeper find-file-history <path-fragment>   # session_id, mutation time, op, source, project_dir (most-recent-first)
+```
+
+Feed a `session_id` to `keeper show-session-events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
+
+**Search past prompts** — "when did we discuss X / decide Y":
+
+```bash
+keeper search-history <term>   # ts, session_id, prompt snippet for every matching UserPromptSubmit row
+```
+
+**What a session did** — the prompt/tool-call spine without transcript bulk:
+
+```bash
+keeper show-session-events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
+```
+
+**One job's metadata / failed-worker forensics**:
+
+```bash
+keeper show-job --session <title>   # the full jobs-projection row (auto-detects your own job with no selector)
+```
+
+`subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.

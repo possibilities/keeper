@@ -1,0 +1,20 @@
+{#-
+name: claude-md-scope
+summary: CLAUDE.md is for small, localized, repo-specific rules — not architecture, walkthroughs, or changelogs. Keep it minimal; prune on edit.
+domain: engineering
+audience: agent
+severity: guard
+tags: [claude-md, agents-md, docs, scope, minimal, prune]
+scope: [any]
+phase: [executing, reviewing]
+related: [future-facing-docs, agents-md-symlink]
+-#}
+**Keep `CLAUDE.md` minimal.** Every line is re-read into context on *every* task in the repo — it is the most expensive prose you write. It earns its place only by stopping an agent from making a mistake it would otherwise make.
+
+**What belongs:** small, localized, repo-specific rules — the build/test command, naming conventions, a non-obvious gotcha, a "never do X in this repo" guard, a pointer to where the real docs live. Things an agent gets *wrong* without being told.
+
+**What does NOT belong:** architecture overviews, module-by-module walkthroughs, state-machine descriptions, schema documentation, design rationale. That is documentation, not a rule — it goes in `README.md`, `docs/`, or a design memo, and `CLAUDE.md` links to it. The code and tests are the source of truth for what the code *does*; don't restate them in prose that silently rots.
+
+**When updating docs after a change, prune and consolidate — never append-only.** Remove detail the change made redundant, collapse duplicate explanations into one, and delete history (see `keeper prompt render future-facing-docs`). If a `CLAUDE.md` has grown into an architecture doc, move that content out to `README.md`/`docs/` and leave a one-line pointer. Append-only doc edits are how a 40-line map becomes a 500-line changelog.
+
+Test each line: *would a capable engineer new to the repo make a mistake without it?* If it only describes what the code already shows, cut it.
