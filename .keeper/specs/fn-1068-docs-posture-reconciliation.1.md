@@ -26,5 +26,5 @@ lint-claude-md.ts green; `bun test` green (comment-only source edits must not di
 - [ ] Non-goal files untouched; `bun test` green
 
 ## Done summary
-
+Reconciled docs posture: reworded the CLAUDE.md merge-gate clause to current behavior (lane_merged + keeper await landed make orphaned/squash-merged stuck-states visible; detection/remediation an explicit deferral), added a README worktree-mode pointer, and purged fn-id provenance from readiness.ts + board-render.ts plus the fn-1016 comment sites in six other src files. Comment/docs-only; lint and fast suite green.
 ## Evidence

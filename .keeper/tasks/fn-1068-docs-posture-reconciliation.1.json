@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reconcile stale autopilot docs",
-  "updated_at": "2026-07-02T09:11:47.992000Z"
+  "updated_at": "2026-07-02T09:46:25.570000Z",
+  "worker_done_at": "2026-07-02T09:46:25.570000Z"
 }
