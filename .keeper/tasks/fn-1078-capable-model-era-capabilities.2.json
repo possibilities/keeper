@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Observable completion criteria for workers",
-  "updated_at": "2026-07-02T16:19:28.546000Z"
+  "updated_at": "2026-07-02T21:18:28.188000Z",
+  "worker_done_at": "2026-07-02T21:18:28.188000Z"
 }

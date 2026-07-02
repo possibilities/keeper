@@ -38,5 +38,5 @@ list must catch in_progress_uncommitted before yield.
 - [ ] Four cells re-rendered; close-out gate and criteria name the same observables
 
 ## Done summary
-
+Front-loaded a checkable, exhaustive, observable-bound Completion criteria block at top-of-prompt in the worker template and added a verify-before-yield Phase 6; criteria name the same observables the close-out gate enforces (in_progress_committed, done, dirty_session_files/session_files). Fans out to all four opus cells on render.
 ## Evidence
