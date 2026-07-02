@@ -454,7 +454,7 @@ function taskStarted(task: Task): boolean {
  * epic carries an embedded epic-form job (`plan`/`close`/`approve`) OR any
  * task satisfies {@link taskStarted}.
  */
-function epicStarted(epic: Epic): boolean {
+export function epicStarted(epic: Epic): boolean {
   if ((epic.jobs?.length ?? 0) > 0) {
     return true;
   }
