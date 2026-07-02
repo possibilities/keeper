@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reverse lint funnel, gate README",
-  "updated_at": "2026-07-02T03:12:08.731000Z"
+  "updated_at": "2026-07-02T04:00:59.528000Z",
+  "worker_done_at": "2026-07-02T04:00:59.528000Z"
 }

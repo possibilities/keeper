@@ -66,5 +66,5 @@ non-zero (manual smoke, don't commit the padding).
 - [ ] `bun scripts/lint-claude-md.ts` exits 0 on the repo as landed
 
 ## Done summary
-
+Reversed the lint-claude-md funnel (docstring + epilogue now say tighten/delete, README is not a relocation target) and added an exported scanReadme enforcing 250-line/24576-byte hard caps plus shared content fingerprints; main scans README when present and the commit-time gate fires on a staged README.md.
 ## Evidence
