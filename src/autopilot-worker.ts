@@ -607,6 +607,39 @@ export function worktreeRecoverDispatchId(dir: string): string {
 }
 
 /**
+ * The `dispatch_failures` id an EPIC-TIED recover failure keys on —
+ * `worktree-recover:<epicId>-<repoDirHash(repoDir)>` (composed
+ * `close::worktree-recover:<epicId>-<repoHash>`). The recover sibling of {@link
+ * worktreeFinalizeDispatchId}: the concurrent recover failures of ONE epic's main
+ * checkout and its multi-repo dirs each land on a DISTINCT row instead of colliding
+ * (last-writer-wins UPSERT) on the single `close::<epicId>` key and masking each
+ * other's actionable reason. Slugs nothing — the epic id is dispatch-safe and {@link
+ * repoDirHash} is base36 — so the composite passes `parseDispatchKey` exactly like the
+ * finalize key. `repoHash` reuses the lane-path dir-hash so the producer level-clear
+ * targets the SAME row it minted across cycles.
+ */
+export function worktreeRecoverEpicDispatchId(
+  epicId: string,
+  repoDir: string,
+): string {
+  return `worktree-recover:${epicId}-${repoDirHash(repoDir)}`;
+}
+
+/**
+ * The `dispatch_failures` id a {@link recoverWorktrees} failure keys on. Epic-tied →
+ * the per-(epic,repo) {@link worktreeRecoverEpicDispatchId}; a path-tied failure (no
+ * epic — the pass-1 list/abort/default-branch/base-list failures) → the per-dir
+ * {@link worktreeRecoverDispatchId} slug. The mint and {@link recoverFailuresToClear}
+ * BOTH route through this one helper so their keys never drift out of lockstep — a
+ * one-sided change would strand rows un-clearable.
+ */
+export function recoverFailureDispatchId(f: WorktreeRecoveryFailure): string {
+  return f.epicId != null
+    ? worktreeRecoverEpicDispatchId(f.epicId, f.dir)
+    : worktreeRecoverDispatchId(f.dir);
+}
+
+/**
  * The `reason` prefix every {@link recoverWorktrees} failure carries
  * (`worktree-recover-conflict`, `-push-failed`, `-not-on-default`, …). The
  * level-triggered auto-clear keys on it to scope clearing to RECOVER-originated
@@ -636,7 +669,7 @@ export function recoverFailuresToClear(
 ): string[] {
   const stillFailing = new Set<string>();
   for (const f of freshFailures) {
-    stillFailing.add(f.epicId ?? worktreeRecoverDispatchId(f.dir));
+    stillFailing.add(recoverFailureDispatchId(f));
   }
   const cleared: string[] = [];
   for (const id of openRecoverIds) {
@@ -5970,9 +6003,11 @@ function main(): void {
             for (const f of failures) {
               deps.emitDispatchFailed({
                 verb: "close",
-                // A path-tied recovery failure (no epic) keys on a slug of the dir so
-                // the operator can clear the row — see worktreeRecoverDispatchId.
-                id: f.epicId ?? worktreeRecoverDispatchId(f.dir),
+                // Per-(epic,repo) for an epic-tied failure so a main checkout and its
+                // multi-repo dirs never collide on `close::<epic>` and mask each
+                // other's reason; a path-tied failure (no epic) keeps the dir slug.
+                // MUST equal recoverFailuresToClear's key — both call the one helper.
+                id: recoverFailureDispatchId(f),
                 reason: f.reason,
                 dir: f.dir,
                 ts: deps.now(),

@@ -3573,14 +3573,22 @@ non-fast-forward → skip), but surfaces them as `worktree-recover-*` reasons wh
 DETAIL names the operator remedy (e.g. `not-on-default` says to switch the checkout
 back to the default branch, committing/stashing first) so the level-triggered
 auto-clear lifts the block the moment the tree settles. A recover merge
-conflict still fails LOUD and blocks ONLY its own `close::<epic>` key (per-key
-`failedKeys`) — but it is LEVEL-TRIGGERED, never a sticky board-jam: each cycle
-re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the sticky
-row (a synthetic `DispatchCleared`, the same fold arm `retry_dispatch` mints) the
-moment the git resolves — junk branch deleted, conflict merged, or epic reaped —
-so a human just fixes the git, never `retry_dispatch`. The auto-clear is SCOPED to
-recover-reason rows (`worktree-recover*`) so a normal close-sink (`finalizeEpic`)
-failure sharing the `close::<epic>` key is never clobbered. A successful close
+conflict still fails LOUD — but it is LEVEL-TRIGGERED, never a sticky board-jam:
+each cycle re-derives "is this lane still blocked?" from live git and AUTO-CLEARS the
+sticky row (a synthetic `DispatchCleared`, the same fold arm `retry_dispatch` mints)
+the moment the git resolves — junk branch deleted, conflict merged, or epic reaped —
+so a human just fixes the git, never `retry_dispatch`. An epic-tied recover failure
+lands on a DISTINCT `close::worktree-recover:<epic>-<repoHash>` row (`repoHash` =
+`repoDirHash(repoDir)`, the SAME dir-hash finalize keys on) — the recover sibling of
+the finalize per-repo key — so a main checkout and its multi-repo dirs never collide
+(last-writer-wins UPSERT) on the single `close::<epic>` key and mask each other's
+actionable reason (the fn-7 incident: a lane's `not-on-default` noise masked the main
+checkout's `dirty-checkout`); a pass-1 failure with no epic (list/abort/default/base)
+keeps the per-dir `worktree-recover:<dirSlug>` key. The auto-clear is SCOPED to
+recover-reason rows (`worktree-recover*`), so a normal close-sink (`finalizeEpic`)
+failure sharing the `close::<epic>` key is never clobbered — and an old-scheme
+bare-`close::<epic>` recover row from before this keying self-heals (level-clears) on
+the first post-fix cycle, since the fresh failure now mints the per-repo key. A successful close
 prunes its now-merged lane branches — every rib (`keeper/epic/<id>--<task>`) THEN
 the base (`git branch -D`), each AFTER its worktree teardown and each gated on
 is-ancestor-of-default so an unmerged/diverged ref is NEVER force-deleted — so a
