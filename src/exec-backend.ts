@@ -448,6 +448,31 @@ export type CloseKind =
   | "window_gone_server_alive"
   | "unknown";
 
+/**
+ * WHY keeper reaped a job — the producer-known cause it stamps on a synthetic
+ * `Killed` event's payload, folded onto `jobs.kill_reason` as an opaque string
+ * copy. Orthogonal to {@link CloseKind}: `close_kind` is HOW the session died
+ * (a tmux liveness verdict); `kill_reason` is WHY keeper acted (which producer
+ * arm minted the reap).
+ *
+ *  - `exit_watched` — steady-state: main's exit-watcher observed the watched
+ *    process exit.
+ *  - `boot_unwatchable` — boot seed sweep reaped a NULL-pid (unwatchable,
+ *    terminal-by-construction) row.
+ *  - `boot_pid_dead` — boot seed sweep proved the row's pid dead.
+ *  - `boot_pid_recycled` — boot seed sweep found the pid recycled into a
+ *    different process (start_time mismatch).
+ *
+ * The reducer copies it verbatim (no re-probe in the fold — a re-probe would
+ * break re-fold determinism), defaulting a field-less historical payload to
+ * NULL. Prefixes stay collision-free with the `dispatch-failure-key` vocabulary.
+ */
+export type KillReason =
+  | "exit_watched"
+  | "boot_unwatchable"
+  | "boot_pid_dead"
+  | "boot_pid_recycled";
+
 /** The slice of a `Bun.spawnSync` result `classifyCloseKind` reads; injectable
  *  for tests so the classifier exercises canned tmux output with no real fork. */
 export interface SyncProbeResult {

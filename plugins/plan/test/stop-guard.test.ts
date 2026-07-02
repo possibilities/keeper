@@ -233,7 +233,12 @@ function writePlanCliShim(envelope: unknown, exitCode = 0): void {
 async function run(
   payload: unknown,
   extraEnv: Record<string, string> = {},
-): Promise<{ stdout: string; code: number; planCliCalled: boolean }> {
+): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number;
+  planCliCalled: boolean;
+}> {
   const proc = Bun.spawn(["bun", GUARD], {
     stdin: "pipe",
     stdout: "pipe",
@@ -248,8 +253,9 @@ async function run(
   proc.stdin.write(JSON.stringify(payload));
   await proc.stdin.end();
   const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
   const code = await proc.exited;
-  return { stdout, code, planCliCalled: existsSync(sentinel) };
+  return { stdout, stderr, code, planCliCalled: existsSync(sentinel) };
 }
 
 function stopPayload(extra: Record<string, unknown> = {}): unknown {
@@ -306,6 +312,22 @@ describe("stop-guard ladder", () => {
     expect(env.reason).toContain("fn-1-x.2");
     expect(env.reason).toContain("not finished");
     expect(env.reason).toContain("keeper plan worker resume fn-1-x.2");
+  });
+
+  test("work marker + null probe → block AND a visible fail-open signal", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_uncommitted",
+      dirty_session_files: null,
+    });
+
+    const { stdout, stderr } = await run(stopPayload());
+    const env = JSON.parse(stdout.trim());
+    // The block still stands on the verdict...
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("fn-1-x.2");
+    // ...but the unreadable observable is announced, never silent.
+    expect(stderr).toContain("session-files probe unreadable");
   });
 
   test("work marker + done → allow AND unlink the stale marker", async () => {

@@ -14,10 +14,12 @@
 
 import {
   emitBlock,
+  emitVisibleSignal,
   isBypassed,
   readMarker,
   readStdin,
   runPlanCli,
+  sessionDirtyCount,
   unlinkMarker,
 } from "./lib.ts";
 
@@ -151,6 +153,7 @@ async function main(): Promise<void> {
   // a typed error (no `verdict` key), or `tooling_error` all fail open.
   const env = await runPlanCli(["reconcile", taskId]);
   const verdict = env?.verdict;
+  const dirty = sessionDirtyCount(env);
 
   // Terminal verdicts: the task is settled. `done` also retires the marker.
   if (verdict === "done") {
@@ -159,7 +162,27 @@ async function main(): Promise<void> {
   }
   if (verdict === "blocked") return;
 
-  const nudgeFor = VERDICT_NUDGE[verdict as string];
+  // Fail-open WITH a visible signal: reconcile could not read the session-files
+  // observable (git unreadable). The gate still decides on the verdict, but the
+  // open is announced rather than passing silently.
+  if (dirty === null) {
+    emitVisibleSignal(
+      `plan close-out gate: session-files probe unreadable for ${taskId} — ` +
+        "failing open on the reconcile verdict.",
+    );
+  }
+
+  // Observable-driven refinement: a source commit landed (in_progress_committed)
+  // but the tree still carries undischarged files — the "run keeper plan done"
+  // nudge would strand them, so fire the finish-and-commit nudge instead.
+  const effectiveVerdict =
+    verdict === "in_progress_committed" &&
+    typeof dirty === "number" &&
+    dirty > 0
+      ? "in_progress_uncommitted"
+      : (verdict as string);
+
+  const nudgeFor = VERDICT_NUDGE[effectiveVerdict];
   if (!nudgeFor) return; // unknown / tooling_error / null → fail open.
   const reason = nudgeFor(taskId);
   if (reason === null) return; // not_started → never trap.

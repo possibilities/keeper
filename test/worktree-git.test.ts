@@ -1018,21 +1018,46 @@ const statusRule = (porcelain: string, exitCode = 0): FakeGitRule => ({
 test("mergeReadiness: on the expected branch + clean tree → ready", async () => {
   const { run, calls } = fakeAsyncGit([onBranchRule("main"), statusRule("")]);
   expect(await mergeReadiness("/repo", "main", run)).toEqual({ kind: "ready" });
-  // It probed the branch THEN the working tree (cheapest discriminant first).
-  expect(calls[0].args).toEqual(["rev-parse", "--abbrev-ref", "HEAD"]);
+  // It probes the working tree FIRST (the dirty cause is the actionable one and
+  // must win over off-branch when a checkout is both), THEN the branch.
+  expect(calls[0].args).toEqual([
+    "status",
+    "--porcelain",
+    "--untracked-files=no",
+  ]);
+  expect(
+    calls.some((c) => argvStartsWith(c.args, "rev-parse", "--abbrev-ref")),
+  ).toBe(true);
+});
+
+test("mergeReadiness: a CLEAN tree off the expected branch → off-branch (dirty probed clean first)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    onBranchRule("feature-x"),
+    statusRule(""), // clean → the dirty check falls through to the branch verdict
+  ]);
+  expect(await mergeReadiness("/repo", "main", run)).toEqual({
+    kind: "off-branch",
+    head: "feature-x",
+  });
+  // Dirty-first: the working-tree probe runs BEFORE the off-branch verdict is
+  // reached, so a dirty+off-branch checkout can never mask its dirty cause.
   expect(
     calls.some((c) => argvStartsWith(c.args, "status", "--porcelain")),
   ).toBe(true);
 });
 
-test("mergeReadiness: HEAD on another branch → off-branch (no status probe)", async () => {
-  const { run, calls } = fakeAsyncGit([onBranchRule("feature-x")]);
-  expect(await mergeReadiness("/repo", "main", run)).toEqual({
-    kind: "off-branch",
-    head: "feature-x",
-  });
-  // Off-branch short-circuits BEFORE the working-tree probe.
-  expect(calls.some((c) => argvStartsWith(c.args, "status"))).toBe(false);
+test("mergeReadiness: a DIRTY tree that is ALSO off the expected branch → dirty (the actionable cause, never masked as off-branch)", async () => {
+  const { run } = fakeAsyncGit([
+    onBranchRule("feature-x"), // off default...
+    statusRule(" M src/foo.ts\n"), // ...AND dirty
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  // The dirty cause wins: an operator sees "clean the tree", not a bare
+  // off-branch that would mask the real blocker (the not-on-default masking bug).
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("src/foo.ts");
+  }
 });
 
 test("mergeReadiness: detached HEAD (mid-rebase reports `HEAD`) → off-branch", async () => {

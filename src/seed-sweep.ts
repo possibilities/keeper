@@ -73,7 +73,7 @@ import {
   parseLinuxStarttime,
   splitArgsLstart,
 } from "../plugins/keeper/plugin/hooks/events-writer";
-import { classifyCloseKind } from "./exec-backend";
+import { classifyCloseKind, type KillReason } from "./exec-backend";
 import { isPidAlive } from "./server-worker";
 
 /**
@@ -133,10 +133,11 @@ export function readOsStartTime(pid: number): string | null {
  * Insert a synthetic `Killed` event for one candidate session, mirroring the
  * shape main uses for `TranscriptTitle` / `EpicSnapshot` (named bindings,
  * everything other than the lifecycle-bearing fields NULL). The payload blob
- * carries the `(pid, start_time, close_kind)` triple the reducer's Killed fold
- * reads — `(pid, start_time)` for the recycle-safe match, `close_kind` for the
- * crash-restore discriminator (folded as an opaque string copy). `close_kind`
- * rides the JSON blob, so the `events` column list is unchanged.
+ * carries the `(pid, start_time, close_kind, reason)` payload the reducer's
+ * Killed fold reads — `(pid, start_time)` for the recycle-safe match,
+ * `close_kind` for the crash-restore discriminator, `reason` for WHY keeper
+ * reaped (which boot arm minted it); both string fields fold on as opaque
+ * copies. All ride the JSON blob, so the `events` column list is unchanged.
  *
  * Why inline SQL here instead of the prepared `stmts.insertEvent`: `db` is the
  * only handle we have at sweep time, and the prepared statement bundle isn't
@@ -150,6 +151,7 @@ function insertKilledEvent(
   pid: number | null,
   startTime: string | null,
   closeKind: string | null,
+  reason: KillReason,
 ): void {
   db.run(
     `INSERT INTO events (
@@ -174,7 +176,12 @@ function insertKilledEvent(
       null,
       null,
       null,
-      JSON.stringify({ pid, start_time: startTime, close_kind: closeKind }),
+      JSON.stringify({
+        pid,
+        start_time: startTime,
+        close_kind: closeKind,
+        reason,
+      }),
       null,
       null,
       null,
@@ -235,7 +242,14 @@ export function seedKilledSweep(db: Database): void {
         // construction. Emit a pidless Killed; the reducer's pidless-reap arm
         // folds it to 'killed' (guarded to NULL-pid rows only, so a watchable
         // row is never touched).
-        insertKilledEvent(db, row.job_id, null, row.start_time, closeKind);
+        insertKilledEvent(
+          db,
+          row.job_id,
+          null,
+          row.start_time,
+          closeKind,
+          "boot_unwatchable",
+        );
         continue;
       }
       const alive = isPidAlive(row.pid);
@@ -244,7 +258,14 @@ export function seedKilledSweep(db: Database): void {
         // payload carries the stored start_time so the reducer's match rule
         // (strict when persisted, loose-on-pid when NULL) folds correctly
         // either way.
-        insertKilledEvent(db, row.job_id, row.pid, row.start_time, closeKind);
+        insertKilledEvent(
+          db,
+          row.job_id,
+          row.pid,
+          row.start_time,
+          closeKind,
+          "boot_pid_dead",
+        );
         continue;
       }
       if (row.start_time == null) {
@@ -267,7 +288,14 @@ export function seedKilledSweep(db: Database): void {
       // process; the original session is gone. Payload carries the STORED
       // start_time so the reducer matches the persisted row (not the live
       // recycler's start_time).
-      insertKilledEvent(db, row.job_id, row.pid, row.start_time, closeKind);
+      insertKilledEvent(
+        db,
+        row.job_id,
+        row.pid,
+        row.start_time,
+        closeKind,
+        "boot_pid_recycled",
+      );
     } catch (err) {
       // Per-row isolation: one bad probe never aborts the sweep.
       console.error(

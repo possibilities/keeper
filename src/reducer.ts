@@ -389,6 +389,17 @@ interface KilledPayload {
    * that does not probe), folding the column to NULL.
    */
   close_kind: string | null;
+  /**
+   * WHY keeper reaped the job — the producer arm that minted this Killed
+   * (`exit_watched` for the steady-state exit-watcher; `boot_unwatchable` /
+   * `boot_pid_dead` / `boot_pid_recycled` for the boot seed sweep). Orthogonal
+   * to `close_kind` (HOW the session died). Folded onto `jobs.kill_reason` as an
+   * OPAQUE string copy — no re-probe in the fold (a re-probe breaks re-fold
+   * determinism). `null` when the producer emitted no reason (a pre-schema-v103
+   * Killed re-folding), folding the column to NULL. Any non-string (including
+   * absent) folds to NULL, never coerced.
+   */
+  reason: string | null;
 }
 
 /**
@@ -401,8 +412,9 @@ interface KilledPayload {
  * null. The pidless arm is opt-in via a literal JSON `null`, so a malformed
  * blob can never accidentally trigger a reap. `start_time` is optional /
  * nullable (the producer may emit a Killed for a row whose stored start_time
- * is NULL). `close_kind` is defensive: any non-string (including absent) folds
- * to NULL, never coerced — a garbage value must not masquerade as a real kind.
+ * is NULL). `close_kind` and `reason` are defensive: any non-string (including
+ * absent) folds to NULL, never coerced — a garbage value must not masquerade as
+ * a real kind/reason.
  */
 function extractKilledPayload(event: Event): KilledPayload | null {
   if (event.data == null || event.data.length === 0) {
@@ -413,6 +425,7 @@ function extractKilledPayload(event: Event): KilledPayload | null {
       pid?: unknown;
       start_time?: unknown;
       close_kind?: unknown;
+      reason?: unknown;
     };
     const pid = parsed.pid;
     // Accept a finite number (proven-dead reap) OR an explicit literal `null`
@@ -424,10 +437,12 @@ function extractKilledPayload(event: Event): KilledPayload | null {
       typeof parsed.start_time === "string" ? parsed.start_time : null;
     const closeKind =
       typeof parsed.close_kind === "string" ? parsed.close_kind : null;
+    const reason = typeof parsed.reason === "string" ? parsed.reason : null;
     return {
       pid: pid as number | null,
       start_time: startTime,
       close_kind: closeKind,
+      reason,
     };
   } catch (err) {
     console.error(
@@ -7995,11 +8010,12 @@ function projectJobsRow(db: Database, event: Event): void {
         // mis-attributed as owning that live window.
         db.run(
           `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?,
+                           kill_reason = ?,
                            backend_exec_pane_id = NULL,
                            backend_exec_generation_id = NULL,
                            last_event_id = ?, updated_at = ?
              WHERE job_id = ?`,
-          [payload.close_kind, event.id, ts, jobId],
+          [payload.close_kind, payload.reason, event.id, ts, jobId],
         );
         // Sweep + sync + clear fire ONLY here, on the proven write path. The
         // earlier `break` arms (malformed / missing / stale) MUST NOT — no

@@ -244,6 +244,18 @@ test("JOBS_DESCRIPTOR serves window_index for the dash intra-band sort", () => {
   expect(JOBS_DESCRIPTOR.jsonColumns.has("window_index")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves kill_reason for reap attribution (v103)", () => {
+  // `kill_reason` (DB v103 / fn-1075) is WHY keeper reaped the job — the Killed
+  // producer arm that minted the reap — folded from the payload as an opaque
+  // string copy. Surfaced so `keeper query jobs` exposes reap attribution;
+  // display-only, so it is out of sortable / filters / jsonColumns, same as the
+  // `close_kind` sibling.
+  expect(JOBS_DESCRIPTOR.columns).toContain("kill_reason");
+  expect(JOBS_DESCRIPTOR.sortable.has("kill_reason")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.kill_reason).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("kill_reason")).toBe(false);
+});
+
 test("JOBS_DESCRIPTOR serves worktree for the durable lane pill (v94)", () => {
   // `worktree` (DB v94 / fn-997) is the durable git lane BRANCH the job ran in,
   // folded set-once from `events.worktree`. Display-only — the renderer's

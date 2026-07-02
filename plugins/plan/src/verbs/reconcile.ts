@@ -345,6 +345,13 @@ export function runReconcile(opts: {
   // 6. epic progress — reporting only, never a verdict input. Degrade gracefully.
   const progress = epicProgress(dataDir, epicId, stateStore);
 
+  // 7. dirty session files — the close-out gate's observable, scanned in the
+  //    worker's lane (target_repo). SEPARATE from the verdict git reads and
+  //    FAIL-OPEN: a git-read failure never collapses the verdict, it surfaces
+  //    `null` (the VISIBLE marker the stop-guard family reads to fail open with a
+  //    signal) instead of a false-clean 0.
+  const dirtySessionFiles = countDirtySessionFiles(targetRepo);
+
   const pc = buildPlanInvocationReadonly("reconcile", projPath, taskId);
   emitReadonly(
     {
@@ -354,12 +361,25 @@ export function runReconcile(opts: {
       status,
       source_commits: sourceCommits,
       state_head_visible: headVisible,
+      dirty_session_files: dirtySessionFiles,
       epic_progress: progress,
       assessed_at: nowIso(),
       blocked_reason: blockedReason,
     },
     pc,
   );
+}
+
+/** Count `targetRepo`'s undischarged session files via the facade, FAIL-OPEN:
+ * a clean tree is 0, an unreadable git (or any unexpected throw) is `null` — the
+ * visible marker the close-out gate reads. Never throws into the verdict path. */
+function countDirtySessionFiles(targetRepo: string): number | null {
+  try {
+    const paths = getVcs().sessionDirtyPaths(targetRepo);
+    return paths === null ? null : paths.length;
+  } catch {
+    return null;
+  }
 }
 
 /** realpath(p), falling back to the absolute path when it can't be resolved. */

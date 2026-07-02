@@ -17,10 +17,12 @@
 
 import {
   emitBlock,
+  emitVisibleSignal,
   isBypassed,
   readMarker,
   readStdin,
   runPlanCli,
+  sessionDirtyCount,
   unlinkMarker,
 } from "./lib.ts";
 
@@ -141,6 +143,15 @@ async function main(): Promise<void> {
       verdict === "tooling_error"
     ) {
       return; // fail open.
+    }
+    // Fail-open WITH a visible signal: reconcile could not read the session-files
+    // observable (git unreadable). The block still stands on the verdict, but the
+    // opened observable is announced rather than passing silently.
+    if (sessionDirtyCount(env) === null) {
+      emitVisibleSignal(
+        `plan close-out gate: session-files probe unreadable for ` +
+          `${marker.task_id} — failing open on the reconcile verdict.`,
+      );
     }
     emitBlock(workBlockReason(marker.task_id, String(verdict)));
     return;

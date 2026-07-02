@@ -20,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { sessionDirtyCount } from "../plugin/hooks/lib.ts";
 import {
   BLOCKED_PATTERN,
   extractTaskId,
@@ -102,6 +103,30 @@ describe("VERDICT_NUDGE", () => {
 
   test("not_started maps to null — never a trap", () => {
     expect(VERDICT_NUDGE.not_started?.("fn-1-x.2")).toBeNull();
+  });
+});
+
+describe("sessionDirtyCount", () => {
+  test("a non-negative count reads through", () => {
+    expect(sessionDirtyCount({ dirty_session_files: 0 })).toBe(0);
+    expect(sessionDirtyCount({ dirty_session_files: 3 })).toBe(3);
+  });
+
+  test("null is the fail-open marker", () => {
+    expect(sessionDirtyCount({ dirty_session_files: null })).toBeNull();
+  });
+
+  test("an absent field / null envelope is unknown (undefined)", () => {
+    expect(sessionDirtyCount({ verdict: "done" })).toBeUndefined();
+    expect(sessionDirtyCount(null)).toBeUndefined();
+  });
+
+  test("a non-numeric or negative shape degrades to unknown", () => {
+    expect(sessionDirtyCount({ dirty_session_files: "2" })).toBeUndefined();
+    expect(sessionDirtyCount({ dirty_session_files: -1 })).toBeUndefined();
+    expect(
+      sessionDirtyCount({ dirty_session_files: Number.NaN }),
+    ).toBeUndefined();
   });
 });
 
@@ -254,7 +279,12 @@ function writePlanCliShim(envelope: unknown, exitCode = 0): void {
 async function run(
   payload: unknown,
   extraEnv: Record<string, string> = {},
-): Promise<{ stdout: string; code: number; planCliCalled: boolean }> {
+): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number;
+  planCliCalled: boolean;
+}> {
   const proc = Bun.spawn(["bun", GUARD], {
     stdin: "pipe",
     stdout: "pipe",
@@ -269,8 +299,9 @@ async function run(
   proc.stdin.write(JSON.stringify(payload));
   await proc.stdin.end();
   const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
   const code = await proc.exited;
-  return { stdout, code, planCliCalled: existsSync(sentinel) };
+  return { stdout, stderr, code, planCliCalled: existsSync(sentinel) };
 }
 
 function stopPayload(extra: Record<string, unknown> = {}): unknown {
@@ -308,6 +339,53 @@ describe("subagent-stop-guard ladder", () => {
     const env = JSON.parse(stdout.trim());
     expect(env.decision).toBe("block");
     expect(env.reason).toContain("keeper plan done fn-1-x.2");
+  });
+
+  test("in_progress_committed + dirty session files → the finish-and-commit nudge", async () => {
+    // The observable overrides the verdict inference: a source commit landed but
+    // the lane still carries undischarged files, so "run done" would strand them.
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_committed",
+      task_id: "fn-1-x.2",
+      dirty_session_files: 2,
+    });
+
+    const { stdout } = await run(stopPayload());
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("keeper commit-work");
+  });
+
+  test("in_progress_committed + zero dirty files stays the done nudge", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_committed",
+      task_id: "fn-1-x.2",
+      dirty_session_files: 0,
+    });
+
+    const { stdout } = await run(stopPayload());
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("keeper plan done fn-1-x.2");
+  });
+
+  test("in_progress_committed + null probe → done nudge AND a visible fail-open signal", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_committed",
+      task_id: "fn-1-x.2",
+      dirty_session_files: null,
+    });
+
+    const { stdout, stderr } = await run(stopPayload());
+    const env = JSON.parse(stdout.trim());
+    // Fail-open: an unreadable probe never upgrades the nudge — the verdict wins.
+    expect(env.reason).toContain("keeper plan done fn-1-x.2");
+    // ...but the open is announced on stderr, never silent.
+    expect(stderr).toContain("session-files probe unreadable");
+    expect(stderr).toContain("fn-1-x.2");
   });
 
   test("blocks on state_uncommitted", async () => {

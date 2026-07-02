@@ -167,6 +167,24 @@ export async function runKeeperPrompt(
   }
 }
 
+/** The close-out gate's observable, read off a reconcile envelope's
+ * `dirty_session_files`: a non-negative COUNT when the probe read git, `null`
+ * when git was unreadable (the fail-open marker the gate announces), or
+ * `undefined` when the field is absent (an older envelope / typed error /
+ * null envelope — treated as unknown, never a block). Any other shape degrades
+ * to `undefined`. Shared by the Stop + SubagentStop guards. */
+export function sessionDirtyCount(
+  env: Record<string, unknown> | null,
+): number | null | undefined {
+  if (env === null) return undefined;
+  const value = env.dirty_session_files;
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  return undefined;
+}
+
 /** Emit a PreToolUse deny envelope. The top-level `decision` field is
  * deprecated on PreToolUse — the hookSpecificOutput shape is canonical. */
 export function emitDeny(reason: string): void {
@@ -194,6 +212,18 @@ export function emitAdditionalContext(message: string): void {
  * blocked agent as its next instruction. */
 export function emitBlock(reason: string): void {
   emit({ decision: "block", reason });
+}
+
+/** Write a one-line visible signal to STDERR (never stdout — stdout carries the
+ * single decision envelope). Used when a gate FAILS OPEN on an unreadable
+ * observable: the open is announced in the hook log rather than passing
+ * silently. Best-effort and never affects the exit code. */
+export function emitVisibleSignal(message: string): void {
+  try {
+    process.stderr.write(`${message}\n`);
+  } catch {
+    // Diagnostics are best-effort — a failed stderr write must never propagate.
+  }
 }
 
 /** Write exactly one JSON object to stdout. The sole stdout writer in the

@@ -516,17 +516,22 @@ export async function isAncestorOf(
 
 /**
  * Probe whether `cwd`'s shared main checkout is ready for a base merge: on
- * `expectedBranch`, clean working tree, no merge/rebase mid-flight. Two git reads:
- *  1. `git rev-parse --abbrev-ref HEAD` — off `expectedBranch` (incl. a detached
- *     HEAD from a mid-rebase, which reports `HEAD`) → `{ kind: "off-branch" }`.
- *  2. `git status --porcelain --untracked-files=no` — any output (uncommitted
+ * `expectedBranch`, clean working tree, no merge/rebase mid-flight. Two git
+ * reads, DIRTY-FIRST:
+ *  1. `git status --porcelain --untracked-files=no` — any output (uncommitted
  *     edits, staged work, or a stopped merge's unmerged entries) → `{ kind:
- *     "dirty" }`. Untracked files are EXCLUDED: a benign untracked file in the
- *     human's shared checkout (editor temp, un-ignored artifact, a `.env`) a
- *     merge cannot disturb must not force a never-finalizing skip-and-retry. A
- *     non-zero status exit is itself treated as not-ready (`dirty`,
- *     conservative). This single probe covers the mid-MERGE and conflict-paused-
- *     rebase cases without a separate `MERGE_HEAD` shell.
+ *     "dirty" }`. Probed FIRST so a checkout that is BOTH dirty and off its
+ *     expected branch surfaces the DIRTY cause (the actionable one — clean the
+ *     tree) rather than masking it behind a bare off-branch verdict. Untracked
+ *     files are EXCLUDED: a benign untracked file in the human's shared checkout
+ *     (editor temp, un-ignored artifact, a `.env`) a merge cannot disturb must
+ *     not force a never-finalizing skip-and-retry. A non-zero status exit is
+ *     itself treated as not-ready (`dirty`, conservative). This single probe
+ *     covers the mid-MERGE and conflict-paused-rebase cases without a separate
+ *     `MERGE_HEAD` shell.
+ *  2. `git rev-parse --abbrev-ref HEAD` — a CLEAN tree off `expectedBranch`
+ *     (incl. a detached HEAD from a mid-rebase, which reports `HEAD`) → `{ kind:
+ *     "off-branch" }`.
  * When `incomingBranch` is supplied, a clean tree gets ONE further probe: a
  * would-clobber intersection (`incomingBranch`'s tracked paths ∩ the main
  * checkout's untracked files) — a non-empty overlap a `git merge` would hard-
@@ -542,13 +547,10 @@ export async function mergeReadiness(
   run: GitRunner = gitExec,
   incomingBranch?: string,
 ): Promise<MergeReadiness> {
-  const head = await currentBranch(cwd, run);
-  if (head !== expectedBranch) {
-    return { kind: "off-branch", head };
-  }
-  // Bound the read (B4). A 124 timeout (non-zero) folds through the existing
-  // `code !== 0` arm to `dirty` — a SAFE not-ready/retry-skip, never a false
-  // clean.
+  // Dirty check FIRST — a dirty+off-branch checkout must report the actionable
+  // DIRTY cause, not mask it as off-branch. Bound the read (B4); a 124 timeout
+  // (non-zero) folds through the `code !== 0` arm to `dirty` — a SAFE
+  // not-ready/retry-skip, never a false clean.
   const status = await run(["status", "--porcelain", "--untracked-files=no"], {
     cwd,
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
@@ -556,6 +558,12 @@ export async function mergeReadiness(
   const detail = (status.stdout + status.stderr).trim();
   if (status.code !== 0 || detail.length > 0) {
     return { kind: "dirty", detail };
+  }
+  // Clean tree — now the branch check. Off `expectedBranch` (incl. a detached
+  // mid-rebase HEAD, which reports `HEAD`) → off-branch.
+  const head = await currentBranch(cwd, run);
+  if (head !== expectedBranch) {
+    return { kind: "off-branch", head };
   }
   if (incomingBranch !== undefined && incomingBranch.length > 0) {
     const clobbered = await wouldClobberUntracked(cwd, incomingBranch, run);

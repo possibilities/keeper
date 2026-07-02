@@ -876,6 +876,79 @@ export interface DispatchClearedPayload {
 }
 
 /**
+ * Interval (in producer-`ts` seconds) after which a still-unchanged
+ * `DispatchFailed` condition re-announces once as a liveness watermark, so its
+ * row's last-seen stays fresh instead of going silent forever. Sparse enough to
+ * kill the per-cycle storm, frequent enough to prove the condition is still live.
+ */
+export const DISPATCH_FAILED_WATERMARK_SEC = 15 * 60;
+
+/**
+ * Producer-side change-gate for `DispatchFailed` emission. The reconciler
+ * re-derives every failure from live git each cycle, so an unconditional emit
+ * mints ONE event per cycle for a persistently-stuck condition — a storm. This
+ * collapses identical re-emits, keyed per `(verb, id)`:
+ *  - FIRST appearance of a `(verb, id)` → emit.
+ *  - A REASON CHANGE for the same `(verb, id)` → emit immediately (dirty→conflict
+ *    is new, actionable information the gate must never swallow).
+ *  - An identical re-emit while the condition persists → suppress, EXCEPT
+ *  - a still-unchanged condition re-announces at most once per
+ *    {@link DISPATCH_FAILED_WATERMARK_SEC} (the producer `ts` is the clock) as a
+ *    bounded liveness watermark.
+ * A DispatchCleared resets the gate (via {@link DispatchFailedGate.noteClear}) so
+ * the next failure of that `(verb, id)` re-emits immediately.
+ *
+ * In-worker memory only, mirroring the `lastWorktreeStatusKey` change-gate. Two
+ * ACCEPTED, BOUNDED degradations: (1) a daemon restart empties the gate and
+ * re-emits once per still-present condition — a bounded boot burst; a crash-
+ * looping daemon regresses toward the old per-cycle behavior, which is its own
+ * louder alarm. (2) An operator `retry_dispatch` clears a row via the reducer
+ * (not through `noteClear`), so a still-stuck condition re-surfaces within one
+ * watermark interval rather than instantly.
+ */
+export interface DispatchFailedGate {
+  /** True → post this event; false → suppress an identical re-emit. */
+  shouldEmit(payload: DispatchFailedPayload): boolean;
+  /** Reset the `(verb, id)` gate on its DispatchCleared, so a re-failure re-emits. */
+  noteClear(verb: Verb, id: string): void;
+}
+
+/**
+ * Build a {@link DispatchFailedGate}. Pure of keeper.db / IO / the wall clock —
+ * the producer `ts` threaded through each payload is the only clock — so the fast
+ * tier drives first-emit / suppress / reason-change / clear-reset / watermark
+ * cadence directly. `watermarkSec` is injectable for the cadence test.
+ */
+export function createDispatchFailedGate(
+  watermarkSec: number = DISPATCH_FAILED_WATERMARK_SEC,
+): DispatchFailedGate {
+  // `${verb}\u0000${id}`: a NUL join is collision-free (neither field carries a
+  // NUL), the same composite-key discipline the provision fan-in set uses.
+  const keyOf = (verb: string, id: string): string => `${verb}\u0000${id}`;
+  const lastEmitted = new Map<string, { reason: string; ts: number }>();
+  return {
+    shouldEmit(payload) {
+      const key = keyOf(payload.verb, payload.id);
+      const prev = lastEmitted.get(key);
+      if (prev === undefined || prev.reason !== payload.reason) {
+        lastEmitted.set(key, { reason: payload.reason, ts: payload.ts });
+        return true;
+      }
+      if (payload.ts - prev.ts >= watermarkSec) {
+        // Still-stuck liveness watermark — re-announce and re-anchor the clock so
+        // the next watermark is one interval out (a steady cadence, not a burst).
+        prev.ts = payload.ts;
+        return true;
+      }
+      return false;
+    },
+    noteClear(verb, id) {
+      lastEmitted.delete(keyOf(verb, id));
+    },
+  };
+}
+
+/**
  * Payload shape the reconciler hands to `emitDispatched` (schema v50).
  * Mirrors the `DispatchedPayload` interface in
  * `src/reducer.ts` exactly — the producer-side stamp (`ts`) is the
@@ -920,12 +993,17 @@ export interface DispatchedAck {
  * mint (schema v50). Mirrors `src/reducer.ts`'s
  * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
  * only (`(verb, id)`), no `ts` carried (the fold is a DELETE; no row
- * field to populate). Strictly `verb` + `id`, mirroring
- * `DispatchClearedPayload`'s minimal shape.
+ * field to populate). `verb` + `id` mirror `DispatchClearedPayload`'s
+ * minimal shape; `reason` is optional attribution telemetry (WHY the
+ * mint fired — today always the TTL-sweep `dispatch_expiry_timeout`),
+ * carried on the event blob for event-log forensics. The reducer fold
+ * reads only `(verb, id)` and ignores `reason` — it discharges a row,
+ * with no jobs projection to surface it on.
  */
 export interface DispatchExpiredPayload {
   verb: Verb;
   id: string;
+  reason?: string;
 }
 
 /**
@@ -3970,6 +4048,12 @@ function main(): void {
   // cycle; thereafter a stable set mints no `LaneMerged` event. In-worker memory
   // only — persists across cycles in this closure. Twin of `lastWorktreeStatusKey`.
   let lastLaneMergedKey: string | null = null;
+  // Producer-side change-gate collapsing the DispatchFailed storm: the reconcile
+  // re-derives every failure from live git each cycle, so an unconditional emit
+  // mints one event per cycle for a persistently-stuck condition. Emits on first
+  // appearance + reason-change + a bounded still-stuck watermark, suppresses
+  // identical re-emits; a DispatchCleared resets it. In-worker memory only.
+  const dispatchFailedGate = createDispatchFailedGate();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -4102,12 +4186,20 @@ function main(): void {
         spec,
       }),
     emitDispatchFailed: (payload) => {
+      // Change-gate: suppress an identical per-cycle re-emit; a first appearance,
+      // a reason change, or a bounded still-stuck watermark passes through.
+      if (!dispatchFailedGate.shouldEmit(payload)) {
+        return;
+      }
       parentPort?.postMessage({
         kind: "dispatch-failed",
         payload,
       } satisfies DispatchFailedMessage);
     },
     emitDispatchCleared: (payload) => {
+      // Resolution resets the gate so a re-failure of this `(verb, id)` re-emits
+      // immediately rather than being folded into a stale suppression window.
+      dispatchFailedGate.noteClear(payload.verb, payload.id);
       parentPort?.postMessage({
         kind: "dispatch-cleared",
         payload,
