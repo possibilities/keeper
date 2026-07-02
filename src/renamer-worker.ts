@@ -27,8 +27,8 @@
  *  4. `backend.listPanes()` — `null` (degraded/missing tmux) → skip the cycle.
  *  5. Pure {@link computeRenames}: join candidates to panes by pane id, group
  *     by window id, winner = max `created_at` (tie → higher `job_id`), target
- *     = winner's `title` with `::` and `.` rewritten to `/` (so a spawn-name
- *     title like `work::fn-1019.2` tabs as `work/fn-1019/2`); emit a rename ONLY
+ *     = winner's `title` verbatim (a spawn-name title like `work::fn-1019.2`
+ *     tabs as `work::fn-1019.2`); emit a rename ONLY
  *     where the swept `windowName !== target`. Every `rename-window` SUPPRESSES
  *     that window's automatic-rename, so a matching name must not re-rename;
  *     the suppression is deliberately left in place (tmux fighting back on
@@ -163,28 +163,15 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
 }
 
 /**
- * Format a job title into a tmux-safe window name. tmux rejects both `:` and
- * `.` in a `rename-window` name — they are its `session:window.pane` target
- * separators — so a name carrying either is refused (exit 1) and the window
- * keeps its default command name. Rewrite both to `/`, so a spawn-name title
- * like `work::fn-1019.2` tabs as `work/fn-1019/2` and a dotless `close::fn-1019`
- * as `close/fn-1019`. Pure.
- */
-export function formatWindowName(title: string): string {
-  return title.replaceAll("::", "/").replaceAll(".", "/");
-}
-
-/**
  * Pure rename decision: join candidates to swept panes by pane id, group by
  * window id, pick the winner per window (max `created_at`; tie → higher
  * `job_id` — a deterministic tiebreak so equal-aged sessions don't flicker
  * the window name every pulse), and emit a `{windowId, name}` ONLY where the
  * sweep's current `windowName` differs from the target. The target is the
- * winner's title run through {@link formatWindowName}, so a spawn-name title
- * like `work::fn-1019.2` tabs as `work/fn-1019/2`; the comparison uses that same
- * formatted target, so a window already wearing it is NOT re-emitted — every
- * `rename-window` permanently suppresses that window's automatic-rename, so
- * re-issuing a no-op rename is pure churn.
+ * winner's title verbatim (a spawn-name title like `work::fn-1019.2` tabs as
+ * `work::fn-1019.2`); the comparison uses that same target, so a window already
+ * wearing it is NOT re-emitted — every `rename-window` permanently suppresses
+ * that window's automatic-rename, so re-issuing a no-op rename is pure churn.
  *
  * Returned in ascending `windowId` order for stable test assertions and a
  * deterministic fire order. Pure relative to its inputs.
@@ -228,7 +215,7 @@ export function computeRenames(
 
   const renames: WindowRename[] = [];
   for (const [windowId, { windowName, winner }] of winners) {
-    const target = formatWindowName(winner.title);
+    const target = winner.title;
     if (windowName !== target) {
       renames.push({ windowId, name: target });
     }
