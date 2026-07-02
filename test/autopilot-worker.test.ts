@@ -3363,6 +3363,46 @@ test("resolveWorkerLaunchConfig: a malformed registry FALLS BACK to constants wi
   }
 });
 
+test("resolveWorkerLaunchConfig: a non-claude worker harness warns ONCE per value and still launches on claude", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const codexPath = join(dir, "codex.yaml");
+    writeFileSync(
+      codexPath,
+      "presets:\n  worker:\n    harness: codex\n    model: gpt\n    effort: high\n",
+    );
+    // A fresh per-call memo standing in for the reconcile cycle's process memo.
+    const warned = new Set<string>();
+    // The harness is DROPPED, not honored — model/effort still resolve from the
+    // preset so the launch proceeds on claude with the configured knobs.
+    const first = resolveWorkerLaunchConfig(codexPath, warned);
+    expect(first).toEqual({ model: "gpt", effort: "high" });
+    // A second reconcile cycle re-resolves the SAME offending value: no new warn.
+    resolveWorkerLaunchConfig(codexPath, warned);
+    const codexWarns = errs.filter((e) => e.includes("pins harness 'codex'"));
+    expect(codexWarns.length).toBe(1);
+
+    // A DISTINCT offending value (pi) warns once more against the same memo.
+    const piPath = join(dir, "pi.yaml");
+    writeFileSync(
+      piPath,
+      "presets:\n  worker:\n    harness: pi\n    model: glm\n    thinking: high\n",
+    );
+    resolveWorkerLaunchConfig(piPath, warned);
+    resolveWorkerLaunchConfig(piPath, warned);
+    const piWarns = errs.filter((e) => e.includes("pins harness 'pi'"));
+    expect(piWarns.length).toBe(1);
+  } finally {
+    console.error = origError;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("buildLaunchArgv wraps the worker command in [shell, -l, -i, -c, body]", () => {
   const argv = buildLaunchArgv(
     "/bin/zsh",

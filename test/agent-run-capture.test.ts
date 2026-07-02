@@ -872,6 +872,15 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     presets: {
       opus: {
         harness: "claude",
+        model: "opus",
+        effort: "high",
+        thinking: null,
+        role: null,
+      },
+      // A matching-harness preset that resolves NEITHER model nor the second
+      // axis — the underspecified case the readiness gate rejects on the run path.
+      "opus-bare": {
+        harness: "claude",
         model: null,
         effort: null,
         thinking: null,
@@ -958,6 +967,53 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
 
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("--preset resolving NEITHER model nor second axis is bad_args, not a doomed pane", async () => {
+    // A matching-harness preset that supplies nothing would launch a detached
+    // pane that fails-loud downstream (no_transcript/timed_out). The shared
+    // readiness gate short-circuits it to clean bad_args BEFORE any launch.
+    const { h } = completedRunHarness(
+      ["--preset", "opus-bare"],
+      PRESET_CATALOG,
+    );
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain("no model/effort resolved");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("a pi preset with effort but NO thinking is bad_args (pi's second axis is thinking)", async () => {
+    // pi's second axis is `thinking`, not `effort`; the pre-fix model&&effort
+    // check wrongly accepted this. The shared helper reads `thinking` for pi, so
+    // a preset that supplies effort (a claude/codex-only knob) but no thinking
+    // resolves no second axis → bad_args, short-circuiting before any launch.
+    const catalog: PresetCatalog = {
+      presets: {
+        "pi-effort-only": {
+          harness: "pi",
+          model: "glm",
+          effort: "high",
+          thinking: null,
+          role: null,
+        },
+      },
+    };
+    const h = makeHarness({
+      argv: ["run", "--preset", "pi-effort-only", "pi", "say hi"],
+      rawArgv: true,
+      presetCatalog: catalog,
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain("no model/effort resolved");
     expect(h.tmuxCommands.length).toBe(0);
   });
 
