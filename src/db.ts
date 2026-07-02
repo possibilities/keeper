@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 102;
+export const SCHEMA_VERSION = 103;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5661,6 +5661,25 @@ function migrate(db: Database): void {
       // reads `dispatch_mint_gate`, but the whitelist is a hard membership set) —
       // this bump MUST add 102 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
       // the SAME commit; test/schema-version.test.ts enforces it.
+
+      // v102→v103 (fn-1075 task .2): add the nullable `jobs.kill_reason` TEXT
+      // column — WHY keeper reaped a job (which producer arm minted the synthetic
+      // `Killed`), stamped by the two Killed producers (main's exit-watcher →
+      // `exit_watched`; the boot seed sweep → `boot_unwatchable`/`boot_pid_dead`/
+      // `boot_pid_recycled`) and folded on verbatim as an opaque string copy.
+      // Orthogonal to `close_kind` (HOW the session died); this is WHY keeper
+      // acted. Nullable, NO default: a `DEFAULT` would poison the NULL=absent
+      // invariant and break re-fold byte-identity. APPEND-via-ALTER keeps existing
+      // rows NULL (the zero-event shape) and is re-fold-safe: a historical Killed
+      // payload carries no `reason`, so a from-scratch re-fold folds the column to
+      // NULL byte-identically (deterministic-replayed, NOT live-only — do NOT add
+      // to `LIVE_ONLY_JOBS_COLUMNS`, and NO cursor rewind). Kept OUT of the
+      // `CREATE_JOBS` literal (the :852 rule) so fresh-vs-migrated
+      // `PRAGMA table_info(jobs)` stays byte-identical. Whitelist-only Python read
+      // (keeper-py never reads this column) — this bump MUST add 103 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "jobs", "kill_reason", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

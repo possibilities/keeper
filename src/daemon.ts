@@ -94,7 +94,7 @@ import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
 } from "./events-ingest-worker";
-import { classifyCloseKind } from "./exec-backend";
+import { classifyCloseKind, type KillReason } from "./exec-backend";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import { seedGitProjection } from "./git-boot-seed";
 import type {
@@ -4008,6 +4008,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // payload blob (no `events` column changes); the reducer folds it to
       // `jobs.close_kind` as an opaque string copy for the crash-restore set.
       const closeKind = classifyCloseKind(row.backend_exec_pane_id);
+      // WHY keeper reaped: the steady-state exit-watcher observed this process
+      // exit (distinct from the boot seed sweep's `boot_*` reasons). Rides the
+      // payload blob; the reducer folds it onto `jobs.kill_reason` opaquely.
+      const killReason: KillReason = "exit_watched";
       stmts.insertEvent.run({
         $ts: Date.now() / 1000, // unix seconds as REAL
         $session_id: msg.jobId, // == job_id
@@ -4025,6 +4029,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           pid: msg.pid,
           start_time: msg.startTime,
           close_kind: closeKind,
+          reason: killReason,
         }),
         $subagent_agent_id: null,
         $spawn_name: null,
@@ -5671,7 +5676,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     for (const row of aged) {
       // Per-row failures are logged and swallowed inside the helper, so a throw
       // doesn't abort the sweep — every aged row gets its own shot.
-      handleDispatchExpiredMint({ verb: row.verb as Verb, id: row.id });
+      handleDispatchExpiredMint({
+        verb: row.verb as Verb,
+        id: row.id,
+        // WHY this mint fired — the producer-side TTL sweep aged the pending row
+        // past its ceiling. Attribution telemetry on the event blob; the reducer
+        // fold reads only `(verb, id)`.
+        reason: "dispatch_expiry_timeout",
+      });
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
     }
     for (const rec of sweepRecords) {

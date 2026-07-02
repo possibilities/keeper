@@ -993,12 +993,17 @@ export interface DispatchedAck {
  * mint (schema v50). Mirrors `src/reducer.ts`'s
  * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
  * only (`(verb, id)`), no `ts` carried (the fold is a DELETE; no row
- * field to populate). Strictly `verb` + `id`, mirroring
- * `DispatchClearedPayload`'s minimal shape.
+ * field to populate). `verb` + `id` mirror `DispatchClearedPayload`'s
+ * minimal shape; `reason` is optional attribution telemetry (WHY the
+ * mint fired — today always the TTL-sweep `dispatch_expiry_timeout`),
+ * carried on the event blob for event-log forensics. The reducer fold
+ * reads only `(verb, id)` and ignores `reason` — it discharges a row,
+ * with no jobs projection to surface it on.
  */
 export interface DispatchExpiredPayload {
   verb: Verb;
   id: string;
+  reason?: string;
 }
 
 /**

@@ -2930,8 +2930,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // gate at the `Dispatched` mint site; a CREATE-only table, NO cursor rewind:
   // producer state like `dead_letters`, never folded, so it is excluded from
   // `EPHEMERAL_PROJECTIONS`, the rewind DELETE list, and the byte-identical re-fold
-  // charter, and an empty log leaves the table empty).
-  expect(SCHEMA_VERSION).toBe(102);
+  // charter, and an empty log leaves the table empty). And to 103 via fn-1075 task
+  // .2 (appending the nullable `jobs.kill_reason` column — WHY keeper reaped a job,
+  // the producer arm that minted the synthetic `Killed`; an additive ALTER folded
+  // on as an opaque string copy, NO cursor rewind: a historical Killed carries no
+  // `reason`, so a from-scratch re-fold leaves it NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(103);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
