@@ -51,9 +51,7 @@ Map the complete journey through the feature:
 
 ### 6. Design System Alignment
 
-Skip if no DESIGN.md in the project.
-
-If DESIGN.md exists and the feature involves UI:
+Only when the target repo has a design system (a `DESIGN.md`) and the feature involves UI — skip entirely otherwise (most backend/CLI work):
 - Are the components needed for this feature defined in DESIGN.md?
 - Do the color/spacing tokens in DESIGN.md cover this feature's needs?
 - Any design gaps that should be raised before implementation?

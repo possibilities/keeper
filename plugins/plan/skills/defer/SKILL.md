@@ -185,7 +185,7 @@ One-line summary citing the new epic id and the defer status:
 
 > *deferred `<epic_id>`: <epic title> — armed and sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
 
-No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer never proactively offers to drive execution (no `/plan:work`, no surprise-launch). The operator skills stay reachable on explicit user intent, never from this flow on its own.
+No menu, no follow-up prompts, no epic close. Autopilot runs the task — this flow never surprise-launches execution (see the intro's not-a-job-launcher rule).
 
 ---
 
@@ -193,7 +193,7 @@ No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer 
 
 - **Never scales up silently.** Phase 3's one-task fit check is the load-bearing gate. If the work won't fit, stop with a concrete alternative — never scaffold a partial epic.
 - **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The two mutating verbs in this skill are `keeper plan scaffold` and its trailing `keeper plan validate --epic` arm, both in Phase 4.
-- **Not a job-launcher.** This skill does not spawn a worker, run an audit, or close the epic — autopilot runs the task. Never proactively drive execution from this flow: no `/plan:work`, no surprise-launch. The model-invocable `keeper:dispatch` / `keeper:autopilot` operator skills are reached only on explicit user intent, never from defer on its own.
+- **Not a job-launcher.** Autopilot runs the task; this flow never spawns a worker, runs an audit, closes the epic, or surprise-launches execution (full rule in the intro).
 - **Subject inference excludes `.keeper/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical plan state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** the plan tooling tracks all tasks.

@@ -96,7 +96,7 @@ Return this markdown to the caller. Omit any section that genuinely has no signa
 
 ## DESIGN.md Validation
 
-When `DESIGN.md` (or `.stitch/DESIGN.md`) is found, validate it is a design system, not an architecture design doc:
+Only when the target repo carries a design system. Most backend/CLI/library repos have no `DESIGN.md` — skip this and omit the Design System findings section entirely. When `DESIGN.md` (or `.stitch/DESIGN.md`) is found, validate it is a design system, not an architecture design doc:
 
 - **Well-formed** if it has 3+ of these headings (case-insensitive substring): Overview, Colors, Color Palette, Typography, Elevation, Depth, Components, Component Stylings, Layout, Do's and Don'ts — AND contains at least 3 hex color codes (`#[0-9A-Fa-f]{3,8}`).
 - **Not a design system** if it lacks hex color codes — likely an architecture design doc. Report status as "likely architecture doc not design system" and omit design tokens from findings.

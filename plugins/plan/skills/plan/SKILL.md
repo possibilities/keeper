@@ -420,7 +420,7 @@ Template (STANDARD — add/remove H3s per 3b):
 ## Evidence
 ```
 
-SHORT: only `### Approach` and `### Investigation targets`. DEEP: also `### Detailed phases`, `### Alternatives`, `### Non-functional targets`, `### Rollout`. `### Design context` is optional at every depth — frontend tasks when DESIGN.md is present.
+Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Design context` is the optional frontend-only row, gated on DESIGN.md.
 
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
@@ -472,8 +472,7 @@ Task that proves the approach: `<task_id>`. If it fails: <recovery plan in 1 sen
 ```
 
 Omission rules (advisory shape — scaffold validates only task specs, not the epic spec):
-- **SHORT**: omit `## Early proof point`, `## References`, `## Docs gaps`.
-- **DEEP**: also append `## Alternatives` (considered and rejected), `## Architecture` (embedded mermaid when the data model/architecture changes), `## Rollout` (rollout + rollback plan).
+- Which `## H2s` appear at each depth follows the 3b epic-depth mapping. DEEP's appended H2s: `## Alternatives` (considered and rejected), `## Architecture` (embedded mermaid when the data model/architecture changes), `## Rollout` (rollout + rollback plan).
 - Omit `## Docs gaps` if docs-gap-scout returned no `### Likely Updates Needed`; else one bullet per entry — update- or prune/delete-shaped, a tracking surface, not an acceptance gate.
 - Omit `## Best practices` if practice-scout returned no signal; else one bullet per distinct non-obvious practice (advisory, not a gate).
 
