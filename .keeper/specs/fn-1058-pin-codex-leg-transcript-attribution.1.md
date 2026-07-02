@@ -22,5 +22,5 @@ Reproduce first from the live evidence: panel slug verify-stab-smoke's codex leg
 - [ ] Full fast suite green
 
 ## Done summary
-
+Codex leg transcript discovery now binds by positive attribution: rejects rollouts whose session_meta creation predates launch, requires exactly one same-cwd survivor, and returns a distinct transcript_ambiguous outcome on a concurrent-session collision instead of a newest-by-mtime guess.
 ## Evidence
