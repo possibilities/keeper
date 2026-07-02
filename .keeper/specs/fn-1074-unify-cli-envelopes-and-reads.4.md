@@ -41,5 +41,5 @@ Shape test for --help --json; keeper-cli test asserts every listed subcommand re
 - [ ] Every top-level subcommand emits non-empty --help; exit-code semantics published
 
 ## Done summary
-
+Added the machine-readable help layer: keeper --help --json emits a flat command index (subcommands with two-level verbs + agent_help marks, plus the shared exit-code taxonomy) from a single SUBCOMMAND_META source of truth; --agent-help operator runbooks on dispatch/handoff/commit-work/autopilot; fixed await help (complete=done-AND-idle, landed documented); statusline-sink now has a one-line help.
 ## Evidence
