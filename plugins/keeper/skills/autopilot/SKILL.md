@@ -27,10 +27,6 @@ operator surface, conservative by default: it mutates global autopilot state
 only on a clear request to steer it. The autopilot quietly working ready epics
 on its own remains the everyday path.
 
-**Name-vs-subcommand collision.** This skill is named `autopilot` and the CLI
-it wraps is `keeper autopilot`. Running the viewer is a **Bash call**
-(`keeper autopilot --snapshot`), NOT "open the skill." Don't confuse the two.
-
 ## When this fires
 
 The user asks to control or inspect the autopilot. Two layers:
@@ -86,7 +82,7 @@ clarifying question — fail loud on ambiguity, never guess a global-state mutat
 
 <!-- POINTER: keeper prompt render engineering/orient -->
 
-Read state with `keeper status --json`, NEVER the live stream:
+Read state with `keeper status --json`:
 
 ```bash
 keeper status --json | jq .data.autopilot
@@ -225,7 +221,7 @@ on its `met`. See `keeper:await` for wiring the Monitor.
    `.data.board.epics[].close.dispatch_failure` name the sticky block KIND
    (multi-repo / merge-conflict / dirty-tree / non-ff) on the exact wedged row.
 2. Report paused/playing, mode, armed epics, and any in-flight or stuck
-   dispatches. NEVER `keeper autopilot --watch` (it hangs).
+   dispatches.
 
 ### Take over for a bit, then put it back
 
@@ -243,43 +239,11 @@ on its `met`. See `keeper:await` for wiring the Monitor.
    surface "autopilot state unknown — verify with `keeper status --json`;
    mode restored to yolo but unpause FAILED (still paused)."
 
-## What NOT to do
-
-- Do not run `keeper autopilot --watch` — it forces the live subscribe stream
-  and HANGS the agent's tool call forever. Read state with `keeper status --json`
-  (or the bare `keeper autopilot --snapshot` block for a human-readable frame).
-- Do not capture/restore around a BARE control op — capture/restore is
-  take-over-window-only. Auto-restoring after "pause it" would silently undo a
-  deliberate pause.
-- Do not close the take-over window on a turn boundary — it closes only on an
-  EXPLICIT human signal or an armed `keeper:await` firing.
-- Do not restore without RE-READING current state first — the level-triggered
-  reconciler may have drifted, and restoring a stale capture sets a wrong global
-  state.
-- Do not capture fewer than the singleton fields your take-over touches
-  ({paused, mode, armed, worktree_mode, max_concurrent_jobs,
-  max_concurrent_per_root}) — a partial capture restores a wrong global state.
-- Do not swallow a restore failure — surface "autopilot state unknown — verify
-  with `keeper status --json`" distinctly, and name the partial-mutation
-  field that's still off.
-- Do not treat "prioritize this" / "do this next" as arm/mode — plan state has
-  no board-priority knob. Only an explicit autopilot/armed reference triggers
-  this skill.
-- Do not use this to launch a worker by hand — that is `keeper:dispatch`.
-- Do not guess on ambiguous control-plane intent — ask ONE clarifying question
-  before mutating global state.
-- Do not invent ids. A slug-less, ambiguous reference → ask.
-
 ## Guardrails
 
-- **Precisely-triggered, conservative by default.** This is the operator surface
-  over the autopilot — the everyday path is the reconciler working ready epics on
-  its own. Reach for it on a clear request to control or inspect it, and never
-  mutate global state on ambiguous intent.
-- **Bare ops just run; take-over captures and restores.** A single control op is
-  one Bash call with no capture. Capture → drive → restore is reserved for an
-  explicit "take over for a bit, then put it back," and the window always closes
-  on restore.
-- **Restore when done.** A take-over owes a restore on the explicit close
-  signal; re-read first, restore only what changed, and surface any restore
-  failure distinctly — never leave the global state silently wrong.
+- **Conservative by default.** Mutate global autopilot state only on a clear
+  request to steer it; ask ONE clarifying question on ambiguous control-plane
+  intent, never guess a global-state mutation.
+- **A take-over always owes its restore.** Bare ops just run (no capture);
+  capture → drive → restore is take-over-window-only, and the window is not
+  discharged until the restore lands on its explicit close signal.
