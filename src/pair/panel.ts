@@ -659,7 +659,7 @@ function legIdentityHolds(
   if (stored === null) {
     return true;
   }
-  const key = `${member.startfile} ${pid}`;
+  const key = `${member.startfile}\0${pid}`;
   const cached = memo?.get(key);
   if (cached !== undefined) {
     return cached;

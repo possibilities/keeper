@@ -55,15 +55,16 @@ while IFS= read -r axis_line; do
   esac
 done < "${config}"
 
-echo "promote: drift guard — rendered worker agents must match subagents.yaml"
+# Render the per-cell work plugins so the slow-tier cell-set guard below sees
+# them on disk. `bun run test:slow` runs consistency-generated-guard.test.ts,
+# whose WORKERS_RENDERED-gated tests pin the workers/ cell set against
+# subagents.yaml in BOTH directions (missing cell fails, stale cell fails) —
+# the real render↔config drift check; without this render they silently skip.
+# A `git status` diff here would be dead: every rendered output (workers/,
+# agents/practice-scout.md) is gitignored and so invisible to porcelain, and
+# the hand-authored agents/ files are never rendered.
+echo "promote: rendering per-cell work plugins for the slow-tier cell-set guard"
 ( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" >/dev/null )
-drift="$(cd "${keeper_root}" && git status --porcelain plugins/plan/agents)"
-if [ -n "${drift}" ]; then
-  echo "promote: ABORT — rendered plan worker agents diverge from subagents.yaml:" >&2
-  echo "${drift}" >&2
-  echo "  re-render (keeper prompt render-plugin-templates) and commit before promote" >&2
-  exit 1
-fi
 
 # Real-git slow-tier gate. The fast `bun test` suite is pure (no real git), so a
 # git-effect regression passes every commit gate; this is the routine surface
