@@ -39,47 +39,17 @@ import { briefPath } from "../src/audit_artifacts.ts";
 import { autoCommitFromInvocation } from "../src/commit.ts";
 import { resolveWorkerRepos, worktreeOverride } from "../src/runtime_status.ts";
 import {
+  realCommitCount as commitCount,
+  git,
+  gitQuiet,
+  realHeadSha as headSha,
+  isAncestor,
   parseCliOutput,
   runCli,
   SLOW_ENABLED,
   seedRuntime,
   seedState,
 } from "./harness.ts";
-
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-/** Non-throwing git for tolerant teardown — a mid-cycle failure must not mask
- * the assertion that tripped it. */
-function gitQuiet(args: string[], cwd: string): void {
-  Bun.spawnSync(["git", ...args], { cwd });
-}
-
-function headSha(cwd: string): string {
-  return git(["rev-parse", "HEAD"], cwd).trim();
-}
-
-function commitCount(cwd: string): number {
-  const proc = Bun.spawnSync(["git", "rev-list", "--count", "HEAD"], { cwd });
-  if (proc.exitCode !== 0) {
-    return 0;
-  }
-  return Number.parseInt(proc.stdout.toString().trim(), 10);
-}
-
-/** True iff `ancestor` is reachable from `ref` (exit 0/1, never throws). */
-function isAncestor(ancestor: string, ref: string, cwd: string): boolean {
-  return (
-    Bun.spawnSync(["git", "merge-base", "--is-ancestor", ancestor, ref], {
-      cwd,
-    }).exitCode === 0
-  );
-}
 
 /** Set or delete `process.env[key]` — the save/restore primitive for the GIT_*
  * and KEEPER_PLAN_WORKTREE pollution windows. */

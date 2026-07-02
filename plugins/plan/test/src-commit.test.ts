@@ -25,7 +25,12 @@ import {
   buildSubject,
   CommitFailed,
 } from "../src/commit.ts";
-import { SLOW_ENABLED } from "./harness.ts";
+import {
+  realCommitCount as commitCount,
+  git,
+  realHeadSha as headSha,
+  SLOW_ENABLED,
+} from "./harness.ts";
 
 // ---------------------------------------------------------------------------
 // git tmp-repo harness + assertion helpers (the bun analogue of conftest's
@@ -33,26 +38,6 @@ import { SLOW_ENABLED } from "./harness.ts";
 // ---------------------------------------------------------------------------
 
 let repo: string;
-
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-function commitCount(cwd: string): number {
-  const proc = Bun.spawnSync(["git", "rev-list", "--count", "HEAD"], { cwd });
-  if (proc.exitCode !== 0) {
-    return 0; // fresh repo, no commits yet
-  }
-  return Number.parseInt(proc.stdout.toString().trim(), 10);
-}
-
-function headSha(cwd: string): string {
-  return git(["rev-parse", "HEAD"], cwd).trim();
-}
 
 function headMessage(cwd: string): string {
   return git(["log", "-1", "--format=%B"], cwd).trim();

@@ -16,30 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listEpicBaseBranches } from "../../../src/worktree-git.ts";
 import { baseBranchFor, ribBranchFor } from "../../../src/worktree-plan.ts";
-import { SLOW_ENABLED } from "./harness.ts";
-
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-/** Non-throwing git for tolerant teardown — a mid-cycle failure must not mask the
- * assertion that tripped it. */
-function gitQuiet(args: string[], cwd: string): void {
-  Bun.spawnSync(["git", ...args], { cwd });
-}
-
-/** True iff `ancestor` is reachable from `ref` (exit 0/1, never throws). */
-function isAncestor(ancestor: string, ref: string, cwd: string): boolean {
-  return (
-    Bun.spawnSync(["git", "merge-base", "--is-ancestor", ancestor, ref], {
-      cwd,
-    }).exitCode === 0
-  );
-}
+import { git, gitQuiet, isAncestor, SLOW_ENABLED } from "./harness.ts";
 
 describe.skipIf(!SLOW_ENABLED)("worktree fork topology (real git)", () => {
   let main: string;

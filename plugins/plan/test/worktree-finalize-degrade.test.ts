@@ -24,25 +24,12 @@ import {
   createWorktreeDriver,
   type WorktreeLaunchInfo,
 } from "../../../src/autopilot-worker.ts";
-import { SLOW_ENABLED } from "./harness.ts";
-
-function git(args: string[], cwd: string): string {
-  const proc = Bun.spawnSync(["git", ...args], { cwd });
-  if (proc.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-/** Non-throwing git for tolerant teardown — a mid-cycle failure must not mask the
- * assertion that tripped it. */
-function gitQuiet(args: string[], cwd: string): void {
-  Bun.spawnSync(["git", ...args], { cwd });
-}
-
-function headSha(cwd: string): string {
-  return git(["rev-parse", "HEAD"], cwd).trim();
-}
+import {
+  git,
+  gitQuiet,
+  realHeadSha as headSha,
+  SLOW_ENABLED,
+} from "./harness.ts";
 
 /** Commit a real file onto the lane checked out at `lane` so its base branch is
  * AHEAD of default — the merge has something to land. The finalize gate reads the
