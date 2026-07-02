@@ -46,5 +46,5 @@ retired workaround's replacement parity (same fields the jq pipeline produced).
 - [ ] CLAUDE.md + skill jq recipes for these reads replaced by the new verbs (same commits)
 
 ## Done summary
-
+Added envelope-shaped reads: keeper query tasks (flat task rows + live readiness verdict, retiring the query-epics jq pipeline), keeper autopilot show (durable config incl. worktree_multi_repo), and keeper session-summary (bounded DB summary vs the transcript). Surfaced worktree_multi_repo on the readiness snapshot + status .data.autopilot (STATUS_SCHEMA_VERSION 2->3) and in the autopilot skill's capture list.
 ## Evidence
