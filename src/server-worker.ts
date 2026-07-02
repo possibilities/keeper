@@ -1086,7 +1086,7 @@ export function peerPidForFd(fd: number): number | null {
   }
 }
 
-function unlinkIfExists(path: string): void {
+export function unlinkIfExists(path: string): void {
   try {
     if (existsSync(path)) {
       unlinkSync(path);

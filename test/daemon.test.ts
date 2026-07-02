@@ -41,6 +41,7 @@ import {
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideGitSeedWatchdog,
+  decideServeLivenessWatchdog,
   drainToCompletion,
   effectiveBlockEscalationRepo,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
@@ -61,6 +62,9 @@ import {
   recoverOneDeadLetter,
   runBlockEscalationSweep,
   runMergeEscalationSweep,
+  SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  SERVE_PROBE_STUCK_THRESHOLD_MS,
+  SERVE_WATCHDOG_BOOT_GRACE_MS,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
@@ -884,6 +888,94 @@ test("decideGitSeedWatchdog: alive-but-never-seeding still grows stale from the 
       reseedAttempts: 0,
     }),
   ).toBe("reseed");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1082 — serve-liveness watchdog pure verdict
+// ---------------------------------------------------------------------------
+
+// Boot grace already elapsed; both sockets probed fresh this instant; no lag
+// breaches. The healthy steady state — every case below perturbs one axis.
+const SWD_BASE = {
+  nowMs: 1_000_000,
+  bootGraceUntilMs: 1_000_000 - SERVE_WATCHDOG_BOOT_GRACE_MS,
+  lastServerProbeOkAtMs: 1_000_000,
+  lastBusProbeOkAtMs: 1_000_000,
+  probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
+  consecutiveLagBreaches: 0,
+  maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+};
+
+test("decideServeLivenessWatchdog: healthy — fresh probes, no lag → ok", () => {
+  expect(decideServeLivenessWatchdog({ ...SWD_BASE })).toBe("ok");
+});
+
+test("decideServeLivenessWatchdog: within boot grace → ok even with stale probes and a full lag run", () => {
+  // The arm-time baselines are meaningless until workers bind + probe once; the
+  // grace window must suppress a verdict no matter how stale the inputs look.
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      nowMs: SWD_BASE.bootGraceUntilMs - 1,
+      lastServerProbeOkAtMs: 0,
+      lastBusProbeOkAtMs: 0,
+      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+    }),
+  ).toBe("ok");
+});
+
+test("decideServeLivenessWatchdog: keeperd read stalled (low lag) → escalate", () => {
+  // The accept-stall mode: reads die, lag stays low. The server probe last
+  // succeeded past the window while the bus probe is fresh — either socket alone
+  // is enough to escalate.
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
+    }),
+  ).toBe("escalate");
+});
+
+test("decideServeLivenessWatchdog: bus registry read stalled (low lag) → escalate", () => {
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
+    }),
+  ).toBe("escalate");
+});
+
+test("decideServeLivenessWatchdog: probe age just under the window → ok", () => {
+  // One-off blips must not restart: a probe that succeeded moments inside the
+  // window (age === threshold − 1) is still healthy — escalate is `>=` only.
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      lastServerProbeOkAtMs:
+        SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
+      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
+    }),
+  ).toBe("ok");
+});
+
+test("decideServeLivenessWatchdog: busy-wedge — lag breached for N consecutive intervals → escalate", () => {
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+    }),
+  ).toBe("escalate");
+});
+
+test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N intervals → ok", () => {
+  // High lag this tick but the run has not reached N — a transient GC pause or a
+  // heavy-but-finite fold must not trip a false restart.
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1,
+    }),
+  ).toBe("ok");
 });
 
 test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {

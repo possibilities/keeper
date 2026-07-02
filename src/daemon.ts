@@ -20,6 +20,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { basename, join, resolve as resolvePath, sep } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
@@ -64,6 +65,7 @@ import {
   readGitProjectionSeedRequired,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
+  resolveBusSockPath,
   resolveClaudeProjectsRoot,
   resolveConfig,
   resolveDbPath,
@@ -1406,6 +1408,177 @@ export function decideTmuxControlWatchdog(inputs: {
   return nowMs - lastLivenessAtMs >= livenessThresholdMs ? "escalate" : "ok";
 }
 
+// ── fn-1082 serve-liveness watchdog ─────────────────────────────────────────────
+/** How often the supervisor runs the serve-liveness probes + verdict. */
+export const SERVE_WATCHDOG_INTERVAL_MS = 30_000;
+/**
+ * Hard per-probe timeout for a single real-read round-trip on either serve socket.
+ * Generous — a healthy daemon answers a local-UDS read in sub-ms — but well under
+ * the interval so a wedged read resolves (as a failure) inside its own tick and the
+ * probe-age simply grows across ticks. This is the detector for the ACCEPT-STALL
+ * wedge mode (the observed failure: reads timed out while the send path stayed
+ * alive), which a connect-only probe would sail straight through.
+ */
+export const SERVE_PROBE_TIMEOUT_MS = 5_000;
+/**
+ * How stale the last SUCCESSFUL real-read on either socket may get before the
+ * watchdog escalates. Three intervals' worth: a genuine wedge fails every probe,
+ * so the age crosses this after ~3 consecutive dead ticks — enough to rule out a
+ * one-off blip, short enough that an operator sees a restart, not a permanent hang.
+ */
+export const SERVE_PROBE_STUCK_THRESHOLD_MS = 3 * SERVE_WATCHDOG_INTERVAL_MS;
+/**
+ * Main-loop event-loop-delay p99 (ms) that counts as a BUSY-wedge breach for one
+ * interval. ~1s of p99 lag means the main loop is starved — legitimate load rarely
+ * sustains this. The accept-stall mode shows LOW lag, so this histogram detector is
+ * the BELT for a main-thread busy-spin; the real-read probes above are what cover a
+ * wedged SERVE thread (whose loop main's histogram cannot see).
+ */
+export const SERVE_LAG_P99_THRESHOLD_MS = 1_000;
+/**
+ * Consecutive breaching intervals before a busy-wedge escalates. Requiring N in a
+ * row (not one spike) keeps a transient GC pause or a heavy-but-finite fold from
+ * tripping a false restart.
+ */
+export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 3;
+/**
+ * Boot grace: the watchdog never escalates within this window of arming. The serve
+ * workers may still be binding and no probe has landed yet, so the arm-time baseline
+ * would otherwise read as instantly stale. Generous — a healthy boot binds both
+ * sockets and answers the first probes well inside it.
+ */
+export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
+
+/**
+ * Pure verdict for the serve-liveness watchdog (fn-1082). Mirrors
+ * {@link decideGitSeedWatchdog} — clock/threshold arithmetic only, no I/O — so the
+ * decision is unit-testable with synthetic clock, probe-age, and lag inputs.
+ *
+ * Two detectors for two wedge modes, both escalating straight to `fatalExit`
+ * (LaunchAgent restart — never an in-process respawn):
+ *   - ACCEPT-STALL (low lag, zero read throughput): a real-read probe on either
+ *     socket last succeeded past `probeStuckThresholdMs`. The caller stamps
+ *     `lastServerProbeOkAtMs`/`lastBusProbeOkAtMs` on each successful round-trip; a
+ *     wedged read never stamps, so the age grows until it crosses the window.
+ *   - BUSY-wedge (main loop starved): the main event-loop-delay p99 breached its
+ *     threshold for `maxConsecutiveLagBreaches` consecutive intervals (the caller
+ *     accumulates/resets the count per tick).
+ *
+ * Returns `"ok"` during the boot-grace window (arm-time baselines are not yet
+ * meaningful) and whenever both detectors are clear; `"escalate"` otherwise.
+ */
+export function decideServeLivenessWatchdog(inputs: {
+  nowMs: number;
+  bootGraceUntilMs: number;
+  lastServerProbeOkAtMs: number;
+  lastBusProbeOkAtMs: number;
+  probeStuckThresholdMs: number;
+  consecutiveLagBreaches: number;
+  maxConsecutiveLagBreaches: number;
+}): "ok" | "escalate" {
+  const {
+    nowMs,
+    bootGraceUntilMs,
+    lastServerProbeOkAtMs,
+    lastBusProbeOkAtMs,
+    probeStuckThresholdMs,
+    consecutiveLagBreaches,
+    maxConsecutiveLagBreaches,
+  } = inputs;
+  // Never trip mid-boot: workers may still be binding, first probes not yet landed.
+  if (nowMs < bootGraceUntilMs) return "ok";
+  // Accept-stall on either socket — a real read has not answered within the window.
+  if (nowMs - lastServerProbeOkAtMs >= probeStuckThresholdMs) return "escalate";
+  if (nowMs - lastBusProbeOkAtMs >= probeStuckThresholdMs) return "escalate";
+  // Busy-wedge — main loop starved for N consecutive intervals.
+  if (consecutiveLagBreaches >= maxConsecutiveLagBreaches) return "escalate";
+  return "ok";
+}
+
+/**
+ * One real-read round-trip on a fresh UDS connection for the serve-liveness
+ * watchdog: connect, write `request` (newline-delimited JSON — the wire format both
+ * the keeperd and bus relays speak), and resolve `true` on the first parsed frame
+ * `isMatch` accepts. Resolves `false` on connect-fail, transport error, server close
+ * before a match, or `timeoutMs` elapsing — NEVER rejects, so the interval callback
+ * stays a plain `.then(ok => …)`. One short-lived connection with an immediate close
+ * so a probe holds no connection slot on the serve thread.
+ *
+ * A REAL read (not connect-only) is the point: the observed wedge kept the send path
+ * alive while reads died, so only a round-trip that gets a frame back proves the
+ * serve loop is live. Frames are tiny (a status query / a bus `list`), well under the
+ * partial-write hang bound (`MAX_CONTROL_FRAME_BYTES`).
+ */
+async function probeSocketRead(
+  sockPath: string,
+  request: Record<string, unknown>,
+  isMatch: (frame: Record<string, unknown>) => boolean,
+  timeoutMs: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let remainder = "";
+    let settled = false;
+    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
+
+    const settle = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        sock?.end();
+      } catch {
+        // best-effort — we're done with this connection either way
+      }
+      resolve(ok);
+    };
+
+    const timer = setTimeout(() => settle(false), timeoutMs);
+    timer.unref?.();
+
+    Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) {
+          sock = s;
+          try {
+            s.write(`${JSON.stringify(request)}\n`);
+          } catch {
+            settle(false);
+          }
+        },
+        data(_s, chunk) {
+          remainder += chunk.toString("utf8");
+          let nl = remainder.indexOf("\n");
+          while (nl !== -1) {
+            const line = remainder.slice(0, nl).trim();
+            remainder = remainder.slice(nl + 1);
+            if (line.length > 0) {
+              let frame: Record<string, unknown>;
+              try {
+                frame = JSON.parse(line) as Record<string, unknown>;
+              } catch {
+                nl = remainder.indexOf("\n");
+                continue; // ignore a malformed line, keep reading
+              }
+              if (isMatch(frame)) {
+                settle(true);
+                return;
+              }
+            }
+            nl = remainder.indexOf("\n");
+          }
+        },
+        close() {
+          settle(false);
+        },
+        error() {
+          settle(false);
+        },
+      },
+    }).catch(() => settle(false));
+  });
+}
+
 /**
  * Scan the dead-letter dir and import each NDJSON file's records into the
  * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`) — a
@@ -2701,6 +2874,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // never trips before the worker has pulsed once (it may be mid-attach/backoff).
   let lastTmuxControlLivenessAtMs: number | null = null;
   let tmuxControlWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+  // fn-1082 serve-liveness watchdog state. Each probe stamps its socket's
+  // `last…ProbeOkAtMs` on a successful real read (arm-time baseline until the first
+  // success), so a wedged read simply stops advancing it and the age grows across
+  // ticks. `serveLagConsecutiveBreaches` accumulates the main-loop lag-breach run
+  // (reset on a clean tick). The lag histogram measures MAIN's loop (the belt for a
+  // main-thread busy-spin — a wedged SERVE thread is caught by the read probes).
+  // {@link decideServeLivenessWatchdog} reads these.
+  let lastServerProbeOkAtMs = Date.now();
+  let lastBusProbeOkAtMs = Date.now();
+  let serveLagConsecutiveBreaches = 0;
+  let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
   // Autopilot in-memory paused flag. Initialized PAUSED (safety default), then
   // re-seeded from the durable `autopilot_state.paused` column after the boot
@@ -6596,6 +6782,88 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }, TMUX_CONTROL_WATCHDOG_INTERVAL_MS);
   }
 
+  // fn-1082 serve-liveness watchdog. The UDS serve layer has twice gone dark while
+  // every worker thread stayed healthy — status reads and bus registry reads timed
+  // out (while sends still delivered), a wedge the crash-only `onerror`/`close`
+  // guards never see. This timer runs a REAL bounded-timeout read on each served
+  // socket from MAIN (each socket is served by a DISTINCT worker thread, so a
+  // self-probe from main is sound: a wedged serve loop cannot answer main's read)
+  // plus a main-loop lag histogram, feeds them to the verdict
+  // ({@link decideServeLivenessWatchdog}), and escalates a detected wedge straight
+  // to `fatalExit` (LaunchAgent restart — the sole recovery path; never a respawn).
+  // Gated on actually serving a socket + out of the in-process tier.
+  if ((serverWorker || busWorker) && !opts.disableNativeWatcher) {
+    const busSockPath = resolveBusSockPath();
+    // Re-stamp the probe baselines at ARM time (the sockets are bound now), so the
+    // stuck-age measures from a fresh anchor, not the early declaration — a long
+    // boot drain must not read as instant staleness. Mirrors the git seed
+    // watchdog's arm-time baseline. Combined with the boot grace below, the first
+    // post-grace tick still measures well under the stuck window even if the
+    // opening probe missed.
+    lastServerProbeOkAtMs = Date.now();
+    lastBusProbeOkAtMs = Date.now();
+    const bootGraceUntilMs = Date.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
+    serveLagHistogram = monitorEventLoopDelay({ resolution: 20 });
+    serveLagHistogram.enable();
+    const lagHistogram = serveLagHistogram;
+    serveLivenessWatchdogTimer = setInterval(() => {
+      if (shuttingDown) return;
+      // Main-loop lag for this interval (ns → ms), then reset the window.
+      const lagP99Ms = lagHistogram.percentile(99) / 1e6;
+      lagHistogram.reset();
+      serveLagConsecutiveBreaches =
+        lagP99Ms >= SERVE_LAG_P99_THRESHOLD_MS
+          ? serveLagConsecutiveBreaches + 1
+          : 0;
+
+      // Fire a real read on each served socket; stamp on success. A wedged read
+      // never resolves `true` inside its timeout, so the age grows across ticks.
+      // The probes are asynchronous — this tick's verdict reads the PRIOR tick's
+      // result (the timeout << interval, so the latest probe has always settled).
+      if (serverWorker) {
+        const id = crypto.randomUUID();
+        void probeSocketRead(
+          sockPath,
+          { type: "query", id, collection: "autopilot_state", limit: 0 },
+          (f) => f.id === id,
+          SERVE_PROBE_TIMEOUT_MS,
+        ).then((ok) => {
+          if (ok) lastServerProbeOkAtMs = Date.now();
+        });
+      }
+      if (busWorker) {
+        void probeSocketRead(
+          busSockPath,
+          { op: "list" },
+          (f) => f.type === "ack" && f.op === "list",
+          SERVE_PROBE_TIMEOUT_MS,
+        ).then((ok) => {
+          if (ok) lastBusProbeOkAtMs = Date.now();
+        });
+      }
+
+      const verdict = decideServeLivenessWatchdog({
+        nowMs: Date.now(),
+        bootGraceUntilMs,
+        // A socket we do not serve never trips: keep its age perpetually fresh.
+        lastServerProbeOkAtMs: serverWorker
+          ? lastServerProbeOkAtMs
+          : Date.now(),
+        lastBusProbeOkAtMs: busWorker ? lastBusProbeOkAtMs : Date.now(),
+        probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
+        consecutiveLagBreaches: serveLagConsecutiveBreaches,
+        maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+      });
+      if (verdict === "escalate") {
+        console.error(
+          "[keeperd] serve-liveness watchdog: a serve socket stopped answering " +
+            "real reads (or the main loop is wedged) — exiting for LaunchAgent restart",
+        );
+        if (!shuttingDown) fatalExit();
+      }
+    }, SERVE_WATCHDOG_INTERVAL_MS);
+  }
+
   // Unrecoverable async errors that escape every guard also take the single
   // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
   // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
@@ -6645,6 +6913,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (gitSeedWatchdogTimer != null) clearInterval(gitSeedWatchdogTimer);
     if (tmuxControlWatchdogTimer != null)
       clearInterval(tmuxControlWatchdogTimer);
+    if (serveLivenessWatchdogTimer != null)
+      clearInterval(serveLivenessWatchdogTimer);
+    // Release the event-loop-delay monitor so it stops pinning a libuv handle.
+    try {
+      serveLagHistogram?.disable();
+    } catch {
+      // best-effort — we're tearing down either way
+    }
 
     // The workers actually spawned this boot (filter out the `null`s). Teardown
     // iterates THIS list, so a minimal-set boot signals only what it spawned.

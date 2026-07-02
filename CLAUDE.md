@@ -82,8 +82,9 @@ imperative guardrails only.
   Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine.
 - **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)`; the
   LaunchAgent restarts the single recovery path. Never respawn a worker in-process (carve-outs:
-  closing a stale/EPIPE UDS client, and the git seed-liveness watchdog's capped MAIN boot-seed
-  re-runs before it escalates to `fatalExit`).
+  closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed
+  re-runs before it escalates to `fatalExit`, and the serve-liveness watchdog's bounded real-read
+  socket probes that `fatalExit` a wedged serve path).
 - **`restore-agents --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract
