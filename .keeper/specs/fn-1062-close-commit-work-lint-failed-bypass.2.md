@@ -50,5 +50,5 @@ tests if snippet content is fixture-covered.
 - [ ] _index.yaml untouched or minimally consistent; committed in the arthack repo
 
 ## Done summary
-
+Applied the pinned lint_failed carve-out to the canonical commit-via-keeper-default arthack snippet: envelope example gained the recovery field and the escape hatch now carries the verbatim 'never a coverage gap' prohibition. Refreshed the keeper render oracle golden to match.
 ## Evidence
