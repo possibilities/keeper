@@ -147,7 +147,7 @@ function matchLiveExact(
  * name_history entry, NOCASE on titles); `prefix` matches job_id/start ids by
  * prefix; `substring` matches the CURRENT TITLE ONLY (history is exact-only — a
  * substring over old names creates spooky false positives from forgotten
- * sessions, per the chatctl resolution model). Bound params only — never
+ * sessions, per the Agent Bus resolution model). Bound params only — never
  * string-interpolated.
  */
 function jobsAtTier(

@@ -230,6 +230,4 @@ agents and a clobbered tree.
 
 The per-prompt advice snippets injected by arthack's `user_prompt_submit`
 hook (the canonical per-prompt messaging surface) are NOT part of this skill.
-They belong to a separate follow-up epic in `~/code/arthack` that retires the
-old chatctl app and rewrites its per-prompt advice against this bus. Do not
-edit them from here.
+They live in a separate project (`~/code/arthack`). Do not edit them from here.

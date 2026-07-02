@@ -17,6 +17,11 @@
 #       counted token defaults to "planctl"; a 4th `|<token>` field overrides it
 #       (the "agentwrap" relocation files are pinned this way — see below).
 #
+#     * `forbid` records: a cleaned file pinned to ZERO occurrences of a
+#       substring (fixed-string, case-insensitive, SINGLE FILE) so a retired
+#       name cannot regrow into a surface a sweep already purged. Missing target
+#       file = FAIL (consistent with anchor/count).
+#
 #   "agentwrap" (fn-1018 + fn-1020) — ZERO-TOLERANCE. The name is fully retired
 #   (env vars -> KEEPER_AGENT_*, config dir -> ~/.config/keeper, runtime state dir
 #   -> ~/.local/state/keeper-agent).
@@ -98,6 +103,20 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             actual="$(grep -icE "$token" "$file" || true)"
             if [[ "$actual" != "$expected" ]]; then
                 violations+=("PURE-FROZEN file ${relpath} drifted: expected ${expected} \"${token}\" lines, found ${actual} (a clobber or a planted retired-name edit)")
+            fi
+            ;;
+        forbid)
+            if [[ ! -f "$file" ]]; then
+                violations+=("MISSING FILE for forbid: ${relpath}")
+                continue
+            fi
+            # Fixed-string (grep -F), case-insensitive (-i), SINGLE FILE only:
+            # the forbidden substring must NOT appear anywhere in this cleaned
+            # file, so a retired name can never regrow into it. `if grep -Fqi`
+            # keeps set -e safe (a no-match exit 1 is the success path here, not
+            # a script abort).
+            if grep -Fqi -- "$payload" "$file"; then
+                violations+=("FORBIDDEN substring in ${relpath}: \`${payload}\` must not appear (retired-name regrowth)")
             fi
             ;;
         exempt)

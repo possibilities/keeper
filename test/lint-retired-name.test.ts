@@ -3,7 +3,9 @@
  *
  * The guard covers three retired names: "planctl" (PROGRESSIVE — enforces only the
  * frozen-literal surface in scripts/frozen-allowlist.txt: anchors via Check A,
- * count-pins via Check B), "agentwrap" (ZERO-TOLERANCE — Check C fails on any
+ * count-pins via Check B, plus `forbid` records pinning already-cleaned files to
+ * ZERO occurrences of a substring so a purged name cannot regrow), "agentwrap"
+ * (ZERO-TOLERANCE — Check C fails on any
  * occurrence repo-wide outside a defined exclusion set), and "keeper pair"
  * (ZERO-TOLERANCE — Check D fails on any space-separated occurrence repo-wide
  * outside the same exclusion set; the colon-separated `keeper:pair` SKILL name
@@ -182,6 +184,40 @@ test("anchor payload may itself contain pipe characters (regex alternation)", ()
   // And it fails when that exact alternation is clobbered.
   put("cli/cw.ts", "const RE = /^(Job-Id:)/m;\n");
   expect(runGuard().code).toBe(1);
+});
+
+test("forbid: passes when the forbidden substring is absent", () => {
+  // The cleaned file no longer carries the retired name → clean.
+  put("scripts/frozen-allowlist.txt", "forbid|src/plugin.json|planctl\n");
+  put("src/plugin.json", '{ "description": "keeper plan projects" }\n');
+  expect(runGuard().code).toBe(0);
+});
+
+test("forbid: fails when the forbidden substring is present", () => {
+  // A retired name regrew into a purged file → fail.
+  put("scripts/frozen-allowlist.txt", "forbid|src/plugin.json|planctl\n");
+  put("src/plugin.json", '{ "description": "supervise planctl projects" }\n');
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("FORBIDDEN substring in src/plugin.json");
+  expect(stderr).toContain("planctl");
+});
+
+test("forbid: fails when the target file is missing", () => {
+  // A missing forbid target FAILs, consistent with anchor/count.
+  put("scripts/frozen-allowlist.txt", "forbid|src/gone.json|planctl\n");
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("MISSING FILE for forbid: src/gone.json");
+});
+
+test("forbid: case-insensitive — a mixed-case variant still fails", () => {
+  // grep -Fqi: a case variant of the retired name is still a hit.
+  put("scripts/frozen-allowlist.txt", "forbid|src/doc.md|planctl\n");
+  put("src/doc.md", "The PlanCtl state directory holds history.\n");
+  const { code, stderr } = runGuard();
+  expect(code).toBe(1);
+  expect(stderr).toContain("FORBIDDEN substring in src/doc.md");
 });
 
 test("fails when the allowlist is missing", () => {
