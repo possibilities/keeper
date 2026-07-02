@@ -41,5 +41,5 @@ binary-absent leaves the command untouched; throw path still emits bare allow.
 - [ ] Dispatcher tests cover both behaviors
 
 ## Done summary
-
+Added arthack provenance markers to additionalContext for the auto-approve and each rewrite (attributability), and PATH-guarded uv/pnpm command rewrites so a missing binary no-ops the rewrite; fail-open preserved. Dispatcher tests extended for both behaviors (68 pass).
 ## Evidence
