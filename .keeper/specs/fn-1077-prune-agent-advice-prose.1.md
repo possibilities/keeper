@@ -35,5 +35,5 @@ Render + consistency suites green; diff review confirms only restatement left.
 - [ ] Four cells + work skill re-rendered; all sacred worker contracts present verbatim
 
 ## Done summary
-
+Pruned worker template Rules block to the two non-phase invariants, deduped the commit escape-hatch to one statement, and trimmed the work skill Guardrails to its lone non-phase bullet. All four cells + work skill re-render byte-stable modulo deletions; sacred contracts intact.
 ## Evidence
