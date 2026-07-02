@@ -50,5 +50,5 @@ check in CI/integration, never the pure unit tier.
 - [ ] All landed in commits that keep the drift gate green at every point
 
 ## Done summary
-
+discoverPluginDirs scans plugins/* and resolveAgentOutput resolves render_to against the plugin dir, so a keeper repo-root render discovers the plan plugin, keeps worker cells at plugins/plan/workers/, and writes repo-root-relative sidecars that check_generated resolves to existing paths. promote.sh reports >0 cells rendered, install.sh renders generated files on a fresh clone, and consistency-skills gates its per-cell block on WORKERS_RENDERED.
 ## Evidence
