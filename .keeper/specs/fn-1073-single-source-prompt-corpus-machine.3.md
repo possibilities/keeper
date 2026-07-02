@@ -42,5 +42,5 @@ green. vendor.lock verify: bump a vendored file without bumping the lock, CI ver
 - [ ] Render cites in keeper/plan skills resolve against the vendored corpus from the keeper root
 
 ## Done summary
-
+Vendored the keeper-relevant snippet subset (engineering + source-dirs domains + engineering-rules bundle) under plugins/prompt/corpus with a vendor.lock (upstream sha + filter rule + sha256 manifest); render resolution defaults to it so a fresh clone renders every keeper/plan cite with no arthack checkout. Split the overloaded marker into BAKE:BEGIN/END guards (byte-equality lint) and a distinct POINTER marker; scripts/vendor-corpus.ts + the prompt suite gate hash, bake identity, and cite resolution.
 ## Evidence
