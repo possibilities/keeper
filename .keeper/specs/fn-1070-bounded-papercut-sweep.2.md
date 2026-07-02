@@ -31,5 +31,5 @@ Cases: underspecified claude default on the run path → bad_args (not no_transc
 - [ ] `bun test` green
 
 ## Done summary
-
+Unified fresh-launch readiness into one resolveLaunchReadiness core both gates route through (each keeping its emission contract); fixed pi's second axis to thinking not effort; the run gate now rejects underspecified presets/defaults as clean bad_args; and resolveWorkerLaunchConfig warns once per distinct non-claude worker harness without ever throwing.
 ## Evidence
