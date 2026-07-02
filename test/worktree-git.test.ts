@@ -13,6 +13,7 @@ import { expect, test } from "bun:test";
 import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import {
   branchExists,
+  classifyLinkedWorktree,
   commitWorkLockPath,
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
@@ -341,6 +342,56 @@ test("isLinkedWorktree: a probe failing exit fails safe to false", async () => {
     },
   ]);
   expect(await isLinkedWorktree("/nowhere", run)).toBe(false);
+});
+
+test("classifyLinkedWorktree: differing git-dir/common-dir, no superproject → linked", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => a.includes("--git-dir"),
+      result: { stdout: "/repo/.git/worktrees/lane\n" },
+    },
+    {
+      when: (a) => a.includes("--git-common-dir"),
+      result: { stdout: "/repo/.git\n" },
+    },
+    {
+      when: (a) => a.includes("--show-superproject-working-tree"),
+      result: { stdout: "" },
+    },
+  ]);
+  expect(await classifyLinkedWorktree("/repo.worktrees/lane", run)).toBe(
+    "linked",
+  );
+});
+
+test("classifyLinkedWorktree: equal git-dir/common-dir → standalone main checkout", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => a.includes("--git-dir"),
+      result: { stdout: "/repo/.git\n" },
+    },
+    {
+      when: (a) => a.includes("--git-common-dir"),
+      result: { stdout: "/repo/.git\n" },
+    },
+    {
+      when: (a) => a.includes("--show-superproject-working-tree"),
+      result: { stdout: "" },
+    },
+  ]);
+  expect(await classifyLinkedWorktree("/repo", run)).toBe("standalone");
+});
+
+test("classifyLinkedWorktree: a git-dir probe nonzero exit → error (defer, never fail-open)", async () => {
+  // Distinct from `isLinkedWorktree`'s fail-open false: the caller must DEFER on
+  // an inconclusive probe rather than fold it into the not-linked/off-branch path.
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => a.includes("--git-dir"),
+      result: { exitCode: 128 },
+    },
+  ]);
+  expect(await classifyLinkedWorktree("/nowhere", run)).toBe("error");
 });
 
 // ---------------------------------------------------------------------------

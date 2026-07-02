@@ -7413,6 +7413,8 @@ function makeRecoveryGit(state: {
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
+  linkedWorktreeAt?: Set<string>; // cwds whose git-dir ≠ common-dir → a linked lane (skipped by the sweep filter)
+  probeErrorAt?: Set<string>; // cwds whose git-dir/common-dir probe exits nonzero → defer the repo this cycle
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
   calls: { cwd: string; args: string; env?: Record<string, string> }[];
@@ -7528,7 +7530,27 @@ function makeRecoveryGit(state: {
         stderr: "",
       };
     }
+    if (
+      joined.startsWith("rev-parse --path-format=absolute --git-common-dir")
+    ) {
+      if (state.probeErrorAt?.has(cwd)) {
+        return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      }
+      // A linked worktree's common-dir points at the SHARED parent .git (≠ its
+      // per-worktree git-dir); a main/standalone checkout's common-dir EQUALS its
+      // git-dir. `classifyLinkedWorktree` keys the linked verdict on the inequality.
+      return {
+        code: 0,
+        stdout: state.linkedWorktreeAt?.has(cwd)
+          ? "/shared/.git\n"
+          : `${cwd}/.git\n`,
+        stderr: "",
+      };
+    }
     if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
+      if (state.probeErrorAt?.has(cwd)) {
+        return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      }
       return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
     }
     if (joined.startsWith("rev-parse --verify --quiet refs/remotes/origin/")) {
@@ -8457,6 +8479,66 @@ test("fn-959.7 recoverWorktrees: repos are deduped — one sweep per distinct re
   expect(calls.filter((c) => c.args.startsWith("worktree list"))).toHaveLength(
     1,
   );
+});
+
+test("fn-1050 recoverWorktrees: a linked-worktree lane in the sweep set is SKIPPED (no off-branch row)", async () => {
+  // The bug: a lane's `--show-toplevel` is the lane itself, so it registers as its
+  // own git-projection root and leaks into the sweep set; pass-2 then fails
+  // `off-branch` by construction (its HEAD is the `keeper/epic/*` branch). The
+  // filter classifies the lane linked and skips it BEFORE any pass runs.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n`,
+    linkedWorktreeAt: new Set([lane]),
+    epicBases: ["keeper/epic/fn-1-foo"], // a done base that WOULD mint off-branch if swept
+    defaultBranch: "main",
+    repoHead: "keeper/epic/fn-1-foo", // the lane's HEAD is its lane branch, never default
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees([lane], async () => true, run);
+  expect(failures).toEqual([]);
+  // Skipped before pass-1: the lane's worktree list was never even enumerated.
+  expect(calls.some((c) => c.args.startsWith("worktree list"))).toBe(false);
+});
+
+test("fn-1050 recoverWorktrees: a linked-worktree probe ERROR defers the repo (no row, no sweep)", async () => {
+  // Every probe inconclusive/error DEFERS — never fail-open into the off-branch
+  // path. Level-triggered retry re-sweeps next cycle.
+  const repo = "/repo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: `worktree ${repo}\nHEAD x\nbranch refs/heads/main\n\n`,
+    probeErrorAt: new Set([repo]),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    repoHead: "feature-x", // off default → would mint off-branch if swept
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees([repo], async () => true, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.args.startsWith("worktree list"))).toBe(false);
+});
+
+test("fn-1050 recoverWorktrees: a main/standalone checkout is still swept (probe → standalone)", async () => {
+  // The filter must not skip a real main checkout: its done base still merges.
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    repoHead: "main",
+    ancestors: new Set(),
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.some(
+      (c) => c.cwd === "/repo" && c.args.startsWith("merge --no-edit"),
+    ),
+  ).toBe(true);
 });
 
 test("fn-959.7 isEpicDoneById: pk-lookup resolves a DONE epic unbounded by the recent-done window", async () => {

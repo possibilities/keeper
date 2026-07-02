@@ -127,6 +127,7 @@ import {
   type EpicLaneBranchSet,
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
+  classifyLinkedWorktree as gitClassifyLinkedWorktree,
   currentBranch as gitCurrentBranch,
   deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
@@ -4555,6 +4556,18 @@ export async function recoverWorktrees(
   }
 
   for (const repo of uniqueRepos) {
+    // A linked-worktree lane is NOT a repo to sweep. `git rev-parse
+    // --show-toplevel` inside a lane returns the lane itself, so a lane registers
+    // as its own git-projection root and leaks into the sweep set, where pass-2
+    // would fail `off-branch` by construction (a lane's HEAD is its `keeper/epic/*`
+    // branch, never the default). Classify and skip a linked lane; a probe ERROR
+    // DEFERS the repo this cycle (never fail-open into the off-branch path) —
+    // level-triggered retry re-sweeps next cycle.
+    const laneState = await gitClassifyLinkedWorktree(repo, run);
+    if (laneState !== "standalone") {
+      continue;
+    }
+
     // --- Pass 1: abort any interrupted merge in a live linked worktree. ---
     let entries: WorktreeEntry[];
     try {
@@ -4656,7 +4669,7 @@ export async function recoverWorktrees(
           case "off-branch":
             failures.push({
               epicId: base.epicId,
-              reason: `worktree-recover-not-on-default: ${repo} HEAD is ${merge.head}, expected ${defaultBranch} to merge ${base.branch}`,
+              reason: `worktree-recover-not-on-default: ${repo} HEAD is ${merge.head}, expected ${defaultBranch} to merge ${base.branch} — switch ${repo} back to ${defaultBranch} (commit or stash any work on ${merge.head} first) so recover can merge it`,
               dir: repo,
             });
             continue;

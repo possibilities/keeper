@@ -3561,9 +3561,17 @@ Crash/restart recovery is producer-only: detect `MERGE_HEAD` in each KEEPER lane
 as another tool's `.claude/worktrees/<name>` lane is never abort-merged or
 pruned, so a vanished foreign dir can't ENOENT the sweep) → abort →
 `git worktree prune --expire now` → retry, plus a deterministic done-but-unmerged
-`keeper/epic/*` scan decoupled from the recent-done window. Pass-2 runs the SAME
-shared-checkout prechecks as finalize (dirty / off-branch / non-fast-forward →
-skip), but surfaces them as `worktree-recover-*` reasons so the level-triggered
+`keeper/epic/*` scan decoupled from the recent-done window. The sweep SET itself
+excludes linked worktrees: a lane's `--show-toplevel` is the lane, so a lane
+registers as its own git-projection root and would leak into the sweep where
+pass-2 fails `off-branch` by construction — each candidate repo is classified via
+`classifyLinkedWorktree` (git-dir vs common-dir, submodule-guarded), a linked lane
+is SKIPPED and an inconclusive probe DEFERS that repo for the cycle (never
+fail-open into the off-branch path; level-triggered retry re-sweeps next cycle).
+Pass-2 runs the SAME shared-checkout prechecks as finalize (dirty / off-branch /
+non-fast-forward → skip), but surfaces them as `worktree-recover-*` reasons whose
+DETAIL names the operator remedy (e.g. `not-on-default` says to switch the checkout
+back to the default branch, committing/stashing first) so the level-triggered
 auto-clear lifts the block the moment the tree settles. A recover merge
 conflict still fails LOUD and blocks ONLY its own `close::<epic>` key (per-key
 `failedKeys`) — but it is LEVEL-TRIGGERED, never a sticky board-jam: each cycle

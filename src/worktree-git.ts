@@ -382,11 +382,22 @@ export async function deleteBranch(
   return r.code === 0;
 }
 
-/** True IFF `cwd` is inside a linked git worktree (submodule-guarded). */
-export async function isLinkedWorktree(
+/**
+ * Three-state linked-worktree probe:
+ *  - `"linked"` — a linked worktree (git-dir ≠ common-dir, submodule-guarded),
+ *  - `"standalone"` — a main / standalone checkout (git-dir == common-dir),
+ *  - `"error"` — the git-dir / common-dir probe could not resolve (nonzero exit).
+ *
+ * The `"error"` case is DISTINCT from `"standalone"` so a caller can DEFER on an
+ * inconclusive probe rather than fold the error into "not linked" (fail-open).
+ */
+export type LinkedWorktreeState = "linked" | "standalone" | "error";
+
+/** Classify `cwd` as a linked worktree, a standalone checkout, or a probe error. */
+export async function classifyLinkedWorktree(
   cwd: string,
   run: GitRunner = gitExec,
-): Promise<boolean> {
+): Promise<LinkedWorktreeState> {
   const gitDir = await run(
     ["rev-parse", "--path-format=absolute", "--git-dir"],
     { cwd },
@@ -395,18 +406,32 @@ export async function isLinkedWorktree(
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     { cwd },
   );
+  if (gitDir.code !== 0 || commonDir.code !== 0) {
+    return "error";
+  }
   const superproject = await run(
     ["rev-parse", "--show-superproject-working-tree"],
     { cwd },
   );
-  if (gitDir.code !== 0 || commonDir.code !== 0) {
-    return false;
-  }
   return isLinkedWorktreePure({
     gitDir: gitDir.stdout,
     gitCommonDir: commonDir.stdout,
     superproject: superproject.code === 0 ? superproject.stdout : "",
-  });
+  })
+    ? "linked"
+    : "standalone";
+}
+
+/**
+ * True IFF `cwd` is inside a linked git worktree (submodule-guarded). Fails OPEN
+ * (a probe error → `false`); a caller that must DEFER on an inconclusive probe
+ * uses {@link classifyLinkedWorktree} instead.
+ */
+export async function isLinkedWorktree(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  return (await classifyLinkedWorktree(cwd, run)) === "linked";
 }
 
 /** Parsed list of every registered worktree (`git worktree list --porcelain`). */
