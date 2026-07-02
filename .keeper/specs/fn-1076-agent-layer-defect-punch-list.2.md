@@ -41,5 +41,5 @@ shows only the single "(currently /hack)" mention.
 - [ ] CLAUDE.md hook rule states the no-mutating-writes intent; shim PATH note landed
 
 ## Done summary
-
+Corrected autopilot skill (worktree_multi_repo config verb + honest status-envelope caveat, config in argument-hint, Monitor grant/aside removed), generalized handoff to the configured handoff_prompt_prefix after one concrete /hack mention, reworded the CLAUDE.md ~/docs hook rule to the no-mutating-writes intent, and added a PATH-activation note to the git shim.
 ## Evidence
