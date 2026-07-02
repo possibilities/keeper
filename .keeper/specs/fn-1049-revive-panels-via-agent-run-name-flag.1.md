@@ -40,5 +40,5 @@ The keystone test is the round-trip: feed `buildPanelLegArgv(...)` output for ea
 - [ ] Goldens updated; full fast suite green
 
 ## Done summary
-
+agent run now accepts --name/--name=, threading the value onto the tmux window name for every harness and the native --name for claude/pi (codex has none). Added a buildPanelLegArgv->splitSubcommand->parseRunArgs round-trip guard across all three harnesses so the builder and parser can never silently drift again.
 ## Evidence
