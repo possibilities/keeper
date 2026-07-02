@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Scoped budgets for fsync-bound root tests",
-  "updated_at": "2026-07-02T03:18:25.259000Z"
+  "updated_at": "2026-07-02T03:46:33.884000Z",
+  "worker_done_at": "2026-07-02T03:46:33.884000Z"
 }

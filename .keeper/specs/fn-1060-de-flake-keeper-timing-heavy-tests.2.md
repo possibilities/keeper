@@ -34,5 +34,5 @@ Scoped 30s budgets on 3-4 tests must not push the root suite past test-full's 30
 - [ ] reclaim's WAL/SHM cleanup is awaited/serialized so no sidecar leaks under load
 
 ## Done summary
-
+Wrapped both >MAX_IN_PARAMS collections seed loops in one db.transaction (collapse ~3000 autocommit fsyncs to 2) and gave the events-ingest, reclaim (x2), and finalizeEpic tests scoped 30s per-test budgets with rationale comments; reclaim's WAL/SHM cleanup now TRUNCATE-checkpoints before close. Global --timeout=10000 untouched; full fast suite 0 fail.
 ## Evidence
