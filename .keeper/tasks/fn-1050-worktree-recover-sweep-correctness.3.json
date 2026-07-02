@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T00:28:26.002000Z",
+  "depends_on": [
+    "fn-1050-worktree-recover-sweep-correctness.2"
+  ],
+  "epic": "fn-1050-worktree-recover-sweep-correctness",
+  "id": "fn-1050-worktree-recover-sweep-correctness.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Teardown removes residue-only husks",
+  "updated_at": "2026-07-02T00:28:26.002000Z"
+}
