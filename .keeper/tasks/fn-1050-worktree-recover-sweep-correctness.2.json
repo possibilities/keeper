@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Per-repo recover failure row keys",
-  "updated_at": "2026-07-02T00:28:26.002000Z"
+  "updated_at": "2026-07-02T01:40:51.706000Z",
+  "worker_done_at": "2026-07-02T01:40:51.706000Z"
 }

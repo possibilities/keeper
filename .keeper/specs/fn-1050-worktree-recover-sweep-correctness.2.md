@@ -43,5 +43,5 @@ Mirror the finalize family: two-repo recover failures → distinct rows, disjoin
 - [ ] Full fast suite green
 
 ## Done summary
-
+Rekeyed epic-tied recover failures to per-(epic,repo) close::worktree-recover:<epic>-<repoHash> (recover sibling of the finalize key) so a main checkout and its multi-repo dirs no longer collide/mask on the bare close::<epic>; null-epic pass-1 failures keep the per-dir slug. Mint and clear share one recoverFailureDispatchId helper (lockstep), so old-scheme bare rows self-heal in one cycle while genuine finalize close-sink conflicts stay untouched.
 ## Evidence
