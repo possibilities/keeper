@@ -116,7 +116,10 @@ not a resume) — so the prompt must reproduce exactly.
 Then wait as in Step 3. If you still hold `$DIR` from this session, `wait --dir "$DIR"` works; after a
 restart you have only the slug, so wait by it — `keeper agent panel wait --slug "$SLUG" --chunk 540` is the
 simple re-entry form (`keeper agent panel status --slug "$SLUG"` gives a one-shot non-blocking snapshot).
-Both resolve the same durable dir.
+Both resolve the same durable dir. A reboot mid-`wait` is detected in-band: the verdict returns promptly with
+a `machine-rebooted` reason on the non-terminal legs (not a 124 spin) — treat it exactly as re-entry, re-issue
+`keeper agent panel start "$PROMPT" --slug "$SLUG" --panel "$PANEL"` (its idempotent reconcile relaunches the
+dead legs) then `wait` again.
 
 ## Step 3 — Wait token-free (re-issue loop)
 

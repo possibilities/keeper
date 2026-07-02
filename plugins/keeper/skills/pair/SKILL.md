@@ -148,7 +148,10 @@ note) to the human rather than reading a stale answer file.
 
 **Re-entry & housekeeping.** The run's state is durable and slug-keyed, so a
 restarted session re-attaches from the slug alone: `keeper agent panel wait --slug
-<slug>` is the preferred re-entry form (no `$DIR` to carry across the restart), and
+<slug>` is the preferred re-entry form (no `$DIR` to carry across the restart). If a
+`wait` verdict carries a `machine-rebooted` reason (a reboot killed the legs mid-wait,
+returned promptly instead of spinning), re-issue `keeper agent panel start … --slug
+<slug>` — its idempotent reconcile relaunches the dead legs — then `wait` again. And
 `keeper agent panel status --slug <slug>` is a one-shot NON-blocking snapshot
 (per-leg `completed|running|failed|absent`, no verdict wait). `keeper agent panel
 prune` GCs aged-out terminal run dirs under the panels root — never a live or

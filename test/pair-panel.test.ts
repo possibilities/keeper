@@ -71,6 +71,12 @@ const DEFAULT_SELECTIONS: PanelSelections = {
 const KEEPER_BIN = "/usr/local/bin/bun";
 const KEEPER_AGENT = "/abs/cli/keeper.ts";
 
+/** The default injected boot-epoch: `start` stamps it and `wait` re-derives the
+ *  same value, so the reboot guard never spuriously fires (and no test forks the
+ *  real kernel probe). A reboot test overrides `bootEpochMs` with a value beyond
+ *  BOOT_EPOCH_TOLERANCE_MS of this. */
+const TEST_BOOT_EPOCH_MS = 1_700_000_000_000;
+
 interface SpawnCall {
   argv: string[];
   env: Record<string, string | undefined>;
@@ -86,6 +92,7 @@ function makeDeps(opts: {
   pollIntervalMs?: number;
   throwOnSpawn?: (argv: string[]) => boolean;
   bootEpochMs?: PanelDeps["bootEpochMs"];
+  readStartTime?: PanelDeps["readStartTime"];
   lock?: PanelDeps["lock"];
 }): {
   deps: PanelDeps;
@@ -121,7 +128,11 @@ function makeDeps(opts: {
     writeErr: (s) => err.push(s),
     pollIntervalMs: opts.pollIntervalMs,
     graceMs: opts.graceMs,
-    bootEpochMs: opts.bootEpochMs,
+    // Deterministic + fork-free by default: a fixed boot-epoch (start + wait agree)
+    // and a start-time probe that can't tell (→ the recycle guard degrades to bare
+    // pid liveness). A recycle/reboot test overrides these.
+    bootEpochMs: opts.bootEpochMs ?? (() => TEST_BOOT_EPOCH_MS),
+    readStartTime: opts.readStartTime ?? (() => null),
     lock: opts.lock,
   };
   return {
@@ -156,6 +167,13 @@ function seedResult(name: string, outcome: string): void {
  *  recorded the leg's real backgrounded pid). */
 function seedPidfile(name: string, pid: number): void {
   writeFileSync(join(dir, `${name}.pidfile`), `${pid}\n`);
+}
+
+/** Seed a leg's `.starttime` with the wrapper-captured OS start-time (trailing
+ *  whitespace + newline mimic real `ps -o lstart=` output, so the read side's trim
+ *  is exercised). The recycle guard compares this against `deps.readStartTime`. */
+function seedStartfile(name: string, startTime: string): void {
+  writeFileSync(join(dir, `${name}.starttime`), `${startTime}    \n`);
 }
 
 function readManifest(): PanelManifest {
@@ -279,6 +297,14 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
   expect(DETACH_SCRIPT).toContain("nohup");
   expect(DETACH_SCRIPT).toContain('>"$LOG" 2>&1');
   expect(DETACH_SCRIPT).toContain('echo $! > "$PIDFILE"');
+  // It captures the leg's OS start-time atomically (temp-then-mv) as the recycle
+  // guard's identity anchor, probing the SAME `$!` after the pidfile write.
+  expect(DETACH_SCRIPT).toContain("ps -o lstart= -p $!");
+  expect(DETACH_SCRIPT).toContain('mv -f "$STARTFILE.tmp" "$STARTFILE"');
+  // Ambient locale/TZ so it byte-matches the same-machine live probe — forcing UTC
+  // would shift the hour and false-flag every leg as recycled.
+  expect(DETACH_SCRIPT).not.toContain("TZ=UTC");
+  expect(DETACH_SCRIPT).not.toContain("LC_ALL=C");
 });
 
 // ---- start -----------------------------------------------------------------
@@ -993,4 +1019,278 @@ test("parseManifest: rejects a manifest missing a top-level slug", () => {
     ],
   });
   expect(r.ok).toBe(false);
+});
+
+// ---- start-time capture (recycle-guard anchor) -----------------------------
+
+test("start: each leg carries a startfile path and the detach wrapper receives $STARTFILE", async () => {
+  const { deps, spawns } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: DEFAULT_SELECTIONS,
+  });
+  await panelStart(
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    deps,
+  );
+  const m = readManifest();
+  for (const mem of m.members) {
+    expect(mem.startfile).toBe(join(dir, `${mem.name}.starttime`));
+  }
+  // The wrapper needs $STARTFILE (beside $PIDFILE) to write the capture.
+  for (const s of spawns) {
+    expect(s.env.PIDFILE).toBeDefined();
+    expect(s.env.STARTFILE).toContain(".starttime");
+  }
+});
+
+// ---- Guard A: pid-recycle identity cross-check -----------------------------
+
+test("wait recycle guard: a live pid whose start-time drifted reads DEAD (not running)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242); // the pid is occupied...
+  seedStartfile("codex", "STORED"); // ...but by a different process now
+  const { deps, stdout } = makeDeps({
+    pidAlive: (pid) => pid === 4242, // kill(pid,0) says alive
+    readStartTime: (pid) => (pid === 4242 ? "RECYCLED" : null), // ≠ stored
+    graceMs: 0,
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(0); // terminal, NOT 124 — the recycled pid is treated as dead
+  const v: PanelVerdict = JSON.parse(stdout().trim());
+  expect(v.ok).toBe(false);
+  const codex = v.members.find((m) => m.name === "codex");
+  expect(codex?.status).toBe("fail");
+  expect(codex?.reason).toContain("exited before producing a result file");
+});
+
+test("wait recycle guard: a MATCHING start-time keeps the leg live (times out 124)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  seedStartfile("codex", "STORED");
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => (pid === 4242 ? "STORED" : null), // == stored → same proc
+    graceMs: 0,
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(124); // still running → chunk elapses
+});
+
+test("wait recycle guard: a null live probe fails OPEN (leg stays live)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  seedStartfile("codex", "STORED");
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: () => null, // can't tell → trust bare pid liveness
+    graceMs: 0,
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(124); // fail-open → still running
+});
+
+test("wait recycle guard: a missing stored start-time degrades to bare pid liveness (no probe)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  // NO seedStartfile — the wrapper's capture failed / a pre-durable leg.
+  const probeCalls: number[] = [];
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => {
+      probeCalls.push(pid);
+      return "IRRELEVANT-MISMATCH";
+    },
+    graceMs: 0,
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(124); // bare pidAlive → running
+  expect(probeCalls).toEqual([]); // an absent stored value short-circuits the probe
+});
+
+test("wait recycle guard: the start-time probe runs at most ONCE per leg across poll ticks (memoized)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  seedStartfile("codex", "STORED");
+  let probeCount = 0;
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => {
+      if (pid === 4242) probeCount++;
+      return "STORED"; // matches → live across every tick
+    },
+    graceMs: 0,
+    pollIntervalMs: 100, // ~10 ticks inside a 1s chunk
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(124); // stayed running the whole chunk
+  expect(probeCount).toBe(1); // …but forked the probe just once
+});
+
+test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHES (not left)", async () => {
+  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
+  const selections: PanelSelections = {
+    panels: { one: ["solo"] },
+    default: "one",
+  };
+  const prompt = writePrompt("recycle me");
+  const first = makeDeps({ catalog, selections });
+  await panelStart(
+    { promptFile: prompt, slug: "one", panel: "one", dir, timeoutSeconds: 900 },
+    first.deps,
+  );
+  seedPidfile("solo", 4242);
+  seedStartfile("solo", "STORED");
+  const second = makeDeps({
+    catalog,
+    selections,
+    graceMs: 0,
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => (pid === 4242 ? "RECYCLED" : null), // ≠ stored → recycled
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "one",
+        panel: "one",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+  // A recycled pid is not a live leg → the leg relaunches to generation 2.
+  expect(second.spawns.length).toBe(1);
+  expect(readManifest().generation).toBe(2);
+});
+
+test("reconcile recycle guard: a MATCHING start-time leaves the live leg untouched", async () => {
+  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
+  const selections: PanelSelections = {
+    panels: { one: ["solo"] },
+    default: "one",
+  };
+  const prompt = writePrompt("keep me");
+  const first = makeDeps({ catalog, selections });
+  await panelStart(
+    { promptFile: prompt, slug: "one", panel: "one", dir, timeoutSeconds: 900 },
+    first.deps,
+  );
+  seedPidfile("solo", 4242);
+  seedStartfile("solo", "STORED");
+  const second = makeDeps({
+    catalog,
+    selections,
+    graceMs: 0,
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => (pid === 4242 ? "STORED" : null), // == stored → same proc
+  });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "one",
+        panel: "one",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+  expect(second.spawns.length).toBe(0); // left running
+  expect(readManifest().generation).toBe(1);
+});
+
+// ---- Guard B: reboot-in-wait ------------------------------------------------
+
+test("wait reboot guard: a boot-epoch mismatch fails non-terminal legs 'machine-rebooted' and returns promptly", async () => {
+  await startLegacy(); // stamps manifest boot_epoch_ms = TEST_BOOT_EPOCH_MS
+  seedResult("opus", "completed"); // a leg that finished pre-reboot
+  seedPidfile("codex", 4242); // a non-terminal leg
+  const clock = { ms: 0 };
+  const { deps, stdout } = makeDeps({
+    clock,
+    pidAlive: (pid) => pid === 4242, // even "alive", a pre-reboot pid is dead
+    bootEpochMs: () => TEST_BOOT_EPOCH_MS + 60 * 60_000, // an hour on → reboot
+  });
+  const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
+  expect(code).toBe(0); // exit-code contract preserved (0, ok:false)
+  expect(clock.ms).toBe(0); // prompt — never slept a poll tick (no spin to 124)
+  const v: PanelVerdict = JSON.parse(stdout().trim());
+  expect(v.ok).toBe(false);
+  const codex = v.members.find((m) => m.name === "codex");
+  expect(codex?.status).toBe("fail");
+  expect(codex?.reason).toBe("machine-rebooted");
+  // A leg that finished before the reboot keeps its real verdict (reused).
+  expect(v.members.find((m) => m.name === "opus")?.status).toBe("ok");
+});
+
+test("wait reboot guard: an absent boot-epoch (pre-durable manifest) does NOT fire the guard", async () => {
+  // Hand-write a pre-durable manifest (no boot_epoch_ms) + a live non-terminal leg.
+  const manifest: PanelManifest = {
+    dir,
+    slug: "run-x",
+    members: [
+      {
+        name: "codex",
+        harness: "codex",
+        yaml: join(dir, "codex.yaml"),
+        pidfile: join(dir, "codex.pidfile"),
+      },
+    ],
+  };
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest));
+  seedPidfile("codex", 4242);
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    bootEpochMs: () => TEST_BOOT_EPOCH_MS + 999 * 60_000, // no stored epoch to compare
+  });
+  const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
+  expect(code).toBe(124); // guard never fires → leg stays running → times out
+});
+
+test("wait reboot+recycle: a reboot supersedes the recycle check (Guard B wins, distinct reason)", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  seedStartfile("codex", "STORED");
+  const clock = { ms: 0 };
+  const { deps, stdout } = makeDeps({
+    clock,
+    pidAlive: (pid) => pid === 4242,
+    readStartTime: (pid) => (pid === 4242 ? "STORED" : null), // Guard A alone → LIVE
+    bootEpochMs: () => TEST_BOOT_EPOCH_MS + 60 * 60_000, // …but a reboot supersedes
+    graceMs: 0,
+  });
+  const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
+  expect(code).toBe(0);
+  expect(clock.ms).toBe(0); // prompt
+  const v: PanelVerdict = JSON.parse(stdout().trim());
+  const codex = v.members.find((m) => m.name === "codex");
+  expect(codex?.reason).toBe("machine-rebooted"); // not "exited before…"
+});
+
+test("wait is strictly read-only: a reboot verdict writes nothing to the manifest", async () => {
+  await startLegacy();
+  seedResult("opus", "completed");
+  seedPidfile("codex", 4242);
+  const before = readFileSync(join(dir, "manifest.json"), "utf8");
+  const { deps } = makeDeps({
+    pidAlive: (pid) => pid === 4242,
+    bootEpochMs: () => TEST_BOOT_EPOCH_MS + 60 * 60_000,
+  });
+  await panelWait({ dir, chunkSeconds: 540 }, deps);
+  const after = readFileSync(join(dir, "manifest.json"), "utf8");
+  expect(after).toBe(before); // no relaunch, no re-stamp — wait never writes
 });
