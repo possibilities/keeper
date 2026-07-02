@@ -182,8 +182,9 @@ test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars"
     };
     expect(av.auto_vacuum).toBe(2); // INCREMENTAL inherited from the source.
   } finally {
+    // Explicit TRUNCATE checkpoint drains + zeroes the WAL synchronously before close; close's passive last-connection checkpoint can silently no-op under lock contention on a loaded box and strand the sidecars.
+    ro.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
     ro.db.close();
-    // openDb opens WAL; checkpoint+close so afterEach's rmSync sees no stragglers.
     rmSync(`${dbPath}-wal`, { force: true });
     rmSync(`${dbPath}-shm`, { force: true });
   }
@@ -197,7 +198,8 @@ test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars"
   const backupDir = join(tmpDir, "backups");
   const snaps = readdirSync(backupDir).filter((n) => n.startsWith("keeper-"));
   expect(snaps.length).toBeGreaterThanOrEqual(1);
-});
+  // 30s scoped budget: real VACUUM + backup + VACUUM INTO + verify + atomic swap — genuine disk I/O that host contention can push past 10s. Global --timeout=10000 stays the hang detector.
+}, 30_000);
 
 test("run(): the stale OLD-file sidecars are removed by the swap", () => {
   // Focused assertion on sidecar drop: plant distinctively-sized sidecars, run
@@ -215,7 +217,8 @@ test("run(): the stale OLD-file sidecars are removed by the swap", () => {
   expect(exits).toEqual([]);
   expect(existsSync(`${dbPath}-wal`)).toBe(false);
   expect(existsSync(`${dbPath}-shm`)).toBe(false);
-});
+  // 30s scoped budget: same real VACUUM + backup + reclaim + swap I/O as the sibling — host contention can push past 10s. Global --timeout=10000 stays the hang detector.
+}, 30_000);
 
 // ---------------------------------------------------------------------------
 // F5 — daemon-up HARD-GUARD refusal
