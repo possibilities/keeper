@@ -5,8 +5,7 @@
  * recording {@link fakeAsyncGit} so the suite asserts keeper's DECISIONS (the
  * default-branch pick, the linked-worktree verdict, the porcelain parse, the
  * is-ancestor merge skip, the MERGE_HEAD-guarded abort, the prune --expire now,
- * the no-blind-force remove, the flock-around-merge). The end-to-end lifecycle
- * against a real repo lives in `worktree-git-realgit.slow.test.ts`.
+ * the no-blind-force remove, the flock-around-merge).
  */
 
 import { expect, test } from "bun:test";

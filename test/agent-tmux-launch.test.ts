@@ -727,10 +727,9 @@ describe("resolveTmuxBin", () => {
   });
 });
 
-// The `defaultTmuxCommandRunner` real-process timeout-classification test
-// (`sleep 30` against the 5s spawn floor) lives in the slow-tier sibling
-// `agent-tmux-launch-timeout.slow.test.ts` — too heavy for the fast tier; runs
-// under `bun run test:full`.
+// The `defaultTmuxCommandRunner` real-process timeout-classification scenario
+// (`sleep 30` against the 5s spawn floor) is too heavy for the fast tier and has
+// no automated slow-tier sibling; it is left to manual verification.
 
 describe("parseKeeperAgentTmuxArgs --x-tmux-env", () => {
   test("split and joined forms both parse; repeatable; last-wins per KEY", () => {
