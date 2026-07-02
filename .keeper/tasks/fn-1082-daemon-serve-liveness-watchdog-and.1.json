@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T22:07:06.870000Z",
+  "depends_on": [],
+  "epic": "fn-1082-daemon-serve-liveness-watchdog-and",
+  "id": "fn-1082-daemon-serve-liveness-watchdog-and.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Serve-liveness watchdog",
+  "updated_at": "2026-07-02T22:07:06.870000Z"
+}

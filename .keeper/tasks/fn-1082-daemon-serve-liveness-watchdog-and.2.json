@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-02T22:07:06.870000Z",
+  "depends_on": [
+    "fn-1082-daemon-serve-liveness-watchdog-and.1"
+  ],
+  "epic": "fn-1082-daemon-serve-liveness-watchdog-and",
+  "id": "fn-1082-daemon-serve-liveness-watchdog-and.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "Wedge root-cause hunt",
+  "updated_at": "2026-07-02T22:07:06.870000Z"
+}
