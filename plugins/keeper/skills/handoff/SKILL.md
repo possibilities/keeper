@@ -151,15 +151,3 @@ Then stop. This is fire-and-forget — do not wait on or monitor the handoff-ee.
 | 1 | Enqueue failure (e.g. daemon unreachable). | Read the message and surface it — keeperd may be down. |
 | 2 | Arg fault: missing/empty `--slug`, both `--prompt` and `--prompt-file`, neither, an over-64KB brief, a NUL byte, or a bad `--dir`. | Fix the named arg; for a large brief use `--prompt-file`. |
 | 3 | Slug already in use (host-global). | Pick a new `--slug` and re-run. |
-
-## What NOT to do
-
-- Do not pass a plan id/verb (`work::fn-N.M`, `close::fn-N`) — handoff carries
-  a free-text brief, not a plan target. Those are `keeper:dispatch`.
-- Do not use the Agent Bus and do not start a Monitor — handoff is
-  fire-and-forget, with no wait-and-watch step.
-- Do not pass BOTH `--prompt` and `--prompt-file` (exit 2).
-- Do not pass a brief over 64KB via `--prompt` — route it to `--prompt-file`
-  (an over-cap brief is rejected, never truncated).
-- Do not call `keeper handoff` more than once for a single hand-off request —
-  one enqueue per handoff.

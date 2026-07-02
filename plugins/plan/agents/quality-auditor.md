@@ -132,11 +132,9 @@ Red flags:
 - Missing pagination/limits
 - Blocking operations on hot paths
 
-### 7. Design System Conformance (if DESIGN.md exists)
+### 7. Design System Conformance
 
-Skip this section if no DESIGN.md in project root.
-
-If DESIGN.md exists and diff contains frontend files (.jsx, .tsx, .vue, .svelte, .css, .scss):
+Only when the target repo has a design system (a `DESIGN.md` in project root) AND the diff touches frontend files (.jsx, .tsx, .vue, .svelte, .css, .scss) — skip entirely otherwise (most backend/CLI diffs):
 - **Hard-coded colors**: Check for hex codes (#xxx) in component files that should use design tokens
 - **Hard-coded spacing**: Arbitrary pixel values where design system spacing scale exists
 - **Missing token usage**: Components not referencing CSS variables / theme tokens when DESIGN.md defines them

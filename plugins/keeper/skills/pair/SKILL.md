@@ -203,13 +203,6 @@ know the guarantee is best-effort.
 - Do NOT poll, tail, or `cat` an answer file before the run/wait returns. It may
   be absent or half-written until the atomic rename; the call's exit is your
   go-signal.
-- Do NOT hold a blocking `agent run` call open past ~10 minutes — use the detached
-  `agent panel start` + chunked `wait` shape (or background the run and poll
-  `--output`).
-- Do NOT pass `--effort` with a claude/pi partner — it is codex-only (arg fault,
-  exit 2).
-- Do NOT inline a long prompt into argv — write it to a file and pass the path (or
-  its contents).
 - This is NOT `keeper:dispatch` (launch a keeper WORKER on plan work), NOT
   `keeper:bus` (message an already-running agent), and a multi-model consensus
   panel is `/plan:panel` (which itself fans out via this). Reach for pairing when

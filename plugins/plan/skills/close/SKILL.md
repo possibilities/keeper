@@ -174,8 +174,6 @@ The `## Audit decisions` table on the follow-up epic (visible via `keeper plan c
 
 ## Out of scope
 
-- **No report/verdict/follow-up prose in the closer's context** — every artifact lives on disk under `audits/<epic_id>/`; the closer holds refs, hashes, counts, and one-line agent returns only.
-- **No saga logic in the skill** — `close-finalize` owns stale-check, fatal-halt, scaffold-before-close ordering, follow-up arming, and idempotency. The skill spawns agents and switches on the typed outcome.
 - **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work.
 - **No write to the source epic body** — provenance lives on the follow-up's `depends_on_epics` and its `## Audit decisions` table; the planner's `fatal` flag is the only ship-block gate.
 - **No retry on a typed `close-finalize` error**, and **no `Skill(plan:plan)` dispatch** — surface verbatim and stop — `close-finalize` is idempotent, so a re-run is safe.

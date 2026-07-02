@@ -79,7 +79,7 @@ Optional flags (both forms unless noted):
 | `--preset <name>` | Named launch-config preset from the catalog `~/.config/keeper/presets.yaml` (claude-only — a codex/pi preset is an arg fault). Must be a real catalog entry: an unknown name or missing catalog exits 2 (run `keeper agent presets list` to see the configured names). Supplies `--model`/`--effort`. Plan form defaults to the SAME `worker` preset the autopilot resolves, so a hand-fired plan worker is byte-identical to an automated one; `--model`/`--effort` override per field. |
 | `--model <m>` | Pass `--model` through to claude (overrides the preset). |
 | `--effort <e>` | Pass `--effort` through to claude (overrides the preset). |
-| `--name <n>` | Free form only: a PURE claude pass-through, NOT a keeper label (see Guardrails). Plan form bakes `--name <verb>::<id>` automatically — never set it there. |
+| `--name <n>` | Free form only: a PURE claude pass-through, NOT a keeper label (see *What NOT to do*). Plan form bakes `--name <verb>::<id>` automatically — never set it there. |
 | `--no-prefix` | Free form only: bypass the configured `dispatch_prompt_prefix`. |
 | `--force` | Plan form only: skip the race guard. **Human-gated** — never a default. |
 
@@ -105,15 +105,17 @@ For a plan-form launch, verify the id is on-board and workable BEFORE
 dispatching — a doomed dispatch wastes a worker window. Free form has no
 board target, so skip straight to Step 2.
 
-```bash
-keeper plan show <id> --format json
-```
+Read the LIVE board, never a `keeper plan show` file read: a `work::<task>` id
+resolves in `keeper query tasks --json` (its row carries `runtime_status` + the
+readiness verdict), a `close::<epic>` id in `keeper status --json` under
+`data.board.epics[]` (carrying the epic `status`) — the same board the orient
+step already fetched.
 
 Refuse to dispatch (and tell the user) when:
 
-- **Nonexistent** — `keeper plan show` exits non-zero / `success: false`. The
-  id doesn't exist; ask the user to double-check.
-- **Already done** — the task `runtime_status == "done"` or the epic
+- **Off-board** — the id is in neither read (nonexistent, or already completed
+  and closed off). Ask the user to double-check.
+- **Already done** — the task row's `runtime_status == "done"` or the epic's
   `status == "done"`. There's nothing to dispatch.
 
 `resolvePlanCwd` reads the same `epics` projection, so an id the board
@@ -188,7 +190,7 @@ on your own.** Offer the two options:
 
 > User: "Manually fire a worker on fn-871-…-skills.2."
 
-1. `keeper plan show fn-871-…-skills.2 --format json` → task exists,
+1. `keeper query tasks --json` → the `fn-871-…-skills.2` row exists,
    `runtime_status != "done"`. Proceed.
 2. `keeper dispatch --dry-run work::fn-871-…-skills.2` → confirm session / cwd.
 3. `keeper dispatch work::fn-871-…-skills.2`.
@@ -201,8 +203,8 @@ on your own.** Offer the two options:
 
 > User: "Spawn a closer for fn-871-…-skills."
 
-1. `keeper plan show fn-871-…-skills --format json` → epic exists,
-   `status != "done"`. Proceed.
+1. `keeper status --json` → the `fn-871-…-skills` epic is on
+   `data.board.epics[]`, `status != "done"`. Proceed.
 2. `keeper dispatch close::fn-871-…-skills` (race-guard handling as above).
 
 ### Run a one-off prompt (free form)
@@ -217,36 +219,13 @@ on your own.** Offer the two options:
 
 ## What NOT to do
 
-- Do not use this for routine plan execution — *"work on fn-N.M"* with no
-  "launch a worker out of band" framing is `/plan:work` in THIS session, not a
-  dispatch.
-- Do not auto-pause the autopilot to clear the race guard, and do not pass
-  `--force` on your own. Surface the refusal and ask (pause via
-  `keeper:autopilot` then retry, or `--force` on explicit confirmation).
-- Do not pass BOTH a `<verb>::<id>` positional AND `--prompt`/`--prompt-file`
-  — the forms are mutually exclusive (exit 2).
-- Do not set `--name` in plan form — it bakes `--name <verb>::<id>`
-  automatically so the SessionStart hook binds a board-visible jobs row.
 - Do not treat free-form `--name` as a keeper label — it is a PURE claude
-  pass-through, forwarded verbatim and nothing else. In particular do NOT pass
-  a `verb::id`-shaped `--name` in free form: keeper's SessionStart hook
-  scrapes any `claude --name` keeper-wide, so it would still bind to that plan
-  row and corrupt the board.
-- Do not wrap `keeper dispatch` in a Monitor — it is a one-shot Bash call with
-  no streaming mode.
-- Do not skip the `keeper plan show` pre-check for a plan-form launch — a
-  doomed dispatch against an unknown / done id wastes a window.
-- Do not pass a prompt over 96 KB (or containing a NUL byte) via `--prompt` —
-  it exits 2. Route large prompts to `--prompt-file`.
-- Do not invent ids. If the user's reference is slug-less and ambiguous, ask.
+  pass-through. In particular do NOT pass a `verb::id`-shaped `--name` in free
+  form: keeper's SessionStart hook scrapes any `claude --name` keeper-wide, so
+  it would still bind to that plan row and corrupt the board.
 
 ## Guardrails
 
-- **Precisely-triggered, conservative by default.** This is a manual operator
-  surface — the everyday paths are the autopilot or `/plan:work`. Reach for it
-  on a clear request to launch a worker by hand, not for routine execution.
-- **Surface-and-ask on the race guard.** The skill never auto-pauses and
-  never self-arms `--force`. It surfaces the refusal verbatim and asks.
-- **One worker per call.** `keeper dispatch` fires exactly one window. To
-  launch several, the user repeats the call (or lets the autopilot do its
-  job).
+- **Surface-and-ask on the race guard.** The skill never auto-pauses and never
+  self-arms `--force` — it surfaces the refusal verbatim and asks (pause via
+  `keeper:autopilot` then retry, or `--force` on explicit confirmation).

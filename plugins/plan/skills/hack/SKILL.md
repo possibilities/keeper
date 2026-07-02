@@ -92,7 +92,7 @@ Before answering solo, gate on size: **strongly prefer `/plan:panel`** for any i
 - **Solo (no panel)** — the prompt is tiny: a bounded factoid, a yes/no, a one-liner, a trivial lookup you'd answer from one or two local reads. Answer it directly here.
 - **Panel** — everything else: any hard question, multi-step reasoning, a high-stakes research/design/architecture call, troubleshooting where being confidently wrong is expensive, an internal or external report worth cross-checking. Invoke `/plan:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
 
-This is distinct from the `/keeper:pair` quick second opinion above (one partner, mid-investigation, to unstick a hunch). The panel answers the inquiry; `/keeper:pair` unsticks the investigation. When in doubt about size, route to the panel — the cost of a redundant fan-out is cheaper than a confidently wrong solo answer.
+When in doubt about size, route to the panel — a redundant fan-out is cheaper than a confidently wrong solo answer. (Distinct from the `/keeper:pair` hunch-unsticking second opinion drawn above: the panel answers the inquiry itself.)
 
 **Work-shaped requests are not exempt.** "Add X," "build Y," "configure Z like the existing thing" reads like a directive with the direction already given — but above inline size the *approach* is still an open call, so route that design question to `/plan:panel` before you sketch. The panel answers the *inquiry* shape (what's true, what's the right approach); the sketch/route machinery below still governs how any resulting work lands.
 
@@ -106,7 +106,7 @@ The chat reply's shape follows the mode. Don't say "operating in X mode" — let
 - **External research** — start with key takeaways, organize into sections with headings, use concrete facts and quotes, note areas of uncertainty, end with a sources list.
 - **Work-shaped** — two tiers, gated by the same size clauses that decide where the work lands:
   - **Inline-sized** (fits one or two files, no schema / protocol / UX boundary change) — one short paragraph naming what would change, what's affected, what's not yet decided. Enough for the human to confirm direction so you can execute inline.
-  - **Above inline** — produce a full sketch block (schema below). Investigate first per the work-shaped moves — prior work, full surface, boundaries. Then, before you commit to a direction, **route the design question to `/plan:panel`** — an above-inline change (new contract, multi-module scope, a partner / worker / migration / screen) is exactly the high-stakes architecture call the panel gate names, and "add X / configure it like the existing thing" framing does **not** exempt it. Feed the panel the raw design question plus neutral evidence, not your tentative direction. The panel's judgment is the sketch's backbone — the sketch is how that judged thinking surfaces for above-inline work. **Commit to one direction: pick the approach you would defend**, informed by the panel, and present it as your own chosen direction — not "the panel recommended X." Don't enumerate options as live equals — a single close alternative belongs in Risks & unknowns as one bullet, nowhere else.
+  - **Above inline** — produce a full sketch block (schema below). Investigate first per the work-shaped moves — prior work, full surface, boundaries. Then, before you commit to a direction, **route the design question to `/plan:panel`** per the panel gate above — an above-inline change (new contract, multi-module scope, a partner / worker / migration / screen) is exactly the high-stakes architecture call it names. The panel's judgment is the sketch's backbone — the sketch is how that judged thinking surfaces for above-inline work. **Commit to one direction: pick the approach you would defend**, informed by the panel, and present it as your own chosen direction — not "the panel recommended X." Don't enumerate options as live equals — a single close alternative belongs in Risks & unknowns as one bullet, nowhere else.
 
 A confident "I don't know yet, here's what I've ruled out" is more useful than a confident wrong answer. Say so when the evidence is thin.
 
@@ -204,7 +204,7 @@ The one optional move is arming an await — and it stays silent unless the conv
 
 ### Cross-skill orchestration
 
-No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopilot`, `keeper:await`) COMBINE across epics — this section does. Reach for these shapes on clear user intent to drive multi-epic work; never proactively, mid-plan, unsolicited. Each skill's own body carries its mechanics — reference them, don't re-teach them here.
+No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopilot`, `keeper:await`) COMBINE across epics — this section does. The quiet-by-default rule above governs when: reach for these shapes on clear user intent to drive multi-epic work, never mid-plan on your own. Each skill's own body carries its mechanics — reference them, don't re-teach them here.
 
 - **Parallel** (epics are independent / dep-free) → scaffold both, then `keeper:autopilot mode yolo` lets the reconciler dispatch them concurrently.
 - **Sequential** (B must run after A) → wire the cross-epic dep on the epic (`epic add-dep` / `depends_on_epics`) so autopilot sequences execution on its own; for a stricter human-gated cadence, `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate holds B until A lands.
@@ -234,7 +234,7 @@ You have standing license to conform the plan tooling to the workflow that best 
 
 If genuinely torn between two endpoints, ask one short plain-text question.
 
-When the chosen endpoint is **execute inline**, the work lands and gets committed here — but only after the human confirms direction in plain text. The commit follows the rule below.
+When the chosen endpoint is **execute inline**, the work lands and gets committed here after the plain-text greenlight — the commit follows the rule below.
 
 **Forward-facing advice and comments only.** Whatever you write — code comments, docs, skill or command prose, CLI `--help` / `--agent-help` strings, hook messages — states the system as it is *now*. Do not narrate what something replaced, was renamed from, or used to do.
 
@@ -243,7 +243,7 @@ When the chosen endpoint is **execute inline**, the work lands and gets committe
 
 The one carve-out: commit messages and changelogs are the sanctioned home for history and *should* narrate the change in past tense. Full rule lives in `keeper prompt render code-comment-style` (comments) and `keeper prompt render future-facing-docs` (docs and prompts) — cite those, don't restate them.
 
-**Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The carve-outs at the bottom of the rule below (human-flagged throwaway / debug instrumentation) are the only reasons to skip — and if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
+**Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The bake block below carries the only skip carve-outs; if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
 
 <!-- BAKE:BEGIN keeper prompt render engineering/commit-via-keeper-default -->
 
