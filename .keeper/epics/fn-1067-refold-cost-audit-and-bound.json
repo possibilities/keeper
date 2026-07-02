@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-02T09:10:34.689000Z",
+  "depends_on_epics": [],
+  "id": "fn-1067-refold-cost-audit-and-bound",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Refold cost audit and bound",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-02T09:10:34.689000Z"
+}
