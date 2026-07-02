@@ -37,5 +37,5 @@ Red-first: a sweep-set test with a lane present in the git projection must fail 
 - [ ] Red-first sweep test exists; full fast suite green
 
 ## Done summary
-
+Filter linked worktrees out of the recover sweep via a tri-state classifyLinkedWorktree probe (linked lane skipped; probe error defers the repo, never fail-open into off-branch), and name the operator remedy in the worktree-recover-not-on-default reason detail (token/family prefix byte-unchanged). Added red-first sweep tests + tri-state probe tests.
 ## Evidence
