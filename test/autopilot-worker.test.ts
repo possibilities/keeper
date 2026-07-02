@@ -4489,12 +4489,24 @@ test("fn-978 classifyWorktreeRepos: >1 distinct resolved toplevel → multi-repo
   );
   const res = map.get("fn-1-foo");
   expect(res?.kind).toBe("multi-repo");
+  // The stable routing prefix is preserved (sticky-row dispatch-failure keying).
   expect(res?.kind === "multi-repo" && res.reason).toContain(
     "worktree-multi-repo",
   );
   // The RESOLVED toplevels, not the raw subdir strings.
   expect(res?.kind === "multi-repo" && res.reason).toContain("/repo-a");
   expect(res?.kind === "multi-repo" && res.reason).toContain("/repo-b");
+  // fn-1071: the reason names the actual condition (the off flag) AND the exact
+  // command that unjams it, not a misleading "not inside a git worktree".
+  expect(res?.kind === "multi-repo" && res.reason).toContain(
+    "worktree_multi_repo",
+  );
+  expect(res?.kind === "multi-repo" && res.reason).toContain(
+    "keeper autopilot config worktree_multi_repo on",
+  );
+  expect(res?.kind === "multi-repo" && res.reason).not.toContain(
+    "not inside a git worktree",
+  );
 });
 
 test("fn-978 classifyWorktreeRepos: a required root resolving null → unresolved (distinct from multi-repo)", () => {

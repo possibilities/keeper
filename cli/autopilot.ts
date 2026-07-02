@@ -75,12 +75,16 @@ Subcommands:
   config   Send set_autopilot_config {<key>:<value>} and exit. Runtime-sets a
            scalar autopilot config value. Keys: max_concurrent_jobs (a positive
            integer cap, or 'unlimited' to clear it); max_concurrent_per_root (a
-           positive integer count of concurrent tasks per root, or 'default'/1).
+           positive integer count of concurrent tasks per root, or 'default'/1);
+           worktree_multi_repo (an on/off rollout flag — see below).
            max_concurrent_per_root > 1 is REJECTED while worktree mode is off
            (workers would share the main checkout) — enable worktree mode first;
-           no --force override.
+           no --force override. worktree_multi_repo on lets worktree mode CLUSTER a
+           >1-toplevel epic into independent per-repo lane groups instead of
+           rejecting it worktree-multi-repo (OFF by default).
            e.g. keeper autopilot config max_concurrent_jobs 8
                 keeper autopilot config max_concurrent_per_root 3
+                keeper autopilot config worktree_multi_repo on
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   worktree Send set_autopilot_config {worktree_mode:<on|off>} and exit. Durable
@@ -618,6 +622,7 @@ export function buildSetConfigFrame(
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
+    worktree_multi_repo?: boolean;
   },
 ): ClientFrame {
   return {
@@ -1111,9 +1116,11 @@ export async function main(argv: string[]): Promise<void> {
     // `config <key> <value>` — the generic runtime config setter. Validate the
     // key + value CLI-side so a typo dies with a clear message before the
     // round-trip (the server re-validates). Keys: `max_concurrent_jobs` (a
-    // positive integer cap, `unlimited`/`null` → unlimited) and
-    // `max_concurrent_per_root` (a positive integer count, `default`/`null` → the
-    // in-memory default = 1; NO 'unlimited').
+    // positive integer cap, `unlimited`/`null` → unlimited), `max_concurrent_per_root`
+    // (a positive integer count, `default`/`null` → the in-memory default = 1; NO
+    // 'unlimited'), and `worktree_multi_repo` (an on/off boolean — the durable
+    // rollout flag that clusters a >1-toplevel epic into per-repo lane groups
+    // instead of rejecting it; mirrors the `worktree` verb's on/off parsing).
     if (rest.length !== 2) {
       die(
         `'config' takes exactly two positionals <key> <value> (got ${rest.length}); pass --help for usage.`,
@@ -1163,8 +1170,24 @@ export async function main(argv: string[]): Promise<void> {
       );
       return;
     }
+    if (key === "worktree_multi_repo") {
+      // A durable on/off boolean rollout flag — mirror the `worktree` verb's
+      // enum parsing, mapped to a boolean patch through the same generic RPC.
+      if (value !== "on" && value !== "off") {
+        die(
+          `'config worktree_multi_repo' value must be one of on | off (got ${JSON.stringify(value)})`,
+        );
+      }
+      await sendControlRpc(
+        sockPath,
+        buildSetConfigFrame(id, { worktree_multi_repo: value === "on" }),
+        id,
+        die,
+      );
+      return;
+    }
     die(
-      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root (got ${JSON.stringify(key)})`,
+      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo (got ${JSON.stringify(key)})`,
     );
   }
 

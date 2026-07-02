@@ -1510,13 +1510,15 @@ function classifyEpicRepo(
       topByTask.push({ taskId, top });
     }
   }
-  // >1 distinct toplevel with the rollout flag OFF → today's whole-epic reject,
-  // byte-identical (reason + sort). Flag ON drops through to the clustered
-  // partition below.
+  // >1 distinct toplevel with the rollout flag OFF → the whole-epic reject. The
+  // reason names the spanned toplevels (sorted) AND the flag+command that unjams
+  // it, since a healthy multi-repo epic is otherwise indistinguishable from an
+  // unresolved-root failure. Flag ON drops through to the clustered partition
+  // below.
   if (resolved.size > 1 && !multiRepoEnabled) {
     return {
       kind: "multi-repo",
-      reason: `worktree-multi-repo: epic ${epic.epic_id} spans ${resolved.size} repos (${[...resolved].sort().join(", ")})`,
+      reason: `worktree-multi-repo: epic ${epic.epic_id} spans ${resolved.size} repos (${[...resolved].sort().join(", ")}); worktree mode rejects a multi-repo epic while worktree_multi_repo is off. Cluster it into per-repo lane groups with \`keeper autopilot config worktree_multi_repo on\``,
     };
   }
   if (resolved.size > 1) {

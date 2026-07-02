@@ -816,6 +816,25 @@ test("buildSetConfigFrame — a worktree_mode boolean patch emits set_autopilot_
   });
 });
 
+test("buildSetConfigFrame — a worktree_multi_repo boolean patch emits set_autopilot_config {worktree_multi_repo} (fn-1071)", () => {
+  expect(
+    buildSetConfigFrame("rpc-uuid-15", { worktree_multi_repo: true }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-15",
+    method: "set_autopilot_config",
+    params: { worktree_multi_repo: true },
+  });
+  expect(
+    buildSetConfigFrame("rpc-uuid-16", { worktree_multi_repo: false }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-16",
+    method: "set_autopilot_config",
+    params: { worktree_multi_repo: false },
+  });
+});
+
 // ---------------------------------------------------------------------------
 // projectWorktreeMode — fn-959 socket-sourced worktree-toggle projection.
 // ---------------------------------------------------------------------------
