@@ -65,6 +65,26 @@ Options:
 Escape hatch: if commit-work won't stage every file you need to commit, use
 plain git — \`git add <explicit paths>\` (never -A / .) then \`git commit\` and
 \`git push\`. Temporary; you're empowered to bypass for now.
+
+Run \`keeper commit-work --agent-help\` for the terse operator runbook.
+`;
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+const AGENT_HELP = `keeper commit-work — operator runbook (agent-facing)
+
+Stage session-touched files, run the lint matrix, commit, and push. .keeper/**
+board files are excluded (the plan-commit hook owns them).
+
+  keeper commit-work --preview-files          # inspect the scoped file list first
+  keeper commit-work "<type>(<scope>): <summary>
+
+  Task: fn-N.M"                               # source commit carries the Task: trailer
+
+On a {"error":"lint_failed"} envelope: read the named files, fix per stderr,
+\`git add\` the fixes, then re-invoke the SAME message — never --no-verify. A
+runaway list (> --max-files, default 500) aborts with file_list_too_large. Every
+verb envelope is exit 1; an arg fault is exit 2. Escape hatch: if it won't stage
+a file you need, \`git add <explicit paths>\` then plain git commit/push.
 `;
 
 // Trailer patterns forbidden in a multi-line commit message body. Forged
@@ -166,6 +186,7 @@ interface ParsedArgs {
   previewFiles: boolean;
   maxFiles: number;
   help: boolean;
+  agentHelp: boolean;
 }
 
 /**
@@ -181,11 +202,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     previewFiles: false,
     maxFiles: DEFAULT_MAX_FILES,
     help: false,
+    agentHelp: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") {
       parsed.help = true;
+    } else if (a === "--agent-help") {
+      parsed.agentHelp = true;
     } else if (a === "--preview-files") {
       parsed.previewFiles = true;
     } else if (a === "--session-id") {
@@ -634,6 +658,10 @@ export async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   if (args.help) {
     process.stdout.write(HELP);
+    return;
+  }
+  if (args.agentHelp) {
+    process.stdout.write(AGENT_HELP);
     return;
   }
   const code = await run(args);

@@ -18,8 +18,10 @@ import {
   parseStatuslinePayload,
   resolveStatuslineDir,
   runSink,
+  HELP as SINK_HELP,
   type StatuslineLeaf,
   sanitizeSessionToken,
+  main as sinkMain,
 } from "../cli/statusline-sink";
 import {
   buildStatuslineCommand,
@@ -51,6 +53,27 @@ function payload(overrides: Record<string, unknown> = {}): string {
     ...overrides,
   });
 }
+
+describe("statusline-sink — help", () => {
+  test("--help writes a non-empty one-liner WITHOUT draining stdin", async () => {
+    const prev = process.stdout.write.bind(process.stdout);
+    let out = "";
+    process.stdout.write = ((s: string) => {
+      out += s;
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      // Would hang on a stdin drain if the help short-circuit regressed; the
+      // test completing at all is the assertion that it does not read stdin.
+      await sinkMain(["--help"]);
+    } finally {
+      process.stdout.write = prev;
+    }
+    expect(out.length).toBeGreaterThan(0);
+    expect(out).toBe(SINK_HELP);
+    expect(out).toContain("not for agent use");
+  });
+});
 
 describe("statusline-sink — parse", () => {
   test("extracts the full contract shape (raw session_id preserved)", () => {

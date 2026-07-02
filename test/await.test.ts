@@ -21,6 +21,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  HELP as AWAIT_HELP,
   parseAwaitArgs,
   parseDurationMs,
   parseMonitorSelector,
@@ -33,6 +34,18 @@ import type {
   ReadinessSocket,
   SocketHandlers,
 } from "../src/readiness-client";
+
+// ---------------------------------------------------------------------------
+// HELP text — drift guard for the two documented-vs-behavior fixes.
+// ---------------------------------------------------------------------------
+
+test("HELP documents complete as done-AND-idle and lists the landed condition", () => {
+  expect(AWAIT_HELP).toContain("done-AND-idle");
+  // `landed` is a real parsed condition — it must appear in the conditions list.
+  expect(AWAIT_HELP).toContain("landed <epic>");
+  const landed = parseAwaitArgs(["landed", "fn-1-foo"]);
+  expect(landed.ok).toBe(true);
+});
 
 // ---------------------------------------------------------------------------
 // Mock socket / connect factory (copy of the canonical helper from

@@ -147,6 +147,25 @@ Options:
   --help, -h           Show this help
 
 Session resolution: --session > $KEEPER_TMUX_SESSION > $TMUX current > work.
+
+Run \`keeper dispatch --agent-help\` for the terse operator runbook.
+`;
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+const AGENT_HELP = `keeper dispatch — operator runbook (agent-facing)
+
+Fire ONE claude worker by hand. Two forms:
+  Plan form:  keeper dispatch work::fn-N.M    (or close::fn-N)
+              Resolves the /plan:<verb> <id> prompt + cwd from the daemon and
+              bakes --name so the hook binds a board-visible jobs row.
+  Free form:  keeper dispatch --prompt "<text>" [--name <n>] [--cwd <dir>]
+              Arbitrary prompt; --name is an OPTIONAL verbatim pass-through.
+
+Preflight:  keeper dispatch <key> --dry-run   # print the resolved launch plan, launch nothing
+
+Exit codes: 0 launched · 1 launch/daemon failure · 2 arg fault (mode misuse,
+missing prompt, unknown --preset). NOT for routine plan execution (that is
+/plan:work) or resuming a stuck retry (that is keeper autopilot retry).
 `;
 
 const FALLBACK_SESSION = "work";
@@ -362,12 +381,17 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       "dry-run": { type: "boolean", default: false },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
+      "agent-help": { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   if (parsed.values.help) {
     process.stdout.write(HELP);
+    process.exit(0);
+  }
+  if (parsed.values["agent-help"]) {
+    process.stdout.write(AGENT_HELP);
     process.exit(0);
   }
 
