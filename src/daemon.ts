@@ -19,7 +19,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
-import { join, resolve as resolvePath, sep } from "node:path";
+import { basename, join, resolve as resolvePath, sep } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
@@ -49,6 +49,8 @@ import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
 import {
   countAbsentBlobs,
+  DEFAULT_RETENTION_BATCH_SIZE,
+  DEFAULT_RETENTION_MAX_BATCHES,
   deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
   retainColdPayloads,
@@ -1471,6 +1473,198 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
       }
     }
   }
+}
+
+/**
+ * Age window a `dead_letters` row must exceed before the retention prune removes
+ * it — 7 days, matching the reclaim/backup sidecar retention horizon. The gate
+ * compares against `recovered_at` (recovered rows) or `dl_written_at` (poison
+ * rows), both stored as unix SECONDS (`Date.now() / 1000`).
+ */
+export const DEAD_LETTER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Injectable knobs for {@link pruneRecoveredDeadLetters} — defaulted so the
+ * daemon caller passes none, overridable so the pass body is drivable
+ * in-process by a test with no timers / no `startDaemon`.
+ */
+export interface DeadLetterRetentionOptions {
+  /** Wall-clock ms the age gate measures against. Defaults to `Date.now()`. */
+  now?: number;
+  /** Age window in ms a row must exceed. Defaults to {@link DEAD_LETTER_RETENTION_MS}. */
+  retentionMs?: number;
+  /** Per-pid liveness probe (the seal check). Defaults to {@link pidAlive}. */
+  isPidAlive?: (pid: number) => boolean;
+}
+
+export interface DeadLetterRetentionResult {
+  /** Sealed dead-letter-dir NDJSON files unlinked this pass. */
+  prunedFiles: number;
+  /** `dead_letters` rows deleted this pass (file-coupled + row-only). */
+  prunedRows: number;
+}
+
+/**
+ * True iff `filePath` resolves STRICTLY beneath `dir`. The hard backstop that
+ * keeps the dead-letter prune's `unlinkSync` from ever escaping
+ * `KEEPER_DEAD_LETTER_DIR` — in particular it can never touch an events-log file
+ * (poison rows point their `source_file` there).
+ */
+function isPathUnderDir(dir: string, filePath: string): boolean {
+  const base = resolvePath(dir);
+  const target = resolvePath(filePath);
+  return target !== base && target.startsWith(base + sep);
+}
+
+/**
+ * The writing pid encoded in a `<pid>.ndjson` dead-letter filename, or `null`
+ * when the stem is non-numeric (never a real dead-letter file — disables the
+ * prune for it, mirroring the events-log cleanup gate).
+ */
+function pidFromDeadLetterFile(filePath: string): number | null {
+  const name = basename(filePath);
+  if (!name.endsWith(".ndjson")) {
+    return null;
+  }
+  const stem = name.slice(0, -".ndjson".length);
+  return /^\d+$/.test(stem) ? Number(stem) : null;
+}
+
+/**
+ * Retention prune for the `dead_letters` operational table + its NDJSON archive
+ * — the producer-side complement of {@link scanDeadLetterDir}. Runs on MAIN's
+ * writable connection (the maintenance worker stays read-only); an exported,
+ * in-process-testable pass body driven by {@link runRetentionPass}.
+ *
+ * THE RESURRECTION HAZARD is the whole game: `scanDeadLetterDir` INSERT-OR-IGNOREs
+ * every surviving line of every file, so deleting a row while its file can still
+ * be scanned re-replays the event as `waiting`. Two prune shapes, direction-
+ * specific unlink ordering:
+ *
+ *  - FILE-COUPLED (dead-letter-dir NDJSON files): a file is prunable iff EVERY
+ *    row referencing it is `recovered` AND aged past the cutoff — DB-derived via
+ *    a GROUP BY (never a line-count/file-read: a torn trailing line yields fewer
+ *    rows than lines, so a count-equality check would be wrong; "no row violates
+ *    the recovered+aged predicate" is torn-tail safe). A `waiting` row (SACRED)
+ *    or a `poison` row on the file keeps it inline. Sealed check: only prune a
+ *    file whose writing pid is DEAD (a live pid may append a NEW `waiting` line
+ *    that a concurrent scan ingests — deleting `WHERE source_file` would then
+ *    race it). Then UNLINK FIRST, DELETE rows second: a crash between the two
+ *    leaves orphaned `recovered` rows, harmless (replay's `WHERE status='waiting'`
+ *    skips them) and swept next pass (the file is gone, `unlinkSync` ENOENT is a
+ *    no-op, the delete still runs).
+ *  - ROW-ONLY (no file to resurrect them): `recovered` rows with `source_file
+ *    IS NULL` (age on `recovered_at`) and `poison` rows (age on `dl_written_at`
+ *    — poison park leaves `recovered_at` NULL). Poison rows' `source_file` points
+ *    at an EVENTS-LOG file the ingester solely owns; its durable byte-offset
+ *    already advanced past the poison line, so the ROW deletes with no re-ingest
+ *    and the file is NEVER touched. Paced (≤500 rows/batch, ≤20 batches) so the
+ *    writer lock never starves a concurrent hook INSERT.
+ *
+ * The `status='waiting'` warn pill is unaffected — this prune removes only
+ * `recovered`/`poison` rows. Never throws for a single-file unlink error
+ * (per-file non-fatal, mirroring events-log cleanup); a DB-level error propagates
+ * to the caller's non-fatal retention try.
+ */
+export function pruneRecoveredDeadLetters(
+  db: Database,
+  dir: string,
+  options: DeadLetterRetentionOptions = {},
+): DeadLetterRetentionResult {
+  const now = options.now ?? Date.now();
+  const retentionMs = options.retentionMs ?? DEAD_LETTER_RETENTION_MS;
+  const probe = options.isPidAlive ?? pidAlive;
+  // recovered_at / dl_written_at are unix SECONDS (Date.now()/1000) — compare in
+  // the SAME unit, never mix ms.
+  const cutoffSec = (now - retentionMs) / 1000;
+
+  let prunedFiles = 0;
+  let prunedRows = 0;
+
+  // --- File-coupled prune (dead-letter-dir NDJSON files) --------------------
+  const candidateFiles = db
+    .prepare(
+      `SELECT source_file AS f
+         FROM dead_letters
+        WHERE source_file IS NOT NULL
+        GROUP BY source_file
+       HAVING SUM(
+                CASE WHEN status = 'recovered'
+                       AND recovered_at IS NOT NULL
+                       AND recovered_at <= ?
+                     THEN 0 ELSE 1 END
+              ) = 0`,
+    )
+    .all(cutoffSec) as { f: string }[];
+
+  const deleteBySourceFile = db.prepare(
+    "DELETE FROM dead_letters WHERE source_file = ?",
+  );
+
+  for (const { f } of candidateFiles) {
+    // Path scope: NEVER unlink outside `dir`. Recovered rows always carry a
+    // dead-letter-dir source_file (scanDeadLetterDir stamps join(dir, name)), so
+    // this is defense-in-depth against an events-log path ever reaching here.
+    if (!isPathUnderDir(dir, f)) {
+      continue;
+    }
+    const pid = pidFromDeadLetterFile(f);
+    if (pid === null || probe(pid)) {
+      continue;
+    }
+    try {
+      try {
+        unlinkSync(f);
+      } catch (err) {
+        // A crash last pass may have unlinked before the delete — the file is
+        // already gone; the row delete below still sweeps the orphans.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw err;
+        }
+      }
+      const info = deleteBySourceFile.run(f);
+      prunedRows += Number(info.changes);
+      prunedFiles += 1;
+    } catch (err) {
+      // Per-file non-fatal (an EPERM unlink, a delete error): the file stays and
+      // a later pass retries — one bad file never aborts the rest of the pass.
+      console.error(
+        `[keeperd] dead-letter prune failed for ${f}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  // --- Row-only prune (no file to resurrect them) ---------------------------
+  const selectRowOnlyBatch = db.prepare(
+    `SELECT dl_id FROM dead_letters
+      WHERE (status = 'recovered' AND source_file IS NULL
+             AND recovered_at IS NOT NULL AND recovered_at <= ?)
+         OR (status = 'poison' AND dl_written_at <= ?)
+      LIMIT ?`,
+  );
+  const deleteByIds = db.prepare(
+    "DELETE FROM dead_letters WHERE dl_id IN (SELECT value FROM json_each(?))",
+  );
+  for (let i = 0; i < DEFAULT_RETENTION_MAX_BATCHES; i++) {
+    const idRows = selectRowOnlyBatch.all(
+      cutoffSec,
+      cutoffSec,
+      DEFAULT_RETENTION_BATCH_SIZE,
+    ) as { dl_id: string }[];
+    if (idRows.length === 0) {
+      break;
+    }
+    const ids = idRows.map((r) => r.dl_id);
+    const info = deleteByIds.run(JSON.stringify(ids));
+    prunedRows += Number(info.changes);
+    if (ids.length < DEFAULT_RETENTION_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return { prunedFiles, prunedRows };
 }
 
 /**
@@ -5604,6 +5798,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (focusDel.deleted > 0) {
         console.error(
           `[keeperd] retention: deleted ${focusDel.deleted} cold tmux-focus row(s) in ${focusDel.batches} batch(es), reclaimed ${focusDel.reclaimedPages} page(s) (watermark id<=${focusDel.coldWatermark}, cursor<${focusDel.cursor}${focusDel.moreLikely ? ", more remain" : ""})`,
+        );
+      }
+      // Dead-letter retention (resurrection-safe): prune fully-recovered aged
+      // sealed files (unlink-FIRST, rows second) + row-only recovered/poison
+      // tails. Its own try so a prune failure is non-fatal AND leaves the
+      // compaction checkpoint gate below untouched — a DB error here must not
+      // forfeit the WAL checkpoint the NULL/DELETE passes just earned. Successful
+      // deletions DO count toward the gate (reclaimed dead_letters pages want the
+      // same PASSIVE checkpoint).
+      try {
+        const dlPrune = pruneRecoveredDeadLetters(db, deadLetterDir);
+        deleted += dlPrune.prunedRows;
+        if (dlPrune.prunedRows > 0) {
+          console.error(
+            `[keeperd] retention: pruned ${dlPrune.prunedRows} recovered/poison dead-letter row(s) across ${dlPrune.prunedFiles} sealed file(s)`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[keeperd] dead-letter retention threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
         );
       }
       // The re-spec'd data-loss sentinel: a NULL body that is NOT shed-class is a

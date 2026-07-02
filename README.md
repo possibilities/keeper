@@ -252,7 +252,9 @@ keyed by `dl_id` and idempotent under re-scan; status flips
 `waiting → recovered` only when the human triggers the `replay_dead_letter`
 RPC. It is NOT a reducer projection — re-folding the event log never touches
 it, because dead letters are the audit log of events that NEVER made it into
-the event log to be folded), and `scheduled_tasks` (schema v68, fn-813 — one
+the event log to be folded; recovered rows + their fully-sealed NDJSON archive
+prune on a 7-day horizon, resurrection-safe (unlink-first, `waiting` rows
+sacred — see the dead-letter recovery narrative below)), and `scheduled_tasks` (schema v68, fn-813 — one
 row per cron a Claude session armed via the `CronCreate` tool, keyed by the
 composite `(job_id, cron_id)`; folded from the `CronCreate` / `CronDelete`
 `PostToolUse` pair, a CronCreate upserts an `active` row (a re-created id
@@ -2463,6 +2465,22 @@ the board (with its full lifecycle, since the original event log carried
 nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 (`profile_name` jobs column) occupies the v35→v36 slot ahead of this
 work.
+Recovered rows and their NDJSON archive do not accumulate forever: the
+producer-side retention pass (`pruneRecoveredDeadLetters`, on main
+alongside the compaction shed) prunes both past a 7-day horizon. The
+coupling is resurrection-specific — `scanDeadLetterDir` INSERT-OR-IGNOREs
+every surviving line, so a row deleted while its file can still be scanned
+re-imports as `waiting` and re-replays a duplicate event. So a dead-letter
+FILE is pruned only when every row referencing it is `recovered` and aged
+AND its writing pid is dead (sealed, so no more lines will be appended),
+prunability DB-derived from a GROUP BY (never a line-count/file read — a
+torn trailing line yields fewer rows than lines), and then unlink FIRST,
+delete rows second (a crash between the two orphans harmless `recovered`
+rows a later pass sweeps). `waiting` rows are SACRED and never touched;
+`recovered` rows with no source file, and aged `poison` rows (whose
+`source_file` points at ingester-owned events-log files the prune never
+unlinks — the ingester's durable byte-offset already prevents re-ingest),
+delete by ROW alone.
 As of schema v48 (fn-668), each Claude session's terminal-multiplexer
 backend-exec coordinates are materialized as first-class columns on the
 `events` row and (folded onto) the `jobs` projection. The hook reads pure
