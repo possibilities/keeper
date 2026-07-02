@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * commands — print the autopilot plan-dispatch command pair for a single
- * planctl id. Takes an epic OR task id, infers which from its shape, queries
+ * plan id. Takes an epic OR task id, infers which from its shape, queries
  * the keeper subscribe socket for the owning epic, and prints the two
  * `cd … && claude … '/plan:<verb> <id>'` shell commands autopilot would
  * dispatch for that row:
@@ -34,7 +34,7 @@
  * Usage:
  *   bun scripts/commands.ts [--sock <path>] <id>
  *
- *   <id>           Planctl epic OR task id. A trailing '.N' marks a task.
+ *   <id>           A keeper plan epic OR task id. A trailing '.N' marks a task.
  *   --sock <path>  Socket path override (else $KEEPER_SOCK, else the
  *                  ~/.local/state/keeper/keeperd.sock default).
  *   --help         Show this help.
@@ -65,11 +65,11 @@ import type { Epic, Task } from "../src/types";
  */
 const RESPONSE_TIMEOUT_MS = 5000;
 
-const HELP = `commands — print the autopilot plan-dispatch command pair for a planctl id
+const HELP = `commands — print the autopilot plan-dispatch command pair for a plan id
 
 Usage: bun scripts/commands.ts [--sock <path>] <id>
 
-  <id>           Planctl epic OR task id. A trailing '.N' marks a task; the
+  <id>           A keeper plan epic OR task id. A trailing '.N' marks a task; the
                  epic_id is derived by stripping the '.N' suffix.
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
@@ -80,8 +80,8 @@ Output (two lines, exactly what autopilot dispatches):
   <epic-slug>      → close command + approve command (epic scope)
 
 Examples:
-  bun scripts/commands.ts fn-592-approval-as-planctl-field
-  bun scripts/commands.ts fn-592-approval-as-planctl-field.4
+  bun scripts/commands.ts fn-100-add-feature
+  bun scripts/commands.ts fn-100-add-feature.4
 
 On success: prints the two commands (one per line) to stdout and exits 0.
 On failure (daemon down, not found, timeout): prints the reason to stderr

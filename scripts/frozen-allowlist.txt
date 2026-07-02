@@ -21,7 +21,7 @@
 # reads to tell a frozen literal from a renamable symbol.
 #
 # Format: pipe-delimited records, one per line. Blank lines and `#` comments are
-# ignored. Three record kinds:
+# ignored. Four record kinds:
 #
 #   anchor|<relpath>|<exact-substring>
 #       A frozen literal that must appear verbatim in <relpath>. The guard
@@ -35,6 +35,12 @@
 #       <token> defaults to "planctl" when the 4th field is omitted. The guard
 #       fails if the live count != <n> — catching both an accidental clobber
 #       (count drops) and a planted retired-name edit (count rises).
+#
+#   forbid|<relpath>|<substring>
+#       A cleaned file pinned to ZERO occurrences of <substring>: the guard
+#       fails if the fixed-string, case-insensitive substring appears anywhere
+#       in <relpath> (a retired name regrew into a purged surface). SINGLE FILE
+#       only — never a directory walk. A missing target file = FAIL.
 #
 #   exempt|<relpath>
 #       A file that legitimately still carries un-renamed "planctl" references
@@ -90,6 +96,21 @@ count|src/db.ts|183
 # and the `planctl-commit-changed` wire kind (collapsed to `plan-commit-changed`)
 # are GONE from live code — producer, reader, and the reducer's commit-trailer
 # fold all read the new spelling single-path. No anchors remain for this class.
+
+# =========================================================================
+# CLASS 4 — Cleaned agent-facing surfaces pinned to ZERO "planctl" (regrowth guard)
+# =========================================================================
+# These agent-facing files were purged of the retired "planctl" name; each is
+# pinned to zero occurrences so a future edit can never reintroduce it. Fixed-
+# string, case-insensitive, single-file; a missing target FAILs. (The `count`-
+# pinned schema/trailer surfaces above legitimately still carry frozen planctl_*
+# literals — those are Class 1/2, never forbid targets.)
+forbid|plugins/plan/.claude-plugin/plugin.json|planctl
+forbid|plugins/plan/hooks/hooks.json|planctl
+forbid|.keeper/CLAUDE.md|planctl
+forbid|plugins/plan/agents/epic-scout.md|planctl
+forbid|scripts/commands.ts|planctl
+forbid|scripts/resume.ts|planctl
 
 # =========================================================================
 # Renamable residue (mixed files; NOT count-pinned) — .6/.7/.8/.5 own these

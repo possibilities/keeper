@@ -517,7 +517,7 @@ export function enrichPeerFromJobs(
 // Harness identity resolution (server-side ancestry walk, anti-spoof-preserving)
 // ---------------------------------------------------------------------------
 
-/** Ancestry-walk depth bound (matches chatctl's `identity.py` walk). */
+/** Ancestry-walk depth bound for the server-side harness identity walk. */
 export const HARNESS_WALK_MAX_DEPTH = 40;
 
 /** Resolved harness identity: the ancestor pid keeper tracks + its job row. */

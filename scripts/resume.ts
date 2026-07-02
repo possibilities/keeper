@@ -2,7 +2,7 @@
 /**
  * resume — print a `claude --resume` command for every job in the `jobs`
  * namespace (the same projection `keeper jobs` renders). The sibling of
- * `scripts/commands.ts`: where that one reads a single planctl id off the
+ * `scripts/commands.ts`: where that one reads a single plan id off the
  * `epics` namespace and prints the autopilot dispatch command pair, this one
  * sweeps the `jobs` collection and prints, per job, the shell command that
  * re-attaches to that session:

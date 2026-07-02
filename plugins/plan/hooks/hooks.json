@@ -1,5 +1,5 @@
 {
-  "description": "planctl generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns. Plus the content-blind orchestrator guards: PreToolUse(Bash) commit hard-deny, SubagentStop worker guard (matcher ^work:worker$, fires cross-plugin for the launch-selected cell), Stop checklist guard (bun dispatchers).",
+  "description": "plan generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns. Plus the content-blind orchestrator guards: PreToolUse(Bash) commit hard-deny, SubagentStop worker guard (matcher ^work:worker$, fires cross-plugin for the launch-selected cell), Stop checklist guard (bun dispatchers).",
   "hooks": {
     "PreToolUse": [
       {

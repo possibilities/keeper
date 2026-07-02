@@ -13,11 +13,12 @@ imperative guardrails only.
 ## Repo facts
 
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
-- **Two plugins live as peers under `plugins/`** — `plugins/keeper/` (hooks + `keeper:*` skills) and
-  `plugins/plan/` (behind `keeper plan`, `plan:*` skills). Each has exactly ONE manifest at
-  `<plugin>/.claude-plugin/plugin.json` (keeper exactly ONE `hooks/hooks.json`); never duplicate
-  either, never add a `~/.claude/plugins/keeper` symlink (double-registers the hook). The daemon,
-  `cli/`, `src/`, and the `keeper` binary stay at the repo root.
+- **Three peers live under `plugins/`** — `plugins/keeper/` (hooks + `keeper:*` skills) and `plugins/plan/`
+  (behind `keeper plan`, `plan:*` skills) are claude-plugins, each with exactly ONE `<plugin>/.claude-plugin/plugin.json`
+  (keeper exactly ONE `hooks/hooks.json`); `plugins/prompt/` is the engine behind `keeper prompt` and carries NO
+  `.claude-plugin` manifest. `plugins/plan/` also renders four per-cell `work`-plugin manifests under `workers/opus-*/`
+  (from `subagents.yaml`), picked at launch via `--plugin-dir`. Never duplicate a manifest, never add a
+  `~/.claude/plugins/keeper` symlink (double-registers the hook); the daemon, `cli/`, `src/`, and the `keeper` binary stay at the repo root.
 - **The Agent Bus inbox watcher is a session Monitor** in `plugins/keeper/monitors.json` — STRICTLY
   separate from `hooks.json`; never fold in.
 - **Bus presence = a SUBSCRIBED `keeper bus watch` channel; a pure `keeper bus chat send` is
