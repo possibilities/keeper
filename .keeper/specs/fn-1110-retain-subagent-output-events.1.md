@@ -27,5 +27,5 @@ Move PostToolUse:Agent (currently shed when `subagent_agent_id IS NOT NULL`) and
 - [ ] The compaction test suite pins the new keep/shed split for both newly-kept classes and at least one still-shed class, and the full fast suite stays green
 
 ## Done summary
-
+Moved PostToolUse:Agent and SubagentStop out of the retention shed allow-list so subagent IO pairs (prompt/answer/model/effort) stay durably SQL-joinable in keeper.db; updated shed/keep rationale comments and pinned the new split in the compaction + refold-equivalence suites.
 ## Evidence
