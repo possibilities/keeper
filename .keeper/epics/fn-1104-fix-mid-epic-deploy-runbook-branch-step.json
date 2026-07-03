@@ -7,7 +7,7 @@
     "fn-1099-live-verification-acceptance-guidance"
   ],
   "id": "fn-1104-fix-mid-epic-deploy-runbook-branch-step",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-03T20:19:43.552000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T20:19:42.613000Z"
+  "updated_at": "2026-07-03T20:19:43.552000Z"
 }
