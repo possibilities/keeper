@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-03T19:55:50.479000Z",
   "created_at": "2026-07-03T19:05:51.832000Z",
   "depends_on_epics": [],
   "id": "fn-1101-fix-stale-board-pill-after-unblock",
   "last_validated_at": "2026-07-03T19:06:17.192000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix stale board pill after unblock",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T19:06:17.192000Z"
+  "updated_at": "2026-07-03T19:55:50.479000Z"
 }
