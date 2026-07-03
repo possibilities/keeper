@@ -163,9 +163,63 @@ export interface KeeperConfig {
   // undefined here); `resolveKeeperAgentPath()` supplies the derived default +
   // the `KEEPER_AGENT_PATH` env override + tilde-expansion.
   keeperAgentPath?: string;
+  // The autoclose worker's off-switch (default TRUE = on). Parsed from
+  // `autoclose_enabled`. Because it gates a WINDOW-KILLING feature the disable
+  // set is deliberately GENEROUS: boolean `false`, OR any of the trimmed,
+  // case-insensitive strings `"false"` / `"off"` / `"no"` / `"0"`, disables.
+  // Absent or ANY other value → enabled (a mistyped off-switch must never
+  // silently keep killing windows). Re-read on every `resolveConfig` call so a
+  // flip lands without a daemon restart.
+  autocloseEnabled: boolean;
+  // Grace period (SECONDS) the autoclose worker waits after an agent is proven
+  // done-and-idle before closing its window. Parsed from
+  // `autoclose_grace_seconds`; a positive FINITE number overrides, anything else
+  // (absent / non-number / NaN / <= 0 / Infinity) → 30. Re-read on every
+  // `resolveConfig` call.
+  autocloseGraceSeconds: number;
   // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
+}
+
+/** Default for {@link KeeperConfig.autocloseEnabled} — the feature ships ON. */
+export const DEFAULT_AUTOCLOSE_ENABLED = true;
+
+/** Default for {@link KeeperConfig.autocloseGraceSeconds} — 30s of proven
+ *  done-and-idle before a window is closed. */
+export const DEFAULT_AUTOCLOSE_GRACE_SECONDS = 30;
+
+/** The generous disable set for `autoclose_enabled` (trimmed, case-insensitive).
+ *  A boolean `false` OR any of these strings disables; anything else enables. */
+const AUTOCLOSE_DISABLE_STRINGS: ReadonlySet<string> = new Set([
+  "false",
+  "off",
+  "no",
+  "0",
+]);
+
+/**
+ * Resolve the generous `autoclose_enabled` key. Boolean `false` OR a trimmed,
+ * case-insensitive `"false"`/`"off"`/`"no"`/`"0"` string disables; absent
+ * (`undefined`) or ANY other value → enabled (default TRUE). Pure. */
+export function resolveAutocloseEnabled(raw: unknown): boolean {
+  if (raw === false) {
+    return false;
+  }
+  if (typeof raw === "string") {
+    return !AUTOCLOSE_DISABLE_STRINGS.has(raw.trim().toLowerCase());
+  }
+  return DEFAULT_AUTOCLOSE_ENABLED;
+}
+
+/**
+ * Resolve the `autoclose_grace_seconds` key: a positive FINITE number wins;
+ * anything else (non-number / NaN / <= 0 / Infinity / absent) → 30. Pure. */
+export function resolveAutocloseGraceSeconds(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  return DEFAULT_AUTOCLOSE_GRACE_SECONDS;
 }
 
 /**
@@ -226,6 +280,10 @@ export function resolveConfig(): KeeperConfig {
   // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
+  // The autoclose keys default independently to ON / 30s; a malformed value for
+  // either falls back through the pure resolvers below.
+  let autocloseEnabled: boolean = DEFAULT_AUTOCLOSE_ENABLED;
+  let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
   let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
@@ -233,6 +291,8 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentusageRoot,
+        autocloseEnabled,
+        autocloseGraceSeconds,
         accountAliases,
       };
     }
@@ -299,6 +359,15 @@ export function resolveConfig(): KeeperConfig {
       if (typeof kap === "string" && kap.length > 0) {
         keeperAgentPath = kap;
       }
+      // Autoclose keys — resolved through the generous pure resolvers so a
+      // mistyped off-switch never silently keeps killing windows, and each key
+      // falls back to its default independently of the other.
+      autocloseEnabled = resolveAutocloseEnabled(
+        (raw as { autoclose_enabled?: unknown }).autoclose_enabled,
+      );
+      autocloseGraceSeconds = resolveAutocloseGraceSeconds(
+        (raw as { autoclose_grace_seconds?: unknown }).autoclose_grace_seconds,
+      );
       // Keep only string→non-empty-string entries; drop the rest.
       const aliases = (raw as { account_aliases?: unknown }).account_aliases;
       if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
@@ -320,6 +389,8 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
+      autocloseEnabled: DEFAULT_AUTOCLOSE_ENABLED,
+      autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
       accountAliases: {},
     };
   }
@@ -333,6 +404,8 @@ export function resolveConfig(): KeeperConfig {
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
+    autocloseEnabled,
+    autocloseGraceSeconds,
     accountAliases,
   };
 }

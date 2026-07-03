@@ -166,7 +166,7 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}",
+    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t#{window_name}",
   ]);
 });
 
@@ -279,12 +279,13 @@ test("createTmuxPaneOps.focusPane: ENOENT throw → { ok: false }, never throws 
 // createTmuxPaneOps.listPanes — server-wide sweep, tab-safe parse, null degrade
 // ---------------------------------------------------------------------------
 
-test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, windowName) from one -a sweep", async () => {
+test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, paneStartTime, paneDead, sessionName, windowName) from one -a sweep", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        stdout: "%1\t@1\tclaude\twork::fn-1-x.2\n%2\t@2\tzsh\tplain shell\n",
+        stdout:
+          "%1\t@1\tclaude\t1700000001\t0\tautopilot\twork::fn-1-x.2\n%2\t@2\tzsh\t1700000002\t1\tmisc\tplain shell\n",
         exitCode: 0,
       },
     },
@@ -298,12 +299,18 @@ test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, win
       paneId: "%1",
       windowId: "@1",
       currentCommand: "claude",
+      paneStartTime: "1700000001",
+      paneDead: "0",
+      sessionName: "autopilot",
       windowName: "work::fn-1-x.2",
     },
     {
       paneId: "%2",
       windowId: "@2",
       currentCommand: "zsh",
+      paneStartTime: "1700000002",
+      paneDead: "1",
+      sessionName: "misc",
       windowName: "plain shell",
     },
   ]);
@@ -314,10 +321,11 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // window name itself contains a tab, a colon, and unicode; the three
-        // leading fixed fields (pane/window/command) are taken off the first
-        // three tabs, so a name-internal tab never bleeds into them.
-        stdout: "%7\t@7\tzsh\tweird:\tname é\n",
+        // window name itself contains a tab, a colon, and unicode; the six
+        // leading fixed fields (pane/window/command/start-time/dead/session) are
+        // taken off the first six tabs, so a name-internal tab never bleeds into
+        // them.
+        stdout: "%7\t@7\tzsh\t1700000007\t0\tsess\tweird:\tname é\n",
         exitCode: 0,
       },
     },
@@ -330,6 +338,9 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
       paneId: "%7",
       windowId: "@7",
       currentCommand: "zsh",
+      paneStartTime: "1700000007",
+      paneDead: "0",
+      sessionName: "sess",
       windowName: "weird:\tname é",
     },
   ]);
@@ -340,9 +351,11 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // line 1 has no tab; line 2 has one tab only; line 3 is 3-tab but has an
-        // empty pane id; line 4 is well-formed (and a name may be empty — valid).
-        stdout: "garbage\n%2\tonlyone\n\t@3\tsh\tname\n%4\t@4\tsh\t\n",
+        // line 1 has no tab; line 2 has only 5 tabs (too few for the six fixed
+        // fields); line 3 is 6-tab but has an empty pane id; line 4 is
+        // well-formed (and a name may be empty — valid).
+        stdout:
+          "garbage\n%2\t@2\tsh\t1\t0\tsess\n\t@3\tsh\t1\t0\tsess\tname\n%4\t@4\tsh\t1700000004\t0\tsess\t\n",
         exitCode: 0,
       },
     },
@@ -351,7 +364,15 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
   const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
   const got = await ops.listPanes();
   expect(got).toEqual([
-    { paneId: "%4", windowId: "@4", currentCommand: "sh", windowName: "" },
+    {
+      paneId: "%4",
+      windowId: "@4",
+      currentCommand: "sh",
+      paneStartTime: "1700000004",
+      paneDead: "0",
+      sessionName: "sess",
+      windowName: "",
+    },
   ]);
 });
 

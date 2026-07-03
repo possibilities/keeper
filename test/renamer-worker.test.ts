@@ -129,7 +129,17 @@ const pane = (
   paneId: string,
   windowId: string,
   windowName: string,
-): PaneInfo => ({ paneId, windowId, currentCommand: "zsh", windowName });
+): PaneInfo => ({
+  paneId,
+  windowId,
+  currentCommand: "zsh",
+  // The renamer never reads these three; fixed placeholders keep the sweep
+  // shape complete so PaneInfo type-checks.
+  paneStartTime: "0",
+  paneDead: "0",
+  sessionName: "autopilot",
+  windowName,
+});
 
 // ---------------------------------------------------------------------------
 // renameCandidates — the projection filter
