@@ -232,11 +232,22 @@ live past a daemon bounce is running blind.
    per-row jam read, `.data.board.epics[].tasks[].dispatch_failure` and
    `.data.board.epics[].close.dispatch_failure` name the block KIND on the exact
    wedged row: the operator-action jams (multi-repo / merge-conflict / dirty-tree /
-   non-ff, cleared by `retry`), plus the self-clearing occupancy signals
+   non-ff, cleared by `retry`), the self-clearing occupancy signals
    `slot-occupied` (a stopped session holds the slot — visibility only) and
-   `slot-reclaimed` (a provably-dead session's pane was auto-killed to free it).
+   `slot-reclaimed` (a provably-dead session's pane was auto-killed to free it),
+   and `instant-death` (a key whose workers bound then died within a minute K
+   times running — the circuit breaker paused its re-dispatch; `retry` re-arms it).
 2. Report paused/playing, mode, armed epics, and any in-flight or stuck
    dispatches.
+
+**Quota-wall signal.** `.data.needs_human.instant_death_wall` counts the distinct
+keys currently tripped by the instant-death breaker. `>= 2` (multiple keys dying
+instantly in a window) is the likely **account session/quota wall** — repeated
+instant worker deaths, not a flaky task; the per-key breakers already stopped each
+key's burn (no silent churn loop), so the board never auto-pauses on it. Resume
+each key with `keeper autopilot retry <verb>::<id>` AFTER the session limit resets
+(check `keeper usage` for the reset time); retrying before the reset just re-arms
+the breaker.
 
 ### Take over for a bit, then put it back
 

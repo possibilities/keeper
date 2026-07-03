@@ -68,6 +68,17 @@ describe("classifyDispatchFailure", () => {
     );
   });
 
+  test("maps the instant-death breaker reason to its own display kind (fn-1086)", () => {
+    // Collision-free: the new reason is not a prefix of any existing rule, nor is
+    // any existing prefix a prefix of it, so it classifies to its own kind.
+    expect(classifyDispatchFailure("instant-death-breaker")).toBe(
+      "instant-death",
+    );
+    expect(classifyDispatchFailure("instant-death-breaker")).not.toBe(
+      classifyDispatchFailure("slot-reclaimed: x"),
+    );
+  });
+
   test("falls back to the leading token before the first : or whitespace", () => {
     expect(classifyDispatchFailure("some-novel-reason: detail")).toBe(
       "some-novel-reason",

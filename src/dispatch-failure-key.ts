@@ -92,6 +92,22 @@ export const SLOT_RECLAIMED_REASON_PREFIX = "slot-reclaimed";
  */
 export const SLOT_OCCUPIED_REASON_PREFIX = "slot-occupied";
 
+/**
+ * The `dispatch_failures.reason` the instant-death circuit breaker mints when a
+ * `(verb, id)` key's dispatched worker BINDS-then-dies within a sub-minute
+ * lifetime {@link import("./reducer").INSTANT_DEATH_THRESHOLD} consecutive
+ * times (the reducer-side sibling of the never-bound breaker — post-bind
+ * lifetime is the cause-AGNOSTIC signal, no transcript parsing). The sticky
+ * feeds the reconciler's `failedKeys` suppression exactly like every other
+ * `dispatch_failures` row, pausing re-dispatch of that key until `retry_dispatch`
+ * clears it. Cause-agnostic by design: a board-wide burst of these (multiple keys
+ * tripping) is the likely session/quota-wall signal the board surfaces. Lands on
+ * the NATURAL `(verb, id)` key, so the router short-circuits a `work` row to
+ * `work-task` and a `close` row to its close family — no new route arm.
+ * Collision-free: no existing reason is a prefix of it, nor it of them.
+ */
+export const INSTANT_DEATH_BREAKER_REASON = "instant-death-breaker";
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -101,7 +117,8 @@ export type DispatchFailureDisplayKind =
   | "merge-conflict"
   | "dirty-tree"
   | "slot-reclaimed"
-  | "slot-occupied";
+  | "slot-occupied"
+  | "instant-death";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -123,6 +140,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: MERGE_ESCALATION_REASON_TOKEN, kind: "merge-conflict" },
   { prefix: SLOT_RECLAIMED_REASON_PREFIX, kind: "slot-reclaimed" },
   { prefix: SLOT_OCCUPIED_REASON_PREFIX, kind: "slot-occupied" },
+  { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

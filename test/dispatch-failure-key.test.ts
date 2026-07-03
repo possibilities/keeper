@@ -392,6 +392,7 @@ describe("single vocabulary source", () => {
       ["worktree-merge-conflict", "merge-conflict"],
       ["slot-reclaimed", "slot-reclaimed"],
       ["slot-occupied", "slot-occupied"],
+      ["instant-death-breaker", "instant-death"],
     ]);
   });
 });

@@ -2032,6 +2032,309 @@ test("from-scratch re-fold reproduces dispatch_never_bound + the never-bound fai
 });
 
 // ---------------------------------------------------------------------------
+// Schema v105 (fn-1086 task .1) — `dispatch_instant_death` reducer projection +
+// the instant-death circuit breaker, the reducer-side SIBLING of never-bound.
+// A worker that BINDS-and-works (`active_since` stamped) then dies via `Killed`
+// within a sub-minute post-bind lifetime increments a per-`(verb, id)`
+// consecutive-instant-death count; at K=3 it mints a sticky
+// `dispatch_failures(reason='instant-death-breaker')` the `failedKeys` arm
+// suppresses. Detection is cause-AGNOSTIC (post-bind lifetime from event `ts`
+// only). A clean `SessionEnd` or a long-lived `Killed` RESETS the count; a
+// successful bind does NOT (the whole signal is bind-then-die — the count must
+// survive re-dispatch). `DispatchCleared` (retry) clears failure + count. All
+// folds pure — a from-scratch re-fold is byte-identical.
+// ---------------------------------------------------------------------------
+
+function getInstantDeathCounter(verb: string, id: string) {
+  return db
+    .query("SELECT * FROM dispatch_instant_death WHERE verb = ? AND id = ?")
+    .get(verb, id) as {
+    verb: string;
+    id: string;
+    consecutive_deaths: number;
+    last_event_id: number;
+  } | null;
+}
+
+// Bind a fresh worker (SessionStart mints the `work::<ref>` job row; a
+// UserPromptSubmit at `bindTs` flips it `working` and stamps `active_since`),
+// then land its terminal at `endTs`: `kind='kill'` mints an abrupt `Killed`
+// (loose pid-only match — start_time NULL), `kind='end'` a clean `SessionEnd`.
+// Each call uses a DISTINCT session so the `(verb, id)` counter accumulates
+// across re-dispatches exactly as production does. Returns the terminal event id.
+let instantDeathSeq = 0;
+function bindThenTerminate(
+  ref: string,
+  bindTs: number,
+  endTs: number,
+  kind: "kill" | "end",
+): number {
+  const session = `sess-idb-${instantDeathSeq++}`;
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: session,
+    spawn_name: `work::${ref}`,
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: session,
+    ts: bindTs,
+  });
+  if (kind === "kill") {
+    return insertEvent({
+      hook_event: "Killed",
+      session_id: session,
+      ts: endTs,
+      data: JSON.stringify({ pid: 4242, start_time: null }),
+    });
+  }
+  return insertEvent({
+    hook_event: "SessionEnd",
+    session_id: session,
+    ts: endTs,
+  });
+}
+
+test("K=3 consecutive instant post-bind deaths mint DispatchFailed(instant-death-breaker) and clear the counter (fn-1086)", () => {
+  // Each sub-minute bind-then-Killed bumps the counter; the sticky does NOT
+  // exist until the K-th death trips the breaker. Every death carries its own
+  // successful bind — proving a bind does NOT reset this counter (unlike
+  // never-bound), the whole point of the bind-then-die signal.
+  bindThenTerminate("fn-1086-loop.1", 100_000, 100_020, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-loop.1")?.consecutive_deaths,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-1086-loop.1")).toBeNull();
+
+  bindThenTerminate("fn-1086-loop.1", 200_000, 200_030, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-loop.1")?.consecutive_deaths,
+  ).toBe(2);
+  expect(getDispatchFailure("work", "fn-1086-loop.1")).toBeNull();
+
+  const tripId = bindThenTerminate("fn-1086-loop.1", 300_000, 300_010, "kill");
+  drainAll();
+  const failure = getDispatchFailure("work", "fn-1086-loop.1");
+  expect(failure).not.toBeNull();
+  expect(failure?.reason).toBe("instant-death-breaker");
+  expect(failure?.dir).toBeNull();
+  expect(failure?.last_event_id).toBe(tripId);
+  expect(failure?.ts).toBe(300_010);
+  // Counter cleared on trip — a post-retry re-arm starts at zero.
+  expect(getInstantDeathCounter("work", "fn-1086-loop.1")).toBeNull();
+});
+
+test("a fast SUCCESSFUL task (clean SessionEnd, sub-minute) NEVER trips — no increment (fn-1086)", () => {
+  // A quick success exits via SessionEnd, not an abrupt Killed. Three of them,
+  // each sub-minute, leave the counter untouched — the explicit guard that a
+  // legitimately-fast completion never trips the breaker.
+  bindThenTerminate("fn-1086-fast.1", 100_000, 100_005, "end");
+  bindThenTerminate("fn-1086-fast.1", 200_000, 200_005, "end");
+  bindThenTerminate("fn-1086-fast.1", 300_000, 300_005, "end");
+  drainAll();
+  expect(getInstantDeathCounter("work", "fn-1086-fast.1")).toBeNull();
+  expect(getDispatchFailure("work", "fn-1086-fast.1")).toBeNull();
+});
+
+test("a long-lived Killed (past the wall window) RESETS the count — consecutive means uninterrupted (fn-1086)", () => {
+  // Two instant deaths, then a worker that lived well past a minute before
+  // dying: real progress broke the fast-death streak, so the count resets. A
+  // later instant death starts fresh at 1 — the breaker never trips at a
+  // spurious cumulative 3.
+  bindThenTerminate("fn-1086-long.1", 100_000, 100_020, "kill");
+  bindThenTerminate("fn-1086-long.1", 200_000, 200_030, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-long.1")?.consecutive_deaths,
+  ).toBe(2);
+
+  // Lifetime 600s ≫ 60s → not an instant death → reset.
+  bindThenTerminate("fn-1086-long.1", 300_000, 300_600, "kill");
+  drainAll();
+  expect(getInstantDeathCounter("work", "fn-1086-long.1")).toBeNull();
+  expect(getDispatchFailure("work", "fn-1086-long.1")).toBeNull();
+
+  bindThenTerminate("fn-1086-long.1", 400_000, 400_010, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-long.1")?.consecutive_deaths,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-1086-long.1")).toBeNull();
+});
+
+test("a clean SessionEnd between instant deaths RESETS the mid-streak count (fn-1086)", () => {
+  // death, death, [clean SessionEnd], death → the success interrupts the
+  // consecutive streak, so the final death is only count 1, not a trip.
+  bindThenTerminate("fn-1086-mix.1", 100_000, 100_020, "kill");
+  bindThenTerminate("fn-1086-mix.1", 200_000, 200_020, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-mix.1")?.consecutive_deaths,
+  ).toBe(2);
+
+  bindThenTerminate("fn-1086-mix.1", 300_000, 300_010, "end"); // reset
+  bindThenTerminate("fn-1086-mix.1", 400_000, 400_010, "kill"); // 1
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-mix.1")?.consecutive_deaths,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-1086-mix.1")).toBeNull();
+});
+
+test("a bind alone does NOT reset the counter — the count survives re-dispatch (fn-1086)", () => {
+  // The key contrast with never-bound: never-bound resets on bind; instant-death
+  // MUST NOT (the signal is bind-then-die). Two deaths → count 2, then a bare
+  // re-dispatch bind (SessionStart + UserPromptSubmit, still live — no terminal)
+  // leaves the count at 2.
+  bindThenTerminate("fn-1086-bind.1", 100_000, 100_020, "kill");
+  bindThenTerminate("fn-1086-bind.1", 200_000, 200_020, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-bind.1")?.consecutive_deaths,
+  ).toBe(2);
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-idb-bindonly",
+    spawn_name: "work::fn-1086-bind.1",
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-idb-bindonly",
+    ts: 300_000,
+  });
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-bind.1")?.consecutive_deaths,
+  ).toBe(2);
+});
+
+test("DispatchCleared (keeper autopilot retry) clears BOTH the instant-death failure and the counter (fn-1086)", () => {
+  bindThenTerminate("fn-1086-retry.1", 100_000, 100_010, "kill");
+  bindThenTerminate("fn-1086-retry.1", 200_000, 200_010, "kill");
+  bindThenTerminate("fn-1086-retry.1", 300_000, 300_010, "kill");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-1086-retry.1")?.reason).toBe(
+    "instant-death-breaker",
+  );
+
+  dispatchClearedEvent("work", "fn-1086-retry.1");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-1086-retry.1")).toBeNull();
+  expect(getInstantDeathCounter("work", "fn-1086-retry.1")).toBeNull();
+
+  // Re-armed from zero: a single post-retry instant death is below K.
+  bindThenTerminate("fn-1086-retry.1", 400_000, 400_010, "kill");
+  drainAll();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-retry.1")?.consecutive_deaths,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-1086-retry.1")).toBeNull();
+});
+
+test("an instant death on an ALREADY-failed key does NOT re-trip or churn the counter (fn-1086)", () => {
+  // Once the sticky stands, a late in-flight terminal is a slot release, not a
+  // fresh trip — mirror never-bound's alreadyFailed guard (no bump, no re-mint).
+  bindThenTerminate("fn-1086-already.1", 100_000, 100_010, "kill");
+  bindThenTerminate("fn-1086-already.1", 200_000, 200_010, "kill");
+  const tripId = bindThenTerminate(
+    "fn-1086-already.1",
+    300_000,
+    300_010,
+    "kill",
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-1086-already.1")?.reason).toBe(
+    "instant-death-breaker",
+  );
+  expect(getInstantDeathCounter("work", "fn-1086-already.1")).toBeNull();
+
+  // A further instant death while the sticky stands: no counter row, failure
+  // unchanged (its last_event_id is still the trip's, not the late death's).
+  bindThenTerminate("fn-1086-already.1", 400_000, 400_010, "kill");
+  drainAll();
+  expect(getInstantDeathCounter("work", "fn-1086-already.1")).toBeNull();
+  expect(getDispatchFailure("work", "fn-1086-already.1")?.last_event_id).toBe(
+    tripId,
+  );
+});
+
+test("a Killed of a NON-plan-keyed job never touches dispatch_instant_death (fn-1086)", () => {
+  // A bare session (no spawn_name → NULL plan_verb/plan_ref) that binds and dies
+  // fast is not a dispatch key — the breaker only tracks `(verb, id)` keys.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-idb-bare" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-idb-bare",
+    ts: 100_000,
+  });
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "sess-idb-bare",
+    ts: 100_010,
+    data: JSON.stringify({ pid: 4242, start_time: null }),
+  });
+  drainAll();
+  const n = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_instant_death").get() as {
+      n: number;
+    }
+  ).n;
+  expect(n).toBe(0);
+});
+
+test("zero-event projection: a fresh DB has zero dispatch_instant_death rows (fn-1086)", () => {
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_instant_death").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("from-scratch re-fold reproduces dispatch_instant_death + the instant-death failure byte-identically (fn-1086)", () => {
+  // A representative sequence exercising every arm: a below-K key, a key reset by
+  // a clean SessionEnd mid-streak, a key that trips + clears its counter, and a
+  // retry-cleared-then-re-armed key.
+  bindThenTerminate("fn-1086-rf-a.1", 100_000, 100_010, "kill"); // a: 1
+  bindThenTerminate("fn-1086-rf-b.1", 110_000, 110_010, "kill"); // b: 1
+  bindThenTerminate("fn-1086-rf-b.1", 120_000, 120_005, "end"); // b: reset (gone)
+  bindThenTerminate("fn-1086-rf-c.1", 130_000, 130_010, "kill"); // c: 1
+  bindThenTerminate("fn-1086-rf-c.1", 140_000, 140_010, "kill"); // c: 2
+  bindThenTerminate("fn-1086-rf-c.1", 150_000, 150_010, "kill"); // c: 3 → trip + clear
+  drainAll();
+  dispatchClearedEvent("work", "fn-1086-rf-c.1"); // c: failure + counter cleared
+  bindThenTerminate("fn-1086-rf-c.1", 160_000, 160_010, "kill"); // c: re-armed → 1
+  drainAll();
+
+  const counterBefore = db
+    .query("SELECT * FROM dispatch_instant_death ORDER BY verb ASC, id ASC")
+    .all();
+  const failuresBefore = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+
+  // Rewind cursor + wipe every projection these folds touch + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_instant_death");
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM pending_dispatches");
+  db.run("DELETE FROM jobs");
+  drainAll();
+
+  const counterAfter = db
+    .query("SELECT * FROM dispatch_instant_death ORDER BY verb ASC, id ASC")
+    .all();
+  const failuresAfter = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(counterAfter).toEqual(counterBefore);
+  expect(failuresAfter).toEqual(failuresBefore);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v47 (fn-667) — `autopilot_state` singleton reducer projection. Main
 // mints `AutopilotPaused{paused:boolean}` events (steady-state via the
 // `set_autopilot_paused` RPC bridge, boot via the daemon's boot-append

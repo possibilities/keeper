@@ -3030,8 +3030,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // via fn-1083 task .2 (appending the nullable `epics.question` column — the
   // epic-level parked-closer question folded from `EpicSnapshot.question`; an
   // additive ALTER, NO cursor rewind: a historical EpicSnapshot carries no
-  // `question` key, so a from-scratch re-fold leaves it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(104);
+  // `question` key, so a from-scratch re-fold leaves it NULL byte-identical). And
+  // to 105 via fn-1086 task .1 (the `dispatch_instant_death` reducer projection —
+  // the instant-death circuit breaker's counter; a CREATE-only table, NO cursor
+  // rewind: an existing DB gains the empty table and folds forward, and a
+  // from-scratch re-fold replays the historical terminal events into it
+  // byte-identical, a deterministic-replayed projection like `dispatch_never_bound`).
+  expect(SCHEMA_VERSION).toBe(105);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

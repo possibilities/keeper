@@ -2567,7 +2567,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `default_visible` so column order stays fresh-vs-migrated identical); it
   // widens the epics row shape but does not touch the v62→v63
   // `default_visible`/`approval` rewrite this test exercises, fn-1083 task .2.
-  expect(SCHEMA_VERSION).toBe(104);
+  // v105 adds the `dispatch_instant_death` reducer projection table (the
+  // instant-death circuit breaker's counter — a CREATE-only table, not an
+  // epics-shape change), fn-1086 task .1.
+  expect(SCHEMA_VERSION).toBe(105);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

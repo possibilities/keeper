@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 104;
+export const SCHEMA_VERSION = 105;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1165,6 +1165,37 @@ CREATE TABLE IF NOT EXISTS dispatch_never_bound (
     verb TEXT NOT NULL,
     id TEXT NOT NULL,
     consecutive_expired INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    PRIMARY KEY (verb, id)
+)
+`;
+
+/**
+ * `dispatch_instant_death` projection table — the instant-death circuit breaker's
+ * per-`(verb, id)` consecutive-instant-post-bind-death counter, the reducer-side
+ * SIBLING of `dispatch_never_bound`. A dispatched worker that BINDS and reaches a
+ * terminal `Killed` within a sub-minute post-bind lifetime (the wall the
+ * never-bound breaker misses — a bind RESETS never-bound, so a bind-then-instant-
+ * death re-dispatch loop never trips it) increments this count; at
+ * {@link import("./reducer").INSTANT_DEATH_THRESHOLD} the fold mints a sticky
+ * `dispatch_failures(reason='instant-death-breaker')` the `failedKeys` arm
+ * suppresses, pausing that key's re-dispatch until `retry_dispatch`. Detection is
+ * cause-AGNOSTIC (post-bind lifetime from event `ts` deltas only — no transcript
+ * parsing, no `close_kind`/`kill_reason` filter). RESET to zero (DELETE) on any
+ * NON-instant terminal for the key (a clean `SessionEnd`, or a long-lived
+ * `Killed` — the worker did real work, the consecutive-fast-death streak is
+ * broken) and on `DispatchCleared` (the retry clear path). A worker's SUCCESSFUL
+ * bind is NOT a reset (unlike never-bound): the whole signal IS bind-then-die, so
+ * the count must persist across the re-dispatch's bind. A reducer projection
+ * (re-fold reset DELETE list); `last_event_id` is an event id, never wall-clock,
+ * so the fold is re-fold-deterministic. Row PRESENCE is incidental — the count is
+ * the signal.
+ */
+const CREATE_DISPATCH_INSTANT_DEATH = `
+CREATE TABLE IF NOT EXISTS dispatch_instant_death (
+    verb TEXT NOT NULL,
+    id TEXT NOT NULL,
+    consecutive_deaths INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL,
     PRIMARY KEY (verb, id)
 )
@@ -2466,6 +2497,7 @@ function migrate(db: Database): void {
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_DISPATCH_NEVER_BOUND);
+      db.run(CREATE_DISPATCH_INSTANT_DEATH);
       db.run(CREATE_DISPATCH_MINT_GATE);
       db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
@@ -5712,6 +5744,21 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` there in the SAME commit;
       // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "epics", "question", "TEXT");
+
+      // v104→v105 (fn-1086 task .1): add the `dispatch_instant_death` reducer
+      // projection table — the instant-death circuit breaker's per-`(verb, id)`
+      // consecutive-instant-post-bind-death counter, the reducer-side sibling of
+      // `dispatch_never_bound`. CREATEd idempotently in the always-run base schema
+      // block above (`CREATE_DISPATCH_INSTANT_DEATH`, `IF NOT EXISTS`), so an
+      // existing DB gains the empty table on this boot and the terminal folds
+      // populate it forward — no ALTER / backfill / cursor rewind (a normal
+      // upgrade folds forward from empty; only a from-scratch re-fold replays
+      // historical deaths, which is the correct deterministic-replayed projection).
+      // A DETERMINISTIC-REPLAYED projection (like `dispatch_never_bound`), so a
+      // future rewinding migration wipes-and-refolds it; this bump adds no rewind.
+      // Whitelist-only Python read (keeper-py never reads `dispatch_instant_death`)
+      // — this bump MUST add 105 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
+      // in the SAME commit; test/schema-version.test.ts enforces it.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
