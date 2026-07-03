@@ -7823,8 +7823,8 @@ function projectJobsRow(db: Database, event: Event): void {
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
@@ -7838,6 +7838,18 @@ function projectJobsRow(db: Database, event: Event): void {
              -- lane env, so it is the sole arm whose excluded.worktree is ever
              -- non-NULL.
              worktree = COALESCE(excluded.worktree, jobs.worktree),
+             -- v107 (fn-1103.3): latest-non-NULL-wins for the harness tag and the
+             -- resume target, mirroring worktree/config_dir. A claude resume
+             -- re-stamps harness "claude" (idempotent); a legacy NULL-harness row
+             -- resumed post-upgrade heals to "claude" (still correct — it IS
+             -- claude). The fold copies the event value verbatim and never
+             -- synthesizes, so a NULL excluded.harness preserves the prior value.
+             -- resume_target stays on THIS SessionStart arm ONLY for claude/pi's
+             -- own seed value; a codex/hermes back-fill flows through the separate
+             -- ResumeTargetResolved arm precisely so it can never trip this arm's
+             -- terminal-row revive (killed -> stopped) semantics.
+             harness = COALESCE(excluded.harness, jobs.harness),
+             resume_target = COALESCE(excluded.resume_target, jobs.resume_target),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
@@ -7899,6 +7911,8 @@ function projectJobsRow(db: Database, event: Event): void {
             event.config_dir == null ? null : projectBasename(event.config_dir),
             spawnNameHistory,
             event.worktree,
+            event.harness,
+            event.resume_target,
           ],
         );
         // Seed a visible `profiles` row for this session's `config_dir` bucket.
@@ -8266,6 +8280,32 @@ function projectJobsRow(db: Database, event: Event): void {
         // increments the consecutive-instant-death count (and mints the sticky at
         // K); a long-lived death resets it. On the proven write path only.
         foldInstantDeathTerminal(db, event, jobId, true);
+      }
+      break;
+
+    case "ResumeTargetResolved":
+      // Synthetic event (fn-1103) minted daemon-side when a harness's native
+      // resume target is resolved AFTER launch — the codex rollout-poll match or
+      // the hermes on_session_start hook id back-fills a keeper-minted job. Folds
+      // ONLY `jobs.resume_target` (idempotent replace) and NEVER touches lifecycle
+      // state, so a late back-fill can NEVER revive a terminal row — which is
+      // exactly why this is a SEPARATE arm from SessionStart's killed->stopped
+      // revive. Reads the `resume_target` COLUMN the producer set via
+      // `insertEvent` (symmetric with the SessionStart arm). A NULL target or a
+      // missing jobs row is a safe no-op (no write). No terminal guard and no
+      // `state` clause: the resume target is valid on a stopped/ended/killed row
+      // alike (you resume a dead session). Reads ONLY event fields, so a
+      // from-scratch re-fold reproduces the row byte-identically.
+      {
+        const resumeTarget = event.resume_target;
+        if (resumeTarget == null) {
+          break; // nothing to resolve — safe no-op.
+        }
+        db.run(
+          `UPDATE jobs SET resume_target = ?, last_event_id = ?, updated_at = ?
+             WHERE job_id = ?`,
+          [resumeTarget, event.id, ts, jobId],
+        );
       }
       break;
 
@@ -9401,7 +9441,7 @@ export function drain(
               plan_op, plan_target, plan_epic_id, plan_task_id,
               plan_subject_present, tool_use_id, config_dir, plan_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-              worktree
+              worktree, harness, resume_target
          FROM events
         WHERE id > ?
         ORDER BY id ASC

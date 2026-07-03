@@ -1006,6 +1006,27 @@ test("SessionStart with an empty KEEPER_PLAN_WORKTREE_BRANCH (serial launch) fol
 });
 
 // ---------------------------------------------------------------------------
+// Record build — harness stamp (buildEventBindings) — fn-1103 task .3
+// ---------------------------------------------------------------------------
+
+test("SessionStart stamps harness 'claude' (this hook only ever fires for claude)", () => {
+  const b = build({ hook_event_name: "SessionStart", session_id: "sess-h" });
+  expect(b.harness).toBe("claude");
+  // resume_target stays NULL from the hook — claude resumes by session id; the
+  // column is the codex/hermes back-fill channel, populated daemon-side.
+  expect(b.resume_target).toBeNull();
+});
+
+test("a non-SessionStart event leaves harness NULL (SessionStart-gated, mirrors worktree)", () => {
+  const b = build({
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-h-ups",
+  });
+  expect(b.harness).toBeNull();
+  expect(b.resume_target).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // Record build — backend-exec coords stamped on EVERY event (buildEventBindings)
 // ---------------------------------------------------------------------------
 

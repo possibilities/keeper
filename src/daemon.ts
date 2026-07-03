@@ -2454,6 +2454,8 @@ export const INGEST_EVENTS_COLUMNS = [
   "background_task_id",
   "mutation_path",
   "worktree",
+  "harness",
+  "resume_target",
 ] as const;
 
 /**

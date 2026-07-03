@@ -286,6 +286,23 @@ export interface Event {
    * `git worktree remove`/`move`.
    */
   worktree: string | null;
+  /**
+   * Launching harness for this session — `"claude"`/`"codex"`/`"pi"`/`"hermes"`.
+   * The claude hook stamps `"claude"` at SessionStart; a codex/hermes birth-ingest
+   * synthetic SessionStart carries its own tag. NULL on every non-SessionStart row
+   * AND on legacy rows. Folded onto `jobs.harness` via the SessionStart COALESCE
+   * arm; the fold NEVER synthesizes a value, so a NULL harness reads as claude at
+   * every consumer.
+   */
+  harness: string | null;
+  /**
+   * The harness-native resume target — the token its own `--resume` argv needs.
+   * claude/pi pin their session uuid at seed (carried on the SessionStart event);
+   * codex/hermes back-fill it later via a synthetic `ResumeTargetResolved` event
+   * (rollout SessionMeta / hook session id) that folds ONLY this column and never
+   * touches lifecycle state. NULL on rows that carry no resume identity.
+   */
+  resume_target: string | null;
 }
 
 /**
@@ -554,6 +571,11 @@ export interface Job {
    * snapshot.
    */
   context_window_size: number | null;
+  // NOTE: the migration-only jobs columns `kill_reason` (v103) and
+  // `harness`/`resume_target` (v107) are DELIBERATELY absent here — this
+  // interface mirrors only the fields Job-typed reads consume today. The columns
+  // exist on the row and are read ad-hoc (a scoped SELECT) by the folds/producers
+  // that own them; a later read surface adds the field when it needs it.
 }
 
 /**

@@ -257,13 +257,14 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v107 harness/resume_target are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1103 task .3)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `kill_reason` (v103) is the current
-  // final appended column, trailing the v100 telemetry six.
+  // re-fold determinism charter depends on. `harness`/`resume_target` (v107) are
+  // the current final appended columns, trailing `kill_reason` (v103) and the
+  // v100 telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -272,6 +273,8 @@ test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail 
     "context_input_tokens",
     "context_window_size",
     "kill_reason",
+    "harness",
+    "resume_target",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -314,6 +317,38 @@ test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail 
   ).toBe(String(SCHEMA_VERSION));
   expect(tailOf(migrated)).toEqual(expectedTail);
   migrated.close();
+});
+
+test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {
+  // The v106->v107 step adds the two multi-harness columns to both surfaces:
+  // events via the FIVE-place lockstep (CREATE literal + migration append), jobs
+  // migration-only. Nullable, NO default (the NULL=absent + re-fold byte-identity
+  // invariant). A bare-inserted row reads NULL on both.
+  const { db } = openDb(":memory:");
+  for (const table of ["events", "jobs"] as const) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[];
+    for (const name of ["harness", "resume_target"] as const) {
+      const col = cols.find((c) => c.name === name);
+      expect(col).toBeDefined();
+      expect(col?.type).toBe("TEXT");
+      expect(col?.notnull).toBe(0);
+      expect(col?.dflt_value).toBeNull();
+    }
+  }
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('jh', 1, 0, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT harness, resume_target FROM jobs WHERE job_id = 'jh'")
+    .get() as { harness: string | null; resume_target: string | null };
+  expect(r.harness).toBeNull();
+  expect(r.resume_target).toBeNull();
+  db.close();
 });
 
 test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
@@ -2572,7 +2607,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // epics-shape change), fn-1086 task .1. v106 appends the nullable
   // `dispatch_failures.resolver_dispatched_at` once-marker (the merge-resolver
   // dispatch latch — an additive ALTER, not an epics-shape change), fn-1088 task .1.
-  expect(SCHEMA_VERSION).toBe(106);
+  // v107 appends the nullable `harness`/`resume_target` columns to BOTH events
+  // (five-place lockstep) and jobs (migration-only) — an additive ALTER, not an
+  // epics-shape change, fn-1103 task .3.
+  expect(SCHEMA_VERSION).toBe(107);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

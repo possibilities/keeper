@@ -587,6 +587,8 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "background_task_id",
   "mutation_path",
   "worktree",
+  "harness",
+  "resume_target",
 ]);
 
 /**
@@ -753,6 +755,18 @@ export function buildEventBindings(
   const worktree =
     hookEvent === "SessionStart" ? worktreeBranchFromEnv(env) : null;
 
+  // SessionStart only: stamp the launching harness. THIS hook only ever fires
+  // for claude (codex/hermes/pi get their harness tag from a birth-ingest
+  // synthetic SessionStart minted daemon-side), so it is a constant "claude"
+  // going forward — NULL on every non-SessionStart row, mirroring `worktree`.
+  // The fold folds it verbatim and never synthesizes a value; a legacy
+  // NULL-harness row therefore reads as claude at every consumer. `resume_target`
+  // stays NULL from this hook — claude resumes by its session id (== job_id)
+  // already; the column is the back-fill channel for codex/hermes, populated by
+  // the daemon's ResumeTargetResolved producer, not here.
+  const harness = hookEvent === "SessionStart" ? "claude" : null;
+  const resumeTarget: string | null = null;
+
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
@@ -827,6 +841,8 @@ export function buildEventBindings(
     background_task_id: backgroundTaskId,
     mutation_path: mutationPath,
     worktree,
+    harness,
+    resume_target: resumeTarget,
   };
   return bindings;
 }
