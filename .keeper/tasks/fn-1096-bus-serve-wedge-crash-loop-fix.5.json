@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T15:54:21.228000Z",
+  "depends_on": [
+    "fn-1096-bus-serve-wedge-crash-loop-fix.1"
+  ],
+  "epic": "fn-1096-bus-serve-wedge-crash-loop-fix",
+  "id": "fn-1096-bus-serve-wedge-crash-loop-fix.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Reclaim keeper.db and measure fold-slow",
+  "updated_at": "2026-07-03T15:54:21.228000Z"
+}
