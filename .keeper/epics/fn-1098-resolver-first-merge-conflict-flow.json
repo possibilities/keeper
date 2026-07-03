@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T19:04:24.979000Z",
+  "depends_on_epics": [],
+  "id": "fn-1098-resolver-first-merge-conflict-flow",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Resolver-first merge conflict flow",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T19:04:24.979000Z"
+}
