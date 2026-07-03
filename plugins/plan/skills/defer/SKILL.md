@@ -86,9 +86,7 @@ Pin the scout return. It feeds the task spec's Investigation targets in Phase 4.
 
 ## Phase 3 — One-task fit check (cognitive)
 
-This is the load-bearing gate. Apply the one-task test from `/plan:plan` Phase 3c:
-
-> Could this ship as a single PR touching a coherent slice of the codebase, with one set of acceptance criteria a reviewer could check in one sitting?
+This is the load-bearing gate. Apply the one-task test from `/plan:plan` Phase 3c — the single-PR / one-sitting-review question, authoritative there, not restated here.
 
 **If YES** → continue to Phase 4.
 
