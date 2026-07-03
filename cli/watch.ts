@@ -5,7 +5,8 @@
  * agent-facing "show me what's moving" stream that pairs with the one-shot
  * `keeper status` orient: subscribe, emit a baseline full-snapshot line, then
  * one coarse delta line per real change (epic added/removed, verdict change,
- * job-state change, autopilot mode/pause/worktree/caps change). Reconnects
+ * runtime block/unblock overlay flip, job-state change, autopilot
+ * mode/pause/worktree/caps change). Reconnects
  * FOREVER (intentional — a daemon bounce must not end the tail).
  *
  * Each line is one `{schema_version, sequence, type, data}` JSON object;
@@ -101,7 +102,8 @@ an idle keepalive carrying the current sequence.
 Delta types (also the --filter allowlist):
   epic-added        an epic appeared on the board
   epic-removed      an epic left the board (done or deleted)
-  verdict-change    a task / close-row readiness verdict changed
+  verdict-change    a task / close-row readiness verdict changed, OR a manual
+                    keeper plan block/unblock flipped a task's runtime overlay
   job-state-change  a job's state changed (added / removed / transitioned)
   autopilot-change  autopilot mode / pause / worktree / caps changed
   keepalive         idle liveness line (filterable)
@@ -134,6 +136,18 @@ export interface CoarseBoard {
   closeVerdicts: Record<string, string>;
   /** job_id → state. */
   jobStates: Record<string, string>;
+  /**
+   * task_id → `true` for a task whose plan `runtime_status` is `blocked` — the
+   * manual `keeper plan block` overlay behind the board's `[rt:blocked]` pill.
+   * Absent ⇒ not blocked. Tracked APART from {@link taskVerdicts} because the
+   * runtime-blocked readiness predicate (rank 10.6) converts ONLY an otherwise-
+   * `ready` row: a block/unblock of a task blocked for another reason (a dep, a
+   * live worker) never moves its verdict, yet the overlay flip IS a real board
+   * move `keeper watch` must surface. Only the `blocked` value is tracked — the
+   * other `runtime_status` values (`todo`/`in_progress`/`done`) already ride the
+   * verdict + job-state families, so tracking them here would double-emit.
+   */
+  taskBlocked: Record<string, true>;
   autopilot: {
     mode: string;
     paused: boolean;
@@ -171,11 +185,22 @@ export function projectCoarseBoard(snap: ReadinessClientSnapshot): CoarseBoard {
   for (const [jobId, job] of snap.jobs) {
     jobStates[jobId] = job.state;
   }
+  // The raw `blocked` runtime-overlay, read off each epic's embedded tasks —
+  // the honest source for the `[rt:blocked]` pill, independent of the verdict.
+  const taskBlocked: Record<string, true> = {};
+  for (const e of snap.epics) {
+    for (const t of e.tasks ?? []) {
+      if (t.runtime_status === "blocked") {
+        taskBlocked[t.task_id] = true;
+      }
+    }
+  }
   return {
     epics,
     taskVerdicts,
     closeVerdicts,
     jobStates,
+    taskBlocked,
     autopilot: {
       mode: snap.autopilotMode,
       paused: snap.autopilotPaused,
@@ -275,6 +300,25 @@ export function diffCoarseBoard(
   }
   for (const [id, from, to] of closeDiff.changed) {
     out.push({ type: "verdict-change", data: { kind: "close", id, from, to } });
+  }
+
+  // Raw `blocked` runtime-overlay transitions — a manual `keeper plan block`
+  // (added) / `unblock` (removed). Routed through the `verdict-change` family
+  // with an explicit `kind: "runtime-status"`, mirroring the `epic-status`
+  // routing above, so the `--filter` allowlist needs no new type. The value is
+  // always `true`, so only `added` (block) / `removed` (unblock) occur.
+  const blockedDiff = diffRecords(prev.taskBlocked, next.taskBlocked);
+  for (const [id] of blockedDiff.added) {
+    out.push({
+      type: "verdict-change",
+      data: { kind: "runtime-status", id, blocked: true },
+    });
+  }
+  for (const [id] of blockedDiff.removed) {
+    out.push({
+      type: "verdict-change",
+      data: { kind: "runtime-status", id, blocked: false },
+    });
   }
 
   const jobDiff = diffRecords(prev.jobStates, next.jobStates);
