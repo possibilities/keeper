@@ -632,8 +632,11 @@ export function shouldEscalateBlockedCategory(
  * shell arg (the helper passes the whole body via stdin / array form). Pure. The
  * directive asks the planner to resolve the blocker, unblock the board, and then
  * RESUME the still-live worker in-context over the bus (`work::<task>`); cold
- * re-dispatch is named only as the dead-worker fallback. The daemon sender still
- * has no subscribable channel — the resume hop runs from the planner session.
+ * re-dispatch is named only as the dead-worker fallback. Opens pause-first so the
+ * unblock does not cold-re-dispatch a fresh worker while the operator is resuming
+ * the live one, and closes with the literal `keeper autopilot play` unstick. The
+ * daemon sender still has no subscribable channel — the resume hop runs from the
+ * planner session.
  */
 export function buildBlockEscalationBody(args: {
   epicId: string;
@@ -643,11 +646,8 @@ export function buildBlockEscalationBody(args: {
   repo: string;
 }): string {
   return [
-    `Plan task ${args.taskId} (epic ${args.epicId}) is BLOCKED and needs you.`,
-    ``,
-    `What happened: the worker exhausted its own resolution and escalated rather`,
-    `than guess. Decision needed: resolve this ${args.category} blocker, then unblock`,
-    `the board and resume the worker (the exact steps are below).`,
+    `Plan task ${args.taskId} (epic ${args.epicId}) is BLOCKED — the worker`,
+    `exhausted its own resolution and escalated rather than guess.`,
     ``,
     `Category: ${args.category}`,
     `Repo: ${args.repo}`,
@@ -655,19 +655,22 @@ export function buildBlockEscalationBody(args: {
     `Blocked reason:`,
     args.blockedReason.trim(),
     ``,
-    `Resolve the blocker (refine the spec, clear the dep, do the human-gated`,
-    `action — whatever the category calls for), then unblock the board:`,
-    `\`keeper plan unblock ${args.taskId}\`.`,
+    `Resolve it:`,
+    `  0. keeper autopilot pause`,
+    `     (so unblocking the board doesn't cold-re-dispatch a fresh worker while you`,
+    `     resume the live one.)`,
+    `  1. Resolve the ${args.category} blocker — refine the spec, clear the dep, do`,
+    `     the human-gated action, whatever the category calls for.`,
+    `  2. keeper plan unblock ${args.taskId}`,
+    `  3. PRIMARY — resume the still-live worker in place over the bus:`,
+    `     \`keeper bus chat send work::${args.taskId} "RESOLVED: <what changed> — resume now"\``,
+    `     An exit-0 \`delivered\` means the live worker session picks the task back`,
+    `     up with full context.`,
+    `     FALLBACK — a \`not_connected\`/\`unknown_target\` miss (exit 1) means that`,
+    `     worker session is gone; run \`keeper dispatch work::${args.taskId}\` yourself.`,
     ``,
-    `PRIMARY — resume the still-live worker in place over the bus:`,
-    `\`keeper bus chat send work::${args.taskId} "RESOLVED: <what changed> — resume now"\``,
-    `(say more if the resolution changes the work). An exit-0 \`delivered\``,
-    `means the live worker session picks the task back up with full context.`,
-    ``,
-    `FALLBACK — a \`not_connected\`/\`unknown_target\` miss (exit 1) means that`,
-    `worker session is gone; the board-unblock you already did lets the autopilot`,
-    `cold-re-dispatch a fresh worker. If the autopilot is paused, run`,
-    `\`keeper dispatch work::${args.taskId}\` yourself.`,
+    `Unstick the board when done:`,
+    `  keeper autopilot play`,
   ].join("\n");
 }
 
@@ -1008,19 +1011,19 @@ export function buildMergeEscalationBody(args: {
   if (parsed == null || !hasRepo) {
     // Parse-miss / no repo dir → a human-actionable manual body, never a throw.
     return [
-      `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict and needs you.`,
+      `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict — the`,
+      `autopilot will NOT auto-retry it. Observable: the base worktree is left clean`,
+      `and the sticky close row is staged for retry.`,
       ``,
-      `The autopilot will NOT auto-retry this close — only you can resolve it, then`,
-      `unstick the board. What is prepared: the base worktree is left clean and the`,
-      `retry command is ready. Decision needed: resolve the conflict merging BOTH`,
-      `sides, or escalate if the conflict is not mechanically clear (see the guardrail).`,
-      ``,
-      `Resolve \`close::${epic}\` by hand: open the epic's base worktree, RE-RUN the`,
-      `failed \`git merge --no-ff <source>\` (NOT \`--squash\` or rebase — a`,
-      `single-parent commit re-conflicts on the next fan-in), resolve the conflict by`,
-      `merging BOTH sides (never pick one side and drop the other), run the epic's`,
-      `tests/build, commit the merge commit, then unstick the board:`,
-      `\`keeper autopilot retry close::${epic}\`.`,
+      `FIRST run \`keeper autopilot pause\` — the recover sweep races your manual merge`,
+      `otherwise (it runs only while autopilot is unpaused). Then resolve`,
+      `\`close::${epic}\` by hand: open the epic's base worktree, RE-RUN the failed`,
+      `\`git merge --no-ff <source>\` (NOT \`--squash\` or rebase — a single-parent`,
+      `commit re-conflicts on the next fan-in), resolve the conflict by merging BOTH`,
+      `sides (never pick one side and drop the other), run the epic's tests/build,`,
+      `commit the merge commit, then verify \`git branch --contains <source>\` lists`,
+      `the base branch and unstick the board:`,
+      `\`keeper autopilot retry close::${epic}\` then \`keeper autopilot play\`.`,
       ``,
       `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
       `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
@@ -1032,12 +1035,14 @@ export function buildMergeEscalationBody(args: {
   }
   const worktree = worktreePathFor(args.repoDir as string, parsed.base);
   return [
-    `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict and needs you.`,
-    ``,
-    `The autopilot will NOT auto-retry this close — only you can resolve it, then`,
-    `unstick the board.`,
+    `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict — the`,
+    `autopilot will NOT auto-retry it. Observable: the base worktree's merge was`,
+    `aborted CLEAN and the sticky close row is staged for retry.`,
     ``,
     `Resolve it:`,
+    `  0. keeper autopilot pause`,
+    `     (the recover sweep races your manual merge otherwise — it runs ONLY while`,
+    `     autopilot is unpaused.)`,
     `  1. cd ${worktree}`,
     `  2. git merge --no-ff ${parsed.source}`,
     `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the`,
@@ -1047,8 +1052,12 @@ export function buildMergeEscalationBody(args: {
     `  3. Resolve the conflict by merging BOTH intents — never pick one side and`,
     `     drop the other.`,
     `  4. Run the epic's tests/build; passing tests are necessary, not sufficient.`,
-    `  5. Commit the merge commit.`,
-    `  6. keeper autopilot retry close::${epic}`,
+    `  5. Commit the merge commit, then verify: \`git branch --contains ${parsed.source}\``,
+    `     lists the base branch (${parsed.source} is an ancestor now).`,
+    ``,
+    `Unstick the board when done:`,
+    `  keeper autopilot retry close::${epic}`,
+    `  keeper autopilot play`,
     ``,
     `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
     `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
@@ -4030,6 +4039,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           status: msg.status,
           depends_on_epics: msg.dependsOnEpics,
           last_validated_at: msg.lastValidatedAt,
+          // The epic-level parked-closer question, sourced from the
+          // gitignored `.state.json` runtime overlay — rides free in the
+          // blob like every other plan-native field (no schema surprise; the
+          // reducer folds it onto `epics.question`).
+          question: msg.question,
         });
       } else if (msg.kind === "plan-task") {
         hookEvent = "TaskSnapshot";

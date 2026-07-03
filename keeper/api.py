@@ -398,6 +398,12 @@ from pathlib import Path
 # v102 (fn-1061 task .1) adds the durable ``dispatch_mint_gate`` producer table
 # (the one-logical-dispatch-one-row rate-limit gate); keeper-py never reads it, so
 # only the version whitelist gains 102.
+# v103 (fn-1075 task .2) adds the nullable ``jobs.kill_reason`` column; keeper-py
+# never reads it, so only the version whitelist gains 103.
+# v104 (fn-1083 task .2) adds the nullable ``epics.question`` column (the
+# epic-level parked-closer question); the fixed epics SELECT list below names
+# only ``epic_id, project_dir, tasks, jobs``, so keeper-py never reads the new
+# column and only the version whitelist gains 104.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -473,6 +479,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         101,
         102,
         103,
+        104,
     }
 )
 

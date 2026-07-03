@@ -1789,6 +1789,11 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     // branch) into a single-column 0/1 derived value served by the partial
     // index `idx_epics_default_visible`.
     "default_visible",
+    // Schema v104 (fn-1083 task .2): nullable TEXT carrying the epic-level
+    // parked-closer question. Declared AFTER `default_visible` in
+    // `CREATE_EPICS` so a fresh CREATE and a migrated `ALTER TABLE ADD
+    // COLUMN` (which always appends) produce the same trailing column order.
+    "question",
   ]);
 
   // Schema v11 rewind-and-redrain wipes the directly-inserted `old` jobs
@@ -2556,9 +2561,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // epics-shape change), fn-1061 task .1. v103 appends the nullable
   // `jobs.kill_reason` column (WHY keeper reaped a job — the producer arm that
   // minted the synthetic `Killed`; an additive ALTER, not an epics-shape
-  // change), fn-1075 task .2. The v62→v63 epics-shape migration this test
-  // exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(103);
+  // change), fn-1075 task .2. v104 appends the nullable `epics.question`
+  // column (the epic-level parked-closer question) — an additive ALTER (both
+  // in the migration AND the fresh `CREATE_EPICS` literal, placed after
+  // `default_visible` so column order stays fresh-vs-migrated identical); it
+  // widens the epics row shape but does not touch the v62→v63
+  // `default_visible`/`approval` rewrite this test exercises, fn-1083 task .2.
+  expect(SCHEMA_VERSION).toBe(104);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

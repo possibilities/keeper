@@ -1534,6 +1534,9 @@ function getEpic(epicId: string) {
     // 0 END` (fn-756 dropped the `approval` branch). `SELECT *` enumerates it
     // like any other column.
     default_visible: number;
+    // Schema v104 (fn-1083 task .2): nullable TEXT carrying the epic-level
+    // parked-closer question.
+    question: string | null;
   } | null;
 }
 
@@ -1639,6 +1642,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // fn-756 (v63) rewrote it to `status IS NOT NULL AND status='open'`;
     // status='open' → 1.
     default_visible: 1,
+    // Schema v104 (fn-1083 task .2): no `question` in the blob → folds to
+    // NULL (no parked closer question, the zero-event reading).
+    question: null,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);

@@ -3026,8 +3026,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // .2 (appending the nullable `jobs.kill_reason` column — WHY keeper reaped a job,
   // the producer arm that minted the synthetic `Killed`; an additive ALTER folded
   // on as an opaque string copy, NO cursor rewind: a historical Killed carries no
-  // `reason`, so a from-scratch re-fold leaves it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(103);
+  // `reason`, so a from-scratch re-fold leaves it NULL byte-identical). And to 104
+  // via fn-1083 task .2 (appending the nullable `epics.question` column — the
+  // epic-level parked-closer question folded from `EpicSnapshot.question`; an
+  // additive ALTER, NO cursor rewind: a historical EpicSnapshot carries no
+  // `question` key, so a from-scratch re-fold leaves it NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(104);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -3513,7 +3517,7 @@ test("effectiveBlockEscalationRepo: target_repo override, else project_dir, else
   expect(effectiveBlockEscalationRepo("", "")).toBe("");
 });
 
-test("buildBlockEscalationBody: carries epic/task/category/repo/reason + the resume directive", () => {
+test("buildBlockEscalationBody: pause-first, carries epic/task/category/repo/reason + resume directive, closes with play", () => {
   const body = buildBlockEscalationBody({
     epicId: "fn-9-foo",
     taskId: "fn-9-foo.2",
@@ -3526,11 +3530,19 @@ test("buildBlockEscalationBody: carries epic/task/category/repo/reason + the res
   expect(body).toContain("SPEC_UNCLEAR");
   expect(body).toContain("/Users/me/code/foo");
   expect(body).toContain("the acceptance is ambiguous");
+  // Opens pause-first (step 0) so the unblock does not cold-re-dispatch a fresh
+  // worker while the operator resumes the live one.
+  expect(body).toContain("keeper autopilot pause");
+  expect(body.indexOf("keeper autopilot pause")).toBeLessThan(
+    body.indexOf("keeper plan unblock fn-9-foo.2"),
+  );
   // Unblock the board, then PRIMARY bus-resume the still-live worker, with the
-  // cold-re-dispatch / manual-dispatch fallback for a dead worker session.
+  // manual-dispatch fallback for a dead worker session.
   expect(body).toContain("keeper plan unblock fn-9-foo.2");
   expect(body).toContain("keeper bus chat send work::fn-9-foo.2");
   expect(body).toContain("keeper dispatch work::fn-9-foo.2");
+  // Closes with the literal unstick command the operator runs when done.
+  expect(body).toContain("keeper autopilot play");
 });
 
 // ---- selectPendingBlockEscalations (the current-state working-set read) -----
@@ -4205,8 +4217,18 @@ test("buildMergeEscalationBody: parses source/base, derives the worktree path, c
   expect(body).toContain("BOTH");
   expect(body).toContain("state machine");
   expect(body).toContain("ping the human");
-  // The unstick command keyed on the epic's close.
+  // Opens pause-first (step 0) — the recover sweep races the manual merge while
+  // autopilot is unpaused — and the pause precedes the merge recipe.
+  expect(body).toContain("keeper autopilot pause");
+  expect(body.indexOf("keeper autopilot pause")).toBeLessThan(
+    body.indexOf(`git merge --no-ff ${source}`),
+  );
+  // The unstick block keyed on the epic's close: retry the close, then play.
   expect(body).toContain("keeper autopilot retry close::fn-9-foo");
+  expect(body).toContain("keeper autopilot play");
+  expect(body.indexOf("keeper autopilot retry close::fn-9-foo")).toBeLessThan(
+    body.indexOf("keeper autopilot play"),
+  );
   // The free-text reason rides as a body line.
   expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
 });
@@ -4221,6 +4243,9 @@ test("buildMergeEscalationBody: a parse-miss degrades to a human-actionable manu
   expect(body).toContain("close::fn-9-foo");
   expect(body).toContain("--no-ff");
   expect(body).toContain("ping the human");
+  // Pause-first + play still frame the degrade body.
+  expect(body).toContain("keeper autopilot pause");
+  expect(body).toContain("keeper autopilot play");
   // No source branch to interpolate, but still a manual recipe — and no throw.
   expect(body).toContain("keeper autopilot retry close::fn-9-foo");
 });
@@ -4233,6 +4258,8 @@ test("buildMergeEscalationBody: a null/empty repoDir degrades to the manual body
   });
   expect(body).toContain("close::fn-9-foo");
   expect(body).toContain("--no-ff");
+  expect(body).toContain("keeper autopilot pause");
+  expect(body).toContain("keeper autopilot play");
 });
 
 // ---- runMergeEscalationSweep (orchestration core, injected deps) ------------

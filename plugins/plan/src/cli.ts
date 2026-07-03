@@ -25,6 +25,7 @@ import { runEpicAddDeps } from "./verbs/epic_add_deps.ts";
 import { runEpicClose } from "./verbs/epic_close.ts";
 import { runEpicCreate } from "./verbs/epic_create.ts";
 import { runEpicAddDep, runEpicRmDep } from "./verbs/epic_dep_edit.ts";
+import { runEpicQuestion } from "./verbs/epic_question.ts";
 import { runEpicRm } from "./verbs/epic_rm.ts";
 import { runEpicSetBranch, runEpicSetTitle } from "./verbs/epic_set_plain.ts";
 import {
@@ -121,6 +122,11 @@ const COMMANDS: CommandSpec[] = [
   { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
   { name: "epic", shortHelp: "Manage epics.", implemented: true },
   { name: "epics", shortHelp: "List all epics.", implemented: true },
+  {
+    name: "epic-question",
+    shortHelp: "Set or clear an epic-level parked question (board-visible).",
+    implemented: true,
+  },
   {
     name: "find-task-commit",
     shortHelp: "Look up a task's source commits.",
@@ -816,6 +822,21 @@ function dispatch(parsed: ParsedArgs): number {
         format,
       });
       break;
+    case "epic-question": {
+      // Positional epic id, then either a positional question text or
+      // --clear. --project is value-taking, so it must be skipped when
+      // scanning for the id/question positionals.
+      const valueTaking = new Set(["--project"]);
+      const [epicId, question] = leafPositionals(rest, valueTaking);
+      runEpicQuestion({
+        epicId: epicId ?? "",
+        question: question ?? null,
+        clear: readFlag(rest, "--clear"),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    }
     case "done":
       // readPositional already skips --project / --summary / --evidence values.
       runDone({

@@ -39,6 +39,7 @@ import {
   buildEpicMessage,
   buildTaskMessage,
   classifyPlanPath,
+  coerceEpicQuestion,
   coerceRuntimeStatus,
   decidePlanResubscribe,
   desiredReflogRepos,
@@ -420,6 +421,29 @@ test("buildTaskMessage carries runtimeStatus passed in by the caller; defaults t
   expect(taskB?.runtimeStatus).toBe("in_progress");
 });
 
+test("coerceEpicQuestion: non-empty string passes through; missing/null/empty → null silently; wrong type → null with log (fn-1083.2)", () => {
+  const logs: unknown[] = [];
+  expect(
+    coerceEpicQuestion("why did commit X fail?", (bad) => logs.push(bad)),
+  ).toBe("why did commit X fail?");
+  // Missing / null / empty-string silently default to null — no onInvalid fire.
+  expect(coerceEpicQuestion(undefined, (bad) => logs.push(bad))).toBeNull();
+  expect(coerceEpicQuestion(null, (bad) => logs.push(bad))).toBeNull();
+  expect(coerceEpicQuestion("", (bad) => logs.push(bad))).toBeNull();
+  expect(logs).toEqual([]);
+  // A wrong-type value coerces to null AND fires onInvalid.
+  expect(coerceEpicQuestion(42, (bad) => logs.push(bad))).toBeNull();
+  expect(coerceEpicQuestion({ q: "x" }, (bad) => logs.push(bad))).toBeNull();
+  expect(logs).toEqual([42, { q: "x" }]);
+});
+
+test("buildEpicMessage carries question passed in by the caller; defaults to null when omitted (fn-1083.2)", () => {
+  const epicA = buildEpicMessage({ id: "fn-1-x" });
+  expect(epicA?.question).toBeNull();
+  const epicB = buildEpicMessage({ id: "fn-1-x" }, "ship or hold?");
+  expect(epicB?.question).toBe("ship or hold?");
+});
+
 test("epicNumberFromId / taskNumberFromId: parse + null on no match", () => {
   expect(epicNumberFromId("fn-558-keeper-plans")).toBe(558);
   expect(epicNumberFromId("fn-1-x")).toBe(1);
@@ -458,6 +482,8 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     dependsOnEpics: [],
     // Missing `last_validated_at` (schema v16) collapses to null via asString.
     lastValidatedAt: null,
+    // No `question` arg passed — defaults to null (no parked question).
+    question: null,
   });
   expect(buildEpicMessage({})).toBeNull();
 });
@@ -521,6 +547,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       status: "open",
       dependsOnEpics: [],
       lastValidatedAt: null,
+      question: null,
     },
   ]);
 
@@ -942,6 +969,7 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
     status: "open",
     dependsOnEpics: [],
     lastValidatedAt: "2026-05-24T00:00:00Z",
+    question: null,
   };
   expect(JSON.stringify(fromBuild)).toBe(JSON.stringify(fromSeed));
 
@@ -1480,6 +1508,97 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
   expect(
     (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
   ).toBe("todo");
+});
+
+test("scanRoot: primes epicQuestionCache from state/epics/ BEFORE the epics/ loop — first EpicSnapshot carries the on-disk question (fn-1083.2)", () => {
+  // Epic mirror of the task runtime-status boot-prime regression above: a
+  // pre-existing `.keeper/state/epics/<id>.state.json` must seed the
+  // question cache before the epic definition file is scanned, so the FIRST
+  // emitted EpicSnapshot already carries the parked question.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const plan = join(tmpDir, ".keeper");
+  mkdirSync(join(plan, "state", "epics"), { recursive: true });
+  writeFileSync(
+    join(plan, "state", "epics", "fn-1-x.state.json"),
+    JSON.stringify({ question: "does the evidence check out?" }),
+  );
+  writeEpic("fn-1-x", { title: "T", status: "open" });
+
+  scanRoot(tmpDir, scanner);
+
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  expect(epicMsgs.length).toBe(1);
+  expect((epicMsgs[0] as { question: string | null }).question).toBe(
+    "does the evidence check out?",
+  );
+});
+
+test("scanRoot: invalid question in a state file skips the cache prime (epic reads default null) (fn-1083.2)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const plan = join(tmpDir, ".keeper");
+  mkdirSync(join(plan, "state", "epics"), { recursive: true });
+  writeFileSync(
+    join(plan, "state", "epics", "fn-1-x.state.json"),
+    JSON.stringify({ question: 42 }),
+  );
+  writeEpic("fn-1-x", { title: "T", status: "open" });
+
+  scanRoot(tmpDir, scanner);
+
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  expect(epicMsgs.length).toBe(1);
+  expect((epicMsgs[0] as { question: string | null }).question).toBeNull();
+});
+
+test("epic-state onChange: setting then clearing the question re-emits an EpicSnapshot each time (fn-1083.2)", () => {
+  // Live-write flow (not the boot scan): epic def lands first, then its
+  // `.state.json` sidecar is written/deleted — mirrors `keeper plan
+  // epic-question <id> "…"` / `--clear`.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  const epicPath = writeEpic("fn-1-x", { title: "T", status: "open" });
+  scanner.onChange(epicPath);
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { question: string | null }).question).toBeNull();
+
+  const plan = join(tmpDir, ".keeper");
+  mkdirSync(join(plan, "state", "epics"), { recursive: true });
+  const statePath = join(plan, "state", "epics", "fn-1-x.state.json");
+  writeFileSync(statePath, JSON.stringify({ question: "ship or hold?" }));
+  scanner.onChange(statePath);
+  expect(emitted.length).toBe(2);
+  expect((emitted[1] as { id: string; question: string | null }).id).toBe(
+    "fn-1-x",
+  );
+  expect((emitted[1] as { question: string | null }).question).toBe(
+    "ship or hold?",
+  );
+
+  // An identical re-write is suppressed by the change-gate (cached value
+  // unchanged).
+  writeFileSync(statePath, JSON.stringify({ question: "ship or hold?" }));
+  scanner.onChange(statePath);
+  expect(emitted.length).toBe(2);
+
+  // Deleting the sidecar reverts the question to null and re-emits.
+  unlinkSync(statePath);
+  scanner.onDelete(statePath);
+  expect(emitted.length).toBe(3);
+  expect((emitted[2] as { question: string | null }).question).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -2118,6 +2237,7 @@ test("fn-759: boot-seed asymmetry — seeded lastEmitted + empty pathToId → un
     status: "open",
     dependsOnEpics: [],
     lastValidatedAt: null,
+    question: null,
   };
   scanner.seed("fn-3-demo", JSON.stringify(expectedMsg));
 

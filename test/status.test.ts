@@ -47,6 +47,7 @@ interface FixtureEpic {
   epic_id: string;
   status: string | null;
   tasks: FixtureTask[];
+  question?: string | null;
 }
 
 interface SnapOverrides {
@@ -161,6 +162,7 @@ describe("buildStatusEnvelope shape", () => {
     const epic = d.board.epics[0];
     expect(epic?.epic_id).toBe("fn-1-a");
     expect(epic?.status).toBe("open");
+    expect(epic?.question).toBeNull();
     expect(epic?.verdict).toBe("ready");
     expect(epic?.pill).toBe("[ready]");
     expect(epic?.tasks).toEqual([
@@ -187,6 +189,7 @@ describe("buildStatusEnvelope shape", () => {
       total: 0,
     });
     expect(d.needs_human.total).toBe(0);
+    expect(d.needs_human.parked_questions).toBe(0);
   });
 
   test("a verdict-map miss renders the inert [blocked:unknown] view", () => {
@@ -343,6 +346,39 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.needs_human.block_escalations).toBe(1);
     expect(d?.needs_human.total).toBe(3);
     expect(d?.jammed).toBe(true);
+  });
+
+  test("a parked epic question feeds needs-human and forces jammed at rest, even with no other signal (fn-1083.2)", () => {
+    const snap = makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [],
+          question: "does the evidence check out?",
+        },
+      ],
+      perEpic: {
+        "fn-1-a": { tag: "blocked", reason: { kind: "unknown" } },
+      },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.board.epics[0]?.question).toBe("does the evidence check out?");
+    expect(d?.needs_human.parked_questions).toBe(1);
+    expect(d?.needs_human.total).toBe(1);
+    expect(d?.jammed).toBe(true);
+    expect(d?.drained).toBe(false);
+  });
+
+  test("an epic with no parked question renders question:null and contributes zero to parked_questions", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "done", tasks: [] }],
+      perEpic: { "fn-1-a": { tag: "completed" } },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.board.epics[0]?.question).toBeNull();
+    expect(d?.needs_human.parked_questions).toBe(0);
+    expect(d?.drained).toBe(true);
   });
 
   test("finalize_non_ff is counted as a subset of stuck_dispatches, not double-added", () => {

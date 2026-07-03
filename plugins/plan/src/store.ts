@@ -329,6 +329,15 @@ export class LocalFileStateStore {
     atomicWriteJson(this.statePath(taskId), data);
   }
 
+  /** Write per-epic runtime state (gitignored sidecar) atomically with sorted
+   * keys — the epic mirror of {@link saveRuntime}. mkdir epics/, then
+   * atomic_write_json. The daemon plan-worker folds this overlay into the
+   * `epics` projection (the epic-level parked-question board surface). */
+  saveEpicRuntime(epicId: string, data: Record<string, unknown>): void {
+    mkdirSync(this.epicsDir, { recursive: true });
+    atomicWriteJson(this.epicStatePath(epicId), data);
+  }
+
   /** Hold an exclusive flock(2) on `<data-dir>/state/locks/<task_id>.lock` for
    * the duration of `fn`, then release. Mirrors lock_task: a real advisory
    * whole-file lock (LOCK_EX) that a Python fcntl peer also blocks on; the fd is
@@ -336,6 +345,26 @@ export class LocalFileStateStore {
   withTaskLock<T>(taskId: string, fn: () => T): T {
     mkdirSync(this.locksDir, { recursive: true });
     const lockPath = this.lockPath(taskId);
+    const fd = openSync(lockPath, "w");
+    try {
+      flockOrThrow(fd, LOCK_EX);
+      return fn();
+    } finally {
+      try {
+        flockOrThrow(fd, LOCK_UN);
+      } finally {
+        closeSync(fd);
+      }
+    }
+  }
+
+  /** Hold an exclusive flock(2) on `<data-dir>/state/locks/<epic_id>.lock` for
+   * the duration of `fn`, then release — the epic mirror of {@link withTaskLock}.
+   * Epic ids (`fn-N-slug`) and task ids (`fn-N-slug.M`) never collide, so the
+   * shared locks dir is safe. */
+  withEpicLock<T>(epicId: string, fn: () => T): T {
+    mkdirSync(this.locksDir, { recursive: true });
+    const lockPath = this.lockPath(epicId);
     const fd = openSync(lockPath, "w");
     try {
       flockOrThrow(fd, LOCK_EX);
