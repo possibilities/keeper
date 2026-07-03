@@ -35,5 +35,5 @@ The check script IS the deliverable proof; keep it re-runnable and side-effect-f
 - [ ] Docs updated (optional-plugin story + opt-in recipe)
 
 ## Done summary
-
+Added scripts/clean-machine-check.ts proving the fresh-machine launch path is arthack-free (keeper-only installer default, vendored-corpus renders, worker permission posture, gate-ON worker isolation); documented arthack as an optional opt-in plugin in README + the composition map; flipped worker_plugin_isolation ON for this machine (keeper-owned ~/.config/keeper/plugins.yaml replacing the arthack stow symlink) and verified the next real worker launch resolves isolated.
 ## Evidence
