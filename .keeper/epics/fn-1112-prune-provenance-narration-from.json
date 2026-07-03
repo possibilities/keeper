@@ -7,7 +7,7 @@
     "fn-1107-autoclose-done-agent-windows"
   ],
   "id": "fn-1112-prune-provenance-narration-from",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-03T23:27:34.417000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T23:27:33.612000Z"
+  "updated_at": "2026-07-03T23:27:34.417000Z"
 }
