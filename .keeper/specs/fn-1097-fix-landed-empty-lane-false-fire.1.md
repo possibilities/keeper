@@ -43,5 +43,5 @@ Note the file needs grep -a (high-byte chars).
 - [ ] bun test green
 
 ## Done summary
-
+Gated the lane_merged present-arm on the ok epic's tasks being administratively done (worker_phase), so a started-but-unworked epic's empty zero-commit lane no longer false-fires landed; merged-awaiting-teardown, merged-and-torn-down, and never-started shapes preserved, and clustered worktree-group verdicts keep their lane-merge contract. Added fn-1097 empty-lane axis tests.
 ## Evidence
