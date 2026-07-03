@@ -55,6 +55,7 @@ import {
   USAGE,
   VERSION,
 } from "./dispatch";
+import { HARNESS_DESCRIPTORS } from "./harness";
 import { READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
@@ -350,23 +351,11 @@ function printVerbose(
 }
 
 function displayAgent(agent: AgentKind): string {
-  if (agent === "claude") {
-    return "Claude";
-  }
-  if (agent === "codex") {
-    return "Codex";
-  }
-  return "Pi";
+  return HARNESS_DESCRIPTORS[agent].displayName;
 }
 
 function agentProfileEnvName(agent: AgentKind): string {
-  if (agent === "claude") {
-    return "KEEPER_AGENT_CLAUDE_PROFILE";
-  }
-  if (agent === "codex") {
-    return "KEEPER_AGENT_CODEX_PROFILE";
-  }
-  return "KEEPER_AGENT_PI_PROFILE";
+  return HARNESS_DESCRIPTORS[agent].profileEnvVar;
 }
 
 function findPassthroughForAgent(
@@ -1536,12 +1525,14 @@ export async function main(deps: MainDeps): Promise<never> {
     agent = dispatch.agent;
     argv = dispatch.rest;
   }
-  const bin =
-    agent === "claude"
-      ? deps.claudeBin
-      : agent === "codex"
-        ? deps.codexBin
-        : deps.piBin;
+  // The injected resolved bins, keyed by harness — the descriptor-lookup form of
+  // the old `agent === "claude" ? … : …` chain (byte-identical selection).
+  const bins: Record<AgentKind, string> = {
+    claude: deps.claudeBin,
+    codex: deps.codexBin,
+    pi: deps.piBin,
+  };
+  const bin = bins[agent];
   const agentLabel = displayAgent(agent);
 
   // Wrapper-owned help short-circuits before the tmux pre-pass, passthrough

@@ -12,12 +12,14 @@
  * (panel legs, the future subagent wrapper).
  *
  * DEP-GRAPH DISCIPLINE: this module imports TYPES ONLY (from `./dispatch` /
- * `./pair-subcommands`); every effect is a passed-in seam. It MUST NOT pull
- * `src/db.ts` / `bun:sqlite` — `cli/agent.ts`'s reach onto the cold-start
- * `keeper plan` path stays db-free (pinned by the hygiene import-scan test).
+ * `./pair-subcommands`) plus the dep-free harness registry (`./harness`, pure
+ * data); every effect is a passed-in seam. It MUST NOT pull `src/db.ts` /
+ * `bun:sqlite` — `cli/agent.ts`'s reach onto the cold-start `keeper plan` path
+ * stays db-free (pinned by the hygiene import-scan test).
  */
 
 import type { AgentKind } from "./dispatch";
+import { HARNESS_NAME_SET } from "./harness";
 import type {
   ResolvedHandle,
   ShowLastMessageResult,
@@ -118,11 +120,9 @@ export function buildRunCaptureEnvelope(
   return { envelope, exitCode: runCaptureExitCode(fields.outcome) };
 }
 
-const RUN_CAPTURE_AGENTS: ReadonlySet<string> = new Set([
-  "claude",
-  "codex",
-  "pi",
-]);
+/** The harnesses `agent run` accepts — derived from the harness registry so the
+ *  name set lives in one place (no near-copy to drift). */
+const RUN_CAPTURE_AGENTS: ReadonlySet<string> = HARNESS_NAME_SET;
 
 /** Discriminated result of {@link parseRunArgs}. */
 export type ParseRunArgsResult =

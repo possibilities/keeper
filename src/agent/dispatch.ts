@@ -12,8 +12,11 @@
  */
 
 import pkg from "../../package.json" with { type: "json" };
+import { type HarnessName, isHarnessName } from "./harness";
 
-export type AgentKind = "claude" | "codex" | "pi";
+/** A harness `keeper agent` dispatches to — derived from the harness registry so
+ *  the name set lives in exactly one place (`src/agent/harness.ts`). */
+export type AgentKind = HarnessName;
 
 /** The composable post-launch verbs that read a detached run's transcript. */
 export type SubcommandKind = "wait-for-stop" | "show-last-message";
@@ -291,7 +294,7 @@ export function splitSubcommand(argv: string[]): Dispatch {
   if (head === undefined) {
     return { kind: "usage" };
   }
-  if (head === "claude" || head === "codex" || head === "pi") {
+  if (isHarnessName(head)) {
     return { kind: "run", agent: head, rest: argv.slice(1) };
   }
   if (head === "presets") {

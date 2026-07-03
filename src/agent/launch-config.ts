@@ -15,22 +15,20 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { HARNESS_NAME_SET, type HarnessName } from "./harness";
 
 // ---------------------------------------------------------------------------
 // CLIs, roles, read-only directive
 // ---------------------------------------------------------------------------
 
-/** The partner CLIs `keeper agent` can fan out to — the full agent-kind set. pi
- *  launches read-only and read-write like claude/codex; its read-only posture is
- *  the prompt directive only (prompting, not enforcement — pi has no native
- *  sandbox of its own). */
-export type AgentCli = "claude" | "codex" | "pi";
+/** The partner CLIs `keeper agent` can fan out to — the full agent-kind set,
+ *  derived from the harness registry (`src/agent/harness.ts`) so the name set
+ *  lives in one place. pi launches read-only and read-write like claude/codex;
+ *  its read-only posture is the prompt directive only (prompting, not enforcement
+ *  — pi has no native sandbox of its own). */
+export type AgentCli = HarnessName;
 
-export const AGENT_CLIS: ReadonlySet<string> = new Set<AgentCli>([
-  "claude",
-  "codex",
-  "pi",
-]);
+export const AGENT_CLIS: ReadonlySet<string> = HARNESS_NAME_SET;
 
 /** The role prompts, keyed by `--role`. Each maps to an in-repo asset under
  *  `src/agent/prompts/<role>.txt`. An unknown role fails loud at the CLI. */
@@ -136,6 +134,19 @@ export interface AgentLaunchOpts {
   name?: string;
 }
 
+/** Per-harness native-flag builder table — the descriptor-lookup form of the old
+ *  `cli === "claude" ? … : …` chain. Byte-identical: each entry is the harness's
+ *  existing pure builder. (The builders are hoisted function declarations, so the
+ *  table resolves them regardless of textual order.) */
+const NATIVE_ARGS_BUILDERS: Record<
+  AgentCli,
+  (opts: AgentLaunchOpts) => string[]
+> = {
+  claude: nativeClaudeArgs,
+  codex: nativeCodexArgs,
+  pi: nativePiArgs,
+};
+
 /**
  * Build the detached `keeper agent` launch argv for a partner. Shape:
  *
@@ -188,12 +199,7 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   if (opts.name !== undefined && opts.name !== "") {
     wrapperFlags.push("--x-tmux-window-name", opts.name);
   }
-  const native =
-    opts.cli === "claude"
-      ? nativeClaudeArgs(opts)
-      : opts.cli === "codex"
-        ? nativeCodexArgs(opts)
-        : nativePiArgs(opts);
+  const native = NATIVE_ARGS_BUILDERS[opts.cli](opts);
   return [
     ...opts.launcherArgvPrefix,
     opts.cli,

@@ -25,6 +25,12 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  HARNESS_DESCRIPTORS,
+  HARNESS_NAME_SET,
+  type HarnessName,
+  isCapturableHarness,
+} from "./harness";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -255,8 +261,9 @@ function parseWorkerPluginIsolation(
   );
 }
 
-/** A harness the launcher can drive. */
-export type PresetHarness = "claude" | "codex" | "pi";
+/** A harness the launcher can drive — derived from the harness registry
+ *  (`src/agent/harness.ts`) so the name set lives in exactly one place. */
+export type PresetHarness = HarnessName;
 
 /**
  * A named launch-config triple. `model`/`effort`/`thinking` are partial: a
@@ -297,18 +304,15 @@ export interface PresetCatalog {
  * list of catalog preset names) plus an optional `default` naming the panel a
  * bare `keeper agent panel start` (no `--panel`) assembles. Resolved against a
  * {@link PresetCatalog} — every panel member must name a catalog preset whose
- * harness is panel-launchable (claude|codex; pi is rejected at load).
+ * harness is panel-eligible (its descriptor is `capturable`; claude/codex/pi all
+ * qualify, a future non-capturable harness is rejected at load).
  */
 export interface PanelSelections {
   panels: Record<string, string[]>;
   default: string | null;
 }
 
-const PRESET_HARNESSES: ReadonlySet<string> = new Set([
-  "claude",
-  "codex",
-  "pi",
-]);
+const PRESET_HARNESSES: ReadonlySet<string> = HARNESS_NAME_SET;
 
 /**
  * Names a preset / panel may NOT take — they would collide with a launcher
@@ -387,12 +391,15 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
       `Preset '${name}' cannot set both effort and thinking in ${configPath}`,
     );
   }
-  if (thinking !== null && harness !== "pi") {
+  // The second-reasoning-axis gate reads the descriptor's `secondAxis` (never a
+  // harness-name literal): a preset may set only the axis its harness exposes.
+  const descriptor = HARNESS_DESCRIPTORS[harness as PresetHarness];
+  if (thinking !== null && descriptor.secondAxis !== "thinking") {
     throw new ConfigError(
       `Preset '${name}' thinking is pi-only, not ${harness} in ${configPath}`,
     );
   }
-  if (effort !== null && harness === "pi") {
+  if (effort !== null && descriptor.secondAxis !== "effort") {
     throw new ConfigError(
       `Preset '${name}' effort is claude/codex-only, not pi in ${configPath}`,
     );
@@ -509,7 +516,8 @@ function parseHarnessDefault(
  * Read the panel selections from `panel.yaml`, resolved against an already-parsed
  * {@link PresetCatalog}. REQUIRED + validated: a missing file is fail-LOUD
  * (ConfigError). Each panel member must name a catalog preset whose harness is
- * panel-launchable (claude|codex — pi is rejected AT LOAD). The optional top-level
+ * panel-eligible — its descriptor is `capturable` (claude/codex/pi all qualify; a
+ * future non-capturable harness is rejected AT LOAD). The optional top-level
  * `default` key (a structural key, exempt from `validatePresetName` though
  * `default` is a reserved preset name) must name a defined panel. Fail-loud on
  * malformed YAML, an unknown top-level key, an empty panel list, or any of the
@@ -551,9 +559,13 @@ export function loadPanelSelections(
           `Panel '${name}' references undefined preset '${memberName}' in ${configPath}`,
         );
       }
-      if (preset.harness !== "claude" && preset.harness !== "codex") {
+      // Panel eligibility is a descriptor CAPABILITY (`capturable`), never a
+      // harness-name allowlist: a member's final message must be capturable for a
+      // panel leg to read its verdict. pi is capturable, so a pi member is valid;
+      // a future non-capturable harness (hermes before M2) is rejected here.
+      if (!isCapturableHarness(preset.harness)) {
         throw new ConfigError(
-          `Panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not panel-launchable (claude|codex only) in ${configPath}`,
+          `Panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not panel-eligible (its final message is not capturable) in ${configPath}`,
         );
       }
       out.push(memberName);
