@@ -17,5 +17,5 @@ inheriting the scanned plugin set with no failing test.
 - [ ] The assertion fails if the flag observation at the seam regresses (e.g. flag no longer in `remainingArgs` at that point).
 
 ## Done summary
-
+Added an end-to-end test driving the real main() arg vector through the worker plugin-isolation seam: a worker argv (knob ON + --dangerously-skip-permissions) strips the scanned plugin set while an interactive argv retains it. Red-capable — regresses if the seam stops observing the flag in remainingArgs.
 ## Evidence
