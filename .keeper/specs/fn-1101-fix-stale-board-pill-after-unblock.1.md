@@ -34,5 +34,5 @@ resubscribe). Keep the fix on the serve/producer side — never a TUI-side poll.
 - [ ] bun test green
 
 ## Done summary
-
+Track the raw blocked runtime-overlay in the coarse keeper watch board so a manual block/unblock is surfaced as a verdict-change kind:runtime-status, even when the readiness verdict is stable (the dropped-delta the stale [rt:blocked] pill exposed). Added pure-tier red→green regression tests.
 ## Evidence

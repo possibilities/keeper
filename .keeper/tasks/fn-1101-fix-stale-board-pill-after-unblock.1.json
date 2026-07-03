@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Repro and fix missed unblock delta",
-  "updated_at": "2026-07-03T19:05:51.832000Z"
+  "updated_at": "2026-07-03T19:50:02.949000Z",
+  "worker_done_at": "2026-07-03T19:50:02.949000Z"
 }
