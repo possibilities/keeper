@@ -34,10 +34,13 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import type { RefoldProgressPoller } from "../src/refold-progress";
 import {
   armViewerExitTriggers,
   createViewShell,
+  DEFAULT_SNAPSHOT_EMPTY_LINE,
+  snapshotBodyLines,
   type ViewerExitProc,
   type ViewRender,
   type ViewShell,
@@ -823,6 +826,74 @@ test("snapshot: empty-but-healthy projection still emits a frame and exits 0", (
   const trailer = parseSnapshotTrailer(h.stdout.join(""));
   expect(trailer.status).toBe("ok");
   expect(trailer.frame).toBe(1);
+});
+
+// snapshotBodyLines — the honest-empty normalizer. A zero-line render becomes
+// the single stand-in line so a snapshot frame is never bare separators; a
+// populated render passes through untouched.
+test("snapshotBodyLines — zero lines becomes the honest-empty line", () => {
+  expect(snapshotBodyLines([], "idle — nothing here")).toEqual([
+    "idle — nothing here",
+  ]);
+});
+
+test("snapshotBodyLines — a populated render passes through untouched", () => {
+  const rows = ["--- current ---", "work::fn-1.2"];
+  expect(snapshotBodyLines(rows, "idle — nothing here")).toEqual(rows);
+});
+
+test("snapshot: an empty render writes a real frame (honest-empty line), never bare separators", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+    snapshotEmptyLine: "idle — no rows",
+  });
+  view.emitLifecycle("connected", {});
+  // Healthy daemon, zero body lines (idle projection) — the first ready emit.
+  view.emit({ body: [] });
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+
+  // stdout frame carries the honest-empty line (not an empty frame).
+  const joined = h.stdout.join("");
+  expect(joined).toContain("idle — no rows");
+  const trailer = parseSnapshotTrailer(joined);
+  expect(trailer.status).toBe("ok");
+  expect(trailer.frame).toBe(1);
+
+  // The sidecar frame file is `---` + the honest-empty line — never a bare
+  // `---` separator alone.
+  const frameSidecar = `/tmp/keeper-${sidecarBase}.${process.pid}.frame.1.txt`;
+  const frameText = readFileSync(frameSidecar, "utf8");
+  expect(frameText).toBe("---\nidle — no rows\n");
+  expect(frameText.trim()).not.toBe("---");
+});
+
+test("snapshot: an empty render with no custom line falls back to the default honest-empty line", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  view.emitLifecycle("connected", {});
+  view.emit({ body: [] });
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.stdout.join("")).toContain(DEFAULT_SNAPSHOT_EMPTY_LINE);
 });
 
 test("snapshot: timeout with 0 streams reported → frame:null on stdout, diagnostic on stderr, exit 1", () => {
