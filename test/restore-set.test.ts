@@ -6,8 +6,8 @@
  *    `window_gone_server_alive` excluded.
  *  - filters: backend coords, autopilot workers, already-live UUID dedup, idle
  *    cutoff with a surfaced excluded count.
- *  - order by `window_index` (nulls to tail); resume target = latest title
- *    (the label carries the same name).
+ *  - order by `window_index` (nulls to tail); resume target = session UUID
+ *    (the label carries the latest title).
  *  - the recorded 2026-06-16 incident burst cohort as a regression fixture.
  *
  * Pure module — fixture DB via `freshDbFile`, no subprocess, no daemon.
@@ -23,12 +23,15 @@ import {
   BURST_MIN_SIZE,
   burstEventIds,
   DEFAULT_IDLE_CUTOFF_SECS,
-  DYING_GENERATION_SCAN_LIMIT,
+  DEGENERATE_MAX_SPAN_SECS,
   deriveCurrentSet,
   deriveLastGenerationSet,
   deriveLastGenerationSetFromTopology,
   deriveRestoreSet,
+  GENERATION_SUMMARY_SQL,
   isCrashLike,
+  RECENT_GENERATION_BOUND,
+  summarizeTopologyGenerations,
 } from "../src/restore-set";
 import type { Event } from "../src/types";
 import { freshDbFile } from "./helpers/template-db";
@@ -151,20 +154,22 @@ interface SeedTopologyPane {
  * `{generation_id, panes}` — mirrors {@link seedBackendExecStart}'s explicit-id
  * shape and the daemon producer's column mapping. Each pane carries the OPTIONAL
  * producer-stamped `job_id`; omit it to model a pane keeper never launched (or
- * whose job row was not yet written at post time).
+ * whose job row was not yet written at post time). `ts` defaults to `NOW - 100`;
+ * pass it to give a generation a ts-span (the degeneracy-filter input).
  */
 function seedTmuxTopologySnapshot(
   db: Database,
   id: number,
   generationId: string,
   panes: SeedTopologyPane[],
+  ts: number = NOW - 100,
 ): void {
   db.run(
     `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
        VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
     [
       id,
-      NOW - 100,
+      ts,
       JSON.stringify({
         generation_id: generationId,
         panes: panes.map((p) => ({
@@ -177,6 +182,20 @@ function seedTmuxTopologySnapshot(
     ],
   );
 }
+
+/**
+ * A pane that resolves to NO job (unowned — no payload `job_id`, no projection
+ * match on `%pad`). Padding a single-pane snapshot with it lifts the
+ * generation's observed pane count above 1 so it clears the degenerate
+ * (`<=1`-pane AND short-span skeleton) filter WITHOUT adding a restorable
+ * candidate (it is dropped like any unowned pane). Models the realistic "a plain
+ * shell pane keeper never launched" case.
+ */
+const PAD_PANE: SeedTopologyPane = {
+  pane_id: "%pad",
+  session_name: "work",
+  window_index: 98,
+};
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -569,7 +588,7 @@ test("deriveRestoreSet: label = latest title, falls back to job_id", () => {
   expect(byId.get("untitled-uuid")?.label).toBe("untitled-uuid");
 });
 
-test("deriveRestoreSet: resume_target is the latest name (resume by the current title, not the UUID)", () => {
+test("deriveRestoreSet: resume_target is the session UUID (exact resume), label carries the latest name", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   seedJob(kdb.db, {
     job_id: uuid,
@@ -577,10 +596,10 @@ test("deriveRestoreSet: resume_target is the latest name (resume by the current 
     title: "renamed-since-launch",
   });
   const res = derive();
-  // Resume by the LATEST name keeper knows (the current title), read live from
-  // the jobs projection — so a session renamed since launch resumes to its
-  // current name. The label carries the same name.
-  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
+  // Resume by the immutable session UUID so `claude --resume <uuid>` re-attaches
+  // to the EXACT session; the label carries the latest name (read live from the
+  // jobs projection) for the human-facing render.
+  expect(res.candidates[0]?.resume_target).toBe(uuid);
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
 });
 
@@ -621,12 +640,14 @@ test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by w
 
   const cur = deriveCurrentSet(kdb.db);
   expect(cur.map((c) => c.job_id)).toEqual(["w1", "w2"]);
-  // Resume target is the LATEST name (the title), never the UUID.
-  expect(cur[0].resume_target).toBe("first");
-  expect(cur[1].resume_target).toBe("second");
+  // Resume target is the session UUID (job_id); the label keeps the latest name.
+  expect(cur[0].resume_target).toBe("w1");
+  expect(cur[1].resume_target).toBe("w2");
+  expect(cur[0].label).toBe("first");
+  expect(cur[1].label).toBe("second");
 });
 
-test("deriveCurrentSet: a never-named live session falls back to its job_id", () => {
+test("deriveCurrentSet: resume_target is always the job_id; a never-named session's label falls back to it too", () => {
   seedJob(kdb.db, {
     job_id: "unnamed-uuid",
     state: "working",
@@ -635,6 +656,8 @@ test("deriveCurrentSet: a never-named live session falls back to its job_id", ()
   });
   const cur = deriveCurrentSet(kdb.db);
   expect(cur).toHaveLength(1);
+  // resume_target is the UUID unconditionally; with no title the label falls back
+  // to the same job_id.
   expect(cur[0].resume_target).toBe("unnamed-uuid");
   expect(cur[0].label).toBe("unnamed-uuid");
 });
@@ -903,7 +926,7 @@ test("deriveLastGenerationSet: a single server_gone with no boundary keeps the m
   expect(res.candidates.map((c) => c.job_id)).toEqual(["lone-crash"]);
 });
 
-test("deriveLastGenerationSet: reuses latest-name resume_target + idle counting", () => {
+test("deriveLastGenerationSet: resume_target is the session UUID, label the latest name + idle counting", () => {
   seedBackendExecStart(kdb.db, 100);
   seedJob(kdb.db, {
     job_id: "uuid-x",
@@ -923,7 +946,7 @@ test("deriveLastGenerationSet: reuses latest-name resume_target + idle counting"
   });
   const res = deriveLastGen();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["uuid-x"]);
-  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
+  expect(res.candidates[0]?.resume_target).toBe("uuid-x");
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
   expect(res.excludedIdleCount).toBe(1);
 });
@@ -984,7 +1007,12 @@ test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot p
   const res = deriveTopo("gen-now");
   // Ordered by window_index ascending (beta=0 before alpha=1).
   expect(res.candidates.map((c) => c.job_id)).toEqual(["agent-b", "agent-a"]);
-  expect(res.candidates.map((c) => c.resume_target)).toEqual(["beta", "alpha"]);
+  // resume_target is the session UUID; the title rides the display label.
+  expect(res.candidates.map((c) => c.resume_target)).toEqual([
+    "agent-b",
+    "agent-a",
+  ]);
+  expect(res.candidates.map((c) => c.label)).toEqual(["beta", "alpha"]);
   expect(res.candidates[0]?.backend_exec_session_id).toBe("work");
   expect(res.fallbackNote).toBeUndefined();
 });
@@ -1003,10 +1031,12 @@ test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback whe
   });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
     { pane_id: "%7", session_name: "work", window_index: 0 }, // no job_id
+    PAD_PANE, // >1 pane so the generation clears the degenerate skeleton filter
   ]);
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["join-resolved"]);
-  expect(res.candidates[0]?.resume_target).toBe("joined");
+  expect(res.candidates[0]?.resume_target).toBe("join-resolved");
+  expect(res.candidates[0]?.label).toBe("joined");
   expect(res.fallbackNote).toBeUndefined();
 });
 
@@ -1037,55 +1067,91 @@ test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded
   // The dying generation's snapshot omits job_id, forcing the projection join.
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
     { pane_id: "%3", session_name: "work", window_index: 0 }, // no job_id
+    PAD_PANE, // >1 pane so the generation clears the degenerate skeleton filter
   ]);
   const res = deriveTopo("gen-now");
   // Only the dying generation's job resolves; the recycled-pane row is never hit.
   expect(res.candidates.map((c) => c.job_id)).toEqual(["right-gen"]);
-  expect(res.candidates[0]?.resume_target).toBe("dying-occupant");
+  expect(res.candidates[0]?.resume_target).toBe("right-gen");
+  expect(res.candidates[0]?.label).toBe("dying-occupant");
   expect(res.fallbackNote).toBeUndefined();
 });
 
-test("deriveLastGenerationSetFromTopology: DYING_GENERATION_SCAN_LIMIT + 1 G_now snapshots ahead of the dying generation ⇒ labeled fallback", () => {
-  // The dying-generation scan is a DESC-head LIMIT heuristic, not a proven
-  // invariant: stack more than DYING_GENERATION_SCAN_LIMIT G_now snapshots
-  // ahead of the dying generation and the window fills before reaching it, so
-  // selectDyingGenerationSnapshot returns null. The deriver must then demote to
-  // the labeled fallbackNote (degraded but visible), never return a wrong/empty
-  // candidate set silently.
-  seedJob(kdb.db, {
-    job_id: "buried-dying",
-    state: "killed",
-    title: "buried",
-    window_index: 0,
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_generation_id: "gen-dead",
-  });
-  // The dying-generation snapshot sits at the LOWEST rowid; DYING_GENERATION_SCAN_LIMIT + 1
-  // newer G_now snapshots bury it past the DESC-head window.
-  seedTmuxTopologySnapshot(kdb.db, 1, "gen-dead", [
-    {
-      pane_id: "%1",
+test("deriveLastGenerationSetFromTopology (bound): a richer generation beyond the newest K is never considered", () => {
+  // The selection is bounded to the newest RECENT_GENERATION_BOUND dead
+  // generations. The OLDEST generation (lowest rowid, one past the bound) is
+  // seeded RICHEST — so a wrong "richest overall" pick would surface its agents.
+  // The bounded walk never considers it; a newer in-bound generation wins.
+  const richPanes: SeedTopologyPane[] = [];
+  for (let i = 0; i < 3; i++) {
+    const jid = `rich-${i}`;
+    seedJob(kdb.db, { job_id: jid, state: "killed", title: jid });
+    richPanes.push({
+      pane_id: `%r${i}`,
       session_name: "work",
-      window_index: 0,
-      job_id: "buried-dying",
-    },
-  ]);
-  for (let i = 0; i <= DYING_GENERATION_SCAN_LIMIT; i++) {
-    seedTmuxTopologySnapshot(kdb.db, 1000 + i, "gen-now", [
-      {
-        pane_id: "%2",
-        session_name: "work",
-        window_index: 0,
-        job_id: "live-now",
-      },
+      window_index: i,
+      job_id: jid,
+    });
+  }
+  seedTmuxTopologySnapshot(kdb.db, 100, "gen-rich-old", richPanes);
+  // RECENT_GENERATION_BOUND newer generations, each 1 restorable (+ PAD_PANE so
+  // none is a degenerate skeleton). Ascending rowids ⇒ the last is newest.
+  for (let g = 0; g < RECENT_GENERATION_BOUND; g++) {
+    const jid = `near-${g}`;
+    seedJob(kdb.db, { job_id: jid, state: "killed", title: jid });
+    seedTmuxTopologySnapshot(kdb.db, 200 + g, `gen-near-${g}`, [
+      { pane_id: `%n${g}`, session_name: "work", window_index: 0, job_id: jid },
+      PAD_PANE,
     ]);
   }
   const res = deriveTopo("gen-now");
-  // The dying generation never enters the scan window, so the deriver demotes to
-  // the retrospective fallback and labels it.
-  expect(res.fallbackNote).toBeDefined();
-  expect(res.candidates.map((c) => c.job_id)).not.toContain("buried-dying");
+  // Pick = the newest in-bound generation (recency tiebreak among equal
+  // restorable=1); the rich-but-old generation is beyond K and excluded.
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    `near-${RECENT_GENERATION_BOUND - 1}`,
+  ]);
+  const ids = new Set(res.candidates.map((c) => c.job_id));
+  for (let i = 0; i < 3; i++) {
+    expect(ids.has(`rich-${i}`)).toBe(false);
+  }
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (bound): a rich dead generation past the idle cutoff is never considered", () => {
+  // gen-stale is richer AND has the higher rowid (newer by recency), but its
+  // newest snapshot ts is older than the idle cutoff — so it is excluded by ts,
+  // not recency, and the in-cutoff gen-fresh is the pick.
+  seedJob(kdb.db, { job_id: "stale-a", state: "killed", title: "stale-a" });
+  seedJob(kdb.db, { job_id: "stale-b", state: "killed", title: "stale-b" });
+  const stale = NOW - DEFAULT_IDLE_CUTOFF_SECS - 3600;
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-stale",
+    [
+      {
+        pane_id: "%1",
+        session_name: "work",
+        window_index: 0,
+        job_id: "stale-a",
+      },
+      {
+        pane_id: "%2",
+        session_name: "work",
+        window_index: 1,
+        job_id: "stale-b",
+      },
+    ],
+    stale,
+  );
+  seedJob(kdb.db, { job_id: "fresh", state: "killed", title: "fresh" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-fresh", [
+    { pane_id: "%3", session_name: "work", window_index: 0, job_id: "fresh" },
+    PAD_PANE,
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["fresh"]);
+  expect(res.fallbackNote).toBeUndefined();
 });
 
 test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot overall is the dying generation", () => {
@@ -1095,19 +1161,22 @@ test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot
   seedJob(kdb.db, { job_id: "late", state: "killed", title: "late-a" });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-early", [
     { pane_id: "%1", session_name: "work", window_index: 0, job_id: "early" },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
   seedTmuxTopologySnapshot(kdb.db, 600, "gen-late", [
     { pane_id: "%2", session_name: "work", window_index: 0, job_id: "late" },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
   const res = deriveTopo(null);
   expect(res.candidates.map((c) => c.job_id)).toEqual(["late"]);
   expect(res.fallbackNote).toBeUndefined();
 });
 
-test("deriveLastGenerationSetFromTopology: multiple dead generations ⇒ the SINGLE newest non-G_now generation only", () => {
+test("deriveLastGenerationSetFromTopology: equally-rich dead generations ⇒ the SINGLE newest is picked (only its candidates)", () => {
   // gen-now is live; gen-dead-2 (id 600) is the most-recent crash; gen-dead-1
-  // (id 500) is an older crash (manual escalation, NOT swept in). G_now's own
-  // snapshot (id 700) is excluded.
+  // (id 500) an older crash. Both are equally rich (1 restorable), so the auto-
+  // pick is the newest by recency and ONLY its candidates are returned (older
+  // generations are not merged in). G_now's own snapshot (id 700) is excluded.
   seedJob(kdb.db, { job_id: "older-crash", state: "killed", title: "old" });
   seedJob(kdb.db, { job_id: "recent-crash", state: "killed", title: "recent" });
   seedJob(kdb.db, { job_id: "live-now", state: "working", title: "now" });
@@ -1118,6 +1187,7 @@ test("deriveLastGenerationSetFromTopology: multiple dead generations ⇒ the SIN
       window_index: 0,
       job_id: "older-crash",
     },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
   seedTmuxTopologySnapshot(kdb.db, 600, "gen-dead-2", [
     {
@@ -1126,6 +1196,7 @@ test("deriveLastGenerationSetFromTopology: multiple dead generations ⇒ the SIN
       window_index: 0,
       job_id: "recent-crash",
     },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
   seedTmuxTopologySnapshot(kdb.db, 700, "gen-now", [
     {
@@ -1137,10 +1208,11 @@ test("deriveLastGenerationSetFromTopology: multiple dead generations ⇒ the SIN
   ]);
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["recent-crash"]);
+  expect(res.ambiguous).toBeUndefined(); // equal richness, newest wins → unambiguous
   expect(res.fallbackNote).toBeUndefined();
 });
 
-test("deriveLastGenerationSetFromTopology: a malformed newest snapshot is SKIPPED to the next-newest != G_now", () => {
+test("deriveLastGenerationSetFromTopology: a malformed snapshot is excluded from the walk, never derailing selection", () => {
   seedJob(kdb.db, { job_id: "good-agent", state: "killed", title: "good" });
   // A good dying-gen snapshot at id 500.
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
@@ -1150,9 +1222,12 @@ test("deriveLastGenerationSetFromTopology: a malformed newest snapshot is SKIPPE
       window_index: 0,
       job_id: "good-agent",
     },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
-  // A malformed newest TmuxTopologySnapshot at id 600 (un-decodable data) — the
-  // scan must skip it, NOT drop straight to the fallback.
+  // A malformed newest TmuxTopologySnapshot at id 600 (un-decodable data): the
+  // generated column's `json_valid` guard leaves its `tmux_generation_id` NULL,
+  // so the summary walk (WHERE tmux_generation_id IS NOT NULL) never groups it
+  // into a generation — it cannot derail the good generation's selection.
   kdb.db.run(
     `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
        VALUES (?, ?, 'tmux-topology-snapshot', 'TmuxTopologySnapshot', 'tmux_topology_snapshot', ?)`,
@@ -1307,6 +1382,7 @@ test("deriveLastGenerationSetFromTopology: works against a read-only connection 
   seedJob(kdb.db, { job_id: "ro-topo", state: "killed", title: "ro-agent" });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
     { pane_id: "%1", session_name: "work", window_index: 0, job_id: "ro-topo" },
+    PAD_PANE, // non-degenerate (>1 pane)
   ]);
   kdb.db.close();
   const ro = new Database(dbPath, { readonly: true });
@@ -1320,4 +1396,361 @@ test("deriveLastGenerationSetFromTopology: works against a read-only connection 
     ro.close();
   }
   kdb = { db: ro, stmts: kdb.stmts };
+});
+
+// ---------------------------------------------------------------------------
+// Bounded richness-ranked selection (epic fn-1102 T1) — the new selection that
+// ranks dead generations by restorable richness instead of "single newest",
+// bounds to the newest K inside the idle cutoff, excludes short-lived single-
+// pane skeletons, steps back to the newest attributed snapshot, flags ambiguity.
+// ---------------------------------------------------------------------------
+
+/** Seed N killed jobs + N owned panes (window_index 0..N-1) for a generation. */
+function ownedPanes(jobIds: string[]): SeedTopologyPane[] {
+  return jobIds.map((jid, i) => {
+    seedJob(kdb.db, { job_id: jid, state: "killed", title: jid });
+    return {
+      pane_id: `%${jid}`,
+      session_name: "work",
+      window_index: i,
+      job_id: jid,
+    };
+  });
+}
+
+test("deriveLastGenerationSetFromTopology (incident): a richer dead generation is picked over a newer degenerate skeleton", () => {
+  // The recorded 2026-06-16 hazard: a rich dead generation was shadowed by a
+  // NEWER 1-pane short-lived skeleton generation, and the skeleton got restored.
+  // The bounded richness-ranked selection must pick the rich generation.
+  // gen-rich (id 500): 3 restorable agents. gen-skel (id 600, NEWER): a single
+  // 1-pane snapshot (span 0) → degenerate skeleton. gen-now is the live server.
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-rich",
+    ownedPanes(["r0", "r1", "r2"]),
+    NOW - 200,
+  );
+  seedJob(kdb.db, { job_id: "skel", state: "killed", title: "skel-agent" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-skel",
+    [
+      {
+        pane_id: "%skel",
+        session_name: "work",
+        window_index: 0,
+        job_id: "skel",
+      },
+    ],
+    NOW - 50,
+  );
+  const res = deriveTopo("gen-now");
+  // The rich generation's 3 agents are restored; the newer skeleton is NOT.
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["r0", "r1", "r2"]);
+  expect(res.candidates.map((c) => c.job_id)).not.toContain("skel");
+  // Only one non-degenerate candidate → unambiguous.
+  expect(res.ambiguous).toBeUndefined();
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (pairing race): the newest ATTRIBUTED snapshot feeds the set when the newest snapshot carries zero job_ids", () => {
+  // The chosen generation's NEWEST snapshot is the unattributed (0-job_id) half
+  // of the emission pair — it yields no candidate. The deriver steps back to the
+  // attributed sibling (one rowid lower) and restores from THAT. The two
+  // snapshots span >30min so the generation is non-degenerate.
+  seedJob(kdb.db, {
+    job_id: "attributed-job",
+    state: "killed",
+    title: "attrib",
+  });
+  // Attributed sibling (older rowid, carries job_id).
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-pair",
+    [
+      {
+        pane_id: "%1",
+        session_name: "work",
+        window_index: 0,
+        job_id: "attributed-job",
+      },
+    ],
+    NOW - 3700,
+  );
+  // Newest snapshot: unattributed — a single unowned pane resolving to nothing.
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    501,
+    "gen-pair",
+    [{ pane_id: "%unowned", session_name: "work", window_index: 0 }],
+    NOW - 100,
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["attributed-job"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (ambiguity): auto-pick differing from the newest non-degenerate flags ambiguous", () => {
+  // Two non-degenerate dead generations. The NEWER (gen-new, id 600) has 1
+  // restorable; the OLDER (gen-old, id 500) has 3 — so the max-restorable auto-
+  // pick (gen-old) is NOT the newest non-degenerate (gen-new). The result must
+  // carry the ambiguity flag AND still return the auto-pick's richer set.
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-old",
+    ownedPanes(["o0", "o1", "o2"]),
+    NOW - 200,
+  );
+  seedJob(kdb.db, { job_id: "n0", state: "killed", title: "n0" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-new",
+    [
+      { pane_id: "%n0", session_name: "work", window_index: 0, job_id: "n0" },
+      PAD_PANE, // non-degenerate (>1 pane)
+    ],
+    NOW - 50,
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["o0", "o1", "o2"]);
+  expect(res.ambiguous).toBe(true);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (ambiguity): newest non-degenerate IS the richest ⇒ NOT ambiguous", () => {
+  // Mirror of the ambiguity case: here the NEWER generation is also the richest,
+  // so the auto-pick equals the newest non-degenerate — no ambiguity.
+  seedJob(kdb.db, { job_id: "lean", state: "killed", title: "lean" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-lean",
+    [
+      {
+        pane_id: "%lean",
+        session_name: "work",
+        window_index: 0,
+        job_id: "lean",
+      },
+      PAD_PANE,
+    ],
+    NOW - 200,
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-fat",
+    ownedPanes(["f0", "f1"]),
+    NOW - 50,
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["f0", "f1"]);
+  expect(res.ambiguous).toBeUndefined();
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (fallback): an all-degenerate board degrades to the labeled killed-cohort fallback", () => {
+  // Two dead generations, each a 1-pane short-lived skeleton → both degenerate →
+  // no eligible generation. Degrade to the retrospective killed-cohort model
+  // (which offers a crash-like killed row) with the visible note.
+  seedJob(kdb.db, { job_id: "skel-1", state: "killed", title: "s1" });
+  seedJob(kdb.db, { job_id: "skel-2", state: "killed", title: "s2" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-skel-1",
+    [
+      {
+        pane_id: "%1",
+        session_name: "work",
+        window_index: 0,
+        job_id: "skel-1",
+      },
+    ],
+    NOW - 200,
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-skel-2",
+    [
+      {
+        pane_id: "%2",
+        session_name: "work",
+        window_index: 0,
+        job_id: "skel-2",
+      },
+    ],
+    NOW - 50,
+  );
+  // A crash-like killed cohort row so the fallback has something to offer.
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "cohort",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  const res = deriveTopo("gen-now");
+  expect(res.fallbackNote).toBeDefined();
+  expect(res.fallbackNote).toContain("retrospective");
+  // The skeleton generations' panes are NOT what got restored.
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["cohort"]);
+});
+
+test("deriveLastGenerationSetFromTopology (fallback): a non-degenerate generation with zero restorable degrades to the labeled fallback", () => {
+  // gen-workers is non-degenerate (2 panes) but every pane is an autopilot worker
+  // (plan_verb='work') → 0 restorable → no eligible generation → labeled fallback.
+  seedJob(kdb.db, {
+    job_id: "w1",
+    state: "killed",
+    title: "w1",
+    plan_verb: "work",
+  });
+  seedJob(kdb.db, {
+    job_id: "w2",
+    state: "killed",
+    title: "w2",
+    plan_verb: "work",
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-workers", [
+    { pane_id: "%1", session_name: "work", window_index: 0, job_id: "w1" },
+    { pane_id: "%2", session_name: "work", window_index: 1, job_id: "w2" },
+  ]);
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "cohort",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  const res = deriveTopo("gen-now");
+  expect(res.fallbackNote).toBeDefined();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["cohort"]);
+});
+
+test("deriveLastGenerationSetFromTopology (degeneracy AND-clause): a long-lived single-pane generation is legitimate, not a skeleton", () => {
+  // A single-agent session observed for >30min is NOT degenerate (the rule is
+  // <=1 pane AND short-span, never OR) — it stays restorable. Two snapshots of
+  // the same 1-pane generation, span exceeding DEGENERATE_MAX_SPAN_SECS.
+  expect(DEGENERATE_MAX_SPAN_SECS).toBe(30 * 60);
+  seedJob(kdb.db, { job_id: "solo", state: "killed", title: "solo-agent" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-solo",
+    [{ pane_id: "%1", session_name: "work", window_index: 0, job_id: "solo" }],
+    NOW - (DEGENERATE_MAX_SPAN_SECS + 1200),
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    501,
+    "gen-solo",
+    [{ pane_id: "%1", session_name: "work", window_index: 0, job_id: "solo" }],
+    NOW - 100,
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["solo"]);
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("summarizeTopologyGenerations: exposes ranked per-generation summaries for the list view", () => {
+  // gen-now (live), gen-rich (2 restorable, older), gen-skel (1-pane short-lived
+  // skeleton, newer). Summaries come back newest-first with the list enrichment.
+  seedJob(kdb.db, { job_id: "s", state: "killed", title: "s" });
+  seedJob(kdb.db, { job_id: "cur", state: "working", title: "cur" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    400,
+    "gen-rich",
+    ownedPanes(["a", "b"]),
+    NOW - 200,
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-skel",
+    [{ pane_id: "%3", session_name: "work", window_index: 0, job_id: "s" }],
+    NOW - 50,
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-now",
+    [{ pane_id: "%4", session_name: "work", window_index: 0, job_id: "cur" }],
+    NOW - 10,
+  );
+  const gens = summarizeTopologyGenerations(kdb.db, {
+    now: NOW,
+    currentGenerationId: "gen-now",
+  });
+  // Newest-first by last_event_id.
+  expect(gens.map((g) => g.generation_id)).toEqual([
+    "gen-now",
+    "gen-skel",
+    "gen-rich",
+  ]);
+  const byId = new Map(gens.map((g) => [g.generation_id, g]));
+  expect(byId.get("gen-now")?.is_current).toBe(true);
+  // Rich: 2 panes, 2 restorable, not degenerate, not the current server.
+  expect(byId.get("gen-rich")?.max_pane_count).toBe(2);
+  expect(byId.get("gen-rich")?.restorable).toBe(2);
+  expect(byId.get("gen-rich")?.degenerate).toBe(false);
+  expect(byId.get("gen-rich")?.is_current).toBe(false);
+  // Skeleton: 1 pane, short-lived → degenerate.
+  expect(byId.get("gen-skel")?.degenerate).toBe(true);
+  expect(byId.get("gen-skel")?.max_pane_count).toBe(1);
+});
+
+test("GENERATION_SUMMARY_SQL: the summary walk is served by the v107 partial index (EXPLAIN QUERY PLAN)", () => {
+  // Seed a spread of snapshot generations + ANALYZE so the planner has stats,
+  // then assert the summary walk hits idx_events_tmux_generation and never does a
+  // bare full-table SCAN of events (the EXPLAIN acceptance instrument).
+  for (let g = 0; g < 8; g++) {
+    for (let s = 0; s < 4; s++) {
+      seedTmuxTopologySnapshot(
+        kdb.db,
+        100 + g * 10 + s,
+        `gen-${g}`,
+        [
+          {
+            pane_id: `%${g}`,
+            session_name: "work",
+            window_index: 0,
+            job_id: `j-${g}`,
+          },
+        ],
+        NOW - 100 - g,
+      );
+    }
+  }
+  kdb.db.run("ANALYZE");
+  const plan = kdb.db
+    .prepare("EXPLAIN QUERY PLAN " + GENERATION_SUMMARY_SQL)
+    .all() as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toContain("idx_events_tmux_generation");
+  // A bare full-table `SCAN events` (not qualified by USING INDEX) must not appear.
+  expect(detail).not.toMatch(/SCAN events(?! USING)/);
+});
+
+test("v107 fresh DB carries the tmux_generation_id generated column + its partial index", () => {
+  // Fresh-vs-migrated parity for acceptance 5: a fresh migrated DB (freshDbFile)
+  // has the generated column (visible only to table_xinfo) AND the partial index,
+  // so the migrated path (idempotent ALTER + IF NOT EXISTS index) lands the same.
+  const cols = kdb.db.prepare("PRAGMA table_xinfo(events)").all() as {
+    name: string;
+  }[];
+  expect(cols.some((c) => c.name === "tmux_generation_id")).toBe(true);
+  const idx = kdb.db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_tmux_generation'",
+    )
+    .all();
+  expect(idx.length).toBe(1);
 });

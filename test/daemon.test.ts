@@ -3204,8 +3204,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `dispatch_failures.resolver_dispatched_at` once-marker — the merge-resolver
   // dispatch latch, sibling of `merge_escalated_at`; an additive ALTER, NO cursor
   // rewind: a pre-v106 stream carries no `ResolverDispatchAttempted` event, so a
-  // from-scratch re-fold leaves it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(106);
+  // from-scratch re-fold leaves it NULL byte-identical). And to 107 via fn-1102
+  // task .1 (adding the `events.tmux_generation_id` VIRTUAL generated column + the
+  // partial covering index `idx_events_tmux_generation` the bounded
+  // generation-summary walk seeks — the column re-derives from each row's `data`,
+  // NO cursor rewind: a from-scratch re-fold recomputes it byte-identical).
+  expect(SCHEMA_VERSION).toBe(107);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

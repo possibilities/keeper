@@ -59,6 +59,31 @@ CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.       | Retry; if it persists, confirm the daemon and CLI are the same version.                             | conditional |
 
+## Tabs command family (`keeper tabs list|restore|dump`)
+
+Crash-restore of keeper-managed agent windows, every read a daemon-down read-only
+`keeper.db` open. `list` rides the shared `{schema_version, ok, error, data}`
+envelope (generation summaries + the live set as `data` at exit 0; a keeper.db
+read failure is `read_failed`, `ok:false`, exit 1, still on stdout). `restore` and
+`dump` are NOT envelope commands — `restore` prints its plan/outcome text (a bad
+board state is not a transport failure) and carries RICH exit codes so an
+orchestrator can tell a policy refusal from a runtime failure; `dump` writes a
+runnable bash script on stdout. The autopilot fail-closed gate on `restore --apply`
+carries over verbatim (exit 1 while autopilot is UNPAUSED unless `--force`).
+
+| code          | emitted by         | meaning                                                                                       | recovery                                                                                            | retry-safe |
+| ------------- | ------------------ | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
+| `read_failed` | `keeper tabs list` | keeper.db could not be opened / read for the generation-summary read.                         | Retry — the read opens keeper.db read-only and never mutates. If it persists, confirm the daemon is healthy. | yes (read-only) |
+
+Exit codes (published in `keeper --help --json`, distinct from the usage code and
+the await-owned range):
+
+| exit | emitted by               | meaning                                                                                       |
+| ---- | ------------------------ | --------------------------------------------------------------------------------------------- |
+| 6    | `keeper tabs restore`    | Refused a non-TTY AMBIGUOUS selection (the richest generation is not the freshest); the ranked table prints on stderr. Re-run with `--generation <id>` or on a TTY for the picker. |
+| 7    | `keeper tabs restore --apply` | ZERO candidates without `--allow-empty`. Pass `--allow-empty` to proceed with an empty set, or drop `--apply` to inspect the plan. |
+| 8    | `keeper tabs restore --apply` | PARTIAL launch failure — some candidates relaunched, some failed; the restored/failed summary prints on stdout. Re-run to retry the failures (already-live sessions are deduped). |
+
 ## Plan family (`keeper plan` accumulate-all failures)
 
 `plugins/plan/src/emit.ts::emitFailureEnvelope` prints

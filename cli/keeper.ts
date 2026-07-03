@@ -33,6 +33,7 @@ export const SUBCOMMANDS = [
   "await",
   "commit-work",
   "setup-tmux",
+  "tabs",
   "session-state",
   "show-session-files",
   "search-history",
@@ -118,6 +119,11 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
   },
   "setup-tmux": {
     summary: "Provision the tmux control plane (dash + work sessions)",
+  },
+  tabs: {
+    summary:
+      "Restore keeper agents after a crash: `keeper tabs <list|restore|dump>`",
+    verbs: ["list", "restore", "dump"],
   },
   "session-state": {
     summary: "Current session git context + on-hook files (JSON)",
@@ -241,6 +247,9 @@ export const EXIT_CODES: Record<string, string> = {
   "3": "await: own-deadline timeout; handoff: slug already in use",
   "4": "await: watched target was deleted",
   "5": "await: stuck verdict (only under --fail-on-stuck)",
+  "6": "tabs restore: refused a non-TTY AMBIGUOUS selection (ranked table on stderr) — re-run with --generation <id> or on a TTY",
+  "7": "tabs restore --apply: ZERO candidates without --allow-empty",
+  "8": "tabs restore --apply: PARTIAL launch failure (restored/failed summary printed)",
 };
 
 /** The `keeper --help --json` command index. A discovery/introspection surface,
@@ -387,6 +396,7 @@ export async function main(): Promise<void> {
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
+    tabs: async (argv) => (await import("./tabs")).main(argv),
     "session-state": async (argv) =>
       (await import("./session-state")).main(argv),
     "show-session-files": async (argv) =>

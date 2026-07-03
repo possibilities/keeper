@@ -32,6 +32,20 @@
  * read by `scripts/restore-agents.ts --snapshot-current` (the runnable-script
  * escape hatch over the live mirror).
  *
+ * **DURABLE REVIVE SCRIPT (`revive.sh`).** On the SAME pulse, the worker also
+ * maintains a runnable `revive.sh` next to `restore.json` (via the shared
+ * {@link renderSnapshotScript}), so a human always has an up-to-date replay
+ * script on disk without a socket round-trip. It renders from the SAME live set
+ * as the JSON mirror with ONE intentional membership divergence: reconciler-
+ * managed workers (`plan_verb === 'work'`) are EXCLUDED — the script is a human
+ * replay surface where the reconciler's own re-dispatch would double-spawn them
+ * (the rendered header names the excluded count; the JSON mirror keeps them).
+ * The sibling is INDEPENDENT: its OWN content-hash gate suppresses no-op
+ * rewrites, its OWN `try/catch` swallows a write failure to stderr, and neither
+ * file's failed write skips the other's. It is written mode `0600` (agent titles
+ * and cwds ride in it) and is DUMP-ONLY — nothing reads it back; crash-restore
+ * still derives from `keeper.db`.
+ *
  * **Generation-boundary probe (epic fn-819).** Riding the SAME data_version
  * pulse (plus a ~1s idle wake so a post-crash respawn is caught even when
  * keeper's DB is idle), the worker runs ONE cheap `display-message -p '#{pid}'`
@@ -81,6 +95,7 @@ import {
   atomicWriteFile,
   openDb,
   resolveRestorePath,
+  resolveRevivePath,
   serializePlanJson,
   sortObjectKeys,
 } from "./db";
@@ -89,8 +104,10 @@ import {
   DEFAULT_EXEC_BACKEND,
   localeDefaultedEnv,
 } from "./exec-backend";
+import { compareCandidates, type RestoreCandidate } from "./restore-set";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
+import { defaultLauncherPrefix, renderSnapshotScript } from "./tabs-core";
 import type { TmuxTopologyPane } from "./tmux-focus-derive";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
@@ -223,8 +240,17 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  * with the side-file's own `RESTORE_SCHEMA_VERSION` only — the DB
  * `SCHEMA_VERSION` and `keeper/api.py` do NOT move. A bucket without `backend`
  * coerces to `DEFAULT_EXEC_BACKEND`.
+ *
+ * **v4 (epic fn-1102): resume_target is the session UUID.** Each agent's
+ * `resume_target` flips from the latest session name to the job's `job_id` (the
+ * Claude session UUID), so a consumer runs `claude --resume <uuid>` and
+ * re-attaches to the EXACT session instead of fuzzy-matching a name. The on-disk
+ * field NAME is unchanged; only its meaning (and now-always-UUID value) moved, so
+ * a restore-agents util reading a v3 file would resume by name — bump so it can
+ * tell the two apart. Side-file version only; the DB `SCHEMA_VERSION` and
+ * `keeper/api.py` do NOT move.
  */
-export const RESTORE_SCHEMA_VERSION = 3;
+export const RESTORE_SCHEMA_VERSION = 4;
 
 /**
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
@@ -236,9 +262,10 @@ export const RESTORE_SCHEMA_VERSION = 3;
  *    restore time.
  *  - `cwd` — the directory the resumed window opens in (set on the
  *    `keeperAgentLaunch` spawn); `null` when the SessionStart event never carried one.
- *  - `resume_target` — pre-resolved via {@link resumeTarget} (the latest session
- *    name, `job_id` fallback — resume by the name keeper currently knows).
- *    Pre-resolved at producer time so the restore-agents util doesn't re-derive it.
+ *  - `resume_target` — pre-resolved via {@link resumeTarget} to the job's session
+ *    UUID (`job_id`), so a consumer runs `claude --resume <uuid>` and re-attaches
+ *    to the EXACT session. Pre-resolved at producer time so the restore-agents
+ *    util doesn't re-derive it.
  *  - `tier` — pre-resolved via {@link tierForJobFromEpics} against the
  *    epicsById map built once per pulse. `null` for non-work jobs or jobs
  *    whose epic isn't in the projection.
@@ -408,6 +435,69 @@ export function buildRestoreTier(
   return { captured_at: capturedAt, sessions };
 }
 
+/** Permission bits for the revive-script side-file. It rides agent titles and
+ *  cwds (an untrusted-data-to-code surface) and is human-owned, so `0600`. */
+const REVIVE_SCRIPT_MODE = 0o600;
+
+/**
+ * Build the candidate set for the durable revive-script sibling (`revive.sh`)
+ * from the SAME live `jobs` the JSON mirror ({@link buildRestoreTier}) reads —
+ * one INTENTIONAL membership divergence: reconciler-managed workers
+ * (`plan_verb === 'work'`) are EXCLUDED, because the script is a human replay
+ * surface and the reconciler already re-dispatches those panes (a re-run would
+ * double-spawn them). The excluded count rides back so the rendered header can
+ * surface it (never a silent drop).
+ *
+ * Applies the identical liveness filters as {@link buildRestoreTier} (`working`/
+ * `stopped`, non-NULL `backend_exec_session_id`, non-empty `job_id`) so the only
+ * difference from the JSON set is the managed-worker exclusion. Each surviving
+ * job maps to a {@link RestoreCandidate}: `resume_target` is the session UUID
+ * (`job_id`) for an exact `claude --resume`, `label` the latest `title` (falling
+ * back to `job_id`). Candidates are sorted by {@link compareCandidates} (visual
+ * window order) so the rendered script is byte-stable across SELECT-order
+ * shuffles — the sibling's own hash gate depends on it. PURE.
+ */
+export function buildReviveScriptCandidates(jobs: Job[]): {
+  candidates: RestoreCandidate[];
+  excludedManagedCount: number;
+} {
+  const candidates: RestoreCandidate[] = [];
+  let excludedManagedCount = 0;
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (job.backend_exec_session_id == null) {
+      continue;
+    }
+    if (typeof job.job_id !== "string" || job.job_id === "") {
+      continue;
+    }
+    // The sole divergence from the JSON mirror's membership: a reconciler-managed
+    // worker is dropped from the human replay script (it would double-spawn), but
+    // its count is surfaced in the rendered header.
+    if (job.plan_verb === "work") {
+      excludedManagedCount++;
+      continue;
+    }
+    const label =
+      typeof job.title === "string" && job.title !== ""
+        ? job.title
+        : job.job_id;
+    candidates.push({
+      job_id: job.job_id,
+      resume_target: resumeTarget(job),
+      label,
+      window_index: job.window_index ?? null,
+      cwd: job.cwd != null && job.cwd !== "" ? job.cwd : null,
+      backend_exec_session_id: job.backend_exec_session_id,
+      created_at: job.created_at,
+    });
+  }
+  candidates.sort(compareCandidates);
+  return { candidates, excludedManagedCount };
+}
+
 /** Strip the `current` tier's `captured_at` for hashing (or `null` passes
  * through). The informational timestamp must not churn the hash on every pulse. */
 function tierForHash(
@@ -468,6 +558,13 @@ export function serializeForWrite(descriptor: RestoreDescriptor): string {
  */
 interface PulseState {
   lastHash: string | null;
+  /**
+   * In-memory write-dedup gate for the durable `revive.sh` sibling — INDEPENDENT
+   * of {@link PulseState.lastHash} so an unchanged live set rewrites neither file
+   * and one file's failed write never advances the other's gate. Hashed over the
+   * full rendered script (no timestamp to strip — the script header carries none).
+   */
+  lastScriptHash: string | null;
   parentDirEnsured: boolean;
   /**
    * Producer-side dedup for the `BackendExecStart` generation-boundary post. The
@@ -752,6 +849,15 @@ export function restorePulse(
      *  tmux jobs — wired whenever a real worker runs so a post-crash respawn is
      *  recorded. */
     postBackendExecStart?: (msg: BackendExecStartMessage) => void;
+    /**
+     * Durable revive-script sibling config. When present, the pulse renders +
+     * hash-gates + writes `revive.sh` (mode 0600) alongside restore.json,
+     * INDEPENDENT of the JSON write (own hash gate, own try/catch). Omit on the
+     * pure-JSON test path. `path` is the on-disk revive-script path, `sourcePath`
+     * the keeper.db provenance printed in the header, `prefix` the absolute
+     * `keeper agent` launcher argv prefix.
+     */
+    script?: { path: string; sourcePath: string; prefix: string[] };
   },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -797,43 +903,77 @@ export function restorePulse(
     current,
   };
 
-  const hashed = serializeForHash(descriptor);
-  // `Bun.hash` returns a number — fine for an in-memory dedup key (we never
-  // compare across daemon boots). Stringify so the equality check is by
-  // value, not by Number coercion edge cases.
-  const hash = String(Bun.hash(hashed));
-  if (state.lastHash === hash) {
-    return; // No content change → no write.
-  }
-
-  const serialized = serializeForWrite(descriptor);
-  if (!state.parentDirEnsured) {
+  // Parent-dir mkdir is shared by both side-files (they live in ONE directory);
+  // best-effort, once per pulse-worker lifetime. atomicWriteFile surfaces a real
+  // ENOENT/EACCES if the dir genuinely can't be made.
+  const ensureParentDir = (dir: string): void => {
+    if (state.parentDirEnsured) {
+      return;
+    }
     try {
-      mkdirSync(dirname(restorePath), { recursive: true });
+      mkdirSync(dir, { recursive: true });
       state.parentDirEnsured = true;
     } catch (err) {
-      // mkdir is best-effort; the atomicWriteFile below will surface the
-      // real failure (ENOENT/EACCES) if the dir really doesn't exist.
       console.error(
         `[restore-worker] mkdir parent dir failed (continuing): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
+  };
+
+  // --- restore.json (the JSON disaster-fallback mirror) ---------------------
+  // Hash-gated on its own content (sans captured_at). `Bun.hash` returns a
+  // number — stringified so the equality check is by value, not Number-coercion
+  // edge cases. A write failure is SWALLOWED to stderr with lastHash left intact
+  // (retry next pulse); it NEVER skips the revive.sh write below — the two
+  // side-files are INDEPENDENT.
+  const jsonHash = String(Bun.hash(serializeForHash(descriptor)));
+  if (state.lastHash !== jsonHash) {
+    ensureParentDir(dirname(restorePath));
+    try {
+      atomicWriteFile(restorePath, serializeForWrite(descriptor));
+      state.lastHash = jsonHash;
+    } catch (err) {
+      console.error(
+        `[restore-worker] restore.json write failed (will retry next pulse): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
-  try {
-    atomicWriteFile(restorePath, serialized);
-    state.lastHash = hash;
-  } catch (err) {
-    // Per design contract: write failure is SWALLOWED to stderr. The next
-    // data_version pulse re-runs this; lastHash stays unchanged so we
-    // retry the write rather than silently skipping it forever.
-    console.error(
-      `[restore-worker] write failed (will retry next pulse): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
+  // --- revive.sh (the durable runnable revive-script sibling) ---------------
+  // Rendered from the SAME live set with reconciler-managed workers excluded (an
+  // intentional membership divergence — see buildReviveScriptCandidates). Its
+  // OWN hash gate + OWN try/catch keep it INDEPENDENT of restore.json: an
+  // unchanged live set rewrites nothing, and either file's failed write never
+  // blocks the other. Written mode 0600 (agent titles/cwds ride in it). The
+  // script header carries no timestamp, so the whole rendered body is the hash
+  // input. Disabled when no `script` config is wired (the pure-JSON test path).
+  if (snapshot?.script) {
+    const { path: scriptPath, sourcePath, prefix } = snapshot.script;
+    const { candidates, excludedManagedCount } =
+      buildReviveScriptCandidates(jobs);
+    const script = renderSnapshotScript(candidates, {
+      prefix,
+      sourcePath,
+      excludedManagedCount,
+    });
+    const scriptHash = String(Bun.hash(script));
+    if (state.lastScriptHash !== scriptHash) {
+      ensureParentDir(dirname(scriptPath));
+      try {
+        atomicWriteFile(scriptPath, script, REVIVE_SCRIPT_MODE);
+        state.lastScriptHash = scriptHash;
+      } catch (err) {
+        console.error(
+          `[restore-worker] revive.sh write failed (will retry next pulse): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
   }
 }
 
@@ -860,8 +1000,13 @@ function main(): void {
     bootRetry: true,
   });
   const restorePath = resolveRestorePath();
+  const revivePath = resolveRevivePath();
+  // The absolute `keeper agent` launcher prefix + the db provenance path are
+  // stable for the worker's lifetime — resolve ONCE, not per pulse.
+  const launcherPrefix = defaultLauncherPrefix();
   const state: PulseState = {
     lastHash: null,
+    lastScriptHash: null,
     parentDirEnsured: false,
     lastGenerationHash: null,
   };
@@ -879,6 +1024,13 @@ function main(): void {
   const snapshot = {
     postBackendExecStart: (msg: BackendExecStartMessage): void => {
       port.postMessage(msg);
+    },
+    // Durable revive-script sibling: rendered + written 0600 next to
+    // restore.json on the same pulse (reconciler-managed workers excluded).
+    script: {
+      path: revivePath,
+      sourcePath: data.dbPath,
+      prefix: launcherPrefix,
     },
   };
 
