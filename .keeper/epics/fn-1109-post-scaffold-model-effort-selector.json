@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T22:07:46.177000Z",
+  "depends_on_epics": [],
+  "id": "fn-1109-post-scaffold-model-effort-selector",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Post-scaffold model effort selector",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T22:07:46.177000Z"
+}
