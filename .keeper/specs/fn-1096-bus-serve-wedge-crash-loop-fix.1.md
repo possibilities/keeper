@@ -73,5 +73,5 @@ throughout; watchdog fatalExit count in server.stderr stops growing.
 - [ ] bun test green
 
 ## Done summary
-
+Moved the bus-worker register ancestry walk (ppidViaPs/resolveHarnessIdentity) off the serve event loop to async Bun.spawn, so the boot reconnect stampede no longer parks the kqueue loop; opRegister defers its ack until the walk resolves and drops a conn that closed mid-walk, with fail-open-to-floor and the anti-spoof peer-pid root unchanged. The repro harness gains register-work/stampede/getsockopt dimensions plus an event-loop-lag detector — RED on the sync shape, GREEN with --async-register; bun test 5626 pass / 0 fail.
 ## Evidence
