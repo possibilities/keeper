@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Bound generation enrichment scan",
-  "updated_at": "2026-07-03T22:22:54.766000Z"
+  "updated_at": "2026-07-03T23:43:00.783000Z",
+  "worker_done_at": "2026-07-03T23:43:00.783000Z"
 }

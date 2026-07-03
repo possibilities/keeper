@@ -21,5 +21,5 @@ snapshots only for those. Preserve the existing selection semantics
 - [ ] Selection output (auto-pick, ambiguity flag, degenerate-skeleton exclusion, list ordering) is unchanged versus the current behavior on existing fixtures.
 
 ## Done summary
-
+Bounded the tab-restore generation snapshot decode: loadEnrichedGenerations now decodes only the current generation plus the newest RECENT_GENERATION_BOUND dead ones (index-only summary walk stays full), restoring the bounded-scan property; auto-pick/list selection output unchanged on fixtures.
 ## Evidence
