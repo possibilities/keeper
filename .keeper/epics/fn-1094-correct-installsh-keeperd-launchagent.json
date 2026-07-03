@@ -7,7 +7,7 @@
     "fn-1089-arthack-orphan-cleanup"
   ],
   "id": "fn-1094-correct-installsh-keeperd-launchagent",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-03T03:12:28.882000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/arthack"
   ],
-  "updated_at": "2026-07-03T03:12:27.998000Z"
+  "updated_at": "2026-07-03T03:12:28.882000Z"
 }
