@@ -7,7 +7,7 @@
     "fn-1099-live-verification-acceptance-guidance"
   ],
   "id": "fn-1103-multi-harness-agent-maturity",
-  "last_validated_at": "2026-07-03T19:55:46.510000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T19:55:46.405000Z"
+  "updated_at": "2026-07-03T20:58:55.508000Z"
 }
