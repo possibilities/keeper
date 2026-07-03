@@ -70,5 +70,5 @@ writes the real state dir — sandbox via sandboxEnv.
 - [ ] bun test and lint-claude-md green
 
 ## Done summary
-
+Serve-liveness watchdog now returns a structured verdict naming the tripped trigger (accept-stall-server|accept-stall-bus|busy-lag) and the escalation logs both probe ages plus the lag-breach count. A durable window-aged restart ledger (state-dir sidecar, no fold) level-triggers one sticky needs_human crash-loop distress row on a synthetic unknown-routed key, self-clearing when the boot rate recovers; the boot orphan-GC exempts it.
 ## Evidence
