@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T01:16:56.509000Z",
+  "depends_on": [
+    "fn-1085-arthack-dissolution.1",
+    "fn-1085-arthack-dissolution.2"
+  ],
+  "epic": "fn-1085-arthack-dissolution",
+  "id": "fn-1085-arthack-dissolution.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Worker plugin-isolation gate",
+  "updated_at": "2026-07-03T01:16:56.509000Z"
+}
