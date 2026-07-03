@@ -45,5 +45,5 @@ metrics. If reclaim-db itself misbehaves, that is a finding to report, not to fi
 - [ ] If fold-slow persists, a follow-up epic is filed and its id recorded; no deeper investigation performed in this task
 
 ## Done summary
-
+Executed keeper reclaim against the live keeper.db (daemon paused+booted out, offline VACUUM INTO, self-verify, atomic swap, daemon restarted clean). Size: 1.2GB (1297080320B) -> 755.5MB (792215552B), reclaimed 452.7MB; verify OK schema_version=106 auto_vacuum=2 row-counts-identical; post-swap quick_check=ok freelist=0; rollback snapshot kept at keeper-20260703T143103.db. fold-slow measured over comparable ~6min windows on the healthy (post-fix) daemon: BEFORE (1.2GB, 48 events) = 0 slow folds; AFTER (755MB, 8 events) = 0 slow folds; the 12588 all-time fold-slow counter did not increment in either window. fold-slow does NOT persist after reclaim -- it was already 0 once the crash-loop fix was deployed, so the 350-400ms incident-era folds were a serve-wedge/stampede artifact, not steady-state DB behavior. Conditional not triggered: no follow-up epic filed. Caveat: both windows low-activity (slow fold-types are git/tmux snapshots, quiet during measurement).
 ## Evidence
