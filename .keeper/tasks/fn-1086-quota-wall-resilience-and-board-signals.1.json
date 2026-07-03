@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T01:18:59.657000Z",
+  "depends_on": [],
+  "epic": "fn-1086-quota-wall-resilience-and-board-signals",
+  "id": "fn-1086-quota-wall-resilience-and-board-signals.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Instant-death breaker with quota surfacing",
+  "updated_at": "2026-07-03T01:18:59.657000Z"
+}
