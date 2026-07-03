@@ -36,5 +36,5 @@ Pure discovery tests (injected sources, both gate states, worker vs interactive)
 - [ ] Composition test pins both states; knob documented
 
 ## Done summary
-
+Config-flagged worker plugin-isolation gate (worker_plugin_isolation in plugins.yaml, default off): a keeper-automated worker launch (keyed on --dangerously-skip-permissions) drops plugin_scan_dirs results while keeping hard-listed plugin_dirs + per-cell dir; interactive never gated. Composition-map test and doc extended to pin both gate states.
 ## Evidence

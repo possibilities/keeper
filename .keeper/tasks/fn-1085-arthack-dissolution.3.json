@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Worker plugin-isolation gate",
-  "updated_at": "2026-07-03T01:16:56.509000Z"
+  "updated_at": "2026-07-03T02:02:02.549000Z",
+  "worker_done_at": "2026-07-03T02:02:02.549000Z"
 }
