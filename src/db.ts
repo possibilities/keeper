@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 106;
+export const SCHEMA_VERSION = 107;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -737,6 +737,27 @@ const CREATE_V66_INDEXES = [
  */
 const CREATE_V73_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_mutation_path ON events(mutation_path, ts, session_id, tool_name, hook_event) WHERE mutation_path IS NOT NULL",
+];
+
+/**
+ * Partial COVERING index on the v106→v107 `events.tmux_generation_id` VIRTUAL
+ * generated column (KEPT OUT of the unconditional CREATE block; see
+ * {@link CREATE_V10_INDEXES} — the generated column doesn't exist yet on a
+ * migrating DB until the matching ALTER runs). Serves the bounded
+ * generation-summary walk in `src/restore-set.ts` (`GENERATION_SUMMARY_SQL`):
+ * `GROUP BY tmux_generation_id ORDER BY MAX(id) DESC` over the
+ * `TmuxTopologySnapshot` slice. The leading `tmux_generation_id` gives the
+ * GROUP BY its ordered walk (no temp b-tree); trailing `id`, `ts` cover every
+ * aggregate the walk reads (MIN/MAX id, MIN/MAX ts) so it stays index-only
+ * (`SCAN ... USING COVERING INDEX`, never a table SCAN). Indexing a generated
+ * column as a plain column removes SQLite's exact-expression-text
+ * index-matching footgun — any column-name query hits it. The
+ * `WHERE hook_event = 'TmuxTopologySnapshot'` partial predicate keeps it tiny
+ * (the snapshot slice only) and lets the covering read skip re-checking
+ * `hook_event` from the row.
+ */
+const CREATE_V107_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_tmux_generation ON events(tmux_generation_id, id, ts) WHERE hook_event = 'TmuxTopologySnapshot'",
 ];
 
 /**
@@ -5798,6 +5819,37 @@ function migrate(db: Database): void {
         "resolver_dispatched_at",
         "REAL",
       );
+
+      // v106→v107 (fn-1102.1): add the `events.tmux_generation_id` VIRTUAL
+      // generated column + its partial covering index — the indexed key the
+      // bounded generation-summary walk (`src/restore-set.ts`) GROUPs on to rank
+      // dead tmux-server generations by richness instead of "single newest"
+      // (the defect that restored a 1-pane skeleton over a 9-pane session).
+      // Expression: the snapshot's `generation_id` extracted from `data`, NULL
+      // on every non-`TmuxTopologySnapshot` row and on a malformed blob
+      // (`json_valid` gates the extract so it never raises mid-scan). A generated
+      // column indexed as a plain column removes SQLite's exact-expression-text
+      // index-matching footgun (a bare expression index matches only a
+      // byte-identical query expression). VIRTUAL because SQLite's ALTER accepts
+      // only VIRTUAL generated columns — it re-derives on read from the already-
+      // immutable `data`, adding no stored bytes and no re-fold concern (nothing
+      // folds it; it is read-only derivation). `addGeneratedColumnIfMissing`
+      // (reads `table_xinfo`, idempotent) + `IF NOT EXISTS` index run
+      // unconditionally on BOTH the fresh-CREATE and migrated paths, so the two
+      // end schemas are byte-identical (no separate CREATE_EVENTS literal to keep
+      // in lockstep). No cursor rewind, no backfill (the column materializes on
+      // read). Whitelist-only Python read (keeper-py never reads the column) —
+      // this bump MUST add 107 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
+      // in the SAME commit; test/schema-version.test.ts enforces it.
+      addGeneratedColumnIfMissing(
+        db,
+        "events",
+        "tmux_generation_id",
+        "TEXT GENERATED ALWAYS AS (CASE WHEN hook_event = 'TmuxTopologySnapshot' AND json_valid(data) THEN json_extract(data, '$.generation_id') END) VIRTUAL",
+      );
+      for (const sql of CREATE_V107_INDEXES) {
+        db.run(sql);
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
