@@ -65,5 +65,5 @@ keeper/api.py).
 - [ ] `bun test` green.
 
 ## Done summary
-
+Added nullable jobs.dispatch_origin (schema v106->v107) stamped 'autopilot' at the reducer's SessionStart discharge-on-bind seam, gated on the actual pending_dispatches DELETE (changes > 0) so manual/handoff/untitled sessions fold NULL. Deterministic-replayed; re-fold reproduces stamps byte-identically. Added 107 to SUPPORTED_SCHEMA_VERSIONS in the same commit.
 ## Evidence
