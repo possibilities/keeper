@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T20:19:42.613000Z",
+  "created_by_close_of": "fn-1099-live-verification-acceptance-guidance",
+  "depends_on_epics": [
+    "fn-1099-live-verification-acceptance-guidance"
+  ],
+  "id": "fn-1104-fix-mid-epic-deploy-runbook-branch-step",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix mid-epic deploy runbook branch step",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T20:19:42.613000Z"
+}
