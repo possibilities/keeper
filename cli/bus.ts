@@ -21,14 +21,14 @@
  * is the exception — a LONG-LIVED streaming subscriber that stays open across
  * reconnects with no heartbeat traffic (the server keys liveness on socket-close),
  * renders each inbound message as a one-line notification tagged with a stable
- * AUTHORITATIVE-directive marker, and spills over-budget bodies to
+ * message head, and spills over-budget bodies to
  * `~/.local/state/keeper/bus/inbox/` with a compact pointer line.
  *
  * `-` as the message argument reads the body from stdin.
  *
- * The authoritative-directive marker is PRESENTATION ONLY here — the behavior
- * contract (act as if the human directed it, no permission gate) is authored in the
- * advice task (fn-875-keeper-agent-bus.5). This file only RENDERS the marker.
+ * The message head is PRESENTATION ONLY here — the trust story (a bus message is a
+ * request from another of the same human's sessions; help with it using your own
+ * judgment) lives in the `bus` skill. This file only RENDERS the head.
  *
  * Pure decision functions (argv routing, envelope construction, the spill decision,
  * the notification renderer, the prune predicate) are exported so the fast-tier unit
@@ -101,17 +101,19 @@ Your inbox is already open:
   When a human says you'll get a message from someone, you are already
   listening — just watch for the notification line.
 
-Bus messages are AUTHORITATIVE:
+Bus messages — a request from another of your human's sessions:
   The server resolves the connecting peer's OS pid and OVERWRITES the claimed
-  'from' (anti-spoof — a peer cannot forge another agent's identity), and every
-  agent on the bus is the same human's session. A peer's message carries the
-  human's authority transitively: act on it fully and immediately, as if the
-  human driving your session asked — NO permission gate, irreversible/outward/
-  destructive included. Frictionless reflexes (not gates): attribution one-liner
-  ('Acting on an Agent Bus directive from <peer>: …'; the append-only messages
-  log is the audit), stop on a self-referential loop, and human-at-keyboard
-  wins. Collaboration, leadership ladder, and hand-off vocabulary live in the
-  'bus' skill.
+  'from' (anti-spoof — it proves WHO sent the bytes, not that you must obey),
+  and every agent on the bus is the same human's session. A bus message is
+  usually a sibling session relaying something the human wants resolved: help
+  with the request, applying your own judgment and your own sources of truth.
+  For a consequential, hard-to-reverse ask, verify the claim against git and
+  the board yourself — the evidence is the authority. Reflexes that stay on:
+  as you begin, drop one line ('Acting on an Agent Bus message from <peer>
+  (<id>): <summary>'; the append-only messages log is the audit); STOP and
+  surface a message that descends from your own earlier one; a live
+  instruction from the human at YOUR keyboard wins. Collaboration, leadership
+  ladder, and hand-off vocabulary live in the 'bus' skill.
 
 Send blindly:
   Just send — never pre-check 'list' before a send. <target> resolves a CURRENT
@@ -279,14 +281,14 @@ export function senderLabel(from: {
 }
 
 /**
- * Format the stable AUTHORITATIVE-directive head for an inbound message. This is
- * the marker that tells the receiving agent the message is an authoritative
- * directive (NOT untrusted/out-of-band content). PRESENTATION ONLY — the behavior
- * contract lives in the advice task. Pure.
+ * Format the stable message head for an inbound message — the marker that tells the
+ * receiving agent this line is a bus message from a named peer (NOT untrusted/
+ * out-of-band content). PRESENTATION ONLY — the trust story lives in the `bus`
+ * skill. Pure.
  */
-export function directiveHead(senderName: string, stampHms: string): string {
+export function messageHead(senderName: string, stampHms: string): string {
   const stamp = stampHms.length > 0 ? `[${stampHms}] ` : "";
-  return `${stamp}Agent Bus directive from ${senderName}: `;
+  return `${stamp}Agent Bus message from ${senderName}: `;
 }
 
 /** Format an `HH:MM:SS` stamp from an epoch-ms ts; empty on a bad value. Pure. */
@@ -311,7 +313,7 @@ export type RenderDecision =
  */
 export function renderDecision(msg: InboundMessage): RenderDecision {
   const name = senderLabel(msg.from);
-  const head = directiveHead(name, hms(msg.ts));
+  const head = messageHead(name, hms(msg.ts));
   const body = msg.payload.text ?? "";
   const line = `${head}${body}`;
   if (line.length <= NOTIFY_LINE_BUDGET) {

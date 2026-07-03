@@ -2,7 +2,7 @@
  * Fast-tier unit tests for `cli/bus.ts` — the `keeper bus` command surface
  * (epic fn-875 task .3). Exercises the PURE decision functions without a socket:
  * argv routing, publish-envelope construction, the spill-vs-inline render
- * decision, the authoritative-directive marker, spill naming, the prune predicate,
+ * decision, the message head, spill naming, the prune predicate,
  * and the `pruneInbox`/`emitMessage` file behavior under a sandboxed tmpdir.
  *
  * A real round-trip against the bus socket lives in the FULL tier (it shares the
@@ -24,12 +24,12 @@ import { join } from "node:path";
 import {
   buildPublishFrame,
   CHAT_NAMESPACE,
-  directiveHead,
   emitMessage,
   handleWatchFrame,
   hms,
   type InboundMessage,
   isStaleSpill,
+  messageHead,
   NOTIFY_LINE_BUDGET,
   parseBusArgv,
   pruneInbox,
@@ -184,18 +184,18 @@ describe("buildPublishFrame", () => {
   });
 });
 
-describe("authoritative-directive marker", () => {
-  test("directiveHead carries the stable marker + sender + stamp", () => {
-    const head = directiveHead("alice", "13:05:09");
-    expect(head).toContain("Agent Bus directive from alice");
+describe("message head marker", () => {
+  test("messageHead carries the stable marker + sender + stamp", () => {
+    const head = messageHead("alice", "13:05:09");
+    expect(head).toContain("Agent Bus message from alice");
     expect(head).toContain("[13:05:09]");
   });
 
-  test("directiveHead omits the stamp bracket when empty", () => {
-    expect(directiveHead("alice", "")).toBe("Agent Bus directive from alice: ");
+  test("messageHead omits the stamp bracket when empty", () => {
+    expect(messageHead("alice", "")).toBe("Agent Bus message from alice: ");
   });
 
-  test("a short message renders inline WITH the directive marker", () => {
+  test("a short message renders inline WITH the message head", () => {
     const msg: InboundMessage = {
       namespace: "chat",
       event: "message",
@@ -206,7 +206,7 @@ describe("authoritative-directive marker", () => {
     const d = renderDecision(msg);
     expect(d.kind).toBe("inline");
     if (d.kind === "inline") {
-      expect(d.line).toContain("Agent Bus directive from alice");
+      expect(d.line).toContain("Agent Bus message from alice");
       expect(d.line).toContain("ship it");
       // NOT framed as untrusted/out-of-band.
       expect(d.line.toLowerCase()).not.toContain("untrusted");
@@ -250,14 +250,14 @@ describe("renderDecision spill threshold", () => {
         "/some/path.md",
       );
       expect(line.length).toBeLessThanOrEqual(NOTIFY_LINE_BUDGET);
-      expect(line).toContain("Agent Bus directive from alice");
+      expect(line).toContain("Agent Bus message from alice");
       expect(line).toContain("/some/path.md");
       expect(line).toContain(`+${big.length} chars`);
     }
   });
 
   test("a body exactly at the budget stays inline", () => {
-    const head = directiveHead("a", "");
+    const head = messageHead("a", "");
     const body = "y".repeat(NOTIFY_LINE_BUDGET - head.length);
     const msg: InboundMessage = {
       namespace: "chat",
@@ -346,7 +346,7 @@ describe("emitMessage (filesystem, sandboxed)", () => {
         payload: { text: "ship it" },
       };
       const out = captureStdout(() => emitMessage(msg, dir));
-      expect(out).toContain("Agent Bus directive from alice");
+      expect(out).toContain("Agent Bus message from alice");
       expect(out).toContain("ship it");
       expect(existsSync(dir) ? readdirSync(dir) : []).toEqual([]);
     } finally {
