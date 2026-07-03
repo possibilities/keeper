@@ -2209,11 +2209,23 @@ export async function main(deps: MainDeps): Promise<never> {
         }
         throw exc;
       }
+      // Worker plugin-isolation gate. A keeper-automated (human-less) worker
+      // launch carries `--dangerously-skip-permissions` (task .1 made that
+      // keeper's own worker permission posture, on the autopilot/dispatch worker
+      // AND the pair partner); an interactive human session never does. When the
+      // `worker_plugin_isolation` config knob is set, such a launch drops the
+      // `plugin_scan_dirs` RESULTS — it keeps the hard-listed `plugin_dirs`
+      // (keeper + plan) plus its additive per-cell `--plugin-dir`. Interactive
+      // launches and the explicitly hard-listed `plugin_dirs` are never touched.
+      const stripScanDirs =
+        (sources.workerPluginIsolation ?? false) &&
+        hasFlagToken(remainingArgs, "--dangerously-skip-permissions");
       try {
         const discovery = discoverPlugins(
           deps.cwd,
           sources,
           deps.pluginConfigPath,
+          { stripScanDirs },
         );
         runCmd.push(...discovery.args);
         actionLog.push(...discovery.actions);

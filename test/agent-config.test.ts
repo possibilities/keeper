@@ -454,11 +454,12 @@ describe("loadPluginSources", () => {
       ConfigError,
     );
   });
-  test("empty config → empty lists", () => {
+  test("empty config → empty lists, gate off", () => {
     const p = writeYaml("plugins.yaml", "{}\n");
     expect(loadPluginSources(p)).toEqual({
       pluginDirs: [],
       pluginScanDirs: [],
+      workerPluginIsolation: false,
     });
   });
   test("entries are read into both lists", () => {
@@ -473,6 +474,7 @@ describe("loadPluginSources", () => {
     expect(loadPluginSources(p)).toEqual({
       pluginDirs: [a],
       pluginScanDirs: [b],
+      workerPluginIsolation: false,
     });
   });
   test("a non-list value is fail-loud", () => {
@@ -482,6 +484,28 @@ describe("loadPluginSources", () => {
   test("an empty-string entry is fail-loud", () => {
     const p = writeYaml("plugins.yaml", 'plugin_dirs:\n  - ""\n');
     expect(() => loadPluginSources(p)).toThrow(/non-empty/);
+  });
+  test("worker_plugin_isolation: strip-scan-dirs → gate on", () => {
+    const p = writeYaml(
+      "plugins.yaml",
+      "worker_plugin_isolation: strip-scan-dirs\n",
+    );
+    expect(loadPluginSources(p).workerPluginIsolation).toBe(true);
+  });
+  test("worker_plugin_isolation: off → gate off", () => {
+    const p = writeYaml("plugins.yaml", "worker_plugin_isolation: off\n");
+    expect(loadPluginSources(p).workerPluginIsolation).toBe(false);
+  });
+  test("an unknown worker_plugin_isolation mode is fail-loud", () => {
+    const p = writeYaml(
+      "plugins.yaml",
+      "worker_plugin_isolation: yes-please\n",
+    );
+    expect(() => loadPluginSources(p)).toThrow(/not a valid mode/);
+  });
+  test("a non-string worker_plugin_isolation is fail-loud", () => {
+    const p = writeYaml("plugins.yaml", "worker_plugin_isolation:\n  - a\n");
+    expect(() => loadPluginSources(p)).toThrow(/must be a string/);
   });
 });
 

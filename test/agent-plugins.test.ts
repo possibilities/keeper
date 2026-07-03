@@ -100,3 +100,36 @@ describe("plugin_scan_dirs (best-effort)", () => {
     ]);
   });
 });
+
+describe("worker isolation gate (stripScanDirs)", () => {
+  test("stripScanDirs drops scan results but keeps plugin_dirs and cwd `.`", () => {
+    const hardDir = join(tmpDir, "keeper");
+    makePlugin(hardDir);
+    const scan = join(tmpDir, "scan");
+    makePlugin(join(scan, "arthack"));
+    const cwd = join(tmpDir, "repo");
+    mkdirSync(join(cwd, "skills"), { recursive: true });
+    const d = discoverPlugins(
+      cwd,
+      { pluginDirs: [hardDir], pluginScanDirs: [scan] },
+      "plugins.yaml",
+      { stripScanDirs: true },
+    );
+    // cwd `.` + the hard-listed plugin_dir survive; the scanned child is gone.
+    expect(d.args).toEqual(["--plugin-dir", ".", "--plugin-dir", hardDir]);
+    expect(d.args).not.toContain(join(scan, "arthack"));
+  });
+  test("stripScanDirs false is byte-identical to the default (scan intact)", () => {
+    const scan = join(tmpDir, "scan");
+    makePlugin(join(scan, "arthack"));
+    const cwd = join(tmpDir, "bare");
+    mkdirSync(cwd, { recursive: true });
+    const sources = { pluginDirs: [], pluginScanDirs: [scan] };
+    const off = discoverPlugins(cwd, sources, "plugins.yaml", {
+      stripScanDirs: false,
+    });
+    const ungated = discoverPlugins(cwd, sources, "plugins.yaml");
+    expect(off.args).toEqual(ungated.args);
+    expect(off.args).toContain(join(scan, "arthack"));
+  });
+});
