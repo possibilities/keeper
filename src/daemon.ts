@@ -1251,11 +1251,14 @@ export function selectPendingResolverDispatches(
  *
  * The CLEAR path resolves preserving both intents, runs the epic's test gate within a
  * bounded budget, commits the merge, then `keeper autopilot retry close::<epic>` (which
- * clears the sticky, dropping BOTH once-markers) and `keeper autopilot play`. The
- * NOT-CLEAR path aborts to a clean lane, stamps BLOCKED with category + evidence + the
- * literal unstick sentence, restores autopilot, and leaves the sticky + human
- * escalation exactly as today. A parse-miss (or missing repo dir) DEGRADES to a still-
- * actionable brief — this producer never throws on a reason it can't parse. Pure.
+ * clears the sticky, dropping BOTH once-markers). The NOT-CLEAR path aborts to a clean
+ * lane, stamps BLOCKED with category + evidence + the literal unstick sentence, and
+ * leaves the sticky + human escalation exactly as today. The brief NO LONGER pauses/
+ * plays autopilot: the recover sweep is excluded per-epic while this worker's
+ * `resolve::<epic>` job is live (`epicHasActiveResolver`), so a crash never durably
+ * pauses the board and concurrent resolvers never race on a shared global flag. A
+ * parse-miss (or missing repo dir) DEGRADES to a still-actionable brief — this producer
+ * never throws on a reason it can't parse. Pure.
  */
 export function buildResolverBrief(args: {
   epicId: string;
@@ -1285,8 +1288,9 @@ export function buildResolverBrief(args: {
     `    transaction-boundary / ordering / unsure), the EVIDENCE (the conflicting`,
     `    hunks + why keeping both is incoherent), and the literal unstick sentence:`,
     `    \`${unstick}\``,
-    `  - \`keeper autopilot play\` to restore autopilot, then EXIT. Leave the sticky`,
-    `    close row and the human escalation exactly as they are — the human resolves it.`,
+    `  - EXIT. Leave the sticky close row and the human escalation exactly as they`,
+    `    are — the human resolves it. (Do NOT pause/play autopilot — the daemon`,
+    `    scopes recovery around you; see above.)`,
   ];
   if (parsed == null || !hasRepo) {
     // Parse-miss / no repo dir → a still-actionable brief, never a throw.
@@ -1296,8 +1300,10 @@ export function buildResolverBrief(args: {
       `resolve it ONLY if it is mechanically clear — otherwise stamp BLOCKED and leave`,
       `it for the human.`,
       ``,
-      `FIRST \`keeper autopilot pause\` — the recover sweep races your manual merge`,
-      `otherwise (it runs only while autopilot is unpaused).`,
+      `Do NOT \`keeper autopilot pause\` — the daemon holds a per-epic recover`,
+      `exclusion for as long as THIS worker is live, so the recover sweep will not`,
+      `race your merge and the rest of the board keeps moving. A global pause would`,
+      `needlessly halt every unrelated epic.`,
       ``,
       `Open the epic's base worktree, RE-RUN the failed \`git merge --no-ff <source>\``,
       `(NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
@@ -1308,7 +1314,7 @@ export function buildResolverBrief(args: {
       `IF mechanically clear: resolve merging BOTH intents (never pick one side and`,
       `drop the other), run the epic's tests/build within a bounded budget (passing`,
       `tests are necessary, not sufficient), commit the merge commit, then unstick the`,
-      `board: \`keeper autopilot retry close::${epic}\` then \`keeper autopilot play\`, then EXIT.`,
+      `board: \`keeper autopilot retry close::${epic}\`, then EXIT (no \`play\` — you never paused).`,
       ``,
       ...blockedPath,
       ``,
@@ -1323,9 +1329,11 @@ export function buildResolverBrief(args: {
     `aborted CLEAN and the sticky close row is staged for retry. Recreate the conflict,`,
     `classify it, and resolve it ONLY if it is mechanically clear.`,
     ``,
-    `  0. keeper autopilot pause`,
-    `     (the recover sweep races your manual merge otherwise — it runs ONLY while`,
-    `     autopilot is unpaused.)`,
+    `Do NOT \`keeper autopilot pause\` — the daemon holds a per-epic recover exclusion`,
+    `for as long as THIS worker is live, so the recover sweep will not race your merge`,
+    `and the rest of the board keeps moving. A global pause would needlessly halt every`,
+    `unrelated epic; it also strands the board if you crash before playing.`,
+    ``,
     `  1. cd ${worktree}`,
     `  2. git merge --no-ff ${parsed.source}`,
     `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
@@ -1340,9 +1348,8 @@ export function buildResolverBrief(args: {
     `      and drop the other. Run the epic's tests/build within a bounded budget`,
     `      (passing tests are necessary, not sufficient). Commit the merge commit, then`,
     `      verify \`git branch --contains ${parsed.source}\` lists the base branch.`,
-    `      Unstick the board and EXIT:`,
+    `      Unstick the board and EXIT (no \`play\` — you never paused):`,
     `        keeper autopilot retry close::${epic}`,
-    `        keeper autopilot play`,
     ``,
     `  4b. ${blockedPath[0]}`,
     ...blockedPath.slice(1).map((line) => `      ${line}`),
@@ -6384,9 +6391,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   //
   // Spawns into the MANAGED autopilot session with `--name resolve::<epic>`, so the
   // worker folds a first-class `jobs` row and every reap / instant-death-breaker /
-  // slot-occupancy discipline applies to it like any dispatch key. The launch cwd is
-  // the epic's base worktree (where the fan-in conflict lives); the resolver brief
-  // carries the pause-first recipe so the recover sweep never races its manual merge.
+  // slot-occupancy discipline applies to it like any dispatch key. That live jobs row
+  // IS the mutex: the recover sweep's pass-1 skips a lane whose epic has a live
+  // `resolve::<epic>` job (`epicHasActiveResolver`), a SCOPED per-epic exclusion that
+  // replaced the resolver's old GLOBAL `keeper autopilot pause` — so a crashed resolver
+  // strands nothing (the skip auto-lifts on reap) and concurrent fan-ins stay
+  // independent. The launch cwd is the epic's base worktree (where the fan-in lives).
   async function dispatchResolver(
     row: PendingResolverDispatch,
   ): Promise<ResolverDispatchOutcome> {
