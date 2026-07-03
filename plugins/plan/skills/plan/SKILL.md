@@ -591,9 +591,9 @@ When the plan spans more than one epic, how those epics EXECUTE is a cross-skill
 
 The planning flow's default wrap-up stays quiet (Phase 8) — these shapes engage only on the human's request.
 
-### Reacting to a blocked-worker bus directive
+### Helping a blocked work agent
 
-A blocked `/plan:work` worker stamps the block and the daemon escalates ONCE to you over the Agent Bus — an authoritative `Plan task <task> (epic <epic>) is BLOCKED and needs you.` directive carrying the category, repo, and `blocked_reason`. When it wakes you, react in this order — **bus-resume is PRIMARY; cold-re-dispatch is the fallback, not the default**:
+Your work agents ask you for help. Either the daemon escalates a blocked `/plan:work` worker to you ONCE over the Agent Bus — a `Plan task <task> (epic <epic>) is BLOCKED — the worker exhausted its own resolution and escalated rather than guess.` message carrying the `Category:`, `Repo:`, and verbatim `Blocked reason:` — or a still-live worker messages you directly. Either way, be prepared to do the work the resolution needs on the worker's behalf, then hand control back and ask it to resume. React in this order — **bus-resume is PRIMARY; cold-re-dispatch is the fallback, not the default**:
 
 1. **Resolve the blocker per its category** — do the human-gated action, clear the dep, refine the spec (`/plan:plan <epic> refine`), or whatever the `Category:` line calls for. The directive carries the verbatim `blocked_reason`.
 2. **Unblock the board** — `keeper plan unblock <task>` (flips the task `blocked → todo`, preserving claim history).
