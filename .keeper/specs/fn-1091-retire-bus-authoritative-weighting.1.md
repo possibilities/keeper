@@ -60,5 +60,5 @@ All prose is forward-facing: no tombstones ("formerly", "used to be authoritativ
 - [ ] `bun test`, `bun run lint`, and `bun scripts/vendor-corpus.ts --check` all pass
 
 ## Done summary
-
+Neutralized the bus message head (directiveHead -> messageHead rendering 'Agent Bus message from <name>: ' across all three renderings) and moved the trust story into skill/help prose as proxy-of-the-human provenance with no gate language in either direction; broadened the plan skill's blocked-worker section to help requests from work agents.
 ## Evidence
