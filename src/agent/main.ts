@@ -18,6 +18,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import {
+  type BirthRecordDraft,
+  buildBirthDraft,
+  emitBirthRecord,
+} from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
 import {
   buildLauncherArgvPrefix,
@@ -88,6 +93,7 @@ import {
 import { makePhaser } from "./phaser";
 import { discoverPlugins, PluginError } from "./plugins";
 import {
+  type ChildSpawnedFn,
   defaultSpawn,
   runPassthrough,
   runWithJobControl,
@@ -191,6 +197,16 @@ export interface MainDeps {
   startCodexSessionNameIndexerFn: (
     opts: CodexSessionNameIndexerOptions,
   ) => () => void;
+  /**
+   * Emit a birth record for a freshly-spawned non-claude harness child (codex /
+   * pi / hermes): probe the child's platform-tagged start_time and atomically
+   * write the maildir record the ingest worker turns into a synthetic
+   * SessionStart. Fail-open — a write failure degrades to presence-only. Injected
+   * so the launcher wiring is testable without a real fs write or `ps` fork;
+   * `realDeps()` binds the real {@link emitBirthRecord}. Claude launches never
+   * call it (its hook SessionStart is the authoritative presence + resume seed).
+   */
+  emitBirthRecord: (draft: BirthRecordDraft, pid: number) => void;
   tmuxBin: string;
   /**
    * The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>,
@@ -255,6 +271,7 @@ export function realDeps(): MainDeps {
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
+    emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
     tmuxBin: resolveTmuxBin(process.env),
     launcherArgvPrefix: buildLauncherArgvPrefix(
       process.execPath,
@@ -2089,7 +2106,13 @@ export async function main(deps: MainDeps): Promise<never> {
       startedAtMs: Date.now(),
     });
 
-    return runWithJobControl(runCmd, deps.spawn, deps.exit);
+    const onCodexSpawned = armBirthRecord(deps, "codex", {
+      spawnName: codexSessionName,
+      configDir: codexHome,
+      pinnedSessionId: null,
+      hasContinueOrResume,
+    });
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onCodexSpawned);
   }
 
   if (agent === "hermes") {
@@ -2136,7 +2159,18 @@ export async function main(deps: MainDeps): Promise<never> {
       deps.write("~ launching hermes\n");
     }
 
-    return runWithJobControl(runCmd, deps.spawn, deps.exit);
+    const hermesSpawnName = resolveLaunchSessionName(
+      remainingArgs,
+      deps.cwd,
+      deps.nextCwdOrdinalFn,
+    ).sessionName;
+    const onHermesSpawned = armBirthRecord(deps, "hermes", {
+      spawnName: hermesSpawnName,
+      configDir: null,
+      pinnedSessionId: null,
+      hasContinueOrResume,
+    });
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned);
   }
 
   if (agent === "claude") {
@@ -2334,6 +2368,8 @@ export async function main(deps: MainDeps): Promise<never> {
   // A fresh launch OR a fork needs a fresh --name (a fork mints a new session
   // id; plain --resume/--continue keeps its persisted title and is excluded).
   const wantSessionName = sessionUuid !== null || hasForkSession;
+  // Captured for the pi birth record's spawn_name (display title).
+  let resolvedSessionName: string | null = null;
   if (
     wantSessionName &&
     !remainingArgs.includes("-n") &&
@@ -2344,6 +2380,7 @@ export async function main(deps: MainDeps): Promise<never> {
       deps.cwd,
       deps.nextCwdOrdinalFn,
     );
+    resolvedSessionName = sessionName;
     if (resolvedSlug) {
       actionLog.push(`Resolved session slug: ${resolvedSlug}`);
     } else {
@@ -2454,7 +2491,19 @@ export async function main(deps: MainDeps): Promise<never> {
     deps.write(`~ launching ${agent}\n`);
   }
 
-  return runWithJobControl(runCmd, deps.spawn, deps.exit);
+  // pi shares this path with claude; only pi gets a birth record (claude's hook
+  // SessionStart is its authoritative presence seed). pi pins its session id, so
+  // the pinned uuid is its job identity + resume target.
+  const onChildSpawned: ChildSpawnedFn | undefined =
+    agent === "pi"
+      ? armBirthRecord(deps, "pi", {
+          spawnName: resolvedSessionName,
+          configDir: profileDir,
+          pinnedSessionId: sessionUuid,
+          hasContinueOrResume,
+        })
+      : undefined;
+  return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned);
 }
 
 function safeList(fn: () => string[]): string[] {
@@ -2463,6 +2512,64 @@ function safeList(fn: () => string[]): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Arm the birth record for a non-claude launch: resolve the keeper job identity,
+ * export it (plus codex's rollout originator override) to the harness child, and
+ * return the post-spawn callback that writes the maildir record. A birth record
+ * is the ONLY presence channel for codex/pi/hermes (they fire no keeper hook);
+ * claude is exempt — its SessionStart hook is authoritative for both presence and
+ * resume seed — and never calls this.
+ *
+ * Identity: pi pins its session id at launch (`job_id = session_id`); codex/hermes
+ * get a keeper-minted uuid. A RESUME relaunch reuses the ORIGINAL job id carried
+ * back in `KEEPER_JOB_ID` (set by the revive script / keeper tabs restore) so the
+ * revived session folds onto its existing row instead of minting an orphan. The
+ * callback runs shared by interactive AND detached launches: a detached pane
+ * re-execs `keeper agent` and passes back through this same spawn choke point, so
+ * the record is written by the pane's own launcher, never the outer wrapper.
+ */
+function armBirthRecord(
+  deps: MainDeps,
+  agent: Exclude<AgentKind, "claude">,
+  opts: {
+    spawnName: string | null;
+    configDir: string | null;
+    /** The session id keeper pinned at launch (pi), or null for a harness that
+     *  mints its own (codex/hermes). */
+    pinnedSessionId: string | null;
+    hasContinueOrResume: boolean;
+  },
+): ChildSpawnedFn {
+  const descriptor = HARNESS_DESCRIPTORS[agent];
+  const carried = (deps.env.KEEPER_JOB_ID ?? "").trim();
+  let jobId: string;
+  if (opts.hasContinueOrResume && carried !== "") {
+    jobId = carried;
+  } else if (opts.pinnedSessionId !== null) {
+    jobId = opts.pinnedSessionId;
+  } else {
+    jobId = deps.randomUuid();
+  }
+  // Export the identity to the harness child. Codex additionally overrides its
+  // rollout originator so the rollout tail can positively attribute the session.
+  deps.env.KEEPER_JOB_ID = jobId;
+  if (agent === "codex") {
+    deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE = jobId;
+  }
+  const draft = buildBirthDraft(deps.env, {
+    session_id: jobId,
+    harness: agent,
+    cwd: deps.cwd,
+    spawn_name: opts.spawnName,
+    config_dir: opts.configDir,
+    // pi's resume target is its pinned session id (authoritative at launch);
+    // codex/hermes back-fill theirs post-stop, so it is null at birth.
+    resume_target: descriptor.mintsOwnSessionId ? null : jobId,
+    launch_ts: new Date(deps.now()).toISOString(),
+  });
+  return (pid: number) => deps.emitBirthRecord(draft, pid);
 }
 
 /**

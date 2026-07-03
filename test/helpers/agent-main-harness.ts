@@ -15,6 +15,7 @@ import type { MainDeps } from "../../src/agent/main";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
+import type { BirthRecordDraft } from "../../src/birth-record";
 
 /**
  * The default preset catalog the harness injects when a test names none: a
@@ -71,12 +72,17 @@ export const throwingExit = (code: number): never => {
   throw new ExitSignal(code);
 };
 
+/** A fixed fake child pid so `runWithJobControl` fires the birth-record seam in
+ *  wiring tests (production `defaultSpawn` carries the real `proc.pid`). */
+export const FAKE_CHILD_PID = 4242;
+
 /** A child that exits 0 immediately — the default fake agent. */
 function okChild(): SpawnedChild {
   return {
     exited: Promise.resolve(0),
     exitCode: 0,
     signalCode: null,
+    pid: FAKE_CHILD_PID,
     kill() {},
   };
 }
@@ -93,6 +99,8 @@ export interface Harness {
   bootstrappedProfiles: string[];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
+  /** Every birth record the launcher emitted (draft + child pid), in order. */
+  birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
   tmuxCommands: string[][];
   /** Call count for the injected picker. */
@@ -156,6 +164,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const err: string[] = [];
   const bootstrappedProfiles: string[] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
+  const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let pickerCalls = 0;
 
@@ -216,6 +225,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
       codexSessionNameIndexers.push(opts);
       return () => {};
     },
+    emitBirthRecord: (draft: BirthRecordDraft, pid: number) => {
+      birthRecords.push({ draft, pid });
+    },
     tmuxBin: opts.tmuxBin ?? "tmux",
     launcherArgvPrefix: opts.launcherArgvPrefix ?? [
       "/fake-home/.bun/bin/bun",
@@ -243,6 +255,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     err,
     bootstrappedProfiles,
     codexSessionNameIndexers,
+    birthRecords,
     tmuxCommands,
     pickerCalls: () => pickerCalls,
   };

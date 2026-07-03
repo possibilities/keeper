@@ -26,12 +26,20 @@ export interface SpawnedChild {
   readonly exitCode: number | null;
   /** Signal name the child died from, or null on a normal exit. */
   readonly signalCode: NodeJS.Signals | null;
+  /** The spawned child's OS pid — the birth-record producer probes its
+   *  start_time. Optional: a test spawn stub may omit it (birth record then
+   *  simply not emitted); production `defaultSpawn` always carries it. */
+  readonly pid?: number;
   /** Send a signal to the child. */
   kill(signal: NodeJS.Signals): void;
 }
 
 /** Injectable spawn seam — the DI point the test-port task records against. */
 export type SpawnFn = (cmd: string[]) => SpawnedChild;
+
+/** Fired synchronously right after the child spawns, with its pid — the
+ *  non-claude birth-record write hooks here (see `emitBirthRecord`). */
+export type ChildSpawnedFn = (pid: number) => void;
 
 /** Production spawn: Bun.spawn with all three stdio streams inherited. */
 export const defaultSpawn: SpawnFn = (cmd: string[]): SpawnedChild => {
@@ -48,6 +56,7 @@ export const defaultSpawn: SpawnFn = (cmd: string[]): SpawnedChild => {
   });
   return {
     exited: proc.exited,
+    pid: proc.pid,
     get exitCode() {
       return proc.exitCode;
     },
@@ -69,8 +78,21 @@ export async function runWithJobControl(
   runCmd: string[],
   spawn: SpawnFn = defaultSpawn,
   exit: (code: number) => never = (code) => process.exit(code),
+  onChildSpawned?: ChildSpawnedFn,
 ): Promise<never> {
   const child = spawn(runCmd);
+
+  // Birth-record seam: fire once, immediately post-spawn, so the recorded
+  // start_time pairs with a still-fresh child pid. Defensive try/catch on top of
+  // the seam's own fail-open contract — a throwing writer must NEVER crash the
+  // human's launch.
+  if (onChildSpawned !== undefined && typeof child.pid === "number") {
+    try {
+      onChildSpawned(child.pid);
+    } catch {
+      // presence-only degrade
+    }
+  }
 
   // SIGINT no-op: the child (in the same foreground pgroup) receives ctrl-c
   // directly from the TTY; the parent must NOT die or it would orphan the
