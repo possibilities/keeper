@@ -39,5 +39,5 @@ test for the pill; refold-equivalence.
 - [ ] Both suites green including refold-equivalence
 
 ## Done summary
-
+Added keeper plan epic-question <epic_id> <text>/--clear verb writing the gitignored state/epics/<id>.state.json overlay (LocalFileStateStore.saveEpicRuntime + withEpicLock), capped at 2000 chars. Wired the epic-state sidecar fold through the plan-worker (epicQuestionCache mirroring runtimeStatusCache: primeEpicQuestion boot pass, coerceEpicQuestion, reemitEpicFromDef) into a new epics.question nullable TEXT column (schema v104, keeper/api.py whitelist updated) folded from EpicSnapshot.question in the reducer (ON CONFLICT-safe, byte-identical re-fold verified). keeper status (schema v4) now renders board.epics[].question and needs_human.parked_questions, feeding jammed/drained. Wired the close skill's QUESTION protocol to stamp/clear via the verb on park/resume. Both suites green (root 5557 pass, plan 1558 pass), typecheck+lint clean.
 ## Evidence
