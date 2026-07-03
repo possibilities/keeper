@@ -20,5 +20,5 @@ line, e.g. `label.replace(/[\r\n]+/g, " ")`.
 - [ ] A test feeds a newline-bearing label AND session name through the generator and asserts the injected text stays inside its `#` comment (no executable line escapes).
 
 ## Done summary
-
+Neutralize CR/LF in every label/session interpolation into a # comment line of the generated revive script (renderSnapshotScript + renderOutcomes summary stanzas) via a new commentSafe helper, plus a test proving a newline-bearing label and session stay inside their # comment with no live line escaping.
 ## Evidence
