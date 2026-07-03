@@ -411,6 +411,9 @@ from pathlib import Path
 # once-marker (the merge-resolver-worker dispatch latch, sibling of
 # ``merge_escalated_at``); keeper-py never reads ``dispatch_failures``, so only the
 # version whitelist gains 106.
+# v107 (fn-1107 task .1) adds the nullable ``jobs.dispatch_origin`` TEXT column (the
+# autopilot-vs-manual provenance discriminator the autoclose worker scopes on);
+# keeper-py never reads the new column, so only the version whitelist gains 107.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -489,6 +492,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         104,
         105,
         106,
+        107,
     }
 )
 

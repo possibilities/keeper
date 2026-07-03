@@ -7930,10 +7930,31 @@ function projectJobsRow(db: Database, event: Event): void {
           plan_verb != null &&
           plan_ref != null
         ) {
-          db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
-            plan_verb,
-            plan_ref,
-          ]);
+          const dischargeRes = db.run(
+            "DELETE FROM pending_dispatches WHERE verb = ? AND id = ?",
+            [plan_verb, plan_ref],
+          );
+          // Provenance stamp (fn-1107): the ONLY airtight autopilot-vs-manual
+          // discriminator. Gate on the ACTUAL discharge — `dischargeRes.changes`
+          // read HERE, before the sibling `dispatch_never_bound` DELETE below
+          // overwrites the changes counter — NEVER on `plan_verb`/`plan_ref`
+          // presence: a manual `keeper dispatch work::fn-N.M` is plan-form but
+          // mints no `Dispatched` event and thus no pending row (`cli/dispatch.ts`
+          // only READS the table as a race guard), so its discharge removes
+          // nothing and the row correctly stays NULL (= manual/unknown). A removed
+          // row means the autopilot's `Dispatched` intent materialized into this
+          // job, so it is autopilot-owned. The `Dispatched` event precedes this
+          // binding SessionStart in the log, so a from-scratch re-fold reproduces
+          // the same discharge and the same stamp byte-identically. The enclosing
+          // UPSERT already wrote this row's `last_event_id`/`updated_at` to this
+          // event in the same fold, so this narrow set-once UPDATE need not touch
+          // them. Pure fold.
+          if (dischargeRes.changes > 0) {
+            db.run(
+              "UPDATE jobs SET dispatch_origin = 'autopilot' WHERE job_id = ?",
+              [jobId],
+            );
+          }
           // Never-bound circuit-breaker reset: a successful bind for this pair
           // zeroes the consecutive-no-bind counter (DELETE), so a bind between
           // expires never trips the breaker and a "bound-then-died" worker (whose

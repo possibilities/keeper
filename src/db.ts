@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 106;
+export const SCHEMA_VERSION = 107;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5798,6 +5798,27 @@ function migrate(db: Database): void {
         "resolver_dispatched_at",
         "REAL",
       );
+
+      // v106→v107 (fn-1107.1): add the nullable `jobs.dispatch_origin` TEXT
+      // column — the airtight autopilot-vs-manual provenance discriminator the
+      // autoclose worker scopes on. Stamped `'autopilot'` in the reducer's
+      // SessionStart discharge-on-bind seam ONLY when the pending_dispatches
+      // DELETE actually removes a row (a real autopilot Dispatched intent
+      // materialized into this job); a manual `keeper dispatch work::fn-N.M` is
+      // plan-form but mints no Dispatched event and therefore no pending row, so
+      // it folds NULL. NULL, NO default: a `DEFAULT` would poison the NULL=manual
+      // invariant and break re-fold byte-identity. APPEND-via-ALTER keeps existing
+      // rows NULL (the zero-event shape) and is re-fold-safe: the Dispatched event
+      // that mints the pending row precedes the binding SessionStart in the log,
+      // so a from-scratch re-fold reproduces the same discharge and the same stamp
+      // byte-identically (deterministic-replayed like `kill_reason`, NOT live-only
+      // — do NOT add to `LIVE_ONLY_JOBS_COLUMNS`, NO cursor rewind). Kept OUT of
+      // the `CREATE_JOBS` literal (the :852 rule) so fresh-vs-migrated
+      // `PRAGMA table_info(jobs)` stays byte-identical. Whitelist-only Python read
+      // (keeper-py never reads this column) — this bump MUST add 107 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "jobs", "dispatch_origin", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

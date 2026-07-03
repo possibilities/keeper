@@ -1966,6 +1966,156 @@ test("from-scratch re-fold reproduces the pending_dispatches projection byte-ide
 });
 
 // ---------------------------------------------------------------------------
+// Schema v107 (fn-1107 task .1) — `jobs.dispatch_origin` provenance stamp. The
+// SessionStart discharge-on-bind seam stamps `'autopilot'` ONLY when the
+// pending_dispatches DELETE actually removes a row (a real autopilot Dispatched
+// intent bound to this job); every manual/handoff/untitled session folds NULL.
+// The airtight autopilot-vs-manual discriminator the autoclose worker scopes on.
+// ---------------------------------------------------------------------------
+
+function getDispatchOrigin(jobId: string): string | null {
+  const row = db
+    .query("SELECT dispatch_origin FROM jobs WHERE job_id = ?")
+    .get(jobId) as { dispatch_origin: string | null } | null;
+  return row?.dispatch_origin ?? null;
+}
+
+test("dispatch_origin: a SessionStart that discharges a pending dispatch folds dispatch_origin 'autopilot' (fn-1107)", () => {
+  // Autopilot outbox flow: `Dispatched` mints the pending row, then the worker's
+  // binding `SessionStart` discharges it — the discharge (changes > 0) is the
+  // gate that stamps the job autopilot-owned.
+  dispatchedEvent("work", "fn-1107-auto.1", "/repo", 1700);
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-auto",
+    spawn_name: "work::fn-1107-auto.1",
+  });
+  drainAll();
+  expect(getPendingDispatch("work", "fn-1107-auto.1")).toBeNull();
+  expect(getDispatchOrigin("sess-auto")).toBe("autopilot");
+});
+
+test("dispatch_origin: a plan-form SessionStart with NO pending row (manual dispatch) folds NULL (fn-1107)", () => {
+  // A manual `keeper dispatch work::fn-N.M` is plan-form (spawn name matches the
+  // whitelist) but mints NO `Dispatched` event — the CLI only READS
+  // pending_dispatches as a race guard. So the discharge DELETE removes nothing
+  // (changes == 0) and the row correctly stays NULL — the exclusion tripwire
+  // that keeps manual plan workers out of the autoclose bucket.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-manual",
+    spawn_name: "work::fn-1107-manual.1",
+  });
+  drainAll();
+  const job = getJob("sess-manual");
+  // The plan correlator still binds (spawn-name parse), but with no discharge…
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-1107-manual.1");
+  // …the provenance stamp stays NULL.
+  expect(getDispatchOrigin("sess-manual")).toBeNull();
+});
+
+test("dispatch_origin: handoff, untitled, and non-whitelist SessionStarts fold NULL (fn-1107)", () => {
+  // A `handoff::<id>` spawn name is a SEPARATE class (`planVerbRefFromSpawnName`
+  // returns null), so the discharge block never fires; an untitled session and a
+  // human-launched arbitrary name likewise never reach the stamp. All NULL.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-handoff",
+    spawn_name: "handoff::fn-1107-h1",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-untitled",
+    // no spawn_name — a bare manual `claude` session
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-arbitrary",
+    spawn_name: "human-launched-session",
+  });
+  drainAll();
+  expect(getDispatchOrigin("sess-handoff")).toBeNull();
+  expect(getDispatchOrigin("sess-untitled")).toBeNull();
+  expect(getDispatchOrigin("sess-arbitrary")).toBeNull();
+});
+
+test("dispatch_origin: a same-key manual SessionStart AFTER the autopilot worker already discharged folds NULL (fn-1107)", () => {
+  // The pending row is consumed by the FIRST binding SessionStart. A later
+  // same-key session (e.g. a manual relaunch of the same task id) finds no
+  // pending row to discharge, so it stays NULL — only the genuinely
+  // autopilot-bound worker carries the stamp.
+  dispatchedEvent("work", "fn-1107-once.1", "/repo", 1700);
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-auto-once",
+    spawn_name: "work::fn-1107-once.1",
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-manual-once",
+    spawn_name: "work::fn-1107-once.1",
+  });
+  drainAll();
+  expect(getDispatchOrigin("sess-auto-once")).toBe("autopilot");
+  expect(getDispatchOrigin("sess-manual-once")).toBeNull();
+});
+
+test("from-scratch re-fold reproduces the dispatch_origin stamps byte-identically (fn-1107)", () => {
+  // Seed a mix of stamped ('autopilot') and NULL (manual/handoff) jobs, then
+  // rewind + wipe the deterministic `jobs` projection + the ephemeral
+  // `pending_dispatches` and re-drain. The Dispatched events precede their
+  // binding SessionStarts in the log, so the re-fold re-mints each pending row
+  // and re-discharges it, reproducing identical dispatch_origin values — the
+  // deterministic-replayed re-fold invariant.
+  dispatchedEvent("work", "fn-1107-r-a.1", "/r1", 1700);
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r-auto",
+    spawn_name: "work::fn-1107-r-a.1",
+  });
+  // Manual (no Dispatched) → NULL.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r-manual",
+    spawn_name: "work::fn-1107-r-manual.1",
+  });
+  // Handoff → NULL.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r-handoff",
+    spawn_name: "handoff::fn-1107-r-h",
+  });
+  drainAll();
+
+  const before = db
+    .query("SELECT job_id, dispatch_origin FROM jobs ORDER BY job_id")
+    .all();
+  // Sanity: exactly one 'autopilot' stamp among the three seeded jobs.
+  expect(before).toContainEqual({
+    job_id: "sess-r-auto",
+    dispatch_origin: "autopilot",
+  });
+  expect(before).toContainEqual({
+    job_id: "sess-r-manual",
+    dispatch_origin: null,
+  });
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM pending_dispatches");
+  drainAll();
+
+  const after = db
+    .query("SELECT job_id, dispatch_origin FROM jobs ORDER BY job_id")
+    .all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v76 (fn-846) — `dispatch_never_bound` reducer projection + the
 // never-bound circuit breaker. `foldDispatchExpired` increments a per-`(verb,
 // id)` consecutive-`DispatchExpired`-without-bind counter; at K=3 it mints a
