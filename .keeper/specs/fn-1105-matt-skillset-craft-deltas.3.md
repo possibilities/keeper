@@ -26,5 +26,5 @@ Author the single-source invariant kernel for keeper's landed-vs-complete semant
 - [ ] Corpus tooling in this repo (index validation / snippet build) passes
 
 ## Done summary
-
+Added landed-vs-complete engineering snippet (kernel: lane-merge, worktree-off degradation, multi-repo all-groups, complete-fires-early) with a valid _index.yaml row; keeper prompt build-snippets validates and find-snippets returns it.
 ## Evidence
