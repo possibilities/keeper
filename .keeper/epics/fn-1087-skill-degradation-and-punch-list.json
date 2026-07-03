@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T01:19:00.272000Z",
+  "depends_on_epics": [],
+  "id": "fn-1087-skill-degradation-and-punch-list",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Skill degradation and punch-list",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T01:19:00.272000Z"
+}
