@@ -12,8 +12,11 @@
  */
 
 import pkg from "../../package.json" with { type: "json" };
+import { type HarnessName, isHarnessName } from "./harness";
 
-export type AgentKind = "claude" | "codex" | "pi";
+/** A harness `keeper agent` dispatches to — derived from the harness registry so
+ *  the name set lives in exactly one place (`src/agent/harness.ts`). */
+export type AgentKind = HarnessName;
 
 /** The composable post-launch verbs that read a detached run's transcript. */
 export type SubcommandKind = "wait-for-stop" | "show-last-message";
@@ -56,6 +59,7 @@ Usage:
   keeper agent claude [args...]        Launch Claude Code.
   keeper agent codex [args...]         Launch Codex CLI.
   keeper agent pi [args...]            Launch pi.
+  keeper agent hermes [args...]        Launch Hermes (Nous Research).
   keeper agent --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
   keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
@@ -119,6 +123,7 @@ Usage:
   keeper agent claude [args...]   Launch Claude Code.
   keeper agent codex [args...]    Launch Codex CLI.
   keeper agent pi [args...]       Launch pi.
+  keeper agent hermes [args...]   Launch Hermes (Nous Research).
 
 The flags below are consumed by the wrapper; every other arg after the agent
 subcommand passes through to that launcher unchanged. For a launcher's own
@@ -291,7 +296,7 @@ export function splitSubcommand(argv: string[]): Dispatch {
   if (head === undefined) {
     return { kind: "usage" };
   }
-  if (head === "claude" || head === "codex" || head === "pi") {
+  if (isHarnessName(head)) {
     return { kind: "run", agent: head, rest: argv.slice(1) };
   }
   if (head === "presets") {

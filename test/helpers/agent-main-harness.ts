@@ -15,6 +15,7 @@ import type { MainDeps } from "../../src/agent/main";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
+import type { BirthRecordDraft } from "../../src/birth-record";
 
 /**
  * The default preset catalog the harness injects when a test names none: a
@@ -47,10 +48,18 @@ export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
       thinking: "high",
       role: null,
     },
+    "hermes-default": {
+      harness: "hermes",
+      model: "gpt-5.5",
+      effort: null,
+      thinking: null,
+      role: null,
+    },
   },
   claude_default: "claude-default",
   codex_default: "codex-default",
   pi_default: "pi-default",
+  hermes_default: "hermes-default",
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -63,12 +72,17 @@ export const throwingExit = (code: number): never => {
   throw new ExitSignal(code);
 };
 
+/** A fixed fake child pid so `runWithJobControl` fires the birth-record seam in
+ *  wiring tests (production `defaultSpawn` carries the real `proc.pid`). */
+export const FAKE_CHILD_PID = 4242;
+
 /** A child that exits 0 immediately — the default fake agent. */
 function okChild(): SpawnedChild {
   return {
     exited: Promise.resolve(0),
     exitCode: 0,
     signalCode: null,
+    pid: FAKE_CHILD_PID,
     kill() {},
   };
 }
@@ -85,6 +99,8 @@ export interface Harness {
   bootstrappedProfiles: string[];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
+  /** Every birth record the launcher emitted (draft + child pid), in order. */
+  birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
   tmuxCommands: string[][];
   /** Call count for the injected picker. */
@@ -100,12 +116,13 @@ export interface HarnessOptions {
    * the dispatch suite to test bare/unknown/help/version classification.
    */
   rawArgv?: boolean;
-  agent?: "claude" | "codex" | "pi";
+  agent?: "claude" | "codex" | "pi" | "hermes";
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeBin?: string;
   codexBin?: string;
   piBin?: string;
+  hermesBin?: string;
   pickProfile?: () => string;
   listProfiles?: () => string[];
   /** Profile dir ensureKeeperAgentProfileDirFn returns (default deterministic). */
@@ -147,12 +164,14 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const err: string[] = [];
   const bootstrappedProfiles: string[] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
+  const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let pickerCalls = 0;
 
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
+  const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
   const profileDir = opts.profileDir ?? "/fake-home/.claude-profiles/stub";
 
   const pickProfile = opts.pickProfile ?? (() => "default");
@@ -185,6 +204,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     claudeBin: homeBin,
     codexBin,
     piBin,
+    hermesBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,
@@ -204,6 +224,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
     startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
       codexSessionNameIndexers.push(opts);
       return () => {};
+    },
+    emitBirthRecord: (draft: BirthRecordDraft, pid: number) => {
+      birthRecords.push({ draft, pid });
     },
     tmuxBin: opts.tmuxBin ?? "tmux",
     launcherArgvPrefix: opts.launcherArgvPrefix ?? [
@@ -232,6 +255,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     err,
     bootstrappedProfiles,
     codexSessionNameIndexers,
+    birthRecords,
     tmuxCommands,
     pickerCalls: () => pickerCalls,
   };

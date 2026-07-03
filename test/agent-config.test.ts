@@ -89,6 +89,7 @@ describe("loadPresetCatalog", () => {
     claude_default: null,
     codex_default: null,
     pi_default: null,
+    hermes_default: null,
   };
 
   test("an empty presets mapping is valid (worker tolerance)", () => {
@@ -322,11 +323,14 @@ describe("loadPanelSelections", () => {
     );
   });
 
-  test("a pi member is rejected at load (claude|codex only)", () => {
+  test("a pi member is accepted at load (panel eligibility is the capturable capability)", () => {
+    // Panel eligibility reads a descriptor capability (`capturable`), never a
+    // claude|codex name list — pi is capturable, so a pi panel member is valid.
     const p = writeYaml("panel.yaml", "panels:\n  mixed:\n    - a\n    - z\n");
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /not panel-launchable/,
-    );
+    expect(loadPanelSelections(catalogFixture(), p).panels.mixed).toEqual([
+      "a",
+      "z",
+    ]);
   });
 
   test("an empty panel list is fail-loud", () => {

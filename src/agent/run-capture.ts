@@ -12,12 +12,14 @@
  * (panel legs, the future subagent wrapper).
  *
  * DEP-GRAPH DISCIPLINE: this module imports TYPES ONLY (from `./dispatch` /
- * `./pair-subcommands`); every effect is a passed-in seam. It MUST NOT pull
- * `src/db.ts` / `bun:sqlite` — `cli/agent.ts`'s reach onto the cold-start
- * `keeper plan` path stays db-free (pinned by the hygiene import-scan test).
+ * `./pair-subcommands`) plus the dep-free harness registry (`./harness`, pure
+ * data); every effect is a passed-in seam. It MUST NOT pull `src/db.ts` /
+ * `bun:sqlite` — `cli/agent.ts`'s reach onto the cold-start `keeper plan` path
+ * stays db-free (pinned by the hygiene import-scan test).
  */
 
 import type { AgentKind } from "./dispatch";
+import { HARNESS_NAME_SET } from "./harness";
 import type {
   ResolvedHandle,
   ShowLastMessageResult,
@@ -118,11 +120,9 @@ export function buildRunCaptureEnvelope(
   return { envelope, exitCode: runCaptureExitCode(fields.outcome) };
 }
 
-const RUN_CAPTURE_AGENTS: ReadonlySet<string> = new Set([
-  "claude",
-  "codex",
-  "pi",
-]);
+/** The harnesses `agent run` accepts — derived from the harness registry so the
+ *  name set lives in one place (no near-copy to drift). */
+const RUN_CAPTURE_AGENTS: ReadonlySet<string> = HARNESS_NAME_SET;
 
 /** Discriminated result of {@link parseRunArgs}. */
 export type ParseRunArgsResult =
@@ -349,7 +349,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   if (cli === undefined || !RUN_CAPTURE_AGENTS.has(cli)) {
     return {
       ok: false,
-      error: `<cli> must be claude|codex|pi: ${cli ?? "(missing)"}`,
+      error: `<cli> must be ${[...RUN_CAPTURE_AGENTS].join("|")}: ${cli ?? "(missing)"}`,
     };
   }
   const prompt = positionals[1];
@@ -448,13 +448,21 @@ export async function captureFromHandle(
   const { handle, handleId, agent, startMs } = args;
   const baseResume = handle.sessionId;
   // claude/pi pin `handle.sessionId` at launch — authoritative, keep it. codex
-  // can't be pinned (it mints its own uuid), so when a transcript resolved and
-  // no id was pinned, discover it POST-STOP from the rollout path via the seam.
+  // and hermes can't be pinned (they mint their own id): discover it POST-STOP.
+  // codex parses the resolved rollout path via the seam; hermes's wait/show carry
+  // its native session id AS the `transcriptPath` (it has no transcript file), so
+  // that value IS the resume target directly.
   const resolveResume = (transcriptPath: string | null): string | null => {
     if (baseResume !== null) {
       return baseResume;
     }
-    if (agent !== "codex" || transcriptPath === null) {
+    if (transcriptPath === null) {
+      return null;
+    }
+    if (agent === "hermes") {
+      return transcriptPath;
+    }
+    if (agent !== "codex") {
       return null;
     }
     return deps.resolveCodexResumeTarget?.({ transcriptPath }) ?? null;

@@ -420,7 +420,7 @@ describe("presets list discovery surface", () => {
         },
       ],
       default: "duo",
-      defaults: { claude: "a", codex: "b", pi: null },
+      defaults: { claude: "a", codex: "b", pi: null, hermes: null },
     });
   });
 
