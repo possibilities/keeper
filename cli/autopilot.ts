@@ -890,6 +890,10 @@ async function runViewer(
     // captured frame reflects the FOLDED state rather than the seed values.
     mode: mode === "snapshot" ? "snapshot" : "live",
     streamCount: 5,
+    // A healthy but fully-idle board (no working/stopped/failed dispatch, no
+    // armed epics, no open-task DAG) renders zero body lines — emit an honest
+    // idle line so the snapshot frame is never bare separators.
+    snapshotEmptyLine: "idle — no active dispatches, failures, or armed epics",
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     persistentBannerPill: () =>
       autopilotBannerLabel({
