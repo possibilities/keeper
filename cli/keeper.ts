@@ -17,6 +17,7 @@
  * Production code calls `main()` which wires the real subcommand mains.
  */
 
+import { Clerc, defineCommand } from "@clerc/core";
 import packageJson from "../package.json" with { type: "json" };
 
 export const SUBCOMMANDS = [
@@ -319,11 +320,51 @@ export interface DispatchDeps {
 }
 
 /**
- * Pure dispatch: examines the first positional token, routes to the named
- * handler with the residual argv, and handles the four top-level cases
- * (bare / unknown / --help / --version). Never returns on the top-level
- * cases (always calls `exit`); returns the handler's promise otherwise so
- * the caller can `await` it.
+ * Build the Clerc-backed top-level command tree. Each public subcommand is a
+ * PROXY command: its `ignore` hook stops parsing at the command path so Clerc
+ * captures the entire residual argv verbatim in `context.ignored`, and the proxy
+ * handler forwards that untouched array to the subcommand's own `main(argv)`.
+ * This is the "proxy before leaf migration" seam — the framework owns command
+ * discovery (and, later, completion generation) while every leaf keeps its
+ * established parser and exit-code contract.
+ *
+ * Two-level verbs (`plan <verb>`, `prompt <verb>`, …) are deliberately NOT
+ * registered as nested Clerc commands: a nested `plan status` command would make
+ * Clerc's command resolver match the longer path and strip `status` out of the
+ * residual, breaking the leaf-owned pass-through. Their verb tokens ride in the
+ * residual instead; completion candidates come from `SUBCOMMAND_META[*].verbs`.
+ */
+export function buildKeeperCli(deps: {
+  handlers: Record<Subcommand, SubcommandHandler>;
+  version: string;
+}): Clerc {
+  const commands = SUBCOMMANDS.map((name) =>
+    defineCommand(
+      {
+        name,
+        description: SUBCOMMAND_META[name].summary,
+        // Returning true on the very first residual token pushes that token and
+        // every token after it into `context.ignored` untouched — never parsing
+        // or normalizing a leaf's flags.
+        ignore: () => true,
+      },
+      (ctx) => deps.handlers[name](ctx.ignored),
+    ),
+  );
+  return Clerc.create({
+    name: "keeper",
+    scriptName: "keeper",
+    version: deps.version,
+  }).command(commands);
+}
+
+/**
+ * Pure dispatch: handles the top-level special cases (bare / unknown / --help /
+ * --version) with their pinned stdout/stderr/exit contracts, then routes a known
+ * subcommand through the Clerc proxy tree, which forwards the residual argv
+ * verbatim to the subcommand's handler. Never returns on the special cases
+ * (always calls `exit`); awaits the proxy route otherwise so the caller can
+ * `await` it.
  */
 export async function dispatch(
   argv: string[],
@@ -361,8 +402,9 @@ export async function dispatch(
     deps.exit(1);
   }
 
-  const handler = deps.handlers[first];
-  await handler(argv.slice(1));
+  // Route the known subcommand through the Clerc proxy tree. The proxy's `ignore`
+  // hook hands the leaf handler the exact residual argv (`argv.slice(1)`).
+  await buildKeeperCli(deps).parse(argv);
 }
 
 export function isSubcommand(s: string): s is Subcommand {
