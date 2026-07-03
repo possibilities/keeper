@@ -41,5 +41,5 @@ Fold tests: 3 instant deaths â†’ breaker verdict; done-stamped fast completion â
 - [ ] Change-gate routed; refold-equivalence + both suites green
 
 ## Done summary
-
+Added the instant-death circuit breaker (reducer-side sibling of never-bound): a bind-then-sub-minute-death, K=3 consecutive, mints a sticky dispatch_failures(instant-death-breaker) that failedKeys suppresses until retry; cause-agnostic post-bind-lifetime detection, fast SessionEnd successes never trip. Board surfaces needs_human.instant_death_wall as the multi-key quota-wall signal (no auto-pause). New dispatch_instant_death projection at schema v105.
 ## Evidence
