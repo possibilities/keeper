@@ -981,7 +981,11 @@ export function verbForVerdict(
  */
 export function isOccupyingJob(
   jobs: Map<string, Job>,
-  verb: Verb,
+  // `Verb | "resolve"`: the reconciler's own dispatch verbs PLUS the daemon's
+  // autonomous merge-resolver (`resolve::<epic>`), whose liveness the recover
+  // pass reads through {@link epicHasActiveResolver}. The check is verb-agnostic
+  // — a `plan_verb` string compare — so admitting `resolve` costs nothing.
+  verb: Verb | "resolve",
   id: string,
   livePaneIds: ReadonlySet<string> | null,
 ): boolean {
@@ -997,6 +1001,27 @@ export function isOccupyingJob(
     }
   }
   return false;
+}
+
+/**
+ * Whether an autonomous merge-resolver worker (`resolve::<epicId>`) is currently
+ * LIVE for `epicId` — the SCOPED, per-epic exclusion that replaces the resolver
+ * brief's former GLOBAL `keeper autopilot pause`. The recover sweep's pass-1
+ * interrupted-merge abort skips a lane whose epic has a live resolver, so the
+ * resolver's own in-progress `git merge` (MERGE_HEAD set) is never raced and
+ * aborted out from under it. The exclusion auto-lifts the instant the resolver
+ * job reaps — a CLEAN exit OR a CRASH — so a dead resolver strands NOTHING (no
+ * durable board-wide pause halting unrelated epics) and concurrent stuck fan-ins
+ * stay independent (each epic gated on its OWN resolver job, never a shared
+ * global flag one resolver's `play` could flip while another is mid-merge).
+ * Reuses {@link isOccupyingJob}'s liveness arms.
+ */
+export function epicHasActiveResolver(
+  jobs: Map<string, Job>,
+  epicId: string,
+  livePaneIds: ReadonlySet<string> | null,
+): boolean {
+  return isOccupyingJob(jobs, "resolve", epicId, livePaneIds);
 }
 
 /**

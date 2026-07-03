@@ -61,6 +61,7 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type DispatchKey,
+  epicHasActiveResolver,
   epicPresentAndNotDone,
   FINALIZER_GUARD_S,
   type FoundJob,
@@ -648,6 +649,54 @@ test("fn-811 isOccupyingJob: stopped-with-DEAD-pane no longer occupies (the wedg
   );
   // No pane id at all is likewise not live-provable here.
   expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set())).toBe(false);
+});
+
+test("fn-1095 epicHasActiveResolver: true only for a LIVE `resolve::<epic>` job, keyed per-epic", () => {
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "working",
+      backend_exec_pane_id: "%1",
+    }),
+  );
+  // A live resolver for fn-1-foo → excluded; an unrelated epic is untouched (the
+  // per-epic scope, not a global flag).
+  expect(epicHasActiveResolver(jobs, "fn-1-foo", null)).toBe(true);
+  expect(epicHasActiveResolver(jobs, "fn-2-bar", null)).toBe(false);
+});
+
+test("fn-1095 epicHasActiveResolver: a reaped/terminal resolver no longer excludes (auto-lift on crash/exit)", () => {
+  const jobs = new Map<string, Job>();
+  // The resolver's pane is DEAD (absent from the live set) and the job is stopped —
+  // a crashed/exited resolver. The exclusion must lift so recover reclaims the lane.
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "stopped",
+      backend_exec_pane_id: "%7",
+    }),
+  );
+  expect(epicHasActiveResolver(jobs, "fn-1-foo", new Set(["%99"]))).toBe(false);
+  // A `work`/`close` job for the same id is NOT a resolver — never excludes recover.
+  const other = new Map<string, Job>();
+  other.set(
+    "j-2",
+    makeJob({
+      job_id: "j-2",
+      plan_verb: "close",
+      plan_ref: "fn-1-foo",
+      state: "working",
+      backend_exec_pane_id: "%2",
+    }),
+  );
+  expect(epicHasActiveResolver(other, "fn-1-foo", null)).toBe(false);
 });
 
 test("fn-811 isOccupyingJob: null livePaneIds (degraded probe) keeps stopped occupying", () => {
@@ -8180,6 +8229,61 @@ test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktree
   // The foreign lane was NEVER touched — zero git spawns against its cwd, so a
   // vanished foreign dir can't ENOENT the recovery sweep.
   expect(calls.some((c) => c.cwd === foreignLane)).toBe(false);
+});
+
+test("fn-1095 recoverWorktrees: pass-1 SKIPS the abort for a lane whose epic has a LIVE resolver (scoped exclusion, no global pause)", async () => {
+  // An autonomous merge-resolver (`resolve::fn-1-foo`) is mid-`git merge` in the
+  // epic's base worktree — MERGE_HEAD is set BY DESIGN, not by a crash. Recover
+  // must NOT abort it (that would race the resolver out from under its own
+  // resolution). `hasActiveResolver(epicId)` scopes the exclusion to THIS epic —
+  // the per-epic replacement for the resolver's old global `keeper autopilot pause`.
+  const resolvingLane = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const idleLane = "/repo.worktrees/keeper-epic-fn-2-bar";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${resolvingLane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n` +
+      `worktree ${idleLane}\nHEAD z\nbranch refs/heads/keeper/epic/fn-2-bar\n\n`,
+    mergeHeadAt: new Set([resolvingLane, idleLane]), // both carry a MERGE_HEAD
+    epicBases: [],
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    undefined,
+    (epicId) => epicId === "fn-1-foo", // ONLY fn-1-foo has a live resolver
+  );
+  expect(failures).toEqual([]);
+  // The resolver's lane was left ALONE — no abort raced its in-progress merge.
+  expect(
+    calls.some((c) => c.cwd === resolvingLane && c.args === "merge --abort"),
+  ).toBe(false);
+  // Every OTHER epic still recovers normally — the exclusion is per-epic, not global.
+  expect(
+    calls.some((c) => c.cwd === idleLane && c.args === "merge --abort"),
+  ).toBe(true);
+});
+
+test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once its resolver is NO LONGER live (auto-lift, no durable pause)", async () => {
+  // The crash edge: a resolver that died mid-merge leaves a real stale MERGE_HEAD.
+  // Its `resolve::<epic>` job has reaped, so `hasActiveResolver` reports false and
+  // recover reclaims the lane — the exclusion auto-lifts, so a dead resolver
+  // strands NOTHING (no durable board-wide pause). Default predicate = no resolver.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n`,
+    mergeHeadAt: new Set([lane]),
+    epicBases: [],
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(failures).toEqual([]);
+  expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
+    true,
+  );
 });
 
 test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {

@@ -112,6 +112,7 @@ import {
   buildWorkerCommand,
   type DispatchKey,
   dispatchKey,
+  epicHasActiveResolver,
   FINALIZER_GUARD_S,
   isFinalizerVerb,
   KEEPER_ROOT,
@@ -144,6 +145,7 @@ import {
 } from "./worktree-eligibility";
 import {
   type EpicLaneBranchSet,
+  epicIdFromKeeperLaneEntry,
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
@@ -207,6 +209,7 @@ export {
   closerJobFinished,
   computeSlotOccupancy,
   dispatchKey,
+  epicHasActiveResolver,
   FINALIZER_GUARD_S,
   isBareShellCommand,
   isEpicInFlight,
@@ -829,7 +832,11 @@ export interface WorktreeDriver {
    *  1. INTERRUPTED MERGE: for every registered linked worktree across `repos`,
    *     detect a stale `MERGE_HEAD` (a crash mid-merge) → `git merge --abort` →
    *     `git worktree prune --expire now`. The next cycle re-runs the merge from a
-   *     clean state (level-triggered retry, no in-process self-heal).
+   *     clean state (level-triggered retry, no in-process self-heal). SKIPPED for a
+   *     lane whose epic has a LIVE autonomous merge-resolver (`hasActiveResolver`):
+   *     that MERGE_HEAD is the resolver's deliberate in-progress merge, not crash
+   *     residue — the scoped per-epic exclusion that replaced the resolver's global
+   *     `keeper autopilot pause`.
    *  2. DONE-BUT-UNMERGED BACKSTOP: enumerate `keeper/epic/<id>` base branches
    *     from git; for each whose epic `isEpicDone` reports done but whose base is
    *     NOT yet an ancestor of the resolved default branch, merge it to default +
@@ -849,6 +856,7 @@ export interface WorktreeDriver {
     repos: readonly string[],
     isEpicDone: (epicId: string) => Promise<boolean>,
     epicPresentAndNotDone: (epicId: string) => Promise<boolean>,
+    hasActiveResolver: (epicId: string) => boolean,
   ): Promise<WorktreeRecoveryFailure[]>;
 }
 
@@ -2701,13 +2709,14 @@ export function createWorktreeDriver(
         };
       }
     },
-    recover(repos, isEpicDone, epicPresentAndNotDone) {
+    recover(repos, isEpicDone, epicPresentAndNotDone, hasActiveResolver) {
       return recoverWorktrees(
         repos,
         isEpicDone,
         run,
         undefined,
         epicPresentAndNotDone,
+        hasActiveResolver,
       );
     },
   };
@@ -3002,6 +3011,14 @@ export async function recoverWorktrees(
   acquireLock?: LockAcquirer,
   epicPresentAndNotDone: (epicId: string) => Promise<boolean> = () =>
     Promise.resolve(true),
+  // Per-epic exclusion: true while an autonomous merge-resolver (`resolve::<epic>`)
+  // is LIVE for the lane's epic. Gates ONLY pass-1's interrupted-merge abort — the
+  // one action that would race a resolver mid-`git merge` — so the resolver no
+  // longer needs a GLOBAL `keeper autopilot pause`. Defaults to "no resolver" so
+  // every existing caller (and the OFF path) is byte-identical. Passes 2/3 need no
+  // gate: both act only on a done/absent epic, but a resolver runs while its epic
+  // is still open (resolution precedes the close→finalize→done that marks it done).
+  hasActiveResolver: (epicId: string) => boolean = () => false,
 ): Promise<WorktreeRecoveryFailure[]> {
   const failures: WorktreeRecoveryFailure[] = [];
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
@@ -3054,6 +3071,16 @@ export async function recoverWorktrees(
       // vanished cwd — minting a spurious recovery failure. Classify on the branch
       // (a keeper lane IS its `keeper/epic/*` branch), not the path.
       if (!isKeeperLaneEntry(entry)) {
+        continue;
+      }
+      // A LIVE autonomous merge-resolver for this lane's epic is mid-`git merge`
+      // (MERGE_HEAD is set by design, not by a crash) — its resolution IS the
+      // work. Skip the abort so recover never races it out from under the
+      // resolver. The scoped per-epic exclusion that replaced the resolver's old
+      // global pause: it auto-lifts the instant that resolver job reaps (clean
+      // exit OR crash), and touches no OTHER epic's lane.
+      const laneEpicId = epicIdFromKeeperLaneEntry(entry);
+      if (laneEpicId !== null && hasActiveResolver(laneEpicId)) {
         continue;
       }
       try {
@@ -4511,6 +4538,16 @@ function main(): void {
               repos,
               (epicId) => isEpicDoneById(db, epicId),
               (epicId) => epicPresentAndNotDone(db, epicId),
+              // Per-epic resolver exclusion (from the SAME snapshot the cycle
+              // reconciled): pass-1 skips a lane whose epic has a live
+              // `resolve::<epic>` worker so its in-progress merge is never raced.
+              // A pure projection read (jobs + read-time liveness) — never a fold.
+              (epicId) =>
+                epicHasActiveResolver(
+                  snapshot.jobs,
+                  epicId,
+                  snapshot.livePaneIds,
+                ),
             );
             for (const f of failures) {
               deps.emitDispatchFailed({

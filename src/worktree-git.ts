@@ -714,6 +714,33 @@ export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
 }
 
 /**
+ * The epic id a keeper lane worktree entry belongs to — the base
+ * (`keeper/epic/<epic_id>`) OR a rib (`keeper/epic/<epic_id>--<task_id>`, split on
+ * the FIRST `--`), recovered from the entry's branch ref. `null` for a
+ * detached/non-keeper entry (mirrors {@link isKeeperLaneEntry}'s classification).
+ * Lets the recover pass gate a per-lane action on WHICH epic owns the lane (e.g.
+ * skip the pass-1 abort while that epic's autonomous merge-resolver is mid-merge).
+ * Pure.
+ */
+export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
+  if (entry.branch === null) {
+    return null;
+  }
+  const short = entry.branch.startsWith("refs/heads/")
+    ? entry.branch.slice("refs/heads/".length)
+    : entry.branch;
+  if (!short.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) {
+    return null;
+  }
+  const rest = short.slice(KEEPER_EPIC_BRANCH_PREFIX.length);
+  if (rest.length === 0) {
+    return null;
+  }
+  const sep = rest.indexOf("--");
+  return sep === -1 ? rest : rest.slice(0, sep);
+}
+
+/**
  * Enumerate the epic BASE branches (`keeper/epic/<epic_id>`) that still exist as
  * local refs — the done-but-unmerged backstop's candidate set, sourced from LIVE
  * git (never a window-bounded projection read), so a daemon restart between an

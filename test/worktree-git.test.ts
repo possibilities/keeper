@@ -32,6 +32,7 @@ import {
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
   enumerateEpicLaneBranches,
+  epicIdFromKeeperLaneEntry,
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
@@ -230,6 +231,33 @@ test("isKeeperLaneEntry: a keeper base/rib branch → true; a foreign or detache
   ).toBe(false);
   // A detached entry (null branch) is never a lane.
   expect(isKeeperLaneEntry(entry({ branch: null }))).toBe(false);
+});
+
+test("fn-1095 epicIdFromKeeperLaneEntry: recovers the epic id from a base OR a rib, null for non-lanes", () => {
+  // A base lane → the whole tail is the epic id.
+  expect(
+    epicIdFromKeeperLaneEntry(
+      entry({ branch: "refs/heads/keeper/epic/fn-1-foo" }),
+    ),
+  ).toBe("fn-1-foo");
+  // A rib lane (`<epic_id>--<task_id>`) → split on the FIRST `--`.
+  expect(
+    epicIdFromKeeperLaneEntry(
+      entry({ branch: "refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2" }),
+    ),
+  ).toBe("fn-1-foo");
+  // A short branch (no `refs/heads/` prefix) is handled the same way.
+  expect(
+    epicIdFromKeeperLaneEntry(entry({ branch: "keeper/epic/fn-9-bar" })),
+  ).toBe("fn-9-bar");
+  // Non-keeper / detached / empty-tail → null (never a lane epic).
+  expect(
+    epicIdFromKeeperLaneEntry(entry({ branch: "refs/heads/some-feature" })),
+  ).toBe(null);
+  expect(epicIdFromKeeperLaneEntry(entry({ branch: null }))).toBe(null);
+  expect(
+    epicIdFromKeeperLaneEntry(entry({ branch: "refs/heads/keeper/epic/" })),
+  ).toBe(null);
 });
 
 // ---------------------------------------------------------------------------

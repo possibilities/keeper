@@ -4555,16 +4555,17 @@ test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on
   expect(brief).toContain(`git merge --no-ff ${source}`);
   expect(brief).toContain("--squash");
   expect(brief).toContain("rebase");
-  // Pause-first — the recover sweep races the manual merge — before the merge recipe.
-  expect(brief).toContain("keeper autopilot pause");
-  expect(brief.indexOf("keeper autopilot pause")).toBeLessThan(
-    brief.indexOf(`git merge --no-ff ${source}`),
-  );
+  // NO global pause/play — the daemon scopes recovery per-epic while this resolver
+  // is live (fn-1095), so a crash never durably pauses the board and concurrent
+  // resolvers never race on a shared flag. The brief PROHIBITS a pause (the only
+  // mention of "pause" is the "Do NOT" guard) and issues NO terminal `play`.
+  expect(brief).toContain("Do NOT `keeper autopilot pause`");
+  expect(brief).toContain("per-epic recover exclusion");
+  expect(brief).not.toContain("keeper autopilot play");
   // The CLEAR path: BOTH intents, run the epic tests, commit, retry the close.
   expect(brief).toContain("BOTH");
   expect(brief).toContain("tests");
   expect(brief).toContain("keeper autopilot retry close::fn-9-foo");
-  expect(brief).toContain("keeper autopilot play");
   // The guardrail classes named VERBATIM + unsure-defaults-to-BLOCKED.
   expect(brief).toContain("state machine");
   expect(brief).toContain("schema");
@@ -4588,7 +4589,8 @@ test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (nev
   });
   expect(brief).toContain("close::fn-9-foo");
   expect(brief).toContain("--no-ff");
-  expect(brief).toContain("keeper autopilot pause");
+  expect(brief).toContain("Do NOT `keeper autopilot pause`");
+  expect(brief).not.toContain("keeper autopilot play");
   expect(brief).toContain("BLOCKED");
   expect(brief).toContain("to proceed, tell me exactly:");
 });
@@ -4601,7 +4603,8 @@ test("buildResolverBrief: a null/empty repoDir degrades to the manual body (neve
   });
   expect(brief).toContain("close::fn-9-foo");
   expect(brief).toContain("--no-ff");
-  expect(brief).toContain("keeper autopilot pause");
+  expect(brief).toContain("Do NOT `keeper autopilot pause`");
+  expect(brief).not.toContain("keeper autopilot play");
   expect(brief).toContain("BLOCKED");
 });
 
