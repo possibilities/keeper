@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 105;
+export const SCHEMA_VERSION = 106;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -5759,6 +5759,30 @@ function migrate(db: Database): void {
       // Whitelist-only Python read (keeper-py never reads `dispatch_instant_death`)
       // — this bump MUST add 105 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
       // in the SAME commit; test/schema-version.test.ts enforces it.
+
+      // v105→v106 (fn-1088.1): add the nullable `dispatch_failures.resolver_dispatched_at`
+      // once-marker (REAL, epoch seconds), the sibling of `merge_escalated_at`. The
+      // daemon resolver-dispatch sweep stamps it via a `ResolverDispatchAttempted`
+      // synthetic event when it dispatches ONE `resolve::<epic>` worker against a
+      // sticky `worktree-merge-conflict` close failure, so the resolver fires exactly
+      // once per condition instance (never a per-cycle re-dispatch loop). Independent
+      // of `merge_escalated_at`: the human escalation notify and the resolver dispatch
+      // are two consumers of the SAME sticky, each latched on its own column.
+      // APPEND-via-ALTER keeps existing rows NULL (the zero-event shape) and is
+      // re-fold-safe: a pre-v106 stream carries no `ResolverDispatchAttempted` event,
+      // so a from-scratch re-fold leaves the column NULL byte-identically;
+      // `foldDispatchFailed` preserves it across the `ON CONFLICT` UPSERT and
+      // `DispatchCleared` drops it with the row so a fresh conflict re-arms at NULL.
+      // NO cursor rewind (mirrors the `merge_escalated_at` add). Whitelist-only Python
+      // read (keeper-py never reads `dispatch_failures`) — this bump MUST add 106 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(
+        db,
+        "dispatch_failures",
+        "resolver_dispatched_at",
+        "REAL",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

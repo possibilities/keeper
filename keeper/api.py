@@ -407,6 +407,10 @@ from pathlib import Path
 # v105 (fn-1086 task .1) adds the ``dispatch_instant_death`` reducer projection
 # table (the instant-death circuit breaker's counter); keeper-py never reads it,
 # so only the version whitelist gains 105.
+# v106 (fn-1088 task .1) adds the nullable ``dispatch_failures.resolver_dispatched_at``
+# once-marker (the merge-resolver-worker dispatch latch, sibling of
+# ``merge_escalated_at``); keeper-py never reads ``dispatch_failures``, so only the
+# version whitelist gains 106.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -484,6 +488,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         103,
         104,
         105,
+        106,
     }
 )
 

@@ -279,3 +279,15 @@ the breaker.
   prepared, and the one decision you need — never a raw failure dump. The daemon's
   own bus notifications (block + merge escalations) already follow this shape;
   match it when you speak for them.
+- **A merge-conflict close attempts an autonomous resolver first (while playing).**
+  On a sticky `worktree-merge-conflict` close the daemon fires TWO independent,
+  once-latched consumers of the same trigger: it notifies the human (the merge
+  escalation above, always) AND — only while autopilot is playing — dispatches ONE
+  `resolve::<epic>` merge-resolver worker (a first-class dispatch key, so reaps and
+  the instant-death breaker apply). Its authority is deliberately narrower than a
+  human's: it resolves ONLY mechanically-clear conflicts (both intents preserved,
+  epic tests green) then commits and fires `retry close::<epic>`; anything
+  state-machine / schema / security / transaction-boundary shaped it stamps BLOCKED
+  with the unstick sentence and leaves for the human. The close audit still gates the
+  merged result, and the human escalation path is unchanged whether the resolver
+  resolves, declines, or fails — so relay the escalation as usual.

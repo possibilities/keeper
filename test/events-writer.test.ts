@@ -413,6 +413,18 @@ test("planVerbRefFromSpawnName: plan::<ref> → {plan, ref}", () => {
   });
 });
 
+test("planVerbRefFromSpawnName: resolve::<epic> → {resolve, epic-id} (fn-1088 merge-resolver key)", () => {
+  // The daemon merge-resolver dispatches `resolve::<epic>`; folding its
+  // plan_verb/plan_ref makes it a first-class dispatch key so reaps + the
+  // instant-death breaker apply to it like any work/close worker.
+  expect(
+    planVerbRefFromSpawnName("resolve::fn-1088-merge-resolver-worker"),
+  ).toEqual({
+    plan_verb: "resolve",
+    plan_ref: "fn-1088-merge-resolver-worker",
+  });
+});
+
 test("fn-756: approve::<epic-task> → {null, null} (approve dropped from the whitelist)", () => {
   // fn-756 removed `approve` from the locked verb whitelist along with the
   // verb. A stale `approve::` spawn name (from before the deploy) no longer

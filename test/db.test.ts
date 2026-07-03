@@ -2569,8 +2569,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `default_visible`/`approval` rewrite this test exercises, fn-1083 task .2.
   // v105 adds the `dispatch_instant_death` reducer projection table (the
   // instant-death circuit breaker's counter — a CREATE-only table, not an
-  // epics-shape change), fn-1086 task .1.
-  expect(SCHEMA_VERSION).toBe(105);
+  // epics-shape change), fn-1086 task .1. v106 appends the nullable
+  // `dispatch_failures.resolver_dispatched_at` once-marker (the merge-resolver
+  // dispatch latch — an additive ALTER, not an epics-shape change), fn-1088 task .1.
+  expect(SCHEMA_VERSION).toBe(106);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

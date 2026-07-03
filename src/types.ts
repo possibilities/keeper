@@ -1107,3 +1107,27 @@ export interface MergeEscalationAttemptedPayload {
   /** Producer-recorded helper outcome; only a terminal outcome stamps the marker. */
   outcome: string;
 }
+
+/**
+ * Pre-flattened `ResolverDispatchAttempted` synthetic event payload — the daemon
+ * resolver-dispatch sweep mints it after it attempts to launch ONE `resolve::<epic>`
+ * merge-resolver worker against a sticky `worktree-merge-conflict` close failure,
+ * stamping the `dispatch_failures.resolver_dispatched_at` once-marker so the resolver
+ * fires exactly once per condition instance (never a per-cycle re-dispatch loop).
+ * Keyed by the close-row `id` (verb is always `close`). The TERMINAL `dispatched`
+ * outcome (the launch succeeded) stamps `resolver_dispatched_at = event.ts`; the
+ * non-terminal `dispatch_failed` outcome folds to a no-op, leaving the marker NULL so
+ * the row stays re-sweepable (mirrors `MergeEscalationAttempted`'s
+ * `send_failed`-is-non-terminal rule). The fold reads ONLY the payload + the persisted
+ * row, so re-fold stays byte-deterministic. The marker NEVER clears the sticky row —
+ * only `retry_dispatch` does (and dropping the row re-arms the marker at NULL). The
+ * `resolver_dispatched_at` latch is INDEPENDENT of `merge_escalated_at`: the human
+ * escalation notify and the resolver dispatch are two consumers of the same sticky.
+ * KEEP-SET inline forever (never added to the retention shed predicate).
+ */
+export interface ResolverDispatchAttemptedPayload {
+  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
+  id: string;
+  /** Producer-recorded launch outcome; only the terminal `dispatched` stamps the marker. */
+  outcome: string;
+}

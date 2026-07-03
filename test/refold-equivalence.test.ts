@@ -1543,6 +1543,97 @@ test("dispatch_failures.merge_escalated_at: a {DispatchFailed(close), MergeEscal
 });
 
 // ---------------------------------------------------------------------------
+// `dispatch_failures.resolver_dispatched_at` once-marker (fn-1088) — the daemon
+// resolver-dispatch sweep's dispatch-once latch folded by `ResolverDispatchAttempted`,
+// sibling of `merge_escalated_at`. A DETERMINISTIC-replayed column on a
+// deterministic-replayed table: a from-scratch re-fold MUST reproduce the stamp
+// (and the NULL non-terminal arm) byte-identically, or the dispatch-once guarantee
+// is unsound. Both markers coexist on the same sticky and must re-fold together.
+// ---------------------------------------------------------------------------
+
+test("dispatch_failures.resolver_dispatched_at: a {DispatchFailed(close), MergeEscalationAttempted, ResolverDispatchAttempted} stream re-folds byte-identically (fn-1088)", () => {
+  // A close row that is BOTH human-escalated AND resolver-dispatched, and a second
+  // close row whose resolver dispatch FAILED (stays NULL, re-sweepable). Both arms —
+  // and the coexistence of the two independent markers — must reproduce byte-identically.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1088-rd",
+      reason: "worktree-merge-conflict",
+      dir: "/repo",
+      ts: 1700,
+    }),
+  });
+  insertEvent({
+    hook_event: "MergeEscalationAttempted",
+    session_id: "reconciler",
+    ts: 1750,
+    data: JSON.stringify({ id: "fn-1088-rd", outcome: "sent" }),
+  });
+  insertEvent({
+    hook_event: "ResolverDispatchAttempted",
+    session_id: "reconciler",
+    ts: 1755,
+    data: JSON.stringify({ id: "fn-1088-rd", outcome: "dispatched" }),
+  });
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1088-rd-df",
+      reason: "worktree-merge-conflict",
+      dir: "/repo",
+      ts: 1760,
+    }),
+  });
+  insertEvent({
+    hook_event: "ResolverDispatchAttempted",
+    session_id: "reconciler",
+    ts: 1770,
+    data: JSON.stringify({ id: "fn-1088-rd-df", outcome: "dispatch_failed" }),
+  });
+  // A re-failure of the dispatched row AFTER it stamped must preserve BOTH markers
+  // through the UPSERT — fold it into the re-folded stream.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-1088-rd",
+      reason: "worktree-merge-conflict",
+      dir: "/repo2",
+      ts: 1800,
+    }),
+  });
+  drainAll();
+
+  const live = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  const dispatched = live.find((r) => r.id === "fn-1088-rd");
+  const failed = live.find((r) => r.id === "fn-1088-rd-df");
+  // Terminal dispatch stamp survives the later re-failure UPSERT; the failed one
+  // stays NULL. The human-escalation marker coexists independently on the dispatched row.
+  expect(dispatched?.resolver_dispatched_at).toBe(1755);
+  expect(dispatched?.merge_escalated_at).toBe(1750);
+  expect(failed?.resolver_dispatched_at).toBeNull();
+
+  // Full from-scratch re-fold: rewind + wipe, then re-drain from id 0.
+  rewindAndWipeProjections();
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+
+  const refolded = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  // Byte-identical — the dispatch-once marker is re-fold-deterministic.
+  expect(refolded).toEqual(live);
+});
+
+// ---------------------------------------------------------------------------
 // Layer 1 — aggregate counts over the live-shaped corpus
 // ---------------------------------------------------------------------------
 
