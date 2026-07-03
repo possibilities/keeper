@@ -26,6 +26,7 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
+import { INSTANT_DEATH_BREAKER_REASON } from "./dispatch-failure-key";
 import {
   epicIsCompleted,
   profileNameForUsageId,
@@ -4039,12 +4040,13 @@ function foldDispatchFailed(db: Database, event: Event): void {
  * — the ONLY legal clear path (a direct DELETE outside the fold arm would break
  * re-fold determinism). Clears the sticky `dispatch_failures` row, the never-bound
  * `dispatch_never_bound` counter (so a `keeper autopilot retry` re-arms the breaker
- * from zero — a residual count would re-trip after one expire instead of K), AND
- * the in-flight `pending_dispatches` row (fn-870 BUG fix: an operator clear must
- * immediately free the launch-window slot + per-root mutex; clearing only the
- * failure + counter left a stale pending stranding the slot until the TTL sweep).
- * All three DELETEs are idempotent no-ops on a missing row. Malformed/missing
- * payload → safe no-op.
+ * from zero — a residual count would re-trip after one expire instead of K), the
+ * instant-death `dispatch_instant_death` counter (same re-arm-from-zero rationale
+ * for its sibling breaker), AND the in-flight `pending_dispatches` row (fn-870 BUG
+ * fix: an operator clear must immediately free the launch-window slot + per-root
+ * mutex; clearing only the failure + counter left a stale pending stranding the
+ * slot until the TTL sweep). All DELETEs are idempotent no-ops on a missing row.
+ * Malformed/missing payload → safe no-op.
  */
 function foldDispatchCleared(db: Database, event: Event): void {
   const payload = extractDispatchClearedPayload(event);
@@ -4056,6 +4058,10 @@ function foldDispatchCleared(db: Database, event: Event): void {
     payload.id,
   ]);
   db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
+  db.run("DELETE FROM dispatch_instant_death WHERE verb = ? AND id = ?", [
     payload.verb,
     payload.id,
   ]);
@@ -4299,6 +4305,159 @@ function foldDispatchExpired(db: Database, event: Event): void {
     db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
       payload.verb,
       payload.id,
+    ]);
+  }
+}
+
+/**
+ * Instant-death circuit-breaker: max post-bind lifetime (event-`ts` seconds) a
+ * terminal `Killed` counts as an INSTANT death. Sub-minute — a worker that binds,
+ * makes its first API call, and dies at the account session/quota wall lives only
+ * seconds (the fn-1083.2 evidence: 6–40s), while a real task that got to work
+ * survives well past a minute. Tunable.
+ */
+const INSTANT_DEATH_LIFETIME_SEC = 60;
+
+/**
+ * Instant-death circuit-breaker threshold: after K CONSECUTIVE instant post-bind
+ * deaths for one `(verb, id)` (bind → sub-minute `Killed` → re-dispatch → …), the
+ * fold mints a sticky `dispatch_failures(reason='instant-death-breaker')` the
+ * `failedKeys` arm suppresses. Mirrors {@link NEVER_BOUND_EXPIRE_THRESHOLD}: 3.
+ * The consecutive-K guard is what makes a lone reaped-fast-completion harmless —
+ * a done task is never re-dispatched, so an isolated instant `Killed` increments
+ * to 1 and stops, never reaching K (the board's real churn had 2 back-to-back
+ * before a supervisor paused).
+ */
+const INSTANT_DEATH_THRESHOLD = 3;
+
+/**
+ * Fold the instant-death circuit breaker on a job's TERMINAL event — the
+ * reducer-side SIBLING of the never-bound breaker (`foldDispatchExpired`), for the
+ * wall never-bound MISSES: a worker that BINDS then dies fast. A bind RESETS the
+ * never-bound counter, so a bind → instant-death → re-dispatch loop never trips
+ * it; this breaker keys on post-bind LIFETIME instead. Called ONLY on the proven
+ * terminal-write path of the `Killed` (`isAbruptDeath=true`) and `SessionEnd`
+ * (`isAbruptDeath=false`) folds, AFTER the row is flipped terminal.
+ *
+ * Detection is cause-AGNOSTIC (no transcript parse, no `close_kind`/`kill_reason`
+ * filter — every close kind in the evidence appears both for genuine churn and
+ * for a reaped success): an INSTANT death is an ABRUPT `Killed` whose job had
+ * BOUND-and-worked (`active_since` non-NULL) and whose post-bind lifetime
+ * (`event.ts - active_since`) is under {@link INSTANT_DEATH_LIFETIME_SEC}.
+ *
+ * Guards that keep a fast SUCCESSFUL task from tripping — encoded explicitly:
+ *  1. A clean `SessionEnd` (the normal completion exit) is `isAbruptDeath=false`,
+ *     so it NEVER increments — it RESETS the counter (a completion is progress).
+ *  2. `active_since` must be non-NULL — a worker that never reached `working` is
+ *     never-bound territory, not this breaker's.
+ *  3. The CONSECUTIVE-K threshold: a done task is never re-dispatched, so even a
+ *     rare success reaped as `Killed` (SessionEnd lost the race) increments to at
+ *     most 1 and stops — it can never reach K without a re-dispatch the done task
+ *     will never get. (Its lone stale count is invisible and re-fold-deterministic.)
+ *
+ * A NON-instant terminal (clean `SessionEnd`, or a long-lived `Killed` — the
+ * worker did real work before dying) RESETS the count: "consecutive" means
+ * uninterrupted by any real progress. A successful bind is NOT a reset (unlike
+ * never-bound) — the whole signal is bind-then-die, so the count MUST survive the
+ * re-dispatch's bind. Breaker-loop safety mirrors never-bound's `alreadyFailed`
+ * guard: once the key holds a sticky `dispatch_failures` row, a late in-flight
+ * terminal is a slot release, not a fresh trip (no bump, no re-mint, no
+ * `last_event_id` churn). Change-gate-equivalent by construction: the sticky is
+ * minted EXACTLY once at K (the mint then clears the counter), never per-event.
+ *
+ * Pure over the persisted row + `event.ts`/`event.id` (no wall-clock/fs/liveness),
+ * so re-fold is byte-deterministic. A non-plan-keyed job (`plan_verb`/`plan_ref`
+ * NULL) is a safe no-op — the breaker only tracks `(verb, id)` dispatch keys.
+ */
+function foldInstantDeathTerminal(
+  db: Database,
+  event: Event,
+  jobId: string,
+  isAbruptDeath: boolean,
+): void {
+  const row = db
+    .query(
+      "SELECT plan_verb, plan_ref, active_since FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    plan_verb: string | null;
+    plan_ref: string | null;
+    active_since: number | null;
+  } | null;
+  if (row == null || row.plan_verb == null || row.plan_ref == null) {
+    return;
+  }
+  const verb = row.plan_verb;
+  const id = row.plan_ref;
+  const bound = row.active_since != null;
+  const isInstantDeath =
+    isAbruptDeath &&
+    bound &&
+    event.ts - (row.active_since as number) < INSTANT_DEATH_LIFETIME_SEC;
+  if (!isInstantDeath) {
+    // Clean exit, or a worker that lived past the wall window — the
+    // consecutive-fast-death streak is broken. Idempotent no-op DELETE.
+    db.run("DELETE FROM dispatch_instant_death WHERE verb = ? AND id = ?", [
+      verb,
+      id,
+    ]);
+    return;
+  }
+  // Breaker-loop safety: an already-failed key's late terminal is a slot release,
+  // not a fresh trip — skip the counter arm (the mint cleared it to zero already).
+  const alreadyFailed = db
+    .query("SELECT verb FROM dispatch_failures WHERE verb = ? AND id = ?")
+    .get(verb, id) as { verb: string } | null;
+  if (alreadyFailed != null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO dispatch_instant_death (verb, id, consecutive_deaths, last_event_id)
+       VALUES (?, ?, 1, ?)
+     ON CONFLICT(verb, id) DO UPDATE SET
+       consecutive_deaths = dispatch_instant_death.consecutive_deaths + 1,
+       last_event_id = excluded.last_event_id`,
+    [verb, id, event.id],
+  );
+  const counter = db
+    .query(
+      "SELECT consecutive_deaths FROM dispatch_instant_death WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { consecutive_deaths: number } | null;
+  if (
+    counter != null &&
+    counter.consecutive_deaths >= INSTANT_DEATH_THRESHOLD
+  ) {
+    // Mint the sticky failure via the SAME UPSERT shape as `foldDispatchFailed`
+    // (dir unknown at kill time → NULL; `ts`/`created_at`/`updated_at` all from
+    // `event.ts`, keeping the fold re-fold-deterministic). The `failedKeys` arm
+    // suppresses re-dispatch of the key until `retry_dispatch` clears it.
+    db.run(
+      `INSERT INTO dispatch_failures (
+         verb, id, reason, dir, ts, last_event_id, created_at, updated_at
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+       ON CONFLICT(verb, id) DO UPDATE SET
+         reason = excluded.reason,
+         dir = excluded.dir,
+         ts = excluded.ts,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [
+        verb,
+        id,
+        INSTANT_DEATH_BREAKER_REASON,
+        event.ts,
+        event.id,
+        event.ts,
+        event.ts,
+      ],
+    );
+    // Clear the counter: the breaker tripped and the sticky now owns suppression;
+    // a post-retry re-arm starts fresh (a residual count would re-trip after one
+    // death instead of K).
+    db.run("DELETE FROM dispatch_instant_death WHERE verb = ? AND id = ?", [
+      verb,
+      id,
     ]);
   }
 }
@@ -7964,6 +8123,10 @@ function projectJobsRow(db: Database, event: Event): void {
         // clear makes the source false, but `buildEmbeddedJob`'s carve-out
         // would otherwise PRESERVE a stale `true` into the terminal element.
         clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
+        // A clean SessionEnd is the normal completion exit — NEVER an instant
+        // death. RESETS the instant-death counter (a completion is real progress
+        // that breaks the consecutive-fast-death streak).
+        foldInstantDeathTerminal(db, event, jobId, false);
       }
       break;
     }
@@ -8035,6 +8198,11 @@ function projectJobsRow(db: Database, event: Event): void {
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         syncIfPlanRef(db, jobId, event.id, ts);
         clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
+        // Instant-death circuit breaker: an ABRUPT proven death. If the job had
+        // bound-and-worked and died within the sub-minute wall window, this
+        // increments the consecutive-instant-death count (and mints the sticky at
+        // K); a long-lived death resets it. On the proven write path only.
+        foldInstantDeathTerminal(db, event, jobId, true);
       }
       break;
 

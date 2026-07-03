@@ -30,6 +30,7 @@
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { INSTANT_DEATH_BREAKER_REASON } from "../src/dispatch-failure-key";
 import {
   classifyDispatchFailure,
   resolveFailureTarget,
@@ -57,8 +58,20 @@ import {
  * `dispatch_failure: string[]` field to the per-task + close-row views; v3 adds
  * the additive `autopilot.worktree_multi_repo` durable-config field; v4 adds the
  * additive `board.epics[].question` parked-closer-question field and the
- * `needs_human.parked_questions` count. */
-export const STATUS_SCHEMA_VERSION = 4;
+ * `needs_human.parked_questions` count; v5 adds the additive
+ * `needs_human.instant_death_wall` count (the instant-death circuit breaker). */
+export const STATUS_SCHEMA_VERSION = 5;
+
+/**
+ * Board-wide quota-wall threshold: at or above this many distinct
+ * instant-death-breaker stickies (distinct `(verb, id)` keys that each tripped
+ * the per-key breaker), the `needs_human.instant_death_wall` count is the likely
+ * SESSION/QUOTA-WALL signal — repeated instant worker deaths across MULTIPLE keys
+ * in a window, not one flaky task. Signal only (the per-key breakers already stop
+ * each key's burn); resume with `keeper autopilot retry <key>` after the limit
+ * resets. A single sticky (below this) is the per-key breaker doing its job.
+ */
+export const INSTANT_DEATH_WALL_KEYS = 2;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -176,6 +189,13 @@ export interface StatusData {
     // (v4) — a distinct needs-human signal from the dispatch-failure family
     // (never mints a `dispatch_failures` row), included in `total`.
     parked_questions: number;
+    // Distinct `(verb, id)` keys currently holding an instant-death-breaker
+    // sticky (bind → sub-minute death × K). Additive (v5), a SUBSET of
+    // `stuck_dispatches` (never double-counted into `total`, like
+    // `finalize_non_ff`). At or above `INSTANT_DEATH_WALL_KEYS` this is the
+    // board-wide SESSION/QUOTA-WALL signal (multiple keys tripping in a window);
+    // a single one is the per-key breaker working. Signal only — no auto-pause.
+    instant_death_wall: number;
     total: number;
   };
   rev: number | null;
@@ -305,6 +325,12 @@ export function buildStatusEnvelope(
   const finalizeNonFf = dispatchFailures.filter(
     (r) => r.reason === FINALIZE_NON_FF_REASON,
   ).length;
+  // Per-key instant-death-breaker stickies (each row is a distinct `(verb, id)`
+  // — the projection PK). A board-wide burst (>= INSTANT_DEATH_WALL_KEYS) is the
+  // likely session/quota wall. Subset of stuck_dispatches, never double-counted.
+  const instantDeathWall = dispatchFailures.filter(
+    (r) => r.reason === INSTANT_DEATH_BREAKER_REASON,
+  ).length;
   const deadLetters = snap.deadLetters.length;
   const blockEscalations = snap.blockEscalations.length;
   // Epics carrying a parked-closer question — a needs-human signal distinct
@@ -354,6 +380,7 @@ export function buildStatusEnvelope(
       stuck_dispatches: stuckDispatches,
       finalize_non_ff: finalizeNonFf,
       parked_questions: parkedQuestions,
+      instant_death_wall: instantDeathWall,
       total: needsHumanTotal,
     },
     rev: boot.rev,

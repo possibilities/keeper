@@ -396,6 +396,36 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.needs_human.total).toBe(2);
   });
 
+  test("instant_death_wall counts per-key breaker stickies as a subset of stuck_dispatches, not double-added (fn-1086)", () => {
+    // Two distinct keys tripped the instant-death breaker (>= the board-wide
+    // quota-wall threshold) plus one unrelated sticky. instant_death_wall counts
+    // only the breaker rows; it is a subset of stuck_dispatches (in total once,
+    // never double-counted — mirrors finalize_non_ff).
+    const failures: Row[] = [
+      { verb: "work", id: "fn-1-a.1", reason: "instant-death-breaker" },
+      { verb: "work", id: "fn-2-b.3", reason: "instant-death-breaker" },
+      { verb: "close", id: "fn-3-c", reason: "worktree-merge-conflict" },
+    ];
+    const d = buildStatusEnvelope(makeSnap(), BOOT, failures).data;
+    expect(d?.needs_human.stuck_dispatches).toBe(3);
+    expect(d?.needs_human.instant_death_wall).toBe(2);
+    expect(d?.needs_human.total).toBe(3);
+  });
+
+  test("a single instant-death sticky surfaces instant_death_wall:1 (per-key breaker, below the wall threshold) (fn-1086)", () => {
+    const failures: Row[] = [
+      { verb: "work", id: "fn-1-a.1", reason: "instant-death-breaker" },
+    ];
+    const d = buildStatusEnvelope(makeSnap(), BOOT, failures).data;
+    expect(d?.needs_human.instant_death_wall).toBe(1);
+    expect(d?.needs_human.stuck_dispatches).toBe(1);
+  });
+
+  test("no instant-death stickies → instant_death_wall:0 (fn-1086)", () => {
+    const d = buildStatusEnvelope(makeSnap(), BOOT, []).data;
+    expect(d?.needs_human.instant_death_wall).toBe(0);
+  });
+
   test("in-flight counts pending dispatches + working jobs", () => {
     const snap = makeSnap({
       pendingDispatches: 2,

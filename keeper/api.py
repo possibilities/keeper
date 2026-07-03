@@ -404,6 +404,9 @@ from pathlib import Path
 # epic-level parked-closer question); the fixed epics SELECT list below names
 # only ``epic_id, project_dir, tasks, jobs``, so keeper-py never reads the new
 # column and only the version whitelist gains 104.
+# v105 (fn-1086 task .1) adds the ``dispatch_instant_death`` reducer projection
+# table (the instant-death circuit breaker's counter); keeper-py never reads it,
+# so only the version whitelist gains 105.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -480,6 +483,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         102,
         103,
         104,
+        105,
     }
 )
 

@@ -7324,6 +7324,111 @@ test("Killed fold treats a non-string kill_reason as NULL (defensive, never coer
   expect(getKillReason()).toBeNull();
 });
 
+// Batch-reap reclassification — the mass path where a whole cohort of live rows
+// flips terminal at ONE instant (the boot seed sweep emitting a Killed per
+// candidate row, or the steady-state exit-watcher reaping several at once after
+// a downtime). Every reaper arm — `boot_pid_dead` / `boot_pid_recycled` /
+// `boot_unwatchable` (pidless) / `exit_watched` — stamps its own `reason` into
+// the per-event payload blob, so a batch is just N independent Killed folds. The
+// verification here: seed a mixed cohort, reap it in a single same-ts batch, and
+// assert EVERY row lands `killed` carrying ITS OWN reason (no cross-row bleed, no
+// dropped reason on the mass path), refold-stable.
+test("Killed fold: a same-instant batch reap carries each row's kill_reason (mass reclassification)", () => {
+  // One entry per reaper arm the two producers emit. `pid: null` is the pidless
+  // `boot_unwatchable` arm (reaped from `stopped`, never prompted); the rest bind
+  // and work, then die. `start_time: null` on every row so the reducer's loose
+  // pid-only match folds each Killed against its row.
+  const cohort = [
+    {
+      jobId: "reap-dead",
+      pid: 5001,
+      reason: "boot_pid_dead",
+      close: "pid_died",
+    },
+    {
+      jobId: "reap-recycled",
+      pid: 5002,
+      reason: "boot_pid_recycled",
+      close: "server_gone",
+    },
+    {
+      jobId: "reap-watched",
+      pid: 5003,
+      reason: "exit_watched",
+      close: "window_gone_server_alive",
+    },
+    {
+      jobId: "reap-unwatchable",
+      pid: null,
+      reason: "boot_unwatchable",
+      close: "unknown",
+    },
+  ] as const;
+
+  // Bring each row to its pre-reap lifecycle: the pidless row stays `stopped`
+  // (the stuck-unwatchable origin), the watchable rows advance to `working`.
+  for (const c of cohort) {
+    insertEvent({
+      hook_event: "SessionStart",
+      session_id: c.jobId,
+      pid: c.pid,
+    });
+    if (c.pid != null) {
+      // Carry the row's pid on the prompt too — the fold tracks jobs.pid from
+      // the latest lifecycle event, so a default-pid prompt would clobber it and
+      // desync the reap's (pid) match.
+      insertEvent({
+        hook_event: "UserPromptSubmit",
+        session_id: c.jobId,
+        pid: c.pid,
+      });
+    }
+  }
+  drainAll();
+  for (const c of cohort) {
+    expect(getJob(c.jobId)?.state).toBe(c.pid == null ? "stopped" : "working");
+  }
+
+  // The batch: one Killed per row, all sharing a single instant (the 14:43:37
+  // flip shape). Each carries only its OWN (pid, reason, close_kind).
+  const BATCH_TS = 200_000;
+  for (const c of cohort) {
+    insertEvent({
+      hook_event: "Killed",
+      session_id: c.jobId,
+      ts: BATCH_TS,
+      data: JSON.stringify({
+        pid: c.pid,
+        start_time: null,
+        close_kind: c.close,
+        reason: c.reason,
+      }),
+    });
+  }
+  drainAll();
+
+  // Every row flipped terminal AND carries its own reason (+ orthogonal
+  // close_kind) — no dropped or bled reason on the mass path.
+  for (const c of cohort) {
+    expect(getJob(c.jobId)?.state).toBe("killed");
+    expect(getKillReason(c.jobId)).toBe(c.reason);
+    expect(getCloseKind(c.jobId)).toBe(c.close);
+  }
+
+  // Refold-equivalence: rewind the cursor, drop + re-drain jobs from cursor=0,
+  // assert byte-identical. A batch reap that read wall-clock or row-order state
+  // instead of the per-event payload would diverge here.
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+});
+
 // ---------------------------------------------------------------------------
 // Schema-v71 window_index — the visual window-order column the
 // WindowIndexSnapshot was RETIRED in fn-907: the standalone window-index fold

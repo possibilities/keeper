@@ -1283,6 +1283,32 @@ test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky fai
   expect(decision.launches).toEqual([]);
 });
 
+test("reconcile: an instant-death-breaker sticky pauses the key's re-dispatch until retry (fn-1086)", () => {
+  // The reducer mints dispatch_failures(reason='instant-death-breaker') at K
+  // consecutive instant deaths, keyed on work::<task>. loadReconcileSnapshot puts
+  // every dispatch_failures row's (verb,id) into failedKeys regardless of reason,
+  // so the tripped key stops re-dispatching — breaking the bind→die→re-dispatch
+  // burn — until retry_dispatch (DispatchCleared) drops the row.
+  const epic = makeEpic({ tasks: [makeTask({ task_id: "fn-1-foo.1" })] });
+  const suppressed = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      failedKeys: new Set(["work::fn-1-foo.1"]),
+    }),
+    makeState(),
+    0,
+  );
+  expect(suppressed.launches).toEqual([]);
+
+  // retry_dispatch cleared the sticky → failedKeys empty → the key re-dispatches.
+  const cleared = reconcile(
+    makeSnapshot({ epics: [epic], failedKeys: new Set() }),
+    makeState(),
+    0,
+  );
+  expect(cleared.launches.map((p) => p.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
 test("fn-976 durable re-dispatch guard: a TOOLING_FAILURE block's sticky DispatchFailed holds the task out even while the projection still shows in_progress; retry_dispatch clears it", () => {
   // The daemon block-escalation sweep mints a sticky DispatchFailed on
   // work::<task> when a worker blocks TOOLING_FAILURE, so failedKeys holds the
