@@ -56,5 +56,5 @@ sets resume_target and leaves state killed (explicit regression case).
 - [ ] Refold-equivalence and the events-writer column-lockstep suites are green; the python API whitelist accepts the new version in the same commit
 
 ## Done summary
-
+Added v107 migration adding nullable harness + resume_target columns to events (five-place lockstep) and jobs (migration-only); the SessionStart fold folds both verbatim (never synthesizing claude) and a new ResumeTargetResolved arm idempotently sets resume_target without changing lifecycle state. Bumped SCHEMA_VERSION to 107 and the api.py whitelist in the same commit.
 ## Evidence
