@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T19:05:20.715000Z",
+  "depends_on_epics": [],
+  "id": "fn-1100-hunt-the-fn-688-lane-keeper-tree-deleter",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Hunt the fn-688 lane keeper-tree deleter",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T19:05:20.715000Z"
+}
