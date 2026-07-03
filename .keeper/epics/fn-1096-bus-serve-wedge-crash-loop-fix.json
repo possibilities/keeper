@@ -4,7 +4,7 @@
   "created_at": "2026-07-03T15:54:21.228000Z",
   "depends_on_epics": [],
   "id": "fn-1096-bus-serve-wedge-crash-loop-fix",
-  "last_validated_at": "2026-07-03T15:54:28.759000Z",
+  "last_validated_at": "2026-07-03T16:59:01.359000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T15:54:28.759000Z"
+  "updated_at": "2026-07-03T16:59:00.954000Z"
 }

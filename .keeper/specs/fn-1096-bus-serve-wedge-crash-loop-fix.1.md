@@ -1,77 +1,72 @@
 ## Description
 
 **Size:** M
-**Files:** src/bus-worker.ts, scripts/repro-serve-wedge.ts, test/bus-worker.test.ts
+**Files:** src/bus-worker.ts, src/seed-sweep.ts, scripts/repro-serve-wedge.ts, test/bus-worker.test.ts
 
 ### Approach
 
-Remove every synchronous blocking call from the bus-worker serve event loop. The reproduced
-wedge mechanism: `opRegister` runs `resolveHarnessIdentity`, which calls `ppidViaPs` — a
-synchronous `Bun.spawnSync(["ps", ...])` per ancestry hop (up to 40) — on the serve thread,
-during the boot reconnect stampede when every watcher's identity is cold. Sync spawn parks the
-kqueue loop; JS-level socket events stop firing; kernel accepts pile up as unserviced fds.
+Second pass — the first fix was necessary but insufficient, disproven live. What landed
+(KEEP): the register ancestry walk runs off the serve loop (async ppidViaPs). What the
+live daemon proved after that fix deployed to main: the bus serve path STILL goes mute
+from bind on every boot (fresh incarnation on the fixed code: bus list "no response
+within 5000ms" at ~80s uptime; watchdog fatalExits continue).
 
-Contract for the fix (resolved during planning):
-- The ancestry walk goes fully async (array-form `Bun.spawn`, await exited, read stdout) —
-  a per-pid memo alone is NOT the fix (every respawn is all-cold); memoize on top if cheap.
-- Register ordering: the ack DEFERS until the walk resolves. Walk completions apply serially
-  on the loop (JS single-thread makes completions serial; two in-flight walks for the same
-  (pid,start_time) resolve as today's sequential re-registers — later completion takes over).
-- A conn that closed while its walk was in flight drops the registration silently — no ack,
-  no registry entry, no throw to the serve loop.
-- Fail-open-to-floor preserved exactly: any spawn failure/parse miss terminates the walk
-  gracefully and falls back to the client-provided floor identity.
-- ANTI-SPOOF INVARIANT UNCHANGED: the walk roots at the server-resolved peerPid, never a
-  client-claimed pid.
+The missed site: `readOsStartTime` is a synchronous `Bun.spawnSync(["ps", ...])`
+(src/seed-sweep.ts:101) and still executes ON the serve loop — `enrichPeerFromJobs`
+calls `readStartTime(pid)` per jobs-row hit as its pid-reuse defense
+(src/bus-worker.ts:497, wired at :848), so every register that reaches a row hit still
+parks the kqueue loop exactly like the walk did. Secondary residents on the hot path to
+audit: the per-accept `peerPidForFd` FFI getsockopt (src/bus-worker.ts:1212) and any
+other synchronous subprocess/FFI reachable from accept/open/data handlers.
 
-Method — red first: extend scripts/repro-serve-wedge.ts so its harness server gains the
-production per-register work (configurable sync-spawn ancestry hops, per-accept getsockopt
-FFI probe) plus a boot reconnect-stampede dimension (N clients connect+register near-simultaneously
-at bind). Demonstrate the wedge RED against the pre-fix serve shape, land the fix, show GREEN.
-If red cannot be reproduced synthetically, instrument the live daemon path with per-conn
-accept/open/data/ack stderr breadcrumbs and diagnose against the production crash-loop (it IS
-the repro). If, after the spawn is off-loop, a concrete Bun.listen-specific defect remains,
-the node:net listener swap is the sanctioned fallback — and file a minimal upstream repro.
+Contract: remove EVERY synchronous subprocess call from code reachable by the serve
+loop's socket handlers — grep-provable (no Bun.spawnSync in any module path invoked from
+the bus-worker serve handlers). The pid-reuse start_time validation MUST survive as a
+defense (async probe or deferred validation), as must the anti-spoof rooting and the
+fail-open-to-floor identity fallback. Extend scripts/repro-serve-wedge.ts with the
+start-time-probe-per-row-hit dimension (the harness's register work must mirror the
+REAL opRegister cost profile including enrichment), show it red against the current
+code, green after. If the wedge STILL reproduces with zero sync subprocess work on the
+loop, instrument per-conn accept/open/data/ack breadcrumbs and diagnose against the
+production crash-loop before choosing the node:net fallback.
 
-Update the harness usage-comment header to describe the new dimensions.
+Note: the fix deploys to the live daemon only when an operator merges the epic lane to
+main — live-host verification is the operator's post-deploy step, not this task's
+acceptance. Acceptance here is code-level + harness-level.
 
 ### Investigation targets
 
 *Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
 
 **Required** (read before coding):
-- src/bus-worker.ts:549-589 — resolveHarnessIdentity + ppidViaPs (the sync spawn, the anti-spoof doc)
-- src/bus-worker.ts:812-876 — opRegister flow: identity resolution, takeover eviction, bus.db cache write, ack ordering
-- src/bus-worker.ts:1187 — peerPidForFd per-accept FFI getsockopt (suspect #3; check buffer/return-code hygiene while there)
-- scripts/repro-serve-wedge.ts — existing four load dimensions, probeRealRead/decide* faithful copies; the harness server is a bare Bun.listen with NO register work today
-- test/bus-worker.test.ts — pure-seam tests with injected getPpid/isPidAlive; extend for the async walk
+- src/seed-sweep.ts:101-130 — readOsStartTime spawnSync (the missed sync spawn)
+- src/bus-worker.ts:470-500 — enrichPeerFromJobs + the start_time pid-reuse defense at :497
+- src/bus-worker.ts:820-880 — the current (post-first-fix) opRegister async flow, where :848 wires readStartTime
+- src/bus-worker.ts:1200-1220 — peerPidForFd FFI per-accept
+- scripts/repro-serve-wedge.ts — the register-work dimensions added by the first pass; extend with the row-hit start-time probe
 
 **Optional** (reference as needed):
-- src/tmux-control-worker.ts:398, src/usage-scrape-runner.ts:381 — worker-side async Bun.spawn precedents
-- src/daemon.ts:1811-1879 — probeSocketRead (the real-read probe the harness mirrors)
+- test/bus-worker.test.ts — injected getPpid/readStartTime seams from the first pass
 
 ### Risks
 
-- Async register introduces in-flight state on the serve loop; keep the completion handler
-  total (no throw paths) and the registry mutation atomic per completion.
-- The harness may not go red on Bun 1.3.14 (prior attempt failed without the register-work
-  dimensions); the live-daemon breadcrumb fallback is in-scope, not a blocker.
+- The start_time probe is a pid-reuse SECURITY defense — moving it async must not create
+  a window where a recycled pid binds a stale identity un-validated.
+- If the true trigger is Bun-internal (re-arm loss under stampede), no amount of
+  off-loop work fixes it — the breadcrumb instrumentation branch is in-scope.
 
 ### Test notes
 
-Unit-test the async walk seam with an injected async getPpid (fast, no subprocess); the
-stampede/wedge proof lives in the manual harness, never the fast tier. Live verification:
-daemon uptime spans several former wedge cycles (>=10 min) with `keeper bus list` answering
-throughout; watchdog fatalExit count in server.stderr stops growing.
+Unit-test the async enrichment seam with injected readStartTime; harness proves the
+wedge mechanism red-to-green; fast tier stays subprocess-free.
 
 ## Acceptance
 
-- [ ] The repro harness gains register-work, stampede, and per-accept-probe dimensions; it demonstrates the wedge against the pre-fix serve shape and passes green after the fix (or, if synthetic red proved impossible, live breadcrumb evidence pinpointing the mechanism is recorded)
-- [ ] No synchronous subprocess call remains anywhere on the bus-worker serve path
-- [ ] Register semantics hold: acks carry resolved identity, takeover eviction still fires, spawn failures fall back to floor identity, the ancestry walk roots at the server-resolved peer pid
-- [ ] On the live host the daemon holds uptime across several former wedge cycles with `keeper bus list` answering continuously
+- [ ] No synchronous subprocess call is reachable from the bus-worker serve handlers (register/subscribe/publish/list/accept), grep-provable across their whole import path
+- [ ] The pid-reuse start_time defense, anti-spoof rooting, and fail-open floor identity all survive with tests
+- [ ] The repro harness gains the row-hit start-time-probe dimension, goes red against pre-fix code and green after
 - [ ] bun test green
 
 ## Done summary
-Moved the bus-worker register ancestry walk (ppidViaPs/resolveHarnessIdentity) off the serve event loop to async Bun.spawn, so the boot reconnect stampede no longer parks the kqueue loop; opRegister defers its ack until the walk resolves and drops a conn that closed mid-walk, with fail-open-to-floor and the anti-spoof peer-pid root unchanged. The repro harness gains register-work/stampede/getsockopt dimensions plus an event-loop-lag detector — RED on the sync shape, GREEN with --async-register; bun test 5626 pass / 0 fail.
+
 ## Evidence
