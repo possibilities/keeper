@@ -1025,6 +1025,59 @@ export function epicHasActiveResolver(
 }
 
 /**
+ * The terminal-outcome verdict of the autonomous `resolve::<epic>` merge-resolver,
+ * or the not-yet-terminal signal — the gate the daemon merge-escalation sweep reads
+ * so it NOTIFIES the human ONLY after the resolver has had its turn (the resolver
+ * owns a mechanically-clear conflict; the human is the fallback). Read off the SAME
+ * `jobs` map + liveness arms as {@link epicHasActiveResolver}:
+ *
+ *  - `{ terminal: false }` — a resolver is still LIVE (working / stopped-alive) OR no
+ *    `resolve::<epic>` job row has folded yet (the launch → SessionStart window). The
+ *    escalation WAITS.
+ *  - `{ terminal: true, verdict }` — a resolver job row folded AND none is live, so
+ *    the resolver reached a terminal outcome WITHOUT clearing the sticky (a CLEAR
+ *    resolution retries the close, deleting the row, so this sweep never sees it).
+ *    `verdict` is `"declined"` when any matching row is `ended` (a clean exit — it
+ *    stamped BLOCKED / gave up) and `"died"` otherwise (killed / stopped-dead — the
+ *    job crashed). Coarse by design: the human brief only needs "declined vs died".
+ *
+ * A `null` `livePaneIds` (degraded probe) keeps a `stopped` resolver LIVE via
+ * {@link epicHasActiveResolver}, so terminal fires only on `ended`/`killed` — the
+ * reap flips a truly-dead job to one of those and the next tick escalates,
+ * conservatively bounding the wait without a new timer class and never a premature
+ * escalation. Pure: reads only the passed jobs + live-pane set (never wall-clock /
+ * fs / a liveness re-probe), so it stays re-fold-safe when a fold consults it.
+ */
+export type ResolverOutcome =
+  | { terminal: false }
+  | { terminal: true; verdict: "declined" | "died" };
+
+export function classifyResolverOutcome(
+  jobs: Map<string, Job>,
+  epicId: string,
+  livePaneIds: ReadonlySet<string> | null,
+): ResolverOutcome {
+  if (epicHasActiveResolver(jobs, epicId, livePaneIds)) {
+    return { terminal: false };
+  }
+  let sawRow = false;
+  let sawEnded = false;
+  for (const job of jobs.values()) {
+    if (job.plan_verb !== "resolve" || job.plan_ref !== epicId) {
+      continue;
+    }
+    sawRow = true;
+    if (job.state === "ended") {
+      sawEnded = true;
+    }
+  }
+  if (!sawRow) {
+    return { terminal: false };
+  }
+  return { terminal: true, verdict: sawEnded ? "declined" : "died" };
+}
+
+/**
  * Is a `stopped` job's backend session still LIVE? `null` `livePaneIds` (probe
  * unavailable) → assume live (the conservative pre-liveness fallback). A row
  * with no `backend_exec_pane_id` is not live-provable → not live here.

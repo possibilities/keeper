@@ -106,6 +106,7 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
+import type { ResolverOutcome } from "../src/reconcile-core";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -4289,29 +4290,42 @@ function seedMergeFailureRow(
     reason: string;
     dir?: string | null;
     mergeEscalatedAt?: number | null;
+    resolverDispatchedAt?: number | null;
   },
 ): void {
   db.run(
     `INSERT INTO dispatch_failures
-       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at)
-       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?)`,
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
+       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
     [
       args.verb,
       args.id,
       args.reason,
       args.dir ?? null,
       args.mergeEscalatedAt ?? null,
+      args.resolverDispatchedAt ?? null,
     ],
   );
 }
 
-test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token and a NULL marker", () => {
+test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token, a NULL escalate marker, and a dispatched resolver", () => {
   const { db } = freshMemDb();
-  // Escalatable: a sticky close merge conflict, not yet escalated.
+  // Escalatable: a sticky close merge conflict, not yet escalated, whose resolver has
+  // already been dispatched (resolver_dispatched_at set) — the escalation sequences
+  // behind the resolver.
   seedMergeFailureRow(db, {
     verb: "close",
     id: "fn-1-foo",
     reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+    dir: "/repo/root",
+    resolverDispatchedAt: 555,
+  });
+  // Resolver NOT yet dispatched (a fresh row, or the window after a retry re-armed
+  // both markers) → dropped: the resolver owns the conflict first.
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-8-nores",
+    reason: mergeConflictReason("fn-8-nores.1", "keeper/epic/fn-8-nores"),
     dir: "/repo/root",
   });
   // Already escalated (marker set) → dropped.
@@ -4377,7 +4391,16 @@ test("buildMergeEscalationBody: parses source/base, derives the worktree path, c
     epicId: "fn-9-foo",
     reason: mergeConflictReason(source, base),
     repoDir,
+    resolverVerdict: "declined",
   });
+  // Names the resolver's verdict up top — the escalation fires only after the resolver
+  // reached a terminal outcome, so the human is the fallback, not a racer.
+  expect(body).toContain("DECLINED");
+  // The pause caveat + defer-to-a-live-resolver runbook: pausing does NOT stop an
+  // in-flight resolver, so check for a live resolve:: job before merging by hand.
+  expect(body).toContain("does NOT stop an in-flight resolver");
+  expect(body).toContain("resolve::fn-9-foo");
+  expect(body).toContain("keeper query jobs");
   // The exact base worktree path, derived from row.dir + the parsed base branch.
   expect(body).toContain(worktreePathFor(repoDir, base));
   // The merge-commit mechanic: --no-ff against the parsed source, never squash/rebase.
@@ -4412,10 +4435,14 @@ test("buildMergeEscalationBody: a parse-miss degrades to a human-actionable manu
     epicId: "fn-9-foo",
     reason: "worktree-merge-conflict: something unparseable happened",
     repoDir: "/Users/me/code/foo",
+    resolverVerdict: "died",
   });
   expect(body).toContain("close::fn-9-foo");
   expect(body).toContain("--no-ff");
   expect(body).toContain("ping the human");
+  // The died verdict + pause caveat survive the degrade.
+  expect(body).toContain("DIED");
+  expect(body).toContain("does NOT stop an in-flight resolver");
   // Pause-first + play still frame the degrade body.
   expect(body).toContain("keeper autopilot pause");
   expect(body).toContain("keeper autopilot play");
@@ -4428,9 +4455,12 @@ test("buildMergeEscalationBody: a null/empty repoDir degrades to the manual body
     epicId: "fn-9-foo",
     reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
     repoDir: null,
+    resolverVerdict: "declined",
   });
   expect(body).toContain("close::fn-9-foo");
   expect(body).toContain("--no-ff");
+  expect(body).toContain("DECLINED");
+  expect(body).toContain("does NOT stop an in-flight resolver");
   expect(body).toContain("keeper autopilot pause");
   expect(body).toContain("keeper autopilot play");
 });
@@ -4445,6 +4475,7 @@ interface MergeMintCall {
 function fakeMergeSweepDeps(opts: {
   pending: PendingMergeEscalation[];
   stillPending?: (id: string) => boolean;
+  resolverOutcome?: (id: string) => ResolverOutcome;
   notify?: (target: string, body: string) => Promise<PlannerNotifyResult>;
   selectThrows?: boolean;
 }): {
@@ -4460,6 +4491,11 @@ function fakeMergeSweepDeps(opts: {
       return opts.pending;
     },
     stillPending: opts.stillPending ?? (() => true),
+    // Default: the resolver already reached a terminal verdict, so the escalation
+    // fires (the pre-sequencing behaviour these tests assert). Cases that exercise
+    // the wait override this.
+    resolverOutcome:
+      opts.resolverOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
     notifyPlanner: async (target, body) => {
       notifies.push({ target, body });
       return (
@@ -4592,6 +4628,44 @@ test("runMergeEscalationSweep: a throwing selectPending degrades to a no-op (fai
   await runMergeEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(notifies).toEqual([]);
+});
+
+test("runMergeEscalationSweep: a live/not-yet-terminal resolver defers the escalation — no send, no mint", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    // The resolver still owns the conflict (live, or its job has not folded yet).
+    resolverOutcome: () => ({ terminal: false }),
+  });
+  await runMergeEscalationSweep(deps);
+  // The human notify waits for the resolver's verdict: nothing sent, marker untouched.
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runMergeEscalationSweep: a resolver that DIED escalates once and names the died verdict", async () => {
+  const { deps, mints, notifies } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    resolverOutcome: () => ({ terminal: true, verdict: "died" }),
+  });
+  await runMergeEscalationSweep(deps);
+  expect(notifies.length).toBe(1);
+  expect(notifies[0]?.target).toBe("planner@fn-1-foo");
+  // The brief names the resolver's died verdict + the pause caveat.
+  expect(notifies[0]?.body).toContain("DIED");
+  expect(notifies[0]?.body).toContain("does NOT stop an in-flight resolver");
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "sent" }]);
 });
 
 // ---- selectPendingResolverDispatches (the resolver working-set read) ---------
