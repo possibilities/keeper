@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T04:00:03.267000Z",
+  "depends_on": [],
+  "epic": "fn-1095-harden-merge-resolver-worker-mutual",
+  "id": "fn-1095-harden-merge-resolver-worker-mutual.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Scope resolver pause mutual-exclusion",
+  "updated_at": "2026-07-03T04:00:03.267000Z"
+}
