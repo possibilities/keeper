@@ -20,5 +20,5 @@ task/study back-references.
 - [ ] The load-bearing invariants (worker-ness keyed on the flag; arthack bundle stays upstream-only) remain stated.
 
 ## Done summary
-
+Rewrote past-tense provenance comments (task ordinals, dissolution-study row citation) forward-facing across main.ts, plugin-composition-map.test.ts, and vendored-corpus.test.ts, preserving the flag-keyed worker-isolation and upstream-only-bundle invariants.
 ## Evidence

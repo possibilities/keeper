@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Prune provenance comment back-references",
-  "updated_at": "2026-07-03T02:46:07.218000Z"
+  "updated_at": "2026-07-03T03:00:45.722000Z",
+  "worker_done_at": "2026-07-03T03:00:45.722000Z"
 }
