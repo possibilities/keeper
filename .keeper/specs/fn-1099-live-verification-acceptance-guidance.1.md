@@ -37,5 +37,5 @@ since the lane becomes an ancestor.
 - [ ] Both edits are forward-facing (no incident narration)
 
 ## Done summary
-
+Added plan-skill guidance that live-deployed-daemon verification belongs to the operator/await layer (never task acceptance, since a task cannot observe its own not-yet-finalized fix), and documented the sanctioned operator mid-epic deploy runbook (pause-first manual lane-merge to main, true-merge never squash, gate, push) in the autopilot skill.
 ## Evidence
