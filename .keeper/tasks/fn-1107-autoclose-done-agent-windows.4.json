@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T21:53:32.589000Z",
+  "depends_on": [
+    "fn-1107-autoclose-done-agent-windows.3"
+  ],
+  "epic": "fn-1107-autoclose-done-agent-windows",
+  "id": "fn-1107-autoclose-done-agent-windows.4",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "daemon wiring and docs",
+  "updated_at": "2026-07-03T21:53:32.589000Z"
+}
