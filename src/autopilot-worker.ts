@@ -1478,12 +1478,17 @@ export async function computeMergedLaneEntries(
   //    MERGED (no ancestry probe); DEFINITIVELY ABSENT ∧ never started → NOT
   //    merged (the lane was never cut, not torn down after a merge — inferring
   //    merged here fires `landed` spuriously on a fresh dep-blocked epic);
-  //  - PRESENT ∧ ancestor of LOCAL default → MERGED; else (not-ancestor / errored /
-  //    timed-out / unresolvable default) → NOT merged.
+  //  - PRESENT ∧ NOT `laneCarriesLandedWork` → NOT merged (a zero-commit lane sits
+  //    AT its fork point, a VACUOUS ancestor of default — git alone cannot tell it
+  //    from a merged lane, so the caller must prove non-emptiness, e.g. an `ok`
+  //    epic's tasks all done);
+  //  - PRESENT ∧ `laneCarriesLandedWork` ∧ ancestor of LOCAL default → MERGED; else
+  //    (not-ancestor / errored / timed-out / unresolvable default) → NOT merged.
   const laneMergedInRepo = async (
     repoDir: string,
     laneBranch: string,
     epicHasStarted: boolean,
+    laneCarriesLandedWork: boolean,
   ): Promise<boolean> => {
     const lanes = await enumerateLanes(repoDir);
     if (!lanes.ok) {
@@ -1494,6 +1499,17 @@ export async function computeMergedLaneEntries(
       // ever started. A never-started epic's lane is absent because it was never
       // cut, so absence proves nothing about merge (keep `landed` waiting).
       return epicHasStarted;
+    }
+    // PRESENT lane. A freshly-cut lane sits AT its fork point, so it is a VACUOUS
+    // ancestor of default (default is at or past the fork) — git alone cannot tell
+    // an empty lane from a merged one. Require external evidence the lane carries
+    // real mergeable work before trusting the ancestry verdict; otherwise a
+    // started-but-unworked epic's empty lane false-fires `landed` the instant it is
+    // armed. A truly-merged lane awaiting teardown still carries this evidence (its
+    // work is done), so the guard does NOT regress the merged-not-yet-torn-down
+    // window.
+    if (!laneCarriesLandedWork) {
+      return false;
     }
     const localDefault = await resolveLocalDefault(repoDir);
     if (localDefault === null) {
@@ -1523,7 +1539,21 @@ export async function computeMergedLaneEntries(
     const started = epicStarted(epic) || epic.status === "done";
     try {
       if (resolution.kind === "ok") {
-        if (await laneMergedInRepo(resolution.repoDir, laneBranch, started)) {
+        // Present-arm emptiness guard: this single lane carries landed work only
+        // once ALL the epic's tasks are administratively done (`worker_phase` — the
+        // terminal-completed signal the clustered serial-group arm keys). A started-
+        // but-unworked epic's lane sits empty at its fork point, so without this its
+        // vacuous ancestry would false-fire `landed`. A task-less epic is vacuously
+        // done (a present + merged lane still reads landed unchanged).
+        const tasksDone = epic.tasks.every((t) => t.worker_phase === "done");
+        if (
+          await laneMergedInRepo(
+            resolution.repoDir,
+            laneBranch,
+            started,
+            tasksDone,
+          )
+        ) {
           out.push({ epic_id: epic.epic_id, repo_dir: resolution.repoDir });
         }
         continue;
@@ -1539,7 +1569,11 @@ export async function computeMergedLaneEntries(
       for (const group of resolution.groups) {
         const groupLanded =
           group.mode === "worktree"
-            ? await laneMergedInRepo(group.repoDir, laneBranch, started)
+            ? // A `worktree` group's landed verdict rides the lane-merge signal per
+              // the clustered aggregation contract (`laneCarriesLandedWork: true`);
+              // the empty-lane guard is scoped to the single-lane `ok` waiter, and
+              // shifting the clustered per-group contract is out of scope here.
+              await laneMergedInRepo(group.repoDir, laneBranch, started, true)
             : group.taskIds.every(
                 (id) => taskById.get(id)?.worker_phase === "done",
               );
