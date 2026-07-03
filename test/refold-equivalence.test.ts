@@ -111,18 +111,21 @@ const SHED_MUTATION_TOOLS = new Set([
  * pins the reader sites). The shed NULLs only bodies in the widened shed-set
  * ({@link RETENTION_SHED_CLASS_PREDICATE}), whose complement is exactly this set.
  *
- * fn-837 widened the shed-set: BackendExecSnapshot / Notification / SubagentStart
- * / SubagentStop folds read CHEAP COLUMNS only (`backend_exec_*` / `event_type` /
- * `agent_id`), never the body, so they moved OUT of the keep-set into the shed.
+ * BackendExecSnapshot / Notification / SubagentStart folds read CHEAP COLUMNS
+ * only (`backend_exec_*` / `event_type` / `agent_id`), never the body, so they
+ * shed. SubagentStop, by contrast, is kept — its body (last_assistant_message,
+ * effort, agent_transcript_path) is the output half of the subagent IO pair,
+ * retained for offline-analysis capture rather than any fold read.
  *
  * NOTE on the three PARTIALLY-kept tool hook_events (they stay in this set as a
  * hook_event because some `tool_name` slice of each is keep):
- *  - PostToolUse: body is keep-set for `tool_name='Agent'` only on a LEGACY row
- *    (`subagent_agent_id IS NULL` → `resolveBridgeAgentId` reads
- *    `tool_response.agentId`); modern Agent rows shed. Also keep for the cron
+ *  - PostToolUse: body is keep-set for ALL `tool_name='Agent'` rows — a LEGACY
+ *    row (`subagent_agent_id IS NULL` → `resolveBridgeAgentId` reads
+ *    `tool_response.agentId`) AND a modern row (kept for capture of the
+ *    subagent's final answer / resolvedModel / usage). Also keep for the cron
  *    tools (`tool_response.id` / `tool_input.id`) and plan-op Bash rows
  *    (`extractPlanStateRepo` reads `tool_response.stdout`). The eight
- *    SHED_POSTTOOLUSE tools + non-plan Bash + modern Agent are the carve-OUT.
+ *    SHED_POSTTOOLUSE tools + non-plan Bash are the carve-OUT.
  *  - PreToolUse: body keep-set for `tool_name='Agent'` (the bridge); every other
  *    PreToolUse tool body sheds.
  *  - PostToolUseFailure: body keep-set for `tool_name='Agent'` (legacy
@@ -166,11 +169,14 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "ApiError",
   "SessionTelemetry",
   "Killed",
-  // Subagent lifecycle (PreToolUse:Agent body is read via the bridge).
+  // Subagent lifecycle (PreToolUse:Agent body is read via the bridge;
+  // SubagentStop body is kept for offline-analysis IO-pair capture).
   "SubagentTurn",
+  "SubagentStop",
   "PreToolUse",
-  // PostToolUse is keep-set for legacy Agent / cron / planctl-op Bash rows; the
-  // eight shed tools + non-planctl Bash + modern Agent are the carve-out.
+  // PostToolUse is keep-set for ALL Agent rows (legacy agentId fold-read + modern
+  // capture) / cron / planctl-op Bash rows; the eight shed tools + non-planctl
+  // Bash are the carve-out.
   "PostToolUse",
   "PostToolUseFailure",
 ]);
@@ -262,30 +268,18 @@ test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS ev
   expect(
     shedRow({ hook_event: "PostToolUse", tool_name: "Bash", plan_op: null }),
   ).toBe(true); // non-planctl Bash sheds
-  expect(
-    shedRow({
-      hook_event: "PostToolUse",
-      tool_name: "Agent",
-      subagent_agent_id: "agent-modern",
-    }),
-  ).toBe(true); // modern Agent sheds
   expect(shedRow({ hook_event: "PreToolUse", tool_name: "Bash" })).toBe(true);
   expect(shedRow({ hook_event: "PostToolUseFailure", tool_name: "Read" })).toBe(
     true,
   );
-  for (const he of [
-    "SubagentStart",
-    "SubagentStop",
-    "BackendExecSnapshot",
-    "Notification",
-  ]) {
+  for (const he of ["SubagentStart", "BackendExecSnapshot", "Notification"]) {
     expect({ he, shed: shedRow({ hook_event: he }) }).toEqual({
       he,
       shed: true,
     });
   }
 
-  // KEEP — the three exact inversions (a flip here is a silent re-fold break).
+  // KEEP — the exact inversions (a flip here is a silent re-fold break).
   expect(
     shedRow({
       hook_event: "PostToolUse",
@@ -293,13 +287,24 @@ test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS ev
       plan_op: "done",
     }),
   ).toBe(false); // planctl Bash KEPT (state_repo fold-read)
+  // ALL PostToolUse:Agent KEPT — legacy for the agentId fold-read, modern for
+  // deliberate offline-analysis capture of the subagent's final answer/model.
   expect(
     shedRow({
       hook_event: "PostToolUse",
       tool_name: "Agent",
       subagent_agent_id: null,
     }),
-  ).toBe(false); // legacy Agent KEPT (agentId fold-read)
+  ).toBe(false);
+  expect(
+    shedRow({
+      hook_event: "PostToolUse",
+      tool_name: "Agent",
+      subagent_agent_id: "agent-modern",
+    }),
+  ).toBe(false);
+  // SubagentStop KEPT — the output half of the subagent IO pair (capture).
+  expect(shedRow({ hook_event: "SubagentStop" })).toBe(false);
   expect(shedRow({ hook_event: "PreToolUse", tool_name: "Agent" })).toBe(false); // bridge body
   expect(
     shedRow({ hook_event: "PostToolUseFailure", tool_name: "Agent" }),
