@@ -53,7 +53,7 @@ The ten slots in ladder order:
 
 **Recompute the meter fresh every turn** from the current verbatim prompt — read the bytes and re-derive filled/total. Never keep a running tally the meter depends on; a compaction that drops history must not corrupt the count.
 
-**Off-ladder `target N`.** The human may set an arbitrary word count: `target 175` makes 175 the container verbatim (not snapped to a rung). The slot gate is the nearest rung's container, ties rounding up — `target 175` sits between `note` (~100) and `memo` (~250), nearer `memo`, so its gate is 6.
+**Off-ladder `target N`.** The human may set an arbitrary word count: `target 175` makes 175 the container verbatim (not snapped to a rung). The container stays 175 words; the slot gate comes from the rung whose container is nearest, ties rounding up to the larger rung — `target 175` is equidistant between `note` (~100) and `memo` (~250), 75 words each way, so the tie rounds up to `memo` and the gate is 6 slots.
 
 **Target overrides re-baseline meter and container together.** A change by rung name (`make it a memo`) or number resets both at once. **Demotion** (to a smaller rung) surfaces now-excess content as *proposed trims* — never an auto-cut; the human still approves each removal.
 
@@ -99,6 +99,13 @@ Question turn:
 
 ```
 (question turn)  next: answer above · skip questions · copy
+```
+
+Explore turn (a no-change turn, so it still carries the meter):
+
+```
+memo ▮▮▮▮▯▯ 4/6 — missing: non-inferable context, edge behavior · 212/~250 words
+next: continue · copy
 ```
 
 **Change-set approval is ALWAYS plain text.** `AskUserQuestion` fires only for question batches and the ready / intent-drift forks — never for change-set approval; the human chose this boundary. This is a **deliberate divergence** from the sibling plan skills' no-`AskUserQuestion` house style — do not strip it in a consistency sweep.
