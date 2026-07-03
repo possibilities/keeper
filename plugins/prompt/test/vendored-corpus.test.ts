@@ -9,9 +9,9 @@
 //      against the vendored corpus AND names a row in the subset `_index.yaml`,
 //      so a future edit that cites a ref outside the vendored subset fails loud;
 //   4. the arthack prompt-reminder bundle (`bundle/hookctl-bus-pointer`) stays
-//      upstream-only — it is arthack-personal advocacy (dissolution study §4
-//      row 12, "drop"), lives only in arthack's own UserPromptSubmit hook, and
-//      is deliberately NOT vendored; nothing keeper-side may cite it.
+//      upstream-only — it is arthack-personal advocacy, lives only in arthack's
+//      own UserPromptSubmit hook, and is deliberately NOT vendored; nothing
+//      keeper-side may cite it.
 // All checks read the in-repo vendored corpus — no arthack checkout required.
 
 import { describe, expect, test } from "bun:test";
@@ -169,10 +169,10 @@ describe("render cites resolve from the vendored corpus", () => {
   });
 
   test("the arthack prompt-reminder bundle is not cited keeper-side", () => {
-    // `bundle/hookctl-bus-pointer` is arthack-personal advocacy (dissolution
-    // study §4 row 12, "drop") and is deliberately upstream-only. If a keeper
-    // surface ever cites it, render() would throw (it is not vendored) — this
-    // pins the drop decision with an explicit, self-documenting failure.
+    // `bundle/hookctl-bus-pointer` is arthack-personal advocacy and is
+    // deliberately upstream-only. If a keeper surface ever cites it, render()
+    // would throw (it is not vendored) — this pins the upstream-only invariant
+    // with an explicit, self-documenting failure.
     const bundleRefs = [...reachableRefs()].filter((r) =>
       r.startsWith("bundle/"),
     );
