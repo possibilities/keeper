@@ -57,7 +57,13 @@ export type BackstopName =
   // that the ingester quarantined an unparseable line and advanced past it
   // (rather than silently wedging the file at that offset). Counted/emitted via
   // the same sole-writer sidecar path as `pending-dispatch-sweep`.
-  | "events-ingest-poison";
+  | "events-ingest-poison"
+  // fn-1096.3: a transient `SQLITE_NOTADB` tolerated (tick skipped, not a
+  // crash) by `NotadbTolerance` on a `PRAGMA data_version` poll — see
+  // `src/notadb-tolerance.ts`. One shared name across every poll site;
+  // `worker` disambiguates which poller, `detail.consecutive_misses` carries
+  // the running miss count for that site.
+  | "notadb-skip";
 
 /**
  * Which worker thread (or main) produced the fire. The worker maintains the
@@ -69,6 +75,11 @@ export type BackstopWorker =
   | "git-worker"
   | "transcript-worker"
   | "autopilot-worker"
+  // fn-1096.3: the remaining `PRAGMA data_version` pollers, wired for
+  // `notadb-skip` telemetry alongside the four above.
+  | "exit-watcher"
+  | "wake-worker"
+  | "server-worker"
   | "main";
 
 /**

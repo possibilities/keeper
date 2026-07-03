@@ -25,7 +25,9 @@
 
 import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import { openDb } from "./db";
+import { NotadbTolerance } from "./notadb-tolerance";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })` — only the DB
@@ -56,6 +58,14 @@ export interface WakeWorkerData {
 export interface WakeMessage {
   kind: "wake";
 }
+
+/**
+ * Every shape the wake-worker posts to main: the contentless wake pulse,
+ * plus the backstop-telemetry channel (fn-1096.3 — a `notadb-skip` record
+ * when `watchLoop`'s `PRAGMA data_version` poll tolerates a transient
+ * `SQLITE_NOTADB`).
+ */
+export type WakeWorkerOutbound = WakeMessage | BackstopMessage;
 
 /** Message the parent sends to ask the worker to stop. */
 export interface ShutdownMessage {
@@ -90,6 +100,16 @@ interface DataVersionRow {
  * It COALESCES by construction: a data_version change resets the idle clock, so
  * a fresh commit and an overdue idle tick never both fire in one iteration —
  * one `onWake` per loop turn, never two.
+ *
+ * fn-1096.3: a transient SQLITE_NOTADB on the `data_version` read is a
+ * boot-checkpoint view race, not corruption — tolerated via the shared
+ * `NotadbTolerance` helper (skip this tick, bounded consecutive-miss
+ * rethrow) rather than letting it crash the worker. Shared by every
+ * `watchLoop` consumer (wake-worker itself, handoff/renamer/restore
+ * workers). `onNotadbSkip` — when given — is invoked with the running
+ * consecutive-miss count on every tolerated skip so the caller can post
+ * countable backstop telemetry; omitted, a rate-limited-by-nature
+ * (skips are rare) `console.error` line covers the default case.
  */
 export async function watchLoop(
   db: Database,
@@ -97,11 +117,36 @@ export async function watchLoop(
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
   maxIdleMs = 0,
+  onNotadbSkip?: (consecutiveMisses: number) => void,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
   const query = db.query("PRAGMA data_version");
-  let last = (query.get() as DataVersionRow).data_version;
+  const tolerance = new NotadbTolerance();
+  const readVersion = (): number | null => {
+    const outcome = tolerance.poll(
+      () => (query.get() as DataVersionRow).data_version,
+    );
+    if (outcome.skipped) {
+      if (onNotadbSkip) {
+        onNotadbSkip(outcome.consecutiveMisses);
+      } else {
+        // Generic label — `watchLoop` is shared across several worker
+        // identities (wake / handoff / renamer / restore), so a consumer
+        // that didn't wire `onNotadbSkip` still gets a grep-countable line
+        // without falsely attributing it to "wake-worker".
+        console.error(
+          `[data-version-poll] transient SQLITE_NOTADB — skipped tick (consecutive=${outcome.consecutiveMisses})`,
+        );
+      }
+      return null;
+    }
+    return outcome.value;
+  };
+  // A tolerated NOTADB on this VERY FIRST read seeds a `null` baseline — the
+  // loop below treats `last === null` as "unknown, always re-diff on the
+  // next successful read," never a false suppression.
+  let last: number | null = readVersion();
   let lastWakeAt = Date.now();
 
   while (!isShutdown()) {
@@ -109,15 +154,16 @@ export async function watchLoop(
     if (isShutdown()) {
       break;
     }
-    const cur = (query.get() as DataVersionRow).data_version;
-    if (cur !== last) {
+    const cur = readVersion();
+    if (cur !== null && cur !== last) {
       // A real commit — fire and reset the idle clock so an overdue idle tick
       // doesn't also fire this turn (the coalesce).
       last = cur;
       lastWakeAt = Date.now();
       onWake();
     } else if (maxIdleMs > 0 && Date.now() - lastWakeAt >= maxIdleMs) {
-      // No commit, but the idle budget elapsed — pulse anyway.
+      // No commit (or a tolerated skip), but the idle budget elapsed —
+      // pulse anyway.
       lastWakeAt = Date.now();
       onWake();
     }
@@ -168,6 +214,25 @@ function main(): void {
     () => parentPort?.postMessage({ kind: "wake" } satisfies WakeMessage),
     () => shutdown,
     data.pollMs,
+    0,
+    // fn-1096.3: countable backstop telemetry for a tolerated transient
+    // SQLITE_NOTADB on the data_version poll.
+    (consecutiveMisses) => {
+      console.error(
+        `[wake-worker] transient SQLITE_NOTADB on data_version poll — skipped tick (consecutive=${consecutiveMisses})`,
+      );
+      parentPort?.postMessage({
+        kind: "backstop",
+        record: buildTimeoutRecord({
+          backstop: "notadb-skip",
+          worker: "wake-worker",
+          rescued: true,
+          now: Date.now(),
+          stalenessMs: null,
+          detail: { consecutive_misses: String(consecutiveMisses) },
+        }),
+      } satisfies BackstopMessage);
+    },
   )
     .then(() => {
       // Clean shutdown path: parent asked us to stop.

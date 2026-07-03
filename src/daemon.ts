@@ -104,7 +104,10 @@ import {
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
 } from "./exec-backend";
-import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
+import type {
+  ExitWatcherOutbound,
+  ExitWatcherWorkerData,
+} from "./exit-watcher";
 import { seedGitProjection } from "./git-boot-seed";
 import type {
   AddDiscoveryRootMessage,
@@ -190,8 +193,8 @@ import type {
 } from "./usage-worker";
 import type {
   ShutdownMessage,
-  WakeMessage,
   WakeWorkerData,
+  WakeWorkerOutbound,
 } from "./wake-worker";
 import { worktreePathFor } from "./worktree-plan";
 
@@ -3368,10 +3371,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } as WorkerOptions & { workerData: unknown });
 
     // Step 4 — each wake message triggers a (coalescing) drain pass.
-    worker.onmessage = (ev: MessageEvent<WakeMessage | undefined>): void => {
-      if (ev.data && ev.data.kind === "wake") {
+    worker.onmessage = (
+      ev: MessageEvent<WakeWorkerOutbound | undefined>,
+    ): void => {
+      if (!ev.data) return;
+      if (ev.data.kind === "wake") {
         wakePending = true;
         pumpWakes();
+        return;
+      }
+      // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
+      // sidecar writer.
+      if (ev.data.kind === "backstop") {
+        handleBackstopMessage(ev.data);
       }
     };
 
@@ -3428,12 +3440,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetAutopilotConfigRequestMessage
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
+        | BackstopMessage
         | { kind: "ready" }
         | undefined
       >,
     ): void => {
       const msg = ev.data;
       if (!msg) return;
+      // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
+      // sidecar writer.
+      if (msg.kind === "backstop") {
+        handleBackstopMessage(msg);
+        return;
+      }
       if (msg.kind === "replay-request") {
         const id = msg.id;
         let reply: ReplayResultMessage;
@@ -4446,9 +4465,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // either is NULL. A strict mismatch is a race-recovered stale event (the row
     // was re-opened with a fresh process); skip it. The reducer's Killed fold also
     // double-checks; this verifier just keeps the event log tight.
-    ew.onmessage = (ev: MessageEvent<ExitMessage | undefined>): void => {
+    ew.onmessage = (
+      ev: MessageEvent<ExitWatcherOutbound | undefined>,
+    ): void => {
       const msg = ev.data;
-      if (!msg || msg.kind !== "exit") {
+      if (!msg) {
+        return;
+      }
+      // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
+      // sidecar writer, same as the plan/git-worker backstop channel.
+      if (msg.kind === "backstop") {
+        handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind !== "exit") {
         return;
       }
       // Re-read the row to confirm the message's pid + start_time still match

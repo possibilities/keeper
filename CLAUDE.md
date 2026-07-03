@@ -79,7 +79,7 @@ imperative guardrails only.
 
 - **No kernel watchers on keeper's OWN DB.** `fs.watch`/FSEvents/kqueue drop same-process and WAL
   writes on macOS — detect DB changes via `PRAGMA data_version` polling on a read-only connection.
-  Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine.
+  Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine. A transient `SQLITE_NOTADB` on that poll skips the tick via the shared `NotadbTolerance` helper, never an ad-hoc per-site catch.
 - **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)`; the
   LaunchAgent restarts the single recovery path. Never respawn a worker in-process (carve-outs:
   closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed

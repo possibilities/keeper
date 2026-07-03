@@ -41,7 +41,7 @@ Claude Code hook  --append NDJSON, no SQLite-->  ~/.local/state/keeper/events-lo
 events-log ingester (worker)  --read from durable byte-offset-->  INSERT rows into `events`
 reducer (main)  --fold, one BEGIN IMMEDIATE per event-->  projections (jobs, epics, git, usage, ...)
 consumers poll `PRAGMA data_version` on their own read-only connections:
-    UDS subscribe + RPC server | autopilot reconciler | exit-watcher | tmux control/renamer workers
+    UDS subscribe + RPC server | autopilot reconciler | plan / exit-watcher / git workers | tmux control/renamer workers
 producers feed the log via main only (never write the DB):
     transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers
 ```
