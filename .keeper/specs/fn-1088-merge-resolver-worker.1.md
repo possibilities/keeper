@@ -42,5 +42,5 @@ exercised by the scratch-conflict proof in task .2, not the fast tier.
 - [ ] Escalation and close audit unchanged around it
 
 ## Done summary
-
+Wired the merge-resolver worker dispatch: a resolver_dispatched_at once-latch (schema v106) + daemon resolver-dispatch sweep that launches ONE resolve::<epic> worker per sticky worktree-merge-conflict (dispatch-once, reset on clear, breaker-covered via a first-class resolve verb). buildResolverBrief encodes both-intents + test-gate + retry on the clear path, BLOCKED + literal unstick sentence otherwise; the human escalation notify and close audit are unchanged (independent latches).
 ## Evidence
