@@ -15,9 +15,13 @@
  * tail emits semantic deltas only. Successive snapshots are projected to a
  * coarse board and diffed client-side; an empty diff (a reconnect re-paint is
  * byte-identical → no delta) emits NOTHING. Frames are coalesced over a short
- * window so a fold burst collapses into one diff. An idle keepalive line fires
- * periodically carrying the current `sequence` so a consumer knows the stream
- * is alive.
+ * window so a fold burst collapses into one diff, then held over a trailing
+ * flap-settle window so a completion-window round-trip (a `worker_phase="done"`
+ * task momentarily re-asserting `running:*` as its session winds down, and the
+ * `running↔blocked` close-row flap downstream of it) collapses to no delta while
+ * a settled change or genuine rescind still emits (see {@link FLAP_SETTLE_MS}).
+ * An idle keepalive line fires periodically carrying the current `sequence` so a
+ * consumer knows the stream is alive.
  *
  * `--filter <type>` is a NAMED-TYPE allowlist (no free-form eval = no injection
  * surface): pass one or more of the delta type names to emit only those. The
@@ -45,6 +49,24 @@ export const COALESCE_MS = 75;
 
 /** Default idle keepalive cadence (ms). */
 export const KEEPALIVE_MS = 30_000;
+
+/**
+ * Trailing flap-settle window (ms). A verdict / job / close-row key that
+ * round-trips back to its last-EMITTED value within this window is
+ * completion-window noise, not a real move: a `worker_phase="done"` stamp races
+ * ahead of the worker session going idle, so the readiness pipeline correctly
+ * re-asserts `running:*` on each post-done liveness blip (a spawned sub-agent, a
+ * final working turn, a backgrounded monitor) then clears back to `completed`;
+ * the close row's synth-close dep flaps `running↔blocked` downstream. Because the
+ * reducer commits per event, a subscriber observes that oscillation, and the raw
+ * diff would emit `A→B` then `B→A`. We instead hold each change this long and
+ * emit only the NET change vs. the last-emitted board: an `A→B→A` round-trip
+ * collapses to nothing, while a settled change or a genuine rescind (a `B` that
+ * persists past the window) still emits. Sized above the readiness-client poll
+ * cadence (`POLL_MS` = 500) so a blip straddling one poll interval still nets
+ * out; a state that outlives the window is real and surfaces.
+ */
+export const FLAP_SETTLE_MS = 750;
 
 /** The coarse delta type names — the `--filter` allowlist (minus baseline,
  *  which is always emitted, and keepalive). */
@@ -354,6 +376,145 @@ export function parseWatchArgs(argv: string[]): ParseFailure | ParseSuccess {
 // Runner (dependency-injected so tests drive without process / wall-clock)
 // ---------------------------------------------------------------------------
 
+/** Timer shims (default real `setInterval`/`setTimeout`); tests inject a fake
+ *  clock so the coalesce + flap-settle windows are driven deterministically. */
+export interface TimerDeps {
+  setInterval: (cb: () => void, ms: number) => unknown;
+  clearInterval: (h: unknown) => void;
+  setTimeout: (cb: () => void, ms: number) => unknown;
+  clearTimeout: (h: unknown) => void;
+}
+
+export interface DeltaEmitterDeps extends TimerDeps {
+  writeStdout: (s: string) => void;
+  /** `--filter` predicate: a delta type not wanted is dropped. `baseline` is
+   *  emitted unconditionally (a consumer needs the ground state). */
+  wants: (type: string) => boolean;
+  /** Window overrides (tests pass small values alongside a fake clock). */
+  coalesceMs?: number;
+  settleMs?: number;
+  keepaliveMs?: number;
+}
+
+export interface DeltaEmitter {
+  /** Feed one readiness snapshot (production: from `subscribeReadiness`). */
+  onSnapshot(snap: ReadinessClientSnapshot): void;
+  dispose(): void;
+}
+
+/**
+ * The stateful NDJSON emit pipeline, factored out of {@link runWatch} so it is
+ * testable with a fake clock and hand-fed snapshots (no socket). Three stages:
+ *   1. Coalesce a fold burst into one board (last-wins over `coalesceMs`).
+ *   2. Trailing flap-settle: hold the change for `settleMs`, emitting only the
+ *      NET diff vs. the last-EMITTED board — an `A→B→A` completion-window
+ *      round-trip nets to nothing, a settled change / genuine rescind emits (see
+ *      {@link FLAP_SETTLE_MS}).
+ *   3. Idle keepalive when no line landed in the window.
+ * The baseline first paint bypasses the settle (emitted at once).
+ */
+export function createDeltaEmitter(deps: DeltaEmitterDeps): DeltaEmitter {
+  const coalesceMs = deps.coalesceMs ?? COALESCE_MS;
+  const settleMs = deps.settleMs ?? FLAP_SETTLE_MS;
+  const keepaliveMs = deps.keepaliveMs ?? KEEPALIVE_MS;
+
+  let sequence = 0;
+  // The board as last reflected in EMITTED output — the diff baseline. Advances
+  // only when the settle fires, so a transient that reverts to it nets to zero.
+  let lastEmittedBoard: CoarseBoard | null = null;
+  // The most recent coalesced board awaiting the settle window.
+  let latestBoard: CoarseBoard | null = null;
+  let pendingSnap: ReadinessClientSnapshot | null = null;
+  let coalesceHandle: unknown = null;
+  let settleHandle: unknown = null;
+  let emittedSinceKeepalive = false;
+
+  const emit = (type: string, data: unknown): void => {
+    deps.writeStdout(
+      `${JSON.stringify({
+        schema_version: WATCH_SCHEMA_VERSION,
+        sequence: sequence++,
+        type,
+        data,
+      })}\n`,
+    );
+    emittedSinceKeepalive = true;
+  };
+
+  // Trailing flap-settle: emit the NET change since the last emission, then
+  // advance the baseline. A key that round-tripped A→B→A within the window nets
+  // to no change and is dropped; a settled change / genuine rescind emits.
+  const settle = (): void => {
+    settleHandle = null;
+    if (lastEmittedBoard === null || latestBoard === null) {
+      return;
+    }
+    const deltas = diffCoarseBoard(lastEmittedBoard, latestBoard);
+    lastEmittedBoard = latestBoard;
+    latestBoard = null;
+    for (const d of deltas) {
+      if (deps.wants(d.type)) {
+        emit(d.type, d.data);
+      }
+    }
+  };
+
+  const flush = (): void => {
+    coalesceHandle = null;
+    const snap = pendingSnap;
+    pendingSnap = null;
+    if (snap === null) {
+      return;
+    }
+    const board = projectCoarseBoard(snap);
+    if (lastEmittedBoard === null) {
+      // First paint → the baseline full-snapshot line, emitted immediately (a
+      // consumer needs ground state at once, not after a settle delay).
+      lastEmittedBoard = board;
+      emit("baseline", board);
+      return;
+    }
+    // Hold the change for the trailing flap-settle window; the newest board wins
+    // if more arrive before it fires. Arm once per settle cycle (trailing from
+    // the first change), so a whole A→B→A burst lands in one window.
+    latestBoard = board;
+    if (settleHandle === null) {
+      settleHandle = deps.setTimeout(settle, settleMs);
+    }
+  };
+
+  const onSnapshot = (snap: ReadinessClientSnapshot): void => {
+    pendingSnap = snap;
+    if (coalesceHandle === null) {
+      coalesceHandle = deps.setTimeout(flush, coalesceMs);
+    }
+  };
+
+  // Idle keepalive: a liveness line only when no other line landed in the
+  // window. Suppressed by `--filter` not naming it.
+  const keepaliveTimer = deps.setInterval(() => {
+    if (!emittedSinceKeepalive && deps.wants("keepalive")) {
+      emit("keepalive", { sequence });
+    }
+    emittedSinceKeepalive = false;
+  }, keepaliveMs);
+
+  return {
+    onSnapshot,
+    dispose(): void {
+      deps.clearInterval(keepaliveTimer);
+      if (coalesceHandle !== null) {
+        deps.clearTimeout(coalesceHandle);
+        coalesceHandle = null;
+      }
+      if (settleHandle !== null) {
+        deps.clearTimeout(settleHandle);
+        settleHandle = null;
+      }
+    },
+  };
+}
+
 export interface RunWatchDeps {
   writeStdout: (s: string) => void;
   /** Test-injection connect factory forwarded to `subscribeReadiness`. */
@@ -383,84 +544,31 @@ export function runWatch(
     deps.clearTimeout ??
     ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
-  let sequence = 0;
-  let lastBoard: CoarseBoard | null = null;
-  let pendingSnap: ReadinessClientSnapshot | null = null;
-  let coalesceHandle: unknown = null;
-  let emittedSinceKeepalive = false;
-
   const wants = (type: string): boolean =>
     args.filter.size === 0 || args.filter.has(type);
 
-  const emit = (type: string, data: unknown): void => {
-    deps.writeStdout(
-      `${JSON.stringify({
-        schema_version: WATCH_SCHEMA_VERSION,
-        sequence: sequence++,
-        type,
-        data,
-      })}\n`,
-    );
-    emittedSinceKeepalive = true;
-  };
-
-  const flush = (): void => {
-    coalesceHandle = null;
-    const snap = pendingSnap;
-    pendingSnap = null;
-    if (snap === null) {
-      return;
-    }
-    const board = projectCoarseBoard(snap);
-    if (lastBoard === null) {
-      // First paint → the baseline full-snapshot line (always emitted).
-      lastBoard = board;
-      emit("baseline", board);
-      return;
-    }
-    const deltas = diffCoarseBoard(lastBoard, board);
-    lastBoard = board;
-    // Null-diff (a reconnect re-paint of an unchanged board) → emit nothing.
-    for (const d of deltas) {
-      if (wants(d.type)) {
-        emit(d.type, d.data);
-      }
-    }
-  };
-
-  const onSnapshot = (snap: ReadinessClientSnapshot): void => {
-    pendingSnap = snap;
-    if (coalesceHandle === null) {
-      coalesceHandle = setTimeoutFn(flush, COALESCE_MS);
-    }
-  };
-
-  // Idle keepalive: a liveness line only when no other line landed in the
-  // window. Suppressed by `--filter` not naming it.
-  const keepaliveTimer = setIntervalFn(() => {
-    if (!emittedSinceKeepalive && wants("keepalive")) {
-      emit("keepalive", { sequence });
-    }
-    emittedSinceKeepalive = false;
-  }, KEEPALIVE_MS);
+  const emitter = createDeltaEmitter({
+    writeStdout: deps.writeStdout,
+    wants,
+    setInterval: setIntervalFn,
+    clearInterval: clearIntervalFn,
+    setTimeout: setTimeoutFn,
+    clearTimeout: clearTimeoutFn,
+  });
 
   const handle = subscribeReadiness({
     sockPath: args.sock,
     idPrefix: `watch-${process.pid}`,
-    onSnapshot,
+    onSnapshot: emitter.onSnapshot,
     // Reconnect-forever: NO give-up policy. A daemon bounce must not end the
     // tail, so we never pass `giveUpPolicy` — the default subscribe behavior.
     ...(deps.connect === undefined ? {} : { connect: deps.connect }),
   });
 
-  // Wrap dispose to also clear our own timers.
+  // Wrap dispose to also clear the emitter's own timers.
   return {
     dispose(): void {
-      clearIntervalFn(keepaliveTimer);
-      if (coalesceHandle !== null) {
-        clearTimeoutFn(coalesceHandle);
-        coalesceHandle = null;
-      }
+      emitter.dispose();
       handle.dispose();
     },
   };

@@ -6,13 +6,16 @@
 
 import { expect, test } from "bun:test";
 import {
+  createDeltaEmitter,
   diffCoarseBoard,
   parseWatchArgs,
   projectCoarseBoard,
   WATCH_DELTA_TYPES,
 } from "../cli/watch";
 import type { Verdict } from "../src/readiness";
+import { computeReadiness } from "../src/readiness";
 import type { ReadinessClientSnapshot } from "../src/readiness-client";
+import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
 
 interface SnapOverrides {
   epics?: { epic_id: string; status: string | null }[];
@@ -201,4 +204,279 @@ test("WATCH_DELTA_TYPES carries the coarse delta vocabulary", () => {
       "autopilot-change",
     ]),
   );
+});
+
+// ---------------------------------------------------------------------------
+// createDeltaEmitter — trailing flap-settle debounce (fn-1086.2)
+//
+// The completion-window flap: `worker_phase="done"` races ahead of the worker
+// session going idle, so the readiness pipeline correctly re-asserts `running:*`
+// on each post-done liveness blip (a spawned sub-agent, a final working turn, a
+// backgrounded monitor) then clears to `completed`. The reducer commits per
+// event, so a watch subscriber observes that `completed→running→completed`
+// oscillation; the close-row `running↔blocked` flap is downstream (its synth-
+// close dep reads `blocked` whenever a task is momentarily non-completed). The
+// debounce holds each change over a settle window and emits only the NET change,
+// collapsing the round-trip while a settled change / genuine rescind still emits.
+// ---------------------------------------------------------------------------
+
+const RUNNING_JOB: Verdict = {
+  tag: "running",
+  reason: { kind: "job-running" },
+};
+const CLOSE_BLOCKED: Verdict = {
+  tag: "blocked",
+  reason: { kind: "dep-on-task", upstream: "fn-1-a.1" },
+};
+
+// Minimal readiness fixtures (mirrors test/readiness.test.ts — helpers are
+// duplicated per file by convention, no shared module).
+function makeTask(overrides: Partial<Task>): Task {
+  return {
+    task_id: "fn-1-a.1",
+    epic_id: "fn-1-a",
+    task_number: 1,
+    title: "task",
+    target_repo: null,
+    tier: null,
+    model: null,
+    worker_phase: "open",
+    runtime_status: "todo",
+    depends_on: [],
+    jobs: [],
+    ...overrides,
+  };
+}
+
+function makeEpic(overrides: Partial<Epic>): Epic {
+  return {
+    epic_id: "fn-1-a",
+    epic_number: 1,
+    title: "epic",
+    project_dir: "/repo",
+    status: "open",
+    last_event_id: 0,
+    updated_at: 0,
+    depends_on_epics: [],
+    tasks: [],
+    jobs: [],
+    job_links: [],
+    resolved_epic_deps: null,
+    last_validated_at: "2026-05-24T00:00:00Z",
+    question: null,
+    ...overrides,
+  };
+}
+
+function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
+  return {
+    job_id: "session-1",
+    plan_verb: "work",
+    state: "working",
+    title: null,
+    created_at: 0,
+    updated_at: 0,
+    last_event_id: 0,
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
+    git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
+    git_orphan_count: 0,
+    active_since: 1,
+    has_live_worker_monitor: false,
+    ...overrides,
+  };
+}
+
+// A deterministic fake clock: `advance(ms)` fires every timer due within the
+// window, in due order, so a callback that schedules a new timer (coalesce → arm
+// settle) is picked up in the same drain.
+interface FakeTimer {
+  id: number;
+  cb: () => void;
+  due: number;
+  interval: number | null;
+}
+function makeClock() {
+  let now = 0;
+  let seq = 1;
+  const timers = new Map<number, FakeTimer>();
+  return {
+    setTimeout: (cb: () => void, ms: number): unknown => {
+      const id = seq++;
+      timers.set(id, { id, cb, due: now + ms, interval: null });
+      return id;
+    },
+    clearTimeout: (h: unknown): void => {
+      timers.delete(h as number);
+    },
+    setInterval: (cb: () => void, ms: number): unknown => {
+      const id = seq++;
+      timers.set(id, { id, cb, due: now + ms, interval: ms });
+      return id;
+    },
+    clearInterval: (h: unknown): void => {
+      timers.delete(h as number);
+    },
+    advance: (ms: number): void => {
+      const target = now + ms;
+      let guard = 0;
+      while (guard++ < 100_000) {
+        let next: FakeTimer | null = null;
+        for (const t of timers.values()) {
+          if (t.due <= target && (next === null || t.due < next.due)) {
+            next = t;
+          }
+        }
+        if (next === null) {
+          break;
+        }
+        now = next.due;
+        if (next.interval === null) {
+          timers.delete(next.id);
+        } else {
+          next.due = now + next.interval;
+        }
+        next.cb();
+      }
+      now = target;
+    },
+  };
+}
+
+interface EmittedLine {
+  type: string;
+  data: Record<string, unknown>;
+}
+
+function driveEmitter() {
+  const clock = makeClock();
+  const lines: EmittedLine[] = [];
+  const emitter = createDeltaEmitter({
+    writeStdout: (s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.length > 0) {
+          lines.push(JSON.parse(line) as EmittedLine);
+        }
+      }
+    },
+    wants: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    setInterval: clock.setInterval,
+    clearInterval: clock.clearInterval,
+    coalesceMs: 10,
+    settleMs: 100,
+    // Park the keepalive far beyond every test's advance window.
+    keepaliveMs: 1_000_000,
+  });
+  const verdictChanges = (): EmittedLine[] =>
+    lines.filter((l) => l.type === "verdict-change");
+  return { clock, lines, emitter, verdictChanges };
+}
+
+test("the completion-window flap is real: a done-stamped worker winding down reads completed then running", () => {
+  // Grounds the root cause against the actual readiness pipeline. Predicate 1
+  // (terminal-completed) needs `worker_phase="done"` AND the session idle;
+  // predicate 5 holds the verdict at `running:*` until it is. So the SAME
+  // done-stamped task reads `completed` while its embedded job is stopped and
+  // `running:job-running` on a post-done working blip — the oscillation the
+  // watch stream must not flap on.
+  const verdictOf = (t: Task): Verdict | undefined =>
+    computeReadiness(
+      [makeEpic({ tasks: [t] })],
+      new Map<string, Job>(),
+      [],
+    ).perTask.get(t.task_id);
+  expect(
+    verdictOf(
+      makeTask({
+        worker_phase: "done",
+        jobs: [makeEmbeddedJob({ state: "stopped" })],
+      }),
+    ),
+  ).toEqual({ tag: "completed" });
+  expect(
+    verdictOf(
+      makeTask({
+        worker_phase: "done",
+        jobs: [makeEmbeddedJob({ state: "working" })],
+      }),
+    ),
+  ).toEqual(RUNNING_JOB);
+});
+
+test("createDeltaEmitter: the baseline paints immediately (no settle delay)", () => {
+  const { clock, lines, emitter } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": DONE } }));
+  clock.advance(10); // one coalesce window
+  emitter.dispose();
+  expect(lines.map((l) => l.type)).toEqual(["baseline"]);
+});
+
+test("createDeltaEmitter: a completed→running→completed round-trip inside the settle window emits no verdict-change", () => {
+  const { clock, lines, emitter, verdictChanges } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": DONE } }));
+  clock.advance(10); // baseline
+  // Post-done liveness blip: the task momentarily reads running.
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": RUNNING_JOB } }));
+  clock.advance(30); // still inside the 100ms settle window
+  // The session goes idle again before the settle fires → back to completed.
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": DONE } }));
+  clock.advance(200); // drain the settle window
+  emitter.dispose();
+  // Net change over the window is zero → nothing but the baseline.
+  expect(verdictChanges()).toEqual([]);
+  expect(lines.map((l) => l.type)).toEqual(["baseline"]);
+});
+
+test("createDeltaEmitter: a settled completed→running (genuine rescind) still emits", () => {
+  const { clock, emitter, verdictChanges } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": DONE } }));
+  clock.advance(10); // baseline
+  // Reconcile genuinely rescinds the done — and it PERSISTS past the window.
+  emitter.onSnapshot(makeSnap({ perTask: { "fn-1-a.1": RUNNING_JOB } }));
+  clock.advance(200); // settle fires with no revert
+  emitter.dispose();
+  const vc = verdictChanges();
+  expect(vc).toHaveLength(1);
+  expect(vc[0]?.data).toEqual({
+    kind: "task",
+    id: "fn-1-a.1",
+    from: "completed",
+    to: "running:job-running",
+  });
+});
+
+test("createDeltaEmitter: the downstream close-row running↔blocked flap is suppressed", () => {
+  const { clock, emitter, verdictChanges } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ perCloseRow: { "fn-1-a": RUNNING_JOB } }));
+  clock.advance(10); // baseline
+  emitter.onSnapshot(makeSnap({ perCloseRow: { "fn-1-a": CLOSE_BLOCKED } }));
+  clock.advance(30);
+  emitter.onSnapshot(makeSnap({ perCloseRow: { "fn-1-a": RUNNING_JOB } }));
+  clock.advance(200);
+  emitter.dispose();
+  expect(verdictChanges()).toEqual([]);
+});
+
+test("createDeltaEmitter: a settled close-row regression (running→blocked, persists) still emits", () => {
+  const { clock, emitter, verdictChanges } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ perCloseRow: { "fn-1-a": RUNNING_JOB } }));
+  clock.advance(10); // baseline
+  emitter.onSnapshot(makeSnap({ perCloseRow: { "fn-1-a": CLOSE_BLOCKED } }));
+  clock.advance(200); // persists past the settle
+  emitter.dispose();
+  const vc = verdictChanges();
+  expect(vc).toHaveLength(1);
+  expect(vc[0]?.data).toEqual({
+    kind: "close",
+    id: "fn-1-a",
+    from: "running:job-running",
+    to: "blocked:dep-on-task",
+  });
 });
