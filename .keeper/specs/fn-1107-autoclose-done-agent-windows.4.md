@@ -69,5 +69,5 @@ A daemon-level test that the Killed mint stamps 'autoclosed' on a hint match and
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Wired the autoclose worker into the daemon fleet (ALL_WORKERS 19->20) with guards, shutdown registry, and a pre-kill intent-hint onmessage handler; added AutocloseHintSet so the exit-watcher's sole Killed mint stamps kill_reason 'autoclosed' on a hinted death and 'exit_watched' otherwise; documented the behavior + config keys in the panel skill and README.
 ## Evidence

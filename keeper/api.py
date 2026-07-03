@@ -411,6 +411,9 @@ from pathlib import Path
 # once-marker (the merge-resolver-worker dispatch latch, sibling of
 # ``merge_escalated_at``); keeper-py never reads ``dispatch_failures``, so only the
 # version whitelist gains 106.
+# v107 (fn-1102 task .1) adds the ``events.tmux_generation_id`` VIRTUAL generated
+# column + its partial index (the tab-restore generation-summary walk's indexed
+# key); keeper-py never reads it, so only the version whitelist gains 107.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -489,6 +492,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         104,
         105,
         106,
+        107,
     }
 )
 

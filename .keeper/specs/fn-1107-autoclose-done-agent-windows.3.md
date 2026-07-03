@@ -94,5 +94,5 @@ inject fakes per the test-isolation rules.
 - [ ] `bun test` green.
 
 ## Done summary
-
+Built src/autoclose-worker.ts: the pure computeAutocloseReaps decision core (autopilot + panel buckets, positive-provenance scoping, every negative safety rail fail-closed, worker-local grace clock, blast cap) plus the autoclosePulse orchestration (shared readiness seam, one pane sweep, intent hint before each killWindow, no keeper.db writes). 29-case in/out matrix + seeded-DB pulse smoke test.
 ## Evidence

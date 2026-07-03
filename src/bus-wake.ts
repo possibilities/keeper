@@ -34,7 +34,9 @@ import { resumeTarget } from "./resume-descriptor";
 /**
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
  * import("./types").Job} so the resolve/liveness/launch pipeline unit-tests with a
- * tiny synthetic row. `title`/`job_id` feed {@link resumeTarget}; `cwd` is the
+ * tiny synthetic row. `job_id` feeds {@link resumeTarget} (the exact session-UUID
+ * `--resume` key); `title` mirrors the `jobs` projection row so a real row stays
+ * assignable directly. `cwd` is the
  * directory the resumed window opens in (set on the `keeperAgentLaunch` spawn —
  * keeper agent reads its own `process.cwd()`, not interpolated into the launch body);
  * `state` is the running-liveness signal; `backend_exec_pane_id` is
