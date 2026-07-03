@@ -38,5 +38,5 @@ Completion tests should call the generation/responder functions or the dispatch 
 - [ ] Completion generation and responder tests run in the fast Bun test tier with no daemon, shell, or HOME side effects.
 
 ## Done summary
-
+Added `keeper completions <bash|zsh|fish>` (Clerc-generated scripts) plus a hidden `keeper complete` responder that suggests all public subcommands and SUBCOMMAND_META verbs; completions is listed in `keeper --help --json`, the responder is not.
 ## Evidence
