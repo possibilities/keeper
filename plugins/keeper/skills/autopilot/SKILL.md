@@ -306,3 +306,24 @@ the breaker.
   for a live `resolve::<epic>` and DEFER to its verdict; a manual merge racing a live
   resolver is the exact collision this flow prevents. (A retry re-dispatches a fresh
   resolver, so the same check applies right after `retry close::<epic>`.)
+
+## Mid-epic deploy (manual lane-merge to main)
+
+When an epic's fix must run in the LIVE daemon before the epic closes — a task's real
+verification needs the code deployed, but base→main deploy only happens at close-finalize —
+deploy the base lane by hand. Task specs push live-verification onto this operator step
+rather than task acceptance, so this is the runbook that discharges it.
+
+1. **Pause first** — `keeper autopilot pause`, so no dispatch or recover sweep races your
+   merge on the shared checkout.
+2. **True-merge the base lane to main** — `git merge --no-edit keeper/epic/<id>`. Merge the
+   epic BASE lane (`keeper/epic/<id>`); task lanes only fan in at finalize, so a specific
+   task lane needs its own `keeper/epic/<id>--<task>` merge. **Never `--squash`** — a squash
+   is not an ancestor of the lane and breaks the cross-epic merge-gate and clean finalize.
+3. **Run the affected-suite gate** — the tests covering what you just merged, green before
+   you ship.
+4. **Push** — `git push` main.
+5. **Play** — `keeper autopilot play`.
+
+Finalize later re-merges the lane cleanly: because your merge made the lane an ancestor of
+main, close-finalize's true merge is a no-op fast-forward, not a conflict.
