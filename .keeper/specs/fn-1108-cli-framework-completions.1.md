@@ -45,5 +45,5 @@ Keep the existing `test/keeper-cli.test.ts` assertions green, and add targeted t
 - [ ] The keeper CLI test suite for top-level dispatch passes under Bun.
 
 ## Done summary
-
+Added exact @clerc/core + @clerc/plugin-completions deps and a buildKeeperCli proxy adapter: every public subcommand routes through a Clerc proxy command whose ignore hook forwards the exact residual argv verbatim to its leaf handler, preserving all top-level special cases and plan/prompt pass-throughs. Proved the early proof point (residual argv preserved exactly).
 ## Evidence
