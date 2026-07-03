@@ -28,5 +28,5 @@ One fold test per batch shape; refold-equivalence green.
 - [ ] Batch-reap fold test asserts reasons populate; gaps fixed or filed with evidence
 
 ## Done summary
-
+Added a batch-reap fold test asserting the mass-reclassification path carries each row's kill_reason. Verified both producer arms (boot seed sweep + exit-watcher) already stamp reason into the per-event Killed payload and the fold copies it per-row on the proven write path; no mint gap found, nothing to fix or file.
 ## Evidence
