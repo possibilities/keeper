@@ -44,6 +44,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import {
   type CollectionDescriptor,
   countAndToken,
@@ -63,6 +64,7 @@ import {
 import type { RetryDispatchVerb } from "./dispatch-command";
 import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
+import { NotadbTolerance } from "./notadb-tolerance";
 import {
   type BootStatus,
   type ClientFrame,
@@ -2843,17 +2845,42 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
  *
  * Exported alongside `diffTick` so the worker `main` wires it and tests can run
  * it against a real two-connection DB.
+ *
+ * fn-1096.3: a transient SQLITE_NOTADB on the `data_version` read is a
+ * boot-checkpoint view race, not corruption — tolerated via the shared
+ * `NotadbTolerance` helper (skip this tick's diffTick, bounded consecutive-
+ * miss rethrow) rather than letting it crash the worker (this is the UDS
+ * subscribe/RPC serve path — the epic's own wedge/crash-loop concern).
+ * `reapConns` still runs every tick regardless, since it has no data_version
+ * dependency. `onNotadbSkip` — when given — is invoked with the running
+ * consecutive-miss count on every tolerated skip so the caller can post
+ * countable backstop telemetry.
  */
 export async function pollLoop(
   db: Database,
   getConns: () => Iterable<Writable>,
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
+  onNotadbSkip?: (consecutiveMisses: number) => void,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
   const query = db.query("PRAGMA data_version");
-  let last = (query.get() as { data_version: number }).data_version;
+  const tolerance = new NotadbTolerance();
+  const readVersion = (): number | null => {
+    const outcome = tolerance.poll(
+      () => (query.get() as { data_version: number }).data_version,
+    );
+    if (outcome.skipped) {
+      onNotadbSkip?.(outcome.consecutiveMisses);
+      return null;
+    }
+    return outcome.value;
+  };
+  // A tolerated NOTADB on this VERY FIRST read seeds a `null` baseline — the
+  // loop below treats `last === null` as "unknown, always re-diff on the
+  // next successful read," never a false suppression.
+  let last: number | null = readVersion();
 
   while (!isShutdown()) {
     const _sleepStart = Date.now();
@@ -2878,8 +2905,8 @@ export async function pollLoop(
     } catch (err) {
       console.error("[server-worker] poll-loop reapConns failed:", err);
     }
-    const cur = (query.get() as { data_version: number }).data_version;
-    if (cur !== last) {
+    const cur = readVersion();
+    if (cur !== null && cur !== last) {
       last = cur;
       const _tickStart = Date.now();
       diffTick(db, getConns());
@@ -3722,6 +3749,24 @@ function main(): void {
     () => server.conns,
     () => stopping,
     data.pollMs,
+    // fn-1096.3: countable backstop telemetry for a tolerated transient
+    // SQLITE_NOTADB on the data_version poll.
+    (consecutiveMisses) => {
+      console.error(
+        `[server-worker] transient SQLITE_NOTADB on data_version poll — skipped tick (consecutive=${consecutiveMisses})`,
+      );
+      parentPort?.postMessage({
+        kind: "backstop",
+        record: buildTimeoutRecord({
+          backstop: "notadb-skip",
+          worker: "server-worker",
+          rescued: true,
+          now: Date.now(),
+          stalenessMs: null,
+          detail: { consecutive_misses: String(consecutiveMisses) },
+        }),
+      } satisfies BackstopMessage);
+    },
   )
     .then(() => {
       // Clean loop exit. Signal `shutdown()` that the poll connection is idle so

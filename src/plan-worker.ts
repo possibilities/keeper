@@ -80,8 +80,10 @@ import {
   type BackstopMessage,
   BackstopRateLimiter,
   buildMissedWakeRecord,
+  buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
+import { NotadbTolerance } from "./notadb-tolerance";
 import { isDropError, RescanScheduler } from "./rescan";
 
 /**
@@ -3756,15 +3758,46 @@ function main(): void {
       console.error(`[plan-worker] db-poll wake failed: ${stringifyErr(err)}`),
   );
 
+  // fn-1096.3: a transient SQLITE_NOTADB on this poll's PRAGMA data_version
+  // read is a boot-checkpoint view race (concurrent WAL checkpoint mid-read),
+  // not corruption — tolerate via the shared helper (skip the tick, bounded
+  // consecutive-miss rethrow) rather than letting it crash the worker. ONE
+  // instance for this poll site so the consecutive-miss count is meaningful
+  // across ticks (including the baseline seed read below).
+  const dbPollNotadbTolerance = new NotadbTolerance();
+  const emitDbPollNotadbSkip = (consecutiveMisses: number): void => {
+    console.error(
+      `[plan-worker] transient SQLITE_NOTADB on data_version poll — skipped tick (consecutive=${consecutiveMisses})`,
+    );
+    port.postMessage({
+      kind: "backstop",
+      record: buildTimeoutRecord({
+        backstop: "notadb-skip",
+        worker: "plan-worker",
+        rescued: true,
+        now: Date.now(),
+        stalenessMs: null,
+        detail: { consecutive_misses: String(consecutiveMisses) },
+      }),
+    } satisfies BackstopMessage);
+  };
+
   // Init the baseline ONCE at startup from a naked autocommit `PRAGMA
   // data_version` read on the worker's existing read-only connection — NEVER
   // reset to 0 on recheck/restart (a reconnect would reset the baseline and
   // false-suppress). The read MUST stay in autocommit (no open BEGIN, or the
   // counter freezes for this connection). Armed AFTER seedFromDb so the seeded
-  // change-gate absorbs the first bump's re-scan without a re-emit storm.
+  // change-gate absorbs the first bump's re-scan without a re-emit storm. A
+  // tolerated NOTADB on this VERY FIRST read (the boot-checkpoint race is
+  // most likely right here) seeds a 0 baseline — harmless: the next
+  // successful poll's real version differs from 0 and fires one extra
+  // (idempotent) reconcile, never a false suppression.
   const dataVersionQuery = db.query("PRAGMA data_version");
-  let lastDataVersion = (dataVersionQuery.get() as { data_version: number })
-    .data_version;
+  const dbPollSeed = dbPollNotadbTolerance.poll(
+    () => (dataVersionQuery.get() as { data_version: number }).data_version,
+  );
+  if (dbPollSeed.skipped) emitDbPollNotadbSkip(dbPollSeed.consecutiveMisses);
+  let lastDataVersion = dbPollSeed.skipped ? 0 : dbPollSeed.value;
   const pollMs = Math.max(25, data.pollMs ?? PLAN_DB_POLL_MS);
   dbPollTimer = setInterval(() => {
     if (shuttingDown) return;
@@ -3772,8 +3805,14 @@ function main(): void {
     // change is meaningful. Store the new version BEFORE onWake so a bump that
     // lands during the wake is observed on the next tick (its own re-run, or
     // the wakePending coalesce if it raced the running cycle).
-    const cur = (dataVersionQuery.get() as { data_version: number })
-      .data_version;
+    const outcome = dbPollNotadbTolerance.poll(
+      () => (dataVersionQuery.get() as { data_version: number }).data_version,
+    );
+    if (outcome.skipped) {
+      emitDbPollNotadbSkip(outcome.consecutiveMisses);
+      return;
+    }
+    const cur = outcome.value;
     if (cur === lastDataVersion) return;
     lastDataVersion = cur;
     onWake();

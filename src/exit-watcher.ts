@@ -57,8 +57,10 @@
 
 import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import { openDb } from "./db";
 import { createExitWatcher, type ExitWatcher } from "./exit-watcher-ffi";
+import { NotadbTolerance } from "./notadb-tolerance";
 import { readOsStartTime } from "./seed-sweep";
 import { isPidAlive } from "./server-worker";
 
@@ -95,6 +97,15 @@ export interface ExitMessage {
   pid: number | null;
   startTime: string | null;
 }
+
+/**
+ * Every shape the exit-watcher posts to main: the exit reap message, plus
+ * the backstop-telemetry channel (fn-1096.3 — a `notadb-skip` record when
+ * `diffLoop`'s `PRAGMA data_version` poll tolerates a transient
+ * `SQLITE_NOTADB`). `main` routes `{kind:"backstop"}` to the sole sidecar
+ * writer and everything else to the exit-reap verifier.
+ */
+export type ExitWatcherOutbound = ExitMessage | BackstopMessage;
 
 /** Main → worker shutdown command (same shape as the other workers). */
 export interface ShutdownMessage {
@@ -177,15 +188,36 @@ function nextToken(prev: bigint): bigint {
  * Polls `PRAGMA data_version` every `pollMs` (naked autocommit reads — no
  * BEGIN, or the counter freezes on this connection). Resolves once
  * `isShutdown()` returns true.
+ *
+ * fn-1096.3: a transient SQLITE_NOTADB on the `data_version` read is a
+ * boot-checkpoint view race, not corruption — tolerated via the shared
+ * `NotadbTolerance` helper (skip this tick, bounded consecutive-miss
+ * rethrow) rather than letting it crash the worker. `onNotadbSkip` — when
+ * given — is invoked with the running consecutive-miss count on every
+ * tolerated skip so the caller can post countable backstop telemetry;
+ * omitted in the existing direct-loop tests (a skip there just re-attempts
+ * next tick, same as production).
  */
 export async function diffLoop(
   db: Database,
   onTick: (rows: CandidateRow[]) => void,
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
+  onNotadbSkip?: (consecutiveMisses: number) => void,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   const versionQuery = db.query("PRAGMA data_version");
+  const tolerance = new NotadbTolerance();
+  const readVersion = (): number | null => {
+    const outcome = tolerance.poll(
+      () => (versionQuery.get() as DataVersionRow).data_version,
+    );
+    if (outcome.skipped) {
+      onNotadbSkip?.(outcome.consecutiveMisses);
+      return null;
+    }
+    return outcome.value;
+  };
   // Invariant: the candidate set INCLUDES NULL-pid rows (no `pid IS NOT NULL`
   // filter). A NULL-pid row is never watched and never folds to terminal on
   // its own, so excluding it strands the session in `stopped` forever. We
@@ -203,13 +235,20 @@ export async function diffLoop(
   // FIRST set-diff should compute against.
   onTick(candidatesQuery.all() as CandidateRow[]);
 
-  let last = (versionQuery.get() as DataVersionRow).data_version;
+  // A tolerated NOTADB on this VERY FIRST read (the boot-checkpoint race is
+  // most likely right here) seeds a `null` baseline — the loop below treats
+  // `last === null` as "unknown, always re-diff on the next successful
+  // read," never a false suppression.
+  let last: number | null = readVersion();
   while (!isShutdown()) {
     await Bun.sleep(interval);
     if (isShutdown()) {
       break;
     }
-    const cur = (versionQuery.get() as DataVersionRow).data_version;
+    const cur = readVersion();
+    if (cur === null) {
+      continue;
+    }
     if (cur !== last) {
       last = cur;
       onTick(candidatesQuery.all() as CandidateRow[]);
@@ -620,12 +659,34 @@ function main(): void {
 
   // Diff loop. The first onTick fires synchronously inside diffLoop, so
   // rows already on disk at boot enter the watch set immediately.
-  const diff = diffLoop(db, diffTick, () => shutdown, data.pollMs).catch(
-    (err) => {
-      console.error("[exit-watcher] diff loop crashed:", err);
-      throw err;
+  const diff = diffLoop(
+    db,
+    diffTick,
+    () => shutdown,
+    data.pollMs,
+    // fn-1096.3: countable backstop telemetry for a tolerated transient
+    // SQLITE_NOTADB on the data_version poll — routed to main (the sole
+    // sidecar writer) alongside the exit-reap channel.
+    (consecutiveMisses) => {
+      console.error(
+        `[exit-watcher] transient SQLITE_NOTADB on data_version poll — skipped tick (consecutive=${consecutiveMisses})`,
+      );
+      parentPort?.postMessage({
+        kind: "backstop",
+        record: buildTimeoutRecord({
+          backstop: "notadb-skip",
+          worker: "exit-watcher",
+          rescued: true,
+          now: Date.now(),
+          stalenessMs: null,
+          detail: { consecutive_misses: String(consecutiveMisses) },
+        }),
+      } satisfies BackstopMessage);
     },
-  );
+  ).catch((err) => {
+    console.error("[exit-watcher] diff loop crashed:", err);
+    throw err;
+  });
   const wait = waitLoop();
   // Re-probe loop — the kernel-arm-miss backstop. Slow (~60s) tick that mints
   // a synthetic Killed for a non-terminal row whose pid is verifiably dead and
