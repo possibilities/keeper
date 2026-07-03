@@ -33,5 +33,5 @@ Argv unit tests only (pure builder); no live launch in the fast tier.
 - [ ] Builder comment states the deny-hooks-still-enforce fact
 
 ## Done summary
-
+Added --permission-mode acceptEdits --dangerously-skip-permissions to buildKeeperAgentLaunchArgv (worker launch argv), mirroring the pair path; workers now carry keeper-owned permission posture instead of relying on a host auto-approve hook. Deny-via-envelope hooks still enforce. Byte-pin tests updated (exec-backend, restore-agents) plus a positive posture pin.
 ## Evidence
