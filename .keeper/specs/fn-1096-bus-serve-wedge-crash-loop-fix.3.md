@@ -56,5 +56,5 @@ freshMemDb for any real-connection smoke.
 - [ ] bun test green; the CLAUDE.md and README lines state the new behavior
 
 ## Done summary
-
+Added src/notadb-tolerance.ts (NotadbTolerance class: skip-and-retry on SQLITE_NOTADB, bounded 20-consecutive-miss rethrow). Adopted it at all five PRAGMA data_version poll sites: plan-worker, exit-watcher (diffLoop), git-worker (the three confirmed crash sites), plus wake-worker's shared watchLoop (also covers handoff/renamer/restore workers) and server-worker's pollLoop, found via the required sibling sweep. Skips route through backstop-telemetry (new notadb-skip BackstopName, worker-tagged) for the 3 primary + wake-worker + server-worker; the 3 watchLoop consumers without dedicated wiring fall back to a grep-countable stderr line. Revised CLAUDE.md's data_version invariant and README's poller enumeration in place. bun run typecheck, bun run lint, and the full bun run test suite (5710 tests) are all green.
 ## Evidence

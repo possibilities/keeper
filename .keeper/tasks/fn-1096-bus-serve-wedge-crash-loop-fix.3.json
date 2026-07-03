@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "NOTADB skip-tick tolerance for pollers",
-  "updated_at": "2026-07-03T15:54:21.228000Z"
+  "updated_at": "2026-07-03T16:32:20.033000Z",
+  "worker_done_at": "2026-07-03T16:32:20.033000Z"
 }
