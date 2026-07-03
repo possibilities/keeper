@@ -18,7 +18,11 @@ import type { ReadinessClientSnapshot } from "../src/readiness-client";
 import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
 
 interface SnapOverrides {
-  epics?: { epic_id: string; status: string | null }[];
+  epics?: {
+    epic_id: string;
+    status: string | null;
+    tasks?: { task_id: string; runtime_status: string }[];
+  }[];
   jobsByState?: Record<string, string>;
   perTask?: Record<string, Verdict>;
   perCloseRow?: Record<string, Verdict>;
@@ -132,6 +136,141 @@ test("diffCoarseBoard: a job-state move → job-state-change", () => {
     job_id: "j-1",
     from: "working",
     to: "stopped",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1101 — the raw `blocked` runtime-overlay (keeper plan block/unblock) is a
+// coarse signal in its own right. The runtime-blocked readiness predicate
+// (rank 10.6) converts ONLY an otherwise-`ready` row, so a block/unblock of a
+// task blocked for another reason never moves its verdict — yet the overlay
+// flip behind the board's `[rt:blocked]` pill IS a real move `keeper watch`
+// must surface. Before the fix the coarse board tracked only verdicts, so the
+// flip was dropped.
+// ---------------------------------------------------------------------------
+
+const DEP_BLOCKED: Verdict = {
+  tag: "blocked",
+  reason: { kind: "dep-on-task", upstream: "fn-1-a.1", cross_project: null },
+} as unknown as Verdict;
+
+test("diffCoarseBoard: unblock (blocked→todo) on a verdict-STABLE task still emits (runtime-status)", () => {
+  // The task's verdict is `dep-on-task` in BOTH boards — only the raw overlay
+  // flips. This is the dropped-delta the bug report hit.
+  const a = projectCoarseBoard(
+    makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [{ task_id: "fn-1-a.2", runtime_status: "blocked" }],
+        },
+      ],
+      perTask: { "fn-1-a.2": DEP_BLOCKED },
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [{ task_id: "fn-1-a.2", runtime_status: "todo" }],
+        },
+      ],
+      perTask: { "fn-1-a.2": DEP_BLOCKED },
+    }),
+  );
+  const deltas = diffCoarseBoard(a, b);
+  expect(deltas).toHaveLength(1);
+  expect(deltas[0]?.type).toBe("verdict-change");
+  expect(deltas[0]?.data).toEqual({
+    kind: "runtime-status",
+    id: "fn-1-a.2",
+    blocked: false,
+  });
+});
+
+test("diffCoarseBoard: block (todo→blocked) on a verdict-stable task emits runtime-status blocked:true", () => {
+  const a = projectCoarseBoard(
+    makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [{ task_id: "fn-1-a.2", runtime_status: "todo" }],
+        },
+      ],
+      perTask: { "fn-1-a.2": DEP_BLOCKED },
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [{ task_id: "fn-1-a.2", runtime_status: "blocked" }],
+        },
+      ],
+      perTask: { "fn-1-a.2": DEP_BLOCKED },
+    }),
+  );
+  const deltas = diffCoarseBoard(a, b);
+  expect(deltas).toHaveLength(1);
+  expect(deltas[0]?.data).toEqual({
+    kind: "runtime-status",
+    id: "fn-1-a.2",
+    blocked: true,
+  });
+});
+
+test("diffCoarseBoard: routine runtime_status churn (todo→in_progress→done) emits no runtime-status delta", () => {
+  // Only the `blocked` overlay is tracked — the other values already ride the
+  // verdict + job-state families, so tracking them here would double-emit.
+  const board = (rt: string) =>
+    projectCoarseBoard(
+      makeSnap({
+        epics: [
+          {
+            epic_id: "fn-1-a",
+            status: "open",
+            tasks: [{ task_id: "fn-1-a.2", runtime_status: rt }],
+          },
+        ],
+      }),
+    );
+  expect(diffCoarseBoard(board("todo"), board("in_progress"))).toEqual([]);
+  expect(diffCoarseBoard(board("in_progress"), board("done"))).toEqual([]);
+});
+
+test("createDeltaEmitter: a settled unblock is emitted as signal, not swallowed by the flap-settle", () => {
+  // fn-1101 Risk: the trailing flap-settle must treat a runtime-overlay flip as
+  // a real (settled) change. A single blocked→todo transition that persists
+  // past the window emits; only an A→B→A round-trip nets to nothing.
+  const { clock, emitter, verdictChanges } = driveEmitter();
+  const withRt = (rt: string) =>
+    makeSnap({
+      epics: [
+        {
+          epic_id: "fn-1-a",
+          status: "open",
+          tasks: [{ task_id: "fn-1-a.2", runtime_status: rt }],
+        },
+      ],
+      perTask: { "fn-1-a.2": DEP_BLOCKED },
+    });
+  emitter.onSnapshot(withRt("blocked"));
+  clock.advance(10); // baseline
+  emitter.onSnapshot(withRt("todo")); // the unblock, persists past the window
+  clock.advance(200);
+  emitter.dispose();
+  const vc = verdictChanges();
+  expect(vc).toHaveLength(1);
+  expect(vc[0]?.data).toEqual({
+    kind: "runtime-status",
+    id: "fn-1-a.2",
+    blocked: false,
   });
 });
 
