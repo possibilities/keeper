@@ -541,23 +541,26 @@ export interface HarnessIdentity {
  * client-supplied pid), so a client can only resolve to an ancestor it is
  * actually descended from — it cannot claim a harness pid it does not belong to.
  *
- * Pure relative to the injected `getPpid` (parent-pid probe) and `lookupJobs`
- * (keeper.db enrichment) so it unit-tests deterministically. Returns null on the
- * resume-gap case (no ancestor within the depth bound has a jobs row) — the
- * caller falls back to the client-provided floor identity exactly as before.
+ * The `getPpid` probe is AWAITED each hop so the parent-pid read runs off the
+ * serve event loop (the production probe spawns `ps`; a sync spawn would park the
+ * kqueue loop under a boot reconnect stampede). Deterministic relative to the
+ * injected `getPpid` and `lookupJobs` (keeper.db enrichment, a fast synchronous
+ * read) so it unit-tests without a subprocess. Returns null on the resume-gap
+ * case (no ancestor within the depth bound has a jobs row) — the caller falls
+ * back to the client-provided floor identity exactly as before.
  */
-export function resolveHarnessIdentity(
+export async function resolveHarnessIdentity(
   peerPid: number,
-  getPpid: (pid: number) => number | null,
+  getPpid: (pid: number) => number | null | Promise<number | null>,
   lookupJobs: (pid: number) => JobIdentity | null,
   maxDepth = HARNESS_WALK_MAX_DEPTH,
-): HarnessIdentity | null {
+): Promise<HarnessIdentity | null> {
   let pid = peerPid;
   for (let depth = 0; depth < maxDepth; depth++) {
     if (pid <= 1) break; // pid 0 (kernel) / 1 (init) are never a harness
     const identity = lookupJobs(pid);
     if (identity !== null) return { pid, identity };
-    const parent = getPpid(pid);
+    const parent = await getPpid(pid);
     if (parent === null || parent === pid) break;
     pid = parent;
   }
@@ -565,21 +568,23 @@ export function resolveHarnessIdentity(
 }
 
 /**
- * Parent pid of `pid` via `ps -o ppid=` (macOS has no /proc). Synchronous and
- * bounded — registrations are infrequent, so a per-register `ps` per ancestry
- * hop is fine. Returns null on any failure (unknown pid, ps unavailable, parse
- * miss) so the ancestry walk terminates gracefully. A process-state read in the
- * worker, like `isPidAlive` — the producer-side process-state precedent.
+ * Parent pid of `pid` via `ps -o ppid=` (macOS has no /proc). ASYNC — the spawn
+ * runs off the serve event loop (a synchronous `Bun.spawnSync` here parks the
+ * kqueue accept/read loop; under a boot reconnect stampede that starves every
+ * socket event and wedges the whole daemon). Returns null on any failure (unknown
+ * pid, ps unavailable, non-zero exit, parse miss) so the ancestry walk terminates
+ * gracefully and the caller falls back to the client floor identity.
  */
-export function ppidViaPs(pid: number): number | null {
+export async function ppidViaPs(pid: number): Promise<number | null> {
   if (pid <= 0) return null;
   try {
-    const res = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], {
+    const proc = Bun.spawn(["ps", "-o", "ppid=", "-p", String(pid)], {
       stdout: "pipe",
       stderr: "ignore",
     });
-    if (!res.success) return null;
-    const raw = res.stdout.toString().trim();
+    const raw = (await new Response(proc.stdout).text()).trim();
+    await proc.exited;
+    if (proc.exitCode !== 0) return null;
     if (raw.length === 0) return null;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
@@ -610,6 +615,13 @@ interface BusConnState {
   boundGeneration: number;
   peerPid: number | null;
   id: number;
+  /**
+   * Set once in the `close` handler. An in-flight async `register` (the ancestry
+   * walk awaits `ps` off-loop) checks this after the walk resolves: a connection
+   * that went away mid-walk drops its registration silently — no ack, no registry
+   * entry.
+   */
+  closed: boolean;
 }
 
 /** The bus relay runtime: registry + both DB handles + the bound listener. */
@@ -786,7 +798,12 @@ export function startBusServer(
   const handleOp = (sock: Writable, conn: BusConnState, op: ClientOp): void => {
     switch (op.op) {
       case "register":
-        opRegister(sock, conn, op);
+        // Fire-and-forget: the register handler is async (the ancestry walk runs
+        // off-loop). Its body is total, but guard the promise so an unexpected
+        // rejection is a logged non-fatal drop, never an unhandled rejection.
+        void opRegister(sock, conn, op).catch((err) => {
+          console.error("[bus-worker] opRegister failed (non-fatal):", err);
+        });
         return;
       case "subscribe":
         opSubscribe(sock, conn, op);
@@ -809,23 +826,31 @@ export function startBusServer(
     }
   };
 
-  const opRegister = (
+  const opRegister = async (
     sock: Writable,
     conn: BusConnState,
     op: Extract<ClientOp, { op: "register" }>,
-  ): void => {
+  ): Promise<void> => {
     // Anti-spoof: the pid is the PEER pid, never the client-claimed one. The
     // peer is the `keeper bus watch` subprocess (harness → zsh → watch), so we
     // resolve the channel's IDENTITY from the nearest ancestor keeper tracks —
     // the Claude harness — rooting the walk at the server-resolved peer pid so a
     // client cannot forge an identity it is not descended from.
     const peerPid = conn.peerPid ?? op.pid ?? 0;
+    // The walk awaits `ps` off the serve loop. The ack DEFERS until it resolves;
+    // meanwhile the loop keeps servicing every other socket (this is the wedge
+    // fix). Completions apply serially (JS single-thread), so two in-flight walks
+    // for the same (pid, start_time) resolve like today's sequential re-registers
+    // — the later completion's takeover evicts the earlier entry.
     const harness =
       peerPid > 0
-        ? resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
+        ? await resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
             enrichPeerFromJobs(keeperDb, p, readStartTime),
           )
         : null;
+    // The connection closed while its walk was in flight: drop the registration
+    // silently — no ack, no registry entry, no throw to the serve loop.
+    if (conn.closed) return;
     const enriched = harness?.identity ?? null;
     // The channel's identity pid is the resolved HARNESS pid (stable across a
     // `/clear`, and what keeper's liveness/takeover keys must track); on a keeper
@@ -1188,6 +1213,7 @@ export function startBusServer(
               (socket as unknown as { fd?: number }).fd ?? -1,
             ),
             id: ++__nextConnId,
+            closed: false,
           };
         } catch (err) {
           console.error("[bus-worker] open handler failed:", err);
@@ -1250,6 +1276,9 @@ export function startBusServer(
         // rebound the entry to a fresh socket with a higher generation, so a
         // superseded victim's late close must NOT clobber the reconnected channel.
         const conn = socket.data;
+        // Mark the conn closed so an in-flight async register drops its pending
+        // registration (checked after the ancestry walk resolves).
+        if (conn) conn.closed = true;
         const entry = conn?.entry;
         if (entry && closeOwnsBinding(conn.boundGeneration, entry.generation)) {
           entry.sock = null;

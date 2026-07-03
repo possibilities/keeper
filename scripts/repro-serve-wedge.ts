@@ -12,19 +12,30 @@
  * up a REAL `Bun.listen` UDS server that mirrors keeper's serve shape — the raw
  * unix listener both `src/server-worker.ts` and `src/bus-worker.ts` use, the
  * production `LineBuffer` NDJSON framing, and the same short-write→queue→`drain`
- * backpressure path — then hammers it with the four load dimensions the wedge was
- * hypothesized to ride on, while a dedicated real-read probe (a faithful copy of
- * the shipped `probeSocketRead` / `decideServeLivenessWatchdog` watchdog from task
- * `.1`) watches for the socket going dark. The wedge lives in Bun's OWN accept/read
- * loop, which a minimal-but-real `Bun.listen` server exercises byte-for-byte the
- * same as `startServer` — so the harness needs no daemon, no DB, no RPC wiring.
+ * backpressure path, PLUS the production per-register ancestry work — then hammers
+ * it with the load dimensions the wedge rides on, while a real-read probe (a
+ * faithful copy of the shipped `probeSocketRead` / `decideServeLivenessWatchdog`
+ * watchdog) and an event-loop-lag detector watch for the serve loop going dark. A
+ * minimal-but-real `Bun.listen` server exercises the same accept/read/write path
+ * as `startServer` — so the harness needs no daemon, no DB, no RPC wiring.
  *
- * Why a real read probe (not connect-only): the observed wedge kept the send path
- * alive while READS died — a connect-only or write-only probe sails straight
+ * Why a real read probe (not connect-only): the #8044-family stall kept the send
+ * path alive while READS died — a connect-only or write-only probe sails straight
  * through it. Only a round-trip that gets a frame back proves the serve loop lives.
  *
- * The four load dimensions (bisect knobs — each probes a distinct #8044-family
- * mechanism; combine them to search the trigger space):
+ * Two detectors, because there are two failure shapes. The socket real-read probe
+ * catches a Bun-internal accept/read stall (JS keeps scheduling, sockets go dark).
+ * The CONFIRMED wedge is different: a SYNCHRONOUS `ps` spawn in the register path
+ * parks the ENTIRE JS loop. In this single-process harness that also parks the
+ * socket probe, so it can never fail-while-parked — an event-loop-LAG detector
+ * (a fine-cadence timer that returns late) is what catches a full-loop park, the
+ * in-process proxy for what the production main-thread watchdog sees cross-thread.
+ * A wedge is EITHER detector crossing --stuck-ms after a first green (boot grace).
+ *
+ * The load dimensions (bisect knobs — each probes a distinct mechanism; combine
+ * them to search the trigger space). The CONFIRMED wedge rides the register-work
+ * + stampede pair — the others are the earlier #8044-family hypotheses kept as a
+ * bisect surface:
  *   --clients / --rate-hz   steady concurrent request load (accept + read + write
  *                           under concurrency — the core #8044 accept-loop stall).
  *   --payload-bytes         large replies past the kernel send buffer — probes the
@@ -35,6 +46,21 @@
  *   --churn                 concurrent connect-then-immediately-destroy storms
  *                           racing live accepts — the dead-peer-reap-races-accept
  *                           class (a close storm interleaved with the accept loop).
+ *   --register-hops         per-register `ps` ancestry spawns run ON the serve
+ *                           loop — the production `opRegister` → `ppidViaPs` work.
+ *                           SYNC (`Bun.spawnSync`, the pre-fix shape) by default:
+ *                           each spawn parks the kqueue loop, so a burst of cold
+ *                           registers starves every socket event. This is the
+ *                           mechanism the epic fixes.
+ *   --async-register        run the --register-hops spawns OFF the loop (async
+ *                           `Bun.spawn` + await, the post-fix shape) and defer the
+ *                           register ack until they resolve. Flips a red run green.
+ *   --stampede              N clients that connect + register near-simultaneously
+ *                           at bind — the boot reconnect stampede where every
+ *                           watcher's identity is cold. Combined with a nonzero
+ *                           --register-hops SYNC, this is the red repro.
+ *   --peer-probe            run a per-accept getsockopt(LOCAL_PEERPID) FFI probe
+ *                           (the production per-accept peer-pid read, suspect #3).
  *
  * BOUNDED / OPT-IN / MANUAL. Never imported by any test tier; spawns no daemon,
  * opens no production DB or socket, writes no events/RPC. The UDS server is a
@@ -71,6 +97,13 @@ Load dimensions (bisect knobs):
                        pinning the write queue — backpressure class (default: 0)
   --churn <n>          Concurrent connect-then-destroy storms racing accepts —
                        the dead-peer-reap-races-accept class (default: 0)
+  --register-hops <n>  Per-register 'ps' ancestry spawns run on the serve loop —
+                       the production opRegister/ppidViaPs work (default: 0)
+  --async-register     Run the --register-hops spawns OFF the loop (post-fix
+                       shape) and defer the register ack (default: sync/pre-fix)
+  --stampede <n>       Clients that connect + register near-simultaneously at
+                       bind — the boot reconnect stampede (default: 0)
+  --peer-probe         Per-accept getsockopt(LOCAL_PEERPID) FFI probe (default off)
 
 Run control:
   --duration-ms <n>    Total run window (default: 20000)
@@ -85,7 +118,15 @@ Exits 0 when the serve loop answered the real-read probe throughout (no wedge),
 1 when the probe went dark past --stuck-ms while the server stayed alive (WEDGE
 REPRODUCED). Standalone — no daemon, no production DB, scratch socket only.
 
-Aggressive search (push all four dimensions):
+Red repro (the confirmed wedge — sync register-work under a boot stampede):
+  bun scripts/repro-serve-wedge.ts --clients 40 --rate-hz 10 \\
+    --register-hops 40 --stampede 40 --peer-probe
+
+Green (the same load, register-work moved off the loop — the fix):
+  bun scripts/repro-serve-wedge.ts --clients 40 --rate-hz 10 \\
+    --register-hops 40 --stampede 40 --peer-probe --async-register
+
+Aggressive search (push the #8044-family dimensions):
   bun scripts/repro-serve-wedge.ts --clients 400 --rate-hz 100 \\
     --payload-bytes 65536 --slow-readers 0.25 --churn 64 --duration-ms 60000
 `;
@@ -98,6 +139,10 @@ interface Args {
   payloadBytes: number;
   slowReaders: number;
   churn: number;
+  registerHops: number;
+  asyncRegister: boolean;
+  stampede: number;
+  peerProbe: boolean;
   durationMs: number;
   probeMs: number;
   probeTimeoutMs: number;
@@ -115,6 +160,10 @@ function parse(argv: string[]): Args | "help" {
       "payload-bytes": { type: "string" },
       "slow-readers": { type: "string" },
       churn: { type: "string" },
+      "register-hops": { type: "string" },
+      "async-register": { type: "boolean", default: false },
+      stampede: { type: "string" },
+      "peer-probe": { type: "boolean", default: false },
       "duration-ms": { type: "string" },
       "probe-ms": { type: "string" },
       "probe-timeout": { type: "string" },
@@ -153,6 +202,12 @@ function parse(argv: string[]): Args | "help" {
     ),
     slowReaders,
     churn: Math.floor(numOr(values.churn, 0, "churn")),
+    registerHops: Math.floor(
+      numOr(values["register-hops"], 0, "register-hops"),
+    ),
+    asyncRegister: values["async-register"] ?? false,
+    stampede: Math.floor(numOr(values.stampede, 0, "stampede")),
+    peerProbe: values["peer-probe"] ?? false,
     durationMs: Math.floor(
       numOr(values["duration-ms"], 20_000, "duration-ms", 1),
     ),
@@ -194,6 +249,113 @@ interface ServerMetrics {
   queries: number;
   replies: number;
   shortWrites: number;
+  registers: number;
+}
+
+// ── per-register ancestry work (the production opRegister → ppidViaPs) ────────
+//
+// Each register runs `--register-hops` `ps -o ppid=` spawns — the exact per-hop
+// ancestry probe `src/bus-worker.ts` runs while resolving a watcher's identity.
+// SYNC (`Bun.spawnSync`, the pre-fix shape) parks the kqueue serve loop for the
+// whole spawn; a burst of cold registers (the boot stampede) starves every other
+// socket event — the wedge. ASYNC (`Bun.spawn` + await, the post-fix shape) runs
+// the same spawns off the loop, so accepts/reads keep flowing.
+
+function registerWorkSync(hops: number): void {
+  for (let i = 0; i < hops; i++) {
+    try {
+      Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+    } catch {
+      // a spawn failure terminates the walk early, exactly like production
+      return;
+    }
+  }
+}
+
+async function registerWorkAsync(hops: number): Promise<void> {
+  for (let i = 0; i < hops; i++) {
+    try {
+      const proc = Bun.spawn(["ps", "-o", "ppid=", "-p", String(process.pid)], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      await new Response(proc.stdout).text();
+      await proc.exited;
+    } catch {
+      return;
+    }
+  }
+}
+
+/** The register ack the server replies once the ancestry work resolves. */
+function ackLine(id: string | undefined): Uint8Array {
+  const idSeg = id !== undefined ? `,"id":${JSON.stringify(id)}` : "";
+  return encoder.encode(`{"type":"ack","op":"register"${idSeg}}\n`);
+}
+
+// ── per-accept peer-pid probe (mirrors src/server-worker.ts peerPidForFd) ─────
+//
+// The production serve path runs a getsockopt(SOL_LOCAL, LOCAL_PEERPID) FFI call
+// per accept. The --peer-probe dimension replays it to rule the probe in or out
+// as a wedge contributor (suspect #3). Replicated here (not imported) to keep the
+// harness standalone — server-worker pulls in the DB layer. macOS-only; inert
+// elsewhere. A faithful copy, like probeRealRead below.
+
+const SOL_LOCAL = 0;
+const LOCAL_PEERPID = 0x002;
+let getsockoptLib:
+  | { getsockopt: (...args: number[]) => number }
+  | null
+  | undefined;
+
+function peerPidForFd(fd: number): number | null {
+  if (!Number.isInteger(fd) || fd < 0 || process.platform !== "darwin") {
+    return null;
+  }
+  if (getsockoptLib === undefined) {
+    try {
+      const { dlopen, FFIType, suffix } =
+        require("bun:ffi") as typeof import("bun:ffi");
+      const lib = dlopen(`libc.${suffix}`, {
+        getsockopt: {
+          args: [
+            FFIType.i32,
+            FFIType.i32,
+            FFIType.i32,
+            FFIType.ptr,
+            FFIType.ptr,
+          ],
+          returns: FFIType.i32,
+        },
+      });
+      getsockoptLib = lib.symbols as unknown as {
+        getsockopt: (...args: number[]) => number;
+      };
+    } catch {
+      getsockoptLib = null;
+    }
+  }
+  if (getsockoptLib === null) return null;
+  try {
+    const { ptr } = require("bun:ffi") as typeof import("bun:ffi");
+    const out = new Int32Array(1);
+    const len = new Uint32Array(1);
+    len[0] = 4;
+    const rc = getsockoptLib.getsockopt(
+      fd,
+      SOL_LOCAL,
+      LOCAL_PEERPID,
+      ptr(out),
+      ptr(len),
+    );
+    if (rc !== 0) return null;
+    return out[0] > 0 ? out[0] : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Build the fixed-size reply line for a query id, padded to `payloadBytes`. */
@@ -211,6 +373,9 @@ function startServer(
   sockPath: string,
   payloadBytes: number,
   metrics: ServerMetrics,
+  registerHops: number,
+  asyncRegister: boolean,
+  peerProbe: boolean,
 ): ReturnType<typeof Bun.listen<ServerConn>> {
   const writeOrQueue = (sock: BunSocket, bytes: Uint8Array): void => {
     // Mirror the server worker's flush: try the socket, stash the unaccepted
@@ -239,6 +404,10 @@ function startServer(
     socket: {
       open(socket) {
         metrics.accepts += 1;
+        // Per-accept peer-pid probe (the production getsockopt read, suspect #3).
+        if (peerProbe) {
+          peerPidForFd((socket as unknown as { fd?: number }).fd ?? -1);
+        }
         socket.data = { buffer: new LineBuffer(), pending: null };
       },
       data(socket, chunk) {
@@ -262,6 +431,21 @@ function startServer(
             metrics.queries += 1;
             writeOrQueue(sock, replyLine(frame.id, payloadBytes));
             metrics.replies += 1;
+          } else if (frame.type === "register") {
+            metrics.registers += 1;
+            const id = frame.id;
+            if (asyncRegister) {
+              // Post-fix shape: the ancestry work runs OFF the loop and the ack
+              // DEFERS until it resolves. The loop keeps servicing sockets.
+              void registerWorkAsync(registerHops).then(() => {
+                writeOrQueue(sock, ackLine(id));
+              });
+            } else {
+              // Pre-fix shape: the sync spawns run INLINE on the serve loop,
+              // parking the kqueue accept/read loop for their whole duration.
+              registerWorkSync(registerHops);
+              writeOrQueue(sock, ackLine(id));
+            }
           }
         }
       },
@@ -464,6 +648,45 @@ function startChurn(sockPath: string, churn: number, state: LoadState): void {
   spin();
 }
 
+/**
+ * The boot reconnect stampede: `stampede` clients connect and each send ONE
+ * register frame near-simultaneously at bind — the production condition where a
+ * respawn re-connects every `keeper bus watch` at once and every watcher's
+ * identity is cold. Each register triggers the server's per-register ancestry
+ * work; under the sync (pre-fix) shape that burst parks the serve loop. The
+ * clients stay open (a real watcher holds its subscription) so the FINs do not
+ * confound the accept loop — the wedge is the register-work, not a close storm.
+ */
+function startStampede(
+  sockPath: string,
+  stampede: number,
+  state: LoadState,
+): void {
+  for (let i = 0; i < stampede; i++) {
+    void Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) {
+          try {
+            s.write(`${JSON.stringify({ type: "register", id: `reg${i}` })}\n`);
+            state.sent += 1;
+          } catch {
+            // a failed register write just drops this stampede slot
+          }
+        },
+        data() {
+          // hold the connection open; the ack is not read (a watcher would
+          // subscribe next, but the wedge lives in the register-work already run)
+        },
+        close() {},
+        error() {},
+      },
+    }).catch(() => {
+      /* a failed connect during the stampede is itself signal */
+    });
+  }
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 interface Report {
@@ -473,11 +696,13 @@ interface Report {
   serverQueries: number;
   serverReplies: number;
   serverShortWrites: number;
+  serverRegisters: number;
   clientSent: number;
   clientReceived: number;
   probeOk: number;
   probeFail: number;
   maxProbeDarkMs: number;
+  maxLoopLagMs: number;
   wedged: boolean;
   wedgeAtMs: number | null;
 }
@@ -494,8 +719,16 @@ async function run(args: Args): Promise<Report> {
     queries: 0,
     replies: 0,
     shortWrites: 0,
+    registers: 0,
   };
-  const server = startServer(sockPath, args.payloadBytes, metrics);
+  const server = startServer(
+    sockPath,
+    args.payloadBytes,
+    metrics,
+    args.registerHops,
+    args.asyncRegister,
+    args.peerProbe,
+  );
 
   // Let the socket bind before dialing.
   await sleep(50);
@@ -506,6 +739,11 @@ async function run(args: Args): Promise<Report> {
     startClient(sockPath, args.rateHz, i < slowCount, loadState);
   }
   if (args.churn > 0) startChurn(sockPath, args.churn, loadState);
+  // The boot reconnect stampede fires AFTER the first green probe (below), so the
+  // serve loop is proven live first — the production crash-loop shape is boot →
+  // brief serve → stampede → wedge, and the wedge verdict needs a prior success
+  // (boot grace) to fire.
+  let stampedeFired = false;
 
   // Probe / wedge-detector state — mirrors decideServeLivenessWatchdog: track the
   // last successful real-read; a wedge is the probe-dark age crossing --stuck-ms
@@ -519,6 +757,24 @@ async function run(args: Args): Promise<Report> {
   let wedged = false;
   let wedgeAtMs: number | null = null;
 
+  // Event-loop-lag detector. The register-work wedge is a SYNCHRONOUS spawn that
+  // parks the WHOLE JS loop — in this single-process harness that also parks the
+  // socket probe, which therefore never fails-while-parked (it just can't run,
+  // then succeeds once the loop frees). So a co-resident socket probe is blind to
+  // a full-loop park; event-loop lag is the faithful in-process proxy for what the
+  // production main-thread watchdog observes cross-thread. A fine-cadence timer
+  // that comes back late measures exactly how long the loop was starved.
+  const LAG_INTERVAL_MS = 100;
+  let maxLoopLagMs = 0;
+  let lastTick = Date.now();
+  const lagTimer = setInterval(() => {
+    const now = Date.now();
+    const lag = now - lastTick - LAG_INTERVAL_MS;
+    if (lag > maxLoopLagMs) maxLoopLagMs = lag;
+    lastTick = now;
+  }, LAG_INTERVAL_MS);
+  lagTimer.unref?.();
+
   while (Date.now() - startedAt < args.durationMs && !wedged) {
     const ok = await probeRealRead(sockPath, args.probeTimeoutMs);
     const now = Date.now();
@@ -526,6 +782,11 @@ async function run(args: Args): Promise<Report> {
       probeOk += 1;
       everProbedOk = true;
       lastProbeOkAt = now;
+      // The serve loop is proven live — now fire the reconnect stampede (once).
+      if (!stampedeFired && args.stampede > 0) {
+        stampedeFired = true;
+        startStampede(sockPath, args.stampede, loadState);
+      }
     } else {
       probeFail += 1;
       const darkMs = now - lastProbeOkAt;
@@ -538,17 +799,25 @@ async function run(args: Args): Promise<Report> {
         wedgeAtMs = now - startedAt;
       }
     }
+    // Loop-lag verdict (checked on every iteration, not just a probe miss): a
+    // full-loop park past --stuck-ms is a wedge even when the co-parked socket
+    // probe never registered a miss. Boot-grace applies here too.
+    if (everProbedOk && !wedged && maxLoopLagMs >= args.stuckMs) {
+      wedged = true;
+      wedgeAtMs = now - startedAt;
+    }
     if (!args.quiet && !args.json) {
       process.stderr.write(
         `t=${String(now - startedAt).padStart(6)}ms  probe=${ok ? "ok " : "DARK"}  ` +
-          `dark=${(now - lastProbeOkAt).toFixed(0)}ms  accepts=${metrics.accepts}  ` +
-          `q=${metrics.queries}  sent=${loadState.sent}  recv=${loadState.received}\n`,
+          `dark=${(now - lastProbeOkAt).toFixed(0)}ms  loop-lag=${maxLoopLagMs.toFixed(0)}ms  ` +
+          `accepts=${metrics.accepts}  q=${metrics.queries}  reg=${metrics.registers}\n`,
       );
     }
     await sleep(args.probeMs);
   }
 
   loadState.stop = true;
+  clearInterval(lagTimer);
   try {
     server.stop(true);
   } catch {
@@ -563,11 +832,13 @@ async function run(args: Args): Promise<Report> {
     serverQueries: metrics.queries,
     serverReplies: metrics.replies,
     serverShortWrites: metrics.shortWrites,
+    serverRegisters: metrics.registers,
     clientSent: loadState.sent,
     clientReceived: loadState.received,
     probeOk,
     probeFail,
     maxProbeDarkMs,
+    maxLoopLagMs,
     wedged,
     wedgeAtMs,
   };
@@ -582,10 +853,16 @@ function printSummary(r: Report): void {
     "load knobs",
     `payload=${r.args.payloadBytes}B slow-readers=${r.args.slowReaders} churn=${r.args.churn}`,
   );
+  out += w(
+    "register work",
+    `hops=${r.args.registerHops} ${r.args.asyncRegister ? "async(off-loop)" : "sync(on-loop)"} ` +
+      `stampede=${r.args.stampede} peer-probe=${r.args.peerProbe}`,
+  );
   out += w("ran", `${(r.durationRanMs / 1000).toFixed(1)}s`);
   out += w("accepts", String(r.accepts));
   out += w("server queries", String(r.serverQueries));
   out += w("server replies", String(r.serverReplies));
+  out += w("server registers", String(r.serverRegisters));
   out += w("short writes", String(r.serverShortWrites));
   out += w("client sent", String(r.clientSent));
   out += w("client received", String(r.clientReceived));
@@ -595,10 +872,14 @@ function printSummary(r: Report): void {
     `${r.maxProbeDarkMs.toFixed(0)}ms (stuck ${r.args.stuckMs}ms)`,
   );
   out += w(
+    "max loop-lag",
+    `${r.maxLoopLagMs.toFixed(0)}ms (stuck ${r.args.stuckMs}ms)`,
+  );
+  out += w(
     "verdict",
     r.wedged
-      ? `WEDGE REPRODUCED at ${r.wedgeAtMs}ms — probe dark past --stuck-ms while server live`
-      : "no wedge — serve loop answered the real-read probe throughout",
+      ? `WEDGE REPRODUCED at ${r.wedgeAtMs}ms — probe-dark or loop-lag past --stuck-ms while server live`
+      : "no wedge — serve loop stayed live (probe answered, loop lag bounded) throughout",
   );
   process.stderr.write(out);
 }

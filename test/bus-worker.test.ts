@@ -394,13 +394,13 @@ function jobIdentity(over: Partial<JobIdentity> = {}): JobIdentity {
   };
 }
 
-test("resolveHarnessIdentity climbs from the watcher peer pid to the nearest ancestor with a jobs row", () => {
+test("resolveHarnessIdentity climbs from the watcher peer pid to the nearest ancestor with a jobs row", async () => {
   // peer (watch subprocess) → zsh → claude harness. Only the harness has a job.
   const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
   const jobs: Record<number, JobIdentity> = {
     100: jobIdentity({ pid: 100, title: "harness" }),
   };
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     300,
     (p) => parents[p] ?? null,
     (p) => jobs[p] ?? null,
@@ -410,14 +410,14 @@ test("resolveHarnessIdentity climbs from the watcher peer pid to the nearest anc
   expect(res?.identity.title).toBe("harness");
 });
 
-test("resolveHarnessIdentity prefers the NEAREST ancestor when multiple have jobs rows", () => {
+test("resolveHarnessIdentity prefers the NEAREST ancestor when multiple have jobs rows", async () => {
   // Both the peer and a grandparent have rows; the nearest (the peer itself) wins.
   const parents: Record<number, number> = { 300: 200, 200: 100 };
   const jobs: Record<number, JobIdentity> = {
     300: jobIdentity({ pid: 300, title: "near" }),
     100: jobIdentity({ pid: 100, title: "far" }),
   };
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     300,
     (p) => parents[p] ?? null,
     (p) => jobs[p] ?? null,
@@ -426,9 +426,9 @@ test("resolveHarnessIdentity prefers the NEAREST ancestor when multiple have job
   expect(res?.identity.title).toBe("near");
 });
 
-test("resolveHarnessIdentity returns null when no ancestor has a jobs row (resume gap)", () => {
+test("resolveHarnessIdentity returns null when no ancestor has a jobs row (resume gap)", async () => {
   const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     300,
     (p) => parents[p] ?? null,
     () => null,
@@ -436,10 +436,10 @@ test("resolveHarnessIdentity returns null when no ancestor has a jobs row (resum
   expect(res).toBeNull();
 });
 
-test("resolveHarnessIdentity terminates at pid 1 / a missing parent without looping", () => {
+test("resolveHarnessIdentity terminates at pid 1 / a missing parent without looping", async () => {
   // getPpid returns null after the first hop — the walk must stop, not spin.
   let calls = 0;
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     300,
     () => {
       calls++;
@@ -451,11 +451,11 @@ test("resolveHarnessIdentity terminates at pid 1 / a missing parent without loop
   expect(calls).toBe(1);
 });
 
-test("resolveHarnessIdentity stops at the depth bound on a pathological chain", () => {
+test("resolveHarnessIdentity stops at the depth bound on a pathological chain", async () => {
   // A chain longer than the bound with no jobs row: the walk caps at maxDepth
   // lookups and returns null rather than walking forever.
   let lookups = 0;
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     1_000_000,
     (p) => p - 1, // strictly-decreasing parent, never null, all > 1
     () => {
@@ -468,9 +468,9 @@ test("resolveHarnessIdentity stops at the depth bound on a pathological chain", 
   expect(lookups).toBe(HARNESS_WALK_MAX_DEPTH);
 });
 
-test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loop)", () => {
+test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loop)", async () => {
   // ps occasionally reports ppid == pid for an orphaned/init-adopted process.
-  const res = resolveHarnessIdentity(
+  const res = await resolveHarnessIdentity(
     300,
     () => 300, // parent == pid
     () => null,
@@ -478,7 +478,7 @@ test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loo
   expect(res).toBeNull();
 });
 
-test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk climbs to the TRUE parent agent", () => {
+test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk climbs to the TRUE parent agent", async () => {
   // The 4th send subprocess inherited pid 89510 — a number a dead agent's
   // lingering jobs row still holds. The TRUE sender is the parent harness (pid
   // 100, sitter-system-overview). The single opRegister path governs BOTH a send
@@ -515,7 +515,7 @@ test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk cl
   // The same enrichment lambda opRegister passes to resolveHarnessIdentity, for
   // both send_only:true and send_only:false (the flag never touches enrichment).
   for (const _form of ["send_only:true", "send_only:false"]) {
-    const res = resolveHarnessIdentity(
+    const res = await resolveHarnessIdentity(
       89510,
       (p) => parents[p] ?? null,
       (p) => enrichPeerFromJobs(db, p, probe),
@@ -528,6 +528,58 @@ test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk cl
     expect(res?.identity.title).not.toBe("fix-duplicate-approve-bug");
   }
   db.close();
+});
+
+// The production `getPpid` (`ppidViaPs`) is async — it awaits a `ps` spawn off
+// the serve loop. The walk must await each hop and thread a promise-returning
+// probe correctly. These inject an ASYNC getPpid (no subprocess) to cover the
+// seam the manual harness proves under real load.
+
+test("resolveHarnessIdentity awaits an async getPpid and climbs to the nearest jobs row", async () => {
+  const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
+  const jobs: Record<number, JobIdentity> = {
+    100: jobIdentity({ pid: 100, title: "harness" }),
+  };
+  const res = await resolveHarnessIdentity(
+    300,
+    async (p) => parents[p] ?? null,
+    (p) => jobs[p] ?? null,
+  );
+  expect(res?.pid).toBe(100);
+  expect(res?.identity.title).toBe("harness");
+});
+
+test("resolveHarnessIdentity walks async hops strictly in order, one at a time", async () => {
+  // A single conn's walk is serial: the next hop is not probed until the prior
+  // hop's promise resolves. Record the probe order and assert it climbs monotone.
+  const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
+  const probed: number[] = [];
+  const res = await resolveHarnessIdentity(
+    300,
+    async (p) => {
+      probed.push(p);
+      await Promise.resolve();
+      return parents[p] ?? null;
+    },
+    () => null,
+  );
+  expect(res).toBeNull();
+  expect(probed).toEqual([300, 200, 100]);
+});
+
+test("resolveHarnessIdentity with an async probe still caps at the depth bound", async () => {
+  let lookups = 0;
+  const res = await resolveHarnessIdentity(
+    1_000_000,
+    async (p) => p - 1,
+    () => {
+      lookups++;
+      return null;
+    },
+    HARNESS_WALK_MAX_DEPTH,
+  );
+  expect(res).toBeNull();
+  expect(lookups).toBe(HARNESS_WALK_MAX_DEPTH);
 });
 
 // ---------------------------------------------------------------------------
