@@ -28,5 +28,5 @@ Frame-writer unit test with seeded rows and with zero rows (honest-empty renderi
 - [ ] Healthy daemon snapshot yields a populated or honestly-empty frame, never bare separators; test pins it
 
 ## Done summary
-
+Fixed the autopilot non-TTY snapshot emitting a bare `---` frame: an empty snapshot render now normalizes to a single honest-empty line via the shared view-shell seam (`snapshotBodyLines` + per-view `snapshotEmptyLine`), so a healthy-but-idle daemon always yields a populated or honestly-empty frame. Added frame-writer shape tests (seeded + zero rows).
 ## Evidence
