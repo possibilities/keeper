@@ -168,8 +168,8 @@ describe("composition map — the config-flagged worker isolation gate", () => {
   });
 
   test("the seam's worker marker rides every worker argv", () => {
-    // The seam keys the gate on `--dangerously-skip-permissions` (task .1's
-    // keeper-owned human-less worker posture). Pin that the worker argv builder
+    // The seam keys the gate on `--dangerously-skip-permissions`, keeper's
+    // human-less worker permission posture. Pin that the worker argv builder
     // always emits it, so the marker the seam sniffs cannot silently drift off
     // the worker launch.
     const cmd = buildKeeperAgentLaunchArgv({
