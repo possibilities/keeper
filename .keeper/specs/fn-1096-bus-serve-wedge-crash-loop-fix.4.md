@@ -66,5 +66,5 @@ retention active proves the serve path stays responsive mid-prune.
 - [ ] bun test green
 
 ## Done summary
-
+bus.db retention: paced worker-timer prune of dead-identity channels + aged messages (queued_for_wake age-immune), (pid,start_time) boot rehydrate + prune, and journal_size_limit + PASSIVE checkpoint + born-INCREMENTAL WAL bounding.
 ## Evidence
