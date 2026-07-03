@@ -36,5 +36,5 @@ Render consistency + skill-id lint green; spot-render practice-scout with a PATH
 - [ ] Renders regenerated; lints green
 
 ## Done summary
-
+Guarded every §1.6 arthack-CLI reference in the hack/panel/plan skills and practice-scout with stated harness- or keeper-native fallbacks; made practice-scout's render-time knowctl shell teasers null-safe (absent CLI renders empty, not a render failure); pruned the stale 'hookctl's tracker' phrasing; rebaselined the prompt parity goldens. skill-id + corpus-drift lints and the prompt suite are green.
 ## Evidence
