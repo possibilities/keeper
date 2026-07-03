@@ -184,6 +184,13 @@ function isContinueOrResumeArg(arg: string, agent: AgentKind): boolean {
   if (agent === "codex") {
     return arg === "resume" || arg === "fork";
   }
+  if (agent === "hermes") {
+    // Hermes resumes by ID (`--resume`/`-r`) or by name/most-recent
+    // (`--continue`/`-c`); it has no fork or session-select flag.
+    return (
+      arg === "--resume" || arg === "--continue" || arg === "-r" || arg === "-c"
+    );
+  }
   return (
     arg === "--continue" ||
     arg === "--resume" ||
@@ -202,6 +209,9 @@ function isForkArg(arg: string, agent: AgentKind): boolean {
   if (agent === "codex") {
     return arg === "fork";
   }
+  if (agent === "hermes") {
+    return false;
+  }
   return arg === "--fork";
 }
 
@@ -211,6 +221,10 @@ function isHeadlessArg(arg: string, agent: AgentKind): boolean {
   }
   if (agent === "codex") {
     return arg === "exec" || arg === "review";
+  }
+  if (agent === "hermes") {
+    // Hermes's one-shot mode prints only the final message — headless-equivalent.
+    return arg === "-z" || arg === "--oneshot";
   }
   return (
     arg === "--print" ||

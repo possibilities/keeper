@@ -59,6 +59,7 @@ Usage:
   keeper agent claude [args...]        Launch Claude Code.
   keeper agent codex [args...]         Launch Codex CLI.
   keeper agent pi [args...]            Launch pi.
+  keeper agent hermes [args...]        Launch Hermes (Nous Research).
   keeper agent --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
   keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
@@ -122,6 +123,7 @@ Usage:
   keeper agent claude [args...]   Launch Claude Code.
   keeper agent codex [args...]    Launch Codex CLI.
   keeper agent pi [args...]       Launch pi.
+  keeper agent hermes [args...]   Launch Hermes (Nous Research).
 
 The flags below are consumed by the wrapper; every other arg after the agent
 subcommand passes through to that launcher unchanged. For a launcher's own

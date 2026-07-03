@@ -57,22 +57,27 @@ describe("harness registry — descriptor completeness", () => {
     );
   });
 
-  test("per-harness facts are pinned (claude/codex/pi)", () => {
+  test("per-harness facts are pinned (claude/codex/pi/hermes)", () => {
     expect(HARNESS_DESCRIPTORS.claude.displayName).toBe("Claude");
     expect(HARNESS_DESCRIPTORS.codex.displayName).toBe("Codex");
     expect(HARNESS_DESCRIPTORS.pi.displayName).toBe("Pi");
-    // Second axis: claude/codex take effort, pi takes thinking.
+    expect(HARNESS_DESCRIPTORS.hermes.displayName).toBe("Hermes");
+    // Second axis: claude/codex take effort, pi takes thinking, hermes is
+    // model-only (none).
     expect(HARNESS_DESCRIPTORS.claude.secondAxis).toBe("effort");
     expect(HARNESS_DESCRIPTORS.codex.secondAxis).toBe("effort");
     expect(HARNESS_DESCRIPTORS.pi.secondAxis).toBe("thinking");
-    // Session identity: only codex mints its own id keeper can't pin at launch.
+    expect(HARNESS_DESCRIPTORS.hermes.secondAxis).toBe("none");
+    // Session identity: codex + hermes mint their own id keeper can't pin at launch.
     expect(HARNESS_DESCRIPTORS.codex.mintsOwnSessionId).toBe(true);
+    expect(HARNESS_DESCRIPTORS.hermes.mintsOwnSessionId).toBe(true);
     expect(HARNESS_DESCRIPTORS.claude.mintsOwnSessionId).toBe(false);
     expect(HARNESS_DESCRIPTORS.pi.mintsOwnSessionId).toBe(false);
     // Only claude has a native hook channel today.
     expect(HARNESS_DESCRIPTORS.claude.hookMechanism).toBe("claude-hooks");
     expect(HARNESS_DESCRIPTORS.codex.hookMechanism).toBe("none");
     expect(HARNESS_DESCRIPTORS.pi.hookMechanism).toBe("none");
+    expect(HARNESS_DESCRIPTORS.hermes.hookMechanism).toBe("none");
     // Profile env vars are the KEEPER_AGENT_<X>_PROFILE names main() consumes.
     expect(HARNESS_DESCRIPTORS.claude.profileEnvVar).toBe(
       "KEEPER_AGENT_CLAUDE_PROFILE",
@@ -82,6 +87,9 @@ describe("harness registry — descriptor completeness", () => {
     );
     expect(HARNESS_DESCRIPTORS.pi.profileEnvVar).toBe(
       "KEEPER_AGENT_PI_PROFILE",
+    );
+    expect(HARNESS_DESCRIPTORS.hermes.profileEnvVar).toBe(
+      "KEEPER_AGENT_HERMES_PROFILE",
     );
   });
 });
@@ -95,22 +103,25 @@ describe("harness registry — membership + capability predicates", () => {
     for (const name of HARNESS_NAMES) {
       expect(isHarnessName(name)).toBe(true);
     }
-    expect(isHarnessName("hermes")).toBe(false);
+    expect(isHarnessName("hermes")).toBe(true);
+    expect(isHarnessName("grok")).toBe(false);
     expect(isHarnessName("")).toBe(false);
   });
 
   test("harnessDescriptor resolves known names and returns undefined otherwise", () => {
     expect(harnessDescriptor("claude")).toBe(HARNESS_DESCRIPTORS.claude);
-    expect(harnessDescriptor("hermes")).toBeUndefined();
+    expect(harnessDescriptor("hermes")).toBe(HARNESS_DESCRIPTORS.hermes);
+    expect(harnessDescriptor("grok")).toBeUndefined();
   });
 
   test("isCapturableHarness reads the capability, defaulting unknown to false", () => {
-    // Panel eligibility gates on this — all three current harnesses are capturable.
+    // Panel eligibility gates on this — all four current harnesses are capturable.
     expect(isCapturableHarness("claude")).toBe(true);
     expect(isCapturableHarness("codex")).toBe(true);
     expect(isCapturableHarness("pi")).toBe(true);
-    // An unknown / not-yet-capturable harness is not panel-eligible.
-    expect(isCapturableHarness("hermes")).toBe(false);
+    expect(isCapturableHarness("hermes")).toBe(true);
+    // An unknown harness is not panel-eligible.
+    expect(isCapturableHarness("grok")).toBe(false);
   });
 });
 
@@ -131,9 +142,9 @@ describe("harness registry — unknown harness fails loud at load", () => {
 
   test("a preset naming an unknown harness is rejected at catalog load", () => {
     const p = join(tmpDir, "presets.yaml");
-    writeFileSync(p, "presets:\n  x:\n    harness: hermes\n");
+    writeFileSync(p, "presets:\n  x:\n    harness: grok\n");
     expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
     // The one place the harness roster is enforced — the registry-derived set.
-    expect(() => loadPresetCatalog(p)).toThrow(/claude\|codex\|pi/);
+    expect(() => loadPresetCatalog(p)).toThrow(/claude\|codex\|pi\|hermes/);
   });
 });

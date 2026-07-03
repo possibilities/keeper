@@ -349,7 +349,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   if (cli === undefined || !RUN_CAPTURE_AGENTS.has(cli)) {
     return {
       ok: false,
-      error: `<cli> must be claude|codex|pi: ${cli ?? "(missing)"}`,
+      error: `<cli> must be ${[...RUN_CAPTURE_AGENTS].join("|")}: ${cli ?? "(missing)"}`,
     };
   }
   const prompt = positionals[1];
@@ -448,13 +448,21 @@ export async function captureFromHandle(
   const { handle, handleId, agent, startMs } = args;
   const baseResume = handle.sessionId;
   // claude/pi pin `handle.sessionId` at launch — authoritative, keep it. codex
-  // can't be pinned (it mints its own uuid), so when a transcript resolved and
-  // no id was pinned, discover it POST-STOP from the rollout path via the seam.
+  // and hermes can't be pinned (they mint their own id): discover it POST-STOP.
+  // codex parses the resolved rollout path via the seam; hermes's wait/show carry
+  // its native session id AS the `transcriptPath` (it has no transcript file), so
+  // that value IS the resume target directly.
   const resolveResume = (transcriptPath: string | null): string | null => {
     if (baseResume !== null) {
       return baseResume;
     }
-    if (agent !== "codex" || transcriptPath === null) {
+    if (transcriptPath === null) {
+      return null;
+    }
+    if (agent === "hermes") {
+      return transcriptPath;
+    }
+    if (agent !== "codex") {
       return null;
     }
     return deps.resolveCodexResumeTarget?.({ transcriptPath }) ?? null;

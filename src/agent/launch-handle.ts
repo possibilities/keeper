@@ -20,6 +20,7 @@ import type {
 } from "../codex-trust";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
+import { HARNESS_DESCRIPTORS } from "./harness";
 import { buildAgentLaunchArgv, stripClaudeEnv } from "./launch-config";
 import type { ResolvedHandle } from "./pair-subcommands";
 import type { RunLaunchResult } from "./run-capture";
@@ -46,17 +47,18 @@ function existingSessionId(args: string[]): string | null {
 /**
  * The pinned transcript session id for a tmux launch: an explicit user
  * `--session-id`, else a freshly minted uuid for a new claude/pi session. Null
- * for codex (no id pin) and for a continue/resume launch (keeps the persisted
- * session). This one id is recorded in run.json `transcriptSessionId`, forwarded
- * into the pane via the `-e KEEPER_AGENT_TMUX_SESSION_ID` carrier, and consumed by
- * the inner re-exec's `--session-id` push — one source of truth, no divergence.
+ * for a harness that mints its OWN id keeper can't pin at launch (codex/hermes)
+ * and for a continue/resume launch (keeps the persisted session). This one id is
+ * recorded in run.json `transcriptSessionId`, forwarded into the pane via the
+ * `-e KEEPER_AGENT_TMUX_SESSION_ID` carrier, and consumed by the inner re-exec's
+ * `--session-id` push — one source of truth, no divergence.
  */
 export function tmuxTranscriptSessionId(
   agent: AgentKind,
   args: string[],
   randomUuid: () => string,
 ): string | null {
-  if (agent === "codex") {
+  if (HARNESS_DESCRIPTORS[agent].mintsOwnSessionId) {
     return null;
   }
 

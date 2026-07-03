@@ -47,10 +47,18 @@ export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
       thinking: "high",
       role: null,
     },
+    "hermes-default": {
+      harness: "hermes",
+      model: "gpt-5.5",
+      effort: null,
+      thinking: null,
+      role: null,
+    },
   },
   claude_default: "claude-default",
   codex_default: "codex-default",
   pi_default: "pi-default",
+  hermes_default: "hermes-default",
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -100,12 +108,13 @@ export interface HarnessOptions {
    * the dispatch suite to test bare/unknown/help/version classification.
    */
   rawArgv?: boolean;
-  agent?: "claude" | "codex" | "pi";
+  agent?: "claude" | "codex" | "pi" | "hermes";
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeBin?: string;
   codexBin?: string;
   piBin?: string;
+  hermesBin?: string;
   pickProfile?: () => string;
   listProfiles?: () => string[];
   /** Profile dir ensureKeeperAgentProfileDirFn returns (default deterministic). */
@@ -153,6 +162,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
+  const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
   const profileDir = opts.profileDir ?? "/fake-home/.claude-profiles/stub";
 
   const pickProfile = opts.pickProfile ?? (() => "default");
@@ -185,6 +195,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     claudeBin: homeBin,
     codexBin,
     piBin,
+    hermesBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,

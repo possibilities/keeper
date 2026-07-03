@@ -145,6 +145,7 @@ const NATIVE_ARGS_BUILDERS: Record<
   claude: nativeClaudeArgs,
   codex: nativeCodexArgs,
   pi: nativePiArgs,
+  hermes: nativeHermesArgs,
 };
 
 /**
@@ -289,6 +290,29 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   if (opts.name !== undefined && opts.name !== "") {
     args.push("--name", opts.name);
   }
+  return args;
+}
+
+/**
+ * Native hermes flags for a one-turn partner. `--yolo` runs the turn with no
+ * approval gate so a detached pane never stalls; `-m <model>` sets the model
+ * (hermes has no effort/thinking axis, so neither is emitted). Hermes has NO
+ * interactive first-turn prompt positional (unlike claude/pi) — the prompt must
+ * ride its `-z/--oneshot` flag — so this builder ENDS with `-z`, making the
+ * trailing `opts.prompt` that {@link buildAgentLaunchArgv} appends the value of
+ * `-z`: `hermes --yolo -m <model> -z <prompt>`. The one-shot prints only the
+ * final message and records the session in hermes's store for post-stop capture.
+ * Hermes has no native `--name` flag (like codex), so `opts.name` rides only the
+ * tmux window name. Consent for its shell hooks is seeded via the
+ * `HERMES_ACCEPT_HOOKS=1` pane env (set by the inner launch), not a flag here.
+ * Pure — exported for tests.
+ */
+export function nativeHermesArgs(opts: AgentLaunchOpts): string[] {
+  const args = ["--yolo"];
+  if (opts.model !== undefined && opts.model !== "") {
+    args.push("-m", opts.model);
+  }
+  args.push("-z");
   return args;
 }
 

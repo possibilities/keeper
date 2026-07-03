@@ -58,6 +58,40 @@ export const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
   "update",
 ]);
 
+/**
+ * Built-in Hermes management/info subcommands that bypass launch-session setup.
+ * The interactive/one-shot launch is the bare invocation (`hermes [-z <prompt>]`),
+ * NOT a subcommand — these are the non-interactive management verbs, so keeper
+ * neither injects a model default nor applies the fresh-launch gate to them.
+ */
+export const HERMES_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
+  "auth",
+  "backup",
+  "checkpoints",
+  "config",
+  "cron",
+  "doctor",
+  "debug",
+  "dump",
+  "hooks",
+  "import",
+  "login",
+  "logout",
+  "mcp",
+  "model",
+  "plugins",
+  "profile",
+  "secrets",
+  "security",
+  "sessions",
+  "setup",
+  "skills",
+  "status",
+  "uninstall",
+  "update",
+  "version",
+]);
+
 /** Options whose next token is always a value (consume two). */
 export const CLAUDE_OPTIONS_WITH_REQUIRED_VALUE: ReadonlySet<string> = new Set([
   "--add-dir",
@@ -166,6 +200,27 @@ export const PI_OPTIONS_WITH_OPTIONAL_VALUE: ReadonlySet<string> = new Set([
   "--list-models",
 ]);
 
+/** Hermes global options whose next token is always a value. */
+export const HERMES_OPTIONS_WITH_REQUIRED_VALUE: ReadonlySet<string> = new Set([
+  "-z",
+  "--oneshot",
+  "-m",
+  "--model",
+  "--provider",
+  "-t",
+  "--toolsets",
+  "--resume",
+  "-r",
+  "--skills",
+]);
+
+/** Hermes options whose next token MAY be a value (`--continue`/`-c` take an
+ *  optional session name). */
+export const HERMES_OPTIONS_WITH_OPTIONAL_VALUE: ReadonlySet<string> = new Set([
+  "--continue",
+  "-c",
+]);
+
 /**
  * Detect a built-in claude subcommand after global options, or null. Walks
  * argv: an option with `=` consumes one token; a required-value option consumes
@@ -200,6 +255,17 @@ export function findPiPassthroughCommand(args: string[]): string | null {
     PI_PASSTHROUGH_COMMANDS,
     PI_OPTIONS_WITH_REQUIRED_VALUE,
     PI_OPTIONS_WITH_OPTIONAL_VALUE,
+    true,
+  );
+}
+
+/** Detect a built-in Hermes management/info command after global options. */
+export function findHermesPassthroughCommand(args: string[]): string | null {
+  return findAgentPassthroughCommand(
+    args,
+    HERMES_PASSTHROUGH_COMMANDS,
+    HERMES_OPTIONS_WITH_REQUIRED_VALUE,
+    HERMES_OPTIONS_WITH_OPTIONAL_VALUE,
     true,
   );
 }

@@ -89,6 +89,7 @@ describe("loadPresetCatalog", () => {
     claude_default: null,
     codex_default: null,
     pi_default: null,
+    hermes_default: null,
   };
 
   test("an empty presets mapping is valid (worker tolerance)", () => {

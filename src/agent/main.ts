@@ -5,6 +5,7 @@
  * the whole flow is testable against a fake agent and a recording spawn.
  */
 
+import { spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
@@ -66,9 +67,11 @@ import {
   resolveHandle,
   runShowLastMessage,
   runWaitForStop,
+  type VerbDeps,
 } from "./pair-subcommands";
 import {
   findCodexPassthroughCommand,
+  findHermesPassthroughCommand,
   findPassthroughCommand,
   findPiPassthroughCommand,
   hasExplicitCodexEffortArg,
@@ -148,6 +151,7 @@ export interface MainDeps {
   claudeBin: string;
   codexBin: string;
   piBin: string;
+  hermesBin: string;
   pluginConfigPath: string;
   loadPluginSourcesFn: () => PluginSources;
   /**
@@ -231,6 +235,7 @@ export function realDeps(): MainDeps {
     claudeBin: join(homedir(), ".local", "bin", "claude"),
     codexBin: resolveCodexBin(process.env),
     piBin: "pi",
+    hermesBin: resolveHermesBin(),
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
@@ -308,6 +313,50 @@ function resolveCodexBin(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Resolve the hermes binary: the canonical `~/.local/bin/hermes` install path
+ * when present + executable, else the bare `hermes` name (PATH fallback). Mirrors
+ * the binary-before-config ordering — a machine without the install path still
+ * launches if `hermes` is on PATH.
+ */
+function resolveHermesBin(): string {
+  const installed = join(homedir(), ".local", "bin", "hermes");
+  try {
+    accessSync(installed, constants.X_OK);
+    return installed;
+  } catch {
+    return "hermes";
+  }
+}
+
+/**
+ * Run `hermes sessions export --source cli -` and return its JSONL text, or null
+ * on any failure. The hermes M2 capture seam ({@link runHermesSessionsExport} is
+ * bound onto {@link VerbDeps.hermesExport} for the wait/show verbs). `--source cli`
+ * bounds the export to keeper's own one-shot launches (`source: cli`); reading is
+ * strictly read-only. A non-zero exit / spawn error / empty stdout → null so the
+ * poll loop keeps trying and fails to `no_transcript`, never hangs. Production
+ * only — tests inject a fixture seam, so this subprocess never runs under test.
+ */
+function runHermesSessionsExport(
+  hermesBin: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  try {
+    const result = spawnSync(
+      hermesBin,
+      ["sessions", "export", "--source", "cli", "-"],
+      { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    );
+    if (result.status !== 0 || typeof result.stdout !== "string") {
+      return null;
+    }
+    return result.stdout.trim() === "" ? null : result.stdout;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * True iff `flag` appears as an exact token or in joined `flag=value` form.
  * A strict superset of `args.includes(flag)`: unlike passthrough.ts's effort/
  * model predicates it does NOT stop at a bare `--`, so it only ever broadens
@@ -367,6 +416,9 @@ function findPassthroughForAgent(
   }
   if (agent === "codex") {
     return findCodexPassthroughCommand(args);
+  }
+  if (agent === "hermes") {
+    return findHermesPassthroughCommand(args);
   }
   return findPiPassthroughCommand(args);
 }
@@ -445,6 +497,16 @@ function resolveLaunchConfigSignals(
       exemptAll: hasExplicitCodexProfileArg(args),
     };
   }
+  if (agent === "hermes") {
+    // Model-only: hermes shares codex's `-m`/`--model` spelling and exposes no
+    // second axis, so `effortOrThinking` is trivially satisfied (readiness rests
+    // on the model alone via the descriptor-driven core).
+    return {
+      model: hasExplicitCodexModelArg(args),
+      effortOrThinking: true,
+      exemptAll: false,
+    };
+  }
   if (agent === "pi") {
     const colon = piModelColonThinking(args) !== null;
     return {
@@ -485,11 +547,37 @@ function unresolvedDefaultMessage(agent: AgentKind): string {
       `(or --model <model>:<thinking>).\n`
     );
   }
+  if (agent === "hermes") {
+    return (
+      `Error: keeper agent hermes: no model resolved for a fresh launch. ` +
+      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
+      `or pass -m <model> (hermes is model-only — no effort/thinking).\n`
+    );
+  }
   return (
     `Error: keeper agent claude: no model/effort resolved for a fresh launch. ` +
     `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
     `or pass --model <model> --effort <effort>.\n`
   );
+}
+
+/** The `<harness>_default` pointer for a harness — the preset a bare
+ *  `keeper agent <harness>` resolves. Keyed per harness so a new harness's default
+ *  never silently falls through to another's. */
+function harnessDefaultName(
+  agent: AgentKind,
+  catalog: PresetCatalog,
+): string | null {
+  switch (agent) {
+    case "claude":
+      return catalog.claude_default ?? null;
+    case "codex":
+      return catalog.codex_default ?? null;
+    case "pi":
+      return catalog.pi_default ?? null;
+    case "hermes":
+      return catalog.hermes_default ?? null;
+  }
 }
 
 /**
@@ -507,10 +595,16 @@ function resolveLaunchReadiness(
   preset: Preset | null,
   signals: LaunchConfigSignals,
 ): boolean {
-  const model = preset?.model ?? null;
+  const modelResolved = (preset?.model ?? null) !== null || signals.model;
+  // A model-only harness (hermes, `secondAxis: "none"`) needs no second axis —
+  // the model alone makes it ready. The axis is descriptor-driven, never a
+  // harness-name literal.
+  const axis = HARNESS_DESCRIPTORS[agent].secondAxis;
+  if (axis === "none") {
+    return modelResolved;
+  }
   const second =
-    agent === "pi" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
-  const modelResolved = model !== null || signals.model;
+    axis === "thinking" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
   const secondResolved = second !== null || signals.effortOrThinking;
   return modelResolved && secondResolved;
 }
@@ -605,6 +699,32 @@ function codexWrapperDefaults(args: string[]): string[] {
     defaults.push("--search");
   }
   return defaults;
+}
+
+/**
+ * The no-approval posture keeper prepends for a hermes launch: `--yolo` unless the
+ * caller already set an explicit posture (`--yolo` or `--safe-mode`). Paired with
+ * the `HERMES_ACCEPT_HOOKS=1` pane env (set at launch) so a detached one-shot never
+ * stalls on an approval or a first-use hook-consent prompt.
+ */
+function hermesWrapperDefaults(args: string[]): string[] {
+  if (args.includes("--yolo") || args.includes("--safe-mode")) {
+    return [];
+  }
+  return ["--yolo"];
+}
+
+/** The hermes model override, or null to leave it to the caller. An explicit
+ *  `-m`/`--model` (hermes shares codex's model-flag spelling) wins over the
+ *  preset/hermes_default. */
+function resolveHermesStartupModelOverride(
+  args: string[],
+  defaultModel: string | null,
+): string | null {
+  if (hasExplicitCodexModelArg(args)) {
+    return null;
+  }
+  return defaultModel;
 }
 
 /** The downstream renderer the statusLine tee chain feeds — the human's own
@@ -775,7 +895,7 @@ async function runTranscriptSubcommand(
     deps.write(tmuxErrorJson(TMUX_EXIT.BAD_ARGS, resolution.error));
     return deps.exit(TMUX_EXIT.BAD_ARGS);
   }
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
 
   if (verb === "wait-for-stop") {
     const result = await runWaitForStop(resolution.handle, verbDeps);
@@ -818,6 +938,18 @@ async function runTranscriptSubcommand(
     })}\n`,
   );
   return deps.exit(0);
+}
+
+/** The transcript-verb deps shared by wait-for-stop / show-last-message / the
+ *  run-capture compose — the env + home for the file-transcript agents, plus the
+ *  hermes export seam (a bounded `hermes sessions export` subprocess) its
+ *  store-based capture polls. */
+function makeVerbDeps(deps: MainDeps): VerbDeps {
+  return {
+    env: deps.env,
+    homeDir: deps.transcriptHomeDir,
+    hermesExport: () => runHermesSessionsExport(deps.hermesBin, deps.env),
+  };
 }
 
 /** The wait/show/clock seams the run-capture compose drives, bound to the
@@ -939,7 +1071,7 @@ async function runRunCaptureSubcommand(
     );
   }
   const agent = parsed.cli;
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
   const runBadArgs = (): Promise<never> =>
     emitRunCapture(
       deps,
@@ -987,12 +1119,7 @@ async function runRunCaptureSubcommand(
       }
       throw exc;
     }
-    const defaultName =
-      (agent === "claude"
-        ? catalog.claude_default
-        : agent === "codex"
-          ? catalog.codex_default
-          : catalog.pi_default) ?? null;
+    const defaultName = harnessDefaultName(agent, catalog);
     if (defaultName !== null) {
       runPreset = resolvePreset(catalog, defaultName);
     }
@@ -1102,7 +1229,7 @@ async function runWaitCaptureSubcommand(
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
     );
   }
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
   const result = await captureFromHandle(runCaptureSeams(deps), verbDeps, {
     handle: resolution.handle,
     handleId: firstHandleToken(rest),
@@ -1248,6 +1375,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
           claude: catalog.claude_default ?? null,
           codex: catalog.codex_default ?? null,
           pi: catalog.pi_default ?? null,
+          hermes: catalog.hermes_default ?? null,
         },
       })}\n`,
     );
@@ -1285,6 +1413,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     ["claude", catalog.claude_default],
     ["codex", catalog.codex_default],
     ["pi", catalog.pi_default],
+    ["hermes", catalog.hermes_default],
   ] as const) {
     lines.push(`  ${harness}_default  ${pointer ?? "(unset)"}`);
   }
@@ -1531,6 +1660,7 @@ export async function main(deps: MainDeps): Promise<never> {
     claude: deps.claudeBin,
     codex: deps.codexBin,
     pi: deps.piBin,
+    hermes: deps.hermesBin,
   };
   const bin = bins[agent];
   const agentLabel = displayAgent(agent);
@@ -1725,12 +1855,7 @@ export async function main(deps: MainDeps): Promise<never> {
         }
         throw exc;
       }
-      const defaultName =
-        (agent === "claude"
-          ? catalog.claude_default
-          : agent === "codex"
-            ? catalog.codex_default
-            : catalog.pi_default) ?? null;
+      const defaultName = harnessDefaultName(agent, catalog);
       if (defaultName !== null) {
         resolvedPreset = resolvePreset(catalog, defaultName);
         actionLog.push(`Resolved ${agent}_default preset '${defaultName}'`);
@@ -1963,6 +2088,53 @@ export async function main(deps: MainDeps): Promise<never> {
       expectedCwd: deps.cwd,
       startedAtMs: Date.now(),
     });
+
+    return runWithJobControl(runCmd, deps.spawn, deps.exit);
+  }
+
+  if (agent === "hermes") {
+    // Hermes uses its native config — keeper does no profile routing for it (M0-M2).
+    if (launcherProfile === "auto") {
+      launcherProfile = "";
+      actionLog.push("Using native Hermes config");
+    }
+
+    const runCmd = [bin];
+    // No-approval posture: --yolo (unless the caller set one) + the hook-consent
+    // env below. hermes is model-only, so there is no effort/thinking to inject.
+    const defaults = hermesWrapperDefaults(remainingArgs);
+    runCmd.push(...defaults);
+    if (defaults.includes("--yolo")) {
+      actionLog.push("Added Hermes no-approval default (--yolo)");
+    }
+
+    // Preset (--x-preset or the resolved hermes_default) supplies the model;
+    // an explicit -m/--model still wins.
+    const startupModel = resolveHermesStartupModelOverride(
+      remainingArgs,
+      resolvedPreset?.model ?? null,
+    );
+    if (startupModel !== null) {
+      runCmd.push("-m", startupModel);
+      actionLog.push(`Added startup model override: -m ${startupModel}`);
+      note(`model: ${startupModel}`);
+    }
+
+    runCmd.push(...remainingArgs);
+
+    // Seed hook consent so a non-TTY / fresh pane never silently skips (or blocks
+    // on) hermes's first-use shell-hook prompt. Equivalent to `--accept-hooks`,
+    // but as pane env it survives the detached re-exec.
+    deps.env.HERMES_ACCEPT_HOOKS = "1";
+    actionLog.push("Set HERMES_ACCEPT_HOOKS=1");
+    deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
+
+    if (launcherVeryVerbose) {
+      printVerbose(deps, actionLog, formatCommand(runCmd));
+    }
+    if (sectionsOn) {
+      deps.write("~ launching hermes\n");
+    }
 
     return runWithJobControl(runCmd, deps.spawn, deps.exit);
   }

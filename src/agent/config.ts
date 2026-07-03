@@ -8,8 +8,9 @@
  * `plugins.yaml` supplies the Claude plugin sources (fail-loud on a missing
  * file). The preset catalog (`presets.yaml`) is the SINGLE source of a launch's
  * model/effort/thinking: it holds the named presets plus the top-level
- * `claude_default`/`codex_default`/`pi_default` pointers naming the preset a bare
- * `keeper agent <harness>` launch resolves. The panel selections (`panel.yaml`)
+ * `<harness>_default` pointers (`claude_default`/`codex_default`/`pi_default`/
+ * `hermes_default`) naming the preset a bare `keeper agent <harness>` launch
+ * resolves. The panel selections (`panel.yaml`)
  * name ordered panels over those presets. All are REQUIRED + validated: a preset
  * referenced by name, a dangling `<harness>_default`, and every panel op fail-loud
  * (`ConfigError`) on a missing or invalid file — the autopilot worker is the sole
@@ -28,6 +29,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   HARNESS_DESCRIPTORS,
   HARNESS_NAME_SET,
+  HARNESS_NAMES,
   type HarnessName,
   isCapturableHarness,
 } from "./harness";
@@ -297,6 +299,8 @@ export interface PresetCatalog {
   codex_default?: string | null;
   /** Preset a bare `keeper agent pi` resolves; null/absent when unset. */
   pi_default?: string | null;
+  /** Preset a bare `keeper agent hermes` resolves; null/absent when unset. */
+  hermes_default?: string | null;
 }
 
 /**
@@ -324,6 +328,7 @@ const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
   "claude",
   "codex",
   "pi",
+  "hermes",
   "wait-for-stop",
   "show-last-message",
   "default",
@@ -381,7 +386,7 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
   const harness = value.harness;
   if (typeof harness !== "string" || !PRESET_HARNESSES.has(harness)) {
     throw new ConfigError(
-      `Preset '${name}' harness must be one of claude|codex|pi in ${configPath}`,
+      `Preset '${name}' harness must be one of ${HARNESS_NAMES.join("|")} in ${configPath}`,
     );
   }
   const effort = presetStringField(value, "effort", name, configPath);
@@ -392,7 +397,8 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
     );
   }
   // The second-reasoning-axis gate reads the descriptor's `secondAxis` (never a
-  // harness-name literal): a preset may set only the axis its harness exposes.
+  // harness-name literal): a preset may set only the axis its harness exposes. A
+  // model-only harness (hermes, `secondAxis: "none"`) accepts neither.
   const descriptor = HARNESS_DESCRIPTORS[harness as PresetHarness];
   if (thinking !== null && descriptor.secondAxis !== "thinking") {
     throw new ConfigError(
@@ -401,7 +407,7 @@ function parsePreset(name: string, value: unknown, configPath: string): Preset {
   }
   if (effort !== null && descriptor.secondAxis !== "effort") {
     throw new ConfigError(
-      `Preset '${name}' effort is claude/codex-only, not pi in ${configPath}`,
+      `Preset '${name}' effort is claude/codex-only, not ${harness} in ${configPath}`,
     );
   }
   return {
@@ -419,6 +425,7 @@ const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "claude_default",
   "codex_default",
   "pi_default",
+  "hermes_default",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
 
@@ -469,6 +476,7 @@ export function loadPresetCatalog(
     claude_default: parseHarnessDefault(raw, "claude", presets, configPath),
     codex_default: parseHarnessDefault(raw, "codex", presets, configPath),
     pi_default: parseHarnessDefault(raw, "pi", presets, configPath),
+    hermes_default: parseHarnessDefault(raw, "hermes", presets, configPath),
   };
 }
 

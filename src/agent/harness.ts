@@ -16,15 +16,15 @@
 
 /** The canonical, ordered set of harness names keeper drives. The one literal
  *  list — every union's membership check derives from it. */
-export const HARNESS_NAMES = ["claude", "codex", "pi"] as const;
+export const HARNESS_NAMES = ["claude", "codex", "pi", "hermes"] as const;
 
 /** A harness keeper can drive — the derivation root for `AgentKind`/`AgentCli`/
  *  `PresetHarness`. */
 export type HarnessName = (typeof HARNESS_NAMES)[number];
 
 /** The second reasoning axis a harness exposes. claude/codex take `effort`; pi
- *  takes `thinking`; the two are mutually exclusive per harness. `none` is
- *  reserved for a future harness exposing neither. */
+ *  takes `thinking`; the two are mutually exclusive per harness. `none` means the
+ *  harness is model-only (hermes) — a preset for it may set neither axis. */
 export type SecondAxis = "effort" | "thinking" | "none";
 
 /** How a harness's live working/stopped churn reaches keeper's jobs projection.
@@ -47,11 +47,12 @@ export interface HarnessDescriptor {
   secondAxis: SecondAxis;
   /** M2 capability: `keeper agent run` / a panel leg can capture this harness's
    *  final message (transcript discovery + stop parser exist). GATES panel
-   *  eligibility — a non-capturable harness (a future hermes before M2) is a
-   *  launchable partner but not a panel member. */
+   *  eligibility — a non-capturable harness is a launchable partner but not a
+   *  panel member. */
   capturable: boolean;
   /** True when the harness mints its OWN session id keeper cannot pin at launch
-   *  (codex): the resume target is discovered post-stop from its rollout file.
+   *  (codex/hermes): the resume target is discovered post-stop by positive
+   *  attribution (codex from its rollout file, hermes from its session store).
    *  False when keeper pins the session id at launch (claude/pi), so it is
    *  authoritative immediately. */
   mintsOwnSessionId: boolean;
@@ -92,6 +93,23 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     secondAxis: "thinking",
     capturable: true,
     mintsOwnSessionId: false,
+    hookMechanism: "none",
+  },
+  hermes: {
+    name: "hermes",
+    displayName: "Hermes",
+    binaryName: "hermes",
+    profileEnvVar: "KEEPER_AGENT_HERMES_PROFILE",
+    // Hermes is model-only: it exposes neither an effort nor a thinking axis, so
+    // a preset for it may set neither (config.ts fails a preset that does).
+    secondAxis: "none",
+    // M2: captured by bounded polling of `hermes sessions export`, positively
+    // attributed by cwd + created-at (refuse-to-guess on collision). Capturable
+    // ⇒ panel-eligible with no extra panel wiring.
+    capturable: true,
+    // Hermes mints its own session id keeper cannot pin at launch; the resume
+    // target is its native session id, discovered post-stop from the store.
+    mintsOwnSessionId: true,
     hookMechanism: "none",
   },
 };
