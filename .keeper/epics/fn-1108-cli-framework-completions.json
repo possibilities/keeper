@@ -6,7 +6,7 @@
     "fn-1102-keeper-tabs-browser-grade-restore"
   ],
   "id": "fn-1108-cli-framework-completions",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-03T21:56:50.044000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T21:56:43.016000Z"
+  "updated_at": "2026-07-03T21:56:50.044000Z"
 }
