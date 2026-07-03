@@ -77,5 +77,5 @@ computeReadiness inputs over the same seeded db (freshMemDb).
 - [ ] `bun test` green.
 
 ## Done summary
-
+Shared autoclose seams: pane sweep + PaneInfo gain pane_start_time/pane_dead/session_name (window_name last, tab-safe six-field parse); autoclose_enabled (default on) + autoclose_grace_seconds (default 30) config keys re-read each resolve; KillReason gains 'autoclosed'; readiness-input loading MOVED into src/readiness-inputs.ts and consumed by the reconciler so its notion of done can't drift.
 ## Evidence
