@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-03T16:36:47.327000Z",
   "created_at": "2026-07-03T16:13:05.465000Z",
   "depends_on_epics": [],
   "id": "fn-1097-fix-landed-empty-lane-false-fire",
   "last_validated_at": "2026-07-03T16:13:12.177000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix landed empty-lane false-fire",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T16:13:12.177000Z"
+  "updated_at": "2026-07-03T16:36:47.327000Z"
 }
