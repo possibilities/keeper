@@ -355,7 +355,7 @@ function seedJob(
   );
 }
 
-test("enrichPeerFromJobs maps a peer pid to its newest job identity", () => {
+test("enrichPeerFromJobs maps a peer pid to its newest job identity", async () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "sess-1",
@@ -366,7 +366,7 @@ test("enrichPeerFromJobs maps a peer pid to its newest job identity", () => {
     updated_at: 10,
   });
   // Live probe matches the row's start_time → the same process that registered.
-  const id = enrichPeerFromJobs(db, 7777, () => "t1");
+  const id = await enrichPeerFromJobs(db, 7777, () => "t1");
   expect(id).not.toBeNull();
   expect(id?.job_id).toBe("sess-1");
   expect(id?.title).toBe("gamma");
@@ -374,7 +374,7 @@ test("enrichPeerFromJobs maps a peer pid to its newest job identity", () => {
   db.close();
 });
 
-test("enrichPeerFromJobs prefers the NEWEST job for a reused pid", () => {
+test("enrichPeerFromJobs prefers the NEWEST job for a reused pid", async () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "old",
@@ -390,19 +390,19 @@ test("enrichPeerFromJobs prefers the NEWEST job for a reused pid", () => {
     title: "fresh",
     updated_at: 50,
   });
-  const id = enrichPeerFromJobs(db, 8888, () => "t2");
+  const id = await enrichPeerFromJobs(db, 8888, () => "t2");
   expect(id?.job_id).toBe("new");
   expect(id?.title).toBe("fresh");
   db.close();
 });
 
-test("enrichPeerFromJobs returns null on a keeper miss (resume-gap fallback path)", () => {
+test("enrichPeerFromJobs returns null on a keeper miss (resume-gap fallback path)", async () => {
   const { db } = freshMemDb();
-  expect(enrichPeerFromJobs(db, 9999, () => "t1")).toBeNull();
+  expect(await enrichPeerFromJobs(db, 9999, () => "t1")).toBeNull();
   db.close();
 });
 
-test("enrichPeerFromJobs returns null for a recycled pid whose live start_time differs from the stale dead row (anti-misattribution)", () => {
+test("enrichPeerFromJobs returns null for a recycled pid whose live start_time differs from the stale dead row (anti-misattribution)", async () => {
   const { db } = freshMemDb();
   // A lingering dead `jobs` row from a former agent that held this pid; the OS
   // has since recycled the number to a new, unrelated process.
@@ -414,7 +414,7 @@ test("enrichPeerFromJobs returns null for a recycled pid whose live start_time d
     updated_at: 10,
   });
   // Live probe returns the CURRENT process's start_time — a different boot.
-  const id = enrichPeerFromJobs(
+  const id = await enrichPeerFromJobs(
     db,
     89510,
     () => "darwin:Mon Jun 23 09:00:00 2026",
@@ -423,7 +423,7 @@ test("enrichPeerFromJobs returns null for a recycled pid whose live start_time d
   db.close();
 });
 
-test("enrichPeerFromJobs fails closed when the start_time probe is null/unreadable", () => {
+test("enrichPeerFromJobs fails closed when the start_time probe is null/unreadable", async () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "sess-1",
@@ -433,11 +433,11 @@ test("enrichPeerFromJobs fails closed when the start_time probe is null/unreadab
     updated_at: 10,
   });
   // Probe failure (ps timeout, gone pid) → cannot verify → drop the enrichment.
-  expect(enrichPeerFromJobs(db, 7777, () => null)).toBeNull();
+  expect(await enrichPeerFromJobs(db, 7777, () => null)).toBeNull();
   db.close();
 });
 
-test("enrichPeerFromJobs fails closed when the row itself has no start_time", () => {
+test("enrichPeerFromJobs fails closed when the row itself has no start_time", async () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "sess-1",
@@ -446,7 +446,52 @@ test("enrichPeerFromJobs fails closed when the row itself has no start_time", ()
     title: "gamma",
     updated_at: 10,
   });
-  expect(enrichPeerFromJobs(db, 7777, () => "t1")).toBeNull();
+  expect(await enrichPeerFromJobs(db, 7777, () => "t1")).toBeNull();
+  db.close();
+});
+
+test("enrichPeerFromJobs awaits an ASYNC start_time probe (the off-loop serve-path shape)", async () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-1",
+    pid: 7777,
+    start_time: "t1",
+    title: "gamma",
+    updated_at: 10,
+  });
+  // The production default probe (startTimeViaPs) is async — awaiting a `ps`
+  // spawn OFF the serve loop. A match still enriches; the recycle guard still
+  // fires, just awaited rather than parking the kqueue loop.
+  const match = await enrichPeerFromJobs(db, 7777, async () => "t1");
+  expect(match?.job_id).toBe("sess-1");
+  const recycled = await enrichPeerFromJobs(db, 7777, async () => "t2");
+  expect(recycled).toBeNull();
+  db.close();
+});
+
+test("enrichPeerFromJobs probes at most ONCE on a hit and NOT AT ALL on a miss or a null-start_time row", async () => {
+  const { db } = freshMemDb();
+  seedJob(db, { job_id: "hit", pid: 7777, start_time: "t1", updated_at: 10 });
+  seedJob(db, {
+    job_id: "legacy",
+    pid: 6666,
+    start_time: null,
+    updated_at: 10,
+  });
+  let probes = 0;
+  const probe = async (_pid: number): Promise<string | null> => {
+    probes += 1;
+    return "t1";
+  };
+  // keeper miss (no row) → fail closed, zero spawns on the common serve path.
+  expect(await enrichPeerFromJobs(db, 5555, probe)).toBeNull();
+  expect(probes).toBe(0);
+  // null-start_time row → unverifiable, fail closed WITHOUT probing.
+  expect(await enrichPeerFromJobs(db, 6666, probe)).toBeNull();
+  expect(probes).toBe(0);
+  // Genuine row hit with a stored start_time → exactly one probe.
+  expect((await enrichPeerFromJobs(db, 7777, probe))?.job_id).toBe("hit");
+  expect(probes).toBe(1);
   db.close();
 });
 

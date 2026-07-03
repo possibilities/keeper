@@ -53,12 +53,22 @@
  *                           registers starves every socket event. This is the
  *                           mechanism the epic fixes.
  *   --async-register        run the --register-hops spawns OFF the loop (async
- *                           `Bun.spawn` + await, the post-fix shape) and defer the
- *                           register ack until they resolve. Flips a red run green.
+ *                           `Bun.spawn` + await, the first-fix shape). Moves the
+ *                           ancestry walk off-loop but NOT the start_time probe.
+ *   --start-time-probe      per-register `ps -ww … -o lstart=,args=` spawns — the
+ *                           HEAVIER `enrichPeerFromJobs`/`readOsStartTime` recycle
+ *                           probe run ONCE per register that hits a keeper jobs
+ *                           row. SYNC on the loop by default. This is the site the
+ *                           FIRST fix missed: the daemon still wedged from bind
+ *                           with `--async-register` set because this probe stayed
+ *                           synchronous on the serve loop.
+ *   --async-start-time      run the --start-time-probe spawns OFF the loop (the
+ *                           SECOND fix). With --async-register, flips the surviving
+ *                           red run green.
  *   --stampede              N clients that connect + register near-simultaneously
  *                           at bind — the boot reconnect stampede where every
- *                           watcher's identity is cold. Combined with a nonzero
- *                           --register-hops SYNC, this is the red repro.
+ *                           watcher's identity is cold. Combined with any SYNC
+ *                           register-work phase (hops OR start-time), the red repro.
  *   --peer-probe            run a per-accept getsockopt(LOCAL_PEERPID) FFI probe
  *                           (the production per-accept peer-pid read, suspect #3).
  *
@@ -97,10 +107,16 @@ Load dimensions (bisect knobs):
                        pinning the write queue — backpressure class (default: 0)
   --churn <n>          Concurrent connect-then-destroy storms racing accepts —
                        the dead-peer-reap-races-accept class (default: 0)
-  --register-hops <n>  Per-register 'ps' ancestry spawns run on the serve loop —
-                       the production opRegister/ppidViaPs work (default: 0)
-  --async-register     Run the --register-hops spawns OFF the loop (post-fix
+  --register-hops <n>  Per-register 'ps -o ppid=' ancestry spawns on the serve
+                       loop — the opRegister/ppidViaPs walk (default: 0)
+  --async-register     Run the --register-hops spawns OFF the loop (first-fix
                        shape) and defer the register ack (default: sync/pre-fix)
+  --start-time-probe <n>
+                       Per-register 'ps -ww … lstart=' spawns — the heavier
+                       enrichPeerFromJobs/readOsStartTime recycle probe run once
+                       per jobs-row hit; the site the first fix MISSED (default: 0)
+  --async-start-time   Run the --start-time-probe spawns OFF the loop (second-fix
+                       shape) — with --async-register, flips the survivor green
   --stampede <n>       Clients that connect + register near-simultaneously at
                        bind — the boot reconnect stampede (default: 0)
   --peer-probe         Per-accept getsockopt(LOCAL_PEERPID) FFI probe (default off)
@@ -119,12 +135,28 @@ Exits 0 when the serve loop answered the real-read probe throughout (no wedge),
 REPRODUCED). Standalone — no daemon, no production DB, scratch socket only.
 
 Red repro (the confirmed wedge — sync register-work under a boot stampede):
-  bun scripts/repro-serve-wedge.ts --clients 40 --rate-hz 10 \\
-    --register-hops 40 --stampede 40 --peer-probe
+  bun scripts/repro-serve-wedge.ts --clients 20 --rate-hz 10 \\
+    --register-hops 1 --start-time-probe 2 --stampede 50 --peer-probe \\
+    --stuck-ms 400 --duration-ms 10000
 
-Green (the same load, register-work moved off the loop — the fix):
-  bun scripts/repro-serve-wedge.ts --clients 40 --rate-hz 10 \\
-    --register-hops 40 --stampede 40 --peer-probe --async-register
+Post-FIRST-fix red (ancestry moved off-loop, start_time probe STILL sync — the
+survivor this task fixes; matches the live daemon that still wedged from bind):
+  bun scripts/repro-serve-wedge.ts --clients 20 --rate-hz 10 \\
+    --register-hops 1 --start-time-probe 2 --stampede 50 --peer-probe \\
+    --stuck-ms 400 --duration-ms 10000 --async-register
+
+Green (both register-work phases off the loop — the second fix):
+  bun scripts/repro-serve-wedge.ts --clients 20 --rate-hz 10 \\
+    --register-hops 1 --start-time-probe 2 --stampede 50 --peer-probe \\
+    --stuck-ms 400 --duration-ms 10000 --async-register --async-start-time
+
+Note on scale: --stuck-ms/--stampede above are tuned modest on purpose. Pushed
+much higher (many hundreds of concurrent stampede registers), REAL subprocess
+fork/exec contention dominates and can wedge even the fully-async (fixed) shape
+— that is genuine OS-level scheduling cost under extreme concurrency, a
+different and expected class of overhead, NOT the JS-event-loop-parking bug
+this harness targets. Keep the demo commands at a scale where the sync/async
+flag is the only variable that flips the verdict.
 
 Aggressive search (push the #8044-family dimensions):
   bun scripts/repro-serve-wedge.ts --clients 400 --rate-hz 100 \\
@@ -141,6 +173,8 @@ interface Args {
   churn: number;
   registerHops: number;
   asyncRegister: boolean;
+  startTimeProbe: number;
+  asyncStartTime: boolean;
   stampede: number;
   peerProbe: boolean;
   durationMs: number;
@@ -162,6 +196,8 @@ function parse(argv: string[]): Args | "help" {
       churn: { type: "string" },
       "register-hops": { type: "string" },
       "async-register": { type: "boolean", default: false },
+      "start-time-probe": { type: "string" },
+      "async-start-time": { type: "boolean", default: false },
       stampede: { type: "string" },
       "peer-probe": { type: "boolean", default: false },
       "duration-ms": { type: "string" },
@@ -206,6 +242,10 @@ function parse(argv: string[]): Args | "help" {
       numOr(values["register-hops"], 0, "register-hops"),
     ),
     asyncRegister: values["async-register"] ?? false,
+    startTimeProbe: Math.floor(
+      numOr(values["start-time-probe"], 0, "start-time-probe"),
+    ),
+    asyncStartTime: values["async-start-time"] ?? false,
     stampede: Math.floor(numOr(values.stampede, 0, "stampede")),
     peerProbe: values["peer-probe"] ?? false,
     durationMs: Math.floor(
@@ -288,6 +328,73 @@ async function registerWorkAsync(hops: number): Promise<void> {
       return;
     }
   }
+}
+
+// ── per-row-hit start_time probe (the production opRegister → enrichment) ──────
+//
+// The FIRST fix moved the ancestry walk (--register-hops) off the loop, but the
+// live daemon STILL wedged from bind: `enrichPeerFromJobs` runs a HEAVIER `ps -ww
+// … -o lstart=,args=` spawn (the exact `readOsStartTime` shape) ONCE per register
+// that hits a keeper `jobs` row, as its pid-reuse recycle defense — and that
+// probe was still SYNCHRONOUS on the serve loop. In a boot reconnect stampede
+// every watcher's register climbs to its harness and hits a row, so this fires
+// once per register. SYNC (`Bun.spawnSync`) parks the kqueue loop even though the
+// ancestry hops are async — the surviving wedge THIS task fixes. ASYNC
+// (`Bun.spawn` + await) runs it off the loop, the fix. Gated INDEPENDENTLY of
+// --async-register so the harness can model the post-first-fix daemon exactly:
+// ancestry off-loop + start_time on-loop (still red).
+
+function startTimeWorkSync(probes: number): void {
+  for (let i = 0; i < probes; i++) {
+    try {
+      Bun.spawnSync(
+        ["ps", "-ww", "-p", String(process.pid), "-o", "lstart=,args="],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+    } catch {
+      return;
+    }
+  }
+}
+
+async function startTimeWorkAsync(probes: number): Promise<void> {
+  for (let i = 0; i < probes; i++) {
+    try {
+      const proc = Bun.spawn(
+        ["ps", "-ww", "-p", String(process.pid), "-o", "lstart=,args="],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      await new Response(proc.stdout).text();
+      await proc.exited;
+    } catch {
+      return;
+    }
+  }
+}
+
+/**
+ * One register's full subprocess cost profile: the ancestry walk (--register-hops
+ * `ps -o ppid=` spawns) THEN the on-hit start_time probe (--start-time-probe
+ * `ps … lstart=` spawns), each independently on- or off-loop. A SYNC phase parks
+ * the serve loop inline (the sync portion of this async fn runs on the invoking
+ * tick, before any await); an ASYNC phase runs off it. Returns a promise that
+ * resolves when both finish — the register ack defers until then.
+ *
+ * The three states this expresses:
+ *   pre-any-fix:        sync hops + sync start_time         (both on-loop)  RED
+ *   post-first-fix:     --async-register + sync start_time  (mixed)         RED
+ *   post-this-fix:      --async-register + --async-start-time (both off)    GREEN
+ */
+async function runRegisterWork(
+  hops: number,
+  asyncHops: boolean,
+  startTimeProbes: number,
+  asyncStartTime: boolean,
+): Promise<void> {
+  if (asyncHops) await registerWorkAsync(hops);
+  else registerWorkSync(hops);
+  if (asyncStartTime) await startTimeWorkAsync(startTimeProbes);
+  else startTimeWorkSync(startTimeProbes);
 }
 
 /** The register ack the server replies once the ancestry work resolves. */
@@ -375,6 +482,8 @@ function startServer(
   metrics: ServerMetrics,
   registerHops: number,
   asyncRegister: boolean,
+  startTimeProbe: number,
+  asyncStartTime: boolean,
   peerProbe: boolean,
 ): ReturnType<typeof Bun.listen<ServerConn>> {
   const writeOrQueue = (sock: BunSocket, bytes: Uint8Array): void => {
@@ -434,18 +543,20 @@ function startServer(
           } else if (frame.type === "register") {
             metrics.registers += 1;
             const id = frame.id;
-            if (asyncRegister) {
-              // Post-fix shape: the ancestry work runs OFF the loop and the ack
-              // DEFERS until it resolves. The loop keeps servicing sockets.
-              void registerWorkAsync(registerHops).then(() => {
-                writeOrQueue(sock, ackLine(id));
-              });
-            } else {
-              // Pre-fix shape: the sync spawns run INLINE on the serve loop,
-              // parking the kqueue accept/read loop for their whole duration.
-              registerWorkSync(registerHops);
+            // The register's subprocess cost — ancestry walk then on-hit
+            // start_time probe, each independently on/off-loop (see
+            // runRegisterWork). A SYNC phase parks the kqueue loop inline before
+            // the first await; the ack defers until BOTH phases resolve. This is
+            // where the wedge lives: async hops + sync start_time (the
+            // post-first-fix daemon) still parks the loop once per register.
+            void runRegisterWork(
+              registerHops,
+              asyncRegister,
+              startTimeProbe,
+              asyncStartTime,
+            ).then(() => {
               writeOrQueue(sock, ackLine(id));
-            }
+            });
           }
         }
       },
@@ -727,6 +838,8 @@ async function run(args: Args): Promise<Report> {
     metrics,
     args.registerHops,
     args.asyncRegister,
+    args.startTimeProbe,
+    args.asyncStartTime,
     args.peerProbe,
   );
 
@@ -856,6 +969,7 @@ function printSummary(r: Report): void {
   out += w(
     "register work",
     `hops=${r.args.registerHops} ${r.args.asyncRegister ? "async(off-loop)" : "sync(on-loop)"} ` +
+      `start-time=${r.args.startTimeProbe} ${r.args.asyncStartTime ? "async(off-loop)" : "sync(on-loop)"} ` +
       `stampede=${r.args.stampede} peer-probe=${r.args.peerProbe}`,
   );
   out += w("ran", `${(r.durationRanMs / 1000).toFixed(1)}s`);

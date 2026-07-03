@@ -558,20 +558,27 @@ export interface JobIdentity {
  * RECYCLED-PID GUARD: a bare-pid match proves only that SOME process holds that
  * number, not that it is the one that registered. An OS-recycled pid carrying a
  * lingering dead `jobs` row would otherwise bind the dead agent's identity. So
- * on a row hit we probe the LIVE process's start_time ONCE (`readStartTime`) and
- * compare it verbatim to the row's `start_time` — the same `(pid, start_time)`
- * identity `src/bus-identity.ts` and `src/exit-watcher.ts` already key on. The
- * persisted format is byte-identical to the probe (both share
+ * on a row hit we probe the LIVE process's start_time ONCE (`readStartTime`,
+ * defaulting to the ASYNC `startTimeViaPs` so the `ps` spawn runs OFF the serve
+ * loop — a synchronous spawn here parks the kqueue accept/read loop under a boot
+ * reconnect stampede and wedges the whole daemon) and compare it verbatim to the
+ * row's `start_time` — the same `(pid, start_time)` identity
+ * `src/bus-identity.ts` and `src/exit-watcher.ts` already key on. The persisted
+ * format is byte-identical to the probe (both share
  * `splitArgsLstart`/`parseLinuxStarttime`), so the compare is a plain string
  * match. On a mismatch OR a null/failed probe we return null (fail closed) — the
  * ancestry walk then climbs to the true parent rather than bind an unverified
- * pid-only identity. Probed at most once per matched row, never per ancestry hop.
+ * pid-only identity. Probed at most once per matched row, never per ancestry hop,
+ * and NEVER on a keeper miss or a null-start_time row (those fail closed without
+ * spawning at all — the common serve-path case stays subprocess-free).
  */
-export function enrichPeerFromJobs(
+export async function enrichPeerFromJobs(
   keeperDb: Database,
   pid: number,
-  readStartTime: (pid: number) => string | null = readOsStartTime,
-): JobIdentity | null {
+  readStartTime: (
+    pid: number,
+  ) => string | null | Promise<string | null> = startTimeViaPs,
+): Promise<JobIdentity | null> {
   const row = keeperDb
     .prepare(
       `SELECT job_id, pid, start_time, title, name_history
@@ -584,8 +591,11 @@ export function enrichPeerFromJobs(
   const rowStartTime = row.start_time == null ? null : String(row.start_time);
   // Recycled-pid guard: verify the live pid is the SAME process the row tracks.
   // Fail closed (return null → keep climbing) on a stale/dead row or an
-  // unreadable probe — never bind a pid-only identity.
-  if (rowStartTime === null || readStartTime(pid) !== rowStartTime) return null;
+  // unreadable probe — never bind a pid-only identity. A null stored start_time
+  // is unverifiable, so we fail closed WITHOUT probing — the async probe fires at
+  // most once, and only on a row that carries a start_time to compare.
+  if (rowStartTime === null) return null;
+  if ((await readStartTime(pid)) !== rowStartTime) return null;
   let history: string[] = [];
   const cell = row.name_history;
   if (typeof cell === "string" && cell.length > 0) {
@@ -632,24 +642,27 @@ export interface HarnessIdentity {
  * client-supplied pid), so a client can only resolve to an ancestor it is
  * actually descended from — it cannot claim a harness pid it does not belong to.
  *
- * The `getPpid` probe is AWAITED each hop so the parent-pid read runs off the
- * serve event loop (the production probe spawns `ps`; a sync spawn would park the
- * kqueue loop under a boot reconnect stampede). Deterministic relative to the
- * injected `getPpid` and `lookupJobs` (keeper.db enrichment, a fast synchronous
- * read) so it unit-tests without a subprocess. Returns null on the resume-gap
- * case (no ancestor within the depth bound has a jobs row) — the caller falls
- * back to the client-provided floor identity exactly as before.
+ * BOTH probes are AWAITED each hop so their subprocess work runs off the serve
+ * event loop: `getPpid` spawns `ps -o ppid=`, and `lookupJobs` (the keeper.db
+ * enrichment) awaits an ASYNC start_time `ps` probe on a jobs-row hit. A
+ * synchronous spawn in either would park the kqueue loop under a boot reconnect
+ * stampede and wedge the daemon. Deterministic relative to the injected
+ * `getPpid` and `lookupJobs` (either may be a plain synchronous function in a
+ * unit test — awaiting a non-promise is a no-op) so it unit-tests without a
+ * subprocess. Returns null on the resume-gap case (no ancestor within the depth
+ * bound has a jobs row) — the caller falls back to the client-provided floor
+ * identity exactly as before.
  */
 export async function resolveHarnessIdentity(
   peerPid: number,
   getPpid: (pid: number) => number | null | Promise<number | null>,
-  lookupJobs: (pid: number) => JobIdentity | null,
+  lookupJobs: (pid: number) => JobIdentity | null | Promise<JobIdentity | null>,
   maxDepth = HARNESS_WALK_MAX_DEPTH,
 ): Promise<HarnessIdentity | null> {
   let pid = peerPid;
   for (let depth = 0; depth < maxDepth; depth++) {
     if (pid <= 1) break; // pid 0 (kernel) / 1 (init) are never a harness
-    const identity = lookupJobs(pid);
+    const identity = await lookupJobs(pid);
     if (identity !== null) return { pid, identity };
     const parent = await getPpid(pid);
     if (parent === null || parent === pid) break;
@@ -784,7 +797,9 @@ export function startBusServer(
   // different process). Keyed on `(pid, start_time)`, not pid alone, so a
   // recycled pid never rehydrates a stale agent. The sync `readStartTime` probe
   // is fine HERE — boot runs before `Bun.listen` binds, so no serve loop is
-  // parked — and the cheap `isPidAlive` short-circuit spares dead pids the probe.
+  // parked, and this boot rehydrate is the ONLY caller of the sync probe; the
+  // live register path uses the async `startTimeViaPs` off-loop. The cheap
+  // `isPidAlive` short-circuit spares dead pids the probe.
   // These are persistence-cache rows only — no socket is bound until the agent
   // reconnects + subscribes, so they seed identity/name resolution but are not
   // delivery targets yet.
@@ -969,15 +984,20 @@ export function startBusServer(
     // the Claude harness — rooting the walk at the server-resolved peer pid so a
     // client cannot forge an identity it is not descended from.
     const peerPid = conn.peerPid ?? op.pid ?? 0;
-    // The walk awaits `ps` off the serve loop. The ack DEFERS until it resolves;
-    // meanwhile the loop keeps servicing every other socket (this is the wedge
-    // fix). Completions apply serially (JS single-thread), so two in-flight walks
-    // for the same (pid, start_time) resolve like today's sequential re-registers
-    // — the later completion's takeover evicts the earlier entry.
+    // The walk awaits `ps` off the serve loop — BOTH the per-hop ppid probe
+    // (`ppidViaPs`) AND the per-row-hit start_time recycle probe inside
+    // `enrichPeerFromJobs` (its default `startTimeViaPs` is async). No
+    // synchronous subprocess runs on the serve loop here: the boot-only sync
+    // `readStartTime` is deliberately NOT threaded into this register path. The
+    // ack DEFERS until the walk resolves; meanwhile the loop keeps servicing
+    // every other socket (this is the wedge fix). Completions apply serially (JS
+    // single-thread), so two in-flight walks for the same (pid, start_time)
+    // resolve like today's sequential re-registers — the later completion's
+    // takeover evicts the earlier entry.
     const harness =
       peerPid > 0
         ? await resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
-            enrichPeerFromJobs(keeperDb, p, readStartTime),
+            enrichPeerFromJobs(keeperDb, p),
           )
         : null;
     // The connection closed while its walk was in flight: drop the registration
