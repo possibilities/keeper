@@ -34,5 +34,5 @@ Extend the existing daemon test assertions to pin the new archaeology step and g
 - [ ] Daemon test suite is green with assertions covering the new lines in both branches
 
 ## Done summary
-
+Grafted an intent-archaeology step (read each side's commits + keeper history before classifying) and a do-not-invent-new-behaviour guard into the shared resolver-brief guardrail array, so both the parse-miss and full branches inherit them; abort-on-unclear, default-to-BLOCKED, and no-pause discipline unchanged. Extended daemon tests to pin both new lines in both branches.
 ## Evidence
