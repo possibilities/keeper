@@ -80,11 +80,12 @@ imperative guardrails only.
 - **No kernel watchers on keeper's OWN DB.** `fs.watch`/FSEvents/kqueue drop same-process and WAL
   writes on macOS — detect DB changes via `PRAGMA data_version` polling on a read-only connection.
   Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine.
-- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)`; the
-  LaunchAgent restarts the single recovery path. Never respawn a worker in-process (carve-outs:
-  closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed
-  re-runs before it escalates to `fatalExit`, and the serve-liveness watchdog's bounded real-read
-  socket probes that `fatalExit` a wedged serve path).
+- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)` (exit
+  NON-zero — `SuccessfulExit:false` gates the LaunchAgent respawn), the single recovery path; never
+  respawn a worker in-process (carve-outs: closing a stale/EPIPE UDS client, the git seed-liveness
+  watchdog's capped MAIN boot-seed re-runs before it escalates to `fatalExit`, and the serve-liveness
+  watchdog's bounded real-read socket probes that `fatalExit` a wedged serve path, NAMING which
+  socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
 - **`restore-agents --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract

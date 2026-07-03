@@ -567,6 +567,21 @@ export function resolveBackstopLogPath(): string {
 }
 
 /**
+ * `KEEPER_RESTART_LEDGER` env wins; else `~/.local/state/keeper/restart-ledger.json`.
+ * The durable crash-loop restart ledger: main appends each boot's timestamp here so a
+ * self-restart storm is detectable from the NEXT boot. Deliberately a plain state-dir
+ * sidecar, NOT keeper.db and NOT a fold — it must survive the very crash it measures.
+ * Main is the SOLE reader/writer; never touches a projection or the reducer. Pure.
+ */
+export function resolveRestartLedgerPath(): string {
+  const override = process.env.KEEPER_RESTART_LEDGER;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "restart-ledger.json");
+}
+
+/**
  * SQLite `SQLITE_MAX_VARIABLE_NUMBER` — `IN (?,?,...)` binds one variable per
  * id, so callers of `selectByIds` must chunk past this cap or cap their input.
  */

@@ -8,6 +8,10 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  CRASH_LOOP_DISTRESS_REASON,
+  CRASH_LOOP_DISTRESS_VERB,
+} from "../src/dispatch-failure-key";
+import {
   classifyDispatchFailure,
   resolveFailureTarget,
 } from "../src/dispatch-failure-pill";
@@ -77,6 +81,33 @@ describe("classifyDispatchFailure", () => {
     expect(classifyDispatchFailure("instant-death-breaker")).not.toBe(
       classifyDispatchFailure("slot-reclaimed: x"),
     );
+  });
+
+  test("maps the crash-loop distress reason to its own display kind", () => {
+    // The full minted reason carries a trailing detail dump; the prefix rule
+    // classifies it to the crash-loop pill, distinct from every other kind.
+    expect(
+      classifyDispatchFailure(
+        `${CRASH_LOOP_DISTRESS_REASON}: 8 daemon boots in 30min — restart-looping`,
+      ),
+    ).toBe("crash-loop");
+    expect(classifyDispatchFailure(CRASH_LOOP_DISTRESS_REASON)).toBe(
+      "crash-loop",
+    );
+    expect(classifyDispatchFailure(CRASH_LOOP_DISTRESS_REASON)).not.toBe(
+      classifyDispatchFailure("instant-death-breaker"),
+    );
+  });
+
+  test("the crash-loop distress row resolves to no board target (a global signal, not per-epic/task)", () => {
+    // Its synthetic verb is neither work nor close, so it decorates no board row —
+    // it surfaces purely as a needs_human count, never as a mis-attributed pill.
+    expect(
+      resolveFailureTarget(
+        { verb: CRASH_LOOP_DISTRESS_VERB, id: "crash-loop", dir: "" },
+        ["fn-1-a"],
+      ),
+    ).toBeNull();
   });
 
   test("falls back to the leading token before the first : or whitespace", () => {
