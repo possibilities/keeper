@@ -39,6 +39,7 @@ import {
   BackstopCounters,
   type BackstopMessage,
   buildMissedWakeRecord,
+  buildTimeoutRecord,
 } from "./backstop-telemetry";
 import {
   openDb,
@@ -55,6 +56,7 @@ import {
   memoizedGitToplevel,
   resolveGitToplevel as resolveGitToplevelImpl,
 } from "./git-toplevel";
+import { NotadbTolerance } from "./notadb-tolerance";
 import { normalizePlanOp } from "./plan-classifier";
 import { DEFAULT_DEBOUNCE_MS, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
@@ -2621,13 +2623,52 @@ function startWorker(): void {
   // root attribution, so it drives membership reconcile ONLY (cheap, O(1),
   // idempotent) — it does NOT fan a per-root snapshot out (that O(roots) fan-out
   // was a CPU-flood source). See {@link decideDataVersionWake}.
+  //
+  // fn-1096.3: a transient SQLITE_NOTADB on this poll's PRAGMA data_version
+  // read is a boot-checkpoint view race, not corruption — tolerate via the
+  // shared helper (skip the tick, bounded consecutive-miss rethrow) rather
+  // than letting it crash the worker. ONE instance for this poll site.
+  const dataVersionTolerance = new NotadbTolerance();
+  const emitDataVersionNotadbSkip = (consecutiveMisses: number): void => {
+    console.error(
+      `[git-worker] transient SQLITE_NOTADB on data_version poll — skipped tick (consecutive=${consecutiveMisses})`,
+    );
+    port.postMessage({
+      kind: "backstop",
+      record: buildTimeoutRecord({
+        backstop: "notadb-skip",
+        worker: "git-worker",
+        rescued: true,
+        now: Date.now(),
+        stalenessMs: null,
+        detail: { consecutive_misses: String(consecutiveMisses) },
+      }),
+    } satisfies BackstopMessage);
+  };
   const dataVersionQuery = db.query("PRAGMA data_version");
-  lastDataVersion = (dataVersionQuery.get() as { data_version: number })
-    .data_version;
+  // A tolerated NOTADB on this VERY FIRST read (the boot-checkpoint race is
+  // most likely right here) leaves `lastDataVersion` at its `null` init —
+  // `decideDataVersionWake(cur, lastDataVersion ?? cur)` already treats a
+  // `null` baseline as "no decision yet", so this is a harmless no-op, never
+  // a false suppression.
+  const dataVersionSeed = dataVersionTolerance.poll(
+    () => (dataVersionQuery.get() as { data_version: number }).data_version,
+  );
+  if (dataVersionSeed.skipped) {
+    emitDataVersionNotadbSkip(dataVersionSeed.consecutiveMisses);
+  } else {
+    lastDataVersion = dataVersionSeed.value;
+  }
   dbPollTimer = setInterval(() => {
     if (shuttingDown) return;
-    const cur = (dataVersionQuery.get() as { data_version: number })
-      .data_version;
+    const outcome = dataVersionTolerance.poll(
+      () => (dataVersionQuery.get() as { data_version: number }).data_version,
+    );
+    if (outcome.skipped) {
+      emitDataVersionNotadbSkip(outcome.consecutiveMisses);
+      return;
+    }
+    const cur = outcome.value;
     const decision = decideDataVersionWake(cur, lastDataVersion ?? cur);
     if (!decision.reconcile) return;
     lastDataVersion = cur;
