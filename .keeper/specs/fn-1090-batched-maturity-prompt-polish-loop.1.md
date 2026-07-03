@@ -76,5 +76,5 @@ cd plugins/plan && bun test test/consistency-skills.test.ts — the new block go
 - [ ] plugins/plan/test/consistency-skills.test.ts pins the preserved and new load-bearing literals and the plan fast suite passes
 
 ## Done summary
-
+Rewrote /plan:prompt into a batched maturity-driven polish loop: cumulative slot ladder + per-turn filled/total meter, clustered approvable change-sets with risky-item opt-in, AskUserQuestion intent batches with a plain-text fallback, and a slot-gate-first Ship it / Keep polishing / Grow a rung ready fork. Echoed the contract into the plan CLAUDE.md paragraph and README row and pinned the load-bearing literals in the consistency suite.
 ## Evidence
