@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T19:32:00.241000Z",
+  "depends_on": [
+    "fn-1102-keeper-tabs-browser-grade-restore.3"
+  ],
+  "epic": "fn-1102-keeper-tabs-browser-grade-restore",
+  "id": "fn-1102-keeper-tabs-browser-grade-restore.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Durable revive side-file",
+  "updated_at": "2026-07-03T19:32:00.241000Z"
+}
