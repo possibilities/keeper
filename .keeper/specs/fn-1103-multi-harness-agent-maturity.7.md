@@ -1,54 +1,62 @@
 ## Description
 
 **Size:** M
-**Files:** src/resume-descriptor.ts, src/restore-set.ts, src/restore-worker.ts, src/exec-backend.ts, src/bus-wake.ts, test/resume-descriptor.test.ts, test/restore-set.test.ts
+**Files:** src/resume-descriptor.ts, src/restore-set.ts, src/restore-worker.ts, src/exec-backend.ts, src/bus-wake.ts, the keeper tabs command family (as landed by fn-1102), test/resume-descriptor.test.ts, test/restore-set.test.ts, test/tabs.test.ts
 
 ### Approach
 
-Make resume/restore harness-aware end to end. resumeTarget(job) becomes
-per-harness: claude keeps title-else-job_id; codex/pi/hermes use the stored
-jobs.resume_target and a NULL target renders the agent visibly not-resumable
-(excluded with a reason) instead of erroring. Restore buckets and each
-RestoreAgent gain a harness tag; the relaunch argv builder emits the descriptor's
-resume verb per harness — claude --resume <target>, codex resume <uuid>
-(subcommand form), pi --session <id>, hermes --resume <id> (verify the hermes
-flag against the live CLI; MEDIUM confidence) — routed through keeper agent
-<harness> so a resume relaunch re-enters the launcher and writes a fresh birth
-record (new pid/start_time re-seed presence). Human display twin strings become
-per-harness. bus-wake routes through the same descriptor path (creators remain
-claude today; the path just stops assuming it).
+Make resume/restore harness-aware end to end, EXTENDING the keeper tabs
+browser-grade restore system (fn-1102 — this epic depends on it; read its landed
+shape first): generation selection, keeper tabs list/restore, the setup-tmux
+offer, and the durable revive side-file all carry a harness tag per agent and
+emit per-harness resume argv. resumeTarget(job) becomes per-harness: claude
+keeps its fn-1102 exact-session-uuid form (cwd prefix stays load-bearing);
+codex/pi/hermes use the stored jobs.resume_target, and a NULL target renders
+that agent visibly not-resumable (excluded with a reason, the rest of the
+generation still restores). Per-descriptor resume verbs: claude --resume
+<uuid>, codex resume <uuid> (subcommand form — the argv builder must support
+verb-position args), pi --session <id>, hermes --resume <id> (verify the
+hermes flag live; MEDIUM confidence). Every relaunch routes through keeper
+agent <harness> so it re-enters the launcher (fresh birth record, original
+job_id preserved per the birth-record contract). The revive side-file
+single-quotes every interpolated field per fn-1102's untrusted-data rule —
+harness resume argv included. Human display twins become per-harness. bus-wake
+routes through the same descriptor path (creators remain claude today; the
+path stops assuming it). Restore-gating semantics (fail-closed --apply while
+autopilot unpaused) are preserved under whichever spelling fn-1102 lands.
 
 ### Investigation targets
 
 *Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
 
 **Required** (read before coding):
-- src/resume-descriptor.ts:39-78 — resumeTarget + the claude display twin
-- src/restore-set.ts:221-235 and :747-754 — bucket shape and the relaunch spec construction
-- src/exec-backend.ts:892-948 — buildKeeperAgentLaunchArgv (the hardcoded agent claude token and --resume emission at :916-921)
-- src/agent/args.ts:174-221 — per-harness resume predicate forms the descriptor should mirror
-- src/restore-worker.ts:283 — where buckets are backend-tagged today (harness tag lands beside it)
+- The landed fn-1102 surface: keeper tabs list/restore/dump, the generation selection, the revive side-file writer, and where resume commands are composed — this task layers harness routing onto exactly those seams
+- src/resume-descriptor.ts:39-78 — resumeTarget + display twins (pre-fn-1102 line refs; re-locate after it lands)
+- src/exec-backend.ts:892-948 — buildKeeperAgentLaunchArgv (the hardcoded agent claude token and --resume emission)
+- src/agent/args.ts:174-221 — per-harness resume predicate forms the descriptor mirrors
+- src/restore-worker.ts:283 — bucket tagging site
 
 **Optional** (reference as needed):
 - src/bus-wake.ts — the wake relaunch call site
 
 ### Risks
 
-- restore-agents --apply fail-closed semantics (non-zero while autopilot unpaused) must be preserved unchanged
-- The codex subcommand resume form breaks the flag-only argv assumption — builder must support verb-position args
+- fn-1102 lands first and reshapes these files — re-locate all line refs against its landed state before coding; the dep edge enforces ordering
+- The codex subcommand resume form breaks flag-only argv assumptions
+- Revive-script interpolation of harness argv is an untrusted-data-to-code boundary — follow fn-1102's quoting rule exactly
 
 ### Test notes
 
-Per-harness argv cases in resume-descriptor/restore-set tests (claude unchanged,
-codex subcommand, pi --session, hermes --resume); NULL-resume_target exclusion
-case; harness routing on mixed-harness restore sets.
+Per-harness argv cases (claude unchanged, codex subcommand, pi --session,
+hermes --resume); NULL-resume_target exclusion; mixed-harness generation
+restore in tabs tests; revive side-file quoting cases with hostile titles/cwds.
 
 ## Acceptance
 
-- [ ] The restore descriptor lists non-claude agents with their harness and native resume target; mixed-harness sets route each agent to its own resume argv
-- [ ] A non-claude job with no resume target is reported not-resumable with a reason, and the rest of the set still restores
-- [ ] Claude restore behavior and the fail-closed --apply gate are byte-for-byte unchanged
-- [ ] A resumed non-claude session re-appears as a tracked row (fresh birth record on relaunch)
+- [ ] keeper tabs list/restore and the durable revive script present mixed-harness generations, each agent tagged with its harness and restored via its own resume argv
+- [ ] A non-claude agent with no resume target is reported not-resumable with a reason, and the rest of the generation still restores
+- [ ] Claude restore behavior and the fail-closed apply gate are unchanged under fn-1102's spelling
+- [ ] A resumed non-claude session re-appears as the SAME tracked row (original job id, fresh birth record)
 
 ## Done summary
 
