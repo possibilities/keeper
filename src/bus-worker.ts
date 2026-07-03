@@ -42,14 +42,20 @@ import type { Database } from "bun:sqlite";
 import { chmodSync } from "node:fs";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
+  parseLinuxStarttime,
+  splitArgsLstart,
+} from "../plugins/keeper/plugin/hooks/events-writer";
+import {
   appendMessage,
   type ChannelRow,
   DELIVERED_AFTER_WAKE,
   deleteChannel,
   loadChannels,
+  loadOldestChannels,
   type MessageRow,
   maxMessageId,
   openBusDb,
+  pruneMessagesOlderThan,
   QUEUED_FOR_WAKE,
   selectQueuedForWake,
   upsertChannel,
@@ -88,6 +94,47 @@ export const MAX_FRAME_LENGTH = 1024 * 1024;
 
 /** Worker-shutdown grace (ms) before the worker force-exits. */
 const SHUTDOWN_DEADLINE_MS = 2_000;
+
+// ---------------------------------------------------------------------------
+// bus.db retention (paced, on the worker's own event loop)
+// ---------------------------------------------------------------------------
+//
+// bus.db grows unboundedly (channel rows kept alive by recycled pids; an
+// append-only message log) and amplifies every boot: the registry rehydrate
+// seeds from the channel table and `registryList()` walks every entry on each
+// fanout/resolve/list. Retention runs INSIDE this worker (the sole bus.db
+// writer) as bounded micro-batches on a low-cadence timer — never one bulk
+// DELETE, which would re-park the very serve loop task .1 unwedged. The batch
+// bounds + the per-tick probe cap + the async identity probe are load-bearing:
+// they keep every tick well under the accept loop's latency budget.
+
+/** Retention timer cadence — a low cadence so a tick's work is a rare blip. */
+export const RETENTION_INTERVAL_MS = 30_000;
+
+/** Message age horizon: rows whose `ts` is older than this are pruned (an
+ *  undelivered `queued_for_wake` row is preserved regardless — see bus-db). */
+export const MESSAGE_RETENTION_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Oldest messages deleted per tick. One bounded transaction; the backlog
+ *  drains across successive ticks. */
+export const MESSAGE_PRUNE_BATCH = 1_000;
+
+/** Oldest channel rows examined per tick (the bounded candidate window). */
+export const CHANNEL_CANDIDATE_BATCH = 64;
+
+/** Max async `ps` identity probes per tick. Dead pids (cheap `isPidAlive`) and
+ *  connected agents need no probe; only an alive-but-disconnected candidate does,
+ *  and those are capped so a tick spawns a bounded number of subprocesses. */
+export const CHANNEL_PROBE_BOUND = 16;
+
+/** A channel row younger than this is never pruned — grace for a just-registered
+ *  agent whose liveness probe momentarily races. */
+export const CHANNEL_PRUNE_GRACE_MS = 5 * 60 * 1000;
+
+/** Pages returned to the OS per tick via `incremental_vacuum` (a no-op unless the
+ *  bus.db was born `auto_vacuum=INCREMENTAL`). Bounded so the reclaim never
+ *  materializes the whole freelist into the WAL. */
+export const BUS_INCREMENTAL_VACUUM_PAGES = 256;
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only paths cross
@@ -361,16 +408,60 @@ export function takeoverVictim(
 }
 
 /**
- * Drop dead-pid channels from a rehydrated channel set — the boot registry-cache
- * pass. A persisted channel whose `(pid)` is no longer alive is stale (the agent
- * exited while the bus was down) and is dropped. Pure relative to the injected
- * `isAlive` probe so it unit-tests deterministically.
+ * Drop dead-IDENTITY channels from a rehydrated channel set — the boot
+ * registry-cache pass. A persisted channel is kept only when its stable
+ * `(pid, start_time)` identity is still live: a bare pid match is not enough,
+ * because an OS-recycled pid running a DIFFERENT process would otherwise keep a
+ * dead agent's row alive forever (the bus.db accumulation mechanism). Pure
+ * relative to the injected `isLiveIdentity` probe so it unit-tests
+ * deterministically.
  */
 export function liveChannelsAtBoot(
   rows: ChannelRow[],
-  isAlive: (pid: number) => boolean,
+  isLiveIdentity: (pid: number, startTime: string) => boolean,
 ): ChannelRow[] {
-  return rows.filter((r) => isAlive(r.pid));
+  return rows.filter((r) => isLiveIdentity(r.pid, r.start_time));
+}
+
+/**
+ * Resolved liveness of a channel's `(pid, start_time)` identity, as gathered by
+ * the retention driver: `dead` when the pid holds no process, else `alive` with
+ * the LIVE process's probed start_time (`null` when the probe failed/raced).
+ */
+export type ChannelLiveness =
+  | { alive: false }
+  | { alive: true; startTime: string | null };
+
+/**
+ * Steady-state channel-prune decision for ONE candidate row. Pure over the
+ * gathered inputs so it unit-tests without a process probe; the impure driver
+ * feeds it `connected` (a live socket for this identity right now) and
+ * `liveness`.
+ *
+ * Prune ONLY a row that is provably stale:
+ *  - `connected` → keep. A live socket is present regardless of what any probe
+ *    says; this also protects a keeper-miss registration whose stored
+ *    `start_time` is a synthetic placeholder that no OS probe would match.
+ *  - younger than `graceMs` → keep. A just-registered row whose probe raced.
+ *  - identity dead (no process on the pid) → prune.
+ *  - alive but the probe returned `null` (transient failure) → keep (fail-safe:
+ *    never prune on an inconclusive probe).
+ *  - alive with a start_time that does NOT match the row → prune (the pid was
+ *    recycled by a different process, or the stored start_time is unverifiable).
+ *  - alive with a matching start_time → keep (the agent's process is still up).
+ */
+export function channelPruneDecision(
+  rowStartTime: string,
+  rowAgeMs: number,
+  graceMs: number,
+  connected: boolean,
+  liveness: ChannelLiveness,
+): "keep" | "prune" {
+  if (connected) return "keep";
+  if (rowAgeMs < graceMs) return "keep";
+  if (!liveness.alive) return "prune";
+  if (liveness.startTime === null) return "keep";
+  return liveness.startTime === rowStartTime ? "keep" : "prune";
 }
 
 // ---------------------------------------------------------------------------
@@ -467,20 +558,27 @@ export interface JobIdentity {
  * RECYCLED-PID GUARD: a bare-pid match proves only that SOME process holds that
  * number, not that it is the one that registered. An OS-recycled pid carrying a
  * lingering dead `jobs` row would otherwise bind the dead agent's identity. So
- * on a row hit we probe the LIVE process's start_time ONCE (`readStartTime`) and
- * compare it verbatim to the row's `start_time` — the same `(pid, start_time)`
- * identity `src/bus-identity.ts` and `src/exit-watcher.ts` already key on. The
- * persisted format is byte-identical to the probe (both share
+ * on a row hit we probe the LIVE process's start_time ONCE (`readStartTime`,
+ * defaulting to the ASYNC `startTimeViaPs` so the `ps` spawn runs OFF the serve
+ * loop — a synchronous spawn here parks the kqueue accept/read loop under a boot
+ * reconnect stampede and wedges the whole daemon) and compare it verbatim to the
+ * row's `start_time` — the same `(pid, start_time)` identity
+ * `src/bus-identity.ts` and `src/exit-watcher.ts` already key on. The persisted
+ * format is byte-identical to the probe (both share
  * `splitArgsLstart`/`parseLinuxStarttime`), so the compare is a plain string
  * match. On a mismatch OR a null/failed probe we return null (fail closed) — the
  * ancestry walk then climbs to the true parent rather than bind an unverified
- * pid-only identity. Probed at most once per matched row, never per ancestry hop.
+ * pid-only identity. Probed at most once per matched row, never per ancestry hop,
+ * and NEVER on a keeper miss or a null-start_time row (those fail closed without
+ * spawning at all — the common serve-path case stays subprocess-free).
  */
-export function enrichPeerFromJobs(
+export async function enrichPeerFromJobs(
   keeperDb: Database,
   pid: number,
-  readStartTime: (pid: number) => string | null = readOsStartTime,
-): JobIdentity | null {
+  readStartTime: (
+    pid: number,
+  ) => string | null | Promise<string | null> = startTimeViaPs,
+): Promise<JobIdentity | null> {
   const row = keeperDb
     .prepare(
       `SELECT job_id, pid, start_time, title, name_history
@@ -493,8 +591,11 @@ export function enrichPeerFromJobs(
   const rowStartTime = row.start_time == null ? null : String(row.start_time);
   // Recycled-pid guard: verify the live pid is the SAME process the row tracks.
   // Fail closed (return null → keep climbing) on a stale/dead row or an
-  // unreadable probe — never bind a pid-only identity.
-  if (rowStartTime === null || readStartTime(pid) !== rowStartTime) return null;
+  // unreadable probe — never bind a pid-only identity. A null stored start_time
+  // is unverifiable, so we fail closed WITHOUT probing — the async probe fires at
+  // most once, and only on a row that carries a start_time to compare.
+  if (rowStartTime === null) return null;
+  if ((await readStartTime(pid)) !== rowStartTime) return null;
   let history: string[] = [];
   const cell = row.name_history;
   if (typeof cell === "string" && cell.length > 0) {
@@ -541,24 +642,27 @@ export interface HarnessIdentity {
  * client-supplied pid), so a client can only resolve to an ancestor it is
  * actually descended from — it cannot claim a harness pid it does not belong to.
  *
- * The `getPpid` probe is AWAITED each hop so the parent-pid read runs off the
- * serve event loop (the production probe spawns `ps`; a sync spawn would park the
- * kqueue loop under a boot reconnect stampede). Deterministic relative to the
- * injected `getPpid` and `lookupJobs` (keeper.db enrichment, a fast synchronous
- * read) so it unit-tests without a subprocess. Returns null on the resume-gap
- * case (no ancestor within the depth bound has a jobs row) — the caller falls
- * back to the client-provided floor identity exactly as before.
+ * BOTH probes are AWAITED each hop so their subprocess work runs off the serve
+ * event loop: `getPpid` spawns `ps -o ppid=`, and `lookupJobs` (the keeper.db
+ * enrichment) awaits an ASYNC start_time `ps` probe on a jobs-row hit. A
+ * synchronous spawn in either would park the kqueue loop under a boot reconnect
+ * stampede and wedge the daemon. Deterministic relative to the injected
+ * `getPpid` and `lookupJobs` (either may be a plain synchronous function in a
+ * unit test — awaiting a non-promise is a no-op) so it unit-tests without a
+ * subprocess. Returns null on the resume-gap case (no ancestor within the depth
+ * bound has a jobs row) — the caller falls back to the client-provided floor
+ * identity exactly as before.
  */
 export async function resolveHarnessIdentity(
   peerPid: number,
   getPpid: (pid: number) => number | null | Promise<number | null>,
-  lookupJobs: (pid: number) => JobIdentity | null,
+  lookupJobs: (pid: number) => JobIdentity | null | Promise<JobIdentity | null>,
   maxDepth = HARNESS_WALK_MAX_DEPTH,
 ): Promise<HarnessIdentity | null> {
   let pid = peerPid;
   for (let depth = 0; depth < maxDepth; depth++) {
     if (pid <= 1) break; // pid 0 (kernel) / 1 (init) are never a harness
-    const identity = lookupJobs(pid);
+    const identity = await lookupJobs(pid);
     if (identity !== null) return { pid, identity };
     const parent = await getPpid(pid);
     if (parent === null || parent === pid) break;
@@ -588,6 +692,40 @@ export async function ppidViaPs(pid: number): Promise<number | null> {
     if (raw.length === 0) return null;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ASYNC re-read of a live pid's start_time, in the SAME platform-tagged shape
+ * ({@link readOsStartTime} / `jobs.start_time`) the channel's stored `start_time`
+ * carries — so the retention comparison is a plain string match. Async (spawn
+ * off the serve loop, awaited) because the sync `readOsStartTime` would park the
+ * kqueue accept loop; this is the retention-pass sibling of {@link ppidViaPs}.
+ * Returns null on any failure (unknown pid, `ps`/proc miss, parse miss) so the
+ * caller treats it as an inconclusive probe and keeps the row.
+ */
+export async function startTimeViaPs(pid: number): Promise<string | null> {
+  if (pid <= 0) return null;
+  try {
+    if (process.platform === "darwin") {
+      const proc = Bun.spawn(
+        ["ps", "-ww", "-p", String(pid), "-o", "lstart=,args="],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      const raw = await new Response(proc.stdout).text();
+      await proc.exited;
+      if (proc.exitCode !== 0) return null;
+      const split = splitArgsLstart(raw);
+      return split ? `darwin:${split.lstart}` : null;
+    }
+    if (process.platform === "linux") {
+      const statText = await Bun.file(`/proc/${pid}/stat`).text();
+      const raw = parseLinuxStarttime(statText);
+      return raw !== null ? `linux:${raw}` : null;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -654,12 +792,21 @@ export function startBusServer(
   // another live instance. Mirrors the server worker's unlink-at-boot.
   unlinkIfExists(sockPath);
 
-  // Rehydrate the registry cache, dropping dead-pid channels (agents that exited
-  // while the bus was down). These are persistence-cache rows only — no socket is
-  // bound until the agent reconnects + subscribes, so they seed identity/name
-  // resolution but are not delivery targets yet.
+  // Rehydrate the registry cache, dropping dead-IDENTITY channels (agents that
+  // exited while the bus was down, plus rows whose pid was recycled by a
+  // different process). Keyed on `(pid, start_time)`, not pid alone, so a
+  // recycled pid never rehydrates a stale agent. The sync `readStartTime` probe
+  // is fine HERE — boot runs before `Bun.listen` binds, so no serve loop is
+  // parked, and this boot rehydrate is the ONLY caller of the sync probe; the
+  // live register path uses the async `startTimeViaPs` off-loop. The cheap
+  // `isPidAlive` short-circuit spares dead pids the probe.
+  // These are persistence-cache rows only — no socket is bound until the agent
+  // reconnects + subscribes, so they seed identity/name resolution but are not
+  // delivery targets yet.
+  const isLiveIdentity = (pid: number, startTime: string): boolean =>
+    isPidAlive(pid) && readStartTime(pid) === startTime;
   const registry = new Map<string, RegistryEntry>();
-  for (const row of liveChannelsAtBoot(loadChannels(busDb), isPidAlive)) {
+  for (const row of liveChannelsAtBoot(loadChannels(busDb), isLiveIdentity)) {
     registry.set(row.channel_id, {
       channel: row,
       namespaces: row.namespaces,
@@ -837,15 +984,20 @@ export function startBusServer(
     // the Claude harness — rooting the walk at the server-resolved peer pid so a
     // client cannot forge an identity it is not descended from.
     const peerPid = conn.peerPid ?? op.pid ?? 0;
-    // The walk awaits `ps` off the serve loop. The ack DEFERS until it resolves;
-    // meanwhile the loop keeps servicing every other socket (this is the wedge
-    // fix). Completions apply serially (JS single-thread), so two in-flight walks
-    // for the same (pid, start_time) resolve like today's sequential re-registers
-    // — the later completion's takeover evicts the earlier entry.
+    // The walk awaits `ps` off the serve loop — BOTH the per-hop ppid probe
+    // (`ppidViaPs`) AND the per-row-hit start_time recycle probe inside
+    // `enrichPeerFromJobs` (its default `startTimeViaPs` is async). No
+    // synchronous subprocess runs on the serve loop here: the boot-only sync
+    // `readStartTime` is deliberately NOT threaded into this register path. The
+    // ack DEFERS until the walk resolves; meanwhile the loop keeps servicing
+    // every other socket (this is the wedge fix). Completions apply serially (JS
+    // single-thread), so two in-flight walks for the same (pid, start_time)
+    // resolve like today's sequential re-registers — the later completion's
+    // takeover evicts the earlier entry.
     const harness =
       peerPid > 0
         ? await resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
-            enrichPeerFromJobs(keeperDb, p, readStartTime),
+            enrichPeerFromJobs(keeperDb, p),
           )
         : null;
     // The connection closed while its walk was in flight: drop the registration
@@ -1301,12 +1453,120 @@ export function startBusServer(
     // best-effort; the dir mode is the real gate
   }
 
-  // No periodic liveness timer: peer death is socket-close (a kill/crash FINs
-  // the peer fd → the `close` handler nulls the entry's socket). Boot rehydration
-  // (`liveChannelsAtBoot`) drops dead pids once; steady state needs no sweep.
+  // No periodic liveness timer for DELIVERY: peer death is socket-close (a
+  // kill/crash FINs the peer fd → the `close` handler nulls the entry's socket).
+  // The retention timer below is a SEPARATE concern — bounded GC, not a delivery
+  // sweep — and never gates or delays fanout.
+
+  /** Is `(pid, start_time)` bound to a LIVE socket in the registry right now? A
+   *  connected agent is never a prune target (its process is up by definition,
+   *  and a synthetic-start_time cache row would fail an OS probe it must survive). */
+  const identityConnected = (pid: number, startTime: string): boolean => {
+    for (const e of registry.values()) {
+      if (
+        e.sock !== null &&
+        e.channel.pid === pid &&
+        e.channel.start_time === startTime
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * Prune the stalest channel cache rows whose `(pid, start_time)` identity is
+   * provably dead — bounded candidate window, capped async identity probes. Drops
+   * the matching disconnected in-memory entries too, so `registryList()` stops
+   * walking them (the fanout/resolve/list amplifier).
+   */
+  const pruneStaleChannels = async (now: number): Promise<void> => {
+    const candidates = loadOldestChannels(busDb, CHANNEL_CANDIDATE_BATCH);
+    let probes = 0;
+    for (const row of candidates) {
+      const connected = identityConnected(row.pid, row.start_time);
+      let liveness: ChannelLiveness;
+      if (connected) {
+        liveness = { alive: true, startTime: row.start_time };
+      } else if (!isPidAlive(row.pid)) {
+        liveness = { alive: false };
+      } else {
+        // Alive pid, no live socket — needs an identity probe. Bounded per tick:
+        // over the cap, leave the rest for the next pass.
+        if (probes >= CHANNEL_PROBE_BOUND) continue;
+        probes += 1;
+        liveness = { alive: true, startTime: await startTimeViaPs(row.pid) };
+      }
+      if (
+        channelPruneDecision(
+          row.start_time,
+          now - row.last_heartbeat,
+          CHANNEL_PRUNE_GRACE_MS,
+          connected,
+          liveness,
+        ) !== "prune"
+      ) {
+        continue;
+      }
+      // Re-check LIVE: a reconnect during the await above may have rebound this
+      // identity to a fresh socket + re-upserted its row — never prune it then.
+      if (identityConnected(row.pid, row.start_time)) continue;
+      try {
+        deleteChannel(busDb, row.pid, row.start_time);
+      } catch {
+        // best-effort cache delete
+      }
+      for (const [cid, e] of registry) {
+        if (
+          e.sock === null &&
+          e.channel.pid === row.pid &&
+          e.channel.start_time === row.start_time
+        ) {
+          registry.delete(cid);
+        }
+      }
+    }
+  };
+
+  /** One paced retention pass: stale channels + aged messages + WAL bound. Every
+   *  step best-effort — a GC hiccup must never bounce the daemon. */
+  const runRetentionPass = async (): Promise<void> => {
+    const now = Date.now();
+    try {
+      await pruneStaleChannels(now);
+    } catch (err) {
+      console.error("[bus-worker] channel retention failed (non-fatal):", err);
+    }
+    try {
+      pruneMessagesOlderThan(
+        busDb,
+        now - MESSAGE_RETENTION_HORIZON_MS,
+        MESSAGE_PRUNE_BATCH,
+      );
+    } catch (err) {
+      console.error("[bus-worker] message retention failed (non-fatal):", err);
+    }
+    // PASSIVE checkpoint flushes pruned pages into the main file and (with
+    // journal_size_limit set at open) truncates the -wal back; the bounded
+    // incremental_vacuum returns freed pages to the OS on a born-INCREMENTAL
+    // bus.db (a no-op otherwise).
+    try {
+      busDb.run("PRAGMA wal_checkpoint(PASSIVE)");
+      busDb.run(`PRAGMA incremental_vacuum(${BUS_INCREMENTAL_VACUUM_PAGES})`);
+    } catch (err) {
+      console.error("[bus-worker] WAL maintenance failed (non-fatal):", err);
+    }
+  };
+
+  const retentionTimer = setInterval(() => {
+    void runRetentionPass();
+  }, RETENTION_INTERVAL_MS);
+  // Never let the GC timer keep the worker alive past shutdown.
+  retentionTimer.unref?.();
 
   return {
     stop() {
+      clearInterval(retentionTimer);
       try {
         listener.stop(true);
       } catch {

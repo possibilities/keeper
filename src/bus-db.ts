@@ -13,10 +13,16 @@
  * Two tables (epic Architecture):
  *  - `channels`  — one row per live registration, keyed on `(pid, start_time)`
  *    to defeat OS pid reuse. Best-effort persistence cache: the in-memory
- *    registry in the worker is the runtime source of truth; this table is
- *    rehydrated at boot with dead pids dropped.
- *  - `messages`  — append-only durable forensic log; `id` autoincrement is the
- *    monotonic cursor a reconnecting subscriber replays from.
+ *    registry in the worker is the runtime source of truth. Rehydrated at boot
+ *    and pruned in steady state by `(pid, start_time)` IDENTITY liveness (not
+ *    pid alone), so an OS-recycled pid can never keep a stale row alive.
+ *  - `messages`  — durable forensic log under a RETENTION contract: rows past the
+ *    age horizon are pruned in paced micro-batches (never one bulk DELETE), so
+ *    the table stays bounded under steady churn. The lone exception is an
+ *    UNDELIVERED `queued_for_wake` row — the sole durable consumer
+ *    ({@link selectQueuedForWake}) — which survives regardless of age. `id`
+ *    autoincrement stays the monotonic cursor: pruning removes only the oldest
+ *    tail, never the max id.
  *
  * Sole-writer: the bus worker owns the single writable connection. These helpers
  * are pure over a passed `Database` handle so they unit-test in-process.
@@ -32,6 +38,14 @@ import { applyPragmas } from "./db";
  * Forward-only: bump only when adding a step to {@link migrateBusDb}.
  */
 export const BUS_SCHEMA_VERSION = 1;
+
+/**
+ * WAL truncation floor (bytes). `journal_size_limit` truncates (not just zeroes)
+ * the `-wal` file back to this after a checkpoint, so the periodic PASSIVE
+ * checkpoint the retention pass runs keeps the WAL bounded instead of letting it
+ * ratchet up to the high-water mark of the biggest write burst.
+ */
+export const BUS_WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024;
 
 const CREATE_CHANNELS = `
 CREATE TABLE IF NOT EXISTS channels (
@@ -124,8 +138,16 @@ export function openBusDb(path: string): Database {
     mkdirSync(dirname(path), { recursive: true });
   }
   const db = new Database(path, { create: true });
+  // auto_vacuum must be chosen BEFORE the first table exists to take hold without
+  // a full VACUUM, so set it on the pristine handle: a FRESH bus.db is born
+  // INCREMENTAL and a later `PRAGMA incremental_vacuum` returns pruned pages to
+  // the OS. On an existing non-INCREMENTAL bus.db this is a silent no-op (pruned
+  // pages sit on the freelist for reuse — the file stops growing either way).
+  db.run("PRAGMA auto_vacuum = INCREMENTAL");
   applyPragmas(db);
   migrateBusDb(db);
+  // Bound the WAL so the retention pass's PASSIVE checkpoint truncates it back.
+  db.run(`PRAGMA journal_size_limit = ${BUS_WAL_SIZE_LIMIT_BYTES}`);
   return db;
 }
 
@@ -217,6 +239,22 @@ export function loadChannels(db: Database): ChannelRow[] {
       "SELECT * FROM channels ORDER BY registered_at ASC, channel_id ASC",
     )
     .all() as Record<string, unknown>[];
+  return rows.map(rowToChannel);
+}
+
+/**
+ * Load the `limit` OLDEST channel rows (by `last_heartbeat`) — the retention
+ * pass's bounded candidate window. Oldest-first so the stalest rows are examined
+ * first; a live-connected row with an old stamp is re-examined each pass but
+ * cheaply kept (the worker's liveness gate), so progress still drains the dead
+ * tail behind it. Bounded read by construction — never a full-table scan.
+ */
+export function loadOldestChannels(db: Database, limit: number): ChannelRow[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM channels ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?",
+    )
+    .all(limit) as Record<string, unknown>[];
   return rows.map(rowToChannel);
 }
 
@@ -368,6 +406,44 @@ export function selectQueuedForWake(
     )
     .all(sessionId, QUEUED_FOR_WAKE);
   return (rows as Record<string, unknown>[]).map(rowToMessage);
+}
+
+/**
+ * Age-horizon message retention: delete up to `batchSize` of the OLDEST messages
+ * whose `ts` is strictly before `cutoffTs`, PRESERVING every undelivered
+ * `queued_for_wake` row regardless of age. Returns the count deleted.
+ *
+ * Bounded by construction — it reads exactly the front `batchSize` rows by `id`
+ * (id-ascending IS oldest-first: {@link appendMessage} assigns `id` and `ts`
+ * monotonically together) and deletes the prunable subset in ONE transaction. A
+ * tick therefore touches at most `batchSize` rows and NEVER an unbounded scan, so
+ * the paced pass cannot re-park the serve loop the way a bulk DELETE would. Call
+ * repeatedly (one batch per timer tick) to drain a backlog gradually.
+ *
+ * Only `queued_for_wake` is age-immune. The namespace reconnect-gap replay
+ * ({@link replayFromCursor}) is NOT a live consumer — the `keeper bus watch`
+ * client subscribes with NO `after_id` (`cli/bus.ts`) — so retention deliberately
+ * protects no replay window; a delivered escalation has already flipped off
+ * `queued_for_wake` and ages out like any other row.
+ */
+export function pruneMessagesOlderThan(
+  db: Database,
+  cutoffTs: number,
+  batchSize: number,
+): number {
+  const front = db
+    .prepare("SELECT id, ts, status FROM messages ORDER BY id ASC LIMIT ?")
+    .all(batchSize) as { id: number; ts: number; status: string | null }[];
+  const prunable = front
+    .filter((r) => r.ts < cutoffTs && r.status !== QUEUED_FOR_WAKE)
+    .map((r) => r.id);
+  if (prunable.length === 0) return 0;
+  db.transaction(() => {
+    db.prepare(
+      "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+    ).run(JSON.stringify(prunable));
+  }).immediate();
+  return prunable.length;
 }
 
 /**
