@@ -10,6 +10,7 @@
 
 import { Database } from "bun:sqlite";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -98,6 +99,17 @@ export function resolveRestorePath(): string {
     return override;
   }
   return join(homedir(), ".local", "state", "keeper", "restore.json");
+}
+
+/**
+ * The durable revive-script side-file — `revive.sh` in the SAME directory as the
+ * JSON restore mirror ({@link resolveRestorePath}), so a `KEEPER_RESTORE_FILE`
+ * override relocates both together. A runnable snapshot of the current live
+ * keeper agents the restore-worker maintains next to `restore.json` on the same
+ * `data_version` pulse; dump-only (nothing reads it back — crash-restore still
+ * derives from `keeper.db`). Pure. */
+export function resolveRevivePath(): string {
+  return join(dirname(resolveRestorePath()), "revive.sh");
 }
 
 /**
@@ -6136,8 +6148,18 @@ function escapeNonAscii(s: string): string {
  * Atomically write `content` to `path` via a same-directory temp file →
  * `renameSync` (POSIX rename atomicity only holds intra-filesystem). The temp
  * file is best-effort unlinked on any throw so a partial file never lingers.
+ *
+ * When `mode` is passed, the permission bits land on the TEMP file (via an
+ * explicit `chmodSync` that defeats umask) BEFORE the rename, so the final path
+ * is never briefly world-readable — the revive-script side-file rides agent
+ * titles and cwds and is written `0600`. Omitting `mode` keeps the default
+ * umask-derived permissions (existing call sites are unaffected).
  */
-export function atomicWriteFile(path: string, content: string): void {
+export function atomicWriteFile(
+  path: string,
+  content: string,
+  mode?: number,
+): void {
   const dir = dirname(path);
   const tmp = join(
     dir,
@@ -6145,6 +6167,11 @@ export function atomicWriteFile(path: string, content: string): void {
   );
   try {
     writeFileSync(tmp, content, { encoding: "utf8" });
+    if (mode !== undefined) {
+      // chmod the temp file explicitly: writeFileSync's `mode` option is masked
+      // by umask, so a bare write can't guarantee an exact 0600.
+      chmodSync(tmp, mode);
+    }
     renameSync(tmp, path);
   } catch (err) {
     try {

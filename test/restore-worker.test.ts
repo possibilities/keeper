@@ -38,13 +38,15 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveRestorePath } from "../src/db";
+import { resolveRestorePath, resolveRevivePath } from "../src/db";
 import {
   type BackendExecStartMessage,
   buildRestoreTier,
+  buildReviveScriptCandidates,
   probeServerGeneration,
   probeTmuxTopology,
   RESTORE_SCHEMA_VERSION,
@@ -64,11 +66,13 @@ import { freshMemDb } from "./helpers/template-db";
  *  the generation-boundary dedup remain. */
 function freshState(): {
   lastHash: string | null;
+  lastScriptHash: string | null;
   parentDirEnsured: boolean;
   lastGenerationHash: string | null;
 } {
   return {
     lastHash: null,
+    lastScriptHash: null,
     parentDirEnsured: false,
     lastGenerationHash: null,
   };
@@ -1049,6 +1053,207 @@ test("probeTmuxTopology classifies a non-zero exit with NO stderr as transient, 
     throw new Error("ENOENT: no tmux binary");
   });
   expect(thrown).toEqual({ kind: "transient" });
+});
+
+// ---------------------------------------------------------------------------
+// buildReviveScriptCandidates — the revive.sh live set (managed workers excluded)
+// ---------------------------------------------------------------------------
+
+test("buildReviveScriptCandidates excludes reconciler-managed workers and counts them", () => {
+  const { candidates, excludedManagedCount } = buildReviveScriptCandidates([
+    fakeJob({ job_id: "human", backend_exec_session_id: "s1", title: "hack" }),
+    fakeJob({
+      job_id: "managed",
+      backend_exec_session_id: "s1",
+      plan_verb: "work",
+      title: "work::fn-1.2",
+    }),
+  ]);
+  expect(candidates.map((c) => c.job_id)).toEqual(["human"]);
+  expect(excludedManagedCount).toBe(1);
+  // resume_target is the session UUID; label is the latest title.
+  expect(candidates[0]?.resume_target).toBe("human");
+  expect(candidates[0]?.label).toBe("hack");
+});
+
+test("buildReviveScriptCandidates applies the same liveness filters as the JSON mirror", () => {
+  const { candidates } = buildReviveScriptCandidates([
+    fakeJob({ job_id: "ended", state: "ended", backend_exec_session_id: "s1" }),
+    fakeJob({ job_id: "nosess", backend_exec_session_id: null }),
+    fakeJob({ job_id: "", backend_exec_session_id: "s1" }),
+    fakeJob({ job_id: "keep", backend_exec_session_id: "s1" }),
+  ]);
+  expect(candidates.map((c) => c.job_id)).toEqual(["keep"]);
+});
+
+test("buildReviveScriptCandidates sorts by visual window order (known index first)", () => {
+  const { candidates } = buildReviveScriptCandidates([
+    fakeJob({
+      job_id: "tail",
+      backend_exec_session_id: "s1",
+      window_index: null,
+    }),
+    fakeJob({
+      job_id: "second",
+      backend_exec_session_id: "s1",
+      window_index: 2,
+    }),
+    fakeJob({
+      job_id: "first",
+      backend_exec_session_id: "s1",
+      window_index: 0,
+    }),
+  ]);
+  expect(candidates.map((c) => c.job_id)).toEqual(["first", "second", "tail"]);
+});
+
+// ---------------------------------------------------------------------------
+// restorePulse — durable revive.sh sibling (0600, managed-excluded, own gate)
+// ---------------------------------------------------------------------------
+
+/** The script config the real worker wires; a fixed prefix + provenance path. */
+function scriptCfg(path: string): {
+  path: string;
+  sourcePath: string;
+  prefix: string[];
+} {
+  return { path, sourcePath: "/db/keeper.db", prefix: ["keeper", "agent"] };
+}
+
+test("resolveRevivePath places revive.sh next to restore.json", () => {
+  // beforeEach wires KEEPER_RESTORE_FILE → tmpDir/restore.json.
+  expect(resolveRevivePath()).toBe(join(tmpDir, "revive.sh"));
+});
+
+test("restorePulse writes a 0600 revive.sh next to restore.json with managed workers excluded", () => {
+  insertJob({
+    job_id: "human",
+    backend_exec_session_id: "s1",
+    cwd: "/repo",
+    title: "hacking",
+  });
+  insertJob({
+    job_id: "managed",
+    backend_exec_session_id: "s1",
+    plan_verb: "work",
+    title: "work::fn-1.2",
+  });
+  const revivePath = join(tmpDir, "revive.sh");
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+
+  // The sibling lands next to restore.json, mode 0600.
+  expect(existsSync(revivePath)).toBe(true);
+  expect(statSync(revivePath).mode & 0o777).toBe(0o600);
+
+  const script = readFileSync(revivePath, "utf8");
+  // Header count reflects the human pane only; the managed worker is excluded
+  // but its exclusion is surfaced (never a silent drop).
+  expect(script).toContain("captured 1 keeper agent(s)");
+  expect(script).toContain("1 reconciler-managed pane(s) not included");
+  expect(script).toContain("hacking");
+  // The reconciler-managed worker's title never reaches the human replay script.
+  expect(script).not.toContain("work::fn-1.2");
+});
+
+test("restorePulse suppresses a no-op revive.sh rewrite via its own hash gate", () => {
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  const revivePath = join(tmpDir, "revive.sh");
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  const firstMtime = statSync(revivePath).mtimeMs;
+  const firstScriptHash = state.lastScriptHash;
+  expect(firstScriptHash).not.toBeNull();
+
+  // Re-run with an unchanged live set (different wall-clock) — the script has no
+  // timestamp, so its content hash is stable and the file is NOT rewritten.
+  Bun.sleepSync(2);
+  restorePulse(db, restorePath, state, () => 9999, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(state.lastScriptHash).toBe(firstScriptHash);
+  expect(statSync(revivePath).mtimeMs).toBe(firstMtime);
+});
+
+test("restorePulse rewrites revive.sh when the live set changes", () => {
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  const revivePath = join(tmpDir, "revive.sh");
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  const firstHash = state.lastScriptHash;
+
+  insertJob({ job_id: "b", backend_exec_session_id: "s1", title: "second" });
+  restorePulse(db, restorePath, state, () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(state.lastScriptHash).not.toBe(firstHash);
+  expect(readFileSync(revivePath, "utf8")).toContain("second");
+});
+
+test("a failed restore.json write does not block the revive.sh write", () => {
+  insertJob({ job_id: "a", backend_exec_session_id: "s1", title: "keep-me" });
+  // Point restore.json into a path whose parent is a FILE → its write throws
+  // (ENOTDIR), swallowed. The revive.sh path stays writable.
+  const blocker = join(tmpDir, "blocker");
+  writeFileSync(blocker, "x");
+  const deadJsonPath = join(blocker, "restore.json");
+  const revivePath = join(tmpDir, "revive.sh");
+  restorePulse(db, deadJsonPath, freshState(), () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(existsSync(deadJsonPath)).toBe(false);
+  expect(existsSync(revivePath)).toBe(true);
+  expect(readFileSync(revivePath, "utf8")).toContain("keep-me");
+});
+
+test("a failed revive.sh write does not block the restore.json write", () => {
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  const blocker = join(tmpDir, "blocker2");
+  writeFileSync(blocker, "x");
+  const deadScriptPath = join(blocker, "revive.sh");
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(deadScriptPath),
+  });
+  expect(existsSync(deadScriptPath)).toBe(false);
+  expect(existsSync(restorePath)).toBe(true);
+  expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
+});
+
+test("the revive.sh sibling leaves the JSON mirror's membership and schema unchanged", () => {
+  // A reconciler-managed worker is EXCLUDED from revive.sh but KEPT in the JSON
+  // mirror — the sibling introduces no membership/schema drift in restore.json.
+  insertJob({ job_id: "human", backend_exec_session_id: "s1" });
+  insertJob({
+    job_id: "managed",
+    backend_exec_session_id: "s1",
+    plan_verb: "work",
+  });
+  const revivePath = join(tmpDir, "revive.sh");
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  const parsed = readFile(restorePath);
+  expect(parsed.schema_version).toBe(RESTORE_SCHEMA_VERSION);
+  // Both jobs remain in the JSON mirror; only revive.sh drops the managed one.
+  expect(tierKeys(parsed.current)).toEqual({ s1: ["human", "managed"] });
+  // The managed worker never becomes a resume target in the human replay script
+  // (the header's "reconciler-managed"/"excluded-managed=1" strings are expected).
+  const script = readFileSync(revivePath, "utf8");
+  expect(script).not.toContain("'--resume' 'managed'");
+  expect(script).toContain("'--resume' 'human'");
 });
 
 // ---------------------------------------------------------------------------
