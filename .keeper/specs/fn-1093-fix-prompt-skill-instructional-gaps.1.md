@@ -15,5 +15,5 @@ Both edits touch the same file and share the "instructional correctness in the p
 - [ ] The Footer section defines a footer shape for the explore turn (its own template or an explicit reuse of the question-turn footer) that carries the slot meter.
 
 ## Done summary
-
+Fixed the off-ladder target N example (175 is an equidistant tie resolved to gate 6 by rounding up; gate kept distinct from container) and added an explore-turn footer template so all three move types carry the per-turn slot meter.
 ## Evidence
