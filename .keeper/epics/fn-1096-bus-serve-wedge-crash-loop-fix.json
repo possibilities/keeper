@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-03T19:02:43.659000Z",
   "created_at": "2026-07-03T15:54:21.228000Z",
   "depends_on_epics": [],
   "id": "fn-1096-bus-serve-wedge-crash-loop-fix",
   "last_validated_at": "2026-07-03T16:59:14.035000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Bus serve wedge crash-loop fix",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T16:59:14.036000Z"
+  "updated_at": "2026-07-03T19:02:43.659000Z"
 }
