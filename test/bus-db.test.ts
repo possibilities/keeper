@@ -18,9 +18,11 @@ import {
   DELIVERED_AFTER_WAKE,
   deleteChannel,
   loadChannels,
+  loadOldestChannels,
   maxMessageId,
   migrateBusDb,
   openBusDb,
+  pruneMessagesOlderThan,
   QUEUED_FOR_WAKE,
   replayFromCursor,
   selectQueuedForWake,
@@ -346,5 +348,150 @@ test("selectQueuedForWake ignores non-send events and other statuses for the sam
   const queued = queueForWake(db, "creator-a", { body: "the real one" });
   const rows = selectQueuedForWake(db, "creator-a");
   expect(rows.map((r) => r.id)).toEqual([queued]);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// Retention — age-horizon message prune + oldest-channel candidate window
+// ---------------------------------------------------------------------------
+
+function idsOf(db: ReturnType<typeof openBusDb>): number[] {
+  return (
+    db.prepare("SELECT id FROM messages ORDER BY id ASC").all() as {
+      id: number;
+    }[]
+  ).map((r) => r.id);
+}
+
+test("pruneMessagesOlderThan deletes rows older than the cutoff and keeps recent ones", () => {
+  const db = openBusDb(":memory:");
+  appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "old1",
+    ts: 1000,
+  });
+  appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "old2",
+    ts: 2000,
+  });
+  const recent = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "recent",
+    ts: 9000,
+  });
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(2);
+  expect(idsOf(db)).toEqual([recent]);
+  db.close();
+});
+
+test("pruneMessagesOlderThan preserves an undelivered queued_for_wake row regardless of age", () => {
+  const db = openBusDb(":memory:");
+  const qfw = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    resolved_session_id: "job-1",
+    body: "escalation",
+    ts: 100,
+    status: QUEUED_FOR_WAKE,
+  });
+  appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "old",
+    ts: 100,
+  });
+  // Both are far older than the cutoff, but only the plain row is pruned; the
+  // undelivered wake queue survives unconditionally.
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(1);
+  expect(idsOf(db)).toEqual([qfw]);
+  db.close();
+});
+
+test("pruneMessagesOlderThan ages out a delivered_after_wake row (only the undelivered queue is immune)", () => {
+  const db = openBusDb(":memory:");
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    resolved_session_id: "job-1",
+    body: "already redelivered",
+    ts: 100,
+    status: DELIVERED_AFTER_WAKE,
+  });
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(1);
+  expect(idsOf(db)).toEqual([]);
+  db.close();
+});
+
+test("pruneMessagesOlderThan honors the batch bound, draining oldest-first across calls", () => {
+  const db = openBusDb(":memory:");
+  const ids: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    ids.push(
+      appendMessage(db, {
+        namespace: "chat",
+        event: "message",
+        body: `m${i}`,
+        ts: 1000 + i,
+      }),
+    );
+  }
+  // Everything is older than the cutoff; a batch of 2 removes the 2 oldest only.
+  expect(pruneMessagesOlderThan(db, 100_000, 2)).toBe(2);
+  expect(idsOf(db)).toEqual(ids.slice(2));
+  expect(pruneMessagesOlderThan(db, 100_000, 2)).toBe(2);
+  expect(idsOf(db)).toEqual(ids.slice(4));
+  db.close();
+});
+
+test("pruneMessagesOlderThan is a no-op when nothing is older than the cutoff", () => {
+  const db = openBusDb(":memory:");
+  appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "recent",
+    ts: 9000,
+  });
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(0);
+  expect(idsOf(db)).toHaveLength(1);
+  db.close();
+});
+
+test("loadOldestChannels returns the oldest channels by last_heartbeat, bounded by the limit", () => {
+  const db = openBusDb(":memory:");
+  upsertChannel(
+    db,
+    makeChannel({
+      channel_id: "ch-newest",
+      pid: 1,
+      start_time: "s1",
+      last_heartbeat: 300,
+    }),
+  );
+  upsertChannel(
+    db,
+    makeChannel({
+      channel_id: "ch-oldest",
+      pid: 2,
+      start_time: "s2",
+      last_heartbeat: 100,
+    }),
+  );
+  upsertChannel(
+    db,
+    makeChannel({
+      channel_id: "ch-mid",
+      pid: 3,
+      start_time: "s3",
+      last_heartbeat: 200,
+    }),
+  );
+  expect(loadOldestChannels(db, 2).map((c) => c.channel_id)).toEqual([
+    "ch-oldest",
+    "ch-mid",
+  ]);
   db.close();
 });

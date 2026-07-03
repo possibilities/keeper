@@ -25,6 +25,8 @@ import type { BusResolveResult, ResolvedIdentity } from "../src/bus-identity";
 import {
   authoritativeFrom,
   backpressureDecision,
+  type ChannelLiveness,
+  channelPruneDecision,
   closeOwnsBinding,
   enrichPeerFromJobs,
   HARNESS_WALK_MAX_DEPTH,
@@ -245,13 +247,83 @@ test("takeoverVictim ignores the new channel itself (no self-takeover)", () => {
 // liveChannelsAtBoot — dead-pid drop on registry-cache rehydrate
 // ---------------------------------------------------------------------------
 
-test("liveChannelsAtBoot drops dead-pid rows and keeps live ones", () => {
+test("liveChannelsAtBoot keeps live-identity rows and drops dead / recycled ones", () => {
   const rows = [
-    makeChannel({ channel_id: "ch-live", pid: 100 }),
-    makeChannel({ channel_id: "ch-dead", pid: 200 }),
+    makeChannel({ channel_id: "ch-live", pid: 100, start_time: "st-100" }),
+    makeChannel({ channel_id: "ch-dead", pid: 200, start_time: "st-200" }),
+    makeChannel({
+      channel_id: "ch-recycled",
+      pid: 300,
+      start_time: "st-300-old",
+    }),
   ];
-  const kept = liveChannelsAtBoot(rows, (pid) => pid === 100);
+  // pid 100: alive AND start_time matches → kept. pid 200: no live process →
+  // dropped. pid 300: pid alive but the live process's start_time differs (an
+  // OS-recycled pid) → dropped, where a pid-only probe would have kept it.
+  const isLiveIdentity = (pid: number, startTime: string): boolean => {
+    if (pid === 100) return startTime === "st-100";
+    if (pid === 300) return startTime === "st-300-new";
+    return false;
+  };
+  const kept = liveChannelsAtBoot(rows, isLiveIdentity);
   expect(kept.map((r) => r.channel_id)).toEqual(["ch-live"]);
+});
+
+// ---------------------------------------------------------------------------
+// channelPruneDecision — steady-state (pid, start_time) identity retention
+// ---------------------------------------------------------------------------
+
+const DEAD: ChannelLiveness = { alive: false };
+const aliveWith = (startTime: string | null): ChannelLiveness => ({
+  alive: true,
+  startTime,
+});
+
+test("channelPruneDecision keeps a connected identity regardless of what the probe says", () => {
+  // A live socket is authoritative — even a dead-looking probe cannot prune it.
+  expect(channelPruneDecision("st", 10_000_000, 1000, true, DEAD)).toBe("keep");
+  // Protects a keeper-miss synthetic start_time a real OS probe would never match.
+  expect(
+    channelPruneDecision(
+      "synthetic",
+      10_000_000,
+      1000,
+      true,
+      aliveWith("darwin:real"),
+    ),
+  ).toBe("keep");
+});
+
+test("channelPruneDecision keeps a row younger than the grace age", () => {
+  expect(channelPruneDecision("st", 500, 1000, false, DEAD)).toBe("keep");
+});
+
+test("channelPruneDecision prunes a dead identity once past the grace age", () => {
+  expect(channelPruneDecision("st", 2000, 1000, false, DEAD)).toBe("prune");
+});
+
+test("channelPruneDecision keeps an alive identity whose start_time still matches", () => {
+  expect(
+    channelPruneDecision("darwin:x", 2000, 1000, false, aliveWith("darwin:x")),
+  ).toBe("keep");
+});
+
+test("channelPruneDecision prunes an alive-but-recycled pid (live start_time differs)", () => {
+  expect(
+    channelPruneDecision(
+      "darwin:old",
+      2000,
+      1000,
+      false,
+      aliveWith("darwin:new"),
+    ),
+  ).toBe("prune");
+});
+
+test("channelPruneDecision keeps on an inconclusive probe (never prune on a null read)", () => {
+  expect(
+    channelPruneDecision("darwin:x", 2000, 1000, false, aliveWith(null)),
+  ).toBe("keep");
 });
 
 // ---------------------------------------------------------------------------
