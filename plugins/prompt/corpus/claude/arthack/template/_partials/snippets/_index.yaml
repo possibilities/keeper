@@ -187,7 +187,30 @@ snippets:
     related:
       - commit-via-keeper-default
     path: _partials/snippets/engineering/keeper-history-forensics.md.tmpl
-    token-estimate: 474
+    token-estimate: 525
+    used-in: []
+  - name: landed-vs-complete
+    summary: keeper plan `landed <epic>` (lane merged to default) vs `complete <id>` (done AND idle) — under worktree mode complete can fire before files reach the default branch, so daisy-chains gate on landed.
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - keeper
+      - plan
+      - landed
+      - complete
+      - worktree
+      - daisy-chain
+      - merge
+    scope:
+      - any
+    phase:
+      - planning
+      - executing
+    related:
+      - escalate-inline-or-plan
+    path: _partials/snippets/engineering/landed-vs-complete.md.tmpl
+    token-estimate: 243
     used-in: []
   - name: network-service-hardening
     summary: Network listeners need IP filtering (Tailscale CGNAT + localhost) and auth; no unauthenticated endpoints.

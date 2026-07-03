@@ -11,7 +11,7 @@ When the plan spans more than one epic, how those epics EXECUTE is a cross-skill
 
 - **Parallel** (dep-free epics) → scaffold both; `keeper:autopilot mode yolo` dispatches them concurrently.
 - **Sequential** (B after A) → the `epic.depends_on_epics` edge wired in Phase 6 sequences execution under autopilot; a stricter human-gated cadence is `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate.
-- **Planning-dependent daisy-chain** (B genuinely unplannable until A lands) → arm `keeper:await landed fn-A`, then re-enter planning for B on `met`. Use `landed` (lane merged to default), not `complete`: under worktree mode a dependent lane is cut before A's finalize merge, so `complete` (done-AND-idle) can fire while A's files aren't yet on the default branch B will author against; `landed` degrades to `complete` semantics when worktree mode is off. When A is a multi-repo epic, `landed` waits for the per-repo slice B shares with A (its group merged to that repo's default) as part of ALL of A's groups landing — `landed` only fires once every group has.
+- **Planning-dependent daisy-chain** (B genuinely unplannable until A lands) → arm `keeper:await landed fn-A`, then re-enter planning for B on `met`. Gate on `landed` (lane merged to default), not `complete` — for why the two milestones diverge (worktree finalize timing, multi-repo groups, worktree-off degrade): <!-- POINTER: keeper prompt render engineering/landed-vs-complete -->.
 - **Take-over window** → `keeper:autopilot` captures `{paused, mode, armed}`, drives by hand, restores; `keeper:dispatch` fires one worker.
 
 The planning flow's default wrap-up stays quiet (Phase 8) — these shapes engage only on the human's request.
