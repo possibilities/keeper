@@ -18,6 +18,7 @@
  */
 
 import { Clerc, defineCommand } from "@clerc/core";
+import { completionsPlugin } from "@clerc/plugin-completions";
 import packageJson from "../package.json" with { type: "json" };
 
 export const SUBCOMMANDS = [
@@ -49,6 +50,7 @@ export const SUBCOMMANDS = [
   "reclaim",
   "bus",
   "statusline-sink",
+  "completions",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -224,6 +226,10 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
     summary:
       "Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf",
   },
+  completions: {
+    summary:
+      "Emit a shell completion script: `keeper completions <bash|zsh|fish>`",
+  },
 };
 
 /**
@@ -358,13 +364,127 @@ export function buildKeeperCli(deps: {
   }).command(commands);
 }
 
+/** The shells `keeper completions <shell>` generates a script for. Deliberately
+ *  a subset of the Clerc plugin's shells — powershell is unsupported. */
+export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
+export type CompletionShell = (typeof COMPLETION_SHELLS)[number];
+
+export function isCompletionShell(s: string): s is CompletionShell {
+  return (COMPLETION_SHELLS as readonly string[]).includes(s);
+}
+
+/** The hidden responder token. Generated scripts invoke `keeper complete -- <words>`
+ *  on every TAB; it is a real command path but deliberately NOT a SUBCOMMAND, so
+ *  `keeper --help --json` and the USAGE index never list it. */
+export const COMPLETION_RESPONDER = "complete";
+
+/**
+ * Build a throwaway Clerc CLI whose command tree mirrors keeper's public surface
+ * — every SUBCOMMAND plus each two-level verb registered as a `"<name> <verb>"`
+ * nested command — wired to the completions plugin. It exists ONLY to generate
+ * completion scripts and serve the hidden responder; it is never a dispatch
+ * path. That separation is deliberate: registering the verbs as nested commands
+ * (which would break `buildKeeperCli`'s residual pass-through) is safe here and
+ * is exactly what lets the responder suggest `keeper plan <verb>`. `completions`
+ * is skipped — the plugin registers that command (and the hidden `complete`)
+ * itself, so both surface as candidates without a double registration.
+ */
+export function buildCompletionCli(version: string): Clerc {
+  const commands = SUBCOMMANDS.filter((name) => name !== "completions").flatMap(
+    (name) => {
+      const parent = defineCommand({
+        name,
+        description: SUBCOMMAND_META[name].summary,
+      });
+      const verbs = (SUBCOMMAND_META[name].verbs ?? []).map((verb) =>
+        defineCommand({
+          name: `${name} ${verb}`,
+          description: `${name} ${verb}`,
+        }),
+      );
+      return [parent, ...verbs];
+    },
+  );
+  return Clerc.create({ name: "keeper", scriptName: "keeper", version })
+    .command(commands)
+    .use(completionsPlugin());
+}
+
+/** Run a completion-CLI parse with `console.log` (the plugin's sole output sink
+ *  for both scripts and candidate lines) captured, and return the emitted text
+ *  reproducing the real stdout (one trailing newline per logged line). */
+async function captureConsoleLog(run: () => Promise<unknown>): Promise<string> {
+  const original = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(
+      args.map((a) => (typeof a === "string" ? a : String(a))).join(" "),
+    );
+  };
+  try {
+    await run();
+  } finally {
+    console.log = original;
+  }
+  return lines.map((line) => `${line}\n`).join("");
+}
+
+/** Generate the framework completion script for a shell (the `keeper completions
+ *  <shell>` payload). */
+export function generateCompletionScript(
+  shell: CompletionShell,
+  version: string,
+): Promise<string> {
+  return captureConsoleLog(() =>
+    buildCompletionCli(version).parse(["completions", shell]),
+  );
+}
+
+/** Serve one completion request. `words` are the argv tokens the generated
+ *  script passes after `keeper complete --` (e.g. `["plan", ""]` for `keeper
+ *  plan <TAB>`); returns the candidate lines (`value\tdescription`, plus the
+ *  plugin's trailing directive line). */
+export function completionResponder(
+  words: string[],
+  version: string,
+): Promise<string> {
+  return captureConsoleLog(() =>
+    buildCompletionCli(version).parse([COMPLETION_RESPONDER, "--", ...words]),
+  );
+}
+
+/** The `keeper completions <shell>` handler: validate the shell against keeper's
+ *  supported set, emit the framework-generated script, exit 0. A missing/unknown
+ *  shell is an arg fault (exit 2) naming the supported shells — never a silent
+ *  empty script. */
+export async function runCompletionsCommand(
+  argv: string[],
+  io: {
+    stdout: (s: string) => void;
+    stderr: (s: string) => void;
+    exit: (code: number) => never;
+    version: string;
+  },
+): Promise<void> {
+  const shell = argv[0];
+  if (shell === undefined || !isCompletionShell(shell)) {
+    io.stderr(
+      `keeper completions: expected a shell (${COMPLETION_SHELLS.join("|")}), got ${
+        shell === undefined ? "nothing" : `'${shell}'`
+      }\n`,
+    );
+    io.exit(2);
+  }
+  io.stdout(await generateCompletionScript(shell, io.version));
+}
+
 /**
  * Pure dispatch: handles the top-level special cases (bare / unknown / --help /
- * --version) with their pinned stdout/stderr/exit contracts, then routes a known
- * subcommand through the Clerc proxy tree, which forwards the residual argv
- * verbatim to the subcommand's handler. Never returns on the special cases
- * (always calls `exit`); awaits the proxy route otherwise so the caller can
- * `await` it.
+ * --version / the hidden completion responder) with their pinned
+ * stdout/stderr/exit contracts, then routes a known subcommand through the Clerc
+ * proxy tree, which forwards the residual argv verbatim to the subcommand's
+ * handler. Never returns on the special cases (always calls `exit`); awaits the
+ * proxy route otherwise so the caller can `await` it.
  */
 export async function dispatch(
   argv: string[],
@@ -393,6 +513,18 @@ export async function dispatch(
       deps.exit(0);
     }
     deps.stdout(USAGE);
+    deps.exit(0);
+  }
+
+  // Hidden completion responder. Generated scripts invoke `keeper complete --
+  // <words>` on every TAB; it is a real command path deliberately kept OUT of
+  // SUBCOMMANDS (so it never appears in `keeper --help --json` or USAGE). Route
+  // it explicitly, before the unknown-subcommand guard, so every OTHER unknown
+  // token still errors exactly as before.
+  if (first === COMPLETION_RESPONDER) {
+    const sep = argv.indexOf("--");
+    const words = sep === -1 ? argv.slice(1) : argv.slice(sep + 1);
+    deps.stdout(await completionResponder(words, deps.version));
     deps.exit(0);
   }
 
@@ -451,6 +583,13 @@ export async function main(): Promise<void> {
     bus: async (argv) => (await import("./bus")).main(argv),
     "statusline-sink": async (argv) =>
       (await import("./statusline-sink")).main(argv),
+    completions: (argv) =>
+      runCompletionsCommand(argv, {
+        stdout: (s) => process.stdout.write(s),
+        stderr: (s) => process.stderr.write(s),
+        exit: (code) => process.exit(code),
+        version: packageJson.version,
+      }),
   };
 
   await dispatch(Bun.argv.slice(2), {
