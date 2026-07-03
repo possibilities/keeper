@@ -350,6 +350,56 @@ describe("panel prose drops the stale subagent claim", () => {
 });
 
 // ---------------------------------------------------------------------------
+// prompt skill — the batched maturity polish loop. Frontmatter grants
+// AskUserQuestion while staying slash-only + write-disallowed, and the body
+// pins both the preserved invariants and the new meter/fork/fallback contract.
+// Pure file reads — no subprocess, daemon, or git.
+// ---------------------------------------------------------------------------
+
+const PROMPT_SKILL = join(REPO, "skills", "prompt", "SKILL.md");
+
+describe("prompt skill frontmatter", () => {
+  test("name: is the bare verb prompt", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PROMPT_SKILL));
+    expect(fm.name).toBe("prompt");
+  });
+
+  test("grants AskUserQuestion in allowed-tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PROMPT_SKILL));
+    expect(fm["allowed-tools"]).toContain("AskUserQuestion");
+  });
+
+  test("stays slash-only and disallows the write tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PROMPT_SKILL));
+    expect(fm["disable-model-invocation"]).toBe("true");
+    expect(fm["disallowed-tools"]).toBe("Edit, Write, NotebookEdit, TodoWrite");
+  });
+});
+
+describe("prompt skill load-bearing literals", () => {
+  const needles = [
+    // preserved invariants
+    "PROMPT_COPY_EOF",
+    "wc -w",
+    "collision-safe fence",
+    "polarity",
+    "Polish only",
+    "Nothing persists to disk",
+    "No `TodoWrite`",
+    // batched-maturity contract
+    "disable-model-invocation: true",
+    "memo ▮▮▮▮▯▯ 4/6",
+    "re-ask the same questions as plain text",
+    "deliberate divergence",
+  ];
+  for (const needle of needles) {
+    test(`pins the literal ${JSON.stringify(needle)}`, () => {
+      expect(readFileSync(PROMPT_SKILL, "utf-8")).toContain(needle);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // work.md.tmpl — verb guard, agentId regex, tier-routed agents, spawn shape
 // ---------------------------------------------------------------------------
 
