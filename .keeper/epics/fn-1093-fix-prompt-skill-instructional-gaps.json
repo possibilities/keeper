@@ -7,7 +7,7 @@
     "fn-1090-batched-maturity-prompt-polish-loop"
   ],
   "id": "fn-1093-fix-prompt-skill-instructional-gaps",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-03T02:52:10.999000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T02:52:09.257000Z"
+  "updated_at": "2026-07-03T02:52:10.999000Z"
 }
