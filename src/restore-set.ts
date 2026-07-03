@@ -772,10 +772,27 @@ export function summarizeTopologyGenerations(
 }
 
 /**
+ * Public read: every observed tmux generation enriched with the restore
+ * candidates its newest attributed snapshot yields (summary + candidates),
+ * newest-first. The SAME enrichment {@link summarizeTopologyGenerations} and
+ * {@link deriveLastGenerationSetFromTopology} read — exposed WHOLE so a consumer
+ * can target ONE generation off the same read the list view uses (the
+ * `keeper tabs restore` numbered picker and its `--generation <id>` flag both
+ * resolve a specific generation's candidates from this list). Reads only
+ * `events` + `jobs` off the read-only connection (daemon-down OK); never throws.
+ */
+export function enrichedTopologyGenerations(
+  db: Database,
+  options: DeriveFromTopologyOptions,
+): EnrichedGeneration[] {
+  return loadEnrichedGenerations(db, options.currentGenerationId);
+}
+
+/**
  * A generation summary paired with the restore candidates its newest attributed
  * snapshot yields — the shared enrichment behind the list view and the auto-pick.
  */
-interface EnrichedGeneration {
+export interface EnrichedGeneration {
   summary: GenerationSummary;
   candidates: RestoreCandidate[];
 }

@@ -86,7 +86,7 @@ imperative guardrails only.
   watchdog's capped MAIN boot-seed re-runs before it escalates to `fatalExit`, and the serve-liveness
   watchdog's bounded real-read socket probes that `fatalExit` a wedged serve path, NAMING which
   socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
-- **`restore-agents --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
+- **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract
 
