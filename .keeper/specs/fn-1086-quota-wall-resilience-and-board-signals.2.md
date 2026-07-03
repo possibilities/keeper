@@ -33,5 +33,5 @@ Seed the observed event sequence in a fold test; assert the emitted delta stream
 - [ ] Root cause documented in the Done summary (ordering bug vs inherent transient)
 
 ## Done summary
-
+Root cause: inherent transient, not a re-fold ordering bug. worker_phase=done races ahead of the worker session going idle, so readiness correctly re-asserts running:* on each post-done liveness blip then clears to completed; per-event fold commits expose the oscillation and the two-window coalescing emits it as completed->running->completed (close-row running<->blocked is downstream). Fix: trailing flap-settle debounce at the watch-delta emit (createDeltaEmitter) that emits only the NET change vs the last-emitted board, collapsing same-window round-trips while settled changes and genuine rescinds still emit.
 ## Evidence
