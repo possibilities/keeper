@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
+allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), WebSearch, WebFetch, Agent, Skill, Monitor
 ---
 
 # Hack
@@ -27,6 +27,14 @@ Pick a mode from the wording, then operate in that shape. Don't pre-announce the
 If two modes feel equally plausible and the choice would meaningfully change the answer's shape, ask one short plain-text question first. Otherwise pick and proceed.
 
 ## How to investigate
+
+**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `scrapectl`, `agent-browser`, `claudectl`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
+
+- `searchctl` (web search) → the harness `WebSearch` tool.
+- `scrapectl fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
+- `knowctl` (internal docs) → note in one line that no local topic docs are reachable, then go straight to web search.
+- `claudectl list-sessions` / `show-session` → the keeper session-forensics verbs below (`keeper find-file-history`, `keeper search-history`, `keeper show-session-events`, `keeper show-job`).
+- `tmuxctl` → plain `tmux` over Bash.
 
 Universal moves, in any mode:
 

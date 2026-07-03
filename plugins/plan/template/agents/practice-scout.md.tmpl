@@ -23,7 +23,7 @@ You receive a feature/change request. Find what the community recommends — NOT
    - Key libraries involved
 
 2. **Search for current guidance**
-   - Use searchctl with specific queries:
+   - Search the web with specific queries (searchctl if present, else the `WebSearch` tool — see Research Tools):
      - `"[framework] [feature] best practices {{ shell("date +%Y") }}"` or the prior year
      - `"[feature] common mistakes [framework]"`
      - `"[feature] security considerations"`
@@ -45,6 +45,12 @@ You receive a feature/change request. Find what the community recommends — NOT
 
 ## Research Tools
 
+**These arthack CLIs are optional — degrade, don't fail.** When one isn't on PATH, use the harness-native fallback instead of blocking:
+
+- `searchctl` → the `WebSearch` tool.
+- `scrapectl fetch-markdown` → the `WebFetch` tool (static pages).
+- `knowctl` → skip the internal-docs pass, note there are no local topic docs, and go straight to web search.
+
 ### searchctl (web search)
 
 Use searchctl for all web searches. Available subcommands:
@@ -60,11 +66,11 @@ Use scrapectl to fetch and read web pages:
 
 ### knowctl (internal knowledge)
 
-{{ shell("knowctl --agent-teaser") }}
+{{ shell("command -v knowctl >/dev/null 2>&1 && knowctl --agent-teaser || true") }}
 
-{{ shell("knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | wc -l | tr -d ' '") }} topics: {{ shell("knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | paste -sd ',' - | sed 's/,/, /g'") }}
+{{ shell("command -v knowctl >/dev/null 2>&1 && knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | wc -l | tr -d ' ' | sed 's/$/ topics:/' || true") }} {{ shell("command -v knowctl >/dev/null 2>&1 && knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | paste -sd ',' - | sed 's/,/, /g' || true") }}
 
-**knowctl first.** When the subject names Claude Code, Claude plugins/skills/agents/hooks, MCP, the Anthropic API, or any tool that has a knowctl topic (`knowctl list-topics`), read the knowctl docs FIRST and reserve web search for what they do not cover. When no topic matches the subject, note that in one line and proceed straight to web search.
+**knowctl first.** When knowctl is on PATH and the subject names Claude Code, Claude plugins/skills/agents/hooks, MCP, the Anthropic API, or any tool that has a knowctl topic (`knowctl list-topics`), read the knowctl docs FIRST and reserve web search for what they do not cover. When knowctl is absent or no topic matches the subject, note that in one line and proceed straight to web search.
 
 ## GitHub Code Search
 

@@ -27,7 +27,7 @@ The human said "work", "/work", or passed an existing plan task id to run. Accep
 
 ## Phase 1 — Claim the task
 
-**Shared-tree principle (read first):** This repo runs concurrent agents and the human's in-progress work in parallel — at any moment the working tree may carry uncommitted changes that have nothing to do with this task. Any file you didn't write through this session belongs to someone else: never auto-stash it, never classify it as in-/out-of-scope for the worker, never commit it. Authoritative attribution comes from `keeper session-state`'s `session_files` field (subagent writes share the parent session_id in hookctl's tracker, so the orchestrator's session_files already covers worker output) — anything in `status_porcelain` but not in `session_files` is someone else's territory.
+**Shared-tree principle (read first):** This repo runs concurrent agents and the human's in-progress work in parallel — at any moment the working tree may carry uncommitted changes that have nothing to do with this task. Any file you didn't write through this session belongs to someone else: never auto-stash it, never classify it as in-/out-of-scope for the worker, never commit it. Authoritative attribution comes from `keeper session-state`'s `session_files` field (subagent writes share the parent session_id, so the orchestrator's session_files already covers worker output) — anything in `status_porcelain` but not in `session_files` is someone else's territory.
 
 One call asserts invariants, claims the task (`todo` → `in_progress`), and returns the full worker briefing — no `detect`, no separate `show`/`cat`, no `cd`. `claim` resolves the owning project cwd-agnostically (scans configured `roots`), so this works from any directory:
 
