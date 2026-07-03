@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T19:55:35.489000Z",
+  "depends_on": [
+    "fn-1103-multi-harness-agent-maturity.2",
+    "fn-1103-multi-harness-agent-maturity.3",
+    "fn-1103-multi-harness-agent-maturity.4"
+  ],
+  "epic": "fn-1103-multi-harness-agent-maturity",
+  "id": "fn-1103-multi-harness-agent-maturity.8",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Hermes hook shim and seeder",
+  "updated_at": "2026-07-03T19:55:35.489000Z"
+}
