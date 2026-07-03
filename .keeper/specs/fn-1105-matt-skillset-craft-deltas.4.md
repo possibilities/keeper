@@ -35,5 +35,5 @@ No generated artifacts touched. Sanity: the skill still parses (frontmatter inta
 - [ ] No orphaned references: every pointer target exists; no content was deleted without a surviving authoritative home
 
 ## Done summary
-
+Split plan/SKILL.md operator detail (multi-epic orchestration + blocked-worker flow) into references/operator-orchestration.md behind condition-worded pointers; deduped the one-task/decomposition-bias repetition to one authoritative statement; added the two-load frame and Leitwort-as-compression levers to skill-authoring.md; and gave Phase 2d the recommended-answer-per-question, no-cap, no-auto-proceed discipline.
 ## Evidence
