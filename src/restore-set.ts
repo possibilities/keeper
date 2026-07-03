@@ -265,7 +265,10 @@ export interface GenerationSummary {
  * presents the set as-is. Total + deterministic for legacy/partial rows: a
  * non-finite `created_at` coerces to `0` (never NaN, which poisons a sort).
  */
-function compareCandidates(a: RestoreCandidate, b: RestoreCandidate): number {
+export function compareCandidates(
+  a: RestoreCandidate,
+  b: RestoreCandidate,
+): number {
   const ai = a.window_index;
   const bi = b.window_index;
   const aKnown = typeof ai === "number" && Number.isFinite(ai);
