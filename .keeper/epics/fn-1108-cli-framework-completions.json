@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T21:56:43.016000Z",
+  "depends_on_epics": [
+    "fn-1102-keeper-tabs-browser-grade-restore"
+  ],
+  "id": "fn-1108-cli-framework-completions",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "CLI framework completions",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T21:56:43.016000Z"
+}
