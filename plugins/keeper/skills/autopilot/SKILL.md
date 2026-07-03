@@ -240,6 +240,13 @@ live past a daemon bounce is running blind.
 2. Report paused/playing, mode, armed epics, and any in-flight or stuck
    dispatches.
 
+**Resolver attempt (read).** A sticky `worktree-merge-conflict` `close` may show an
+autonomous `resolve::<epic>` worker in-flight — the daemon's one-shot merge-resolver
+(dispatched only while playing; see Guardrails). It is a first-class dispatch key, so
+reaps and the instant-death breaker apply to it. It fires ONCE per stuck close: to make
+it re-attempt, clear the close sticky with `keeper autopilot retry close::<epic>` (that
+re-arms the dispatch-once marker) — there is no `retry resolve::`.
+
 **Quota-wall signal.** `.data.needs_human.instant_death_wall` counts the distinct
 keys currently tripped by the instant-death breaker. `>= 2` (multiple keys dying
 instantly in a window) is the likely **account session/quota wall** — repeated
