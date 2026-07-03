@@ -29,5 +29,5 @@ The harness script is the proof artifact; keep it re-runnable and isolated.
 - [ ] Operator docs updated (conflict flow + key + reasons)
 
 ## Done summary
-
+Added scripts/resolver-conflict-harness.ts: a re-runnable, isolated manual-tier proof (real git + sandboxed keeper projection, 27 checks) of both merge-resolver branches — mechanically-clear resolves keeping both intents then retry clears the sticky so the close proceeds; schema-shaped stamps BLOCKED with the unstick sentence, sticky + human escalation unchanged. Updated operator docs: autopilot SKILL.md resolver-attempt read note, composition-map resolve:: launch producer, CLAUDE.md sibling resolver_dispatched_at invariant.
 ## Evidence
