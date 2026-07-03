@@ -60,6 +60,12 @@ inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
 test.
 
+The daemon's own **merge-resolver dispatch** (`resolve::<epic>`, launched by the
+resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME
+`buildKeeperAgentLaunchArgv` path — it is another launch producer of the
+autopilot/dispatch-worker channel, inheriting the identical additive base set, never a
+separate isolation channel.
+
 ## The worker isolation gate (config-flagged, default OFF)
 
 The `worker_plugin_isolation` key in `~/.config/keeper/plugins.yaml` (parsed by

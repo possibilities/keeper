@@ -74,6 +74,7 @@ import type {
   MergeEscalationAttemptedPayload,
   PermissionPromptKind,
   ResolvedEpicDep,
+  ResolverDispatchAttemptedPayload,
   SessionTelemetryPayload,
   SubagentDisposition,
 } from "./types";
@@ -3999,8 +4000,8 @@ function foldDispatchFailed(db: Database, event: Event): void {
   db.run(
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-       merge_escalated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+       merge_escalated_at, resolver_dispatched_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
@@ -4008,10 +4009,11 @@ function foldDispatchFailed(db: Database, event: Event): void {
        last_event_id = excluded.last_event_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
        -- view is the FIRST observation of this failure, never the latest.
-       -- merge_escalated_at preserved through UPSERT (excluded from the SET
-       -- clause, same as created_at): a re-failure of an uncleared row must
-       -- NOT reset the escalate-once marker, or the daemon merge-escalation
-       -- sweep would re-notify the planner. The marker re-arms only on a
+       -- merge_escalated_at + resolver_dispatched_at preserved through UPSERT
+       -- (excluded from the SET clause, same as created_at): a re-failure of an
+       -- uncleared row must NOT reset either once-marker, or the daemon
+       -- merge-escalation sweep would re-notify the planner and the resolver
+       -- sweep would re-dispatch the resolver. Both markers re-arm only on a
        -- DispatchCleared (retry_dispatch) DELETE dropping the row entirely.
        updated_at = excluded.updated_at`,
     [
@@ -4637,6 +4639,67 @@ function foldMergeEscalationAttempted(db: Database, event: Event): void {
     `UPDATE dispatch_failures
         SET merge_escalated_at = ?
       WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NULL`,
+    [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `ResolverDispatchAttempted` event payload. Returns null on any
+ * structural miss ({@link foldResolverDispatchAttempted} folds null to a safe
+ * no-op); NEVER throws. Strict: `id` / `outcome` non-empty strings.
+ */
+function extractResolverDispatchAttemptedPayload(
+  event: Event,
+): ResolverDispatchAttemptedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<ResolverDispatchAttemptedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse ResolverDispatchAttempted payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `ResolverDispatchAttempted` event — the resolver-dispatch
+ * once-latch, sibling to {@link foldMergeEscalationAttempted}. For the TERMINAL
+ * `dispatched` outcome (the daemon sweep launched the `resolve::<epic>` worker) it
+ * stamps `resolver_dispatched_at = event.ts` on the sticky `worktree-merge-conflict`
+ * close row, gated `resolver_dispatched_at IS NULL` so the first observation wins and
+ * a re-fold reproduces it byte-identically. Every other outcome (`dispatch_failed` /
+ * unknown) is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts on the next tick. The branch reads ONLY the payload `outcome` +
+ * `event.ts` (no wall-clock/fs/liveness), so re-fold stays byte-deterministic. The
+ * UPDATE no-ops on a missing row (the clear-before-mint race) and NEVER clears the row
+ * — only `DispatchCleared` (`retry_dispatch`) does, which re-arms the marker at NULL.
+ * Independent of `merge_escalated_at`: a row can be human-escalated, resolver-
+ * dispatched, both, or neither. Malformed/missing payload → safe no-op.
+ */
+function foldResolverDispatchAttempted(db: Database, event: Event): void {
+  const payload = extractResolverDispatchAttemptedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "dispatched") {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET resolver_dispatched_at = ?
+      WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL`,
     [event.ts, payload.id],
   );
 }
@@ -8997,6 +9060,8 @@ export function applyEvent(
       foldBlockEscalationAttempted(db, event);
     } else if (event.hook_event === "MergeEscalationAttempted") {
       foldMergeEscalationAttempted(db, event);
+    } else if (event.hook_event === "ResolverDispatchAttempted") {
+      foldResolverDispatchAttempted(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {

@@ -624,6 +624,7 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
     "created_at",
     "updated_at",
     "merge_escalated_at",
+    "resolver_dispatched_at",
   ],
   pk: "verb",
   liveKeyColumns: ["verb", "id"],

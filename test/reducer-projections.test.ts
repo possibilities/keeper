@@ -1253,6 +1253,197 @@ test("MergeEscalationAttempted with a malformed payload is a safe no-op (cursor 
   expect(getMergeEscalatedAt("close", "fn-mc-mal")).toBeNull();
 });
 
+// ---------------------------------------------------------------------------
+// Schema v106 (fn-1088.1) — `ResolverDispatchAttempted` folds the dispatch-once
+// `dispatch_failures.resolver_dispatched_at` once-marker on a sticky
+// `worktree-merge-conflict` CLOSE row. The TERMINAL `dispatched` outcome stamps
+// `resolver_dispatched_at = event.ts` (gated IS NULL); a `dispatch_failed` / unknown
+// outcome leaves it NULL (re-sweepable). The marker PERSISTS across a `DispatchFailed`
+// re-UPSERT of an uncleared row and is dropped with the row on `DispatchCleared`.
+// INDEPENDENT of `merge_escalated_at`. Pure fold (event.ts + persisted row only).
+// ---------------------------------------------------------------------------
+
+function resolverDispatchEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "ResolverDispatchAttempted",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome }),
+  });
+}
+
+function getResolverDispatchedAt(verb: string, id: string): number | null {
+  const row = db
+    .query(
+      "SELECT resolver_dispatched_at FROM dispatch_failures WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { resolver_dispatched_at: number | null } | null;
+  return row?.resolver_dispatched_at ?? null;
+}
+
+test("ResolverDispatchAttempted stamps resolver_dispatched_at = event.ts on the terminal dispatched outcome", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-1",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-1")).toBeNull();
+
+  const dispatchedId = resolverDispatchEvent("fn-rd-1", "dispatched", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getResolverDispatchedAt("close", "fn-rd-1")).toBe(1750);
+  expect(getCursor()).toBe(dispatchedId);
+});
+
+test("ResolverDispatchAttempted with a dispatch_failed / unknown outcome leaves resolver_dispatched_at NULL (re-sweepable)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-df",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  resolverDispatchEvent("fn-rd-df", "dispatch_failed", 1750);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-df")).toBeNull();
+
+  // An unknown / unexpected outcome is non-terminal too (terminal is a strict
+  // allow-list: only a CONFIRMED launch stamps the once-marker).
+  resolverDispatchEvent("fn-rd-df", "weird_outcome", 1760);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-df")).toBeNull();
+
+  // A later terminal retry over the same still-uncleared row stamps it.
+  resolverDispatchEvent("fn-rd-df", "dispatched", 1770);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-df")).toBe(1770);
+});
+
+test("ResolverDispatchAttempted only stamps a CLOSE-verb row (a same-id work failure is untouched)", () => {
+  dispatchFailedEvent("work", "fn-rd-verb", "launch_failed", "/r", 1700);
+  resolverDispatchEvent("fn-rd-verb", "dispatched", 1750);
+  drainAll();
+  expect(getResolverDispatchedAt("work", "fn-rd-verb")).toBeNull();
+});
+
+test("ResolverDispatchAttempted on a missing close row is a safe no-op (cursor still advances)", () => {
+  const id = resolverDispatchEvent("fn-rd-gone", "dispatched", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getDispatchFailure("close", "fn-rd-gone")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("resolver_dispatched_at is INDEPENDENT of merge_escalated_at (both latch on the same sticky)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-ind",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  // Human escalation stamps merge_escalated_at but NOT resolver_dispatched_at.
+  mergeEscalationEvent("fn-rd-ind", "sent", 1750);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-rd-ind")).toBe(1750);
+  expect(getResolverDispatchedAt("close", "fn-rd-ind")).toBeNull();
+
+  // Resolver dispatch stamps resolver_dispatched_at but leaves merge_escalated_at.
+  resolverDispatchEvent("fn-rd-ind", "dispatched", 1760);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-rd-ind")).toBe(1750);
+  expect(getResolverDispatchedAt("close", "fn-rd-ind")).toBe(1760);
+});
+
+test("a DispatchFailed re-UPSERT of an uncleared close row preserves resolver_dispatched_at (dispatch-once)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-pres",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  resolverDispatchEvent("fn-rd-pres", "dispatched", 1750);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-pres")).toBe(1750);
+
+  // A re-failure of the SAME uncleared close row must NOT reset the dispatch-once
+  // marker — else the resolver sweep would re-dispatch.
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-pres",
+    "worktree-merge-conflict",
+    "/r2",
+    1800,
+  );
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-pres")).toBe(1750);
+});
+
+test("DispatchCleared drops resolver_dispatched_at with the close row so a fresh conflict re-arms at NULL", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  resolverDispatchEvent("fn-rd-clr", "dispatched", 1750);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-clr")).toBe(1750);
+
+  dispatchClearedEvent("close", "fn-rd-clr");
+  drainAll();
+  expect(getDispatchFailure("close", "fn-rd-clr")).toBeNull();
+
+  // A fresh conflict on the same key re-arms the marker at the column default.
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1800,
+  );
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-rd-clr")).toBeNull();
+});
+
+test("ResolverDispatchAttempted with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-rd-mal",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ outcome: "dispatched" }), // missing id
+    JSON.stringify({ id: "", outcome: "dispatched" }), // empty id
+    JSON.stringify({ id: "fn-rd-mal" }), // missing outcome
+    JSON.stringify({ id: "fn-rd-mal", outcome: "" }), // empty outcome
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "ResolverDispatchAttempted",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  expect(getResolverDispatchedAt("close", "fn-rd-mal")).toBeNull();
+});
+
 test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {
   const count = (
     db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {

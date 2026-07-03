@@ -35,6 +35,7 @@ import {
   buildBlockEscalationBody,
   buildMergeEscalationBody,
   buildPendingDispatchSweepRecords,
+  buildResolverBrief,
   checkKeeperAgentPresence,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
@@ -55,13 +56,17 @@ import {
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingMergeEscalation,
+  type PendingResolverDispatch,
   type PlannerNotifyResult,
   parseBlockedCategory,
   prewarmWatcherAddon,
   pruneRecoveredDeadLetters,
+  type ResolverDispatchOutcome,
+  type ResolverDispatchSweepDeps,
   recoverOneDeadLetter,
   runBlockEscalationSweep,
   runMergeEscalationSweep,
+  runResolverDispatchSweep,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
   SERVE_PROBE_STUCK_THRESHOLD_MS,
   SERVE_WATCHDOG_BOOT_GRACE_MS,
@@ -69,6 +74,7 @@ import {
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
   selectPendingMergeEscalations,
+  selectPendingResolverDispatches,
   serializeSessionTelemetry,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
@@ -3036,7 +3042,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // rewind: an existing DB gains the empty table and folds forward, and a
   // from-scratch re-fold replays the historical terminal events into it
   // byte-identical, a deterministic-replayed projection like `dispatch_never_bound`).
-  expect(SCHEMA_VERSION).toBe(105);
+  // And to 106 via fn-1088 task .1 (appending the nullable
+  // `dispatch_failures.resolver_dispatched_at` once-marker — the merge-resolver
+  // dispatch latch, sibling of `merge_escalated_at`; an additive ALTER, NO cursor
+  // rewind: a pre-v106 stream carries no `ResolverDispatchAttempted` event, so a
+  // from-scratch re-fold leaves it NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(106);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -4424,6 +4435,308 @@ test("runMergeEscalationSweep: a throwing selectPending degrades to a no-op (fai
   await runMergeEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(notifies).toEqual([]);
+});
+
+// ---- selectPendingResolverDispatches (the resolver working-set read) ---------
+// fn-1088.1 — the resolver-dispatch sweep's selector, gated on the INDEPENDENT
+// `resolver_dispatched_at IS NULL` latch (sibling of `merge_escalated_at`).
+
+function seedResolverFailureRow(
+  db: ReturnType<typeof openDb>["db"],
+  args: {
+    verb: string;
+    id: string;
+    reason: string;
+    dir?: string | null;
+    mergeEscalatedAt?: number | null;
+    resolverDispatchedAt?: number | null;
+  },
+): void {
+  db.run(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
+       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
+    [
+      args.verb,
+      args.id,
+      args.reason,
+      args.dir ?? null,
+      args.mergeEscalatedAt ?? null,
+      args.resolverDispatchedAt ?? null,
+    ],
+  );
+}
+
+test("selectPendingResolverDispatches: picks only close rows with an exact worktree-merge-conflict token and a NULL resolver latch", () => {
+  const { db } = freshMemDb();
+  // Dispatchable: a sticky close merge conflict, no resolver yet.
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-1-foo",
+    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+    dir: "/repo/root",
+  });
+  // Already merge-ESCALATED (human notified) but resolver latch still NULL → STILL
+  // dispatchable: the two latches are independent consumers of the same sticky.
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-2-escalated",
+    reason: mergeConflictReason(
+      "fn-2-escalated.1",
+      "keeper/epic/fn-2-escalated",
+    ),
+    dir: "/repo/root",
+    mergeEscalatedAt: 12345,
+  });
+  // Already resolver-dispatched (latch set) → dropped (dispatch-once).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-3-done",
+    reason: mergeConflictReason("fn-3-done.1", "keeper/epic/fn-3-done"),
+    dir: "/repo/root",
+    resolverDispatchedAt: 999,
+  });
+  // Excluded reasons on a close row — a `worktree-merge` prefix must NOT match.
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-4-lock",
+    reason: "worktree-merge-lock-timeout: could not acquire the lock",
+  });
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-5-nonff",
+    reason: "worktree-finalize-non-fast-forward: origin is ahead",
+  });
+  // A WORK row carrying the token — wrong verb, dropped.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-6-foo.1",
+    reason: mergeConflictReason("fn-6-foo.1", "keeper/epic/fn-6-foo"),
+  });
+
+  const rows = selectPendingResolverDispatches(db);
+  expect(rows).toEqual([
+    {
+      id: "fn-1-foo",
+      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+      dir: "/repo/root",
+    },
+    {
+      id: "fn-2-escalated",
+      reason: mergeConflictReason(
+        "fn-2-escalated.1",
+        "keeper/epic/fn-2-escalated",
+      ),
+      dir: "/repo/root",
+    },
+  ]);
+  db.close();
+});
+
+test("selectPendingResolverDispatches: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingResolverDispatches(db)).toEqual([]);
+  db.close();
+});
+
+// ---- buildResolverBrief (the autonomous resolver worker prompt) --------------
+
+test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on the clear path, BLOCKED + unstick on everything else", () => {
+  const repoDir = "/Users/me/code/foo";
+  const base = "keeper/epic/fn-9-foo";
+  const source = "fn-9-foo.2";
+  const brief = buildResolverBrief({
+    epicId: "fn-9-foo",
+    reason: mergeConflictReason(source, base),
+    repoDir,
+  });
+  // Recreate the merge in the base worktree with --no-ff (never squash/rebase).
+  expect(brief).toContain(worktreePathFor(repoDir, base));
+  expect(brief).toContain(`git merge --no-ff ${source}`);
+  expect(brief).toContain("--squash");
+  expect(brief).toContain("rebase");
+  // Pause-first — the recover sweep races the manual merge — before the merge recipe.
+  expect(brief).toContain("keeper autopilot pause");
+  expect(brief.indexOf("keeper autopilot pause")).toBeLessThan(
+    brief.indexOf(`git merge --no-ff ${source}`),
+  );
+  // The CLEAR path: BOTH intents, run the epic tests, commit, retry the close.
+  expect(brief).toContain("BOTH");
+  expect(brief).toContain("tests");
+  expect(brief).toContain("keeper autopilot retry close::fn-9-foo");
+  expect(brief).toContain("keeper autopilot play");
+  // The guardrail classes named VERBATIM + unsure-defaults-to-BLOCKED.
+  expect(brief).toContain("state machine");
+  expect(brief).toContain("schema");
+  expect(brief).toContain("security");
+  expect(brief).toContain("transaction-boundary");
+  expect(brief).toContain("BLOCKED");
+  expect(brief).toContain("UNSURE");
+  // The literal unstick sentence.
+  expect(brief).toContain("to proceed, tell me exactly:");
+  // The NOT-clear path aborts to a clean lane (never a half-merge).
+  expect(brief).toContain("git merge --abort");
+  // The free-text reason rides as a body line.
+  expect(brief).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
+});
+
+test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (never throws)", () => {
+  const brief = buildResolverBrief({
+    epicId: "fn-9-foo",
+    reason: "worktree-merge-conflict: something unparseable happened",
+    repoDir: "/Users/me/code/foo",
+  });
+  expect(brief).toContain("close::fn-9-foo");
+  expect(brief).toContain("--no-ff");
+  expect(brief).toContain("keeper autopilot pause");
+  expect(brief).toContain("BLOCKED");
+  expect(brief).toContain("to proceed, tell me exactly:");
+});
+
+test("buildResolverBrief: a null/empty repoDir degrades to the manual body (never throws)", () => {
+  const brief = buildResolverBrief({
+    epicId: "fn-9-foo",
+    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
+    repoDir: null,
+  });
+  expect(brief).toContain("close::fn-9-foo");
+  expect(brief).toContain("--no-ff");
+  expect(brief).toContain("keeper autopilot pause");
+  expect(brief).toContain("BLOCKED");
+});
+
+// ---- runResolverDispatchSweep (orchestration core, injected deps) ------------
+
+interface ResolverMintCall {
+  id: string;
+  outcome: ResolverDispatchOutcome;
+}
+
+function fakeResolverSweepDeps(opts: {
+  pending: PendingResolverDispatch[];
+  stillPending?: (id: string) => boolean;
+  dispatch?: (row: PendingResolverDispatch) => Promise<ResolverDispatchOutcome>;
+  selectThrows?: boolean;
+}): {
+  deps: ResolverDispatchSweepDeps;
+  mints: ResolverMintCall[];
+  dispatches: PendingResolverDispatch[];
+} {
+  const mints: ResolverMintCall[] = [];
+  const dispatches: PendingResolverDispatch[] = [];
+  const deps: ResolverDispatchSweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    dispatchResolver: async (row) => {
+      dispatches.push(row);
+      return (await opts.dispatch?.(row)) ?? "dispatched";
+    },
+    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
+  };
+  return { deps, mints, dispatches };
+}
+
+test("runResolverDispatchSweep: a dispatchable close launches ONE resolver and mints attempted{dispatched}", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+  });
+  await runResolverDispatchSweep(deps);
+  expect(dispatches.length).toBe(1);
+  expect(dispatches[0]?.id).toBe("fn-1-foo");
+  // The terminal `dispatched` outcome stamps the once-marker (via the fold); NEVER a
+  // DispatchCleared (the sweep has no clear path — only retry_dispatch clears).
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
+});
+
+test("runResolverDispatchSweep: a non-token reason in the pending set is NOT dispatched (defense-in-depth gate)", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: "worktree-merge-lock-timeout: could not acquire the lock",
+        dir: "/repo/root",
+      },
+    ],
+  });
+  await runResolverDispatchSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runResolverDispatchSweep: a dispatch_failed outcome is recorded and leaves the latch unset (re-sweepable)", async () => {
+  const { deps, mints } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    dispatch: async () => "dispatch_failed",
+  });
+  await runResolverDispatchSweep(deps);
+  // dispatch_failed mints attempted{dispatch_failed} — the fold no-ops on it, so the
+  // latch stays NULL and the next sweep retries.
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
+});
+
+test("runResolverDispatchSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
+  const { deps, mints } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    dispatch: async () => {
+      throw new Error("boom");
+    },
+  });
+  await runResolverDispatchSweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
+});
+
+test("runResolverDispatchSweep: a row cleared mid-sweep (stillPending false) is skipped — no dispatch, no mint", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    stillPending: () => false,
+  });
+  await runResolverDispatchSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runResolverDispatchSweep: an empty pending set is a no-op", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({ pending: [] });
+  await runResolverDispatchSweep(deps);
+  expect(mints).toEqual([]);
+  expect(dispatches).toEqual([]);
+});
+
+test("runResolverDispatchSweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({
+    pending: [],
+    selectThrows: true,
+  });
+  await runResolverDispatchSweep(deps);
+  expect(mints).toEqual([]);
+  expect(dispatches).toEqual([]);
 });
 
 // fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is

@@ -23,15 +23,19 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 
 /**
  * Anchored spawn-name → `{verb, ref}` match:
- * `{plan|work|close}::fn-\d+-[a-z0-9-]+(.\d+)?`. The verb whitelist is locked —
- * any other verb returns `(null, null)`; adding one is a deliberate edit here.
- * The `$` anchor rejects extra `::` segments so a typo never partial-matches
- * and lands wrong data in the projection. The ref matches both epic and task
- * refs (the optional dot-suffix is the task-number tail); its slug class is
- * narrower than the slash-command class (kebab-only, no `_`/`:`) so a malformed
- * ref rejects rather than masking the error.
+ * `{plan|work|close|resolve}::fn-\d+-[a-z0-9-]+(.\d+)?`. The verb whitelist is
+ * locked — any other verb returns `(null, null)`; adding one is a deliberate edit
+ * here. `resolve` is the daemon merge-resolver dispatch (`resolve::<epic>`): folding
+ * its `plan_verb`/`plan_ref` makes the resolver a first-class dispatch key, so the
+ * jobs-keyed reaps + instant-death breaker apply to it like any work/close worker.
+ * The `$` anchor rejects extra `::` segments so a typo never partial-matches and
+ * lands wrong data in the projection. The ref matches both epic and task refs (the
+ * optional dot-suffix is the task-number tail); its slug class is narrower than the
+ * slash-command class (kebab-only, no `_`/`:`) so a malformed ref rejects rather than
+ * masking the error.
  */
-const SPAWN_VERB_REF_RE = /^(plan|work|close)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
+const SPAWN_VERB_REF_RE =
+  /^(plan|work|close|resolve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
 
 /**
  * Anchored `handoff::<slug>` spawn-name match — the SEPARATE spawn-name class for
