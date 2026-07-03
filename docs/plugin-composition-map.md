@@ -22,14 +22,16 @@ Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
 - **cwd `--plugin-dir .`** when the cwd is itself a plugin (`plugins.ts:70-75`).
 - **`plugin_dirs`** — hard deps, fail-loud on a missing manifest
   (`plugins.ts:78-90`): `~/code/keeper/plugins/keeper`, `~/code/keeper/plugins/plan`.
-- **`plugin_scan_dirs`** — best-effort parents whose manifest-bearing children are
-  each added (`plugins.ts:93-110`): `~/code/arthack/apps`, `~/code/arthack/claude`.
-  The manifest-bearing children today are `arthack`, `internal`, `lsp` (under
-  `~/code/arthack/claude`).
+- **`plugin_scan_dirs`** (optional, opt-in) — best-effort parents whose
+  manifest-bearing children are each added (`plugins.ts:93-110`). The
+  `install.sh`-written default carries NONE (keeper-only, no third-party sources); a
+  machine opts a set in by appending its parent — e.g. arthack via
+  `~/code/arthack/apps`, `~/code/arthack/claude`, whose manifest-bearing children are
+  `arthack`, `internal`, `lsp`.
 
-So by default every claude session — interactive OR worker — inherits keeper +
-plan + the arthack third-party set (see the gate below to isolate workers). The
-**arthack** plugin
+So a fresh machine inherits keeper + plan only; a machine that has opted arthack in
+inherits keeper + plan + the scanned arthack third-party set (see the gate below to
+isolate workers from it). The **arthack** plugin
 (`~/code/arthack/claude/arthack/hooks/hooks.json`) is the notable one: a
 four-dispatcher hook set —
 
@@ -90,6 +92,15 @@ flag, so it is never gated — "interactive unaffected" holds by construction.
 today (scan set intact), ON strips only the scanned child while keeper + plan
 survive, and the worker argv always carries the `--dangerously-skip-permissions`
 marker the seam keys on.
+
+**Opt-in + proof.** arthack is an optional plugin: a fresh machine's default
+`plugins.yaml` is keeper-only, and you opt a third-party set in by appending its
+parent to `plugin_scan_dirs`. Enable worker isolation from that set with
+`worker_plugin_isolation: strip-scan-dirs`. `bun scripts/clean-machine-check.ts`
+proves the whole fresh-machine path end to end — the installer default is
+arthack-free, prompt renders resolve from the in-repo vendored corpus, the worker
+argv carries the permission posture, and a gate-ON worker resolves no arthack
+checkout while an interactive launch is unaffected.
 
 ## Logged-vs-executed skew (read this before mining events)
 

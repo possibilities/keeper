@@ -66,10 +66,18 @@ path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`);
 owned by you and mode `644` or macOS silently ignores it. Optional roots and runtimes live in
 `~/.config/keeper/config.yaml`.
 
-`keeper agent` loads keeper's two plugins (`plugins/keeper`, `plugins/plan`) from
-`~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine and leaves untouched when
-a file or symlink is already there. Do NOT add a `~/.claude/plugins/keeper` symlink — it double-registers
-the hook (two `events` rows per invocation).
+`keeper agent` loads keeper's own two plugins (`plugins/keeper`, `plugins/plan`) from
+`~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine (keeper-only, no
+third-party sources) and leaves untouched when a file or symlink is already there. Do NOT add a
+`~/.claude/plugins/keeper` symlink — it double-registers the hook (two `events` rows per invocation).
+
+Any third-party plugin set (arthack's, for one) is **optional** — a fresh machine loads keeper's two and
+nothing else. Opt in by appending a parent to `plugin_scan_dirs` in your own `plugins.yaml` (e.g.
+`- ~/code/arthack/claude`). Automated workers additionally carry a keeper-owned permission posture
+(`--permission-mode acceptEdits --dangerously-skip-permissions`) and an optional `worker_plugin_isolation`
+gate that drops those scanned third-party plugins from worker launches (interactive sessions unaffected).
+[docs/plugin-composition-map.md](./docs/plugin-composition-map.md) is the full map;
+`bun scripts/clean-machine-check.ts` proves the arthack-free launch path end to end.
 
 One manual step has no code home:
 
