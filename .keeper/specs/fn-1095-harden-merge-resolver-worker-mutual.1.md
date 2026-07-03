@@ -29,5 +29,5 @@ merge-escalation notify and close audit paths untouched.
 - [ ] The merge-escalation notify and close audit paths are behaviorally unchanged.
 
 ## Done summary
-
+Scoped the merge-resolver's mutual-exclusion per-epic: recover pass-1 now skips a lane whose epic has a live resolve::<epic> job (epicHasActiveResolver), replacing the resolver brief's global autopilot pause/play. A crashed resolver strands nothing (auto-lifts on reap) and concurrent fan-ins stay independent.
 ## Evidence

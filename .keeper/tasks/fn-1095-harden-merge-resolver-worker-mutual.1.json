@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Scope resolver pause mutual-exclusion",
-  "updated_at": "2026-07-03T04:00:03.267000Z"
+  "updated_at": "2026-07-03T04:23:21.960000Z",
+  "worker_done_at": "2026-07-03T04:23:21.960000Z"
 }
