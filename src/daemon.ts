@@ -60,6 +60,7 @@ import {
   retainColdPayloads,
 } from "./compaction";
 import {
+  atomicWriteFile,
   clearDispatchMintGate,
   evictStaleDispatchMintGate,
   openDb,
@@ -75,6 +76,7 @@ import {
   resolveHandoffSpillDir,
   resolveKeeperAgentPath,
   resolvePlanRoots,
+  resolveRestartLedgerPath,
   resolveSockPath,
   resolveStatuslineRoot,
   resolveUsageRoot,
@@ -90,6 +92,9 @@ import type {
 import { extractMutationPath } from "./derivers";
 import { isRetryableDispatchKey } from "./dispatch-command";
 import {
+  CRASH_LOOP_DISTRESS_ID,
+  CRASH_LOOP_DISTRESS_REASON,
+  CRASH_LOOP_DISTRESS_VERB,
   isMergeEscalationReason,
   MERGE_ESCALATION_REASON_TOKEN,
 } from "./dispatch-failure-key";
@@ -303,6 +308,11 @@ export function drainToCompletion(
  * `worktree-recover:<abs-path>`), so it strands forever. This mints the sanctioned
  * `DispatchCleared` for each via `mintClear` (the caller folds + pumps). Returns the
  * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
+ *
+ * EXEMPTS the crash-loop distress key: its synthetic verb is un-retryable by the
+ * wire validator BY DESIGN (an operator never clears it), and main's own
+ * level-triggered recovery owns dropping it — so the orphan sweep must never reap
+ * this self-managed row out from under the distress signal.
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
@@ -315,6 +325,12 @@ export function gcUnretryableDispatchFailures(
   let swept = 0;
   for (const row of rows) {
     if (isRetryableDispatchKey(row.verb, row.id)) {
+      continue;
+    }
+    if (
+      row.verb === CRASH_LOOP_DISTRESS_VERB &&
+      row.id === CRASH_LOOP_DISTRESS_ID
+    ) {
       continue;
     }
     mintClear(row.verb, row.id);
@@ -1763,9 +1779,22 @@ export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
  *     threshold for `maxConsecutiveLagBreaches` consecutive intervals (the caller
  *     accumulates/resets the count per tick).
  *
- * Returns `"ok"` during the boot-grace window (arm-time baselines are not yet
- * meaningful) and whenever both detectors are clear; `"escalate"` otherwise.
+ * Returns `{ kind: "ok" }` during the boot-grace window (arm-time baselines are not
+ * yet meaningful) and whenever both detectors are clear; otherwise `{ kind:
+ * "escalate", trigger }` NAMING which detector fired, so the producer's escalation
+ * log pins the wedge mode (accept-stall on which socket, or a busy-lag spin) instead
+ * of a bare "something wedged". The server socket is checked before the bus so the
+ * trigger is deterministic when both stall at once.
  */
+export type ServeLivenessTrigger =
+  | "accept-stall-server"
+  | "accept-stall-bus"
+  | "busy-lag";
+
+export type ServeLivenessVerdict =
+  | { kind: "ok" }
+  | { kind: "escalate"; trigger: ServeLivenessTrigger };
+
 export function decideServeLivenessWatchdog(inputs: {
   nowMs: number;
   bootGraceUntilMs: number;
@@ -1774,7 +1803,7 @@ export function decideServeLivenessWatchdog(inputs: {
   probeStuckThresholdMs: number;
   consecutiveLagBreaches: number;
   maxConsecutiveLagBreaches: number;
-}): "ok" | "escalate" {
+}): ServeLivenessVerdict {
   const {
     nowMs,
     bootGraceUntilMs,
@@ -1785,13 +1814,19 @@ export function decideServeLivenessWatchdog(inputs: {
     maxConsecutiveLagBreaches,
   } = inputs;
   // Never trip mid-boot: workers may still be binding, first probes not yet landed.
-  if (nowMs < bootGraceUntilMs) return "ok";
+  if (nowMs < bootGraceUntilMs) return { kind: "ok" };
   // Accept-stall on either socket — a real read has not answered within the window.
-  if (nowMs - lastServerProbeOkAtMs >= probeStuckThresholdMs) return "escalate";
-  if (nowMs - lastBusProbeOkAtMs >= probeStuckThresholdMs) return "escalate";
+  if (nowMs - lastServerProbeOkAtMs >= probeStuckThresholdMs) {
+    return { kind: "escalate", trigger: "accept-stall-server" };
+  }
+  if (nowMs - lastBusProbeOkAtMs >= probeStuckThresholdMs) {
+    return { kind: "escalate", trigger: "accept-stall-bus" };
+  }
   // Busy-wedge — main loop starved for N consecutive intervals.
-  if (consecutiveLagBreaches >= maxConsecutiveLagBreaches) return "escalate";
-  return "ok";
+  if (consecutiveLagBreaches >= maxConsecutiveLagBreaches) {
+    return { kind: "escalate", trigger: "busy-lag" };
+  }
+  return { kind: "ok" };
 }
 
 /**
@@ -1876,6 +1911,115 @@ async function probeSocketRead(
       },
     }).catch(() => settle(false));
   });
+}
+
+// ── crash-loop distress signal ───────────────────────────────────────────────
+/**
+ * How many boots inside {@link CRASH_LOOP_WINDOW_MS} count as a crash-loop. The
+ * plist ships `ThrottleInterval 10` + `KeepAlive{SuccessfulExit:false}`, and an
+ * observed wedge-restart cycle is ~60-120s, so a healthy daemon never restarts
+ * this often — 8 boots inside a half-hour is an unambiguous self-restart storm,
+ * while a routine deploy/reboot (one boot) never approaches it.
+ */
+export const CRASH_LOOP_THRESHOLD = 8;
+/** Sliding window (ms) the boot count is measured over. */
+export const CRASH_LOOP_WINDOW_MS = 30 * 60_000;
+/**
+ * Hard length cap on the restart ledger. Window-aging already bounds it under
+ * normal cadence; the cap is the belt against a pathological same-window burst
+ * bloating the sidecar. Comfortably above {@link CRASH_LOOP_THRESHOLD} so a real
+ * loop still records enough boots to trip.
+ */
+export const RESTART_LEDGER_CAP = 64;
+
+/**
+ * Parse a restart-ledger file body into a boot-timestamp array. FAIL-OPEN: any
+ * malformed body (not JSON, not an array, non-finite entries) yields `[]` so a
+ * corrupt ledger becomes an empty one — never new `fatalExit` fuel, and never a
+ * false crash-loop trip. The next write overwrites it clean. Pure; NEVER throws.
+ */
+export function parseRestartLedger(raw: string): number[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (t): t is number => typeof t === "number" && Number.isFinite(t),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fold this boot into the ledger: drop timestamps outside the window (and any
+ * future-dated garbage), append `nowMs`, sort ascending, and keep only the most
+ * recent `cap`. Window-aging makes the ledger self-heal after a loop stops;
+ * the cap bounds the file under a same-window burst. Pure; NEVER throws.
+ */
+export function updateRestartLedger(inputs: {
+  existing: number[];
+  nowMs: number;
+  windowMs: number;
+  cap: number;
+}): number[] {
+  const { existing, nowMs, windowMs, cap } = inputs;
+  const cutoff = nowMs - windowMs;
+  const kept = existing.filter(
+    (t) => Number.isFinite(t) && t >= cutoff && t <= nowMs,
+  );
+  kept.push(nowMs);
+  kept.sort((a, b) => a - b);
+  return kept.length > cap ? kept.slice(kept.length - cap) : kept;
+}
+
+/**
+ * Pure crash-loop verdict: how many of `bootTimestamps` fall inside the window
+ * ending at `nowMs`, and whether that count reached `threshold`. Windowing here
+ * (not just trusting a pre-aged caller) keeps the decision self-contained and
+ * unit-testable across the threshold/window/aging axes. NEVER throws.
+ */
+export function decideCrashLoop(inputs: {
+  nowMs: number;
+  bootTimestamps: number[];
+  threshold: number;
+  windowMs: number;
+}): { crashLoop: boolean; recentBoots: number } {
+  const { nowMs, bootTimestamps, threshold, windowMs } = inputs;
+  const cutoff = nowMs - windowMs;
+  const recentBoots = bootTimestamps.filter(
+    (t) => Number.isFinite(t) && t >= cutoff && t <= nowMs,
+  ).length;
+  return { crashLoop: recentBoots >= threshold, recentBoots };
+}
+
+/**
+ * Read + fail-open-parse the restart ledger at `path`. A missing file (first
+ * boot) or any read/parse error yields `[]` — the crash-loop detector must never
+ * be the thing that crashes boot. Mirrors {@link parseRestartLedger}'s contract.
+ */
+export function readRestartLedger(path: string): number[] {
+  try {
+    return parseRestartLedger(readFileSync(path, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist the ledger (best-effort, atomic). A write failure (full disk, ENOENT
+ * dir) is swallowed: a lost boot record only undercounts a future loop — strictly
+ * safer than crashing boot on the write. NEVER throws.
+ */
+export function writeRestartLedger(path: string, timestamps: number[]): void {
+  try {
+    atomicWriteFile(path, JSON.stringify(timestamps));
+  } catch (err) {
+    console.error(
+      `[keeperd] restart-ledger write threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }
 
 /**
@@ -3997,6 +4141,60 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // Crash-loop distress signal. Fold this boot into the durable restart ledger (a
+  // state-dir sidecar — NOT keeper.db, NOT a fold — so it survives the very crash
+  // it measures), then LEVEL-TRIGGER a sticky `needs_human` distress row: a boot
+  // rate at/over the threshold inside the window mints ONE row on the synthetic
+  // crash-loop key (idempotent — the fold UPSERTs, so a persistent loop is one row,
+  // not one per boot); a boot whose rate has fallen back under threshold drops the
+  // row (the recover-row idiom, resolved on the NEXT boot as the window ages out
+  // the old timestamps). A hot ledger inherited by a healthy post-fix boot reports
+  // honestly, then self-clears. FAIL-OPEN throughout — a corrupt ledger folds to
+  // empty, so the crash-loop detector can never itself become new boot-crash fuel.
+  {
+    const nowMs = Date.now();
+    const ledgerPath = resolveRestartLedgerPath();
+    const bootTimestamps = updateRestartLedger({
+      existing: readRestartLedger(ledgerPath),
+      nowMs,
+      windowMs: CRASH_LOOP_WINDOW_MS,
+      cap: RESTART_LEDGER_CAP,
+    });
+    writeRestartLedger(ledgerPath, bootTimestamps);
+    const verdict = decideCrashLoop({
+      nowMs,
+      bootTimestamps,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CRASH_LOOP_WINDOW_MS,
+    });
+    const distressPresent =
+      db
+        .query(
+          "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+        )
+        .get(CRASH_LOOP_DISTRESS_VERB, CRASH_LOOP_DISTRESS_ID) != null;
+    const windowMin = Math.round(CRASH_LOOP_WINDOW_MS / 60_000);
+    if (verdict.crashLoop && !distressPresent) {
+      console.error(
+        `[keeperd] crash-loop distress: ${verdict.recentBoots} boots within ${windowMin}min (threshold ${CRASH_LOOP_THRESHOLD}) — minting a sticky needs_human signal`,
+      );
+      mintCrashLoopDistress(
+        `${CRASH_LOOP_DISTRESS_REASON}: ${verdict.recentBoots} daemon boots in ${windowMin}min — the serve/boot path is restart-looping (see server.stderr)`,
+        nowMs / 1000,
+      );
+    } else if (!verdict.crashLoop && distressPresent) {
+      console.error(
+        "[keeperd] crash-loop distress cleared: boot rate recovered under threshold",
+      );
+      mintDispatchClearedEvent(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
+      );
+      wakePending = true;
+      pumpWakes();
+    }
+  }
+
   // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.
   // Flip the server worker's boot gate so mutating RPCs are accepted and the
   // `catching_up` header settles. One-way, idempotent; `?.` tolerates a
@@ -5520,6 +5718,66 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // an extra retry round-trip, not a correctness hazard).
       console.error(
         `[keeperd] DispatchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint the crash-loop distress `DispatchFailed` on the fixed synthetic key
+   * ({@link CRASH_LOOP_DISTRESS_VERB}::{@link CRASH_LOOP_DISTRESS_ID}) — the
+   * {@link handleDispatchFailedMint} shape, but the synthetic verb is not part of
+   * the strict `DispatchFailedMessage` union so it rides its own thin closure.
+   * `reason` MUST start with {@link CRASH_LOOP_DISTRESS_REASON} so the pill maps.
+   * `ts` is producer-stamped for re-fold determinism. NON-FATAL on insert failure.
+   */
+  function mintCrashLoopDistress(reason: string, tsSec: number): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${CRASH_LOOP_DISTRESS_VERB}::${CRASH_LOOP_DISTRESS_ID}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: CRASH_LOOP_DISTRESS_VERB,
+          id: CRASH_LOOP_DISTRESS_ID,
+          reason,
+          dir: null,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] crash-loop distress mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -7304,22 +7562,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         });
       }
 
+      const verdictNowMs = Date.now();
       const verdict = decideServeLivenessWatchdog({
-        nowMs: Date.now(),
+        nowMs: verdictNowMs,
         bootGraceUntilMs,
         // A socket we do not serve never trips: keep its age perpetually fresh.
         lastServerProbeOkAtMs: serverWorker
           ? lastServerProbeOkAtMs
-          : Date.now(),
-        lastBusProbeOkAtMs: busWorker ? lastBusProbeOkAtMs : Date.now(),
+          : verdictNowMs,
+        lastBusProbeOkAtMs: busWorker ? lastBusProbeOkAtMs : verdictNowMs,
         probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
         consecutiveLagBreaches: serveLagConsecutiveBreaches,
         maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
       });
-      if (verdict === "escalate") {
+      if (verdict.kind === "escalate") {
+        // Name the wedge mode + carry both probe ages and the lag-breach count so
+        // the crash-loop's cause is legible in server.stderr, not a bare "wedged".
+        const serverAgeMs = serverWorker
+          ? verdictNowMs - lastServerProbeOkAtMs
+          : null;
+        const busAgeMs = busWorker ? verdictNowMs - lastBusProbeOkAtMs : null;
         console.error(
-          "[keeperd] serve-liveness watchdog: a serve socket stopped answering " +
-            "real reads (or the main loop is wedged) — exiting for LaunchAgent restart",
+          `[keeperd] serve-liveness watchdog: ${verdict.trigger} — server-probe-age=${
+            serverAgeMs ?? "n/a"
+          }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} — exiting for LaunchAgent restart`,
         );
         if (!shuttingDown) fatalExit();
       }

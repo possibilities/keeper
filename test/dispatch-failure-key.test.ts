@@ -10,6 +10,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertNever,
+  CRASH_LOOP_DISTRESS_ID,
+  CRASH_LOOP_DISTRESS_REASON,
+  CRASH_LOOP_DISTRESS_VERB,
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
   isMergeEscalationReason,
@@ -244,6 +247,21 @@ describe("routeDispatchFailure: representative variant kinds", () => {
     );
     expect(routeDispatchFailure(row("open", "z", "x")).kind).toBe("unknown");
   });
+
+  test("crash-loop distress key → unknown (never collides with work/close failedKeys)", () => {
+    // The synthetic distress verb is deliberately neither work nor close, so it
+    // routes as `unknown` — it can never enter the reconciler's failedKeys
+    // suppression against a real dispatch key, whatever the reason carries.
+    expect(
+      routeDispatchFailure(
+        row(
+          CRASH_LOOP_DISTRESS_VERB,
+          CRASH_LOOP_DISTRESS_ID,
+          `${CRASH_LOOP_DISTRESS_REASON}: 8 daemon boots in 30min`,
+        ),
+      ).kind,
+    ).toBe("unknown");
+  });
 });
 
 describe("historical recover/finalize collision shapes stay DISJOINT", () => {
@@ -361,6 +379,23 @@ describe("preserved predicate helpers", () => {
     expect(leadingReasonToken("no-colon")).toBe("");
     expect(leadingReasonToken("")).toBe("");
   });
+
+  test("crash-loop distress vocabulary: synthetic verb is neither work nor close", () => {
+    expect(CRASH_LOOP_DISTRESS_REASON).toBe("daemon-crash-loop");
+    expect(CRASH_LOOP_DISTRESS_VERB).not.toBe("work");
+    expect(CRASH_LOOP_DISTRESS_VERB).not.toBe("close");
+    // Collision-free against the other reason prefixes — no existing rule is a
+    // prefix of it, nor it of them, so the pill classifies it to its own kind.
+    for (const other of [
+      MERGE_ESCALATION_REASON_TOKEN,
+      WORKTREE_FINALIZE_NON_FF_REASON,
+      SLOT_RECLAIMED_REASON_PREFIX,
+      SLOT_OCCUPIED_REASON_PREFIX,
+    ]) {
+      expect(CRASH_LOOP_DISTRESS_REASON.startsWith(other)).toBe(false);
+      expect(other.startsWith(CRASH_LOOP_DISTRESS_REASON)).toBe(false);
+    }
+  });
 });
 
 describe("single vocabulary source", () => {
@@ -393,6 +428,7 @@ describe("single vocabulary source", () => {
       ["slot-reclaimed", "slot-reclaimed"],
       ["slot-occupied", "slot-occupied"],
       ["instant-death-breaker", "instant-death"],
+      ["daemon-crash-loop", "crash-loop"],
     ]);
   });
 });

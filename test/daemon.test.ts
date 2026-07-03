@@ -36,11 +36,14 @@ import {
   buildMergeEscalationBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
+  CRASH_LOOP_THRESHOLD,
+  CRASH_LOOP_WINDOW_MS,
   checkKeeperAgentPresence,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
+  decideCrashLoop,
   decideGitSeedWatchdog,
   decideServeLivenessWatchdog,
   drainToCompletion,
@@ -59,8 +62,10 @@ import {
   type PendingResolverDispatch,
   type PlannerNotifyResult,
   parseBlockedCategory,
+  parseRestartLedger,
   prewarmWatcherAddon,
   pruneRecoveredDeadLetters,
+  RESTART_LEDGER_CAP,
   type ResolverDispatchOutcome,
   type ResolverDispatchSweepDeps,
   recoverOneDeadLetter,
@@ -80,6 +85,7 @@ import {
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   startDaemon,
+  updateRestartLedger,
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
   withBootDrainCheckpointTuning,
@@ -95,6 +101,11 @@ import {
   upsertDispatchMintGate,
 } from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
+import {
+  CRASH_LOOP_DISTRESS_ID,
+  CRASH_LOOP_DISTRESS_REASON,
+  CRASH_LOOP_DISTRESS_VERB,
+} from "../src/dispatch-failure-key";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -220,6 +231,30 @@ test("gcUnretryableDispatchFailures: sweeps only the rows the retry wire path ca
   expect(cleared).toEqual([
     { verb: "close", id: "worktree-recover:/Users/mike/code/arthack" },
   ]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: the crash-loop distress row is EXEMPT (self-managed, never orphan-swept)", () => {
+  const { db } = freshMemDb();
+  // The distress row's synthetic verb is un-retryable by the wire validator BY
+  // DESIGN — but main's level-triggered recovery owns it, so the orphan sweep
+  // must leave it alone rather than reap the live distress signal.
+  db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
+  ).run(
+    CRASH_LOOP_DISTRESS_VERB,
+    CRASH_LOOP_DISTRESS_ID,
+    `${CRASH_LOOP_DISTRESS_REASON}: 8 daemon boots in 30min`,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
+    cleared.push({ verb, id }),
+  );
+
+  expect(swept).toBe(0);
+  expect(cleared).toEqual([]);
   db.close();
 });
 
@@ -913,7 +948,7 @@ const SWD_BASE = {
 };
 
 test("decideServeLivenessWatchdog: healthy — fresh probes, no lag → ok", () => {
-  expect(decideServeLivenessWatchdog({ ...SWD_BASE })).toBe("ok");
+  expect(decideServeLivenessWatchdog({ ...SWD_BASE })).toEqual({ kind: "ok" });
 });
 
 test("decideServeLivenessWatchdog: within boot grace → ok even with stale probes and a full lag run", () => {
@@ -927,28 +962,40 @@ test("decideServeLivenessWatchdog: within boot grace → ok even with stale prob
       lastBusProbeOkAtMs: 0,
       consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
     }),
-  ).toBe("ok");
+  ).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: keeperd read stalled (low lag) → escalate", () => {
+test("decideServeLivenessWatchdog: keeperd read stalled (low lag) → escalate names accept-stall-server", () => {
   // The accept-stall mode: reads die, lag stays low. The server probe last
   // succeeded past the window while the bus probe is fresh — either socket alone
-  // is enough to escalate.
+  // is enough to escalate, and the verdict NAMES which one tripped.
   expect(
     decideServeLivenessWatchdog({
       ...SWD_BASE,
       lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
     }),
-  ).toBe("escalate");
+  ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
 });
 
-test("decideServeLivenessWatchdog: bus registry read stalled (low lag) → escalate", () => {
+test("decideServeLivenessWatchdog: bus registry read stalled (low lag) → escalate names accept-stall-bus", () => {
   expect(
     decideServeLivenessWatchdog({
       ...SWD_BASE,
       lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
     }),
-  ).toBe("escalate");
+  ).toEqual({ kind: "escalate", trigger: "accept-stall-bus" });
+});
+
+test("decideServeLivenessWatchdog: both sockets stalled → server trigger wins (deterministic)", () => {
+  // When both accept-stalls are live the server socket is checked first, so the
+  // named trigger is stable rather than order-dependent.
+  expect(
+    decideServeLivenessWatchdog({
+      ...SWD_BASE,
+      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
+      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
+    }),
+  ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
 });
 
 test("decideServeLivenessWatchdog: probe age just under the window → ok", () => {
@@ -961,16 +1008,16 @@ test("decideServeLivenessWatchdog: probe age just under the window → ok", () =
         SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
       lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
     }),
-  ).toBe("ok");
+  ).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: busy-wedge — lag breached for N consecutive intervals → escalate", () => {
+test("decideServeLivenessWatchdog: busy-wedge — lag breached for N consecutive intervals → escalate names busy-lag", () => {
   expect(
     decideServeLivenessWatchdog({
       ...SWD_BASE,
       consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
     }),
-  ).toBe("escalate");
+  ).toEqual({ kind: "escalate", trigger: "busy-lag" });
 });
 
 test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N intervals → ok", () => {
@@ -981,7 +1028,117 @@ test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer th
       ...SWD_BASE,
       consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1,
     }),
-  ).toBe("ok");
+  ).toEqual({ kind: "ok" });
+});
+
+// ---------------------------------------------------------------------------
+// crash-loop distress — pure verdict + restart ledger
+// ---------------------------------------------------------------------------
+
+const CL_NOW = 10_000_000;
+const CL_WINDOW = CRASH_LOOP_WINDOW_MS;
+
+// N boots spaced one interval apart, ending at `end`. `stepMs` defaults to a
+// mid-window spacing so all N land inside one window unless a test says otherwise.
+function bootsEndingAt(end: number, n: number, stepMs: number): number[] {
+  return Array.from({ length: n }, (_, i) => end - (n - 1 - i) * stepMs);
+}
+
+test("decideCrashLoop: boot count at threshold inside the window → crash-loop", () => {
+  const bootTimestamps = bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD, 90_000);
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+test("decideCrashLoop: one under threshold → healthy", () => {
+  const bootTimestamps = bootsEndingAt(
+    CL_NOW,
+    CRASH_LOOP_THRESHOLD - 1,
+    90_000,
+  );
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: false, recentBoots: CRASH_LOOP_THRESHOLD - 1 });
+});
+
+test("decideCrashLoop: boots aged past the window are not counted", () => {
+  // Threshold-many boots, but all older than one full window → window-aging drops
+  // them, so a daemon that looped-then-recovered reads healthy.
+  const bootTimestamps = bootsEndingAt(
+    CL_NOW - CL_WINDOW - 1,
+    CRASH_LOOP_THRESHOLD,
+    1_000,
+  );
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: false, recentBoots: 0 });
+});
+
+test("decideCrashLoop: future-dated garbage is ignored", () => {
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: [CL_NOW + 5_000, CL_NOW + 10_000],
+      threshold: 1,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: false, recentBoots: 0 });
+});
+
+test("updateRestartLedger: appends this boot, ages out old, sorts ascending", () => {
+  const updated = updateRestartLedger({
+    existing: [CL_NOW - CL_WINDOW - 1, CL_NOW - 1_000, CL_NOW - 500],
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  // The stale entry is dropped; the current boot is appended; result is sorted.
+  expect(updated).toEqual([CL_NOW - 1_000, CL_NOW - 500, CL_NOW]);
+});
+
+test("updateRestartLedger: length cap keeps the most recent entries", () => {
+  // More in-window boots than the cap → keep the newest `cap` (including now).
+  const existing = bootsEndingAt(CL_NOW - 1, RESTART_LEDGER_CAP + 20, 100);
+  const updated = updateRestartLedger({
+    existing,
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(updated.length).toBe(RESTART_LEDGER_CAP);
+  expect(updated[updated.length - 1]).toBe(CL_NOW);
+  // Sorted ascending, so the retained slice is the newest window of boots.
+  expect(updated[0]).toBeGreaterThan(existing[0]);
+});
+
+test("parseRestartLedger: valid array of finite numbers round-trips", () => {
+  expect(parseRestartLedger("[1, 2, 3]")).toEqual([1, 2, 3]);
+});
+
+test("parseRestartLedger: corrupt body fails open to empty (never throws, never trips)", () => {
+  // A torn/garbage ledger must become an EMPTY one — never new fatalExit fuel and
+  // never a false crash-loop trip. Non-array, non-JSON, and non-finite entries
+  // all collapse to [].
+  expect(parseRestartLedger("not json at all")).toEqual([]);
+  expect(parseRestartLedger('{"not":"an array"}')).toEqual([]);
+  expect(parseRestartLedger("")).toEqual([]);
+  expect(parseRestartLedger('[1, "two", null, 3, 1e999]')).toEqual([1, 3]);
 });
 
 test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {
@@ -4890,6 +5047,7 @@ function spawnedWorkerNames(opts?: {
     KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
     KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
     KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
+    KEEPER_RESTART_LEDGER: join(tmpDir, "restart-ledger.json"),
     KEEPER_SOCK: sockPath,
   };
   const prior: Record<string, string | undefined> = {};

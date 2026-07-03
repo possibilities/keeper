@@ -108,6 +108,26 @@ export const SLOT_OCCUPIED_REASON_PREFIX = "slot-occupied";
  */
 export const INSTANT_DEATH_BREAKER_REASON = "instant-death-breaker";
 
+/**
+ * The synthetic `(verb, id)` and `reason` prefix of the daemon CRASH-LOOP distress
+ * signal — a self-restart storm made loud. Main appends each boot to a durable
+ * restart ledger (a state-dir sidecar, NOT a fold) and, when the recent-boot rate
+ * crosses the crash-loop threshold, mints ONE sticky `dispatch_failures` row on this
+ * fixed key so the storm surfaces in `needs_human` instead of running invisible.
+ *
+ * The verb is DELIBERATELY neither `work` nor `close`: it routes as {@link
+ * routeDispatchFailure}'s `unknown` arm, so it never enters the reconciler's
+ * `failedKeys` suppression (no real dispatch key can collide with it) and is cleared
+ * ONLY by main's level-triggered recovery (the boot whose rate falls back under
+ * threshold), never a `retry_dispatch` — whose wire validator rejects the synthetic
+ * verb, which is exactly why the boot un-retryable-orphan GC exempts this one key.
+ * Idempotent by construction: the fold UPSERTs on `(verb, id)`, so a persistently-
+ * looping daemon mints ONE row, not one per boot.
+ */
+export const CRASH_LOOP_DISTRESS_VERB = "daemon";
+export const CRASH_LOOP_DISTRESS_ID = "crash-loop";
+export const CRASH_LOOP_DISTRESS_REASON = "daemon-crash-loop";
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -118,7 +138,8 @@ export type DispatchFailureDisplayKind =
   | "dirty-tree"
   | "slot-reclaimed"
   | "slot-occupied"
-  | "instant-death";
+  | "instant-death"
+  | "crash-loop";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -141,6 +162,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: SLOT_RECLAIMED_REASON_PREFIX, kind: "slot-reclaimed" },
   { prefix: SLOT_OCCUPIED_REASON_PREFIX, kind: "slot-occupied" },
   { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
+  { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────
