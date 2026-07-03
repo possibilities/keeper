@@ -136,6 +136,15 @@ export interface PlanEpicMessage {
    * `[validated]` / `[unvalidated]` pill.
    */
   lastValidatedAt: string | null;
+  /**
+   * The epic-level parked-closer question, ingested from
+   * `.keeper/state/epics/<epic_id>.state.json` (top-level `question` field) —
+   * the epic mirror of {@link PlanTaskMessage.runtimeStatus}. Carried in the
+   * scanner's per-epic cache (like the task's runtime-status cache) so a def
+   * change composes against the latest observed question and vice versa.
+   * `null` when no question is parked (never-observed / cleared).
+   */
+  question: string | null;
 }
 
 /** Snapshot message for one `.keeper/tasks/*.json` file. */
@@ -592,6 +601,16 @@ interface RawTaskState {
   status?: unknown;
 }
 
+/**
+ * Raw plan epic runtime-state JSON shape — only the field we project. The
+ * state file (`.keeper/state/epics/<epic_id>.state.json`) is written by plan
+ * `LocalFileStateStore.saveEpicRuntime` (`keeper plan epic-question`); keeper
+ * ingests only `question`.
+ */
+interface RawEpicState {
+  question?: unknown;
+}
+
 /** Coerce a value to a non-empty string, else null. */
 function asString(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -740,6 +759,33 @@ export function coerceRuntimeStatus(
 }
 
 /**
+ * Coerce a value off an epic state file to the parked-question field. A
+ * non-empty string passes through; a missing/`null`/empty-string field
+ * defaults silently to `null` (no parked question); any other value (wrong
+ * type, e.g. a number or object) coerces to `null` with a stderr log via
+ * `onInvalid` — mirrors {@link coerceRuntimeStatus}. The bounded-length cap
+ * (`EPIC_QUESTION_MAX_CHARS`) is enforced at the `keeper plan epic-question`
+ * write boundary, not here — the fold stays a pure function of the persisted
+ * file (re-fold determinism preserved) and the per-file byte cap already
+ * guards against a pathological state file.
+ */
+export function coerceEpicQuestion(
+  v: unknown,
+  onInvalid?: (raw: unknown) => void,
+): string | null {
+  if (v === undefined || v === null) {
+    return null; // missing/explicit-null field — quiet default, no log
+  }
+  if (typeof v === "string") {
+    return v.length > 0 ? v : null;
+  }
+  if (onInvalid) {
+    onInvalid(v);
+  }
+  return null;
+}
+
+/**
  * Parse a stored JSON-TEXT array column (`epics.depends_on_epics`) back into a
  * clean `string[]` — JSON.parse then {@link asStringArray}. A NULL/empty/
  * malformed cell yields `[]`, mirroring the read-boundary `decodeRow` tolerance,
@@ -827,6 +873,20 @@ export class PlanScanner {
    * (definition) path — the cache is the state file's projection.
    */
   private readonly runtimeStatusCache = new Map<string, string>();
+  /**
+   * Per-epic cache of the latest parked-closer question observed in
+   * `.keeper/state/epics/<epic_id>.state.json` (top-level `question` field) —
+   * the epic mirror of {@link runtimeStatusCache}. Keyed by plan epic id. An
+   * epic never observed in the cache reads `null` (no parked question, the
+   * plan default); the {@link buildEpicMessage} caller passes this default.
+   *
+   * Updated by an `onChange` over an `epic-state` path AFTER the file
+   * coerce-parses cleanly, and reset to `null` by `onDelete` over the same
+   * path (a state-file vanish clears the question, matching the "no state
+   * file → no question" convention). NEVER mutated from an `epic` (definition)
+   * path — the cache is the state file's projection.
+   */
+  private readonly epicQuestionCache = new Map<string, string | null>();
   /**
    * The set of plan ids whose backing `.json` file was actually enumerated
    * on disk by a boot scan ({@link markSeen}, called from `scanPlanDir` for
@@ -1143,6 +1203,20 @@ export class PlanScanner {
   }
 
   /**
+   * Prime the per-epic question cache from a boot enumeration of
+   * `.keeper/state/epics/<epic_id>.state.json` (called by `scanPlanDir`
+   * BEFORE the `epics/` loop) — the epic mirror of {@link primeRuntimeStatus}.
+   * Pure cache write — does NOT emit a snapshot, does NOT touch `pathToId`,
+   * does NOT touch the on-disk census. The subsequent `epics/` loop's
+   * `onChange` reads this cache and emits the epic's first `EpicSnapshot`
+   * already carrying the parked question, with no redundant re-emit on a
+   * follow-up state-file write.
+   */
+  primeEpicQuestion(epicId: string, question: string | null): void {
+    this.epicQuestionCache.set(epicId, question);
+  }
+
+  /**
    * Process a delete for `path`. Emits a tombstone so the projection retracts,
    * then drops the change-gate entry (so a re-created file re-emits). A path
    * with no change-gate entry (never folded) emits nothing — nothing to retract.
@@ -1185,10 +1259,30 @@ export class PlanScanner {
       this.reemitTaskFromDef(defPath);
       return;
     }
-
-    // the `epic-state` sidecar arm is gone — epic state files carried
-    // ONLY the now-removed `approval` field, so a sidecar change/delete no
-    // longer mutates any keeper-folded projection.
+    if (kind === "epic-state") {
+      // Sidecar delete: reset the question cache to `null` (reverts to "no
+      // parked question") and re-emit an EpicSnapshot from the still-present
+      // epic-definition file. A state-file path is NOT tracked in `pathToId`
+      // (the cache key is the epic id directly), so there is no entry to
+      // drop there. Mirrors the `task-state` arm above.
+      const epicId = epicIdFromStatePath(path);
+      if (epicId === null) {
+        return;
+      }
+      const hadCache = this.epicQuestionCache.has(epicId);
+      this.epicQuestionCache.delete(epicId);
+      if (!hadCache) {
+        // The cache was already empty (reading the default null); deleting a
+        // never-cached sidecar can't change the projection. Skip the re-emit.
+        return;
+      }
+      const defPath = epicDefPathFromStatePath(path);
+      if (defPath === null) {
+        return;
+      }
+      this.reemitEpicFromDef(defPath);
+      return;
+    }
 
     const id = this.pathToId.get(path);
     if (id === undefined) {
@@ -1288,6 +1382,84 @@ export class PlanScanner {
     }
     const runtimeStatus = this.runtimeStatusCache.get(id) ?? "todo";
     const msg = buildTaskMessage(raw, runtimeStatus, this.log);
+    if (msg === null) {
+      return false;
+    }
+    // Observation gate: same producer-side gate as {@link onChange}.
+    // The sidecar state file fired this re-emit, but the def file is what
+    // we project; if the def file isn't in HEAD yet, stash and wait for
+    // the next git-worker pulse to drain it via {@link recheckPending}.
+    if (!this.isTracked(defPath)) {
+      this.addPending(defPath);
+      return false;
+    }
+    this.deletePending(defPath);
+    this.pathToId.set(defPath, msg.id);
+    const serialized = JSON.stringify(msg);
+    if (this.lastEmitted.get(msg.id) === serialized) {
+      return false;
+    }
+    this.lastEmitted.set(msg.id, serialized);
+    this.onSnapshot(msg);
+    return true;
+  }
+
+  /**
+   * Read the epic-definition file at `defPath` (if present) and re-emit an
+   * EpicSnapshot composed with the latest cached parked question. Used by the
+   * `epic-state` change/delete arms — the sidecar carries only the `question`
+   * field, but the snapshot the reducer folds is full. Mirrors
+   * {@link reemitTaskFromDef}.
+   *
+   * A missing/unreadable/malformed definition file is skip-and-logged without
+   * emitting; the next true `epic` event will replay through the same path.
+   *
+   * Returns `true` iff a snapshot was emitted. The def-file in-HEAD gate STAYS
+   * in force here: `epic-state` sidecars are gitignored and never appear in a
+   * commit's file list, so the commit-driven bypass never reaches this method.
+   */
+  private reemitEpicFromDef(defPath: string): boolean {
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(defPath);
+    } catch {
+      // Definition file absent (or read-vs-delete race) — the sidecar
+      // changed for an epic whose definition hasn't appeared yet. The cache
+      // already updated; when the def lands, its `epic` `onChange` reads the
+      // cache and emits correctly.
+      return false;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      return false;
+    }
+    let text: string;
+    try {
+      text = readFileSync(defPath, "utf8");
+    } catch (err) {
+      this.log(
+        `[plan-worker] read failed for ${defPath}: ${stringifyErr(err)}`,
+      );
+      return false;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      this.log(
+        `[plan-worker] malformed JSON in ${defPath}: ${stringifyErr(err)}`,
+      );
+      return false;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return false;
+    }
+    const raw = parsed as RawEpic;
+    const id = asString(raw.id);
+    if (id === null) {
+      return false;
+    }
+    const question = this.epicQuestionCache.get(id) ?? null;
+    const msg = buildEpicMessage(raw, question, this.log);
     if (msg === null) {
       return false;
     }
@@ -1412,19 +1584,45 @@ export class PlanScanner {
       return this.reemitTaskFromDef(defPath);
     }
 
-    // the `epic-state` sidecar arm is gone — epic state files carried
-    // ONLY the now-removed `approval` field, so a sidecar change no longer
-    // mutates any keeper-folded projection. The `classifyPlanPath` "epic-state"
-    // kind still resolves (so the path is recognized, not mis-routed), but no
-    // change/delete arm acts on it.
+    // `epic-state` (sidecar) updates the per-epic question cache and re-emits
+    // an EpicSnapshot composed against the sibling definition file. Mirrors
+    // the `task-state` arm above; the sidecar carries only `question`, so the
+    // def file is read and merged in `reemitEpicFromDef`.
     if (kind === "epic-state") {
-      return false;
+      const epicId = epicIdFromStatePath(path);
+      if (epicId === null) {
+        return false;
+      }
+      const raw = parsed as RawEpicState;
+      const question = coerceEpicQuestion(raw.question, (bad) => {
+        this.log(
+          `[plan-worker] invalid epic question in ${path}: ${JSON.stringify(bad)}; defaulting to null`,
+        );
+      });
+      const priorQuestion = this.epicQuestionCache.get(epicId) ?? null;
+      this.epicQuestionCache.set(epicId, question);
+      if (priorQuestion === question) {
+        // The cached value is unchanged: the composed EpicSnapshot wouldn't
+        // change and the change-gate would suppress it anyway.
+        return false;
+      }
+      const defPath = epicDefPathFromStatePath(path);
+      if (defPath === null) {
+        return false;
+      }
+      // `epic-state` paths are gitignored sidecars that never appear in a
+      // commit's file list, so the def-file gate inside `reemitEpicFromDef`
+      // stays in force.
+      return this.reemitEpicFromDef(defPath);
     }
 
     let msg: PlanEpicMessage | PlanTaskMessage | null;
     if (kind === "epic") {
       const raw = parsed as RawEpic;
-      msg = buildEpicMessage(raw, this.log);
+      const id = asString(raw.id);
+      const question =
+        id !== null ? (this.epicQuestionCache.get(id) ?? null) : null;
+      msg = buildEpicMessage(raw, question, this.log);
     } else {
       // `kind === "task"`: thread the cached runtime status (default `"todo"`
       // when never observed) so the composed TaskSnapshot carries the sidecar
@@ -1801,8 +1999,22 @@ export function isWithinRoots(
  * has no usable id (the projection pk). The number is derived from the id; every
  * other field is taken verbatim (coerced to string-or-null).
  */
+/**
+ * Build a `plan-epic` message from a parsed epic JSON + the epic's current
+ * parked question (carried in the sibling `.keeper/state/epics/<id>.state.json`
+ * file), or null when the file has no usable id. `question` is passed in by
+ * the caller (the {@link PlanScanner}, which caches the last per-epic value)
+ * mirroring {@link buildTaskMessage}'s `runtimeStatus` parameter; absent /
+ * never-observed defaults to `null` (no parked question).
+ *
+ * The OBJECT-LITERAL SLOT ORDER below is load-bearing — the change-gate
+ * compares `JSON.stringify` output byte-for-byte, and the seed reconstruction
+ * in {@link seedFromDb} must produce identical key order or every epic
+ * re-emits a synthetic snapshot on every daemon boot.
+ */
 export function buildEpicMessage(
   raw: RawEpic,
+  question: string | null = null,
   // `log` is retained in the signature for call-site parity (the scanner passes
   // its own logger positionally) even though no field currently coerces.
   _log: (msg: string) => void = (m) => console.error(m),
@@ -1820,6 +2032,7 @@ export function buildEpicMessage(
     status: asString(raw.status),
     dependsOnEpics: asStringArray(raw.depends_on_epics),
     lastValidatedAt: asString(raw.last_validated_at),
+    question,
   };
 }
 
@@ -2320,13 +2533,79 @@ function scanPlanDir(
     }
   }
 
-  // the `state/epics/` prime pass is gone — epic sidecars carried ONLY
-  // the now-removed `approval` field, so there is nothing keeper ingests from
-  // them at boot.
+  // Pass 1b: prime `epicQuestionCache` from `state/epics/*.state.json` —
+  // the epic mirror of the tasks prime pass above. A missing dir is fine
+  // (fresh clone with no state files yet, or an epic with no parked
+  // question). Each file is bounded-read + safe-parsed + coerced through the
+  // same guard as the live `epic-state` onChange arm; malformed JSON /
+  // bad-question / oversized files skip-and-log without poisoning the cache.
+  const epicStateDir = join(planDir, "state", "epics");
+  let epicStateNames: string[];
+  try {
+    epicStateNames = readdirSync(epicStateDir);
+  } catch {
+    epicStateNames = []; // No state/epics/ subdir — nothing to prime.
+  }
+  for (const name of epicStateNames) {
+    if (!name.endsWith(".state.json")) {
+      continue;
+    }
+    const epicId = name.slice(0, -".state.json".length);
+    if (epicId.length === 0) {
+      continue;
+    }
+    const full = join(epicStateDir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan stat failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(full, "utf8");
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan read failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan malformed JSON in ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const raw = parsed as RawEpicState;
+    let primed = true;
+    const coerced = coerceEpicQuestion(raw.question, (bad) => {
+      // Match the live onChange arm: an invalid value logs and is SKIPPED
+      // (no cache write), so the cache miss reads as the plan default null.
+      console.error(
+        `[plan-worker] boot scan invalid epic question in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
+      );
+      primed = false;
+    });
+    if (primed) {
+      scanner.primeEpicQuestion(epicId, coerced);
+    }
+  }
 
   // Pass 2: enumerate the canonical definition trees. Tasks now read the
   // primed cache so their first emitted snapshot carries the correct
-  // runtime_status.
+  // runtime_status; epics read the epic-question cache the same way.
   for (const collection of ["epics", "tasks"]) {
     const dir = join(planDir, collection);
     let names: string[];
@@ -2550,7 +2829,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
   // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -2560,6 +2839,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     status: string | null;
     depends_on_epics: string | null;
     last_validated_at: string | null;
+    question: string | null;
     tasks: string | null;
   }[];
   for (const e of epics) {
@@ -2578,6 +2858,12 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       // compares `JSON.stringify` output byte-for-byte, and a slot mismatch
       // would re-emit one synthetic `EpicSnapshot` per epic every boot.
       lastValidatedAt: asString(e.last_validated_at),
+      // `question` is a nullable TEXT column; `asString` collapses any
+      // non-string / empty-string stored value to `null`, mirroring
+      // `coerceEpicQuestion`'s producer-side contract (a valid stored value is
+      // always a non-empty string or NULL, so this is defensive-only). Slot
+      // position (last) MUST match `buildEpicMessage`'s return.
+      question: asString(e.question),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
 

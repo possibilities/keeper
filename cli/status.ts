@@ -22,10 +22,10 @@
  * stderr.
  *
  * `drained`/`jammed`/`needs-human` are computed INLINE here from the readiness
- * snapshot (verdicts + in-flight) plus the `dispatch_failures` read. The
- * canonical pure predicate is task-4's (`await drained`); when it lands, dedupe
- * this with an import. TODO(fn-1015.4): replace the inline drained/jammed with
- * the shared predicate.
+ * snapshot (verdicts + in-flight + each epic's parked-closer `question`) plus
+ * the `dispatch_failures` read. The canonical pure predicate is task-4's
+ * (`await drained`); when it lands, dedupe this with an import.
+ * TODO(fn-1015.4): replace the inline drained/jammed with the shared predicate.
  */
 
 import { parseArgs } from "node:util";
@@ -55,8 +55,10 @@ import {
 
 /** Envelope schema version for `keeper status`. v2 adds the additive
  * `dispatch_failure: string[]` field to the per-task + close-row views; v3 adds
- * the additive `autopilot.worktree_multi_repo` durable-config field. */
-export const STATUS_SCHEMA_VERSION = 3;
+ * the additive `autopilot.worktree_multi_repo` durable-config field; v4 adds the
+ * additive `board.epics[].question` parked-closer-question field and the
+ * `needs_human.parked_questions` count. */
+export const STATUS_SCHEMA_VERSION = 4;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -136,6 +138,10 @@ interface EpicView extends VerdictView {
   status: string | null;
   tasks: TaskView[];
   close: VerdictView | null;
+  // The epic-level parked-closer question (`keeper plan epic-question`), or
+  // `null` when none is parked. Additive (v4) — a needs-human board signal
+  // orthogonal to the verdict/pill (readiness is untouched here).
+  question: string | null;
 }
 
 export interface StatusData {
@@ -166,6 +172,10 @@ export interface StatusData {
     block_escalations: number;
     stuck_dispatches: number;
     finalize_non_ff: number;
+    // Count of epics carrying a non-null parked-closer question. Additive
+    // (v4) — a distinct needs-human signal from the dispatch-failure family
+    // (never mints a `dispatch_failures` row), included in `total`.
+    parked_questions: number;
     total: number;
   };
   rev: number | null;
@@ -263,6 +273,7 @@ export function buildStatusEnvelope(
       return {
         epic_id: epic.epic_id,
         status: epic.status,
+        question: epic.question ?? null,
         ...verdictView(snap.readiness.perEpic.get(epic.epic_id)),
         tasks: epic.tasks.map(
           (task): TaskView => ({
@@ -296,9 +307,15 @@ export function buildStatusEnvelope(
   ).length;
   const deadLetters = snap.deadLetters.length;
   const blockEscalations = snap.blockEscalations.length;
+  // Epics carrying a parked-closer question — a needs-human signal distinct
+  // from the dispatch-failure family (mints no `dispatch_failures` row).
+  const parkedQuestions = snap.epics.filter(
+    (e) => (e.question ?? null) !== null,
+  ).length;
   // `finalize_non_ff` is a SUBSET of `stuck_dispatches` — surfaced separately,
   // never double-counted into the total.
-  const needsHumanTotal = deadLetters + blockEscalations + stuckDispatches;
+  const needsHumanTotal =
+    deadLetters + blockEscalations + stuckDispatches + parkedQuestions;
 
   // At rest: nothing the autopilot could dispatch right now (no ready/running
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
@@ -336,6 +353,7 @@ export function buildStatusEnvelope(
       block_escalations: blockEscalations,
       stuck_dispatches: stuckDispatches,
       finalize_non_ff: finalizeNonFf,
+      parked_questions: parkedQuestions,
       total: needsHumanTotal,
     },
     rev: boot.rev,

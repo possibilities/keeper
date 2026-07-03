@@ -4030,6 +4030,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           status: msg.status,
           depends_on_epics: msg.dependsOnEpics,
           last_validated_at: msg.lastValidatedAt,
+          // The epic-level parked-closer question, sourced from the
+          // gitignored `.state.json` runtime overlay — rides free in the
+          // blob like every other plan-native field (no schema surprise; the
+          // reducer folds it onto `epics.question`).
+          question: msg.question,
         });
       } else if (msg.kind === "plan-task") {
         hookEvent = "TaskSnapshot";

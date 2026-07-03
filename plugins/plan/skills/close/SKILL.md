@@ -97,17 +97,31 @@ No `model=` kwarg — the agent file owns the model and effort.
 
 The close-planner returns `QUESTION: <text>` when a single judgement call would flip a verdict and it has exhausted its escape-hatch ladder. Nothing is persisted before a QUESTION.
 
-**Surface and pin.** Relay the question to the human verbatim, then close the relayed message with the literal unstick sentence naming the exact decision an answer must supply — `to proceed, tell me exactly: <the judgement the answer resolves>` — so the parked surface is actionable, never a vague "waiting for input". Then end the turn with `planner_agent_id` pinned. Do not finalize, do not close. **Under autopilot, QUESTION behaves like BLOCKED** — the chain halts, the epic stays open, no `close-finalize` fires; a human picks it up later.
+**Surface and pin.** Relay the question to the human verbatim, then close the relayed message with the literal unstick sentence naming the exact decision an answer must supply — `to proceed, tell me exactly: <the judgement the answer resolves>` — so the parked surface is actionable, never a vague "waiting for input". Stamp the same question + unstick sentence onto the epic so the board shows a parked closer instead of calm (`keeper status` renders it as a needs-human signal):
 
-**On the human's answer (warm resume):** send the answer to the pinned agent (fire-and-forget):
+```bash
+keeper plan epic-question <epic_id> "<question text> to proceed, tell me exactly: <the judgement the answer resolves>"
+```
+
+Then end the turn with `planner_agent_id` pinned. Do not finalize, do not close. **Under autopilot, QUESTION behaves like BLOCKED** — the chain halts, the epic stays open, no `close-finalize` fires; a human picks it up later.
+
+**On the human's answer (warm resume):** clear the parked epic-question — the closer is acting on the answer now — then send it to the pinned agent (fire-and-forget):
+
+```bash
+keeper plan epic-question <epic_id> --clear
+```
 
 ```
 SendMessage(to=planner_agent_id, message="ANSWER: <human's answer>")
 ```
 
-Wait for the planner to finish, then re-parse its one-line return (fatal / non-fatal / a fresh QUESTION) and continue. A SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent is dead — fall through to the cold path.
+Wait for the planner to finish, then re-parse its one-line return (fatal / non-fatal / a fresh QUESTION — which re-parks via the Surface-and-pin step above) and continue. A SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent is dead — fall through to the cold path.
 
-**Cold fallback (SendMessage error, or a fresh session with no pinned id):** re-spawn the close-planner against the persisted artifacts, folding the answer into the prompt. The report and (any) prior verdict still live at their refs under `audits/<epic_id>/`, so the planner re-reads them by path:
+**Cold fallback (SendMessage error, or a fresh session with no pinned id):** clear the parked epic-question, then re-spawn the close-planner against the persisted artifacts, folding the answer into the prompt. The report and (any) prior verdict still live at their refs under `audits/<epic_id>/`, so the planner re-reads them by path:
+
+```bash
+keeper plan epic-question <epic_id> --clear
+```
 
 ```
 Task(
@@ -121,7 +135,7 @@ ANSWER (to your prior QUESTION): <human's answer>"""
 )
 ```
 
-Re-parse the return and continue.
+Re-parse the return and continue (a fresh QUESTION re-parks via the Surface-and-pin step above).
 
 ### Consequential bus directives — verify against ground truth, then act
 

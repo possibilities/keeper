@@ -46,7 +46,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 103;
+export const SCHEMA_VERSION = 104;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -870,7 +870,14 @@ CREATE TABLE IF NOT EXISTS epics (
     job_links TEXT NOT NULL DEFAULT '[]',
     last_validated_at TEXT,
     resolved_epic_deps TEXT,
-    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL
+    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL,
+    -- question: nullable TEXT, the epic-level parked-closer question (the
+    -- keeper plan epic-question runtime overlay, folded like any other plan
+    -- snapshot field). NULL = no parked question (the zero-event reading).
+    -- Declared AFTER the VIRTUAL default_visible column so a fresh CREATE and
+    -- a migrated ALTER TABLE ... ADD COLUMN (which always appends) produce
+    -- byte-identical table_info/table_xinfo column order.
+    question TEXT
 )
 `;
 
@@ -2220,6 +2227,7 @@ function backfillResolvedEpicDeps(db: Database): void {
       job_links: [],
       last_validated_at: null,
       resolved_epic_deps: null,
+      question: null,
     };
     epicById.set(row.epic_id, epic);
     if (row.epic_number != null) {
@@ -2265,6 +2273,7 @@ function backfillResolvedEpicDeps(db: Database): void {
           job_links: [],
           last_validated_at: null,
           resolved_epic_deps: null,
+          question: null,
         };
         let depTokens: string[] = [];
         if (row.depends_on_epics != null && row.depends_on_epics.length > 0) {
@@ -5680,6 +5689,29 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "jobs", "kill_reason", "TEXT");
+
+      // v103→v104 (fn-1083 task .2): add the nullable `epics.question` TEXT
+      // column — the epic-level parked-closer question, the board-visible home
+      // for a stuck closer's judgement call (`keeper plan epic-question`). Folded
+      // from the `EpicSnapshot` synthetic event's `question` field, mirroring
+      // `runtime_status` on tasks: the plan-worker caches the value observed in
+      // the gitignored `<state>/epics/<epic_id>.state.json` overlay and re-emits
+      // a full EpicSnapshot (def fields + cached question) on either a def or
+      // overlay change. Nullable, NO default: NULL = no parked question (the
+      // zero-event reading) and a `DEFAULT` would poison that invariant. A
+      // historical EpicSnapshot payload carries no `question` key, so a
+      // from-scratch re-fold folds the column to NULL byte-identically
+      // (deterministic-replayed, NO cursor rewind needed — migration and re-fold
+      // agree at NULL until a fresh post-upgrade EpicSnapshot lands). Declared in
+      // the `CREATE_EPICS` literal too (unlike the jobs `:852` convention) —
+      // placed AFTER the VIRTUAL `default_visible` column so `ALTER TABLE ADD
+      // COLUMN` (which always appends) keeps fresh-vs-migrated
+      // `PRAGMA table_info`/`table_xinfo(epics)` byte-identical (test/db.test.ts
+      // parity asserts). The fixed epics SELECT list in `keeper/api.py` names only
+      // `epic_id, project_dir, tasks, jobs`, so this bump MUST add 104 to
+      // `SUPPORTED_SCHEMA_VERSIONS` there in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "epics", "question", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -3026,8 +3026,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // .2 (appending the nullable `jobs.kill_reason` column — WHY keeper reaped a job,
   // the producer arm that minted the synthetic `Killed`; an additive ALTER folded
   // on as an opaque string copy, NO cursor rewind: a historical Killed carries no
-  // `reason`, so a from-scratch re-fold leaves it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(103);
+  // `reason`, so a from-scratch re-fold leaves it NULL byte-identical). And to 104
+  // via fn-1083 task .2 (appending the nullable `epics.question` column — the
+  // epic-level parked-closer question folded from `EpicSnapshot.question`; an
+  // additive ALTER, NO cursor rewind: a historical EpicSnapshot carries no
+  // `question` key, so a from-scratch re-fold leaves it NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(104);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

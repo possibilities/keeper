@@ -900,6 +900,16 @@ export interface Epic {
    * round-trip by the `projectPlanRow` ON CONFLICT carve-out.
    */
   resolved_epic_deps: ResolvedEpicDep[] | null;
+  /**
+   * The epic-level parked-closer question (`keeper plan epic-question`), or
+   * `null` when none is parked (the zero-event reading). Folded from the
+   * `EpicSnapshot` synthetic event's `question` field, sourced from the
+   * gitignored `<state>/epics/<epic_id>.state.json` runtime overlay — mirrors
+   * how {@link Task.runtime_status} rides the task-level `.state.json`
+   * sidecar. `keeper status` surfaces a non-null value as a needs-human
+   * board signal.
+   */
+  question: string | null;
 }
 
 /**

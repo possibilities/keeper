@@ -3230,6 +3230,93 @@ test("from-scratch re-fold over [EpicArmed X true, EpicSnapshot X done] leaves z
 });
 
 // ---------------------------------------------------------------------------
+// Schema v104 / fn-1083 task .2 — epics.question (epic-level parked question)
+// ---------------------------------------------------------------------------
+
+function getEpicQuestion(epicId: string): string | null {
+  const row = db
+    .query("SELECT question FROM epics WHERE epic_id = ?")
+    .get(epicId) as { question: string | null } | null;
+  return row?.question ?? null;
+}
+
+test("EpicSnapshot with a question folds onto epics.question; absent folds to NULL (fn-1083.2)", () => {
+  epicSnapshotEvent("fn-30-question", {
+    epic_number: 30,
+    title: "parked",
+    status: "open",
+    question: "verify commit X reachable? to proceed, tell me exactly: yes/no",
+  });
+  drainAll();
+  expect(getEpicQuestion("fn-30-question")).toBe(
+    "verify commit X reachable? to proceed, tell me exactly: yes/no",
+  );
+
+  // A later EpicSnapshot with no `question` key folds to NULL (clears it) —
+  // the fold is a pure function of the CURRENT blob, not a merge.
+  epicSnapshotEvent("fn-30-question", {
+    epic_number: 30,
+    title: "parked",
+    status: "open",
+  });
+  drainAll();
+  expect(getEpicQuestion("fn-30-question")).toBeNull();
+});
+
+test("a fresh epic row with no EpicSnapshot.question reads NULL (zero-event default) (fn-1083.2)", () => {
+  epicSnapshotEvent("fn-31-no-question", { epic_number: 31, status: "open" });
+  drainAll();
+  expect(getEpicQuestion("fn-31-no-question")).toBeNull();
+});
+
+test("from-scratch re-fold reproduces epics.question byte-identically (fn-1083.2)", () => {
+  epicSnapshotEvent("fn-32-replay-q", {
+    epic_number: 32,
+    status: "open",
+    question: "does the evidence check out?",
+  });
+  epicSnapshotEvent("fn-33-replay-noq", { epic_number: 33, status: "open" });
+  drainAll();
+  const before = db
+    .query("SELECT epic_id, question FROM epics ORDER BY epic_id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_tombstones");
+  drainAll();
+  const after = db
+    .query("SELECT epic_id, question FROM epics ORDER BY epic_id ASC")
+    .all();
+  expect(after).toEqual(before);
+  expect(getEpicQuestion("fn-32-replay-q")).toBe(
+    "does the evidence check out?",
+  );
+  expect(getEpicQuestion("fn-33-replay-noq")).toBeNull();
+});
+
+test("EpicSnapshot ON CONFLICT update never wipes tasks/jobs when setting question (fn-1083.2)", () => {
+  // Land a task first (shell-inserts the epic row with a non-empty `tasks`
+  // array), then fold an EpicSnapshot carrying a question — the scalar-only
+  // ON CONFLICT update must preserve the embedded tasks array.
+  taskSnapshotEvent("fn-34-q-with-tasks.1", {
+    epic_id: "fn-34-q-with-tasks",
+    task_number: 1,
+    title: "t1",
+  });
+  drainAll();
+  expect(getTask("fn-34-q-with-tasks.1")).not.toBeNull();
+
+  epicSnapshotEvent("fn-34-q-with-tasks", {
+    epic_number: 34,
+    status: "open",
+    question: "ship or hold?",
+  });
+  drainAll();
+  expect(getEpicQuestion("fn-34-q-with-tasks")).toBe("ship or hold?");
+  expect(getTask("fn-34-q-with-tasks.1")).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // Schema v46 / fn-666 — plan-file attribution mint
 // ---------------------------------------------------------------------------
 

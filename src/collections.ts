@@ -231,6 +231,10 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // index can serve it. Display-only — clients may SEE it but MUST NOT
     // filter/sort by it; it's an implementation detail of `defaultClause`.
     "default_visible",
+    // `question`: nullable scalar TEXT, the epic-level parked-closer question.
+    // Display-only (out of `jsonColumns`/`sortable`/`filters`) — `keeper
+    // status` reads it to render the needs-human board pill.
+    "question",
   ],
   pk: "epic_id",
   version: "last_event_id",

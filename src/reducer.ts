@@ -505,6 +505,13 @@ interface PlanSnapshot {
    * across re-fold.
    */
   last_validated_at?: string | null;
+  /**
+   * The epic-level parked-closer question (EpicSnapshot blob, epic-level
+   * only), sourced from the gitignored `.state.json` runtime overlay. Absent
+   * / NULL folds to `null` (no parked question) so a pre-this-feature blob
+   * reproduces the same row across re-fold.
+   */
+  question?: string | null;
 }
 
 /**
@@ -587,8 +594,8 @@ function projectPlanRow(db: Database, event: Event): void {
     // EpicSnapshot re-fold would wipe the provenance, job-link, and
     // resolved-deps projections.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -596,6 +603,7 @@ function projectPlanRow(db: Database, event: Event): void {
          status = excluded.status,
          depends_on_epics = excluded.depends_on_epics,
          last_validated_at = excluded.last_validated_at,
+         question = excluded.question,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
       [
@@ -608,6 +616,9 @@ function projectPlanRow(db: Database, event: Event): void {
         JSON.stringify(snapshot.depends_on_epics ?? []),
         // A missing / NULL blob value folds to NULL.
         snapshot.last_validated_at ?? null,
+        // The parked-closer question — a missing / NULL blob value folds to
+        // NULL (no parked question, the zero-event reading).
+        snapshot.question ?? null,
         event.id,
         ts,
       ],
@@ -7205,6 +7216,7 @@ function epicLiteToEpic(row: EpicLite): Epic {
     job_links: [],
     last_validated_at: null,
     resolved_epic_deps: null,
+    question: null,
   };
 }
 
