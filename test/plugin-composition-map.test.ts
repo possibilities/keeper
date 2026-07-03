@@ -35,8 +35,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPluginSources } from "../src/agent/config";
+import { main } from "../src/agent/main";
 import { discoverPlugins } from "../src/agent/plugins";
 import { buildKeeperAgentLaunchArgv } from "../src/exec-backend";
+import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
 
 let tmpDir: string;
 
@@ -64,7 +66,7 @@ const PREFIX = [
  * are the arthack-shaped third-party plugins. Returns the config path plus the
  * absolute dirs so assertions can pin membership.
  */
-function writeConfig(): {
+function writeConfig(opts: { gated?: boolean } = {}): {
   configPath: string;
   keeperDir: string;
   planDir: string;
@@ -81,6 +83,7 @@ function writeConfig(): {
   writeFileSync(
     configPath,
     [
+      ...(opts.gated ? ["worker_plugin_isolation: strip-scan-dirs"] : []),
       "plugin_dirs:",
       `  - ${keeperDir}`,
       `  - ${planDir}`,
@@ -168,8 +171,8 @@ describe("composition map — the config-flagged worker isolation gate", () => {
   });
 
   test("the seam's worker marker rides every worker argv", () => {
-    // The seam keys the gate on `--dangerously-skip-permissions` (task .1's
-    // keeper-owned human-less worker posture). Pin that the worker argv builder
+    // The seam keys the gate on `--dangerously-skip-permissions`, keeper's
+    // human-less worker permission posture. Pin that the worker argv builder
     // always emits it, so the marker the seam sniffs cannot silently drift off
     // the worker launch.
     const cmd = buildKeeperAgentLaunchArgv({
@@ -180,6 +183,53 @@ describe("composition map — the config-flagged worker isolation gate", () => {
       noConfirm: true,
     });
     expect(cmd).toContain("--dangerously-skip-permissions");
+  });
+});
+
+/**
+ * End-to-end seam drive: the previous describe blocks call `discoverPlugins`
+ * with an EXPLICIT `{stripScanDirs}` boolean, which never proves `main()` itself
+ * reads `--dangerously-skip-permissions` back out of `remainingArgs` at the
+ * `agent/main.ts` gate call site to COMPUTE that boolean. These tests drive the
+ * real `main()` arg vector end-to-end (config knob ON) and assert the composed
+ * native argv — so a regression where the flag is consumed upstream, moves past a
+ * `--` separator, or the gate stops ANDing it in leaves a worker inheriting the
+ * scanned set and turns one of these red.
+ */
+describe("composition map — the isolation gate reads the flag from the real main() argv", () => {
+  function driveMain(argv: string[]): Promise<string[]> {
+    const { configPath } = writeConfig({ gated: true });
+    const h = makeHarness({ argv, rawArgv: true });
+    // Point the launcher's config seams at the gated fixture; the harness cwd
+    // (`/fake-home/code/proj`) has no commands/agents/skills/hooks dir on disk,
+    // so no cwd `--plugin-dir .` is injected — the only scanned entry is arthack.
+    h.deps.pluginConfigPath = configPath;
+    h.deps.loadPluginSourcesFn = () => loadPluginSources(configPath);
+    return runAndCapture(h, main);
+  }
+
+  test("worker argv (knob ON + flag present) strips the scanned set, keeps plugin_dirs", async () => {
+    const { keeperDir, planDir, arthackDir } = writeConfig({ gated: true });
+    const cmd = await driveMain([
+      "claude",
+      "hello",
+      "--dangerously-skip-permissions",
+    ]);
+    // The gate observed the flag at the seam: hard-listed dirs ride, the scanned
+    // arthack child is gone. The marker itself must still reach the seam.
+    expect(cmd).toContain("--dangerously-skip-permissions");
+    expect(cmd).toContain(keeperDir);
+    expect(cmd).toContain(planDir);
+    expect(cmd).not.toContain(arthackDir);
+  });
+
+  test("interactive argv (knob ON, flag absent) retains the scanned set", async () => {
+    const { arthackDir } = writeConfig({ gated: true });
+    const cmd = await driveMain(["claude", "hello"]);
+    // Same knob-ON config, but no worker marker → the AND-gate is false and the
+    // scanned arthack child survives, exactly as an interactive human launch.
+    expect(cmd).not.toContain("--dangerously-skip-permissions");
+    expect(cmd).toContain(arthackDir);
   });
 });
 
