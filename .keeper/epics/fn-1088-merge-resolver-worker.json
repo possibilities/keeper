@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-03T01:19:56.070000Z",
+  "depends_on_epics": [
+    "fn-1085-arthack-dissolution",
+    "fn-1086-quota-wall-resilience-and-board-signals"
+  ],
+  "id": "fn-1088-merge-resolver-worker",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Merge-resolver worker",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-03T01:19:56.070000Z"
+}

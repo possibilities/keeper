@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T01:19:56.070000Z",
+  "depends_on": [
+    "fn-1088-merge-resolver-worker.1"
+  ],
+  "epic": "fn-1088-merge-resolver-worker",
+  "id": "fn-1088-merge-resolver-worker.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Scratch-conflict proof and docs",
+  "updated_at": "2026-07-03T01:19:56.070000Z"
+}
