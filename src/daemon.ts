@@ -24,6 +24,10 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import type {
+  AutocloseIntentMessage,
+  AutocloseWorkerData,
+} from "./autoclose-worker";
+import type {
   AutopilotWorkerData,
   DispatchClearedMessage,
   DispatchExpiredMessage,
@@ -118,6 +122,7 @@ import type {
   ExitWatcherOutbound,
   ExitWatcherWorkerData,
 } from "./exit-watcher";
+import { REPROBE_MIN_AGE_SECS, REPROBE_MS } from "./exit-watcher";
 import { seedGitProjection } from "./git-boot-seed";
 import type {
   AddDiscoveryRootMessage,
@@ -3030,6 +3035,7 @@ export type WorkerName =
   | "maintenance"
   | "restore"
   | "renamer"
+  | "autoclose"
   | "bus"
   | "tmuxControl";
 
@@ -3056,6 +3062,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "maintenance",
   "restore",
   "renamer",
+  "autoclose",
   "bus",
   "tmuxControl",
 ] as const;
@@ -3075,6 +3082,94 @@ const WATCHER_WORKERS: readonly WorkerName[] = [
   "deadLetter",
   "eventsIngest",
 ] as const;
+
+/**
+ * TTL (ms) for an autoclose intent hint (epic fn-1107). Sized to OUTLIVE the
+ * slowest path by which the exit-watcher can observe an autoclosed process's
+ * death: the periodic reprobe backstop, which cannot reap a row until it ages
+ * past {@link REPROBE_MIN_AGE_SECS} and then fires on up to one more
+ * {@link REPROBE_MS} tick. Doubling the age gate and adding a tick keeps a hint
+ * alive well past that worst case — a slow-observed autoclose whose hint expired
+ * merely mislabels the `Killed` row `exit_watched` (non-fatal, never a crash).
+ */
+export const AUTOCLOSE_HINT_TTL_MS =
+  REPROBE_MIN_AGE_SECS * 2 * 1000 + REPROBE_MS;
+
+/**
+ * Consume-once, TTL-bounded set of autoclose intent hints, keyed by job id (epic
+ * fn-1107). The autoclose worker posts a hint IMMEDIATELY before it force-closes
+ * a window; main consults it at the SINGLE `Killed`-mint site so a hinted death
+ * is stamped `kill_reason: 'autoclosed'` instead of `exit_watched`. The
+ * exit-watcher stays the sole `Killed` producer — this only relabels.
+ *
+ * Pure (the clock is injected), so the insert / consume-once / TTL-expiry /
+ * identity-mismatch matrix is unit-tested with no daemon. A hint is consumed AT
+ * MOST ONCE (a match deletes it) and only when the exit event's `(pid, startTime)`
+ * matches the posted tuple under the same null-tolerant rule the exit verifier
+ * uses. An absent, expired, already-consumed, or mismatched hint yields `false`
+ * and the mint falls back to `exit_watched`.
+ */
+export class AutocloseHintSet {
+  private readonly hints = new Map<
+    string,
+    { pid: number | null; startTime: string | null; expiresAtMs: number }
+  >();
+
+  constructor(
+    private readonly ttlMs: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** Record a hint for `jobId`, expiring `ttlMs` from now (a repeat post for the
+   *  same job replaces the entry and refreshes its expiry). Opportunistically
+   *  prunes expired entries so an aborted kill can't leak one past its TTL. */
+  post(jobId: string, pid: number | null, startTime: string | null): void {
+    const nowMs = this.now();
+    for (const [id, h] of this.hints) {
+      if (nowMs >= h.expiresAtMs) this.hints.delete(id);
+    }
+    this.hints.set(jobId, { pid, startTime, expiresAtMs: nowMs + this.ttlMs });
+  }
+
+  /** Consume the hint for `jobId` iff one is live AND its `(pid, startTime)`
+   *  identity matches. Returns `true` and deletes the entry on a match; returns
+   *  `false` on absent / expired / identity mismatch. */
+  consume(
+    jobId: string,
+    pid: number | null,
+    startTime: string | null,
+  ): boolean {
+    const hint = this.hints.get(jobId);
+    if (hint === undefined) return false;
+    if (this.now() >= hint.expiresAtMs) {
+      this.hints.delete(jobId);
+      return false;
+    }
+    // Null-tolerant identity match, mirroring the exit verifier: pids match when
+    // both are NULL or both non-null and equal; start_time matches when either
+    // side is NULL or they are equal. A mismatch is a racy/stale hint — leave it
+    // (a later correct event may still match within the TTL) and fall back to
+    // exit_watched.
+    const pidMatches =
+      (hint.pid == null && pid == null) ||
+      (hint.pid != null && hint.pid === pid);
+    const startMatches =
+      hint.startTime == null ||
+      startTime == null ||
+      hint.startTime === startTime;
+    if (!pidMatches || !startMatches) return false;
+    this.hints.delete(jobId);
+    return true;
+  }
+
+  /** Live (unexpired) hint count — introspection for tests only. */
+  size(): number {
+    const nowMs = this.now();
+    let n = 0;
+    for (const h of this.hints.values()) if (nowMs < h.expiresAtMs) n++;
+    return n;
+  }
+}
 
 /**
  * Options for {@link startDaemon}. The production `runDaemon()` boot passes none;
@@ -4735,6 +4830,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } as WorkerOptions & { workerData: unknown })
     : null;
 
+  // The autoclose worker (spawned far below) posts a pre-kill intent hint here so
+  // the exit-watcher's SOLE Killed mint can relabel the resulting row
+  // `kill_reason: 'autoclosed'`. Declared in the exit worker's scope so the mint
+  // site can consume it; the TTL outlives the slowest reprobe-backstop observe.
+  const autocloseHints = new AutocloseHintSet(AUTOCLOSE_HINT_TTL_MS);
+
   if (exitWorker) {
     const ew = exitWorker;
     // Main stays the SOLE writer: an `exit` message becomes a synthetic `Killed`
@@ -4815,8 +4916,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       const closeKind = classifyCloseKind(row.backend_exec_pane_id);
       // WHY keeper reaped: the steady-state exit-watcher observed this process
       // exit (distinct from the boot seed sweep's `boot_*` reasons). Rides the
-      // payload blob; the reducer folds it onto `jobs.kill_reason` opaquely.
-      const killReason: KillReason = "exit_watched";
+      // payload blob; the reducer folds it onto `jobs.kill_reason` opaquely. A
+      // live, identity-matching autoclose intent hint (posted just before the
+      // worker force-closed the window) relabels it `autoclosed` — consumed at
+      // most once; an absent/expired/mismatched hint keeps `exit_watched`.
+      const killReason: KillReason = autocloseHints.consume(
+        msg.jobId,
+        msg.pid,
+        msg.startTime,
+      )
+        ? "autoclosed"
+        : "exit_watched";
       stmts.insertEvent.run({
         $ts: Date.now() / 1000, // unix seconds as REAL
         $session_id: msg.jobId, // == job_id
@@ -7354,6 +7464,41 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
+  // Gated on the selector — `null` when unselected. The autoclose worker
+  // (epic fn-1107): a pure external actuator cloned from the renamer — reads the
+  // jobs projection READ-ONLY, self-gates on `autoclose_enabled` every pulse, and
+  // writes ONLY to tmux (`kill-window`), NEVER keeper.db. ALWAYS spawned (a
+  // runtime enable/disable flip needs no restart); NOT a WATCHER_WORKER (dlopens
+  // no parcel watcher). Unlike the renamer it DOES post to main — the pre-kill
+  // intent hint — which `autocloseHints` records so the exit-watcher's sole
+  // Killed mint labels the row 'autoclosed'.
+  const autocloseWorker = want("autoclose")
+    ? new Worker(new URL("./autoclose-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies AutocloseWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (autocloseWorker) {
+    const aw = autocloseWorker;
+    aw.onmessage = (
+      ev: MessageEvent<AutocloseIntentMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "autoclose-intent") return;
+      // Record the pre-kill hint keyed by jobId; the exit-watcher's SOLE Killed
+      // mint consumes it (identity-checked, once) to stamp 'autoclosed'.
+      autocloseHints.post(msg.jobId, msg.pid, msg.startTime);
+    };
+    aw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] autoclose worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    aw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   // Gated on the selector — `null` when unselected. The Agent Bus relay
   // (epic fn-875): opens keeper.db READ-ONLY for jobs identity reads and owns
   // its OWN writable bus.db + dedicated bus.sock (paths default to
@@ -7791,6 +7936,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       maintenanceWorker,
       restoreWorker,
       renamerWorker,
+      autocloseWorker,
       busWorker,
       tmuxControlWorker,
     ].filter((w): w is Worker => w !== null);

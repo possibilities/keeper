@@ -25,6 +25,8 @@ import {
 } from "../src/backstop-telemetry";
 import {
   ALL_WORKERS,
+  AUTOCLOSE_HINT_TTL_MS,
+  AutocloseHintSet,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
   type BlockEscalationOutcome,
@@ -5059,6 +5061,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "maintenance-worker.ts": "maintenance",
   "restore-worker.ts": "restore",
   "renamer-worker.ts": "renamer",
+  "autoclose-worker.ts": "autoclose",
   "bus-worker.ts": "bus",
   "tmux-control-worker.ts": "tmuxControl",
 };
@@ -5151,7 +5154,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -5170,9 +5173,11 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
   // the spy boot's default `disableNativeWatcher:false` but never in-process).
   // fn-1024 added `statusline` (the sixth file-watcher producer; watches the
   // statusLine leaf dir and mints `SessionTelemetry`, reads keeper.db read-only).
+  // fn-1107 added `autoclose` (the done-window reaper; no watcher, posts a
+  // pre-kill intent hint to main but writes keeper.db NOTHING).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(19);
+  expect(spawned).toHaveLength(20);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -5193,9 +5198,175 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
     "maintenance",
     "restore",
     "renamer",
+    "autoclose",
     "bus",
     "tmuxControl",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1107 task .4 — the autoclose intent-hint set + the Killed-mint relabel.
+// The autoclose worker posts a pre-kill hint; main consults it at the SOLE
+// Killed-mint site so a hinted death stamps `kill_reason: 'autoclosed'` and every
+// other death keeps `exit_watched`. The set is a pure structure (injected clock);
+// the mint-relabel test mirrors the exit-watcher onmessage closure driven directly
+// (the established insertPlanSnapshot/insertDispatchedRow pattern — no Worker).
+// ---------------------------------------------------------------------------
+
+test("AUTOCLOSE_HINT_TTL_MS outlives the reprobe backstop worst case", () => {
+  // The hint must survive until the slowest exit-observe path mints the Killed:
+  // the reprobe backstop cannot reap a row until it ages past REPROBE_MIN_AGE_SECS
+  // (300s) and then fires on up to one more REPROBE_MS (60s) tick. The TTL is sized
+  // OFF those constants (doubled age gate + a tick), never a guessed literal.
+  expect(AUTOCLOSE_HINT_TTL_MS).toBe(300 * 2 * 1000 + 60_000);
+  expect(AUTOCLOSE_HINT_TTL_MS).toBeGreaterThan(300 * 1000 + 60_000);
+});
+
+test("AutocloseHintSet: a matching hint is consumed exactly once", () => {
+  const nowMs = 1_000_000;
+  const hints = new AutocloseHintSet(10_000, () => nowMs);
+  hints.post("job-a", 4242, "darwin:start-a");
+  expect(hints.size()).toBe(1);
+
+  // First consume with the matching identity → true, and the entry is gone.
+  expect(hints.consume("job-a", 4242, "darwin:start-a")).toBe(true);
+  expect(hints.size()).toBe(0);
+  // A second consume finds nothing → exit_watched fallback.
+  expect(hints.consume("job-a", 4242, "darwin:start-a")).toBe(false);
+});
+
+test("AutocloseHintSet: an expired hint is not consumed", () => {
+  let nowMs = 1_000_000;
+  const hints = new AutocloseHintSet(10_000, () => nowMs);
+  hints.post("job-a", 7, "start");
+  // Advance past the TTL — the hint has expired.
+  nowMs += 10_001;
+  expect(hints.consume("job-a", 7, "start")).toBe(false);
+  expect(hints.size()).toBe(0);
+});
+
+test("AutocloseHintSet: an identity mismatch does not consume, a later match still does", () => {
+  const nowMs = 1_000_000;
+  const hints = new AutocloseHintSet(10_000, () => nowMs);
+  hints.post("job-a", 100, "start-x");
+  // Wrong pid → no consume; the entry survives for a correct event.
+  expect(hints.consume("job-a", 999, "start-x")).toBe(false);
+  // Wrong start_time → no consume either.
+  expect(hints.consume("job-a", 100, "start-y")).toBe(false);
+  expect(hints.size()).toBe(1);
+  // The correct identity still consumes it once.
+  expect(hints.consume("job-a", 100, "start-x")).toBe(true);
+  expect(hints.size()).toBe(0);
+});
+
+test("AutocloseHintSet: null pid/start_time match null-tolerantly (pidless reap)", () => {
+  const hints = new AutocloseHintSet(10_000);
+  // A pidless-reap hint: both sides NULL → match.
+  hints.post("job-a", null, null);
+  expect(hints.consume("job-a", null, null)).toBe(true);
+
+  // A hint with a NULL start_time matches any exit start_time (loose side).
+  hints.post("job-b", 55, null);
+  expect(hints.consume("job-b", 55, "whatever")).toBe(true);
+
+  // A hint carrying a real pid is NOT matched by a pidless (null-pid) exit.
+  hints.post("job-c", 88, "start");
+  expect(hints.consume("job-c", null, "start")).toBe(false);
+});
+
+test("AutocloseHintSet: a repeat post refreshes expiry and prunes dead entries", () => {
+  let nowMs = 0;
+  const hints = new AutocloseHintSet(10_000, () => nowMs);
+  hints.post("job-a", 1, "s"); // expires at 10_000
+  nowMs = 9_000;
+  hints.post("job-a", 1, "s"); // refresh → expires at 19_000
+  nowMs = 15_000;
+  // Still live thanks to the refresh.
+  expect(hints.consume("job-a", 1, "s")).toBe(true);
+
+  // A fresh post opportunistically prunes an unrelated expired entry.
+  nowMs = 0;
+  const h2 = new AutocloseHintSet(10_000, () => nowMs);
+  h2.post("stale", 1, "s");
+  nowMs = 20_000;
+  h2.post("fresh", 2, "s"); // the post-time prune drops `stale`
+  expect(h2.consume("stale", 1, "s")).toBe(false);
+  expect(h2.consume("fresh", 2, "s")).toBe(true);
+});
+
+/** Mint a synthetic `Killed` exactly as the exit-watcher onmessage closure does:
+ *  select the reason via the hint set (a match → 'autoclosed', else 'exit_watched')
+ *  and ride it on the payload the reducer folds onto `jobs.kill_reason`. */
+function mintKilledViaHint(
+  db: ReturnType<typeof openDb>["db"],
+  hints: AutocloseHintSet,
+  jobId: string,
+  pid: number | null,
+  startTime: string | null,
+  tsSec: number,
+): void {
+  const reason = hints.consume(jobId, pid, startTime)
+    ? "autoclosed"
+    : "exit_watched";
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'Killed', 'killed', ?)`,
+    [
+      tsSec,
+      jobId,
+      JSON.stringify({ pid, start_time: startTime, close_kind: null, reason }),
+    ],
+  );
+}
+
+test("the Killed mint stamps 'autoclosed' on a hint match and 'exit_watched' otherwise", () => {
+  const { db } = freshMemDb();
+  const hints = new AutocloseHintSet(AUTOCLOSE_HINT_TTL_MS);
+
+  // A hinted death (autoclose posted the intent just before killing the window).
+  seedJobsRow(db, "sess-autoclosed", 4242, "darwin:start-a");
+  hints.post("sess-autoclosed", 4242, "darwin:start-a");
+  mintKilledViaHint(db, hints, "sess-autoclosed", 4242, "darwin:start-a", 100);
+
+  // An unhinted death (an ordinary observed exit) — keeps exit_watched.
+  seedJobsRow(db, "sess-exit", 5353, "darwin:start-b");
+  mintKilledViaHint(db, hints, "sess-exit", 5353, "darwin:start-b", 101);
+
+  drainToCompletion(db);
+
+  const reasonOf = (jobId: string): string | null =>
+    (
+      db.query("SELECT kill_reason FROM jobs WHERE job_id = ?").get(jobId) as {
+        kill_reason: string | null;
+      }
+    ).kill_reason;
+  const stateOf = (jobId: string): string =>
+    (
+      db.query("SELECT state FROM jobs WHERE job_id = ?").get(jobId) as {
+        state: string;
+      }
+    ).state;
+
+  expect(stateOf("sess-autoclosed")).toBe("killed");
+  expect(reasonOf("sess-autoclosed")).toBe("autoclosed");
+  expect(stateOf("sess-exit")).toBe("killed");
+  expect(reasonOf("sess-exit")).toBe("exit_watched");
+
+  // The hint was consumed once — a second observed exit for the same job falls
+  // back to exit_watched (a re-opened row would carry a fresh identity anyway).
+  seedJobsRow(db, "sess-autoclosed-again", 4242, "darwin:start-a");
+  mintKilledViaHint(
+    db,
+    hints,
+    "sess-autoclosed-again",
+    4242,
+    "darwin:start-a",
+    102,
+  );
+  drainToCompletion(db);
+  expect(reasonOf("sess-autoclosed-again")).toBe("exit_watched");
+
+  db.close();
 });
 
 test("fn-749: passing the full ALL_WORKERS set is identical to passing no selector", () => {

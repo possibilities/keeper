@@ -131,7 +131,7 @@ const WAIT_TIMEOUT_MS = 1000;
  * is the rare-miss safety net, so a coarse 60s tick keeps the syscall + `ps`
  * cost negligible.
  */
-const REPROBE_MS = 60_000;
+export const REPROBE_MS = 60_000;
 /**
  * Launch-race age gate (seconds). A freshly-launched job whose pid we read
  * before the SessionStart hook's `(pid, start_time)` fully settled must not be
@@ -140,7 +140,7 @@ const REPROBE_MS = 60_000;
  * reset on a stopped row); the dead-pid conjunct carries correctness, the age
  * gate only suppresses the launch-race false positive.
  */
-const REPROBE_MIN_AGE_SECS = 5 * 60;
+export const REPROBE_MIN_AGE_SECS = 5 * 60;
 
 /** Internal tracked-pid entry. udata = the i64 token we registered with. */
 interface TrackedEntry {
