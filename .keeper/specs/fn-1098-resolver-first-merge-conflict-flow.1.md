@@ -43,5 +43,7 @@ resolve:: job and defer to its verdict.
 - [ ] retry_dispatch re-arms both stamps as today; bun test green
 
 ## Done summary
-
+Sequenced the merge-escalation sweep behind the resolver. selectPendingMergeEscalations now also requires resolver_dispatched_at IS NOT NULL; runMergeEscalationSweep skips a row whose resolver is live or not-yet-terminal via a new resolverOutcome dep (classifyResolverOutcome in reconcile-core, reading the same jobs map + liveness arms as epicHasActiveResolver). The planner escalation fires exactly once, only after the resolver reaches a terminal verdict (declined=ended/BLOCKED, died=killed/dead-pane); the bounded wait rides existing reap, no new timer. buildMergeEscalationBody now names the resolver's verdict and carries the pause caveat (pause does not stop an in-flight resolver; check keeper query jobs for a live resolve::<epic> before merging by hand). retry_dispatch still re-arms both stamps by deleting the row. SKILL.md runbook + CLAUDE.md invariant updated; stale two-independent-sweeps comments corrected.
 ## Evidence
+- Commits: ba6fb2ea
+- Tests: bun test test/daemon.test.ts test/autopilot-worker.test.ts: 537 pass / 0 fail, tsc --noEmit clean (installed prompt plugin liquidjs dep), biome + lint-claude-md green

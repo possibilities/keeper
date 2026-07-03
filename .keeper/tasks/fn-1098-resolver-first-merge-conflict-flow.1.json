@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Gate merge escalation on resolver verdict",
-  "updated_at": "2026-07-03T19:04:24.979000Z"
+  "updated_at": "2026-07-03T19:56:53.987000Z",
+  "worker_done_at": "2026-07-03T19:56:53.987000Z"
 }
