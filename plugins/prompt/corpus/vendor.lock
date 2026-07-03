@@ -6,7 +6,7 @@ upstream:
   repo: arthack
   remote: git@github.com:possibilities/arthack.git
   path: claude/arthack/template/_partials
-  sha: 0134fe441178b61e52ecda2d8108e0d47158463f
+  sha: ad56551cb41110083e746b9e7ef8517193ed34e9
 filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
 files:
   claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
@@ -19,7 +19,7 @@ files:
   claude/arthack/template/_partials/snippets/engineering/commit-via-keeper-default.md.tmpl: 7ccd36aa5c5fc7ea53592e24b1439da0156ec753737340fd3845398a9450f935
   claude/arthack/template/_partials/snippets/engineering/escalate-inline-or-plan.md.tmpl: 812e953b1584d91ee6308b8c9e4aebdcabee0a842ff999884f3e7bd094801745
   claude/arthack/template/_partials/snippets/engineering/future-facing-docs.md.tmpl: e25ea5703a4b547f5146d830764eafa0be2a10db4ecbdd23d89aec199ca26c83
-  claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 9716788e042f19e845b3587765c8e51f1bf83e399a708934818b0271b32e28bc
+  claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 676ac8271205d8f3c17744ab772e0e387eb104dc98d247416d946d6d4b383e82
   claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 42297fa00860e86eb326e1e8d505c1bc1a6fa37b3fa01a92e3e20d6f99817408
   claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3
   claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: 9a39a73c6c3b5f0e1ab63724b11bbe9091a5a89f964be70f1df9896a3aa31b32

@@ -81,6 +81,12 @@ keeper search-history <term>   # ts, session_id, prompt snippet for every matchi
 keeper show-session-events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
 ```
 
+**One session at a glance** — orient before touching any transcript:
+
+```bash
+keeper session-summary <session-id>   # bounded envelope: title, lifecycle, plan linkage, first+last prompt, event counts
+```
+
 **One job's metadata / failed-worker forensics**:
 
 ```bash
