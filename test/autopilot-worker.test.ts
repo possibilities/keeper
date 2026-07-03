@@ -46,6 +46,7 @@ import {
   buildWorkerCommand,
   buildWorktreeStatusEntries,
   type ConfirmRunningDeps,
+  classifyResolverOutcome,
   classifyWorktreeRepos,
   closerJobFinished,
   computeDeferredEpicIds,
@@ -697,6 +698,121 @@ test("fn-1095 epicHasActiveResolver: a reaped/terminal resolver no longer exclud
     }),
   );
   expect(epicHasActiveResolver(other, "fn-1-foo", null)).toBe(false);
+});
+
+test("classifyResolverOutcome: no resolve job row is not terminal (launch window — the escalation waits)", () => {
+  const jobs = new Map<string, Job>();
+  // A close job for the epic is NOT a resolver — never a terminal resolver verdict.
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "close",
+      plan_ref: "fn-1-foo",
+      state: "ended",
+    }),
+  );
+  expect(classifyResolverOutcome(jobs, "fn-1-foo", null)).toEqual({
+    terminal: false,
+  });
+});
+
+test("classifyResolverOutcome: a live resolver is not terminal (working, or stopped under a degraded probe)", () => {
+  const working = new Map<string, Job>();
+  working.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "working",
+      backend_exec_pane_id: "%1",
+    }),
+  );
+  expect(classifyResolverOutcome(working, "fn-1-foo", null)).toEqual({
+    terminal: false,
+  });
+  // A stopped resolver under a null (degraded) probe stays LIVE — conservative, so the
+  // escalation waits for a definitive ended/killed rather than firing prematurely.
+  const stopped = new Map<string, Job>();
+  stopped.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "stopped",
+      backend_exec_pane_id: "%7",
+    }),
+  );
+  expect(classifyResolverOutcome(stopped, "fn-1-foo", null)).toEqual({
+    terminal: false,
+  });
+});
+
+test("classifyResolverOutcome: an ended resolver is terminal/declined; a killed or dead-pane resolver is terminal/died", () => {
+  const ended = new Map<string, Job>();
+  ended.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "ended",
+    }),
+  );
+  // A clean exit (SessionEnd) — it stamped BLOCKED / gave up → declined.
+  expect(classifyResolverOutcome(ended, "fn-1-foo", null)).toEqual({
+    terminal: true,
+    verdict: "declined",
+  });
+  const killed = new Map<string, Job>();
+  killed.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "killed",
+    }),
+  );
+  // Proven-gone → died.
+  expect(classifyResolverOutcome(killed, "fn-1-foo", null)).toEqual({
+    terminal: true,
+    verdict: "died",
+  });
+  // A stopped resolver whose pane is DEAD under a real probe — crashed → died.
+  const deadPane = new Map<string, Job>();
+  deadPane.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "stopped",
+      backend_exec_pane_id: "%7",
+    }),
+  );
+  expect(
+    classifyResolverOutcome(deadPane, "fn-1-foo", new Set(["%99"])),
+  ).toEqual({ terminal: true, verdict: "died" });
+});
+
+test("classifyResolverOutcome: keyed per-epic — a terminal resolver for another epic never speaks for this one", () => {
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-2-bar",
+      state: "ended",
+    }),
+  );
+  // No resolve row for fn-1-foo → not terminal (its escalation still waits).
+  expect(classifyResolverOutcome(jobs, "fn-1-foo", null)).toEqual({
+    terminal: false,
+  });
 });
 
 test("fn-811 isOccupyingJob: null livePaneIds (degraded probe) keeps stopped occupying", () => {

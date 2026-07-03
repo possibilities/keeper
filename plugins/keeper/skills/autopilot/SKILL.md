@@ -245,7 +245,10 @@ autonomous `resolve::<epic>` worker in-flight — the daemon's one-shot merge-re
 (dispatched only while playing; see Guardrails). It is a first-class dispatch key, so
 reaps and the instant-death breaker apply to it. It fires ONCE per stuck close: to make
 it re-attempt, clear the close sticky with `keeper autopilot retry close::<epic>` (that
-re-arms the dispatch-once marker) — there is no `retry resolve::`.
+re-arms the dispatch-once marker) — there is no `retry resolve::`. The `planner@<epic>`
+merge-conflict escalation follows this resolver's verdict (see Guardrails): a brief
+arriving means the resolver already declined or died, so before you act on it confirm no
+`resolve::<epic>` is live.
 
 **Quota-wall signal.** `.data.needs_human.instant_death_wall` counts the distinct
 keys currently tripped by the instant-death breaker. `>= 2` (multiple keys dying
@@ -286,15 +289,20 @@ the breaker.
   prepared, and the one decision you need — never a raw failure dump. The daemon's
   own bus notifications (block + merge escalations) already follow this shape;
   match it when you speak for them.
-- **A merge-conflict close attempts an autonomous resolver first (while playing).**
-  On a sticky `worktree-merge-conflict` close the daemon fires TWO independent,
-  once-latched consumers of the same trigger: it notifies the human (the merge
-  escalation above, always) AND — only while autopilot is playing — dispatches ONE
-  `resolve::<epic>` merge-resolver worker (a first-class dispatch key, so reaps and
-  the instant-death breaker apply). Its authority is deliberately narrower than a
-  human's: it resolves ONLY mechanically-clear conflicts (both intents preserved,
-  epic tests green) then commits and fires `retry close::<epic>`; anything
-  state-machine / schema / security / transaction-boundary shaped it stamps BLOCKED
-  with the unstick sentence and leaves for the human. The close audit still gates the
-  merged result, and the human escalation path is unchanged whether the resolver
-  resolves, declines, or fails — so relay the escalation as usual.
+- **A merge-conflict close is the resolver's first, the human's second.** On a sticky
+  `worktree-merge-conflict` close the daemon dispatches ONE `resolve::<epic>`
+  merge-resolver worker (only while playing) — a first-class dispatch key, so reaps and
+  the instant-death breaker apply. Its authority is deliberately narrower than a human's:
+  it resolves ONLY mechanically-clear conflicts (both intents preserved, epic tests
+  green) then commits and fires `retry close::<epic>`; anything state-machine / schema /
+  security / transaction-boundary shaped it stamps BLOCKED with the unstick sentence and
+  leaves for the human. The `planner@<epic>` escalation fires ONLY after that resolver
+  reaches a terminal verdict — it DECLINED (stamped BLOCKED) or its job died — never
+  concurrently, so the two never race the same base worktree. The close audit still gates
+  the merged result whichever path resolves; relay the escalation as usual.
+- **Pausing does NOT stop an in-flight resolver.** `pause` stops the recover sweep and
+  new dispatches, not a resolver already running. On a merge-conflict escalation — or
+  before you manually resolve ANY stuck merge-conflict close — check `keeper query jobs`
+  for a live `resolve::<epic>` and DEFER to its verdict; a manual merge racing a live
+  resolver is the exact collision this flow prevents. (A retry re-dispatches a fresh
+  resolver, so the same check applies right after `retry close::<epic>`.)

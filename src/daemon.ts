@@ -31,10 +31,15 @@ import type {
   DispatchedMessage,
   DispatchFailedMessage,
   LaneMergedMessage,
+  ResolverOutcome,
   Verb,
   WorktreeRepoStatusMessage,
 } from "./autopilot-worker";
-import { WORKER_EFFORT, WORKER_MODEL } from "./autopilot-worker";
+import {
+  classifyResolverOutcome,
+  WORKER_EFFORT,
+  WORKER_MODEL,
+} from "./autopilot-worker";
 import {
   backfillMutationPath,
   isMutationPathBackfillComplete,
@@ -189,7 +194,7 @@ import type {
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
-import type { SessionTelemetryMessage } from "./types";
+import type { Job, SessionTelemetryMessage } from "./types";
 import type { UsageScraperWorkerData } from "./usage-scraper-worker";
 import type {
   UsageMessage,
@@ -960,7 +965,15 @@ export interface PlannerNotifyResult {
  * {@link MERGE_ESCALATION_REASON_TOKEN}, so a `worktree-merge-lock-timeout` /
  * `worktree-merge-local-timeout` / `worktree-finalize-non-fast-forward` /
  * `worktree-recover*` row never matches. `merge_escalated_at IS NULL` is the
- * escalate-once gate — a stamped row (task .1's terminal fold) drops out.
+ * escalate-once gate — a stamped row (the terminal escalation fold) drops out.
+ *
+ * `resolver_dispatched_at IS NOT NULL` sequences the escalation BEHIND the resolver:
+ * the sibling resolver-dispatch sweep owns the conflict first, so a row whose resolver
+ * has not yet been dispatched (a fresh row, a paused board, or the window after a
+ * `retry_dispatch` re-armed both markers at NULL) is NOT escalatable — the human
+ * notify waits. A dispatched-but-still-running resolver is filtered downstream in the
+ * sweep by its terminal-outcome check ({@link classifyResolverOutcome}); this SQL gate
+ * only rules out the not-yet-dispatched case cheaply off the durable column.
  */
 export function selectPendingMergeEscalations(
   db: Database,
@@ -970,11 +983,37 @@ export function selectPendingMergeEscalations(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'close'
            AND merge_escalated_at IS NULL
+           AND resolver_dispatched_at IS NOT NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
     )
     .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
+}
+
+/**
+ * Load the `resolve::<epic>` job rows for `epicId` into the map shape {@link
+ * classifyResolverOutcome} reads — the merge-escalation sweep's terminal-resolver
+ * probe. Bounded (a handful of rows per epic on the `plan_verb='resolve'` partial
+ * index), selecting only the columns the liveness arms touch. A jobs read failure
+ * degrades to an EMPTY map, which classifies as `{terminal:false}` so the escalation
+ * conservatively WAITS (never a premature notify on a transient error).
+ */
+function resolveJobsForEpic(db: Database, epicId: string): Map<string, Job> {
+  const jobs = new Map<string, Job>();
+  try {
+    const rows = db
+      .query(
+        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ?",
+      )
+      .all(epicId) as unknown as Job[];
+    for (const row of rows) {
+      jobs.set(row.job_id, row);
+    }
+  } catch {
+    // Transient jobs read failure → empty map → terminal:false → wait next tick.
+  }
+  return jobs;
 }
 
 /**
@@ -1025,21 +1064,43 @@ function parseMergeConflictReason(
  * DEGRADES to a still-human-actionable manual body — the sweep never throws on a
  * reason it can't parse. The free-text reason rides as a body line, never a shell
  * arg (the notify helper passes the whole body via stdin). Pure.
+ *
+ * Opens by naming the resolver's `resolverVerdict` — the escalation fires only AFTER
+ * the autonomous resolver reached a terminal outcome (`declined` = it stamped BLOCKED,
+ * `died` = its job crashed), so the human is the fallback, never a racer. Carries the
+ * pause caveat: pausing does NOT stop an in-flight resolver, so on a retry (or a
+ * still-live resolver) the operator defers to the resolver's verdict before merging by
+ * hand.
  */
 export function buildMergeEscalationBody(args: {
   epicId: string;
   reason: string;
   repoDir: string | null;
+  resolverVerdict: "declined" | "died";
 }): string {
   const epic = args.epicId;
   const parsed = parseMergeConflictReason(args.reason);
   const hasRepo = args.repoDir != null && args.repoDir !== "";
+  const verdictLine =
+    args.resolverVerdict === "died"
+      ? `An autonomous merge-resolver already ran on close::${epic} and its job DIED before resolving — it now needs you.`
+      : `An autonomous merge-resolver already ran on close::${epic} and DECLINED it (not mechanically clear — it stamped BLOCKED) — it now needs you.`;
+  const resolverPauseNote = [
+    `NOTE: pausing does NOT stop an in-flight resolver — it only stops the recover`,
+    `sweep and new dispatches. If you retry this close (which re-dispatches a fresh`,
+    `resolver) or one is otherwise live, WAIT for its verdict: check`,
+    `\`keeper query jobs\` for a live \`resolve::${epic}\` and defer to it. A manual`,
+    `merge racing a live resolver is the exact collision this flow prevents.`,
+  ];
   if (parsed == null || !hasRepo) {
     // Parse-miss / no repo dir → a human-actionable manual body, never a throw.
     return [
-      `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict — the`,
+      verdictLine,
+      `The worktree fan-in close for epic ${epic} is STUCK on a merge conflict; the`,
       `autopilot will NOT auto-retry it. Observable: the base worktree is left clean`,
       `and the sticky close row is staged for retry.`,
+      ``,
+      ...resolverPauseNote,
       ``,
       `FIRST run \`keeper autopilot pause\` — the recover sweep races your manual merge`,
       `otherwise (it runs only while autopilot is unpaused). Then resolve`,
@@ -1061,9 +1122,12 @@ export function buildMergeEscalationBody(args: {
   }
   const worktree = worktreePathFor(args.repoDir as string, parsed.base);
   return [
-    `A worktree fan-in close for epic ${epic} is STUCK on a merge conflict — the`,
+    verdictLine,
+    `The worktree fan-in close for epic ${epic} is STUCK on a merge conflict; the`,
     `autopilot will NOT auto-retry it. Observable: the base worktree's merge was`,
     `aborted CLEAN and the sticky close row is staged for retry.`,
+    ``,
+    ...resolverPauseNote,
     ``,
     `Resolve it:`,
     `  0. keeper autopilot pause`,
@@ -1107,6 +1171,12 @@ export interface MergeEscalationSweepDeps {
    *  the clear-mid-sweep window (a `retry_dispatch` between select and send drops
    *  the row). Reads the live projection on the writable connection in production. */
   readonly stillPending: (id: string) => boolean;
+  /** Classify the dispatched `resolve::<epic>` resolver's outcome for `id`
+   *  (DELEGATES to {@link classifyResolverOutcome} over the live `jobs` map in
+   *  production). The escalation NOTIFIES only on a terminal verdict; while the
+   *  resolver is live or its job has not folded yet it returns `{terminal:false}` and
+   *  the sweep skips the row (the resolver owns the conflict first). */
+  readonly resolverOutcome: (id: string) => ResolverOutcome;
   /** Notify `planner@<epic>` with the prebuilt body (and wake on the offline-creator
    *  path). Async + fail-open. */
   readonly notifyPlanner: (
@@ -1162,15 +1232,24 @@ export async function runMergeEscalationSweep(
     // non-escalatable reason.
     if (!shouldEscalateMergeConflict(row.reason)) continue;
     // Re-read immediately before the send: a `retry_dispatch` that cleared the row
-    // (or task .1's fold that stamped the marker) between select and send means
+    // (or the escalation fold that stamped the marker) between select and send means
     // there is nothing left to escalate — skip without minting.
     if (!deps.stillPending(row.id)) continue;
+    // Sequence behind the resolver: the sibling resolver-dispatch sweep owns the
+    // conflict first (the selector already required `resolver_dispatched_at`), so the
+    // human notify waits until that resolver reaches a TERMINAL outcome. While it is
+    // live — or its job has not folded yet (the launch window) — skip without minting,
+    // so the row re-sweeps next tick. A terminal verdict names the resolver's fate in
+    // the brief. `retry_dispatch` re-arms the whole flow by deleting the row.
+    const outcome = deps.resolverOutcome(row.id);
+    if (!outcome.terminal) continue;
 
     const target = `planner@${row.id}`;
     const body = buildMergeEscalationBody({
       epicId: row.id,
       reason: row.reason,
       repoDir: row.dir,
+      resolverVerdict: outcome.verdict,
     });
     let result: PlannerNotifyResult;
     try {
@@ -1201,9 +1280,11 @@ export async function runMergeEscalationSweep(
 // human (`planner@<epic>`) once, this sweep DISPATCHES one autonomous `resolve::<epic>`
 // worker once — a narrower-authority automation that resolves ONLY mechanically-clear
 // conflicts and stamps BLOCKED for anything state-machine / schema / security /
-// transaction-boundary shaped. The two are INDEPENDENT consumers of the same trigger
-// (each latched on its own `dispatch_failures` column), so the human escalation path is
-// unchanged whether the resolver resolves, declines, or fails.
+// transaction-boundary shaped. Each latches on its own `dispatch_failures` column, but
+// the resolver goes FIRST: the human escalation is SEQUENCED behind it — the notify fires
+// only after a resolver was dispatched AND reached a terminal verdict (declined/BLOCKED or
+// job death), so the two never race the same base worktree. The close audit is unchanged
+// whichever path resolves.
 
 /** The outcome the resolver-dispatch producer records on the `ResolverDispatchAttempted`
  *  event. The TERMINAL `dispatched` (the `resolve::<epic>` worker launched) stamps the
@@ -6626,7 +6707,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // sends `planner@<epic>` the resolve+unstick brief over the bus, and mints
   // `MergeEscalationAttempted{outcome}`. NOTIFIES ONLY — it never clears the sticky
   // row; only `retry_dispatch` does. A terminal `sent` / `queued_for_wake` stamps
-  // the `merge_escalated_at` once-marker (task .1's fold), so a daemon escalates a
+  // the `merge_escalated_at` once-marker (the escalation fold), so a daemon escalates a
   // given stuck close ONCE. All wall-clock + spawn lives HERE in the producer, never
   // in a fold; the spawn lives only here, so a re-fold never re-fires a notify.
   //
@@ -6654,6 +6735,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return false;
         }
       },
+      resolverOutcome: (id) =>
+        classifyResolverOutcome(resolveJobsForEpic(db, id), id, null),
       notifyPlanner: (target, body) => notifyPlanner(target, body),
       mintAttempted: (id, outcome) => mintMergeEscalationEvent(id, outcome),
       noteLine: (line) => console.error(`[keeperd] ${line}`),
@@ -6673,9 +6756,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // merge-escalation notify above. Where that sweep pings a human ONCE, this one
   // launches ONE autonomous `resolve::<epic>` merge-resolver worker ONCE per sticky
   // condition — narrower authority (mechanically-clear conflicts only; everything else
-  // stamps BLOCKED and stays for the human). The `resolver_dispatched_at` latch is
-  // INDEPENDENT of `merge_escalated_at`, so both fire on the same sticky and the human
-  // escalation path is unchanged whether the resolver resolves, declines, or fails.
+  // stamps BLOCKED and stays for the human). The `resolver_dispatched_at` latch is a
+  // DISTINCT column from `merge_escalated_at`, but the two are no longer independent: the
+  // human escalation is SEQUENCED behind this resolver (the notify fires only once a
+  // resolver was dispatched AND reached a terminal verdict — declined/BLOCKED or job
+  // death), so the two never race the same base. Both re-arm at NULL only when
+  // `retry_dispatch` drops the row.
   //
   // Spawns into the MANAGED autopilot session with `--name resolve::<epic>`, so the
   // worker folds a first-class `jobs` row and every reap / instant-death-breaker /
@@ -6724,9 +6810,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function runResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a
-    // paused board never auto-dispatches a resolver, mirroring the reconciler's own
-    // pause gate. The merge-escalation NOTIFY still fires (a human wants to know),
-    // but the autonomous LAUNCH waits for play.
+    // paused board never auto-dispatches a NEW resolver, mirroring the reconciler's own
+    // pause gate. Pause does NOT stop an in-flight resolver, and the merge-escalation
+    // sweep still runs — it stays sequenced behind that resolver's verdict. So a fresh
+    // sticky on a paused board defers BOTH the launch and the notify until play (a human
+    // watching a paused board reads the sticky via `keeper status` meanwhile).
     if (autopilotPaused) return;
     await runResolverDispatchSweep({
       selectPending: () => selectPendingResolverDispatches(db),

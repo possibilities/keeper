@@ -188,6 +188,7 @@ export type {
   ReconcileDecision,
   ReconcileSnapshot,
   ReconcileState,
+  ResolverOutcome,
   SlotOccupancyDecision,
   SlotOccupancyInput,
   SlotOccupancySignal,
@@ -206,6 +207,7 @@ export type {
 export {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
+  classifyResolverOutcome,
   closerJobFinished,
   computeSlotOccupancy,
   dispatchKey,
