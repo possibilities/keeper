@@ -191,9 +191,32 @@ export function armViewerExitTriggers(
   };
 }
 
+/** Default honest-empty body line for a snapshot whose render produced zero
+ *  lines — a healthy but idle projection. A snapshot must never write bare
+ *  separators (`---` alone / empty stdout frame); this stands in so the frame
+ *  reads as a deliberate idle state. Overridable per view via
+ *  `snapshotEmptyLine`. */
+export const DEFAULT_SNAPSHOT_EMPTY_LINE = "(idle — nothing to display)";
+
+/**
+ * Normalize a render's body lines for a SNAPSHOT frame: a render that produced
+ * zero lines becomes the honest-empty single line, so a healthy-but-idle daemon
+ * yields a real one-line frame instead of bare separators. Live-mode painting
+ * keeps today's empty-body behavior — this is snapshot-only. Pure — exported
+ * for tests.
+ */
+export function snapshotBodyLines(
+  bodyLines: string[],
+  emptyLine: string,
+): string[] {
+  return bodyLines.length > 0 ? bodyLines : [emptyLine];
+}
+
 /** Output of one render pass — the body the view wants to emit. */
 export interface ViewRender {
-  /** Body lines, one per output row. Empty array yields a `---`-only frame. */
+  /** Body lines, one per output row. In snapshot mode an empty array is
+   * normalized to the honest-empty line (`snapshotBodyLines`), never a
+   * `---`-only frame; live mode paints an empty body as-is. */
   bodyLines: string[];
   /** Arbitrary JSON-serializable state captured per frame in the sidecar. */
   stateJson: unknown;
@@ -269,6 +292,13 @@ export interface ViewShellOptions<TSnap> {
    * synchronously.
    */
   snapshotIo?: SnapshotIo;
+  /**
+   * Snapshot mode only: the single body line substituted when a render produces
+   * ZERO body lines, so a healthy-but-idle daemon yields an honest one-line
+   * frame instead of bare separators. Defaults to
+   * {@link DEFAULT_SNAPSHOT_EMPTY_LINE}.
+   */
+  snapshotEmptyLine?: string;
 }
 
 /** Injectable IO + clock for the snapshot path (tests only; prod omits). */
@@ -390,6 +420,8 @@ export function createViewShell<TSnap>(
   const mode = opts.mode ?? "live";
   const isSnapshot = mode === "snapshot";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
+  const snapshotEmptyLine =
+    opts.snapshotEmptyLine ?? DEFAULT_SNAPSHOT_EMPTY_LINE;
 
   // Sidecar paths — keyed on `<script>.<pid>` exactly as the pre-factory
   // siblings emitted. Bit-for-bit shape preservation: any consumer that
@@ -885,7 +917,10 @@ export function createViewShell<TSnap>(
         // A frame was captured (ready, or timeout-degrade with ≥1 stream).
         // Bump frameCount to 1 so the sidecar filenames are frame-1 and the
         // trailer's `frame` matches, then write the sidecars ONCE.
-        const { bodyLines, stateJson } = snapshotCapture;
+        const { bodyLines: rawBodyLines, stateJson } = snapshotCapture;
+        // A zero-line render (healthy but idle projection) becomes the
+        // honest-empty line so the frame is never bare separators.
+        const bodyLines = snapshotBodyLines(rawBodyLines, snapshotEmptyLine);
         const truncated = outcome.kind === "timeout";
         frameCount = 1;
         const frameText = sidecarFrameText(bodyLines);

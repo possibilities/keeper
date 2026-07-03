@@ -614,7 +614,7 @@ Precedence is strict: try the bus-resume FIRST and fall through to cold-re-dispa
 
 Runs on **both** paths, unconditionally, after Phase 6.
 
-**Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — `epic add-deps` re-stamps only when it writes ≥1 edge, so a dep-free epic reaches Phase 7 still a ghost and the arm is its only readiness step. `dashctl` and `keeper plan watch` render a null-marker epic dashed until this runs.
+**Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — `epic add-deps` re-stamps only when it writes ≥1 edge, so a dep-free epic reaches Phase 7 still a ghost and the arm is its only readiness step. `keeper plan watch` (and `dashctl` when it's on PATH) render a null-marker epic dashed until this runs.
 
 **Refine path:** R1's `refine-context --invalidate` cleared the marker; this re-stamps it on success (`null → timestamp`).
 
