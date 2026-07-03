@@ -69,5 +69,5 @@ env exports asserted per harness; claude launch writes NO record.
 - [ ] The launcher path remains db-free (depgraph pin green) and the births tree is sandboxed in tests
 
 ## Done summary
-
+Added src/birth-record.ts (dep-free maildir birth-record contract + atomic write + child start_time probe) and wired the launcher spawn choke point (run.ts child-pid callback, main.ts armBirthRecord) so every codex/pi/hermes launch drops one birth record with keeper job identity + KEEPER_JOB_ID/originator env exports; claude emits none; resume reuses the original job id.
 ## Evidence
