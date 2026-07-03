@@ -6,11 +6,11 @@ upstream:
   repo: arthack
   remote: git@github.com:possibilities/arthack.git
   path: claude/arthack/template/_partials
-  sha: ad56551cb41110083e746b9e7ef8517193ed34e9
+  sha: 47459411a786819107b2dfc979db0d6c61c75f42
 filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
 files:
   claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
-  claude/arthack/template/_partials/snippets/_index.yaml: 3674b3833a127360f9e59d3c9976ece25029ae0eb2970198571618af6cfda637
+  claude/arthack/template/_partials/snippets/_index.yaml: 377bc48d10f7e3a32ba9149bfc12e45b223171c75f0cd48cac55cc9de36999cd
   claude/arthack/template/_partials/snippets/engineering/agents-md-symlink.md.tmpl: 61b73be6a5c6fb55c9bb838fc3065bec00b086fed59f1d9164ebb07637f7c245
   claude/arthack/template/_partials/snippets/engineering/build-forward-no-fallback.md.tmpl: 508fa1c40b0c61de5b8a1d2f0dee17482af4d8a62ac2d5440d03d9c555ca5577
   claude/arthack/template/_partials/snippets/engineering/claude-md-scope.md.tmpl: 67aab3e5032248ace1f549785e2fe89e5547e6954bbebd73cf3624100f007eb7
@@ -20,6 +20,7 @@ files:
   claude/arthack/template/_partials/snippets/engineering/escalate-inline-or-plan.md.tmpl: 812e953b1584d91ee6308b8c9e4aebdcabee0a842ff999884f3e7bd094801745
   claude/arthack/template/_partials/snippets/engineering/future-facing-docs.md.tmpl: e25ea5703a4b547f5146d830764eafa0be2a10db4ecbdd23d89aec199ca26c83
   claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 676ac8271205d8f3c17744ab772e0e387eb104dc98d247416d946d6d4b383e82
+  claude/arthack/template/_partials/snippets/engineering/landed-vs-complete.md.tmpl: f03b52e43b167d2a496ea1d5182a4717bb817b7d434b30c63044ade7c4451f5e
   claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 42297fa00860e86eb326e1e8d505c1bc1a6fa37b3fa01a92e3e20d6f99817408
   claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3
   claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: 9a39a73c6c3b5f0e1ab63724b11bbe9091a5a89f964be70f1df9896a3aa31b32

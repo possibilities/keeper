@@ -1,0 +1,17 @@
+{#-
+name: landed-vs-complete
+summary: keeper plan `landed <epic>` (lane merged to default) vs `complete <id>` (done AND idle) — under worktree mode complete can fire before files reach the default branch, so daisy-chains gate on landed.
+domain: engineering
+audience: agent
+severity: default
+tags: [keeper, plan, landed, complete, worktree, daisy-chain, merge]
+scope: [any]
+phase: [planning, executing]
+related: [escalate-inline-or-plan]
+-#}
+**`landed` and `complete` are distinct keeper plan milestones — they can fire at different times, and which one gates downstream work matters.**
+
+- **`landed <epic>`** fires when the epic's lane is merged to the default branch. Epic-only. It **degrades to `complete` semantics when worktree mode is off** (no lanes exist, so merged ⇔ done). For a **multi-repo** epic it fires only once ALL per-repo groups have merged — not on the first group.
+- **`complete <id>`** is **done AND idle**: the work is finished and every owning subagent has gone idle. Under worktree mode a dependent lane is cut before the upstream's finalize merge, so `complete` can fire while the epic's files are **not yet on the default branch**.
+
+Consequence: a planning daisy-chain — authoring or building against another epic's merged reality — gates on **`landed`, not `complete`**, because `complete` can report done while the files the downstream work reads still aren't on the default branch.
