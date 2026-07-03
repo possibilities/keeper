@@ -1,25 +1,33 @@
 /**
  * Standing assertion for the plugin composition map (docs/plugin-composition-map.md).
  *
- * The map's load-bearing claim is that EVERY claude launch channel — interactive,
- * `keeper agent` manual dispatch, AND the autopilot worker — inherits the SAME
- * base plugin set from plugins.yaml, and the per-cell worker `--plugin-dir` is
- * ADDITIVE (it never isolates a worker to just the cell manifest). This test pins
- * that reality at the two seams the map is derived from, so the doc cannot
- * silently rot:
+ * The map's load-bearing claim is that BY DEFAULT every claude launch channel —
+ * interactive, `keeper agent` manual dispatch, AND the autopilot worker —
+ * inherits the SAME base plugin set from plugins.yaml, and the per-cell worker
+ * `--plugin-dir` is ADDITIVE (it never isolates a worker to just the cell
+ * manifest). This test pins that reality at the two seams the map is derived
+ * from, so the doc cannot silently rot:
  *
- *   1. config parsing (`loadPluginSources`) → discovery (`discoverPlugins`): the
- *      discovery seam takes NO channel/worker discriminator, so its output is a
- *      pure function of (cwd, sources). A worker and an interactive launch on the
- *      same cwd+config compute an identical base set.
+ *   1. config parsing (`loadPluginSources`) → discovery (`discoverPlugins`): with
+ *      the worker-isolation gate OFF (the default), discovery is a pure function
+ *      of (cwd, sources) with no channel/worker branch, so a worker and an
+ *      interactive launch on the same cwd+config compute an identical base set.
  *   2. flag assembly (`buildKeeperAgentLaunchArgv`): a worker launch routes
  *      through `keeper agent claude` (so it hits the `agent === "claude"`
  *      discovery gate in agent/main.ts), and the per-cell `--plugin-dir` rides as
  *      an ADDITIVE flag — the argv with a cell dir is byte-identical to the argv
  *      without it plus exactly that one `--plugin-dir <cell>` pair.
  *
- * If a future change gates discovery on a worker flag, or turns the per-cell dir
- * into a replacement, one of these pins fails.
+ * The `worker_plugin_isolation` config knob (default OFF) adds a config-flagged
+ * worker sub-gate at the discovery seam: when ON, a keeper-automated worker
+ * launch (marked by `--dangerously-skip-permissions`) drops the
+ * `plugin_scan_dirs` results but keeps the hard-listed `plugin_dirs`. The final
+ * describe block pins BOTH gate states — OFF byte-identical to today, ON stripping
+ * only the scanned third-party set — plus the argv marker the seam keys on.
+ *
+ * If a future change gates discovery on a worker flag WHEN THE KNOB IS OFF, turns
+ * the per-cell dir into a replacement, or lets the gate strip a hard-listed
+ * plugin_dir, one of these pins fails.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -43,6 +51,12 @@ function makePlugin(dir: string): void {
   mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
   writeFileSync(join(dir, ".claude-plugin", "plugin.json"), "{}\n");
 }
+
+const PREFIX = [
+  "/fake-home/.bun/bin/bun",
+  "/fake-home/code/keeper/cli/keeper.ts",
+  "agent",
+] as const;
 
 /**
  * Materialize a plugins.yaml fixture mirroring production reality: two hard
@@ -92,28 +106,84 @@ describe("composition map — base set derives from config + is channel-invarian
     expect(args).toContain(arthackDir);
   });
 
-  test("discovery has no channel discriminator — worker and interactive compute the same base set", () => {
+  test("gate OFF (default) — worker and interactive compute the same base set", () => {
     const { configPath } = writeConfig();
     const sources = loadPluginSources(configPath);
     const cwd = join(tmpDir, "bare");
     mkdirSync(cwd, { recursive: true });
-    // The launcher gates discovery ONLY on `agent === "claude"` (agent/main.ts),
-    // with no worker sub-gate; `discoverPlugins` itself takes no channel arg. So
-    // the "interactive" and "worker" channels are the identical call — pin that
-    // by asserting two invocations are deep-equal (there is no branch to diverge).
+    // With the worker-isolation knob OFF (the default), the launcher gates
+    // discovery ONLY on `agent === "claude"` (agent/main.ts) with no worker
+    // sub-gate. The "interactive" and "worker" channels are the identical call —
+    // pin that by asserting an ungated (no options) and an explicit gate-OFF call
+    // are deep-equal (there is no branch to diverge).
     const interactive = discoverPlugins(cwd, sources, configPath);
-    const worker = discoverPlugins(cwd, sources, configPath);
+    const worker = discoverPlugins(cwd, sources, configPath, {
+      stripScanDirs: false,
+    });
     expect(worker.args).toEqual(interactive.args);
   });
 });
 
-describe("composition map — per-cell --plugin-dir is additive", () => {
-  const PREFIX = [
-    "/fake-home/.bun/bin/bun",
-    "/fake-home/code/keeper/cli/keeper.ts",
-    "agent",
-  ] as const;
+describe("composition map — the config-flagged worker isolation gate", () => {
+  test("gate ON strips the scanned third-party set but keeps hard-listed plugin_dirs", () => {
+    const { configPath, keeperDir, planDir, arthackDir } = writeConfig();
+    const sources = loadPluginSources(configPath);
+    const cwd = join(tmpDir, "bare");
+    mkdirSync(cwd, { recursive: true });
+    const { args } = discoverPlugins(cwd, sources, configPath, {
+      stripScanDirs: true,
+    });
+    // A gated worker loads ONLY the explicitly hard-listed plugin_dirs (keeper +
+    // plan). The scanned arthack child is stripped — the risk boundary: strip
+    // SCAN results, never the plugin_dirs a machine hard-lists.
+    expect(args).toContain(keeperDir);
+    expect(args).toContain(planDir);
+    expect(args).not.toContain(arthackDir);
+  });
 
+  test("gate OFF is byte-identical to today (scan set intact)", () => {
+    const { configPath, arthackDir } = writeConfig();
+    const sources = loadPluginSources(configPath);
+    const cwd = join(tmpDir, "bare");
+    mkdirSync(cwd, { recursive: true });
+    // Explicit OFF and the ungated (options-omitted) call are the same args, and
+    // both still carry the scanned arthack child — the OFF path never diverges.
+    const off = discoverPlugins(cwd, sources, configPath, {
+      stripScanDirs: false,
+    });
+    const ungated = discoverPlugins(cwd, sources, configPath);
+    expect(off.args).toEqual(ungated.args);
+    expect(off.args).toContain(arthackDir);
+  });
+
+  test("the knob parses from plugins.yaml as the gate's ON source", () => {
+    // `loadPluginSources` surfaces the resolved policy the seam ANDs with
+    // worker-ness; the seam obeys the config knob, discovery obeys the resolved
+    // decision. Pin that the knob maps to workerPluginIsolation.
+    const { configPath } = writeConfig();
+    expect(loadPluginSources(configPath).workerPluginIsolation).toBe(false);
+    const gated = join(tmpDir, "gated.yaml");
+    writeFileSync(gated, "worker_plugin_isolation: strip-scan-dirs\n");
+    expect(loadPluginSources(gated).workerPluginIsolation).toBe(true);
+  });
+
+  test("the seam's worker marker rides every worker argv", () => {
+    // The seam keys the gate on `--dangerously-skip-permissions` (task .1's
+    // keeper-owned human-less worker posture). Pin that the worker argv builder
+    // always emits it, so the marker the seam sniffs cannot silently drift off
+    // the worker launch.
+    const cmd = buildKeeperAgentLaunchArgv({
+      launcherArgvPrefix: [...PREFIX],
+      session: "work",
+      prompt: "do it",
+      claudeName: "proj-001",
+      noConfirm: true,
+    });
+    expect(cmd).toContain("--dangerously-skip-permissions");
+  });
+});
+
+describe("composition map — per-cell --plugin-dir is additive", () => {
   test("worker launch routes through `keeper agent claude` (hits the claude discovery gate)", () => {
     const cmd = buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: [...PREFIX],

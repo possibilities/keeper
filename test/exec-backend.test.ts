@@ -610,6 +610,11 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // ...and an empty branch entry (the durable-marker sibling), same reason.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    // Keeper-owned worker permission posture (mirrors the pair path); rides every
+    // launch, right after the worktree env block and before model/effort/name.
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "--model",
     "sonnet",
     "--effort",
@@ -646,6 +651,9 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "--model",
     "sonnet",
     "--effort",
@@ -693,6 +701,10 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    // Permission posture rides even the minimal launch (no model/effort/name).
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "do a thing",
   ]);
 });
@@ -719,6 +731,10 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    // Resume is just as human-less as a fresh launch — the posture rides it too.
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "--x-no-confirm",
     "--resume",
     "planner-session",
@@ -749,6 +765,9 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "fallback prompt",
   ]);
 });
@@ -782,6 +801,9 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     // The 3rd repeated env entry — the durable lane-branch marker.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "--model",
     "sonnet",
     "--effort",
@@ -819,6 +841,9 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     "--x-no-confirm",
     "--resume",
     "work::fn-1-x.1",
@@ -856,6 +881,50 @@ test("buildKeeperAgentLaunchArgv: serial (empty/absent worktreePath) ALWAYS emit
     a.startsWith("KEEPER_PLAN_WORKTREE_BRANCH="),
   );
   expect(branchEntries).toEqual(["KEEPER_PLAN_WORKTREE_BRANCH="]);
+});
+
+test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {
+  // The load-bearing severance: a worker is a detached automated session with no
+  // human to answer a prompt, so keeper OWNS its permission posture rather than
+  // leaning on any host auto-approve hook. Both flags ride, in the pair-path
+  // order (`--permission-mode acceptEdits` then `--dangerously-skip-permissions`).
+  const posture = [
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
+  ];
+  const containsPosture = (argv: readonly string[]): boolean => {
+    for (let i = 0; i + posture.length <= argv.length; i++) {
+      if (posture.every((tok, j) => argv[i + j] === tok)) return true;
+    }
+    return false;
+  };
+  // Prompt mode.
+  expect(
+    containsPosture(
+      buildKeeperAgentLaunchArgv({
+        launcherArgvPrefix: LAP,
+        session: "autopilot",
+        prompt: "/plan:work fn-1-x.1",
+        claudeName: "work::fn-1-x.1",
+        model: "sonnet",
+        effort: "max",
+        noConfirm: true,
+      }),
+    ),
+  ).toBe(true);
+  // Resume mode — a resumed worker is just as human-less, so it rides too.
+  expect(
+    containsPosture(
+      buildKeeperAgentLaunchArgv({
+        launcherArgvPrefix: LAP,
+        session: "agentbus",
+        prompt: "",
+        resumeTarget: "planner-session",
+        noConfirm: true,
+      }),
+    ),
+  ).toBe(true);
 });
 
 // --- parseKeeperAgentStdout ---

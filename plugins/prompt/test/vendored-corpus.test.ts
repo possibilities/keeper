@@ -1,16 +1,24 @@
-// Drift gate for the vendored keeper-relevant snippet corpus. Three guarantees:
+// Drift gate for the vendored keeper-relevant snippet corpus. Four guarantees:
 //   1. every vendored file matches its sha256 in `vendor.lock` (a hand-edit not
 //      reflected in the lock fails here);
 //   2. every byte-verbatim BAKE guard in the hack skill equals its render, and
 //      every POINTER ref resolves;
-//   3. every `keeper prompt render <ref>` cite in a keeper/plan skill body
-//      resolves against the vendored corpus.
+//   3. every `keeper prompt render <ref>` cite reachable from a worker/skill
+//      surface — keeper/plan skill bodies, the plan agent briefs, and the
+//      transitive cites inside the vendored snippet bodies themselves — resolves
+//      against the vendored corpus AND names a row in the subset `_index.yaml`,
+//      so a future edit that cites a ref outside the vendored subset fails loud;
+//   4. the arthack prompt-reminder bundle (`bundle/hookctl-bus-pointer`) stays
+//      upstream-only — it is arthack-personal advocacy (dissolution study §4
+//      row 12, "drop"), lives only in arthack's own UserPromptSubmit hook, and
+//      is deliberately NOT vendored; nothing keeper-side may cite it.
 // All checks read the in-repo vendored corpus — no arthack checkout required.
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { render } from "../src/render.ts";
 import {
   bakeCount,
@@ -35,9 +43,23 @@ const HACK_SKILL = join(
   "hack",
   "SKILL.md",
 );
-const SKILL_DIRS = [
+// The worker/skill-reachable surfaces a render cite can appear on: keeper + plan
+// skill bodies, the plan agent briefs (worker + practice-scout templates), and
+// the vendored snippet bodies themselves (a cite inside a rendered snippet is
+// reachable when a reader follows it). Every ref found here must resolve inside
+// the vendored subset — that is the arthack-free reachability guarantee.
+const SNIPPETS_SUBDIR = [
+  "claude",
+  "arthack",
+  "template",
+  "_partials",
+  "snippets",
+];
+const REACHABLE_DIRS = [
   join(REPO_ROOT, "plugins", "keeper", "skills"),
   join(REPO_ROOT, "plugins", "plan", "skills"),
+  join(REPO_ROOT, "plugins", "plan", "template", "agents"),
+  join(CORPUS, ...SNIPPETS_SUBDIR),
 ];
 
 /** All `keeper prompt render <ref>` refs found in `text` (deduped by caller). */
@@ -46,7 +68,7 @@ function citeRefs(text: string): string[] {
   return Array.from(text.matchAll(re), (m) => m[1] as string);
 }
 
-/** Recursively collect skill bodies (`.md` + `.md.tmpl`) under `dir`. */
+/** Recursively collect prompt-bearing bodies (`.md` + `.md.tmpl`) under `dir`. */
 function skillFiles(dir: string): string[] {
   const out: string[] = [];
   const walk = (cur: string): void => {
@@ -61,6 +83,16 @@ function skillFiles(dir: string): string[] {
   };
   walk(dir);
   return out;
+}
+
+/** Snippet `name`s in the vendored subset index — the pin the reachable set is
+ * checked against, so a cite naming a snippet outside the subset fails loud. */
+function subsetSnippetNames(): Set<string> {
+  const p = join(CORPUS, ...SNIPPETS_SUBDIR, "_index.yaml");
+  const data = yaml.load(readFileSync(p, "utf-8")) as {
+    snippets?: { name: string }[];
+  } | null;
+  return new Set((data?.snippets ?? []).map((r) => r.name));
 }
 
 describe("vendor.lock manifest", () => {
@@ -91,15 +123,21 @@ describe("baked snippets", () => {
 });
 
 describe("render cites resolve from the vendored corpus", () => {
-  test("every cite in a keeper/plan skill body renders", () => {
+  /** Deduped refs cited across every worker/skill-reachable surface. */
+  function reachableRefs(): Set<string> {
     const refs = new Set<string>();
-    for (const dir of SKILL_DIRS) {
+    for (const dir of REACHABLE_DIRS) {
       for (const file of skillFiles(dir)) {
         for (const ref of citeRefs(readFileSync(file, "utf-8"))) {
           refs.add(ref);
         }
       }
     }
+    return refs;
+  }
+
+  test("every reachable cite renders arthack-free from the subset", () => {
+    const refs = reachableRefs();
     expect(refs.size).toBeGreaterThan(0);
     const unresolved: string[] = [];
     for (const ref of refs) {
@@ -110,5 +148,34 @@ describe("render cites resolve from the vendored corpus", () => {
       }
     }
     expect(unresolved).toEqual([]);
+  });
+
+  test("every reachable snippet cite names a row in the subset index", () => {
+    const names = subsetSnippetNames();
+    // Snippet refs are `<name>` or `<domain>/<name>`; the terminal segment is
+    // the snippet name. Bundle/sketch refs are namespaced and resolve via
+    // render() above — they carry no snippet-index row, so skip them here.
+    const outside: string[] = [];
+    for (const ref of reachableRefs()) {
+      if (ref.startsWith("bundle/") || ref.startsWith("sketch/")) {
+        continue;
+      }
+      const name = ref.split("/").pop() as string;
+      if (!names.has(name)) {
+        outside.push(ref);
+      }
+    }
+    expect(outside).toEqual([]);
+  });
+
+  test("the arthack prompt-reminder bundle is not cited keeper-side", () => {
+    // `bundle/hookctl-bus-pointer` is arthack-personal advocacy (dissolution
+    // study §4 row 12, "drop") and is deliberately upstream-only. If a keeper
+    // surface ever cites it, render() would throw (it is not vendored) — this
+    // pins the drop decision with an explicit, self-documenting failure.
+    const bundleRefs = [...reachableRefs()].filter((r) =>
+      r.startsWith("bundle/"),
+    );
+    expect(bundleRefs).toEqual([]);
   });
 });

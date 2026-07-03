@@ -108,6 +108,19 @@ export interface PluginSources {
   pluginDirs: string[];
   /** Each entry is a parent whose children are scanned; missing → skipped. */
   pluginScanDirs: string[];
+  /**
+   * Worker plugin-isolation policy from the `worker_plugin_isolation` key.
+   * `true` when set to `strip-scan-dirs`: a keeper-automated (human-less) worker
+   * claude launch drops the `plugin_scan_dirs` RESULTS from its argv, loading
+   * only the hard-listed `plugin_dirs` (keeper + plan) plus its additive per-cell
+   * `--plugin-dir`. NEVER strips the `plugin_dirs` a machine explicitly hard-lists,
+   * and NEVER touches interactive launches. Absent / `off` → `false` (the default:
+   * every launch inherits the full scan set, byte-identical to an ungated launch).
+   * This is launch config, not reconciler state — it lives here, never in
+   * `autopilot_state`. The seam (`agent/main.ts`) resolves it against worker-ness;
+   * `discoverPlugins` obeys the resolved decision, not this field.
+   */
+  workerPluginIsolation?: boolean;
 }
 
 /**
@@ -206,7 +219,40 @@ export function loadPluginSources(
   return {
     pluginDirs: paths("plugin_dirs"),
     pluginScanDirs: paths("plugin_scan_dirs"),
+    workerPluginIsolation: parseWorkerPluginIsolation(raw, configPath),
   };
+}
+
+/**
+ * Parse the `worker_plugin_isolation` knob (a string, not a boolean — the config
+ * corpus is boolean-free). Absent / null / `off` → `false`; `strip-scan-dirs` →
+ * `true`; any other value is fail-loud (a typo must be visible, never a silent
+ * off). The mode name states the boundary: only `plugin_scan_dirs` RESULTS are
+ * stripped, never the explicitly hard-listed `plugin_dirs`.
+ */
+function parseWorkerPluginIsolation(
+  raw: Record<string, unknown>,
+  configPath: string,
+): boolean {
+  const value = raw.worker_plugin_isolation;
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (typeof value !== "string") {
+    throw new ConfigError(
+      `worker_plugin_isolation must be a string (off | strip-scan-dirs) in ${configPath}`,
+    );
+  }
+  const mode = value.trim();
+  if (mode === "strip-scan-dirs") {
+    return true;
+  }
+  if (mode === "off" || mode === "") {
+    return false;
+  }
+  throw new ConfigError(
+    `worker_plugin_isolation '${mode}' is not a valid mode in ${configPath} (allowed: off, strip-scan-dirs)`,
+  );
 }
 
 /** A harness the launcher can drive. */

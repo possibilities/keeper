@@ -34,6 +34,18 @@ export interface PluginDiscovery {
   actions: string[];
 }
 
+export interface DiscoverPluginsOptions {
+  /**
+   * The worker plugin-isolation gate, ALREADY resolved by the caller (the
+   * `agent/main.ts` seam combines the `worker_plugin_isolation` config knob with
+   * the launch's worker-ness). When `true`, the `plugin_scan_dirs` RESULTS are
+   * omitted entirely — the hard-listed `plugin_dirs` and the cwd `.` detection are
+   * untouched. Default `false` = byte-identical to an ungated launch: the scan
+   * loop runs exactly as before, so no OFF-path arg or action changes.
+   */
+  stripScanDirs?: boolean;
+}
+
 function isDir(p: string): boolean {
   try {
     return statSync(p).isDirectory();
@@ -63,6 +75,7 @@ export function discoverPlugins(
   cwd: string,
   sources: PluginSources,
   pluginConfigPathStr: string,
+  options: DiscoverPluginsOptions = {},
 ): PluginDiscovery {
   const args: string[] = [];
   const actions: string[] = [];
@@ -89,7 +102,19 @@ export function discoverPlugins(
     actions.push(`Added --plugin-dir for configured plugin: ${pluginDir}`);
   }
 
-  // 2b. plugin_scan_dirs — best-effort; a missing parent is skipped.
+  // 2b. plugin_scan_dirs — best-effort; a missing parent is skipped. Skipped
+  // WHOLESALE when the worker isolation gate is on: a keeper-automated worker
+  // loads only the hard-listed plugin_dirs above (keeper + plan) plus its
+  // additive per-cell --plugin-dir. Guarded so the OFF path is byte-identical
+  // (no scan-loop arg or action changes when the gate is off).
+  if (options.stripScanDirs) {
+    if (sources.pluginScanDirs.length > 0) {
+      actions.push(
+        "Worker plugin isolation on — stripped plugin_scan_dirs results",
+      );
+    }
+    return { args, actions };
+  }
   for (const scanDir of sources.pluginScanDirs) {
     if (!isDir(scanDir)) {
       continue;

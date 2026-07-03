@@ -2,16 +2,18 @@
 
 This note is the observed reality of the Claude Code plugin layer under keeper:
 which plugins a session inherits, per launch channel, with file:line grounding.
-It is **observe-only** — no gate or isolation is asserted here; the isolation
-decision belongs to the worker-plugin dissolution study. A standing test
-(`test/plugin-composition-map.test.ts`) pins the two seams below so this map
-cannot silently drift.
+**By default** no worker isolation is applied — every claude launch inherits the
+same base set. A config-flagged worker sub-gate exists (`worker_plugin_isolation`,
+default OFF); it is documented in [The worker isolation gate](#the-worker-isolation-gate-config-flagged-default-off)
+below. A standing test (`test/plugin-composition-map.test.ts`) pins the seams and
+BOTH gate states so this map cannot silently drift.
 
 ## The base set (every claude launch)
 
 `keeper agent claude …` discovers plugins in `src/agent/main.ts` behind a single
-gate — `if (agent === "claude")` (`src/agent/main.ts:2194`). There is **no worker
-sub-gate**: any launch whose agent token is `claude` runs the full discovery.
+gate — `if (agent === "claude")` (`src/agent/main.ts:2194`). By default there is
+**no worker sub-gate**: any launch whose agent token is `claude` runs the full
+discovery (the `worker_plugin_isolation` knob below can add one, OFF by default).
 
 Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
 `~/.config/keeper/plugins.yaml` (parsed by `loadPluginSources`,
@@ -20,13 +22,16 @@ Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
 - **cwd `--plugin-dir .`** when the cwd is itself a plugin (`plugins.ts:70-75`).
 - **`plugin_dirs`** — hard deps, fail-loud on a missing manifest
   (`plugins.ts:78-90`): `~/code/keeper/plugins/keeper`, `~/code/keeper/plugins/plan`.
-- **`plugin_scan_dirs`** — best-effort parents whose manifest-bearing children are
-  each added (`plugins.ts:93-110`): `~/code/arthack/apps`, `~/code/arthack/claude`.
-  The manifest-bearing children today are `arthack`, `internal`, `lsp` (under
-  `~/code/arthack/claude`).
+- **`plugin_scan_dirs`** (optional, opt-in) — best-effort parents whose
+  manifest-bearing children are each added (`plugins.ts:93-110`). The
+  `install.sh`-written default carries NONE (keeper-only, no third-party sources); a
+  machine opts a set in by appending its parent — e.g. arthack via
+  `~/code/arthack/apps`, `~/code/arthack/claude`, whose manifest-bearing children are
+  `arthack`, `internal`, `lsp`.
 
-So every claude session — interactive OR worker — inherits keeper + plan + the
-arthack third-party set. The **arthack** plugin
+So a fresh machine inherits keeper + plan only; a machine that has opted arthack in
+inherits keeper + plan + the scanned arthack third-party set (see the gate below to
+isolate workers from it). The **arthack** plugin
 (`~/code/arthack/claude/arthack/hooks/hooks.json`) is the notable one: a
 four-dispatcher hook set —
 
@@ -54,6 +59,48 @@ The per-cell worker manifest (`plugins/plan/workers/opus-*/`, rendered from
 inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
 test.
+
+## The worker isolation gate (config-flagged, default OFF)
+
+The `worker_plugin_isolation` key in `~/.config/keeper/plugins.yaml` (parsed by
+`loadPluginSources`, `src/agent/config.ts`) is the sole worker sub-gate. It is a
+string, not a boolean (the config corpus is boolean-free):
+
+- **absent / `off`** (the default) — no isolation. Every launch inherits the full
+  base set above. The launcher argv is byte-identical to a machine that never set
+  the key.
+- **`strip-scan-dirs`** — a keeper-automated **worker** launch drops the
+  `plugin_scan_dirs` RESULTS from its argv, loading only the hard-listed
+  `plugin_dirs` (keeper + plan) plus its additive per-cell `--plugin-dir`.
+
+The seam (`src/agent/main.ts`, the `agent === "claude"` discovery gate) resolves
+the knob against worker-ness and passes the decision to `discoverPlugins` as
+`stripScanDirs`; discovery obeys the resolved decision.
+
+**The boundary (load-bearing):** the gate strips only `plugin_scan_dirs` RESULTS —
+best-effort third-party scans. It NEVER strips a `plugin_dirs` entry a machine
+explicitly hard-lists (those are hard deps, keeper + plan among them), and NEVER
+touches the cwd `--plugin-dir .` detection.
+
+**What counts as a worker:** a launch carrying `--dangerously-skip-permissions` —
+keeper's own human-less worker permission posture (`src/exec-backend.ts`
+`buildKeeperAgentLaunchArgv`; the pair partner in `launch-config.ts`
+`nativeClaudeArgs` carries it too). An interactive human session never carries the
+flag, so it is never gated — "interactive unaffected" holds by construction.
+
+`test/plugin-composition-map.test.ts` pins BOTH states: OFF is byte-identical to
+today (scan set intact), ON strips only the scanned child while keeper + plan
+survive, and the worker argv always carries the `--dangerously-skip-permissions`
+marker the seam keys on.
+
+**Opt-in + proof.** arthack is an optional plugin: a fresh machine's default
+`plugins.yaml` is keeper-only, and you opt a third-party set in by appending its
+parent to `plugin_scan_dirs`. Enable worker isolation from that set with
+`worker_plugin_isolation: strip-scan-dirs`. `bun scripts/clean-machine-check.ts`
+proves the whole fresh-machine path end to end — the installer default is
+arthack-free, prompt renders resolve from the in-repo vendored corpus, the worker
+argv carries the permission posture, and a gate-ON worker resolves no arthack
+checkout while an interactive launch is unaffected.
 
 ## Logged-vs-executed skew (read this before mining events)
 
