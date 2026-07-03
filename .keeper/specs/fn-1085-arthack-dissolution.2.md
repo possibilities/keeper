@@ -36,5 +36,5 @@ The probe (render with no arthack root) runs in the prompt plugin's own test tie
 - [ ] Test pins the reachable-ref set against the subset index
 
 ## Done summary
-
+Extended the vendored-corpus drift test to pin every worker/skill-reachable render cite — skill bodies, plan agent briefs, and transitive cites inside vendored snippet bodies — against the subset _index.yaml, so a cite outside the vendored subset fails loud. All reachable refs render arthack-free; the arthack prompt-reminder bundle stays upstream-only (study §4 drop verdict) with an explicit guard.
 ## Evidence
