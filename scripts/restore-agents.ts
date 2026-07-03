@@ -15,10 +15,10 @@
  * the tmux window (session get-or-create + handoff), re-attaches via
  * `--resume <target>`, and holds the pane open after claude exits;
  * `scripts/resume.ts` keeps the human-facing DISPLAY form
- * (`buildResumeCommand`). The resume key is the job's LATEST name (`title`,
- * `job_id` fallback) — read live from the jobs projection at restore time,
- * never a frozen one — so a renamed session restores to the name keeper
- * currently knows.
+ * (`buildResumeCommand`). The resume key is the job's session UUID (`job_id`),
+ * so `claude --resume <uuid>` re-attaches to the EXACT session; the
+ * human-readable label keeps the latest name (`title`, `job_id` fallback), read
+ * live from the jobs projection, for the display line only.
  *
  * The candidate set already excludes any `job_id` still occupying a live
  * backend (`restore-set.ts`'s UUID-liveness dedup, computed from the same DB
@@ -67,10 +67,10 @@
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
 import {
-  keeperAgentLaunch,
   buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
+  keeperAgentLaunch,
   localeDefaultedEnv,
 } from "../src/exec-backend";
 import {
@@ -151,7 +151,7 @@ interface ParsedArgs {
 /**
  * Outcome of one restore attempt — fed into the summary counts and (for the
  * dry-run path) the per-agent label lines. PURE shape — no I/O leaks out. The
- * candidate carries everything the launch needs: `resume_target` (the latest-name
+ * candidate carries everything the launch needs: `resume_target` (the session-UUID
  * resume key), `backend_exec_session_id` (the tmux session to relaunch into), and
  * `cwd` (the directory the resumed window opens in, set on the `keeperAgentLaunch`
  * spawn). `tier` is irrelevant — fn-10 inverted tier routing dropped the

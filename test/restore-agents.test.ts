@@ -10,9 +10,9 @@
  *  - `applyRestore` — apply-vs-dry-run via a capturing fake ensureLaunched
  *    (carrying the resume target), the 0.5s inter-window pacing,
  *    continue-past-failure.
- *  - `renderOutcomes` — latest-name resume commands, label display, idle note.
+ *  - `renderOutcomes` — session-UUID resume commands, label display, idle note.
  *  - `loadRestoreSet` — read-only `deriveRestoreSet` over a seeded DB (daemon-down,
- *    no socket); a candidate resumes by its latest name, read live from the DB.
+ *    no socket); a candidate resumes by its session UUID, label read live from the DB.
  *
  * The util's `main()` exit path (Bun.argv parsing, real openDb, real
  * `keeperAgentLaunch`) is NOT spawned — the same shape every other one-shot CLI
@@ -238,7 +238,9 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE keeper agent
       "'--permission-mode' 'acceptEdits' '--dangerously-skip-permissions' " +
       "'--x-no-confirm' '--resume' 'first-name'",
   );
-  // Resume by the LATEST name, never the job_id UUID.
+  // renderSnapshotScript renders the candidate's resume_target field (kept
+  // distinct from job_id here to prove the wiring; production resume_target IS
+  // the job_id UUID).
   expect(script).toContain("'--resume' 'first-name'");
   expect(script).toContain("'--resume' 'second-name'");
   expect(script).not.toContain("j1");
@@ -580,7 +582,7 @@ test("renderOutcomes omits the idle note when zero excluded", () => {
 // loadRestoreSet — read-only deriveRestoreSet over a seeded DB (daemon-down)
 // ---------------------------------------------------------------------------
 
-test("loadRestoreSet derives a crash-killed session into a latest-name candidate (no socket)", () => {
+test("loadRestoreSet derives a crash-killed session into a session-UUID candidate (no socket)", () => {
   // Persist the seeded rows so the fresh read-only open in loadRestoreSet sees
   // them, then close our writer handle.
   seedJob(kdb.db, {
@@ -595,16 +597,16 @@ test("loadRestoreSet derives a crash-killed session into a latest-name candidate
 
   const { candidates } = loadRestoreSet(dbPath);
   expect(candidates).toHaveLength(1);
-  // The resume target is the LATEST name (the current title) — a renamed session
-  // resumes to the name keeper currently knows, read live from the DB. The label
-  // shows the same name.
-  expect(candidates[0].resume_target).toBe("my-renamed-session");
+  // The resume target is the immutable session UUID (job_id) so `claude --resume
+  // <uuid>` re-attaches to the EXACT session; the label carries the latest title
+  // (read live from the DB) for the human-facing display line.
+  expect(candidates[0].resume_target).toBe("uuid-1111");
   expect(candidates[0].label).toBe("my-renamed-session");
   expect(candidates[0].cwd).toBe("/repo");
 
-  // And the rendered command targets the latest name end-to-end.
+  // The rendered command targets the UUID, while the label line shows the name.
   const out = renderOutcomes(planRestore(candidates, null), false, 0);
-  expect(out).toContain(`claude --resume "my-renamed-session"`);
+  expect(out).toContain(`claude --resume "uuid-1111"`);
   expect(out).toContain("would restore my-renamed-session");
 });
 
@@ -679,8 +681,8 @@ test("loadRestoreSet end-to-end: the apply path relaunches each derived candidat
   );
   expect(out.map((o) => o.kind)).toEqual(["restored", "restored"]);
   expect(calls.map((c) => c.session)).toEqual(["work", "work"]);
-  // The candidate's latest-name resume target (the UUID here, no title) + cwd
-  // flow straight to the keeperAgentLaunch seam.
+  // The candidate's session-UUID resume target + cwd flow straight to the
+  // keeperAgentLaunch seam.
   expect(calls[0].resumeTarget).toBe("uuid-a");
   expect(calls[0].cwd).toBe("/repo/a");
   expect(calls[1].resumeTarget).toBe("uuid-b");

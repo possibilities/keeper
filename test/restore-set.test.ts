@@ -6,8 +6,8 @@
  *    `window_gone_server_alive` excluded.
  *  - filters: backend coords, autopilot workers, already-live UUID dedup, idle
  *    cutoff with a surfaced excluded count.
- *  - order by `window_index` (nulls to tail); resume target = latest title
- *    (the label carries the same name).
+ *  - order by `window_index` (nulls to tail); resume target = session UUID
+ *    (the label carries the latest title).
  *  - the recorded 2026-06-16 incident burst cohort as a regression fixture.
  *
  * Pure module — fixture DB via `freshDbFile`, no subprocess, no daemon.
@@ -588,7 +588,7 @@ test("deriveRestoreSet: label = latest title, falls back to job_id", () => {
   expect(byId.get("untitled-uuid")?.label).toBe("untitled-uuid");
 });
 
-test("deriveRestoreSet: resume_target is the latest name (resume by the current title, not the UUID)", () => {
+test("deriveRestoreSet: resume_target is the session UUID (exact resume), label carries the latest name", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   seedJob(kdb.db, {
     job_id: uuid,
@@ -596,10 +596,10 @@ test("deriveRestoreSet: resume_target is the latest name (resume by the current 
     title: "renamed-since-launch",
   });
   const res = derive();
-  // Resume by the LATEST name keeper knows (the current title), read live from
-  // the jobs projection — so a session renamed since launch resumes to its
-  // current name. The label carries the same name.
-  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
+  // Resume by the immutable session UUID so `claude --resume <uuid>` re-attaches
+  // to the EXACT session; the label carries the latest name (read live from the
+  // jobs projection) for the human-facing render.
+  expect(res.candidates[0]?.resume_target).toBe(uuid);
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
 });
 
@@ -640,12 +640,14 @@ test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by w
 
   const cur = deriveCurrentSet(kdb.db);
   expect(cur.map((c) => c.job_id)).toEqual(["w1", "w2"]);
-  // Resume target is the LATEST name (the title), never the UUID.
-  expect(cur[0].resume_target).toBe("first");
-  expect(cur[1].resume_target).toBe("second");
+  // Resume target is the session UUID (job_id); the label keeps the latest name.
+  expect(cur[0].resume_target).toBe("w1");
+  expect(cur[1].resume_target).toBe("w2");
+  expect(cur[0].label).toBe("first");
+  expect(cur[1].label).toBe("second");
 });
 
-test("deriveCurrentSet: a never-named live session falls back to its job_id", () => {
+test("deriveCurrentSet: resume_target is always the job_id; a never-named session's label falls back to it too", () => {
   seedJob(kdb.db, {
     job_id: "unnamed-uuid",
     state: "working",
@@ -654,6 +656,8 @@ test("deriveCurrentSet: a never-named live session falls back to its job_id", ()
   });
   const cur = deriveCurrentSet(kdb.db);
   expect(cur).toHaveLength(1);
+  // resume_target is the UUID unconditionally; with no title the label falls back
+  // to the same job_id.
   expect(cur[0].resume_target).toBe("unnamed-uuid");
   expect(cur[0].label).toBe("unnamed-uuid");
 });
@@ -922,7 +926,7 @@ test("deriveLastGenerationSet: a single server_gone with no boundary keeps the m
   expect(res.candidates.map((c) => c.job_id)).toEqual(["lone-crash"]);
 });
 
-test("deriveLastGenerationSet: reuses latest-name resume_target + idle counting", () => {
+test("deriveLastGenerationSet: resume_target is the session UUID, label the latest name + idle counting", () => {
   seedBackendExecStart(kdb.db, 100);
   seedJob(kdb.db, {
     job_id: "uuid-x",
@@ -942,7 +946,7 @@ test("deriveLastGenerationSet: reuses latest-name resume_target + idle counting"
   });
   const res = deriveLastGen();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["uuid-x"]);
-  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
+  expect(res.candidates[0]?.resume_target).toBe("uuid-x");
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
   expect(res.excludedIdleCount).toBe(1);
 });
@@ -1003,7 +1007,12 @@ test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot p
   const res = deriveTopo("gen-now");
   // Ordered by window_index ascending (beta=0 before alpha=1).
   expect(res.candidates.map((c) => c.job_id)).toEqual(["agent-b", "agent-a"]);
-  expect(res.candidates.map((c) => c.resume_target)).toEqual(["beta", "alpha"]);
+  // resume_target is the session UUID; the title rides the display label.
+  expect(res.candidates.map((c) => c.resume_target)).toEqual([
+    "agent-b",
+    "agent-a",
+  ]);
+  expect(res.candidates.map((c) => c.label)).toEqual(["beta", "alpha"]);
   expect(res.candidates[0]?.backend_exec_session_id).toBe("work");
   expect(res.fallbackNote).toBeUndefined();
 });
@@ -1026,7 +1035,8 @@ test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback whe
   ]);
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["join-resolved"]);
-  expect(res.candidates[0]?.resume_target).toBe("joined");
+  expect(res.candidates[0]?.resume_target).toBe("join-resolved");
+  expect(res.candidates[0]?.label).toBe("joined");
   expect(res.fallbackNote).toBeUndefined();
 });
 
@@ -1062,7 +1072,8 @@ test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded
   const res = deriveTopo("gen-now");
   // Only the dying generation's job resolves; the recycled-pane row is never hit.
   expect(res.candidates.map((c) => c.job_id)).toEqual(["right-gen"]);
-  expect(res.candidates[0]?.resume_target).toBe("dying-occupant");
+  expect(res.candidates[0]?.resume_target).toBe("right-gen");
+  expect(res.candidates[0]?.label).toBe("dying-occupant");
   expect(res.fallbackNote).toBeUndefined();
 });
 

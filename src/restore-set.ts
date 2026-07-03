@@ -47,12 +47,12 @@
  * `job_id`. The candidate set is returned already ordered, so
  * `scripts/restore-agents.ts` is a thin presenter that never re-sorts.
  *
- * RESULT. Each candidate's `resume_target` is the latest `title` — the session
- * name keeper currently knows, read live from the jobs projection so it is never
- * a frozen name — falling back to the `job_id` for a never-named session. `label`
- * carries the same display name. Restore resumes by the LATEST name, which is why
- * deriving from the live DB (not a snapshot) is what makes a renamed session
- * restore correctly.
+ * RESULT. Each candidate's `resume_target` is the job's session UUID (`job_id`),
+ * so `claude --resume <uuid>` re-attaches to the EXACT session. `label` carries
+ * the latest `title` — the session name keeper currently knows, read live from
+ * the jobs projection so it is never a frozen name — falling back to the `job_id`
+ * for a never-named session. The title is display only; deriving from the live DB
+ * keeps that label current, but the resume key is the immutable UUID.
  *
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
@@ -120,12 +120,15 @@ interface KilledJobRow {
 }
 
 /**
- * One crash-restore candidate. `resume_target` is the latest `title` (the resume
- * key `claude --resume` targets), falling back to the `job_id` for a never-named
- * session; `label` carries the same human-readable name.
+ * One crash-restore candidate. `resume_target` is the job's session UUID
+ * (`job_id`) — the exact key `claude --resume` targets; `label` carries the
+ * human-readable name (the latest `title`, falling back to the `job_id` for a
+ * never-named session) for the render only.
  * `window_index` rides through for the ordered render's debugging/diagnostics.
  * `cwd` is the directory the restore command `cd`s into before `claude --resume`
- * (`null` when the SessionStart event never carried one).
+ * (`null` when the SessionStart event never carried one) — load-bearing, since a
+ * session UUID resolves only within the session's project dir plus its git
+ * worktrees.
  */
 export interface RestoreCandidate {
   job_id: string;
@@ -477,7 +480,7 @@ function collectCrashCandidates(
     collected.push({
       candidate: {
         job_id: jobId,
-        resume_target: label,
+        resume_target: jobId,
         label,
         window_index:
           typeof row.window_index === "number" &&
@@ -539,7 +542,7 @@ function collectCrashCandidates(
  *
  * Empty candidate set ⇒ empty result. Reads only `events` + `jobs` off the
  * passed read-only connection (daemon-down OK); reuses {@link RestoreCandidate}
- * and {@link compareCandidates} verbatim (resume_target = latest name).
+ * and {@link compareCandidates} verbatim (resume_target = session UUID).
  */
 export function deriveLastGenerationSet(
   db: Database,
@@ -671,8 +674,9 @@ interface TopologyJobRow {
  * emission pair. Each pane resolves a keeper `job_id` from the EVENT PAYLOAD
  * (`pane.job_id`), with the `(generation_id, pane_id)` projection join as the
  * per-pane fallback when the payload carries none. The job's row supplies the
- * latest name (`title`, `job_id` fallback) for `resume_target` / `label`, its
- * `cwd`, and `created_at`. The pane's `session_name` is the restore location and
+ * display `label` (latest `title`, `job_id` fallback), its `cwd`, and
+ * `created_at`; `resume_target` is the session UUID (`job_id`). The pane's
+ * `session_name` is the restore location and
  * its `window_index` the visual order. The idempotence filters are reused
  * VERBATIM: require backend coords, exclude `plan_verb='work'`
  * (reconciler-managed), and exclude any `job_id` already occupying a LIVE
@@ -996,7 +1000,7 @@ function buildCandidatesFromSnapshot(
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: label,
+      resume_target: jobId,
       label,
       window_index:
         typeof pane.window_index === "number" &&
@@ -1090,9 +1094,10 @@ function loadTopologyJobRow(
  * It applies no crash-membership / idle / dedup filtering — the whole point is to
  * capture the live session verbatim so the human can dump a script and re-run it
  * after a crash the automatic path can't be trusted to catch. The resume target
- * is the latest name (`title`, `job_id` fallback), same as a crash candidate, so
- * the emitted script resumes by the name keeper currently knows. Pure read off
- * the passed read-only connection; empty input returns `[]`, never throws.
+ * is the session UUID (`job_id`), same as a crash candidate, so the emitted
+ * script resumes each session EXACTLY; the display `label` keeps the latest name
+ * (`title`, `job_id` fallback). Pure read off the passed read-only connection;
+ * empty input returns `[]`, never throws.
  */
 export function deriveCurrentSet(db: Database): RestoreCandidate[] {
   const rows = db
@@ -1129,7 +1134,7 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: label,
+      resume_target: jobId,
       label,
       window_index:
         typeof row.window_index === "number" &&

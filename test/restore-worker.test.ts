@@ -17,10 +17,10 @@
  *  - `buildRestoreTier`: filters to live jobs (`working`/`stopped`), drops
  *    `ended`/`killed`, drops `backend_exec_session_id == null`, drops empty
  *    job_id; groups by session; sorts agents by job_id; stamps `resume_target`
- *    as the latest name (job_id fallback); pre-resolves tier; reads
- *    `window_index` straight off the `jobs` projection row.
+ *    as the session UUID (job_id) for exact `claude --resume`; pre-resolves tier;
+ *    reads `window_index` straight off the `jobs` projection row.
  *  - `serializeForHash`: strips `current.captured_at`; an index change rewrites.
- *  - `serializeForWrite`: keeps `captured_at`, schema v3, trailing \n, no
+ *  - `serializeForWrite`: keeps `captured_at`, schema v4, trailing \n, no
  *    `last_session` field.
  *  - `restorePulse`: write-on-change gate; the live set mirrors empty without a
  *    frozen `last_session`; restore.json window_index re-sourced from the
@@ -422,10 +422,10 @@ test("buildRestoreTier leaves tier null when no epicsById entry matches", () => 
   expect(out.sessions.s1.agents[0].tier).toBeNull();
 });
 
-test("buildRestoreTier stamps resume_target as the latest name, falling back to job_id", () => {
-  // The resume key is the latest session name (the title) — read live from the
-  // jobs projection, so a renamed session restores to its current name; a
-  // never-named job falls back to its job_id.
+test("buildRestoreTier stamps resume_target as the session UUID (job_id), independent of the title", () => {
+  // The resume key is the immutable session UUID (`job_id`), so `claude --resume
+  // <uuid>` re-attaches to the EXACT session; a title (however recently renamed)
+  // never changes the key.
   const named: Job[] = [
     fakeJob({
       job_id: "sess-xyz",
@@ -436,7 +436,7 @@ test("buildRestoreTier stamps resume_target as the latest name, falling back to 
   expect(
     buildRestoreTier(named, new Map(), 1000).sessions.s1.agents[0]
       .resume_target,
-  ).toBe("work::fn-1-foo.2");
+  ).toBe("sess-xyz");
 
   const unnamed: Job[] = [
     fakeJob({ job_id: "sess-abc", backend_exec_session_id: "s1", title: null }),
@@ -578,10 +578,10 @@ test("serializeForHash includes window_index (an index change rewrites the file)
 });
 
 // ---------------------------------------------------------------------------
-// serializeForWrite — disk shape keeps captured_at, schema v3, no last_session
+// serializeForWrite — disk shape keeps captured_at, schema v4, no last_session
 // ---------------------------------------------------------------------------
 
-test("serializeForWrite keeps captured_at, schema v3, ends with \\n, no last_session field", () => {
+test("serializeForWrite keeps captured_at, schema v4, ends with \\n, no last_session field", () => {
   const out = serializeForWrite(descFor(buildRestoreTier([], new Map(), 1234)));
   expect(out.endsWith("\n")).toBe(true);
   const parsed = JSON.parse(out) as {
@@ -670,7 +670,7 @@ test("restorePulse on a first-ever empty boot writes an empty current tier", () 
   expect("last_session" in parsed).toBe(false);
 });
 
-test("restorePulse end-to-end pre-resolves tier and stamps the latest-name resume_target", () => {
+test("restorePulse end-to-end pre-resolves tier and stamps the session-UUID resume_target", () => {
   insertJob({
     job_id: "sess-xyz",
     backend_exec_session_id: "autopilot",
@@ -691,8 +691,9 @@ test("restorePulse end-to-end pre-resolves tier and stamps the latest-name resum
     {
       job_id: "sess-xyz",
       cwd: "/repo",
-      // resume_target is the latest name (the title), read live from the jobs row.
-      resume_target: "work::fn-1-foo.2",
+      // resume_target is the session UUID (job_id) for exact `claude --resume`,
+      // never the title.
+      resume_target: "sess-xyz",
       tier: "mint",
       plan_verb: "work",
       plan_ref: "fn-1-foo.2",

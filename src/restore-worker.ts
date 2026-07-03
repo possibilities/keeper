@@ -223,8 +223,17 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  * with the side-file's own `RESTORE_SCHEMA_VERSION` only — the DB
  * `SCHEMA_VERSION` and `keeper/api.py` do NOT move. A bucket without `backend`
  * coerces to `DEFAULT_EXEC_BACKEND`.
+ *
+ * **v4 (epic fn-1102): resume_target is the session UUID.** Each agent's
+ * `resume_target` flips from the latest session name to the job's `job_id` (the
+ * Claude session UUID), so a consumer runs `claude --resume <uuid>` and
+ * re-attaches to the EXACT session instead of fuzzy-matching a name. The on-disk
+ * field NAME is unchanged; only its meaning (and now-always-UUID value) moved, so
+ * a restore-agents util reading a v3 file would resume by name — bump so it can
+ * tell the two apart. Side-file version only; the DB `SCHEMA_VERSION` and
+ * `keeper/api.py` do NOT move.
  */
-export const RESTORE_SCHEMA_VERSION = 3;
+export const RESTORE_SCHEMA_VERSION = 4;
 
 /**
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
@@ -236,9 +245,10 @@ export const RESTORE_SCHEMA_VERSION = 3;
  *    restore time.
  *  - `cwd` — the directory the resumed window opens in (set on the
  *    `keeperAgentLaunch` spawn); `null` when the SessionStart event never carried one.
- *  - `resume_target` — pre-resolved via {@link resumeTarget} (the latest session
- *    name, `job_id` fallback — resume by the name keeper currently knows).
- *    Pre-resolved at producer time so the restore-agents util doesn't re-derive it.
+ *  - `resume_target` — pre-resolved via {@link resumeTarget} to the job's session
+ *    UUID (`job_id`), so a consumer runs `claude --resume <uuid>` and re-attaches
+ *    to the EXACT session. Pre-resolved at producer time so the restore-agents
+ *    util doesn't re-derive it.
  *  - `tier` — pre-resolved via {@link tierForJobFromEpics} against the
  *    epicsById map built once per pulse. `null` for non-work jobs or jobs
  *    whose epic isn't in the projection.
