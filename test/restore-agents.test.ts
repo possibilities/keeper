@@ -310,6 +310,38 @@ test("renderSnapshotScript: a resume target with shell metacharacters is single-
   expect(script).toContain(`'--resume' ${quoted}`);
 });
 
+test("renderSnapshotScript: a newline in label AND session stays inside its # comment, never a live line", () => {
+  const script = renderSnapshotScript(
+    [
+      fakeCandidate({
+        job_id: "j",
+        resume_target: "name",
+        // Agent-influenced job title carrying a newline + a live command.
+        label: "harmless\nrm -rf ~/precious",
+        cwd: "/repo",
+        backend_exec_session_id: "work\ntouch /tmp/pwned",
+      }),
+    ],
+    null,
+    RESTORE_PREFIX,
+    "/tmp/keeper.db",
+  );
+  // Both agent-influenced values fold onto a single `#` comment line each.
+  expect(script).toContain("# harmless rm -rf ~/precious");
+  expect(script).toContain("# session: work touch /tmp/pwned (1 window)");
+  // Erase every single-quoted span (shellQuote-wrapped argv tokens/cwd — a
+  // literal newline inside single quotes is inert), then assert no injected
+  // payload survives on a bare, non-comment line: nothing escaped its comment.
+  const bare = script.replace(/'[^']*'/g, "");
+  for (const line of bare.split("\n")) {
+    if (line.startsWith("#")) {
+      continue;
+    }
+    expect(line.includes("rm -rf ~/precious")).toBe(false);
+    expect(line.includes("touch /tmp/pwned")).toBe(false);
+  }
+});
+
 test("renderSnapshotScript --session filter narrows to one bucket", () => {
   const candidates = [
     fakeCandidate({

@@ -67,10 +67,10 @@
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
 import {
-  keeperAgentLaunch,
   buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
+  keeperAgentLaunch,
   localeDefaultedEnv,
 } from "../src/exec-backend";
 import {
@@ -328,16 +328,19 @@ export function renderOutcomes(
     const c = o.candidate;
     const cwd = c.cwd == null ? "" : seg(c.cwd);
     const cmd = buildResumeCommand(cwd, c.resume_target, null);
-    const session = c.backend_exec_session_id;
+    const session = commentSafe(c.backend_exec_session_id);
+    const label = commentSafe(c.label);
     if (o.kind === "would-restore") {
       wouldRestore++;
-      stanzas.push(`# (${session}) would restore ${c.label}\n${cmd}`);
+      stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "restored") {
       restored++;
-      stanzas.push(`# (${session}) restored ${c.label}\n${cmd}`);
+      stanzas.push(`# (${session}) restored ${label}\n${cmd}`);
     } else {
       failed++;
-      stanzas.push(`# (${session}) FAILED ${c.label}: ${o.error}\n${cmd}`);
+      stanzas.push(
+        `# (${session}) FAILED ${label}: ${commentSafe(o.error)}\n${cmd}`,
+      );
     }
   }
 
@@ -364,6 +367,17 @@ export function renderOutcomes(
  */
 export function shellQuote(arg: string): string {
   return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Pure: fold CR/LF to a space before embedding an agent-influenced value into a
+ * `#` comment line of the generated script. `label`/`sessionName` derive from
+ * job titles the handoff RPC accepts unfiltered; a newline would break out of
+ * the comment into a live script line the human runs after a crash. Exported for
+ * tests.
+ */
+export function commentSafe(value: string): string {
+  return value.replace(/[\r\n]+/g, " ");
 }
 
 /**
@@ -430,7 +444,9 @@ export function renderSnapshotScript(
     sessionCount++;
     const n = bucket.length;
     lines.push("");
-    lines.push(`# session: ${sessionName} (${n} window${n === 1 ? "" : "s"})`);
+    lines.push(
+      `# session: ${commentSafe(sessionName)} (${n} window${n === 1 ? "" : "s"})`,
+    );
     // Get-or-create the session up front. keeper agent also mints it, so this is
     // redundant — kept so the script reads self-contained. `|| ` keeps `set -e`
     // from tripping when has-session exits non-zero (session absent).
@@ -452,7 +468,7 @@ export function renderSnapshotScript(
       if (windowsEmitted > 0) {
         lines.push("sleep 0.5");
       }
-      lines.push(`# ${candidate.label}`);
+      lines.push(`# ${commentSafe(candidate.label)}`);
       // `cd <cwd> &&` sets keeper agent's process.cwd() (the directory it reads for
       // the launch-script `cd`); the --apply path sets it on the spawn instead.
       const cdPrefix = cwd === "" ? "" : `cd ${shellQuote(cwd)} && `;
