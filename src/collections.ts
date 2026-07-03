@@ -405,6 +405,7 @@ export const USAGE_DESCRIPTOR: CollectionDescriptor = {
     "last_rate_limit_session_id",
     "status",
     "subscription_active",
+    "account_state",
     "error_type",
     "error_message",
     "error_at",
