@@ -1370,6 +1370,13 @@ export function buildResolverBrief(args: {
   const hasRepo = args.repoDir != null && args.repoDir !== "";
   const unstick = `to proceed, tell me exactly: whether to keep both sides, pick one, or how to reconcile them`;
   const guardrail = [
+    `INTENT ARCHAEOLOGY — before you classify, read the PRIMARY SOURCES behind each`,
+    `side, not just the conflict-marker diff text. For each conflicting commit, read`,
+    `its commit message (\`git show\`/\`git log\` the conflicting shas) and run`,
+    `\`keeper find-file-history <path>\` / \`keeper search-history <term>\` to recover`,
+    `WHY each change was made. Ground your classification in each side's INTENT — the`,
+    `diff alone hides whether two edits are independent or encode one shared decision.`,
+    ``,
     `GUARDRAIL — your authority is narrower than a human's. Resolve ONLY a`,
     `MECHANICALLY-CLEAR conflict: both sides are INDEPENDENT ADDITIVE edits to the`,
     `same region (e.g. an install-script fan-in gaining two idempotent steps, a CLI`,
@@ -1379,6 +1386,10 @@ export function buildResolverBrief(args: {
     `transaction-boundary, or an ordering/precedence choice — where keeping both would`,
     `be incoherent, it is NOT clear. When UNSURE, default to BLOCKED. A`,
     `confident-but-wrong merge is worse than a stuck close.`,
+    ``,
+    `Do NOT invent new behaviour — resolve by composing the two intents VERBATIM or`,
+    `not at all. If a coherent merge would require writing anything NEITHER side wrote,`,
+    `it is NOT mechanically clear: default to BLOCKED.`,
   ];
   const blockedPath = [
     `IF NOT mechanically clear (or you are unsure):`,
