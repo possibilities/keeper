@@ -7,7 +7,7 @@
     "fn-1102-keeper-tabs-browser-grade-restore"
   ],
   "id": "fn-1111-harden-keeper-tabs-restore-script",
-  "last_validated_at": "2026-07-03T22:22:55.330000Z",
+  "last_validated_at": "2026-07-03T23:25:30.190000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T22:22:55.330000Z"
+  "updated_at": "2026-07-03T23:25:30.190000Z"
 }
