@@ -19,5 +19,5 @@ deleted symlink.
 - [ ] No code/behavior change; comment text only
 
 ## Done summary
-
+Corrected section-6c comment in arthack scripts/install.sh: keeper's own installer (~/code/keeper/scripts/install.sh) now documented as owner/bootstrapper of the arthack.keeperd load path, and the stale claim that system/launchagents + processctl start-processes loads it is removed, with a guardrail against re-adding the deleted symlink.
 ## Evidence
