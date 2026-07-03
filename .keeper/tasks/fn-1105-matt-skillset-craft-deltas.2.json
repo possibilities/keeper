@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Worker tautological-test guard",
-  "updated_at": "2026-07-03T20:32:16.625000Z"
+  "updated_at": "2026-07-03T20:45:47.928000Z",
+  "worker_done_at": "2026-07-03T20:45:47.928000Z"
 }

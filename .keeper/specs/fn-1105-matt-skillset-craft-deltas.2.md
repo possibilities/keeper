@@ -27,5 +27,5 @@ Shift the tautological-test rule left from audit time to authoring time: the wor
 - [ ] The quality-auditor's audit-time check is unchanged
 
 ## Done summary
-
+Worker template's Phase 3 tests and completion criteria now require test expected values from an independent source of truth, in the auditor's voice; worker cells re-rendered and plan suite green.
 ## Evidence
