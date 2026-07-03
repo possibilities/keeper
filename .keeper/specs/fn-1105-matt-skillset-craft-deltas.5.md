@@ -34,5 +34,5 @@ Pull the upstream snippet into keeper's vendored corpus and make it the single s
 - [ ] The corpus drift gate and prompt test suite pass
 
 ## Done summary
-
+Vendored engineering/landed-vs-complete into the corpus (arthack sync); hack BAKEs it, plan orchestration ref and await POINTER it, plan CLAUDE.md bake count four->five. Drift gate + vendored-corpus tests green.
 ## Evidence
