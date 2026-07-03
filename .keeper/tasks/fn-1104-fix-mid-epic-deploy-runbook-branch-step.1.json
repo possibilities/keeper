@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Add switch-to-main runbook step",
-  "updated_at": "2026-07-03T20:19:42.613000Z"
+  "updated_at": "2026-07-03T20:23:20.324000Z",
+  "worker_done_at": "2026-07-03T20:23:20.324000Z"
 }

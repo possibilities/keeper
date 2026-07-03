@@ -50,6 +50,20 @@ export interface GitExecOptions {
 export const GIT_SPAWN_TIMEOUT_CODE = 124;
 
 /**
+ * Exit code {@link spawnGitExec} reports when the spawn ITSELF fails synchronously
+ * — `Bun.spawn` throws at `posix_spawn` before the child ever runs. The dominant
+ * cause is an ENOENT because the requested `cwd` has VANISHED (a lane dir removed
+ * out from under a reconcile sweep); a `git` missing from PATH throws the same way.
+ * The GNU 127 "command not found" convention, chosen so it never collides with
+ * git's real 0/1/128 nor the {@link GIT_SPAWN_TIMEOUT_CODE} 124. Surfacing a spawn
+ * failure as a nonzero RESULT — rather than letting the throw propagate — keeps
+ * every {@link GitRunner} caller on its normal `code !== 0` error path, so a single
+ * vanished-cwd probe (e.g. {@link classifyLinkedWorktree}) DEFERS that repo instead
+ * of unwinding an entire recover/finalize sweep.
+ */
+export const GIT_SPAWN_FAILED_CODE = 127;
+
+/**
  * Default wall-clock bound (ms) for a NETWORK git op (push / push --dry-run)
  * spawned via {@link spawnGitExec}. Generous so a legitimately-progressing push
  * is never killed, while still bounding a post-connect SSH stall that would
@@ -138,13 +152,34 @@ export async function spawnGitExec(
   args: string[],
   options: GitExecOptions = {},
 ): Promise<GitExecResult> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd: options.cwd,
-    stdin: options.stdin ?? "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildGitEnv(options.env),
-  });
+  // `Bun.spawn` throws SYNCHRONOUSLY when posix_spawn fails before the child runs
+  // — an ENOENT on a vanished `cwd` (a lane dir removed out from under a sweep) or
+  // a `git` missing from PATH. Convert that throw into a nonzero RESULT so every
+  // caller stays on its `code !== 0` path instead of the exception unwinding a
+  // whole reconcile sweep. The IIFE keeps the `stdout`/`stderr` "pipe" narrowing
+  // that a `let`-typed binding would lose.
+  const proc = (() => {
+    try {
+      return Bun.spawn(["git", ...args], {
+        cwd: options.cwd,
+        stdin: options.stdin ?? "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: buildGitEnv(options.env),
+      });
+    } catch (err) {
+      return {
+        spawnFailed: err instanceof Error ? err.message : String(err),
+      } as const;
+    }
+  })();
+  if ("spawnFailed" in proc) {
+    return {
+      code: GIT_SPAWN_FAILED_CODE,
+      stdout: "",
+      stderr: proc.spawnFailed,
+    };
+  }
 
   // A bounded spawn SIGKILLs the child on expiry so a stalled network git op
   // (an SSH TCP stall that does not trip GIT_TERMINAL_PROMPT) cannot hang the

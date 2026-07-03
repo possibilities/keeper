@@ -282,7 +282,7 @@ test("runWake: cooldown skips when a recent failure is still inside the window",
   expect(launched).toBe(false);
 });
 
-test("runWake: launched resumes into agentbus via the resume seam, clears cooldown, no marker", async () => {
+test("runWake: launched resumes into agentbus by the creator's session UUID, clears cooldown, no marker", async () => {
   const launchArgs: { session: string; target: string; cwd: string }[] = [];
   const cooldowns = new Map<string, WakeCooldownRecord>([
     ["s1", { failures: 1, last_failure_ms: 0 }],
@@ -301,17 +301,19 @@ test("runWake: launched resumes into agentbus via the resume seam, clears cooldo
   );
   expect(res.outcome).toBe("launched");
   expect(res.sessionId).toBe("s1");
-  // Launched into the dedicated agentbus session, carrying the RESUME TARGET
-  // (the creator's current name) and cwd — NOT a pre-wrapped argv. keeperAgentLaunch
-  // builds the `--resume <target>` invocation and owns the window.
+  // Launched into the dedicated agentbus session, carrying the RESUME TARGET (the
+  // creator's session UUID `job_id`, so `claude --resume <uuid>` re-attaches to
+  // the EXACT session — a title never becomes the key) and cwd, NOT a pre-wrapped
+  // argv. keeperAgentLaunch builds the `--resume <target>` invocation and owns the
+  // window.
   expect(launchArgs).toEqual([
-    { session: "agentbus", target: "planner", cwd: "/abs/repo" },
+    { session: "agentbus", target: "s1", cwd: "/abs/repo" },
   ]);
   // Cooldown cleared on success.
   expect(cooldowns.has("s1")).toBe(false);
 });
 
-test("runWake: resume target falls back to job_id when the creator has no name", async () => {
+test("runWake: resume target is the creator's session UUID (job_id) even with no name", async () => {
   const launchArgs: { session: string; target: string; cwd: string }[] = [];
   const res = await runWake(
     "fn-x",

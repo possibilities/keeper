@@ -22,11 +22,12 @@
  * every class a live fold reads (snapshot/synthetic folds, session/prompt folds,
  * the subagent PreToolUse:Agent bridge, search-history's UserPromptSubmit
  * `$.prompt`, the legacy Agent `tool_response.agentId` fallback, plan Bash
- * `tool_response.stdout`, …). The shed-set spans PostToolUse
+ * `tool_response.stdout`, …) PLUS PostToolUse:Agent and SubagentStop, kept not for
+ * a fold but for deliberate offline-analysis capture of the subagent IO pair. The
+ * shed-set spans PostToolUse
  * Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch, non-plan
- * PostToolUse:Bash, modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`),
- * non-Agent PreToolUse / PostToolUseFailure tool bodies, and
- * SubagentStart/SubagentStop/BackendExecSnapshot/Notification. Every keep-set
+ * PostToolUse:Bash, non-Agent PreToolUse / PostToolUseFailure tool bodies, and
+ * SubagentStart/BackendExecSnapshot/Notification. Every keep-set
  * body stays inline forever, so a from-scratch re-fold reads it from
  * `events.data` and reproduces byte-identical projection rows.
  *
@@ -117,13 +118,19 @@ export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
 /**
  * The SHED-CLASS retention predicate — a POSITIVE ALLOW-list of event classes
  * whose body no live fold reads, expressed over CHEAP HEADER COLUMNS ONLY
- * (`hook_event` / `tool_name` / `plan_op` / `subagent_agent_id` — NEVER a
+ * (`hook_event` / `tool_name` / `plan_op` — NEVER a
  * `json_extract`). A new or unlisted event type matches NOTHING here and so
  * defaults to KEPT — the fail-safe direction (an unclassified body is never
  * shed). The complement of this set IS the keep-set: every class a live fold
  * parses (snapshot / synthetic folds, session / prompt folds, the subagent
  * PreToolUse:Agent bridge, the legacy Agent `tool_response.agentId` fallback,
- * plan Bash `tool_response.stdout`, the cron `tool_response.id`, …).
+ * plan Bash `tool_response.stdout`, the cron `tool_response.id`, …), PLUS two
+ * classes kept for deliberate offline-analysis capture rather than any fold read:
+ * PostToolUse:Agent (the subagent's final answer, resolvedModel, usage) and
+ * SubagentStop (last_assistant_message, effort, agent_transcript_path). Paired
+ * with the already-kept PreToolUse:Agent prompt they make every subagent's full
+ * IO pair durable and SQL-joinable — no fold reads them, so they are simply
+ * absent from the shed allow-list below.
  *
  * The shed-set, each clause justified by an exhaustive fold-read audit:
  *  - PostToolUse Write/Edit/MultiEdit/NotebookEdit — the four mutation tools
@@ -133,17 +140,12 @@ export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
  *  - PostToolUse Bash WHERE `plan_op IS NULL` — a plan Bash row's
  *    `tool_response.stdout` envelope IS fold-read (`extractPlanStateRepo`),
  *    so the inversion KEEPS `plan_op IS NOT NULL` and sheds the rest.
- *  - PostToolUse Agent WHERE `subagent_agent_id IS NOT NULL` — the modern bridge
- *    resolves the agent id from the indexed column; only a LEGACY row
- *    (`subagent_agent_id IS NULL`) falls back to the `tool_response.agentId`
- *    body, so the inversion KEEPS the legacy rows.
  *  - PreToolUse tool bodies EXCLUDING Agent — the subagent bridge reads the
  *    PreToolUse:Agent body (`findBridgePreToolUse` / `findPendingPreToolUseForStart`).
  *  - PostToolUseFailure tool bodies EXCLUDING Agent — a legacy failure:Agent row
  *    falls back to the `tool_response.agentId` body, so all Agent failures KEEP.
- *  - SubagentStart / SubagentStop / BackendExecSnapshot / Notification — their
- *    folds read CHEAP COLUMNS only (`agent_id` / `event_type` / `backend_exec_*`),
- *    never the body.
+ *  - SubagentStart / BackendExecSnapshot / Notification — their folds read CHEAP
+ *    COLUMNS only (`agent_id` / `event_type` / `backend_exec_*`), never the body.
  *
  * Used as the class gate of {@link RETENTION_SHED_PREDICATE} AND inside
  * {@link countAbsentBlobs}'s `NOT(...)`. Cheap-cols only is a hard contract: the
@@ -157,14 +159,12 @@ export const RETENTION_SHED_CLASS_PREDICATE = `(
          ))
      OR (hook_event = 'PostToolUse' AND tool_name = 'Bash'
            AND plan_op IS NULL)
-     OR (hook_event = 'PostToolUse' AND tool_name = 'Agent'
-           AND subagent_agent_id IS NOT NULL)
      OR (hook_event = 'PreToolUse' AND tool_name IS NOT NULL
            AND tool_name != 'Agent')
      OR (hook_event = 'PostToolUseFailure' AND tool_name IS NOT NULL
            AND tool_name != 'Agent')
      OR hook_event IN (
-           'SubagentStart','SubagentStop','BackendExecSnapshot','Notification'
+           'SubagentStart','BackendExecSnapshot','Notification'
          )
       )`;
 

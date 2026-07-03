@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T20:32:16.625000Z",
+  "depends_on": [
+    "fn-1105-matt-skillset-craft-deltas.3",
+    "fn-1105-matt-skillset-craft-deltas.4"
+  ],
+  "epic": "fn-1105-matt-skillset-craft-deltas",
+  "id": "fn-1105-matt-skillset-craft-deltas.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Vendor sync and re-point sites",
+  "updated_at": "2026-07-03T21:15:15.112000Z",
+  "worker_done_at": "2026-07-03T21:15:15.112000Z"
+}

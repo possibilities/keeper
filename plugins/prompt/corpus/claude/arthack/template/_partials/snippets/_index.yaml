@@ -187,7 +187,7 @@ snippets:
     related:
       - commit-via-keeper-default
     path: _partials/snippets/engineering/keeper-history-forensics.md.tmpl
-    token-estimate: 474
+    token-estimate: 525
     used-in: []
   - name: network-service-hardening
     summary: Network listeners need IP filtering (Tailscale CGNAT + localhost) and auth; no unauthenticated endpoints.

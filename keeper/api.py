@@ -411,9 +411,12 @@ from pathlib import Path
 # once-marker (the merge-resolver-worker dispatch latch, sibling of
 # ``merge_escalated_at``); keeper-py never reads ``dispatch_failures``, so only the
 # version whitelist gains 106.
-# v107 (fn-1103 task .3) adds the nullable ``harness`` + ``resume_target`` TEXT
+# v107 (fn-1102 task .1) adds the ``events.tmux_generation_id`` VIRTUAL generated
+# column + its partial index (the tab-restore generation-summary walk's indexed
+# key); keeper-py never reads it, so only the version whitelist gains 107.
+# v108 (fn-1103 task .3) adds the nullable ``harness`` + ``resume_target`` TEXT
 # columns to BOTH the events and jobs surfaces (multi-harness agent maturity);
-# keeper-py reads neither column, so only the version whitelist gains 107.
+# keeper-py reads neither column, so only the version whitelist gains 108.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -493,6 +496,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         105,
         106,
         107,
+        108,
     }
 )
 

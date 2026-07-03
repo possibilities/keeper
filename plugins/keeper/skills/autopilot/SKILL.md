@@ -316,14 +316,17 @@ rather than task acceptance, so this is the runbook that discharges it.
 
 1. **Pause first** — `keeper autopilot pause`, so no dispatch or recover sweep races your
    merge on the shared checkout.
-2. **True-merge the base lane to main** — `git merge --no-edit keeper/epic/<id>`. Merge the
+2. **Switch to main** — `git checkout main` (or your default branch). `git merge` merges into
+   the current HEAD, so you MUST be on main before step 3 or you deploy the lane to the wrong
+   branch and step 5 pushes it — silently failing the to-main deploy this runbook promises.
+3. **True-merge the base lane to main** — `git merge --no-edit keeper/epic/<id>`. Merge the
    epic BASE lane (`keeper/epic/<id>`); task lanes only fan in at finalize, so a specific
    task lane needs its own `keeper/epic/<id>--<task>` merge. **Never `--squash`** — a squash
    is not an ancestor of the lane and breaks the cross-epic merge-gate and clean finalize.
-3. **Run the affected-suite gate** — the tests covering what you just merged, green before
+4. **Run the affected-suite gate** — the tests covering what you just merged, green before
    you ship.
-4. **Push** — `git push` main.
-5. **Play** — `keeper autopilot play`.
+5. **Push** — `git push` main.
+6. **Play** — `keeper autopilot play`.
 
 Finalize later re-merges the lane cleanly: because your merge made the lane an ancestor of
 main, close-finalize's true merge is a no-op fast-forward, not a conflict.
