@@ -942,6 +942,16 @@ export function buildKeeperAgentLaunchArgv(
     // hook's SessionStart capture.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
+    // Keeper-owned worker permission posture, mirroring the pair-launch precedent
+    // (`nativeClaudeArgs`): every launch this builder mints is a detached automated
+    // worker with NO human to answer a prompt, so it skips permission prompting
+    // outright. This changes PROMPTING, not GUARDING — deny-via-envelope hooks
+    // (branch-guard et al) still hard-enforce under `--dangerously-skip-permissions`,
+    // so a worker still cannot create/switch branches. Unconditional (prompt AND
+    // resume): a resumed worker is just as human-less as a fresh one.
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
     ...flags,
     ...tail,
   ];
