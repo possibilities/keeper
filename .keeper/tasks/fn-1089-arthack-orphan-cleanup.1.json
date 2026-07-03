@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Delete keeper orphans from arthack",
-  "updated_at": "2026-07-03T02:18:13.936000Z"
+  "updated_at": "2026-07-03T03:03:19.255000Z",
+  "worker_done_at": "2026-07-03T03:03:19.255000Z"
 }

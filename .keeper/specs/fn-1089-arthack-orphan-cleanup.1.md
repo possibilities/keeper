@@ -43,5 +43,5 @@ land in the Done summary/Evidence.
 - [ ] Corpus/template tree untouched; docs pruned
 
 ## Done summary
-
+Deleted the three keeper-orphaned artifacts (system/arthack/.config/keeper/plugins.yaml, system/launchagents/Library/LaunchAgents/arthack.keeperd.plist, claude/internal/ + its claude/CLAUDE.md entry) in commit 68afb927a. Machine config swap was already complete: live ~/.config/keeper/plugins.yaml is a keeper-written real file preserving the opt-in arthack scan dirs (not the arthack-free DEFAULT_PLUGINS_YAML). Verified post-delete: 'keeper agent claude --help' boots (exit 0), launchctl shows arthack.keeperd loaded from keeper's plist (/Users/mike/code/keeper/plist/arthack.keeperd.plist), and no dangling symlinks under ~/.config/keeper or ~/Library/LaunchAgents. Corpus/template tree untouched.
 ## Evidence
