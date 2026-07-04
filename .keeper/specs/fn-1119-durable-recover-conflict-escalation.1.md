@@ -100,5 +100,5 @@ this epic's open row RETAINED, no merge attempt, no clear.
 - [ ] `bun test` green.
 
 ## Done summary
-
+Recover pass-2 content conflicts now escalate on the bare close::<epic> id (worktree-merge-conflict, merge-escalation scope, retry_dispatch-only clear); a shared tri-state epicFrameVerdict drives pass-2 defer/observe and pass-3 preserve on inconclusive; recoverFailuresToClear is positive-evidence, clearing only on a same-cycle resolved observation.
 ## Evidence
