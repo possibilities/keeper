@@ -47,12 +47,14 @@
  * `job_id`. The candidate set is returned already ordered, so
  * `scripts/restore-agents.ts` is a thin presenter that never re-sorts.
  *
- * RESULT. Each candidate's `resume_target` is the job's session UUID (`job_id`),
- * so `claude --resume <uuid>` re-attaches to the EXACT session. `label` carries
- * the latest `title` — the session name keeper currently knows, read live from
- * the jobs projection so it is never a frozen name — falling back to the `job_id`
- * for a never-named session. The title is display only; deriving from the live DB
- * keeps that label current, but the resume key is the immutable UUID.
+ * RESULT. Each candidate carries a `harness` tag and a harness-native
+ * `resume_target`: the session UUID (`job_id`) for a claude candidate (exact
+ * `claude --resume <uuid>` re-attach), the stored native id for codex/pi/hermes,
+ * or EMPTY when a non-claude harness has no resolved target (not-resumable — see
+ * {@link isRestorableCandidate}). `label` carries the latest `title` — the session
+ * name keeper currently knows, read live from the jobs projection so it is never a
+ * frozen name — falling back to the `job_id` for a never-named session. The title
+ * is display only; the resume key is the immutable harness-native target.
  *
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
@@ -61,8 +63,10 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { harnessOrClaude } from "./agent/harness";
 import type { CloseKind } from "./exec-backend";
 import { extractTmuxTopologySnapshot } from "./reducer";
+import { resumeTarget } from "./resume-descriptor";
 
 /**
  * Idle cutoff (seconds): a killed row whose last activity is older than this is
@@ -117,6 +121,11 @@ interface KilledJobRow {
   plan_verb: string | null;
   /** The Killed event's rowid — the burst-cluster sort key. */
   last_event_id: number | null;
+  /** Launching harness (`jobs.harness`); NULL reads as claude. */
+  harness: string | null;
+  /** Harness-native resume target (`jobs.resume_target`); NULL/empty ⇒ the
+   *  candidate is not-resumable for a non-claude harness. */
+  resume_target: string | null;
 }
 
 /**
@@ -138,6 +147,27 @@ export interface RestoreCandidate {
   cwd: string | null;
   backend_exec_session_id: string;
   created_at: number;
+  /**
+   * The launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). ABSENT ⇒
+   * claude (a NULL `jobs.harness` reads as claude at every consumer), so a legacy
+   * candidate carries none and every claude-only consumer stays byte-stable. The
+   * resume surfaces route `resume_target` through this harness's native resume
+   * argv; `resume_target` is EMPTY when the harness minted its own id keeper never
+   * back-filled — see {@link isRestorableCandidate}.
+   */
+  harness?: string;
+}
+
+/**
+ * True when a candidate carries a usable resume target — the gate the restore
+ * surfaces read to skip a non-claude agent whose harness-native `resume_target`
+ * was never resolved (an empty string), reporting it not-resumable rather than
+ * emitting a broken `--resume ""` argv. Claude candidates always resolve to their
+ * session UUID, so this is always true for them (a degenerate empty `job_id` is
+ * filtered upstream). Pure.
+ */
+export function isRestorableCandidate(c: RestoreCandidate): boolean {
+  return c.resume_target !== "";
 }
 
 /** Why a non-candidate killed row was dropped — surfaced in the result counts. */
@@ -383,7 +413,7 @@ function loadRows(db: Database): {
               window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              plan_verb, last_event_id
+              plan_verb, last_event_id, harness, resume_target
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -480,11 +510,20 @@ function collectCrashCandidates(
     }
 
     const label = row.title != null && row.title !== "" ? row.title : jobId;
+    const harness = harnessOrClaude(row.harness);
     collected.push({
       candidate: {
         job_id: jobId,
-        resume_target: jobId,
+        // Per-harness: claude resolves to its session UUID (`job_id`); a
+        // non-claude harness resolves to the stored `resume_target` (EMPTY when
+        // never back-filled ⇒ not-resumable, surfaced downstream).
+        resume_target: resumeTarget({
+          job_id: jobId,
+          harness: row.harness,
+          resume_target: row.resume_target,
+        }),
         label,
+        harness,
         window_index:
           typeof row.window_index === "number" &&
           Number.isFinite(row.window_index)
@@ -647,6 +686,8 @@ interface TopologyJobRow {
   cwd: string | null;
   backend_exec_session_id: string | null;
   plan_verb: string | null;
+  harness: string | null;
+  resume_target: string | null;
 }
 
 /**
@@ -925,7 +966,12 @@ function enrichGeneration(
         currentGenerationId !== null &&
         raw.generation_id === currentGenerationId,
       degenerate,
-      restorable: candidates.length,
+      // A candidate whose harness-native resume target never resolved is LISTED
+      // (surfaced not-resumable) but does NOT count toward `restorable` — the
+      // auto-pick/eligibility gate must rank a generation by what it can actually
+      // bring back, so a generation of only not-resumable agents reads restorable
+      // 0 and falls through, while a mixed one still ranks by its resumable set.
+      restorable: candidates.filter(isRestorableCandidate).length,
     },
     candidates,
   };
@@ -1020,8 +1066,13 @@ function buildCandidatesFromSnapshot(
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: jobId,
+      resume_target: resumeTarget({
+        job_id: jobId,
+        harness: row.harness,
+        resume_target: row.resume_target,
+      }),
       label,
+      harness: harnessOrClaude(row.harness),
       window_index:
         typeof pane.window_index === "number" &&
         Number.isFinite(pane.window_index)
@@ -1093,7 +1144,7 @@ function loadTopologyJobRow(
         `SELECT job_id, created_at, title, cwd,
                 COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                   AS backend_exec_session_id,
-                plan_verb
+                plan_verb, harness, resume_target
            FROM jobs
           WHERE job_id = ?
           LIMIT 1`,
@@ -1124,7 +1175,8 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     .query(
       `SELECT job_id, created_at, title, window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
-                AS backend_exec_session_id
+                AS backend_exec_session_id,
+              harness, resume_target
          FROM jobs
         WHERE state IN ('working', 'stopped')
           AND COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
@@ -1139,6 +1191,8 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     window_index: number | null;
     cwd: string | null;
     backend_exec_session_id: string;
+    harness: string | null;
+    resume_target: string | null;
   }[];
 
   const candidates: RestoreCandidate[] = [];
@@ -1154,8 +1208,13 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: jobId,
+      resume_target: resumeTarget({
+        job_id: jobId,
+        harness: row.harness,
+        resume_target: row.resume_target,
+      }),
       label,
+      harness: harnessOrClaude(row.harness),
       window_index:
         typeof row.window_index === "number" &&
         Number.isFinite(row.window_index)

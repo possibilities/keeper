@@ -91,6 +91,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { harnessOrClaude } from "./agent/harness";
 import {
   atomicWriteFile,
   openDb,
@@ -249,8 +250,15 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  * a restore-agents util reading a v3 file would resume by name — bump so it can
  * tell the two apart. Side-file version only; the DB `SCHEMA_VERSION` and
  * `keeper/api.py` do NOT move.
+ *
+ * **v5 (epic fn-1103): resume_target is HARNESS-NATIVE + a `harness` tag rides.**
+ * Each agent gains a `harness` field, and `resume_target` is now the harness's own
+ * resume token — the session UUID for claude/pi, the back-filled native id for
+ * codex/hermes (EMPTY when keeper never resolved one ⇒ not-resumable). A v4 reader
+ * assumed `resume_target` was always the claude UUID, so bump. Side-file version
+ * only; the DB `SCHEMA_VERSION` and `keeper/api.py` do NOT move.
  */
-export const RESTORE_SCHEMA_VERSION = 4;
+export const RESTORE_SCHEMA_VERSION = 5;
 
 /**
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
@@ -293,6 +301,10 @@ export interface RestoreAgent {
   plan_ref: string | null;
   window_index: number | null;
   created_at: number;
+  /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). ABSENT ⇒ claude
+   *  (a NULL `jobs.harness` reads as claude), so a legacy/claude-only file stays
+   *  byte-stable. `resume_target` is this harness's own resume token. */
+  harness?: string;
 }
 
 /**
@@ -396,9 +408,12 @@ export function buildRestoreTier(
     }
     const sessionId = job.backend_exec_session_id;
     const tier = tierForJobFromEpics(job, epicsById);
+    const harness = harnessOrClaude(job.harness);
     const agent: RestoreAgent = {
       job_id: job.job_id,
       cwd: job.cwd,
+      // Per-harness (see resumeTarget): the session UUID for claude/pi, the
+      // back-filled native id for codex/hermes, "" when not-resumable.
       resume_target: resumeTarget(job),
       tier,
       plan_verb: job.plan_verb,
@@ -407,6 +422,9 @@ export function buildRestoreTier(
       // TmuxTopologySnapshot fold); a number|null already.
       window_index: job.window_index ?? null,
       created_at: job.created_at,
+      // Tag ONLY a non-claude harness so a claude-only file stays byte-identical
+      // (ABSENT ⇒ claude); the hash gate then never churns on the common case.
+      ...(harness !== "claude" ? { harness } : {}),
     };
     // Backend tag for the bucket (schema v3): the job's `backend_exec_type`,
     // defaulting to `DEFAULT_EXEC_BACKEND` when NULL. A session name
@@ -484,6 +502,7 @@ export function buildReviveScriptCandidates(jobs: Job[]): {
       typeof job.title === "string" && job.title !== ""
         ? job.title
         : job.job_id;
+    const harness = harnessOrClaude(job.harness);
     candidates.push({
       job_id: job.job_id,
       resume_target: resumeTarget(job),
@@ -492,6 +511,9 @@ export function buildReviveScriptCandidates(jobs: Job[]): {
       cwd: job.cwd != null && job.cwd !== "" ? job.cwd : null,
       backend_exec_session_id: job.backend_exec_session_id,
       created_at: job.created_at,
+      // ABSENT ⇒ claude: tag only a non-claude harness so the claude revive
+      // script stays byte-identical (renderSnapshotScript reads harnessOrClaude).
+      ...(harness !== "claude" ? { harness } : {}),
     });
   }
   candidates.sort(compareCandidates);

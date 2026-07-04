@@ -14,10 +14,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, loadPresetCatalog } from "../src/agent/config";
 import {
+  buildHarnessResumeArgv,
   HARNESS_DESCRIPTORS,
   HARNESS_NAME_SET,
   HARNESS_NAMES,
   harnessDescriptor,
+  harnessOrClaude,
   isCapturableHarness,
   isHarnessName,
   type SecondAxis,
@@ -48,6 +50,9 @@ describe("harness registry — descriptor completeness", () => {
       expect(typeof d.capturable).toBe("boolean");
       expect(typeof d.mintsOwnSessionId).toBe("boolean");
       expect(HOOK_MECHANISMS.has(d.hookMechanism)).toBe(true);
+      expect(["flag", "subcommand"]).toContain(d.resumeArgv.kind);
+      expect(typeof d.resumeArgv.token).toBe("string");
+      expect(d.resumeArgv.token.length).toBeGreaterThan(0);
     }
   });
 
@@ -112,6 +117,46 @@ describe("harness registry — membership + capability predicates", () => {
     expect(harnessDescriptor("claude")).toBe(HARNESS_DESCRIPTORS.claude);
     expect(harnessDescriptor("hermes")).toBe(HARNESS_DESCRIPTORS.hermes);
     expect(harnessDescriptor("grok")).toBeUndefined();
+  });
+
+  test("resumeArgv forms are pinned per harness (codex is the verb-position subcommand)", () => {
+    expect(HARNESS_DESCRIPTORS.claude.resumeArgv).toEqual({
+      kind: "flag",
+      token: "--resume",
+    });
+    // Codex resumes via a VERB-POSITION subcommand, not an option flag.
+    expect(HARNESS_DESCRIPTORS.codex.resumeArgv).toEqual({
+      kind: "subcommand",
+      token: "resume",
+    });
+    expect(HARNESS_DESCRIPTORS.pi.resumeArgv).toEqual({
+      kind: "flag",
+      token: "--session",
+    });
+    expect(HARNESS_DESCRIPTORS.hermes.resumeArgv).toEqual({
+      kind: "flag",
+      token: "--resume",
+    });
+  });
+
+  test("buildHarnessResumeArgv emits the [token, target] pair, defaulting unknown/NULL to claude", () => {
+    expect(buildHarnessResumeArgv("claude", "u")).toEqual(["--resume", "u"]);
+    expect(buildHarnessResumeArgv("codex", "r")).toEqual(["resume", "r"]);
+    expect(buildHarnessResumeArgv("pi", "p")).toEqual(["--session", "p"]);
+    expect(buildHarnessResumeArgv("hermes", "h")).toEqual(["--resume", "h"]);
+    // NULL/unknown ⇒ claude form.
+    expect(buildHarnessResumeArgv(null, "u")).toEqual(["--resume", "u"]);
+    expect(buildHarnessResumeArgv("grok", "u")).toEqual(["--resume", "u"]);
+  });
+
+  test("harnessOrClaude normalizes NULL/empty/unknown to claude, passing known names through", () => {
+    expect(harnessOrClaude(null)).toBe("claude");
+    expect(harnessOrClaude(undefined)).toBe("claude");
+    expect(harnessOrClaude("")).toBe("claude");
+    expect(harnessOrClaude("  ")).toBe("claude");
+    expect(harnessOrClaude("grok")).toBe("claude");
+    expect(harnessOrClaude("codex")).toBe("codex");
+    expect(harnessOrClaude("hermes")).toBe("hermes");
   });
 
   test("isCapturableHarness reads the capability, defaulting unknown to false", () => {

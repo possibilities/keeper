@@ -313,6 +313,47 @@ test("runWake: launched resumes into agentbus by the creator's session UUID, cle
   expect(cooldowns.has("s1")).toBe(false);
 });
 
+test("runWake: threads the creator's harness to the launch — claude by default, per-harness target otherwise", async () => {
+  const claudeCalls: { target: string; harness: string }[] = [];
+  await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [creator({ job_id: "s1", cwd: "/abs/repo" })],
+      nowMs: WAKE_COOLDOWN_MS * 100,
+      launch: async (_session, target, _cwd, harness) => {
+        claudeCalls.push({ target, harness });
+        return { ok: true };
+      },
+    }),
+  );
+  // A default creator carries no harness ⇒ claude, resuming by its session UUID.
+  expect(claudeCalls).toEqual([{ target: "s1", harness: "claude" }]);
+
+  const codexCalls: { target: string; harness: string }[] = [];
+  await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({
+          job_id: "keeper-job",
+          cwd: "/abs/repo",
+          harness: "codex",
+          resume_target: "codex-rollout-id",
+        }),
+      ],
+      nowMs: WAKE_COOLDOWN_MS * 100,
+      launch: async (_session, target, _cwd, harness) => {
+        codexCalls.push({ target, harness });
+        return { ok: true };
+      },
+    }),
+  );
+  // A codex creator resumes via its own harness + stored native target.
+  expect(codexCalls).toEqual([
+    { target: "codex-rollout-id", harness: "codex" },
+  ]);
+});
+
 test("runWake: resume target is the creator's session UUID (job_id) even with no name", async () => {
   const launchArgs: { session: string; target: string; cwd: string }[] = [];
   const res = await runWake(

@@ -571,11 +571,25 @@ export interface Job {
    * snapshot.
    */
   context_window_size: number | null;
-  // NOTE: the migration-only jobs columns `kill_reason` (v103) and
-  // `harness`/`resume_target` (v107) are DELIBERATELY absent here — this
-  // interface mirrors only the fields Job-typed reads consume today. The columns
-  // exist on the row and are read ad-hoc (a scoped SELECT) by the folds/producers
-  // that own them; a later read surface adds the field when it needs it.
+  /**
+   * Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`), folded onto
+   * `jobs.harness` from the SessionStart tag. NULL on legacy rows and reads as
+   * claude at every consumer (the fold never synthesizes a value). The resume/
+   * restore surfaces route {@link resume_target} through this harness's native
+   * resume argv.
+   */
+  harness: string | null;
+  /**
+   * The harness-native resume target — the token the launching harness's own
+   * resume argv needs (claude/pi the session id at seed; codex/hermes back-filled
+   * post-stop). NULL when keeper resolved no resume identity, which the restore
+   * surfaces render as not-resumable for a non-claude harness.
+   */
+  resume_target: string | null;
+  // NOTE: the migration-only jobs column `kill_reason` (v103) is DELIBERATELY
+  // absent here — this interface mirrors only the fields Job-typed reads consume
+  // today. The column exists on the row and is read ad-hoc (a scoped SELECT) by
+  // the folds/producers that own it; a later read surface adds it when needed.
 }
 
 /**

@@ -60,6 +60,47 @@ test("resumeTarget coerces an empty job_id to the empty string; a title never re
   expect(resumeTarget(fixtureJob({ job_id: "", title: "has-name" }))).toBe("");
 });
 
+test("resumeTarget: a codex job resolves to the stored resume_target, not job_id", () => {
+  // A non-claude harness resumes via its OWN native id (back-filled into
+  // resume_target), never the keeper-minted job_id.
+  const job = fixtureJob({
+    job_id: "keeper-job-1",
+    harness: "codex",
+    resume_target: "codex-rollout-uuid",
+  });
+  expect(resumeTarget(job)).toBe("codex-rollout-uuid");
+});
+
+test("resumeTarget: a pi job resolves to its stored session id", () => {
+  const job = fixtureJob({
+    job_id: "keeper-job-2",
+    harness: "pi",
+    resume_target: "pi-session-42",
+  });
+  expect(resumeTarget(job)).toBe("pi-session-42");
+});
+
+test("resumeTarget: a non-claude job with no back-filled target is not-resumable (empty)", () => {
+  // codex/hermes back-fill resume_target post-stop; before that it is NULL and the
+  // agent is not-resumable — resumeTarget returns "" (never the job_id, which is
+  // NOT a codex resume key).
+  const job = fixtureJob({
+    job_id: "keeper-job-3",
+    harness: "hermes",
+    resume_target: null,
+  });
+  expect(resumeTarget(job)).toBe("");
+});
+
+test("resumeTarget: an explicit claude harness still resolves to job_id", () => {
+  const job = fixtureJob({
+    job_id: "sess-claude",
+    harness: "claude",
+    resume_target: null,
+  });
+  expect(resumeTarget(job)).toBe("sess-claude");
+});
+
 test("buildResumeCommand emits cd + claude --resume with a quoted UUID target", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   const cmd = buildResumeCommand("/Users/mike/code/keeper", uuid, null);
@@ -88,6 +129,33 @@ test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (f
 test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
   const cmd = buildResumeCommand("/repo", "fn-1.1", "");
   expect(cmd).toBe('cd /repo && claude --resume "fn-1.1" --x-no-confirm');
+});
+
+test("buildResumeCommand: codex renders the native `codex resume` subcommand form", () => {
+  const cmd = buildResumeCommand("/repo", "rollout-uuid", null, "codex");
+  expect(cmd).toBe('cd /repo && codex resume "rollout-uuid"');
+});
+
+test("buildResumeCommand: pi renders `pi --session`", () => {
+  expect(buildResumeCommand("/repo", "pi-42", null, "pi")).toBe(
+    'cd /repo && pi --session "pi-42"',
+  );
+});
+
+test("buildResumeCommand: hermes renders `hermes --resume`", () => {
+  expect(buildResumeCommand("", "hx-9", null, "hermes")).toBe(
+    'hermes --resume "hx-9"',
+  );
+});
+
+test("buildResumeCommand: a NULL/absent harness stays the claude alias form", () => {
+  // ABSENT ⇒ claude — a legacy candidate (no harness tag) renders byte-identically.
+  expect(buildResumeCommand("/repo", "u", null)).toBe(
+    'cd /repo && claude --resume "u" --x-no-confirm',
+  );
+  expect(buildResumeCommand("/repo", "u", null, null)).toBe(
+    'cd /repo && claude --resume "u" --x-no-confirm',
+  );
 });
 
 test("tierForJobFromEpics resolves the tier for a work job whose epic is in the map", () => {
