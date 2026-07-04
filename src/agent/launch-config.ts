@@ -12,8 +12,8 @@
  * handler, the atomic writes — lives in the callers.
  */
 
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HARNESS_NAME_SET, type HarnessName } from "./harness";
 
@@ -345,4 +345,42 @@ export function stripClaudeEnv(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// pi extension arming (M3b live-state)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the on-disk path to keeper's ephemeral pi extension
+ * (`plugins/keeper/pi-extension/keeper-events.ts`). Like {@link promptsDir}, it
+ * resolves relative to THIS module's location so it holds under both the source
+ * tree and a `bun link`ed binary (`src/agent/` → repo root → `plugins/…`). The
+ * file must ship as source `.ts`: pi loads it via jiti, outside the keeper build.
+ */
+export function piExtensionPath(): string {
+  return resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "plugins",
+    "keeper",
+    "pi-extension",
+    "keeper-events.ts",
+  );
+}
+
+/**
+ * The pi native flags that arm the keeper extension: `["-e", <path>]` when the
+ * extension file is present, else `[]`. FAIL-OPEN existence check is the load
+ * -bearing guard — pi ABORTS the launch on an `-e` path that does not exist, so a
+ * partial checkout must degrade to presence-only rather than break every pi
+ * launch. `exists` is injected for tests; defaults to {@link existsSync}. Pure
+ * over its inputs.
+ */
+export function piExtensionArgs(
+  exists: (path: string) => boolean = existsSync,
+): string[] {
+  const path = piExtensionPath();
+  return exists(path) ? ["-e", path] : [];
 }

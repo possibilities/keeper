@@ -63,7 +63,7 @@ import {
   VERSION,
 } from "./dispatch";
 import { HARNESS_DESCRIPTORS } from "./harness";
-import { READ_ONLY_DIRECTIVE } from "./launch-config";
+import { piExtensionArgs, READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
   launchToResolvedHandle,
@@ -227,6 +227,14 @@ export interface MainDeps {
    * `~/.config/keeper`.
    */
   resolveStatuslineSettingsPathFn: () => string | null;
+  /**
+   * The pi native flags that arm keeper's ephemeral in-process extension
+   * (`["-e", <path>]`, or `[]` when the extension file is absent). Injected into
+   * every managed pi launch so pi shows live working/stopped churn; a seam so the
+   * byte-pin harness fixes the flags without depending on the real repo path.
+   * `realDeps()` binds it to {@link piExtensionArgs} (fail-open existence check).
+   */
+  resolvePiExtensionArgsFn: () => string[];
 }
 
 /** Production deps — the real collaborators. */
@@ -286,6 +294,7 @@ export function realDeps(): MainDeps {
         join(homedir(), ".config", "keeper"),
         process.env,
       ),
+    resolvePiExtensionArgsFn: () => piExtensionArgs(),
   };
 }
 
@@ -2348,6 +2357,18 @@ export async function main(deps: MainDeps): Promise<never> {
       runCmd.push("--model", startupModel);
       actionLog.push(`Added startup model override: --model ${startupModel}`);
       note(`model: ${startupModel}`);
+    }
+
+    // Arm keeper's ephemeral pi extension (`-e <path>`) so this session shows
+    // live working/stopped churn — the M3b live-state channel, paired with the
+    // birth record armed below. EPHEMERAL per-launch only (never a persistent pi
+    // install). Fail-open: `resolvePiExtensionArgsFn` returns `[]` when the
+    // extension file is absent, degrading pi to presence-only. Both interactive
+    // and detached launches pass through this managed-launch choke point.
+    const piExtArgs = deps.resolvePiExtensionArgsFn();
+    if (piExtArgs.length > 0) {
+      runCmd.push(...piExtArgs);
+      actionLog.push(`Armed keeper pi extension: ${piExtArgs.join(" ")}`);
     }
   }
 

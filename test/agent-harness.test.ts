@@ -31,7 +31,11 @@ const SECOND_AXES: ReadonlySet<SecondAxis> = new Set([
   "thinking",
   "none",
 ]);
-const HOOK_MECHANISMS: ReadonlySet<string> = new Set(["claude-hooks", "none"]);
+const HOOK_MECHANISMS: ReadonlySet<string> = new Set([
+  "claude-hooks",
+  "pi-extension",
+  "none",
+]);
 
 describe("harness registry — descriptor completeness", () => {
   test("every harness has a fully-defined descriptor keyed by its own name", () => {
@@ -78,10 +82,11 @@ describe("harness registry — descriptor completeness", () => {
     expect(HARNESS_DESCRIPTORS.hermes.mintsOwnSessionId).toBe(true);
     expect(HARNESS_DESCRIPTORS.claude.mintsOwnSessionId).toBe(false);
     expect(HARNESS_DESCRIPTORS.pi.mintsOwnSessionId).toBe(false);
-    // Only claude has a native hook channel today.
+    // claude drives churn via its native hooks; pi via the in-process extension
+    // (M3b); codex/hermes are presence-only today.
     expect(HARNESS_DESCRIPTORS.claude.hookMechanism).toBe("claude-hooks");
     expect(HARNESS_DESCRIPTORS.codex.hookMechanism).toBe("none");
-    expect(HARNESS_DESCRIPTORS.pi.hookMechanism).toBe("none");
+    expect(HARNESS_DESCRIPTORS.pi.hookMechanism).toBe("pi-extension");
     expect(HARNESS_DESCRIPTORS.hermes.hookMechanism).toBe("none");
     // Profile env vars are the KEEPER_AGENT_<X>_PROFILE names main() consumes.
     expect(HARNESS_DESCRIPTORS.claude.profileEnvVar).toBe(

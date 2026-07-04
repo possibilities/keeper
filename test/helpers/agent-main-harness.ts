@@ -151,6 +151,10 @@ export interface HarnessOptions {
   tmuxCommand?: (cmd: string[]) => TmuxCommandResult;
   /** Statusline `--settings` path seam (default: a fixed fake path, no write). */
   resolveStatuslineSettingsPath?: () => string | null;
+  /** Pi extension arming flags seam (default: `[]` — no `-e` injected, so the
+   *  argv byte-pins stay path-independent). Pass `["-e", "<fake>"]` to exercise
+   *  the injection. */
+  resolvePiExtensionArgs?: () => string[];
 }
 
 /**
@@ -246,6 +250,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     resolveStatuslineSettingsPathFn:
       opts.resolveStatuslineSettingsPath ??
       (() => "/fake-home/.config/keeper/agent-statusline-settings.json"),
+    resolvePiExtensionArgsFn: opts.resolvePiExtensionArgs ?? (() => []),
   };
 
   return {

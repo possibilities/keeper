@@ -141,6 +141,21 @@ describe("Pi command assembly", () => {
     expect(flagValues(cmd, "--session-id")).toEqual([]);
     expect(flagValues(cmd, "--name")).toEqual([]);
   });
+
+  test("arms the keeper pi extension (-e) when the resolver yields flags", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      resolvePiExtensionArgs: () => ["-e", "/fake/keeper-events.ts"],
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "-e")).toEqual(["/fake/keeper-events.ts"]);
+  });
+
+  test("omits -e when the extension resolver fails open to []", async () => {
+    // The harness default resolver returns [] (extension absent / partial checkout).
+    const h = piHarness(["--x-no-confirm", "hello"]);
+    const cmd = await runAndCapture(h, main);
+    expect(cmd).not.toContain("-e");
+  });
 });
 
 describe("Pi passthrough commands", () => {
