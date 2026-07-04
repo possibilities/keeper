@@ -1,11 +1,11 @@
 # keeper
 
 Event-sourced control-data daemon for Claude Code agents — Bun + `bun:sqlite`, single host, single
-SQLite DB. Imperative fold/migration/write-scoping guardrails live in [CLAUDE.md](./CLAUDE.md);
-rationale and provenance live in `.keeper/` specs and git history.
+SQLite DB. Imperative fold/migration/write-scoping guardrails live in [CLAUDE.md](./CLAUDE.md).
 
 Domain vocabulary lives in the [CONTEXT.md](./CONTEXT.md) glossary; resolved architectural decisions
-live in [docs/adr/](./docs/adr/).
+and their rationale live in [docs/adr/](./docs/adr/) alongside commit messages; `.keeper/` specs are
+the plan/spec archive.
 
 ## What keeper is
 
