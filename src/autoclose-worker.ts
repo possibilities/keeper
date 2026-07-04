@@ -1,0 +1,599 @@
+/**
+ * autoclose worker (epic fn-1107). A daemon Bun Worker thread that force-closes
+ * the tmux window of a done-and-idle agent keeper itself dispatched — an
+ * autopilot `work::`/`close::` worker whose plan row reached a `completed`
+ * verdict, or a finished claude `/plan:panel` leg — ~grace after it is provably
+ * done. Every other window (a manual session, a hand-run `keeper dispatch`, a
+ * handoff, a pair partner, a bus-woken planner) keeps its stay-open-until-
+ * hand-closed behavior. Off-switch: `autoclose_enabled: false` in the config,
+ * re-read every pulse (a flip lands with no restart).
+ *
+ * A PURE EXTERNAL ACTUATOR, cloned from the renamer worker's shape: it opens its
+ * own read-only connection, watches the projection (level-triggered on `PRAGMA
+ * data_version` via {@link watchLoop}, WITH a non-zero idle wake so a grace that
+ * elapses on a quiet board — no DB write to bump data_version — still gets
+ * re-examined), and writes ONLY to tmux (`kill-window`). It NEVER writes
+ * keeper.db and mints NO events: the exit-watcher remains the sole `Killed`
+ * producer. The one worker→main message is the pre-kill intent hint
+ * ({@link AutocloseIntentMessage}); main owns the `kill_reason: 'autoclosed'`
+ * labeling (a sibling task).
+ *
+ * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic (the
+ * prior tmux-heuristic reaper — fn-1005 — is dead scar tissue): the autopilot
+ * bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only when a
+ * SessionStart discharged a real `pending_dispatches` row), the panel bucket on
+ * the `panels` birth-session + the `panel::x::y` name shape. The `completed`
+ * verdict is read through the SHARED {@link loadReadinessInputs} +
+ * {@link computeReadiness} seam so autoclose's notion of "done" can never drift
+ * from the reconciler's.
+ *
+ * Every tmux/DB probe is a NEGATIVE safety gate that fails CLOSED: a degraded or
+ * empty pane sweep skips the whole pulse and mints nothing; a mismatch is a
+ * PERMANENT skip, never a retry (a retry against a since-recycled pane id is
+ * exactly how the prior incarnation interrupted live sessions — commit 5b844449).
+ * Kills are blast-capped per pulse so a bad projection state cannot cascade.
+ *
+ * Worker contract (see CLAUDE.md "Worker contract"):
+ *  - `isMainThread` guard — a plain import is inert.
+ *  - Own read-only `openDb` connection (`prepareStmts:false`, `bootRetry:true`).
+ *  - Typed messages: `{type:"shutdown"}` main→worker; the intent hint
+ *    worker→main. Exit 0 clean / 1 crash.
+ *  - The read-only DB connection is closed in the shutdown path before exit.
+ */
+
+import type { Database } from "bun:sqlite";
+import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { openDb, resolveConfig } from "./db";
+import {
+  createTmuxPaneOps,
+  MANAGED_EXEC_SESSION,
+  PANELS_EXEC_SESSION,
+  type PaneInfo,
+  type TmuxPaneOps,
+} from "./exec-backend";
+import { computeReadiness, type ReadinessSnapshot } from "./readiness";
+import { loadReadinessInputs } from "./readiness-inputs";
+import { watchLoop } from "./wake-worker";
+
+/** Cap on kills per pulse — the blast-radius bound so a bad projection state
+ *  cannot cascade into a mass window close. Candidates over the cap stay in the
+ *  grace map and reap on a later pulse. */
+export const AUTOCLOSE_MAX_KILLS_PER_PULSE = 5;
+
+/** Idle-wake cadence (ms) for {@link watchLoop}. NON-ZERO by necessity: grace
+ *  expiry is time-based and a quiet board never bumps `data_version`, so a
+ *  data_version-only loop would never re-examine a candidate whose grace
+ *  elapsed. ~5s mirrors the restore-worker precedent. */
+export const AUTOCLOSE_IDLE_MS = 5000;
+
+/** The `panel::<model>::<slug>` title shape a claude `/plan:panel` leg wears —
+ *  exactly two `::` separators, no colon inside a segment. Part of the panel
+ *  bucket's positive allowlist alongside the `panels` birth session. */
+const PANEL_TITLE_RE = /^panel::[^:]+::[^:]+$/;
+
+/** Data the parent passes via `new Worker(url, { workerData })`. Only the DB
+ *  path crosses the boundary — the read-only connection is opened on the worker
+ *  thread (handles are thread-affine). */
+export interface AutocloseWorkerData {
+  dbPath: string;
+  /** Poll cadence (ms) for the underlying `data_version` watch. Optional;
+   *  defaults to {@link watchLoop}'s default. */
+  pollMs?: number;
+}
+
+/** Message the parent sends to ask the worker to stop. */
+export interface ShutdownMessage {
+  type: "shutdown";
+}
+
+/**
+ * The pre-kill intent hint — the ONLY worker→main message. Posted IMMEDIATELY
+ * before {@link TmuxPaneOps.killWindow} so main can label the resulting `Killed`
+ * row `kill_reason: 'autoclosed'`. Carries the recycle-safe identity tuple
+ * (`jobId`, `pid`, `startTime`, `paneId`) plus the audit context (`bucket`,
+ * `ref`). The worker writes nothing to keeper.db; this hint is the whole
+ * worker→main surface.
+ */
+export interface AutocloseIntentMessage {
+  kind: "autoclose-intent";
+  jobId: string;
+  pid: number | null;
+  startTime: string | null;
+  paneId: string;
+  bucket: AutocloseBucket;
+  ref: string | null;
+}
+
+/** Which ownership bucket a reap belongs to — the two provably-keeper-owned
+ *  window classes. */
+export type AutocloseBucket = "autopilot" | "panel";
+
+/**
+ * The narrow `jobs` row the decision core reads. A PURPOSE-BUILT projection, not
+ * the full {@link import("./types").Job}: it carries the two columns the shared
+ * jobs descriptor deliberately omits (`dispatch_origin` — the airtight
+ * autopilot-vs-manual discriminator — and `backend_exec_generation_id` — the
+ * live-pane-resolved marker), so the pulse reads it via a direct SELECT rather
+ * than the descriptor read path.
+ */
+export interface AutocloseJob {
+  job_id: string;
+  state: string;
+  pid: number | null;
+  start_time: string | null;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  title: string | null;
+  dispatch_origin: string | null;
+  backend_exec_type: string | null;
+  backend_exec_pane_id: string | null;
+  backend_exec_birth_session_id: string | null;
+  backend_exec_generation_id: string | null;
+  last_input_request_at: number | null;
+  last_permission_prompt_at: number | null;
+}
+
+/** One window the decision core owes a close. Mirrors the intent hint's identity
+ *  + audit fields. */
+export interface AutocloseReapDecision {
+  jobId: string;
+  pid: number | null;
+  startTime: string | null;
+  paneId: string;
+  bucket: AutocloseBucket;
+  ref: string | null;
+}
+
+/** Injected inputs to the pure decision core — side-effect free, every input a
+ *  plain value so the full in/out matrix drives it with no DB / tmux. */
+export interface ComputeAutocloseReapsArgs {
+  /** Candidate `jobs` rows (the pulse pre-filters to `state = 'stopped'`; the
+   *  core re-checks defensively). */
+  jobs: readonly AutocloseJob[];
+  /** The shared readiness snapshot — `perTask` (work, keyed by task id) and
+   *  `perCloseRow` (close, keyed by epic id) carry the `completed` verdict. */
+  readiness: Pick<ReadinessSnapshot, "perTask" | "perCloseRow">;
+  /** One pane sweep. `null` (degraded tmux) OR empty (a suspiciously empty
+   *  server) → skip the whole pulse, mint nothing, preserve the grace map. */
+  panes: readonly PaneInfo[] | null;
+  /** Worker-local first-observed-eligible clock: `job_id → unix-seconds`. */
+  graceMap: ReadonlyMap<string, number>;
+  config: { autocloseEnabled: boolean; autocloseGraceSeconds: number };
+  /** Autopilot `paused` — suspends the AUTOPILOT bucket only (the panel bucket
+   *  is governed solely by the config key). */
+  autopilotPaused: boolean;
+  /** Reference instant, unix SECONDS (same clock as the grace map + the config
+   *  grace seconds). */
+  now: number;
+}
+
+/** The decision core's output: the (capped, deterministically ordered) reaps and
+ *  the NEXT grace map to carry into the following pulse. */
+export interface AutocloseReapsResult {
+  reaps: AutocloseReapDecision[];
+  graceMap: Map<string, number>;
+}
+
+/**
+ * Decide, for one bucket-membership + rail check, whether a job is eligible NOW
+ * (every gate EXCEPT grace-elapsed). Returns the `{bucket, ref}` on a pass, or
+ * `null` on any failing gate — the caller treats `null` as "prune the grace
+ * entry" (any ineligible observation resets the clock, the inherent hysteresis).
+ * Pure.
+ */
+function classifyEligible(
+  job: AutocloseJob,
+  readiness: Pick<ReadinessSnapshot, "perTask" | "perCloseRow">,
+  paneById: ReadonlyMap<string, PaneInfo>,
+  paneCountByWindow: ReadonlyMap<string, number>,
+  autopilotPaused: boolean,
+): { bucket: AutocloseBucket; ref: string | null } | null {
+  // Precondition rails common to every bucket. A terminal (killed/ended) row
+  // has a NULLed pane id — untargetable by design; never touch it.
+  if (job.state !== "stopped") {
+    return null;
+  }
+  if (job.backend_exec_type !== "tmux") {
+    return null;
+  }
+  const paneId = job.backend_exec_pane_id;
+  if (paneId == null || paneId === "") {
+    return null;
+  }
+  // Generation present = the pane was resolved by the live topology fold; a row
+  // whose pane was never live-resolved is not a safe kill target.
+  if (
+    job.backend_exec_generation_id == null ||
+    job.backend_exec_generation_id === ""
+  ) {
+    return null;
+  }
+  // Prompt-parked rail. `last_input_request_at` flips state to stopped and is
+  // NOT cleared on Stop, so a non-null value on a stopped row means "parked
+  // awaiting a human answer" — never close it. `last_permission_prompt_at` IS
+  // cleared on Stop, so a non-null value is a prompt NEWER than the last stop
+  // (re-parked) — also excluded. Both null ⇒ not parked.
+  if (job.last_input_request_at != null) {
+    return null;
+  }
+  if (job.last_permission_prompt_at != null) {
+    return null;
+  }
+
+  // Bucket membership — POSITIVE provenance only.
+  let bucket: AutocloseBucket;
+  let managedSession: string;
+  let ref: string | null;
+  if (
+    job.dispatch_origin === "autopilot" &&
+    (job.plan_verb === "work" || job.plan_verb === "close")
+  ) {
+    // Autopilot bucket: pause suspends it (unlike the panel bucket).
+    if (autopilotPaused) {
+      return null;
+    }
+    const planRef = job.plan_ref;
+    if (planRef == null || planRef === "") {
+      return null;
+    }
+    // work → perTask keyed by task id; close → perCloseRow keyed by epic id
+    // (the plan_ref of a close worker IS the epic id) — the await-conditions
+    // consumer pattern.
+    const verdict =
+      job.plan_verb === "work"
+        ? readiness.perTask.get(planRef)
+        : readiness.perCloseRow.get(planRef);
+    if (verdict?.tag !== "completed") {
+      return null;
+    }
+    bucket = "autopilot";
+    managedSession = MANAGED_EXEC_SESSION;
+    ref = planRef;
+  } else if (
+    job.backend_exec_birth_session_id === PANELS_EXEC_SESSION &&
+    job.plan_verb == null &&
+    job.plan_ref == null &&
+    job.title != null &&
+    PANEL_TITLE_RE.test(job.title)
+  ) {
+    bucket = "panel";
+    managedSession = PANELS_EXEC_SESSION;
+    ref = job.title;
+  } else {
+    // Everything else — manual (origin NULL), handoff, pair/agentbus,
+    // resolve/plan/approve verbs — is out of scope.
+    return null;
+  }
+
+  // Live pane rails against the fresh sweep. Each is a fail-closed negative gate.
+  const pane = paneById.get(paneId);
+  if (pane === undefined) {
+    // Pane absent from the sweep — the window is gone (or the kill already
+    // landed). Suppresses a double-kill next pulse while the row is still
+    // 'stopped' pending the Killed fold.
+    return null;
+  }
+  if (pane.paneDead !== "0") {
+    return null;
+  }
+  // Sane pane_start_time: a positive finite integer (garbage → skip).
+  const startTime = Number.parseInt(pane.paneStartTime, 10);
+  if (!Number.isFinite(startTime) || startTime <= 0) {
+    return null;
+  }
+  // Live session membership — a window moved out of the bucket's managed session
+  // is the human's now.
+  if (pane.sessionName !== managedSession) {
+    return null;
+  }
+  // Exactly one pane: kill-window destroys every pane in the window, so a human
+  // split (two panes) makes the window theirs.
+  if ((paneCountByWindow.get(pane.windowId) ?? 0) !== 1) {
+    return null;
+  }
+
+  return { bucket, ref };
+}
+
+/**
+ * The pure decision core — the whole unit-test surface. Given the candidate
+ * jobs, the shared readiness snapshot, ONE pane sweep, the incoming grace map,
+ * the config, the paused flag, and `now`, returns the windows to close plus the
+ * NEXT grace map. Side-effect free and deterministic in its inputs.
+ *
+ * Grace: an entry records `now` the first pulse a job is observed eligible;
+ * `now - firstObserved >= graceSeconds` makes it due. An ineligible observation
+ * (resumed, killed, verdict regressed, prompt-parked, session moved, …) drops
+ * the entry — so the clock resets. A brand-new eligible observation is never due
+ * (elapsed 0 < the positive grace). Reaps are ordered by `job_id` and capped at
+ * {@link AUTOCLOSE_MAX_KILLS_PER_PULSE}; a capped-out candidate STAYS in the
+ * grace map and reaps on a later pulse.
+ */
+export function computeAutocloseReaps(
+  args: ComputeAutocloseReapsArgs,
+): AutocloseReapsResult {
+  const { jobs, readiness, panes, graceMap, config, autopilotPaused, now } =
+    args;
+
+  // Config off-switch: disabled ⇒ clear state, mint nothing (a re-enable then
+  // restarts every grace clock — a flip only ever DELAYS a close).
+  if (!config.autocloseEnabled) {
+    return { reaps: [], graceMap: new Map() };
+  }
+
+  // Degraded (null) OR empty sweep: skip the whole pulse, mint nothing. A
+  // non-observation, so the grace map is PRESERVED (neither advanced nor reset).
+  if (panes == null || panes.length === 0) {
+    return { reaps: [], graceMap: new Map(graceMap) };
+  }
+
+  const paneById = new Map<string, PaneInfo>();
+  const paneCountByWindow = new Map<string, number>();
+  for (const pane of panes) {
+    paneById.set(pane.paneId, pane);
+    paneCountByWindow.set(
+      pane.windowId,
+      (paneCountByWindow.get(pane.windowId) ?? 0) + 1,
+    );
+  }
+
+  const nextGrace = new Map<string, number>();
+  const due: AutocloseReapDecision[] = [];
+  for (const job of jobs) {
+    const elig = classifyEligible(
+      job,
+      readiness,
+      paneById,
+      paneCountByWindow,
+      autopilotPaused,
+    );
+    if (elig === null) {
+      // Ineligible ⇒ prune (absent from nextGrace resets the clock).
+      continue;
+    }
+    const firstObserved = graceMap.get(job.job_id) ?? now;
+    nextGrace.set(job.job_id, firstObserved);
+    if (now - firstObserved >= config.autocloseGraceSeconds) {
+      due.push({
+        jobId: job.job_id,
+        pid: job.pid,
+        startTime: job.start_time,
+        // Non-null: classifyEligible passed only past the pane-id gate.
+        paneId: job.backend_exec_pane_id as string,
+        bucket: elig.bucket,
+        ref: elig.ref,
+      });
+    }
+  }
+
+  due.sort((a, b) => (a.jobId < b.jobId ? -1 : a.jobId > b.jobId ? 1 : 0));
+  return {
+    reaps: due.slice(0, AUTOCLOSE_MAX_KILLS_PER_PULSE),
+    graceMap: nextGrace,
+  };
+}
+
+/** In-memory pulse state: the worker-local grace map, carried pulse to pulse. A
+ *  daemon restart starts it empty — a restart only DELAYS a close, never
+ *  accelerates one, so the map is never persisted. */
+export interface AutoclosePulseState {
+  graceMap: Map<string, number>;
+}
+
+/** Injected pulse collaborators — clock, config re-read, the intent-hint sink,
+ *  and the stderr audit line. All injectable so the pulse drives against a
+ *  seeded DB + fake backend with no real Worker / tmux. */
+export interface AutoclosePulseDeps {
+  resolveConfig: () => {
+    autocloseEnabled: boolean;
+    autocloseGraceSeconds: number;
+  };
+  now: () => number;
+  postIntent: (msg: AutocloseIntentMessage) => void;
+  noteLine: (line: string) => void;
+}
+
+/** Read the autopilot `paused` flag off the singleton `autopilot_state` row.
+ *  A missing/malformed value defaults to PAUSED (the safe default — matches the
+ *  readiness client). */
+function readAutopilotPaused(db: Database): boolean {
+  const rows = db
+    .prepare("SELECT paused FROM autopilot_state WHERE id = 1")
+    .all() as { paused: unknown }[];
+  const raw = rows[0]?.paused;
+  return typeof raw === "number" ? raw !== 0 : true;
+}
+
+/** Read the stopped candidate rows via a direct SELECT — the two provenance
+ *  columns (`dispatch_origin`, `backend_exec_generation_id`) are omitted from
+ *  the shared jobs descriptor, so the descriptor read path can't surface them.
+ *  Only `state = 'stopped'` rows are ever candidates; a resumed row simply
+ *  vanishes from this set and its grace entry is pruned by absence. */
+function readAutocloseJobs(db: Database): AutocloseJob[] {
+  return db
+    .prepare(
+      `SELECT job_id, state, pid, start_time, plan_verb, plan_ref, title,
+              dispatch_origin, backend_exec_type, backend_exec_pane_id,
+              backend_exec_birth_session_id, backend_exec_generation_id,
+              last_input_request_at, last_permission_prompt_at
+         FROM jobs
+        WHERE state = 'stopped'`,
+    )
+    .all() as AutocloseJob[];
+}
+
+/**
+ * Drive one autoclose pulse against the worker's read-only connection.
+ * Re-reads config (live kill-switch both directions), sweeps tmux ONCE
+ * (degraded/empty → skip), loads the shared readiness inputs + verdict, reads
+ * the paused flag + candidate rows, runs the pure {@link computeAutocloseReaps},
+ * then for each capped decision posts the intent hint and IMMEDIATELY fires
+ * `killWindow`. A non-zero kill exit is an expected TOCTOU no-op — treated as
+ * done, never re-enqueued, no retry. NEVER throws for an expected degradation.
+ *
+ * Exported for unit reach: tests drive it directly against a seeded DB with an
+ * injected backend + deps.
+ */
+export async function autoclosePulse(
+  db: Database,
+  backend: Pick<TmuxPaneOps, "listPanes" | "killWindow">,
+  state: AutoclosePulseState,
+  deps: AutoclosePulseDeps,
+): Promise<void> {
+  const config = deps.resolveConfig();
+  if (!config.autocloseEnabled) {
+    // Disabled ⇒ clear state, do nothing (a re-enable restarts every clock).
+    state.graceMap = new Map();
+    return;
+  }
+
+  // ONE sweep per pulse. Degraded (null) or empty ⇒ skip the whole pulse and
+  // mint nothing, preserving the grace map (a non-observation).
+  const panes = await backend.listPanes();
+  if (panes === null || panes.length === 0) {
+    return;
+  }
+
+  const inputs = loadReadinessInputs(db);
+  const now = deps.now();
+  const readiness = computeReadiness(
+    inputs.epics,
+    inputs.jobs,
+    inputs.subagentInvocations,
+    inputs.gitStatusByProjectDir,
+    now,
+    inputs.pendingDispatches,
+    // Autoclose needs only done-detection, so armed-mode eligibility is N/A.
+    undefined,
+    inputs.unseededRoots,
+    inputs.maxConcurrentPerRoot,
+  );
+  const autopilotPaused = readAutopilotPaused(db);
+  const jobs = readAutocloseJobs(db);
+
+  const { reaps, graceMap } = computeAutocloseReaps({
+    jobs,
+    readiness,
+    panes,
+    graceMap: state.graceMap,
+    config,
+    autopilotPaused,
+    now,
+  });
+  state.graceMap = graceMap;
+
+  for (const decision of reaps) {
+    // Post the hint BEFORE the kill so main can label the Killed row; the
+    // exit-watcher remains the sole Killed producer.
+    deps.postIntent({
+      kind: "autoclose-intent",
+      jobId: decision.jobId,
+      pid: decision.pid,
+      startTime: decision.startTime,
+      paneId: decision.paneId,
+      bucket: decision.bucket,
+      ref: decision.ref,
+    });
+    await backend.killWindow(decision.paneId);
+    deps.noteLine(
+      `closed job=${decision.jobId} bucket=${decision.bucket} ref=${
+        decision.ref ?? "-"
+      } pane=${decision.paneId}`,
+    );
+  }
+}
+
+/**
+ * Worker entrypoint. Opens its own read-only connection, wires the shutdown
+ * message, runs an initial pulse, then drives the watch loop (with the non-zero
+ * idle wake) until told to stop.
+ */
+function main(): void {
+  if (!parentPort) {
+    console.error("[autoclose-worker] no parentPort — not running as a Worker");
+    process.exit(1);
+  }
+
+  const data = workerData as AutocloseWorkerData | undefined;
+  if (!data || typeof data.dbPath !== "string") {
+    console.error("[autoclose-worker] missing dbPath in workerData");
+    process.exit(1);
+  }
+
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
+  const backend = createTmuxPaneOps({
+    noteLine: (line: string): void => {
+      console.error(`[autoclose-worker] ${line}`);
+    },
+  });
+  const state: AutoclosePulseState = { graceMap: new Map() };
+  const deps: AutoclosePulseDeps = {
+    resolveConfig: () => {
+      const cfg = resolveConfig();
+      return {
+        autocloseEnabled: cfg.autocloseEnabled,
+        autocloseGraceSeconds: cfg.autocloseGraceSeconds,
+      };
+    },
+    now: () => Math.floor(Date.now() / 1000),
+    postIntent: (msg: AutocloseIntentMessage): void => {
+      parentPort?.postMessage(msg);
+    },
+    noteLine: (line: string): void => {
+      console.error(`[autoclose-worker] ${line}`);
+    },
+  };
+  let shutdown = false;
+
+  parentPort.on("message", (msg: ShutdownMessage | undefined) => {
+    if (msg && msg.type === "shutdown") {
+      shutdown = true;
+    }
+  });
+
+  const closeDb = (): void => {
+    try {
+      db.close();
+    } catch {
+      // best-effort; we're exiting either way
+    }
+  };
+
+  const pulse = (): void => {
+    // Per-pulse try/catch: any unexpected error degrades to a logged non-fatal
+    // skip rather than escaping the watch loop (which would fatalExit the
+    // daemon over a cosmetic side-effect).
+    autoclosePulse(db, backend, state, deps).catch((err) => {
+      console.error(
+        `[autoclose-worker] pulse threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  };
+
+  // Initial pulse before the watch loop's first sleep so a freshly-spawned
+  // worker reaps already-due windows immediately.
+  pulse();
+
+  watchLoop(db, pulse, () => shutdown, data.pollMs, AUTOCLOSE_IDLE_MS)
+    .then(() => {
+      closeDb();
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("[autoclose-worker] watch loop crashed:", err);
+      closeDb();
+      process.exit(1);
+    });
+}
+
+// Only run inside a real Worker; a plain import on the main thread (tests
+// driving the pure decision core / pulse) is inert.
+if (!isMainThread) {
+  main();
+}

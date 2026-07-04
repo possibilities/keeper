@@ -41,7 +41,7 @@ Claude Code hook  --append NDJSON, no SQLite-->  ~/.local/state/keeper/events-lo
 events-log ingester (worker)  --read from durable byte-offset-->  INSERT rows into `events`
 reducer (main)  --fold, one BEGIN IMMEDIATE per event-->  projections (jobs, epics, git, usage, ...)
 consumers poll `PRAGMA data_version` on their own read-only connections:
-    UDS subscribe + RPC server | autopilot reconciler | plan / exit-watcher / git workers | tmux control/renamer workers
+    UDS subscribe + RPC server | autopilot reconciler | plan / exit-watcher / git workers | tmux control/renamer/autoclose workers
 producers feed the log via main only (never write the DB):
     transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers
 ```
@@ -64,7 +64,10 @@ bash scripts/install.sh          # bun install -> bun link -> keeperd LaunchAgen
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
 owned by you and mode `644` or macOS silently ignores it. Optional roots and runtimes live in
-`~/.config/keeper/config.yaml`.
+`~/.config/keeper/config.yaml`. The autoclose worker force-closes the tmux window of a done-and-idle
+keeper-dispatched agent (an autopilot `work::`/`close::` worker or a finished claude panel leg) after a
+grace: `autoclose_enabled` (default `true`; set `false`/`off`/`no`/`0` to disable — re-read every pulse,
+so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`) govern it.
 
 `keeper agent` loads keeper's own two plugins (`plugins/keeper`, `plugins/plan`) from
 `~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine (keeper-only, no

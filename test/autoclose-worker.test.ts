@@ -1,0 +1,641 @@
+/**
+ * autoclose worker (fn-1107.3) — the pure decision-core in/out matrix plus a
+ * seeded-DB pulse smoke test. NO real tmux / daemon / Worker: the core takes
+ * plain injected values, and the pulse test drives a fresh in-memory DB with a
+ * fake pane backend (per the test-isolation rules).
+ */
+
+import { expect, test } from "bun:test";
+import {
+  AUTOCLOSE_IDLE_MS,
+  AUTOCLOSE_MAX_KILLS_PER_PULSE,
+  type AutocloseIntentMessage,
+  type AutocloseJob,
+  type AutoclosePulseState,
+  autoclosePulse,
+  type ComputeAutocloseReapsArgs,
+  computeAutocloseReaps,
+} from "../src/autoclose-worker";
+import type { LaunchResult, PaneInfo } from "../src/exec-backend";
+import type { ReadinessSnapshot, Verdict } from "../src/readiness";
+import { freshMemDb } from "./helpers/template-db";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/** A stopped, autopilot-dispatched WORK worker that passes every rail. Override
+ *  any field to drive an exclusion / rail case. */
+const autopilotWork = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
+  job_id: "j-work",
+  state: "stopped",
+  pid: 111,
+  start_time: "100",
+  plan_verb: "work",
+  plan_ref: "fn-1-x.2",
+  title: "work::fn-1-x.2",
+  dispatch_origin: "autopilot",
+  backend_exec_type: "tmux",
+  backend_exec_pane_id: "%1",
+  backend_exec_birth_session_id: "autopilot",
+  backend_exec_generation_id: "gen-1",
+  last_input_request_at: null,
+  last_permission_prompt_at: null,
+  ...over,
+});
+
+/** A stopped, autopilot-dispatched CLOSE worker (plan_ref = epic id). */
+const autopilotClose = (over: Partial<AutocloseJob> = {}): AutocloseJob =>
+  autopilotWork({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: "fn-1-x",
+    title: "close::fn-1-x",
+    backend_exec_pane_id: "%2",
+    ...over,
+  });
+
+/** A stopped claude panel leg that passes every rail. */
+const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
+  job_id: "j-panel",
+  state: "stopped",
+  pid: 222,
+  start_time: "200",
+  plan_verb: null,
+  plan_ref: null,
+  title: "panel::claude::q1",
+  dispatch_origin: null,
+  backend_exec_type: "tmux",
+  backend_exec_pane_id: "%3",
+  backend_exec_birth_session_id: "panels",
+  backend_exec_generation_id: "gen-3",
+  last_input_request_at: null,
+  last_permission_prompt_at: null,
+  ...over,
+});
+
+/** A swept pane matching a job's pane id. */
+const pane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
+  paneId: "%1",
+  windowId: "@1",
+  currentCommand: "claude",
+  paneStartTime: "1700000000",
+  paneDead: "0",
+  sessionName: "autopilot",
+  windowName: "work::fn-1-x.2",
+  ...over,
+});
+
+const completed: Verdict = { tag: "completed" };
+
+const readiness = (
+  over: Partial<Pick<ReadinessSnapshot, "perTask" | "perCloseRow">> = {},
+): Pick<ReadinessSnapshot, "perTask" | "perCloseRow"> => ({
+  perTask: new Map<string, Verdict>([["fn-1-x.2", completed]]),
+  perCloseRow: new Map<string, Verdict>([["fn-1-x", completed]]),
+  ...over,
+});
+
+const CONFIG = { autocloseEnabled: true, autocloseGraceSeconds: 30 };
+const NOW = 1_000_000;
+/** A grace map whose entry is already past the 30s grace at {@link NOW}. */
+const elapsed = (jobId: string): Map<string, number> =>
+  new Map([[jobId, NOW - 31]]);
+
+const run = (
+  over: Partial<ComputeAutocloseReapsArgs>,
+): ReturnType<typeof computeAutocloseReaps> =>
+  computeAutocloseReaps({
+    jobs: [],
+    readiness: readiness(),
+    panes: [],
+    graceMap: new Map(),
+    config: CONFIG,
+    autopilotPaused: false,
+    now: NOW,
+    ...over,
+  });
+
+// ---------------------------------------------------------------------------
+// IN — the three closeable classes
+// ---------------------------------------------------------------------------
+
+test("IN: autopilot work, completed + stopped, past grace → reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({
+    jobId: "j-work",
+    pid: 111,
+    startTime: "100",
+    paneId: "%1",
+    bucket: "autopilot",
+    ref: "fn-1-x.2",
+  });
+});
+
+test("IN: autopilot close, completed via perCloseRow (epic id), past grace → reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotClose()],
+    panes: [
+      pane({ paneId: "%2", windowId: "@2", windowName: "close::fn-1-x" }),
+    ],
+    graceMap: elapsed("j-close"),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({ bucket: "autopilot", ref: "fn-1-x" });
+});
+
+test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
+  const { reaps } = run({
+    jobs: [panelLeg()],
+    // No readiness verdict for the panel — the panel bucket is verdict-free.
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [
+      pane({
+        paneId: "%3",
+        windowId: "@3",
+        sessionName: "panels",
+        windowName: "panel::claude::q1",
+      }),
+    ],
+    graceMap: elapsed("j-panel"),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::claude::q1" });
+});
+
+// ---------------------------------------------------------------------------
+// OUT — exclusion classes (never keeper-owned or not done)
+// ---------------------------------------------------------------------------
+
+test("OUT: manual plan-form worker (dispatch_origin NULL) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork({ dispatch_origin: null })],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: handoff worker (origin NULL, non-panels birth session) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [
+      autopilotWork({
+        dispatch_origin: null,
+        backend_exec_birth_session_id: "autopilot",
+      }),
+    ],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: pair / agentbus sessions → never reaped", () => {
+  for (const birth of ["pair", "agentbus"]) {
+    const { reaps } = run({
+      // panel-shaped title but the wrong birth session → not the panel bucket.
+      jobs: [panelLeg({ backend_exec_birth_session_id: birth })],
+      panes: [pane({ paneId: "%3", windowId: "@3", sessionName: birth })],
+      graceMap: elapsed("j-panel"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: resolve worker (origin autopilot, plan_verb resolve) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork({ plan_verb: "resolve" })],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: working row (not stopped) → never reaped", () => {
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork({ state: "working" })],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+  // Ineligible observation prunes the grace entry.
+  expect(graceMap.has("j-work")).toBe(false);
+});
+
+test("OUT: killed row (terminal) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork({ state: "killed", backend_exec_pane_id: null })],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: verdict not completed (ready / running / absent) → never reaped", () => {
+  const running: Verdict = { tag: "running", reason: { kind: "job-running" } };
+  for (const rmap of [
+    new Map<string, Verdict>([["fn-1-x.2", { tag: "ready" }]]),
+    new Map<string, Verdict>([["fn-1-x.2", running]]),
+    new Map<string, Verdict>(), // absent
+  ]) {
+    const { reaps } = run({
+      jobs: [autopilotWork()],
+      readiness: { perTask: rmap, perCloseRow: new Map() },
+      panes: [pane()],
+      graceMap: elapsed("j-work"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: prompt-parked (input request OR permission prompt set) → never reaped", () => {
+  for (const over of [
+    { last_input_request_at: NOW - 5 },
+    { last_permission_prompt_at: NOW - 5 },
+  ]) {
+    const { reaps } = run({
+      jobs: [autopilotWork(over)],
+      panes: [pane()],
+      graceMap: elapsed("j-work"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: split window (two panes in the window) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork()],
+    panes: [
+      pane(),
+      // a human split: a second pane in the SAME window
+      pane({ paneId: "%99", windowId: "@1", currentCommand: "zsh" }),
+    ],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: dead pane (pane_dead = 1) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork()],
+    panes: [pane({ paneDead: "1" })],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: insane pane_start_time → never reaped", () => {
+  for (const bad of ["", "0", "not-a-number"]) {
+    const { reaps } = run({
+      jobs: [autopilotWork()],
+      panes: [pane({ paneStartTime: bad })],
+      graceMap: elapsed("j-work"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: session moved out of the managed session → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork()],
+    panes: [pane({ sessionName: "someones-other-session" })],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: generation absent → never reaped", () => {
+  for (const gen of [null, ""]) {
+    const { reaps } = run({
+      jobs: [autopilotWork({ backend_exec_generation_id: gen })],
+      panes: [pane()],
+      graceMap: elapsed("j-work"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: non-tmux backend → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork({ backend_exec_type: null })],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: pane absent from the sweep → never reaped, grace pruned (double-kill suppression)", () => {
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork()],
+    // sweep is non-empty but does NOT contain the job's pane (killed last pulse)
+    panes: [pane({ paneId: "%77", windowId: "@77" })],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.has("j-work")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Pause — autopilot bucket only
+// ---------------------------------------------------------------------------
+
+test("paused suspends the autopilot bucket but NOT the panel bucket", () => {
+  const both = {
+    jobs: [autopilotWork(), panelLeg()],
+    panes: [
+      pane(),
+      pane({
+        paneId: "%3",
+        windowId: "@3",
+        sessionName: "panels",
+        windowName: "panel::claude::q1",
+      }),
+    ],
+    graceMap: new Map([
+      ["j-work", NOW - 31],
+      ["j-panel", NOW - 31],
+    ]),
+  };
+  const { reaps } = run({ ...both, autopilotPaused: true });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({ jobId: "j-panel", bucket: "panel" });
+});
+
+// ---------------------------------------------------------------------------
+// Config off-switch
+// ---------------------------------------------------------------------------
+
+test("disabled config → zero decisions and grace state CLEARED", () => {
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+    config: { autocloseEnabled: false, autocloseGraceSeconds: 30 },
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.size).toBe(0);
+});
+
+test("re-enabling after a disable RESTARTS the grace clock (delay, never accelerate)", () => {
+  // Disabled pulse clears state.
+  const disabled = run({
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+    config: { autocloseEnabled: false, autocloseGraceSeconds: 30 },
+  });
+  expect(disabled.graceMap.size).toBe(0);
+
+  // First enabled pulse: the clock restarts at `now` — NOT immediately due.
+  const reenabled = run({
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: disabled.graceMap,
+  });
+  expect(reenabled.reaps).toHaveLength(0);
+  expect(reenabled.graceMap.get("j-work")).toBe(NOW);
+});
+
+// ---------------------------------------------------------------------------
+// Grace clock
+// ---------------------------------------------------------------------------
+
+test("grace not yet elapsed → not reaped, first observation recorded at now", () => {
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: new Map(), // first observation
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.get("j-work")).toBe(NOW);
+});
+
+test("grace resets on an intervening ineligible observation", () => {
+  // Pulse 1: eligible at t0 → recorded.
+  const t0 = 1000;
+  const p1 = computeAutocloseReaps({
+    jobs: [autopilotWork()],
+    readiness: readiness(),
+    panes: [pane()],
+    graceMap: new Map(),
+    config: CONFIG,
+    autopilotPaused: false,
+    now: t0,
+  });
+  expect(p1.graceMap.get("j-work")).toBe(t0);
+
+  // Pulse 2 at t0+20: resumed (working) → pruned.
+  const p2 = computeAutocloseReaps({
+    jobs: [autopilotWork({ state: "working" })],
+    readiness: readiness(),
+    panes: [pane()],
+    graceMap: p1.graceMap,
+    config: CONFIG,
+    autopilotPaused: false,
+    now: t0 + 20,
+  });
+  expect(p2.graceMap.has("j-work")).toBe(false);
+
+  // Pulse 3 at t0+40: eligible again → clock STARTS OVER at t0+40, not yet due.
+  const p3 = computeAutocloseReaps({
+    jobs: [autopilotWork()],
+    readiness: readiness(),
+    panes: [pane()],
+    graceMap: p2.graceMap,
+    config: CONFIG,
+    autopilotPaused: false,
+    now: t0 + 40,
+  });
+  expect(p3.reaps).toHaveLength(0);
+  expect(p3.graceMap.get("j-work")).toBe(t0 + 40);
+});
+
+test("a quiet board (no input change) still reaps a due candidate when now advances (idle-wake path)", () => {
+  const jobs = [autopilotWork()];
+  const panes = [pane()];
+  // Pulse 1 records the clock; nothing due yet.
+  const p1 = computeAutocloseReaps({
+    jobs,
+    readiness: readiness(),
+    panes,
+    graceMap: new Map(),
+    config: CONFIG,
+    autopilotPaused: false,
+    now: 5000,
+  });
+  expect(p1.reaps).toHaveLength(0);
+  // Pulse 2: identical inputs, only `now` advanced past the grace → reaped.
+  const p2 = computeAutocloseReaps({
+    jobs,
+    readiness: readiness(),
+    panes,
+    graceMap: p1.graceMap,
+    config: CONFIG,
+    autopilotPaused: false,
+    now: 5040,
+  });
+  expect(p2.reaps).toHaveLength(1);
+  expect(AUTOCLOSE_IDLE_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Blast cap
+// ---------------------------------------------------------------------------
+
+test("blast cap enforced: > MAX due → only MAX reaped, all stay in the grace map", () => {
+  const n = AUTOCLOSE_MAX_KILLS_PER_PULSE + 3;
+  const jobs: AutocloseJob[] = [];
+  const panes: PaneInfo[] = [];
+  const graceMap = new Map<string, number>();
+  for (let i = 0; i < n; i++) {
+    const id = `j-${String(i).padStart(2, "0")}`;
+    const paneId = `%${i}`;
+    jobs.push(
+      autopilotWork({
+        job_id: id,
+        plan_ref: "fn-1-x.2",
+        backend_exec_pane_id: paneId,
+      }),
+    );
+    panes.push(pane({ paneId, windowId: `@${i}` }));
+    graceMap.set(id, NOW - 31);
+  }
+  const { reaps, graceMap: next } = run({ jobs, panes, graceMap });
+  expect(reaps).toHaveLength(AUTOCLOSE_MAX_KILLS_PER_PULSE);
+  // Deterministic job_id order → the lowest ids are the ones reaped this pulse.
+  expect(reaps.map((r) => r.jobId)).toEqual([
+    "j-00",
+    "j-01",
+    "j-02",
+    "j-03",
+    "j-04",
+  ]);
+  // Every eligible candidate — capped-out included — stays in the grace map.
+  expect(next.size).toBe(n);
+});
+
+// ---------------------------------------------------------------------------
+// Degraded / empty sweep
+// ---------------------------------------------------------------------------
+
+test("degraded sweep (null) → zero decisions, grace PRESERVED", () => {
+  const incoming = elapsed("j-work");
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork()],
+    panes: null,
+    graceMap: incoming,
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.get("j-work")).toBe(NOW - 31);
+});
+
+test("empty sweep → zero decisions, grace PRESERVED", () => {
+  const incoming = elapsed("j-work");
+  const { reaps, graceMap } = run({
+    jobs: [autopilotWork()],
+    panes: [],
+    graceMap: incoming,
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.get("j-work")).toBe(NOW - 31);
+});
+
+// ---------------------------------------------------------------------------
+// Pulse smoke test — seeded in-memory DB + fake backend (no real tmux/Worker)
+// ---------------------------------------------------------------------------
+
+test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", async () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at, pid, start_time)
+     VALUES
+       ('paneljob', 1, 1, 'stopped', 'panel::claude::q1', NULL, NULL,
+        NULL, 'tmux', '%9', 'panels', 'gen-9', NULL, NULL, 4242, '55')`,
+  );
+
+  const killed: string[] = [];
+  const intents: AutocloseIntentMessage[] = [];
+  const backend = {
+    listPanes: async (): Promise<PaneInfo[] | null> => [
+      pane({
+        paneId: "%9",
+        windowId: "@9",
+        sessionName: "panels",
+        windowName: "panel::claude::q1",
+      }),
+    ],
+    killWindow: async (paneId: string): Promise<LaunchResult> => {
+      // The hint must already be posted by the time the kill fires.
+      expect(intents).toHaveLength(1);
+      killed.push(paneId);
+      return { ok: true };
+    },
+  };
+
+  let clock = 1000;
+  const state: AutoclosePulseState = { graceMap: new Map() };
+  const deps = {
+    resolveConfig: () => CONFIG,
+    now: () => clock,
+    postIntent: (m: AutocloseIntentMessage) => intents.push(m),
+    noteLine: () => {},
+  };
+
+  // Pulse 1: observes eligibility, records the grace clock, kills nothing.
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toHaveLength(0);
+  expect(intents).toHaveLength(0);
+  expect(state.graceMap.get("paneljob")).toBe(1000);
+
+  // Pulse 2: grace elapsed → one intent hint then one kill.
+  clock = 1040;
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toEqual(["%9"]);
+  expect(intents).toHaveLength(1);
+  expect(intents[0]).toMatchObject({
+    kind: "autoclose-intent",
+    jobId: "paneljob",
+    pid: 4242,
+    startTime: "55",
+    paneId: "%9",
+    bucket: "panel",
+    ref: "panel::claude::q1",
+  });
+
+  db.close();
+});
+
+test("autoclosePulse: disabled config kills nothing and clears grace state", async () => {
+  const { db } = freshMemDb();
+  const state: AutoclosePulseState = { graceMap: new Map([["stale", 1]]) };
+  let listed = false;
+  const backend = {
+    listPanes: async (): Promise<PaneInfo[] | null> => {
+      listed = true;
+      return [];
+    },
+    killWindow: async (): Promise<LaunchResult> => ({ ok: true }),
+  };
+  await autoclosePulse(db, backend, state, {
+    resolveConfig: () => ({
+      autocloseEnabled: false,
+      autocloseGraceSeconds: 30,
+    }),
+    now: () => 1000,
+    postIntent: () => {},
+    noteLine: () => {},
+  });
+  // Disabled short-circuits BEFORE the sweep and clears state.
+  expect(listed).toBe(false);
+  expect(state.graceMap.size).toBe(0);
+  db.close();
+});

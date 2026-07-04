@@ -127,14 +127,31 @@ export interface LaunchSpec {
 
 /** One row of a `list-panes -a` sweep: the server-global pane id, its window
  *  id (`@N`), the pane's current foreground command (`pane_current_command`),
- *  and the window's current name. The renamer worker keys windows by `windowId`
- *  and compares `windowName`; the reconciler's slot-occupancy gate reads
- *  `currentCommand` to tell a live claude from the dead `exec $SHELL -l -i`
- *  shell tail holding a stopped session's pane. */
+ *  the pane's start time / dead flag / hosting session, and the window's current
+ *  name. The renamer worker keys windows by `windowId` and compares `windowName`;
+ *  the reconciler's slot-occupancy gate reads `currentCommand` to tell a live
+ *  claude from the dead `exec $SHELL -l -i` shell tail holding a stopped
+ *  session's pane.
+ *
+ *  The three trailing-but-fixed fields are the autoclose kill path's per-pane
+ *  discriminators (all carried verbatim as tmux emits them — no parse, no
+ *  semantics applied here):
+ *   - `paneStartTime` — `#{pane_start_time}`, unix EPOCH SECONDS the pane was
+ *     created. Survives same-server pane-id reuse (ids recycle after destroy;
+ *     the stored generation id is only the tmux server pid), so it is the tuple
+ *     that identifies a pane across recycle.
+ *   - `paneDead` — `#{pane_dead}`, `"1"` when the pane's process has exited
+ *     (a `remain-on-exit` dead pane) else `"0"`.
+ *   - `sessionName` — `#{session_name}`, the tmux session hosting the pane; a
+ *     LIVE session-membership signal (a window moved out of the managed session
+ *     is skipped). */
 export interface PaneInfo {
   readonly paneId: string;
   readonly windowId: string;
   readonly currentCommand: string;
+  readonly paneStartTime: string;
+  readonly paneDead: string;
+  readonly sessionName: string;
   readonly windowName: string;
 }
 
@@ -386,14 +403,17 @@ export function buildTmuxServerPidArgs(): string[] {
 }
 
 /**
- * Build the tmux `list-panes -a -F
- * '#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}'` sweep argv.
- * Pure — exported for tests. `-a` spans every session on the server. The format is
- * TAB-delimited with `window_name` LAST so the parse's final split keeps a tab
- * inside an arbitrary window name from corrupting the three leading FIXED fields
- * (pane id / window id / current command); names are free user text — tabs,
- * colons, unicode all survive. `pane_current_command` is a bare process name (no
- * tabs) so it rides a fixed field. `pane_id` stays FIRST so `classifyCloseKind`'s
+ * Build the tmux `list-panes -a -F '#{pane_id}\t#{window_id}\t
+ * #{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t
+ * #{window_name}'` sweep argv. Pure — exported for tests. `-a` spans every
+ * session on the server. The format is TAB-delimited with `window_name` LAST so
+ * the parse's final split keeps a tab inside an arbitrary window name from
+ * corrupting the SIX leading FIXED fields (pane id / window id / current command
+ * / pane start time / pane dead flag / session name); names are free user text —
+ * tabs, colons, unicode all survive. The six leading values are tab-free by
+ * construction (`pane_current_command` is a bare process name; start-time is
+ * digits; `pane_dead` is `0`/`1`; a tmux session name cannot contain a tab), so
+ * each rides a fixed field. `pane_id` stays FIRST so `classifyCloseKind`'s
  * leading-field match is unaffected.
  */
 export function buildTmuxListPanesArgs(): string[] {
@@ -402,7 +422,7 @@ export function buildTmuxListPanesArgs(): string[] {
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{window_name}",
+    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t#{window_name}",
   ];
 }
 
@@ -469,6 +489,9 @@ export type CloseKind =
  *  - `boot_pid_dead` — boot seed sweep proved the row's pid dead.
  *  - `boot_pid_recycled` — boot seed sweep found the pid recycled into a
  *    different process (start_time mismatch).
+ *  - `autoclosed` — the autoclose worker force-closed a done-and-idle agent's
+ *    tmux window after the grace; the exit-watcher then mints the `Killed` row
+ *    carrying this reason (autoclose itself writes nothing to keeper.db).
  *
  * The reducer copies it verbatim (no re-probe in the fold — a re-probe would
  * break re-fold determinism), defaulting a field-less historical payload to
@@ -478,7 +501,8 @@ export type KillReason =
   | "exit_watched"
   | "boot_unwatchable"
   | "boot_pid_dead"
-  | "boot_pid_recycled";
+  | "boot_pid_recycled"
+  | "autoclosed";
 
 /** The slice of a `Bun.spawnSync` result `classifyCloseKind` reads; injectable
  *  for tests so the classifier exercises canned tmux output with no real fork. */
@@ -663,10 +687,11 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
-      // to skip this cycle. Parse takes the THREE leading fixed fields (pane id /
-      // window id / current command) off the first three tabs, with `window_name`
-      // LAST so a tab inside an arbitrary window name cannot bleed into them.
-      // Malformed lines are dropped silently — a partial sweep is still a usable
+      // to skip this cycle. Parse takes the SIX leading fixed fields (pane id /
+      // window id / current command / pane start time / pane dead flag / session
+      // name) off the first six tabs, with `window_name` LAST so a tab inside an
+      // arbitrary window name cannot bleed into them. Malformed lines (fewer than
+      // six tabs) are dropped silently — a partial sweep is still a usable
       // snapshot. The locale-defaulted env is LOAD-BEARING: a C-locale client
       // sanitizes the TAB delimiters to `_`, which would drop every line and read
       // as an empty sweep.
@@ -678,31 +703,46 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
       if (res == null || res.exitCode !== 0) {
         return null;
       }
+      const FIXED_FIELDS = 6;
       const panes: PaneInfo[] = [];
       for (const line of res.stdout.split("\n")) {
         if (line === "") {
           continue;
         }
-        const firstTab = line.indexOf("\t");
-        if (firstTab < 0) {
+        // Locate the first FIXED_FIELDS tab positions; `window_name` (free text,
+        // may contain tabs) is the entire remainder after the last fixed tab.
+        const tabs: number[] = [];
+        let from = 0;
+        for (let i = 0; i < FIXED_FIELDS; i++) {
+          const idx = line.indexOf("\t", from);
+          if (idx < 0) {
+            break;
+          }
+          tabs.push(idx);
+          from = idx + 1;
+        }
+        if (tabs.length < FIXED_FIELDS) {
           continue;
         }
-        const secondTab = line.indexOf("\t", firstTab + 1);
-        if (secondTab < 0) {
-          continue;
-        }
-        const thirdTab = line.indexOf("\t", secondTab + 1);
-        if (thirdTab < 0) {
-          continue;
-        }
-        const paneId = line.slice(0, firstTab);
-        const windowId = line.slice(firstTab + 1, secondTab);
-        const currentCommand = line.slice(secondTab + 1, thirdTab);
-        const windowName = line.slice(thirdTab + 1);
+        const paneId = line.slice(0, tabs[0]);
+        const windowId = line.slice(tabs[0] + 1, tabs[1]);
+        const currentCommand = line.slice(tabs[1] + 1, tabs[2]);
+        const paneStartTime = line.slice(tabs[2] + 1, tabs[3]);
+        const paneDead = line.slice(tabs[3] + 1, tabs[4]);
+        const sessionName = line.slice(tabs[4] + 1, tabs[5]);
+        const windowName = line.slice(tabs[5] + 1);
         if (paneId === "" || windowId === "") {
           continue;
         }
-        panes.push({ paneId, windowId, currentCommand, windowName });
+        panes.push({
+          paneId,
+          windowId,
+          currentCommand,
+          paneStartTime,
+          paneDead,
+          sessionName,
+          windowName,
+        });
       }
       return panes;
     },

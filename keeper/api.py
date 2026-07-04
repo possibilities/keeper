@@ -414,6 +414,9 @@ from pathlib import Path
 # v107 (fn-1102 task .1) adds the ``events.tmux_generation_id`` VIRTUAL generated
 # column + its partial index (the tab-restore generation-summary walk's indexed
 # key); keeper-py never reads it, so only the version whitelist gains 107.
+# v108 (fn-1107 task .1) adds the nullable ``jobs.dispatch_origin`` TEXT column (the
+# autopilot-vs-manual provenance discriminator the autoclose worker scopes on);
+# keeper-py never reads the new column, so only the version whitelist gains 108.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -493,6 +496,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         105,
         106,
         107,
+        108,
     }
 )
 

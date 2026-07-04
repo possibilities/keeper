@@ -79,8 +79,6 @@ import {
   DEFAULT_MAX_CONCURRENT_JOBS,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   openDb,
-  readGitProjectionFloor,
-  readGitProjectionSeedRequired,
 } from "./db";
 import {
   assertNever,
@@ -95,18 +93,8 @@ import {
   MANAGED_EXEC_SESSION,
   type PaneInfo,
 } from "./exec-backend";
-import { unseededGatedRoots } from "./gated-roots";
-import {
-  localBranchExists,
-  memoizedGitToplevel,
-  memoizedNullableGitToplevel,
-} from "./git-toplevel";
-import { orderEpicsForScheduling } from "./readiness";
-import {
-  collapseSubagentsByName,
-  projectGitStatusByProjectDir,
-  projectPendingDispatches,
-} from "./readiness-client";
+import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
+import { loadReadinessInputs } from "./readiness-inputs";
 import {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
@@ -136,7 +124,7 @@ import {
   worktreeRecoverDispatchId,
 } from "./reconcile-core";
 import { runQuery } from "./server-worker";
-import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
+import type { Epic } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
   ELIGIBLE_REASON,
@@ -3769,48 +3757,22 @@ export async function loadReconcileSnapshot(
     return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
   };
 
-  // The default-scope (open) epics — the live work set — MERGED with the
-  // recently-DONE window (`epics_recent_done`, time-bounded by its descriptor's
-  // `recencyBound` on `updated_at`) so the close-row completion reap is
-  // reachable. The `read()` helper passes no `nowSec`, so `runQuery` defaults the
-  // recency cutoff to live `Date.now()/1000`. Dedup keys on `epic_id` with the
-  // OPEN row winning (a collision is only a fold-lag transient; preferring the
-  // live row keeps dispatch arms on the freshest view).
-  const openEpics = read("epics") as unknown as Epic[];
-  const doneEpics = read("epics_recent_done") as unknown as Epic[];
-  const seenEpicIds = new Set<string>();
-  const dedupedEpics: Epic[] = [];
-  for (const epic of openEpics) {
-    if (seenEpicIds.has(epic.epic_id)) {
-      continue;
-    }
-    seenEpicIds.add(epic.epic_id);
-    dedupedEpics.push(epic);
-  }
-  for (const epic of doneEpics) {
-    if (seenEpicIds.has(epic.epic_id)) {
-      continue;
-    }
-    seenEpicIds.add(epic.epic_id);
-    dedupedEpics.push(epic);
-  }
-  // Route the creation-order seed through the single scheduling-order seam:
-  // started epics sort first (Rule #1) so the reconciler finishes in-progress
-  // epics before opening new ones, then `epic_number` within each tier.
-  const epics = orderEpicsForScheduling(dedupedEpics);
-
-  const jobs = new Map<string, Job>();
-  for (const row of read("jobs") as unknown as Job[]) {
-    jobs.set(row.job_id, row);
-  }
-
-  const subagentInvocations = collapseSubagentsByName(
-    read("subagent_invocations") as unknown as SubagentInvocation[],
-  ).map((g) => g.row);
-
-  const gitStatusByProjectDir = projectGitStatusByProjectDir(
-    read("git") as unknown as GitStatus[],
-  );
+  // The DB-sourced readiness inputs (`epics` — open MERGED with the recently-DONE
+  // window, deduped + scheduling-ordered — `jobs`, `subagentInvocations`,
+  // `gitStatusByProjectDir`, `pendingDispatches`, `unseededRoots`, and the per-root
+  // cap) are loaded through the shared `loadReadinessInputs` module so the
+  // reconciler and the autoclose worker can NEVER diverge on what "done" means.
+  // MOVED (not copied) — the epics merge/dedup, the pending-dispatch builder, and
+  // the git-seed gate all live in that ONE place now.
+  const {
+    epics,
+    jobs,
+    subagentInvocations,
+    gitStatusByProjectDir,
+    pendingDispatches,
+    unseededRoots,
+    maxConcurrentPerRoot,
+  } = loadReadinessInputs(db);
 
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
@@ -3865,21 +3827,20 @@ export async function loadReconcileSnapshot(
     }
   }
 
-  // Read `pending_dispatches` ONCE for its TWO orthogonal uses (each row is a
-  // dispatched-but-not-yet-bound worker): `liveTabKeys` (the same-`(verb,id)`
-  // re-dispatch dedup arm) and `pendingDispatches` (the cross-sibling
-  // `dispatch-pending` occupant fed into `computeReadiness`, via the shared
-  // `projectPendingDispatches` helper so the readiness paths agree).
-  const pendingRows = read("pending_dispatches");
+  // Read `pending_dispatches` for the reconciler-only `liveTabKeys` arm (the
+  // same-`(verb,id)` re-dispatch dedup — NOT a readiness input). Each row is a
+  // dispatched-but-not-yet-bound worker. The cross-sibling `dispatch-pending`
+  // occupant set (`pendingDispatches`, fed into `computeReadiness`) is loaded by
+  // `loadReadinessInputs` above through the SAME `projectPendingDispatches`
+  // builder, so the readiness paths never diverge.
   const liveTabKeys = new Set<DispatchKey>();
-  for (const row of pendingRows) {
+  for (const row of read("pending_dispatches")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
       liveTabKeys.add(dispatchKey(verb as Verb, id));
     }
   }
-  const pendingDispatches = projectPendingDispatches(pendingRows);
 
   // Read the autopilot `mode` and the armed id set — PROJECTION-PULL only (no
   // `workerData`, no cache) so the gate survives a restart with one source of
@@ -3901,20 +3862,10 @@ export async function loadReconcileSnapshot(
       ? capRaw
       : DEFAULT_MAX_CONCURRENT_JOBS;
 
-  // The per-root dispatch concurrency count N rides the SAME singleton
-  // row — resolve `max_concurrent_per_root ?? DEFAULT` (= 1, the one-task-per-root
-  // mutex). An absent/never-set row, NULL, or a non-positive / non-integer value
-  // → DEFAULT. Projection-pull only so a runtime `set_autopilot_config` lands the
-  // very next cycle. RESERVED for task .2's allocator (carried but unconsumed now).
-  const perRootRaw = (
-    autopilotRows[0] as { max_concurrent_per_root?: unknown } | undefined
-  )?.max_concurrent_per_root;
-  const maxConcurrentPerRoot: number =
-    typeof perRootRaw === "number" &&
-    Number.isInteger(perRootRaw) &&
-    perRootRaw > 0
-      ? perRootRaw
-      : DEFAULT_MAX_CONCURRENT_PER_ROOT;
+  // The per-root dispatch concurrency count N (`max_concurrent_per_root`) is
+  // resolved off the SAME `autopilot_state` row by `loadReadinessInputs` above —
+  // one source of truth shared with the readiness client so both consumers
+  // compute identical demotions.
 
   // The durable worktree-mode toggle rides the SAME singleton row —
   // resolve `worktree_mode truthy` (an absent/never-set row, NULL, or 0 = OFF,
@@ -3973,20 +3924,11 @@ export async function loadReconcileSnapshot(
     }
   }
 
-  // Compute the PER-ROOT unseeded set so `reconcile` forces UNKNOWN only
-  // for rows whose `effectiveRoot` is unseeded (a stale/failed root never darks
-  // the whole board). The read connection is the autopilot's own. The gate is
-  // bounded to the `seed_required`-set window: while the flag is CLEAR the set is
-  // EMPTY (the gate is fully off), so a clean root that `retractGitStatus` later
-  // DELETEd never re-wedges. While SET, a root is unseeded iff it has no
-  // `git_status` row with `last_event_id > floor`. The seed-read helper degrades
-  // a missing control row to `true` (treat unknown as unseeded).
-  const unseededRoots = readGitProjectionSeedRequired(db)
-    ? // normalize the gated read key to the toplevel write key (memoized)
-      // so a subdir/symlink `target_repo` un-darks once its toplevel-keyed row
-      // lands.
-      unseededGatedRoots(db, readGitProjectionFloor(db), memoizedGitToplevel())
-    : new Set<string>();
+  // The PER-ROOT unseeded set (`reconcile` forces UNKNOWN only for rows whose
+  // `effectiveRoot` is unseeded, so a stale/failed root never darks the whole
+  // board) is resolved by `loadReadinessInputs` above off the autopilot's own read
+  // connection — bounded to the `seed_required`-set window, EMPTY while the flag is
+  // clear.
 
   // Resolve the `worker` preset per cycle (cheap single-file parse, fail-safe to
   // the WORKER_* constants) — producer-side launch config, never a fold input.

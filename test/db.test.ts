@@ -257,13 +257,14 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v107 dispatch_origin are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `kill_reason` (v103) is the current
-  // final appended column, trailing the v100 telemetry six.
+  // re-fold determinism charter depends on. `dispatch_origin` (v107) is the
+  // current final appended column, trailing `kill_reason` (v103) and the v100
+  // telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -272,6 +273,7 @@ test("the v100 telemetry columns + v103 kill_reason are the byte-identical tail 
     "context_input_tokens",
     "context_window_size",
     "kill_reason",
+    "dispatch_origin",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -2582,7 +2584,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v107 adds the `events.tmux_generation_id` VIRTUAL generated column + its
   // partial index (the tab-restore generation-summary walk's indexed key — an
   // ALTER + index on `events`, not an epics-shape change), fn-1102 task .1.
-  expect(SCHEMA_VERSION).toBe(107);
+  // v108 appends the nullable `jobs.dispatch_origin` provenance column (the
+  // autopilot-vs-manual discriminator the autoclose worker scopes on — an
+  // additive ALTER, not an epics-shape change), fn-1107 task .1.
+  expect(SCHEMA_VERSION).toBe(108);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

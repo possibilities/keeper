@@ -59,5 +59,5 @@ restore in tabs tests; revive side-file quoting cases with hostile titles/cwds.
 - [ ] A resumed non-claude session re-appears as the SAME tracked row (original job id, fresh birth record)
 
 ## Done summary
-
+Made resume/restore harness-aware end to end: resumeTarget/buildResumeCommand/buildKeeperAgentLaunchArgv route each agent through its harness's native resume verb (claude --resume, codex resume, pi --session, hermes --resume) off the descriptor registry; RestoreCandidate carries a harness tag and a non-claude agent with no resolved target is reported not-resumable while the rest restore; revive.sh + bus wake thread the harness and JOBS_DESCRIPTOR serves harness/resume_target; claude paths stay byte-identical.
 ## Evidence

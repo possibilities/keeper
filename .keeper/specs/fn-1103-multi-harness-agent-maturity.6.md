@@ -50,5 +50,5 @@ minted event round-trips to jobs.resume_target through the fold.
 - [ ] The producer reads only session metadata, never message content, and idles when no candidate jobs exist
 
 ## Done summary
-
+Daemon-side codex resume-target producer: resolves a tracked codex job's rollout uuid (originator exact-match, cwd+created-at refuse-to-guess fallback) from the rollout SessionMeta head and has MAIN mint a ResumeTargetResolved synthetic event; reads only metadata, idles when no candidate exists.
 ## Evidence

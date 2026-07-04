@@ -12,7 +12,12 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_MAX_CONCURRENT_JOBS, resolveConfig } from "../src/db";
+import {
+  DEFAULT_MAX_CONCURRENT_JOBS,
+  resolveAutocloseEnabled,
+  resolveAutocloseGraceSeconds,
+  resolveConfig,
+} from "../src/db";
 
 let dir: string;
 let prevEnv: string | undefined;
@@ -199,4 +204,104 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
   const cfg = resolveConfig();
   expect(cfg.handoffPromptPrefix).toBe("/hack");
   expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// autoclose_enabled / autoclose_grace_seconds (fn-1107) — the FIRST boolean-ish
+// and numeric keys in the config corpus. The off-switch is deliberately
+// generous; the pure resolvers carry the parse contract and are unit-tested
+// directly for the values YAML can't cleanly express (NaN / Infinity).
+// ---------------------------------------------------------------------------
+
+test("autoclose defaults: absent file → enabled + 30s grace", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  const cfg = resolveConfig();
+  expect(cfg.autocloseEnabled).toBe(true);
+  expect(cfg.autocloseGraceSeconds).toBe(30);
+});
+
+test("autoclose defaults: absent keys → enabled + 30s grace", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  const cfg = resolveConfig();
+  expect(cfg.autocloseEnabled).toBe(true);
+  expect(cfg.autocloseGraceSeconds).toBe(30);
+});
+
+test("autoclose_enabled: boolean false disables", () => {
+  writeConfig("autoclose_enabled: false\n");
+  expect(resolveConfig().autocloseEnabled).toBe(false);
+});
+
+test("autoclose_enabled: boolean true stays enabled", () => {
+  writeConfig("autoclose_enabled: true\n");
+  expect(resolveConfig().autocloseEnabled).toBe(true);
+});
+
+for (const form of ["false", "off", "no", "0", "OFF", "  No  "]) {
+  test(`autoclose_enabled: string ${JSON.stringify(form)} disables (trimmed, case-insensitive)`, () => {
+    writeConfig(`autoclose_enabled: ${JSON.stringify(form)}\n`);
+    expect(resolveConfig().autocloseEnabled).toBe(false);
+  });
+}
+
+test("autoclose_enabled: an unrelated string stays enabled (any other value → on)", () => {
+  writeConfig('autoclose_enabled: "maybe"\n');
+  expect(resolveConfig().autocloseEnabled).toBe(true);
+});
+
+test("autoclose_enabled is re-read on each resolveConfig call (no restart to flip)", () => {
+  writeConfig("autoclose_enabled: false\n");
+  expect(resolveConfig().autocloseEnabled).toBe(false);
+  // Flip the file back on and re-resolve — the new value lands with no restart.
+  writeConfig("autoclose_enabled: true\n");
+  expect(resolveConfig().autocloseEnabled).toBe(true);
+});
+
+test("autoclose keys resolve independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\nautoclose_enabled: false\n");
+  const cfg = resolveConfig();
+  expect(cfg.autocloseEnabled).toBe(false);
+  expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+test("autoclose_grace_seconds: a positive number overrides", () => {
+  writeConfig("autoclose_grace_seconds: 45\n");
+  expect(resolveConfig().autocloseGraceSeconds).toBe(45);
+});
+
+for (const [label, yaml] of [
+  ["zero", "autoclose_grace_seconds: 0\n"],
+  ["negative", "autoclose_grace_seconds: -5\n"],
+  ["a string", 'autoclose_grace_seconds: "soon"\n'],
+] as const) {
+  test(`autoclose_grace_seconds: ${label} falls back to 30`, () => {
+    writeConfig(yaml);
+    expect(resolveConfig().autocloseGraceSeconds).toBe(30);
+  });
+}
+
+// The pure resolvers carry the whole parse contract — unit-tested directly for
+// the boolean / numeric edge values a YAML round-trip can't reliably express.
+test("resolveAutocloseEnabled: boolean false + every disable string → false; else true", () => {
+  expect(resolveAutocloseEnabled(false)).toBe(false);
+  for (const s of ["false", "off", "no", "0", "OFF", " Off "]) {
+    expect(resolveAutocloseEnabled(s)).toBe(false);
+  }
+  // Absent, boolean true, numeric 0 (NOT the string "0"), and any other string
+  // are all enabled per the documented contract.
+  expect(resolveAutocloseEnabled(undefined)).toBe(true);
+  expect(resolveAutocloseEnabled(true)).toBe(true);
+  expect(resolveAutocloseEnabled(0)).toBe(true);
+  expect(resolveAutocloseEnabled("yes")).toBe(true);
+});
+
+test("resolveAutocloseGraceSeconds: positive finite wins; NaN / Infinity / <=0 / non-number → 30", () => {
+  expect(resolveAutocloseGraceSeconds(45)).toBe(45);
+  expect(resolveAutocloseGraceSeconds(0.5)).toBe(0.5);
+  expect(resolveAutocloseGraceSeconds(0)).toBe(30);
+  expect(resolveAutocloseGraceSeconds(-1)).toBe(30);
+  expect(resolveAutocloseGraceSeconds(Number.NaN)).toBe(30);
+  expect(resolveAutocloseGraceSeconds(Number.POSITIVE_INFINITY)).toBe(30);
+  expect(resolveAutocloseGraceSeconds("30")).toBe(30);
+  expect(resolveAutocloseGraceSeconds(undefined)).toBe(30);
 });

@@ -554,6 +554,18 @@ export interface Job {
    * snapshot.
    */
   context_window_size: number | null;
+  /**
+   * Dispatch provenance (schema v107 / fn-1107): `'autopilot'` iff this job's
+   * binding SessionStart discharged a real `pending_dispatches` row — i.e. the
+   * autopilot minted a `Dispatched` intent that materialized into this worker.
+   * NULL for every manually-launched session, including a manual `keeper
+   * dispatch work::fn-N.M` (plan-form but mints no pending row), a handoff, a
+   * pair partner, and a bus-woken session. The airtight autopilot-vs-manual
+   * discriminator the autoclose worker scopes on — never a tmux/name heuristic.
+   * Deterministic-replayed (survives wipe-and-replay like the `kill_reason`
+   * column); set once on discharge-on-bind, untouched by resume.
+   */
+  dispatch_origin: string | null;
 }
 
 /**

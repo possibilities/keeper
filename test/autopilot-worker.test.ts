@@ -131,6 +131,7 @@ import {
   type Verdict,
 } from "../src/readiness";
 import { projectPendingDispatches } from "../src/readiness-client";
+import { loadReadinessInputs } from "../src/readiness-inputs";
 import type {
   EmbeddedJob,
   Epic,
@@ -4015,6 +4016,40 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
   });
 });
 
+test("fn-1107: loadReadinessInputs and loadReconcileSnapshot produce identical readiness inputs over the same seeded db", async () => {
+  await withSeededDb(async (db) => {
+    // Seed a spread: an open epic, a done epic (pulled back via the recent-done
+    // window), and a non-default per-root cap — the read paths must agree on all.
+    seedEpicRow(db, "fn-1-open", { epic_number: 1, status: "open" });
+    seedEpicRow(db, "fn-2-done", { epic_number: 2, status: "done" });
+    db.run(
+      `INSERT OR REPLACE INTO autopilot_state
+         (id, paused, last_event_id, created_at, updated_at, max_concurrent_per_root)
+       VALUES (1, 0, 0, 0, 0, 3)`,
+    );
+
+    // The MOVED loader and the reconciler's snapshot both read off the same db;
+    // every readiness input must be byte-for-byte identical (the anti-drift
+    // guarantee this factoring exists to enforce).
+    const inputs = loadReadinessInputs(db);
+    const snap = await loadReconcileSnapshot(db);
+
+    expect(inputs.epics).toEqual(snap.epics);
+    expect([...inputs.jobs.entries()]).toEqual([...snap.jobs.entries()]);
+    expect(inputs.subagentInvocations).toEqual(snap.subagentInvocations);
+    expect([...inputs.gitStatusByProjectDir.entries()]).toEqual([
+      ...snap.gitStatusByProjectDir.entries(),
+    ]);
+    expect(inputs.pendingDispatches).toEqual(snap.pendingDispatches);
+    expect([...inputs.unseededRoots].sort()).toEqual(
+      [...snap.unseededRoots].sort(),
+    );
+    // The per-root cap is read off the SAME autopilot_state row by both paths.
+    expect(inputs.maxConcurrentPerRoot).toBe(3);
+    expect(snap.maxConcurrentPerRoot).toBe(3);
+  });
+});
+
 test("fn-811: loadReconcileSnapshot maps a listPanes probe into livePaneIds", async () => {
   await withSeededDb(async (db) => {
     const snap = await loadReconcileSnapshot(db, async () => [
@@ -4022,9 +4057,20 @@ test("fn-811: loadReconcileSnapshot maps a listPanes probe into livePaneIds", as
         paneId: "%1",
         windowId: "@1",
         currentCommand: "claude",
+        paneStartTime: "1700000001",
+        paneDead: "0",
+        sessionName: "autopilot",
         windowName: "w1",
       },
-      { paneId: "%2", windowId: "@2", currentCommand: "zsh", windowName: "w2" },
+      {
+        paneId: "%2",
+        windowId: "@2",
+        currentCommand: "zsh",
+        paneStartTime: "1700000002",
+        paneDead: "0",
+        sessionName: "autopilot",
+        windowName: "w2",
+      },
     ]);
     expect(snap.livePaneIds).not.toBeNull();
     expect([...(snap.livePaneIds ?? [])].sort()).toEqual(["%1", "%2"]);
