@@ -26,5 +26,5 @@ Upstream corpus work for the domain layer, in the arthack repo keeper vendors fr
 - [ ] Corpus tooling in this repo passes
 
 ## Done summary
-
+Added engineering/domain-docs snippet (interactive domain-modeling reflex: challenge/sharpen terms, offer-don't-auto-write with inline-on-confirm, 3-part ADR test, supersession, genre boundaries) and revised future-facing-docs, claude-md-scope, code-comment-style to the per-genre history policy (docs/adr as the sole sanctioned decision-history home). Index rebuilt; corpus tooling green.
 ## Evidence
