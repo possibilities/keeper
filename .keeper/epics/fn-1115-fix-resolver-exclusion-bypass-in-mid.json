@@ -7,7 +7,7 @@
     "fn-1114-shared-checkout-mid-merge-wedge-recovery"
   ],
   "id": "fn-1115-fix-resolver-exclusion-bypass-in-mid",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-04T14:15:27.955000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-04T14:15:27.241000Z"
+  "updated_at": "2026-07-04T14:15:27.955000Z"
 }
