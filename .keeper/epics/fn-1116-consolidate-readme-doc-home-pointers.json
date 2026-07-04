@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-04T15:36:47.804000Z",
+  "created_by_close_of": "fn-1106-keeper-domain-knowledge-layer",
+  "depends_on_epics": [
+    "fn-1106-keeper-domain-knowledge-layer"
+  ],
+  "id": "fn-1116-consolidate-readme-doc-home-pointers",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Consolidate README doc-home pointers",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-04T15:36:47.804000Z"
+}
