@@ -8165,6 +8165,9 @@ test("fn-988 reposForRecovery: knownRoots union in repos with no current epic (o
 function makeRecoveryGit(state: {
   worktreeList?: string; // git worktree list --porcelain stdout
   mergeHeadAt?: Set<string>; // cwds with a stale MERGE_HEAD
+  pointsAtBranches?: Map<string, string[]>; // cwd → `refs/heads/...` refs pointing at its MERGE_HEAD (ownership + owning-epic derivation)
+  autostashAt?: Set<string>; // cwds whose mid-merge carries a MERGE_AUTOSTASH (refuses keeper ownership)
+  abortFailsAt?: Set<string>; // cwds whose `merge --abort` returns non-zero (the un-cleared wedge)
   epicBases?: string[]; // keeper/epic/<id> short refs (for-each-ref output)
   defaultBranch?: string; // resolved via symbolic-ref
   ancestors?: Set<string>; // branches already an ancestor of LOCAL default
@@ -8219,8 +8222,30 @@ function makeRecoveryGit(state: {
       };
     }
     if (joined === "merge --abort") {
+      if (state.abortFailsAt?.has(cwd)) {
+        // The guarded abort ITSELF fails — the mid-merge residue does NOT clear.
+        return { code: 1, stdout: "", stderr: "error: could not abort merge" };
+      }
       state.mergeHeadAt?.delete(cwd);
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
+      const present = state.autostashAt?.has(cwd) ?? false;
+      return {
+        code: present ? 0 : 1,
+        stdout: present ? "stash\n" : "",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("--points-at")) {
+      // The branch-set at a cwd's MERGE_HEAD — shared by the mergeReadiness ownership
+      // probe (`refs/heads/`) and the recover pass's owning-epic derivation
+      // (`refs/heads/keeper/epic/`). MUST precede the `keeper/epic` catch-all below.
+      return {
+        code: 0,
+        stdout: (state.pointsAtBranches?.get(cwd) ?? []).join("\n"),
+        stderr: "",
+      };
     }
     if (joined.startsWith("worktree prune")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -8352,6 +8377,10 @@ function makeRecoveryGit(state: {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
       }
       if (state.mergeConflict) {
+        // A real merge conflict leaves the tree MID-MERGE (MERGE_HEAD present), so
+        // mergeBranchInto's guarded abort actually fires — modeling this lets a test
+        // drive the abort-failed path (abortFailsAt keeps the residue).
+        state.mergeHeadAt?.add(cwd);
         return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
       }
       const merged = args[2];
@@ -8502,6 +8531,228 @@ test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once i
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
     true,
   );
+});
+
+test("fn-1114 recoverWorktrees: a keeper-owned mid-merge in the SHARED MAIN checkout is aborted (flock-guarded) EXACTLY ONCE, then pass-2 merges from a clean tree (incident reproduction)", async () => {
+  // The incident: a keeper base→default merge conflicted and left the human's
+  // shared MAIN checkout mid-merge (MERGE_HEAD + unresolved paths). The lane loop
+  // never sees it (the main worktree is on `main`, not a `keeper/epic/*` lane), so
+  // it wedged: finalize/recover skip-retried the folded-in "dirty" forever. Now the
+  // main checkout gets its own guarded, keeper-owned abort → pass-2 re-derives clean.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]), // the MAIN checkout is wedged mid-merge
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]), // MERGE_HEAD is a keeper base → keeper-owned
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // base not yet merged
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-1-foo", // epic is done
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  // The wedge was aborted EXACTLY ONCE in the main checkout...
+  const aborts = calls.filter(
+    (c) => c.cwd === "/repo" && c.args === "merge --abort",
+  );
+  expect(aborts).toHaveLength(1);
+  // ...under the commit-work flock (the lock path is keyed on the checkout's git dir).
+  expect(
+    calls.some(
+      (c) =>
+        c.cwd === "/repo" &&
+        c.args === "rev-parse --path-format=absolute --git-dir",
+    ),
+  ).toBe(true);
+  // ...then pass-2 re-derived the base merge from the now-clean tree.
+  expect(
+    calls.some(
+      (c) => c.cwd === "/repo" && c.args === `merge --no-edit ${base}`,
+    ),
+  ).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a FOREIGN mid-merge in the main checkout is NEVER aborted; the reason names owner + MERGE_HEAD (not dirty-checkout), inside the recover prefix", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", ["refs/heads/feature/human-wip"]]]), // a foreign branch at MERGE_HEAD
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // A human's own merge is not keeper's to touch — never aborted.
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).toContain("owner=foreign");
+  expect(failures[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(failures[0]?.reason).not.toContain("dirty-checkout");
+  // Inside the recover prefix so the level-triggered clear releases it on recovery.
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a keeper-branch mid-merge WITH a MERGE_AUTOSTASH refuses ownership → never aborted (an abort could lose the stashed work)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]), // a keeper base...
+    autostashAt: new Set(["/repo"]), // ...but a MERGE_AUTOSTASH is present → foreign-shaped
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).toContain("owner=foreign");
+  expect(failures[0]?.reason).toContain("autostash=true");
+});
+
+test("fn-1114 recoverWorktrees: a keeper-owned main mid-merge is NOT aborted while the owning epic has a LIVE resolver (scoped exclusion, silent skip)", async () => {
+  // The main-checkout wedge and a `resolve::<epic>` worker share the epic that owns
+  // the MERGE_HEAD base; racing an abort under a live resolver would destroy its
+  // in-progress resolution. Derive the owning epic from the branch-set at MERGE_HEAD
+  // and honor the SAME per-epic exclusion the lane loop uses — no failure minted.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    (epicId) => epicId === "fn-1-foo", // the owning epic's resolver is live
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toEqual([]); // silent skip — the resolver is actively working it
+});
+
+test("fn-1114 recoverWorktrees: a FAILED guarded abort of the main-checkout wedge surfaces its own worktree-recover-abort-failed reason (telemetry, not vanishing)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    abortFailsAt: new Set(["/repo"]), // the guarded abort itself fails → residue not cleared
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+  );
+  // The abort WAS attempted (keeper-owned) but did not clear the residue.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(true);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-abort-failed");
+  expect(failures[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a lock-timeout acquiring the flock for the main-checkout abort degrades to a defer (no blind abort)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  // A bounded acquirer that TIMES OUT (returns null) — the abort must never run.
+  const timedOutLock: NonNullable<
+    Parameters<typeof recoverWorktrees>[3]
+  > = () => null;
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    timedOutLock,
+  );
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-lock-timeout");
+});
+
+test("fn-1114 recoverWorktrees pass-2: a foreign main-checkout wedge blocking a DONE base mints worktree-recover-mid-merge keyed on the epic (not dirty-checkout), no merge attempted", async () => {
+  const base = "keeper/epic/fn-2-bar";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", ["refs/heads/feature/human-wip"]]]), // foreign wedge
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-2-bar", // done → pass-2 attempts the base merge and hits the wedge
+    run,
+    lock,
+  );
+  // The foreign wedge is never aborted, and its base merge is never attempted.
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  // pass-2's shared merge routine names the wedge distinctly, keyed on the epic.
+  const epicMid = failures.filter(
+    (f) =>
+      f.epicId === "fn-2-bar" &&
+      f.reason.includes("worktree-recover-mid-merge"),
+  );
+  expect(epicMid).toHaveLength(1);
+  expect(epicMid[0]?.reason).toContain("owner=foreign");
+  expect(epicMid[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(epicMid[0]?.reason).not.toContain("dirty-checkout");
+});
+
+test("fn-1114 recoverWorktrees pass-2: a base→default merge whose conflict-abort ITSELF fails surfaces worktree-recover-abort-failed (the un-cleared wedge), not a plain conflict", async () => {
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(), // starts clean — the wedge is created by the failing merge below
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    mergeConflict: true, // the base→default `merge --no-edit` conflicts (leaves MERGE_HEAD)
+    abortFailsAt: new Set(["/repo"]), // ...and the guarded `merge --abort` itself fails
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-abort-failed");
+  expect(failures[0]?.reason).not.toContain("worktree-recover-conflict");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // No push on an un-cleared wedge.
+  expect(calls.some((c) => c.args === "push")).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {
@@ -10025,11 +10276,31 @@ function makeFinalizeReadinessRun(opts: {
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   untracked?: string; // ls-files --others --exclude-standard (main's untracked)
   incomingTracked?: string; // ls-tree -r --name-only <base> (incoming tracked)
+  midMergeHead?: string; // MERGE_HEAD present at readiness time (a wedge) → mid-merge verdict
+  midMergePointsAt?: string[]; // refs/heads/... at MERGE_HEAD (ownership)
+  midMergeAutostash?: boolean; // MERGE_AUTOSTASH present → foreign-shaped
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+      return opts.midMergeHead !== undefined
+        ? { code: 0, stdout: `${opts.midMergeHead}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
+      return opts.midMergeAutostash
+        ? { code: 0, stdout: "stash\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("--points-at")) {
+      return {
+        code: 0,
+        stdout: (opts.midMergePointsAt ?? []).join("\n"),
+        stderr: "",
+      };
+    }
     if (joined === "remote get-url origin") {
       return opts.noRemote
         ? { code: 1, stdout: "", stderr: "error: No such remote 'origin'" }
@@ -10105,6 +10376,113 @@ test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true)
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-1114 finalizeEpic: a MID-MERGE main checkout → skip-and-retry naming the wedge (worktree-finalize-mid-merge), NOT dirty-checkout, never aborted by finalize", async () => {
+  // Finalize does NOT abort the shared checkout (only the recover pass does) — it
+  // names the wedge distinctly and retry-skips, so the recover pass self-heals a
+  // keeper-owned residue next cycle. The incident's core regression was this
+  // degrading to a generic dirty-checkout skip that never surfaced the mid-merge.
+  const { run, cmds } = makeFinalizeReadinessRun({
+    midMergeHead: "deadbeef",
+    midMergePointsAt: ["refs/heads/keeper/epic/fn-1-foo"], // keeper-owned
+  });
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // transient — the recover pass self-heals it
+    expect(res.reason).toContain("worktree-finalize-mid-merge");
+    expect(res.reason).toContain("owner=keeper");
+    expect(res.reason).toContain("MERGE_HEAD=deadbeef");
+    expect(res.reason).not.toContain("dirty-checkout");
+    // finalize-side reason stays OUT of the recover auto-clear prefix.
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // finalize never touches the wedge — no abort, no merge, no teardown.
+  expect(cmds.some((c) => c === "merge --abort")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-1114 finalizeEpic: a base→default merge whose conflict-abort ITSELF fails → VISIBLE sticky worktree-finalize-abort-failed (no retry), not a plain conflict", async () => {
+  // Reaches the real `merge --no-edit` (base ahead of default) under the real bounded
+  // FFI flock on a free temp lock file (acquires immediately); the merge conflicts,
+  // and the guarded `git merge --abort` ITSELF fails — the un-cleared wedge.
+  const lockDir = mkdtempSync(join(tmpdir(), "kw-finalize-abortfail-"));
+  try {
+    const cmds: string[] = [];
+    let mergeHeadPresent = false; // flips true once the conflict starts a merge
+    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+      args,
+    ) => {
+      const joined = args.join(" ");
+      cmds.push(joined);
+      if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
+        return { code: 0, stdout: `${lockDir}\n`, stderr: "" }; // real, writable
+      }
+      if (joined === "rev-parse --abbrev-ref HEAD") {
+        return { code: 0, stdout: "main\n", stderr: "" }; // on default
+      }
+      if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+        return mergeHeadPresent
+          ? { code: 0, stdout: "confhead\n", stderr: "" }
+          : { code: 1, stdout: "", stderr: "" };
+      }
+      if (
+        joined === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+        joined === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+        joined === "rev-parse --verify --quiet REVERT_HEAD"
+      ) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: other in-progress refs absent
+      }
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin refs exist
+      }
+      if (joined.startsWith("symbolic-ref")) {
+        return { code: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (joined.startsWith("status --porcelain")) {
+        return { code: 0, stdout: "", stderr: "" }; // clean checkout
+      }
+      if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+        return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
+      }
+      if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+        return { code: 0, stdout: "", stderr: "" }; // ff-able
+      }
+      if (joined.startsWith("merge-base --is-ancestor")) {
+        return { code: 1, stdout: "", stderr: "" }; // base vs HEAD: NOT merged → reach the merge
+      }
+      if (joined.startsWith("merge --no-edit")) {
+        mergeHeadPresent = true; // the conflict leaves the tree mid-merge
+        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+      }
+      if (joined === "merge --abort") {
+        return { code: 1, stdout: "", stderr: "error: could not abort merge" }; // abort itself fails
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+      makeFinalizeInfo(),
+      async () => true,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.retry).not.toBe(true); // STICKY — a real wedge needs an operator
+      expect(res.reason).toContain("worktree-finalize-abort-failed");
+      expect(res.reason).not.toContain("worktree-finalize-conflict");
+      expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+    }
+    // The abort WAS attempted (the conflict left a MERGE_HEAD), and teardown is skipped.
+    expect(cmds.some((c) => c === "merge --abort")).toBe(true);
+    expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+    expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 });
 
 test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no working-tree probe past the branch", async () => {

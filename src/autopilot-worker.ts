@@ -64,7 +64,9 @@ import {
   type BackstopMessage,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
+import { CommitWorkLock } from "./commit-work/flock";
 import {
+  GIT_LOCAL_TIMEOUT_MS,
   GIT_PUSH_TIMEOUT_MS,
   GIT_SPAWN_TIMEOUT_CODE,
   gitExec,
@@ -137,6 +139,7 @@ import {
   abortInterruptedMerge as gitAbortInterruptedMerge,
   branchExists as gitBranchExists,
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
+  commitWorkLockPath as gitCommitWorkLockPath,
   currentBranch as gitCurrentBranch,
   deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
@@ -2577,6 +2580,23 @@ export function createWorktreeDriver(
             return retrySkip(
               `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
             );
+          case "mid-merge":
+            // A merge is IN FLIGHT on the shared checkout (the wedge, no longer folded
+            // into dirty). A retry-skip (no sticky) that NAMES the residue (owner +
+            // MERGE_HEAD): the recover pass self-heals a keeper-owned one via its
+            // guarded abort next cycle, and a foreign/ambiguous one waits for the human
+            // — either way finalize retries once the checkout is clean.
+            return retrySkip(
+              `worktree-finalize-mid-merge: ${repoDir} is mid-merge (owner=${merge.owner}, autostash=${merge.autostash}, MERGE_HEAD=${merge.mergeHead}) — skipping the base merge of ${baseBranch} until the checkout is clean (${merge.owner === "keeper" ? "the recover pass aborts keeper-owned residue" : "foreign/ambiguous residue is never auto-aborted"})`,
+            );
+          case "abort-failed":
+            // The guarded `git merge --abort` ITSELF failed, leaving the checkout
+            // mid-merge — a real wedge that will NOT self-clear, so a VISIBLE sticky
+            // (no `retry: true`) an operator resolves, mirroring the conflict arm.
+            return {
+              ok: false,
+              reason: `worktree-finalize-abort-failed: the guarded git merge --abort left ${repoDir} mid-merge while merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+            };
           case "would-clobber":
             return retrySkip(
               `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
@@ -2760,10 +2780,27 @@ export type MergeLaneResult =
   | { kind: "not-ahead" }
   | { kind: "off-branch"; head: string }
   | { kind: "dirty"; detail: string }
+  // A merge is IN FLIGHT on the shared checkout (`MERGE_HEAD` present) — the wedge
+  // classification, NO LONGER folded into `dirty`. Carries the incoming `mergeHead`
+  // sha, the repo-state-only sole-ownership `owner`, and whether a MERGE_AUTOSTASH
+  // is set, so each caller names it distinctly (recover pass-1 self-heals a
+  // keeper-owned one via a guarded abort; both merge switches name it rather than
+  // degrading to a generic dirty-checkout skip — the incident's core regression).
+  | {
+      kind: "mid-merge";
+      mergeHead: string;
+      owner: "keeper" | "foreign";
+      autostash: boolean;
+    }
   | { kind: "would-clobber"; paths: string[] }
   | { kind: "non-ff" }
   | { kind: "not-turn-key"; reason: PushNotReadyReason }
   | { kind: "conflict"; stderr: string }
+  // The conflict/timeout guarded `git merge --abort` ITSELF failed, leaving the
+  // shared checkout mid-merge (MERGE_HEAD + unresolved paths) — DISTINCT from
+  // `conflict` (which aborted cleanly): the residue did NOT clear, so the caller
+  // ESCALATES the un-cleared wedge instead of mislabeling it a content conflict.
+  | { kind: "abort-failed"; stderr: string }
   | { kind: "push-timeout" }
   | { kind: "push-failed"; detail: string }
   | { kind: "push-unconfirmed" }
@@ -2939,14 +2976,17 @@ export async function mergeLaneBaseIntoDefault(
   if (ready.kind === "dirty") {
     return { kind: "dirty", detail: ready.detail };
   }
-  // A mid-merge shared checkout is not-ready exactly like today's folded-in dirty
-  // (skip-and-retry) — return the existing `dirty` result but naming it. Task 2
-  // replaces this with the distinct classification + keeper-owned self-heal +
-  // sustained-wedge escalation.
+  // A mid-merge shared checkout is not-ready — surface the DISTINCT classification
+  // (mergeHead + ownership + autostash) so recover/finalize name it and recover
+  // pass-1 self-heals a keeper-owned one. NO LONGER folded into `dirty`: that fold
+  // was the incident's core regression — the wedge read as a generic dirty-checkout
+  // skip the recover/finalize pass retried forever without ever escalating.
   if (ready.kind === "mid-merge") {
     return {
-      kind: "dirty",
-      detail: `mid-merge in progress (owner=${ready.owner}, autostash=${ready.autostash}, MERGE_HEAD=${ready.mergeHead})`,
+      kind: "mid-merge",
+      mergeHead: ready.mergeHead,
+      owner: ready.owner,
+      autostash: ready.autostash,
     };
   }
   if (ready.kind === "would-clobber") {
@@ -2970,10 +3010,15 @@ export async function mergeLaneBaseIntoDefault(
   const merge: MergeResult = acquireLock
     ? await gitMergeBranchInto(repo, baseBranch, run, acquireLock)
     : await gitMergeBranchInto(repo, baseBranch, run);
-  // `abort-failed` leaves the shared checkout mid-merge; today's behavior is the
-  // conflict sticky (task 2 specializes it into the wedge-escalation path).
-  if (merge.kind === "conflict" || merge.kind === "abort-failed") {
+  if (merge.kind === "conflict") {
     return { kind: "conflict", stderr: merge.stderr };
+  }
+  // The guarded `git merge --abort` after a conflict/timeout ITSELF failed — the
+  // shared checkout is left mid-merge (MERGE_HEAD + unresolved paths), DISTINCT
+  // from a cleanly-aborted `conflict`. Surface it so the caller escalates the
+  // un-cleared wedge with its own reason rather than mislabeling it a conflict.
+  if (merge.kind === "abort-failed") {
+    return { kind: "abort-failed", stderr: merge.stderr };
   }
   // A bounded-lock or local-op (blocking hook) timeout means NO merge landed —
   // surface the transient degrade so the caller skip-retries; NEVER fall through
@@ -3015,6 +3060,146 @@ export async function mergeLaneBaseIntoDefault(
 }
 
 /**
+ * The default bounded commit-work flock acquirer for the recover pass's shared
+ * main-checkout abort — the {@link recoverWorktrees} sibling of the acquirer
+ * {@link mergeBranchInto} bakes in. Used when the caller injects no `acquireLock`
+ * (production), so the abort ALWAYS serializes against a concurrent `keeper
+ * commit-work` in the SAME checkout; a bounded deadline degrades a stuck holder to
+ * a defer, never a frozen cycle. The fast tier injects a stub instead.
+ */
+const defaultRecoverLockAcquirer: LockAcquirer = (lockPath) =>
+  CommitWorkLock.acquireWithDeadline(lockPath);
+
+/**
+ * Recover a mid-merge in the SHARED MAIN checkout (`repo`, a standalone checkout) —
+ * the wedge pass-1's lane loop cannot see (that loop filters to `keeper/epic/*`
+ * linked lanes, and the main worktree is on the default branch). A keeper-initiated
+ * base→default merge that conflicted can leave the human's shared checkout mid-merge
+ * (MERGE_HEAD + unresolved paths); today that folds into a generic dirty-checkout
+ * skip the finalize/recover pass retries forever while every board-wide plan-state
+ * commit fails "cannot do a partial commit during a merge" — the incident this heals.
+ *
+ * Consumes the {@link mergeReadiness} classification: only a `mid-merge` verdict
+ * acts. A `owner: "keeper"` residue (the branch-set at MERGE_HEAD is non-empty and
+ * ENTIRELY `keeper/epic/*`, no MERGE_AUTOSTASH, every probe resolved) is self-healed
+ * with a bounded `MERGE_HEAD`-guarded `git merge --abort` UNDER the commit-work flock
+ * — so the next cycle (or pass-2 this cycle) re-derives the merge from a clean tree.
+ * A `owner: "foreign"` residue (any foreign branch, an empty set, a probe failure, or
+ * a present autostash) is NEVER auto-aborted: it defers with a reason NAMING what was
+ * found (owner + MERGE_HEAD), inside the `worktree-recover-*` prefix so the level-clear
+ * releases it once the checkout recovers. Guards, in order: a live `resolve::<epic>`
+ * worker for ANY epic owning the MERGE_HEAD base excludes the abort (its in-progress
+ * merge must never be raced — the same per-epic exclusion pass-1's lane loop honors);
+ * a lock-timeout degrades to a defer, never a blind abort; a failed abort surfaces its
+ * own `worktree-recover-abort-failed` reason (the un-cleared wedge). Only ever reached
+ * while the board is PLAYING — the caller gates the whole recover sweep on `!paused`.
+ * Returns a {@link WorktreeRecoveryFailure} to record, or `null` (clean, self-healed,
+ * or resolver-excluded — nothing to escalate).
+ */
+async function recoverSharedCheckoutMidMerge(
+  repo: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+  acquireLock: LockAcquirer | undefined,
+  hasActiveResolver: (epicId: string) => boolean,
+): Promise<WorktreeRecoveryFailure | null> {
+  // Cheap MERGE_HEAD pre-probe (per-worktree pseudo-ref, never a `.git/` stat) — the
+  // common clean checkout exits in ONE git read rather than the full readiness ladder.
+  const headProbe = await run(
+    ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (headProbe.code !== 0 || headProbe.stdout.trim().length === 0) {
+    return null; // not mid-merge (or an inconclusive probe → defer to next cycle)
+  }
+  // Mid-merge — consume the full classification (ownership + autostash + sha).
+  const readiness = await gitMergeReadiness(repo, defaultBranch, run);
+  if (readiness.kind !== "mid-merge") {
+    return null; // raced clean between the pre-probe and here → nothing to do
+  }
+  const { mergeHead, owner, autostash } = readiness;
+  if (owner !== "keeper") {
+    // Foreign / ambiguous residue — NEVER auto-aborted (a human's own merge, a
+    // present MERGE_AUTOSTASH `git merge --abort` could fail to reconstruct, or a
+    // probe that could not resolve ownership). Defer with a reason that NAMES it.
+    return {
+      epicId: null,
+      reason: `worktree-recover-mid-merge: ${repo} is mid-merge (owner=foreign, autostash=${autostash}, MERGE_HEAD=${mergeHead}) — foreign/ambiguous residue is never auto-aborted; waiting for the checkout to clear`,
+      dir: repo,
+    };
+  }
+  // Keeper-owned. Honor the per-epic resolver exclusion: derive the owning epic(s)
+  // from the branch-set at MERGE_HEAD and skip the abort while ANY has a live
+  // `resolve::<epic>` worker — its in-progress merge is set BY DESIGN, not a crash,
+  // and racing an abort under it would destroy the resolution. Auto-lifts when the
+  // resolver reaps (the scoped replacement for the resolver's old global pause).
+  const refsAt = await run(
+    [
+      "for-each-ref",
+      "--format=%(refname)",
+      `--points-at=${mergeHead}`,
+      "refs/heads/keeper/epic/",
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const owningEpics =
+    refsAt.code === 0
+      ? refsAt.stdout
+          .split("\n")
+          .map((ref) =>
+            epicIdFromKeeperLaneEntry({
+              path: repo,
+              branch: ref.trim(),
+              head: null,
+              bare: false,
+            }),
+          )
+          .filter((e): e is string => e !== null)
+      : [];
+  if (owningEpics.some((e) => hasActiveResolver(e))) {
+    return null; // a live resolver owns this merge — leave it; the exclusion auto-lifts
+  }
+  // Abort under the commit-work flock so it never races a concurrent agent commit in
+  // the SAME shared checkout (the incident's hazard). A lock-timeout degrades to a
+  // defer — NEVER a blind abort.
+  const acquire = acquireLock ?? defaultRecoverLockAcquirer;
+  const lockPath = await gitCommitWorkLockPath(repo, run);
+  const lock = await acquire(lockPath);
+  if (lock === null) {
+    return {
+      epicId: null,
+      reason: `worktree-recover-lock-timeout: could not acquire the commit-work lock for ${repo} within the deadline (a concurrent holder) to abort the mid-merge (MERGE_HEAD=${mergeHead}) — retrying next cycle`,
+      dir: repo,
+    };
+  }
+  try {
+    const abort = await run(["merge", "--abort"], {
+      cwd: repo,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (abort.code === 0) {
+      return null; // self-healed — the merge re-derives from a clean tree next
+    }
+    // The abort ITSELF failed / timed out — the wedge did NOT clear. Surface it as
+    // its own recover reason (the un-cleared wedge) instead of silently skip-retrying.
+    const out = (abort.stdout + abort.stderr).trim();
+    const detail =
+      abort.code === GIT_SPAWN_TIMEOUT_CODE
+        ? `git merge --abort timed out${out.length > 0 ? `: ${out}` : ""}`
+        : out.length > 0
+          ? out
+          : `git merge --abort failed (exit ${abort.code})`;
+    return {
+      epicId: null,
+      reason: `worktree-recover-abort-failed: the guarded git merge --abort left ${repo} mid-merge (MERGE_HEAD=${mergeHead}) — ${detail}`,
+      dir: repo,
+    };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
  * The producer-only crash/restart recovery sweep wrapped by
  * {@link WorktreeDriver.recover}. Exported so the fast tier drives both passes
  * with a fake {@link WorktreeGitRunner}; the real-git lifecycle lives in the slow
@@ -3024,7 +3209,11 @@ export async function mergeLaneBaseIntoDefault(
  * Pass 1 (interrupted-merge abort): every linked worktree under each repo (the
  * registered base + ribs) is checked for a stale `MERGE_HEAD`; when present, abort
  * the merge then prune the repo's worktree admin entries. The next reconcile cycle
- * re-runs the merge from a clean tree (level-triggered retry).
+ * re-runs the merge from a clean tree (level-triggered retry). The SHARED MAIN
+ * checkout — invisible to that lane loop (it is on the default branch, not a
+ * `keeper/epic/*` lane) — gets its own {@link recoverSharedCheckoutMidMerge} probe:
+ * a keeper-owned mid-merge there is self-healed with a flock-guarded abort, a
+ * foreign/ambiguous one is named and left alone.
  *
  * Pass 2 (done-but-unmerged backstop): every `keeper/epic/<id>` base branch in
  * each repo whose epic `isEpicDone` reports done but whose base is NOT yet an
@@ -3157,6 +3346,29 @@ export async function recoverWorktrees(
       continue;
     }
 
+    // Self-heal a mid-merge WEDGE in the shared MAIN checkout BEFORE pass-2 attempts
+    // the base merge — a keeper-owned residue is aborted (flock-guarded) so pass-2
+    // re-derives from a clean tree this very cycle; a foreign/ambiguous one is named
+    // and left alone. Wrapped so a producer git error can't wedge the cycle.
+    try {
+      const midMerge = await recoverSharedCheckoutMidMerge(
+        repo,
+        defaultBranch,
+        run,
+        acquireLock,
+        hasActiveResolver,
+      );
+      if (midMerge !== null) {
+        failures.push(midMerge);
+      }
+    } catch (err) {
+      failures.push({
+        epicId: null,
+        reason: `worktree-recover-mid-merge-failed: ${repo} — ${errMsg(err)}`,
+        dir: repo,
+      });
+    }
+
     // --- Pass 2: merge any done-but-unmerged epic base into the default branch. ---
     let bases: { branch: string; epicId: string }[];
     try {
@@ -3205,6 +3417,28 @@ export async function recoverWorktrees(
             failures.push({
               epicId: base.epicId,
               reason: `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — skipping the merge of ${base.branch} until it is clean — ${merge.detail}`,
+              dir: repo,
+            });
+            continue;
+          case "mid-merge":
+            // A merge is IN FLIGHT on the shared checkout (the wedge). Named
+            // distinctly — NOT the generic dirty-checkout the incident degraded to.
+            // Inside the `worktree-recover-*` prefix so the level-clear releases it
+            // once the checkout recovers; a keeper-owned residue is self-healed by
+            // this pass's own main-checkout guarded abort (above), a foreign one waits.
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-mid-merge: ${repo} is mid-merge (owner=${merge.owner}, autostash=${merge.autostash}, MERGE_HEAD=${merge.mergeHead}) — skipping the merge of ${base.branch} until the checkout is clean (${merge.owner === "keeper" ? "keeper-owned residue self-heals via the guarded abort" : "foreign/ambiguous residue is never auto-aborted"})`,
+              dir: repo,
+            });
+            continue;
+          case "abort-failed":
+            // The guarded `git merge --abort` ITSELF failed, leaving the checkout
+            // mid-merge — the un-cleared wedge, named as its own recover reason
+            // (inside the level-clear prefix) instead of vanishing into a conflict.
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-abort-failed: the guarded git merge --abort left ${repo} mid-merge while merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
               dir: repo,
             });
             continue;
