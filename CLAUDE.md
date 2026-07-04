@@ -23,8 +23,7 @@ file is imperative guardrails only.
   `~/.claude/plugins/keeper` symlink (double-registers the hook); the daemon, `cli/`, `src/`, and the `keeper` binary stay at the repo root.
 - **The Agent Bus inbox watcher is a session Monitor** in `plugins/keeper/monitors.json` — STRICTLY
   separate from `hooks.json`; never fold in.
-- **Bus presence = a SUBSCRIBED `keeper bus watch` channel; a pure `keeper bus chat send` is
-  EPHEMERAL** (`send_only:true`): a send MUST NOT join the live registry — only `watch` does.
+- **A `keeper bus chat send` MUST NOT join the live registry** (`send_only:true`); only a subscribed `keeper bus watch` channel establishes bus presence (`CONTEXT.md`).
 
 ## Event-sourcing invariants
 
@@ -68,15 +67,13 @@ file is imperative guardrails only.
 
 ## Process & DB-watch invariants
 
-- **No kernel watchers on keeper's OWN DB.** `fs.watch`/FSEvents/kqueue drop same-process and WAL
-  writes on macOS — detect DB changes via `PRAGMA data_version` polling on a read-only connection.
-  Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine. A transient `SQLITE_NOTADB` on that poll skips the tick via the shared `NotadbTolerance` helper, never an ad-hoc per-site catch.
-- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)` (exit
-  NON-zero — `SuccessfulExit:false` gates the LaunchAgent respawn), the single recovery path; never
-  respawn a worker in-process (carve-outs: closing a stale/EPIPE UDS client, the git seed-liveness
-  watchdog's capped MAIN boot-seed re-runs before it escalates to `fatalExit`, and the serve-liveness
-  watchdog's bounded real-read socket probes that `fatalExit` a wedged serve path, NAMING which
-  socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
+- **No kernel watchers on keeper's OWN DB.** Detect DB changes via `PRAGMA data_version` polling on a
+  read-only connection. Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine. A transient `SQLITE_NOTADB` on that poll skips the tick via the shared `NotadbTolerance` helper, never an ad-hoc per-site catch.
+- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` (non-zero exit — the
+  LaunchAgent respawn is the sole recovery path); never respawn a worker in-process (carve-outs:
+  closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed re-runs
+  before it escalates to `fatalExit`, and the serve-liveness watchdog's bounded real-read socket
+  probes that `fatalExit` a wedged serve path, NAMING which socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
 - **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract
