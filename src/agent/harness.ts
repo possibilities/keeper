@@ -29,8 +29,10 @@ export type SecondAxis = "effort" | "thinking" | "none";
 
 /** How a harness's live working/stopped churn reaches keeper's jobs projection.
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
- *  `none`: no live hook channel — presence-only (codex/pi today). */
-export type HookMechanism = "claude-hooks" | "none";
+ *  `pi-extension`: an ephemeral in-process pi extension (armed per-launch via
+ *  `-e`) translates pi's AgentHarness events into the same events-log channel.
+ *  `none`: no live hook channel — presence-only (codex today). */
+export type HookMechanism = "claude-hooks" | "pi-extension" | "none";
 
 /** One harness's full behavioral row: identity, launch, second axis, and the
  *  capability flags that gate downstream behavior. */
@@ -93,7 +95,10 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     secondAxis: "thinking",
     capturable: true,
     mintsOwnSessionId: false,
-    hookMechanism: "none",
+    // M3b: an ephemeral in-process extension (plugins/keeper/pi-extension,
+    // armed per-launch via `-e`) mirrors pi's AgentHarness lifecycle into the
+    // events-log channel, so pi shows the same working/stopped churn as claude.
+    hookMechanism: "pi-extension",
   },
   hermes: {
     name: "hermes",
