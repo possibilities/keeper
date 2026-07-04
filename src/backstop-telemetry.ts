@@ -58,6 +58,12 @@ export type BackstopName =
   // (rather than silently wedging the file at that offset). Counted/emitted via
   // the same sole-writer sidecar path as `pending-dispatch-sweep`.
   | "events-ingest-poison"
+  // fn-1103: a malformed birth record parked in `dead_letters` by the births
+  // ingester (`scanBirthDir`) — the non-hook presence channel's analogue of
+  // `events-ingest-poison`. Records that the ingester quarantined an unparseable
+  // (or perpetually-mint-failing) record and retired it, rather than wedging the
+  // scan. Same sole-writer sidecar path.
+  | "birth-ingest-poison"
   // fn-1096.3: a transient `SQLITE_NOTADB` tolerated (tick skipped, not a
   // crash) by `NotadbTolerance` on a `PRAGMA data_version` poll — see
   // `src/notadb-tolerance.ts`. One shared name across every poll site;

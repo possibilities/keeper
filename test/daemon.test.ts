@@ -5054,6 +5054,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "usage-scraper-worker.ts": "usageScraper",
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
+  "birth-ingest-worker.ts": "birthIngest",
   "autopilot-worker.ts": "autopilot",
   "handoff-worker.ts": "handoff",
   "maintenance-worker.ts": "maintenance",
@@ -5151,7 +5152,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -5170,9 +5171,13 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
   // the spy boot's default `disableNativeWatcher:false` but never in-process).
   // fn-1024 added `statusline` (the sixth file-watcher producer; watches the
   // statusLine leaf dir and mints `SessionTelemetry`, reads keeper.db read-only).
+  // fn-1103 added `birthIngest` (the seventh file-watcher; watches the births
+  // maildir the `keeper agent` launcher drops non-claude birth records into and
+  // mints a synthetic SessionStart per record — the twin of `eventsIngest`, no
+  // DB handle).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(19);
+  expect(spawned).toHaveLength(20);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -5188,6 +5193,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL nineteen wo
     "usageScraper",
     "deadLetter",
     "eventsIngest",
+    "birthIngest",
     "autopilot",
     "handoff",
     "maintenance",
@@ -5209,7 +5215,7 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
   // The UDS/RPC/fold tier's set: wake (main's reducer pump) + server (UDS).
   const minimal = spawnedWorkerNames({ workers: ["wake", "server"] });
   expect(minimal).toEqual(["wake", "server"]);
-  // Crucially NONE of the six @parcel/watcher workers spawned.
+  // Crucially NONE of the @parcel/watcher workers spawned.
   for (const w of [
     "transcript",
     "plan",
@@ -5217,6 +5223,7 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
     "usage",
     "deadLetter",
     "eventsIngest",
+    "birthIngest",
   ] as const) {
     expect(minimal).not.toContain(w);
   }
