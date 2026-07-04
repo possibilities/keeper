@@ -98,6 +98,7 @@ the input is always safe.
 | code                 | meaning                                                        | recovery                                                                    |
 | -------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | `bad_yaml`           | The scaffold / refine YAML is malformed.                      | Fix the reported parse or shape error in the input and re-run.              |
+| `cell_invalid`       | An `assign-cells` cell set is invalid: an out-of-axis tier/model, or an unknown, duplicate, missing, or non-todo task id (the full-set + todo-only contract). | Correct the cells so every todo task of the epic is covered exactly once with in-axis values, then re-run. |
 | `dep_cycle`          | The task dependency graph has a cycle.                        | Break the cycle among the listed tasks, then re-run.                        |
 | `dep_invalid`        | A declared task dependency does not resolve.                  | Correct the referenced task id (or remove the edge) and re-run.            |
 | `epic_dep_invalid`   | A declared epic dependency does not resolve.                  | Correct the referenced epic id (or remove the edge) and re-run.           |

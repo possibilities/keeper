@@ -302,6 +302,7 @@ describe("VALIDATION_RESTAMP_VERBS membership", () => {
       "set-target-repo",
       "mv-repo",
       "refine-apply",
+      "assign-cells",
     ];
     expect([...VALIDATION_RESTAMP_VERBS]).toEqual(canonical);
   });

@@ -195,6 +195,10 @@ const PLAN_ERROR_RECOVERY: Record<string, string> = {
   bad_yaml:
     "The scaffold/refine YAML is malformed. Fix the reported parse or shape " +
     "error in the input and re-run the verb.",
+  cell_invalid:
+    "A selection cell set is invalid (an out-of-axis tier/model, or an unknown, " +
+    "duplicate, missing, or non-todo task id). Correct the cells so every todo " +
+    "task of the epic is covered exactly once with in-axis values, then re-run.",
   dep_cycle:
     "The task dependency graph has a cycle. Break the cycle among the listed " +
     "tasks so the graph is acyclic, then re-run.",

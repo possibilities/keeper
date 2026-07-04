@@ -11,6 +11,12 @@
 # Adding a model or effort is a one-line edit here — no per-cell plugin dirs by
 # hand. Effort is NOT spawn-overridable in Claude Code, so each effort is baked
 # into its generated agent definition rather than passed at spawn.
+#
+# This file is the SINGLE source of truth for the efforts/models axes. The
+# post-scaffold selector's policy config (model-selector.yaml, owned by the
+# model-guidance skill) carries exactly one guidance block per axis value here;
+# its drift gate (model-guidance-check.ts --check) fails until a newly-added
+# value is backfilled there.
 efforts: [medium, high, xhigh, max]
 models: [opus]
 subagents: [template/agents/worker.md.tmpl]

@@ -1,0 +1,83 @@
+# Post-scaffold model+effort selector policy config.
+#
+# Read off disk by the /plan:plan and /plan:defer orchestrators only — never a
+# verb, never compile-embedded. During the ghost window the selector leg loads
+# this whole file into its prompt to choose each task's {effort, model} cell,
+# then writes the cells via `keeper plan assign-cells`.
+#
+# The `model-guidance` skill (plugins/plan/skills/model-guidance/) OWNS the
+# content here: every efforts:/models: block is authored and refreshed by that
+# skill, and the research: map's hashes are drift-gated against the skill's
+# references/ cache. Axis source of truth is subagents.yaml (efforts: + models:);
+# this file must carry exactly one guidance block per configured axis value.
+# Adding an axis value = edit subagents.yaml, then run the model-guidance skill
+# to backfill here. The gate fails until backfilled:
+#   bun plugins/plan/scripts/model-guidance-check.ts --check
+
+# The leg the selector itself runs as (`keeper agent run --harness --model`).
+# harness is one of the agent-run harness tokens (claude/codex/pi/hermes); model
+# is an opaque passthrough string, hand-tuned to the strongest available.
+selector:
+  harness: claude
+  model: opus
+
+# How the selector weighs the two axes, and its default-when-uncertain rule.
+usage: |
+  Choose an {effort, model} cell per task from the two axes below. The effort
+  axis carries most of the signal: match the effort band to the task's true
+  difficulty (its acceptance shape and blast radius), not its line count. The
+  model axis is a capability floor — pick the model whose guidance fits, and
+  route a task DOWN to a cheaper model only when the work is genuinely mechanical
+  and that model exists on the axis. Weigh model first (can this tier do it at
+  all?), then effort (how hard should it think?). When uncertain on either axis,
+  pick UP: the higher-capability model and xhigh effort. A wrong routing-up costs
+  tokens; a wrong routing-down costs a failed task.
+
+# One guidance block per configured `efforts:` axis value (subagents.yaml).
+# Concrete, behavioral, worker-facing selection advice — when to route a task to
+# this effort. Keep each block short: the whole config rides in every selector
+# prompt.
+efforts:
+  medium: |
+    Single-file edit, mechanical refactor, or a straight test addition where the
+    acceptance is "do exactly this." No abstraction to get wrong, no cross-module
+    reasoning. Route here only when the task is genuinely bounded.
+  high: |
+    Multi-file feature in a known pattern, a typical bug fix with the root cause
+    already named, or anything following an obvious in-repo template. The path is
+    clear; the work is applying it correctly across a few files.
+  xhigh: |
+    Multi-step refactor, new-pattern introduction, or contract-touching work
+    (RPC, schema, public API, wire format) — anything where a wrong abstraction
+    propagates past the task. The default when in doubt: the highest-capability
+    band that is not reserved.
+  max: |
+    Gnarly debugging with no clear hypothesis, evals, or security review —
+    reserved for where deeper reasoning measurably lifts quality. Prone to
+    overthinking; do not reach for it casually, and never as a generic "be
+    careful" upgrade over xhigh.
+
+# One guidance block per configured `models:` axis value (subagents.yaml).
+# Distilled from the skill's references/ research — strengths, weaknesses,
+# when-to-pick. Raw research stays in references/, never in this prompt-sized
+# block.
+models:
+  opus: |
+    The strongest widely released Opus-tier model and keeper's highest-capability
+    worker tier. Strengths: long-horizon autonomous execution, contract-shaped
+    reasoning where a wrong abstraction propagates, and strong bug-finding that
+    tells a flake from a real failure. Weaknesses: under-reaches for subagents /
+    memory / search / custom tools unless the prompt names when to use them, and
+    narrates and deliberates more than the prior generation. When to pick: the
+    default for anything intelligence-sensitive; route away only for genuinely
+    mechanical work when a cheaper tier exists on the axis. When uncertain, keep
+    opus.
+
+# Research provenance map: per configured model, the references/ cache file
+# (path relative to the plan plugin root) and its sha256. The drift gate asserts
+# every configured model has an entry AND each recorded hash matches the file on
+# disk — so re-researching a model without re-hashing here fails the fast suite.
+research:
+  opus:
+    reference: skills/model-guidance/references/opus.md
+    sha256: 8af8eaa19f62a59684796458b50a98cbd3cea95202a9cb1a65d8873e48a4e11e

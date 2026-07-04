@@ -37,6 +37,7 @@ export const VALIDATION_RESTAMP_VERBS: readonly string[] = [
   "set-target-repo",
   "mv-repo",
   "refine-apply",
+  "assign-cells",
 ];
 
 /** The compact integrity_failed envelope shape the restamp gate prints. */
