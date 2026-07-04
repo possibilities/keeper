@@ -46,6 +46,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Merge-gate**: The check that holds a dependent lane until every upstream it needs has truly merged into the local default branch. Avoid: barrier, dependency wait, lock.
 - **Resolver**: An autonomous worker autopilot dispatches to settle a mechanically-clear merge conflict, stamping blocked when judgment is needed. Avoid: merger, rebase bot, fixer.
 - **Fan-in**: The convergence point where parallel lanes or failures collapse onto one epic-keyed outcome. Avoid: join, merge point, aggregation.
+- **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
 
 ## Bus, presence, and session surface
 
