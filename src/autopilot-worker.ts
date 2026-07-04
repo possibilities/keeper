@@ -2456,7 +2456,10 @@ export function createWorktreeDriver(
           if (merge.kind === "missing-source") {
             continue; // phantom lane: nothing to merge, never created
           }
-          if (merge.kind === "conflict") {
+          // `abort-failed` (the conflict/timeout abort itself failed, leaving the
+          // lane worktree mid-merge) folds into today's conflict fail-loud; task 2
+          // specializes it into the distinct wedge-escalation reason.
+          if (merge.kind === "conflict" || merge.kind === "abort-failed") {
             return {
               ok: false,
               reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
@@ -2936,6 +2939,16 @@ export async function mergeLaneBaseIntoDefault(
   if (ready.kind === "dirty") {
     return { kind: "dirty", detail: ready.detail };
   }
+  // A mid-merge shared checkout is not-ready exactly like today's folded-in dirty
+  // (skip-and-retry) — return the existing `dirty` result but naming it. Task 2
+  // replaces this with the distinct classification + keeper-owned self-heal +
+  // sustained-wedge escalation.
+  if (ready.kind === "mid-merge") {
+    return {
+      kind: "dirty",
+      detail: `mid-merge in progress (owner=${ready.owner}, autostash=${ready.autostash}, MERGE_HEAD=${ready.mergeHead})`,
+    };
+  }
   if (ready.kind === "would-clobber") {
     return { kind: "would-clobber", paths: ready.paths };
   }
@@ -2957,7 +2970,9 @@ export async function mergeLaneBaseIntoDefault(
   const merge: MergeResult = acquireLock
     ? await gitMergeBranchInto(repo, baseBranch, run, acquireLock)
     : await gitMergeBranchInto(repo, baseBranch, run);
-  if (merge.kind === "conflict") {
+  // `abort-failed` leaves the shared checkout mid-merge; today's behavior is the
+  // conflict sticky (task 2 specializes it into the wedge-escalation path).
+  if (merge.kind === "conflict" || merge.kind === "abort-failed") {
     return { kind: "conflict", stderr: merge.stderr };
   }
   // A bounded-lock or local-op (blocking hook) timeout means NO merge landed —

@@ -147,6 +147,23 @@ import {
   fakeAsyncGit,
 } from "./helpers/fake-git";
 
+// A clean shared checkout has NO in-progress pseudo-ref present. mergeReadiness
+// now probes these via `rev-parse --verify --quiet <REF>`; real git exits 1 on
+// each for a settled tree, so the finalize/merge fakes below (whose broad
+// `rev-parse --verify → exists` catch-all would otherwise answer "present") must
+// report them absent or mergeReadiness would misread a clean checkout as
+// mid-merge / in-progress.
+const IN_PROGRESS_PSEUDO_REFS = [
+  "MERGE_HEAD",
+  "MERGE_AUTOSTASH",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+];
+const isInProgressPseudoRefProbe = (args: string[]): boolean =>
+  args[0] === "rev-parse" &&
+  args.includes("--verify") &&
+  IN_PROGRESS_PSEUDO_REFS.some((r) => args.includes(r));
+
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
 // ---------------------------------------------------------------------------
@@ -6908,6 +6925,9 @@ test("fn-990 finalizeEpic: a crashed closer (NOT done in the main projection) �
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch EXISTS
     }
@@ -6935,6 +6955,9 @@ test("fn-990 finalizeEpic: done in the projection but the lane is NOT ahead of d
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
     }
@@ -6968,6 +6991,9 @@ test("fn-992 finalizeEpic: a stranded base (absent from origin) while HEAD is OF
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
     }
@@ -7017,6 +7043,9 @@ test("fn-993 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → { kind
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7061,6 +7090,9 @@ test("fn-993 mergeLaneBaseIntoDefault: a local `merge --no-edit` TIMEOUT (124) �
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7114,6 +7146,9 @@ test("fn-993 finalizeEpic: a local merge timeout → worktree-finalize-local-tim
       }
       if (joined === "rev-parse --abbrev-ref HEAD") {
         return { code: 0, stdout: "main\n", stderr: "" }; // on default
+      }
+      if (isInProgressPseudoRefProbe(args)) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
       }
       if (args[0] === "rev-parse" && args.includes("--verify")) {
         return { code: 0, stdout: "abc\n", stderr: "" }; // base/origin refs exist
@@ -7169,6 +7204,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs exist
     }
@@ -7221,6 +7259,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a real merge CONFLICT → { kind: 'confli
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7263,6 +7304,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: '
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7303,6 +7347,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) �
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7356,6 +7403,9 @@ test("fn-990 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF prechec
       joined.includes("refs/remotes/origin/")
     ) {
       return { code: 1, stdout: "", stderr: "" };
+    }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
     }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base/source refs exist
@@ -7584,6 +7634,9 @@ test("fn-993 mergeLaneBaseIntoDefault: the MERGED arm re-pushes branch-explicit 
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7661,6 +7714,9 @@ test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no ba
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     cmds.push(args.join(" "));
     // The base branch does not exist → rev-parse --verify returns non-zero.
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 1, stdout: "", stderr: "" };
     }
@@ -8692,6 +8748,9 @@ test("fn-1050 finalizeEpic teardown: a residue-only base husk is swept after a c
       args,
     ) => {
       const joined = args.join(" ");
+      if (isInProgressPseudoRefProbe(args)) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+      }
       if (args[0] === "rev-parse" && args.includes("--verify")) {
         return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
       }
@@ -9675,6 +9734,9 @@ test("fn-982 finalizeEpic: a fully-merged lane base is pruned (branch -D) after 
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base exists / source exists
     }
@@ -9718,6 +9780,9 @@ test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ances
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9758,6 +9823,9 @@ test("fn-985 finalizeEpic: fully-merged rib worktrees + branches are pruned alon
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9823,6 +9891,9 @@ test("fn-988 finalizeEpic teardown: an orphan rib NOT in laneOrder (live-git enu
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9877,6 +9948,9 @@ test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while t
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9976,6 +10050,9 @@ function makeFinalizeReadinessRun(opts: {
       return opts.dryRunReject !== undefined
         ? { code: 1, stdout: "", stderr: opts.dryRunReject }
         : { code: 0, stdout: "", stderr: "" };
+    }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
     }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin ref exists
@@ -10198,6 +10275,9 @@ test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-fin
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -10264,6 +10344,9 @@ test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -11231,6 +11314,9 @@ test("fn-1014 regression: a lane base AHEAD of default merges via a TRUE `git me
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs resolve
     }
