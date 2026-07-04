@@ -24,6 +24,7 @@ The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id 
 - **Phase 4** — Undersized gate → maybe stop & sketch *(create only)*
 - **Phase 5** — Write the epic tree
 - **Phase 6** — Auto-wire epic dependencies
+- **Phase 6.5** — Select model+effort cells *(create only — a detached selector overwrites the stamped defaults before the arm)*
 - **Phase 7** — Validate & arm (both paths — arms the ghost scaffold minted)
 - **Phase 8** — Report
 - **Phase R** — Refine an existing id (branches from Phase 1; rejoins at Phase 7)
@@ -374,12 +375,7 @@ For each task, decide:
 - **size**: S (a few hours) or M (a day or two). L must be split.
 - **files** (disjoint = parallel-safe; any shared path means the two tasks MUST carry a dep edge — same-file parallel tasks collide at worktree fan-in)
 - **deps** on sibling tasks (required whenever `Files:` overlap, per above; otherwise only for a hard "must-finish-first")
-- **tier** (worker reasoning effort) — `medium | high | xhigh | max`; folds into the per-task entry in 5e, no extra round trip. Paired with **model** (below); `claim` composes the two into `worker_agent: plan:worker-<model>-<effort>`, the generated worker agent `/plan:work` spawns. Bands:
-  - **`medium`** — single-file edit, mechanical refactor, straight test addition. Acceptance is "do exactly this."
-  - **`high`** — multi-file feature in a known pattern, typical bug fix with the root cause named, anything following an obvious in-repo template.
-  - **`xhigh`** — multi-step refactor, new-pattern introduction, contract-touching work (RPC, schema, public API, wire format), anything where a wrong abstraction propagates. **Default when in doubt** (the highest-capability tier).
-  - **`max`** — gnarly debug with no clear hypothesis, evals, security review. Reserved for where deeper reasoning measurably lifts quality; prone to overthinking, don't reach for it casually.
-- **model** (worker model) — one of the configured `models:` axis in `plugins/plan/subagents.yaml` (`opus` today). Required on every task and folds into the per-task entry in 5e beside `tier`. Use `opus` unless you are deliberately A/B-comparing a newly-added model on the same task; adding a model is a one-line config edit, not a per-task decision.
+- **tier + model** — the planner does not choose per task. Stamp the **mechanical default cell `xhigh` / `opus`** on every task and fold it into the per-task entry in 5e. Scaffold still requires both (`tier_invalid` / `model_invalid` if missing or out-of-axis), so write `tier: xhigh` and `model: opus` on every entry — but the real {tier, model} choice belongs to the **post-scaffold selector beat (Phase 6.5)**, and the effort bands and per-model guidance it weighs live in `plugins/plan/model-selector.yaml`, not here. `claim` composes the resolved cell into `worker_agent: plan:worker-<model>-<effort>`, the generated worker agent `/plan:work` spawns.
 
 ### 5e. For each task — assemble the YAML entry (cognitive)
 
@@ -435,9 +431,7 @@ Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Des
 
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
-**Tier** — write the band from 5d as `tier:`. **Required on every task** — scaffold errors `tier_invalid` if missing or unknown. Say the choice in one line per task (*"task 3 is contract-touching — xhigh"*) so the human can redirect.
-
-**Model** — write the model from 5d as `model:`. **Required on every task** — scaffold errors `model_invalid` if missing or unknown. Use `opus` unless deliberately A/B-comparing a newly-added model; no need to narrate the choice per task when it is the default.
+**Tier + model** — stamp the mechanical default `tier: xhigh` and `model: opus` on every task (per 5d). **Both required on every task** — scaffold errors `tier_invalid` / `model_invalid` if missing or unknown. Do not choose per task and do not narrate a choice: the default is uniform, and the Phase 6.5 selector overwrites it with the researched pick before the epic arms.
 
 **Target repo (cross-repo epics only)** — when a task lands outside `primary_repo`, set `target_repo:` to the absolute path (`~` expands); omit otherwise (defaults to `primary_repo`). `primary_repo` is where scaffold runs, so run `/plan:plan` from it. Do **not** hand-set `epic.touched_repos` — the engine auto-derives it from the resolved per-task `target_repo` set. Canonical wording: `keeper plan scaffold --agent-help`. After a post-scaffold repo directory rename, fix the stored paths in one shot with `keeper plan mv-repo <old> <new>` — not per-task `task set-target-repo`; `mv-repo` rewrites every `primary_repo` / `target_repo` / `touched_repos` match across the board in one commit.
 
@@ -500,8 +494,8 @@ epic:
     ...
 tasks:                                 # required, ordered list (>=1 entry), decomposition order
   - title: "<task title>"              # required, non-empty (5e)
-    tier: xhigh                        # required, one of medium|high|xhigh|max (5d/5e)
-    model: opus                        # required, one of the configured models (opus today) (5d/5e)
+    tier: xhigh                        # required — the mechanical default; Phase 6.5 overwrites it (5d/5e)
+    model: opus                        # required — the mechanical default (opus today); selector-owned (5d/5e)
     deps: []                           # 1-based ordinals into this list (5f)
     target_repo: <path>                # optional, absolute path (~ expanded); omit to default
                                        # to primary_repo; epic.touched_repos auto-derives (5e).
@@ -513,7 +507,7 @@ tasks:                                 # required, ordered list (>=1 entry), dec
       ## Done summary
       ## Evidence
   - title: "<second task title>"
-    tier: medium
+    tier: xhigh                        # every task carries the same mechanical default
     model: opus
     deps: [1]                          # depends on the first task
     spec: |
@@ -586,9 +580,87 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 ---
 
+## Phase 6.5 — Select model+effort cells (create path only)
+
+Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets a detached selector agent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path skips this beat entirely (it rejoins at Phase 7).
+
+### 6.5a — Load the selector config
+
+Read `plugins/plan/model-selector.yaml` off disk. If it is **absent or unparseable, skip the whole beat** — the default cells stand and you proceed straight to Phase 7 (no sidecar, no degrade record; the config's presence is the beat's on/off switch). Otherwise pin its `selector: {harness, model}`, the `usage:` advice, and every `efforts:` / `models:` guidance block.
+
+### 6.5b — Build a self-contained selector prompt
+
+The captured envelope must be complete on its own — the selector reads nothing off disk. Inline into one prompt:
+
+- the config's `usage:` advice and every `efforts:` / `models:` guidance block;
+- the epic spec and **every task's full spec** (note each task's spec length so the selector can discount verbosity bias — a long spec is not a hard task);
+- the **candidate cells in per-task shuffled order** — shuffle the {tier, model} candidate order independently per task to counter first-position bias, and **record the shuffle seed** for the sidecar;
+- an explicit output contract: a **single raw JSON object**, one cell per task id, covering **exactly the epic's todo task-id set**, each cell's `tier` from the configured efforts axis and `model` from the configured models axis, plus a per-task `rationale` and `confidence`.
+
+### 6.5c — Launch the detached read-only leg
+
+Harness and model come from the config's `selector:` block. One bounded blocking call writes the uniform 9-key envelope to `--output` on every outcome (write the prompt to a file — never hand-inline a long prompt):
+
+```bash
+keeper agent run <harness> "$(cat "$PROMPT_FILE")" --model <model> --read-only --output "$OUT" --stop-timeout-ms <bound>
+```
+
+### 6.5d — Branch on the envelope `outcome` field
+
+Read `$OUT` and switch on its **`outcome`** field, **never the exit code** (`no_message` also exits 0). Only `completed` carries a verdict to parse; `no_message`, `timed_out`, `launch_failed`, `no_transcript`, and `transcript_ambiguous` all route to the degrade path (6.5f).
+
+### 6.5e — Extract + validate the verdict
+
+On `completed`, take the envelope's `message` and parse it as raw JSON (fenced ```` ```json ```` block fallback if the model wrapped it). Then validate, rejecting on any miss:
+
+- schema shape (one cell per task with `tier` / `model` / `rationale` / `confidence`);
+- **enum-clamp** each `tier` to the configured efforts and `model` to the configured models;
+- the cell set covers **exactly the epic's todo task-id set** — no missing, extra, or duplicate id (schema validation cannot express in-epic membership, so check it explicitly).
+
+A clean verdict → apply it (6.5g, `label_source: selector-chosen`). A validation miss → one repair retry (6.5f).
+
+### 6.5f — One repair retry, then degrade
+
+On the **first** validation miss only, relaunch a **fresh** leg (6.5c) with the validation errors appended to the prompt, and re-validate once. If it still fails — or on any non-`completed` outcome from 6.5d — **degrade**: stop (never loop) and apply the stamped defaults via 6.5g with `outcome: degraded:<reason>` and `label_source: heuristic-default`.
+
+### 6.5g — Apply cells via assign-cells
+
+Feed the cell set to the batch verb — a YAML with a `cells:` list (one cell per todo task, the full set) and a `selection:` provenance block:
+
+```bash
+keeper plan assign-cells <epic_id> --file - <<'YAML_EOF'
+cells:
+  - task_id: <epic_id>.1
+    tier: <tier>
+    model: <model>
+    rationale: <one-line why>
+    confidence: <0-1 or a label>
+    label_source: selector-chosen        # heuristic-default on a degrade
+  # … one cell per todo task, covering the exact set
+selection:
+  harness: <config selector harness>
+  model: <config selector model>
+  config_hash: <hash of the config the run used>
+  input_hash: <hash of the epic/task inputs>
+  shuffle_seed: <the recorded seed, or null>
+  outcome: completed                     # or degraded:<reason>
+  verdict_raw: <the selector's raw message, or null>
+YAML_EOF
+```
+
+On success the verb overwrites every cell, writes the schema-versioned sidecar to `.keeper/selections/<epic_id>.json`, and lands both in one auto-commit. Failure codes: `bad_yaml` (shape/type), `cell_invalid` (out-of-axis tier/model, or an unknown / duplicate / missing / non-todo task id — the full-set + todo-only contract). A verb rejection of a real verdict is a validation miss (one repair retry, then degrade).
+
+**On ANY failure path** (config missing handled in 6.5a; `launch_failed` / `timed_out` / `no_message` / parse-or-schema failure after the one retry / assign-cells rejection) call assign-cells with the **stamped default cells** (`xhigh` / `opus`), `outcome: degraded:<reason>`, and `label_source: heuristic-default`, so the sidecar records the failure for offline analysis. If even that degrade write fails, **log one line and proceed** — Phase 7 still arms.
+
+### Failure invariant
+
+Every path out of Phase 6.5 leaves the epic ready to arm: a real selection, a degraded sidecar over the defaults, or the bare stamped defaults. Phase 7 runs **unconditionally** next — no selector failure mode may leave a stuck ghost.
+
+---
+
 ## Phase 7 — Validate & arm
 
-Runs on **both** paths, unconditionally, after Phase 6.
+Runs on **both** paths, unconditionally, after Phase 6 (on the create path, after the Phase 6.5 selector beat).
 
 **Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — `epic add-deps` re-stamps only when it writes ≥1 edge, so a dep-free epic reaches Phase 7 still a ghost and the arm is its only readiness step. `keeper plan watch` (and `dashctl` when it's on PATH) render a null-marker epic dashed until this runs.
 

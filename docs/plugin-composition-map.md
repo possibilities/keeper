@@ -67,6 +67,13 @@ inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
 test.
 
+A sibling plan-plugin config surface, `plugins/plan/model-selector.yaml` (the
+post-scaffold model+effort selector's policy config), is read off disk by the
+`/plan:plan` and `/plan:defer` orchestrators during the select beat — never
+compiled in, never a `--plugin-dir` — so it rides no launch channel and is noted
+here only to keep the plan plugin's config-surface inventory complete alongside
+`subagents.yaml`.
+
 The daemon's own **merge-resolver dispatch** (`resolve::<epic>`, launched by the
 resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME
 `buildKeeperAgentLaunchArgv` path — it is another launch producer of the
