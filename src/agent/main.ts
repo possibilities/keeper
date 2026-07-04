@@ -24,6 +24,7 @@ import {
   emitBirthRecord,
 } from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
+import { ensureHermesShimTrust } from "../hermes-trust";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
@@ -993,6 +994,7 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
     ensureCodexDirTrust,
+    ensureHermesShimTrust,
     now: deps.now,
     writeErr: deps.writeErr,
   };

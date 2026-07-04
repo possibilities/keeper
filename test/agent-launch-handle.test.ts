@@ -17,6 +17,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  hermesShimCommand,
   type LaunchHandleDeps,
   launchEnvForAgent,
   launchToResolvedHandle,
@@ -24,6 +25,7 @@ import {
 } from "../src/agent/launch-handle";
 import type { TmuxCommandResult } from "../src/agent/tmux-launch";
 import type { EnsureCodexDirTrustOptions } from "../src/codex-trust";
+import type { EnsureHermesShimTrustOptions } from "../src/hermes-trust";
 
 const SESSION_ID = "11111111-1111-1111-1111-111111111111";
 
@@ -40,6 +42,7 @@ function deps(opts: {
   now?: number;
   env?: NodeJS.ProcessEnv;
   trustCalls?: EnsureCodexDirTrustOptions[];
+  hermesCalls?: EnsureHermesShimTrustOptions[];
 }): LaunchHandleDeps {
   return {
     env: opts.env ?? {},
@@ -51,6 +54,10 @@ function deps(opts: {
     runTmuxCommand: (cmd) => opts.tmuxCommand(cmd),
     ensureCodexDirTrust: (o) => {
       opts.trustCalls?.push(o);
+      return "seeded";
+    },
+    ensureHermesShimTrust: (o) => {
+      opts.hermesCalls?.push(o);
       return "seeded";
     },
     now: () => opts.now ?? 0,
@@ -179,6 +186,63 @@ describe("launchToResolvedHandle", () => {
         stopTimeoutMs: null,
       });
       expect(trustCalls.length).toBe(0);
+    });
+  }
+
+  test("hermes launch fires the hermes-shim seam once with the shim command + raw env", () => {
+    const errs: string[] = [];
+    const hermesCalls: EnsureHermesShimTrustOptions[] = [];
+    const result = launchToResolvedHandle({
+      deps: deps({
+        tmuxCommand: tmuxRunner(0),
+        errs,
+        env: { HERMES_HOME: "/x/.hermes", CLAUDE_CODE_X: "leak" },
+        hermesCalls,
+      }),
+      agent: "hermes",
+      prompt: "reply DONE",
+      posture: {},
+      stopTimeoutMs: null,
+    });
+    expect(result.ok).toBe(true);
+    expect(hermesCalls.length).toBe(1);
+    // The seam sees the RAW env (hermes reads HERMES_HOME off it) — NOT scrubbed.
+    expect(hermesCalls[0]?.env.HERMES_HOME).toBe("/x/.hermes");
+    expect(hermesCalls[0]?.env.CLAUDE_CODE_X).toBe("leak");
+    // The command is the two-token `<bun> <shim path>` (launcherArgvPrefix[0] = /bun).
+    expect(hermesCalls[0]?.shimCommand).toBe(
+      hermesShimCommand(["/bun", "/cli/keeper.ts", "agent"]),
+    );
+    expect(hermesCalls[0]?.shimCommand.startsWith("/bun ")).toBe(true);
+    expect(hermesCalls[0]?.shimCommand).toContain("hermes-events-shim.ts");
+    expect(hermesCalls[0]?.events.length).toBeGreaterThan(0);
+  });
+
+  test("hermes launch never fires the codex-trust seam", () => {
+    const errs: string[] = [];
+    const trustCalls: EnsureCodexDirTrustOptions[] = [];
+    launchToResolvedHandle({
+      deps: deps({ tmuxCommand: tmuxRunner(0), errs, trustCalls }),
+      agent: "hermes",
+      prompt: "hi",
+      posture: {},
+      stopTimeoutMs: null,
+    });
+    expect(trustCalls.length).toBe(0);
+  });
+
+  for (const agent of ["claude", "codex", "pi"] as const) {
+    test(`${agent} launch never fires the hermes-shim seam`, () => {
+      const errs: string[] = [];
+      const hermesCalls: EnsureHermesShimTrustOptions[] = [];
+      launchToResolvedHandle({
+        deps: deps({ tmuxCommand: tmuxRunner(0), errs, hermesCalls }),
+        agent,
+        prompt: "hi",
+        posture: {},
+        stopTimeoutMs: null,
+      });
+      expect(hermesCalls.length).toBe(0);
     });
   }
 });
