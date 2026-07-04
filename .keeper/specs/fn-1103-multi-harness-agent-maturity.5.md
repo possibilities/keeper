@@ -59,5 +59,7 @@ codex launch appears as a jobs row, window renamed, kill flips killed.
 - [ ] The daemon boots with the new worker in the production worker list and shuts it down cleanly; the births tree stays bounded
 
 ## Done summary
-
+Birth-ingest worker (twin of events-ingest-worker) watches the births maildir and mints a synthetic SessionStart per non-claude birth record via scanBirthDir, process-then-retiring each file inside a BEGIN IMMEDIATE (exactly-once by construction; a duplicate re-mint folds idempotently as a resume). Malformed records poison-park to dead_letters; a perpetually-failing mint with a provably-dead pid GCs after a grace window. Boot scan + watcher hint + fallback poll mirror the events-log trio. Worker registry gained birthIngest as the 20th worker (WorkerName, ALL_WORKERS, WATCHER_WORKERS, spawn site, shutdown post-list) with zero reducer changes -- exit-watcher, renamer, and tmux poller inherit the tracked jobs row for free. Added a birth-ingest-poison BackstopName variant. bun run test (fast gate + opentui) green across two full passes; tsc --noEmit and biome check clean.
 ## Evidence
+- Commits: 4f950605
+- Tests: test/birth-ingest-worker.test.ts, test/daemon.test.ts
