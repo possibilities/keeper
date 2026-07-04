@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-04T14:15:27.648000Z",
   "created_at": "2026-07-04T02:14:08.948000Z",
   "depends_on_epics": [
     "fn-1103-multi-harness-agent-maturity"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-04T02:14:20.025000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Shared checkout mid-merge wedge recovery",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-04T02:14:19.929000Z"
+  "updated_at": "2026-07-04T14:15:27.648000Z"
 }
