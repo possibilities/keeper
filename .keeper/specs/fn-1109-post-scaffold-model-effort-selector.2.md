@@ -45,5 +45,5 @@ consistency-model-selector.test.ts (fast tier, pure disk reads): axis coverage b
 - [ ] The subagents.yaml header cross-references the guidance config, keeping the axis source-of-truth singular
 
 ## Done summary
-
+Added model-selector.yaml (repo-committed selector policy: harness+model, per-effort/per-model guidance, research provenance map) plus the model-guidance skill that owns its research->cache->distill flow, a config<->axes coverage + hash-parity drift gate (model-guidance-check.ts) asserted in the fast suite, and a subagents.yaml header cross-reference keeping the axis source-of-truth singular.
 ## Evidence
