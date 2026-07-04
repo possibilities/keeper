@@ -65,5 +65,5 @@ recovery. End-to-end (slow tier): hermes session shows working/stopped churn.
 - [ ] Removing consent or the shim degrades that harness to presence-only tracking with no errors anywhere
 
 ## Done summary
-
+hermes M3b live-state: a fail-open events-log shim translating hermes lifecycle events into keeper's NDJSON contract (working/stopped churn, keyed on KEEPER_JOB_ID, native session id -> resume_target), plus a dep-free O_EXCL-locked trust seeder that registers the shim in a sentinel-managed config.yaml block and pre-approves the allowlist; launch-handle/main wire the hermes-only seam before launch.
 ## Evidence
