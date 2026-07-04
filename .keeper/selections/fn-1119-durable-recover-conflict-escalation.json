@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching (DispatchFailed routing precedence, return-shape change, event-sourcing invariants) where a mis-key silently reintroduces the bug \u2014 xhigh's default-when-in-doubt band, not max since the approach is fully specified.",
+      "task_id": "fn-1119-durable-recover-conflict-escalation.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Two-file docs edit but precision word-smithing of a dense invariant paragraph under a hard byte-budget lint gate, faithful to task 1's landed contract \u2014 above purely mechanical medium.",
+      "task_id": "fn-1119-durable-recover-conflict-escalation.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-04T21:44:17.759000Z",
+  "epic_id": "fn-1119-durable-recover-conflict-escalation",
+  "input_hash": "f225f08fb4b44294820edbac5aeb00c2b50693aaeb86795721d03b4ee77a9a57",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"fn-1119-durable-recover-conflict-escalation.1\":{\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.8},\"fn-1119-durable-recover-conflict-escalation.2\":{\"tier\":\"high\",\"model\":\"opus\",\"confidence\":0.62}}"
+}
