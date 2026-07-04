@@ -16,5 +16,5 @@ history home). Do not reintroduce a second rationale home.
 - [ ] README carries a single non-contradictory doc-home map; no line points rationale/decision history anywhere but docs/adr + commit messages
 
 ## Done summary
-
+Consolidated README doc-home pointers into one non-contradictory map: vocabulary -> CONTEXT.md, resolved decisions + rationale -> docs/adr alongside commit messages, .keeper/ specs framed as plan/spec archive only. Removed the line pointing rationale/provenance at .keeper/ specs + git history.
 ## Evidence
