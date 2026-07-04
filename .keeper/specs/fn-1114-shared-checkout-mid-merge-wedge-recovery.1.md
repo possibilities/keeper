@@ -63,5 +63,5 @@ the verdict detail.
 - [ ] Every abort invocation is bounded by the local git timeout; the fast-tier suite passes with no real git
 
 ## Done summary
-
+mergeReadiness now classifies a mid-merge shared checkout distinctly (MERGE_HEAD probed before dirty, carrying sha + sole-ownership attribution + autostash presence), names rebase/cherry-pick/revert/index.lock states in the dirty detail (detection only), and mergeBranchInto surfaces a failed/timed-out guarded abort as a distinct abort-failed arm; every abort is bounded by GIT_LOCAL_TIMEOUT_MS and the three probe/abort helpers are consolidated.
 ## Evidence
