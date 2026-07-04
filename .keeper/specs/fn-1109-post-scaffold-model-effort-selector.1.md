@@ -51,5 +51,5 @@ saga-assign-cells.test.ts in the fast in-process tier: happy path (cells overwri
 - [ ] The fast plan suite passes with the new saga conformance tests included
 
 ## Done summary
-
+Added the keeper plan assign-cells batch verb: overwrites tier/model on every todo task of a ghost epic (assert-all validation with a typed cell_invalid code + restamp) and writes a schema-versioned, git-committed selection sidecar at .keeper/selections/<epic>.json, both landing in one auto-commit.
 ## Evidence
