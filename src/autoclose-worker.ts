@@ -1,5 +1,5 @@
 /**
- * autoclose worker (epic fn-1107). A daemon Bun Worker thread that force-closes
+ * autoclose worker. A daemon Bun Worker thread that force-closes
  * the tmux window of a done-and-idle agent keeper itself dispatched — an
  * autopilot `work::`/`close::` worker whose plan row reached a `completed`
  * verdict, or a finished claude `/plan:panel` leg — ~grace after it is provably
@@ -18,20 +18,19 @@
  * ({@link AutocloseIntentMessage}); main owns the `kill_reason: 'autoclosed'`
  * labeling (a sibling task).
  *
- * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic (the
- * prior tmux-heuristic reaper — fn-1005 — is dead scar tissue): the autopilot
- * bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only when a
- * SessionStart discharged a real `pending_dispatches` row), the panel bucket on
- * the `panels` birth-session + the `panel::x::y` name shape. The `completed`
- * verdict is read through the SHARED {@link loadReadinessInputs} +
+ * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic: the
+ * autopilot bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only
+ * when a SessionStart discharged a real `pending_dispatches` row), the panel
+ * bucket on the `panels` birth-session + the `panel::x::y` name shape. The
+ * `completed` verdict is read through the SHARED {@link loadReadinessInputs} +
  * {@link computeReadiness} seam so autoclose's notion of "done" can never drift
  * from the reconciler's.
  *
  * Every tmux/DB probe is a NEGATIVE safety gate that fails CLOSED: a degraded or
  * empty pane sweep skips the whole pulse and mints nothing; a mismatch is a
- * PERMANENT skip, never a retry (a retry against a since-recycled pane id is
- * exactly how the prior incarnation interrupted live sessions — commit 5b844449).
- * Kills are blast-capped per pulse so a bad projection state cannot cascade.
+ * PERMANENT skip, never a retry (a retry against a since-recycled pane id can
+ * interrupt a live session). Kills are blast-capped per pulse so a bad
+ * projection state cannot cascade.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.

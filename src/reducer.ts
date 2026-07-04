@@ -7934,7 +7934,7 @@ function projectJobsRow(db: Database, event: Event): void {
             "DELETE FROM pending_dispatches WHERE verb = ? AND id = ?",
             [plan_verb, plan_ref],
           );
-          // Provenance stamp (fn-1107): the ONLY airtight autopilot-vs-manual
+          // Provenance stamp: the ONLY airtight autopilot-vs-manual
           // discriminator. Gate on the ACTUAL discharge — `dischargeRes.changes`
           // read HERE, before the sibling `dispatch_never_bound` DELETE below
           // overwrites the changes counter — NEVER on `plan_verb`/`plan_ref`

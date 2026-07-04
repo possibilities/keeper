@@ -555,7 +555,7 @@ export interface Job {
    */
   context_window_size: number | null;
   /**
-   * Dispatch provenance (schema v107 / fn-1107): `'autopilot'` iff this job's
+   * Dispatch provenance (schema v107): `'autopilot'` iff this job's
    * binding SessionStart discharged a real `pending_dispatches` row — i.e. the
    * autopilot minted a `Dispatched` intent that materialized into this worker.
    * NULL for every manually-launched session, including a manual `keeper
