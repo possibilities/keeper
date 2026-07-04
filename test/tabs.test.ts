@@ -413,6 +413,30 @@ test("renderOutcomes: a newline in label AND session stays inside its # comment"
   }
 });
 
+test("renderOutcomes: a newline in the FAILED-branch error stays inside its # comment", () => {
+  const out = renderOutcomes(
+    [
+      {
+        kind: "failed",
+        candidate: fakeCandidate({
+          job_id: "j",
+          resume_target: "name",
+          label: "some-agent",
+          cwd: "/repo",
+          backend_exec_session_id: "work",
+        }),
+        error: "boom\nrm -rf ~/x",
+      },
+    ],
+    true,
+    0,
+  );
+  expect(out).toContain("# (work) FAILED some-agent: boom rm -rf ~/x");
+  for (const line of executableRemainders(out)) {
+    expect(line.includes("rm -rf ~/x")).toBe(false);
+  }
+});
+
 test("renderSnapshotScript --session filter narrows to one bucket", () => {
   const candidates = [
     fakeCandidate({
