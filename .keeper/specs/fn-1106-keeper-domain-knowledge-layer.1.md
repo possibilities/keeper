@@ -38,5 +38,5 @@ Fixture corpus drives the pure scanner; one integration-shaped test through runS
 - [ ] A repo with no CONTEXT.md or docs/adr staged is completely untouched by the arm
 
 ## Done summary
-
+Added the domain-docs lint arm to commit-work: a deterministic pure scanner (src/commit-work/domain-docs-lint.ts) gates CONTEXT.md/CONTEXT-MAP.md (structural caps + prose-only impl-detail/re-narration fingerprints, keeper-lint escape hatch, NDJSON pain ledger) and docs/adr (naming/size, history allowed), wired at order 11 in the lint matrix and gated on staged paths so it fires in any repo. Fixture corpus of 23 tests proves good/bad lines.
 ## Evidence
