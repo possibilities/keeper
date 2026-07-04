@@ -3316,20 +3316,32 @@ async function recoverSharedCheckoutMidMerge(
     ],
     { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
-  const owningEpics =
-    refsAt.code === 0
-      ? refsAt.stdout
-          .split("\n")
-          .map((ref) =>
-            epicIdFromKeeperLaneEntry({
-              path: repo,
-              branch: ref.trim(),
-              head: null,
-              bare: false,
-            }),
-          )
-          .filter((e): e is string => e !== null)
-      : [];
+  if (refsAt.code !== 0) {
+    // Inconclusive owning-epic probe (a spawn failure or a 124 timeout) — we
+    // CANNOT tell whether a live `resolve::<epic>` worker owns this merge, so the
+    // resolver-exclusion guard would pass vacuously and the abort would race (and
+    // destroy) an in-progress resolution. Defer instead: an unknown resolver state
+    // is never a licence to abort. A genuine resolver-free wedge (code 0, empty
+    // set) still self-heals below. Named inside the `worktree-recover-*` prefix so
+    // the level-clear releases it once the probe resolves next cycle.
+    const timedOut = refsAt.code === GIT_SPAWN_TIMEOUT_CODE;
+    return {
+      epicId: null,
+      reason: `worktree-recover-mid-merge: inconclusive owning-epic probe for ${repo} (for-each-ref --points-at=${mergeHead} ${timedOut ? "timed out" : `failed exit ${refsAt.code}`}) — cannot rule out a live resolver, deferring the abort to the next cycle`,
+      dir: repo,
+    };
+  }
+  const owningEpics = refsAt.stdout
+    .split("\n")
+    .map((ref) =>
+      epicIdFromKeeperLaneEntry({
+        path: repo,
+        branch: ref.trim(),
+        head: null,
+        bare: false,
+      }),
+    )
+    .filter((e): e is string => e !== null);
   if (owningEpics.some((e) => hasActiveResolver(e))) {
     return null; // a live resolver owns this merge — leave it; the exclusion auto-lifts
   }
