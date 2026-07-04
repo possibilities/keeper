@@ -117,8 +117,8 @@ describe("baked snippets", () => {
     expect(ok).toBe(true);
   });
 
-  test("the five byte-verbatim bake guards are all present", () => {
-    expect(bakeCount(readFileSync(HACK_SKILL, "utf-8"))).toBe(5);
+  test("the six byte-verbatim bake guards are all present", () => {
+    expect(bakeCount(readFileSync(HACK_SKILL, "utf-8"))).toBe(6);
   });
 });
 
