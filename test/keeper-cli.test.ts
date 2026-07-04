@@ -30,6 +30,7 @@ import {
 } from "../cli/dispatch";
 import {
   buildHelpIndex,
+  buildKeeperCli,
   type DispatchDeps,
   dispatch,
   EXIT_CODES,
@@ -97,6 +98,7 @@ function makeHarness(): Harness {
       reclaim: mkHandler("reclaim"),
       bus: mkHandler("bus"),
       "statusline-sink": mkHandler("statusline-sink"),
+      completions: mkHandler("completions"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -334,6 +336,69 @@ describe("cli/keeper command index", () => {
     for (const code of ["0", "1", "2", "3", "4", "5", "6", "7", "8"]) {
       expect(index.exit_codes[code]?.length ?? 0).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/keeper Clerc proxy — dispatch now routes every known subcommand through a
+// Clerc-backed proxy command whose `ignore` hook stops parsing at the command
+// path, so the leaf handler receives the EXACT residual argv. These assert the
+// proxy never parses/normalizes a leaf's flags or verbs (the Risks regression:
+// residual beginning with both flags and positionals, `--`, and the leaf-owned
+// plan/prompt verb pass-throughs).
+// ---------------------------------------------------------------------------
+describe("cli/keeper Clerc proxy routing", () => {
+  test("forwards a residual that begins with a flag AND has positionals verbatim", async () => {
+    const h = makeHarness();
+    await dispatch(["query", "--collection", "epics", "pos1", "pos2"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "query", argv: ["--collection", "epics", "pos1", "pos2"] },
+    ]);
+  });
+
+  test("forwards a residual that begins with a positional then a flag verbatim", async () => {
+    const h = makeHarness();
+    await dispatch(["dispatch", "work::fn-1-x.2", "--force"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "dispatch", argv: ["work::fn-1-x.2", "--force"] },
+    ]);
+  });
+
+  test("a `--` in the residual is preserved untouched (never consumed by the proxy)", async () => {
+    const h = makeHarness();
+    await dispatch(["agent", "claude", "--", "--model", "opus"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "agent", argv: ["claude", "--", "--model", "opus"] },
+    ]);
+  });
+
+  test("plan verb + flags + positionals ride in the residual — the verb is NOT stripped", async () => {
+    const h = makeHarness();
+    await dispatch(["plan", "done", "fn-1-x.2", "--summary", "did it"], h.deps);
+    // The `plan` proxy hands its leaf the whole residual, verb token first — the
+    // framework never validates or reorders the plan sub-CLI's args.
+    expect(h.calls).toEqual([
+      { sub: "plan", argv: ["done", "fn-1-x.2", "--summary", "did it"] },
+    ]);
+  });
+
+  test("prompt verb pass-through: leaf owns its verb + flags", async () => {
+    const h = makeHarness();
+    await dispatch(["prompt", "render", "--json", "-x", "y"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "prompt", argv: ["render", "--json", "-x", "y"] },
+    ]);
+  });
+
+  test("buildKeeperCli registers exactly the public subcommands as proxy commands", () => {
+    const h = makeHarness();
+    const cli = buildKeeperCli(h.deps);
+    const registered = new Set(cli._commands.keys());
+    for (const name of SUBCOMMANDS) {
+      expect(registered.has(name)).toBe(true);
+    }
+    // No stray commands beyond the public surface (aliases would show here).
+    expect(registered.size).toBe(SUBCOMMANDS.length);
   });
 });
 

@@ -71,6 +71,16 @@ owned by you and mode `644` or macOS silently ignores it. Optional roots and run
 third-party sources) and leaves untouched when a file or symlink is already there. Do NOT add a
 `~/.claude/plugins/keeper` symlink — it double-registers the hook (two `events` rows per invocation).
 
+**Shell completions.** The installer writes generated bash/zsh/fish completion files into shell-owned
+user locations (idempotent — a rerun overwrites the same managed files, never appends): fish to
+`~/.config/fish/completions/keeper.fish` (autoloaded), bash to
+`~/.local/share/bash-completion/completions/keeper` (needs the bash-completion package), and zsh to a
+writable Homebrew `share/zsh/site-functions/_keeper` when available, else
+`~/.local/share/zsh/site-functions/_keeper`. It **never** edits `.zshrc`, `.bashrc`, `.bash_profile`,
+or fish config — when a shell needs activation (e.g. adding the zsh dir to `fpath` before `compinit`)
+the installer prints a one-time snippet to opt into. Set `KEEPER_SKIP_COMPLETIONS=1` to skip the step,
+or regenerate a script by hand with `keeper completions <bash|zsh|fish>`.
+
 Any third-party plugin set (arthack's, for one) is **optional** — a fresh machine loads keeper's two and
 nothing else. Opt in by appending a parent to `plugin_scan_dirs` in your own `plugins.yaml` (e.g.
 `- ~/code/arthack/claude`). Automated workers additionally carry a keeper-owned permission posture
@@ -93,6 +103,11 @@ launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 rm ~/.config/tmux/conf.d/zz-keeper-guard.conf
 rm ~/.config/keeper/plugins.yaml   # the shipped keeper-agent plugin sources
+# Shell completions (whichever the installer wrote — safe if absent):
+rm -f ~/.config/fish/completions/keeper.fish
+rm -f ~/.local/share/bash-completion/completions/keeper
+rm -f ~/.local/share/zsh/site-functions/_keeper
+rm -f "$(brew --prefix 2>/dev/null)/share/zsh/site-functions/_keeper"
 # Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```

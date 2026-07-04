@@ -52,6 +52,19 @@ fi
 echo "install: ensure default plugins.yaml"
 ( cd "${repo_root}" && bun run scripts/ensure-plugin-config.ts )
 
+# 2c. Shell completions. Write the generated bash/zsh/fish completion files into
+#     shell-owned user locations (idempotent; never edits a shell rc file). Runs
+#     after `bun link` so `keeper` is on PATH, though the helper generates scripts
+#     in-process and needs no linked binary. KEEPER_SKIP_COMPLETIONS=1 opts out.
+#     Completions are non-critical: this step never aborts the daemon install.
+if [ "${KEEPER_SKIP_COMPLETIONS:-0}" = "1" ]; then
+  echo "install: KEEPER_SKIP_COMPLETIONS=1; skipping shell completions"
+else
+  echo "install: shell completions"
+  ( cd "${repo_root}" && bun run scripts/install-completions.ts ) || \
+    echo "install: shell completions step failed (non-fatal); continuing" >&2
+fi
+
 # 3. Render the plan plugin's generated files (per-cell work plugins, skills/work,
 #    agents/practice-scout) so a fresh clone can spawn work:worker and the plan
 #    consistency suites run instead of skipping. Every rendered output + sidecar is
