@@ -31,8 +31,16 @@ export type SecondAxis = "effort" | "thinking" | "none";
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
  *  `pi-extension`: an ephemeral in-process pi extension (armed per-launch via
  *  `-e`) translates pi's AgentHarness events into the same events-log channel.
- *  `none`: no live hook channel — presence-only (codex today). */
-export type HookMechanism = "claude-hooks" | "pi-extension" | "none";
+ *  `codex-rollout-tail`: the daemon-side producer forward-tails the attributed
+ *  rollout and mints a synthetic Stop per turn-completion — STOP-ONLY, since
+ *  codex's rollout carries no turn-START marker (degrades to presence-only when a
+ *  rollout is unattributed or absent).
+ *  `none`: no live hook channel — presence-only (hermes today). */
+export type HookMechanism =
+  | "claude-hooks"
+  | "pi-extension"
+  | "codex-rollout-tail"
+  | "none";
 
 /**
  * How a harness's resume target is passed on its OWN native CLI argv.
@@ -104,7 +112,10 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     secondAxis: "effort",
     capturable: true,
     mintsOwnSessionId: true,
-    hookMechanism: "none",
+    // M3b: live stop-churn via the daemon-side rollout tailer. Stop-only — codex's
+    // rollout has no turn-START marker — and degrades to presence-only when the
+    // session is unattributed.
+    hookMechanism: "codex-rollout-tail",
     // Codex resumes via a VERB-POSITION subcommand (`codex resume <uuid>`), not an
     // option flag — the argv builder must lead the forwarded args with it.
     resumeArgv: { kind: "subcommand", token: "resume" },

@@ -66,6 +66,12 @@ import {
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
 import {
+  type CodexStopSignal,
+  collectCodexStopSignals,
+  type LiveCodexJob,
+  type RolloutCursor,
+} from "./codex-state-worker";
+import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
   DEFAULT_RETENTION_MAX_BATCHES,
@@ -3089,6 +3095,33 @@ export function resolveCodexResumeCandidates(
 }
 
 /**
+ * The tracked codex jobs whose live stop-churn the state producer tails: harness
+ * `codex`, a resolved (non-NULL) `resume_target` — the attributed rollout uuid
+ * the tailer keys on, so an unattributed job idles presence-only — and a
+ * non-terminal (`working`/`stopped`) state. No recency floor: a non-terminal job
+ * is recent by construction (the reapers drive stale sessions terminal), and
+ * following a long-lived session's ongoing churn is the point. Pure over the db.
+ */
+export function findLiveCodexStateJobs(db: Database): LiveCodexJob[] {
+  const rows = db
+    .query(
+      `SELECT job_id, resume_target, created_at FROM jobs
+         WHERE harness = 'codex' AND resume_target IS NOT NULL
+           AND state IN ('working', 'stopped')`,
+    )
+    .all() as {
+    job_id: string;
+    resume_target: string;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    resumeTarget: r.resume_target,
+    createdAtMs: r.created_at * 1000,
+  }));
+}
+
+/**
  * Park a birth record that cannot be folded — a malformed (poison) record, or a
  * stale one whose mint perpetually throws — as a `dead_letters` row with
  * status='poison' (replay's `WHERE status='waiting'` skips it). Deterministic
@@ -3998,6 +4031,52 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       $backend_exec_pane_id: null,
       $worktree: null,
       $resume_target: resolution.resumeTarget,
+    });
+  }
+
+  /**
+   * Mint ONE synthetic `Stop` event (fn-1103) carrying a codex turn-completion
+   * the daemon-side rollout tailer parsed. Stamped with the ROLLOUT LINE's own
+   * timestamp (never wall-clock), so a boot-scan / tail-catch-up replay of a dead
+   * session's rollout folds through the Stop arm's terminal guard as a no-op and
+   * can never flicker a killed/ended row back to life. MAIN is the sole event
+   * writer, so the tailer mints here rather than writing `jobs` directly — a
+   * from-scratch re-fold reproduces the row. Caller sets `wakePending` + pumps.
+   */
+  function mintCodexStop(signal: CodexStopSignal): void {
+    stmts.insertEvent.run({
+      $ts: signal.tsSec,
+      $session_id: signal.jobId,
+      $pid: null,
+      $hook_event: "Stop",
+      $event_type: "stop",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: null,
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+      $resume_target: null,
     });
   }
 
@@ -7400,6 +7479,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // — the sibling steady-state jobs producer — so a server-only boot skips it. A
   // per-tick no-throw guard keeps a transient rollout-read error off fatalExit.
   const codexResumeHome = resolveCodexHomeDir();
+  // Codex live-state producer cursors (fn-1103): per-job rollout forward-tail
+  // offsets, EOF-anchored on first sight and GC'd once a job leaves the live set,
+  // so the map stays bounded by the live codex sessions, never history. Rides the
+  // same `exit`-role sweep tick as the resume back-fill below.
+  const codexStateCursors = new Map<string, RolloutCursor>();
   const codexResumeSweepTimer = want("exit")
     ? setInterval(() => {
         if (shuttingDown) return;
@@ -7431,6 +7515,32 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           console.error(
             `[keeperd] codex-resume sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        // Codex live stop-churn (fn-1103) rides the same tick under its OWN guard,
+        // so a rollout-tail throw never skips the resume mint above (and vice
+        // versa). Forward-tails each attributed codex job's rollout and mints a
+        // synthetic Stop per turn-completion — an unattributed job is absent from
+        // the query and stays presence-only. A job attributed THIS tick is folded
+        // by a later tick, so the state read here always sees the settled target.
+        try {
+          const stopSignals = collectCodexStopSignals(
+            findLiveCodexStateJobs(db),
+            codexResumeHome,
+            codexStateCursors,
+          );
+          if (stopSignals.length > 0) {
+            for (const signal of stopSignals) {
+              mintCodexStop(signal);
+            }
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] codex-state sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );

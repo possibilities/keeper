@@ -34,6 +34,7 @@ const SECOND_AXES: ReadonlySet<SecondAxis> = new Set([
 const HOOK_MECHANISMS: ReadonlySet<string> = new Set([
   "claude-hooks",
   "pi-extension",
+  "codex-rollout-tail",
   "none",
 ]);
 
@@ -82,10 +83,11 @@ describe("harness registry — descriptor completeness", () => {
     expect(HARNESS_DESCRIPTORS.hermes.mintsOwnSessionId).toBe(true);
     expect(HARNESS_DESCRIPTORS.claude.mintsOwnSessionId).toBe(false);
     expect(HARNESS_DESCRIPTORS.pi.mintsOwnSessionId).toBe(false);
-    // claude drives churn via its native hooks; pi via the in-process extension
-    // (M3b); codex/hermes are presence-only today.
+    // Live-churn mechanism: claude via native hooks, pi via the in-process
+    // extension (M3b), codex via the daemon-side rollout tailer (stop-only);
+    // hermes is presence-only today.
     expect(HARNESS_DESCRIPTORS.claude.hookMechanism).toBe("claude-hooks");
-    expect(HARNESS_DESCRIPTORS.codex.hookMechanism).toBe("none");
+    expect(HARNESS_DESCRIPTORS.codex.hookMechanism).toBe("codex-rollout-tail");
     expect(HARNESS_DESCRIPTORS.pi.hookMechanism).toBe("pi-extension");
     expect(HARNESS_DESCRIPTORS.hermes.hookMechanism).toBe("none");
     // Profile env vars are the KEEPER_AGENT_<X>_PROFILE names main() consumes.
