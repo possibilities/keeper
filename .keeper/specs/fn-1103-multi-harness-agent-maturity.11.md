@@ -61,5 +61,5 @@ payload -> NDJSON tests like the hermes shim.
 - [ ] Codex sessions with no live-state mechanism available degrade to presence-only with no errors
 
 ## Done summary
-
+Codex live stop-churn via a daemon-side rollout tailer: forward-tails an attributed job's rollout and mints a synthetic Stop per turn-completion, stamped with the rollout line's own ts so a replay folds as a terminal-guarded no-op. Stop-only (no turn-START marker), recorded in the harness descriptor's hookMechanism; EOF-anchors for O(1) restart; reads only markers, idles on unattributed jobs.
 ## Evidence
