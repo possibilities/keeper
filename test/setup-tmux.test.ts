@@ -594,8 +594,10 @@ describe("main() --kill-sessions busy-pane gate", () => {
     }) as typeof process.stdout.write;
 
     try {
-      // Must NOT throw (no exit), must complete setup.
-      await main(["--kill-sessions"], spawn);
+      // Must NOT throw (no exit), must complete setup. The restore offer is
+      // stubbed empty — the default reads the live keeper.db and probes the
+      // real tmux server, whose latency under load breaches the test timeout.
+      await main(["--kill-sessions"], spawn, () => ({}));
     } finally {
       process.stdout.write = savedOut;
     }
