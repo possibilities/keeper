@@ -19,10 +19,12 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join, resolve as resolvePath, sep } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
+import { resolveCodexResumeTarget } from "./agent/codex-session-index";
 import type {
   AutopilotWorkerData,
   DispatchClearedMessage,
@@ -549,6 +551,25 @@ export function buildPendingDispatchSweepRecords(
  * blocked task is not latency-sensitive on the order of seconds.
  */
 export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Cadence of the codex resume-target back-fill sweep (fn-1103). A tracked codex
+ * job is born with `resume_target` NULL (it mints its own rollout uuid); this
+ * sweep resolves the uuid from the rollout head and mints a `ResumeTargetResolved`
+ * synthetic event. Seconds-scale so a freshly-launched session becomes resumable
+ * promptly, yet the tick is cheap: the candidate query is an indexed point-read and
+ * the rollout-tree read runs ONLY when a NULL-target codex job exists.
+ */
+export const CODEX_RESUME_SWEEP_INTERVAL_MS = 5_000;
+
+/**
+ * Recency floor for codex resume candidates: a job whose rollout uuid stays
+ * unresolved past this (a same-cwd collision with the originator override
+ * stripped, or a rollout that never persisted) drops out of the candidate set so
+ * the sweep goes quiet instead of scanning the tree forever. Its presence is
+ * unaffected — it simply stays `resume_target` NULL (not-resumable).
+ */
+export const CODEX_RESUME_RECENT_WINDOW_SEC = 600;
 
 /**
  * The ONE blocked category that does NOT escalate to the planner: a
@@ -2978,6 +2999,96 @@ function retireBirthFile(full: string): void {
 }
 
 /**
+ * Resolve CODEX_HOME for the resume-target sweep — an explicit non-empty
+ * `CODEX_HOME` wins, else `<home>/.codex` (the same rule
+ * `codex-trust` / `transcript-watch` use).
+ */
+export function resolveCodexHomeDir(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return (env.CODEX_HOME ?? "").trim() || join(homedir(), ".codex");
+}
+
+/** A codex job awaiting resume-target back-fill — see {@link findCodexResumeCandidates}. */
+export interface CodexResumeCandidate {
+  jobId: string;
+  cwd: string | null;
+  /** Job launch instant in ms (jobs.created_at seconds × 1000). */
+  startedAtMs: number;
+}
+
+/**
+ * The live codex jobs whose native rollout uuid is not yet back-filled: harness
+ * `codex`, `resume_target` still NULL, a non-terminal (`working`/`stopped`) state,
+ * and launched within `recentWindowSec` of `nowSec`. The recency floor is what
+ * makes the sweep go quiet — an old unresolved job (collision, override stripped)
+ * drops out instead of provoking a tree scan every tick. Pure over the db + clock.
+ */
+export function findCodexResumeCandidates(
+  db: Database,
+  nowSec: number,
+  recentWindowSec: number,
+): CodexResumeCandidate[] {
+  const rows = db
+    .query(
+      `SELECT job_id, cwd, created_at FROM jobs
+         WHERE harness = 'codex' AND resume_target IS NULL
+           AND state IN ('working', 'stopped')
+           AND created_at >= ?`,
+    )
+    .all(nowSec - recentWindowSec) as {
+    job_id: string;
+    cwd: string | null;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    cwd: r.cwd,
+    startedAtMs: r.created_at * 1000,
+  }));
+}
+
+/** A resolved (jobId → native rollout uuid) pair the sweep mints as `ResumeTargetResolved`. */
+export interface CodexResumeResolution {
+  jobId: string;
+  resumeTarget: string;
+}
+
+/**
+ * Resolve the native rollout uuid for every current codex resume candidate,
+ * reading each candidate's rollout `SessionMeta` head via
+ * {@link resolveCodexResumeTarget} (originator exact-match first, cwd+created-at
+ * fallback with refuse-to-guess). An unresolvable candidate is omitted — it keeps
+ * its NULL resume_target (not-resumable) and is retried next tick until it ages
+ * out of the recency window. Reads NO session content. Returns [] with NO tree
+ * read when there are no candidates (the sweep's idle path).
+ */
+export function resolveCodexResumeCandidates(
+  db: Database,
+  codexHome: string,
+  nowSec: number,
+  recentWindowSec: number,
+): CodexResumeResolution[] {
+  const resolutions: CodexResumeResolution[] = [];
+  for (const candidate of findCodexResumeCandidates(
+    db,
+    nowSec,
+    recentWindowSec,
+  )) {
+    const resumeTarget = resolveCodexResumeTarget({
+      codexHome,
+      jobId: candidate.jobId,
+      expectedCwd: candidate.cwd,
+      startedAtMs: candidate.startedAtMs,
+    });
+    if (resumeTarget !== null) {
+      resolutions.push({ jobId: candidate.jobId, resumeTarget });
+    }
+  }
+  return resolutions;
+}
+
+/**
  * Park a birth record that cannot be folded — a malformed (poison) record, or a
  * stale one whose mint perpetually throws — as a `dead_letters` row with
  * status='poison' (replay's `WHERE status='waiting'` skips it). Deterministic
@@ -3841,6 +3952,55 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * DELETE is a direct producer write (the gate is NOT a projection), idempotent,
    * and runs before the event insert so a clear is never swallowed.
    */
+  /**
+   * Mint ONE `ResumeTargetResolved` synthetic event (fn-1103) that back-fills a
+   * tracked codex job's `resume_target` with its resolved native rollout uuid.
+   * MAIN is the sole event writer, so the daemon-side codex rollout producer mints
+   * here rather than writing `jobs` directly — the fold's dedicated
+   * `ResumeTargetResolved` arm folds ONLY `jobs.resume_target` (never lifecycle
+   * state, so a late back-fill can never revive a terminal row) and a from-scratch
+   * re-fold reproduces it from the event's `resume_target` COLUMN. The caller sets
+   * `wakePending` + pumps.
+   */
+  function mintCodexResumeTargetResolved(
+    resolution: CodexResumeResolution,
+  ): void {
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: resolution.jobId,
+      $pid: null,
+      $hook_event: "ResumeTargetResolved",
+      $event_type: "resume_target_resolved",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: null,
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+      $resume_target: resolution.resumeTarget,
+    });
+  }
+
   function mintDispatchClearedEvent(verb: string, id: string): void {
     clearDispatchMintGate(db, `${verb}::${id}`);
     stmts.insertEvent.run({
@@ -7228,6 +7388,56 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  // Codex resume-target back-fill producer (fn-1103). A tracked codex job is born
+  // with resume_target NULL (it mints its own rollout uuid post-launch); this
+  // sweep resolves that uuid from the rollout SessionMeta head — originator
+  // exact-match (the launcher's CODEX_INTERNAL_ORIGINATOR_OVERRIDE) first, cwd +
+  // created-at with refuse-to-guess fallback — and has MAIN mint a
+  // `ResumeTargetResolved` synthetic event (never a direct jobs write, so a
+  // from-scratch re-fold reproduces it). Reads ONLY session metadata, never
+  // content, and does NO tree read when no NULL-target codex job exists (the
+  // candidate query is an indexed point-read). Gated on the `exit` lifecycle role
+  // — the sibling steady-state jobs producer — so a server-only boot skips it. A
+  // per-tick no-throw guard keeps a transient rollout-read error off fatalExit.
+  const codexResumeHome = resolveCodexHomeDir();
+  const codexResumeSweepTimer = want("exit")
+    ? setInterval(() => {
+        if (shuttingDown) return;
+        try {
+          const resolutions = resolveCodexResumeCandidates(
+            db,
+            codexResumeHome,
+            Date.now() / 1000,
+            CODEX_RESUME_RECENT_WINDOW_SEC,
+          );
+          let minted = false;
+          for (const resolution of resolutions) {
+            // Re-read: mint only while resume_target is still NULL. The candidate
+            // query already filters it, but a concurrent fold (a resume re-seed)
+            // could have set it since — never overwrite a resolved target.
+            const row = db
+              .query("SELECT resume_target FROM jobs WHERE job_id = ?")
+              .get(resolution.jobId) as { resume_target: string | null } | null;
+            if (!row || row.resume_target != null) {
+              continue;
+            }
+            mintCodexResumeTargetResolved(resolution);
+            minted = true;
+          }
+          if (minted) {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] codex-resume sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }, CODEX_RESUME_SWEEP_INTERVAL_MS)
+    : null;
+
   // Poll-is-truth fallback for the events-log live ingest. The watcher hint is
   // the fast path, but a dropped/coalesced event (or a worker that never
   // subscribed) would otherwise leave hook events undrained until the next boot
@@ -8143,6 +8353,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     clearInterval(mergeEscalationSweepTimer);
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
+    }
+    if (codexResumeSweepTimer !== null) {
+      clearInterval(codexResumeSweepTimer);
     }
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(retentionTimer);
