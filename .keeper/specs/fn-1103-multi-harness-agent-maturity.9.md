@@ -51,5 +51,5 @@ three-harness.
 - [ ] No shipped docstring claims claude-only behavior for code that is now harness-agnostic
 
 ## Done summary
-
+Aligned CLAUDE.md, README, pair/panel skills, and the renamer-worker docstring with the landed multi-harness system: multi-writer events-log class, births-tree sole writer, birth-ingest + codex-state producers, shim/extension hook discipline, four-harness pair/panel enumeration with capability-derived eligibility. Lint green, fast gate green.
 ## Evidence
