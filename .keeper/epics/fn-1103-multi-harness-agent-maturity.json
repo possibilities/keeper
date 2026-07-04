@@ -8,7 +8,7 @@
     "fn-1102-keeper-tabs-browser-grade-restore"
   ],
   "id": "fn-1103-multi-harness-agent-maturity",
-  "last_validated_at": "2026-07-03T21:13:20.395000Z",
+  "last_validated_at": "2026-07-04T01:34:25.422000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-03T21:13:20.311000Z"
+  "updated_at": "2026-07-04T01:34:25.422000Z"
 }
