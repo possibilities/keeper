@@ -145,6 +145,31 @@ function isBranchMutatingInvocation(args: string): boolean {
     return tokens[0] === "add";
   }
 
+  if (sub === "stash") {
+    // refs/stash is ONE repo-global ref stack shared by every sibling worktree
+    // and the human's checkout — git has no per-worktree stash — so a worker's
+    // `stash push/pop` displaces files across trees mid-epic. ALLOWLIST, never a
+    // deny-list: git keeps adding stash verbs (export/import landed in 2.50), so
+    // deny-by-default covers every future verb for free. The three allowed verbs
+    // are read-only or ref-free — `list`/`show` only read; `create` writes no
+    // ref and materializes nothing. Everything else denies, INCLUDING `pop`/
+    // `apply`: they are denied on the "touches the shared stack OR materializes
+    // stashed files into THIS tree" axis even though `apply` writes no ref — that
+    // materialization was the incident shape, so do NOT relax this to a
+    // writes-refs/stash test. Verb-first, never substring matching: the verb is
+    // exactly tokens[0] after the global-flag strip. An empty token list (bare
+    // `git stash`, which git defines as `push`) or a LEADING FLAG denies — that
+    // also closes the `-m <allowlist-word>` operand bypass (`git stash -m show`:
+    // tokens[0] is `-m`, a flag, so it denies and never reaches `show`); a future
+    // "skip flags then find the verb" refactor must not reintroduce it. Alias-
+    // laundered stash (`git -c alias.x=stash x`, repo `[alias] st=stash`) can't
+    // be resolved by a dep-free hook — accepted gap; the worker-prose ban backs
+    // it up.
+    const STASH_ALLOWLIST = new Set(["list", "show", "create"]);
+    const verb = tokens[0];
+    return verb === undefined || !STASH_ALLOWLIST.has(verb);
+  }
+
   return false;
 }
 
@@ -181,9 +206,12 @@ export function isBranchMutatingCommand(command: string): boolean {
 
 const DENY_REASON =
   "Subagents must work IN PLACE on the current branch — never create or " +
-  "switch git branches. Drop the branch operation. For file-level undo use " +
-  "`git restore <path>` or `git checkout -- <path>`; the orchestrator owns " +
-  "all branch/worktree decisions.";
+  "switch git branches, and never touch `git stash` (only list/show/create " +
+  "are allowed). refs/stash is ONE stack shared by every sibling worktree and " +
+  "the human's checkout, so a worker stash push/pop displaces files across " +
+  "trees. Drop the operation. For file-level undo use `git restore <path>` or " +
+  "`git checkout -- <path>`; to park work make a temp commit, never stash; " +
+  "the orchestrator owns all branch/worktree decisions.";
 
 /** Read all of stdin as text. `Bun.stdin.stream()` avoids the macOS
  * `process.stdin` buffer-until-close hang (Bun #18239). */

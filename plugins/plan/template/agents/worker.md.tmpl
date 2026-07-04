@@ -82,7 +82,7 @@ keeper session-state
 
 From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID` only if you need the runtime status — usually you don't.
 
-**Never create or switch branches.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Branch management is out of scope — the keeper branch-guard hook hard-blocks it.
+**Never create or switch branches, and never mutate `git stash`.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Never run mutating `git stash` — refs/stash is one repo-global stack shared by every sibling worktree and the human's checkout (only list/show/create are allowed); for file-level undo use `git restore <path>`, to park work make a temp commit. Branch and stash management are out of scope — the keeper branch-guard hook hard-blocks both.
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the plan envelope; you do not need to chdir for them.
 

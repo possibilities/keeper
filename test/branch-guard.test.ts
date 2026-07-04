@@ -51,6 +51,38 @@ describe("isBranchMutatingCommand", () => {
     "git branch -f newbranch",
     // worktree add
     "git worktree add ../wt feature",
+    // stash — deny-by-default over the shared refs/stash stack. Bare `git
+    // stash` == push; every mutating/materializing verb, unknown verbs, and any
+    // leading-flag form deny; only list/show/create are allowlisted.
+    "git stash",
+    "git stash push",
+    "git stash push -u -m x",
+    "git stash save",
+    "git stash pop",
+    "git stash apply",
+    "git stash apply stash@{0}",
+    "git stash drop",
+    "git stash clear",
+    "git stash store deadbeef",
+    "git stash branch b",
+    "git stash export",
+    "git stash import",
+    // flag-only forms (leading flag, no verb token) — all push aliases
+    "git stash -u",
+    "git stash -p",
+    "git stash --all",
+    "git stash --include-untracked",
+    // `-m <word>` operand bypass: `show` is the message, not a verb — tokens[0]
+    // is the `-m` flag, so this denies and must never reach the allowlist
+    "git stash -m show",
+    // unknown verb — deny-by-default covers verbs git may add later
+    "git stash puhs",
+    // wrapped / compound / env-prefix / global-flag stash forms
+    'sh -c "git stash pop"',
+    "git status && git stash",
+    "$(git stash pop)",
+    "FOO=1 git stash pop",
+    "git -C /x stash pop",
     // compound / subshell / env-prefix / global-flag forms
     "cd x && git checkout -b y",
     'sh -c "git switch z"',
@@ -108,7 +140,14 @@ describe("isBranchMutatingCommand", () => {
     "git log --oneline",
     "git diff HEAD",
     "git show HEAD",
-    "git stash",
+    // stash allowlist — read-only / ref-free verbs stay allowed (diff flags on
+    // show and an operand on create do not change the verb at tokens[0])
+    "git stash list",
+    "git stash list --oneline",
+    "git stash show",
+    "git stash show -p",
+    "git stash create",
+    "git stash create msg",
     // quoted-string false-positive guards: the verb lives inside an echo/grep
     // argument, not at a command boundary
     'git log --grep "git checkout -b"',
@@ -167,6 +206,40 @@ describe("decideBranchGuard ladder", () => {
       }),
     );
     expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("denies a subagent `git stash pop`; reason names the shared stash stack and `git restore`", () => {
+    const decision = decideBranchGuard(
+      bashPayload({
+        agent_id: "agent-7",
+        tool_input: { command: "git stash pop" },
+      }),
+    );
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    const reason = decision?.hookSpecificOutput.permissionDecisionReason ?? "";
+    expect(reason).toContain("git stash");
+    expect(reason).toContain("refs/stash");
+    expect(reason).toContain("shared");
+    expect(reason).toContain("git restore <path>");
+  });
+
+  test("allows an allowlisted `git stash list` for a subagent", () => {
+    expect(
+      decideBranchGuard(
+        bashPayload({
+          agent_id: "agent-7",
+          tool_input: { command: "git stash list" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("allows a mutating stash form with NO agent context (main/human)", () => {
+    expect(
+      decideBranchGuard(
+        bashPayload({ tool_input: { command: "git stash pop" } }),
+      ),
+    ).toBeNull();
   });
 
   // The allow-main-producer direction is load-bearing: main's own in-daemon
