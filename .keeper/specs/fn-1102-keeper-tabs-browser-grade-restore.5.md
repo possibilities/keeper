@@ -50,5 +50,5 @@ vice versa.
 - [ ] The JSON mirror's membership and schema are unchanged by the new sibling
 
 ## Done summary
-
+restore-worker now maintains a durable revive.sh next to restore.json on the same data_version pulse (via shared renderSnapshotScript, reconciler-managed workers excluded), with its own hash gate, 0600 mode via atomicWriteFile's new optional mode param, and independent swallow-on-failure writes.
 ## Evidence

@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T21:56:43.016000Z",
+  "depends_on": [
+    "fn-1108-cli-framework-completions.2"
+  ],
+  "epic": "fn-1108-cli-framework-completions",
+  "id": "fn-1108-cli-framework-completions.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Install completion files",
+  "updated_at": "2026-07-03T21:56:43.016000Z"
+}

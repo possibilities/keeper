@@ -2,14 +2,17 @@
  * Pure resume-descriptor helpers — ONE DISPLAY form, shared by the resume
  * surfaces.
  *
- *  - DISPLAY ({@link buildResumeCommand}): the human-facing
- *    `claude --resume "<target>"` shell string `scripts/resume.ts` prints.
- *    Byte-unchanged, alias-shaped (a bare `claude` token a human pastes).
+ *  - DISPLAY ({@link buildResumeCommand}): the human-facing resume shell string
+ *    `scripts/resume.ts` prints. PER-HARNESS: the alias-shaped
+ *    `claude --resume "<uuid>" --x-no-confirm` for claude, or the harness's own
+ *    native form (`codex resume`, `pi --session`, `hermes --resume`) off the
+ *    descriptor registry.
  *
  * There is NO separate LAUNCH form here: `keeper bus wake` and crash-restore
  * both resume via keeper's sole launch transport (`keeperAgentLaunch` in resume
- * mode, `src/exec-backend.ts`), which builds the `--resume <target>` invocation
- * itself. {@link resumeTarget} is the shared key both paths resolve.
+ * mode, `src/exec-backend.ts`), which builds the harness-native resume invocation
+ * itself. {@link resumeTarget} is the shared key both paths resolve — per-harness:
+ * the session UUID for claude, the stored native id for codex/pi/hermes.
  *
  * Everything in this module is PURE — no socket, no fs, no `Date.now()`, no
  * env reads. `scripts/resume.ts` still owns the lazy per-epic UDS fetch loop
@@ -22,23 +25,39 @@
  * the emitted `worker_agent`, not selected via a `--plugin-dir` flag).
  */
 
+import { HARNESS_DESCRIPTORS, harnessOrClaude } from "./agent/harness";
 import type { Epic, Job, Task } from "./types";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
- * The `--resume` target for a job: its latest session NAME (`title`) when it has
- * one, else the `job_id` (the Claude session id) for a job that never carried a
- * name. `title` tracks the newest `name_history` entry, so this is the CURRENT
- * name keeper knows — resolved live from the jobs projection at resume time,
- * never a frozen one. `claude --resume "<name>"` filters the /resume picker to
- * that session; an exact `job_id` resolves directly. A degenerate job with no
- * name and no id coerces to the empty string (the producer invariant says this
- * never happens). Pure.
+ * The harness-native resume target for a job — the token its OWN `--resume` argv
+ * needs, resolved per-harness from the launching-harness tag:
+ *
+ *  - claude (NULL/`"claude"` harness): the `job_id` — the Claude session UUID.
+ *    `claude --resume "<uuid>"` resolves the EXACT session (browser-grade
+ *    restore), where a name would only fuzzy-filter the /resume picker. pi pins
+ *    its session id at launch too, but stores it in `resume_target`.
+ *  - codex/pi/hermes: the stored `jobs.resume_target` — the harness's own native
+ *    resume id (codex/hermes back-fill it post-stop, pi at seed). NULL/empty when
+ *    keeper never resolved one, which renders that agent NOT-RESUMABLE (an empty
+ *    string the restore surfaces surfaces with a reason, never a broken argv).
+ *
+ * The session's latest `title` feeds the DISPLAY label only (a candidate's
+ * `label`), never the resume key. A degenerate claude job with no id coerces to
+ * the empty string (the producer invariant says this never happens); a title
+ * never rescues an empty id — a name is not an exact resume key. Pure.
  */
-export function resumeTarget(job: Pick<Job, "title" | "job_id">): string {
-  const name = seg(job.title);
-  return name !== "" ? name : seg(job.job_id);
+export function resumeTarget(
+  job: Pick<Job, "job_id"> & {
+    harness?: string | null;
+    resume_target?: string | null;
+  },
+): string {
+  if (harnessOrClaude(job.harness) === "claude") {
+    return seg(job.job_id);
+  }
+  return seg(job.resume_target);
 }
 
 /**
@@ -62,19 +81,30 @@ export function resumeTarget(job: Pick<Job, "title" | "job_id">): string {
  * {@link tierForJobFromEpics}) so keeper's board/projection `task.tier` reads
  * stay intact; it just no longer shapes the emitted argv.
  *
- * `target` is the job's latest name (`title`), falling back to its `job_id`
- * (see {@link resumeTarget}). `claude --resume "<value>"` resolves an exact
- * session id directly, or filters the /resume picker by the value as a search
- * term — so the current display name re-attaches to that session. Double-quoted
- * because a promoted name can contain spaces. Pure.
+ * `target` is the harness-native resume target (see {@link resumeTarget}). The
+ * DISPLAY twin is per-harness: claude keeps the alias-shaped
+ * `claude --resume "<uuid>" --x-no-confirm` (the `--x-no-confirm` is a keeper
+ * launcher-alias flag); a non-claude harness renders its OWN native form —
+ * `codex resume "<t>"`, `pi --session "<t>"`, `hermes --resume "<t>"` — off the
+ * descriptor's `binaryName` + resume token, with no launcher-only suffix. The
+ * `cd <cwd> &&` prefix is LOAD-BEARING: a session id resolves only within the
+ * session's project dir plus its git worktrees, so a present `cwd` must prefix
+ * the command for resolution to succeed; a missing/torn-down cwd drops the prefix
+ * and surfaces as that one resume's failure, never a batch abort. Double-quoted
+ * for shape parity with `buildWorkerCommand`. Pure.
  */
 export function buildResumeCommand(
   cwd: string,
   target: string,
   _tier: string | null,
+  harness?: string | null,
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
-  return `${cdPrefix}claude --resume "${target}" --x-no-confirm`;
+  const descriptor = HARNESS_DESCRIPTORS[harnessOrClaude(harness)];
+  if (descriptor.name === "claude") {
+    return `${cdPrefix}claude --resume "${target}" --x-no-confirm`;
+  }
+  return `${cdPrefix}${descriptor.binaryName} ${descriptor.resumeArgv.token} "${target}"`;
 }
 
 /**

@@ -170,6 +170,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // which is NOT in this descriptor). Surfaced for reap attribution; never a
     // `sortable` / `filters` / `jsonColumns` key.
     "kill_reason",
+    // `harness` / `resume_target`: the launching harness + its native resume
+    // token (schema v107/v108 / fn-1103). Served so the restore-worker's
+    // `revive.sh` and JSON mirror tag each agent's harness and emit its own
+    // resume argv; NULL harness reads as claude. Display-only — never a
+    // `sortable` / `filters` / `jsonColumns` key.
+    "harness",
+    "resume_target",
   ],
   pk: "job_id",
   version: "last_event_id",

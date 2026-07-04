@@ -76,5 +76,5 @@ flag-mapping coverage.
 - [ ] The legacy restore-agents script delegates to the new verbs, and problem-codes, README, and the CLAUDE.md guardrail reflect the new surface
 
 ## Done summary
-
+Promoted crash-restore to first-class keeper tabs list/restore/dump verbs over a dep-lean src/tabs-core.ts engine, with published exit codes (6/7/8), the autopilot fail-closed gate, non-TTY refusal + TTY picker/confirm, dump managed-worker exclusion, and a restore-agents deprecation shim. Docs (problem-codes, README, CLAUDE.md guardrail) updated.
 ## Evidence

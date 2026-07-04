@@ -32,6 +32,21 @@ export type SecondAxis = "effort" | "thinking" | "none";
  *  `none`: no live hook channel — presence-only (codex/pi today). */
 export type HookMechanism = "claude-hooks" | "none";
 
+/**
+ * How a harness's resume target is passed on its OWN native CLI argv.
+ *  - `flag`: an `<token> <target>` OPTION pair that may follow other flags —
+ *    claude `--resume <uuid>`, pi `--session <id>`, hermes `--resume <id>`.
+ *  - `subcommand`: a VERB-POSITION `<token> <target>` that must LEAD the
+ *    forwarded harness argv — codex `resume <uuid>`. The launcher strips its own
+ *    `--x-*` flags before forwarding, so a subcommand token still lands first
+ *    among the harness-visible args.
+ * `token` is the literal first element (`--resume` / `--session` / `resume`).
+ */
+export interface ResumeArgvForm {
+  kind: "flag" | "subcommand";
+  token: string;
+}
+
 /** One harness's full behavioral row: identity, launch, second axis, and the
  *  capability flags that gate downstream behavior. */
 export interface HarnessDescriptor {
@@ -58,6 +73,9 @@ export interface HarnessDescriptor {
   mintsOwnSessionId: boolean;
   /** How this harness's live churn reaches the jobs projection. */
   hookMechanism: HookMechanism;
+  /** How this harness's resume target is spelled on its native CLI (the verb
+   *  or option token keeper emits after `keeper agent <name>` to re-attach). */
+  resumeArgv: ResumeArgvForm;
 }
 
 /** The registry — one {@link HarnessDescriptor} per {@link HarnessName}. The
@@ -74,6 +92,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     capturable: true,
     mintsOwnSessionId: false,
     hookMechanism: "claude-hooks",
+    resumeArgv: { kind: "flag", token: "--resume" },
   },
   codex: {
     name: "codex",
@@ -84,6 +103,9 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     capturable: true,
     mintsOwnSessionId: true,
     hookMechanism: "none",
+    // Codex resumes via a VERB-POSITION subcommand (`codex resume <uuid>`), not an
+    // option flag — the argv builder must lead the forwarded args with it.
+    resumeArgv: { kind: "subcommand", token: "resume" },
   },
   pi: {
     name: "pi",
@@ -94,6 +116,8 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     capturable: true,
     mintsOwnSessionId: false,
     hookMechanism: "none",
+    // Pi pins its session id at launch and resumes by it via `pi --session <id>`.
+    resumeArgv: { kind: "flag", token: "--session" },
   },
   hermes: {
     name: "hermes",
@@ -111,6 +135,9 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // target is its native session id, discovered post-stop from the store.
     mintsOwnSessionId: true,
     hookMechanism: "none",
+    // Hermes resumes by native session id: `hermes --resume <id>` (option flag,
+    // MEDIUM confidence — verified against `src/agent/args.ts`'s hermes predicate).
+    resumeArgv: { kind: "flag", token: "--resume" },
   },
 };
 
@@ -134,4 +161,31 @@ export function harnessDescriptor(name: string): HarnessDescriptor | undefined {
  *  capability. An unknown name is not capturable. */
 export function isCapturableHarness(name: string): boolean {
   return harnessDescriptor(name)?.capturable ?? false;
+}
+
+/**
+ * The harness a `jobs` row belongs to, defaulting a NULL/empty/unknown tag to
+ * `"claude"`. NULL harness reads as claude at every consumer (the SessionStart
+ * fold never synthesizes a value), so this is the single normalization point the
+ * resume/restore surfaces resolve a stored `jobs.harness` through.
+ */
+export function harnessOrClaude(name: string | null | undefined): HarnessName {
+  const n = (name ?? "").trim();
+  return isHarnessName(n) ? n : "claude";
+}
+
+/**
+ * The per-harness resume argv tokens for a target — the verb-position or
+ * option-flag pair the harness's own CLI re-attaches with (`--resume <t>` /
+ * `resume <t>` / `--session <t>`). Both forms yield `[token, target]`; the
+ * descriptor's {@link ResumeArgvForm.kind} documents WHY codex's token carries no
+ * dashes (a subcommand, not an option) and is asserted by the builder's tests. An
+ * unknown harness falls back to claude's `--resume` form. Pure.
+ */
+export function buildHarnessResumeArgv(
+  name: string | null | undefined,
+  target: string,
+): string[] {
+  const d = HARNESS_DESCRIPTORS[harnessOrClaude(name)];
+  return [d.resumeArgv.token, target];
 }

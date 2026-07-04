@@ -77,11 +77,12 @@ function insertEvent(overrides: {
   ts?: number;
   data?: string | null;
   mutation_path?: string | null;
+  subagent_agent_id?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   db.run(
-    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path, subagent_agent_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? TEST_UUID,
@@ -91,6 +92,7 @@ function insertEvent(overrides: {
       overrides.cwd ?? null,
       overrides.data ?? "{}",
       overrides.mutation_path ?? null,
+      overrides.subagent_agent_id ?? null,
     ],
   );
   return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
@@ -289,6 +291,79 @@ test("retention NULLs a cold shed-class body; keep-set + recent bodies stay inli
     db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
   ).n;
   expect(afterRowCount).toBe(beforeRowCount);
+});
+
+test("retention keeps PostToolUse:Agent + SubagentStop bodies for IO-pair capture; still sheds SubagentStart/Notification", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+
+  // KEEP (offline-analysis capture): a modern PostToolUse:Agent carrying the
+  // subagent's final answer/model/usage — kept even with subagent_agent_id set.
+  const agentBody = JSON.stringify({
+    tool_response: { agentId: "sub-1", content: "the subagent's final answer" },
+    resolvedModel: "claude-opus-4-8",
+  });
+  const agentId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    subagent_agent_id: "sub-1",
+    ts: 100,
+    data: agentBody,
+  });
+
+  // KEEP (offline-analysis capture): a SubagentStop carrying the output half.
+  const stopBody = JSON.stringify({
+    agent_id: "sub-1",
+    last_assistant_message: "wrapping up",
+    effort: "high",
+    agent_transcript_path: "/t/sub-1.jsonl",
+  });
+  const stopId = insertEvent({
+    hook_event: "SubagentStop",
+    ts: 101,
+    data: stopBody,
+  });
+
+  // STILL SHED: SubagentStart + Notification bodies (no fold reads them).
+  const startId = insertEvent({
+    hook_event: "SubagentStart",
+    ts: 102,
+    data: JSON.stringify({ agent_id: "sub-1", shed: "me" }),
+  });
+  const notifyId = insertEvent({
+    hook_event: "Notification",
+    ts: 103,
+    data: JSON.stringify({ message: "shed me too" }),
+  });
+
+  // Filler keep-set events so the seeded ids sit far below the recent window
+  // AND below the fold cursor after the drain.
+  for (let i = 0; i < 30; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID, ts: 300 + i });
+  }
+  drainAll();
+
+  const result = retainColdPayloads(db, {
+    recentRetentionMargin: 2,
+    batchSize: 10,
+    maxBatches: 5,
+    incrementalVacuumPages: 0,
+  });
+  expect(result.shed).toBeGreaterThan(0);
+
+  const bodyOf = (id: number) =>
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+        data: string | null;
+      }
+    ).data;
+
+  // Newly-kept classes: bodies intact.
+  expect(bodyOf(agentId)).toBe(agentBody);
+  expect(bodyOf(stopId)).toBe(stopBody);
+
+  // Still-shed classes: bodies NULLed.
+  expect(bodyOf(startId)).toBeNull();
+  expect(bodyOf(notifyId)).toBeNull();
 });
 
 test("retention never strips a body at or above the fold cursor", () => {

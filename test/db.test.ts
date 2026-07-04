@@ -1517,6 +1517,13 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
         if (idx.sql.includes("mutation_path")) {
           continue;
         }
+        // The v107 `idx_events_tmux_generation` indexes the `tmux_generation_id`
+        // VIRTUAL generated column the faithful v57 events shape lacks; migrate()
+        // recreates it (with the column) at the v106→v107 step on the walk up, so
+        // the post-migrate index-set assertion below still sees it.
+        if (idx.sql.includes("tmux_generation_id")) {
+          continue;
+        }
         if (idx.name.startsWith("idx_events_plan_")) {
           continue;
         }
@@ -2607,10 +2614,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // epics-shape change), fn-1086 task .1. v106 appends the nullable
   // `dispatch_failures.resolver_dispatched_at` once-marker (the merge-resolver
   // dispatch latch — an additive ALTER, not an epics-shape change), fn-1088 task .1.
-  // v107 appends the nullable `harness`/`resume_target` columns to BOTH events
+  // v107 adds the `events.tmux_generation_id` VIRTUAL generated column + its
+  // partial index (the tab-restore generation-summary walk's indexed key — an
+  // ALTER + index on `events`, not an epics-shape change), fn-1102 task .1.
+  // v108 appends the nullable `harness`/`resume_target` columns to BOTH events
   // (five-place lockstep) and jobs (migration-only) — an additive ALTER, not an
   // epics-shape change, fn-1103 task .3.
-  expect(SCHEMA_VERSION).toBe(107);
+  expect(SCHEMA_VERSION).toBe(108);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

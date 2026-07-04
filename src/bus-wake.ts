@@ -24,6 +24,7 @@
  * 2c has already fallen back.
  */
 
+import { harnessOrClaude } from "./agent/harness";
 import {
   AGENTBUS_EXEC_SESSION,
   keeperAgentLaunch,
@@ -34,7 +35,9 @@ import { resumeTarget } from "./resume-descriptor";
 /**
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
  * import("./types").Job} so the resolve/liveness/launch pipeline unit-tests with a
- * tiny synthetic row. `title`/`job_id` feed {@link resumeTarget}; `cwd` is the
+ * tiny synthetic row. `job_id` feeds {@link resumeTarget} (the exact session-UUID
+ * `--resume` key); `title` mirrors the `jobs` projection row so a real row stays
+ * assignable directly. `cwd` is the
  * directory the resumed window opens in (set on the `keeperAgentLaunch` spawn —
  * keeper agent reads its own `process.cwd()`, not interpolated into the launch body);
  * `state` is the running-liveness signal; `backend_exec_pane_id` is
@@ -49,6 +52,13 @@ export interface WakeCreator {
   state: string;
   backend_exec_pane_id: string | null;
   updated_at: number;
+  /** Launching harness (`jobs.harness`); NULL reads as claude. Creators are claude
+   *  today, but the resume routes through the harness descriptor path, so the wake
+   *  stops ASSUMING claude — a non-claude creator resumes via its own verb. */
+  harness?: string | null;
+  /** Harness-native resume target (`jobs.resume_target`) — the token
+   *  {@link resumeTarget} returns for a non-claude creator (claude uses `job_id`). */
+  resume_target?: string | null;
 }
 
 /**
@@ -221,14 +231,15 @@ export interface WakeDeps {
   /** Acquire the per-session single-flight lock NON-BLOCKING. Returns a release
    *  handle, or null when another wake of this session holds it. */
   readonly tryLock: (sessionId: string) => { release: () => void } | null;
-  /** The resume launch transport. Carries the RESUME TARGET (not a pre-wrapped
-   *  argv) — `keeperAgentLaunch` builds the `--resume <target>` invocation and owns
-   *  the tmux window. Defaults to {@link defaultWakeLaunch} (the real
-   *  `keeperAgentLaunch` path); injected by tests. */
+  /** The resume launch transport. Carries the RESUME TARGET + harness (not a
+   *  pre-wrapped argv) — `keeperAgentLaunch` builds the harness's own resume
+   *  invocation and owns the tmux window. Defaults to {@link defaultWakeLaunch}
+   *  (the real `keeperAgentLaunch` path); injected by tests. */
   readonly launch?: (
     session: string,
     resumeTarget: string,
     cwd: string,
+    harness: string,
   ) => Promise<LaunchResult>;
   /** Clock (epoch-ms). */
   readonly now: () => number;
@@ -304,7 +315,12 @@ export async function runWake(
     }
 
     const cwd = job.cwd ?? "";
-    const result = await launch(AGENTBUS_EXEC_SESSION, resumeTarget(job), cwd);
+    const result = await launch(
+      AGENTBUS_EXEC_SESSION,
+      resumeTarget(job),
+      cwd,
+      harnessOrClaude(job.harness),
+    );
     if (!result.ok) {
       const failures = (cd?.failures ?? 0) + 1;
       deps.writeCooldown(sessionId, {
@@ -348,14 +364,15 @@ function defaultWakeLaunch(
   session: string,
   resumeTarget: string,
   cwd: string,
+  harness: string,
 ) => Promise<LaunchResult> {
-  return (session, target, cwd) =>
+  return (session, target, cwd, harness) =>
     keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix: launcherPrefix,
       session,
       cwd,
-      label: `wake resume ${target}`,
-      spec: { prompt: "", resumeTarget: target },
+      label: `wake resume ${harness} ${target}`,
+      spec: { prompt: "", resumeTarget: target, harness },
     });
 }

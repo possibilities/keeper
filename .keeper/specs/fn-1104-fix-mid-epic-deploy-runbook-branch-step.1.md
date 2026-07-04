@@ -18,5 +18,5 @@ wrong branch. Preserve the existing invariants the runbook already states
 - [ ] The pause-first, never-squash, and gate-before-push steps remain intact.
 
 ## Done summary
-
+Added an explicit 'git checkout main' step before the lane merge in the mid-epic deploy runbook and renumbered the following steps, so following it literally from any branch deploys the lane to main; pause-first, never-squash, and gate-before-push preserved.
 ## Evidence

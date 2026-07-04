@@ -23,8 +23,11 @@
  *
  * When the human `work` session is ABSENT after a
  * crash and the last tmux-server generation left crashed agents for it, the
- * first `setup-tmux` offers — one combined y/N TTY prompt — to relaunch them;
- * the reconciler-managed `autopilot` session is never offered.
+ * first `setup-tmux` offers — one combined y/N TTY prompt carrying the picked
+ * generation's age + agent count — to relaunch them by spawning
+ * `keeper tabs restore --apply` SYNCHRONOUSLY per session and printing one
+ * authoritative outcome line each; the reconciler-managed `autopilot` session is
+ * never offered.
  *
  *   keeper setup-tmux [--kill-sessions]
  *   keeper setup-tmux --help
@@ -33,10 +36,10 @@
 import * as fs from "node:fs";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
-import { openDb, resolveDbPath } from "../src/db";
+import { resolveDbPath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
-import { deriveLastGenerationSetFromTopology } from "../src/restore-set";
-import { probeServerGeneration } from "../src/restore-worker";
+import { loadRestorePlan } from "../src/tabs-core";
+import { formatAge } from "./tabs";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
 
@@ -61,10 +64,13 @@ sources conf.d/*.conf. Refuses to clobber a real (non-symlink) file there.
 
 When the work session ('work') is ABSENT (the first run
 after a crash) and the last tmux-server generation left crashed agents for it,
-it offers — ONE combined y/N prompt on a TTY only, never auto — to relaunch them
-via 'restore-agents --last-generation', per absent session. The managed
-'autopilot' session is never offered. A present session, zero candidates, or a
-non-TTY skips that session's offer.
+it offers — ONE combined y/N prompt on a TTY only, never auto — to relaunch them.
+The prompt carries the picked generation's age + agent count (a skeleton is
+recognizable at the prompt); on confirm it spawns 'keeper tabs restore --apply'
+SYNCHRONOUSLY per session and prints one authoritative outcome line each (the
+restored count with generation context, or the verbatim failure incl. the
+autopilot-gate refusal). The managed 'autopilot' session is never offered. A
+present session, zero candidates, or a non-TTY skips that session's offer.
 
 Options:
   --kill-sessions  Kill the default-server 'work'/'autopilot' sessions before
@@ -655,70 +661,127 @@ export const RESTORABLE = SWEEP_KILL_SESSIONS.filter(
 );
 
 /**
- * Injectable provider for the last-generation crash-candidate counts, keyed by
- * backend session name. Default opens `keeper.db` READ-ONLY (NOT the ExecBackend
- * seam — reading the DB is allowed here; only multiplexer drive stays outside
- * it), runs {@link deriveLastGenerationSet} ONCE, and groups its candidates by
- * `backend_exec_session_id`. Tests inject a fake so they need no real DB.
- * Daemon-down is fine (read-only connection); any open/read failure degrades to
- * `{}` (skip every offer rather than crash setup).
+ * One session's restore offer, derived from the SAME selection seam
+ * (`loadRestorePlan`) the applied restore reads — so the promised count matches
+ * what `keeper tabs restore --apply --generation <id>` restores. `count` is the
+ * session's candidate count in the picked generation; `generationId` is that
+ * generation (the `--generation <id>` target, `null` on the killed-cohort
+ * fallback); `generationLastTs` / `generationMaxPanes` are the prompt's age +
+ * skeleton-hint context (`null` on the fallback, which carries no generation).
  */
-export type CandidateCountFn = () => Record<string, number>;
+export interface RestoreOffer {
+  count: number;
+  generationId: string | null;
+  generationLastTs: number | null;
+  generationMaxPanes: number | null;
+}
 
-const defaultCandidateCount: CandidateCountFn = () => {
+/**
+ * Injectable provider for the per-session restore offers, keyed by backend
+ * session name. Default runs {@link loadRestorePlan} ONCE (read-only `keeper.db`,
+ * NO tmux drive — it probes `G_now` read-only itself) and groups the picked
+ * generation's candidates by `backend_exec_session_id`, stamping each session's
+ * offer with the shared generation context. Routing the offer through the SAME
+ * seam the applied restore reads keeps the promised count and the restored set in
+ * lockstep. Tests inject a fake so they need no real DB. Daemon-down is fine
+ * (read-only); any open/read failure degrades to `{}` (skip every offer rather
+ * than crash setup) — exactly the old count-path catch.
+ */
+export type RestoreOfferFn = () => Record<string, RestoreOffer>;
+
+const defaultRestoreOffer: RestoreOfferFn = () => {
   try {
-    // Probe G_now (the current server pid) under the LOAD-BEARING locale default
-    // so the topology deriver excludes the still-live generation and isolates the
-    // dying one. A degraded probe → null → the newest snapshot overall is taken.
-    const currentGenerationId = probeServerGeneration((cmd) =>
-      Bun.spawnSync(cmd, {
-        stdout: "pipe",
-        stderr: "ignore",
-        env: localeDefaultedEnv(
-          process.env as Record<string, string | undefined>,
-        ),
-      }),
-    );
-    const { db } = openDb(resolveDbPath(), { readonly: true });
-    try {
-      const { candidates } = deriveLastGenerationSetFromTopology(db, {
-        currentGenerationId,
-      });
-      const counts: Record<string, number> = {};
-      for (const c of candidates) {
-        counts[c.backend_exec_session_id] =
-          (counts[c.backend_exec_session_id] ?? 0) + 1;
+    const selection = loadRestorePlan(resolveDbPath());
+    const gen = selection.pickedGeneration;
+    const offers: Record<string, RestoreOffer> = {};
+    for (const c of selection.candidates) {
+      const existing = offers[c.backend_exec_session_id];
+      if (existing !== undefined) {
+        existing.count += 1;
+      } else {
+        offers[c.backend_exec_session_id] = {
+          count: 1,
+          generationId: gen?.generation_id ?? null,
+          generationLastTs: gen?.last_ts ?? null,
+          generationMaxPanes: gen?.max_pane_count ?? null,
+        };
       }
-      return counts;
-    } finally {
-      db.close();
     }
+    return offers;
   } catch {
     return {};
   }
 };
 
 /**
- * Build the restore-agents spawn argv for one session's last-generation set —
- * the subprocess owns ExecBackend; setup-tmux only spawns it. `--apply` actually
- * relaunches, `--session <name>` scopes to that session, `--last-generation`
- * bounds to the kill-anchored generation window.
+ * Build the `keeper tabs restore --apply` spawn argv for one session — the
+ * subprocess owns ExecBackend; setup-tmux only spawns it. `--session <name>`
+ * scopes to that session; `--generation <id>` targets the offer's picked
+ * generation (omitted on the killed-cohort fallback, where the child auto-picks);
+ * `--allow-empty` makes the count/apply race — a candidate going live between the
+ * offer and this apply — a benign `restored 0` (exit 0), never a failure.
  */
-export function buildRestoreAgentsArgv(session: string): string[] {
-  return [
-    "bun",
-    `${KEEPER_DIR}/scripts/restore-agents.ts`,
+export function buildTabsRestoreArgv(
+  session: string,
+  generationId: string | null,
+): string[] {
+  const argv = [
+    "keeper",
+    "tabs",
+    "restore",
     "--apply",
+    "--allow-empty",
     "--session",
     session,
-    "--last-generation",
   ];
+  if (generationId !== null && generationId !== "") {
+    argv.push("--generation", generationId);
+  }
+  return argv;
+}
+
+/** Parse the `restored=<n>` field off a `keeper tabs restore` summary line; null
+ *  when absent (degraded/older child output — the offer count is the fallback). */
+function parseRestoredCount(stdout: string): number | null {
+  const m = stdout.match(/restored=(\d+)/);
+  return m != null ? Number.parseInt(m[1] as string, 10) : null;
+}
+
+/**
+ * Render the ONE authoritative outcome line for a session's synchronous
+ * `keeper tabs restore --apply` spawn. Exit 0 ⇒ a success line: the restored
+ * count (parsed from the child summary, offer count as fallback) plus the
+ * picked-generation context — a candidate going live between offer and apply
+ * reads here as a benign `restored 0`, never a failure. Any non-zero exit ⇒ a
+ * FAILED line carrying the verbatim child stderr (the autopilot-gate refusal
+ * included). Pure.
+ */
+export function renderRestoreOutcome(
+  session: string,
+  offer: RestoreOffer | undefined,
+  result: SyncSpawnResult,
+  nowSecs: number = Date.now() / 1000,
+): string {
+  if (result.exitCode === 0) {
+    const restored =
+      parseRestoredCount(result.stdout.toString()) ?? offer?.count ?? 0;
+    const genId = offer?.generationId ?? null;
+    const ctx =
+      genId !== null && offer?.generationLastTs != null
+        ? ` from generation ${genId} (${formatAge(nowSecs - offer.generationLastTs)} ago)`
+        : "";
+    return `keeper setup-tmux: '${session}' restored ${restored} agent(s)${ctx}`;
+  }
+  const code = result.exitCode === null ? "signal" : String(result.exitCode);
+  const stderr = result.stderr.toString().trim();
+  const detail = stderr !== "" ? stderr : result.stdout.toString().trim();
+  return `keeper setup-tmux: '${session}' restore FAILED (exit ${code}): ${detail}`;
 }
 
 export async function main(
   argv: string[],
   spawn: SyncSpawnFn = defaultSpawn,
-  candidateCount: CandidateCountFn = defaultCandidateCount,
+  restoreOffer: RestoreOfferFn = defaultRestoreOffer,
   guardFs: GuardFs = defaultGuardFs,
 ): Promise<void> {
   const parsed = parseArgs({
@@ -779,24 +842,40 @@ export async function main(
     // kill-anchored window). rebuildDash lives on a SEPARATE `-L dash` server
     // and no longer perturbs the default-server anchor, but the offer stays here
     // ahead of provisioning regardless. A session is offered only when it is
-    // ABSENT (the first setup-tmux after a crash) AND has >0 last-generation
-    // candidates; a present session means this run isn't a recovery for it and
-    // we skip silently. Counts are read ONCE up front, and RESTORABLE (not the
-    // count-map keys) is the iteration source so a stale or non-provisioned
-    // `backend_exec_session_id` can't leak into the prompt.
-    const counts = candidateCount();
+    // ABSENT (the first setup-tmux after a crash) AND has >0 candidates in the
+    // picked generation; a present session means this run isn't a recovery for it
+    // and we skip silently. Offers are read ONCE up front off the SAME selection
+    // seam the apply reads, and RESTORABLE (not the offer-map keys) is the
+    // iteration source so a stale or non-provisioned `backend_exec_session_id`
+    // can't leak into the prompt.
+    const offers = restoreOffer();
+    const nowSecs = Date.now() / 1000;
     const offered = RESTORABLE.filter(
       (session) =>
         run(spawn, buildHasSessionArgs(session)).exitCode !== 0 &&
-        (counts[session] ?? 0) > 0,
+        (offers[session]?.count ?? 0) > 0,
     );
     let restoreSessions: readonly string[] = [];
     if (offered.length > 0) {
       const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
-      // Non-empty offer AND TTY ⇒ ONE combined prompt naming each session +
-      // count; non-TTY NEVER auto-restores.
+      // Non-empty offer AND TTY ⇒ ONE combined prompt naming each session with
+      // its agent count + the picked generation's age (a skeleton is
+      // recognizable here); non-TTY NEVER auto-restores.
       if (tty) {
-        const detail = offered.map((s) => `${s}: ${counts[s] ?? 0}`).join(", ");
+        const detail = offered
+          .map((s) => {
+            const o = offers[s] as RestoreOffer;
+            const age =
+              o.generationLastTs !== null
+                ? `${formatAge(nowSecs - o.generationLastTs)} ago`
+                : "age unknown";
+            const panes =
+              o.generationMaxPanes !== null
+                ? `, peak ${o.generationMaxPanes} pane(s)`
+                : "";
+            return `${s}: ${o.count} agent(s), ${age}${panes}`;
+          })
+          .join("; ");
         if (await confirm(`Restore last-session agents (${detail})? [y/N] `)) {
           restoreSessions = offered;
         }
@@ -819,11 +898,30 @@ export async function main(
       `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux -L ${DASH_SESSION} attach\n`,
     );
 
-    // Continue-on-error: each spawn is fire-and-forget via run() so one
-    // session's restore failing can't abort the other or the completed setup.
+    // Synchronous restore: spawn `keeper tabs restore --apply` per offered
+    // session through the SyncSpawnFn seam (the subprocess owns ExecBackend),
+    // capture the exit code + output, and print ONE authoritative outcome line
+    // per session — nothing fire-and-forget. Continue-on-error: a spawn fault
+    // (ENOENT) degrades to a FAILED line, never aborting the next session or the
+    // completed setup.
     for (const session of restoreSessions) {
-      // The subprocess owns ExecBackend; setup-tmux only spawns it.
-      run(spawn, buildRestoreAgentsArgv(session));
+      const offer = offers[session];
+      const argv = buildTabsRestoreArgv(session, offer?.generationId ?? null);
+      let result: SyncSpawnResult;
+      try {
+        result = spawn(argv);
+      } catch (e) {
+        result = {
+          exitCode: null,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(
+            `keeper setup-tmux: failed to spawn ${argv[0]}: ${String(e)}`,
+          ),
+        };
+      }
+      process.stdout.write(
+        `${renderRestoreOutcome(session, offer, result, nowSecs)}\n`,
+      );
     }
   } catch (e) {
     if (e instanceof TmuxError) {

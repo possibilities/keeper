@@ -49,5 +49,5 @@ unchanged; no references to the deleted script remain.
 - [ ] The legacy restore-agents script is retired with no remaining references
 
 ## Done summary
-
+setup-tmux restore offer now routes through the shared loadRestorePlan selection seam: the prompt carries the picked generation's age + agent count and confirm spawns 'keeper tabs restore --apply --generation <id>' synchronously with one authoritative outcome line per session; retired the restore-agents shim.
 ## Evidence

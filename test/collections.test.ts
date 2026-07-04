@@ -257,6 +257,19 @@ test("JOBS_DESCRIPTOR serves kill_reason for reap attribution (v103)", () => {
   expect(JOBS_DESCRIPTOR.jsonColumns.has("kill_reason")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves harness + resume_target for the harness-aware revive script (v107/v108)", () => {
+  // `harness` / `resume_target` (DB v107/v108 / fn-1103) are the launching harness
+  // and its native resume token; served so the restore-worker's revive.sh + JSON
+  // mirror tag each agent's harness and emit its own resume argv. Plain TEXT
+  // scalars — display-only, so out of sortable / filters / jsonColumns.
+  for (const col of ["harness", "resume_target"]) {
+    expect(JOBS_DESCRIPTOR.columns).toContain(col);
+    expect(JOBS_DESCRIPTOR.sortable.has(col)).toBe(false);
+    expect(JOBS_DESCRIPTOR.filters[col]).toBeUndefined();
+    expect(JOBS_DESCRIPTOR.jsonColumns.has(col)).toBe(false);
+  }
+});
+
 test("JOBS_DESCRIPTOR serves worktree for the durable lane pill (v94)", () => {
   // `worktree` (DB v94 / fn-997) is the durable git lane BRANCH the job ran in,
   // folded set-once from `events.worktree`. Display-only — the renderer's

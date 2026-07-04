@@ -57,5 +57,5 @@ all harnesses; unknown harness fails loud at load.
 - [ ] An unknown harness name in presets or panel config fails loud at load
 
 ## Done summary
-
+Introduced src/agent/harness.ts per-harness descriptor registry as the single source of harness facts; derived AgentKind/AgentCli/PresetHarness and the AGENT_CLIS/PRESET_HARNESSES/run-capture name sets from it. Panel eligibility now reads the capturable capability (pi lifted); unknown harness fails loud at load. claude/codex/pi launch argv byte-identical (byte-pin suite unmodified + green).
 ## Evidence
