@@ -8174,6 +8174,7 @@ function makeRecoveryGit(state: {
   pointsAtBranches?: Map<string, string[]>; // cwd → `refs/heads/...` refs pointing at its MERGE_HEAD (ownership + owning-epic derivation)
   autostashAt?: Set<string>; // cwds whose mid-merge carries a MERGE_AUTOSTASH (refuses keeper ownership)
   abortFailsAt?: Set<string>; // cwds whose `merge --abort` returns non-zero (the un-cleared wedge)
+  owningEpicProbeFailAt?: Map<string, number>; // cwd → non-zero exit for the owning-epic derivation `for-each-ref ... refs/heads/keeper/epic/` (an inconclusive resolver-ownership probe)
   epicBases?: string[]; // keeper/epic/<id> short refs (for-each-ref output)
   defaultBranch?: string; // resolved via symbolic-ref
   ancestors?: Set<string>; // branches already an ancestor of LOCAL default
@@ -8247,6 +8248,15 @@ function makeRecoveryGit(state: {
       // The branch-set at a cwd's MERGE_HEAD — shared by the mergeReadiness ownership
       // probe (`refs/heads/`) and the recover pass's owning-epic derivation
       // (`refs/heads/keeper/epic/`). MUST precede the `keeper/epic` catch-all below.
+      // Only the OWNING-EPIC derivation (keeper/epic prefix) is pinnable to fail — the
+      // readiness ownership probe (`refs/heads/`) still succeeds, so ownership resolves
+      // keeper and the code reaches the resolver-exclusion guard on an inconclusive probe.
+      const owningEpicFailCode = joined.includes("keeper/epic")
+        ? state.owningEpicProbeFailAt?.get(cwd)
+        : undefined;
+      if (owningEpicFailCode !== undefined && owningEpicFailCode !== 0) {
+        return { code: owningEpicFailCode, stdout: "", stderr: "" };
+      }
       return {
         code: 0,
         stdout: (state.pointsAtBranches?.get(cwd) ?? []).join("\n"),
@@ -8649,6 +8659,102 @@ test("fn-1114 recoverWorktrees: a keeper-owned main mid-merge is NOT aborted whi
     calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
   ).toBe(false);
   expect(failures).toEqual([]); // silent skip — the resolver is actively working it
+});
+
+test("fn-1115 recoverWorktrees: an INCONCLUSIVE owning-epic probe (for-each-ref exit 1) defers instead of aborting — an unknown resolver state is never a licence to abort", async () => {
+  // The fail-safe gap: a keeper-owned mid-merge whose owning-epic derivation
+  // `for-each-ref ... refs/heads/keeper/epic/` fails (spawn failure / timeout). The
+  // resolver-exclusion guard cannot see whether a live `resolve::<epic>` worker owns
+  // the merge, so aborting would race (and destroy) an in-progress resolution. Defer.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]), // readiness ⇒ keeper-owned
+    owningEpicProbeFailAt: new Map([["/repo", 1]]), // ...but the owning-epic derivation fails
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false, // even with NO known resolver, an inconclusive probe still defers
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  // No abort raced a possible live resolver.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  // A defer failure was minted (epicId null, dir /repo) naming the inconclusive probe,
+  // inside the recover prefix so the level-clear releases it once the probe resolves.
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBeNull();
+  expect(failures[0]?.dir).toBe("/repo");
+  expect(failures[0]?.reason).toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).toContain("inconclusive owning-epic probe");
+  expect(failures[0]?.reason).toContain("failed exit 1");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1115 recoverWorktrees: a TIMED-OUT owning-epic probe (for-each-ref exit 124) defers with a timeout-worded reason, no abort", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    owningEpicProbeFailAt: new Map([["/repo", GIT_SPAWN_TIMEOUT_CODE]]), // 124 SIGKILL sentinel
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("inconclusive owning-epic probe");
+  expect(failures[0]?.reason).toContain("timed out");
+});
+
+test("fn-1115 recoverWorktrees: a resolver-free keeper-owned wedge with a SUCCEEDING empty owning-epic probe still self-heals (no regression to the clean abort path)", async () => {
+  // The distinguishing guard: a CLEAN empty result (code 0, no owning epic) is not a
+  // deferral — a genuinely resolver-free wedge must still abort-and-recover. Only a
+  // NON-zero probe defers. MERGE_HEAD points at a non-keeper-epic branch so the
+  // owning-epic derivation is legitimately empty while readiness stays keeper-owned.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    // owningEpicProbeFailAt unset ⇒ the derivation returns code 0; base yields fn-1-foo,
+    // which has NO live resolver, so the clean abort path runs.
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-1-foo",
+    run,
+    lock,
+    undefined,
+    () => false, // no live resolver
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(1);
 });
 
 test("fn-1114 recoverWorktrees: a FAILED guarded abort of the main-checkout wedge surfaces its own worktree-recover-abort-failed reason (telemetry, not vanishing)", async () => {
