@@ -48,5 +48,5 @@ Skill prose has no unit surface; verification is a live round-trip: scaffold a t
 - [ ] Baked-snippet and corpus drift gates remain green after the skill edits
 
 ## Done summary
-
+Wired the post-scaffold model+effort selector beat into /plan:plan (Phase 6.5) and /plan:defer (Phase 4b): both stamp the mechanical default xhigh/opus at scaffold, run a detached read-only selector leg that overwrites cells via assign-cells (with sidecar), and degrade to defaults on every failure while still arming. Swept CLAUDE.md, README, and the composition-map docs for the select-time cell flow.
 ## Evidence
