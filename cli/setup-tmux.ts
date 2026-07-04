@@ -26,17 +26,19 @@
  * first `setup-tmux` offers — one combined y/N TTY prompt carrying the picked
  * generation's age + agent count — to relaunch them by spawning
  * `keeper tabs restore --apply` SYNCHRONOUSLY per session and printing one
- * authoritative outcome line each; the reconciler-managed `autopilot` session is
- * never offered.
+ * authoritative outcome line each. An accepted batch is marked for retry before
+ * apply and cleared only after a successful restore; the reconciler-managed
+ * `autopilot` session is never offered.
  *
  *   keeper setup-tmux [--kill-sessions]
  *   keeper setup-tmux --help
  */
 
 import * as fs from "node:fs";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
-import { resolveDbPath } from "../src/db";
+import { resolveDbPath, resolveRestorePath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import { loadRestorePlan } from "../src/tabs-core";
 import { formatAge } from "./tabs";
@@ -69,8 +71,11 @@ The prompt carries the picked generation's age + agent count (a skeleton is
 recognizable at the prompt); on confirm it spawns 'keeper tabs restore --apply'
 SYNCHRONOUSLY per session and prints one authoritative outcome line each (the
 restored count with generation context, or the verbatim failure incl. the
-autopilot-gate refusal). The managed 'autopilot' session is never offered. A
-present session, zero candidates, or a non-TTY skips that session's offer.
+autopilot-gate refusal). An accepted batch is marked for retry before apply and
+cleared only after a successful restore; a marked retry is offered even when the
+session now exists. The managed 'autopilot' session is never offered. A present
+session without a retry marker, zero candidates, or a non-TTY skips that
+session's offer.
 
 Options:
   --kill-sessions  Kill the default-server 'work'/'autopilot' sessions before
@@ -713,6 +718,130 @@ const defaultRestoreOffer: RestoreOfferFn = () => {
   }
 };
 
+const RESTORE_RETRY_SCHEMA_VERSION = 1;
+
+/** Durable retry marker for setup-tmux's accepted restore batches. */
+export interface RestoreRetryStore {
+  read(): Record<string, RestoreOffer>;
+  mark(offers: Record<string, RestoreOffer>): void;
+  clear(sessions: readonly string[]): void;
+}
+
+export function resolveSetupTmuxRestoreRetryPath(): string {
+  return join(dirname(resolveRestorePath()), "setup-tmux-restore-retry.json");
+}
+
+function normalizeRetryOffer(raw: unknown): RestoreOffer | null {
+  if (typeof raw !== "object" || raw === null) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const count = obj.count;
+  if (!Number.isInteger(count) || (count as number) <= 0) {
+    return null;
+  }
+  const generationId =
+    typeof obj.generationId === "string" && obj.generationId !== ""
+      ? obj.generationId
+      : null;
+  const generationLastTs =
+    typeof obj.generationLastTs === "number" &&
+    Number.isFinite(obj.generationLastTs)
+      ? obj.generationLastTs
+      : null;
+  const generationMaxPanes =
+    typeof obj.generationMaxPanes === "number" &&
+    Number.isFinite(obj.generationMaxPanes)
+      ? obj.generationMaxPanes
+      : null;
+  return {
+    count: count as number,
+    generationId,
+    generationLastTs,
+    generationMaxPanes,
+  };
+}
+
+function readRetryFile(path: string): Record<string, RestoreOffer> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return {};
+  }
+  const sessions = (parsed as { sessions?: unknown }).sessions;
+  if (typeof sessions !== "object" || sessions === null) {
+    return {};
+  }
+  const out: Record<string, RestoreOffer> = {};
+  for (const [session, offer] of Object.entries(sessions)) {
+    const normalized = normalizeRetryOffer(offer);
+    if (session !== "" && normalized !== null) {
+      out[session] = normalized;
+    }
+  }
+  return out;
+}
+
+function writeRetryFile(
+  path: string,
+  sessions: Record<string, RestoreOffer>,
+): void {
+  const keys = Object.keys(sessions)
+    .filter((k) => k !== "")
+    .sort();
+  if (keys.length === 0) {
+    try {
+      fs.unlinkSync(path);
+    } catch (err) {
+      if ((err as { code?: string })?.code !== "ENOENT") {
+        throw err;
+      }
+    }
+    return;
+  }
+  const ordered: Record<string, RestoreOffer> = {};
+  for (const key of keys) {
+    ordered[key] = sessions[key] as RestoreOffer;
+  }
+  fs.mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(
+    tmp,
+    `${JSON.stringify(
+      {
+        schema_version: RESTORE_RETRY_SCHEMA_VERSION,
+        sessions: ordered,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+  fs.renameSync(tmp, path);
+}
+
+function fileRestoreRetryStore(
+  path = resolveSetupTmuxRestoreRetryPath(),
+): RestoreRetryStore {
+  return {
+    read: () => readRetryFile(path),
+    mark: (offers) => {
+      writeRetryFile(path, { ...readRetryFile(path), ...offers });
+    },
+    clear: (sessions) => {
+      const next = readRetryFile(path);
+      for (const session of sessions) {
+        delete next[session];
+      }
+      writeRetryFile(path, next);
+    },
+  };
+}
+
 /**
  * Build the `keeper tabs restore --apply` spawn argv for one session — the
  * subprocess owns ExecBackend; setup-tmux only spawns it. `--session <name>`
@@ -783,6 +912,7 @@ export async function main(
   spawn: SyncSpawnFn = defaultSpawn,
   restoreOffer: RestoreOfferFn = defaultRestoreOffer,
   guardFs: GuardFs = defaultGuardFs,
+  retryStore: RestoreRetryStore = fileRestoreRetryStore(),
 ): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -841,20 +971,28 @@ export async function main(
     // mints `work` on the DEFAULT server (a new generation that would shift the
     // kill-anchored window). rebuildDash lives on a SEPARATE `-L dash` server
     // and no longer perturbs the default-server anchor, but the offer stays here
-    // ahead of provisioning regardless. A session is offered only when it is
-    // ABSENT (the first setup-tmux after a crash) AND has >0 candidates in the
-    // picked generation; a present session means this run isn't a recovery for it
-    // and we skip silently. Offers are read ONCE up front off the SAME selection
-    // seam the apply reads, and RESTORABLE (not the offer-map keys) is the
-    // iteration source so a stale or non-provisioned `backend_exec_session_id`
-    // can't leak into the prompt.
-    const offers = restoreOffer();
+    // ahead of provisioning regardless. A fresh session is offered only when it
+    // is ABSENT (the first setup-tmux after a crash) AND has >0 candidates in the
+    // picked generation. A marked retry is offered even when the session now
+    // exists, so a failed apply remains reachable after setup created the empty
+    // shell session. Offers are read ONCE up front off the SAME selection seam
+    // the apply reads, and RESTORABLE (not the offer-map keys) is the iteration
+    // source so a stale or non-provisioned `backend_exec_session_id` can't leak
+    // into the prompt.
+    const freshOffers = restoreOffer();
+    const retryOffers = retryStore.read();
+    const offers = { ...freshOffers, ...retryOffers };
     const nowSecs = Date.now() / 1000;
-    const offered = RESTORABLE.filter(
-      (session) =>
-        run(spawn, buildHasSessionArgs(session)).exitCode !== 0 &&
-        (offers[session]?.count ?? 0) > 0,
-    );
+    const offered = RESTORABLE.filter((session) => {
+      const offer = offers[session];
+      if ((offer?.count ?? 0) <= 0) {
+        return false;
+      }
+      if (retryOffers[session] !== undefined) {
+        return true;
+      }
+      return run(spawn, buildHasSessionArgs(session)).exitCode !== 0;
+    });
     let restoreSessions: readonly string[] = [];
     if (offered.length > 0) {
       const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
@@ -878,6 +1016,21 @@ export async function main(
           .join("; ");
         if (await confirm(`Restore last-session agents (${detail})? [y/N] `)) {
           restoreSessions = offered;
+          retryStore.mark(
+            Object.fromEntries(
+              restoreSessions.map((session) => [
+                session,
+                offers[session] as RestoreOffer,
+              ]),
+            ),
+          );
+        } else {
+          const declinedRetries = offered.filter(
+            (session) => retryOffers[session] !== undefined,
+          );
+          if (declinedRetries.length > 0) {
+            retryStore.clear(declinedRetries);
+          }
         }
       }
     }
@@ -922,6 +1075,9 @@ export async function main(
       process.stdout.write(
         `${renderRestoreOutcome(session, offer, result, nowSecs)}\n`,
       );
+      if (result.exitCode === 0) {
+        retryStore.clear([session]);
+      }
     }
   } catch (e) {
     if (e instanceof TmuxError) {

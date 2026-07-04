@@ -22,6 +22,7 @@ import {
   main,
   parseBusyPanes,
   type RestoreOffer,
+  type RestoreRetryStore,
   renderBusyTable,
   renderRestoreOutcome,
   resolveDashSize,
@@ -808,11 +809,31 @@ function makeOfferStub(
  *  every stdout write. `answer` of "" ⇒ EOF (confirm → false). `offers` is the
  *  injected per-session restore-offer map. Returns the captured stdout writes so
  *  a test can assert the prompt + outcome lines. */
+function memoryRetryStore(
+  initial: Record<string, RestoreOffer> = {},
+): RestoreRetryStore {
+  let state = { ...initial };
+  return {
+    read: () => ({ ...state }),
+    mark: (offers) => {
+      state = { ...state, ...offers };
+    },
+    clear: (sessions) => {
+      state = Object.fromEntries(
+        Object.entries(state).filter(
+          ([session]) => !sessions.includes(session),
+        ),
+      );
+    },
+  };
+}
+
 async function runWithTTY(opts: {
   spawn: SyncSpawnFn;
   offers: Record<string, RestoreOffer>;
   tty: boolean;
   answer: string;
+  retryStore?: RestoreRetryStore;
 }): Promise<string[]> {
   const savedStdin = process.stdin;
   const savedStdinTTY = process.stdin.isTTY;
@@ -843,7 +864,13 @@ async function runWithTTY(opts: {
   }) as typeof process.stdout.write;
 
   try {
-    await main([], opts.spawn, () => opts.offers);
+    await main(
+      [],
+      opts.spawn,
+      () => opts.offers,
+      undefined,
+      opts.retryStore ?? memoryRetryStore(),
+    );
   } finally {
     Object.defineProperty(process, "stdin", {
       value: savedStdin,
@@ -927,6 +954,63 @@ describe("main() restore-last-session offer", () => {
     const outcome = writes.find((w) => w.includes("'work' restore FAILED"));
     expect(outcome).toBeDefined();
     expect(outcome).toContain("autopilot is UNPAUSED");
+  });
+
+  test("accepted restore is marked before apply and remains marked on child failure", async () => {
+    const calls: string[][] = [];
+    const retryStore = memoryRetryStore();
+    const spawn = makeOfferStub({}, calls, {
+      exitCode: 1,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from("keeper tabs: nope"),
+    });
+    await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      tty: true,
+      answer: "y",
+      retryStore,
+    });
+
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
+    expect(retryStore.read().work?.count).toBe(2);
+  });
+
+  test("marked retry is offered even when work exists, and success clears it", async () => {
+    const calls: string[][] = [];
+    const retryStore = memoryRetryStore({ work: offerFor(4) });
+    const spawn = makeOfferStub({ work: 0 }, calls, {
+      exitCode: 0,
+      stdout: Buffer.from("# summary: restored=4 failed=0\n"),
+      stderr: Buffer.from(""),
+    });
+    const writes = await runWithTTY({
+      spawn,
+      offers: {},
+      tty: true,
+      answer: "y",
+      retryStore,
+    });
+
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
+    expect(writes.some((w) => w.includes("'work' restored 4"))).toBe(true);
+    expect(retryStore.read().work).toBeUndefined();
+  });
+
+  test("declining a marked retry clears the marker", async () => {
+    const calls: string[][] = [];
+    const retryStore = memoryRetryStore({ work: offerFor(4) });
+    const spawn = makeOfferStub({ work: 0 }, calls);
+    await runWithTTY({
+      spawn,
+      offers: {},
+      tty: true,
+      answer: "",
+      retryStore,
+    });
+
+    expect(spawnedAnyRestore(calls)).toBe(false);
+    expect(retryStore.read().work).toBeUndefined();
   });
 
   test("work present ⇒ no offer, no spawn", async () => {

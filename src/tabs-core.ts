@@ -44,6 +44,7 @@ import {
   buildTmuxNewSessionArgs,
   keeperAgentLaunch,
   localeDefaultedEnv,
+  MANAGED_EXEC_SESSION,
 } from "./exec-backend";
 import {
   buildLauncherArgvPrefix,
@@ -807,18 +808,34 @@ export function readAutopilotPaused(dbPath: string): boolean {
  *  a fixed verdict so the gate is asserted without a seeded autopilot row. */
 export type ReadPausedFn = (dbPath: string) => boolean;
 
+/** True iff a restore plan targets the reconciler-managed backend session. */
+export function restorePlanTouchesManagedSession(
+  plan: AgentOutcome[],
+  managedSession = MANAGED_EXEC_SESSION,
+): boolean {
+  return plan.some((entry) => {
+    if (entry.kind === "not-resumable") {
+      return false;
+    }
+    return entry.candidate.backend_exec_session_id === managedSession;
+  });
+}
+
 /**
  * Pure: decide the `--apply` autopilot fail-closed gate from the last-durable
- * paused state and the `--force` flag. `"proceed"` — paused (safe): launch, no
- * warning. `"blocked"` — unpaused without `--force`: FAIL CLOSED (the caller
- * exits non-zero having launched nothing). `"forced"` — unpaused WITH `--force`:
- * launch anyway, but the caller emits a stderr double-dispatch warning.
+ * paused state, the `--force` flag, and whether this restore touches the managed
+ * backend session. `"proceed"` — paused (safe), or unpaused while restoring only
+ * human sessions. `"blocked"` — unpaused managed-session restore without
+ * `--force`: FAIL CLOSED (the caller exits non-zero having launched nothing).
+ * `"forced"` — unpaused managed-session restore WITH `--force`: launch anyway,
+ * but the caller emits a stderr double-dispatch warning.
  */
 export function autopilotGateDecision(
   paused: boolean,
   force: boolean,
+  touchesManagedSession = true,
 ): "proceed" | "blocked" | "forced" {
-  if (paused) {
+  if (paused || !touchesManagedSession) {
     return "proceed";
   }
   return force ? "forced" : "blocked";

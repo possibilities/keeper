@@ -51,6 +51,7 @@ import {
   readAutopilotPaused,
   renderOutcomes,
   renderSnapshotScript,
+  restorePlanTouchesManagedSession,
   selectRestoreGeneration,
 } from "../src/tabs-core";
 import { freshDbFile } from "./helpers/template-db";
@@ -1063,6 +1064,24 @@ test("autopilotGateDecision matrix", () => {
   expect(autopilotGateDecision(true, true)).toBe("proceed");
   expect(autopilotGateDecision(false, false)).toBe("blocked");
   expect(autopilotGateDecision(false, true)).toBe("forced");
+  expect(autopilotGateDecision(false, false, false)).toBe("proceed");
+});
+
+const outcomeForSession = (session: string): AgentOutcome => ({
+  kind: "would-restore",
+  candidate: fakeCandidate({
+    job_id: `job-${session}`,
+    backend_exec_session_id: session,
+  }),
+});
+
+test("restorePlanTouchesManagedSession: only the managed backend session trips the gate", () => {
+  expect(restorePlanTouchesManagedSession([outcomeForSession("work")])).toBe(
+    false,
+  );
+  expect(
+    restorePlanTouchesManagedSession([outcomeForSession("autopilot")]),
+  ).toBe(true);
 });
 
 test("readAutopilotPaused reads folded state (0 unpaused, 1 paused, absent permissive)", () => {

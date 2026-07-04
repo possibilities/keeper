@@ -25,11 +25,12 @@
  *   7 — `restore --apply` found ZERO candidates without `--allow-empty`.
  *   8 — `restore --apply` had a PARTIAL launch failure (restored/failed summary).
  *
- * The autopilot fail-closed gate carries over verbatim: `--apply` refuses while
- * autopilot is UNPAUSED (restored tabs aren't `verb::id`-named, so a live
- * autopilot may double-dispatch) unless `--force` is passed (which still launches,
- * with a stderr double-dispatch warning). The paused read is daemon-down (last
- * durable state); unknown/absent reads as paused (permissive).
+ * The autopilot fail-closed gate is scoped to the managed backend session:
+ * `--apply` refuses while autopilot is UNPAUSED only when the restore plan targets
+ * that session (restored tabs aren't `verb::id`-named, so a live autopilot may
+ * double-dispatch) unless `--force` is passed (which still launches, with a
+ * stderr double-dispatch warning). The paused read is daemon-down (last durable
+ * state); unknown/absent reads as paused (permissive).
  *
  * Pure decision functions (argv routing, the restore exit-code classifier, the
  * picker parse, the table/summary renderers) are exported so the fast-tier unit
@@ -55,6 +56,7 @@ import {
   readAutopilotPaused,
   renderOutcomes,
   renderSnapshotScript,
+  restorePlanTouchesManagedSession,
 } from "../src/tabs-core";
 import {
   emitEnvelope,
@@ -125,8 +127,8 @@ off a TTY (exit ${TABS_EXIT_REFUSE_AMBIGUOUS}, ranked table on stderr).
   --db <path>         keeper.db path override ($KEEPER_DB / default otherwise)
   --help, -h          Show this help
 
---apply FAILS CLOSED (exit 1, launches nothing) while autopilot is UNPAUSED unless
---force is passed. Zero candidates under --apply exits ${TABS_EXIT_ZERO_CANDIDATES} (pass --allow-empty to
+--apply FAILS CLOSED (exit 1, launches nothing) while autopilot is UNPAUSED only
+when the restore plan targets the managed autopilot session, unless --force is passed. Zero candidates under --apply exits ${TABS_EXIT_ZERO_CANDIDATES} (pass --allow-empty to
 proceed); any partial launch failure exits ${TABS_EXIT_PARTIAL_FAILURE} with a restored/failed summary.
 `;
 
@@ -524,7 +526,11 @@ async function runRestore(cmd: {
   const tty = isTty();
   let plan = planRestore(selection.candidates, cmd.session);
   let gate = cmd.apply
-    ? autopilotGateDecision(readAutopilotPaused(dbPath), cmd.force)
+    ? autopilotGateDecision(
+        readAutopilotPaused(dbPath),
+        cmd.force,
+        restorePlanTouchesManagedSession(plan),
+      )
     : ("proceed" as const);
 
   let decision = classifyRestore({
@@ -564,7 +570,11 @@ async function runRestore(cmd: {
     }
     plan = planRestore(selection.candidates, cmd.session);
     gate = cmd.apply
-      ? autopilotGateDecision(readAutopilotPaused(dbPath), cmd.force)
+      ? autopilotGateDecision(
+          readAutopilotPaused(dbPath),
+          cmd.force,
+          restorePlanTouchesManagedSession(plan),
+        )
       : ("proceed" as const);
     decision = classifyRestore({
       ambiguous: false,
@@ -598,9 +608,10 @@ async function runRestore(cmd: {
     }
     case "gate-blocked": {
       return fail(
-        "autopilot is UNPAUSED — refusing to --apply (restored tabs aren't " +
-          "'verb::id'-named, so autopilot may double-dispatch). Pause autopilot, " +
-          "or pass --force to override.",
+        "autopilot is UNPAUSED — refusing to --apply for the managed " +
+          "autopilot session (restored tabs aren't 'verb::id'-named, so " +
+          "autopilot may double-dispatch). Pause autopilot, restore only a " +
+          "human session with --session, or pass --force to override.",
         1,
       );
     }
