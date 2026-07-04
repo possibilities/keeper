@@ -1707,6 +1707,63 @@ test("summarizeTopologyGenerations: exposes ranked per-generation summaries for 
   expect(byId.get("gen-skel")?.max_pane_count).toBe(1);
 });
 
+test("summarizeTopologyGenerations (bound): only the current + newest K dead generations are decoded", () => {
+  // Seed MORE than RECENT_GENERATION_BOUND dead generations plus the live one.
+  // The index-only summary walk sees them all, but only the current generation
+  // and the newest K dead ones are ENRICHED (decoded) — an old generation past
+  // the bound never yields a summary, so its snapshots are never decoded. Every
+  // seeded snapshot is 2-pane (non-degenerate) and in-cutoff, so nothing is
+  // dropped by the selection filters; only the decode bound removes the oldest.
+  const total = RECENT_GENERATION_BOUND + 3;
+  for (let g = 0; g < total; g++) {
+    const a = `g${g}-a`;
+    const b = `g${g}-b`;
+    // Ascending rowids ⇒ higher g is newer.
+    seedTmuxTopologySnapshot(
+      kdb.db,
+      100 + g,
+      `gen-dead-${g}`,
+      ownedPanes([a, b]),
+      NOW - 100,
+    );
+  }
+  seedJob(kdb.db, { job_id: "live", state: "working", title: "live" });
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    100 + total,
+    "gen-now",
+    [
+      {
+        pane_id: "%now",
+        session_name: "work",
+        window_index: 0,
+        job_id: "live",
+      },
+    ],
+    NOW - 10,
+  );
+
+  const gens = summarizeTopologyGenerations(kdb.db, {
+    now: NOW,
+    currentGenerationId: "gen-now",
+  });
+  // Current + the newest RECENT_GENERATION_BOUND dead generations, newest-first.
+  const expected = ["gen-now"];
+  for (let g = total - 1; g >= total - RECENT_GENERATION_BOUND; g--) {
+    expected.push(`gen-dead-${g}`);
+  }
+  expect(gens.map((g) => g.generation_id)).toEqual(expected);
+  // The three oldest dead generations are past the decode bound — absent.
+  const seen = new Set(gens.map((g) => g.generation_id));
+  for (let g = 0; g < total - RECENT_GENERATION_BOUND; g++) {
+    expect(seen.has(`gen-dead-${g}`)).toBe(false);
+  }
+  // The current generation is decoded (its restorable count reflects a decode).
+  const now = gens.find((g) => g.generation_id === "gen-now");
+  expect(now?.is_current).toBe(true);
+  expect(now?.max_pane_count).toBe(1);
+});
+
 test("GENERATION_SUMMARY_SQL: the summary walk is served by the v107 partial index (EXPLAIN QUERY PLAN)", () => {
   // Seed a spread of snapshot generations + ANALYZE so the planner has stats,
   // then assert the summary walk hits idx_events_tmux_generation and never does a

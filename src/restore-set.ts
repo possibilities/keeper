@@ -801,11 +801,23 @@ export interface EnrichedGeneration {
 }
 
 /**
- * Run the index-only generation-summary walk, then enrich each generation by
- * decoding its snapshots: peak pane count, degeneracy, current-server flag, and
- * the restore candidates from its newest attributed snapshot. Ordered
- * newest-first (the walk's `ORDER BY MAX(id) DESC`). `liveJobIds` is read ONCE
- * and shared across every generation's candidate build.
+ * Run the index-only generation-summary walk, then enrich a BOUNDED window of
+ * generations by decoding their snapshots: peak pane count, degeneracy,
+ * current-server flag, and the restore candidates from the newest attributed
+ * snapshot. Ordered newest-first (the walk's `ORDER BY MAX(id) DESC`).
+ *
+ * The summary walk is index-only and stays full over the retained history, but
+ * decoding a generation's snapshots is the cost that grows unbounded on a
+ * long-lived host — so only the CURRENT generation (always, for the list view)
+ * plus the newest {@link RECENT_GENERATION_BOUND} DEAD generations are decoded;
+ * older generations keep only their (never-returned) index-only summary. That
+ * window is a superset of every generation the auto-pick's
+ * idle-cutoff-then-slice-K selection can reach: rowid order tracks `ts` order in
+ * the append-only event log, so any dead generation past the newest K is older
+ * than all of them and thus already past the idle cutoff whenever a top-K
+ * generation is — bounding the decode never drops a generation the full-scan
+ * selection would have picked. `liveJobIds` is read ONCE and shared across every
+ * decoded generation's candidate build.
  */
 function loadEnrichedGenerations(
   db: Database,
@@ -815,8 +827,25 @@ function loadEnrichedGenerations(
   if (raws.length === 0) {
     return [];
   }
+  // Bound the DECODE (not the index-only summary walk above). `raws` is
+  // newest-first, so pushing in encounter order keeps the result newest-first.
+  const toEnrich: RawGenerationSummary[] = [];
+  let deadEnriched = 0;
+  for (const raw of raws) {
+    const isCurrent =
+      currentGenerationId !== null && raw.generation_id === currentGenerationId;
+    if (isCurrent) {
+      toEnrich.push(raw);
+      continue;
+    }
+    if (deadEnriched < RECENT_GENERATION_BOUND) {
+      toEnrich.push(raw);
+      deadEnriched++;
+    }
+    // Older dead generations past the bound are never decoded.
+  }
   const { liveJobIds } = loadRows(db);
-  return raws.map((raw) =>
+  return toEnrich.map((raw) =>
     enrichGeneration(db, raw, currentGenerationId, liveJobIds),
   );
 }

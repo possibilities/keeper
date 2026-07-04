@@ -202,6 +202,16 @@ export function countOutcomes(outcomes: AgentOutcome[]): {
  * `excludedIdleCount > 0` a trailing note surfaces the idle-excluded count (a
  * false-negative we make visible, never a silent drop).
  */
+/**
+ * Collapse CR/LF runs to a single space so an agent-influenced value (a job
+ * title driving `label`, a session name) interpolated into a `#` comment line
+ * cannot break out of the comment into a live, executed line of the generated
+ * script. Every comment-line interpolation of such a value routes through here.
+ */
+export function commentSafe(value: string): string {
+  return value.replace(/[\r\n]+/g, " ");
+}
+
 export function renderOutcomes(
   outcomes: AgentOutcome[],
   apply: boolean,
@@ -214,13 +224,16 @@ export function renderOutcomes(
     const c = o.candidate;
     const cwd = c.cwd == null ? "" : seg(c.cwd);
     const cmd = buildResumeCommand(cwd, c.resume_target, null);
-    const session = c.backend_exec_session_id;
+    const session = commentSafe(c.backend_exec_session_id);
+    const label = commentSafe(c.label);
     if (o.kind === "would-restore") {
-      stanzas.push(`# (${session}) would restore ${c.label}\n${cmd}`);
+      stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "restored") {
-      stanzas.push(`# (${session}) restored ${c.label}\n${cmd}`);
+      stanzas.push(`# (${session}) restored ${label}\n${cmd}`);
     } else {
-      stanzas.push(`# (${session}) FAILED ${c.label}: ${o.error}\n${cmd}`);
+      stanzas.push(
+        `# (${session}) FAILED ${label}: ${commentSafe(o.error)}\n${cmd}`,
+      );
     }
   }
 
@@ -329,7 +342,9 @@ export function renderSnapshotScript(
     sessionCount++;
     const n = bucket.length;
     lines.push("");
-    lines.push(`# session: ${sessionName} (${n} window${n === 1 ? "" : "s"})`);
+    lines.push(
+      `# session: ${commentSafe(sessionName)} (${n} window${n === 1 ? "" : "s"})`,
+    );
     // Get-or-create the session up front. keeper agent also mints it, so this is
     // redundant — kept so the script reads self-contained. `|| ` keeps `set -e`
     // from tripping when has-session exits non-zero (session absent).
@@ -351,7 +366,7 @@ export function renderSnapshotScript(
       if (windowsEmitted > 0) {
         lines.push("sleep 0.5");
       }
-      lines.push(`# ${candidate.label}`);
+      lines.push(`# ${commentSafe(candidate.label)}`);
       // `cd <cwd> &&` sets keeper agent's process.cwd() (the directory it reads for
       // the launch-script `cd`); the --apply path sets it on the spawn instead.
       const cdPrefix = cwd === "" ? "" : `cd ${shellQuote(cwd)} && `;
