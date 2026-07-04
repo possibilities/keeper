@@ -34,5 +34,5 @@ Keeper becomes the first adopter — this doc work is the task's declared delive
 - [ ] All commits landed through the domain-docs lint arm
 
 ## Done summary
-
+Bootstrapped keeper's domain-knowledge layer: a 55-line linted CONTEXT.md glossary (35 terms across five bounded contexts, each with an Avoid line, zero impl detail), four seed ADRs, a net-smaller CLAUDE.md (110->107 lines) with all guardrails intact, and a README pointer to the two doc homes. All commits passed through the new domain-docs lint arm.
 ## Evidence
