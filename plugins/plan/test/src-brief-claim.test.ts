@@ -75,8 +75,91 @@ describe("brief assemble + write", () => {
       // Missing specs -> empty markdown, never a throw.
       expect(brief.task_spec_md).toBe("");
       expect(brief.epic_spec_md).toBe("");
+      // Absent CONTEXT.md -> present-but-empty glossary (stable key set).
+      expect("glossary_md" in brief).toBe(true);
+      expect(brief.glossary_md).toBe("");
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("assembleBrief reads the target repo's CONTEXT.md verbatim", () => {
+    const repo = tmp("planctl-glossary-");
+    const dataDir = tmp("planctl-glossary-data-");
+    try {
+      const glossary = "## Glossary\n\n**Lane**: a worktree checkout.\n";
+      writeFileSync(join(repo, "CONTEXT.md"), glossary);
+      const brief = assembleBrief({
+        taskId: "fn-1-x.1",
+        epicId: "fn-1-x",
+        targetRepo: repo,
+        primaryRepo: repo,
+        stateRepo: repo,
+        tier: "high",
+        dataDir,
+      });
+      expect(brief.glossary_md).toBe(glossary);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("assembleBrief sources the glossary from targetRepo, not primaryRepo", () => {
+    const target = tmp("planctl-glossary-t-");
+    const primary = tmp("planctl-glossary-p-");
+    try {
+      // The worker edits the target repo's code -> its glossary must win.
+      writeFileSync(join(target, "CONTEXT.md"), "target glossary\n");
+      writeFileSync(join(primary, "CONTEXT.md"), "primary glossary\n");
+      const brief = assembleBrief({
+        taskId: "fn-1-x.1",
+        epicId: "fn-1-x",
+        targetRepo: target,
+        primaryRepo: primary,
+        stateRepo: primary,
+        tier: null,
+        dataDir: primary,
+      });
+      expect(brief.glossary_md).toBe("target glossary\n");
+    } finally {
+      rmSync(target, { recursive: true, force: true });
+      rmSync(primary, { recursive: true, force: true });
+    }
+  });
+
+  test("assembleBrief caps an oversize glossary at a line boundary with a marker", () => {
+    const repo = tmp("planctl-glossary-big-");
+    try {
+      // 101-byte lines * 200 = 20200 bytes > the 16 KiB (16384) cap. The cap
+      // slice (first 16384 bytes) spans 162 whole lines (16362 bytes) plus a
+      // 22-byte partial line 163; truncation backs up to the last newline, so
+      // exactly 162 whole lines survive. Constants hand-computed from the input,
+      // independent of the code path under test.
+      const line = "x".repeat(100) + "\n"; // 101 bytes
+      writeFileSync(join(repo, "CONTEXT.md"), line.repeat(200));
+      const brief = assembleBrief({
+        taskId: "fn-1-x.1",
+        epicId: "fn-1-x",
+        targetRepo: repo,
+        primaryRepo: repo,
+        stateRepo: repo,
+        tier: "high",
+        dataDir: repo,
+      });
+      const g = brief.glossary_md as string;
+      const expectedBody = line.repeat(162); // 16362 bytes, ends on a newline
+      const marker =
+        "[glossary truncated at 16KiB — read CONTEXT.md for the full text]\n";
+      expect(Buffer.byteLength(expectedBody, "utf-8")).toBe(16362);
+      expect(g).toBe(expectedBody + marker);
+      // The retained body stays within the cap and ends cleanly on a line.
+      expect(Buffer.byteLength(expectedBody, "utf-8")).toBeLessThanOrEqual(
+        16 * 1024,
+      );
+      expect(expectedBody.endsWith("\n")).toBe(true);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
     }
   });
 

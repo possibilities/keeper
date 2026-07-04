@@ -29,6 +29,43 @@ function readSpecMd(dataDir: string, specId: string): string {
   return readFileSync(specPath, "utf-8");
 }
 
+/** Byte cap on the glossary carried in a brief — bounds always-loaded worker
+ * context. Truncation cuts at a line boundary within this cap, then appends the
+ * marker below. */
+export const GLOSSARY_CAP_BYTES = 16 * 1024;
+
+/** Appended when the glossary is truncated, so the worker knows the text is
+ * partial and the full glossary lives in the repo's CONTEXT.md. */
+const GLOSSARY_TRUNCATION_MARKER =
+  "[glossary truncated at 16KiB — read CONTEXT.md for the full text]\n";
+
+/** Read the target repo's root CONTEXT.md glossary for a brief. Absent or
+ * unreadable → "" (stable-key discipline: the field is present-but-empty, never
+ * omitted). Oversize → truncated at a line boundary within GLOSSARY_CAP_BYTES
+ * plus a marker line. Assembly-time only: re-read on every claim, never folded
+ * into a projection, so editing CONTEXT.md needs no re-fold or migration. */
+function readGlossaryMd(repoPath: string): string {
+  const glossaryPath = join(repoPath, "CONTEXT.md");
+  let content: string;
+  try {
+    content = readFileSync(glossaryPath, "utf-8");
+  } catch {
+    return "";
+  }
+  if (Buffer.byteLength(content, "utf-8") <= GLOSSARY_CAP_BYTES) {
+    return content;
+  }
+  // Cut on a byte cap, then back up to the last line boundary so the truncation
+  // lands cleanly and never splits a multibyte char (the discarded tail sits
+  // after the last kept newline).
+  const capped = Buffer.from(content, "utf-8")
+    .subarray(0, GLOSSARY_CAP_BYTES)
+    .toString("utf-8");
+  const lastNl = capped.lastIndexOf("\n");
+  const body = lastNl >= 0 ? capped.slice(0, lastNl + 1) : capped;
+  return body + GLOSSARY_TRUNCATION_MARKER;
+}
+
 export interface BriefInputs {
   taskId: string;
   epicId: string;
@@ -55,6 +92,7 @@ export function assembleBrief(inputs: BriefInputs): Record<string, unknown> {
     tier: inputs.tier,
     task_spec_md: readSpecMd(inputs.dataDir, inputs.taskId),
     epic_spec_md: readSpecMd(inputs.dataDir, inputs.epicId),
+    glossary_md: readGlossaryMd(inputs.targetRepo),
     snippet_context: "",
   };
 }
