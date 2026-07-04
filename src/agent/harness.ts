@@ -29,8 +29,12 @@ export type SecondAxis = "effort" | "thinking" | "none";
 
 /** How a harness's live working/stopped churn reaches keeper's jobs projection.
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
- *  `none`: no live hook channel — presence-only (codex/pi today). */
-export type HookMechanism = "claude-hooks" | "none";
+ *  `codex-rollout-tail`: the daemon-side producer forward-tails the attributed
+ *  rollout and mints a synthetic Stop per turn-completion — STOP-ONLY, since
+ *  codex's rollout carries no turn-START marker (degrades to presence-only when a
+ *  rollout is unattributed or absent).
+ *  `none`: no live hook channel — presence-only (pi today). */
+export type HookMechanism = "claude-hooks" | "codex-rollout-tail" | "none";
 
 /** One harness's full behavioral row: identity, launch, second axis, and the
  *  capability flags that gate downstream behavior. */
@@ -83,7 +87,10 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     secondAxis: "effort",
     capturable: true,
     mintsOwnSessionId: true,
-    hookMechanism: "none",
+    // M3b: live stop-churn via the daemon-side rollout tailer. Stop-only — codex's
+    // rollout has no turn-START marker — and degrades to presence-only when the
+    // session is unattributed.
+    hookMechanism: "codex-rollout-tail",
   },
   pi: {
     name: "pi",
